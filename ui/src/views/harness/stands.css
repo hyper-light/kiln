@@ -1,0 +1,169 @@
+/* How your agents stand (stands.tsx): a spectral rule under Mission control's head, a length for
+   each way they stand, and under it the counts. Motion is transform and opacity only, so the GPU
+   runs it and nothing is painted again; only what goes on moves. */
+
+.st {
+  min-height: 26px;
+  margin: -6px 0 26px;
+}
+.st-lead {
+  max-width: 560px;
+  margin: -6px 0 26px;
+  color: #a1a4ad;
+  font-size: 14px;
+  line-height: 1.8;
+}
+@media (max-width: 640px) {
+  .st,
+  .st-lead {
+    margin: -2px 0 16px;
+  }
+}
+.st [data-stand] {
+  --st-c: #7e818a;
+  --st-t: #a1a4ad;
+}
+.st [data-stand="needs"] {
+  --st-c: #d8bb95;
+  --st-t: #e2cfae;
+}
+.st [data-stand="crashed"] {
+  --st-c: #d1aaad;
+  --st-t: #e2b9bd;
+}
+.st [data-stand="paused"] {
+  --st-c: #a6b2c6;
+  --st-t: #b8c2d3;
+}
+.st [data-stand="working"] {
+  --st-c: #bab0e3;
+  --st-t: #cdc6ea;
+}
+.st [data-stand="finished"] {
+  --st-c: #a8c9bc;
+  --st-t: #bfdccf;
+}
+.st [data-stand="ready"] {
+  --st-c: #6f8f84;
+  --st-t: #a1a4ad;
+}
+.st [data-stand="offline"] {
+  --st-c: #7e818a;
+  --st-t: #8b8e96;
+}
+
+/* The rule: one length for each way they stand, as long as its share of your agents. */
+.st-rule {
+  display: flex;
+  width: 100%;
+  height: 3px;
+  margin-bottom: 12px;
+  gap: 3px;
+}
+.st-rule > i {
+  position: relative;
+  display: block;
+  min-width: 4px;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--st-c);
+}
+/* Working: the prism as a current flowing along it (a strip twice the prism long, slid one prism on). */
+.st-rule > i[data-stand="working"] {
+  background: none;
+}
+.st-rule > i[data-stand="working"]::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 300%;
+  background: linear-gradient(90deg, #b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa, #d8cbb0, #b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa, #d8cbb0, #b8d9d2);
+  animation: st-flow 5s linear infinite;
+}
+/* Needs you: it brightens and dims. Paused and offline: broken into dashes, still. */
+.st-rule > i[data-stand="needs"] {
+  animation: st-hold 1.6s ease-in-out infinite alternate;
+}
+.st-rule > i[data-stand="paused"],
+.st-rule > i[data-stand="offline"] {
+  background: repeating-linear-gradient(90deg, var(--st-c) 0 6px, transparent 6px 9px);
+}
+.st-rule > i[data-stand="offline"] {
+  opacity: 0.6;
+}
+
+/* Under it, each one's count after a tick of its length, and on a desktop its name. */
+.st-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.st-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--st-t);
+}
+.st-tick {
+  display: block;
+  flex: none;
+  width: 10px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--st-c);
+}
+.st [data-stand="working"] > .st-tick {
+  background: var(--prism);
+}
+.st [data-stand="paused"] > .st-tick,
+.st [data-stand="offline"] > .st-tick {
+  background: repeating-linear-gradient(90deg, var(--st-c) 0 4px, transparent 4px 6px);
+}
+.st-n {
+  font-size: 15px;
+  font-weight: 450;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  line-height: 1;
+}
+.st-quiet,
+.st-word {
+  color: #97999f;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+@media (max-width: 640px) {
+  .st-word {
+    display: none;
+  }
+}
+
+@keyframes st-flow {
+  to {
+    transform: translateX(-50%);
+  }
+}
+@keyframes st-hold {
+  from {
+    opacity: 0.45;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .st *,
+  .st *::before,
+  .st *::after {
+    animation: none !important;
+  }
+}

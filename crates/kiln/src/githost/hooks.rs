@@ -42,11 +42,11 @@ pub async fn gitlab(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
         crate::deploy::remote::on_gitlab_event(&d, &event, &v).await;
     }
     let Some(repo) = repo_named(hub, &path, |r| host.name_of(r)).await else {
-        hub.gitops_kick.notify();
+        crate::gitops::wake(hub);
         return Ok(srv::status(StatusCode::ACCEPTED));
     };
     match event.as_str() {
-        "Push Hook" | "Tag Push Hook" => hub.gitops_kick.notify(),
+        "Push Hook" | "Tag Push Hook" => crate::gitops::want(hub, &repo.id),
         "Pipeline Hook" | "Job Hook" | "Deployment Hook" => {
             let hub2 = Arc::clone(hub);
             crate::rt::spawn(async move {
@@ -81,11 +81,11 @@ pub async fn bitbucket(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
         crate::deploy::remote::on_bitbucket_event(&d, &event, &v).await;
     }
     let Some(repo) = repo_named(hub, &full, |r| host.name_of(r)).await else {
-        hub.gitops_kick.notify();
+        crate::gitops::wake(hub);
         return Ok(srv::status(StatusCode::ACCEPTED));
     };
     match event.as_str() {
-        "repo:push" => hub.gitops_kick.notify(),
+        "repo:push" => crate::gitops::want(hub, &repo.id),
         "repo:commit_status_created" | "repo:commit_status_updated" => {
             let hub2 = Arc::clone(hub);
             crate::rt::spawn(async move {

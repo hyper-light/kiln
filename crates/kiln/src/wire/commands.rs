@@ -6,8 +6,10 @@
 //! - **Parked** commands (a leg to cancel, a session to close) wait while their runner is away.
 //!   They're kept, and sent again after a reconnect from where the runner has them.
 //! - **Live** commands (keystrokes, a terminal to open, a leg to run) are refused at once while
-//!   their runner is away. If the link drops before one is answered, it ends unanswered: sent
-//!   again later, it would surprise. Within a live link, a live command goes again like any item.
+//!   their runner is away (its link down). A runner that has just connected and not yet said what
+//!   it has isn't away: a live command sent then goes once it has. If the link drops before one is
+//!   answered, it ends unanswered (unreachable if it never went): sent again later, it would
+//!   surprise. Within a live link, a live command goes again like any item.
 //!
 //! Each stream's name carries the server's incarnation and a generation (`p:<born>.<gen>`,
 //! `l:<born>.<gen>`). A runner process that started again has neither stream. Its parked commands
@@ -120,6 +122,8 @@ struct Peer {
     tx: Sender,
     parked: Stream,
     live: Stream,
+    /// The link is up: the runner process is connected, and may not have said what it has yet.
+    link: bool,
     /// The link is up and the runner has said what it has.
     up: bool,
 }
@@ -144,7 +148,7 @@ impl Commands {
 
     fn peer(&mut self, peer: PeerId) -> &mut Peer {
         let (room, patience) = (self.room, self.patience);
-        self.peers.entry(peer).or_insert_with(|| Peer { tx: Sender::new(room, patience), parked: Stream::new("p"), live: Stream::new("l"), up: false })
+        self.peers.entry(peer).or_insert_with(|| Peer { tx: Sender::new(room, patience), parked: Stream::new("p"), live: Stream::new("l"), link: false, up: false })
     }
 
     /// Whether runner process `peer` takes commands on the channel (it said so, or sent a frame of
@@ -159,8 +163,9 @@ impl Commands {
     }
 
     /// Runner process `peer` keeps the channel, on a link that just came up: its commands go on
-    /// it from now on, once it says what it has. A link the server took for up went without the
-    /// server hearing it go (a runner that started again on the same certificate is the same
+    /// it from now on, once it says what it has (a live one sent meanwhile waits for that, rather
+    /// than being refused as if its runner were away). A link the server took for up went without
+    /// the server hearing it go (a runner that started again on the same certificate is the same
     /// peer): as when it drops, its live commands end, and its parked ones wait for what the new
     /// link's first `Have` says (one that started again has nothing: they go on a new generation).
     pub fn connected(&mut self, peer: PeerId) {
@@ -169,17 +174,19 @@ impl Commands {
         if p.up {
             p.up = false;
             p.tx.down();
-            restart(p, Kind::Live, born);
+            restart(p, Kind::Live, born, true);
         }
+        p.link = true;
     }
 
     /// Queues `body` (an encoded `ServerMsg`) as a command to `peer`: its answer comes on the
-    /// receiver. A live command to a runner that's away, or one past the room, is answered at once.
+    /// receiver. A live command to a runner that's away (its link down), or one past the room, is
+    /// answered at once; one to a runner that has just connected goes once it has said what it has.
     pub fn push(&mut self, peer: PeerId, kind: Kind, body: Vec<u8>, now: Instant) -> oneshot::Receiver<Answer> {
         let (tx, rx) = oneshot::channel();
         let born = self.born;
         let p = self.peer(peer);
-        if kind == Kind::Live && !p.up {
+        if kind == Kind::Live && !p.link {
             let _ = tx.send(Answer::Unreachable { why: "its runner is away".into() });
             return rx;
         }
@@ -206,6 +213,7 @@ impl Commands {
         let p = self.peer(peer);
         let events = p.tx.on_frame(frame);
         if have {
+            p.link = true;
             p.up = true;
         }
         for e in events {
@@ -229,23 +237,26 @@ impl Commands {
                 // commands not yet answered go again on a new generation; its live ones end.
                 Event::Regressed { stream, .. } => {
                     if stream == p.parked.name(born) {
-                        restart(p, Kind::Parked, born);
+                        restart(p, Kind::Parked, born, true);
                     } else if stream == p.live.name(born) {
-                        restart(p, Kind::Live, born);
+                        restart(p, Kind::Live, born, true);
                     }
                 }
             }
         }
     }
 
-    /// Runner process `peer`'s link went down: its live commands not yet answered end, and its
-    /// parked ones wait for it.
+    /// Runner process `peer`'s link went down: its live commands not yet answered end (unreachable
+    /// when it never said what it has on the link, so none of them went), and its parked ones wait
+    /// for it.
     pub fn down(&mut self, peer: PeerId) {
         let born = self.born;
         let Some(p) = self.peers.get_mut(&peer) else { return };
+        let went = p.up;
+        p.link = false;
         p.up = false;
         p.tx.down();
-        restart(p, Kind::Live, born);
+        restart(p, Kind::Live, born, went);
     }
 
     /// Runner process `peer` is gone for good (retired, forgotten): every command it hadn't
@@ -271,7 +282,7 @@ impl Commands {
                         let _ = w.answer.send(Answer::Unreachable { why: "its runner didn't come back in time".into() });
                     }
                 }
-                restart(p, Kind::Parked, born);
+                restart(p, Kind::Parked, born, true);
             }
             out.extend(p.tx.poll(now).into_iter().map(|f| (*peer, f)));
         }
@@ -285,8 +296,9 @@ impl Commands {
 }
 
 /// Starts one of `p`'s streams over on a new generation: a parked stream with what it hadn't had
-/// answered, in order; a live one empty, what it hadn't had answered ending unanswered.
-fn restart(p: &mut Peer, kind: Kind, born: u64) {
+/// answered, in order; a live one empty, what it hadn't had answered ending unanswered (`went`:
+/// it may have reached the runner), or unreachable (it can't have).
+fn restart(p: &mut Peer, kind: Kind, born: u64, went: bool) {
     let stream = match kind {
         Kind::Parked => &mut p.parked,
         Kind::Live => &mut p.live,
@@ -297,8 +309,11 @@ fn restart(p: &mut Peer, kind: Kind, born: u64) {
     let name = stream.name(born);
     for (_, w) in waiting {
         match kind {
-            Kind::Live => {
+            Kind::Live if went => {
                 let _ = w.answer.send(Answer::Unanswered { why: "the link to its runner dropped before it answered".into() });
+            }
+            Kind::Live => {
+                let _ = w.answer.send(Answer::Unreachable { why: "its runner went away before it said what it has".into() });
             }
             Kind::Parked => match p.tx.push(&name, w.body.clone()) {
                 Ok(seq) => {
@@ -397,10 +412,13 @@ mod tests {
         let mut c = Commands::new(7);
         let mut r = Runner::new();
         c.connected(1);
-        // Away (it hasn't said what it has yet): the live command ends at once, the parked one waits.
+        c.down(1);
+        // Away (its link down): the live command ends at once, the parked one waits.
         let mut keys = c.push(1, Kind::Live, b"keys".to_vec(), base);
         assert!(matches!(answer(&mut keys), Some(Answer::Unreachable { .. })));
         let mut cancel = c.push(1, Kind::Parked, b"cancel a".to_vec(), base);
+        assert!(c.poll(base).is_empty(), "nothing goes while it's away");
+        c.connected(1);
         assert!(c.poll(base).is_empty(), "nothing goes before the runner says what it has");
         c.on_frame(1, r.rx.have());
         for a in r.deliver(c.poll(t(base, 10)), |_| false) {
@@ -408,6 +426,32 @@ mod tests {
         }
         assert_eq!(answer(&mut cancel), Some(Answer::Taken));
         assert_eq!(r.took, vec![b"cancel a".to_vec()]);
+    }
+
+    /// w20_ac05's race: a leg assigned the moment its runner connected, before it said what it
+    /// has, was refused as though its runner were away, and the leg was never run.
+    #[test]
+    fn a_live_command_to_a_runner_that_just_connected_goes_once_it_says_what_it_has() {
+        let base = Instant::now();
+        let mut c = Commands::new(7);
+        let mut r = Runner::new();
+        c.connected(1);
+        let mut assign = c.push(1, Kind::Live, b"assign".to_vec(), base);
+        assert_eq!(answer(&mut assign), None, "not refused: its runner is here");
+        assert!(c.poll(base).is_empty(), "nor sent before it says what it has");
+        c.on_frame(1, r.rx.have());
+        for a in r.deliver(c.poll(t(base, 5)), |_| false) {
+            c.on_frame(1, a);
+        }
+        assert_eq!(answer(&mut assign), Some(Answer::Taken));
+        assert_eq!(r.took, vec![b"assign".to_vec()]);
+        // Its link drops before it says what it has: nothing went, so it never reached it.
+        let mut c = Commands::new(7);
+        c.connected(2);
+        let mut lost = c.push(2, Kind::Live, b"assign".to_vec(), base);
+        c.down(2);
+        assert!(matches!(answer(&mut lost), Some(Answer::Unreachable { .. })), "never sent: unreachable, not unanswered");
+        assert_eq!(c.waiting(), 0);
     }
 
     #[test]

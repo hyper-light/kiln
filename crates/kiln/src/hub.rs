@@ -295,7 +295,11 @@ pub struct Hub {
     /// One-time outpost invites (`POST /api/outposts/invite`).
     pub outpost_invites: OutpostInvites,
     pub k8s: std::sync::OnceLock<Option<Arc<crate::k8s::K8s>>>,
+    /// Wakes the repository poller ([`crate::gitops::poll_loop`]) to look at what's due: what a
+    /// kick names ([`Hub::gitops_wanted`], [`crate::gitops::want`]) and what its interval says.
     pub gitops_kick: Notify,
+    /// Repositories (by id) asked to be polled now: a push, a webhook, a new repository.
+    pub gitops_wanted: Mutex<HashSet<String>>,
     pub shutdown: Shutdown,
     /// Time, as the goal driver and what else moves onto it take it: kiln's runtime in production,
     /// a simulated clock in tests (kiln-seams' `Clock`, docs/seams.md).
@@ -425,6 +429,7 @@ impl Hub {
             outpost_invites: OutpostInvites::default(),
             k8s: std::sync::OnceLock::new(),
             gitops_kick: Notify::new(),
+            gitops_wanted: Mutex::new(HashSet::new()),
             shutdown,
             clock,
             cancel_sent: Mutex::new(HashMap::new()),
@@ -964,6 +969,10 @@ impl Hub {
             Err(e) => return at_once(Answer::Unreachable { why: format!("it couldn't be encoded: {e}") }),
         };
         let mut waits = Vec::new();
+        // Answers a process gave at once (away, or with too much waiting for it already): what the
+        // command is now when no other process takes it, so a caller sees it (and puts a leg back
+        // in the queue) rather than wait on an answer that came and went.
+        let mut given = Vec::new();
         let mut sent = false;
         let mut away = stream == Some(Stream::Parked);
         for p in peers {
@@ -971,7 +980,11 @@ impl Hub {
             match on_channel {
                 Some(kind) => {
                     away &= !self.cmds.lock().is_up(p);
-                    waits.push(self.cmds.lock().push(p, kind, body.clone(), Instant::now()));
+                    let mut rx = self.cmds.lock().push(p, kind, body.clone(), Instant::now());
+                    match rx.try_recv() {
+                        Ok(Some(a)) => given.push(a),
+                        _ => waits.push(rx),
+                    }
                 }
                 None => {
                     away = false;
@@ -980,7 +993,21 @@ impl Hub {
             }
         }
         self.flush_commands().await;
-        let first = if sent { Answer::Sent } else if waits.is_empty() { Answer::Unreachable { why: format!("{agent} is not connected") } } else { Answer::Taken };
+        let first = if sent {
+            Answer::Sent
+        } else if !waits.is_empty() {
+            Answer::Taken
+        } else {
+            given.first().cloned().unwrap_or_else(|| Answer::Unreachable { why: format!("{agent} is not connected") })
+        };
+        // Beside processes still to answer, those that answered at once count with them.
+        if !waits.is_empty() {
+            for a in given {
+                let (tx, rx) = futures::channel::oneshot::channel();
+                let _ = tx.send(a);
+                waits.push(rx);
+            }
+        }
         Pending { agent: agent.to_owned(), what, away: away && !waits.is_empty(), waits, at_once: first }
     }
 

@@ -216,7 +216,7 @@ pub async fn create(d: &Deploy, t: &RepoTemplate, app: &App, by: &str) -> Result
             }
         });
     }
-    d.hub.gitops_kick.notify();
+    crate::gitops::wake(&d.hub);
     Ok(name)
 }
 
@@ -286,7 +286,7 @@ async fn create_there(d: &Deploy, t: &RepoTemplate, app: &App, by: &str) -> Resu
         let (hub, branch) = (d.hub.clone(), t.branch.clone());
         crate::rt::spawn(async move { first_build(&hub, &repo, &branch, sha).await });
     }
-    d.hub.gitops_kick.notify();
+    crate::gitops::wake(&d.hub);
     Ok(name)
 }
 

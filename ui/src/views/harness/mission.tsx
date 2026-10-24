@@ -40,6 +40,7 @@ import { PushOffer } from "./push-offer";
 import { RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
 import { subagentsAtWork, throughSubagents } from "./tasks";
+import { Stands } from "./stands";
 
 /** A phone: the page's head is one line, and the message box folds. */
 const PHONE = "(max-width: 640px)";
@@ -249,28 +250,13 @@ function RowsLoading() {
   );
 }
 
-/** What the page's lead says before the agents are known. */
-const LEAD = "Every coding agent kiln runs, on every machine.";
-
-/** The lead: how your agents stand, and where (on a phone, how they stand). */
-function Lead({ short }: { short?: boolean }) {
+/** How your agents stand, in a row of its own under the page's head (stands.tsx). */
+function StandsNow() {
   const list = useAgentList();
   const seen = useSeen();
   const done = useAnswered();
-  const all = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
-  const n = (s: Stand) => all.filter((r) => r.stand === s).length;
-  const machines = [...new Set(all.filter((r) => r.stand !== "ended").map((r) => machineName(r.a.target)))];
-  const status = [
-    n("needs") && `${n("needs")} need${n("needs") === 1 ? "s" : ""} you`,
-    n("crashed") && `${n("crashed")} stopped`,
-    n("paused") && `${n("paused")} paused`,
-    n("working") && `${n("working")} working`,
-    n("finished") && `${n("finished")} finished`,
-  ]
-    .filter(Boolean)
-    .join(", ");
-  if (short && all.length > 0) return <>{status || "All quiet"}</>;
-  return <>{all.length === 0 ? "Start coding agents on any of your machines and run them all from here." : `${status || "All quiet"}${machines.length ? ` — on ${machines.join(" and ")}` : ""}.`}</>;
+  const rows = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
+  return <Stands rows={rows} />;
 }
 
 export default function Mission() {
@@ -296,11 +282,6 @@ export default function Mission() {
         label="Agents"
         title="Mission control."
         compact
-        lead={
-          <React.Suspense fallback={LEAD}>
-            <Lead short={phone} />
-          </React.Suspense>
-        }
         actions={
           phone ? (
             <>
@@ -323,6 +304,9 @@ export default function Mission() {
           )
         }
       />
+      <React.Suspense fallback={<div className="st" aria-hidden="true" />}>
+        <StandsNow />
+      </React.Suspense>
       <Loadable label="Loading agents" fallback={<RowsLoading />}>
         <Agents onSpawn={() => setSpawn(true)} />
       </Loadable>

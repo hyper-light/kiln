@@ -85,8 +85,10 @@ The server's commands to a runner process ride that process's command streams on
 - **Parked** (`p:<born>.<gen>`): a leg to cancel, a session to close, a state's newest. While its
   runner is away it waits. After a reconnect it goes again from where the runner has the stream.
 - **Live** (`l:<born>.<gen>`): a leg to run, a terminal or a page to open, what a viewer does. It's
-  refused at once while its runner is away. A link that drops before it's answered ends it
-  `unanswered`: sent again later, it would surprise.
+  refused at once while its runner is away (its link down). A runner that has just connected and
+  not yet said what it has isn't away: the command goes once it has, as a deploy's reconnecting
+  runners need for the legs assigned to them at once. A link that drops before it's answered ends
+  it `unanswered` (`unreachable` if it never went): sent again later, it would surprise.
 
 The runner process takes each command once however often it comes, applies it as if it had come
 alone, and answers it: an ACK, or a NACK with its kind (`unknown`, `refused`, `stale_epoch`,
@@ -109,7 +111,8 @@ Callers take it in one of two ways:
   `unknown`, 409 for another refusal, 503 for `unreachable`, 504 for `unanswered`.
 - **A caller that mustn't wait gets it to come** (`Hub::command_start`): the scheduler, and the
   hub as it takes runners' messages, which is where the answers come from. It acts on what it
-  knows at once (a leg whose runner is away goes back in the queue) and logs the rest.
+  knows at once (a leg whose runner is away goes back in the queue) and logs the rest. An answer
+  the server gives itself (away, too many waiting) is known at once.
 
 A runner process that started again has neither stream. Its parked commands not yet answered go
 again on a new generation, and its live ones end `unanswered`. It connects with the same

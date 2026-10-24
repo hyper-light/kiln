@@ -98,9 +98,21 @@ Watch:
 - **A server from before P2** never tells a runner to hold a replica: its front door pipes
   connections whole, as before.
 - **A runner from before P2** never says it can hold one.
+- **The release before starts on this one's database.** The group's configuration (its voters and
+  learners) is kept in `cluster_conf`, not on `cluster_state`. Every release since P1 fills
+  `cluster_state`'s four columns by position as it starts, so a fifth column stopped 8adeadba from
+  starting at all ("table cluster_state has 5 columns but 4 values were supplied"). The rollback
+  drill of 2026-10-24 found this before production took it. A database an earlier P2 build widened
+  is narrowed when this one opens it, its configuration kept.
 
 ## Open
 
 - Learners are added, never removed: a runner deleted stays a learner, lagging.
 - Only the reads above are a replica's; the rest of the API is still the server's.
 - Reads for anyone but the owner go to the server (its route table judges them).
+- While the log has no room (stalled under a slow disk), the store's writes wait for it in order
+  (`Held`), up to 256 MiB. Past that, a write kiln.db holds goes without its entry, and the
+  server's log says so. So does a stop before a write reached the log. A learner meets such a gap
+  as a write number past the next. It takes a new copy of the database before it applies anything
+  after the gap, and its front door answers no read from it until then: its last write stays
+  behind the server's, so reads go to the server.

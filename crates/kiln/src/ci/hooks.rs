@@ -19,11 +19,21 @@ use super::{events, load};
 use crate::gitops::{self, Trigger};
 use crate::hub::Hub;
 
+/// Asks the poller for the repository a GitHub webhook names (its payload's
+/// `repository.full_name`), if kiln has it; for any other, the poller is only woken.
+pub async fn want_github(hub: &Hub, body: &[u8]) {
+    let name = serde_json::from_slice::<Value>(body).ok().and_then(|v| v.pointer("/repository/full_name").and_then(Value::as_str).map(str::to_owned));
+    match name {
+        Some(n) => gitops::want_named(hub, &n).await,
+        None => gitops::wake(hub),
+    }
+}
+
 /// A delivery, after its signature checked out.
 pub async fn github(hub: &Arc<Hub>, name: &str, delivery: Option<String>, body: &[u8]) -> anyhow::Result<()> {
     if !hub.ci.enabled() {
-        // Without the engine a webhook only hints that a poll is due, as before.
-        hub.gitops_kick.notify();
+        // Without the engine a webhook only hints that its repository's poll is due.
+        want_github(hub, body).await;
         return Ok(());
     }
     if let Some(id) = delivery
@@ -35,7 +45,8 @@ pub async fn github(hub: &Arc<Hub>, name: &str, delivery: Option<String>, body: 
     let payload: Value = serde_json::from_slice(body)?;
     let full = payload.pointer("/repository/full_name").and_then(Value::as_str).unwrap_or_default().to_owned();
     let Some(repo) = hub.store.repos().await?.into_iter().find(|r| r.name.eq_ignore_ascii_case(&full)) else {
-        hub.gitops_kick.notify();
+        // Not one of kiln's: there's nothing of it to poll.
+        gitops::wake(hub);
         return Ok(());
     };
     // A move a poll would also see.

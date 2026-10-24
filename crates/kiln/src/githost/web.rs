@@ -73,7 +73,7 @@ pub async fn webhook(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
             crate::rt::spawn(async move {
                 if let Err(e) = crate::ci::hooks::github(&hub2, &event, delivery, &body).await {
                     tracing::warn!(event = %event, error = %format!("{e:#}"), "the GitHub App's event");
-                    hub2.gitops_kick.notify();
+                    crate::ci::hooks::want_github(&hub2, &body).await;
                 }
             });
         }
