@@ -10,13 +10,15 @@
 //! Python with Datadog's `datadog` package (or one is at
 //! `~/.cache/claude-scratch/dsd-client/venv/bin/python`), by Datadog's own client too.
 //!
+//! On Windows, over UDP alone (it has no Unix datagram sockets).
+//!
 //! `cargo test -p kiln --test observe_statsd -- --ignored --nocapture`
-#![cfg(unix)]
 
 mod common;
 
 use std::collections::BTreeMap;
 use std::net::UdpSocket;
+#[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -143,8 +145,12 @@ fn dogstatsd_is_taken_as_datadog_s_agent_takes_it_on_every_machine() -> anyhow::
     f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
     let (p_server, p_runner) = (free_udp_port()?, free_udp_port()?);
     let socket = dir.path().join("dsd.socket");
+    let mut edge = vec![format!("udp://127.0.0.1:{p_server}")];
+    if cfg!(unix) {
+        edge.push(format!("unix://{}", socket.display()));
+    }
     let listeners = [
-        ("edge", json!({ "listen": [format!("udp://127.0.0.1:{p_server}"), format!("unix://{}", socket.display())], "tags": ["env:e2e"], "on": "server" })),
+        ("edge", json!({ "listen": edge, "tags": ["env:e2e"], "on": "server" })),
         ("r1", json!({ "listen": [format!("udp://127.0.0.1:{p_runner}")], "histogram_aggregates": ["max", "min", "count"], "histogram_percentiles": ["0.99"], "on": "r1" })),
     ];
     for (name, body) in &listeners {
@@ -158,31 +164,34 @@ fn dogstatsd_is_taken_as_datadog_s_agent_takes_it_on_every_machine() -> anyhow::
     }
     // A socket another process reads (a Datadog Agent's, here the test's) is left to it: the
     // listener says why it could not listen there.
-    let theirs_path = dir.path().join("agent.socket");
-    let theirs = UnixDatagram::bind(&theirs_path)?;
-    let (code, _) = f.request("PUT", "/api/observe/v1/statsd/taken", Some(&json!({ "listen": [format!("unix://{}", theirs_path.display())], "on": "server" })))?;
-    anyhow::ensure!(code == 204);
-    let start = Instant::now();
-    loop {
-        let st = states(&f)?.get("taken").and_then(|m| m.get("server")).cloned().unwrap_or(Value::Null);
-        if at(&st, &["error"]).as_str().is_some_and(|e| e.contains("a process listens")) {
-            break;
+    #[cfg(unix)]
+    {
+        let theirs_path = dir.path().join("agent.socket");
+        let theirs = UnixDatagram::bind(&theirs_path)?;
+        let (code, _) = f.request("PUT", "/api/observe/v1/statsd/taken", Some(&json!({ "listen": [format!("unix://{}", theirs_path.display())], "on": "server" })))?;
+        anyhow::ensure!(code == 204);
+        let start = Instant::now();
+        loop {
+            let st = states(&f)?.get("taken").and_then(|m| m.get("server")).cloned().unwrap_or(Value::Null);
+            if at(&st, &["error"]).as_str().is_some_and(|e| e.contains("a process listens")) {
+                break;
+            }
+            anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the taken socket: {st}");
+            std::thread::sleep(Duration::from_millis(250));
         }
-        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the taken socket: {st}");
-        std::thread::sleep(Duration::from_millis(250));
+        UnixDatagram::unbound()?.send_to(b"still mine", &theirs_path)?;
+        let mut got = [0u8; 16];
+        theirs.set_read_timeout(Some(Duration::from_secs(5)))?;
+        anyhow::ensure!(theirs.recv(&mut got)? == 10, "the other process's socket still its own");
+        let (code, _) = f.request("DELETE", "/api/observe/v1/statsd/taken", None)?;
+        anyhow::ensure!(code == 204 && theirs_path.exists());
     }
-    UnixDatagram::unbound()?.send_to(b"still mine", &theirs_path)?;
-    let mut got = [0u8; 16];
-    theirs.set_read_timeout(Some(Duration::from_secs(5)))?;
-    anyhow::ensure!(theirs.recv(&mut got)? == 10, "the other process's socket still its own");
-    let (code, _) = f.request("DELETE", "/api/observe/v1/statsd/taken", None)?;
-    anyhow::ensure!(code == 204 && theirs_path.exists());
     // Each machine opens its own, and says so.
     let start = Instant::now();
     loop {
         let s = states(&f)?;
         let listening = |l: &str, m: &str, n: usize| s.get(l).and_then(|x| x.get(m)).is_some_and(|st| at(st, &["listening"]).as_array().map_or(0, Vec::len) == n);
-        if listening("edge", "server", 2) && listening("r1", "r1", 1) && s.get("edge").is_some_and(|x| !x.contains_key("r1")) {
+        if listening("edge", "server", edge.len()) && listening("r1", "r1", 1) && s.get("edge").is_some_and(|x| !x.contains_key("r1")) {
             break;
         }
         anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the listeners never opened: {s:?}\n{}", f.logs());
@@ -216,9 +225,12 @@ fn dogstatsd_is_taken_as_datadog_s_agent_takes_it_on_every_machine() -> anyhow::
         "e2e.bad:abc|c".to_owned(),
     ];
     udp.send_to(batch.join("\n").as_bytes(), to_server)?;
-    let uds = UnixDatagram::unbound()?;
-    for _ in 0..10 {
-        uds.send_to(b"e2e.unix:1|c", &socket)?;
+    #[cfg(unix)]
+    {
+        let uds = UnixDatagram::unbound()?;
+        for _ in 0..10 {
+            uds.send_to(b"e2e.unix:1|c", &socket)?;
+        }
     }
     udp.send_to(b"e2e.runner:7|c\ne2e.rlat:1:2:3:4|h", ("127.0.0.1", p_runner))?;
 
@@ -246,7 +258,9 @@ fn dogstatsd_is_taken_as_datadog_s_agent_takes_it_on_every_machine() -> anyhow::
     anyhow::ensure!((p50 - 2.0).abs() <= 2.0 * 0.0109 && (p99 - 1000.0).abs() <= 1000.0 * 0.0109, "the distribution's p50 {p50}, p99 {p99}");
     // A gauge with its own time is written at it: two minutes before the test began.
     anyhow::ensure!(last(&f, "max:e2e.backfill{*}", t0 - 180_000, t0 - 60_000)? == Some(42.0), "a gauge at its timestamp");
-    until_total(&f, "sum:e2e.unix{*}.as_count()", 10.0, t0, within)?;
+    if cfg!(unix) {
+        until_total(&f, "sum:e2e.unix{*}.as_count()", 10.0, t0, within)?;
+    }
     // The runner's own, of its host, its histogram as its listener says.
     until_total(&f, "sum:e2e.runner{host:r1}.as_count()", 7.0, t0, within)?;
     for (q, want) in [("max:e2e.rlat.max{host:r1}", 4.0), ("max:e2e.rlat.min{host:r1}", 1.0), ("max:e2e.rlat.99percentile{host:r1}", 4.0)] {
@@ -277,8 +291,8 @@ fn dogstatsd_is_taken_as_datadog_s_agent_takes_it_on_every_machine() -> anyhow::
     let edge = s.get("edge").and_then(|m| m.get("server")).cloned().unwrap_or(Value::Null);
     anyhow::ensure!(at(&edge, &["invalid"]).as_u64() == Some(2) && at(&edge, &["events"]).as_u64() == Some(1) && at(&edge, &["checks"]).as_u64() == Some(1), "{edge}");
 
-    // Datadog's own client, when there is one.
-    match datadog_python() {
+    // Datadog's own client, when there is one (it sends over the Unix socket too).
+    match datadog_python().filter(|_| cfg!(unix)) {
         Some(python) => {
             early_in_bucket();
             let t1 = now_ms();
@@ -322,7 +336,7 @@ fn dogstatsd_is_taken_as_datadog_s_agent_takes_it_on_every_machine() -> anyhow::
     let (code, _) = f.request("DELETE", "/api/observe/v1/statsd/edge", None)?;
     anyhow::ensure!(code == 204);
     let start = Instant::now();
-    while socket.exists() {
+    while cfg!(unix) && socket.exists() {
         anyhow::ensure!(start.elapsed() < Duration::from_secs(10), "the Unix socket outlived its listener");
         std::thread::sleep(Duration::from_millis(100));
     }
