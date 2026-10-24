@@ -3,14 +3,15 @@
 CP-T6.1's part of the critical path's merge train (its master plan's §6): what it delivers, what
 deploying it does and how to watch it, its risks and its rollback, and what's still open.
 
-**Where it stands (2026-10-22):**
-- **Not merged:** branch `cp/t6-sim` at 6d83211, local to adacachy's repo, not pushed. It holds main
-  through 6063b42 (merged at d04d8fb); the train merges main again and gates the merge.
-- **Not deployed:** production runs kiln:6063b42.
-- **Gated** on fedora, on 6d83211 exactly (2026-10-22, 18:27 to 18:37Z, then the UI's steps again
-  once npm was on the job's PATH), every step passing: clippy; the workspace's tests; the macOS and
-  Windows cross-checks; npm ci, tsc, eslint and the UI build. Log:
-  `fedora:~/.cache/kiln-cp/t6-gate/6d83211/gate.log`.
+**Where it stands (2026-10-24, as it lands):**
+- **Merged:** with this file, as one fast-forward of main, on Ada's word (2026-10-24, "You can do
+  all of these things!", to her agent's asks for fedora, the gate and the landing). Branch
+  `cp/t6-sim` merged main as it moved, the last time just before the push. The landing commit's
+  message has the change request's evidence and the gate's.
+- **Not deployed:** deploys go through Ada.
+- **Gated** before the push: clippy for Linux, macOS and Windows; the workspace's tests; npm ci,
+  tsc, eslint and the UI build. The landing commit's message says where and on what. 6d83211, the
+  branch before main's later merges, passed the same gate on 2026-10-22.
 
 ## What it delivers
 
@@ -66,9 +67,11 @@ None: CP-T6.1 adds no metrics.
 - **The nightly's cost:** one k8s job a night, 4 CPUs and 16 GiB, up to 4 hours.
 - **What the models leave out** (docs/sim.md): the harness host's record and sends aren't run under
   kiln-sim yet; members' logs and the server's contents store are outside the disk's nemesis.
-- **Found, not fixed (for T10):** the server's upload intake fsyncs a blob's bytes but not the
-  folder it renames it into before answering 201: the same power-loss hole server-side, which no
-  model covers.
+- **Found for T10, and narrower since:** the server's upload intake fsynced a blob's bytes but not
+  the folder it renamed the blob into before answering 201. T10's contents store, merged here,
+  keeps chunks through `blobs::chunks::keep`, which syncs that folder after the rename. The
+  folders it makes for a chunk (`create_dir_all`) still aren't synced into the folders above
+  them. POSIX needs that; ext4's one journal doesn't. No model covers the server's store.
 
 ## Rollback
 
@@ -88,5 +91,5 @@ None: CP-T6.1 adds no metrics.
   T3 reviews).
 - **CP-T3.1:** the harness host's journal on `Records` takes its crash test on
   `kiln_sim::records::Crashing`.
-- **T10:** the server-side upload finding above; and `sync/server.rs`'s step intake is
-  `take_steps` here, which T10's branch also changes (pass its `contents.has` as `has`).
+- **T10:** the upload finding above. Its contents store is merged here: `sync/server.rs`'s step
+  intake (`take_steps`) asks it whether the server has a step's contents (`contents.has`).
