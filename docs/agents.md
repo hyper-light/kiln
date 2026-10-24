@@ -93,9 +93,10 @@ harness process). What an agent started that runs on apart from its harness (a s
 `left-<pid>`) while its turn goes on; stopping that task stops it and what runs under it. Nothing
 outlives the turn that left it: once the agent is between turns (idle, nothing waiting on a
 person), what its commands left running apart from its harness is stopped. Its harness's own
-background tasks (a shell or a monitor it runs in the background, which run under it) are its work
-and stay until they end, it stops them, or the agent ends; a server meant to keep going runs as
-one. So does a job of the machine's own: a systemd user unit (`systemd-run --user`, a service or a
+background tasks (a shell or a monitor it runs in the background, which run under it, however many
+processes they make) are its work and stay until they end, it stops them, or the agent ends; a
+server meant to keep going runs as one. Its MCP servers stay too, with what they run (a browser one
+drives). So does a job of the machine's own: a systemd user unit (`systemd-run --user`, a service or a
 scope) leaves the agent's group of processes, and kiln leaves it alone. An `ssh-agent` a shell's startup file starts (`eval "$(ssh-agent -s)"`) is no work of the
 agent's at all: never shown as left running, and stopped between turns or once 30 minutes old.
 
