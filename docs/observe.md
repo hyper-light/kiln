@@ -4778,6 +4778,20 @@ resolve, not at all (it advertises its listener now; a runner that cannot resolv
 address never trying the tunnel is kiln's own, said, not changed here); and two tests' own
 assumptions (an `openssl` that binds one address; a metric read before its write landed).
 
+**On Windows** (2026-10-24, jupiter: Windows 11, x86_64, MSVC, Git for Windows' own `core.autocrlf`,
+at c1d7efd9): kiln-obs's tests (351) and its replication group's (4), and kiln's observe and CD tests
+(274), all pass. Running them there found two things: git turned a recorded Python traceback's lines
+into CRLF as it checked it out, and the test reading it failed (fixtures and test data are now
+`-text`: their bytes as committed on every machine); and the log collector, which knew a file off
+Unix by its creation time, lost the first lines of a rotated log's new file, since NTFS gives a file
+made at a name another was renamed from moments before that one's creation time (its "tunneling",
+15 s by default), so the new file passed for the old. A file there is now its volume's serial number
+and its file index (`GetFileInformationByHandle`, through `winapi-util`), as a device and an inode
+are on Unix. The live scenarios have not run on Windows yet: their test fleet stops a process with
+`kill`'s SIGTERM (Windows asks a console program to stop with a console control event to its process
+group instead), and starts each with nothing of the environment but a Unix `PATH`, where Windows
+needs `SystemRoot` and its own `PATH` too.
+
 **Live** (`crates/kiln/tests/observe_live.rs`, `cargo test -p kiln --test observe_live -- --ignored`):
 a kiln server and two runners as processes of their own, each with a home of its own and a clean
 environment, on real sockets and disks. Points and log records are written through the API and read
