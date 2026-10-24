@@ -35,10 +35,10 @@ fn text(v: &Value, k: &str) -> Option<String> {
 
 /// Whether `cx`'s caller adds to research `r`: a person to any; an agent to its own and the
 /// research of the agents it started.
-fn may_add(cx: &Cx, r: &Research) -> Result<(), Fail> {
+async fn may_add(cx: &Cx, r: &Research) -> Result<(), Fail> {
     match (cx.caller.agent.as_deref(), r.agent.as_deref()) {
         (None, _) => Ok(()),
-        (Some(_), Some(a)) => crate::harness::lineage::may_steer(&cx.hub, &cx.caller, a),
+        (Some(_), Some(a)) => crate::harness::lineage::may_steer(&cx.hub, &cx.caller, a).await,
         (Some(_), None) => Err((StatusCode::FORBIDDEN, "this research is a person's: an agent adds to its own (and to that of the agents it started)".into())),
     }
 }
@@ -57,7 +57,7 @@ async fn start(cx: Cx, v: Value) -> Out {
 async fn add(cx: Cx, v: Value) -> Out {
     let id = id_of(&v)?;
     let r = super::get(&cx.hub, &id).await.map_err(fail)?;
-    may_add(&cx, &r)?;
+    may_add(&cx, &r).await?;
     let a: Add = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let view = super::add(&cx.hub, &id, a).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "research.add".into(), id).await;
@@ -107,19 +107,37 @@ async fn search(cx: Cx, v: Value) -> Out {
         status: None,
         since: num("since"),
         until: num("until"),
-        limit: num("limit").and_then(|l| usize::try_from(l).ok()).map(|l| l.clamp(1, 100)).or(Some(30)),
+        limit: None,
     };
+    let wanted = num("limit").and_then(|l| usize::try_from(l).ok()).map_or(30, |l| l.clamp(1, 100));
+    // Only the conversations of agents the caller sees (docs/agents.md, "Whose agents"): one who
+    // sees only some looks further back, so hits they may read still fill the page.
+    let everyone = cx.caller.agent.is_none() && (cx.caller.is_owner() || cx.caller.can("agents.manage", &crate::authz::Scope::Server));
+    let query = crate::convo::store::Query { limit: Some(if everyone { wanted } else { wanted.saturating_mul(5).min(500) }), ..query };
     let rows = crate::rt::blocking(move || store.search(query)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let rows = rows.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
     let infos: std::collections::HashMap<String, crate::harness::session::Info> = cx.hub.harness.list().into_iter().map(|i| (i.id.clone(), i)).collect();
-    let hits: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            let info = infos.get(&r.session);
-            let at = serde_json::from_str::<Value>(&r.body).ok().and_then(|e| e.get("at").and_then(Value::as_i64));
-            json!({"agent": r.session, "name": info.map(|i| i.name.clone()), "machine": info.map(|i| crate::harness::wait::machine(&i.target).to_owned()), "at": at, "words": event_words(&r.body, 600)})
-        })
-        .collect();
+    let mut seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut hits: Vec<Value> = Vec::new();
+    for r in &rows {
+        let sees = match seen.get(&r.session) {
+            Some(&b) => b,
+            None => {
+                let b = everyone || crate::harness::lineage::access(&cx.hub, &cx.caller, &r.session).await >= crate::harness::lineage::Access::See;
+                seen.insert(r.session.clone(), b);
+                b
+            }
+        };
+        if !sees {
+            continue;
+        }
+        let info = infos.get(&r.session);
+        let at = serde_json::from_str::<Value>(&r.body).ok().and_then(|e| e.get("at").and_then(Value::as_i64));
+        hits.push(json!({"agent": r.session, "name": info.map(|i| i.name.clone()), "machine": info.map(|i| crate::harness::wait::machine(&i.target).to_owned()), "at": at, "words": event_words(&r.body, 600)}));
+        if hits.len() >= wanted {
+            break;
+        }
+    }
     Ok(json!({"hits": hits}))
 }
 

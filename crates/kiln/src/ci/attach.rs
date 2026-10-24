@@ -1180,7 +1180,7 @@ async fn start(hub: &Arc<Hub>, a: &Attachment, i: &Incident) -> Result<String, S
         return Ok(s.clone());
     }
     let h = a.harness.clone().ok_or_else(|| "it names no agent".to_owned())?;
-    let starter = crate::harness::lineage::Starter { parent: None, opener: Some(a.by.clone()), actor: format!("attachment:{}", a.name), plan_run: None };
+    let starter = crate::harness::lineage::Starter { parent: None, opener: Some(a.by.clone()), actor: format!("attachment:{}", a.name), plan_run: None, asker: None };
     let name: String = format!("{}: {}", a.name, i.title).chars().take(80).collect();
     let ask = crate::harness::lineage::Ask {
         kind: h.kind,
