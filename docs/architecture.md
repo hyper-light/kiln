@@ -8,7 +8,7 @@ runs the same way on bare metal and on Kubernetes.
 
 | Requirement | How kiln meets it |
 | --- | --- |
-| GitOps, pulls from GitHub | Server polls registered repositories (conditional requests, ETag; 304s are free against the rate limit) and optionally accepts webhooks. Pipelines live in the repo at `.kiln/*.yaml`. |
+| GitOps, pulls from GitHub | Server polls registered repositories (conditional requests, ETag; 304s are free against the rate limit) and optionally accepts webhooks. Each is polled on its interval, and at once when a push or a webhook names it; a failed poll backs off (from 10 s, doubling, to 5 minutes), so an outage can't make the poller spin. Pipelines live in the repo at `.kiln/*.yaml`. |
 | Rust / Python / Go / TypeScript (+ Erlang) | Toolchain presets pick images and caches; steps are plain shell so anything installed works. |
 | Heavy concurrent load | Async scheduler on hyper-rt (thread-per-core shards), HTTP/1.1 and HTTP/2 from kiln-http ([http.md](http.md)), bounded per-agent slots, per-repo concurrency groups, back-pressure. Logs go to disk segment files, never through the database. |
 | In-cluster **and** on-hardware jobs | One executor: the `kiln agent`. On bare metal it is a long-lived daemon; on Kubernetes the server launches an ephemeral agent pod per job. Jobs choose with `runs-on` labels (`k8s`, `baremetal`, `bench`, `gpu`, …). |

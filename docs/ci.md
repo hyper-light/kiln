@@ -1179,8 +1179,8 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
     - The dispatch routes: `/api/ci/repos/:repo/workflows/<path>/dispatches`,
       `/api/ci/repos/:repo/dispatches`, and the facade's `/api/v3/…/dispatches` for a trusted
       run's token.
-  - All of it is behind `[ci] enabled`. With it off, a webhook only hints that a poll is due, as
-    before.
+  - All of it is behind `[ci] enabled`. With it off, a webhook only hints that its repository's
+    poll is due.
   - Checked end to end on a local server:
     - push, then matrix legs, needs and outputs;
     - a per-minute schedule firing once a minute;

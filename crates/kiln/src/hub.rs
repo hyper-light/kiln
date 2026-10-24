@@ -295,7 +295,11 @@ pub struct Hub {
     /// One-time outpost invites (`POST /api/outposts/invite`).
     pub outpost_invites: OutpostInvites,
     pub k8s: std::sync::OnceLock<Option<Arc<crate::k8s::K8s>>>,
+    /// Wakes the repository poller ([`crate::gitops::poll_loop`]) to look at what's due: what a
+    /// kick names ([`Hub::gitops_wanted`], [`crate::gitops::want`]) and what its interval says.
     pub gitops_kick: Notify,
+    /// Repositories (by id) asked to be polled now: a push, a webhook, a new repository.
+    pub gitops_wanted: Mutex<HashSet<String>>,
     pub shutdown: Shutdown,
     /// Time, as the goal driver and what else moves onto it take it: kiln's runtime in production,
     /// a simulated clock in tests (kiln-seams' `Clock`, docs/seams.md).
@@ -422,6 +426,7 @@ impl Hub {
             outpost_invites: OutpostInvites::default(),
             k8s: std::sync::OnceLock::new(),
             gitops_kick: Notify::new(),
+            gitops_wanted: Mutex::new(HashSet::new()),
             shutdown,
             clock,
             cancel_sent: Mutex::new(HashMap::new()),

@@ -729,7 +729,7 @@ async fn after_push(hub: &Arc<Hub>, repo: &Repo, p: &str, by: &super::cr::By, tr
     hub.store.audit(by.pushed_by.clone(), "repo.push".into(), format!("{}: {summary}", repo.name)).await;
     // The poller takes the new refs now: events, runs.
     if updates.iter().any(|u| !u.name.starts_with("refs/for/")) {
-        hub.gitops_kick.notify();
+        crate::gitops::want(hub, &repo.id);
     }
     said
 }
