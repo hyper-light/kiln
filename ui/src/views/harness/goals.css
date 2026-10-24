@@ -516,3 +516,19 @@
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
+
+/* Its head folds it (views/harness/fold.tsx keeps which): folded, the card is its head. */
+.gs-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+.gs-toggle:hover {
+  color: var(--color-bright);
+}

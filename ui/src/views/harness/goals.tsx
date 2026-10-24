@@ -14,7 +14,7 @@
  * paused for a while says when it resumes by itself.
  */
 import * as React from "react";
-import { ListTree } from "lucide-react";
+import { ChevronRight, ListTree } from "lucide-react";
 import { harnessApi, type GoalItem, type GoalStack } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
@@ -30,6 +30,8 @@ import { useSuspenseResource } from "@/lib/resource";
 import { Link } from "@/lib/router";
 import { canPlan, fromLines, stackReads, startWords, stepStand, stoppedBy, toGo } from "./goal-stack";
 import { GoalPlan } from "./goal-plan";
+import { useFold } from "./fold";
+import { cn } from "@/lib/utils";
 import { machineWord, type GoalStep } from "./goal-plan-layout";
 import "./goals.css";
 
@@ -337,6 +339,7 @@ function GoalPanel({
   };
 
   // Not read yet (the stand-in while it loads), or it couldn't be: not "no goals", which it may have.
+  const [open, setOpen] = useFold("goal-stack");
   const state = !stack ? (readError ? "unread" : "reading") : items.length === 0 ? "empty" : stack.state;
   const chip =
     state === "running"
@@ -352,248 +355,258 @@ function GoalPanel({
               : "No goals yet";
 
   return (
-    <section className="gs-panel" aria-label="Goal stack">
+    <section className="gs-panel" aria-label="Goal stack" data-open={open || undefined}>
       <header className="gs-top">
-        <h3 className="gs-h">Goal stack</h3>
+        <h3 className="gs-h">
+          <button type="button" className="gs-toggle" aria-expanded={open} onClick={() => setOpen(!open)}>
+            <ChevronRight size={12} className={cn("hx-chev", open && "rotate-90")} aria-hidden="true" />
+            Goal stack
+          </button>
+        </h3>
         <span className="gs-chip" data-state={state}>
           {chip}
         </span>
       </header>
-      <p className="gs-what">
-        {asMessage
-          ? `Goals run one after another on this agent: each goes to ${who} as a message, and the next starts once it says the goal is met (GOAL MET).`
-          : `Goals run one after another on this agent: each goes to ${who} as its own /goal, and the next starts once it's met.`}{" "}
-        Until then kiln keeps it on the goal: whenever it stops short, or loses the goal when it starts again, kiln sends it again.
-      </p>
-      {/* Big goals planned first (docs/goals.md): a person's setting, on unless turned off. */}
-      <label className="gs-option">
-        <input type="checkbox" className="check" checked={stack?.plan_big ?? true} disabled={busy} onChange={(e) => void act(() => harnessApi.goalSettings(agent, { plan_big: e.target.checked }))} />
-        <span>
-          Plan big goals first
-          <span className="gs-option-hint">A goal longer than a couple of sentences is researched and planned before it&rsquo;s worked on, its steps run under it.</span>
-        </span>
-      </label>
-      {!stack && readError ? <p className="gs-error">{errorMessage(readError)}</p> : null}
-      {stack?.state === "paused" && stack.reason && (
-        <p className="gs-reason">
-          {stack.reason}
-          {stack.resume_at ? ` · resumes by itself ${relativeTime(stack.resume_at / 1000)}` : ""}
-        </p>
-      )}
-
-      {editing !== null ? (
-        <div className="gs-edit">
-          <label className="field-label" htmlFor={`gs-edit-${agent}`}>
-            Goals not yet met, one a line
-          </label>
-          <div className="field">
-            <textarea
-              id={`gs-edit-${agent}`}
-              value={editing.text}
-              onChange={(e) => {
-                const text = e.target.value;
-                setEditing((cur) => cur && { ...cur, text });
-              }}
-              rows={Math.max(3, editing.text.split("\n").length + 1)}
-            />
-          </div>
-          <div className="gs-actions">
-            <Button size="sm" disabled={busy} onClick={() => void saveEdit()}>
-              Save goals
-            </Button>
-            <Button size="sm" variant="ghost" onClick={() => setEditing(null)}>
-              Cancel
-            </Button>
-          </div>
-        </div>
-      ) : (
+      {/* Folded, the card is its head. */}
+      {open && (
         <>
-          {goals.length > 0 && (
-            <ol className="gs-chain">
-              {folded > 0 || (earlier && done.length > 3) ? (
-                <li className="gs-more">
-                  <button type="button" className="gs-more-btn" onClick={() => setEarlier(!earlier)}>
-                    {earlier ? "Hide the earlier ones" : `${folded} earlier`}
-                  </button>
-                </li>
-              ) : null}
-              {shown.map((g) => {
-                // A goal whose parts come first is under way while they are (its steps, or its run's agents, at work).
-                const doing = g.status === "pending" ? partsOf(g, items).find((i) => i.status === "active") : undefined;
-                const status = doing ? "active" : g.status;
-                // The goal under way while you've paused the stack: paused, not under way.
-                const held = status === "active" && stack?.state === "paused";
-                // One handed to another agent (a program's track's worker): under way there.
-                const away = g.status === "pending" && !doing ? g.on : undefined;
-                const stand = standOf({ ...g, status }, held, doing?.waits_on ? true : working && !g.waits_on);
-                return (
-                  <li key={g.id} className="gs-link" data-status={held ? "paused" : away ? "active" : status}>
-                    {/* Its number in the stack, ringed by where it stands: the one at work in the turning light. */}
-                    <span className="gs-node" data-stand={stand} data-wide={(numbers.get(g.id) ?? 0) > 9 ? "" : undefined} title={WORD[status]}>
-                      {numbers.get(g.id)}
-                    </span>
-                    <span className="gs-text">
-                      {/* A plan's step as a goal reads "title — description — Done when: …": its title first, the rest under it. */}
-                      <GoalWords text={g.text.split(" — ")[0] ?? g.text} stand={stand} />
-                      {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
-                      <span className="gs-word">
-                        {held ? "paused" : away ? (
-                          <>
-                            under way on{" "}
-                            <Link to={`/agents/${encodeURIComponent(away)}`}>
-                              <AgentLabel id={away} />
-                            </Link>
-                          </>
-                        ) : (
-                          WORD[status]
+          <p className="gs-what">
+            {asMessage
+              ? `Goals run one after another on this agent: each goes to ${who} as a message, and the next starts once it says the goal is met (GOAL MET).`
+              : `Goals run one after another on this agent: each goes to ${who} as its own /goal, and the next starts once it's met.`}{" "}
+            Until then kiln keeps it on the goal: whenever it stops short, or loses the goal when it starts again, kiln sends it again.
+          </p>
+          {/* Big goals planned first (docs/goals.md): a person's setting, on unless turned off. */}
+          <label className="gs-option">
+            <input type="checkbox" className="check" checked={stack?.plan_big ?? true} disabled={busy} onChange={(e) => void act(() => harnessApi.goalSettings(agent, { plan_big: e.target.checked }))} />
+            <span>
+              Plan big goals first
+              <span className="gs-option-hint">A goal longer than a couple of sentences is researched and planned before it&rsquo;s worked on, its steps run under it.</span>
+            </span>
+          </label>
+          {!stack && readError ? <p className="gs-error">{errorMessage(readError)}</p> : null}
+          {stack?.state === "paused" && stack.reason && (
+            <p className="gs-reason">
+              {stack.reason}
+              {stack.resume_at ? ` · resumes by itself ${relativeTime(stack.resume_at / 1000)}` : ""}
+            </p>
+          )}
+
+          {editing !== null ? (
+            <div className="gs-edit">
+              <label className="field-label" htmlFor={`gs-edit-${agent}`}>
+                Goals not yet met, one a line
+              </label>
+              <div className="field">
+                <textarea
+                  id={`gs-edit-${agent}`}
+                  value={editing.text}
+                  onChange={(e) => {
+                    const text = e.target.value;
+                    setEditing((cur) => cur && { ...cur, text });
+                  }}
+                  rows={Math.max(3, editing.text.split("\n").length + 1)}
+                />
+              </div>
+              <div className="gs-actions">
+                <Button size="sm" disabled={busy} onClick={() => void saveEdit()}>
+                  Save goals
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setEditing(null)}>
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <>
+              {goals.length > 0 && (
+                <ol className="gs-chain">
+                  {folded > 0 || (earlier && done.length > 3) ? (
+                    <li className="gs-more">
+                      <button type="button" className="gs-more-btn" onClick={() => setEarlier(!earlier)}>
+                        {earlier ? "Hide the earlier ones" : `${folded} earlier`}
+                      </button>
+                    </li>
+                  ) : null}
+                  {shown.map((g) => {
+                    // A goal whose parts come first is under way while they are (its steps, or its run's agents, at work).
+                    const doing = g.status === "pending" ? partsOf(g, items).find((i) => i.status === "active") : undefined;
+                    const status = doing ? "active" : g.status;
+                    // The goal under way while you've paused the stack: paused, not under way.
+                    const held = status === "active" && stack?.state === "paused";
+                    // One handed to another agent (a program's track's worker): under way there.
+                    const away = g.status === "pending" && !doing ? g.on : undefined;
+                    const stand = standOf({ ...g, status }, held, doing?.waits_on ? true : working && !g.waits_on);
+                    return (
+                      <li key={g.id} className="gs-link" data-status={held ? "paused" : away ? "active" : status}>
+                        {/* Its number in the stack, ringed by where it stands: the one at work in the turning light. */}
+                        <span className="gs-node" data-stand={stand} data-wide={(numbers.get(g.id) ?? 0) > 9 ? "" : undefined} title={WORD[status]}>
+                          {numbers.get(g.id)}
+                        </span>
+                        <span className="gs-text">
+                          {/* A plan's step as a goal reads "title — description — Done when: …": its title first, the rest under it. */}
+                          <GoalWords text={g.text.split(" — ")[0] ?? g.text} stand={stand} />
+                          {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
+                          <span className="gs-word">
+                            {held ? "paused" : away ? (
+                              <>
+                                under way on{" "}
+                                <Link to={`/agents/${encodeURIComponent(away)}`}>
+                                  <AgentLabel id={away} />
+                                </Link>
+                              </>
+                            ) : (
+                              WORD[status]
+                            )}
+                            {g.planned_as ? (
+                              <Loadable label="its plan" fallback={null}>
+                                <PlannedWords goal={g} items={items} paused={paused} agent={agent} />
+                              </Loadable>
+                            ) : g.status === "active" && !held && !g.waits_on ? (
+                              sentWords(g)
+                            ) : (
+                              ""
+                            )}
+                            {g.reason && g.status !== "pending" ? ` · ${g.reason}` : ""}
+                            {g.waits_on && (
+                              <>
+                                {" · waits for "}
+                                <Link to={runHref(g.waits_on)}>its run</Link>
+                              </>
+                            )}
+                          </span>
+                        </span>
+                        {/* What can be done with it: a goal of its own still to go becomes a plan. */}
+                        {canPlan(g) && (
+                          <div className="gs-acts">
+                            <Button
+                              size="xs"
+                              variant="secondary"
+                              disabled={busy}
+                              onClick={() =>
+                                void act(async () => {
+                                  await harnessApi.planGoal(agent, g.id);
+                                  return harnessApi.goals(agent);
+                                })
+                              }
+                            >
+                              <ListTree aria-hidden="true" /> Make a plan
+                            </Button>
+                          </div>
                         )}
+                        {/* Its steps under it, on its line: its plan's, or the parts it was split into. */}
                         {g.planned_as ? (
                           <Loadable label="its plan" fallback={null}>
-                            <PlannedWords goal={g} items={items} paused={paused} agent={agent} />
+                            <PlannedSteps goal={g} items={items} paused={paused} agent={agent} />
                           </Loadable>
-                        ) : g.status === "active" && !held && !g.waits_on ? (
-                          sentWords(g)
-                        ) : (
-                          ""
-                        )}
-                        {g.reason && g.status !== "pending" ? ` · ${g.reason}` : ""}
-                        {g.waits_on && (
-                          <>
-                            {" · waits for "}
-                            <Link to={runHref(g.waits_on)}>its run</Link>
-                          </>
-                        )}
-                      </span>
+                        ) : items.some((i) => i.part_of === g.id) ? (
+                          <Loadable label="its parts" fallback={null}>
+                            <PartSteps parts={items.filter((i) => i.part_of === g.id)} items={items} paused={paused} agent={agent} />
+                          </Loadable>
+                        ) : null}
+                      </li>
+                    );
+                  })}
+                </ol>
+              )}
+              <form
+                className="gs-add"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void add();
+                }}
+              >
+                <label className="sr-only" htmlFor={`gs-add-${agent}`}>
+                  Add a goal
+                </label>
+                <div className="field">
+                  <input id={`gs-add-${agent}`} value={adding} placeholder={items.length ? "Add the next goal" : "Add a goal"} onChange={(e) => setAdding(e.target.value)} />
+                </div>
+                <Button size="sm" variant="secondary" type="submit" disabled={busy || !adding.trim() || !onStack}>
+                  Add
+                </Button>
+              </form>
+              <p className="field-hint gs-hint">A condition it can meet, like &ldquo;the parser tests pass&rdquo;. A plan&rsquo;s steps go here too: run it as Goals.</p>
+              {(items.length > 0 || cleared > 0) && (
+                <div className="gs-actions">
+                  {startWord && (
+                    <Button size="sm" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "start"))}>
+                      {startWord}
+                    </Button>
+                  )}
+                  {unmet && (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={busy}
+                      onClick={() =>
+                        void act(async () => {
+                          await harnessApi.setGoals(agent, [{ text: unmet.text }, ...pending.map((p) => ({ id: p.id, text: p.text }))]);
+                          return harnessApi.goalAction(agent, "start");
+                        })
+                      }
+                    >
+                      Try it again
+                    </Button>
+                  )}
+                  {stack?.state === "running" && (
+                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "pause"))}>
+                      Pause
+                    </Button>
+                  )}
+                  {active && (
+                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "skip"))}>
+                      Skip this one
+                    </Button>
+                  )}
+                  {(pending.length > 0 || active) && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={busy}
+                      onClick={() => {
+                        const goals = toGo(items);
+                        setEditing({ text: goals.map((g) => g.text).join("\n"), goals });
+                      }}
+                    >
+                      Edit
+                    </Button>
+                  )}
+                  {cleared > 0 && (
+                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "restore"))}>
+                      Bring back {cleared} cleared {cleared === 1 ? "goal" : "goals"}
+                    </Button>
+                  )}
+                  {items.length === 0 ? null : asking ? (
+                    <span className="gs-confirm" role="group" aria-label="Clear the goal stack">
+                      Clear every goal here?
+                      <Button
+                        size="sm"
+                        variant="danger"
+                        disabled={busy}
+                        onClick={() => {
+                          setAsking(false);
+                          void act(() => harnessApi.goalAction(agent, "clear"));
+                        }}
+                      >
+                        Clear
+                      </Button>
+                      <Button size="sm" variant="ghost" onClick={() => setAsking(false)}>
+                        Keep them
+                      </Button>
                     </span>
-                    {/* What can be done with it: a goal of its own still to go becomes a plan. */}
-                    {canPlan(g) && (
-                      <div className="gs-acts">
-                        <Button
-                          size="xs"
-                          variant="secondary"
-                          disabled={busy}
-                          onClick={() =>
-                            void act(async () => {
-                              await harnessApi.planGoal(agent, g.id);
-                              return harnessApi.goals(agent);
-                            })
-                          }
-                        >
-                          <ListTree aria-hidden="true" /> Make a plan
-                        </Button>
-                      </div>
-                    )}
-                    {/* Its steps under it, on its line: its plan's, or the parts it was split into. */}
-                    {g.planned_as ? (
-                      <Loadable label="its plan" fallback={null}>
-                        <PlannedSteps goal={g} items={items} paused={paused} agent={agent} />
-                      </Loadable>
-                    ) : items.some((i) => i.part_of === g.id) ? (
-                      <Loadable label="its parts" fallback={null}>
-                        <PartSteps parts={items.filter((i) => i.part_of === g.id)} items={items} paused={paused} agent={agent} />
-                      </Loadable>
-                    ) : null}
-                  </li>
-                );
-              })}
-            </ol>
+                  ) : (
+                    <Button size="sm" variant="ghost" onClick={() => setAsking(true)}>
+                      Clear
+                    </Button>
+                  )}
+                </div>
+              )}
+            </>
           )}
-          <form
-            className="gs-add"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void add();
-            }}
-          >
-            <label className="sr-only" htmlFor={`gs-add-${agent}`}>
-              Add a goal
-            </label>
-            <div className="field">
-              <input id={`gs-add-${agent}`} value={adding} placeholder={items.length ? "Add the next goal" : "Add a goal"} onChange={(e) => setAdding(e.target.value)} />
-            </div>
-            <Button size="sm" variant="secondary" type="submit" disabled={busy || !adding.trim() || !onStack}>
-              Add
-            </Button>
-          </form>
-          <p className="field-hint gs-hint">A condition it can meet, like &ldquo;the parser tests pass&rdquo;. A plan&rsquo;s steps go here too: run it as Goals.</p>
-          {(items.length > 0 || cleared > 0) && (
-            <div className="gs-actions">
-              {startWord && (
-                <Button size="sm" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "start"))}>
-                  {startWord}
-                </Button>
-              )}
-              {unmet && (
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  disabled={busy}
-                  onClick={() =>
-                    void act(async () => {
-                      await harnessApi.setGoals(agent, [{ text: unmet.text }, ...pending.map((p) => ({ id: p.id, text: p.text }))]);
-                      return harnessApi.goalAction(agent, "start");
-                    })
-                  }
-                >
-                  Try it again
-                </Button>
-              )}
-              {stack?.state === "running" && (
-                <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "pause"))}>
-                  Pause
-                </Button>
-              )}
-              {active && (
-                <Button size="sm" variant="ghost" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "skip"))}>
-                  Skip this one
-                </Button>
-              )}
-              {(pending.length > 0 || active) && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={busy}
-                  onClick={() => {
-                    const goals = toGo(items);
-                    setEditing({ text: goals.map((g) => g.text).join("\n"), goals });
-                  }}
-                >
-                  Edit
-                </Button>
-              )}
-              {cleared > 0 && (
-                <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "restore"))}>
-                  Bring back {cleared} cleared {cleared === 1 ? "goal" : "goals"}
-                </Button>
-              )}
-              {items.length === 0 ? null : asking ? (
-                <span className="gs-confirm" role="group" aria-label="Clear the goal stack">
-                  Clear every goal here?
-                  <Button
-                    size="sm"
-                    variant="danger"
-                    disabled={busy}
-                    onClick={() => {
-                      setAsking(false);
-                      void act(() => harnessApi.goalAction(agent, "clear"));
-                    }}
-                  >
-                    Clear
-                  </Button>
-                  <Button size="sm" variant="ghost" onClick={() => setAsking(false)}>
-                    Keep them
-                  </Button>
-                </span>
-              ) : (
-                <Button size="sm" variant="ghost" onClick={() => setAsking(true)}>
-                  Clear
-                </Button>
-              )}
-            </div>
-          )}
+          {error && <p className="gs-error">{error}</p>}
         </>
       )}
-      {error && <p className="gs-error">{error}</p>}
     </section>
   );
 }

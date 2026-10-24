@@ -4,6 +4,7 @@
  * output reads live; it stops with one tap, or all of them at once.
  */
 import * as React from "react";
+import { Fold } from "./fold";
 import { ChevronRight, Square } from "lucide-react";
 import { harnessApi, useSession, type Command, type SessionStore, type State, type Task } from "@/api/harness";
 import { Button } from "@/components/ui/button";
@@ -178,9 +179,10 @@ export function Background({ state, agent, send }: { state: State | null; agent:
   const live = tasks.filter(isLive);
   const done = tasks.filter((t) => !isLive(t)).reverse();
   return (
-    <section>
-      <h3 className="in-sec-head">
-        In the background
+    <Fold
+      id="background"
+      title="In the background"
+      aside={
         <span>
           {live.length} running
           {live.length > 1 && !confirm && (
@@ -189,7 +191,8 @@ export function Background({ state, agent, send }: { state: State | null; agent:
             </button>
           )}
         </span>
-      </h3>
+      }
+    >
       {confirm && (
         <div className="bg-confirm" role="group" aria-label="Stop everything in the background">
           <span>Stop the {live.length} shells and monitors it left running? The agent keeps going.</span>
@@ -221,7 +224,7 @@ export function Background({ state, agent, send }: { state: State | null; agent:
         )}
         {ended && done.map((t) => <Row key={t.id} t={t} agent={agent} send={send} />)}
       </ul>
-    </section>
+    </Fold>
   );
 }
 
