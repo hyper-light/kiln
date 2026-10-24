@@ -181,6 +181,16 @@ pub enum AgentMsg {
     /// couldn't be (JSON `kiln_ci::wire::Undeployed`). Appended last: postcard encodes variants
     /// by index.
     Undeployed { json: String },
+    /// What this runner can do, in 64 bits ([`AgentMsg::Build`]'s 32 ran out): the first 32 are
+    /// `Build`'s, mirrored, and the rest new ([`CAP_WIRE`] on). Sent after `Build`; a runner from
+    /// before this never sends it, and an older server skips it. Appended last: postcard encodes
+    /// variants by index.
+    Caps { caps: u64 },
+    /// A frame of the channel between this runner and the server ([`crate::wire::channel`],
+    /// docs/wire.md): numbered items carrying messages, their answers, and what each side has
+    /// after a reconnect. Only once both sides announced [`CAP_WIRE`]. Appended last: postcard
+    /// encodes variants by index.
+    Wire(crate::wire::channel::Frame),
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -278,6 +288,11 @@ pub const CAP_RECEIVED: u32 = 1 << 29;
 /// The runner takes down a deployment it made when its environment goes ([`ServerMsg::Undeploy`],
 /// docs/ci.md W15-R07), and says so ([`AgentMsg::Undeployed`]).
 pub const CAP_UNDEPLOY: u32 = 1 << 30;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability, the first past `Build`'s 32 bits: the
+/// peer keeps the channel (`crate::wire::channel`, docs/wire.md). What must arrive goes as
+/// numbered items, answered by the process that applied them and sent again after a reconnect.
+pub const CAP_WIRE: u64 = 1 << 32;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -500,6 +515,12 @@ pub enum ServerMsg {
     /// W15-R07): its environment, a preview, went. Only to runners announcing [`CAP_UNDEPLOY`].
     /// Appended last: postcard encodes variants by index.
     Undeploy { json: String },
+    /// What this server can do, in 64 bits, as [`AgentMsg::Caps`]: sent after `Welcome` to a
+    /// runner that announced [`CAP_WIRE`]. Appended last: postcard encodes variants by index.
+    Caps { caps: u64 },
+    /// A frame of the channel between the server and this runner, as [`AgentMsg::Wire`]. Appended
+    /// last: postcard encodes variants by index.
+    Wire(crate::wire::channel::Frame),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -572,6 +593,37 @@ mod tests {
         assert!(d.first() > b.first());
         let u = encode(&ServerMsg::Upgrade { job: "j".into(), path: "/dl/kiln/x".into(), sha256: "00".into(), size: 1 })?;
         assert!(u.first() > r.first(), "Upgrade must be appended after Retire");
+        Ok(())
+    }
+
+    #[test]
+    fn the_channel_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        use crate::wire::channel::{Frame, Has, Nack, Refusal};
+        // AgentMsg had 45 variants (Undeployed last, 44) and ServerMsg 53 (Undeploy last, 52):
+        // an older peer skips what comes after.
+        let undeployed = encode(&AgentMsg::Undeployed { json: String::new() })?;
+        let undeploy = encode(&ServerMsg::Undeploy { json: String::new() })?;
+        assert_eq!((undeployed.first(), undeploy.first()), (Some(&44), Some(&52)));
+        let frames = [
+            Frame::Item { stream: "cmd".into(), seq: 3, low: 2, body: vec![1, 2, 3] },
+            Frame::Ack(Has { stream: "cmd".into(), upto: 3, nacks: vec![Nack { seq: 2, code: Refusal::Unknown, why: "gone".into() }] }),
+            Frame::Want { stream: "cmd".into(), from: 2 },
+            Frame::Have(vec![Has { stream: "s:x#1".into(), upto: 9, nacks: Vec::new() }]),
+        ];
+        let agent = [(AgentMsg::Caps { caps: CAP_WIRE | u64::from(CAP_UPGRADE) }, 45u8)].into_iter().chain(frames.iter().cloned().map(|f| (AgentMsg::Wire(f), 46)));
+        for (m, idx) in agent {
+            let b = encode(&m)?;
+            assert_eq!(b.first(), Some(&idx), "{m:?} is AgentMsg variant {idx} on the wire");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+            assert!(decode::<AgentMsg>(b.get(..b.len() - 1).unwrap_or_default()).is_err(), "a cut-off frame is an error");
+        }
+        let server = [(ServerMsg::Caps { caps: CAP_WIRE }, 53u8)].into_iter().chain(frames.into_iter().map(|f| (ServerMsg::Wire(f), 54)));
+        for (m, idx) in server {
+            let b = encode(&m)?;
+            assert_eq!(b.first(), Some(&idx), "{m:?} is ServerMsg variant {idx} on the wire");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        assert!(CAP_WIRE.is_power_of_two() && CAP_WIRE > u64::from(u32::MAX), "CAP_WIRE is past Build's 32 bits");
         Ok(())
     }
 

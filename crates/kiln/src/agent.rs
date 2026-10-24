@@ -1642,6 +1642,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     continue;
                 }
                 match msg {
+                    // What the server can do past Build's 32 bits (docs/wire.md). The channel
+                    // starts once both sides said CAP_WIRE, which this runner doesn't yet.
+                    ServerMsg::Caps { caps } => tracing::debug!(caps, "the server's capabilities"),
+                    ServerMsg::Wire(frame) => tracing::warn!(?frame, "a channel frame from a server this runner never said it keeps the channel to: not taken"),
                     ServerMsg::Welcome { server_version, sample_seconds } => {
                         tracing::info!(%server_version, "server welcomed agent");
                         // What waited for the connection, in order: what was held while it was

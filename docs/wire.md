@@ -1,0 +1,258 @@
+# The wire: what every message kiln sends is held to
+
+Kiln's processes talk over three kinds of wire:
+- runners and the server, over QUIC lanes (`crate::proto`'s `AgentMsg` and `ServerMsg`);
+- the UI and the server, over WebSockets;
+- a session and wherever it runs, inside `HarnessCmd` and `Harness` (`Command`, `Update`).
+
+Each message is in one **class**, and the class says what its sender may count on. This page lists
+every message with its class, why, and what it does today. `crate::wire` holds the same tables
+(`wire::class_of` gives any message's class), matched without a catch-all arm, so a new message
+can't be added to a wire without a class, and a test (`cargo test -p kiln wire::contract`) fails
+when this page and the tables disagree.
+
+Why it matters: QUIC is reliable only while its connection lives. "A CONNECTION_CLOSE frame causes
+all streams to immediately become closed; open streams can be assumed to be implicitly reset"
+(RFC 9000, §10.2). So whatever is in flight when a link drops is gone, unless the application
+keeps it and sends it again. Only the process that applied a message can say it was applied, so
+acknowledgements come from that process, never from the transport under it.
+
+## The classes
+
+| Class | What its sender may count on |
+|---|---|
+| handshake | Part of connecting. The connection being made or refused answers it. |
+| command, parked | It carries an id, and the process that applied it answers: an ACK, or a NACK saying why not (refused, unknown, stale epoch, unsupported, malformed). It is sent again under the same id until answered, and taken once however often it comes. While its receiver is away it is kept, then delivered in order once the receiver is back. |
+| command, refused while away | As a parked command, except that while its receiver is away it is refused at once as unreachable. Done later it would surprise (a keystroke, an interrupt), so it is never replayed. |
+| command, as its `Command` says | `HarnessCmd` carries one `Command`, and that command's own row decides. |
+| ask | A question asked under a `req`, answered by an answer. Its asker waits with a deadline, and a lost link answers it at once with a typed error. |
+| answer | The answer to an ask or a command. |
+| ack | An acknowledgement, or a NACK, itself. |
+| stream | An item of an ordered stream: a session's timeline, a terminal's output, a job's events. Items are numbered and acknowledged cumulatively. After a reconnect they are sent again from where the receiver says it has them, and a snapshot is sent only when the sender no longer has what's missing. |
+| state | The newest of something that changes: an inventory, a session's state, a terminal's size. It is versioned, the newest wins, and it is acknowledged by version and sent again until it is. |
+| carried (…) | A protocol of its own, carried on the link, that acknowledges and resends by itself: the conversation feed (`convo/feed.rs`), repo sync's Raft, reach's links, ports' windows, the tunnel, and the channel itself (`crate::wire::channel`, whose items carry other messages, each with its own class). |
+| telemetry | Measurements sent every few seconds. The next one stands in for a lost one, so there is no ACK. |
+| media | Live pictures and sound. A lost frame is overtaken by the next and never sent again. |
+
+## Who builds what
+
+Ada made this kiln's top priority on 2026-10-23: nothing kiln sends is fire-and-forget, and no
+crash or reconnect replays a whole session. Messages *to agents* are critical-path track T3's, on
+`cp/t3-sends` (its `docs/sends.md`):
+- `Send`, `SkillRun` and the queue's commands: their ids made once (CP-T3.2), the inbox that takes
+  each once (CP-T3.2), their states end to end and parking for a runner that's away (CP-T3.3);
+- the composer's durable outbox (CP-T3.4);
+- the Uncertain state after a crash mid-handoff (CP-T3.5).
+
+Everything else here is kiln plan `01a16ba4988b71358e7edb6f309a5986` ("Nothing kiln sends between
+its processes is fire-and-forget"):
+- the channel each runner and the server keep, numbering, acknowledging and resending;
+- every other command answered;
+- runners' updates acknowledged and sent again after a reconnect;
+- the UI's commands answered;
+- loss below the channel counted and repaired;
+- a lab that injects faults.
+
+Messages to agents ride the same channel, and their answers are T3's inbox answers.
+
+## Runner to server: `AgentMsg`
+
+| Message | Class | Why | Today |
+|---|---|---|---|
+| `Hello` | handshake | The runner says who it is and what it runs. | Answered by `Welcome` or `Refused`. |
+| `Heartbeat` | telemetry | Free slots and running jobs, every few seconds. | As its class says. |
+| `Sample` | telemetry | The machine's load, every `sample_seconds`. | As its class says. |
+| `JobStarted` | answer | Answers an `Assign`: the leg runs here. | Not acknowledged as a frame. |
+| `StepStarted` | stream | A v1 leg's steps, in order. | Not kept across a reconnect. |
+| `StepFinished` | stream | A v1 leg's steps, in order. | Not kept across a reconnect. |
+| `JobFinished` | stream | A leg's result: its stream's last item. | Kept until `Received` and sent again after a reconnect (`CAP_RECEIVED`). |
+| `JobSample` | telemetry | A running leg's memory and CPU. | As its class says. |
+| `Reject` | answer | The NACK of an `Assign`: the runner couldn't take the leg, and why. | Not acknowledged as a frame. |
+| `TermOutput` | stream | A terminal's output, by byte offset. | Not kept across a reconnect; a viewer attaches again (`TermAttach`). |
+| `TermExit` | stream | A terminal's last item. | Not kept across a reconnect. |
+| `TermList` | state | The terminals still running here. | Sent on every connect, not acknowledged. |
+| `TermReplay` | answer | Answers `TermAttach`. | As its class says. |
+| `AiSessions` | state | The AI sessions found running on this machine. | Sent when they change, not acknowledged. |
+| `AiTranscript` | answer | Answers `AiTranscript`. | As its class says. |
+| `Harness` | stream | A session's updates, in order, a stream per session. | Fire-and-forget. Updates made while the link is down are thrown away, and every connect sends every session whole (`agent.rs`, "then all of each"). |
+| `HarnessInventory` | state | The sessions this machine runs and the harnesses it offers. | Sent on every connect, not acknowledged. |
+| `AiView` | answer | Answers `AiView`. | As its class says. |
+| `Instance` | handshake | Which runner process of its machine this connection is. | As its class says. |
+| `Build` | handshake | The build and what it can do. | As its class says. |
+| `UpgradeLog` | stream | An upgrade's output. | Not kept across a reconnect. |
+| `UpgradeDone` | answer | Answers `Upgrade`. | As its class says. |
+| `HarnessTaskOutput` | answer | Answers `HarnessTaskOutput`. | As its class says. |
+| `DirList` | answer | Answers `DirList`. | As its class says. |
+| `HarnessHistory` | answer | Answers `HarnessHistory`. | As its class says. |
+| `Sync` | carried (repo sync's Raft) | Repo sync: hyper-raft acknowledges and resends its own messages. | As its class says. |
+| `FrontDoorStatus` | state | The machine's front door. | Sent on every connect and change, not acknowledged. |
+| `JobEvent` | stream | A v2 leg's events, numbered per leg (`seq`). | Kept until `Received` and sent again after a reconnect (`CAP_RECEIVED`). |
+| `Facts` | state | What the runner is: OS, CPUs, tools and so on. | Sent on connect, every 10 minutes and when asked. |
+| `Reach` | carried (reach link) | A frame of a link between two runners, relayed. The link's ends frame it. | As its class says. |
+| `ReachHello` | state | This runner's reach identity. | Sent on every connect. |
+| `ReachAsk` | ask | A question for the server, answered by `ReachAnswer`. | As its class says. |
+| `Convo` | carried (conversation feed) | The runner's conversation store, fed to the server's. | Acknowledged and resent by number (`convo/feed.rs`). |
+| `UpdatePrefs` | state | Whether this machine takes upgrades. | Sent on every connect and change. |
+| `Power` | state | The machine's battery. | Sent on change and every 10 minutes. |
+| `Answer` | answer | Answers `Diagnose`, `Repair`, `Preview` or `Workspace`. | As its class says. |
+| `HarnessFileData` | answer | Answers `HarnessFileRead`. | As its class says. |
+| `StreamFrame` | media | A streamed page's picture and sound. | As its class says. |
+| `StreamEvent` | stream | What a stream says: opened, navigated, closed. | Not kept across a reconnect. |
+| `PortOpened` | answer | Answers `PortOpen`. | As its class says. |
+| `PortData` | carried (port window) | A port's bytes, at most a window ahead of `PortAck`. | As its class says. |
+| `PortAck` | ack | Opens the server's window on a port. | As its class says. |
+| `PortClose` | carried (port window) | A port's end. | As its class says. |
+| `Executor` | answer | Answers `Executor`. | As its class says. |
+| `Undeployed` | answer | Answers `Undeploy`. | As its class says. |
+| `Caps` | handshake | What the runner can do, in 64 bits (`Build`'s 32 ran out): `CAP_WIRE` says it keeps the channel. | New: sent from plan step 3. |
+| `Wire` | carried (the channel) | A frame of the channel: numbered items carrying other messages, their ACKs and NACKs, wants, and what each side has after a reconnect. | New: `crate::wire::channel`. |
+
+## Server to runner: `ServerMsg`
+
+| Message | Class | Why | Today |
+|---|---|---|---|
+| `Welcome` | handshake | The server takes the connection. | As its class says. |
+| `Refused` | handshake | The server refuses it, saying why. | As its class says. |
+| `Assign` | command, refused while away | A v1 leg to run. A runner that's away gets none, and the scheduler gives it to another. | Answered by `JobStarted` or `Reject`. |
+| `Cancel` | command, parked | A leg to stop. A leg still running when its runner is back must stop then. | Fire-and-forget. |
+| `Drain` | command, parked | Take no more jobs. | Fire-and-forget. |
+| `TermOpen` | command, refused while away | A terminal to open. | Fire-and-forget. |
+| `TermInput` | command, refused while away | Keystrokes, never replayed later. | Fire-and-forget: lost with a dropped link. |
+| `TermResize` | state | A terminal's size: the newest wins. | Fire-and-forget. |
+| `TermClose` | command, parked | A terminal to close. | Fire-and-forget. |
+| `TermAttach` | ask | Answered by `TermReplay`. | As its class says. |
+| `AiTranscript` | ask | Answered by `AiTranscript`. | As its class says. |
+| `HarnessOpen` | command, refused while away | An agent to start. One started later than asked would surprise. | Fire-and-forget: reported opened once queued. |
+| `HarnessCmd` | command, as its `Command` says | Carries one `Command`. | Fire-and-forget: `Sent::Ok` once queued in the server's own process (`harness/registry.rs`). |
+| `HarnessClose` | command, parked | A session closed while its machine was away must still close once it's back. | Fire-and-forget. |
+| `AiView` | ask | Answered by `AiView`. | As its class says. |
+| `HarnessFile` | command, parked | A piece of a file a message carries, kept with the message. | Fire-and-forget. |
+| `Retire` | command, parked | An older runner process may stop. | Fire-and-forget. |
+| `Upgrade` | command, refused while away | Upgrade the runner. The updater tries again on its own schedule. | Answered by `UpgradeDone`. |
+| `HarnessTaskOutput` | ask | Answered by `HarnessTaskOutput`. | As its class says. |
+| `DirList` | ask | Answered by `DirList`. | As its class says. |
+| `HarnessHistory` | ask | Answered by `HarnessHistory`. | As its class says. |
+| `Sync` | carried (repo sync's Raft) | Repo sync. | As its class says. |
+| `FrontDoor` | state | The front door's settings and certificate. | Sent on connect and change. |
+| `AssignV2` | command, refused while away | A v2 leg to run, as `Assign`. | Answered by `JobStarted` or `Reject`. |
+| `SecretsFor` | command, parked | A running leg's secrets. A leg still running when its runner is back needs them. | Fire-and-forget. |
+| `JobTerminalOpen` | command, refused while away | A terminal into a leg. | Fire-and-forget. |
+| `KeepRelease` | command, parked | A kept leg may be cleaned up. | Fire-and-forget. |
+| `ProbeFacts` | ask | Answered by `Facts`. | As its class says. |
+| `Reach` | carried (reach link) | A frame of a link from another runner. | As its class says. |
+| `ReachAnswer` | answer | Answers `ReachAsk`. | As its class says. |
+| `KeepExtend` | command, parked | Keep a kept leg longer. | Fire-and-forget. |
+| `JobRerunStep` | command, refused while away | Run a kept leg's step again. | Fire-and-forget. |
+| `JobExec` | command, refused while away | Run a command in a leg's shell. | Fire-and-forget. |
+| `Convo` | carried (conversation feed) | The feed's answers. | As its class says. |
+| `HarnessPackage` | command, refused while away | A moving session's package. A move goes only to a machine that's up. | Fire-and-forget. |
+| `HarnessRelease` | command, parked | A machine that comes back must let go of a session that went on elsewhere. | Fire-and-forget. |
+| `UpdateAvailable` | state | The newest kiln for this machine. | Sent once per commit. |
+| `Diagnose` | ask | Answered by `Answer`. | As its class says. |
+| `Repair` | ask | Answered by `Answer`. | As its class says. |
+| `HarnessFileRead` | ask | Answered by `HarnessFileData`. | As its class says. |
+| `StreamOpen` | command, refused while away | Stream a page. | Fire-and-forget. |
+| `StreamControl` | command, refused while away | What a viewer asks of a stream. | Fire-and-forget. |
+| `StreamInput` | command, refused while away | What a viewer did, never replayed later. | Fire-and-forget. |
+| `StreamClose` | command, parked | Close a stream. | Fire-and-forget. |
+| `Preview` | ask | Answered by `Answer`. | As its class says. |
+| `PortOpen` | ask | Answered by `PortOpened`. | As its class says. |
+| `PortData` | carried (port window) | Bytes for a port. | As its class says. |
+| `PortAck` | ack | Opens the runner's window on a port. | As its class says. |
+| `PortClose` | carried (port window) | A port's end. | As its class says. |
+| `Workspace` | ask | Answered by `Answer`. | As its class says. |
+| `Executor` | ask | Answered by `Executor`. | As its class says. |
+| `Received` | ack | The server has a leg's result. | As its class says. |
+| `Undeploy` | command, parked | Take down a deployment. Answered by `Undeployed`. | Fire-and-forget until answered. |
+| `Caps` | handshake | What the server can do, in 64 bits, to a runner that said `CAP_WIRE`. | New: sent from plan step 3. |
+| `Wire` | carried (the channel) | A frame of the channel, as the runner's. | New: `crate::wire::channel`. |
+
+## Commands to a session: `Command`
+
+From the UI's session socket, the API and kiln's MCP operations. A command for a session on a runner
+travels in `HarnessCmd`.
+
+| Command | Class | Why | Today |
+|---|---|---|---|
+| `Send` | command, parked | A message. T3's: its inbox takes each id once and parks it for a runner that's away. | T3 (`cp/t3-sends`): ids and inbox answers built, not on main. |
+| `QueueEdit` | command, parked | Goes with the messages it edits (T3). | Fire-and-forget. |
+| `QueueRemove` | command, parked | Goes with the messages it edits (T3). | Fire-and-forget. |
+| `QueueMove` | command, parked | Goes with the messages it edits (T3). | Fire-and-forget. |
+| `QueueSendNow` | command, refused while away | It interrupts the turn under way. | Fire-and-forget. |
+| `QueueSteer` | command, refused while away | It steers the turn under way. | Fire-and-forget. |
+| `Approve` | command, parked | Answers one approval by its id. One that no longer waits is NACKed unknown. | Fire-and-forget. |
+| `Interrupt` | command, refused while away | An interrupt later would stop the wrong turn. | Fire-and-forget. |
+| `ForceStop` | command, refused while away | As `Interrupt`. | Fire-and-forget. |
+| `SetMode` | command, refused while away | The person sees it didn't apply, and sets it again. | Fire-and-forget. |
+| `SetModel` | command, refused while away | As `SetMode`. | Fire-and-forget. |
+| `SetEffort` | command, refused while away | As `SetMode`. | Fire-and-forget. |
+| `MoveTo` | command, refused while away | A move starts from a machine that's up. | Fire-and-forget. |
+| `Moving` | command, refused while away | A move's progress note. | Fire-and-forget. |
+| `Control` | command, refused while away | A control's value, or an action. | Fire-and-forget. |
+| `StopTask` | command, refused while away | Stops one task now. | Fire-and-forget. |
+| `Restart` | command, refused while away | Starts the harness again now. | Fire-and-forget. |
+| `Suggest` | ask | Answered by a `Reply` to its client. | As its class says. |
+| `Snapshot` | ask | The whole session, for a server that lost track of it. A resume by revision replaces it. | Asked for by a server that restarted. |
+| `McpEnable` | command, refused while away | Switches an MCP server now. | Fire-and-forget. |
+| `McpReconnect` | command, refused while away | As `McpEnable`. | Fire-and-forget. |
+| `McpRefresh` | command, refused while away | As `McpEnable`. | Fire-and-forget. |
+| `McpAuth` | ask | Answered to its client with the address to open. | As its class says. |
+| `McpAdd` | command, refused while away | Runs the harness's own CLI now. | Fire-and-forget. |
+| `McpRemove` | command, refused while away | As `McpAdd`. | Fire-and-forget. |
+| `SkillView` | ask | Answered to its client. | As its class says. |
+| `SkillRun` | command, parked | Delivered like a message (T3). | T3 (`cp/t3-sends`). |
+| `SkillsReload` | command, refused while away | Reads the skills again now. | Fire-and-forget. |
+| `StopTasks` | command, refused while away | Stops what runs now. | Fire-and-forget. |
+| `Resume` | command, refused while away | Ends a pause now. | Fire-and-forget. |
+| `AutoResume` | command, refused while away | A setting the person sets again if it didn't apply. | Fire-and-forget. |
+| `PauseAt` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
+| `MaxSubagents` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
+| `MoveOnLimit` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
+| `LimitHold` | command, refused while away | The server works the hold out again once the machine is back. | Fire-and-forget. |
+
+## Updates of a session: `Update`
+
+From wherever a session runs to the server, inside `Harness`, and on to its viewers.
+
+| Update | Class | Why | Today |
+|---|---|---|---|
+| `Open` | stream | A session's first item, and its first again after a reset. | As `Harness` (above). |
+| `Closed` | stream | Its last item. | As `Harness`. |
+| `State` | state | Its state: the newest wins. | As `Harness`. |
+| `Meta` | state | Its harness's settings: the newest wins. | As `Harness`. |
+| `Events` | stream | Timeline events, upserted by id. | As `Harness`. |
+| `Changes` | state | Its whole changeset: each replaces the last. | As `Harness`. |
+| `Stream` | stream | Text appended to a streaming event. | As `Harness`. |
+| `Reply` | answer | Answers one client's ask. | As its class says. |
+| `Reset` | stream | The timeline starts over (a snapshot follows). | As `Harness`. |
+
+## The UI's sockets
+
+The session socket's commands up are `Command`s, each classed in its own table.
+
+| Socket | Way | Message | Class | Why | Today |
+|---|---|---|---|---|---|
+| `/api/harness/sessions/:id/ws` | down | `open` | stream | Starts what a viewer is sent. | Every attach sends the whole session. |
+| `/api/harness/sessions/:id/ws` | down | `meta` | state | The newest wins. | Sent whole on every attach. |
+| `/api/harness/sessions/:id/ws` | down | `state` | state | The newest wins. | Sent whole on every attach. |
+| `/api/harness/sessions/:id/ws` | down | `state_patch` | state | What changed since the last state. | As its class says. |
+| `/api/harness/sessions/:id/ws` | down | `changes` | state | The whole changeset. | Sent whole on every attach. |
+| `/api/harness/sessions/:id/ws` | down | `files` | state | Files its messages mention. | Sent on attach. |
+| `/api/harness/sessions/:id/ws` | down | `events` | stream | Timeline events. | Every attach, and a viewer that falls behind, gets them all again. |
+| `/api/harness/sessions/:id/ws` | down | `synced` | stream | Follows a snapshot. | As its class says. |
+| `/api/harness/sessions/:id/ws` | down | `closed` | stream | The session is gone. | As its class says. |
+| `/api/harness/sessions/:id/ws` | down | `error` | answer | A command's refusal. | Says some refusals. Others go unanswered. |
+| `/api/events` | down | `event` | stream | Kiln's events for the UI. | Not resumed after a reconnect. |
+| `/api/terminal/ws` | up | `input` | command, refused while away | Keystrokes, never replayed later. | Not answered. |
+| `/api/terminal/ws` | up | `resize` | state | The newest wins. | Not answered. |
+| `/api/terminal/ws` | down | `output` | stream | By byte offset. | A reconnect attaches again from a replay. |
+| `/api/ci/legs/:id/terminal` | up | `input` | command, refused while away | As the terminal's. | Not answered. |
+| `/api/ci/legs/:id/terminal` | up | `resize` | state | As the terminal's. | Not answered. |
+| `/api/ci/legs/:id/terminal` | down | `output` | stream | As the terminal's. | As the terminal's. |
+| `/api/jobs/:id/logs/ws` | down | `log` | stream | A step's log, by offset. | As its class says. |
+| `/api/harness/sessions/:id/streams/:sid/ws` | up | `input` | command, refused while away | What the viewer did. | Not answered. |
+| `/api/harness/sessions/:id/streams/:sid/ws` | down | `frame` | media | Picture and sound. | As its class says. |
+| `/api/harness/sessions/:id/streams/:sid/ws` | down | `event` | stream | What the stream says. | Not resumed. |
+| `/api/deploy/apps/:app/logs/follow` | down | `log` | stream | A deployment's logs, followed. | As its class says. |
+| `/api/tunnel` | up | `datagram` | carried (tunnel) | The tunnel's own protocol. | As its class says. |
+| `/api/tunnel` | down | `datagram` | carried (tunnel) | The tunnel's own protocol. | As its class says. |

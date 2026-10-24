@@ -89,6 +89,9 @@ pub struct Instance {
     pub build: Option<String>,
     /// What it can do ([`crate::proto::CAP_UPGRADE`] ...).
     pub caps: u32,
+    /// What it can do past `caps`' 32 bits ([`crate::proto::AgentMsg::Caps`]:
+    /// [`crate::proto::CAP_WIRE`] ...); 0 for runners from before.
+    pub wide: u64,
     /// The kiln it says it runs ([`crate::proto::AgentMsg::Facts`]); `None` for runners from before.
     pub kiln: Option<kiln_ci::facts::KilnFacts>,
 }
@@ -176,6 +179,7 @@ impl Instances {
                 drained: false,
                 build: None,
                 caps: 0,
+                wide: 0,
                 kiln: None,
             },
         );
@@ -248,6 +252,13 @@ impl Instances {
         if let Some(i) = self.by_peer.get_mut(&peer) {
             i.build = Some(build);
             i.caps = caps;
+        }
+    }
+
+    /// What it can do past `Build`'s 32 bits ([`crate::proto::AgentMsg::Caps`]).
+    pub fn set_wide(&mut self, peer: PeerId, caps: u64) {
+        if let Some(i) = self.by_peer.get_mut(&peer) {
+            i.wide = caps;
         }
     }
 

@@ -1251,6 +1251,11 @@ impl Hub {
             AgentMsg::Executor { json } => self.ci.send(crate::ci::dispatch::Msg::Executor { agent: agent.clone(), json }),
             // A preview's deployment it was asked to take down (docs/ci.md W15-R07).
             AgentMsg::Undeployed { json } => crate::ci::previews::undeployed(self, &agent, &json).await,
+            // What it can do past Build's 32 bits: whether it keeps the channel (docs/wire.md).
+            AgentMsg::Caps { caps } => self.instances.lock().set_wide(peer, caps),
+            // A frame of the channel. Nothing sends one before both sides said CAP_WIRE, and this
+            // server doesn't yet: said, and not taken.
+            AgentMsg::Wire(frame) => tracing::warn!(agent = %agent, ?frame, "a channel frame from a runner this server never said it keeps the channel to: not taken"),
             // The kiln it runs (`crate::fleet`); the rest is W13's.
             AgentMsg::Facts { json } => match serde_json::from_str::<kiln_ci::facts::RunnerFacts>(&json) {
                 Ok(f) => {
@@ -1673,6 +1678,13 @@ impl Hub {
     pub fn runner_caps(&self, name: &str) -> u32 {
         let inst = self.instances.lock();
         inst.newest(name).and_then(|p| inst.get(p)).map_or(0, |i| i.caps)
+    }
+
+    /// What a machine's newest runner can do in 64 bits: `Build`'s 32 and the rest
+    /// ([`proto::AgentMsg::Caps`]: [`proto::CAP_WIRE`] ...).
+    pub fn runner_wide_caps(&self, name: &str) -> u64 {
+        let inst = self.instances.lock();
+        inst.newest(name).and_then(|p| inst.get(p)).map_or(0, |i| u64::from(i.caps) | i.wide)
     }
 
     /// The kiln a machine's newest runner process says it runs (`crate::fleet`).
