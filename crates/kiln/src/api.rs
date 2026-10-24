@@ -4132,7 +4132,7 @@ async fn harness_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     Ok(srv::json(StatusCode::CREATED, &b))
 }
 
-/// One of the Programs view's changes (`programs.set`, `programs.assign`): the request's JSON
+/// One of a program's changes (`programs.set`, `programs.assign`): the request's JSON
 /// object with `base` (the program, and the track) on it.
 async fn programs_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, base: serde_json::Value, req: Request) -> R {
     let mut b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;

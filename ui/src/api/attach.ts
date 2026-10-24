@@ -109,7 +109,6 @@ export const CAN = ["rerun", "cancel", "diagnose", "fix", "edit-pipelines", "qua
 const enc = encodeURIComponent;
 
 /** The attachments page, its form open on what `on` names (`repo:acme/app`, `environment:acme/app:production`, …): a page's "Attach agent". */
-export const attachHref = (on: string) => `/agents/attached?on=${enc(on)}`;
 
 export type AttachmentInput = Omit<Attachment, "id" | "by" | "created_at" | "updated_at" | "paused"> & { paused?: boolean; attachment?: string };
 

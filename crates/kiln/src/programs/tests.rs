@@ -1,4 +1,4 @@
-//! CP-M3's Programs view (docs/programs.md): how programs are found and shown, the rotation, and
+//! CP-M3's programs (docs/programs.md): how programs are found and given, the rotation, and
 //! the usage rules.
 
 use std::sync::Arc;
