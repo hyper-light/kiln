@@ -2525,8 +2525,8 @@ Gives step execution for `uses:`.
   kiln, whose repositories aren't read anonymously as a public one on GitHub is.
 - *Done.* AC01 but two (with W22-AC02): F-21's actions green, those that need an account in dry
   configurations against stand-ins for their providers (`tests/account_actions.rs`).
-- *Left.* AC01's `azure/login` (a test tenant, W11-AC03) and `actions/attest-build-provenance`
-  (GitHub's Sigstore only).
+- *Left.* AC01's `azure/login` (a test tenant, W11-AC03) and `actions/attest-build-provenance`,
+  which signs only on github.com and GHE.com (W18-R02): what it attests there, kiln verifies.
 
 ### W08 Runtime services: store, caches, artifacts, reuse
 
@@ -5381,9 +5381,14 @@ code from outside a repository's trust safely: microVMs or containers, limited e
   kiln is configured with (self-hosted instances can be deployed in kiln's cluster), or with a key
   (a cosign key file, or a KMS integration). Signatures and attestations attach to images through
   the OCI referrers API (W12) and to files as `.sigstore.json` bundles.
-  `actions/attest-build-provenance` works when a Fulcio that trusts kiln's issuer is configured and
-  the facade's attestations endpoint is used; otherwise `kiln/attest@v1` is the supported path, and
-  the catalog says so.
+  `actions/attest-build-provenance` (and `actions/attest`, `attest-sbom`) sign only on github.com
+  and GHE.com: `@actions/attest` accepts no other server (`GITHUB_SERVER_URL`) and checks the job's
+  ID token with `token.actions.<host>`'s keys before it signs, so no Fulcio that trusts kiln's
+  issuer makes them work in a kiln leg. `kiln/attest@v1` is the supported path, and the catalog
+  and the leg say so; what those actions attest on GitHub, kiln verifies (`kiln attest verify`).
+  *Corrected 2026-10-24:* this said such a Fulcio made the action work. @actions/attest's
+  `getIssuer` (actions/toolkit `packages/attest/src/oidc.ts`, used by actions/attest v4.2.1 and
+  so attest-build-provenance v4.2.2) refuses every other server.
 - **W18-R03 SBOMs.** SPDX 2.3 and CycloneDX 1.6 from lockfiles: `Cargo.lock`, `go.mod`/`go.sum`,
   `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `uv.lock`, `poetry.lock`, requirements files,
   `Gemfile.lock` and `composer.lock` built in; others through `syft` when it is on the runner.
@@ -5572,6 +5577,13 @@ Done since:
   (private repositories' attestations and its release attestations: RFC 3161 timestamps, no
   transparency log) and Rekor v2's entries are refused, saying so: kiln doesn't verify
   timestamp authorities' signatures.
+- *Done.* R02's GitHub-only actions: the catalog notes `actions/attest`, `attest-build-provenance`
+  and `attest-sbom` as signing only on github.com and GHE.com (`note` in `GET /api/ci/actions`),
+  naming `kiln/attest@v1`; a leg running one is told so in a warning on its step, by the Node
+  action that signs (not twice for a composite around it), and the action runs as asked
+  (`w18_r02_actions_that_sign_only_on_github`). Checked with `kiln workflow run` on the host
+  executor: `attest-build-provenance` v4.2.2's step shows the warning once, then the action's own
+  `Invalid server URL: http://127.0.0.1:…`.
 - *Done.* R04's CD half and AC04: an environment's `require_provenance: { builder, workflows,
   branches }` (deploy-api.md §9.1) holds a release until kiln has provenance of each artifact it
   deploys (for half an hour, its build perhaps still attesting it), refuses one whose provenance
@@ -6855,8 +6867,9 @@ and AC02.
 
   That is every one of F-21's 50 but two: `azure/login`, which has no such configuration (it
   signs in with the Azure CLI against Microsoft Entra), waits for a test tenant (W11-AC03); and
-  `actions/attest-build-provenance`, which signs only through a Sigstore that trusts GitHub's ID
-  tokens (kiln's own `kiln/attest@v1` and the job's `attest:` are W18-R01's).
+  `actions/attest-build-provenance`, which signs only on github.com and GHE.com (W18-R02: its
+  toolkit accepts no other server; kiln's own `kiln/attest@v1` and the job's `attest:` are
+  W18-R01's).
 - *AC02, first batch* (16 actions, 2026-10-18):
   - Green: `setup-node`, `setup-go`, `setup-java`, `setup-uv`, `pnpm/action-setup`,
     `setup-bun`, `dtolnay/rust-toolchain`, `setup-terraform`, `docker/metadata-action`,

@@ -585,6 +585,15 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::col
     }
 }
 
+/// What's said of an action that signs only for github.com and GHE.com (docs/ci.md W18-R02):
+/// `@actions/attest` accepts no other server (`GITHUB_SERVER_URL`) and checks the job's ID token
+/// with `token.actions.<host>`'s keys, so on kiln it fails whatever Sigstore is set up. The
+/// catalog notes it, and a leg running one is told.
+pub fn github_only(repo: &str) -> Option<&'static str> {
+    const NOTE: &str = "signs only on github.com and GHE.com: @actions/attest accepts no other server, and checks the job's ID token with token.actions.<host>'s keys. On kiln, kiln/attest@v1 attests the same subjects (subject-path, subject-name with subject-digest, subject-checksums), signed by kiln.";
+    ["actions/attest", "actions/attest-build-provenance", "actions/attest-sbom"].iter().any(|r| r.eq_ignore_ascii_case(repo)).then_some(NOTE)
+}
+
 /// The mirrored actions whose name has `q`: each with its newest versions (tags, newest first,
 /// with their commits) and the `action.yml` of the newest (W07-R12).
 async fn catalog(hub: &Hub, q: &str) -> Vec<Value> {
@@ -625,7 +634,8 @@ async fn catalog(hub: &Hub, q: &str) -> Vec<Value> {
                 "outputs": a.outputs.iter().map(|o| json!({ "name": o.name, "description": o.description })).collect::<Vec<_>>(),
             })
         });
-        out.push(json!({ "uses": format!("{owner}/{repo}"), "versions": versions, "action": action }));
+        let uses = format!("{owner}/{repo}");
+        out.push(json!({ "note": github_only(&uses), "uses": uses, "versions": versions, "action": action }));
     }
     out
 }
@@ -633,6 +643,17 @@ async fn catalog(hub: &Hub, q: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W18-R02: the actions that sign only on GitHub are noted so; others aren't.
+    #[test]
+    fn w18_r02_actions_that_sign_only_on_github() {
+        for repo in ["actions/attest", "actions/attest-build-provenance", "Actions/Attest-SBOM"] {
+            assert!(github_only(repo).is_some_and(|n| n.contains("kiln/attest@v1")), "{repo}");
+        }
+        for repo in ["actions/checkout", "actions/attest-x", "sigstore/cosign-installer"] {
+            assert_eq!(github_only(repo), None, "{repo}");
+        }
+    }
 
     #[test]
     fn forms() {
