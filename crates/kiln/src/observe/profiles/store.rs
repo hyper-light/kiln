@@ -302,16 +302,12 @@ impl<'a> Bytes<'a> {
     }
 }
 
-/// A profile in a header: its name, how it is kept, its length inflated, its place, length and
-/// CRC-32C in the blob file, its sample types (a range of the header's).
+/// A profile in a header, as the index and the header's readers want it: its name, its sample
+/// types (a range of the header's). Where it is kept, and how, a profile's reading finds
+/// ([`find_profile`]).
 #[derive(Debug, Clone)]
 struct ProfRef<'a> {
     name: &'a str,
-    kept: Kept,
-    plain_len: u32,
-    offset: u64,
-    len: u32,
-    crc: u32,
     types: Range<usize>,
 }
 
@@ -352,19 +348,101 @@ impl<'a> HeadRef<'a> {
         self.blobs_end = 0;
         for _ in 0..r.u8()? {
             let name = r.str()?;
-            let kept = Kept::of(r.u8()?).ok_or(StoreError::Corrupt("how a profile is kept"))?;
-            let (plain_len, offset, len, crc) = (r.u32()?, r.u64()?, r.u32()?, r.u32()?);
+            Kept::of(r.u8()?).ok_or(StoreError::Corrupt("how a profile is kept"))?;
+            // Its length inflated, its place, its length and CRC-32C.
+            let (_, offset, len, _) = (r.u32()?, r.u64()?, r.u32()?, r.u32()?);
             let from = self.types.len();
             for _ in 0..r.u8()? {
                 self.types.push((r.str()?, r.str()?, r.i64()?));
             }
             self.blobs_end = self.blobs_end.max(offset.saturating_add(u64::from(len)));
-            self.profiles.push(ProfRef { name, kept, plain_len, offset, len, crc, types: from..self.types.len() });
+            self.profiles.push(ProfRef { name, types: from..self.types.len() });
         }
         self.endpoints = (r.u64()?, r.u32()?, r.u32()?);
         self.blobs_end = self.blobs_end.max(self.endpoints.0.saturating_add(u64::from(self.endpoints.1)));
         Ok(())
     }
+}
+
+/// Profile `name` of a header (`b`, read in place): how it is kept, its length inflated, its place,
+/// length and CRC-32C in the blob file; none where the upload holds none of that name. Walked to it,
+/// its tags and others' types passed over, nothing made.
+fn find_profile(b: &[u8], name: &str) -> Result<Option<(Kept, u32, u64, u32, u32)>, StoreError> {
+    let mut r = Bytes { at: b };
+    if r.u8()? != HEAD_VERSION {
+        return Err(StoreError::Corrupt("its version"));
+    }
+    r.take(24)?;
+    r.str()?;
+    for _ in 0..r.u16()? {
+        r.str()?;
+        r.str()?;
+    }
+    for _ in 0..r.u8()? {
+        let this = r.str()? == name;
+        let kept = Kept::of(r.u8()?).ok_or(StoreError::Corrupt("how a profile is kept"))?;
+        let (plain_len, offset, len, crc) = (r.u32()?, r.u64()?, r.u32()?, r.u32()?);
+        if this {
+            return Ok(Some((kept, plain_len, offset, len, crc)));
+        }
+        for _ in 0..r.u8()? {
+            r.str()?;
+            r.str()?;
+            r.i64()?;
+        }
+    }
+    Ok(None)
+}
+
+/// A gzip member (RFC 1952: Go's profiles as they came) inflated into `out` (its room for `plain`
+/// bytes made first) with `state`, kept from one to the next: its header's fields passed over (its
+/// CRC-16 checked where it has one), its trailer's CRC-32 and length checked against what came
+/// out.
+fn gunzip(b: &[u8], plain: usize, state: &mut flate2::Decompress, out: &mut Vec<u8>) -> Result<(), StoreError> {
+    let bad = || StoreError::Corrupt("its gzip");
+    let mut r = Bytes { at: b };
+    let [id1, id2, method, flags] = r.array::<4>()?;
+    if (id1, id2, method) != (0x1f, 0x8b, 8) || flags & 0xe0 != 0 {
+        return Err(bad());
+    }
+    // Its time, its compressor's flags, its system.
+    r.take(6)?;
+    if flags & 4 != 0 {
+        let n = usize::from(r.u16()?);
+        r.take(n)?;
+    }
+    // Its name and its comment, each ended by a zero.
+    for flag in [8u8, 16] {
+        if flags & flag != 0 {
+            let end = r.at.iter().position(|&c| c == 0).ok_or_else(bad)?;
+            r.take(end + 1)?;
+        }
+    }
+    if flags & 2 != 0 {
+        // The header's CRC-16: its CRC-32's low half.
+        let header = b.get(..b.len() - r.at.len()).ok_or_else(bad)?;
+        let mut sum = flate2::Crc::new();
+        sum.update(header);
+        if r.u16()? != (sum.sum() & 0xffff) as u16 {
+            return Err(bad());
+        }
+    }
+    state.reset(false);
+    out.clear();
+    out.reserve(plain);
+    let status = state.decompress_vec(r.at, out, flate2::FlushDecompress::Finish).map_err(|_| bad())?;
+    if status != flate2::Status::StreamEnd {
+        return Err(bad());
+    }
+    let used = usize::try_from(state.total_in()).map_err(|_| bad())?;
+    let mut trailer = Bytes { at: r.at.get(used..).ok_or_else(bad)? };
+    let (crc, size) = (trailer.u32()?, trailer.u32()?);
+    let mut sum = flate2::Crc::new();
+    sum.update(out);
+    if sum.sum() != crc || size != out.len() as u32 {
+        return Err(bad());
+    }
+    Ok(())
 }
 
 /// A segment's files.
@@ -589,7 +667,7 @@ impl Store {
 
     /// A reader of uploads' profiles.
     pub fn reader(&self) -> Reader<'_> {
-        Reader { store: self, files: HashMap::new(), buf: Vec::new(), zstd: kiln_obs::zstd::Decoder::default() }
+        Reader { store: self, files: HashMap::new(), buf: Vec::new(), kept: Vec::new(), zstd: kiln_obs::zstd::Decoder::default(), gzip: flate2::Decompress::new(false) }
     }
 
     pub fn stats(&self) -> Stats {
@@ -834,12 +912,15 @@ pub struct Header {
     pub profiles: Vec<(String, Vec<(String, String, i64)>)>,
 }
 
-/// Reads uploads' profiles: their segments' files kept open, its buffers kept, from one to the next.
+/// Reads uploads' profiles: their segments' files kept open, its buffers and its decompressors'
+/// states kept, from one to the next.
 pub struct Reader<'s> {
     store: &'s Store,
     files: HashMap<i64, (File, File)>,
     buf: Vec<u8>,
+    kept: Vec<u8>,
     zstd: kiln_obs::zstd::Decoder,
+    gzip: flate2::Decompress,
 }
 
 impl Reader<'_> {
@@ -900,14 +981,22 @@ impl Reader<'_> {
 
     /// `len` bytes at `offset` of segment `segment`'s blob file, checked against `crc`.
     fn blob(&mut self, segment: i64, offset: u64, len: u32, crc: u32) -> Result<Vec<u8>, StoreError> {
+        let mut kept = Vec::new();
+        self.blob_into(segment, offset, len, crc, &mut kept)?;
+        Ok(kept)
+    }
+
+    /// [`Reader::blob`] into `into` (its room kept).
+    fn blob_into(&mut self, segment: i64, offset: u64, len: u32, crc: u32, into: &mut Vec<u8>) -> Result<(), StoreError> {
         let Some((blobs, _)) = self.files.get_mut(&segment) else { return Err(StoreError::Corrupt("its segment")) };
-        let mut kept = vec![0u8; len as usize];
+        into.clear();
+        into.resize(len as usize, 0);
         blobs.seek(SeekFrom::Start(offset))?;
-        blobs.read_exact(&mut kept)?;
-        if kiln_obs::crc32c::checksum(&kept) != crc {
+        blobs.read_exact(into)?;
+        if kiln_obs::crc32c::checksum(into) != crc {
             return Err(StoreError::Corrupt("its checksum"));
         }
-        Ok(kept)
+        Ok(())
     }
 
     /// Upload `h`'s profile `name`, inflated into `out` (cleared first): false where it holds none
@@ -917,23 +1006,27 @@ impl Reader<'_> {
         if !self.head(h)? {
             return Ok(false);
         }
-        let found = {
-            let mut r = HeadRef::default();
-            r.read(self.buf.get(8..).unwrap_or_default())?;
-            r.profiles.iter().find(|p| p.name == name).map(|p| (p.kept, p.plain_len, p.offset, p.len, p.crc))
-        };
-        let Some((kept_as, plain_len, offset, len, crc)) = found else { return Ok(false) };
-        let kept = self.blob(h.segment, offset, len, crc)?;
+        let Some((kept_as, plain_len, offset, len, crc)) = find_profile(self.buf.get(8..).unwrap_or_default(), name)? else { return Ok(false) };
         let plain = (plain_len as usize).min(MAX_PROFILE);
-        match kept_as {
-            Kept::Plain => out.extend_from_slice(&kept),
-            Kept::Gzip => {
-                flate2::read::GzDecoder::new(kept.as_slice()).take(plain as u64).read_to_end(out)?;
+        // Kept as it came where it is plain: read straight into `out`.
+        if kept_as == Kept::Plain {
+            self.blob_into(h.segment, offset, len, crc, out)?;
+            if out.len() != plain {
+                return Err(StoreError::Corrupt("its length inflated"));
             }
-            Kept::Zstd => self.zstd.decompress(&kept, out, plain).map_err(|_| StoreError::Corrupt("its zstd"))?,
-            Kept::Lz4Frames => kiln_obs::lz4::decompress_frames(&kept, out, plain).map_err(|_| StoreError::Corrupt("its LZ4 frames"))?,
-            Kept::Lz4Block => kiln_obs::lz4::decompress(&kept, out, plain).map_err(|_| StoreError::Corrupt("its LZ4 block"))?,
+            return Ok(true);
         }
+        let mut kept = std::mem::take(&mut self.kept);
+        let read = self.blob_into(h.segment, offset, len, crc, &mut kept);
+        let inflated = read.and_then(|()| match kept_as {
+            Kept::Plain => Ok(()),
+            Kept::Gzip => gunzip(&kept, plain, &mut self.gzip, out),
+            Kept::Zstd => self.zstd.decompress(&kept, out, plain).map_err(|_| StoreError::Corrupt("its zstd")),
+            Kept::Lz4Frames => kiln_obs::lz4::decompress_frames(&kept, out, plain).map_err(|_| StoreError::Corrupt("its LZ4 frames")),
+            Kept::Lz4Block => kiln_obs::lz4::decompress(&kept, out, plain).map_err(|_| StoreError::Corrupt("its LZ4 block")),
+        });
+        self.kept = kept;
+        inflated?;
         if out.len() != plain {
             return Err(StoreError::Corrupt("its length inflated"));
         }
@@ -1022,6 +1115,49 @@ mod tests {
         assert!(s.reader().profile(all(&s)[0].2, "heap.pprof", &mut out).unwrap());
         assert_eq!(out, plain);
         assert!(s.stats().bytes < plain.len() as u64, "{} bytes kept of {}", s.stats().bytes, plain.len());
+    }
+
+    /// A gzip member inflated with a state kept from one to the next, as `GzDecoder` inflates it:
+    /// each of its header's optional fields (an extra field, a name, a comment) passed over, its
+    /// CRC-16 checked; a header or trailer whose CRC or length is not what came refused, and the
+    /// state used again after it.
+    #[test]
+    fn a_gzip_member_of_any_header_inflates_and_a_wrong_trailer_is_refused() {
+        use std::io::Write as _;
+        let mut plain = Vec::new();
+        intake::inflate(fx::HEAP, &mut plain).unwrap();
+        let gz = |b: flate2::GzBuilder| {
+            let mut e = b.write(Vec::new(), flate2::Compression::default());
+            e.write_all(&plain).unwrap();
+            e.finish().unwrap()
+        };
+        let (mut state, mut out) = (flate2::Decompress::new(false), Vec::new());
+        // A plain member, one of every field flate2 writes, Go's own; and one with a header CRC-16
+        // (flate2 writes none: made here, RFC 1952's way).
+        let mut hcrc = gz(flate2::GzBuilder::new());
+        hcrc[3] |= 2;
+        let mut sum = flate2::Crc::new();
+        sum.update(&hcrc[..10]);
+        let crc16 = ((sum.sum() & 0xffff) as u16).to_le_bytes();
+        hcrc.splice(10..10, crc16);
+        let members = [gz(flate2::GzBuilder::new()), gz(flate2::GzBuilder::new().extra(vec![1, 2, 3]).filename("heap.pprof").comment("kiln").operating_system(3)), fx::HEAP.to_vec(), hcrc.clone()];
+        for m in &members {
+            gunzip(m, plain.len(), &mut state, &mut out).unwrap();
+            assert_eq!(out, plain);
+        }
+        let mut wrong = members[1].clone();
+        let n = wrong.len();
+        wrong[n - 8] ^= 1;
+        assert!(gunzip(&wrong, plain.len(), &mut state, &mut out).is_err(), "its CRC-32");
+        let mut short = members[0].clone();
+        let n = short.len();
+        short[n - 4] ^= 1;
+        assert!(gunzip(&short, plain.len(), &mut state, &mut out).is_err(), "its length");
+        assert!(gunzip(&members[0][..members[0].len() / 2], plain.len(), &mut state, &mut out).is_err(), "cut short");
+        hcrc[10] ^= 1;
+        assert!(gunzip(&hcrc, plain.len(), &mut state, &mut out).is_err(), "its header's CRC-16");
+        gunzip(&members[0], plain.len(), &mut state, &mut out).unwrap();
+        assert_eq!(out, plain, "the state used again");
     }
 
     /// A header file's torn tail (half a frame, a crash's) is passed over; a frame whose bytes

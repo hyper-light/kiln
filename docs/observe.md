@@ -4550,9 +4550,24 @@ three rounds each:
 | Into a graph that has its nodes | 31–40 ns a frame | 26 ns a frame, 0 |
 | Ten profiles in turn (a million nodes, the bound) | 14–16 ns a frame | 11–13 ns a frame |
 
-Left for the next pass: a query reads an upload with 57 allocations (its header's lists, its blob's buffer, gzip's
-state, `pprof::read`'s lists grown as it reads), and merging eight threads' graphs is serial (58 ms for two graphs of
-750,000 nodes).
+The next pass (2026-10-23, after O-34), the same bench: a query read an upload with 57 allocations (its header's
+lists, its blob's buffer, gzip's state, `pprof::read`'s lists grown as it read) and merged its threads' graphs one
+after another. Now an upload's header is walked to the profile asked for, nothing made (`find_profile`); its blob
+read into the reader's buffer; gzip inflated with one state a reader keeps (`flate2::Decompress`: its member's header
+fields passed over, its header's CRC-16 and its trailer's CRC-32 and length checked, as `GzDecoder` checks them);
+pprof read with a scratch a thread keeps (`pprof::read_with`: its tables emptied and kept, each of the profile's
+lists made its size once, from one counting pass and the last profile's); and the threads' graphs merged in pairs at
+once, a round at a time, each pair the one before into the one after, so the graph is the same whichever thread
+ends first (a test: one, three, four and eight threads, the same graph drawn and the same functions):
+
+| | Before | After |
+|---|---:|---:|
+| 500 uploads of one service (Go's CPU fixture), one thread | 13.6 ms, 28,588 allocations (57 an upload) | 10.2 ms, 3,110 (6 an upload: the profile's own lists) |
+| The same, on eight threads | 5.4 ms | 2.1 ms |
+| An hour's of one service (60 uploads), one thread / eight | 1.62 / 0.77 ms, 3,505 allocations | 1.19 / 0.46 ms, 467 |
+
+Left: merging two large graphs is still one thread's (51 ms for two of 750,000 nodes: a node found under its parent
+by a lookup each); eight threads' graphs take three rounds of it, not seven.
 
 ### 12.37 Java's recordings
 

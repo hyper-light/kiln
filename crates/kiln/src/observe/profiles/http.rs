@@ -400,10 +400,10 @@ pub async fn compare(q: &HashMap<String, String>) -> Result<Response, Fail> {
         let nodes = c.drawn(!by_before, (whole as f64 * min_share).ceil() as i64);
         let shares = [before.flame.nodes.first().map_or(0, |r| r.total).max(1) as f64, after.flame.nodes.first().map_or(0, |r| r.total).max(1) as f64];
         let mut by = c.by_function();
-        // Most changed first: its self's share of its whole, after less before.
+        // Most changed first: its self's share of its whole, after less before; alike, by name.
         by.sort_by(|a, b| {
             let d = |x: &(u32, [i64; 2], [i64; 2])| (x.1[1] as f64 / shares[1] - x.1[0] as f64 / shares[0]).abs();
-            d(b).total_cmp(&d(a))
+            d(b).total_cmp(&d(a)).then_with(|| c.flame.name(a.0).cmp(&c.flame.name(b.0)))
         });
         by.truncate(TOP);
         let (mut names, mut files, mut place) = (Vec::new(), Vec::new(), HashMap::<u32, u32>::new());
@@ -448,7 +448,7 @@ fn drawn(summed: query::Summed, profile: String, kind: String, min_share: f64) -
     }
     let nodes = g.drawn(min_total);
     let mut by_function = g.by_function();
-    by_function.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+    by_function.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then_with(|| g.name(a.0).cmp(&g.name(b.0))));
     by_function.truncate(TOP);
     // Functions named once, as they are first drawn or listed.
     let (mut names, mut files, mut place) = (Vec::new(), Vec::new(), HashMap::<u32, u32>::new());

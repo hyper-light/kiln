@@ -190,11 +190,13 @@ pub fn flame(store: &Store, asked: &Asked<'_>, threads: usize) -> Summed {
     let part = chosen.len().div_ceil(threads).max(1);
     let profile = asked.profile;
     let read_part = |part: &[(Handle, usize, u32)]| -> (Flame, usize) {
+        // One reader, buffer and pprof scratch a thread, kept from one upload to the next.
         let mut reader = store.reader();
+        let mut scratch = kiln_obs::profile::pprof::Scratch::default();
         let (mut g, mut buf, mut failed) = (Flame::new(), Vec::new(), 0usize);
         for &(h, i, _) in part {
             match reader.profile(h, profile, &mut buf) {
-                Ok(true) => match kiln_obs::profile::pprof::read(&buf) {
+                Ok(true) => match kiln_obs::profile::pprof::read_with(&buf, &mut scratch) {
                     Ok(p) => g.add(&p, i),
                     Err(_) => failed += 1,
                 },
@@ -204,7 +206,7 @@ pub fn flame(store: &Store, asked: &Asked<'_>, threads: usize) -> Summed {
         }
         (g, failed)
     };
-    let mut parts: Vec<(Flame, usize)> = if threads == 1 {
+    let parts: Vec<(Flame, usize)> = if threads == 1 {
         vec![read_part(&chosen)]
     } else {
         std::thread::scope(|s| {
@@ -221,11 +223,52 @@ pub fn flame(store: &Store, asked: &Asked<'_>, threads: usize) -> Summed {
             running.into_iter().zip(chosen.chunks(part)).map(|(t, c)| t.join().unwrap_or_else(|_| (Flame::new(), c.len()))).collect()
         })
     };
-    let (mut flame, mut failed) = parts.pop().unwrap_or_else(|| (Flame::new(), 0));
-    for (g, f) in &parts {
-        flame.merge(g);
-        failed += f;
+    let failed: usize = parts.iter().map(|(_, f)| f).sum();
+    let mut graphs: Vec<Flame> = parts.into_iter().map(|(g, _)| g).collect();
+    // The threads' graphs merged in pairs at once, a round at a time (log2 of them, not one a
+    // thread in turn): each pair the one before into the one after it, so the graph is the same
+    // whichever thread ends first.
+    while graphs.len() > 1 {
+        let mut pairs = Vec::with_capacity(graphs.len() / 2);
+        let mut rest = graphs.into_iter();
+        let mut odd = None;
+        loop {
+            match (rest.next(), rest.next()) {
+                (Some(a), Some(b)) => pairs.push((a, b)),
+                (Some(a), None) => {
+                    odd = Some(a);
+                    break;
+                }
+                _ => break,
+            }
+        }
+        graphs = if pairs.len() == 1 {
+            pairs
+                .into_iter()
+                .map(|(mut a, b)| {
+                    a.merge(&b);
+                    a
+                })
+                .collect()
+        } else {
+            std::thread::scope(|s| {
+                let running: Vec<_> = pairs
+                    .into_iter()
+                    .map(|(mut a, b)| {
+                        s.spawn(move || {
+                            crate::os::lower_thread_priority();
+                            a.merge(&b);
+                            a
+                        })
+                    })
+                    .collect();
+                // A thread that panicked (none should: the crate's lints) gives an empty graph.
+                running.into_iter().map(|t| t.join().unwrap_or_else(|_| Flame::new())).collect()
+            })
+        };
+        graphs.extend(odd);
     }
+    let mut flame = graphs.pop().unwrap_or_default();
     let read = chosen.len() - failed;
     let averaged = snapshot(asked.kind) && read > 1;
     if averaged {
@@ -300,6 +343,18 @@ mod tests {
         let (one_all, two_all) = (all(1), all(4));
         assert_eq!((two_all.read, two_all.flame.nodes[0].total, two_all.flame.profiles), (12, 12 * 1_500_000_000, 12));
         assert_eq!(two_all.flame.nodes.len(), one_all.flame.nodes.len(), "the same graph");
+        // Merged in pairs at once, however many threads: the same graph drawn, the same functions.
+        let shown = |f: &Flame| {
+            let drawn: Vec<(String, i64, i64)> = f.drawn(0).iter().map(|d| (if d.function == u32::MAX { String::new() } else { f.name(d.function).0.to_owned() }, d.total, d.own)).collect();
+            let mut by: Vec<(String, i64, i64)> = f.by_function().iter().map(|&(g, own, total)| (f.name(g).0.to_owned(), own, total)).collect();
+            by.sort();
+            (drawn, by)
+        };
+        for threads in [3, 4, 8] {
+            let t = all(threads);
+            assert_eq!((t.read, t.failed, t.flame.profiles, t.flame.samples), (one_all.read, 0, one_all.flame.profiles, one_all.flame.samples));
+            assert_eq!(shown(&t.flame), shown(&one_all.flame), "{threads} threads");
+        }
         let some = flame(&s, &asked(3, None), 2);
         assert_eq!((some.matched, some.read, some.flame.nodes[0].total), (8, 3, 3 * 1_500_000_000));
         let h = list(&s, i64::MIN, i64::MAX, &q, 1).0[0];

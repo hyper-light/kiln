@@ -123,6 +123,12 @@ struct Ids {
 impl Ids {
     const NONE: u32 = u32::MAX;
 
+    /// Emptied, its room kept.
+    fn clear(&mut self) {
+        self.dense.clear();
+        self.sparse.clear();
+    }
+
     fn put(&mut self, id: u64, place: u32) -> Result<(), PprofError> {
         if id == 0 {
             return Err(PprofError::Id(0));
@@ -151,19 +157,52 @@ impl Ids {
     }
 }
 
+/// What reading a profile needs beside the profile, kept from one to the next (emptied, its room
+/// kept): ids' tables, locations' functions, a sample's ids and values; and how many strings,
+/// frames and labels the last held, the room the next is given (a query's profiles are of one
+/// service and type: alike). A reader of many profiles allocates for each one's own lists alone,
+/// each once where they are alike.
+#[derive(Default)]
+pub struct Scratch {
+    function_ids: Ids,
+    location_ids: Ids,
+    location_functions: Vec<u32>,
+    locations: Vec<(u32, u32)>,
+    ids: Vec<u64>,
+    vals: Vec<u64>,
+    strings: usize,
+    frames: usize,
+    labels: usize,
+}
+
 /// `msg` (a `Profile`, inflated) read.
 pub fn read(msg: &[u8]) -> Result<Profile<'_>, PprofError> {
-    // The string table first: everything else names its strings by index.
-    let mut strings: Vec<&str> = Vec::new();
+    read_with(msg, &mut Scratch::default())
+}
+
+/// [`read`], what it needs beside the profile `scratch`'s.
+pub fn read_with<'a>(msg: &'a [u8], scratch: &mut Scratch) -> Result<Profile<'a>, PprofError> {
+    // The string table first (everything else names its strings by index), each list counted in
+    // the same pass, so each is made its size at once.
+    let mut strings: Vec<&str> = Vec::with_capacity(scratch.strings);
+    let (mut types, mut functions, mut locations_n, mut samples) = (0usize, 0usize, 0usize, 0usize);
     for f in Fields::new(msg) {
         let (n, w) = f?;
-        if n == 6 {
-            if strings.len() >= MAX_STRINGS {
-                return Err(PprofError::Bound("strings"));
+        match n {
+            6 => {
+                if strings.len() >= MAX_STRINGS {
+                    return Err(PprofError::Bound("strings"));
+                }
+                strings.push(w.str().ok_or(PprofError::Kind("a string"))?);
             }
-            strings.push(w.str().ok_or(PprofError::Kind("a string"))?);
+            1 => types += 1,
+            2 => samples += 1,
+            4 => locations_n += 1,
+            5 => functions += 1,
+            _ => {}
         }
     }
+    scratch.strings = strings.len();
     if strings.first().is_some_and(|s| !s.is_empty()) {
         return Err(PprofError::Table);
     }
@@ -179,12 +218,24 @@ pub fn read(msg: &[u8]) -> Result<Profile<'_>, PprofError> {
         }
         Ok(ValueType { kind: s(kind)?, unit: s(unit)? })
     };
-    let mut p = Profile::default();
+    // Each list its size (a sample's values one a type), its frames and labels the last one's.
+    let mut p = Profile {
+        sample_types: Vec::with_capacity(types.min(MAX_TYPES)),
+        functions: Vec::with_capacity(functions.min(MAX_FUNCTIONS)),
+        samples: Vec::with_capacity(samples.min(MAX_SAMPLES)),
+        stacks: Vec::with_capacity(scratch.frames),
+        values: Vec::with_capacity(samples.saturating_mul(types).min(MAX_SAMPLES * MAX_TYPES)),
+        labels: Vec::with_capacity(scratch.labels),
+        ..Profile::default()
+    };
     // Functions, then locations (each its functions, inlined ones first, the caller last), then
     // samples: locations name functions by id, samples locations.
-    let (mut function_ids, mut location_ids) = (Ids::default(), Ids::default());
-    let mut location_functions: Vec<u32> = Vec::new();
-    let mut locations: Vec<(u32, u32)> = Vec::new();
+    let Scratch { function_ids, location_ids, location_functions, locations, ids, vals, .. } = scratch;
+    function_ids.clear();
+    location_ids.clear();
+    location_functions.clear();
+    locations.clear();
+    locations.reserve(locations_n.min(MAX_LOCATIONS));
     let mut default_type = None;
     for f in Fields::new(msg) {
         let (n, w) = f?;
@@ -252,7 +303,6 @@ pub fn read(msg: &[u8]) -> Result<Profile<'_>, PprofError> {
         locations.push(range);
     }
     let types = p.sample_types.len();
-    let (mut ids, mut vals): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
     for f in Fields::new(msg) {
         let (n, w) = f?;
         if n != 2 {
@@ -266,8 +316,8 @@ pub fn read(msg: &[u8]) -> Result<Profile<'_>, PprofError> {
         let (stack_start, values_start, labels_start) = (p.stacks.len(), p.values.len(), p.labels.len());
         for g in Fields::new(w.bytes().ok_or(PprofError::Kind("a sample"))?) {
             match g? {
-                (1, v) => varints(&v, &mut ids)?,
-                (2, v) => varints(&v, &mut vals)?,
+                (1, v) => varints(&v, ids)?,
+                (2, v) => varints(&v, vals)?,
                 (3, Wire::Len(label)) => {
                     let (mut key, mut str_, mut num, mut unit) = (0, 0, None, 0);
                     for h in Fields::new(label) {
@@ -295,7 +345,7 @@ pub fn read(msg: &[u8]) -> Result<Profile<'_>, PprofError> {
         p.values.extend(vals.iter().map(|v| v.cast_signed()));
         // The leaf at location_id[0]: each location's functions in their order (inlined first).
         let mut depth = 0usize;
-        'stack: for &id in &ids {
+        'stack: for &id in ids.iter() {
             let place = location_ids.get(id).ok_or(PprofError::Location(id))?;
             let (a, b) = locations.get(place as usize).copied().unwrap_or((0, 0));
             for &f in location_functions.get(a as usize..b as usize).unwrap_or_default() {
@@ -314,6 +364,7 @@ pub fn read(msg: &[u8]) -> Result<Profile<'_>, PprofError> {
         p.samples.push(Sample { stack: (to(stack_start)?, to(p.stacks.len())?), values: (to(values_start)?, to(p.values.len())?), labels: (to(labels_start)?, to(p.labels.len())?) });
     }
     p.default_type = default_type.and_then(|d| p.sample_types.iter().position(|t| t.kind == d)).unwrap_or(types.saturating_sub(1));
+    (scratch.frames, scratch.labels) = (p.stacks.len(), p.labels.len());
     Ok(p)
 }
 
@@ -427,6 +478,27 @@ mod tests {
         assert_eq!((h.samples.len(), h.period, h.default_type), (48, 4096, 3));
         assert_eq!((sum(&h, 0), sum(&h, 1), sum(&h, 2), sum(&h, 3)), (10_503, 13_105_703, 9_786, 10_278_807));
         assert!(h.samples.iter().any(|s| h.labels_of(s).iter().any(|(k, v)| *k == "bytes" && *v == LabelValue::Num(262_144, ""))));
+    }
+
+    /// One scratch kept from profile to profile (a query's way), each read as it reads alone: a
+    /// heap profile after a CPU profile, the CPU profile again, a malformed one between them
+    /// refused and nothing of it left for the next.
+    #[test]
+    fn a_scratch_kept_from_one_profile_to_the_next_reads_each_as_alone() {
+        let (cpu, heap) = (inflate(include_bytes!("../fixtures/pprof/go-cpu.pprof")), inflate(include_bytes!("../fixtures/pprof/go-heap.pprof")));
+        // A sample written as a number, not a message.
+        let mut w = Writer { buf: profile() };
+        w.varint(2, 7);
+        let bad = w.buf;
+        let mut scratch = Scratch::default();
+        let same = |a: &Profile<'_>, b: &Profile<'_>| {
+            assert_eq!((&a.sample_types, &a.functions, &a.samples, &a.stacks, &a.values, &a.labels), (&b.sample_types, &b.functions, &b.samples, &b.stacks, &b.values, &b.labels));
+            assert_eq!((a.period, a.period_type, a.time_nanos, a.duration_nanos, a.default_type, a.cut), (b.period, b.period_type, b.time_nanos, b.duration_nanos, b.default_type, b.cut));
+        };
+        same(&read_with(&cpu, &mut scratch).unwrap(), &read(&cpu).unwrap());
+        same(&read_with(&heap, &mut scratch).unwrap(), &read(&heap).unwrap());
+        assert!(read_with(&bad, &mut scratch).is_err());
+        same(&read_with(&cpu, &mut scratch).unwrap(), &read(&cpu).unwrap());
     }
 
     /// What a profile may not be: a string index past its table, a sample of too few values, a
