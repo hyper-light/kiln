@@ -2249,6 +2249,10 @@ impl Leg {
                 }
                 Err(e) => self.note(idx, &format!("The leg container's mounts: {e:#}")).await,
             }
+            // The BuildKit containers it makes reach kiln by the GHES stand-in's name (W08-R08).
+            if let Some(l) = super::egress::relay_binary().and_then(|b| super::docker_sock::Loopback::new(b, &a.runtime.facade_url, started.cli.clone())) {
+                p.set_loopback(l);
+            }
             st.docker_sock = Some(std::sync::Arc::new(p));
         }
         // kiln's runner image is the leg's machine: the server's authority goes in its own store,
