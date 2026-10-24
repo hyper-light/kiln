@@ -1,0 +1,52 @@
+[package]
+name = "hyper-block"
+description = "Block I/O for the shared log: aligned direct I/O, the platform's full flush, buffers that meet the device's alignment, group commit's wait, a device issuer and a simulated device with power-loss semantics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Test support for other crates: the simulated power-loss file, over hyper-sim's block device, and,
+# on macOS, a disk image attached as a device node.
+sim = ["dep:hyper-sim"]
+
+[dependencies]
+# A kept record's checksum (`record`), the log's CRC-32C.
+crc32c.workspace = true
+getrandom.workspace = true
+hyper-rt = { path = "../hyper-rt" }
+# The simulated device's model (`sim`, test support only): hyper-sim's block device.
+hyper-sim = { path = "../hyper-sim", optional = true }
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux's native AIO system calls (`aio`): io_setup, io_submit, io_getevents, io_destroy.
+libc = "0.2.189"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# mmap(2), mincore(2) and munmap(2) (`resident`): which pages of a file the unified buffer cache
+# holds, so a read of them is made without waiting for the device.
+libc = "0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+# The simulated file's model, for this crate's own tests of it (`cfg(test)` compiles `sim`).
+hyper-sim = { path = "../hyper-sim" }
+proptest.workspace = true
+tempfile.workspace = true
+# The reads bench counts allocator calls and page faults (benches/reads.rs).
+hyper-measure = { path = "../hyper-measure" }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "reads"
+harness = false

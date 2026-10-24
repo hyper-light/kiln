@@ -54,6 +54,10 @@ pub const DURATION_BUCKETS: &[f64] =
 pub const QUEUE_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0];
 /// A millisecond to ten minutes, about 2.5 times apart: sync's commits, transfers and how long a
 /// change takes to reach another machine, and a move's waits.
+/// 50 µs to 5 s: an in-process delivery (the live feed's publish to a viewer's read) sits well
+/// under a millisecond, so the buckets start there (Kiln Metrics, 2026-10-23).
+pub const DELIVERY_BUCKETS: &[f64] =
+    &[0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
 pub const LATENCY_BUCKETS: &[f64] =
     &[0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0, 150.0, 300.0, 600.0];
 
@@ -548,6 +552,62 @@ pub fn blobs() -> &'static BlobsMetrics {
     })
 }
 
+/// The bus kiln's events ride (docs/bus.md): what its live feeds published and were refused, and
+/// what its viewers were told they missed.
+pub struct BusMetrics {
+    /// Frames the live feeds published.
+    pub published: Counter,
+    /// What the bus refused a live feed, by operation (create, publish, delete).
+    pub refused: CounterVec,
+    /// Viewers told they fell behind what a feed keeps, and sent back to a snapshot.
+    pub lag_notices: Counter,
+    /// How long a frame took from its publish to a viewer's read.
+    pub delivery_seconds: Histogram,
+}
+
+pub fn bus() -> &'static BusMetrics {
+    static M: OnceLock<BusMetrics> = OnceLock::new();
+    M.get_or_init(|| BusMetrics { published: Counter::default(), refused: CounterVec::new(&["op"]), lag_notices: Counter::default(), delivery_seconds: Histogram::new(DELIVERY_BUCKETS) })
+}
+
+/// The bus's figures as the server's node states them when scraped: set by whoever holds the bus.
+pub struct BusGauges {
+    pub topics: Gauge,
+    pub viewers: Gauge,
+    pub memory_bytes: Gauge,
+    pub memory_limit_bytes: Gauge,
+}
+
+pub fn bus_gauges() -> &'static BusGauges {
+    static M: OnceLock<BusGauges> = OnceLock::new();
+    M.get_or_init(|| BusGauges { topics: Gauge::default(), viewers: Gauge::default(), memory_bytes: Gauge::default(), memory_limit_bytes: Gauge::default() })
+}
+
+/// The `kiln_bus_*` families, in the exposition.
+fn render_bus(o: &mut String) {
+    let m = bus();
+    let g = bus_gauges();
+    let help = |o: &mut String, name: &str, kind: &str, h: &str| {
+        let _ = writeln!(o, "# HELP {name} {h}\n# TYPE {name} {kind}");
+    };
+    help(o, "kiln_bus_published_total", "counter", "Frames sessions' live feeds published on the bus.");
+    let _ = writeln!(o, "kiln_bus_published_total {}", m.published.get());
+    help(o, "kiln_bus_refused_total", "counter", "Operations the bus refused a live feed, by operation (create, publish, delete): each sends the feed's viewers back to a snapshot.");
+    m.refused.render(o, "kiln_bus_refused_total");
+    help(o, "kiln_bus_lag_notices_total", "counter", "Viewers told they fell behind what a live feed keeps, and sent back to a snapshot.");
+    let _ = writeln!(o, "kiln_bus_lag_notices_total {}", m.lag_notices.get());
+    help(o, "kiln_bus_delivery_seconds", "histogram", "How long a live feed's frame took from its publish to a viewer's read.");
+    m.delivery_seconds.render(o, "kiln_bus_delivery_seconds", "");
+    help(o, "kiln_bus_topics", "gauge", "Topics the bus holds.");
+    let _ = writeln!(o, "kiln_bus_topics {}", g.topics.get());
+    help(o, "kiln_bus_viewers", "gauge", "Viewers reading sessions' live feeds.");
+    let _ = writeln!(o, "kiln_bus_viewers {}", g.viewers.get());
+    help(o, "kiln_bus_memory_bytes", "gauge", "Bytes the bus's messages take, framing included, until their readers let them go.");
+    let _ = writeln!(o, "kiln_bus_memory_bytes {}", g.memory_bytes.get());
+    help(o, "kiln_bus_memory_limit_bytes", "gauge", "Bytes the bus's messages may take ([bus] memory).");
+    let _ = writeln!(o, "kiln_bus_memory_limit_bytes {}", g.memory_limit_bytes.get());
+}
+
 /// The `kiln_blobs_*` families, in the exposition.
 fn render_blobs(o: &mut String) {
     let m = blobs();
@@ -870,6 +930,7 @@ pub fn render() -> String {
     render_sync(&mut o);
     render_agents(agents(), &mut o);
     render_blobs(&mut o);
+    render_bus(&mut o);
     render_net(&mut o);
 
     let samples = agent_samples().read();

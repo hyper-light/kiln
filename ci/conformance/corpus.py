@@ -105,6 +105,13 @@ KNOWN = [
     # Two legs at once on that network share one EPMD (Erlang's port mapper), and name their
     # nodes alike: elixir's `primary@<host>`.
     (r"seems to be in use by another Erlang node", "two of its legs at once share the lab's host network, so their Erlang nodes share one port mapper and one name; a hosted runner's own machine has one each"),
+    # buildx's remote+multinode workers: two such legs at once on that network (pass 1023d,
+    # 03:38-04:03 and 03:43-04:08) and one's mirror registry answered on localhost without the
+    # manifest its build resolved; the other passed. To run again on networks of their own.
+    (r"failed to resolve source metadata for docker\.io/library/\S+: failed to copy: httpReadSeeker: failed open: content at http://localhost:\d+/v2/\S+ not found", "two of buildx's remote+multinode legs at once share the lab's host network, and one's mirror registry on localhost answered without the manifest its build asked for; a hosted runner's own machine has its own"),
+    # apk fetching Alpine's index over TLS from its CDN, in buildx's own test image build (kiln
+    # isn't on the way); the same `apk add` steps passed in its other legs.
+    (r"WARNING: fetching https://dl-cdn\.alpinelinux\.org/\S+/APKINDEX\.tar\.gz: TLS: unspecified error", "Alpine's CDN failed a TLS fetch of its package index for the build's own container (kiln isn't on the way), and apk then found no packages; the same steps passed in the other legs: the network, a flake to run again"),
 ]
 
 

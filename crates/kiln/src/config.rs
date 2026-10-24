@@ -41,6 +41,8 @@ pub struct Config {
     pub agents: Agents,
     /// Where kiln keeps its bytes (docs/blobs.md): the server's data directory, or any S3.
     pub blobs: crate::blobs::Config,
+    /// The bus kiln's events ride (docs/bus.md): Quiver, in the server's process.
+    pub bus: crate::bus::Config,
     /// What a runner's administrator declares of it (docs/ci.md W13-R02): `[agent.facts]` and
     /// `[agent.probes]`. The server's own runner reads them here; `kiln agent` from its config file.
     pub agent: crate::runner::probe::Declared,

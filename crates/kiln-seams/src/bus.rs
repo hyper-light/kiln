@@ -2,8 +2,8 @@
 //! any number of readers each read from any offset still kept, and wait for the next. A topic
 //! keeps its newest messages up to its retention: a reader behind them is told where they start
 //! (`Behind`), never skipped silently. Each topic states its durability class (Focal's doc 33:
-//! ephemeral, replicated, persisted, windowed). Quiver is the real one (CP-T2.1); [`SimBus`] keeps
-//! topics in memory (ephemeral, whatever class is asked).
+//! ephemeral, replicated, persisted, windowed). Quiver is the real one (CP-T2.1: `kiln::bus`, over
+//! the vendored `quiver`); [`SimBus`] keeps topics in memory (ephemeral, whatever class is asked).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -88,6 +88,9 @@ pub trait Bus: Send + Sync + 'static {
     fn wait<'a>(&'a self, name: &'a str, from: Offset) -> BoxFuture<'a, Result<(), Refusal>>;
     /// The first offset kept and the next to be given.
     fn bounds<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(Offset, Offset), Refusal>>;
+    /// Deletes `name` and its messages: waits on it are refused `NoTopic`, and created again its
+    /// offsets start at 0.
+    fn delete<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), Refusal>>;
 }
 
 /// Longest topic name.
@@ -232,6 +235,15 @@ impl Bus for SimBus {
 
     fn bounds<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(Offset, Offset), Refusal>> {
         let out = self.inner.topics.lock().get(name).map(|t| (t.first, t.next())).ok_or_else(|| Refusal::NoTopic(name.to_owned()));
+        Box::pin(async move { out })
+    }
+
+    fn delete<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), Refusal>> {
+        let out = self.inner.topics.lock().remove(name).map(|_| ()).ok_or_else(|| Refusal::NoTopic(name.to_owned()));
+        if out.is_ok() {
+            // Its waits look again and find it gone.
+            self.inner.published.notify(usize::MAX);
+        }
         Box::pin(async move { out })
     }
 }
@@ -386,6 +398,23 @@ fn c10<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c11<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let b = f.bus();
+        fine("create", b.create(T, topic(10)).await)?;
+        publish_all(b, T, &["a", "b"]).await?;
+        let mut waiting = b.wait(T, 5);
+        ensure(futures::FutureExt::now_or_never(&mut waiting).is_none(), || "a wait for a later message completed".into())?;
+        fine("delete", b.delete(T).await)?;
+        same("the wait, once the topic is deleted", waiting.await, Err(Refusal::NoTopic(T.into())))?;
+        same("a publish to the deleted topic", b.publish(T, None, b"c".to_vec()).await, Err(Refusal::NoTopic(T.into())))?;
+        same("a read of the deleted topic", b.read(T, 0, 1).await, Err(Refusal::NoTopic(T.into())))?;
+        same("a delete of no topic", b.delete(T).await, Err(Refusal::NoTopic(T.into())))?;
+        fine("create it again", b.create(T, topic(10)).await)?;
+        same("its offsets start again", publish_all(b, T, &["first again"]).await?, vec![0])
+    })
+}
+
 /// The `Bus` contract, clause by clause (docs/seams.md, "Bus").
 pub fn cases<F: BusFixture>() -> Vec<Case<F>> {
     vec![
@@ -399,6 +428,7 @@ pub fn cases<F: BusFixture>() -> Vec<Case<F>> {
         Case { id: "BUS-8", says: "a payload over the limit is refused TooLarge and publishes nothing", check: c8::<F> },
         Case { id: "BUS-9", says: "a read gives at most its limit and says where to go on; at the end it's empty; a limit of 0 is refused", check: c9::<F> },
         Case { id: "BUS-10", says: "topics are apart: each has its own messages and offsets", check: c10::<F> },
+        Case { id: "BUS-11", says: "a deleted topic is gone: its waits, publishes, reads and deletes are refused NoTopic, and created again its offsets start at 0", check: c11::<F> },
     ]
 }
 

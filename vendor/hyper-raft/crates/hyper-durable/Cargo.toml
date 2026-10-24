@@ -1,0 +1,55 @@
+[package]
+name = "hyper-durable"
+description = "The durable shell around hyper-raft's core: generic over the log a group's writes become durable in and the state machine it applies to, with the release rules of docs/durable.md stated as invariants."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hyper-block = { path = "../hyper-block" }
+hyper-liveness = { path = "../hyper-liveness" }
+hyper-log = { path = "../hyper-log" }
+hyper-raft = { path = "../hyper-raft" }
+hyper-timing = { path = "../hyper-timing" }
+thiserror.workspace = true
+
+[features]
+# `RamStore`, a store whose writes complete as they're submitted, for tests alone: a dev-dependency
+# asks for it (this crate's own tests, below). Quiver's and kiln's copies make it so, as the
+# write-ahead log is mandatory there (Quiver's docs/design/focal-bus.md, "GroupStore mandated").
+test-store = []
+
+[dev-dependencies]
+hyper-durable = { path = ".", features = ["test-store"] }
+hyper-block = { path = "../hyper-block", features = ["sim"] }
+# The oracles the simulated groups are held to, and their crash enumeration by fork (docs/sim.md
+# S-6, `tests/support/cluster.rs`).
+hyper-check = { path = "../hyper-check" }
+hyper-measure = { path = "../hyper-measure" }
+# The world the simulated groups run in: its streams, its network and its write queue.
+hyper-sim = { path = "../hyper-sim" }
+
+[[bench]]
+name = "depth"
+harness = false
+
+[[bench]]
+name = "budget"
+harness = false
+
+[[bench]]
+name = "apply"
+harness = false
+
+[[bench]]
+name = "quiet"
+harness = false
+
+[[bench]]
+name = "repair"
+harness = false
+
+[lints]
+workspace = true

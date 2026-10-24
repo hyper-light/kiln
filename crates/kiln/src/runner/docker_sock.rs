@@ -79,6 +79,124 @@ impl Paths {
 }
 
 /// `p` with `.` and `..` resolved as written: never above `/`.
+/// Where a static kiln goes in a BuildKit container the leg makes.
+const RELAY_PATH: &str = "/.kiln-relay";
+
+/// What a BuildKit container a leg makes needs to reach kiln by the GHES stand-in's name
+/// (`kiln.localhost`, docs/ci.md W08-R08): BuildKit fetches a build's git context with git, whose
+/// curl takes every `*.localhost` name for its own loopback, whatever `/etc/hosts` says. So a
+/// static kiln in it (the egress relay's, [`super::egress::relay_main`]) takes the connections to
+/// `127.0.0.1:<port>` there, and the runner dials in to it through a port published on the
+/// host's loopback (nothing in the container connects to the host, whose firewall need not let
+/// containers in) and splices each on to the server.
+#[derive(Debug, Clone)]
+pub struct Loopback {
+    /// A static kiln, mounted into the container.
+    pub binary: PathBuf,
+    /// The port the stand-in names (the server's).
+    pub port: u16,
+    /// Where the runner reaches the server.
+    pub server: (String, u16),
+    /// The CLI the runner sets the relay up with.
+    pub cli: super::docker::Cli,
+}
+
+impl Loopback {
+    /// A leg's, the server at `server_url` as the runner reaches it (the stand-in keeps its port,
+    /// [`super::runtime::not_ghes`]): `None` for a URL without a host.
+    pub fn new(binary: PathBuf, server_url: &str, cli: super::docker::Cli) -> Option<Loopback> {
+        let (scheme, rest) = server_url.split_once("://")?;
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let (host, port) = kiln_ci::trust::split_host(authority.rsplit_once('@').map_or(authority, |(_, h)| h));
+        let port = port.unwrap_or(if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 });
+        (!host.is_empty()).then_some(Loopback { binary, port, server: (host, port), cli })
+    }
+}
+
+/// Whether `v`, the create of a container `name`d so, is a BuildKit daemon's (a `docker-container`
+/// builder's, as `setup-buildx-action` makes them: `buildx_buildkit_…`, of BuildKit's image or the
+/// one it was given) on a network of its own, which [`Loopback`] is for.
+fn wants_relay(v: &Value, name: &str) -> bool {
+    let image = v.get("Image").and_then(Value::as_str).unwrap_or_default().to_ascii_lowercase();
+    let mode = v.pointer("/HostConfig/NetworkMode").and_then(Value::as_str).unwrap_or_default();
+    (image.contains("buildkit") || name.starts_with("buildx_buildkit_")) && mode != "host" && mode != "none" && !mode.starts_with("container:")
+}
+
+/// A BuildKit container's create made ready for its relay: the static kiln mounted at
+/// [`RELAY_PATH`], the relay's runner port published on the host's loopback, and the stand-in's
+/// name its own loopback for what reads `/etc/hosts` too.
+fn with_relay(v: &mut Value, binary: &Path) -> bool {
+    let port = format!("{}/tcp", super::egress::RUNNER_PORT);
+    let Some(o) = v.as_object_mut() else { return false };
+    let exposed = o.entry("ExposedPorts").or_insert(Value::Null);
+    if !exposed.is_object() {
+        *exposed = serde_json::json!({});
+    }
+    if let Some(e) = exposed.as_object_mut() {
+        e.insert(port.clone(), serde_json::json!({}));
+    }
+    let Some(hc) = o.entry("HostConfig").or_insert(serde_json::json!({})).as_object_mut() else { return false };
+    let binds = hc.entry("Binds").or_insert(Value::Null);
+    if !binds.is_array() {
+        *binds = serde_json::json!([]);
+    }
+    if let Some(b) = binds.as_array_mut() {
+        b.push(Value::String(format!("{}:{RELAY_PATH}:ro", binary.display())));
+    }
+    let published = hc.entry("PortBindings").or_insert(Value::Null);
+    if !published.is_object() {
+        *published = serde_json::json!({});
+    }
+    if let Some(m) = published.as_object_mut() {
+        m.insert(port, serde_json::json!([{ "HostIp": "127.0.0.1", "HostPort": "" }]));
+    }
+    let hosts = hc.entry("ExtraHosts").or_insert(Value::Null);
+    if !hosts.is_array() {
+        *hosts = serde_json::json!([]);
+    }
+    if let Some(list) = hosts.as_array_mut() {
+        let stand_in = super::runtime::NOT_GHES_HOST;
+        list.retain(|h| h.as_str().is_none_or(|h| h.split([':', '=']).next() != Some(stand_in)));
+        list.push(Value::String(format!("{stand_in}:127.0.0.1")));
+    }
+    true
+}
+
+/// BuildKit container `name`'s loopback relay ([`Loopback`]), once it runs (its maker starts it
+/// right after making it): the static kiln run in it, and the runner's connections waiting at its
+/// published port, each spliced on to the server when it hands one over, until the leg ends.
+async fn loopback_relay(name: String, l: Loopback, stop: crate::rt::Shutdown) {
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+    let (none, call) = (BTreeMap::new(), Duration::from_secs(60));
+    let s = |x: &str| x.to_owned();
+    let until = Instant::now() + Duration::from_secs(600);
+    loop {
+        if l.cli.run(&[s("inspect"), s("--format"), s("{{.State.Running}}"), name.clone()], &none, call).await.is_ok_and(|o| o == "true") {
+            break;
+        }
+        if Instant::now() > until || !stop.sleep(Duration::from_millis(500)).await {
+            return;
+        }
+    }
+    let token = crate::util::random_token();
+    let env: BTreeMap<String, String> = [(s("KILN_EGRESS_TOKEN"), token.clone()), (s("KILN_RELAY_LISTEN"), format!("127.0.0.1:{}", l.port))].into();
+    let exec = [s("exec"), s("-d"), s("-e"), s("KILN_EGRESS_TOKEN"), s("-e"), s("KILN_RELAY_LISTEN"), name.clone(), s(RELAY_PATH), s("egress-relay")];
+    if let Err(e) = l.cli.run(&exec, &env, call).await {
+        tracing::warn!(container = %name, error = %format!("{e:#}"), "a BuildKit container's loopback relay didn't start");
+        return;
+    }
+    let ports = super::docker::parse_ports(&l.cli.run(&[s("port"), name.clone()], &none, call).await.unwrap_or_default());
+    let Some(port) = ports.get(&super::egress::RUNNER_PORT.to_string()).and_then(|p| p.parse::<u16>().ok()) else {
+        tracing::warn!(container = %name, "a BuildKit container's loopback relay has no published port");
+        return;
+    };
+    tracing::debug!(container = %name, port, "a BuildKit container's loopback relay");
+    let pool = super::egress::Pool::direct(port, token, l.server.clone());
+    stop.cancelled().await;
+    drop(pool);
+}
+
 fn normalize(p: &str) -> PathBuf {
     let mut out = PathBuf::from("/");
     for c in Path::new(p).components() {
@@ -502,13 +620,23 @@ fn route(method: &str, target: &str, names: &mut Names) -> Route {
 
 /// A body `gather` names, with the leg's names the daemon's (and a create's bind mounts the
 /// host's): `None` when there's nothing to change (or it isn't JSON), and it goes on as it came.
-fn rewrite(gather: &Gather, body: &[u8], paths: &Paths, names: &mut Names) -> Option<Vec<u8>> {
+/// A BuildKit container's create given its loopback relay ([`Loopback`]) names it, as the daemon
+/// calls it, in `relayed`.
+fn rewrite(gather: &Gather, body: &[u8], paths: &Paths, names: &mut Names, loopback: Option<&Loopback>, relayed: &mut Option<String>) -> Option<Vec<u8>> {
     let mut v: Value = serde_json::from_slice(body).ok()?;
     let changed = match gather {
         Gather::ContainerCreate(name) => {
             let mounts = translate_create(&mut v, paths);
             let named = name_references(&mut v, names, name.as_deref());
-            mounts | named | names.label(&mut v)
+            // After the mounts' translation: the static kiln's path is the host's.
+            let relay = match (loopback, name) {
+                (Some(l), Some(n)) if wants_relay(&v, n) && with_relay(&mut v, &l.binary) => {
+                    *relayed = Some(names.own(Kind::Container, n));
+                    true
+                }
+                _ => false,
+            };
+            mounts | named | relay | names.label(&mut v)
         }
         Gather::NetworkCreate | Gather::VolumeCreate => {
             let kind = if *gather == Gather::NetworkCreate { Kind::Network } else { Kind::Volume };
@@ -996,7 +1124,11 @@ impl Requests {
                         self.stage = Flow::Gather { head, target, gather, body, raw, data };
                         return;
                     }
-                    let rewritten = if done { rewrite(&gather, &data, &leg.paths.read(), &mut leg.names.lock()) } else { None };
+                    let (loopback, mut relayed) = (leg.loopback.read().clone(), None);
+                    let rewritten = if done { rewrite(&gather, &data, &leg.paths.read(), &mut leg.names.lock(), loopback.as_ref(), &mut relayed) } else { None };
+                    if let (Some(name), Some(l)) = (relayed, loopback) {
+                        crate::rt::spawn(loopback_relay(name, l, leg.stop.clone()));
+                    }
                     match rewritten {
                         Some(new) => {
                             head.write(target.as_deref(), Some(new.len()), out);
@@ -1224,11 +1356,20 @@ impl Answers {
     }
 }
 
-/// What a leg's connections share: where its paths are, and its names.
-#[derive(Debug, Default)]
+/// What a leg's connections share: where its paths are, its names, what its BuildKit containers'
+/// loopback relays need, and the leg's end, which ends them.
+#[derive(Default)]
 struct Leg {
     paths: RwLock<Paths>,
     names: Mutex<Names>,
+    loopback: RwLock<Option<Loopback>>,
+    stop: crate::rt::Shutdown,
+}
+
+impl std::fmt::Debug for Leg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Leg").field("paths", &*self.paths.read()).finish_non_exhaustive()
+    }
 }
 
 /// A leg's socket, served until it's dropped.
@@ -1248,7 +1389,7 @@ impl Socket {
     /// Listens at `path` for a leg whose names are `names`, passing its connections on to the
     /// daemon at `daemon`.
     pub async fn listen(path: PathBuf, daemon: PathBuf, names: Names) -> anyhow::Result<Socket> {
-        let leg = Arc::new(Leg { paths: RwLock::new(Paths::default()), names: Mutex::new(names) });
+        let leg = Arc::new(Leg { paths: RwLock::new(Paths::default()), names: Mutex::new(names), ..Leg::default() });
         let (bound, listening) = futures::channel::oneshot::channel::<Result<(), String>>();
         let (at, served) = (path.clone(), leg.clone());
         let task = crate::rt::spawn(async move {
@@ -1281,11 +1422,17 @@ impl Socket {
     pub fn set_paths(&self, paths: Paths) {
         *self.leg.paths.write() = paths;
     }
+
+    /// What the BuildKit containers the leg makes get, to reach kiln by the GHES stand-in's name.
+    pub fn set_loopback(&self, loopback: Loopback) {
+        *self.leg.loopback.write() = Some(loopback);
+    }
 }
 
 impl Drop for Socket {
     fn drop(&mut self) {
         self.task.abort();
+        self.leg.stop.cancel();
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -1465,7 +1612,7 @@ mod tests {
 
     /// A create's body as a socket whose names are the daemon's passes it on.
     fn translated(body: &[u8], paths: &Paths) -> Option<Vec<u8>> {
-        rewrite(&Gather::ContainerCreate(None), body, paths, &mut Names::default())
+        rewrite(&Gather::ContainerCreate(None), body, paths, &mut Names::default(), None, &mut None)
     }
 
     fn create_request(body: &[u8], chunked: bool) -> Vec<u8> {
@@ -1500,7 +1647,7 @@ mod tests {
     }
 
     fn leg_of(paths: Paths, names: Names) -> Leg {
-        Leg { paths: RwLock::new(paths), names: Mutex::new(names) }
+        Leg { paths: RwLock::new(paths), names: Mutex::new(names), ..Leg::default() }
     }
 
     #[test]
@@ -1601,7 +1748,7 @@ mod tests {
     }
 
     fn rewritten(gather: &Gather, body: &Value, names: &mut Names) -> anyhow::Result<Value> {
-        let out = rewrite(gather, &serde_json::to_vec(body)?, &leg(), names).ok_or_else(|| anyhow::anyhow!("nothing rewritten: {body}"))?;
+        let out = rewrite(gather, &serde_json::to_vec(body)?, &leg(), names, None, &mut None).ok_or_else(|| anyhow::anyhow!("nothing rewritten: {body}"))?;
         Ok(serde_json::from_slice(&out)?)
     }
 
@@ -1672,18 +1819,138 @@ mod tests {
         // A network's connect and disconnect: the leg's container, found by its name on it.
         assert_eq!(rewritten(&Gather::NetworkMember(true), &json!({"Container": "db"}), &mut names)?, json!({"Container": format!("db{k}"), "EndpointConfig": {"Aliases": ["db"]}}));
         assert_eq!(rewritten(&Gather::NetworkMember(false), &json!({"Container": "db", "Force": false}), &mut names)?, json!({"Container": format!("db{k}"), "Force": false}));
-        assert_eq!(rewrite(&Gather::NetworkMember(true), br#"{"Container":"theirs"}"#, &leg(), &mut names), None);
+        assert_eq!(rewrite(&Gather::NetworkMember(true), br#"{"Container":"theirs"}"#, &leg(), &mut names, None, &mut None), None);
         // A socket whose names are the daemon's: on as it came, unless a bind mount is the host's elsewhere.
         assert_eq!(
             rewrite(
                 &Gather::ContainerCreate(Some("web".to_owned())),
                 br#"{"HostConfig":{"NetworkMode":"net","Binds":["data:/d"],"ExtraHosts":["host.docker.internal:host-gateway","kiln.localhost:host-gateway"]}}"#,
                 &leg(),
-                &mut Names::default()
+                &mut Names::default(),
+                None,
+                &mut None
             ),
             None
         );
         Ok(())
+    }
+
+    /// A BuildKit container a leg makes (`setup-buildx-action`'s builder) gets its loopback relay:
+    /// the static kiln mounted, the relay's port published on the host's loopback, the stand-in's
+    /// name its own loopback; and it's named, as the daemon has it, for the relay to start in.
+    /// Others, and those on the host's network or another's, get none.
+    #[test]
+    fn w08_r08_buildkit_containers_get_a_loopback_relay() -> anyhow::Result<()> {
+        use serde_json::json;
+        let cli = super::super::docker::Cli::new("docker", PathBuf::from("/nowhere"));
+        let l = Loopback::new(PathBuf::from("/opt/kiln/kiln-musl"), "https://kiln.example:8443/x", cli.clone()).ok_or_else(|| anyhow::anyhow!("no loopback"))?;
+        assert_eq!((l.port, l.server.clone()), (8443, ("kiln.example".to_owned(), 8443)));
+        let plain = Loopback::new(PathBuf::new(), "http://kiln:token@127.0.0.1", cli.clone()).ok_or_else(|| anyhow::anyhow!("no loopback"))?;
+        assert_eq!((plain.port, plain.server), (80, ("127.0.0.1".to_owned(), 80)));
+        assert_eq!(Loopback::new(PathBuf::new(), "http://[::1]:7070/", cli.clone()).map(|l| l.server), Some(("::1".to_owned(), 7070)));
+        assert!(Loopback::new(PathBuf::new(), "kiln.example", cli).is_none());
+        let made = |name: Option<&str>, body: &Value, names: &mut Names, l: Option<&Loopback>| -> anyhow::Result<(Value, Option<String>)> {
+            let target = name.map_or_else(|| "/containers/create".to_owned(), |n| format!("/containers/create?name={n}"));
+            let gather = route("POST", &target, names).gather.ok_or_else(|| anyhow::anyhow!("no gather"))?;
+            let mut relayed = None;
+            let out = rewrite(&gather, &serde_json::to_vec(body)?, &leg(), names, l, &mut relayed).ok_or_else(|| anyhow::anyhow!("nothing rewritten: {body}"))?;
+            Ok((serde_json::from_slice(&out)?, relayed))
+        };
+        let mut names = Names::for_leg("leg-a", None);
+        let k = names.suffix.clone();
+        // As buildx makes a `docker-container` builder.
+        let builder = json!({
+            "Image": "moby/buildkit:buildx-stable-1",
+            "HostConfig": {"Privileged": true, "Binds": ["/usr/local/cargo:/cargo"], "Mounts": [{"Type": "volume", "Source": "buildx_buildkit_b0_state", "Target": "/var/lib/buildkit"}]}
+        });
+        let (out, relayed) = made(Some("buildx_buildkit_b0"), &builder, &mut names, Some(&l))?;
+        assert_eq!(relayed, Some(format!("buildx_buildkit_b0{k}")));
+        assert_eq!(out.pointer("/HostConfig/Binds"), Some(&json!(["/var/lib/docker/rootfs/overlayfs/abc/usr/local/cargo:/cargo", "/opt/kiln/kiln-musl:/.kiln-relay:ro"])));
+        assert_eq!(out.get("ExposedPorts"), Some(&json!({"3129/tcp": {}})));
+        assert_eq!(out.pointer("/HostConfig/PortBindings"), Some(&json!({"3129/tcp": [{"HostIp": "127.0.0.1", "HostPort": ""}]})));
+        assert_eq!(out.pointer("/HostConfig/ExtraHosts"), Some(&json!(["host.docker.internal:host-gateway", "kiln.localhost:127.0.0.1"])));
+        // Of another image, by buildx's name; and through a socket whose names are the daemon's.
+        let custom = json!({"Image": "registry.example/tools/bk:1", "HostConfig": {"NetworkMode": "default", "PortBindings": {"8080/tcp": [{"HostPort": "8080"}]}}});
+        let (out, relayed) = made(Some("buildx_buildkit_c0"), &custom, &mut Names::default(), Some(&l))?;
+        assert_eq!(relayed.as_deref(), Some("buildx_buildkit_c0"));
+        assert_eq!(out.pointer("/HostConfig/PortBindings/8080~1tcp"), Some(&json!([{"HostPort": "8080"}])));
+        assert_eq!(out.pointer("/HostConfig/PortBindings/3129~1tcp/0/HostIp"), Some(&json!("127.0.0.1")));
+        // None for the rest.
+        let on = |mode: &str| json!({"Image": "moby/buildkit:v0.25.1", "HostConfig": {"NetworkMode": mode}});
+        let cases = [
+            (Some("buildx_buildkit_h0"), on("host"), Some(&l)),
+            (Some("buildx_buildkit_n0"), on("none"), Some(&l)),
+            (Some("buildx_buildkit_s0"), on("container:db"), Some(&l)),
+            (Some("web"), json!({"Image": "nginx", "HostConfig": {}}), Some(&l)),
+            (None, on("bridge"), Some(&l)),
+            (Some("buildx_buildkit_b1"), on("bridge"), None),
+        ];
+        for (name, body, l) in cases {
+            let (out, relayed) = made(name, &body, &mut names, l)?;
+            assert_eq!(relayed, None, "{name:?} {body}");
+            assert!(!out.to_string().contains(RELAY_PATH), "{out}");
+        }
+        Ok(())
+    }
+
+    /// A BuildKit container a leg makes through its socket reaches kiln's server at the stand-in's
+    /// name and at its own loopback, as curl takes `*.localhost`, without connecting to the host: its
+    /// loopback relay (with a static kiln, `KILN_EGRESS_BINARY`), started once it runs, and the
+    /// runner's connections waiting at its published port.
+    #[test]
+    fn w08_r08_a_buildkit_container_reaches_kiln_through_its_relay() -> anyhow::Result<()> {
+        use std::io::{Read as _, Write as _};
+        let Some(bin) = super::super::docker::find() else { return Ok(()) };
+        let Some(binary) = super::super::egress::relay_binary() else { return Ok(()) };
+        if !Path::new("/var/run/docker.sock").exists() || super::super::docker::host_network() {
+            return Ok(());
+        }
+        // kiln's server, on the runner's loopback only.
+        let server = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = server.local_addr()?.port();
+        std::thread::spawn(move || {
+            for conn in server.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut conn = conn;
+                    let mut got = [0u8; 4096];
+                    let n = conn.read(&mut got).unwrap_or_default();
+                    let host = String::from_utf8_lossy(got.get(..n).unwrap_or_default()).lines().find_map(|l| l.strip_prefix("Host: ").map(str::to_owned)).unwrap_or_default();
+                    let body = format!("kiln, as {host}");
+                    let _ = write!(conn, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                });
+            }
+        });
+        let tmp = tempfile::tempdir()?;
+        let (at, dir) = (tmp.path().join("leg.sock"), tmp.path().to_owned());
+        let leg = format!("test-loopback-{}", std::process::id());
+        crate::rt::block_on(async move {
+            let cli = super::super::docker::Cli::new(&bin, dir.join("config")).owned_by(&dir);
+            let socket = Socket::listen(at.clone(), PathBuf::from("/var/run/docker.sock"), Names::for_leg(&leg, cli.owner())).await?;
+            socket.set_paths(Paths::new(None, Vec::new()));
+            let l = Loopback::new(binary, &format!("http://127.0.0.1:{port}"), cli.clone()).ok_or_else(|| anyhow::anyhow!("no loopback"))?;
+            socket.set_loopback(l);
+            let env = std::collections::BTreeMap::from([("DOCKER_HOST".to_owned(), format!("unix://{}", at.display()))]);
+            let checked: anyhow::Result<()> = async {
+                docker_at(&cli, &env, &["run", "-d", "--name", "buildx_buildkit_probe0", "alpine:3", "sleep", "300"]).await?;
+                let (mut by_name, mut by_loopback) = (String::new(), String::new());
+                for _ in 0..60 {
+                    let fetch = |url: String| ["exec", "buildx_buildkit_probe0", "wget", "-qO-", "-T", "5"].map(str::to_owned).into_iter().chain([url]).collect::<Vec<_>>();
+                    by_name = cli.run(&fetch(format!("http://kiln.localhost:{port}/")), &env, std::time::Duration::from_secs(30)).await.unwrap_or_default();
+                    by_loopback = cli.run(&fetch(format!("http://127.0.0.1:{port}/")), &env, std::time::Duration::from_secs(30)).await.unwrap_or_default();
+                    if !by_name.is_empty() && !by_loopback.is_empty() {
+                        break;
+                    }
+                    crate::rt::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                anyhow::ensure!(by_name == format!("kiln, as kiln.localhost:{port}"), "by the stand-in's name: {by_name:?}");
+                anyhow::ensure!(by_loopback == format!("kiln, as 127.0.0.1:{port}"), "at its loopback: {by_loopback:?}");
+                Ok(())
+            }
+            .await;
+            let _ = docker_at(&cli, &env, &["rm", "-f", "buildx_buildkit_probe0"]).await;
+            drop(socket);
+            checked
+        })
     }
 
     /// What `Answers` gives the leg for `input`, fed `step` bytes at a time, its requests' answers

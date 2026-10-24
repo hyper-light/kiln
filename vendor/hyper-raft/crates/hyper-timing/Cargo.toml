@@ -1,0 +1,20 @@
+[package]
+name = "hyper-timing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+hyper-measure = { path = "../hyper-measure" }
+# Tests that need an Instant epoch take it from simulated time's one anchor, not the host clock
+# (docs/sim.md §3.2, §12.6).
+hyper-sim = { path = "../hyper-sim" }
+proptest.workspace = true
+
+[[bench]]
+name = "estimator"
+harness = false
+
+[lints]
+workspace = true

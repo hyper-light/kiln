@@ -69,3 +69,59 @@ files = { "ld-musl-x86_64.so.1" = "/lib/ld-musl-x86_64.so.1", "libstdc++.so.6" =
 [projects.bun.musl.aarch64]
 platform = "linux/arm64"
 files = { "ld-musl-aarch64.so.1" = "/lib/ld-musl-aarch64.so.1", "libstdc++.so.6" = "/usr/lib/libstdc++.so.6", "libgcc_s.so.1" = "/usr/lib/libgcc_s.so.1" }
+
+# Quiver, the topic store (docs/bus.md): kiln's bus, behind kiln-seams' `Bus`. Its own vendored
+# projects (Focal's bus, hyper-raft) are kiln's below, so kiln's copy of it leaves them out, and
+# its benchmarks' records, which are Quiver's evidence and no part of what kiln builds.
+[projects.quiver]
+kind = "git"
+repository = "https://github.com/hyper-light/quiver"
+commit = "88409ddda5307abe166f310760bbe3bd51f27878"
+path = "vendor/quiver"
+exclude = ["vendor", "bench/records"]
+
+# Focal's event bus, which Quiver is built on, at the commit Quiver takes (Quiver's
+# docs/design/focal-bus.md); its recorded change is Quiver's.
+[projects.focal-bus]
+kind = "git"
+repository = "https://github.com/hyper-light/focal"
+commit = "f8052a5eaf21f81709129583e535331c2e9722f3"
+path = "vendor/focal-bus"
+take = [
+  "Cargo.toml",
+  "LICENSE",
+  "crates/focal-bus",
+  "crates/focal-memory",
+  "crates/focal-platform",
+  "crates/focal-seal",
+  "crates/focal-timing",
+]
+own = ["UPSTREAM.md"]
+
+# hyper-raft's shared crates at the revision Focal's bus takes: Quiver's, and kiln's own transport,
+# runtime and replicated stores (sync, CD) too; its recorded change is Quiver's.
+[projects.hyper-raft]
+kind = "git"
+repository = "https://github.com/hyper-light/hyper-raft"
+commit = "25cf88924895ee55976caa061a48789355fb3354"
+path = "vendor/hyper-raft"
+take = [
+  "Cargo.toml",
+  "LICENSE",
+  "crates/hyper-block",
+  "crates/hyper-datagram",
+  "crates/hyper-durable",
+  "crates/hyper-liveness",
+  "crates/hyper-log",
+  "crates/hyper-measure",
+  "crates/hyper-quic",
+  "crates/hyper-raft",
+  "crates/hyper-rt",
+  "crates/hyper-rt-transport",
+  "crates/hyper-seal",
+  "crates/hyper-sim",
+  "crates/hyper-timing",
+  "crates/hyper-tls",
+  "crates/hyper-transport",
+]
+own = ["UPSTREAM.md"]

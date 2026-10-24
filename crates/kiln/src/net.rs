@@ -9,8 +9,8 @@
 //!   app ──Out──▶ [ net thread: Driver<Endpoint> ⇄ UDP ] ──NetEvent──▶ app
 //! ```
 //!
-//! Lanes have no "writable" event, so frames refused with `LaneFull` wait in a bounded per-lane
-//! outbox and are retried as the connection drains. A failure or panic inside the loop ends that
+//! Frames refused with `LaneFull` wait in a bounded per-lane outbox and are sent again once the
+//! lane says it has room (`Event::LaneRoom`), or as the connection drains. A failure or panic inside the loop ends that
 //! incarnation; the thread rebuilds the endpoint on a fresh runtime and an agent re-dials. The
 //! owner can force the same rebuild with [`Out::Rebuild`] (the agent's dial watchdog does).
 //!
@@ -29,8 +29,8 @@ use hyper_rt::runtime::LocalRuntime;
 use hyper_rt_transport::{Driver, Io};
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, Tls};
 use hyper_transport::{
-    AdmissionLimits, Authenticated, Classes, Config, Directory, Endpoint, Event, Fixed, Limits,
-    PeerId, RECEIVE_CHUNK, Refusal,
+    AdmissionLimits, AskQueue, Authenticated, Classes, Config, Directory, Endpoint, Event, Fixed, Limits,
+    PeerId, RECEIVE_CHUNK, Refusal, StreamCredit,
 };
 
 use crate::pki::Leaf;
@@ -233,6 +233,14 @@ pub fn limits(server: bool) -> Limits {
             per_identity: 2,
         },
         streams_per_connection: 64,
+        // kiln opens no exchanges (lanes only): every connection holds its streams from its
+        // handshake, and the exchange table alone bounds what would wait for one.
+        stream_credit: StreamCredit::Fixed,
+        ask_queue: AskQueue::Table,
+        // A handshake from an address not yet proven is answered with a Retry once half the
+        // pending places are taken (RFC 9000 §8.1.2), as before: kiln's places are a count, not
+        // derived from its memory.
+        retry_bytes: None,
         exchanges: if server { 4096 } else { 256 },
         // Eight lanes kiln has always had, and `proto::LANE_STREAM` and `proto::LANE_PORTS` past
         // them (a peer opens one only when the other side announced it takes it).
@@ -747,7 +755,9 @@ fn on_event<B, D>(
         // kiln uses lanes only; refuse any exchange a peer tries to open.
         Event::Request { exchange, .. } => ep.refuse_exchange(exchange, Refusal::Kind),
         Event::Reply { exchange, .. } | Event::Refused { exchange, .. } => ep.end(exchange),
-        Event::BodyReady { .. } | Event::Writable { .. } => {}
+        // A lane that found a frame too full has room again: the loop flushes the outbox after
+        // every event it handles.
+        Event::BodyReady { .. } | Event::Writable { .. } | Event::LaneRoom { .. } => {}
     }
 }
 
