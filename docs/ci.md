@@ -2815,6 +2815,489 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
   `actions/cache` works as on GitHub. Its S3 credentials (an `aws` integration, a key pair, or
   the server's `AWS_*` environment) are what the OIDC issuer's publishing uses
   (`crates/kiln/src/ci/services/s3.rs`).
+- *Done.* R11's `type=gha`, and AC03, end to end on a Docker runner
+  (`w08_ac03_buildkit_gha_cache`): a build on a BuildKit builder of the run's own exports its
+  layers' cache to kiln's (`mode=max`), and the next run's build, on a fresh builder, takes every
+  layer from it. It found that BuildKit's cache client (`go-actions-cache`) reads the runtime
+  token's `ac` claim only as GitHub writes it, a string holding the scopes' JSON; kiln's was a
+  list. It is the string now, and a list minted before is still read.
+- *Done.* R11's `type=registry`, end to end (`w08_r11_buildkit_registry_cache`): the cache as an
+  image in kiln's registry (W12), the job's own token its credentials (W12-R03), and the next
+  run's build, on a fresh builder, takes every layer from it.
+- *Done.* AC01 and AC09 with the published clients: `@actions/cache` 6.3.0 and
+  `@actions/artifact` 6.3.1, bundled and pinned (`crates/kiln/tests/fixtures/storage-action`),
+  in `crates/kiln/tests/storage.rs`:
+  - AC01: the cache saved (a second save finds it there), restored by key and by prefix, a miss,
+    and a branch restoring its default branch's entry; artifacts of one file, of a thousand and
+    (with `KILN_TEST_BIG=1`) of 2 GiB uploaded, listed, downloaded by name and by id, one deleted.
+  - AC09: a dispatched run's jobs unset (`write`), `read`, `write-only` and `none`, each with its
+    `ACTIONS_CACHE_MODE` and the client restoring and saving as it allows, saying what it skipped;
+    a `pull_request_target` run restoring the default branch's entry and unable to save there;
+    a called workflow asking for more than its caller allows not starting, and saying why.
+- *Left.*
+  - R12 and AC08 on a real 10 GbE LAN. The store's part is measured by `kiln ci bench`
+    (W22-AC08): a 1 GiB entry restored at 7,962 MiB/s, against 500. R13's insights are done
+    (`cache_v1.rs` and the chunked cache record every lookup and save; W19 shows them by key
+    prefix, with the time hits saved).
+- *Done.* R10's rebased diff (`w08_r10_a_rebased_diff_reuses_what_it_did_not_touch`): a diff's
+  first version builds and documents; the trunk moves on, changing only its docs; the diff
+  rebased onto it, its own change the same, takes the build's result (its log the first
+  version's) and documents again, the listed paths' trees deciding.
+
+### W09 Secrets and variables
+
+**Scope.** Secrets and variables at every scope, encrypted at rest, delivered only where used,
+masked; pipeline-scoped secrets; actions that declare the secrets they need and get them, checked
+before the run starts; secrets brokered from integrations and external stores. Today every job
+receives every `[secrets]` entry of the server configuration; that ends here (v1 config secrets
+become server-scope secrets).
+
+**Requirements**
+
+- **W09-R01 Scopes and resolution.** `server`, `organization` (an owner), `repository`,
+  `workflow` (one workflow file of one repository: the "pipeline scope"), `environment`. A name
+  resolves to the most specific scope that has it: environment, then workflow, then repository,
+  then organization, then server. GitHub-exact for the scopes GitHub has (environment over
+  repository over organization).
+- **W09-R02 Names.** `[A-Za-z_][A-Za-z0-9_]*`, case-insensitive, stored upper-case, not starting
+  with `GITHUB_` (GitHub-exact) or `KILN_`. Values up to 64 KiB. Up to 1,000 per scope.
+- **W09-R03 Encryption.** AES-256-GCM (aws-lc-rs) with a fresh nonce per write, under a data key
+  wrapped by the master key (`[ci.secrets] master_key_file`, default `<data>/secrets/master.key`,
+  32 random bytes, mode 0600, created at first start). `kiln secrets rotate-key` re-wraps in the
+  background. The database never holds a plaintext value, and the API never returns one: reads give
+  names, scopes, sizes, timestamps and last use.
+- **W09-R04 Delivery.** A leg receives only the secrets its expressions reference (W01-R12): in the
+  workflow, in the reusable workflows it calls, and those its kiln actions declare. `GITHUB_TOKEN`
+  is always available. Secrets go in `AssignV2` over the runner's mutually authenticated QUIC
+  connection. Environment secrets of a protected environment are sent only after approval
+  (`ServerMsg::SecretsFor`). Every delivery is recorded (`ci_secret_uses`), shown as "last used by
+  run #N, leg L".
+- **W09-R05 GitHub-exact rules.** The `secrets` context's availability (Appendix B), reusable
+  workflows getting secrets only explicitly or by `inherit`, untrusted runs (fork pull requests)
+  getting no secrets but a read-only `GITHUB_TOKEN`, and secrets referenced in `if:` at job level
+  being an error.
+- **W09-R06 Pipeline-scoped secrets** (G-05). A workflow-scope secret is visible only to runs of
+  that workflow. A kiln-dialect workflow may declare what it uses:
+
+  ```yaml
+  secrets:
+    NPM_TOKEN: { required: true }
+    SENTRY_DSN: { required: false }
+  ```
+
+  When declared, the list is exhaustive: referencing another secret is `KCI4041`, and only the
+  declared ones are resolved. When the run starts, every required secret must resolve for the
+  environments its jobs bind; if one does not, the run ends `startup_failure` with `KCI4040`
+  naming each missing secret, the scopes searched, and a link to add it.
+- **W09-R07 Actions that declare secrets.** A kiln action's metadata may say:
+
+  ```yaml
+  secrets:
+    DEPLOY_KEY: { required: true, description: "Key for the deploy host" }
+  ```
+
+  Inside the action, `${{ secrets.DEPLOY_KEY }}` is the calling job's secret of that name, or the
+  one the caller maps: `with-secrets: { DEPLOY_KEY: PROD_DEPLOY_KEY }`. The action sees only what it
+  declares. Before the run starts the plan checks that each required declared secret resolves for
+  the calling job ("needs DEPLOY_KEY: found in workflow scope"), failing with `KCI4040` otherwise.
+  So an action can rely on `secrets.DEPLOY_KEY` existing in the pipeline it runs in. GitHub's
+  JavaScript, Docker and composite actions have no such declaration and keep GitHub's rule: they
+  get secrets only through `with` and `env`.
+- **W09-R08 Brokered secrets.** A secret may be defined as coming from an integration (W11)
+  instead of a stored value: `{ from: "integration:aws-prod" }` yields short-lived credentials at
+  leg start; `{ from: "vault:kv/data/ci#npm" }`, `"aws-sm:arn:…"`, `"gcp-sm:projects/…"`,
+  `"azure-kv:…"`, `"infisical:…"`, `"doppler:…"`, `"1password:…"` read an external store through
+  the broker, authenticated with kiln's own OIDC identity where the store accepts it. Brokered
+  values are never stored.
+- **W09-R09 Variables**, GitHub-exact (`vars` context; same scopes; plain text; up to 48 KiB each).
+- **W09-R10 Secret outputs** (W04-R22) are encrypted with the same keys and deleted with the run.
+- **W09-R11 Management.** UI (Settings → Secrets, and on each repository, workflow and environment
+  page: a scope select, the list, set and delete in place), CLI (`kiln secrets set NAME --scope
+  repo:owner/name [--from-file f | stdin]`, `list`, `delete`, `import --dotenv f`), API.
+  Every change is audited (W19).
+
+**Interfaces.** Takes W01's references, W04's plan, W11's broker. Gives values to W06 (delivery
+and masking), names to the editor's completion (W21; names only).
+
+**Acceptance criteria**
+
+- **W09-AC01 At rest.** After setting 100 secrets, a scan of the SQLite file, its WAL and the data
+  directory finds none of the values. *Integration test.*
+- **W09-AC02 API.** No route, MCP tool or event ever contains a value (a test walks the route table
+  and calls every read). *Integration test.*
+- **W09-AC03 Resolution.** A table of scopes × names gives the documented winner. *Unit test.*
+- **W09-AC04 Least delivery.** A leg referencing one of ten secrets receives exactly that one plus
+  `GITHUB_TOKEN` (the assignment is inspected). *Integration test.*
+- **W09-AC05 Pipeline scope.** A workflow-scope secret is visible to runs of its workflow and absent
+  from another workflow of the same repository. *E2E.*
+- **W09-AC06 Declarations.** Missing required secrets give `KCI4040` with scopes searched; an
+  undeclared reference gives `KCI4041`; an action reading an undeclared secret gets nothing and the
+  validator reports it. *Integration test.*
+- **W09-AC07 Environments.** Environment secrets reach a leg only after approval, through
+  `SecretsFor`. *Integration test.*
+- **W09-AC08 Untrusted.** A fork pull request's legs get no secrets and a read-only token
+  (W18-AC03). *E2E.*
+- **W09-AC09 Rotation.** `rotate-key` re-wraps every value; runs keep working throughout.
+  *Integration test.*
+
+**Progress.** In progress.
+
+- *Done.*
+  - `kiln_ci::secrets`, pure code:
+    - names and scopes, and which scope wins (R01, R02, AC03);
+    - which secrets a job reads, and what a called workflow's leg gets (R04, R05);
+    - declared secrets (R06): `KCI4041` from the validator, `KCI4040` at run start.
+  - `crates/kiln/src/ci/secrets.rs` (R03, R09):
+    - AES-256-GCM under a data key wrapped by the master key file, ciphertexts bound to scope and
+      name;
+    - rotation;
+    - the config's `[secrets]` as server scope;
+    - uses recorded;
+    - variables.
+  - Each trusted leg gets exactly the secrets it references, plus `GITHUB_TOKEN`; untrusted runs
+    get only the token (R04).
+  - The API (names only) and the CLI: `kiln secrets`, `kiln vars` (R11).
+  - Checked end to end on a local server:
+    - resolution across the repository, server, workflow and organization scopes;
+    - AC05, a workflow-scoped secret invisible to another workflow;
+    - AC04, each leg receiving only its references, read from the recorded uses;
+    - masking;
+    - `vars` by scope;
+    - AC01, no stored value anywhere in the data directory;
+    - AC09, rotation with runs still working.
+  - R10: secret outputs (W04-R22) sealed by the master key the moment the server reads them,
+    bound to their leg and name, deleted with the run; consumers get them only as masked
+    environment; the step outputs that feed them are masked as their step ends.
+  - `ACTIONS_STEP_DEBUG` and `ACTIONS_RUNNER_DEBUG` reach a leg whenever they're set, unmasked
+    (W06-R13).
+- *Done.* R08, brokered secrets (`crates/kiln/src/ci/broker.rs`, migration
+  `20261018-2300_w09_brokered.sql`):
+  - **Defining one.** `PUT /api/ci/secrets/:name` with `{ "from": … }` (or `kiln secrets set NAME
+    --from …`) defines a secret by where its value comes from. The source is checked when it is
+    set.
+  - **The sources:**
+    - `integration:<name>`: a stored token as it is; AWS credentials as `credential_process`
+      JSON; a Google or Azure access token (Azure's `?scope=`, Resource Manager by default);
+    - `aws-sm:<arn>`: a Secrets Manager secret's string;
+    - `gcp-sm:projects/<p>/secrets/<s>[/versions/<v>]`: a Secret Manager version's payload,
+      `latest` by default;
+    - `azure-kv:<vault>/<secret>`: a Key Vault secret's value.
+
+    The stores are read through the repository's integration of their cloud (`@<integration>`
+    names one), which exchanges kiln's identity for the leg's workload (W11).
+  - **At leg start.** Its value is made then, never stored, and delivered and masked as any
+    secret. A more specific scope's definition wins as usual.
+  - **When one can't be made**, the leg goes on without it, with a warning that says why.
+  - **Verified end to end:** a secret brokered from a Cloudflare integration reached the leg
+    masked. One from Secrets Manager, through an AWS role that doesn't trust this server, left a
+    warning naming AWS's refusal. A `vault:` source was refused when set.
+- *Done.* R07, kiln actions' declared secrets:
+  - **Recorded at run start.** When a run starts, each action's `secrets:` (with W07-R11's
+    `requires:` and `permissions:`) is read from its `action.yml` and kept with the pinned
+    action.
+  - **Checked.** A required one that doesn't resolve for the job using the action fails the run
+    then, with `KCI4040`. The message names the action, the job, the name `with-secrets` maps it
+    to, the scopes searched, and how to add it.
+  - **Delivered.** The leg gets the job's secrets those declarations read.
+  - **Seen inside.** Inside the action, `secrets` is exactly its declarations: each the job's
+    secret of that name, or the one `with-secrets` maps. The job's are back after it.
+  - **Verified end to end:**
+    - an action declaring `DEPLOY_KEY`, mapped from `PROD_DEPLOY_KEY`, read it (masked) and saw
+      nothing of the job's undeclared `OTHER`, which the job's own step read;
+    - a mapping to an unset secret failed the run at start with `KCI4040`.
+- *Done.* R04's environment secrets after approval (AC07). The dispatcher holds a leg bound to
+  a protected environment out of the scheduler until its protection lets it go (W15-R04). A
+  leg's secrets, its environment's included, are resolved only when it is assigned, and they go
+  in that `AssignV2`. So nothing of a protected environment's reaches a runner before approval,
+  and no separate `SecretsFor` message is needed. Checked end to end
+  (`w09_ac07_environment_secrets_after_approval`): while the leg waited for its reviewer, the
+  environment's secret was never used. Once approved, the leg read it and the use was
+  recorded.
+- *Done.* The UI: Settings → CI's secrets and variables, by scope (W21-R11).
+- *Done.* R08's other stores (`crates/kiln/src/ci/integrations/stores.rs`), each an integration
+  kind, read as a leg starts like the clouds' and never stored:
+  - `vault:<path>#<key>`: HashiCorp Vault, kiln's identity for the leg at the JWT auth method
+    (`role`, `auth_path`, `namespace`), then the key from KV v2 or v1;
+  - `infisical:<environment>[/<path>]/<NAME>`: Infisical, a machine identity by OIDC or universal
+    auth;
+  - `doppler:<project>/<config>/<NAME>`: Doppler, a service token or a service account identity
+    by OIDC, the computed value;
+  - `1password:<vault>/<item>/<field>`: 1Password through a Connect server.
+
+  Each store's address keeps to the server's reach, and Verify signs in as a leg would.
+  Checked against a fake of all four (`w09_r08_secret_stores`).
+
+- *Done.* AC02. The leak test (`w22_ac07_secrets_never_leak`) runs a workflow that puts a secret
+  everywhere a step can (its log, an annotation, the summary, an output, the environment), then
+  walks every read of the route table, each `*` the run's ids and each `**` the tails reads have,
+  bare and with the scope, repository and words reads take, and calls every read-only operation as
+  an MCP tool does. None answers with the value. When written, 66 of the 108 read patterns and 39
+  of the 58 read-only tools answered (the rest have nothing to show on that server), the secrets,
+  variables, run, leg and log reads among them.
+- *Done.* AC06, end to end (`w07_ac06_declared_secrets`). A kiln action's required secret,
+  unset, fails the run as it starts with `KCI4040`, naming the scopes it searched and how to add
+  it; once set, it's there inside the action, masked. A secret the action reads without
+  declaring it gets nothing, though the repository has it, and the validator says so (`KCI4041`,
+  a warning for an action: `crates/kiln-ci/src/wf/action.rs`), as it does, an error, for a
+  workflow that declares its secrets and uses another.
+- *Done.* AC08 is W18-AC03's end-to-end check: a fork pull request ran untrusted, with no
+  secrets and a token whose writes through the facade got 403.
+- *Done.* R11's pages: a repository's secrets and variables in its details on the Repositories
+  page, and a workflow's under its editor, each listed (never a value), set and removed in place,
+  for those who may manage them (`ScopeSecrets`, Settings → CI's lists). Checked in Chromium and
+  WebKit, desktop and phone (`ci/ui/people_check.mjs`).
+- *Done.* R11 on each environment's page (W15-R08): its secrets and variables, set and removed
+  there, values never shown again.
+
+### W10 Identity: tokens, principals, OIDC issuer
+
+**Scope.** Who calls kiln and what they may do (adapted from [access.md](access.md)), the tokens
+that prove it, and kiln as an OpenID Connect issuer whose tokens jobs exchange for credentials
+elsewhere (G-24, G-33).
+
+**Requirements: principals and tokens**
+
+- **W10-R01 Principals.** `owner` (whoever installed kiln: admin token, password, sign-in links),
+  `user`, `agent` (always on behalf of a user; its rights are the intersection of its grant and
+  that user's), `job` (a leg's attempt), `machine` (a runner: mutual TLS, not an API principal).
+  Today's admin token, password sign-in, one-time links and MCP tokens keep working.
+- **W10-R02 Capabilities and scopes**, as access.md lists them, extended for CI: `runs.read`,
+  `runs.trigger`, `runs.cancel`, `runs.rerun`, `runs.debug`, `runs.approve`, `logs.read`,
+  `artifacts.read`, `artifacts.write`, `caches.write`, `workflows.edit` (always as a reviewed
+  change), `secrets.use:<name>`, `secrets.manage`, `variables.manage`, `integrations.manage`,
+  `runners.read`, `runners.manage`, `runners.terminal`, `pools.manage`, `images.build`,
+  `routing.manage`, `environments.deploy`, `environments.manage`, `diffs.read`, `diffs.submit`,
+  `diffs.review`, `diffs.land`, `queue.manage`, `agents.run`, `agents.attach`, `experiments.run`,
+  `settings.manage`, `tokens.manage`, `users.manage`, `audit.read`. Scopes: server, organization,
+  repository, workflow, environment, runner, pool, and a deploy environment (`deploy:<env>`,
+  deploy-api.md §15). Roles `viewer`, `developer`, `maintainer`,
+  `admin`, `owner` as access.md defines, plus custom roles. An explicit deny wins.
+- **W10-R03 Tokens**, stored as SHA-256 hashes with their last use: personal access tokens
+  `kiln_pat_<id>_<secret>` (≤ 1 year), agent tokens `kiln_agt_<id>_<secret>` (rotated hourly while
+  the agent lives), job tokens `kiln_job_<id>_<secret>` (one per attempt, random, revoked when the
+  attempt ends; replacing today's HMAC of the admin token and job id), registry tokens (W12). The
+  prefixes let masking (W06-R08) and secret scanners recognize them.
+- **W10-R04 Job permissions.** A job token carries the job's resolved `permissions` (W04-R06) and
+  kiln's additions (`permissions: { binaries: publish, environments: deploy, registry: push }`).
+  The facade (W14), the registry (W12), the API and runtime services check it.
+- **W10-R05 One route table.** Each route declares its capability and scope; authorization, the
+  OpenAPI document (`/api/openapi.json`), the CLI and the MCP tools come from it (W20).
+
+**Requirements: the OIDC issuer**
+
+- **W10-R06 Issuer.** `[ci.oidc] issuer` (default `<public_url>/oidc`) serves
+  `<issuer>/.well-known/openid-configuration` and `<issuer>/jwks`. Signing keys live in
+  `oidc_keys`: RS256 by default (accepted everywhere), ES256 optional. A new key is published 7 days
+  before it signs and kept published 7 days after it stops; rotation every 90 days.
+- **W10-R07 Job tokens for the toolkit.** With `permissions: { id-token: write }` (GitHub-exact
+  requirement), a leg gets `ACTIONS_ID_TOKEN_REQUEST_URL` (`<server>/_kiln/oidc/token?api-version=1`,
+  which already has a query, because the toolkit appends `&audience=`) and
+  `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. `GET` with that bearer and an optional `audience` answers
+  `{"value": "<jwt>"}`, GitHub-exact.
+- **W10-R08 Claims**, GitHub-compatible so existing trust policies and actions work: `iss`, `aud`
+  (default `[ci.oidc] default_audience`, the issuer URL), `sub`, `jti`, `iat`, `nbf`, `exp`
+  (5 minutes by default, at most 1 hour), `repository`, `repository_id`, `repository_owner`,
+  `repository_owner_id`, `repository_visibility`, `ref`, `ref_type`, `ref_protected`, `sha`,
+  `actor`, `actor_id`, `event_name`, `workflow`, `workflow_ref`, `workflow_sha`,
+  `job_workflow_ref`, `job_workflow_sha`, `run_id`, `run_number`, `run_attempt`,
+  `runner_environment` (`self-hosted`), `environment`, `head_ref`, `base_ref`; plus kiln's
+  `kiln_trust` (`trusted`/`untrusted`), `kiln_executor`, `kiln_runner`, `kiln_pool`, `kiln_job`,
+  `kiln_diff`, `kiln_diff_version`, `kiln_stack`.
+- **W10-R09 Subjects.** Default GitHub-exact: `repo:<owner>/<repo>:environment:<env>` when the job
+  has an environment, `repo:<owner>/<repo>:pull_request` for pull requests, otherwise
+  `repo:<owner>/<repo>:ref:<ref>`. Per organization or repository, the subject can be built from a
+  list of claim keys (GitHub's "customize subject claims", `include_claim_keys`), e.g.
+  `["repo", "context", "job_workflow_ref", "kiln_trust"]`.
+- **W10-R10 Untrusted runs** get ID tokens only when the repository allows it, and always with
+  `kiln_trust: untrusted`, so cloud trust policies can refuse them.
+- **W10-R11 kiln as a workload.** The server mints tokens for itself (`sub:
+  kiln:<server-id>:service:<name>`) and for agents it starts (`sub: kiln:agent:<session>`, on
+  behalf of a user), so the broker (W11) and agents (W20) can federate into model providers and
+  secret stores without static keys.
+- **W10-R12 Reachability.** Some providers fetch discovery and keys from the internet (AWS, Azure,
+  HashiCorp Cloud Platform, Tailscale, Databricks, Snowflake, JFrog, Cloudsmith, Quay); others
+  accept keys uploaded or pasted (Google Cloud, Anthropic, OpenAI). kiln therefore offers three
+  ways, chosen in Settings → OIDC: (1) serve the two issuer paths through the public front door
+  (only those paths, rate-limited); (2) `kiln oidc publish --to s3://… | gs://… | <static
+  host>` writes them to a static host on every key change, and the issuer is that URL; (3)
+  `kiln oidc jwks` prints the keys for providers that accept them inline. The OIDC page shows
+  each configured provider's needs and whether they are met.
+
+**Acceptance criteria**
+
+- **W10-AC01 Tokens.** Hash-only storage, expiry, revocation, last use, prefixes masked; a revoked
+  token is refused within 1 s everywhere. *Integration test.*
+- **W10-AC02 Authorization.** For every route in the table, each role and an agent with a reduced
+  grant: allowed or 403 exactly as declared. *Integration test generated from the table.*
+- **W10-AC03 Toolkit.** `core.getIDToken()` and `core.getIDToken('sts.amazonaws.com')` in a JS action
+  return verifiable JWTs with the claims of W10-R08 and the right `aud`. *Integration test.*
+- **W10-AC04 Real federation.** With kiln's issuer trusted by an AWS account (role trust policy on
+  `sub`), `aws-actions/configure-aws-credentials` (unmodified) gets credentials and `aws sts
+  get-caller-identity` shows the role; the same for Google Cloud
+  (`google-github-actions/auth`), Azure (`azure/login` with a federated credential) and Vault.
+  *E2E against test tenants; user-assisted to create the tenants once.*
+- **W10-AC05 Keys.** Rotation publishes the next key early and keeps the old one late; tokens signed
+  just before rotation still verify. *Unit test with a simulated clock.*
+- **W10-AC06 Subjects.** Default and customized subjects for push, pull request and environment
+  jobs. *Unit test.*
+- **W10-AC07 Static publishing.** `kiln oidc publish --to <dir>` writes documents that a provider
+  reading them over HTTPS accepts (checked by a verifier that fetches only from that location).
+  *Integration test.*
+
+**Progress.** In progress.
+
+- *Done.*
+  - Job tokens (R03, R04):
+    - `GITHUB_TOKEN` is `kiln_job_<leg>_<random>`, stored as its SHA-256 hash with its last use,
+      carrying the job's permissions;
+    - it is revoked when its attempt ends;
+    - the facade checks it with GitHub's mapping (git fetches need `contents: read`, and so on),
+      refusing with "Resource not accessible by integration";
+    - `ACTIONS_RUNTIME_TOKEN` stays the leg's signed JWT (W08-R04).
+  - The OIDC issuer:
+    - `kiln_ci::oidc`: rotation, claims, subjects and the discovery document (R06, R08, R09, AC05,
+      AC06);
+    - `crates/kiln/src/ci/oidc.rs`: RS256 keys sealed by the master key, the open discovery and
+      JWKS documents, and `/_kiln/oidc/token` for legs granted `id-token: write` (R07);
+    - untrusted runs get no ID tokens unless `[ci.oidc] untrusted` (R10).
+  - Workload tokens (R11, the CD half): `kiln_ci::oidc::workload_claims` gives a CD sync a deploy
+    job's subject (`repo:<owner>/<repo>:environment:<env>`), so one trust policy per environment
+    covers both; `kiln_source`, `kiln_app`, `kiln_deployment` and `kiln_trigger` tell them apart.
+    `ci::oidc::mint` signs them for the broker (W11).
+  - Publishing (R12): `/api/ci/oidc` (status, `jwks-export`, `rotate`, `publish`); `kiln oidc
+    status | jwks | publish --to <dir> | rotate [--now]`; `[ci.oidc] publish_dir`, rewritten by
+    the hourly upkeep and at each rotation, each file replaced by rename. AC07: a verifier that
+    reads only the published files accepts the signing and next keys' tokens and refuses
+    unpublished keys, forged bodies and other issuers.
+  - Checked end to end on a local server:
+    - AC03: `core.getIDToken('sts.amazonaws.com')` returns a token that verifies against the
+      published keys, with GitHub's claims;
+    - no ID token variables without the permission;
+    - the token permissions;
+    - a token refused once its attempt ended;
+    - `kiln oidc` publishing to a directory, and a rotation's next key published at once;
+    - AC04's Vault case: unmodified `hashicorp/vault-action` logged in to a Vault dev server whose
+      JWT auth trusts kiln's issuer by discovery, and read a secret (a role bound to the
+      branch's subject).
+  - Principals, roles and the one route table (R01, R02, R05; `crates/kiln/src/authz/`):
+    - the owner keeps every way in (the admin token, the password, one-time links, MCP tokens)
+      and is never held to the table;
+    - users (`users`) sign in with a one-time link of their own (`kiln users add | link`,
+      `POST /api/users/:id/link`: only the newest link works, once, for a day); a session
+      carries the user's epoch, so `kiln users sign-out` and disabling a user end them all;
+    - grants (`grants`): a built-in role (`viewer`, `developer`, `maintainer`, `admin`,
+      `owner`), a custom role (`roles`, `kiln roles set`) or a capability, in a scope (`server`,
+      `org:`, `repo:`, `workflow:`, `environment:`, `runner:`, `pool:`), written
+      `developer@org:acme`; a grant reaches what its scope contains, and a deny (`!…`) wins;
+    - the route table (`authz::ROUTES`) gives each route its capability and where its scope comes
+      from: a path segment's repository, run, job or runner, `?repo=`, or `?scope=`. A route it
+      doesn't name needs `settings.manage`. `GET /api/openapi.json` is generated from it. The
+      repository list shows what the caller reads, and a plan preview checks the repository its
+      body names;
+    - every change a non-owner makes is audited under its name (`user:<name>`, `pat:<id> of
+      user:<name>`, `agent:<label> for user:<name>`, `job:<leg>`).
+  - Personal access and agent tokens (R03): `kiln_pat_<id>_<secret>` (1 to 366 days) and
+    `kiln_agt_<id>_<secret>` (an hour; `POST /api/tokens/:id/rotate` gives the next secret and
+    the old one stops at once). Each carries its own grant, so it does at most what both it and
+    its user allow. Tokens are minted from a session (or with `tokens.manage`), never by a token
+    for itself: `kiln tokens create | list | revoke | rotate`. Disabling a user revokes theirs.
+    The runner's masker masks all three prefixes by their shape, across chunk boundaries.
+  - Job tokens on the API (R04): a job token reaches the API for what its job's permissions
+    give. `actions: read` reads its repository's runs, logs and artifacts; `actions: write` also
+    triggers, cancels and reruns there; `contents: write` triggers; `environments: deploy`
+    deploys; `binaries: publish` publishes binaries, so a release workflow needs no admin token.
+    kiln's scopes take their verbs (`publish`, `deploy`, `push`) as `write`.
+  - AC02 as a unit test generated from the table: every route, for each built-in role on the
+    server and on one repository, for an agent acting for a maintainer whose token is reduced to
+    `viewer@repo:…`, and under a deny.
+  - Checked end to end on a local server (AC01, AC02), 45 checks:
+    - a link signs a user in once;
+    - a developer on one repository reads its runs there, and gets 403 for every repository's
+      runs, secrets, runners and a route the table doesn't name;
+    - another organization's viewer sees an empty repository list and can't preview;
+    - a PAT reduced to `viewer` reads but can't cancel, and is refused 3 ms after it is revoked;
+    - an agent token rotates and its old secret is refused;
+    - a deny wins over a role;
+    - disabling the user ends their session and revokes their agent's token;
+    - the audit names the user, and the admin token still does everything.
+
+    A job token with `actions: read` read its repository's runs (200), not every run nor the
+    runners (403), couldn't cancel (403), got past the check to publish binaries, and was masked
+    in its own log.
+- *R09, subjects per scope* (`ci_oidc_subjects`; `GET/PUT/DELETE /api/ci/oidc/subject?scope=`,
+  `kiln oidc subject --scope repo:acme/app --keys repo,context,kiln_trust | --default |
+  --inherit`; the facade's `GET /repos/{owner}/{repo}/actions/oidc/customization/sub`):
+  - The subject comes from the repository's setting, else its organization's, else the server's,
+    else `[ci.oidc] subject_claims`.
+  - A repository's `use_default` is GitHub's default subject, whatever its organization says.
+  - Keys must be claims kiln's tokens carry, or GitHub's `repo` and `context`.
+  - Setting a repository's needs `settings.manage` there; reading needs `runs.read`.
+  - Verified end to end: a leg's token said `repo:acme/e2e:ref:refs/heads/main:kiln_trust:trusted`
+    under the organization's keys, and GitHub's default again once the repository chose
+    `use_default`. The facade answered both in GitHub's shape.
+- *Done.* Run lists narrowed row by row: `/api/runs` and `/api/ci/runs` (and `ci.runs.list`) list
+  the runs of the repositories the caller may read, `?repo=` narrowing that further; a person
+  of one repository lists without saying which and gets its runs alone, and asking for another
+  gets none (`w10_run_lists_narrowed_to_what_the_caller_reads`). The event stream too: such a
+  person hears events about those repositories (a run's, a job's run's, any that names one) and
+  their own inbox's, the rest being the server's, so the UI's live updates work for them. And the
+  overview (`/api/overview`, the home page): theirs is those repositories' runs, jobs and queue,
+  with none of the server's (its runners, processes, samples and host name), and the home page
+  shows it so, without the fleet and the server.
+- *Done.* `secrets.use:<NAME>`: a run's legs are given only the secrets whoever started it may
+  use, in the leg's environment (else its workflow).
+  - A grant names one secret (`secrets.use:DEPLOY_KEY@repo:acme/app`, names compared as kiln keeps
+    them), or any (`secrets.use`, `secrets.use:*`); custom roles take them too. `developer` and
+    up use any, so a deny takes one away (`!secrets.use:DEPLOY_KEY@repo:acme/app`), and an agent
+    does what its grant and its person's both allow.
+  - Who started a run: the pusher of a kiln-hosted repository's branch or tag (kept as the push
+    is taken, before git has it; a push kiln can't keep this for is refused), a diff's or change
+    request's submitter (its versions keep it; a restack keeps the version before's), whoever
+    landed a land queue entry (a batch: each of them), and the caller of a dispatch or an
+    `agent` event; a rerun is held to its run's, as GitHub's keep its actor's. Their grants are
+    read as each leg starts (a user gone or disabled: none), a token's own as the run started (an
+    agent's is rotated while it waits).
+  - What the repository starts itself (schedules, another run, `pull_request_target`, a comment's
+    `issue_comment`, a host's events) and a job's runs answer to its configuration, as do the
+    owner's.
+  - A secret withheld is left out, as an untrusted run's are, and the leg says which and why
+    (`w10_r02_secrets_use_by_name`, `w10_secrets_use_holds_a_run_to_whoever_started_it`).
+- *Done.* R11, kiln as a workload: the server's own tokens (`kiln:<server-id>:service:<name>`,
+  the id kept with its data, `kiln_service` naming the service: `ci::oidc::service_token`, for
+  W11's broker) and an agent's (`kiln:agent:<session>`, `kiln_on_behalf_of` the person who
+  started it, `kiln_harness`). An agent asks for its own with `ci.oidc.token` (an MCP tool, code
+  mode's `kiln.ci.oidc.token`, `POST /api/ci/oidc/token`) for the audience it federates into,
+  ten minutes by default and an hour at most; nobody but an agent session gets one. Unit-tested
+  (`w10_r11_service_and_agent_subjects`, `w10_r11_agent_and_service_tokens`).
+- *Done.* Passkeys and people's own passwords (`crates/kiln/src/authz/passkeys.rs`,
+  `passwords.rs`, migration `20261019-2300_w10_passkeys.sql`; Settings → Sign-in):
+  - Whoever is signed in makes a passkey (WebAuthn) in Settings, the owner or a person, never
+    through a token or an agent. It's a discoverable credential with user verification, for the
+    domain of the address in use (the public URL's or a front door's): ES256, EdDSA or RS256,
+    without attestation.
+  - Once any is kept, the sign-in page offers it: the browser lists this domain's passkeys, and
+    the one picked signs its person in. Each challenge is used once, within 5 minutes, on its
+    origin. Refused: another domain's, another key's signature, a counter gone backwards (a
+    copied authenticator), a removed passkey, a disabled person.
+  - A person may keep a password of their own (Argon2id), changed and removed with the current
+    one, and sign in with their name and it. Guesses are throttled per person, and an unknown
+    name takes as long as a known one.
+  - The sign-in page offers the hosts SSO is set up with (W23-R08) too.
+  - Checked end to end with a software authenticator (`w10_passkeys_and_passwords`), and in
+    Chromium with a virtual authenticator: a passkey made in Settings, then signed in with, and
+    a name and password; the pages in WebKit too, desktop and phone.
+- *Done.* Settings → People and → Tokens (`ui/src/views/settings-people.tsx`, `settings-tokens.tsx`):
+  - People, for those with `users.manage`: who signs in here and their grants, someone added
+    with a first grant (a role, and where it holds: the server, an organization, a repository)
+    and their email for SSO to find them, a sign-in link for each, more grants given and taken
+    back, and someone removed (signed out everywhere, their tokens revoked). Roles: the built-in
+    ones and their capabilities, and roles of one's own made from capabilities and removed.
+  - Tokens, for everyone signed in: one's personal access tokens (everyone's, with
+    `tokens.manage`) with what each may do, when it ends and when it was last used; a new one
+    shown once; any revoked.
+  - Checked in Chromium and WebKit, desktop and phone (`ci/ui/people_check.mjs`): a person
+    added, linked, granted and removed; a role made and removed; a token made, shown once and
+    revoked; a viewer with Tokens and no People.
 - *Done.* R12, the issuer reached from the internet, three ways (`crates/kiln/src/ci/oidc.rs`):
   - An address of its own (`[ci.oidc] listen`, with `listen_cert` and `listen_key` for the
     issuer's public name, else the server's TLS, else plain HTTP behind a TLS proxy or tunnel)
@@ -2879,7 +3362,11 @@ catalog; this section is the machinery.
   so on. **Verify** runs a real exchange from a short verification leg and shows the result.
 - **W11-R06 Chat and paging** (for W19): Slack (bot token or incoming webhook), Discord (bot or
   webhook), Microsoft Teams (workflow webhook), Telegram (bot), email (SMTP), generic webhooks
-  (HMAC-signed), PagerDuty and Opsgenie (events APIs).
+  (HMAC-signed), PagerDuty and Opsgenie (events APIs). The chats take commands too
+  (docs/deploy-api.md §12.3): a kind's second secret (`signing`, set as `signing_secret` beside
+  `secret`) is what its requests are checked with, a Slack app's signing secret or a Teams
+  outgoing webhook's security token; Discord's `public_key` and Telegram's `commands` are config,
+  and each of Discord and Telegram takes an `api` (a test's, a Bot API server of one's own).
 - **W11-R07 Issue trackers** (opt-in rules): Linear and Jira (Atlassian) link runs and diffs to
   issues from trailers (`Fixes: LIN-123`, `Refs: ABC-42`), comment when a diff lands or a trunk run
   fails, and open an issue when a test is quarantined (W16).
@@ -5291,10 +5778,12 @@ with W11-AC03's tenants).
   - Events so far: `run.failed`, `run.fixed`, `run.succeeded`, `run.cancelled` and
     `approval.waiting`, announced once per leg; an agent's `agent.needs_you`,
     `agent.finished`, `agent.stopped` and `agent.paused` (docs/notifications.md), which only the
-    server's rules take, `where` reading `agent`; and a release's `release.waiting_approval`,
-    `release.succeeded`, `release.failed` and `release.cancelled` (docs/deploy-api.md §12.3),
-    which only the server's rules take, `where` reading `release`, and which go to the app's own
-    channels too, once per release, event and channel.
+    server's rules take, `where` reading `agent`; and a release's `release.started`,
+    `release.waiting_approval`, `release.succeeded`, `release.failed` and `release.cancelled`
+    (docs/deploy-api.md §12.3), which only the server's rules take, `where` reading `release`,
+    and which go to the app's own channels too: where a channel can change a message afterwards
+    (a Slack bot, a Discord webhook, a Telegram bot), as the one message the release has there,
+    edited as it moves; elsewhere once per release, event and channel.
   - Channels are W11-R06's integration kinds (`slack`, `discord`, `teams`, `telegram`,
     `pagerduty`, `opsgenie`, `webhook`), named `kind:target`: the integration called `target`,
     or the first the repository may use, with `target` as its channel or chat.
@@ -5484,8 +5973,8 @@ mode in QuickJS, a tool per operation, skills) from deployments to all of CI, an
 
 **Requirements: attachments and incidents** (adapted from ci-agents.md)
 
-- **W20-R08 Attaching.** In the UI ("Attach agent" on a repository, workflow, run, environment or
-  runner pool) or in trunk's `.kiln/agents.yaml`, an attachment names:
+- **W20-R08 Attaching.** In the UI (**Watched by** on a repository's panel or a runner's details)
+  or in trunk's `.kiln/agents.yaml`, an attachment names:
   - a harness (Claude Code, Codex, any ACP agent, or Devin through W11-R08), or a live session;
   - what wakes it: `failure`, `ejected`, `flaky`, `stuck`, `slow`, `schedule`, `mention`, `degraded`
     (W15), `unroutable` (W05);
@@ -5652,17 +6141,18 @@ R04, R05's skills, and R06's rights.
   that doesn't name it refuses it (403). Checked with W03-R09's events
   (`w03_r09_native_activity_and_kiln_events`).
 - *R08 to R10* (`crate::ci::attach`; docs/agents.md, "Attached agents"): attachments and
-  incidents, by API, on Agents → Attached and in trunk's `.kiln/agents.yaml`. Since:
+  incidents, by API, under Watched by (a repository's panel, a runner's details) and in trunk's
+  `.kiln/agents.yaml`. Since:
   - the rest of R08's wakes:
     - `slow`: a green run whose critical path took longer than the median of its workflow's last
       ten green runs on its branch (three at least) by more than `limits.slow_percent` (25%);
     - `unroutable`: a job no runner meets what it asks for, a minute on, one incident for each
       set of unmet requirements;
     - `degraded`: an app kiln CD deploys turning degraded wakes what looks after its environment.
-  - "Attach agent" on a repository (its details), a workflow (its file in the editor), a run (its
-    header: its workflow), an environment (its page) and a runner pool (its detail). Each opens
-    Agents → Attached with the form filled in for it, offering what can wake an agent there (an
-    environment's: its deployments failing, its apps degrading, mentions, a schedule).
+  - **Watched by** on a repository's panel (its own, its workflows' and its environments'
+    attachments) and on a runner's details (its own and every runner's): each one's chip, its
+    line opened from it (Pause, Remove), and Attach (its name, its agent and what can wake an
+    agent there), the rest kiln's defaults.
   - R10's other daily limits:
     - tokens (`tokens_per_day`, 5,000,000: its incidents' sessions together);
     - runner minutes (`runner_minutes_per_day`, 300): the runs its agents asked for, and the
@@ -5675,8 +6165,8 @@ R04, R05's skills, and R06's rights.
   Checked by `w20_r08_unroutable_is_what_no_runner_meets`,
   `w20_r08_slow_is_its_critical_path_past_the_median`, `w20_r10_runner_minutes_a_day` and
   `w05_r17_triggering_actor_is_who_reran_it`. The end-to-end
-  `w20_r08_what_happens_wakes_the_agent_attached_to_it` now has a degraded app too. The run
-  page's Attach agent is checked in Chromium and WebKit (`ci/ui/pages_check.mjs`).
+  `w20_r08_what_happens_wakes_the_agent_attached_to_it` now has a degraded app too. A
+  repository's Watched by is checked in Chromium and WebKit (`ci/ui/pages_check.mjs`).
 - *AC03* (`tests/ops.rs`, `w20_ac03_authority`), on a server with a failed run. Two agents are
   refused its rerun through every surface: the route, the operation over HTTP, its MCP tool,
   code mode, `kiln rerun` and `kiln op`, each refusal naming `runs.rerun`:
@@ -5731,7 +6221,7 @@ R04, R05's skills, and R06's rights.
   - The diagnose skill says how. Checked by `tests/bisect.rs`: four commits after the last green
     run, the second broke it, found in two tries.
 - *R11* (`kiln_ci::experiments`, `crates/kiln/src/ci/experiments.rs`; `experiments.*`,
-  `/api/experiments`, `kiln experiment`; Agents → Experiments):
+  `/api/experiments`, `kiln experiment`):
   - **Options** are changes on a base commit (the default branch's head unless said): a commit, a
     branch, a diff (its latest version), each applied as the commits it adds. An option can
     also be implemented by an agent (`implement`: what it is), in the asking agent's harness, on

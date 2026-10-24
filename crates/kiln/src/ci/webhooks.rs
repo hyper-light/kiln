@@ -345,7 +345,7 @@ mod tests {
     use super::*;
 
     fn sub(scope: &str, events: Value) -> Integration {
-        Integration { id: "i1".into(), kind: "webhook".into(), name: "audit".into(), config: json!({ "url": "http://x", "events": events }), has_secret: true, scope: scope.into(), created_by: "admin".into(), created_at: 0, updated_at: 0, verified_at: None, last_error: None, last_used_at: None }
+        Integration { id: "i1".into(), kind: "webhook".into(), name: "audit".into(), config: json!({ "url": "http://x", "events": events }), has_secret: true, has_signing_secret: false, scope: scope.into(), created_by: "admin".into(), created_at: 0, updated_at: 0, verified_at: None, last_error: None, last_used_at: None }
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod attach;
 pub mod attest;
 pub mod bench;
 pub mod bisect;
+pub mod chat;
 pub mod cd_events;
 pub mod broker;
 pub mod cli;

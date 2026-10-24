@@ -716,6 +716,10 @@ async fn put_manifest(hub: &Hub, who: &Who, name: &str, reference: &str, req: Re
             let mut fresh = None;
             if let Some(t) = &tag {
                 let before: Option<String> = tx.query_row("SELECT digest FROM registry_tags WHERE repo = ?1 AND tag = ?2", params![n, t], |r| r.get(0)).optional()?;
+                // A release path's tags never move (docs/deploy-api.md §3.1, step 5).
+                if immutable_in(&tx, &n)? && before.as_deref().is_some_and(|b| b != d) {
+                    return Ok(Err(format!("{n}:{t} is a release's, and tags here never move: push it under a tag of its own")));
+                }
                 tx.execute(
                     "INSERT INTO registry_tags (repo, tag, digest, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (repo, tag) DO UPDATE SET digest = excluded.digest, updated_at = excluded.updated_at",
                     params![n, t, d, now],
@@ -725,10 +729,11 @@ async fn put_manifest(hub: &Hub, who: &Who, name: &str, reference: &str, req: Re
                 }
             }
             tx.commit()?;
-            Ok(fresh)
+            Ok(Ok(fresh))
         })
         .await
-        .map_err(internal)?;
+        .map_err(internal)?
+        .map_err(|why| err(StatusCode::CONFLICT, "DENIED", why))?;
     if let Some(action) = fresh_tag {
         published(hub, who, name, reference, &digest, action).await;
     }
@@ -769,6 +774,13 @@ async fn delete_manifest(hub: &Hub, name: &str, reference: &str) -> Answer {
         .store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
+            // A release path's tags never go, nor the manifests they name.
+            if immutable_in(&tx, &n)? {
+                let tagged: bool = if by_digest { tx.query_row("SELECT EXISTS(SELECT 1 FROM registry_tags WHERE repo = ?1 AND digest = ?2)", params![n, r], |x| x.get(0))? } else { true };
+                if tagged {
+                    return Ok(Err(format!("{n}'s tags are a release's, and never go")));
+                }
+            }
             let gone = if by_digest {
                 tx.execute("DELETE FROM registry_tags WHERE repo = ?1 AND digest = ?2", params![n, r])?;
                 tx.execute("DELETE FROM registry_manifests WHERE repo = ?1 AND digest = ?2", params![n, r])?
@@ -777,10 +789,11 @@ async fn delete_manifest(hub: &Hub, name: &str, reference: &str) -> Answer {
                 tx.execute("DELETE FROM registry_tags WHERE repo = ?1 AND tag = ?2", params![n, r])?
             };
             tx.commit()?;
-            Ok(gone)
+            Ok(Ok(gone))
         })
         .await
-        .map_err(internal)?;
+        .map_err(internal)?
+        .map_err(|why| err(StatusCode::CONFLICT, "DENIED", why))?;
     if gone == 0 {
         return Err(err(StatusCode::NOT_FOUND, "MANIFEST_UNKNOWN", format!("{name} has no manifest {reference}")));
     }
@@ -918,6 +931,94 @@ pub fn local_name(hub: &Hub, reference: &str) -> Option<String> {
     valid_name(name).then(|| name.to_owned())
 }
 
+/// Bytes put into kiln's repository `name` as a blob (into the content store, linked there): their
+/// digest and size.
+async fn put_bytes(hub: &Hub, name: &str, bytes: &[u8]) -> anyhow::Result<(String, u64)> {
+    let path = crate::ci::services::cas::staging(hub).join(format!("put-{}", crate::util::new_id()));
+    let (p, b) = (path.clone(), bytes.to_vec());
+    crate::rt::blocking(move || -> std::io::Result<()> {
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&p, b)
+    })
+    .await??;
+    let obj = crate::ci::services::cas::put_file(hub, &path).await;
+    let _ = crate::rt::blocking(move || std::fs::remove_file(path)).await;
+    let obj = obj?;
+    let digest = format!("sha256:{}", obj.digest);
+    link(hub, name, &digest, obj.size).await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    Ok((digest, obj.size))
+}
+
+/// Whether `repo`'s tags are immutable (a release path's).
+fn immutable_in(c: &rusqlite::Connection, repo: &str) -> rusqlite::Result<bool> {
+    Ok(c.query_row("SELECT immutable FROM registry_policies WHERE repo = ?1", [repo], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false))
+}
+
+/// What a repository of kiln's registry keeps (docs/deploy-api.md §3.1, step 5): its tags
+/// immutable (a release path's: none moves or goes), or only its newest `keep` tags (a snapshot
+/// path's: [`collect`] drops the rest). The repository is made if it isn't there.
+pub async fn set_policy(hub: &Hub, name: &str, immutable: bool, keep: Option<u32>) -> anyhow::Result<()> {
+    anyhow::ensure!(valid_name(name), "`{name}` isn't a repository's name");
+    let (n, k) = (name.to_owned(), keep.map(i64::from));
+    hub.store
+        .call(move |c| {
+            let now = crate::util::now_unix();
+            c.execute("INSERT INTO registry_repos (name, created_at) VALUES (?1, ?2) ON CONFLICT (name) DO NOTHING", params![n, now])?;
+            c.execute(
+                "INSERT INTO registry_policies (repo, immutable, keep, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (repo) DO UPDATE SET immutable = excluded.immutable, keep = excluded.keep, updated_at = excluded.updated_at",
+                params![n, immutable, k, now],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
+/// Helm's media types for a chart in an OCI registry, as `helm push` writes them.
+pub const HELM_CONFIG: &str = "application/vnd.cncf.helm.config.v1+json";
+pub const HELM_CHART: &str = "application/vnd.cncf.helm.chart.content.v1.tar+gzip";
+
+/// A Helm chart (its packaged `.tgz`, and its `Chart.yaml` as JSON) published in kiln's repository
+/// `name` under the tag `version`, as `helm push` does; one there under that tag already is kept.
+/// The manifest's digest.
+pub async fn put_chart(hub: &Hub, name: &str, version: &str, tgz: &[u8], meta: &Value) -> anyhow::Result<String> {
+    anyhow::ensure!(valid_name(name) && valid_tag(version), "{name}:{version} isn't a repository and a tag");
+    if let Some(m) = find_manifest(hub, name, version).await.map_err(|e| anyhow::anyhow!("{}", e.message))? {
+        return Ok(m.digest);
+    }
+    let (cd, cs) = put_bytes(hub, name, &serde_json::to_vec(meta)?).await?;
+    let (ld, ls) = put_bytes(hub, name, tgz).await?;
+    let chart = meta.get("name").and_then(Value::as_str).unwrap_or(name);
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "config": { "mediaType": HELM_CONFIG, "digest": cd, "size": cs },
+        "layers": [{ "mediaType": HELM_CHART, "digest": ld, "size": ls }],
+        "annotations": { "org.opencontainers.image.title": chart, "org.opencontainers.image.version": version },
+    });
+    let body = serde_json::to_vec(&manifest)?;
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
+    let annotations = manifest.get("annotations").map(Value::to_string);
+    let (n, d, t, len) = (name.to_owned(), digest.clone(), version.to_owned(), i64::try_from(body.len()).unwrap_or(i64::MAX));
+    hub.store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            let now = crate::util::now_unix();
+            tx.execute("INSERT INTO registry_repos (name, created_at) VALUES (?1, ?2) ON CONFLICT (name) DO NOTHING", params![n, now])?;
+            tx.execute(
+                "INSERT INTO registry_manifests (repo, digest, media_type, artifact_type, subject, annotations, body, size, created_at) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (repo, digest) DO NOTHING",
+                params![n, d, OCI_MANIFEST, HELM_CONFIG, annotations, body, len, now],
+            )?;
+            tx.execute("INSERT INTO registry_tags (repo, tag, digest, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (repo, tag) DO NOTHING", params![n, t, d, now])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok(digest)
+}
+
 /// Attaches `bundle` (a Sigstore bundle about `subject`, its predicate `predicate_type`) to that
 /// image in kiln's repository `name` through the referrers API: an artifact manifest whose
 /// subject is the image (W18). `None` when the image isn't there.
@@ -927,21 +1028,7 @@ pub async fn attach(hub: &Hub, name: &str, subject: &str, bundle: &[u8], predica
     let Some((media_type, size)) = target else { return Ok(None) };
     let mut blobs = Vec::new();
     for bytes in [b"{}".as_slice(), bundle] {
-        let path = crate::ci::services::cas::staging(hub).join(format!("attach-{}", crate::util::new_id()));
-        let (p, b) = (path.clone(), bytes.to_vec());
-        crate::rt::blocking(move || -> std::io::Result<()> {
-            if let Some(dir) = p.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&p, b)
-        })
-        .await??;
-        let obj = crate::ci::services::cas::put_file(hub, &path).await;
-        let _ = crate::rt::blocking(move || std::fs::remove_file(path)).await;
-        let obj = obj?;
-        let digest = format!("sha256:{}", obj.digest);
-        link(hub, name, &digest, obj.size).await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
-        blobs.push((digest, obj.size));
+        blobs.push(put_bytes(hub, name, bytes).await?);
     }
     let ((cd, cs), (bd, bs)) = match (blobs.first(), blobs.get(1)) {
         (Some(c), Some(b)) => (c.clone(), b.clone()),
@@ -980,6 +1067,8 @@ pub async fn attach(hub: &Hub, name: &str, subject: &str, bundle: &[u8], predica
 pub struct Collected {
     pub uploads: usize,
     pub blobs: usize,
+    /// Tags past what a repository keeps (a snapshot path's), and the manifests they took along.
+    pub tags: usize,
 }
 
 /// Drops uploads left a day, and each repository's blobs that none of its manifests use (and were
@@ -987,7 +1076,7 @@ pub struct Collected {
 /// collection then frees their content once nothing else uses it.
 pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
     let now = crate::util::now_unix();
-    let (stale, blobs): (Vec<String>, usize) = hub
+    let (stale, blobs, tags): (Vec<String>, usize, usize) = hub
         .store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
@@ -997,6 +1086,32 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
                 rows.collect::<Result<Vec<_>, _>>()?
             };
             tx.execute("DELETE FROM registry_uploads WHERE updated_at < ?1", [now - UPLOAD_TTL])?;
+            // A path that keeps its newest tags only: the rest go, and a manifest no tag names any
+            // more with them, unless another of the repository's manifests names it (an index).
+            let keeping: Vec<(String, i64)> = {
+                let mut q = tx.prepare("SELECT repo, keep FROM registry_policies WHERE keep IS NOT NULL")?;
+                let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let mut tags = 0;
+            for (repo, keep) in keeping {
+                let old: Vec<(String, String)> = {
+                    let mut q = tx.prepare("SELECT tag, digest FROM registry_tags WHERE repo = ?1 ORDER BY updated_at DESC, tag DESC LIMIT -1 OFFSET ?2")?;
+                    let rows = q.query_map(params![repo, keep.max(0)], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                for (tag, digest) in old {
+                    tags += tx.execute("DELETE FROM registry_tags WHERE repo = ?1 AND tag = ?2", params![repo, tag])?;
+                    let named: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM registry_tags WHERE repo = ?1 AND digest = ?2) OR EXISTS(SELECT 1 FROM registry_manifests WHERE repo = ?1 AND digest != ?2 AND instr(CAST(body AS TEXT), ?2) > 0)",
+                        params![repo, digest],
+                        |r| r.get(0),
+                    )?;
+                    if !named {
+                        tx.execute("DELETE FROM registry_manifests WHERE repo = ?1 AND digest = ?2", params![repo, digest])?;
+                    }
+                }
+            }
             // Every digest each repository's manifests name.
             let mut used: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
             {
@@ -1028,14 +1143,14 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
                 }
             }
             tx.commit()?;
-            Ok((stale, gone))
+            Ok((stale, gone, tags))
         })
         .await?;
     for id in &stale {
         let p = upload_path(hub, id);
         let _ = crate::rt::blocking(move || std::fs::remove_file(p)).await;
     }
-    Ok(Collected { uploads: stale.len(), blobs })
+    Ok(Collected { uploads: stale.len(), blobs, tags })
 }
 
 /// Collects every hour, for as long as the server runs.
@@ -1045,7 +1160,7 @@ pub async fn collect_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
             return Ok(());
         }
         match collect(&hub).await {
-            Ok(c) if c.uploads + c.blobs > 0 => tracing::info!(uploads = c.uploads, blobs = c.blobs, "the registry collected"),
+            Ok(c) if c.uploads + c.blobs + c.tags > 0 => tracing::info!(uploads = c.uploads, blobs = c.blobs, tags = c.tags, "the registry collected"),
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "the registry's collection"),
         }
@@ -1118,6 +1233,50 @@ mod tests {
         assert!(sha256_of(&format!("sha256:{}", "a".repeat(64))).is_some());
         assert!(sha256_of("sha256:abc").is_none() && sha256_of(&format!("sha512:{}", "a".repeat(64))).is_none());
         assert!(valid_tag("v1.2.3") && valid_tag("_x") && !valid_tag("-x") && !valid_tag(&"a".repeat(129)));
+    }
+
+    /// docs/deploy-api.md §3.1, step 5: a snapshot path keeps its newest tags, and a manifest goes
+    /// with its last tag unless something else names it.
+    #[test]
+    fn a_snapshot_path_keeps_its_newest_tags() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            set_policy(&hub, "shop/web/snapshots", false, Some(2)).await?;
+            let d = |i: u8| format!("sha256:{}", hex::encode([i; 32]));
+            let (d1, d2, d5) = (d(1), d(2), d(5));
+            let index = d1.clone();
+            hub.store
+                .call(move |c| {
+                    let manifest = |digest: &str, body: &str| c.execute("INSERT INTO registry_manifests (repo, digest, media_type, body, size, created_at) VALUES ('shop/web/snapshots', ?1, 'm', ?2, 2, 0)", params![digest, body.as_bytes()]);
+                    let tag = |t: &str, digest: &str, at: i64| c.execute("INSERT INTO registry_tags (repo, tag, digest, updated_at) VALUES ('shop/web/snapshots', ?1, ?2, ?3)", params![t, digest, at]);
+                    for i in 1..=4u8 {
+                        manifest(&d(i), "{}")?;
+                        tag(&format!("s{i}"), &d(i), i64::from(i))?;
+                    }
+                    // s1's manifest is named by an index too, which a newer tag holds.
+                    manifest(&d5, &format!("{{\"manifests\":[{{\"digest\":\"{index}\"}}]}}"))?;
+                    tag("s5", &d5, 5)?;
+                    Ok(())
+                })
+                .await?;
+            let c = collect(&hub).await?;
+            assert_eq!(c.tags, 3, "s1, s2 and s3 past the newest two");
+            let left = hub
+                .store
+                .call(|c| {
+                    let tags = c.prepare("SELECT tag FROM registry_tags ORDER BY tag")?.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+                    let manifests = c.prepare("SELECT digest FROM registry_manifests ORDER BY digest")?.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+                    Ok((tags, manifests))
+                })
+                .await?;
+            assert_eq!(left.0, ["s4", "s5"]);
+            assert!(left.1.contains(&d1), "the index still names s1's manifest");
+            assert!(!left.1.contains(&d2), "s2's went with its tag");
+            // A repository without a policy keeps everything; a release path's tags never move.
+            set_policy(&hub, "shop/web", true, None).await?;
+            assert!(hub.store.call(|c| Ok(immutable_in(c, "shop/web")? && !immutable_in(c, "shop/web/snapshots")? && !immutable_in(c, "other")?)).await?);
+            Ok(())
+        })
     }
 
     #[test]

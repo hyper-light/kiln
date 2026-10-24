@@ -1030,7 +1030,7 @@ impl Codex {
         self.stopped.clear();
         self.unheard.clear();
         core.state.approvals.clear();
-        core.state.exit = Some(ExitInfo { code, error });
+        core.state.exit = Some(ExitInfo::now(code, error));
         core.state.activity = None;
         core.state.doing = None;
         core.state.turn_started = None;
@@ -2606,7 +2606,7 @@ impl Codex {
             core.state.doing = None;
             core.set_status(next);
         }
-        core.state.exit = (next == Status::Exited).then(|| ExitInfo { code: None, error: Some("Codex reported a thread error".into()) });
+        core.state.exit = (next == Status::Exited).then(|| ExitInfo::now(None, Some("Codex reported a thread error".into())));
         core.touch_state();
         self.settle(core);
     }

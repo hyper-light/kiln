@@ -211,6 +211,8 @@ enum Cmd {
     Debug(kiln::ci::cli::DebugArgs),
     /// People who sign in: add (with a sign-in link), list, link, sign out, remove.
     Users(kiln::authz::cli::UsersArgs),
+    /// Groups of users, which own apps: list, add, add-member, remove-member, remove.
+    Groups(kiln::authz::cli::GroupsArgs),
     /// What users may do: roles and capabilities in scopes (`developer@org:acme`).
     Grants(kiln::authz::cli::GrantsArgs),
     /// The built-in roles and custom ones.
@@ -939,6 +941,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Users(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             boxed(|| kiln::authz::cli::users(a, &cfg)).await
+        }
+        Cmd::Groups(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::authz::cli::groups(a, &cfg)).await
         }
         Cmd::Grants(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();

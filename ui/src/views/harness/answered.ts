@@ -6,6 +6,7 @@
  */
 import { useSyncExternalStore } from "react";
 import { harnessApi, type ApprovalBrief, type Command } from "@/api/harness";
+import { markNotices } from "./notices";
 
 /** How long an answer given here stands in for the agent's own word. */
 const STANDS_MS = 60_000;
@@ -60,6 +61,8 @@ export async function answer(agent: string, c: Extract<Command, { type: "approve
     unmark([c.id]);
     throw e;
   }
+  // Dealt with: gone from your other devices and pages too.
+  markNotices([c.id], "done", [agent]);
 }
 
 const subscribe = (l: () => void) => {

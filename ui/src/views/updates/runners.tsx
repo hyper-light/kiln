@@ -892,7 +892,7 @@ function DoctorLine({ runner }: { runner: string }) {
   if (!i) return null;
   return (
     <p className="up-note">
-      <Link to="/agents/attached">{i.name}</Link>: {i.title} · {i.state === "open" ? (i.report ?? "its agent is on it") : (i.why ?? "waiting for you")}
+      {i.name}: {i.title} · {i.state === "open" ? (i.report ?? "its agent is on it") : (i.why ?? "waiting for you")}
       {i.agent && (
         <>
           {" · "}

@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::Integration;
 use crate::hub::Hub;
-use crate::http::client::{Client, Roots};
+use crate::http::client::{Client, Method, Roots};
 
 /// Azure Resource Manager's scope.
 pub const MANAGEMENT: &str = "https://management.azure.com/.default";
@@ -57,6 +57,11 @@ impl AzureError {
     pub fn is_not_found(e: &anyhow::Error) -> bool {
         e.downcast_ref::<AzureError>().is_some_and(|a| a.status == 404 || a.code.ends_with("NotFound"))
     }
+
+    /// Whether `e` is Azure saying something changed meanwhile, or is busy.
+    pub fn is_conflict(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<AzureError>().is_some_and(|a| a.status == 409 || a.status == 412)
+    }
 }
 
 /// Azure's error shapes.
@@ -68,6 +73,90 @@ pub fn error_of(status: u16, body: &[u8]) -> AzureError {
         _ => ("Error".to_owned(), String::from_utf8_lossy(body).chars().take(300).collect()),
     };
     AzureError { status, code, message }
+}
+
+/// Resource Manager's base (`https://management.azure.com`), or a test's fake.
+pub fn management() -> String {
+    super::endpoint("azure:management", || "https://management.azure.com".into())
+}
+
+/// The base of a host Azure names (`shop.scm.azurewebsites.net`,
+/// `kilnab12.blob.core.windows.net`): `https://<host>`, or the test's fake with the host as its
+/// first path segment.
+pub fn host(host: &str) -> String {
+    match super::endpoint("azure:hosts", String::new) {
+        b if b.is_empty() => format!("https://{host}"),
+        b => format!("{b}/{host}"),
+    }
+}
+
+/// An answer: its status, headers (an operation's `Location`, `Azure-AsyncOperation`) and JSON.
+pub struct Answer {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Value,
+}
+
+impl Answer {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+}
+
+/// Azure's REST APIs with an access token for Resource Manager.
+pub struct Arm<'a> {
+    pub token: &'a str,
+}
+
+/// A request's body: JSON, or a file's bytes as they're read.
+pub enum Body {
+    None,
+    Json(Value),
+    Stream { rx: async_channel::Receiver<bytes::Bytes>, len: u64, content_type: String },
+}
+
+impl Arm<'_> {
+    /// `method` on Resource Manager's `path` (`/subscriptions/…`) at `api_version`: its answer, or
+    /// the error Azure gave.
+    pub async fn call(&self, method: Method, path: &str, api_version: &str, body: Option<&Value>) -> Result<Value> {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let url = format!("{}{path}{sep}api-version={api_version}", management());
+        Ok(self.send(method, &url, body.map_or(Body::None, |b| Body::Json(b.clone())), &[], true).await?.body)
+    }
+
+    /// `method` on Resource Manager's `path`, the whole answer.
+    pub async fn answer(&self, method: Method, path: &str, api_version: &str, body: Option<&Value>) -> Result<Answer> {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let url = format!("{}{path}{sep}api-version={api_version}", management());
+        self.send(method, &url, body.map_or(Body::None, |b| Body::Json(b.clone())), &[], true).await
+    }
+
+    /// `method` on any URL (an operation's status, an app's SCM site, a blob signed with a SAS),
+    /// with Resource Manager's token when `token`.
+    pub async fn send(&self, method: Method, url: &str, body: Body, headers: &[(&str, &str)], token: bool) -> Result<Answer> {
+        let mut req = client()?.request(method, url).timeout(std::time::Duration::from_secs(300));
+        if token {
+            req = req.bearer(self.token);
+        }
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        req = match body {
+            Body::None => req,
+            Body::Json(v) => req.json(&v),
+            Body::Stream { rx, len, content_type } => req.header("Content-Type", &content_type).header("Content-Length", &len.to_string()).body_stream(rx),
+        };
+        // Where it went, without a signature's query.
+        let shown = url.split('?').next().unwrap_or(url).to_owned();
+        let resp = req.send().await.with_context(|| format!("Azure {shown}"))?;
+        let status = resp.status();
+        let headers = resp.headers();
+        let bytes = resp.bytes(32 << 20).await?;
+        if !(200..300).contains(&status) {
+            return Err(error_of(status, &bytes).into());
+        }
+        Ok(Answer { status, headers, body: serde_json::from_slice(&bytes).unwrap_or(Value::Null) })
+    }
 }
 
 fn client() -> Result<&'static Client> {

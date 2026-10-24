@@ -2,4 +2,4 @@ apiVersion: v2
 name: kiln-base
 description: kiln's base library chart (docs/deploy-api.md §3.4) - an app's workload, service, ingress, autoscaling, disruption budget, service account, config, cron jobs, hook jobs, network policy and volumes, from its values, with safe defaults.
 type: library
-version: 0.1.2
+version: 0.1.3

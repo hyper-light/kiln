@@ -2,8 +2,8 @@
 
 A program is work too big for one goal stack: a master plan, run as goals on a coordinating agent,
 and tracks, each a plan of its own, each worked by an agent assigned to it. kiln's critical path
-(master plan `01a157fddb8276a2996246ea931c4808`, ten tracks) is one. The Programs view follows them:
-Mission control's **Programs** (`/agents/programs`), the critical path first.
+(master plan `01a157fddb8276a2996246ea931c4808`, ten tracks) is one. They are followed through
+`/api/programs` and code mode's `kiln.programs.*`, the critical path first.
 
 ## What a program is, to kiln
 

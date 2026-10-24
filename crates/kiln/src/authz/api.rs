@@ -39,6 +39,9 @@ fn body<T: serde::de::DeserializeOwned>(v: &Value) -> Result<T, Fail> {
 
 /// The identity routes, or `None` for a path that isn't one.
 pub async fn route(hub: &Hub, caller: &Caller, method: &Method, s: &[&str], q: &HashMap<String, String>, req: Request) -> Option<Result<Response, Fail>> {
+    if s.get(1) == Some(&"groups") {
+        return super::groups::route(hub, caller, method, s, req).await;
+    }
     let v: Value = if matches!(*method, Method::POST | Method::PUT) {
         match srv::body_json(req.into_body(), JSON_LIMIT).await {
             Ok(v) => v,
@@ -135,7 +138,7 @@ async fn delete_role(hub: &Hub, caller: &Caller, name: &str) -> Result<Response,
 // ------------------------------------------------------------------ users
 
 /// A user by id or name: `(id, name)`.
-async fn find_user(hub: &Hub, key: &str) -> Result<(String, String), Fail> {
+pub(super) async fn find_user(hub: &Hub, key: &str) -> Result<(String, String), Fail> {
     let k = key.trim_start_matches("user:").to_owned();
     hub.store
         .call(move |c| Ok(c.query_row("SELECT id, name FROM users WHERE (id = ?1 OR name = ?1 COLLATE NOCASE) AND disabled_at IS NULL", [&k], |r| Ok((r.get(0)?, r.get(1)?))).optional()?))

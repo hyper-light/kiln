@@ -32,12 +32,14 @@ struct Gitlab {
     /// (method, path with its query, body).
     calls: Vec<(String, String, Value)>,
     made: bool,
-    /// GitLab's JSON for each merge request.
+    /// GitLab's JSON for each merge request, with `project` (its path), numbered in its project.
     mrs: Vec<Value>,
     /// Each deployment: `{id, sha, environment, ref, status}`.
     deployments: Vec<Value>,
     /// Each commit status: (project, sha, its body).
     statuses: Vec<(String, String, Value)>,
+    /// Projects made besides the release repository (apps' sources), by name.
+    sources: Vec<String>,
 }
 
 type Shared = Arc<Mutex<Gitlab>>;
@@ -209,6 +211,26 @@ fn api_answer(method: &str, full: &str, body: Value, root: &Path, shared: &Share
                 (404, json!({ "message": "404 Project Not Found" }))
             }
         }
+        ("POST", ["projects"]) if body.get("namespace_id") == Some(&json!(5)) && body.get("path") != Some(&json!("releases")) => {
+            let path = body.get("path").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let made = !path.is_empty() && !g.sources.contains(&path) && git(root, &["init", "-q", "--bare", &format!("acme/{path}.git")]).is_ok();
+            if made {
+                g.sources.push(path.clone());
+                (201, json!({ "id": 50 + g.sources.len(), "path_with_namespace": format!("acme/{path}") }))
+            } else {
+                (400, json!({ "message": "has already been taken" }))
+            }
+        }
+        ("GET", ["projects", project]) if decode(project).starts_with("acme/") && decode(project) != "acme/releases" => {
+            let name = decode(project).trim_start_matches("acme/").to_owned();
+            if g.sources.contains(&name) { (200, json!({ "path_with_namespace": format!("acme/{name}") })) } else { (404, json!({ "message": "404 Project Not Found" })) }
+        }
+        ("DELETE", ["projects", project]) if g.sources.contains(&decode(project).trim_start_matches("acme/").to_owned()) => {
+            let name = decode(project).trim_start_matches("acme/").to_owned();
+            let _ = std::fs::remove_dir_all(root.join(format!("acme/{name}.git")));
+            g.sources.retain(|s| *s != name);
+            (202, json!({ "message": "202 Accepted" }))
+        }
         ("POST", ["projects"]) if body.get("namespace_id") == Some(&json!(5)) && body.get("path") == Some(&json!("releases")) => {
             let made = git(root, &["init", "-q", "--bare", "acme/releases.git"]).is_ok();
             g.made = made;
@@ -218,27 +240,28 @@ fn api_answer(method: &str, full: &str, body: Value, root: &Path, shared: &Share
             g.statuses.push((decode(project), (*sha).to_owned(), body.clone()));
             (201, json!({ "id": g.statuses.len() }))
         }
-        ("GET", ["projects", "acme%2Freleases", "merge_requests"]) => {
-            let branch = arg("source_branch");
-            let found: Vec<Value> = g.mrs.iter().filter(|m| m.get("source_branch") == Some(&json!(branch))).cloned().collect();
+        ("GET", ["projects", project, "merge_requests"]) => {
+            let (branch, project) = (arg("source_branch"), decode(project));
+            let found: Vec<Value> = g.mrs.iter().filter(|m| m.get("project") == Some(&json!(project)) && m.get("source_branch") == Some(&json!(branch))).cloned().collect();
             (200, json!(found))
         }
-        ("POST", ["projects", "acme%2Freleases", "merge_requests"]) => {
-            let iid = g.mrs.len() + 1;
+        ("POST", ["projects", project, "merge_requests"]) => {
+            let project = decode(project);
+            let iid = g.mrs.iter().filter(|m| m.get("project") == Some(&json!(project))).count() + 1;
             let mr = json!({
-                "iid": iid, "state": "opened", "merge_commit_sha": null, "squash_commit_sha": null,
+                "project": project, "iid": iid, "state": "opened", "merge_commit_sha": null, "squash_commit_sha": null,
                 "title": body.get("title"), "description": body.get("description"),
                 "source_branch": body.get("source_branch"), "target_branch": body.get("target_branch"),
-                "web_url": format!("{web}/acme/releases/-/merge_requests/{iid}"),
+                "web_url": format!("{web}/{project}/-/merge_requests/{iid}"),
             });
             g.mrs.push(mr.clone());
             (201, mr)
         }
-        ("GET", ["projects", "acme%2Freleases", "merge_requests", n]) => match n.parse::<usize>().ok().and_then(|n| g.mrs.get(n.wrapping_sub(1))) {
+        ("GET", ["projects", project, "merge_requests", n]) => match g.mrs.iter().find(|m| m.get("project") == Some(&json!(decode(project))) && m.get("iid").and_then(Value::as_u64).map(|i| i.to_string()).as_deref() == Some(n)) {
             Some(m) => (200, m.clone()),
             None => (404, json!({ "message": "404 Not found" })),
         },
-        ("PUT", ["projects", "acme%2Freleases", "merge_requests", n]) => match n.parse::<usize>().ok().and_then(|n| g.mrs.get_mut(n.wrapping_sub(1))) {
+        ("PUT", ["projects", project, "merge_requests", n]) => match g.mrs.iter_mut().find(|m| m.get("project") == Some(&json!(decode(project))) && m.get("iid").and_then(Value::as_u64).map(|i| i.to_string()).as_deref() == Some(n)) {
             Some(m) => {
                 if body.get("state_event") == Some(&json!("close"))
                     && let Some(o) = m.as_object_mut()
@@ -249,9 +272,9 @@ fn api_answer(method: &str, full: &str, body: Value, root: &Path, shared: &Share
             }
             None => (404, json!({ "message": "404 Not found" })),
         },
-        ("POST", ["projects", "acme%2Freleases", "merge_requests", _, "notes"]) => (201, json!({ "id": 1 })),
-        ("DELETE", ["projects", "acme%2Freleases", "repository", "branches", branch]) => {
-            let gone = git(&root.join("acme/releases.git"), &["update-ref", "-d", &format!("refs/heads/{}", decode(branch))]).is_ok();
+        ("POST", ["projects", _, "merge_requests", _, "notes"]) => (201, json!({ "id": 1 })),
+        ("DELETE", ["projects", project, "repository", "branches", branch]) => {
+            let gone = git(&root.join(format!("{}.git", decode(project))), &["update-ref", "-d", &format!("refs/heads/{}", decode(branch))]).is_ok();
             if gone { (204, Value::Null) } else { (404, json!({ "message": "404 Branch Not Found" })) }
         }
         ("GET", ["projects", "acme%2Freleases", "deployments"]) => {
@@ -521,6 +544,18 @@ fn p3_gitlab_release_repositories_and_ci() -> anyhow::Result<()> {
         let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
         let found = v.get("releases").and_then(Value::as_array).is_some_and(|l| l.iter().any(|r| r.get("origin") == Some(&json!("git")) && r.get("commit") == Some(&json!(c))));
         Ok((!found).then(|| format!("{body}\n{}", s.log())))
+    })?;
+
+    // An app's source repository made on the GitLab with its token, from a starter there.
+    common::source_on_host(&s, "gitlab", &gl_root, &format!("http://127.0.0.1:{port}/acme/ci.git"), (".kiln/ci.yaml", "built on kiln"), true)?;
+    // A fleet change in it: a merge request there, followed until GitLab merges it.
+    common::fleet_on_host(&s, "gitlab", &gl_root, |n, merge| {
+        let mut g = shared.lock().map_err(|_| anyhow::anyhow!("the fake GitLab"))?;
+        let m = g.mrs.iter_mut().find(|m| m.get("project") == Some(&json!("acme/gitlab-web")) && m.get("iid") == Some(&json!(n))).and_then(Value::as_object_mut).ok_or_else(|| anyhow::anyhow!("no merge request {n} of acme/gitlab-web"))?;
+        m.insert("state".into(), json!("merged"));
+        m.insert("merge_commit_sha".into(), json!(merge));
+        m.insert("merge_user".into(), json!({ "username": "ada" }));
+        Ok(())
     })?;
     Ok(())
 }

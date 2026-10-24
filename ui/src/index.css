@@ -465,6 +465,7 @@ html.fills-window body {
     align-items: baseline;
     gap: 8px;
     min-width: 0;
+    overflow: hidden;
   }
   .page-intro[data-compact] .eyebrow {
     display: none;

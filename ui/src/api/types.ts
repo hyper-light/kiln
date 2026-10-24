@@ -39,6 +39,8 @@ export interface Me {
   origins?: string[];
   /** Where pages agents show are served, when not here (docs/previews.md). */
   pages_url?: string | null;
+  /** The groups the person is in: kiln's (`shop`), and their identity providers' (`github:acme/platform`), as an app's owner teams name them. */
+  groups?: string[];
 }
 
 export interface Repo {
@@ -596,6 +598,8 @@ export type ServerEvent =
   | { type: "places" }
   /** Your notifications changed (a device, a mute, a delivery): refetch GET /api/push and its devices. */
   | { type: "push" }
+  /** Someone marked notices (`principal`: whose; `tags`: agents whose shown notifications go): notices.ts. */
+  | { type: "notices"; principal: string; keys: string[]; how: "away" | "done" | "seen"; at: number; tags?: string[] }
   /** An agent's change request opened or moved on (`agents.change`, review, CI): refetch GET /api/harness/changes. */
   | { type: "agent_change"; agent: string };
 

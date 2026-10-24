@@ -2,11 +2,12 @@
  * One release: what it does and where, how far it has come, each gate's result with its evidence,
  * people's answers, and what its provider last said. While it waits for approval the answer is
  * here; while it is on its way it can be cancelled (one being delivered is reverted in git, one
- * proposed as a pull request has it closed).
+ * proposed as a pull request has it closed). Landed, it is rolled back from here: while it runs, to
+ * the release before it; once another replaced it, back to it.
  */
 import * as React from "react";
-import { Link, useParams } from "@/lib/router";
-import { CircleCheck, CircleX } from "lucide-react";
+import { Link, useNavigate, useParams } from "@/lib/router";
+import { CircleCheck, CircleX, Undo2 } from "lucide-react";
 
 import { boardHref, deployApi, describe, inFlight, pullRequestOf, releaseAppHref, releaseHref, STATE_WORDS, type Release } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
@@ -105,6 +106,50 @@ function Answers({ r }: { r: Release }) {
   );
 }
 
+/** A rollback from a release that landed: the one before it while it runs, or back to it once another replaced it. */
+function RollBack({ r }: { r: Release }) {
+  const navigate = useNavigate();
+  const d = useSuspenseResource(`deploy/reg/${r.app}/${r.environment}`, (s) => deployApi.registration(r.app, r.environment, s), { on: DEPLOY_EVENTS }).data;
+  const [asking, setAsking] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const runs = d.registration.running === r.id;
+  const ran = !runs && (r.state === "succeeded" || r.state === "superseded") && r.kind !== "enable" && r.kind !== "disable";
+  // One release at a time: none while another is on its way.
+  if ((!runs && !ran) || d.in_flight) return null;
+  const go = async () => {
+    setBusy(true);
+    try {
+      const n = await deployApi.rollbackRelease(r.id, runs ? undefined : r.id);
+      toast({ title: `Release ${n.id}: ${describe(n)} → ${r.environment}`, description: STATE_WORDS[n.state], tone: "running", href: releaseHref(n.id) });
+      invalidate("deploy/");
+      navigate(releaseHref(n.id));
+    } catch (e) {
+      toast({ title: "Not rolled back", description: errorMessage(e), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <Button size="sm" variant="secondary" disabled={busy} onClick={() => setAsking(true)}>
+        <Undo2 /> {runs ? "Roll back" : "Roll back to this"}
+      </Button>
+      <ConfirmDialog
+        open={asking}
+        onOpenChange={setAsking}
+        title={runs ? `Roll ${r.app} back in ${r.environment}?` : `Back to release ${r.id}?`}
+        description={
+          runs
+            ? "A new release goes back to the newest one that succeeded before this: its version, artifacts and values, through the environment's gates."
+            : `A new release runs what release ${r.id} ran: its version, artifacts and values, through the environment's gates.`
+        }
+        confirmLabel="Roll back"
+        onConfirm={go}
+      />
+    </>
+  );
+}
+
 function ReleaseView({ id }: { id: number }) {
   const r = useSuspenseResource(`deploy/release/${id}`, (s) => deployApi.release(id, s), { on: DEPLOY_EVENTS }).data;
   const [asking, setAsking] = React.useState(false);
@@ -147,7 +192,11 @@ function ReleaseView({ id }: { id: number }) {
               <Button size="sm" variant="danger" onClick={() => setAsking(true)}>
                 Cancel
               </Button>
-            ) : undefined
+            ) : inFlight(r.state) ? undefined : (
+              <Loadable label="what runs there" fallback={null}>
+                <RollBack r={r} />
+              </Loadable>
+            )
           }
         >
           <Facts items={facts} />

@@ -96,14 +96,14 @@ machine, harness and folder chosen for the run, or for the step; the run has a p
 Control groups its agents under it.
 
 The run's page draws its steps as their graph, in rounds (each step after the latest step it waits
-for, a round's steps side by side), with a bar of where each stands, the way an agent's
+for), with a bar of where each stands, the way an agent's
 conversation draws its work: a step at work with hyperlight's mark turning and its title in the
 holographic shimmer; one needing a person with the optic held in amber; met, its loop closed; not
 met, broken; skipped, dashed; stopped, faint; waiting, sketched and still. Only steps at work move.
 A plan's page draws its steps the same way, without where they stand, so **Runs after** reads as a
-graph while it's written. Wide, its rounds run across; narrow (a phone, a side panel), down, two
-steps a row. A line that would run behind another step isn't drawn: the step it leads to says
-what it waits for instead (**after 2, 3**).
+graph while it's written. It runs down, a step a row at every width, a round's steps one under
+another. A line that would run behind another step isn't drawn: the step it leads to says what it
+waits for instead (**after 2, 3**).
 
 - **Which steps run when.** A step starts once each step it waits for is met (**Runs after**;
   `needs` in the API). Steps that don't wait for each other run side by side: the run's page says

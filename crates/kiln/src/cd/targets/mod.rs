@@ -20,13 +20,47 @@
 //!   before they expire.
 
 pub mod api;
+pub mod aws_beanstalk;
+pub mod aws_ec2;
 pub mod aws_ecs;
 pub mod aws_lambda;
 pub mod aws_s3;
+pub mod aws_static;
+pub mod azure;
+pub mod azure_containerapps;
+pub mod azure_static;
+pub mod azure_vmss;
+pub mod azure_web;
+pub mod cloudflare_pages;
 pub mod cloudflare_workers;
+pub mod cloudformation;
+pub mod digitalocean;
+pub mod fly;
+pub mod gcp;
+pub mod gcp_appengine;
+pub mod gcp_compute;
+pub mod gcp_functions;
+pub mod gcp_run;
+pub mod heroku;
+pub mod netlify;
+pub mod nomad;
+pub mod render;
+pub mod runner;
 pub mod vercel;
 #[cfg(test)]
 pub mod fake;
+#[cfg(test)]
+pub mod fake_azure;
+#[cfg(test)]
+pub mod fake_gcp;
+#[cfg(test)]
+pub mod fake_hosting;
+#[cfg(test)]
+pub mod fake_nomad;
+#[cfg(test)]
+pub mod fake_query;
+#[cfg(test)]
+pub mod fake_runners;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -126,6 +160,8 @@ pub enum Creds {
     Bearer(String),
     /// A token platform's stored token, with its integration's configuration (an account id).
     Token { token: String, config: Value },
+    /// kiln's runners, which act as kiln (`runner` targets).
+    Runners,
 }
 
 /// Where what kiln applied is kept, and the rollouts of what it applied (§5): the CD store
@@ -189,6 +225,27 @@ impl Cx<'_> {
             Creds::Aws(a) => Ok(a),
             _ => bail!("{} isn't an AWS target", self.conn.target.name()),
         }
+    }
+
+    /// Google Cloud's APIs, for `gcp-*` providers.
+    pub fn gcp(&self) -> Result<integrations::gcp::Gcp<'_>> {
+        match &self.creds {
+            Creds::Bearer(token) if self.conn.def.integration == "gcp" => Ok(integrations::gcp::Gcp { token }),
+            _ => bail!("{} isn't a Google Cloud target", self.conn.target.name()),
+        }
+    }
+
+    /// Azure's APIs, for `azure-*` providers.
+    pub fn arm(&self) -> Result<integrations::azure::Arm<'_>> {
+        match &self.creds {
+            Creds::Bearer(token) if self.conn.def.integration == "azure" => Ok(integrations::azure::Arm { token }),
+            _ => bail!("{} isn't an Azure target", self.conn.target.name()),
+        }
+    }
+
+    /// The target's place value `key` (`project`, `region`, `zone`).
+    pub fn place(&self, key: &str) -> Result<&str> {
+        self.conn.target.place_value(key).ok_or_else(|| anyhow::anyhow!("{} has no {key}", self.conn.target.name()))
     }
 
     /// A token platform's token and its integration's configuration.
@@ -324,6 +381,10 @@ impl Cd {
     /// Credentials for calls on `conn`, as the workload of `app` (or of the target's apps), for
     /// `trigger` (`watch`, `sync`, `delete`).
     pub(super) async fn creds(&self, conn: &Conn, app: Option<&str>, trigger: &str) -> Result<Creds> {
+        // kiln's runners act as kiln: no integration, no credentials.
+        if conn.def.integration == "runner" {
+            return Ok(Creds::Runners);
+        }
         let i = self.account(conn).await?;
         let (repository, environment, app) = self.identity(&conn.target.name(), app);
         let w = kiln_ci::oidc::Workload { repository: &repository, environment: environment.as_deref(), actor: "kiln", source: "cd", app: app.as_deref(), trigger: Some(trigger), ..Default::default() };
@@ -486,6 +547,48 @@ pub(super) fn app_of(o: &Value) -> Option<String> {
     obj::annotation(o, kiln_cd::engine::TRACKING).and_then(|t| t.split_once(':')).map(|(app, _)| app.to_owned())
 }
 
+/// `body` with each secret reference in it ([`kiln_cd::apps::SECRET_REF`]) replaced by the value
+/// it stands for, as text, for the app `desired` is of (docs/deploy-api.md §3.5): what a provider
+/// sends the platform, and never keeps.
+pub async fn resolve_secrets(cx: &Cx<'_>, desired: &Value, mut body: Value) -> Result<Value> {
+    fn refs(v: &Value, out: &mut BTreeSet<String>) {
+        match v {
+            Value::String(s) if s.starts_with(kiln_cd::apps::SECRET_REF) => {
+                out.insert(s.clone());
+            }
+            Value::Array(a) => a.iter().for_each(|x| refs(x, out)),
+            Value::Object(m) => m.values().for_each(|x| refs(x, out)),
+            _ => {}
+        }
+    }
+    fn fill(v: &mut Value, values: &HashMap<String, String>) {
+        match v {
+            Value::String(s) => {
+                if let Some(x) = values.get(s.as_str()) {
+                    x.clone_into(s);
+                }
+            }
+            Value::Array(a) => a.iter_mut().for_each(|x| fill(x, values)),
+            Value::Object(m) => m.values_mut().for_each(|x| fill(x, values)),
+            _ => {}
+        }
+    }
+    let mut found = BTreeSet::new();
+    refs(&body, &mut found);
+    if found.is_empty() {
+        return Ok(body);
+    }
+    let app = app_of(desired).unwrap_or_default();
+    let mut values = HashMap::new();
+    for r in found {
+        let name = kiln_cd::apps::parse_secret_ref(&r).map(|(_, n, _)| n.to_owned()).unwrap_or_default();
+        let text = String::from_utf8(cx.files.secret(&app, &r).await?).map_err(|_| anyhow::anyhow!("secret {name} isn't text, and {} takes secrets as text", cx.conn.def.title))?;
+        values.insert(r, text);
+    }
+    fill(&mut body, &values);
+    Ok(body)
+}
+
 /// `owner/name` from a clone URL.
 pub fn repo_name(url: &str) -> String {
     let path = url.trim_end_matches('/').trim_end_matches(".git");
@@ -501,9 +604,29 @@ pub fn repo_name(url: &str) -> String {
 /// Reads `names` (namespace, name) of `kind` on the target.
 async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec<Value>> {
     let objects = match cx.conn.def.name {
+        "aws-beanstalk" => aws_beanstalk::list(cx, kind, names).await?,
+        "aws-ec2" => aws_ec2::list(cx, kind, names).await?,
         "aws-lambda" => aws_lambda::list(cx, kind, names).await?,
+        "aws-static" => aws_static::list(cx, kind, names).await?,
+        "azure-appservice" | "azure-functions" => azure_web::list(cx, kind, names).await?,
+        "azure-containerapps" => azure_containerapps::list(cx, kind, names).await?,
+        "azure-static" => azure_static::list(cx, kind, names).await?,
+        "azure-vmss" => azure_vmss::list(cx, kind, names).await?,
         "aws-ecs" => aws_ecs::list(cx, kind, names).await?,
+        "cloudflare-pages" => cloudflare_pages::list(cx, kind, names).await?,
         "cloudflare-workers" => cloudflare_workers::list(cx, kind, names).await?,
+        "cloudformation" => cloudformation::list(cx, kind, names).await?,
+        "gcp-appengine" => gcp_appengine::list(cx, kind, names).await?,
+        "gcp-compute" => gcp_compute::list(cx, kind, names).await?,
+        "gcp-functions" => gcp_functions::list(cx, kind, names).await?,
+        "gcp-run" => gcp_run::list(cx, kind, names).await?,
+        "digitalocean" => digitalocean::list(cx, kind, names).await?,
+        "fly" => fly::list(cx, kind, names).await?,
+        "heroku" => heroku::list(cx, kind, names).await?,
+        "netlify" => netlify::list(cx, kind, names).await?,
+        "nomad" => nomad::list(cx, kind, names).await?,
+        "render" => render::list(cx, kind, names).await?,
+        "terraform" | "pulumi" | "job" | "host" | "compose" | "microvm" => runner::list(cx, kind, names).await?,
         "vercel" => vercel::list(cx, kind, names).await?,
         other => bail!("no reading {other} yet"),
     };
@@ -518,9 +641,29 @@ pub(super) async fn read(cx: &Cx<'_>, o: &Value) -> Result<Option<Value>> {
 /// Applies `desired`, keeping what was applied: the object as it now reads.
 pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     let live = match cx.conn.def.name {
+        "aws-beanstalk" => aws_beanstalk::apply(cx, desired).await,
+        "aws-ec2" => aws_ec2::apply(cx, desired).await,
         "aws-lambda" => aws_lambda::apply(cx, desired).await,
+        "aws-static" => aws_static::apply(cx, desired).await,
+        "azure-appservice" | "azure-functions" => azure_web::apply(cx, desired).await,
+        "azure-containerapps" => azure_containerapps::apply(cx, desired).await,
+        "azure-static" => azure_static::apply(cx, desired).await,
+        "azure-vmss" => azure_vmss::apply(cx, desired).await,
         "aws-ecs" => aws_ecs::apply(cx, desired).await,
+        "cloudflare-pages" => cloudflare_pages::apply(cx, desired).await,
         "cloudflare-workers" => cloudflare_workers::apply(cx, desired).await,
+        "cloudformation" => cloudformation::apply(cx, desired).await,
+        "gcp-appengine" => gcp_appengine::apply(cx, desired).await,
+        "gcp-compute" => gcp_compute::apply(cx, desired).await,
+        "gcp-functions" => gcp_functions::apply(cx, desired).await,
+        "gcp-run" => gcp_run::apply(cx, desired).await,
+        "digitalocean" => digitalocean::apply(cx, desired).await,
+        "fly" => fly::apply(cx, desired).await,
+        "heroku" => heroku::apply(cx, desired).await,
+        "netlify" => netlify::apply(cx, desired).await,
+        "nomad" => nomad::apply(cx, desired).await,
+        "render" => render::apply(cx, desired).await,
+        "terraform" | "pulumi" | "job" | "host" | "compose" | "microvm" => runner::apply(cx, desired).await,
         "vercel" => vercel::apply(cx, desired).await,
         other => bail!("no applying to {other} yet"),
     }
@@ -530,9 +673,29 @@ pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
 
 async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
     match cx.conn.def.name {
+        "aws-beanstalk" => aws_beanstalk::delete(cx, key).await,
+        "aws-ec2" => aws_ec2::delete(cx, key).await,
         "aws-lambda" => aws_lambda::delete(cx, key).await,
+        "aws-static" => aws_static::delete(cx, key).await,
+        "azure-appservice" | "azure-functions" => azure_web::delete(cx, key).await,
+        "azure-containerapps" => azure_containerapps::delete(cx, key).await,
+        "azure-static" => azure_static::delete(cx, key).await,
+        "azure-vmss" => azure_vmss::delete(cx, key).await,
         "aws-ecs" => aws_ecs::delete(cx, key).await,
+        "cloudflare-pages" => cloudflare_pages::delete(cx, key).await,
         "cloudflare-workers" => cloudflare_workers::delete(cx, key).await,
+        "cloudformation" => cloudformation::delete(cx, key).await,
+        "gcp-appengine" => gcp_appengine::delete(cx, key).await,
+        "gcp-compute" => gcp_compute::delete(cx, key).await,
+        "gcp-functions" => gcp_functions::delete(cx, key).await,
+        "gcp-run" => gcp_run::delete(cx, key).await,
+        "digitalocean" => digitalocean::delete(cx, key).await,
+        "fly" => fly::delete(cx, key).await,
+        "heroku" => heroku::delete(cx, key).await,
+        "netlify" => netlify::delete(cx, key).await,
+        "nomad" => nomad::delete(cx, key).await,
+        "render" => render::delete(cx, key).await,
+        "terraform" | "pulumi" | "job" | "host" | "compose" | "microvm" => runner::delete(cx, key).await,
         "vercel" => vercel::delete(cx, key).await,
         other => bail!("no deleting from {other} yet"),
     }

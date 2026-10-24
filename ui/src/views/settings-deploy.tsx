@@ -3,11 +3,12 @@
  * local Docker of the machine that builds it, loaded into the cluster's nodes, or a registry), the
  * registries kiln pulls from and pipelines push to, and the accounts kiln deploys through (AWS,
  * Google Cloud and Azure trust kiln's identity, so nothing is stored for them; the other
- * platforms take a token).
+ * platforms take a token). A chat account (Slack, Discord, Telegram, Teams) says where its
+ * commands and buttons come to kiln, and what that chat needs set (docs/deploy-api.md §12.3).
  */
 import * as React from "react";
-import { Check, ChevronDown, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { api, type CdImages, type ImageHome, type Integration, type IntegrationKind, type Integrations, type OidcIssuer } from "@/api/client";
+import { Check, ChevronDown, MessageSquare, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { api, type CdImages, type ChatSetup, type ImageHome, type Integration, type IntegrationKind, type Integrations, type OidcIssuer } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -43,8 +44,11 @@ const REGISTRIES = {
 };
 const ACCOUNTS = {
   about: "Accounts kiln deploys through. Clouds trust kiln's identity; other platforms use a stored token.",
-  words: "accounts cloud aws gcp google azure oidc token platform verify add remove argo",
+  words: "accounts cloud aws gcp google azure oidc token platform verify add remove argo slack discord telegram teams chat commands",
 };
+
+/** The kinds a release's messages go to and commands come from. */
+const CHAT_KINDS = ["slack", "discord", "telegram", "teams"];
 
 /** The deployment settings: images, registries, then accounts. */
 export function DeploySettings() {
@@ -523,9 +527,12 @@ function AccountRow({ a, kind }: { a: Integration; kind?: IntegrationKind }) {
   const [asking, setAsking] = React.useState(false);
   const [repository, setRepository] = React.useState("");
   const [environment, setEnvironment] = React.useState("");
+  const [commands, setCommands] = React.useState(false);
   const verifyId = React.useId();
+  const commandsId = React.useId();
   const federated = kind?.mode === "oidc";
-  const summary = accountSummary(a);
+  const chat = CHAT_KINDS.includes(a.kind);
+  const summary = [accountSummary(a), a.has_signing_secret ? "signing secret stored" : ""].filter(Boolean).join(" · ");
   return (
     <>
       <div className="dep-row" aria-busy={pending !== null}>
@@ -535,6 +542,11 @@ function AccountRow({ a, kind }: { a: Integration; kind?: IntegrationKind }) {
           <IntegrationStatus integration={a} pending={pending} feedback={feedback} unavailable={!kind?.built ? `${kind?.title ?? a.kind} deployments aren't available yet` : undefined} />
         </div>
         <div className="dep-actions">
+          {chat && (
+            <Button size="xs" variant="ghost" aria-label={`Commands from ${a.name}`} aria-expanded={commands} aria-controls={commandsId} onClick={() => setCommands((x) => !x)}>
+              <MessageSquare /> Commands
+            </Button>
+          )}
           <Button size="xs" variant="ghost" disabled={pending !== null || !kind?.built || removing} aria-label={`Verify ${a.name}`} aria-expanded={federated ? asking : undefined} aria-controls={federated ? verifyId : undefined} onClick={() => (federated ? setAsking((x) => !x) : void verify())}>
             <RefreshCw /> {pending === "verify" ? "Verifying…" : "Verify"}
           </Button>
@@ -543,6 +555,7 @@ function AccountRow({ a, kind }: { a: Integration; kind?: IntegrationKind }) {
           </Button>
         </div>
       </div>
+      {commands && chat && <ChatCommands a={a} id={commandsId} />}
       {asking && federated && (
         <form
           id={verifyId}
@@ -592,6 +605,104 @@ function AccountRow({ a, kind }: { a: Integration; kind?: IntegrationKind }) {
   );
 }
 
+/** What's still missing before a chat's commands come to kiln, if anything. */
+function chatMissing(kind: string, setup: ChatSetup): string | null {
+  if (kind === "discord") return setup.public_key ? null : "Add the application's public key (public_key) to check its interactions with.";
+  if (kind === "telegram") return setup.commands ? null : "Point the bot's webhook at kiln to take its chats' commands and buttons.";
+  return setup.signing_secret ? null : kind === "teams" ? "Store the outgoing webhook's security token as this account's signing secret." : "Store the Slack app's signing secret on this account: commands and buttons are taken only then.";
+}
+
+/** Where a chat's commands and buttons come to kiln, what that chat needs set, and for a Telegram
+ * bot, its webhook pointed here (docs/deploy-api.md §12.3). */
+function ChatCommands({ a, id }: { a: Integration; id: string }) {
+  return (
+    <Loadable label={`${a.name}'s commands`} fallback={<Hold height={60} />}>
+      <ChatCommandsLoaded a={a} id={id} />
+    </Loadable>
+  );
+}
+
+function ChatCommandsLoaded({ a, id }: { a: Integration; id: string }) {
+  const { setData } = useRes(integrationsRes);
+  const chat = useRes<ChatSetup>({ key: `ci/integrations/${a.name}/chat`, fetch: (sig) => api.integrationChat(a.name, sig) });
+  const setup = chat.data;
+  const [problem, setProblem] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [draft, setDraft] = React.useState("");
+  const connect = async () => {
+    setBusy(true);
+    setProblem(null);
+    try {
+      const next = await api.connectIntegrationChat(a.name);
+      chat.setData(() => next);
+      invalidate("ci/integrations");
+      toast({ title: `${a.name}'s bot reports to kiln`, description: "Commands and buttons in its chats come here now.", tone: "succeeded" });
+    } catch (e) {
+      setProblem(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  // What Slack and Teams sign with, or Discord's public key, kept now.
+  const keep = async (value: string) => {
+    setBusy(true);
+    setProblem(null);
+    try {
+      const changed = await api.updateIntegration(a.name, a.kind === "discord" ? { config: { ...a.config, public_key: value } } : { signing_secret: value });
+      setData((data) => ({ ...data, integrations: upsert(data.integrations, changed, (item) => item.id, false) }));
+      invalidate("ci/integrations");
+      const next = await api.integrationChat(a.name);
+      chat.setData(() => next);
+      setDraft("");
+    } catch (e) {
+      setProblem(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const missing = chatMissing(a.kind, setup);
+  const asks = a.kind === "discord" ? (setup.public_key ? null : "The application's public key") : a.kind === "telegram" ? null : setup.signing_secret ? null : a.kind === "teams" ? "The outgoing webhook's security token" : "The Slack app's signing secret";
+  return (
+    <div id={id} className="st-trust" aria-label={`Commands from ${a.name}`}>
+      <p>
+        Its address: <code className="break-all">{setup.address}</code>
+      </p>
+      <p>{setup.how}</p>
+      {setup.scopes && (
+        <p>
+          The bot&rsquo;s scopes <code>{setup.scopes.join(", ")}</code>, its events <code>{(setup.events ?? []).join(", ")}</code>.
+        </p>
+      )}
+      <p className="dep-status" data-tone={missing ? undefined : "succeeded"} role="status">
+        {missing ??
+          `kiln takes its commands: deploy, approve, reject, rollback, status. Each runs as the person who said it: whoever linked that account (Settings → You → Chat accounts)${a.kind === "slack" ? ", or the one person here with its email" : ""}.`}
+      </p>
+      {asks && (
+        <form
+          className="st-form-acts dep-form-actions"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (draft.trim()) void keep(draft.trim());
+          }}
+        >
+          <TextField label={asks} type={a.kind === "discord" ? "text" : "password"} placeholder={a.kind === "discord" ? "hex, from the application's General Information" : "kept in kiln's secret store, never shown again"} value={draft} onChange={(e) => setDraft(e.target.value)} />
+          <Button type="submit" size="xs" variant="secondary" disabled={busy || !draft.trim()}>
+            {busy ? "Keeping…" : "Keep it"}
+          </Button>
+        </form>
+      )}
+      {problem && <p className="dep-status" data-tone="error" role="alert">{problem}</p>}
+      {a.kind === "telegram" && (
+        <div className="st-form-acts dep-form-actions">
+          <Button size="xs" variant="secondary" disabled={busy} onClick={() => void connect()}>
+            {busy ? "Pointing…" : setup.commands ? "Point its webhook here again" : "Point its webhook at kiln"}
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** What the cloud needs to trust kiln: its issuer, the audience, the subject a sync presents. */
 function TrustNote({ kind }: { kind: IntegrationKind }) {
   const issuer = useRes(oidcRes).data;
@@ -618,6 +729,7 @@ function AddAccount({ kinds, onDone }: { kinds: IntegrationKind[]; onDone: () =>
   const [name, setName] = React.useState("");
   const [config, setConfig] = React.useState<Record<string, string>>({});
   const [secret, setSecret] = React.useState("");
+  const [signing, setSigning] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
   const active = React.useRef(false);
@@ -640,6 +752,7 @@ function AddAccount({ kinds, onDone }: { kinds: IntegrationKind[]; onDone: () =>
         name: name.trim(),
         config: c,
         ...(secret.trim() ? { secret: secret.trim() } : {}),
+        ...(kind.signing && signing.trim() ? { signing_secret: signing.trim() } : {}),
       });
       setData((data) => ({ ...data, integrations: upsert(data.integrations, added, (item) => item.id, false) }));
       invalidate("ci/integrations");
@@ -669,6 +782,7 @@ function AddAccount({ kinds, onDone }: { kinds: IntegrationKind[]; onDone: () =>
               setKindName(v);
               setConfig({});
               setSecret("");
+              setSigning("");
               setProblem(null);
             }}
           >
@@ -699,6 +813,7 @@ function AddAccount({ kinds, onDone }: { kinds: IntegrationKind[]; onDone: () =>
             />
           ))}
           {kind?.secret && <TextField label={kind.secret} type="password" placeholder="kept in kiln's secret store, never shown again" value={secret} onChange={(e) => setSecret(e.target.value)} />}
+          {kind?.signing && <TextField label={`Signing secret (optional): ${kind.signing}`} type="password" placeholder="kept in kiln's secret store, never shown again" value={signing} onChange={(e) => setSigning(e.target.value)} />}
         </div>
         {kind?.mode === "oidc" && (
           <Loadable label="kiln's issuer" fallback={<Hold height={60} />}>

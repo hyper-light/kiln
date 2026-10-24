@@ -1,5 +1,5 @@
 //! The program operations (`programs.*`), in kiln's one operation table (`crate::ops::own`): the
-//! Programs view's `/api/programs` routes, and code mode's `kiln.programs.*`, which a program's
+//! `/api/programs` routes, and code mode's `kiln.programs.*`, which a program's
 //! coordinator reads its slots and each track's turn from, and assigns its tracks' workers with.
 //! Only a person changes the slots and weights.
 

@@ -185,7 +185,7 @@ fn local_tools(spec: &Spec) -> Option<(std::path::PathBuf, &'static str, Option<
         return None;
     }
     let sock = crate::reach::local::socket()?;
-    let kiln = std::env::current_exe().ok()?;
+    let kiln = crate::os::this_kiln().ok()?;
     Some((kiln, sock, pref))
 }
 

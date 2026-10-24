@@ -381,6 +381,13 @@ impl Store {
         Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, scratch: None }) })
     }
 
+    /// Run `f` with the connection on this thread: for what's read once as the server starts,
+    /// before anything else runs (a constructor that can't wait). Only reads: a write here would
+    /// go past the cluster group.
+    pub fn now<R>(&self, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
+        f(&mut self.inner.conn.lock())
+    }
+
     /// Whether this store's writes go through the cluster group.
     pub fn grouped(&self) -> bool {
         self.inner.group.is_some()

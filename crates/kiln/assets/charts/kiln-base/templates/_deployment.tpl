@@ -30,6 +30,10 @@ spec:
         {{- end }}
       annotations:
         kubectl.kubernetes.io/default-container: app
+        {{- /* The versions of the secrets a release pins, where Argo CD deploys it: they roll pods onto new ones. */}}
+        {{- with (.Values.kiln | default dict).secrets }}
+        kiln.dev/secrets: {{ . | quote }}
+        {{- end }}
         {{- if or .Values.config.files .Values.config.env }}
         checksum/config: {{ include "kiln-base.configMaps" . | sha256sum }}
         {{- end }}

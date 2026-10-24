@@ -62,8 +62,8 @@ struct Ask {
 /// The one app `repo_id`'s repository is the source of that `environment` registers; else why not.
 async fn default_app(hub: &Hub, d: &crate::deploy::Deploy, repo_id: &str, environment: &str) -> Result<Result<String, String>, Fail> {
     let Some(repo) = hub.store.repos().await.map_err(internal)?.into_iter().find(|r| r.id == repo_id) else { return Ok(Err("which app? name it (`app:`)".into())) };
-    let registered: Vec<String> = crate::deploy::store::registrations(&d.hub.store, None, Some(environment)).await.map_err(internal)?.into_iter().map(|r| r.app).collect();
-    let mut apps: Vec<String> = crate::deploy::store::apps(&d.hub.store)
+    let registered: Vec<String> = crate::deploy::store::registrations(&*d.records, None, Some(environment)).await.map_err(internal)?.into_iter().map(|r| r.app).collect();
+    let mut apps: Vec<String> = crate::deploy::store::apps(&*d.records)
         .await
         .map_err(internal)?
         .into_iter()
@@ -105,7 +105,8 @@ async fn create(hub: &Arc<Hub>, leg: &str, repo_id: &str, req: Request) -> Resul
             Err(why) => return Ok(msg(StatusCode::BAD_REQUEST, &why)),
         },
     };
-    let who = crate::deploy::flow::Who { name: who(leg), agent: false };
+    // The job passed its environment's protection before it started: nothing checked again.
+    let who = crate::deploy::flow::Who::kiln(who(leg));
     let flow_ask = crate::deploy::flow::Ask {
         app: app.clone(),
         environment: ask.environment.clone(),
@@ -139,7 +140,7 @@ fn release_json(r: &crate::deploy::model::Release) -> Value {
 async fn get(leg: &str, id: &str) -> Result<Response, Fail> {
     let Ok(id) = id.parse::<i64>() else { return Ok(msg(StatusCode::NOT_FOUND, "no such release")) };
     let Some(d) = crate::deploy::get() else { return Ok(msg(StatusCode::SERVICE_UNAVAILABLE, "the deploy service isn't running on this server")) };
-    let found = crate::deploy::store::release(&d.hub.store, id).await.map_err(internal)?;
+    let found = crate::deploy::store::release(&*d.records, id).await.map_err(internal)?;
     match found.filter(|r| r.requested_by == who(leg)) {
         Some(r) => Ok(srv::json(StatusCode::OK, &release_json(&r))),
         None => Ok(msg(StatusCode::NOT_FOUND, "no such release of this job's")),

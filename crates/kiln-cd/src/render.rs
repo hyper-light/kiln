@@ -35,6 +35,10 @@ pub struct Tools {
     pub timeout: Duration,
     /// Helm's cache, configuration and data home (kept apart from the user's).
     pub helm_home: Option<PathBuf>,
+    /// Charts the server has itself, packaged (`<dir>/<name>-<version>.tgz`), by the repository a
+    /// chart's dependency names them from (`oci://kiln.example.com/kiln/charts`): one depended on
+    /// at an exact version is laid into the chart's `charts/`, not pulled.
+    pub local_charts: Vec<(String, PathBuf)>,
 }
 
 impl Default for Tools {
@@ -47,6 +51,7 @@ impl Default for Tools {
             plugins: BTreeMap::new(),
             timeout: Duration::from_secs(90),
             helm_home: None,
+            local_charts: Vec::new(),
         }
     }
 }
@@ -553,6 +558,7 @@ fn build_dependencies(chart: &Path, tools: &Tools, env: &[(String, String)]) -> 
                 .map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().starts_with(&format!("{name}-"))))
                 .unwrap_or(false)
     };
+    lay_local(chart, &deps, tools, &have)?;
     if deps.iter().all(|d| d.get("name").and_then(Value::as_str).is_some_and(have)) {
         return Ok(());
     }
@@ -569,6 +575,27 @@ fn build_dependencies(chart: &Path, tools: &Tools, env: &[(String, String)]) -> 
     let mut c = Command::new(&tools.helm);
     c.args(["dependency", "build", "--skip-refresh", "."]);
     exec(c, chart, env, tools.timeout).map(|_| ())
+}
+
+/// The dependencies the server has itself ([`Tools::local_charts`]), at the exact version asked
+/// for, copied into the chart's `charts/`.
+fn lay_local(chart: &Path, deps: &[Value], tools: &Tools, have: &dyn Fn(&str) -> bool) -> Result<()> {
+    // A name and a version are a file's name here: nothing that leaves the directory.
+    let plain = |s: &str| !s.is_empty() && s.len() <= 128 && !s.contains("..") && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'));
+    for d in deps {
+        let s = |k: &str| d.get(k).and_then(Value::as_str).unwrap_or_default();
+        let (name, version, repo) = (s("name"), s("version"), s("repository").trim_end_matches('/'));
+        if !plain(name) || !plain(version) || have(name) {
+            continue;
+        }
+        let Some((_, dir)) = tools.local_charts.iter().find(|(r, _)| r.trim_end_matches('/').eq_ignore_ascii_case(repo)) else { continue };
+        let file = dir.join(format!("{name}-{version}.tgz"));
+        if file.is_file() {
+            std::fs::create_dir_all(chart.join("charts"))?;
+            std::fs::copy(&file, chart.join("charts").join(format!("{name}-{version}.tgz")))?;
+        }
+    }
+    Ok(())
 }
 
 fn kustomize(req: &Request<'_>, k: &Kustomize, tools: &Tools) -> Result<Vec<Value>> {
@@ -718,6 +745,32 @@ fn plugin(req: &Request<'_>, p: &Plugin, tools: &Tools) -> Result<Vec<Value>> {
 mod tests {
     use super::*;
     use crate::apps::Directory;
+
+    #[test]
+    fn charts_the_server_has_are_laid_in_not_pulled() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (have_dir, chart) = (tmp.path().join("charts-here"), tmp.path().join("web"));
+        std::fs::create_dir_all(&have_dir)?;
+        std::fs::create_dir_all(&chart)?;
+        std::fs::write(have_dir.join("kiln-base-0.2.0.tgz"), b"chart")?;
+        std::fs::write(
+            chart.join("Chart.yaml"),
+            "apiVersion: v2\nname: web\nversion: 0.1.0\ndependencies:\n  - name: kiln-base\n    version: 0.2.0\n    repository: oci://Kiln.example.com/kiln/charts/\n",
+        )?;
+        // No helm: the dependency is the server's, so nothing is pulled.
+        let tools = Tools { helm: tmp.path().join("no-helm"), local_charts: vec![("oci://kiln.example.com/kiln/charts".into(), have_dir.clone())], ..Tools::default() };
+        build_dependencies(&chart, &tools, &[])?;
+        assert_eq!(std::fs::read(chart.join("charts/kiln-base-0.2.0.tgz"))?, b"chart");
+        // Another version, another repository, or a name that leaves the directory: not the server's.
+        for (version, repo) in [("0.3.0", "oci://kiln.example.com/kiln/charts"), ("0.2.0", "oci://other.example.com/kiln/charts"), ("../../x", "oci://kiln.example.com/kiln/charts")] {
+            let other = tmp.path().join(format!("app-{}", version.len() + repo.len()));
+            std::fs::create_dir_all(&other)?;
+            std::fs::write(other.join("Chart.yaml"), format!("apiVersion: v2\nname: app\nversion: 0.1.0\ndependencies:\n  - name: kiln-base\n    version: \"{version}\"\n    repository: {repo}\n"))?;
+            assert!(build_dependencies(&other, &tools, &[]).is_err(), "{version} from {repo}: helm is asked (and isn't here)");
+            assert!(!other.join("charts").exists());
+        }
+        Ok(())
+    }
 
     #[test]
     fn joins_stay_inside_the_repository() {

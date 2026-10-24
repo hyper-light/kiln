@@ -118,14 +118,14 @@ fn conflict(m: impl Into<String>) -> Fail {
 
 /// An environment's move, the one under way or the last.
 pub async fn get(d: &Deploy, env: &str) -> anyhow::Result<Option<Move>> {
-    Ok(match d.hub.store.kv_get(key(env)).await? {
+    Ok(match store::kv_get(&*d.records, &key(env)).await? {
         Some(text) => Some(serde_json::from_str(&text)?),
         None => None,
     })
 }
 
 async fn save(d: &Deploy, m: &Move) -> anyhow::Result<()> {
-    d.hub.store.kv_set(key(&m.environment), serde_json::to_string(m)?).await?;
+    store::kv_set(&*d.records, &key(&m.environment), &serde_json::to_string(m)?).await?;
     d.hub.emit(&json!({ "type": "deploy_move", "move": m }));
     Ok(())
 }
@@ -141,7 +141,7 @@ pub async fn start(d: &Deploy, who: &Who, env_name: &str, ask: Ask) -> Result<Mo
     if who.agent {
         return Err((StatusCode::FORBIDDEN, "a person moves an environment between providers".into()));
     }
-    let env = store::environment(&d.hub.store, env_name).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment {env_name}")))?;
+    let env = store::environment(&*d.records, env_name).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment {env_name}")))?;
     let to = ask.to.trim().to_owned();
     match to.strip_prefix("argocd/") {
         Some(name) => match crate::ci::integrations::get(&d.hub, name).await.map_err(internal)? {
@@ -176,8 +176,8 @@ pub async fn start(d: &Deploy, who: &Who, env_name: &str, ask: Ask) -> Result<Mo
             if to == env.provider {
                 return Err(bad(format!("{env_name} is on {to} already")));
             }
-            for reg in store::registrations(&d.hub.store, None, Some(env_name)).await.map_err(internal)? {
-                if let Some(r) = store::in_flight(&d.hub.store, &reg.app, env_name).await.map_err(internal)? {
+            for reg in store::registrations(&*d.records, None, Some(env_name)).await.map_err(internal)? {
+                if let Some(r) = store::in_flight(&*d.records, &reg.app, env_name).await.map_err(internal)? {
                     return Err(conflict(format!("release {} of {} is in flight in {env_name}: a move waits for it", r.id, reg.app)));
                 }
             }
@@ -214,7 +214,7 @@ pub async fn cancel(d: &Deploy, who: &Who, env_name: &str) -> Result<Move, Fail>
     if !matches!(m.phase, Phase::Compared | Phase::Failed) {
         return Err(conflict(format!("{env_name}'s move is {}: cancel it once it has compared", phase_name(m.phase))));
     }
-    let env = store::environment(&d.hub.store, env_name).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment {env_name}")))?;
+    let env = store::environment(&*d.records, env_name).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment {env_name}")))?;
     let runs = running(d, &env).await.map_err(internal)?;
     let target = target(&env, &m);
     match target.provider.strip_prefix("argocd/") {
@@ -239,7 +239,7 @@ pub async fn cancel(d: &Deploy, who: &Who, env_name: &str) -> Result<Move, Fail>
 
 /// Takes up the moves under way, after a restart.
 pub async fn resume(d: &Deploy) {
-    let Ok(moves) = d.hub.store.kv_prefix("deploy/move/".into()).await else { return };
+    let Ok(moves) = store::kv_prefix(&*d.records, "deploy/move/").await else { return };
     for (_, text) in moves {
         if let Ok(m) = serde_json::from_str::<Move>(&text)
             && matches!(m.phase, Phase::Comparing | Phase::HandingOver)
@@ -320,10 +320,10 @@ struct Runs {
 /// The registrations of an environment that run something: enabled, a release landed.
 async fn running(d: &Deploy, env: &Environment) -> anyhow::Result<Vec<Runs>> {
     let mut out = Vec::new();
-    for reg in store::registrations(&d.hub.store, None, Some(&env.name)).await? {
+    for reg in store::registrations(&*d.records, None, Some(&env.name)).await? {
         let (true, Some(id)) = (reg.enabled, reg.running) else { continue };
-        let Some(commit) = store::release(&d.hub.store, id).await?.and_then(|r| r.commit) else { continue };
-        let Some(app) = store::app(&d.hub.store, &reg.app).await? else { continue };
+        let Some(commit) = store::release(&*d.records, id).await?.and_then(|r| r.commit) else { continue };
+        let Some(app) = store::app(&*d.records, &reg.app).await? else { continue };
         let file = super::flow::release_file_at(d, &app, env, &commit).await.map_err(anyhow::Error::msg)?;
         if file.version.is_none() {
             continue;
@@ -339,7 +339,7 @@ fn target(env: &Environment, m: &Move) -> Environment {
 }
 
 async fn environment(d: &Deploy, m: &Move) -> Result<Environment, String> {
-    store::environment(&d.hub.store, &m.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", m.environment))
+    store::environment(&*d.records, &m.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", m.environment))
 }
 
 /// How long the new provider has to compare.
@@ -530,7 +530,7 @@ async fn handover(d: &Deploy, m: &mut Move) -> Result<(), String> {
         }
         env.provider = m.to.clone();
         env.argocd = m.argocd;
-        store::put_environment(&d.hub.store, &env).await.map_err(|e| format!("{e:#}"))?;
+        store::put_environment(&*d.records, &env).await.map_err(|e| format!("{e:#}"))?;
         d.wake.notify();
     }
     // Nothing was made again: each object has the uid it had.

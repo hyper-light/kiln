@@ -203,6 +203,9 @@ struct Out {
     framing: Framing,
     left: u64,
     trailers: Option<Box<http::HeaderMap>>,
+    /// The body ended: all of it, and its framing's end, is in the write buffer (it isn't asked
+    /// for more).
+    done: bool,
 }
 
 /// How far gathering a request body got.
@@ -254,6 +257,9 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static> Wire<I> {
 
     /// Gathers a request body, framed, as it comes.
     fn gather<B: SendBody + Unpin>(&mut self, cx: &mut Context<'_>, body: &mut B, out: &mut Out) -> Result<Gathered, Error> {
+        if out.done {
+            return Ok(Gathered::All);
+        }
         while self.wbuf.len() < 64 << 10 {
             match Pin::new(&mut *body).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
@@ -288,6 +294,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static> Wire<I> {
                     if out.framing == Framing::Chunked {
                         head::last_chunk(self.wbuf.tail(), out.trailers.as_deref());
                     }
+                    out.done = true;
                     return Ok(Gathered::All);
                 }
                 Poll::Pending => return Ok(Gathered::Paused),
@@ -366,7 +373,7 @@ fn start<I, B: SendBody>(wire: &mut Wire<I>, job: Job<B>) -> Step<B> {
         || (parts.headers.contains_key(http::header::UPGRADE)
             && parts.headers.get_all(http::header::CONNECTION).iter().any(|v| v.as_bytes().split(|b| *b == b',').any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade"))));
     let framing = head::encode_request(wire.wbuf.tail(), &parts.method, &parts.uri, &parts.headers, body.size_hint().exact(), false);
-    let out = Out { framing, left: if let Framing::Length(n) = framing { n } else { 0 }, trailers: None };
+    let out = Out { framing, left: if let Framing::Length(n) = framing { n } else { 0 }, trailers: None, done: false };
     Step::Sending { body, out, ask: Ask { method: parts.method, upgrading, answer: Some(answer) } }
 }
 
@@ -470,7 +477,10 @@ where
                         Poll::Ready(Err(e)) => return self.fail(e),
                         Poll::Pending => false,
                     };
-                    if gathered == Gathered::All {
+                    // Sent only once the body ended and all of it went: a last write the socket
+                    // couldn't take yet still has to go, or the server waits for it and never
+                    // answers (over a link slower than loopback, the end of a body often waits so).
+                    if gathered == Gathered::All && flushed {
                         let ask = Ask { method: ask.method.clone(), upgrading: ask.upgrading, answer: ask.answer.take() };
                         Step::Awaiting { ask, sent_all: true }
                     } else {

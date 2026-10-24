@@ -141,7 +141,14 @@ doesn't need a person for any of it:
   first part is planning it (research inside and outside, its steps written, said ready with
   `plans_ready`). Ready, the plan's steps become its parts (or it runs with an agent per step, a
   part waiting for the run), and once every one is met, so is the goal: "Met with its plan: its 4
-  steps are met."
+  steps are met." A goal the agent isn't on yet, planned by someone else (a person's **Make a
+  plan**, or another agent), is planned now rather than in its turn: the agent is told, steered
+  into what it's doing, to dispatch a subagent of its own (its Agent or Task tool; without one, an
+  agent it starts) with the plan's and its research's ids, and to go on with its own work. Its
+  planning part waits its turn saying so, and is met once the subagent says the plan is ready. A
+  goal being planned whose planning still waits its turn has **Plan it now**, which does the same;
+  one subagent a plan, and another after half an hour only. The agent planning a goal of its own
+  plans it itself.
 - **Changing one goal: `goals_update`** by its `id`, without giving the whole list: other words
   (`text`: the goal under way goes again as they say), moved (`next`, right after the goal under
   way; `before` or `after` another goal still to go: put before the goal under way, it goes next

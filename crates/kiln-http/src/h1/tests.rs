@@ -92,6 +92,39 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
+/// A socket that drains slower than it's filled, as one over a real link does (not loopback's):
+/// each write takes at most 16 KiB, and the next waits until the connection is woken again.
+struct Choppy {
+    io: TcpIo,
+    wait: bool,
+}
+
+impl futures::AsyncRead for Choppy {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut [u8]) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl futures::AsyncWrite for Choppy {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        if std::mem::replace(&mut self.wait, false) {
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        let wrote = std::pin::Pin::new(&mut self.io).poll_write(cx, buf.get(..buf.len().min(16 << 10)).unwrap_or_default());
+        self.wait = matches!(wrote, std::task::Poll::Ready(Ok(_)));
+        wrote
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_close(cx)
+    }
+}
+
 #[test]
 fn requests_on_one_connection_are_answered_in_order_pipelined_or_not() -> Result<(), String> {
     block_on(async {
@@ -273,5 +306,39 @@ fn the_client_sends_receives_and_keeps_its_connection() -> Result<(), String> {
         assert_eq!(&buf, b"ping");
         assert!(send.is_closed());
         Ok(())
+    })?
+}
+
+/// A request body whose end the socket can't take at once still goes, all of it: the client writes
+/// the rest before it waits for the answer. It used to wait for the answer as soon as the body had
+/// ended, so the server waited for the rest and the client for the answer, until it gave up: a
+/// runner's uploads over Wi-Fi stalled within 64 KiB of the end of every piece, so often that a Mac's
+/// release builds ran out of time.
+#[test]
+fn a_body_whose_end_waits_for_the_socket_still_goes_whole() -> Result<(), String> {
+    block_on(async {
+        let addr = serve(crate::server::http1::Builder::new())?;
+        let io = Choppy { io: connect(addr).await?, wait: false };
+        let (mut send, conn) = crate::client::http1::handshake::<_, Boxed>(io).await.map_err(|e| e.to_string())?;
+        spawn(async move {
+            let _ = conn.await;
+        });
+        let body = Bytes::from((0..1u32 << 20).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        let req = Request::post("http://t/echo").header("host", "t").body(full(body.clone())).map_err(|e| e.to_string())?;
+        let answered = async {
+            let resp = send.send_request(req).await.map_err(|e| e.to_string())?;
+            resp.into_body().collect().await.map(|b| b.to_bytes()).map_err(|e| e.to_string())
+        };
+        let late = hyper_rt::futures::sleep(10_000_000_000);
+        futures::pin_mut!(answered, late);
+        match futures::future::select(answered, late).await {
+            futures::future::Either::Left((got, _)) => {
+                let got = got?;
+                assert_eq!(got.len(), body.len(), "the whole body came back");
+                assert!(got == body, "byte for byte");
+                Ok(())
+            }
+            futures::future::Either::Right(_) => Err("no answer in 10 s: the end of the body never went".to_owned()),
+        }
     })?
 }

@@ -172,6 +172,10 @@ fn client() -> Result<&'static Client> {
 pub fn endpoint(service: &str, region: &str) -> String {
     super::endpoint(&format!("aws:{service}"), || {
         let domain = if region.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
+        // CloudFront is global: one endpoint, its requests signed for us-east-1.
+        if service == "cloudfront" {
+            return format!("https://cloudfront.{domain}");
+        }
         format!("https://{service}.{region}.{domain}")
     })
 }
@@ -444,6 +448,105 @@ pub fn unescape(s: &str) -> String {
     out
 }
 
+/// A Query-protocol answer as JSON, in the shape AWS documents it: each element its name's
+/// field, a list's members (`<member>`, EC2's `<item>`) an array, an element of text its text
+/// (unescaped), an empty one `""`. Attributes, the declaration and comments are let go; an element
+/// named twice among its siblings is an array of them.
+pub fn xml_json(xml: &str) -> Value {
+    let mut rest = xml;
+    let mut root = Node::default();
+    parse_children(&mut rest, &mut root);
+    node_value(&root)
+}
+
+#[derive(Default)]
+struct Node {
+    name: String,
+    text: String,
+    children: Vec<Node>,
+}
+
+/// Reads elements into `parent` until its end tag (or the input's end).
+fn parse_children(rest: &mut &str, parent: &mut Node) {
+    loop {
+        let Some(lt) = rest.find('<') else {
+            parent.text.push_str(rest);
+            *rest = "";
+            return;
+        };
+        parent.text.push_str(rest.get(..lt).unwrap_or_default());
+        let tag = rest.get(lt..).unwrap_or_default();
+        // A declaration, a comment, CDATA: what's in CDATA is text.
+        if let Some(after) = tag.strip_prefix("<![CDATA[") {
+            let end = after.find("]]>").unwrap_or(after.len());
+            parent.text.push_str(&escape_text(after.get(..end).unwrap_or_default()));
+            *rest = after.get(end + 3..).unwrap_or_default();
+            continue;
+        }
+        if tag.starts_with("<?") || tag.starts_with("<!") {
+            let close = if tag.starts_with("<!--") { "-->" } else { ">" };
+            *rest = tag.find(close).and_then(|e| tag.get(e + close.len()..)).unwrap_or_default();
+            continue;
+        }
+        let Some(gt) = tag.find('>') else {
+            *rest = "";
+            return;
+        };
+        let inner = tag.get(1..gt).unwrap_or_default();
+        *rest = tag.get(gt + 1..).unwrap_or_default();
+        if inner.starts_with('/') {
+            return;
+        }
+        let selfclosing = inner.ends_with('/');
+        let name = inner.trim_end_matches('/').split_whitespace().next().unwrap_or_default().to_owned();
+        let mut node = Node { name, ..Node::default() };
+        if !selfclosing {
+            parse_children(rest, &mut node);
+        }
+        parent.children.push(node);
+    }
+}
+
+/// Text back as XML has it, for [`unescape`] to read once.
+fn escape_text(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;")
+}
+
+fn node_value(n: &Node) -> Value {
+    if n.children.is_empty() {
+        return Value::String(unescape(n.text.trim()));
+    }
+    if n.children.iter().all(|c| c.name == "member" || c.name == "item") {
+        return Value::Array(n.children.iter().map(node_value).collect());
+    }
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for c in &n.children {
+        *seen.entry(c.name.as_str()).or_default() += 1;
+    }
+    let mut m = serde_json::Map::new();
+    for c in &n.children {
+        let v = node_value(c);
+        if seen.get(c.name.as_str()).copied().unwrap_or(0) > 1 {
+            if let Value::Array(a) = m.entry(c.name.clone()).or_insert_with(|| Value::Array(Vec::new())) {
+                a.push(v);
+            }
+        } else {
+            m.insert(c.name.clone(), v);
+        }
+    }
+    Value::Object(m)
+}
+
+/// The params of a Query-protocol request for a list: `Name.member.1=a&Name.member.2=b`.
+pub fn list_params(name: &str, items: &[String]) -> Vec<(String, String)> {
+    items.iter().enumerate().map(|(i, v)| (format!("{name}.member.{}", i + 1), v.clone())).collect()
+}
+
+/// The params for a list of key-value pairs: `Tags.member.1.Key=team&Tags.member.1.Value=shop`.
+pub fn pairs_params(name: &str, key: &str, value: &str, pairs: &[(String, String)]) -> Vec<(String, String)> {
+    pairs.iter().enumerate().flat_map(|(i, (k, v))| [(format!("{name}.member.{}.{key}", i + 1), k.clone()), (format!("{name}.member.{}.{value}", i + 1), v.clone())]).collect()
+}
+
 // ------------------------------------------------------------------ STS
 
 /// Exchanges a web identity token for a role's credentials. Not signed: the token is the
@@ -533,6 +636,24 @@ pub fn advice(e: &anyhow::Error) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_answers_read_as_json() {
+        let xml = r#"<?xml version="1.0"?><DescribeStacksResponse xmlns="http://cloudformation.amazonaws.com/doc/2010-05-15/"><DescribeStacksResult><Stacks><member><StackName>net</StackName><Parameters><member><ParameterKey>Env</ParameterKey><ParameterValue>a &amp; b</ParameterValue></member></Parameters><Tags/><Description><![CDATA[<x> & y]]></Description></member></Stacks></DescribeStacksResult><!-- a note --><ResponseMetadata><RequestId>r1</RequestId></ResponseMetadata></DescribeStacksResponse>"#;
+        let v = xml_json(xml);
+        let stack = v.pointer("/DescribeStacksResponse/DescribeStacksResult/Stacks/0").cloned().unwrap_or_default();
+        assert_eq!(stack.get("StackName"), Some(&Value::String("net".into())));
+        assert_eq!(stack.pointer("/Parameters/0/ParameterValue"), Some(&Value::String("a & b".into())));
+        assert_eq!(stack.get("Tags"), Some(&Value::String(String::new())), "an empty list reads as empty");
+        assert_eq!(stack.get("Description"), Some(&Value::String("<x> & y".into())));
+        assert_eq!(v.pointer("/DescribeStacksResponse/ResponseMetadata/RequestId"), Some(&Value::String("r1".into())));
+        let ec2 = xml_json("<R><launchTemplateVersionSet><item><versionNumber>3</versionNumber></item><item><versionNumber>2</versionNumber></item></launchTemplateVersionSet></R>");
+        assert_eq!(ec2.pointer("/R/launchTemplateVersionSet/1/versionNumber"), Some(&Value::String("2".into())));
+        let repeated = xml_json("<R><a>1</a><a>2</a><a>3</a><b>x</b></R>");
+        assert_eq!(repeated.pointer("/R/a"), Some(&serde_json::json!(["1", "2", "3"])));
+        assert_eq!(list_params("Capabilities", &["CAPABILITY_IAM".into()]), [("Capabilities.member.1".to_owned(), "CAPABILITY_IAM".to_owned())]);
+        assert_eq!(pairs_params("Tags", "Key", "Value", &[("team".into(), "shop".into())]).len(), 2);
+    }
 
     /// AWS's own example of deriving a signing key (date 20120215, us-east-1, iam).
     #[test]

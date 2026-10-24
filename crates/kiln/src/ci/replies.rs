@@ -19,14 +19,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use http::StatusCode;
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use super::Fail;
 use super::integrations::{self, Integration};
-use crate::http::server::{self as srv, Request, Response};
+use crate::http::server::{Request, Response};
 use crate::hub::Hub;
 
 /// How long a reply address takes replies.
@@ -321,7 +320,7 @@ pub async fn chat_posted(hub: &Hub, integration: &str, channel: &str, ts: &str, 
 }
 
 /// The key in a Slack integration's events address.
-fn events_key(hub: &Hub, id: &str) -> anyhow::Result<String> {
+pub(crate) fn events_key(hub: &Hub, id: &str) -> anyhow::Result<String> {
     super::secrets::derived(hub, &format!("kiln ci slack events v1\n{id}"))
 }
 
@@ -337,7 +336,7 @@ pub(crate) fn slack_api(i: &Integration) -> String {
 }
 
 /// A Slack user's email, by their id, through the bot's `users.info`.
-async fn slack_email(i: &Integration, token: &str, user: &str) -> Result<String, String> {
+pub(crate) async fn slack_email(i: &Integration, token: &str, user: &str) -> Result<String, String> {
     let base = integrations::endpoint("slack:users", || slack_api(i));
     let http = crate::http::client::Client::public().map_err(|e| format!("{e:#}"))?;
     let r = http.get(&format!("{base}/users.info?user={}", crate::ci::cli::enc(user))).bearer(token).send().await.map_err(|e| format!("{e:#}"))?;
@@ -348,8 +347,8 @@ async fn slack_email(i: &Integration, token: &str, user: &str) -> Result<String,
     v.pointer("/user/profile/email").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| "Slack doesn't say their email (the bot needs `users:read.email`)".to_owned())
 }
 
-/// A reply in a Slack thread kiln started: posted as its person.
-async fn slack_reply(hub: &Arc<Hub>, i: &Integration, event: &Value) -> Result<(), String> {
+/// A reply in a Slack thread kiln started: posted as its person, the one here with their email.
+pub(crate) async fn slack_reply(hub: &Arc<Hub>, i: &Integration, event: &Value) -> Result<(), String> {
     let get = |k: &str| event.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
     let (channel, parent, user, text) = (get("channel"), get("thread_ts"), get("user"), get("text"));
     let (id, ch, ts) = (i.id.clone(), channel.clone(), parent.clone());
@@ -361,7 +360,7 @@ async fn slack_reply(hub: &Arc<Hub>, i: &Integration, event: &Value) -> Result<(
     let thread = thread.ok_or("it's in a thread kiln didn't start")?;
     let token = integrations::token(hub, i).await.map_err(|e| format!("{e:#}"))?.filter(|t| t.starts_with("xox")).ok_or("the integration has no bot token")?;
     let address = slack_email(i, &token, &user).await?;
-    let person = user_by_address(hub, &address).await.ok_or_else(|| format!("nobody here has the address {address}"))?;
+    let person = super::chat::user_by_email(hub, &address).await?;
     let text = text.trim();
     if text.is_empty() {
         return Err("it says nothing".into());
@@ -371,42 +370,11 @@ async fn slack_reply(hub: &Arc<Hub>, i: &Integration, event: &Value) -> Result<(
     Ok(())
 }
 
-/// `POST /api/ci/replies/slack/:integration/:key`: Slack's Events API. Its address is the
-/// integration's own (`key`, from the server's master key); the challenge is answered, and each
-/// message in a thread kiln started is taken after the answer, as Slack wants one within 3 s.
+/// `POST /api/ci/replies/slack/:integration/:key`: Slack's Events API, at the integration's own
+/// address (`key`, from the server's master key), which takes its commands and buttons too
+/// (`crate::ci::chat::slack`).
 pub async fn slack_events(hub: &Arc<Hub>, id: &str, key: &str, req: Request) -> Result<Response, Fail> {
-    let want = events_key(hub, id).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    if !crate::util::ct_eq(want.as_bytes(), key.as_bytes()) {
-        return Err((StatusCode::NOT_FOUND, "not found".into()));
-    }
-    let i = integrations::list(hub)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
-        .into_iter()
-        .find(|i| i.id == id && i.kind == "slack")
-        .ok_or((StatusCode::NOT_FOUND, "not found".into()))?;
-    let body = srv::body_bytes(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let v: Value = serde_json::from_slice(&body).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
-    match v.get("type").and_then(Value::as_str) {
-        Some("url_verification") => Ok(srv::json(StatusCode::OK, &json!({ "challenge": v.get("challenge").cloned().unwrap_or(Value::Null) }))),
-        Some("event_callback") => {
-            let event = v.get("event").cloned().unwrap_or(Value::Null);
-            let reply = event.get("type").and_then(Value::as_str) == Some("message")
-                && event.get("thread_ts").and_then(Value::as_str).is_some_and(|t| event.get("ts").and_then(Value::as_str) != Some(t))
-                && event.get("bot_id").is_none()
-                && event.get("subtype").is_none();
-            if reply {
-                let hub = Arc::clone(hub);
-                crate::rt::spawn(async move {
-                    if let Err(why) = slack_reply(&hub, &i, &event).await {
-                        tracing::info!(integration = %i.name, why, "a Slack thread's reply was left");
-                    }
-                });
-            }
-            Ok(srv::status(StatusCode::OK))
-        }
-        _ => Ok(srv::status(StatusCode::OK)),
-    }
+    super::chat::inbound(hub, "slack", id, key, req).await
 }
 
 #[cfg(test)]

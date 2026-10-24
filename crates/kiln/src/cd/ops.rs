@@ -889,7 +889,12 @@ pub(super) fn display(mut v: Value) -> Value {
 
 /// Masks a Secret's values on both sides of a diff alike: equal values get equal masks and
 /// different ones different masks, so a changed value still shows as changed and no value shows.
+/// On a platform's object, what one side holds where the other holds a secret's reference
+/// (docs/deploy-api.md §3.5) is masked: a variable kiln takes over doesn't show.
 pub(super) fn mask_secrets(before: &mut Option<Value>, after: &mut Option<Value>) {
+    if let (Some(b), Some(a)) = (before.as_mut(), after.as_mut()) {
+        mask_refs(b, a);
+    }
     let secret = |v: &Value| obj::kind(v) == "Secret" && obj::group(v).is_empty();
     if !before.as_ref().or(after.as_ref()).is_some_and(secret) {
         return;
@@ -906,6 +911,30 @@ pub(super) fn mask_secrets(before: &mut Option<Value>, after: &mut Option<Value>
                 *val = Value::String("+".repeat(8 + n));
             }
         }
+    }
+}
+
+/// Masks each string of one side the other holds a secret's reference in place of.
+fn mask_refs(a: &mut Value, b: &mut Value) {
+    let is_ref = |s: &str| s.starts_with(kiln_cd::apps::SECRET_REF);
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            for (k, v) in x.iter_mut() {
+                if let Some(w) = y.get_mut(k) {
+                    mask_refs(v, w);
+                }
+            }
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            for (v, w) in x.iter_mut().zip(y.iter_mut()) {
+                mask_refs(v, w);
+            }
+        }
+        (Value::String(s), Value::String(t)) if is_ref(s) != is_ref(t) => {
+            let plain = if is_ref(s) { t } else { s };
+            *plain = "+".repeat(8);
+        }
+        _ => {}
     }
 }
 
@@ -1409,4 +1438,19 @@ async fn remove_repo(cx: Cx, v: Value) -> Out {
     propose(&cx.cd, Command::DeleteRepo(url.clone())).await?;
     audit(&cx, "cd.repo.delete", url.clone()).await;
     Ok(json!({"removed": url}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_value_a_secrets_reference_takes_the_place_of_never_shows() {
+        let function = |key: &str| json!({ "apiVersion": "lambda.aws.kiln.dev/v1", "kind": "Function", "metadata": { "name": "thumbs" }, "spec": { "Environment": { "Variables": { "API_KEY": key, "MODE": "prod" } } } });
+        let (mut before, mut after) = (Some(function("handmade")), Some(function("kiln-secret:app/thumbs/production/API_KEY@1")));
+        mask_secrets(&mut before, &mut after);
+        let at = |v: &Option<Value>, k: &str| v.as_ref().and_then(|o| o.pointer(&format!("/spec/Environment/Variables/{k}"))).cloned();
+        assert_eq!((at(&before, "API_KEY"), at(&before, "MODE")), (Some(json!("++++++++")), Some(json!("prod"))));
+        assert_eq!(at(&after, "API_KEY"), Some(json!("kiln-secret:app/thumbs/production/API_KEY@1")));
+    }
 }

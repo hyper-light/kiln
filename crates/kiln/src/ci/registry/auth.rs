@@ -9,7 +9,8 @@
 //!   A job's token pulls where `packages: read` (or `actions: read`) lets it, and pushes where
 //!   `packages: write` does, in its own repository's names.
 //! - **Anonymous pull** is opt-in, per namespace (`[ci.registry] anonymous_pull`), or per mirror
-//!   (`anonymous`: Docker's `registry-mirrors` pull without signing in).
+//!   (`anonymous`: Docker's `registry-mirrors` pull without signing in). What kiln publishes
+//!   itself ([`KILNS_OWN`]: its base chart) anyone pulls, and nobody pushes.
 //! - **A mirror** (W12-R02) is pulled from by anyone signed in, and pushed to by no one.
 
 use base64::Engine as _;
@@ -120,8 +121,15 @@ pub fn anonymous(hub: &Hub, name: &str) -> bool {
     })
 }
 
+/// Repositories kiln publishes itself (its base chart, docs/deploy-api.md §3.4): anyone pulls
+/// them, nobody pushes, tags or deletes there through the API (every app's chart depends on them).
+pub const KILNS_OWN: &[&str] = &["kiln/charts/kiln-base"];
+
 /// What `caller` (none: anonymous) may do with `name`, of `wanted`.
 pub fn may(hub: &Hub, caller: Option<&Caller>, name: &str, wanted: &[Action]) -> Vec<Action> {
+    if KILNS_OWN.contains(&name) {
+        return wanted.iter().copied().filter(|a| *a == Action::Pull).collect();
+    }
     wanted
         .iter()
         .copied()

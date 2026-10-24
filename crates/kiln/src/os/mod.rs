@@ -97,6 +97,19 @@ pub fn have(name: &str) -> bool {
     which(name).is_some()
 }
 
+/// This kiln's binary, as a path another process can start. On Linux, once an upgrade has put a new
+/// binary in its place (and until this process takes it up, once its jobs are done), the path
+/// reads `<path> (deleted)`: the kiln at `<path>` is the one to start.
+pub fn this_kiln() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(replaced(&exe).unwrap_or(exe))
+}
+
+/// The binary now at a running binary's path that was replaced (`<path> (deleted)`).
+fn replaced(exe: &Path) -> Option<PathBuf> {
+    exe.to_str()?.strip_suffix(" (deleted)").map(PathBuf::from).filter(|p| p.is_file())
+}
+
 /// Where [`add_to_user_path`] put a folder on the user's PATH.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathAdded {
@@ -299,6 +312,57 @@ mod tests {
         assert_eq!(program_stem("/usr/bin/bash"), "bash");
         assert_eq!(program_stem(r"C:\Program Files\PowerShell\7\pwsh.exe"), "pwsh");
         assert_eq!(program_stem("CMD.EXE"), "cmd");
+    }
+
+    #[test]
+    fn a_replaced_binary_s_path_names_the_new_one() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let kiln = dir.path().join("kiln");
+        std::fs::write(&kiln, b"new")?;
+        let gone = |p: &Path| PathBuf::from(format!("{} (deleted)", p.display()));
+        assert_eq!(replaced(&gone(&kiln)), Some(kiln.clone()));
+        assert_eq!(replaced(&kiln), None, "not replaced");
+        assert_eq!(replaced(&gone(&dir.path().join("uninstalled"))), None, "nothing in its place");
+        assert!(this_kiln()?.is_file());
+        Ok(())
+    }
+
+    /// As an upgrade does it: a running binary's path given a new file, the process names the new
+    /// one (its own `/proc/self/exe` reads `<path> (deleted)`). The running binary is this test's,
+    /// linked into a folder of its own (a copy would be gigabytes).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_running_binary_replaced_on_disk_names_the_one_in_its_place() -> anyhow::Result<()> {
+        const GO: &str = "KILN_TEST_REPLACED_GO";
+        // The run in the replaced binary: once told, what it names.
+        if let Some(go) = std::env::var_os(GO) {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !Path::new(&go).exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            println!("exe={}", std::env::current_exe()?.display());
+            println!("this_kiln={}", this_kiln()?.display());
+            return Ok(());
+        }
+        let me = std::env::current_exe()?;
+        let dir = tempfile::tempdir_in(me.parent().unwrap_or(Path::new(".")))?;
+        let bin = dir.path().join("kiln");
+        std::fs::hard_link(&me, &bin)?;
+        let go = dir.path().join("go");
+        let child = std::process::Command::new(&bin)
+            .args(["--exact", "os::tests::a_running_binary_replaced_on_disk_names_the_one_in_its_place", "--nocapture", "--test-threads=1"])
+            .env(GO, &go)
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let new = dir.path().join("kiln.new");
+        std::fs::write(&new, b"the next kiln")?;
+        std::fs::rename(&new, &bin)?;
+        std::fs::write(&go, b"")?;
+        let said = String::from_utf8_lossy(&child.wait_with_output()?.stdout).into_owned();
+        println!("{said}");
+        assert!(said.contains(&format!("exe={} (deleted)\n", bin.display())), "the replaced binary's own path: {said}");
+        assert!(said.contains(&format!("this_kiln={}\n", bin.display())), "{said}");
+        Ok(())
     }
 
     #[test]

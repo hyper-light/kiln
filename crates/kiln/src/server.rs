@@ -175,6 +175,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             crate::ci::experiments::interrupted(&h).await;
         });
         child!("registry-collect", h => crate::ci::registry::collect_loop(h));
+        // kiln's base chart in its own registry, for apps' charts to depend on (docs/deploy-api.md §3.4).
+        child!("kiln-base", h => crate::deploy::init::publish_base(h));
         if cfg.cd.enabled {
             child!("cd", h => crate::cd::run(h));
             child!("deploy", h => crate::deploy::run(h));

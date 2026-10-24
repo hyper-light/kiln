@@ -3,7 +3,7 @@
  * its plan, subagents and the commands it ran; and what it works with — MCP servers, skills, usage.
  */
 import * as React from "react";
-import { Bot, ChevronRight, Square } from "lucide-react";
+import { Bot, Square } from "lucide-react";
 import { useSession, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
 import { changesetOf, duration, editsOf, money, relPath, runsOf, taskDot, taskLive, tokens, useSameList, type FileChange, type ToolEvent } from "./derive";
@@ -21,6 +21,7 @@ import { Goals } from "./goals";
 import { LivePages } from "./live-pages";
 import { Loadable } from "@/components/ui/loading";
 import { ChangeBar } from "./change-bar";
+import { Fold, FoldOpen } from "./fold";
 import { WorkspaceBar } from "./workspace-bar";
 import { SubagentOutput } from "./task-output";
 
@@ -29,23 +30,14 @@ const NO_EVENTS: HEvent[] = [];
 /** Three places beside the conversation: what it changed, its plan (and goals, and saved plans to run), and its tools (what it has running, subagents, commands it ran, MCP, skills, usage). */
 export type InspectorTab = "changes" | "plan" | "tools";
 
-const ToolSectionOpen = React.createContext(true);
 
 /** Large tool inventories start folded; hiding them keeps searches and unfinished forms intact. */
-function ToolSection({ title, count, children }: { title: string; count?: number; children: React.ReactNode }) {
-  const [open, setOpen] = React.useState(false);
-  const bodyId = React.useId();
+/** A section that folds, closed until opened (what's in it is long, or read only once it's open). */
+function ToolSection({ id, title, count, children }: { id: string; title: string; count?: number; children: React.ReactNode }) {
   return (
-    <section className="in-fold" data-open={open || undefined}>
-      <h3 className="in-sec-head">
-        <button type="button" className="in-sec-toggle" aria-expanded={open} aria-controls={bodyId} onClick={() => setOpen(!open)}>
-          <ChevronRight size={12} className={cn("hx-chev", open && "rotate-90")} aria-hidden="true" />
-          {title}
-          {count !== undefined && <span className="in-sec-count">{count}</span>}
-        </button>
-      </h3>
-      <div id={bodyId} hidden={!open}><ToolSectionOpen.Provider value={open}>{children}</ToolSectionOpen.Provider></div>
-    </section>
+    <Fold id={id} title={title} count={count} defaultOpen={false}>
+      {children}
+    </Fold>
   );
 }
 
@@ -175,7 +167,7 @@ const Runs = React.memo(function Runs({ runs: ran }: { runs: ToolEvent[] }) {
 function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number; canStop: boolean; store: SessionStore; onOpen?: (toolId: string) => void }) {
   const live = taskLive(t);
   const [outputOpen, setOutputOpen] = React.useState(false);
-  const sectionOpen = React.useContext(ToolSectionOpen);
+  const sectionOpen = React.useContext(FoldOpen);
   const outputId = React.useId();
   return (
     <li className="hx-task" style={{ paddingLeft: depth * 14 }}>
@@ -369,7 +361,7 @@ export function Inspector({
         {tab === "plan" && (
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
-              <section>
+              <Fold id="plan" title="Plan">
                 {/* Its to-do list, drawn as a plan's steps are: how far it's come. */}
                 {todos.length > 0 && (
                   <div className="hx-stack">
@@ -391,7 +383,7 @@ export function Inspector({
                   )
                 )}
                 {todos.length === 0 && !proposed && <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>}
-              </section>
+              </Fold>
               {/* What it found out, graded by kiln (research.tsx): the newest in full. */}
               {agentId && (
                 <Loadable label="its research" fallback={null}>
@@ -399,10 +391,9 @@ export function Inspector({
                 </Loadable>
               )}
               {agentId && (
-                <section>
-                  <h3 className="in-sec-head">Your plans</h3>
+                <Fold id="your-plans" title="Your plans">
                   <PlansHere session={agentId} />
-                </section>
+                </Fold>
               )}
               {agentId && <Goals agent={agentId} harness={harness} working={working} />}
             </PlanSourceContext.Provider>
@@ -414,31 +405,28 @@ export function Inspector({
                 every command it ran, last, since that list only grows. */}
             {agentId && send && <Background state={state} agent={agentId} send={send} />}
             {agentId && (
-              <section>
-                <h3 className="in-sec-head">Live pages</h3>
+              <Fold id="live-pages" title="Live pages">
                 <LivePages session={agentId} />
-              </section>
+              </Fold>
             )}
             {tasks.length > 0 && (
-              <ToolSection title="Subagents" count={tasks.length}>
+              <ToolSection id="subagents" title="Subagents" count={tasks.length}>
                 <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} />
               </ToolSection>
             )}
-            <ToolSection title="MCP servers" count={state?.mcp?.length}>
+            <ToolSection id="mcp" title="MCP servers" count={state?.mcp?.length}>
               <McpPanel state={state} store={store} />
             </ToolSection>
-            <ToolSection title="Skills" count={state?.skills?.length}>
+            <ToolSection id="skills" title="Skills" count={state?.skills?.length}>
               <SkillsPanel state={state} store={store} />
             </ToolSection>
-            <section>
-              <h3 className="in-sec-head">Usage and status</h3>
+            <Fold id="usage" title="Usage and status">
               <Status state={state} />
-            </section>
+            </Fold>
             {runs.length > 0 && (
-              <section>
-                <h3 className="in-sec-head">Commands it ran<span>{runs.length}</span></h3>
+              <Fold id="commands" title="Commands it ran" count={runs.length}>
                 <Runs runs={runs} />
-              </section>
+              </Fold>
             )}
           </div>
         )}

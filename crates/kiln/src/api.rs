@@ -411,7 +411,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
     }
     let mut req = req;
     req.extensions_mut().insert(caller.clone());
-    if matches!(s.get(1), Some(&("users" | "grants" | "roles" | "tokens"))) {
+    if matches!(s.get(1), Some(&("users" | "groups" | "grants" | "roles" | "tokens"))) {
         return match boxed(|| crate::authz::api::route(&hub, &caller, &method, &s, &q, req)).await {
             Some(r) => r.map_err(|(c, m)| err(c, m)),
             None => Err(err(StatusCode::NOT_FOUND, "not found")),
@@ -462,6 +462,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::PUT, ["api", "me", "notifications"]) => {
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), 1 << 20)).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             boxed(|| crate::ci::notify::mine(&hub, &caller, Some(body))).await.map_err(|(s, m)| ApiError(s, m))
+        }
+        // docs/deploy-api.md §12.3: one's own chat accounts.
+        (_, ["api", "me", "chat", rest @ ..]) => {
+            let rest: Vec<&str> = rest.to_vec();
+            boxed(|| crate::ci::chat::mine(&hub, &caller, &method, &rest)).await.map_err(|(s, m)| ApiError(s, m))
         }
         // W10: one's own passkeys and password.
         (&Method::GET, ["api", "me", "passkeys"]) => boxed(|| crate::authz::passkeys::list(&hub, &caller)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m)),
@@ -2131,6 +2136,12 @@ fn logout() -> Response {
 
 async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
     let caller = caller_of(hub, headers).await;
+    // The groups the person is in (kiln's, and their identity providers'): the owner teams they may
+    // name for an app (docs/deploy-api.md §3.1).
+    let groups = match caller.as_ref().and_then(|c| c.user.clone()) {
+        Some(u) => crate::authz::groups::of_user(hub, &u).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
     // What discovery announces anyway (when it does), so a probe can tell which instance answers.
     let d = &hub.discovery;
     let announced = d.announcing().then(|| {
@@ -2149,6 +2160,7 @@ async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
             "principal": caller.as_ref().map(|c| c.name.clone()),
             "kind": caller.as_ref().map(|c| c.kind),
             "grants": caller.as_ref().and_then(crate::authz::Caller::grants),
+            "groups": groups,
             // What it may do (W10-R02), for pages that show only what one can use: each
             // capability held on the whole server, or only somewhere (a repository, …).
             "can": caller.as_ref().map(|c| {
@@ -2588,12 +2600,35 @@ async fn put_artifacts(hub: &Hub, id: &str, req: Request) -> R {
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
+/// How long a piece of a job's artifacts may go without a byte before what came of it is kept and
+/// answered for: longer than any pause of an upload still going, well inside the 120 s a runner
+/// gives a piece. A runner's HTTP client could stop up to 64 KiB short of a piece's end and wait
+/// for an answer (fixed in kiln-http's client); answered, it goes on from where the pieces end.
+const PIECE_STALL: Duration = Duration::from_secs(15);
+
 /// One piece of a job's artifacts, at byte `at`: taken only where the pieces so far end (the first
 /// starts them afresh), so a piece that broke off costs only itself. One elsewhere is refused with
-/// where they end (`409 {"have": n}`), for the upload to go on from there.
+/// where they end (`409 {"have": n}`), for the upload to go on from there. What came of a piece
+/// that stalls or breaks off is kept too, and answered for at once, so the runner sends only the
+/// rest, and nothing of it is held while a connection waits.
 async fn put_artifacts_piece(hub: &Hub, id: &str, at: u64, req: Request) -> R {
     let part = artifact_path(hub, id).with_extension("part");
-    let piece = srv::body_bytes(req.into_body(), ARTIFACT_PIECE).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("the piece broke off: {e:#}")))?;
+    let mut body = req.into_body();
+    let mut came = bytes::BytesMut::new();
+    let whole = loop {
+        match crate::rt::timeout(PIECE_STALL, srv::next_chunk(&mut body)).await {
+            Ok(Ok(Some(chunk))) => {
+                if came.len().saturating_add(chunk.len()) > ARTIFACT_PIECE {
+                    return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("a piece is at most {ARTIFACT_PIECE} bytes")));
+                }
+                came.extend_from_slice(&chunk);
+            }
+            Ok(Ok(None)) => break true,
+            Ok(Err(_)) | Err(_) => break false,
+        }
+    };
+    drop(body);
+    let piece = came.freeze();
     let had = crate::rt::blocking(move || -> anyhow::Result<Result<u64, u64>> {
         if let Some(dir) = part.parent() {
             std::fs::create_dir_all(dir)?;
@@ -2612,10 +2647,13 @@ async fn put_artifacts_piece(hub: &Hub, id: &str, at: u64, req: Request) -> R {
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    Ok(match had {
+    let answer = match had {
         Ok(have) => srv::json(StatusCode::OK, &serde_json::json!({"have": have})),
         Err(have) => srv::json(StatusCode::CONFLICT, &serde_json::json!({"have": have})),
-    })
+    };
+    // The rest of a piece that didn't all come is left unread: the connection ends with the answer,
+    // and the runner doesn't send its next piece on it.
+    Ok(if whole { answer } else { srv::with_header(answer, header::CONNECTION, "close") })
 }
 
 /// `GET /api/jobs/:id/artifacts/upload`: how much of an upload in pieces has come (`{"have": n}`;
@@ -4094,7 +4132,7 @@ async fn harness_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     Ok(srv::json(StatusCode::CREATED, &b))
 }
 
-/// One of the Programs view's changes (`programs.set`, `programs.assign`): the request's JSON
+/// One of a program's changes (`programs.set`, `programs.assign`): the request's JSON
 /// object with `base` (the program, and the track) on it.
 async fn programs_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, base: serde_json::Value, req: Request) -> R {
     let mut b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;

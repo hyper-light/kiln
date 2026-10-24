@@ -7,9 +7,11 @@
 //!   and workflow), `run.succeeded`, `run.cancelled`, `approval.waiting`; and an agent's
 //!   (docs/agentic.md N2): `agent.needs_you`, `agent.finished`, `agent.stopped`, `agent.paused`,
 //!   which only the server's rules take (an agent is no repository's), `where` reading `agent`;
-//!   and a release's (docs/deploy-api.md §12.3): `release.waiting_approval`, `release.succeeded`,
-//!   `release.failed`, `release.cancelled`, which the server's rules take (`where` reading
-//!   `release`) and which go to the app's own channels too (its `contacts.channels`); for people,
+//!   and a release's (docs/deploy-api.md §12.3): `release.started`, `release.waiting_approval`,
+//!   `release.succeeded`, `release.failed`, `release.cancelled`, which the server's rules take
+//!   (`where` reading `release`) and which go to the app's own channels too (its
+//!   `contacts.channels`): where a channel can change a message afterwards, as one message a
+//!   release has there, edited as it moves (`crate::ci::chat`); for people,
 //!   about a diff or change request: `review.requested`, `comment.reply`, `mention`; and
 //!   `quota.near` (a repository's cache past 90 % of its quota) and `secret.unused` (no run read
 //!   it in 90 days); `diff.landed` (a diff on its trunk) and `test.quarantined` (a test the
@@ -56,6 +58,7 @@ pub const EVENTS: &[&str] = &[
     "agent.finished",
     "agent.stopped",
     "agent.paused",
+    "release.started",
     "release.waiting_approval",
     "release.succeeded",
     "release.failed",
@@ -72,7 +75,7 @@ pub const EVENTS: &[&str] = &[
 pub const AGENT_EVENTS: &[&str] = &["agent.needs_you", "agent.finished", "agent.stopped", "agent.paused"];
 /// The events about a release deployed by API (`crate::deploy`): the server's rules take them, a
 /// repository's can't, and each goes to the app's own channels as well.
-pub const RELEASE_EVENTS: &[&str] = &["release.waiting_approval", "release.succeeded", "release.failed", "release.cancelled"];
+pub const RELEASE_EVENTS: &[&str] = &["release.started", "release.waiting_approval", "release.succeeded", "release.failed", "release.cancelled"];
 /// The events about a runner: the server's rules take them, a repository's can't.
 pub const RUNNER_EVENTS: &[&str] = &["runner.offline"];
 /// How long a runner is gone before `runner.offline` is said of it.
@@ -442,7 +445,8 @@ impl Msg {
 
 impl Msg {
     /// A release's event: `release` as `/api/deploy/releases/{id}` answers it, with the people who
-    /// may approve it (`approvers`) when it waits for them.
+    /// may approve it (`approvers`) when it waits for them. `event` may be the state it's in now
+    /// (`release.committing`, `release.rolled_back`): what a message it has says as it moves.
     fn of_release(event: &str, r: &Value, url: &str) -> Msg {
         let get = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
         let (app, env, version, by, message) = (get("app"), get("environment"), get("version"), get("requested_by"), get("message"));
@@ -456,16 +460,27 @@ impl Msg {
             other => other.to_owned(),
         };
         let title = match event {
+            "release.started" => format!("▸ {app} {what} → {env} is on its way"),
+            "release.waiting" => format!("◷ {app} {what} → {env} waits"),
+            "release.committing" => format!("▸ {app} {what} → {env} is being committed"),
+            "release.delivering" => format!("▸ {app} {what} → {env} is being delivered"),
             "release.waiting_approval" => format!("⏸ {app} {what} → {env} waits for approval"),
             "release.succeeded" => format!("✓ {app} {what} landed in {env}"),
             "release.failed" => format!("✗ {app} {what} failed in {env}"),
             "release.cancelled" => format!("◌ {app} {what} → {env} was cancelled"),
+            "release.rolled_back" => format!("↩ {app} {what} in {env} was rolled back"),
+            "release.superseded" => format!("✓ {app} {what} landed in {env}, replaced since"),
             other => format!("{other}: {app} → {env}"),
         };
         let approvers: Vec<&str> = r.get("approvers").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
         let mut parts = vec![format!("release {id}, asked by {by}")];
-        if !approvers.is_empty() {
+        if event == "release.waiting_approval" && !approvers.is_empty() {
             parts.push(format!("approvers: {}", approvers.join(", ")));
+        }
+        // Each person's answer so far.
+        for a in r.get("approvals").and_then(Value::as_array).into_iter().flatten() {
+            let who = crate::deploy::gates::person(a.get("by").and_then(Value::as_str).unwrap_or_default()).to_owned();
+            parts.push(if a.get("approved") == Some(&Value::Bool(false)) { format!("rejected by {who}") } else { format!("approved by {who}") });
         }
         if let Some(first) = message.lines().next().filter(|l| !l.is_empty()) {
             parts.push(first.to_owned());
@@ -833,31 +848,181 @@ fn app_channel(c: &str) -> String {
     if c.contains(':') { c.to_owned() } else { format!("slack:{c}") }
 }
 
-/// A release's event (docs/deploy-api.md §12.3), through every server rule that takes it and to
-/// the app's own channels: once per release, event and channel (kept, so a restart or the same
-/// state said again sends nothing more).
-pub async fn release_event(hub: Arc<Hub>, event: &'static str, release: Value, channels: Vec<String>) {
-    let id = release.get("id").and_then(Value::as_i64).unwrap_or_default();
-    let url = format!("{}/deployments/releases/{id}", hub.cfg.server.public_url.trim_end_matches('/'));
-    let m = Msg::of_release(event, &release, &url);
-    let mut sends: Vec<(String, String)> = Vec::new();
-    for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
-        if rule.check(true).is_err() || !takes_release(rule, event, &release) {
-            continue;
+/// What a release's message says now: its state, as [`Msg::of_release`] names it.
+fn release_now(r: &Value) -> String {
+    format!("release.{}", r.get("state").and_then(Value::as_str).unwrap_or("waiting"))
+}
+
+/// Releases whose messages are being brought up to date: the events each has waiting, and
+/// whether it moved again meanwhile.
+static MOVING: parking_lot::Mutex<Option<std::collections::HashMap<i64, (Vec<&'static str>, bool)>>> = parking_lot::Mutex::new(None);
+
+/// A release moved (docs/deploy-api.md §12.3): `events` said of it through every server rule that
+/// takes them and to the app's own channels, and every message it has brought up to date. Where a
+/// channel can change a message afterwards (a Slack bot, a Discord webhook, a Telegram bot), a
+/// release has one message there, posted the first time something of it is sent there and edited
+/// as it moves on; elsewhere each event is a message of its own, once per release, event and
+/// channel (kept, so a restart or the same state said again sends nothing more), and the app's
+/// own channels take `release.started` only where it becomes their one message. One release's
+/// moves are taken one at a time, each reading it as it is by then.
+pub async fn release_moved(hub: Arc<Hub>, id: i64, events: Vec<&'static str>) {
+    {
+        let mut moving = MOVING.lock();
+        let all = moving.get_or_insert_with(std::collections::HashMap::new);
+        if let Some((waiting, again)) = all.get_mut(&id) {
+            waiting.extend(events);
+            *again = true;
+            return;
         }
-        sends.extend(rule.to.iter().map(|spec| (format!("server#{}", n + 1), spec.clone())));
+        all.insert(id, (events, false));
     }
-    sends.extend(channels.iter().map(|c| ("app".to_owned(), app_channel(c))));
-    let mut seen = std::collections::HashSet::new();
-    for (rule, spec) in sends {
-        if !seen.insert(spec.clone()) || throttled(&hub, &format!("release\u{0}{id}\u{0}{event}\u{0}{spec}"), Some(RELEASE_ONCE)).await {
+    // A panic in the work below lets the release's later moves be taken again.
+    struct Unwinding(i64);
+    impl Drop for Unwinding {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                MOVING.lock().get_or_insert_with(std::collections::HashMap::new).remove(&self.0);
+            }
+        }
+    }
+    let _unwinding = Unwinding(id);
+    loop {
+        let events = MOVING.lock().get_or_insert_with(std::collections::HashMap::new).get_mut(&id).map(|(e, again)| {
+            *again = false;
+            std::mem::take(e)
+        });
+        Box::pin(release_up_to_date(&hub, id, &events.unwrap_or_default())).await;
+        let mut moving = MOVING.lock();
+        let all = moving.get_or_insert_with(std::collections::HashMap::new);
+        if all.get(&id).is_some_and(|(_, again)| *again) {
             continue;
         }
-        deliver(&hub, None, &rule, event, &format!("release:{id}"), &m, &spec).await;
+        all.remove(&id);
+        return;
     }
 }
 
-/// A run's facts for its events.
+/// A message a release has where its channel can change it.
+struct Post {
+    spec: String,
+    integration: String,
+    at: super::chat::posts::Posted,
+    shown: String,
+}
+
+async fn posts_of(hub: &Hub, id: i64) -> Vec<Post> {
+    hub.store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT spec, integration, channel, message, shown FROM release_chat_posts WHERE release_id = ?1")?;
+            let rows = st.query_map([id], |r| Ok(Post { spec: r.get(0)?, integration: r.get(1)?, at: super::chat::posts::Posted { channel: r.get(2)?, message: r.get(3)? }, shown: r.get(4)? }))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .unwrap_or_default()
+}
+
+/// Records how a release's message went through `spec`.
+async fn delivered(hub: &Hub, rule: &str, event: &str, id: i64, spec: &str, result: &Result<(), String>) {
+    if let Err(e) = result {
+        tracing::warn!(channel = spec, event, release = id, error = %e, "a release's chat message didn't go");
+    }
+    let (rule, event, about, spec, now) = (rule.to_owned(), event.to_owned(), format!("release:{id}"), spec.to_owned(), crate::util::now_unix());
+    let (status, error) = match result {
+        Ok(()) => ("sent", None),
+        Err(e) => ("failed", Some(e.clone())),
+    };
+    let _ = hub
+        .store
+        .call(move |c| Ok(c.execute("INSERT INTO notify_deliveries (ts, rule, event, run_id, channel, status, error, attempts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)", params![now, rule, event, about, spec, status, error]).map(|_| ())?))
+        .await;
+}
+
+/// A release's message as `i` shows it now.
+fn view_now(release: &Value, url: &str) -> super::chat::posts::View {
+    let m = Msg::of_release(&release_now(release), release, url);
+    let asks = (release.get("state").and_then(Value::as_str) == Some("waiting_approval")).then(|| release.get("id").and_then(Value::as_i64)).flatten();
+    super::chat::posts::View { title: m.title, line: m.line, asks }
+}
+
+/// [`release_moved`]'s work: what `events` send, then each message the release has made to say
+/// what it is now.
+async fn release_up_to_date(hub: &Arc<Hub>, id: i64, events: &[&'static str]) {
+    let Ok(Some(r)) = crate::deploy::store::release(&*hub.records, id).await else { return };
+    let release = crate::deploy::flow::release_value(&r);
+    let url = format!("{}/deployments/releases/{id}", hub.cfg.server.public_url.trim_end_matches('/'));
+    let channels = crate::deploy::store::app(&*hub.records, &r.app).await.ok().flatten().map(|a| a.contacts.channels).unwrap_or_default();
+    let mut posted: std::collections::HashSet<String> = posts_of(hub, id).await.into_iter().map(|p| p.spec).collect();
+    for &event in events {
+        let m = Msg::of_release(event, &release, &url);
+        let mut sends: Vec<(String, String)> = Vec::new();
+        for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
+            if rule.check(true).is_err() || !takes_release(rule, event, &release) {
+                continue;
+            }
+            sends.extend(rule.to.iter().map(|spec| (format!("server#{}", n + 1), spec.clone())));
+        }
+        sends.extend(channels.iter().map(|c| ("app".to_owned(), app_channel(c))));
+        let mut seen = std::collections::HashSet::new();
+        for (rule, spec) in sends {
+            if !seen.insert(spec.clone()) {
+                continue;
+            }
+            // Its one message, where the channel can change it.
+            if let Ok((i, target)) = channel(hub, None, &spec).await
+                && let Ok(Some(secret)) = integrations::token(hub, &i).await
+                && super::chat::posts::edits(&i, Some(&secret))
+            {
+                if posted.contains(&spec) {
+                    continue;
+                }
+                let v = view_now(&release, &url);
+                let made = Box::pin(super::chat::posts::post(hub, &i, &secret, target.as_deref(), &v)).await;
+                if let Ok(at) = &made {
+                    let (s, iid, ch, msg, shown, now) = (spec.clone(), i.id.clone(), at.channel.clone(), at.message.clone(), super::chat::posts::shown(&i, &v), crate::util::now_unix());
+                    let _ = hub
+                        .store
+                        .call(move |c| {
+                            c.execute(
+                                "INSERT OR IGNORE INTO release_chat_posts (release_id, spec, integration, channel, message, shown, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                                params![id, s, iid, ch, msg, shown, now],
+                            )?;
+                            Ok(())
+                        })
+                        .await;
+                    posted.insert(spec.clone());
+                }
+                delivered(hub, &rule, event, id, &spec, &made.map(|_| ())).await;
+                continue;
+            }
+            // A message per event elsewhere; the app's own channels aren't told each release starts.
+            if rule == "app" && event == "release.started" {
+                continue;
+            }
+            if throttled(hub, &format!("release\u{0}{id}\u{0}{event}\u{0}{spec}"), Some(RELEASE_ONCE)).await {
+                continue;
+            }
+            deliver(hub, None, &rule, event, &format!("release:{id}"), &m, &spec).await;
+        }
+    }
+    // Every message it has, saying what it is now.
+    let all = integrations::list(hub).await.unwrap_or_default();
+    for p in posts_of(hub, id).await {
+        let Some(i) = all.iter().find(|i| i.id == p.integration) else { continue };
+        let v = view_now(&release, &url);
+        let shown = super::chat::posts::shown(i, &v);
+        if shown == p.shown {
+            continue;
+        }
+        let Ok(Some(secret)) = integrations::token(hub, i).await else { continue };
+        let result = Box::pin(super::chat::posts::update(hub, i, &secret, &p.at, &v)).await;
+        if result.is_ok() {
+            let (spec, now) = (p.spec.clone(), crate::util::now_unix());
+            let _ = hub.store.call(move |c| Ok(c.execute("UPDATE release_chat_posts SET shown = ?3, updated_at = ?4 WHERE release_id = ?1 AND spec = ?2", params![id, spec, shown, now]).map(|_| ())?)).await;
+        }
+        delivered(hub, "edit", &release_now(&release), id, &p.spec, &result).await;
+    }
+}
+
 async fn subject(hub: &Hub, run: &str) -> anyhow::Result<Option<(Repo, Subject)>> {
     let r = run.to_owned();
     let row: Option<(String, i64, String, String, String, String, String, String, Option<String>, Option<String>)> = hub

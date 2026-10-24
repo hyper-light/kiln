@@ -351,7 +351,7 @@ impl Acp {
         self.pending.clear();
         self.asks.clear();
         core.state.approvals.clear();
-        core.state.exit = Some(ExitInfo { code, error });
+        core.state.exit = Some(ExitInfo::now(code, error));
         core.state.doing = None;
         core.state.turn_started = None;
         core.set_status(Status::Exited);
