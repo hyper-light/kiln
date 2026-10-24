@@ -28,6 +28,13 @@ config:
   kubernetes:
     max_pods: 64
 
+# Production's memory limit (Ada, 2026-10-24). kiln:61b07ceb's start peaked at the chart's 2Gi,
+# which tripped the guard's memory check (share over 0.8) and rolled it back into a crash loop. The
+# chart's default stays 2Gi; the requests stay the chart's.
+resources:
+  limits:
+    memory: 16Gi
+
 # kiln's own repository is on GitHub: its CI follows it there, like every hyper-light repository's
 # (Argo CD still deploys from the in-cluster git server). Registered here because the repository
 # was first added pointing at the in-cluster server, and discovery leaves names it already has.
