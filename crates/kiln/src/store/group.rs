@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, bail};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
-use hyper_durable::{Fatal, GroupStore, OpenError, Output, Point, Replica, Settings, StateMachine, Unbounded};
+use hyper_durable::{Fatal, GroupStore, LogStore as _, OpenError, Output, Point, Replica, Settings, StateMachine, Unbounded};
 use hyper_log::{Config as LogConfig, Facts, Log};
 use hyper_raft::proto::{ConfChangeV2, ConfState, Message, MessageType};
 use hyper_raft::wire::Record as _;
@@ -203,6 +203,8 @@ pub struct Group {
     /// The last entry applied with its term, and the group's configuration there: where a copy of
     /// kiln.db made from now on stands.
     point: Arc<Mutex<(Point, ConfState)>>,
+    /// Where the log starts (its compaction's index): a member behind it is sent an image.
+    log_start: Arc<AtomicU64>,
     /// The group's messages to the other members: to whom, and the message's bytes.
     outgoing: async_channel::Receiver<(u64, Vec<u8>)>,
 }
@@ -284,7 +286,8 @@ impl Group {
         let (out_tx, outgoing) = async_channel::bounded(OUTGOING);
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), Opening>>();
         let applied = Arc::new(AtomicU64::new(0));
-        let (applied2, point2) = (applied.clone(), point.clone());
+        let log_start = Arc::new(AtomicU64::new(0));
+        let (applied2, point2, log_start2) = (applied.clone(), point.clone(), log_start.clone());
         let join = thread::Builder::new()
             .name("kiln-cluster".into())
             .spawn(move || {
@@ -312,6 +315,7 @@ impl Group {
                     broken: None,
                     applied: applied2,
                     point: point2,
+                    log_start: log_start2,
                     outgoing: out_tx,
                     server: !learner,
                     wanted: None,
@@ -328,7 +332,7 @@ impl Group {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(failed(anyhow::anyhow!("the cluster group didn't start within 60 s"))),
         }
-        Ok(Group { tx, thread, join: Some(join), seq, applied, point, outgoing })
+        Ok(Group { tx, thread, join: Some(join), seq, applied, point, log_start, outgoing })
     }
 
     /// Where it stands: kiln.db's last write, and the last entry applied (`/healthz/server`).
@@ -340,6 +344,11 @@ impl Group {
     /// of kiln.db made from now on stands (every entry up to it is in kiln.db before it's logged).
     pub fn point(&self) -> (Point, ConfState) {
         self.point.lock().clone()
+    }
+
+    /// Where the log starts: a member that applied no further is sent an image, not entries.
+    pub fn log_start(&self) -> u64 {
+        self.log_start.load(Ordering::SeqCst)
     }
 
     /// The group's messages to the other members, as they come: the member, and the message.
@@ -425,6 +434,8 @@ struct Driver {
     applied: Arc<AtomicU64>,
     /// The last entry applied with its term, and the configuration there (for copies).
     point: Arc<Mutex<(Point, ConfState)>>,
+    /// Where the log starts, for [`Group::log_start`].
+    log_start: Arc<AtomicU64>,
     /// The group's messages to the other members.
     outgoing: async_channel::Sender<(u64, Vec<u8>)>,
     /// The server's member (the group's leader), or a runner's learner.
@@ -512,6 +523,9 @@ impl Driver {
                 if self.replica.compact(self.keep().min(applied), now, &self.waker).unwrap_or(false) {
                     self.since = applied;
                 }
+            }
+            if let Ok((start, _)) = self.replica.log_mut().bounds() {
+                self.log_start.store(start.index, Ordering::SeqCst);
             }
             if stopping && self.pending.is_empty() {
                 self.replica.machine_mut().persist().ok();
@@ -1124,11 +1138,15 @@ mod tests {
         until("the write after the copy on the learner", || Ok(read("after")?.as_deref() == Some("2")))?;
         assert_eq!(learner.standing().0, server.group_standing().map_or(0, |s| s.0), "the learner holds the server's last write");
         // Away while the server writes past what the log keeps for it: back, it takes a new copy.
+        // Back only once the log starts past it: compactions go out when the log has room for
+        // them, so the writes alone don't say one has.
+        let away_at = learner.standing().1;
         up.store(false, Ordering::SeqCst);
         for i in 0..200 {
             set(&server, &format!("away{i}"), "x")?;
         }
         server.flush_group()?;
+        until("the server's log starting past the learner", || Ok(g.log_start() > away_at))?;
         up.store(true, Ordering::SeqCst);
         until("the writes made while it was away", || Ok(read("away199")?.as_deref() == Some("x")))?;
         assert_eq!(copies.load(Ordering::SeqCst), 2, "left behind by the log, it took a new copy");
