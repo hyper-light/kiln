@@ -2600,12 +2600,35 @@ async fn put_artifacts(hub: &Hub, id: &str, req: Request) -> R {
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
+/// How long a piece of a job's artifacts may go without a byte before what came of it is kept and
+/// answered for: longer than any pause of an upload still going, well inside the 120 s a runner
+/// gives a piece. A runner's HTTP client could stop up to 64 KiB short of a piece's end and wait
+/// for an answer (fixed in kiln-http's client); answered, it goes on from where the pieces end.
+const PIECE_STALL: Duration = Duration::from_secs(15);
+
 /// One piece of a job's artifacts, at byte `at`: taken only where the pieces so far end (the first
 /// starts them afresh), so a piece that broke off costs only itself. One elsewhere is refused with
-/// where they end (`409 {"have": n}`), for the upload to go on from there.
+/// where they end (`409 {"have": n}`), for the upload to go on from there. What came of a piece
+/// that stalls or breaks off is kept too, and answered for at once, so the runner sends only the
+/// rest, and nothing of it is held while a connection waits.
 async fn put_artifacts_piece(hub: &Hub, id: &str, at: u64, req: Request) -> R {
     let part = artifact_path(hub, id).with_extension("part");
-    let piece = srv::body_bytes(req.into_body(), ARTIFACT_PIECE).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("the piece broke off: {e:#}")))?;
+    let mut body = req.into_body();
+    let mut came = bytes::BytesMut::new();
+    let whole = loop {
+        match crate::rt::timeout(PIECE_STALL, srv::next_chunk(&mut body)).await {
+            Ok(Ok(Some(chunk))) => {
+                if came.len().saturating_add(chunk.len()) > ARTIFACT_PIECE {
+                    return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("a piece is at most {ARTIFACT_PIECE} bytes")));
+                }
+                came.extend_from_slice(&chunk);
+            }
+            Ok(Ok(None)) => break true,
+            Ok(Err(_)) | Err(_) => break false,
+        }
+    };
+    drop(body);
+    let piece = came.freeze();
     let had = crate::rt::blocking(move || -> anyhow::Result<Result<u64, u64>> {
         if let Some(dir) = part.parent() {
             std::fs::create_dir_all(dir)?;
@@ -2624,10 +2647,13 @@ async fn put_artifacts_piece(hub: &Hub, id: &str, at: u64, req: Request) -> R {
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    Ok(match had {
+    let answer = match had {
         Ok(have) => srv::json(StatusCode::OK, &serde_json::json!({"have": have})),
         Err(have) => srv::json(StatusCode::CONFLICT, &serde_json::json!({"have": have})),
-    })
+    };
+    // The rest of a piece that didn't all come is left unread: the connection ends with the answer,
+    // and the runner doesn't send its next piece on it.
+    Ok(if whole { answer } else { srv::with_header(answer, header::CONNECTION, "close") })
 }
 
 /// `GET /api/jobs/:id/artifacts/upload`: how much of an upload in pieces has come (`{"have": n}`;

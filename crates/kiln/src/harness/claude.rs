@@ -18,7 +18,7 @@ use super::core::{Core, Effect, PreviewJob};
 use super::model::{
     AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Hunk, Known, Level, Limit, McpServer, McpStatus,
     McpTool, ModeOption, ModelOption, Objective, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall, ToolKind, ToolStatus,
-    ChoiceAnswer, OUTPUT_MAX, Route, account_id, choices_of, clip_json, clip_middle, mask_emails, plan_label, safe_url, sort_catalog,
+    ChoiceAnswer, OUTPUT_MAX, Route, account_id, choices_of, clip_json, clip_middle, mask_emails, plan_label, safe_url, same_account, sort_catalog,
 };
 
 /// Environment variables a Claude Code session sets for its children; a harness kiln starts must
@@ -245,17 +245,6 @@ pub struct Claude {
     /// Where a background command's output goes, by the tool call that started it, until its
     /// task is known: (task id, file).
     bg_files: HashMap<String, (String, String)>,
-}
-
-/// Whether two account ids name the same account: the short hash that ends an id says who it is,
-/// and different places name the same plan differently ("max", "claude_max"); ids without a who
-/// compare whole.
-fn same_account(a: &str, b: &str) -> bool {
-    let who = |id: &str| id.split(':').nth(2).map(str::to_owned);
-    match (who(a), who(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => a == b,
-    }
 }
 
 impl Claude {
@@ -953,8 +942,9 @@ impl Claude {
         self.request(core, Pending::Status, json!({"subtype": "get_status"}));
     }
 
-    /// A pause's limit should have reset: ask for the usage now (the answer goes to
-    /// `pause::checked`). A CLI that has ended can't say; the pause goes on waiting for a person.
+    /// A pause's limit should have reset, or another session's limit is to be checked: ask who it's
+    /// signed in as and its usage now (the answer goes to `pause::checked`). A CLI that has ended
+    /// can't say; the pause goes on waiting for a person.
     pub fn check_limits(&mut self, core: &mut Core) {
         if core.state.status == Status::Exited {
             return;
@@ -963,6 +953,11 @@ impl Claude {
             return;
         }
         self.usage_at = Core::now();
+        // Who it's signed in as first: a sign-in made since (on the machine, outside kiln) is
+        // taken before the usage settles anything, so another account's limit never holds it.
+        if !self.pending.values().any(|p| matches!(p, Pending::Status)) {
+            self.request(core, Pending::Status, json!({"subtype": "get_status"}));
+        }
         self.request(core, Pending::Usage, json!({"subtype": "get_usage", "skip_behaviors": true}));
     }
 

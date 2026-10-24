@@ -936,7 +936,7 @@ impl Registry {
                         && let Some(p) = m.info.pause.as_ref().filter(|p| p.reason == super::pause::LIMIT && p.by == "harness")
                         && let Some(account) = m.info.account.clone()
                     {
-                        let c = Command::LimitHold { window: p.window.clone(), label: p.label.clone(), until: p.until, said: p.said.clone() };
+                        let c = Command::LimitHold { window: p.window.clone(), label: p.label.clone(), until: p.until, said: p.said.clone(), account: Some(account.clone()) };
                         hold = Some((c, Vec::new()));
                         // Collected below, once this mirror is let go.
                         hold_for = Some((account, p.window.clone(), p.until));

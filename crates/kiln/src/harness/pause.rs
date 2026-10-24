@@ -17,7 +17,7 @@
 //! the pause at any time, or keep it until they do (`Pause::auto`).
 
 use super::core::{Core, Effect};
-use super::model::{Body, Checkpoint, Command, Cut, Level, Limit, Pause, QueueItem, Status, ToolStatus};
+use super::model::{Body, Checkpoint, Command, Cut, Level, Limit, Pause, QueueItem, Status, ToolStatus, same_account};
 
 /// A usage limit was reached.
 pub const LIMIT: &str = "limit";
@@ -170,34 +170,36 @@ pub fn hold(core: &mut Core, reason: &str, by: &str, hit: Hit, cut: Option<Cut>)
     true
 }
 
-/// A limit another session on the account reached (`Command::LimitHold`) that this one's own
-/// limits didn't settle: its harness is asked for its usage, and the answer does ([`checked`]).
+/// A limit another session on the account reached (`Command::LimitHold`): its harness is asked
+/// for its usage, and the answer settles it ([`checked`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ask {
     pub hit: Hit,
+    /// The account that reached it, when the server said.
+    pub account: Option<String>,
     /// Unix ms the harness was asked, once it was.
     pub asked: Option<i64>,
 }
 
 /// Another session on the account reached a usage limit (`Command::LimitHold`): this one pauses
-/// until it resets too, rather than finding out by failing, if the limit is its own as well. Its
-/// own limits say whether it is ([`shares`]): a limit they show isn't (another account's, another
-/// model's) leaves it be; one they don't settle is asked of its harness first ([`step`], then
-/// [`checked`]). Paused, it keeps to its own settings, as at any limit: whether it goes on by itself
-/// at the reset, and whether on another machine. True when it paused.
-pub fn account_hold(core: &mut Core, hit: Hit) -> bool {
+/// until it resets too, rather than finding out by failing, if the limit is its own as well. Only
+/// the account it's signed in to now counts: a limit of `account` (the one that reached it, as the
+/// server says) when it's signed in as another leaves it be, as does one its own limits show isn't
+/// its own ([`shares`]: another account's window, another model's). Otherwise its harness is asked
+/// for its usage first ([`step`], then [`checked`]), and only that answer holds it: what it knew
+/// of its limits may be out of date, or from before it signed in as someone else, and a session
+/// with room is never paused for another's limit. Paused, it keeps to its own settings, as at any
+/// limit: whether it goes on by itself at the reset, and whether on another machine.
+pub fn account_hold(core: &mut Core, hit: Hit, account: Option<String>) {
     // On no account kiln knows: no other session's limit is its own.
-    if core.state.account.is_none() {
-        return false;
+    let Some(own) = core.state.account.as_deref() else { return };
+    if account.as_deref().is_some_and(|a| !same_account(a, own)) {
+        return;
     }
-    match shares(&core.state.limits, &core.state.model, hit.window.as_deref(), hit.until, Core::now()) {
-        Some(true) => hold(core, LIMIT, "account", hit, None),
-        Some(false) => false,
-        None => {
-            core.limit_ask = Some(Ask { hit, asked: None });
-            false
-        }
+    if shares(&core.state.limits, &core.state.model, hit.window.as_deref(), hit.until, Core::now()) == Some(false) {
+        return;
     }
+    core.limit_ask = Some(Ask { hit, account, asked: None });
 }
 
 /// Whether a limit another session on the account reached (its window, and when that starts over)
@@ -323,7 +325,10 @@ pub fn step(core: &mut Core, now: i64, key: &str) -> Step {
 /// later, when that isn't known). The pause ended is returned. Asked about another session's
 /// limit ([`account_hold`]), it pauses only if its own usage shows that limit reached.
 pub fn checked(core: &mut Core, now: i64) -> Option<Pause> {
+    // Held for another session's limit only while still signed in to that account (a sign-in seen
+    // meanwhile is another), and as the fresh usage says.
     if let Some(ask) = core.limit_ask.take()
+        && ask.account.as_deref().is_none_or(|a| core.state.account.as_deref().is_some_and(|own| same_account(a, own)))
         && shares(&core.state.limits, &core.state.model, ask.hit.window.as_deref(), ask.hit.until, now) == Some(true)
     {
         hold(core, LIMIT, "account", ask.hit, None);
@@ -886,18 +891,23 @@ mod tests {
             core
         };
         let hit = || Hit { window: Some("five_hour".into()), until: Some(reset), said: "You've hit your session limit".into() };
-        // Another account's: it goes on, and asks nothing.
+        let theirs = || Some("claude:max:abc".to_owned());
+        // Another account's window: it goes on, and asks nothing.
         let mut other = session(12.0, reset + 9_000_000);
-        assert!(!account_hold(&mut other, hit()));
+        account_hold(&mut other, hit(), theirs());
         assert!(other.state.pause.is_none() && other.limit_ask.is_none());
-        // Used up here too, as last said: it pauses now, as one held for the account.
-        let mut full = session(100.0, reset);
-        assert!(account_hold(&mut full, hit()));
-        assert_eq!(full.state.pause.as_ref().map(|p| p.by.as_str()), Some("account"));
-        // Not used up as last said: its harness is asked first, once, and its answer settles it.
+        // Used up here too, as last said: still asked first (what it knew may be out of date, or
+        // another account's), and the answer holds it, as one held for the account.
         let now = Core::now();
+        let mut full = session(100.0, reset);
+        account_hold(&mut full, hit(), theirs());
+        assert!(full.state.pause.is_none());
+        assert_eq!(step(&mut full, now, "k"), Step::Check);
+        assert!(checked(&mut full, now + 2_000).is_none());
+        assert_eq!(full.state.pause.as_ref().map(|p| (p.by.as_str(), p.until)), Some(("account", Some(reset))));
+        // Not used up as last said: its harness is asked first, once, and its answer settles it.
         let mut near = session(97.0, reset);
-        assert!(!account_hold(&mut near, hit()));
+        account_hold(&mut near, hit(), theirs());
         assert!(near.state.pause.is_none());
         assert_eq!(step(&mut near, now, "k"), Step::Check);
         assert_eq!(step(&mut near, now + 1_000, "k"), Step::Nothing);
@@ -906,22 +916,65 @@ mod tests {
         assert_eq!(near.state.pause.as_ref().map(|p| (p.by.as_str(), p.until)), Some(("account", Some(reset))));
         // The answer says there's room: it goes on.
         let mut room = session(97.0, reset);
-        account_hold(&mut room, hit());
+        account_hold(&mut room, hit(), theirs());
         assert_eq!(step(&mut room, now, "k"), Step::Check);
         room.state.limits = vec![window("five_hour", 98.0, reset)];
         assert!(checked(&mut room, now + 2_000).is_none());
         assert!(room.state.pause.is_none() && room.limit_ask.is_none());
         // No answer: it's let be.
         let mut quiet = session(97.0, reset);
-        account_hold(&mut quiet, hit());
+        account_hold(&mut quiet, hit(), theirs());
         assert_eq!(step(&mut quiet, now, "k"), Step::Check);
         assert_eq!(step(&mut quiet, now + CHECK_WAIT_MS, "k"), Step::Nothing);
         assert!(quiet.state.pause.is_none() && quiet.limit_ask.is_none());
         // On no account kiln knows: no other session's limit is its own.
         let mut none = session(100.0, reset);
         none.state.account = None;
-        assert!(!account_hold(&mut none, hit()));
+        account_hold(&mut none, hit(), theirs());
         assert!(none.state.pause.is_none());
+    }
+
+    /// A limit of an account the session isn't signed in to now is never its own: the server's
+    /// word for whose it was is kept to, at the hold and again when its harness answers (a sign-in
+    /// seen meanwhile), and the session isn't paused, its own window used up or not.
+    #[test]
+    fn a_limit_of_another_account_never_holds_a_session_signed_in_elsewhere() {
+        let reset = Core::now() + 3_600_000;
+        let now = Core::now();
+        let hit = || Hit { window: Some("five_hour".into()), until: Some(reset), said: "You've hit your session limit".into() };
+        let on = |account: &str| {
+            let mut core = Core::new();
+            core.state.account = Some(account.into());
+            core.state.model = "claude-opus-5-5".into();
+            core.state.limits = vec![window("five_hour", 100.0, reset)];
+            core
+        };
+        // Signed in as someone else, its own window full at the same moment: not held, not asked.
+        let mut elsewhere = on("claude:claude-max:fff");
+        account_hold(&mut elsewhere, hit(), Some("claude:claude-max:abc".into()));
+        assert!(elsewhere.state.pause.is_none() && elsewhere.limit_ask.is_none());
+        // The same account, its plan named in other words: its own.
+        let mut same = on("claude:max:abc");
+        account_hold(&mut same, hit(), Some("claude:claude-max:abc".into()));
+        assert!(same.limit_ask.is_some());
+        // Asked, then signed in as someone else before the answer: the answer holds nothing.
+        let mut moved = on("claude:claude-max:abc");
+        account_hold(&mut moved, hit(), Some("claude:claude-max:abc".into()));
+        assert_eq!(step(&mut moved, now, "k"), Step::Check);
+        moved.state.account = Some("claude:claude-max:fff".into());
+        assert!(checked(&mut moved, now + 2_000).is_none());
+        assert!(moved.state.pause.is_none() && moved.limit_ask.is_none());
+        // Another harness's account is another account.
+        let mut codex = on("codex:pro:abc");
+        account_hold(&mut codex, hit(), Some("claude:claude-max:abc".into()));
+        assert!(codex.state.pause.is_none() && codex.limit_ask.is_none());
+        // A server that didn't say whose it was: the session's own usage decides, as before.
+        let mut unsaid = on("claude:claude-max:fff");
+        account_hold(&mut unsaid, hit(), None);
+        assert_eq!(step(&mut unsaid, now, "k"), Step::Check);
+        unsaid.state.limits = vec![window("five_hour", 40.0, reset)];
+        assert!(checked(&mut unsaid, now + 2_000).is_none());
+        assert!(unsaid.state.pause.is_none());
     }
 
     #[test]
