@@ -814,15 +814,25 @@ impl Registry {
 
     /// Lists the sessions of machines that are away, from the store (the last month's): after a
     /// start, and after a restore from a mirror's copy.
+    ///
+    /// The server lists them as it starts, before it takes in any runner's messages: a runner that
+    /// comes back finds its sessions' copies here, and its streams send only what they lack
+    /// (`ServerMsg::Kept`, docs/wire.md "Restarts"). A session that changed within the last day
+    /// is rebuilt with as many events as a live copy keeps, so the copy its machine goes on from
+    /// is the session's; an older one with its last few, to show.
     pub async fn list_away(hub: &Arc<Hub>) {
         let Some(st) = hub.harness.convo.clone() else { return };
         const AWAY_DAYS: i64 = 30;
         const AWAY_EVENTS: usize = 200;
-        let since = crate::util::now_ms() - AWAY_DAYS * 24 * 3600 * 1000;
+        const RECENT: i64 = 24 * 3600 * 1000;
+        let now = crate::util::now_ms();
+        let since = now - AWAY_DAYS * 24 * 3600 * 1000;
         let read = crate::rt::blocking(move || -> anyhow::Result<Vec<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)>> {
+            let recent: std::collections::HashSet<String> = st.unended(now - RECENT)?.into_iter().map(|u| u.id).collect();
             let mut out = Vec::new();
             for u in st.unended(since)? {
-                let events = st.events(&u.id, None, AWAY_EVENTS)?;
+                let keep = if recent.contains(&u.id) { MAX_EVENTS } else { AWAY_EVENTS };
+                let events = st.events(&u.id, None, keep)?;
                 out.push((u, events));
             }
             Ok(out)

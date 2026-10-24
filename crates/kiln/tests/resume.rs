@@ -3,7 +3,8 @@
 //! (`?after=<born>.<rev>`). It gets only what changed since, not the whole session again. Under
 //! another incarnation's number, it gets the session whole. A runner killed mid-session and
 //! started again sends only what the server's copy lacks, and the copy ends up holding every event
-//! once, in order.
+//! once, in order. So does a server killed mid-session: it starts again with its copies rebuilt
+//! from its store, and its runners send only what they lack.
 //!
 //! The harness is a stand-in for Claude Code (`tests/fixtures/fake-claude`): it calls no model.
 //!
@@ -173,5 +174,67 @@ fn a_runner_that_starts_again_sends_only_what_the_server_lacks() -> anyhow::Resu
     let fresh = server.lines().filter(|l| l.contains("an agent session's copy starts from its machine") && l.contains(&id)).count();
     let went_on = server.lines().filter(|l| l.contains("an agent session's copy goes on from its machine") && l.contains(&id)).count();
     assert_eq!((fresh, went_on), (1, 1), "the copy started over {fresh} times and went on {went_on} times");
+    Ok(())
+}
+
+#[test]
+fn a_server_that_starts_again_has_its_runners_send_only_what_its_copies_lack() -> anyhow::Result<()> {
+    const LINES: u64 = 200;
+    let dir = tempfile::tempdir()?;
+    let mut s = start(dir.path(), &Options { agent: false, ci: "", extra: "" })?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    let (_runner, log) = agents::runner(dir.path(), s.port, "steady-runner", None, Talk { lines: LINES as usize, every_ms: 50 })?;
+    agents::connected(s.port, &s.admin, "steady-runner", &log, Duration::from_secs(120))?;
+    let id = agents::open_session(s.port, &s.admin, "steady-runner", &work, Duration::from_secs(60))?;
+
+    // Killed mid-turn, as a crash would; the turn goes on on its runner meanwhile.
+    std::thread::sleep(Duration::from_secs(3));
+    let (before, _) = agents::attach(s.port, &s.admin, &id, "")?;
+    let had = agents::lines(&agents::events(&before)).len();
+    anyhow::ensure!(had > 10 && (had as u64) < LINES, "the turn was {had} lines in when its server stopped: the test needs it mid-turn");
+    let runner_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    let server_log = || std::fs::read_to_string(dir.path().join("server.log")).unwrap_or_default();
+    let connections = |text: &str| text.matches("connected to server").count();
+    let (upto, seen, server_upto) = (runner_log().len(), connections(&runner_log()), server_log().len());
+    s.restart()?;
+
+    // Started again, it has the session's copy at once, rebuilt from its store.
+    let (rebuilt, _) = agents::attach(s.port, &s.admin, &id, "")?;
+    anyhow::ensure!(!agents::lines(&agents::events(&rebuilt)).is_empty(), "the copy wasn't rebuilt from the store: {:?}", rebuilt.first());
+    // Its runner comes back, and the turn ends with every line in the copy once, in order.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while connections(&runner_log()) == seen {
+        anyhow::ensure!(Instant::now() < deadline, "the runner didn't connect again:\n{}", runner_log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let said = loop {
+        let (_, info) = common::http(s.port, "GET", &format!("/api/harness/sessions/{id}"), &s.admin, None)?;
+        let info: Value = serde_json::from_str(&info).unwrap_or_default();
+        let (frames, _) = agents::attach(s.port, &s.admin, &id, "")?;
+        let said = turns(&agents::events(&frames));
+        if info.pointer("/last_turn/how").and_then(Value::as_str) == Some("done") && said.values().any(|l| l.len() as u64 >= LINES) {
+            break said;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the turn never ended in the copy\nsession: {info}\nturns: {said:?}\nrunner:\n{}", runner_log());
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    assert_eq!(said.len(), 1, "one turn: {said:?}");
+    assert_eq!(said.values().next().cloned().unwrap_or_default(), (0..LINES).collect::<Vec<_>>(), "every line once, in order");
+
+    // Its runner sent only what the rebuilt copy lacked: not the session whole, and at most 4 KiB
+    // beyond its events after the copy's newest and its newest state.
+    let since = runner_log().get(upto..).unwrap_or_default().to_owned();
+    let start: Vec<&str> = since.lines().filter(|l| l.contains("updates start on the channel") && l.contains(&id)).collect();
+    assert!(!start.iter().any(|l| l.contains("on the channel, whole")), "the session went whole after the restart:\n{}", start.join("\n"));
+    let delta = start.iter().find(|l| l.contains("after what the server's copy has")).ok_or_else(|| anyhow::anyhow!("no stream started again after the restart:\n{since}"))?;
+    let beyond = field(delta, "beyond").ok_or_else(|| anyhow::anyhow!("no beyond= in {delta}"))?;
+    assert!(beyond <= 4096, "the runner sent {beyond} bytes beyond the events after the copy's and its newest state: {delta}");
+    // And the server's new copy went on from what its store had: it never started over.
+    let after = server_log().get(server_upto..).unwrap_or_default().to_owned();
+    let fresh = after.lines().filter(|l| l.contains("an agent session's copy starts from its machine") && l.contains(&id)).count();
+    let went_on = after.lines().filter(|l| l.contains("an agent session's copy goes on from its machine") && l.contains(&id)).count();
+    assert_eq!((fresh, went_on), (0, 1), "after the restart the copy started over {fresh} times and went on {went_on} times");
     Ok(())
 }

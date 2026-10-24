@@ -168,6 +168,13 @@ Each new stream sends the server only what its copy of the session lacks, not th
 Before its `Welcome`, a runner sends no session's updates outside the channel: the `Welcome` brings
 the server what it lacks of each (or, to a server from before the channel, all of each).
 
+A server that starts again rebuilds its copies of the sessions its store has open before it takes
+in any runner's message. A session that changed within the last day gets as many events as a live
+copy keeps; an older one gets its last 200, to show. The server has none of its runners' streams
+any more, and the first `Have` it sends says so. Each stream then starts again as above, sending
+only what the rebuilt copy lacks. A viewer attaches to the rebuilt copy at once, and gets it whole:
+the server's incarnation is new.
+
 ## Runner to server: `AgentMsg`
 
 | Message | Class | Why | Today |
