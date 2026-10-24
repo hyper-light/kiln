@@ -111,6 +111,11 @@ counted.
 
 ## Mission control
 
+- **How they stand.** Under the page's title, one rule across the page has a length for each way
+  your agents stand (needs you, stopped, paused, working, finished, ready, offline), as long as
+  its share of them; under it, each one's count (and on a desktop its name). Working's length
+  carries the prism flowing along it and needs you's brightens and dims; the rest hold still, and
+  nothing moves with reduced motion or kiln's motion paused.
 - **Order.** By default (Needs you first) the agents that wait on you (a request, or goals they
   paused for you) come first, longest waiting first, then those stopped, paused, finished since
   you last looked, working, ready, offline and ended. The list follows the agents as they change:
