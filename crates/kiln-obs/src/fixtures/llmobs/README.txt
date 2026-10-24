@@ -9,3 +9,7 @@ the Datadog Agent that kept each request. Every value is the capture's own, noth
   same run: the evaluation the app submitted.
 - dd-trace-py-4.16.0-apm-traces.msgpack: POST /v0.4/traces, APM on and the Agent's /info listing
   /evp_proxy/v2/: the events riding their APM spans (meta_struct["_llmobs"], MessagePack).
+- datadog-agent-7.84.4-traces.pb: what Datadog's Agent 7.84.4 forwarded of the same app run with
+  APM on beside it (`capture.py.txt agent_mode`: the Agent's receiver its tracer's, the Agent's
+  intake a stand-in on 127.0.0.1): POST /api/v0.2/traces, unzipped (zstd), its indexed form, each
+  span's LLM event an attribute of bytes (`_llmobs`).

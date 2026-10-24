@@ -499,6 +499,27 @@ impl<'a> Cx<'a, '_> {
         Ok(Some(Attr { key: cut(key, MAX_NAME_BYTES), val }))
     }
 
+    /// An indexed attribute's bytes where it is a span's LLM event (`_llmobs`, its value bytes).
+    fn llmobs_attr(&self, msg: &'a [u8]) -> Result<Option<&'a [u8]>, OtlpError> {
+        let (mut key, mut value) = ("", None);
+        for f in Fields::new(msg) {
+            match f? {
+                (1, w) => key = self.string(w),
+                (2, w) => value = w.bytes(),
+                _ => {}
+            }
+        }
+        if key != "_llmobs" {
+            return Ok(None);
+        }
+        for f in Fields::new(value.unwrap_or(&[])) {
+            if let (5, w) = f? {
+                return Ok(w.bytes());
+            }
+        }
+        Ok(None)
+    }
+
     /// An indexed `AnyValue`: a string the payload's own, a bool's name, anything else written.
     fn indexed_value(&mut self, v: &'a [u8]) -> Result<Val<'a>, OtlpError> {
         for f in Fields::new(v) {
@@ -719,7 +740,16 @@ impl<'a> Cx<'a, '_> {
                 (7, w) => s.duration = w.u64().unwrap_or(0),
                 (8, w) => s.error = w.u64().is_some_and(|b| b != 0),
                 (9, w) => {
-                    if let Some(a) = self.indexed_attr(w.bytes().unwrap_or(&[]))? {
+                    let msg = w.bytes().unwrap_or(&[]);
+                    // Its LLM event, where it rides the span (`crate::llm::intake::llmobs_struct`):
+                    // an Agent 7.84 sends a span's `meta_struct` as attributes of bytes.
+                    if let Some(bin) = self.llmobs_attr(msg)? {
+                        let (n, t) = (tags.len(), self.text.len());
+                        if crate::llm::intake::llmobs_struct(bin, &mut tags, &mut self.text).is_err() {
+                            tags.truncate(n);
+                            self.text.truncate(t);
+                        }
+                    } else if let Some(a) = self.indexed_attr(msg)? {
                         tags.push(a);
                     }
                 }

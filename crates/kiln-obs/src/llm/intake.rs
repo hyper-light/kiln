@@ -612,6 +612,8 @@ mod tests {
     const EVENTS: &[u8] = include_bytes!("../fixtures/llmobs/dd-trace-py-4.16.0-llmobs.json");
     const EVALS: &[u8] = include_bytes!("../fixtures/llmobs/dd-trace-py-4.16.0-eval-metric.json");
     const APM: &[u8] = include_bytes!("../fixtures/llmobs/dd-trace-py-4.16.0-apm-traces.msgpack");
+    /// What Datadog's Agent 7.84.4 forwarded of those APM spans (its indexed form, unzipped).
+    const AGENT: &[u8] = include_bytes!("../fixtures/llmobs/datadog-agent-7.84.4-traces.pb");
 
     fn rows(s: &Spans) -> Vec<RecordRef<'_>> {
         let mut out = Vec::new();
@@ -758,6 +760,24 @@ mod tests {
             assert_eq!(get(chat, k), Some(v), "{k}");
         }
         assert_eq!(get(named(&rows, "tool"), "meta.span.kind"), Some("tool"));
+        assert_eq!(get(named(&rows, "Messages.create"), "metrics.estimated_total_cost"), Some("1700000"));
+    }
+
+    /// The same APM spans as Datadog's Agent 7.84 forwards them (each span's LLM event an attribute
+    /// of bytes, `_llmobs`): read as the tracer's own are, the event not kept as its bytes.
+    #[test]
+    fn an_agent_s_spans_carrying_their_events_are_llm_spans_themselves() {
+        let mut out = Spans::default();
+        crate::ddtrace::Decoder::new().decode(AGENT, 0, &mut out).unwrap();
+        let rows = rows(&out);
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().all(|r| get(r, "_llmobs").is_none() && get(r, "meta.span.kind").is_some()));
+        let chat = named(&rows, "createChatCompletion");
+        for (k, v) in
+            [("meta.span.kind", "llm"), ("llmobs.name", "OpenAI.createChatCompletion"), ("metrics.input_tokens", "1200"), ("metrics.estimated_total_cost", "129000"), ("ml_app", "kiln-capture")]
+        {
+            assert_eq!(get(chat, k), Some(v), "{k}");
+        }
         assert_eq!(get(named(&rows, "Messages.create"), "metrics.estimated_total_cost"), Some("1700000"));
     }
 }

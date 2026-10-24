@@ -78,7 +78,10 @@ class Model(Quiet):
         self.answer(200, r)
 
 
-for port, h in ((8126, Agent), (18080, Model)):
+# agent_mode: a real Agent receives (DD_TRACE_AGENT_PORT), on the host's loopback: no stand-in, and
+# the model server on a port of its own.
+MODEL = int(os.environ.get("MODEL_PORT", "18080"))
+for port, h in (((8126, Agent),) if MODE != "agent_mode" else ()) + ((MODEL, Model),):
     s = socketserver.ThreadingTCPServer(("127.0.0.1", port), h)
     s.daemon_threads = True
     threading.Thread(target=s.serve_forever, daemon=True).start()
@@ -90,8 +93,8 @@ LLMObs.enable(ml_app="kiln-capture", integrations_enabled=True)
 import anthropic
 import openai
 
-oc = openai.OpenAI(base_url="http://127.0.0.1:18080/v1", api_key="sk-kiln-capture")
-ac = anthropic.Anthropic(base_url="http://127.0.0.1:18080", api_key="sk-ant-kiln-capture")
+oc = openai.OpenAI(base_url=f"http://127.0.0.1:{MODEL}/v1", api_key="sk-kiln-capture")
+ac = anthropic.Anthropic(base_url=f"http://127.0.0.1:{MODEL}", api_key="sk-ant-kiln-capture")
 
 
 @tool(name="weather")
@@ -117,7 +120,10 @@ def answer(q):
 
 
 out, exported = answer("Weather in Paris?")
-LLMObs.submit_evaluation(label="accuracy", metric_type="score", value=0.8, span=exported, assessment="pass", reasoning="matches the forecast")
+# An evaluation goes through the Agent's event platform proxy, to Datadog's own intake past a real
+# Agent: none in agent_mode.
+if MODE != "agent_mode":
+    LLMObs.submit_evaluation(label="accuracy", metric_type="score", value=0.8, span=exported, assessment="pass", reasoning="matches the forecast")
 LLMObs.flush()
 try:
     from ddtrace.trace import tracer
