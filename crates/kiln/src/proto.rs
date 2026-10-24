@@ -41,6 +41,28 @@ pub const LANE_STREAM: u32 = 8;
 /// runners announcing [`CAP_PORTS`].
 pub const LANE_PORTS: u32 = 9;
 
+/// A lane's name, as metrics and runner pages say it.
+pub fn lane_name(lane: u32) -> &'static str {
+    match lane {
+        LANE_CONTROL => "control",
+        LANE_TERM => "term",
+        LANE_LOGS => "logs",
+        LANE_SYNC => "sync",
+        LANE_REACH => "reach",
+        5 => "observe",
+        LANE_CONVO => "convo",
+        LANE_FILES => "files",
+        LANE_STREAM => "stream",
+        LANE_PORTS => "ports",
+        _ => "other",
+    }
+}
+
+/// The lane a name says (as [`lane_name`] says it), or its number.
+pub fn lane_named(name: &str) -> Option<u32> {
+    (0..16).find(|l| lane_name(*l) == name).or_else(|| name.parse().ok())
+}
+
 /// Protocol version; bumped on incompatible changes. Agents with another version are refused.
 pub const VERSION: u32 = 1;
 
@@ -196,6 +218,19 @@ pub enum AgentMsg {
     /// when none) from this runner's learner. Only from runners announcing [`CAP_CLUSTER`].
     /// Appended last: postcard encodes variants by index.
     Cluster { json: String, raft: Vec<u8> },
+    /// What this runner's QUIC layer let go before it reached the wire since it started, by lane
+    /// and reason (`crate::metrics::NetMetrics`): each supersedes the last. Sent with its samples
+    /// once it changed, only to a server announcing [`CAP_NET_DROPS`]. Appended last: postcard
+    /// encodes variants by index.
+    NetDrops { dropped: Vec<NetDrop> },
+}
+
+/// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetDrop {
+    pub lane: String,
+    pub reason: String,
+    pub frames: u64,
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -301,6 +336,10 @@ pub const CAP_CLUSTER: u32 = 1 << 31;
 /// peer keeps the channel (`crate::wire::channel`, docs/wire.md). What must arrive goes as
 /// numbered items, answered by the process that applied them and sent again after a reconnect.
 pub const CAP_WIRE: u64 = 1 << 32;
+
+/// [`ServerMsg::Caps`] capability: the server takes [`AgentMsg::NetDrops`], what a runner's QUIC
+/// layer let go, for its page.
+pub const CAP_NET_DROPS: u64 = 1 << 33;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -533,6 +572,30 @@ pub enum ServerMsg {
     /// runner's learner. Only to runners announcing [`CAP_CLUSTER`]. Appended last: postcard
     /// encodes variants by index.
     Cluster { json: String, raft: Vec<u8> },
+    /// What the server's copy of each of this runner's agent sessions has: sent before `Welcome`
+    /// to a runner that keeps the channel (as many of these as it takes), so a stream it starts
+    /// (it started again, or the server lost its streams) sends only what the copy lacks
+    /// (docs/wire.md, "Restarts"). Appended last: postcard encodes variants by index.
+    Kept { sessions: Vec<KeptSession> },
+}
+
+/// What the server's copy of one agent session has of its events, said in digests
+/// ([`ServerMsg::Kept`], `crate::wire::sums`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeptSession {
+    pub session: String,
+    /// The epoch its copy is of: a session that went on elsewhere since starts over whole.
+    pub epoch: u64,
+    /// Its newest event's number in the copy (0: it has none).
+    pub seq: u64,
+    /// Its oldest event's number in the copy.
+    pub from: u64,
+    /// How many events a digest in `runs` covers.
+    pub run: u64,
+    /// A digest of each run of `run` events from `from` on, up to the events `last` has one of each.
+    pub runs: Vec<u64>,
+    /// A digest of each of its newest events, through `seq` (0: the copy lacks that one).
+    pub last: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -629,7 +692,8 @@ mod tests {
             assert_eq!(decode::<AgentMsg>(&b)?, m);
             assert!(decode::<AgentMsg>(b.get(..b.len() - 1).unwrap_or_default()).is_err(), "a cut-off frame is an error");
         }
-        let server = [(ServerMsg::Caps { caps: CAP_WIRE }, 53u8)].into_iter().chain(frames.into_iter().map(|f| (ServerMsg::Wire(f), 54)));
+        let kept = ServerMsg::Kept { sessions: vec![KeptSession { session: "s".into(), epoch: 2, seq: 40, from: 1, run: 64, runs: Vec::new(), last: vec![7; 40] }] };
+        let server = [(ServerMsg::Caps { caps: CAP_WIRE }, 53u8)].into_iter().chain(frames.into_iter().map(|f| (ServerMsg::Wire(f), 54))).chain([(kept, 56)]);
         for (m, idx) in server {
             let b = encode(&m)?;
             assert_eq!(b.first(), Some(&idx), "{m:?} is ServerMsg variant {idx} on the wire");
@@ -650,6 +714,18 @@ mod tests {
         assert_eq!(CAP_CLUSTER.count_ones(), 1);
         assert_eq!(CAP_CLUSTER & CAP_UNDEPLOY, 0);
         assert_eq!(u64::from(CAP_CLUSTER) & CAP_WIRE, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn what_a_runner_dropped_is_appended_after_the_cluster_group() -> anyhow::Result<()> {
+        // After `Cluster` (47), so a server from before skips it; and only to one that takes it.
+        let m = AgentMsg::NetDrops { dropped: vec![NetDrop { lane: lane_name(LANE_TERM).into(), reason: "shed".into(), frames: 3 }] };
+        let b = encode(&m)?;
+        assert_eq!(b.first(), Some(&48));
+        assert_eq!(decode::<AgentMsg>(&b)?, m);
+        assert!(CAP_NET_DROPS.is_power_of_two() && CAP_NET_DROPS & CAP_WIRE == 0 && CAP_NET_DROPS > u64::from(u32::MAX));
+        assert_eq!((lane_name(LANE_CONTROL), lane_name(LANE_PORTS), lane_name(99)), ("control", "ports", "other"));
         Ok(())
     }
 

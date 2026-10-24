@@ -4110,6 +4110,15 @@ impl Leg {
         aenv.insert("GITHUB_ACTION_PATH".into(), loc.dir.to_string_lossy().to_string());
         aenv.insert("GITHUB_ACTION_REPOSITORY".into(), loc.repo.clone());
         aenv.insert("GITHUB_ACTION_REF".into(), loc.git_ref.clone());
+        // One that signs only on GitHub (docs/ci.md W18-R02) runs as asked, and the leg is told
+        // why it fails: by the action that signs (a composite around it says nothing of its own).
+        if action.runs.using.starts_with("node")
+            && let Some(note) = crate::ci::actions::github_only(&loc.repo)
+        {
+            let warning = format!("{} {note}", loc.repo);
+            self.text(st, idx, format!("\x1b[33mwarning: {warning}\x1b[0m\n").as_bytes()).await;
+            self.annotate(idx, "warning", &warning).await;
+        }
         for (k, v) in std::mem::take(&mut st.action_state) {
             aenv.insert(format!("STATE_{k}"), v);
         }

@@ -306,7 +306,8 @@ pub async fn effect(hub: &Hub, rules: &[Rule]) -> (Vec<Value>, Vec<Value>) {
 }
 
 /// `POST /api/ci/routing/explain` with a leg's routing (`labels`, `repo`, `job`, `workflow`,
-/// `event`, `requires`): where it would go now, and why each runner can or can't take it.
+/// `event`, `requires`, `untrusted`, `nests_containers`): where it would go now, and why each
+/// runner can or can't take it.
 pub async fn explain(hub: &Hub, body: Value) -> Result<Response, Fail> {
     if !hub.ci.enabled() {
         return Err((StatusCode::NOT_FOUND, "the CI engine is off".into()));
@@ -329,6 +330,8 @@ pub async fn explain(hub: &Hub, body: Value) -> Result<Response, Fail> {
         caps: u64::from(crate::proto::CAP_CI2),
         // `untrusted: true`: where an untrusted leg would go (W18-R07).
         untrusted: body.get("untrusted").and_then(Value::as_bool).unwrap_or(false).then(|| hub.cfg.ci.untrusted.route()),
+        // `nests_containers: true`: where one whose steps run podman would go.
+        nests_containers: body.get("nests_containers").and_then(Value::as_bool).unwrap_or(false),
     };
     let (tx, rx) = async_channel::bounded(1);
     hub.ci.send(super::dispatch::Msg::ExplainRoute { route: Box::new(route), reply: tx });

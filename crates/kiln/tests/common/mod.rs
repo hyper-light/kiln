@@ -2,6 +2,9 @@
 
 #![allow(dead_code, reason = "each test file uses what it needs")]
 
+#[cfg(unix)]
+pub mod agents;
+
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;

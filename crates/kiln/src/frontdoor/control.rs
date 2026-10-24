@@ -29,8 +29,7 @@ use serde_json::json;
 use crate::http::server::{self as srv, Request, Response};
 use crate::hub::Hub;
 use crate::instances::PeerId;
-use crate::net::Kind;
-use crate::proto::{CAP_FRONT_DOOR, LANE_CONTROL, ServerMsg};
+use crate::proto::{CAP_FRONT_DOOR, ServerMsg};
 
 use super::{CertMode, CustomCert, Push, Settings, Status};
 
@@ -169,12 +168,15 @@ fn peers(hub: &Hub, machine: &str) -> (Option<PeerId>, Vec<PeerId>) {
     (newest.filter(|p| capable(*p)), others)
 }
 
-async fn send(hub: &Hub, peer: PeerId, push: &Push) -> bool {
+/// Sends `push` to runner process `peer` of `machine` (a state: its newest goes, answered once
+/// taken, `crate::wire::commands`). Whether it's on its way: its answer is logged when it comes
+/// (this runs as the hub takes the runner's messages, which is where the answer comes from).
+async fn send(hub: &Hub, machine: &str, peer: PeerId, push: &Push) -> bool {
     let Ok(json) = serde_json::to_string(push) else { return false };
-    match crate::proto::encode(&ServerMsg::FrontDoor { json }) {
-        Ok(b) => hub.net.send(peer, LANE_CONTROL, Kind::Control, b).await,
-        Err(_) => false,
-    }
+    let pending = hub.command_peers(machine, vec![peer], &ServerMsg::FrontDoor { json }).await;
+    let on_its_way = pending.at_once().is_none_or(|a| matches!(a, crate::wire::commands::Answer::Sent));
+    pending.log_when_answered(crate::hub::LOG_WITHIN);
+    on_its_way
 }
 
 /// Send `machine` its front door (to the process that runs it; the others stand by), with a
@@ -182,11 +184,11 @@ async fn send(hub: &Hub, peer: PeerId, push: &Push) -> bool {
 pub async fn push(hub: &Hub, machine: &str, issued: Option<String>, custom: Option<CustomCert>) -> bool {
     let (runs, others) = peers(hub, machine);
     for p in others {
-        send(hub, p, &Push { standby: true, ..Push::default() }).await;
+        send(hub, machine, p, &Push { standby: true, ..Push::default() }).await;
     }
     let Some(peer) = runs else { return false };
     let settings = hub.front_doors.settings(machine);
-    send(hub, peer, &Push { settings, standby: false, issued, custom, renew: false, peers: Some(crate::peers::table(hub)) }).await
+    send(hub, machine, peer, &Push { settings, standby: false, issued, custom, renew: false, peers: Some(crate::peers::table(hub)) }).await
 }
 
 /// A runner process said what it can do (`AgentMsg::Build`): one that runs front doors gets
@@ -295,7 +297,7 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, csr: &str, status: &Statu
     tracing::info!(machine, names = ?names, "front door: issued a certificate from the kiln CA");
     hub.store.audit(machine.to_owned(), "front_door.certificate".into(), format!("kiln CA certificate for {} until {}", names.join(", "), date(until))).await;
     let settings = hub.front_doors.settings(machine);
-    send(hub, peer, &Push { settings, standby: false, issued: Some(pem), custom: None, renew: false, peers: Some(crate::peers::table(hub)) }).await;
+    send(hub, machine, peer, &Push { settings, standby: false, issued: Some(pem), custom: None, renew: false, peers: Some(crate::peers::table(hub)) }).await;
 }
 
 fn date(unix: i64) -> String {
@@ -449,7 +451,7 @@ pub async fn renew(hub: &Hub, name: &str) -> Answer {
         e.issued_at = None;
     }
     let settings = hub.front_doors.settings(name);
-    if !send(hub, peer, &Push { settings, renew: true, ..Push::default() }).await {
+    if !send(hub, name, peer, &Push { settings, renew: true, ..Push::default() }).await {
         return Err(fail(StatusCode::BAD_GATEWAY, format!("{name} could not be reached; try again")));
     }
     hub.store.audit("admin".into(), "front_door.renew".into(), format!("{name}: asked for a new key and self-signed certificate")).await;

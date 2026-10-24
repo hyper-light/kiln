@@ -2525,8 +2525,8 @@ Gives step execution for `uses:`.
   kiln, whose repositories aren't read anonymously as a public one on GitHub is.
 - *Done.* AC01 but two (with W22-AC02): F-21's actions green, those that need an account in dry
   configurations against stand-ins for their providers (`tests/account_actions.rs`).
-- *Left.* AC01's `azure/login` (a test tenant, W11-AC03) and `actions/attest-build-provenance`
-  (GitHub's Sigstore only).
+- *Left.* AC01's `azure/login` (a test tenant, W11-AC03) and `actions/attest-build-provenance`,
+  which signs only on github.com and GHE.com (W18-R02): what it attests there, kiln verifies.
 
 ### W08 Runtime services: store, caches, artifacts, reuse
 
@@ -3928,6 +3928,38 @@ enforcement points to W18, agent isolation to W20.
   apt assumes yes, as GitHub's images set it. Cargo's and npm's global directories are the
   `runner` user's, so `cargo install` and `npm install -g` work. `kiln/runner-ubuntu-24.04-slim`
   is the basics alone. A new build removes its user's older ones.
+- *Done.* Podman, Buildah and Skopeo in the image, as GitHub's have them. Their containers can't
+  run in a container executor's container, so a leg whose `run:` steps call `podman` or
+  `buildah` (at a command's start, past `sudo` and `NAME=value`, not in a comment:
+  `runs_containers`) leaves the `docker` and `k8s` executors for the others its rules allow, else
+  a Firecracker microVM; a rule's `match.nests_containers` sends such legs where it says, as the
+  corpus lab's sends them to microVMs, the user's choice (rails' `rails-new-docker`;
+  `w13_a_leg_that_runs_podman_leaves_container_executors`). `POST /api/ci/routing/explain` takes
+  `nests_containers` too.
+- *Done.* kiln's runner images in Firecracker microVMs, and Podman in them. No registry has
+  `kiln/runner-*`, so a microVM leg of one builds it with Docker as the `docker` executor does
+  (once per version), saves it (`docker save`, unpacked as it streams), and builds its layers into
+  the microVM's ext4 as a pulled image's are, kept by Docker's id for the image: gzip, as Docker's
+  containerd image store keeps them, or plain tar (zstd is refused)
+  (`w13_saved_images_read_in_order`). Podman's storage there is on the scratch disk, and its
+  containers share the guest's own network, the only one it has (out through the egress
+  proxy), with cgroupfs and file events. Checked with `kiln workflow run --executor firecracker`
+  (Firecracker 1.17, its 6.1 kernel, Docker 29 with the containerd image store): Podman 4.9.3
+  built an image whose `RUN apk add` reached the internet through the proxy, ran it, and served
+  nginx on its port. On the guest's network a published port is the container's own
+  (`-p 3000:3000`, as rails' test has it); one mapped to another (`-p 8080:80`) stays the
+  container's.
+- *Done.* `kiln/runner-ubuntu-24.04-android` (and `-26.04`, `-22.04`): the full image and
+  Android's SDK where GitHub's images have it (`ANDROID_HOME` and `ANDROID_SDK_ROOT`
+  `/usr/local/lib/android/sdk`; the command-line tools, latest, checked against the SHA-1 Google's
+  repository lists; NDK 27.3.13750724 and the platform tools through `sdkmanager`, which checks
+  them against it; `ANDROID_NDK`, `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT` and
+  `ANDROID_NDK_LATEST_HOME` set as GitHub's images set them; the SDK the `runner` user's). Only a
+  routing rule that names it chooses it: building it accepts the Android Software Development Kit
+  License Agreement (developer.android.com/studio/terms) that `sdkmanager --licenses` asks for,
+  so the administrator who names it accepts it, and the image is labelled so
+  (`kiln.android-sdk-license=accepted`). There's no slim one (sdkmanager needs the JDK)
+  (`runner_images_have_a_dockerfile`).
 - *Done.* R04's opt-in Docker access: a routing rule's `docker: socket` gives a trusted run's
   `docker` legs the host's Docker socket, reached through the socket's group. The image has the
   Docker CLI with buildx and compose. The leg's machine is a container the daemon doesn't look
@@ -5381,9 +5413,14 @@ code from outside a repository's trust safely: microVMs or containers, limited e
   kiln is configured with (self-hosted instances can be deployed in kiln's cluster), or with a key
   (a cosign key file, or a KMS integration). Signatures and attestations attach to images through
   the OCI referrers API (W12) and to files as `.sigstore.json` bundles.
-  `actions/attest-build-provenance` works when a Fulcio that trusts kiln's issuer is configured and
-  the facade's attestations endpoint is used; otherwise `kiln/attest@v1` is the supported path, and
-  the catalog says so.
+  `actions/attest-build-provenance` (and `actions/attest`, `attest-sbom`) sign only on github.com
+  and GHE.com: `@actions/attest` accepts no other server (`GITHUB_SERVER_URL`) and checks the job's
+  ID token with `token.actions.<host>`'s keys before it signs, so no Fulcio that trusts kiln's
+  issuer makes them work in a kiln leg. `kiln/attest@v1` is the supported path, and the catalog
+  and the leg say so; what those actions attest on GitHub, kiln verifies (`kiln attest verify`).
+  *Corrected 2026-10-24:* this said such a Fulcio made the action work. @actions/attest's
+  `getIssuer` (actions/toolkit `packages/attest/src/oidc.ts`, used by actions/attest v4.2.1 and
+  so attest-build-provenance v4.2.2) refuses every other server.
 - **W18-R03 SBOMs.** SPDX 2.3 and CycloneDX 1.6 from lockfiles: `Cargo.lock`, `go.mod`/`go.sum`,
   `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `uv.lock`, `poetry.lock`, requirements files,
   `Gemfile.lock` and `composer.lock` built in; others through `syft` when it is on the runner.
@@ -5539,6 +5576,46 @@ Done since:
   branches }`, globs) answers whether kiln's own provenance about a digest, its signature checked
   again, meets the requirement: `{ verified, attestation }`, or `{ verified: false, why }`. CD's
   `require-provenance` asks it before it deploys an image (W15-R03).
+- *Done.* Keyless bundles are verified as Sigstore's clients verify them (`ci::sigstore`), so a
+  keyless signer's provenance meets R04's requirements too, and attestations other Sigstore users
+  made (GitHub's `actions/attest-build-provenance`) can be checked:
+  - the certificate chains to a Fulcio of the trusted root, each certificate valid when the log
+    took the signature, the leaf for code signing, and a CT log of the trusted root signed its
+    SCT (over the precertificate, RFC 6962 §3.2);
+  - the DSSE envelope's signature is the certificate's key's;
+  - a Rekor entry (`dsse` 0.0.1 or `intoto` 0.0.2) is of this payload, signature and
+    certificate; its signed entry timestamp, which gives the signing time, is the log's; and its
+    inclusion proof leads to a checkpoint the log signed;
+  - the certificate names the identity asked for: its issuer, its subject (exactly or by prefix)
+    and Fulcio's claims (`source_repository_uri`, `source_repository_ref`…);
+  - the statement names the artifact's digest.
+
+  The trusted root is `[ci.attest] trusted_root` (a `trusted_root.json`: the Sigstore kiln signs
+  with, when it's kiln's own), or Sigstore's public instance's through its TUF repository. kiln
+  ships that repository's root metadata (version 16, byte for byte as Sigstore publishes it) and
+  takes each newer root, then the timestamp, snapshot and targets, as TUF's client workflow says
+  (each signed by a threshold of its role's keys, none expired or older than the last taken),
+  then `trusted_root.json`, kept for a day. kiln's own keyless bundles verify against it, kiln's
+  issuer their identity: against a Sigstore of the test's own (a Fulcio certifying the key for the
+  token's issuer, a Rekor logging and signing the entry), CD's check finds kiln's keyless
+  provenance verified, and another issuer or another Sigstore's root doesn't verify it
+  (`w18_r04_keyless_provenance_verifies`). `kiln attest verify <file | sha256:…> --repo OWNER/NAME
+  [--signer-workflow …] [--source-ref …]` checks an artifact's attestations on GitHub (its
+  attestations API, whose bundles come snappy-compressed behind `bundle_url`) or in a file
+  (`--bundle`). Checked against the GitHub CLI's provenance of its 2.103.2 release (cli/cli's
+  `deployment.yml`, on Sigstore's public instance), each part of it changed failing the check
+  that covers it (`w18_github_attestation_*`, `w18_the_trusted_root_decides`), and the TUF chain
+  against Sigstore's published metadata (`w18_sigstore_*`). Bundles from GitHub's own Sigstore
+  (private repositories' attestations and its release attestations: RFC 3161 timestamps, no
+  transparency log) and Rekor v2's entries are refused, saying so: kiln doesn't verify
+  timestamp authorities' signatures.
+- *Done.* R02's GitHub-only actions: the catalog notes `actions/attest`, `attest-build-provenance`
+  and `attest-sbom` as signing only on github.com and GHE.com (`note` in `GET /api/ci/actions`),
+  naming `kiln/attest@v1`; a leg running one is told so in a warning on its step, by the Node
+  action that signs (not twice for a composite around it), and the action runs as asked
+  (`w18_r02_actions_that_sign_only_on_github`). Checked with `kiln workflow run` on the host
+  executor: `attest-build-provenance` v4.2.2's step shows the warning once, then the action's own
+  `Invalid server URL: http://127.0.0.1:…`.
 - *Done.* R04's CD half and AC04: an environment's `require_provenance: { builder, workflows,
   branches }` (deploy-api.md §9.1) holds a release until kiln has provenance of each artifact it
   deploys (for half an hour, its build perhaps still attesting it), refuses one whose provenance
@@ -6822,8 +6899,9 @@ and AC02.
 
   That is every one of F-21's 50 but two: `azure/login`, which has no such configuration (it
   signs in with the Azure CLI against Microsoft Entra), waits for a test tenant (W11-AC03); and
-  `actions/attest-build-provenance`, which signs only through a Sigstore that trusts GitHub's ID
-  tokens (kiln's own `kiln/attest@v1` and the job's `attest:` are W18-R01's).
+  `actions/attest-build-provenance`, which signs only on github.com and GHE.com (W18-R02: its
+  toolkit accepts no other server; kiln's own `kiln/attest@v1` and the job's `attest:` are
+  W18-R01's).
 - *AC02, first batch* (16 actions, 2026-10-18):
   - Green: `setup-node`, `setup-go`, `setup-java`, `setup-uv`, `pnpm/action-setup`,
     `setup-bun`, `dtolnay/rust-toolchain`, `setup-terraform`, `docker/metadata-action`,

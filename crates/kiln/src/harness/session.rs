@@ -619,7 +619,7 @@ impl Session {
 
     /// Everything a new viewer (or a restarted server) needs, starting with the announcement.
     pub fn snapshot(&self) -> Vec<Update> {
-        let mut out = vec![Update::Open { info: Box::new(self.info()) }];
+        let mut out = vec![Update::Open { info: Box::new(self.info()), since: None }];
         out.extend(self.core.lock().snapshot(256 * 1024));
         out
     }

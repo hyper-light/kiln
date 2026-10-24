@@ -224,3 +224,198 @@ fn w18_r02_keyless() -> anyhow::Result<()> {
     assert_eq!(st, 404);
     Ok(())
 }
+
+fn sha256(b: &[u8]) -> Vec<u8> {
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b).as_ref().to_vec()
+}
+
+/// A Sigstore of the test's own whose answers verify: a Fulcio that certifies the key it's sent
+/// for the identity token's issuer and subject (from a CA of its own), and a Rekor that logs the
+/// envelope as a dsse entry in a tree of one, its promise and checkpoint signed with its key.
+struct Sigstore {
+    port: u16,
+    ca: Vec<u8>,
+    log_key: Vec<u8>,
+    /// The issuer of the identity tokens Fulcio was sent.
+    issuers: Arc<Mutex<Vec<String>>>,
+}
+
+/// One request's path and JSON body, from `stream`.
+fn request(stream: &std::net::TcpStream) -> Option<(String, Value)> {
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let path = line.split_whitespace().nth(1).unwrap_or_default().to_owned();
+    let mut len = 0usize;
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h).is_err() || h.trim().is_empty() {
+            break;
+        }
+        if let Some((k, v)) = h.split_once(':')
+            && k.trim().eq_ignore_ascii_case("content-length")
+        {
+            len = v.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body).ok()?;
+    Some((path, serde_json::from_slice(&body).unwrap_or(Value::Null)))
+}
+
+/// Fulcio's answer to `ask`: a certificate for its key, for code signing, naming the token's
+/// issuer (1.3.6.1.4.1.57264.1.8, a DER UTF8String) and subject (a URI), signed by `ca`.
+fn certify(ask: &Value, ca: &rcgen::Issuer<'_, rcgen::KeyPair>) -> anyhow::Result<(String, Value)> {
+    let token = ask.pointer("/credentials/oidcIdentityToken").and_then(Value::as_str).unwrap_or_default();
+    let claims: Value = token.split('.').nth(1).and_then(|c| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(c).ok()).and_then(|c| serde_json::from_slice(&c).ok()).unwrap_or(Value::Null);
+    let (iss, sub) = (claims.get("iss").and_then(Value::as_str).unwrap_or_default(), claims.get("sub").and_then(Value::as_str).unwrap_or_default());
+    anyhow::ensure!(!iss.is_empty() && iss.len() < 128, "the token's issuer: {claims}");
+    let pem = ask.pointer("/publicKeyRequest/publicKey/content").and_then(Value::as_str).unwrap_or_default();
+    let spki = B64.decode(pem.lines().filter(|l| !l.starts_with("-----")).collect::<String>())?;
+    let mut p = rcgen::CertificateParams::new(Vec::<String>::new())?;
+    p.distinguished_name = rcgen::DistinguishedName::new();
+    p.subject_alt_names = vec![rcgen::SanType::URI(format!("https://kiln.test/{sub}").try_into()?)];
+    p.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::CodeSigning];
+    let mut utf8 = vec![0x0C, u8::try_from(iss.len())?];
+    utf8.extend_from_slice(iss.as_bytes());
+    p.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 57264, 1, 8], utf8)];
+    let cert = p.signed_by(&rcgen::SubjectPublicKeyInfo::from_der(&spki)?, ca)?;
+    Ok((iss.to_owned(), json!({ "signedCertificateEmbeddedSct": { "chain": { "certificates": [cert.pem()] } } })))
+}
+
+/// Rekor's answer to `proposed` (a dsse entry): the entry, alone in its tree, with the log's
+/// signed entry timestamp and a checkpoint it signed.
+fn logged(proposed: &Value, key: &aws_lc_rs::signature::EcdsaKeyPair, log_id: &[u8]) -> anyhow::Result<Value> {
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let sign = |m: &[u8]| -> anyhow::Result<Vec<u8>> { Ok(key.sign(&rng, m).map_err(|_| anyhow::anyhow!("signing"))?.as_ref().to_vec()) };
+    let envelope = proposed.pointer("/spec/proposedContent/envelope").and_then(Value::as_str).unwrap_or_default();
+    let verifier = proposed.pointer("/spec/proposedContent/verifiers/0").and_then(Value::as_str).unwrap_or_default();
+    let env: Value = serde_json::from_str(envelope)?;
+    let payload = B64.decode(env.get("payload").and_then(Value::as_str).unwrap_or_default())?;
+    let sig = env.pointer("/signatures/0/sig").and_then(Value::as_str).unwrap_or_default();
+    let body = json!({ "apiVersion": "0.0.1", "kind": "dsse", "spec": {
+        "envelopeHash": { "algorithm": "sha256", "value": hex::encode(sha256(envelope.as_bytes())) },
+        "payloadHash": { "algorithm": "sha256", "value": hex::encode(sha256(&payload)) },
+        "signatures": [{ "signature": sig, "verifier": verifier }],
+    } })
+    .to_string();
+    let body_b64 = B64.encode(&body);
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let promise = format!("{{\"body\":\"{body_b64}\",\"integratedTime\":{at},\"logID\":\"{}\",\"logIndex\":7}}", hex::encode(log_id));
+    let root = sha256(&[[0u8].as_slice(), body.as_bytes()].concat());
+    let note = format!("rekor.test - 1\n1\n{}\n", B64.encode(&root));
+    let mut hinted = log_id.get(..4).unwrap_or_default().to_vec();
+    hinted.extend(sign(note.as_bytes())?);
+    Ok(json!({ "e1": {
+        "body": body_b64, "integratedTime": at, "logID": hex::encode(log_id), "logIndex": 7,
+        "verification": {
+            "signedEntryTimestamp": B64.encode(sign(promise.as_bytes())?),
+            "inclusionProof": { "logIndex": 0, "rootHash": hex::encode(&root), "treeSize": 1, "hashes": [], "checkpoint": format!("{note}\n\u{2014} rekor.test {}\n", B64.encode(&hinted)) },
+        },
+    } }))
+}
+
+fn real_sigstore() -> anyhow::Result<Sigstore> {
+    use aws_lc_rs::encoding::AsDer as _;
+    use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _};
+    let ca_key = rcgen::KeyPair::generate()?;
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.distinguished_name.push(rcgen::DnType::CommonName, "kiln test fulcio");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::DigitalSignature];
+    let ca = params.self_signed(&ca_key)?.der().to_vec();
+    let issuer = rcgen::Issuer::new(params, ca_key);
+    let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &aws_lc_rs::rand::SystemRandom::new()).map_err(|_| anyhow::anyhow!("no log key"))?;
+    let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, doc.as_ref()).map_err(|_| anyhow::anyhow!("the log key"))?;
+    let log_key = key.public_key().as_der().map_err(|_| anyhow::anyhow!("the log key's public half"))?.as_ref().to_vec();
+    let log_id = sha256(&log_key);
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let issuers: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = issuers.clone();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let Some((path, v)) = request(&stream) else { continue };
+            let answer = match path.as_str() {
+                "/fulcio/api/v2/signingCert" => certify(&v, &issuer).map(|(iss, a)| {
+                    if let Ok(mut s) = seen.lock() {
+                        s.push(iss);
+                    }
+                    a
+                }),
+                "/rekor/api/v1/log/entries" => logged(&v, &key, &log_id),
+                _ => Err(anyhow::anyhow!("no {path}")),
+            };
+            let (status, text) = match answer {
+                Ok(a) => (201, a.to_string()),
+                Err(e) => (400, json!({ "message": format!("{e:#}") }).to_string()),
+            };
+            let _ = write!(stream, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+        }
+    });
+    Ok(Sigstore { port, ca, log_key, issuers })
+}
+
+/// The Sigstore's trusted root, as `trusted_root.json` has it (no CT log: it asks for no SCT).
+fn trusted_root(s: &Sigstore) -> Value {
+    json!({
+        "mediaType": "application/vnd.dev.sigstore.trustedroot+json;version=0.1",
+        "tlogs": [{
+            "baseUrl": format!("http://127.0.0.1:{}/rekor", s.port), "hashAlgorithm": "SHA2_256",
+            "publicKey": { "rawBytes": B64.encode(&s.log_key), "keyDetails": "PKIX_ECDSA_P256_SHA_256", "validFor": { "start": "2020-01-01T00:00:00Z" } },
+            "logId": { "keyId": B64.encode(sha256(&s.log_key)) },
+        }],
+        "certificateAuthorities": [{
+            "subject": { "commonName": "kiln test fulcio" }, "uri": format!("http://127.0.0.1:{}/fulcio", s.port),
+            "certChain": { "certificates": [{ "rawBytes": B64.encode(&s.ca) }] }, "validFor": { "start": "2020-01-01T00:00:00Z" },
+        }],
+        "ctlogs": [],
+        "timestampAuthorities": [],
+    })
+}
+
+/// R04 with keyless signing: kiln's provenance verifies as Sigstore's clients verify it, against
+/// the trusted root of the Sigstore it signed with (`[ci.attest] trusted_root`), kiln's issuer its
+/// identity; CD's check finds it so; and against another Sigstore's root, or for another issuer,
+/// it doesn't.
+#[test]
+fn w18_r04_keyless_provenance_verifies() -> anyhow::Result<()> {
+    use kiln::ci::sigstore::{Identity, TrustedRoot, verify};
+    let sig = real_sigstore()?;
+    let dir = tempfile::tempdir()?;
+    let root_file = dir.path().join("trusted_root.json");
+    std::fs::write(&root_file, trusted_root(&sig).to_string())?;
+    let ci = format!(
+        "[ci.attest]\nsigning = \"keyless\"\nfulcio_url = \"http://127.0.0.1:{0}/fulcio\"\nrekor_url = \"http://127.0.0.1:{0}/rekor\"\ntrusted_root = \"{1}\"\n",
+        sig.port,
+        root_file.display()
+    );
+    let (s, list, _) = attested(dir.path(), "", &ci)?;
+    let bundle = list
+        .iter()
+        .find(|a| a.get("predicate_type").and_then(Value::as_str) == Some("https://slsa.dev/provenance/v1"))
+        .and_then(|a| a.get("bundle"))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no provenance: {list:?}\n{}", s.log()))?;
+    let hex = hex::encode(sha256(b"the artifact\n"));
+    // CD's check (R04): kiln's provenance of the file, its signature verified.
+    let (st, body) = http(s.port, "POST", "/api/ci/attestations/verify", &s.admin, Some(&json!({ "digest": format!("sha256:{hex}") })))?;
+    assert_eq!(st, 200, "{body}");
+    let v: Value = serde_json::from_str(&body)?;
+    assert_eq!(v.get("verified"), Some(&json!(true)), "{body}\n{}", s.log());
+    // As Sigstore's clients check it.
+    let issuer = sig.issuers.lock().map(|i| i.first().cloned().unwrap_or_default()).unwrap_or_default();
+    assert!(issuer.ends_with("/oidc"), "kiln's issuer: {issuer}");
+    let root = TrustedRoot::from_json(trusted_root(&sig).to_string().as_bytes())?;
+    let kiln_id = Identity { issuer: issuer.clone(), subject: None, claims: Vec::new() };
+    let ok = verify(&bundle, &root, &kiln_id, Some(("sha256", hex.as_str())))?;
+    assert!(ok.subject.contains("acme/sig"), "{}", ok.subject);
+    assert_eq!(ok.log_index, 7);
+    let github = Identity { issuer: "https://token.actions.githubusercontent.com".into(), subject: None, claims: Vec::new() };
+    assert!(verify(&bundle, &root, &github, None).is_err(), "another issuer's");
+    let other = TrustedRoot::from_json(trusted_root(&real_sigstore()?).to_string().as_bytes())?;
+    assert!(verify(&bundle, &other, &kiln_id, None).is_err(), "another Sigstore's root");
+    Ok(())
+}
