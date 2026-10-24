@@ -56,6 +56,45 @@ its processes is fire-and-forget"):
 
 Messages to agents ride the same channel, and their answers are T3's inbox answers.
 
+## Commands
+
+The server's commands to a runner process ride that process's command streams on the channel
+(`crate::wire::commands`), one stream for each way a command waits:
+
+- **Parked** (`p:<born>.<gen>`): a leg to cancel, a session to close, a state's newest. While its
+  runner is away it waits. After a reconnect it goes again from where the runner has the stream.
+- **Live** (`l:<born>.<gen>`): a leg to run, a terminal or a page to open, what a viewer does. It's
+  refused at once while its runner is away. A link that drops before it's answered ends it
+  `unanswered`: sent again later, it would surprise.
+
+The runner process takes each command once however often it comes, applies it as if it had come
+alone, and answers it: an ACK, or a NACK with its kind (`unknown`, `refused`, `stale_epoch`,
+`unsupported`, `malformed`) and why. Within a live link, a command whose answer is late goes
+again (`Want` and patience, as for any item: "Loss below the channel").
+
+Its caller gets one of these answers:
+
+| Answer | What it means |
+|---|---|
+| `taken` | The runner applied it. |
+| `refused` | The runner refused it, saying how and why. |
+| `unreachable` | It never reached the runner: away for a live command, gone for good, or too many waiting. |
+| `unanswered` | The runner may or may not have applied it: its link dropped before it answered a live command, or no answer came in time. |
+| `parked` | A person's parked command to a runner that's away: it goes once the runner is back. |
+| `sent` | Sent to a runner from before the channel, which can't say. |
+
+Callers take it in one of two ways:
+- **An API call waits for it** (`Hub::command`). Its HTTP error says what the runner said: 404 for
+  `unknown`, 409 for another refusal, 503 for `unreachable`, 504 for `unanswered`.
+- **A caller that mustn't wait gets it to come** (`Hub::command_start`): the scheduler, and the
+  hub as it takes runners' messages, which is where the answers come from. It acts on what it
+  knows at once (a leg whose runner is away goes back in the queue) and logs the rest.
+
+A runner process that started again has neither stream. Its parked commands not yet answered go
+again on a new generation, and its live ones end `unanswered`. A parked command waits for its
+runner a day at the most. A forgotten runner's waiting commands end `unreachable`. Commands live
+in the server's memory: one that restarts lets go of them, which their callers see as `unanswered`.
+
 ## Loss below the channel
 
 kiln's QUIC layer (`crate::net`) holds frames a lane can't take yet in a queue of 8,192 frames per
@@ -77,6 +116,9 @@ The channel makes up for what of these it carried, without waiting for a reconne
 - An item whose answer doesn't come within the stream's patience (15 s for session updates and
   terminal output) is sent again, and the receiver takes it once.
 - A closed connection resumes as every reconnect does (`Have`).
+- What each side has (`Have`) is said again every few seconds, the runner's with its samples and
+  the server's every 5 s. A lost one doesn't hold a link's sends up: a sender's sends wait for the
+  first, and it takes the ones after as answers only.
 
 What a runner's QUIC layer drops it tells the server with its samples (`NetDrops`), once that
 changes. The runner's page shows both sides' counts, and the server exports what each runner last
@@ -144,10 +186,10 @@ queue let go.
 |---|---|---|---|
 | `Welcome` | handshake | The server takes the connection. | As its class says. |
 | `Refused` | handshake | The server refuses it, saying why. | As its class says. |
-| `Assign` | command, refused while away | A v1 leg to run. A runner that's away gets none, and the scheduler gives it to another. | Answered by `JobStarted` or `Reject`. |
-| `Cancel` | command, parked | A leg to stop. A leg still running when its runner is back must stop then. | Fire-and-forget. |
-| `Drain` | command, parked | Take no more jobs. | Fire-and-forget. |
-| `TermOpen` | command, refused while away | A terminal to open. | Fire-and-forget. |
+| `Assign` | command, refused while away | A v1 leg to run. A runner that's away gets none, and the scheduler gives it to another. | On the channel ("Commands"): answered once taken, then by `JobStarted` or `Reject`. |
+| `Cancel` | command, parked | A leg to stop. A leg still running when its runner is back must stop then. | On the channel ("Commands"): answered once applied. |
+| `Drain` | command, parked | Take no more jobs. | On the channel ("Commands"): answered once applied. |
+| `TermOpen` | command, refused while away | A terminal to open. | On the channel ("Commands"): answered once applied; refused at once while away. |
 | `TermInput` | command, refused while away | Keystrokes, never replayed later. | Fire-and-forget: lost with a dropped link. |
 | `TermResize` | state | A terminal's size: the newest wins. | Fire-and-forget. |
 | `TermClose` | command, parked | A terminal to close. | Fire-and-forget. |
@@ -158,34 +200,34 @@ queue let go.
 | `HarnessClose` | command, parked | A session closed while its machine was away must still close once it's back. | Fire-and-forget. |
 | `AiView` | ask | Answered by `AiView`. | As its class says. |
 | `HarnessFile` | command, parked | A piece of a file a message carries, kept with the message. | Fire-and-forget. |
-| `Retire` | command, parked | An older runner process may stop. | Fire-and-forget. |
-| `Upgrade` | command, refused while away | Upgrade the runner. The updater tries again on its own schedule. | Answered by `UpgradeDone`. |
+| `Retire` | command, parked | An older runner process may stop. | On the channel ("Commands"): answered once applied. |
+| `Upgrade` | command, refused while away | Upgrade the runner. The updater tries again on its own schedule. | On the channel ("Commands"): answered once taken, then by `UpgradeDone`. |
 | `HarnessTaskOutput` | ask | Answered by `HarnessTaskOutput`. | As its class says. |
 | `DirList` | ask | Answered by `DirList`. | As its class says. |
 | `HarnessHistory` | ask | Answered by `HarnessHistory`. | As its class says. |
 | `Sync` | carried (repo sync's Raft) | Repo sync. | As its class says. |
-| `FrontDoor` | state | The front door's settings and certificate. | Sent on connect and change. |
-| `AssignV2` | command, refused while away | A v2 leg to run, as `Assign`. | Answered by `JobStarted` or `Reject`. |
+| `FrontDoor` | state | The front door's settings and certificate. | On the channel ("Commands"), parked: the newest goes, answered once taken. Sent on connect and change. |
+| `AssignV2` | command, refused while away | A v2 leg to run, as `Assign`. | On the channel ("Commands"): answered once taken, then by `JobStarted` or `Reject`. |
 | `SecretsFor` | command, parked | A running leg's secrets. A leg still running when its runner is back needs them. | Fire-and-forget. |
-| `JobTerminalOpen` | command, refused while away | A terminal into a leg. | Fire-and-forget. |
-| `KeepRelease` | command, parked | A kept leg may be cleaned up. | Fire-and-forget. |
+| `JobTerminalOpen` | command, refused while away | A terminal into a leg. | On the channel ("Commands"): answered once applied; refused at once while away. |
+| `KeepRelease` | command, parked | A kept leg may be cleaned up. | On the channel ("Commands"): answered once applied. |
 | `ProbeFacts` | ask | Answered by `Facts`. | As its class says. |
 | `Reach` | carried (reach link) | A frame of a link from another runner. | As its class says. |
 | `ReachAnswer` | answer | Answers `ReachAsk`. | As its class says. |
-| `KeepExtend` | command, parked | Keep a kept leg longer. | Fire-and-forget. |
-| `JobRerunStep` | command, refused while away | Run a kept leg's step again. | Fire-and-forget. |
-| `JobExec` | command, refused while away | Run a command in a leg's shell. | Fire-and-forget. |
+| `KeepExtend` | command, parked | Keep a kept leg longer. | On the channel ("Commands"): answered once applied. |
+| `JobRerunStep` | command, refused while away | Run a kept leg's step again. | On the channel ("Commands"): answered once applied; refused at once while away. |
+| `JobExec` | command, refused while away | Run a command in a leg's shell. | On the channel ("Commands"): answered once applied; refused at once while away. |
 | `Convo` | carried (conversation feed) | The feed's answers. | As its class says. |
 | `HarnessPackage` | command, refused while away | A moving session's package. A move goes only to a machine that's up. | Fire-and-forget. |
 | `HarnessRelease` | command, parked | A machine that comes back must let go of a session that went on elsewhere. | Fire-and-forget. |
-| `UpdateAvailable` | state | The newest kiln for this machine. | Sent once per commit. |
+| `UpdateAvailable` | state | The newest kiln for this machine. | On the channel ("Commands"), parked: answered once taken. Sent once per commit. |
 | `Diagnose` | ask | Answered by `Answer`. | As its class says. |
 | `Repair` | ask | Answered by `Answer`. | As its class says. |
 | `HarnessFileRead` | ask | Answered by `HarnessFileData`. | As its class says. |
-| `StreamOpen` | command, refused while away | Stream a page. | Fire-and-forget. |
-| `StreamControl` | command, refused while away | What a viewer asks of a stream. | Fire-and-forget. |
-| `StreamInput` | command, refused while away | What a viewer did, never replayed later. | Fire-and-forget. |
-| `StreamClose` | command, parked | Close a stream. | Fire-and-forget. |
+| `StreamOpen` | command, refused while away | Stream a page. | On the channel ("Commands"): answered once applied; refused at once while away. |
+| `StreamControl` | command, refused while away | What a viewer asks of a stream. | On the channel ("Commands"): answered once applied; refused at once while away. |
+| `StreamInput` | command, refused while away | What a viewer did, never replayed later. | On the channel ("Commands"): answered once applied; refused at once while away. |
+| `StreamClose` | command, parked | Close a stream. | On the channel ("Commands"): answered once applied. |
 | `Preview` | ask | Answered by `Answer`. | As its class says. |
 | `PortOpen` | ask | Answered by `PortOpened`. | As its class says. |
 | `PortData` | carried (port window) | Bytes for a port. | As its class says. |
@@ -194,7 +236,7 @@ queue let go.
 | `Workspace` | ask | Answered by `Answer`. | As its class says. |
 | `Executor` | ask | Answered by `Executor`. | As its class says. |
 | `Received` | ack | The server has a leg's result. | As its class says. |
-| `Undeploy` | command, parked | Take down a deployment. Answered by `Undeployed`. | Fire-and-forget until answered. |
+| `Undeploy` | command, parked | Take down a deployment. Answered by `Undeployed`. | On the channel ("Commands"): answered once taken, then by `Undeployed`. |
 | `Caps` | handshake | What the server can do, in 64 bits, to a runner that said `CAP_WIRE`. | New: sent from plan step 3. |
 | `Wire` | carried (the channel) | A frame of the channel, as the runner's. | New: `crate::wire::channel`. |
 | `Cluster` | carried (the cluster group) | To the runner's learner: join or leave the group (said again on every connect), hyper-raft's messages, and where the server's records are. | As its class says. |

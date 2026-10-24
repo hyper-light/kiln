@@ -876,8 +876,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut drops_said: Option<Vec<proto::NetDrop>> = None;
     // The channel's updates go (a server that keeps it welcomed this runner since it started).
     let mut updates_on = false;
-    // The server's items: none before plan step 3, each refused, saying so.
+    // The server's commands on the channel (`crate::wire::commands`): what this runner has of
+    // each stream; and the one being applied, answered at the top of the next turn of the loop
+    // (however its arm ended), taken unless its arm refused it.
     let mut wire_in = crate::wire::channel::Receiver::new();
+    let mut answer_after: Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)> = None;
     // Blue/green: this runner's upgrade under way (it is the old one), its steps' results, and (it is
     // the new one) the runner it takes over from.
     #[cfg_attr(not(unix), allow(unused_variables))]
@@ -1002,7 +1005,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         terminal: o.terminal,
     };
 
-    loop {
+    'events: loop {
+        if let Some((stream, seq, refusal)) = answer_after.take() {
+            let a = match refusal {
+                Some((code, why)) => wire_in.refused(&stream, seq, code, why),
+                None => wire_in.took(&stream, seq),
+            };
+            uplink.0.send(Up::Term(AgentMsg::Wire(a))).await.ok();
+        }
         // Ephemeral agents leave once their one job is done and everything is delivered: its
         // result received, or given 30 s (a server older than receipts never says).
         if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() > Duration::from_secs(30)) {
@@ -1664,6 +1674,37 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         continue;
                     }
                 };
+                // A command on the channel (docs/wire.md, "Commands"): taken once, however often
+                // it comes, then applied as if it had come alone, and answered at the top of the
+                // next turn of the loop.
+                let (msg, data) = 'item: {
+                    match msg {
+                        ServerMsg::Wire(crate::wire::channel::Frame::Item { stream, seq, low, body }) => {
+                            use crate::wire::channel::{Arrival, Refusal};
+                            // A command stream's new generation: the ones before it are done with.
+                            if seq == 1
+                                && let Some(prefix) = crate::wire::commands::prefix_of(&stream)
+                            {
+                                wire_in.forget_where(|s| s != stream && crate::wire::commands::prefix_of(s) == Some(prefix));
+                            }
+                            let answer = match wire_in.on_item(&stream, seq, low, body) {
+                                Arrival::Take(body) => match proto::decode::<ServerMsg>(&body) {
+                                    Ok(ServerMsg::Wire(_)) => wire_in.refused(&stream, seq, Refusal::Malformed, "a channel frame inside a command"),
+                                    Ok(inner) => {
+                                        answer_after = Some((stream, seq, None));
+                                        break 'item (inner, body);
+                                    }
+                                    Err(e) => wire_in.refused(&stream, seq, Refusal::Malformed, e.to_string()),
+                                },
+                                Arrival::Answered(Some(a)) | Arrival::Gap(a) => a,
+                                Arrival::Answered(None) => continue 'events,
+                            };
+                            uplink.0.send(Up::Term(AgentMsg::Wire(answer))).await.ok();
+                            continue 'events;
+                        }
+                        m => (m, data),
+                    }
+                };
                 // About something handed to the new build (blue/green), or new while this runner
                 // hands everything over or retires: it goes there.
                 #[cfg(unix)]
@@ -1691,19 +1732,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                         }
                     }
-                    ServerMsg::Wire(crate::wire::channel::Frame::Item { stream, seq, low, body }) => {
-                        use crate::wire::channel::{Arrival, Refusal};
-                        // Nothing the server sends rides the channel before plan step 3: refused,
-                        // saying so, never dropped.
-                        let answer = match wire_in.on_item(&stream, seq, low, body) {
-                            Arrival::Take(_) => Some(wire_in.refused(&stream, seq, Refusal::Unsupported, "this runner takes nothing from the server on the channel yet")),
-                            Arrival::Answered(a) => a,
-                            Arrival::Gap(want) => Some(want),
-                        };
-                        if let Some(a) = answer {
-                            uplink.0.send(Up::Term(AgentMsg::Wire(a))).await.ok();
-                        }
-                    }
+                    // Taken above, before this match: what it carries came here instead.
+                    ServerMsg::Wire(crate::wire::channel::Frame::Item { .. }) => {}
                     // What the server has of this runner's streams, its answers and wants: what it
                     // lacks goes; a stream it lost starts over, its snapshot first.
                     ServerMsg::Wire(frame) => {
@@ -1897,6 +1927,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let error = format!("cancelled; it hadn't ended {}s later, so the runner let it go", CANCEL_GRACE.as_secs());
                                 let _ = tx.send(JobResult { job: j, status: Status::Cancelled, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
                             });
+                        } else {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no job {job} runs here"));
                         }
                     }
                     ServerMsg::Drain => draining = true,
@@ -2666,6 +2698,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         if !crate::runner::runtime::rerun_step(&job, step, idx) {
                             tracing::info!(leg = %job, "a step rerun for a leg that isn't kept here");
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("leg {job} isn't kept here"));
                         }
                     }
                     // The rest of CI's messages (W09, W13) land with their workstreams.
@@ -2835,6 +2868,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // Items whose answers are overdue (lost below the channel) go again.
                     flush_updates(&mut updates, &uplink).await;
                 }
+                // What it has of the server's commands, said again: one lost below the channel
+                // mustn't hold the server's commands up until the next connection.
+                if connected && server_wire {
+                    uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                }
                 if connected {
                     let s = sampler.sample();
                     uplink.msg(AgentMsg::Sample(s)).await;
@@ -2932,6 +2970,14 @@ const HARNESS_FRAME: usize = 512 * 1024;
 /// same way: dropped, its page would go on showing what no longer is, the agent looking stuck. A
 /// state still too large sheds its finished tasks, the oldest first. Only what still doesn't fit
 /// is dropped, and logged.
+/// The command being applied on the channel (`answer_after`) is refused, saying how and why: a
+/// message that came alone has no one to tell.
+fn refuse(answer_after: &mut Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)>, code: crate::wire::channel::Refusal, why: impl Into<String>) {
+    if let Some((_, _, refusal)) = answer_after.as_mut() {
+        *refusal = Some((code, why.into()));
+    }
+}
+
 fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
     use crate::harness::core::Update;
     let Ok(json) = serde_json::to_string(u) else { return Vec::new() };

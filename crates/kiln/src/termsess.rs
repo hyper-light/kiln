@@ -516,11 +516,21 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
         let key = format!("{machine}/{}", s.id);
         let (out_tx, out_rx) = async_channel::bounded::<TermOut>(4096);
         h.terms.lock().insert(key.clone(), out_tx);
-        if let Some(msg) = first
-            && !h.send_to_agent(&machine, LANE_TERM, &msg).await
-        {
+        // A terminal to open is a live command (`crate::wire::commands`): refused at once while its
+        // machine is away, and answered once it opened it. Unanswered, it goes on: its output says.
+        let failed = match first {
+            Some(msg) if matches!(crate::wire::server_class(&msg), crate::wire::Class::Command(_)) => {
+                match h.command_start(&machine, &msg).await.answer(crate::hub::COMMAND_WITHIN).await {
+                    a @ (crate::wire::commands::Answer::Refused { .. } | crate::wire::commands::Answer::Unreachable { .. }) => Some(a.words()),
+                    _ => None,
+                }
+            }
+            Some(msg) => (!h.send_to_agent(&machine, LANE_TERM, &msg).await).then(|| format!("machine {machine} is not connected")),
+            None => None,
+        };
+        if let Some(why) = failed {
             h.terms.lock().remove(&key);
-            s.finish(None, Some(format!("machine {machine} is not connected")));
+            s.finish(None, Some(why));
             h.emit_terminals();
             return;
         }

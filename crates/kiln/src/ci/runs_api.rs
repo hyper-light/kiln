@@ -597,7 +597,11 @@ async fn kept_on(hub: &Hub, id: &str) -> Result<String, Fail> {
 /// `POST /api/ci/legs/:id/release`: a kept leg let go now (W17-R02).
 pub async fn release(hub: &Hub, id: &str, by: &str) -> Result<Response, Fail> {
     let agent = kept_on(hub, id).await?;
-    hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::KeepRelease { job: id.to_owned() }).await;
+    // Parked: a runner that's away lets it go once it's back. Refused, it says why.
+    let answer = hub.command(&agent, &crate::proto::ServerMsg::KeepRelease { job: id.to_owned() }, crate::hub::COMMAND_WITHIN).await;
+    if let Some(f) = answer.failure(&agent) {
+        return Err(f);
+    }
     super::runs::kept(hub, id, None).await.map_err(internal)?;
     hub.ci.keep(id, None);
     hub.store.audit(by.to_owned(), "ci.legs.release".into(), id.to_owned()).await;
@@ -611,7 +615,10 @@ pub async fn extend(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respo
     let agent = kept_on(hub, id).await?;
     let minutes = body.get("minutes").and_then(Value::as_u64).unwrap_or(30).clamp(1, u64::from(crate::runner::kept::MAX_KEEP_MINUTES));
     let minutes = u32::try_from(minutes).unwrap_or(30);
-    hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::KeepExtend { job: id.to_owned(), minutes }).await;
+    let answer = hub.command(&agent, &crate::proto::ServerMsg::KeepExtend { job: id.to_owned(), minutes }, crate::hub::COMMAND_WITHIN).await;
+    if let Some(f) = answer.failure(&agent) {
+        return Err(f);
+    }
     let until = crate::util::now_unix() + i64::from(minutes) * 60;
     super::runs::kept(hub, id, Some(until)).await.map_err(internal)?;
     hub.ci.keep(id, Some((agent.clone(), until)));
@@ -647,7 +654,10 @@ pub async fn rerun_step(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<R
     if busy {
         return Err((StatusCode::CONFLICT, "a step of this leg is running again already; rerun once it ends".into()));
     }
-    hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::JobRerunStep { job: id.to_owned(), step, idx: next }).await;
+    // Live: refused at once while its runner is away, rather than run later.
+    if let Some(f) = hub.command(&agent, &crate::proto::ServerMsg::JobRerunStep { job: id.to_owned(), step, idx: next }, crate::hub::COMMAND_WITHIN).await.failure(&agent) {
+        return Err(f);
+    }
     hub.store.audit(by.to_owned(), "ci.legs.rerun_step".into(), format!("{id} step {}", step + 1)).await;
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "leg": id, "step": step, "idx": next })))
 }
