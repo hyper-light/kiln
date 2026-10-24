@@ -495,7 +495,8 @@ fn the_live_feed_in_the_sync_lab_shows_what_a_fresh_viewer_is_shown() -> anyhow:
 
 /// CP-T2.1, test 4: a full bus refuses a feed's frames and the resync marker after them, and every
 /// viewer of that feed starts over within 5 s of the refusal, none waiting on silently. The bus is
-/// small (256 KiB) and a first session, watched so its feed is kept, fills it with large frames; a
+/// small (3 MiB, a little over the least a Quiver node takes: two of its largest messages, 2,166,784
+/// bytes) and a first session, watched so its feed is kept, fills it with large frames; a
 /// topic makes room for a message by letting its own oldest go, never another topic's, so the
 /// second session's frames, and its resync marker, find no room and are refused.
 #[test]
@@ -503,10 +504,11 @@ fn a_full_bus_refusing_a_feed_sends_every_viewer_of_it_back_within_5_s() -> anyh
     let dir = tempfile::tempdir()?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
-    // 60 messages of 8 KiB of text: more than the bus holds, so the filler's feed takes all of it.
-    let filler = stand_in_as(dir.path(), "filler", "filler.go", 60, 8192)?;
+    // 160 messages of 16 KiB of text, each sent twice (its last part, then whole), about 5 MiB: more
+    // than the bus holds, so the filler's feed takes all of it.
+    let filler = stand_in_as(dir.path(), "filler", "filler.go", 160, 16384)?;
     let starved = stand_in_as(dir.path(), "starved", "starved.go", MESSAGES, 0)?;
-    let s = common::start(dir.path(), &Options { extra: "[terminal]\nenabled = true\n\n[bus]\nmemory = 262144\n", ..Options::default() })?;
+    let s = common::start(dir.path(), &Options { extra: "[terminal]\nenabled = true\n\n[bus]\nmemory = 3145728\n", ..Options::default() })?;
     let (port, admin) = (s.port, s.admin.clone());
 
     let filling = session(port, &admin, "local", &work, &filler, "filler")?;

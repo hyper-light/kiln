@@ -21,7 +21,7 @@ open: the metric names Kiln Metrics hasn't answered and the decisions that are A
     (`quiver`, `hyper-rt`): every one is pinned exactly, and bench/kilndb patches them too;
   - the labs passed even if viewers only ever caught up by starting over: they now require one
     snapshot each, and no lag notice or refusal on the server.
-  Since then, CP-T2.1's test 4 has a lab of its own: a 256 KiB bus, filled by one watched
+  Since then, CP-T2.1's test 4 has a lab of its own: a 3 MiB bus, filled by one watched
   session's feed, refuses a second session's frames and its resync marker, and both of that
   session's viewers must start over within 5 s. A viewer with nothing to read looked again after
   5 s, so one whose wait began just after the refusal started over a little past it; it looks
