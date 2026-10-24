@@ -728,11 +728,15 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 }
 .in-sec-toggle {
   display: flex;
+  flex: 1 1 auto;
   align-items: center;
   gap: 8px;
-  width: 100%;
+  min-width: 0;
   min-height: 44px;
+  /* The heading's own lettering (a button's would be its own). */
+  letter-spacing: inherit;
   text-align: left;
+  text-transform: inherit;
 }
 .in-sec-toggle:hover {
   color: var(--color-bright);

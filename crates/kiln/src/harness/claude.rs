@@ -2518,6 +2518,12 @@ impl Claude {
         }
         // The replay of our own message: its words without the attached-files list we added.
         let t = t.split("\n\nAttached files:\n").next().unwrap_or(t);
+        // Claude Code starts what waits in its queue together, as one prompt, their words joined:
+        // its replay (under the last one's id, or an id of its own) says what kiln shows already,
+        // each message as it was sent. It changes none of them, and adds none.
+        if v.get("isReplay").and_then(Value::as_bool) == Some(true) && joins_in_flight(core, &id, t, ours) {
+            return;
+        }
         core.upsert(
             &id,
             parent,
@@ -2844,6 +2850,31 @@ impl Claude {
 }
 
 // ---------------------------------------------------------------------- helpers
+
+/// Whether a replay's words are kiln's own messages in flight, joined (Claude Code starts what
+/// waits in its queue together, as one prompt): under one of their ids (`ours`), that it holds
+/// another one's words too; under an id of its own, that it holds nothing else.
+fn joins_in_flight(core: &Core, id: &str, text: &str, ours: bool) -> bool {
+    let others: Vec<String> = core
+        .state
+        .delivery
+        .iter()
+        .filter(|(k, d)| k.as_str() != id && matches!(d, Delivery::Sent | Delivery::Queued | Delivery::Started))
+        .filter_map(|(k, _)| match core.get(k).map(|e| &e.body) {
+            Some(Body::User { text, .. }) => Some(text.trim().to_owned()),
+            _ => None,
+        })
+        .filter(|w| !w.is_empty() && text.contains(w.as_str()))
+        .collect();
+    if others.is_empty() {
+        return false;
+    }
+    if ours {
+        return true;
+    }
+    // What's left once each of them is taken out: nothing but how they were joined.
+    others.iter().fold(text.to_owned(), |rest, w| rest.replacen(w.as_str(), "", 1)).trim().is_empty()
+}
 
 fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
@@ -4396,6 +4427,32 @@ mod tests {
         // Unknown: nothing happens.
         c.command(&mut core, Command::QueueSteer { id: "nope".into() });
         assert!(core.take_writes().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn messages_the_cli_starts_together_stay_as_they_were_sent() -> anyhow::Result<()> {
+        // Two written during a turn: Claude Code queues both, then starts them together, as one
+        // prompt, their words joined, under the second's id (as Claude Code 2.1 does).
+        let (mut c, mut core, _) = started();
+        let steer = |c: &mut Claude, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
+        steer(&mut c, &mut core, "m1", "So I have an issue with your research.");
+        steer(&mut c, &mut core, "m2", "This means that your plan isn't grounded.");
+        for (id, state) in [("m1", "queued"), ("m2", "queued"), ("m1", "started"), ("m2", "started")] {
+            c.line(&mut core, &json!({"type": "command_lifecycle", "command_uuid": id, "state": state, "uuid": "x", "session_id": "s"}).to_string());
+        }
+        let joined = "So I have an issue with your research.\nThis means that your plan isn't grounded.";
+        let replay = |uuid: &str| json!({"type": "user", "message": {"role": "user", "content": joined}, "session_id": "s", "parent_tool_use_id": null, "uuid": uuid, "isReplay": true}).to_string();
+        let said = |core: &Core| core.events().filter_map(|e| if let Body::User { text, .. } = &e.body { Some((e.id.clone(), text.clone())) } else { None }).collect::<Vec<_>>();
+        c.line(&mut core, &replay("m2"));
+        let both = vec![("m1".to_owned(), "So I have an issue with your research.".to_owned()), ("m2".to_owned(), "This means that your plan isn't grounded.".to_owned())];
+        assert_eq!(said(&core), both, "each as it was sent, once");
+        // Under an id of its own: nothing more is shown.
+        c.line(&mut core, &replay("fresh"));
+        assert_eq!(said(&core), both);
+        // A replay of one alone is still that one's.
+        c.line(&mut core, &json!({"type": "user", "message": {"role": "user", "content": "This means that your plan isn't grounded."}, "session_id": "s", "parent_tool_use_id": null, "uuid": "m2", "isReplay": true}).to_string());
+        assert_eq!(said(&core), both);
         Ok(())
     }
 
