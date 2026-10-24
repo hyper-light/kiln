@@ -25,6 +25,7 @@ import { discoveryRes, joinRequestsRes } from "./add-machines/data";
 import { JoinNotice } from "./add-machines/notice";
 import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct } from "./shared";
 import { BatteryLine, LowBattery } from "./battery";
+import { lostLine } from "./runner-lost";
 import { ImagesPanel, PoolsPanel } from "./runners-pools";
 import { useAuth } from "@/lib/auth";
 
@@ -553,6 +554,7 @@ function AgentDetails({
             { label: "CPU", value: s ? `${formatPct(s.cpu_pct, 1)} · ${s.cpus} cores` : "—" },
             { label: "Memory", value: s ? `${formatBytes(s.mem_used)} / ${formatBytes(s.mem_total)}` : "—" },
             { label: "Disk", value: s ? `${formatBytes(s.disk_used)} / ${formatBytes(s.disk_total)}` : "—" },
+            { label: "Lost below the channel", value: lostLine(agent) },
           ]}
         />
       </div>

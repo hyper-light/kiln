@@ -716,6 +716,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // What the server last heard of it on this connection.
     let mut front_door_sent: Option<String> = None;
     let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
+    // A test build's fault: frames lost below the channel, which it makes up for.
+    if let Some(rule) = crate::runner::chaos::get().and_then(|c| c.shed) {
+        net.command(net::Out::Shed(rule)).await;
+    }
     // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
     let mut paths = if o.ephemeral {
         crate::tunnel::Paths::new(&o.server_url, &quic_addr)
@@ -866,6 +870,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut updates = crate::wire::uplink::Updates::new(format!("{:016x}", rand::random::<u64>()));
     // The server keeps the channel: it said so on this connection, before its Welcome.
     let mut server_wire = false;
+    // The server takes what this runner's QUIC layer dropped (`AgentMsg::NetDrops`), and what it
+    // was last told of it on this connection.
+    let mut server_drops = false;
+    let mut drops_said: Option<Vec<proto::NetDrop>> = None;
     // The channel's updates go (a server that keeps it welcomed this runner since it started).
     let mut updates_on = false;
     // The server's items: none before plan step 3, each refused, saying so.
@@ -1628,6 +1636,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // The channel's items in flight go again once the server says what it has.
                 updates.down();
                 server_wire = false;
+                server_drops = false;
+                drops_said = None;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -1676,6 +1686,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // says what it has of the server's streams (none yet).
                     ServerMsg::Caps { caps } => {
                         server_wire = caps & proto::CAP_WIRE != 0;
+                        server_drops = caps & proto::CAP_NET_DROPS != 0;
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                         }
@@ -2827,6 +2838,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     let s = sampler.sample();
                     uplink.msg(AgentMsg::Sample(s)).await;
+                    // What its QUIC layer let go below the channel, for its page: once it changed.
+                    let dropped = crate::metrics::net().counts();
+                    if server_drops && welcomed && drops_said.as_ref() != Some(&dropped) {
+                        uplink.msg(AgentMsg::NetDrops { dropped: dropped.clone() }).await;
+                        drops_said = Some(dropped);
+                    }
                     // What its conversation stores are doing, for the server's board (a server from
                     // before takes it for nothing). Never waits: a full link skips one.
                     for (st, role, feed) in [(convo.as_ref(), "own", shipper.as_ref().map(crate::convo::feed::Shipper::stats)), (mirror_store.as_ref(), "mirror", None)] {

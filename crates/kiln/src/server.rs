@@ -97,6 +97,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         server: true,
         dial_deadline: crate::net::DIAL_DEADLINE,
     })?;
+    // A test build's fault (`KILN_CHAOS`): frames lost below the channel, which it makes up for.
+    if let Some(rule) = crate::runner::chaos::get().and_then(|c| c.shed) {
+        net.command(crate::net::Out::Shed(rule)).await;
+    }
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
     let tls = if cfg.server.https { Some(server_tls(&cfg, &leaf)?) } else { None };
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone())?;

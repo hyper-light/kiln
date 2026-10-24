@@ -175,6 +175,7 @@ classes! {
         AgentMsg::Caps { .. } => Class::Handshake,
         AgentMsg::Wire(..) => CHANNEL,
         AgentMsg::Cluster { .. } => CLUSTER,
+        AgentMsg::NetDrops { .. } => Class::Telemetry,
     }
 }
 

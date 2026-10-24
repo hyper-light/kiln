@@ -128,6 +128,12 @@ pub struct AgentLive {
     /// Its battery, when it has one and its runner says ([`AgentMsg::Power`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub battery: Option<crate::os::battery::Battery>,
+    /// What its QUIC layer let go before the wire, by lane and reason, as it last said
+    /// ([`AgentMsg::NetDrops`]); and what the server's let go of what it had for it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<proto::NetDrop>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped_toward: Vec<proto::NetDrop>,
     pub terminal: bool,
     /// An outpost (`kiln outpost`, [`crate::proto::CAP_OUTPOST`]): kiln run where it isn't
     /// installed. It takes no jobs and the server doesn't upgrade it.
@@ -597,6 +603,8 @@ impl Hub {
                     draining: false,
                     sample: None,
                     battery: None,
+                    dropped: Vec::new(),
+                    dropped_toward: Vec::new(),
                     terminal: false,
                     dedicated_job: None,
                     exclusive: false,
@@ -617,6 +625,7 @@ impl Hub {
         }
         for a in &mut out {
             a.transport = a.peer.filter(|_| a.connected).map(|p| self.tunnels.transport(p));
+            a.dropped_toward = a.peer.map(|p| metrics::net().toward(p)).unwrap_or_default();
         }
         out.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
         out
@@ -1435,6 +1444,13 @@ impl Hub {
                 }
             }
             AgentMsg::Power { json } => self.on_power(&agent, &json).await,
+            AgentMsg::NetDrops { dropped } => {
+                let series = dropped.iter().map(|d| (vec![agent.clone(), d.lane.clone(), d.reason.clone()], i64::try_from(d.frames).unwrap_or(i64::MAX)));
+                metrics::global().runner_net_dropped.replace_owned(&std::collections::BTreeSet::from([agent.clone()]), series);
+                if let Some(a) = self.agents.lock().get_mut(&agent) {
+                    a.dropped = dropped;
+                }
+            }
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -1624,6 +1640,8 @@ impl Hub {
             draining: false,
             sample: None,
             battery: None,
+            dropped: Vec::new(),
+            dropped_toward: Vec::new(),
             terminal: h.terminal,
             dedicated_job: h.dedicated_job.clone(),
             exclusive: false,
@@ -1679,7 +1697,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS }).await;
         self.send_peer(
             peer,
             &ServerMsg::Welcome {
