@@ -1,0 +1,22 @@
+[package]
+name = "hyper-measure"
+description = "What a run costs: allocations, reallocations, bytes and page faults, counted by the allocator and read from the OS. For benchmarks and tests only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[target.'cfg(unix)'.dependencies]
+# getrusage(2) and, on macOS, task_info(3) from the Mach interface: rustix 1.1 has neither
+# (no getrusage, and no Mach calls).
+libc = "0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+# K32GetProcessMemoryInfo and PROCESS_MEMORY_COUNTERS (psapi.h), declared by Microsoft's metadata
+# rather than by hand.
+windows-sys.workspace = true
+
+[lints]
+workspace = true

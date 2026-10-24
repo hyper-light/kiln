@@ -1,0 +1,29 @@
+[package]
+name = "focal-seal"
+description = "A node's keys at rest: the root key's file, the node key and the keys of each store below it (docs/archictecutre/29-sealing-at-rest.md)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+## Keys for dependents' tests (`test_keys`): a data directory's keys under a root key file kept
+## outside it, made once a process; release binaries are built without it.
+test-support = ["dep:tempfile"]
+
+[dependencies]
+blake3.workspace = true
+getrandom.workspace = true
+focal-platform = { version = "0.1.0", path = "../focal-platform" }
+hyper-block.workspace = true
+hyper-seal = { workspace = true, features = ["files"] }
+tempfile = { workspace = true, optional = true }
+thiserror.workspace = true
+zeroize = "1.8"
+
+[dev-dependencies]
+tempfile.workspace = true

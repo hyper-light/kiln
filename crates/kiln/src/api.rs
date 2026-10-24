@@ -4693,38 +4693,144 @@ async fn send_snapshot(tx: &mut ws::Sender, frames: Vec<String>, packed: bool) -
     Ok(())
 }
 
+/// Live frames a viewer reads from its session's feed at once: at most this many of the bus's
+/// largest messages (1 MiB) held for it at a time.
+const FEED_READ: usize = 16;
+
+/// How long a viewer with nothing to read waits before it looks whether its feed broke (a full bus
+/// may refuse the resync marker as well as its frames), and how long a viewer of a session whose
+/// feed the bus can't hold waits between snapshots. Under 5 s, so a viewer whose feed broke starts
+/// over within 5 s of it, its wait having begun at most a frame's handling after.
+const FEEDLESS: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// What a viewer's wait on its session's feed came to.
+enum Live {
+    /// A frame or more to read.
+    Ready,
+    Refused(kiln_seams::bus::Refusal),
+    /// The session has no feed on the bus: time for another snapshot.
+    Feedless,
+    /// A while with nothing: time to see whether the feed broke since (a full bus may refuse its
+    /// resync marker as well as its frames).
+    Quiet,
+}
+
 /// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
 /// viewer sends commands (JSON tagged `type`). `{"t": "synced"}` follows each snapshot sent here
 /// (on attach, and again after falling behind): the history resent since its `open` is complete,
 /// so a viewer can swap it in at once instead of clearing what it shows.
+///
+/// The live updates come from the session's feed on kiln's bus (docs/bus.md), read from the
+/// offset the snapshot was taken at, so none is missed or seen twice. A viewer that falls behind
+/// what the feed keeps is refused `Behind` (the bus's lag notice) and starts over from a snapshot,
+/// as it does at the feed's resync marker; nothing it does holds up the session or another viewer.
 async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes) -> anyhow::Result<()> {
     use futures::FutureExt as _;
+    use kiln_seams::Bus as _;
+    use kiln_seams::bus::Refusal;
     let (mut tx, mut rx) = socket.split();
     let Some(att) = hub.harness.attach_from(&id, takes.after) else {
         tx.send(ws::text(json!({"t": "closed"}).to_string())).await?;
         return Ok(());
     };
     send_snapshot(&mut tx, att.frames, takes.packed).await?;
-    let mut live = att.live;
-    // The newest revision of the copy this viewer has: what it resumes from if it falls behind,
-    // and what live frames it already has (a catch-up holds them) are told by.
+    // Its place among the session's viewers, given back as it goes.
+    let viewer = att.viewer;
+    let topic = att.topic;
+    let mut at = att.at;
+    // The feed's refusals as of the snapshot it has.
+    let mut refusals = att.refusals;
+    // The newest revision of the copy this viewer has: what it catches up from when it starts
+    // over, and what a live frame it already has (a catch-up held it) is told by (docs/wire.md,
+    // "Revisions").
     let mut have = att.rev;
+    let closed = || ws::text(json!({"t": "closed"}).to_string());
     loop {
+        let live = {
+            let (bus, topic, from) = (&hub.bus, &topic, at);
+            async move {
+                match from {
+                    Some(from) => {
+                        let wait = bus.wait(topic, from).fuse();
+                        let quiet = crate::rt::sleep(FEEDLESS).fuse();
+                        futures::pin_mut!(wait, quiet);
+                        futures::select_biased! {
+                            w = wait => match w {
+                                Ok(()) => Live::Ready,
+                                Err(e) => Live::Refused(e),
+                            },
+                            () = quiet => Live::Quiet,
+                        }
+                    }
+                    None => {
+                        crate::rt::sleep(FEEDLESS).await;
+                        Live::Feedless
+                    }
+                }
+            }
+        };
+        // Set when what the feed holds for this viewer isn't what it should take next.
+        let mut start_over = false;
         futures::select_biased! {
-            f = live.recv().fuse() => match f {
-                Ok(frame) if frame.rev != 0 && frame.rev <= have => {}
-                Ok(frame) => {
-                    have = have.max(frame.rev);
-                    tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
+            w = live.fuse() => match w {
+                Live::Ready => match hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ).await {
+                    Ok(batch) => {
+                        // Read now: each frame's delivery, from its publish on this process's
+                        // microsecond clock (the bus's own stamps are milliseconds).
+                        let now = crate::harness::live::now_us();
+                        for m in &batch.messages {
+                            match crate::harness::live::decode(&m.payload) {
+                                Some(frame) if frame.text.as_ref() == crate::harness::live::RESYNC => {
+                                    start_over = true;
+                                    break;
+                                }
+                                // The session's last frame: the viewer ends with it, and its
+                                // place, given back, lets the topic go.
+                                Some(frame) if frame.text.as_ref() == crate::harness::live::CLOSED => {
+                                    tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
+                                    return Ok(());
+                                }
+                                // One its catch-up already held.
+                                Some(frame) if frame.rev != 0 && frame.rev <= have => {}
+                                Some(frame) => {
+                                    if let Some(at) = crate::harness::live::published_us(&m.payload) {
+                                        crate::metrics::bus().delivery_seconds.observe(now.saturating_sub(at) as f64 / 1e6);
+                                    }
+                                    have = have.max(frame.rev);
+                                    tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
+                                }
+                                None => {
+                                    tracing::warn!(target: "kiln.bus", event = "feed.unreadable", topic = %topic, offset = m.offset, "a frame the feed didn't make: the viewer starts over");
+                                    start_over = true;
+                                    break;
+                                }
+                            }
+                        }
+                        at = Some(batch.next);
+                    }
+                    Err(Refusal::Behind { .. }) => {
+                        crate::metrics::bus().lag_notices.inc();
+                        start_over = true;
+                    }
+                    Err(Refusal::NoTopic(_)) => {
+                        tx.send(closed()).await?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %topic, error = %e, "a viewer's read of its session's feed was refused: it starts over");
+                        start_over = true;
+                    }
+                },
+                Live::Refused(Refusal::NoTopic(_)) => {
+                    tx.send(closed()).await?;
+                    return Ok(());
                 }
-                Err(async_broadcast::RecvError::Overflowed(_)) => {
-                    // Fell behind: what it missed since what it has (it begins with "resumed"),
-                    // or all of it when the copy can't tell (it begins with "open").
-                    let (frames, now) = hub.harness.frames_since(&id, have).unwrap_or_default();
-                    have = have.max(now);
-                    send_snapshot(&mut tx, frames, takes.packed).await?;
+                Live::Refused(e) => {
+                    tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %topic, error = %e, "a viewer's wait on its session's feed was refused: it starts over");
+                    start_over = true;
                 }
-                Err(async_broadcast::RecvError::Closed) => return Ok(()),
+                Live::Feedless => start_over = true,
+                Live::Quiet => start_over = viewer.refusals() != refusals,
             },
             m = rx.next().fuse() => match m {
                 Some(Ok(Message::Text(t))) => match serde_json::from_str::<crate::harness::model::Command>(t.as_str()) {
@@ -4740,6 +4846,18 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
                 _ => {}
             },
+        }
+        if start_over {
+            // What it missed since what it has (it begins with "resumed"), or all of it when the copy
+            // can't tell (it begins with "open"); and the feed from where that is.
+            let Some((frames, from, now, rev)) = hub.harness.frames_since(&id, have) else {
+                tx.send(closed()).await?;
+                return Ok(());
+            };
+            send_snapshot(&mut tx, frames, takes.packed).await?;
+            at = from;
+            refusals = now;
+            have = have.max(rev);
         }
     }
 }
@@ -4782,6 +4900,8 @@ fn metrics_handler(hub: &Hub, headers: &HeaderMap) -> Response {
     if !hub.cfg.server.metrics_public && !authed(hub, headers) {
         return err(StatusCode::UNAUTHORIZED, "authentication required").into_response();
     }
+    // The bus's figures as its node states them now.
+    hub.bus.observe();
     srv::response(StatusCode::OK, "text/plain; version=0.0.4", srv::full(crate::metrics::render()))
 }
 

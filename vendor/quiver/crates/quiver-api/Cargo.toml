@@ -1,0 +1,21 @@
+[package]
+name = "quiver-api"
+description = "What other code reaches Quiver through: topics of messages in order, read from any offset kept or followed by a subscription told what it missed; the trait, its simulator, and the conformance suite every implementation passes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Waits that wake on a publish, under any executor (the simulator's; Quiver's node has its own).
+event-listener = "5.4"
+# `BoxFuture`, the traits' futures, and the conformance suite's combinators.
+futures = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }
+
+[dev-dependencies]
+futures = { version = "0.3.31", default-features = false, features = ["std", "async-await", "executor"] }
+
+[lints]
+workspace = true

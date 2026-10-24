@@ -338,6 +338,8 @@ pub struct Hub {
     /// Where kiln keeps its bytes (`crate::blobs`, docs/blobs.md): the server's data directory, or
     /// any S3.
     pub blobs: crate::blobs::Opened,
+    /// The bus kiln's events ride: its sessions' live feeds (docs/bus.md).
+    pub bus: crate::bus::QuiverBus,
 }
 
 impl Hub {
@@ -373,7 +375,9 @@ impl Hub {
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
-        let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock));
+        // The bus every session's live feed rides (docs/bus.md): Quiver's node, in this process.
+        let bus = crate::bus::QuiverBus::open(&cfg.bus, Arc::clone(&clock))?;
+        let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock), Arc::new(bus.clone()));
         let contents = crate::sync::contents::Contents::start(&blobs, cfg.data("sync").join("blobs"));
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
         let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
@@ -438,6 +442,7 @@ impl Hub {
             cluster: crate::store::learner::Learners::default(),
             push: crate::push::Service::default(),
             blobs,
+            bus,
         }))
     }
 

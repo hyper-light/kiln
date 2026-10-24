@@ -1,0 +1,127 @@
+[workspace]
+resolver = "3"
+# The shared crates (transport, consensus) consumed by slates, focal and mantle. A crate joins the
+# members only once it meets every rule below (CLAUDE.md).
+members = ["crates/*"]
+# Vendored upstream sources are staged here, outside the build and the lint wall, until they are
+# conformed into a member crate (vendor/*/VENDORED.md). The comparison bench is a workspace of its
+# own: it builds slates', focal's and raft-rs's cores from their repositories at pinned revisions,
+# which the gates of this workspace do not fetch (docs/benchmarks.md).
+# hyper-tls's test support crate is upstream's `rustls-test`, test code outside the wall.
+exclude = [
+    "vendor",
+    "crates/hyper-raft-compare",
+    "crates/hyper-durable-compare",
+    "crates/hyper-log-compare",
+    "crates/hyper-datagram-compare",
+    "crates/hyper-swim-compare",
+    "crates/hyper-timing-compare",
+    "crates/hyper-transport-compare",
+    "crates/hyper-rt-compare",
+    "crates/hyper-tls/tests/support/rustls-test",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+rust-version = "1.98.1"
+
+[workspace.dependencies]
+# raft-rs at the revision focal and mantle run: upstream PR #578 (native prost compatibility and a
+# maintained rustc-hash), recorded in focal's docs/dependencies/raft-upstream.md. hyper-raft takes
+# its message and log types (`raft-proto`) until step R-2 declares them itself (docs/raft.md); the
+# library itself is only the differential's oracle, a dev-dependency.
+raft = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
+raft-proto = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
+slog = "2.7"
+thiserror = "2.0"
+# The log's checksum, CRC-32C, which hyper-log computes with the `crc32c` crate (in place of
+# mantle-crc's `crc-fast`).
+crc32c = "0.6"
+crc-fast = { version = "1.10", default-features = false, features = ["std", "vpclmulqdq"] }
+# Segment nonces and scratch-file names from the operating system's random source.
+getrandom = "0.4"
+# Positional I/O, direct I/O, the platform's full flush and the thread ceilings (hyper-block).
+rustix = { version = "1.1", features = ["fs", "system", "param", "process", "time"] }
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Kernel",
+  "Win32_System_Performance",
+  "Win32_System_Ioctl",
+  "Win32_System_Memory",
+  "Win32_System_ProcessStatus",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_System_WindowsProgramming",
+] }
+# mimalloc (Leijen, Zorn and de Moura, APLAS 2019) at the version focal's binary allocates through: its heap
+# API for hyper-heap, and its global allocator for the tests and measurements that run under it.
+libmimalloc-sys = { version = "=0.1.49", default-features = false, features = ["v2", "extended"] }
+mimalloc = { version = "=0.1.52", default-features = false, features = ["v2"] }
+proptest = "1.11"
+tempfile = "3.20"
+# Pin projection for hyper-rt's named futures (its combinators and `within`): each holds the futures it is
+# given in place, once, with no `unsafe` of hyper-rt's own (tokio's choice for the same futures). A
+# dependency by the owner's approval, 2026-10-11 (docs/runtime.md §3.8, "The dependency").
+pin-project-lite = "0.2.17"
+
+[workspace.lints.rust]
+# Allowed only in the OS-interface files scripts/check-contracts.py lists, each block commented.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "deny"
+unused_must_use = "deny"
+unreachable_pub = "warn"
+# `--cfg loom` and `--cfg shuttle` select the interleaving and randomized-schedule tests.
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(fuzzing)"] }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+# No shared ownership or locks, and no disk writes: the disallowed types and methods are listed in
+# clippy.toml with reasons. The union of slates', focal's and mantle's rules is the floor (CLAUDE.md).
+disallowed_types = "deny"
+disallowed_methods = "deny"
+# Every unsafe block carries a `// SAFETY:` line stating the invariant that makes it sound.
+undocumented_unsafe_blocks = "deny"
+# The no-panic law: typed refusals, never panics, outside tests (clippy.toml allows tests).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+exit = "deny"
+# Indexing, slicing and arithmetic that can go out of bounds, overflow or divide by zero unwind:
+# use `.get()`, `checked_*` (`saturating_*` only where saturation is the stated meaning).
+indexing_slicing = "deny"
+string_slice = "deny"
+arithmetic_side_effects = "deny"
+# The assert family and print macros are listed in clippy.toml.
+disallowed_macros = "deny"
+panic_in_result_fn = "deny"
+unwrap_in_result = "deny"
+# Integers are checked: a narrowing `as` is a review failure; use `try_from`.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+# Bounded functions: the threshold is a ratified shape constant in clippy.toml.
+cognitive_complexity = "deny"
+mem_forget = "deny"
+missing_safety_doc = "deny"
+missing_panics_doc = "deny"
+
+[profile.release]
+lto = true
+
+# The heartbeat trace recorder keeps line tables in its release build, for profiles of a run.
+[profile.release.package.hyper-timing-trace]
+debug = "line-tables-only"

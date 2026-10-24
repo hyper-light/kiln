@@ -23,7 +23,12 @@ futures-io = "0.3"
 futures-core = "0.3"
 http-body = "1"
 kiln-http = { path = "../../crates/kiln-http" }
-hyper-rt = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+hyper-rt = "=0.1.0"
+
+# hyper-rt at kiln's one copy of hyper-raft (vendor/MANIFEST.toml), as kiln's root manifest points it
+# (docs/vendoring.md): kiln-http names it by version.
+[patch.crates-io]
+hyper-rt = { path = "../../vendor/hyper-raft/crates/hyper-rt" }
 
 [profile.release]
 lto = true
