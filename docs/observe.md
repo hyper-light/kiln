@@ -935,7 +935,7 @@ the list; each node applies it where it takes a record (a request's, a log sourc
 what is stored is read already, on the machine that took it. A log source's line a pipeline (or the
 scanner, §8.9) reads is run through where it is read and written as its row then, its record one
 buffer (`kiln_obs::logs::buf::RecordBuf`: its fields and attributes side by side, kept from line to
-line), what a processor makes written side by side too and taken in one copy (`Attrs`: a grok
+line, a long line's room let go past 128 KiB as a line's own is past 64), what a processor makes written side by side too and taken in one copy (`Attrs`: a grok
 rule's values, a URL's parts, a user agent's), so a line costs no string of its own; the row is
 the one its record wrote when records were run through as they were offered (a test holds 6,000
 lines of every kind to it, byte for byte), and the processors make what they made before, held to

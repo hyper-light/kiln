@@ -357,6 +357,18 @@ impl RecordBuf {
     pub fn text_len(&self) -> usize {
         self.text.len()
     }
+
+    /// Its room let go where its buffer has grown past `bytes` (a long line's), so what a reader
+    /// keeps from line to line stays bounded; emptied either way.
+    pub fn let_go_past(&mut self, bytes: usize) {
+        self.clear();
+        if self.text.capacity() > bytes {
+            self.text = String::new();
+        }
+        if self.attrs.capacity() > bytes / 64 {
+            self.attrs = Vec::new();
+        }
+    }
 }
 
 impl Fields for RecordBuf {
@@ -463,6 +475,21 @@ mod tests {
             super::super::record::put_row(&mut theirs, &r, 5);
             assert_eq!(ours, theirs, "round {round}'s row");
         }
+    }
+
+    /// A long line's room is let go past its bound; a short one's is kept for the next.
+    #[test]
+    fn a_long_line_s_room_is_let_go() {
+        let mut b = RecordBuf::default();
+        b.set_message(&"x".repeat(100));
+        b.let_go_past(1 << 10);
+        let kept = b.text.capacity();
+        assert!(kept >= 100 && b.message().is_empty(), "a short line's room kept, the record emptied");
+        b.set_message(&"x".repeat(200_000));
+        b.let_go_past(1 << 10);
+        assert_eq!(b.text.capacity(), 0, "a long line's let go");
+        b.set_message("again");
+        assert_eq!(b.message(), "again");
     }
 
     /// A message past a record's bound is kept whole and cut in its row where a record's is; a pair

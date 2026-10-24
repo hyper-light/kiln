@@ -40,6 +40,9 @@ pub const SOURCES: usize = 256;
 /// The longest record a line makes: a longer line is cut into records this long, each said to be
 /// cut (Datadog's Agent's 256 kB).
 pub const MAX_LINE: usize = 256 << 10;
+/// The most room a line's record of one buffer keeps for the next line's (a long line's goes): the
+/// room a reader keeps a line's text in, and what processors add to it.
+const RECORD_ROOM: usize = 128 << 10;
 /// What one offer of records holds at the most: records and bytes.
 const BATCH_RECORDS: usize = 1_000;
 const BATCH_BYTES: usize = 1 << 20;
@@ -570,6 +573,8 @@ impl Compiled {
                 }
                 kiln_obs::errors::put_log_issue_buf(r);
                 b.push_row(r.ts, r.severity, [r.service(), r.host(), r.source()], r.message(), r.attrs(), r.attr_count(), (r.trace_id, r.span_id));
+                // Its room kept for the next line's, but a long line's (as a line's own room is).
+                r.let_go_past(RECORD_ROOM);
                 return Some(text);
             }
             let ts = read.as_ref().and_then(|j| j.ts).or(line.ts).unwrap_or(now_ns);
