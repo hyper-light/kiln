@@ -265,6 +265,11 @@ impl Sender {
     pub fn unanswered(&self) -> usize {
         self.streams.values().map(|o| o.pending.len()).sum()
     }
+
+    /// The bytes every stream keeps unanswered, together.
+    pub fn bytes(&self) -> usize {
+        self.streams.values().map(|o| o.bytes).sum()
+    }
 }
 
 /// Refusals a receiver keeps for a stream whose sender hasn't heard them, at the most.

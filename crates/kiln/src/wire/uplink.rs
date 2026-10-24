@@ -19,9 +19,13 @@ use std::time::{Duration, Instant};
 
 use super::channel::{Event, Frame, Sender};
 
-/// What one session's stream keeps unanswered, at the most. Past it the stream starts over with a
-/// snapshot, rather than keep a backlog without end while the server is away.
-pub const ROOM: usize = 32 << 20;
+/// What one stream keeps unanswered, at the most. Past it the stream starts over with its picture
+/// once the server is back, rather than keep a backlog without end while the server is away.
+pub const ROOM: usize = 8 << 20;
+/// What all of a runner's streams keep unanswered together, at the most: past it, the stream an
+/// item is pushed to starts over as one past its own room does. Many busy sessions and a long
+/// outage never hold more than this.
+pub const TOTAL_ROOM: usize = 64 << 20;
 /// How long an update sent on a live link waits for its answer before it goes again.
 pub const PATIENCE: Duration = Duration::from_secs(15);
 
@@ -53,6 +57,8 @@ pub fn session_of(stream: &str) -> Option<&str> {
 /// A runner's session and terminal streams, by key.
 pub struct Updates {
     tx: Sender,
+    /// What all its streams keep unanswered together, at the most.
+    total: usize,
     /// This runner process's incarnation.
     boot: String,
     /// Each key's stream generation, once its stream has started.
@@ -69,7 +75,12 @@ impl Updates {
     }
 
     pub fn with(boot: impl Into<String>, room: usize, patience: Duration) -> Self {
-        Self { tx: Sender::new(room, patience), boot: boot.into(), generation: BTreeMap::new(), stale: BTreeSet::new(), closing: BTreeSet::new() }
+        Self::bounded(boot, room, TOTAL_ROOM, patience)
+    }
+
+    /// Streams of `room` bytes each, `total` together.
+    pub fn bounded(boot: impl Into<String>, room: usize, total: usize, patience: Duration) -> Self {
+        Self { tx: Sender::new(room, patience), total, boot: boot.into(), generation: BTreeMap::new(), stale: BTreeSet::new(), closing: BTreeSet::new() }
     }
 
     /// The stream `key`'s items go on now.
@@ -105,7 +116,8 @@ impl Updates {
             return false;
         }
         let stream = self.stream(key);
-        if self.tx.push(&stream, body).is_err() {
+        let over = self.tx.bytes().saturating_add(body.len()) > self.total;
+        if over || self.tx.push(&stream, body).is_err() {
             self.stale.insert(key.to_owned());
             self.tx.drop_stream(&stream);
             return false;
@@ -306,6 +318,18 @@ mod tests {
         assert_eq!(u.unanswered(), 0, "what it kept went with it");
         start(&mut u, "s:x", 1);
         assert!(u.push("s:x", vec![0; 16]));
+    }
+
+    #[test]
+    fn all_streams_together_keep_no_more_than_their_total() {
+        let mut u = Updates::bounded("boot1", 1 << 20, 100, PATIENCE);
+        start(&mut u, "s:a", 0);
+        start(&mut u, "s:b", 0);
+        assert!(u.push("s:a", vec![0; 60]));
+        // b's own room is ample, but together they'd pass the total: b starts over.
+        assert!(!u.push("s:b", vec![0; 60]));
+        assert_eq!(u.take_stale(), vec!["s:b".to_owned()]);
+        assert!(u.push("s:a", vec![0; 30]), "a goes on within the total");
     }
 
     #[test]
