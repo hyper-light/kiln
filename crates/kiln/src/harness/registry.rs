@@ -147,7 +147,7 @@ impl Mirror {
             return false;
         }
         let seq = |v: &Value| v.get("seq").and_then(Value::as_u64);
-        if let (Some(q), Some(top)) = (seq(&e), self.events.last().and_then(seq))
+        if let (Some(q), Some(top)) = (seq(&e), self.events.last().and_then(|last| seq(last)))
             && q <= top
         {
             let at = self.events.partition_point(|x| seq(x).is_some_and(|s| s < q));
@@ -218,12 +218,6 @@ impl Mirror {
             rev: self.rev,
             resumed: true,
         })
-    }
-
-    /// The frames that bring a new viewer to the current state ([`Mirror::parts`], made at once).
-    #[cfg(test)]
-    fn snapshot(&self, files: Option<String>) -> Vec<String> {
-        self.parts().frames(files)
     }
 
     /// What brings a viewer that has this copy through revision `after` up to now
@@ -1868,7 +1862,7 @@ mod tests {
 
     #[test]
     fn a_viewer_resumes_with_only_what_changed() {
-        let mut m = Mirror::new(Info::default(), Location::Local);
+        let mut m = Mirror::new(Info::default(), Location::Local, sim_bus());
         for id in ["e1", "e2", "e3"] {
             took(&mut m, |m| m.upsert(event(id, "x")));
         }
@@ -1886,7 +1880,7 @@ mod tests {
 
     #[test]
     fn a_copy_that_started_over_is_sent_whole() {
-        let mut m = Mirror::new(Info::default(), Location::Local);
+        let mut m = Mirror::new(Info::default(), Location::Local, sim_bus());
         took(&mut m, |m| m.upsert(event("e1", "x")));
         let had = m.rev;
         took(&mut m, |m| {
