@@ -393,6 +393,14 @@ requests through that runner timed out.
   - Lanes have priorities: control and request lanes are never starved by a bulk lane (lane 6
     here). A busy runner's sessions share its budget fairly.
   - The refusal rate is a metric per peer and lane, with an alert.
+  - **Nothing is lost for good.** In the same minutes, adacachy's runner dropped agent session
+    updates as "too large to send, even cut" (1.9 MB). The server then forgot every adacachy
+    session (1 of 18 listed at 21:27), so agents_send and Mission Control couldn't reach them.
+    The fix:
+    - large updates are split, or sent as a delta against what the server acknowledged;
+    - a runner keeps what the server hasn't acknowledged and sends it again;
+    - each side checks the other's session list against its own every few minutes, and the
+      server can ask a runner to announce again (`runners.resync`, no restart).
 - **Done when:** a runner flooding one lane in a test sees its other lanes' requests answered, with
   no refused frames, only slower bulk.
 
