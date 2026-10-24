@@ -83,6 +83,7 @@ impl Fleet {
 http_addr = "127.0.0.1:{http}"
 quic_addr = "127.0.0.1:{quic}"
 public_url = "http://127.0.0.1:{http}"
+quic_advertise = "127.0.0.1:{quic}"
 data_dir = "{data}"
 
 [gitops]
