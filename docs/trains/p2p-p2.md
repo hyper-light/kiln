@@ -98,6 +98,12 @@ Watch:
 - **A server from before P2** never tells a runner to hold a replica: its front door pipes
   connections whole, as before.
 - **A runner from before P2** never says it can hold one.
+- **The release before starts on this one's database.** The group's configuration (its voters and
+  learners) is kept in `cluster_conf`, not on `cluster_state`. Every release since P1 fills
+  `cluster_state`'s four columns by position as it starts, so a fifth column stopped 8adeadba from
+  starting at all ("table cluster_state has 5 columns but 4 values were supplied"). The rollback
+  drill of 2026-10-24 found this before production took it. A database an earlier P2 build widened
+  is narrowed when this one opens it, its configuration kept.
 
 ## Open
 

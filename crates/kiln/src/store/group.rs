@@ -47,15 +47,21 @@ use hyper_raft::proto::{ConfChangeV2, ConfState, Message, MessageType};
 use hyper_raft::wire::Record as _;
 use hyper_raft::{Config, Elections, Limits, Stated};
 use parking_lot::Mutex;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
 
 use super::capture::{self, Change, Row, TableInfo};
 use crate::sync::group::Conf;
 
 /// The table that says where kiln.db stands: the last write it holds (`seq`) and the last entry
-/// made durable with it (`applied`, `term`). One row.
+/// made durable with it (`applied`, `term`). One row, of exactly these four columns: every release
+/// since P1 fills them by position as it starts, so one more there would stop each from starting on
+/// this database, and a rollback to it with them.
 pub const STATE: &str = "cluster_state";
+/// The group's configuration where [`STATE`] stands (its voters and learners, as JSON), in a table of
+/// its own for that reason. One row; none said means the server alone, as before the group had
+/// learners.
+pub const CONF: &str = "cluster_conf";
 /// The log's id, the same in every kiln's file.
 const LOG_ID: u128 = u128::from_be_bytes(*b"kiln-cluster-gp1");
 /// The group, the log's only one.
@@ -702,26 +708,27 @@ struct Machine {
 }
 
 /// Where kiln.db stands, as [`STATE`] says: its last entry applied (with its term), its last
-/// write, and the group's configuration there.
+/// write, and the group's configuration there ([`CONF`]).
 fn stands(conn: &Connection) -> anyhow::Result<(Point, u64, ConfState)> {
-    let (index, term, seq, conf): (i64, i64, i64, Option<String>) =
-        conn.query_row(&format!("SELECT applied, term, seq, conf FROM {STATE}"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    let (index, term, seq): (i64, i64, i64) = conn.query_row(&format!("SELECT applied, term, seq FROM {STATE}"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let conf: Option<String> = conn.query_row(&format!("SELECT conf FROM {CONF} WHERE one = 1"), [], |r| r.get(0)).optional()?.flatten();
     let at = Point { index: u64::try_from(index).unwrap_or(0), term: u64::try_from(term).unwrap_or(0) };
     // Before the group had learners, its configuration was the server alone, unsaid.
     let conf = conf.and_then(|c| serde_json::from_str::<Conf>(&c).ok()).map_or_else(|| ConfState { voters: vec![SERVER], ..ConfState::default() }, |c| ConfState::from(&c));
     Ok((at, u64::try_from(seq).unwrap_or(0), conf))
 }
 
-/// Says in [`STATE`] that kiln.db stands at `at` under `conf`, in a commit that waits for the disk
-/// (kiln.db's others don't): everything before it is durable too.
+/// Says in [`STATE`] and [`CONF`] that kiln.db stands at `at` under `conf`, in one commit that
+/// waits for the disk (kiln.db's others don't): everything before it is durable too.
 pub(super) fn stand(conn: &Connection, at: Point, conf: &ConfState) -> anyhow::Result<()> {
+    let (index, term, conf) = (i64::try_from(at.index)?, i64::try_from(at.term)?, serde_json::to_string(&Conf::from(conf))?);
+    conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {CONF} (one INTEGER PRIMARY KEY CHECK (one = 1), conf TEXT)"))?;
     conn.execute_batch("PRAGMA synchronous = FULL")?;
     let done = (|| -> anyhow::Result<()> {
         conn.execute_batch("BEGIN IMMEDIATE")?;
-        let wrote = conn.execute(
-            &format!("UPDATE {STATE} SET applied = ?1, term = ?2, conf = ?3 WHERE one = 1"),
-            rusqlite::params![i64::try_from(at.index)?, i64::try_from(at.term)?, serde_json::to_string(&Conf::from(conf))?],
-        );
+        let wrote = conn
+            .execute(&format!("UPDATE {STATE} SET applied = ?1, term = ?2 WHERE one = 1"), rusqlite::params![index, term])
+            .and_then(|_| conn.execute(&format!("INSERT INTO {CONF} (one, conf) VALUES (1, ?1) ON CONFLICT (one) DO UPDATE SET conf = excluded.conf"), [&conf]));
         match wrote {
             Ok(_) => Ok(conn.execute_batch("COMMIT")?),
             Err(e) => {
@@ -734,6 +741,28 @@ pub(super) fn stand(conn: &Connection, at: Point, conf: &ConfState) -> anyhow::R
     done
 }
 
+/// A database that builds from before [`CONF`] kept the configuration on [`STATE`] in, as a fifth
+/// column: it moves to [`CONF`] and the column goes, in one commit, so the releases before them
+/// start on it again. The column's, when it says one, is the newest: only those builds write it.
+fn unwiden(conn: &Connection) -> anyhow::Result<()> {
+    let wide: bool = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{STATE}') WHERE name = 'conf'"), [], |r| r.get::<_, i64>(0))? > 0;
+    if !wide {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let done = conn.execute_batch(&format!(
+        "INSERT INTO {CONF} (one, conf) SELECT 1, conf FROM {STATE} WHERE one = 1 AND conf IS NOT NULL ON CONFLICT (one) DO UPDATE SET conf = excluded.conf;
+         ALTER TABLE {STATE} DROP COLUMN conf;"
+    ));
+    match done {
+        Ok(()) => Ok(conn.execute_batch("COMMIT")?),
+        Err(e) => {
+            conn.execute_batch("ROLLBACK").ok();
+            Err(anyhow::Error::from(e).context(format!("moving the cluster group's configuration off {STATE}")))
+        }
+    }
+}
+
 impl Machine {
     /// Opens kiln.db at `db` to apply entries: foreign keys off (an entry's rows hold its cascades
     /// already), and where it stands read from [`STATE`] (made, at 0, on the first start).
@@ -741,14 +770,11 @@ impl Machine {
         let conn = Connection::open(db).with_context(|| format!("opening {} for the cluster group", db.display()))?;
         conn.execute_batch(&format!(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = OFF; PRAGMA busy_timeout = 5000;
-             CREATE TABLE IF NOT EXISTS {STATE} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL, term INTEGER NOT NULL, seq INTEGER NOT NULL, conf TEXT);
-             INSERT OR IGNORE INTO {STATE} (one, applied, term, seq) VALUES (1, 0, 0, 0);"
+             CREATE TABLE IF NOT EXISTS {STATE} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL, term INTEGER NOT NULL, seq INTEGER NOT NULL);
+             INSERT OR IGNORE INTO {STATE} (one, applied, term, seq) VALUES (1, 0, 0, 0);
+             CREATE TABLE IF NOT EXISTS {CONF} (one INTEGER PRIMARY KEY CHECK (one = 1), conf TEXT);"
         ))?;
-        // P1's table had no configuration (the server alone).
-        let has_conf: bool = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{STATE}') WHERE name = 'conf'"), [], |r| r.get::<_, i64>(0))? > 0;
-        if !has_conf {
-            conn.execute_batch(&format!("ALTER TABLE {STATE} ADD COLUMN conf TEXT"))?;
-        }
+        unwiden(&conn)?;
         let (at, seq, configuration) = stands(&conn)?;
         Ok(Machine {
             conn,
@@ -957,6 +983,58 @@ mod tests {
         assert_eq!(kv(&store, "nothing")?, None);
         set(&store, "b", "2")?;
         assert_eq!(state(&db)?.0, 2, "a read takes no number");
+        Ok(())
+    }
+
+    /// What every release since P1 does to [`STATE`] as it starts (8adeadba's own statements): its
+    /// four columns filled by position, then where kiln.db stands read and said again.
+    fn start_a_release_from_before(db: &Path) -> anyhow::Result<()> {
+        let c = Connection::open(db)?;
+        c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cluster_state (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL, term INTEGER NOT NULL, seq INTEGER NOT NULL);
+             INSERT OR IGNORE INTO cluster_state VALUES (1, 0, 0, 0);",
+        )?;
+        let (applied, term): (i64, i64) = c.query_row("SELECT applied, term, seq FROM cluster_state", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        c.execute("UPDATE cluster_state SET applied = ?1, term = ?2 WHERE one = 1", [applied, term])?;
+        Ok(())
+    }
+
+    /// A rollback starts the release before on what this one left. A fifth column on [`STATE`]
+    /// stopped 8adeadba there: "table cluster_state has 5 columns but 4 values were supplied".
+    #[test]
+    fn the_release_before_starts_on_a_database_this_one_ran() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("kiln.db");
+        {
+            let store = Store::open_grouped(&db, &dir.path().join("cluster"))?;
+            set(&store, "a", "1")?;
+            store.flush_group()?;
+        }
+        start_a_release_from_before(&db)
+    }
+
+    /// A database an earlier build of this release ran keeps the configuration on [`STATE`], in a
+    /// fifth column. Opened, the column goes and the configuration moves to [`CONF`], learners and
+    /// all, and the release before starts on it again.
+    #[test]
+    fn a_database_an_earlier_build_widened_is_narrowed_and_keeps_its_configuration() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("kiln.db");
+        let conf = Conf { voters: vec![SERVER], learners: vec![7, 9], ..Conf::default() };
+        {
+            let c = Connection::open(&db)?;
+            c.execute_batch(&format!("CREATE TABLE {STATE} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL, term INTEGER NOT NULL, seq INTEGER NOT NULL, conf TEXT);"))?;
+            c.execute(&format!("INSERT INTO {STATE} (one, applied, term, seq, conf) VALUES (1, 4, 2, 6, ?1)"), [serde_json::to_string(&conf)?])?;
+        }
+        let m = Machine::open(&db, None)?;
+        assert_eq!(m.configuration.learners, vec![7, 9], "its learners kept");
+        assert_eq!((m.applied.index, m.applied.term, m.seq.load(Ordering::SeqCst)), (4, 2, 6), "where it stands kept");
+        drop(m);
+        let columns: i64 = Connection::open(&db)?.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{STATE}')"), [], |r| r.get(0))?;
+        assert_eq!(columns, 4, "the four columns every release since P1 fills");
+        start_a_release_from_before(&db)?;
+        // And this release again: the configuration still there.
+        assert_eq!(Machine::open(&db, None)?.configuration.learners, vec![7, 9]);
         Ok(())
     }
 
