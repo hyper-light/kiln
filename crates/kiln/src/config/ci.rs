@@ -145,6 +145,7 @@ pub struct Ci {
     /// rekor_url = "https://rekor.example.com"
     /// # key: key_file = "/etc/kiln/cosign.key", key_password_file = "/etc/kiln/cosign.password"
     /// # kms: kms = "awskms:///arn:aws:kms:eu-west-1:123456789012:key/…", integration = "aws-signing"
+    /// trusted_root = "/etc/kiln/trusted_root.json" # keyless bundles verify against it (default: Sigstore's public one)
     /// ```
     pub attest: Attest,
     /// `[ci.land_signing]`: the land queue signs the commits it writes (docs/ci.md W14-R07).
@@ -353,6 +354,10 @@ pub struct Attest {
     pub fulcio_url: Option<String>,
     pub rekor_url: Option<String>,
     pub audience: Option<String>,
+    /// The Sigstore trusted root (`trusted_root.json`: its Fulcios, Rekors and CT logs) keyless
+    /// bundles are verified against: the instance's kiln signs with, when that's its own.
+    /// Without one, Sigstore's public instance's, through its TUF repository.
+    pub trusted_root: Option<std::path::PathBuf>,
 }
 
 /// How landed commits are signed.

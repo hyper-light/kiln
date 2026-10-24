@@ -5539,6 +5539,39 @@ Done since:
   branches }`, globs) answers whether kiln's own provenance about a digest, its signature checked
   again, meets the requirement: `{ verified, attestation }`, or `{ verified: false, why }`. CD's
   `require-provenance` asks it before it deploys an image (W15-R03).
+- *Done.* Keyless bundles are verified as Sigstore's clients verify them (`ci::sigstore`), so a
+  keyless signer's provenance meets R04's requirements too, and attestations other Sigstore users
+  made (GitHub's `actions/attest-build-provenance`) can be checked:
+  - the certificate chains to a Fulcio of the trusted root, each certificate valid when the log
+    took the signature, the leaf for code signing, and a CT log of the trusted root signed its
+    SCT (over the precertificate, RFC 6962 §3.2);
+  - the DSSE envelope's signature is the certificate's key's;
+  - a Rekor entry (`dsse` 0.0.1 or `intoto` 0.0.2) is of this payload, signature and
+    certificate; its signed entry timestamp, which gives the signing time, is the log's; and its
+    inclusion proof leads to a checkpoint the log signed;
+  - the certificate names the identity asked for: its issuer, its subject (exactly or by prefix)
+    and Fulcio's claims (`source_repository_uri`, `source_repository_ref`…);
+  - the statement names the artifact's digest.
+
+  The trusted root is `[ci.attest] trusted_root` (a `trusted_root.json`: the Sigstore kiln signs
+  with, when it's kiln's own), or Sigstore's public instance's through its TUF repository. kiln
+  ships that repository's root metadata (version 16, byte for byte as Sigstore publishes it) and
+  takes each newer root, then the timestamp, snapshot and targets, as TUF's client workflow says
+  (each signed by a threshold of its role's keys, none expired or older than the last taken),
+  then `trusted_root.json`, kept for a day. kiln's own keyless bundles verify against it, kiln's
+  issuer their identity: against a Sigstore of the test's own (a Fulcio certifying the key for the
+  token's issuer, a Rekor logging and signing the entry), CD's check finds kiln's keyless
+  provenance verified, and another issuer or another Sigstore's root doesn't verify it
+  (`w18_r04_keyless_provenance_verifies`). `kiln attest verify <file | sha256:…> --repo OWNER/NAME
+  [--signer-workflow …] [--source-ref …]` checks an artifact's attestations on GitHub (its
+  attestations API, whose bundles come snappy-compressed behind `bundle_url`) or in a file
+  (`--bundle`). Checked against the GitHub CLI's provenance of its 2.103.2 release (cli/cli's
+  `deployment.yml`, on Sigstore's public instance), each part of it changed failing the check
+  that covers it (`w18_github_attestation_*`, `w18_the_trusted_root_decides`), and the TUF chain
+  against Sigstore's published metadata (`w18_sigstore_*`). Bundles from GitHub's own Sigstore
+  (private repositories' attestations and its release attestations: RFC 3161 timestamps, no
+  transparency log) and Rekor v2's entries are refused, saying so: kiln doesn't verify
+  timestamp authorities' signatures.
 - *Done.* R04's CD half and AC04: an environment's `require_provenance: { builder, workflows,
   branches }` (deploy-api.md §9.1) holds a release until kiln has provenance of each artifact it
   deploys (for half an hour, its build perhaps still attesting it), refuses one whose provenance

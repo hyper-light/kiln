@@ -157,6 +157,9 @@ enum Cmd {
     Auth(kiln::runner::auth::AuthArgs),
     /// The packages a tree's lockfiles pin, as an SBOM (SPDX 2.3 or CycloneDX 1.6).
     Sbom(kiln::ci::sbom::SbomArgs),
+    /// Attestations: `kiln attest verify` checks an artifact's Sigstore bundles (GitHub's
+    /// `actions/attest-build-provenance`, kiln's keyless signing).
+    Attest(kiln::ci::sigstore::AttestArgs),
     /// The egress relay in a leg's container (docs/ci.md W18-R08); the runner starts it.
     #[command(hide = true)]
     EgressRelay,
@@ -867,6 +870,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Auth(a) => boxed(|| kiln::runner::auth::cli(a)).await,
         Cmd::Sbom(a) => boxed(|| kiln::ci::sbom::cli(a)).await,
+        Cmd::Attest(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| async move { kiln::ci::sigstore::cli(a, &cfg).await }).await
+        }
         Cmd::Runner(a) => boxed(|| kiln::runner::setup::cli(a)).await,
         Cmd::EgressRelay => kiln::runner::egress::relay_main(),
         Cmd::Workflow(a) => {
