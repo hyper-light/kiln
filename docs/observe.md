@@ -734,6 +734,21 @@ time, sent again until answered; §5), from:
   events; apps counted by health and sync (`kiln.cd.apps`), a pair once counted written from then
   on, 0 when no app is in it, as a Prometheus gauge's labels stay: a monitor on the degraded apps
   sees them leave and recovers (it would hold its alert on no data otherwise).
+- **kiln's own transport**: each node's QUIC endpoint (hyper-quic under hyper-transport, the lane
+  runners and the server talk on) as its registry is read, each `host_seconds`: the net thread is
+  asked for a sample and answers on its next turn (`net::NetHandle::sample`; nothing is computed
+  when nobody asks). Each connection's path, gauges tagged with the node and the `peer`: its
+  smoothed and least round trips and its probe timeout (RFC 9002 §5, §6.2.1), its congestion
+  window, slow-start threshold and pacing rate where the controller keeps them, its delivery rate,
+  receive window and largest datagram (`kiln.quic.smoothed_rtt`, `kiln.quic.min_rtt`,
+  `kiln.quic.pto`, `kiln.quic.congestion_window`, `kiln.quic.ssthresh`, `kiln.quic.pacing_rate`,
+  ...: qlog's recovery metrics' names, draft-ietf-quic-qlog-quic-events). What each connection
+  counted, counters (a reconnection's reset found at query time): packets sent and lost, bytes lost
+  and acknowledged, congestion events, black holes, UDP datagrams and bytes each way, STREAM and
+  RESET_STREAM frames each way, and frames that say flow control held a side
+  (`sum:kiln.quic.packets_lost{*} by {host,peer}.as_count()` over `packets_sent` is a loss rate).
+  The endpoint's: connections and exchanges open, streams refused, lane frames and responses
+  dropped.
 - **GitHub's webhooks**: pushes, pull requests, workflow runs and jobs (durations, conclusions),
   releases, deployments, issues; events and counts.
 - **The API**: Datadog's v1 series (`POST series`), log intake (`POST logs`) and events (`POST
