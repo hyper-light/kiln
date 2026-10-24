@@ -20,8 +20,17 @@
 //! - **Images (snapshots):** the log compacts behind what's applied and durable; on one node the
 //!   image is kiln.db itself, so the machine's image is only where it stands.
 //! - Writes forwarded by learners (P2), and a group with voters (P3), answer once committed.
+//!
+//! **Learners (P2).** A runner holds a replica: a copy of kiln.db, fetched from the server over
+//! HTTP ([`Fetch`]) and made at a point the group had applied, then the log's entries past it. Any
+//! copy made later stands in for that point: an entry its `seq` holds already is skipped, as a
+//! restart skips them. So a learner the log has moved past (its entries compacted) installs a
+//! fresh copy, and the image the group sends it is only where it stands. The server adds each
+//! runner as a learner ([`Group::learners`]), one change at a time, and the group's messages to
+//! and from the runners go through [`Group::outgoing`] and [`Group::step`].
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -32,14 +41,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, bail};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
-use hyper_durable::{Fatal, GroupStore, Output, Point, Replica, Settings, StateMachine, Unbounded};
+use hyper_durable::{Fatal, GroupStore, OpenError, Output, Point, Replica, Settings, StateMachine, Unbounded};
 use hyper_log::{Config as LogConfig, Facts, Log};
-use hyper_raft::proto::{ConfChangeV2, ConfState};
+use hyper_raft::proto::{ConfChangeV2, ConfState, Message, MessageType};
+use hyper_raft::wire::Record as _;
 use hyper_raft::{Config, Elections, Limits, Stated};
+use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use super::capture::{self, Change, Row, TableInfo};
+use crate::sync::group::Conf;
 
 /// The table that says where kiln.db stands: the last write it holds (`seq`) and the last entry
 /// made durable with it (`applied`, `term`). One row.
@@ -56,13 +68,52 @@ const BLOCK: usize = 4096;
 pub const LARGEST: usize = 8 << 20;
 /// Bytes the log's file may take (it grows as it's used).
 const DISK: u64 = 4 << 30;
-/// Entries a compaction leaves behind what's applied.
-const KEEP: u64 = 256;
+/// Entries a compaction leaves behind what's applied (fewer in tests, which compact past a learner).
+const KEEP: u64 = if cfg!(test) { 8 } else { 256 };
 /// Changes waiting for the log, at most: past them a write waits its turn.
 const QUEUED: usize = 1024;
 /// Entries, and log bytes, between compactions.
-const COMPACT_ENTRIES: u64 = 8192;
+const COMPACT_ENTRIES: u64 = if cfg!(test) { 64 } else { 8192 };
 const COMPACT_BYTES: u64 = 128 << 20;
+/// With learners, a compaction keeps up to this much of the log behind what's applied, at the
+/// entries' mean size, for a learner a little behind (a runner reconnecting); one further behind
+/// takes a copy of the database.
+const KEEP_LEARNERS_BYTES: u64 = 64 << 20;
+const KEEP_LEARNERS: u64 = if cfg!(test) { 16 } else { 65_536 };
+/// How often the server's member beats while it has learners: a learner hears what's committed
+/// when no write moves.
+const BEAT: Duration = Duration::from_secs(1);
+/// A change of learners that hasn't applied in this long is proposed again.
+const CHANGE_PATIENCE: Duration = Duration::from_secs(30);
+/// The group's messages waiting for the links to the runners, at most (past them, they're
+/// dropped: Raft sends what's needed again).
+const OUTGOING: usize = 4096;
+/// How many times a learner tries to fetch a copy of the database before its replica stops.
+const FETCH_TRIES: u32 = 4;
+
+/// Fetches a copy of the server's kiln.db into a file, made now (a learner's way to the database:
+/// the runner's HTTP client to the server).
+pub type Fetch = Arc<dyn Fn(&Path) -> anyhow::Result<()> + Send + Sync>;
+
+/// Whether `db` is a copy of kiln.db a learner opens on: it says where it stands.
+fn holds_a_copy(db: &Path) -> bool {
+    db.exists()
+        && Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()
+            .and_then(|c| c.query_row(&format!("SELECT applied FROM {STATE}"), [], |r| r.get::<_, i64>(0)).ok())
+            .is_some()
+}
+
+/// A runner's member in the group: from its machine's name, stable, never the server's.
+pub fn member_of(machine: &str) -> u64 {
+    // FNV-1a: the same on every build and platform.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in machine.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h.max(SERVER + 1)
+}
 
 /// The log's layout. Every value is fixed: a log reopens with the facts it was made with.
 fn log_config(align: Alignment) -> anyhow::Result<LogConfig> {
@@ -119,6 +170,12 @@ enum Request {
     Append(u64, Change),
     /// An answer once everything asked before is applied.
     Flush(mpsc::SyncSender<Result<(), String>>),
+    /// A message from another member (a learner's to the server, the server's to a learner).
+    Step(Box<Message>),
+    /// The learners the group should have (the server's: the runners that hold a replica).
+    Learners(BTreeSet<u64>),
+    /// A member no link reaches now: the group stops sending it entries until it answers again.
+    Unreachable(u64),
     Stop,
 }
 
@@ -143,65 +200,173 @@ pub struct Group {
     seq: Arc<AtomicU64>,
     /// The last entry the group applied: how far the log has taken the writes.
     applied: Arc<AtomicU64>,
+    /// The last entry applied with its term, and the group's configuration there: where a copy of
+    /// kiln.db made from now on stands.
+    point: Arc<Mutex<(Point, ConfState)>>,
+    /// The group's messages to the other members: to whom, and the message's bytes.
+    outgoing: async_channel::Receiver<(u64, Vec<u8>)>,
+}
+
+/// What opening a member of the group found wrong.
+enum Opening {
+    /// A learner's log starts past its copy of the database: the log goes, the copy stays.
+    LogPastCopy,
+    Failed(anyhow::Error),
 }
 
 impl Group {
-    /// Opens the group for the database at `db`, its log in `dir`, and replays the log's writes
-    /// kiln.db doesn't hold.
+    /// Opens the server's member of the group for the database at `db`, its log in `dir`, and
+    /// replays the log's writes kiln.db doesn't hold.
     pub fn open(db: &Path, dir: &Path) -> anyhow::Result<Group> {
-        std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
+        match Self::start(db, dir, SERVER, None) {
+            Ok(g) => Ok(g),
+            Err(Opening::LogPastCopy) => bail!("the cluster log starts past kiln.db"),
+            Err(Opening::Failed(e)) => Err(e),
+        }
+    }
+
+    /// Opens a runner's learner, `member` of the group, on its replica at `db` (fetched with
+    /// `fetch` when it has none) and its own log in `dir`.
+    pub fn learner(db: &Path, dir: &Path, member: u64, fetch: Fetch) -> anyhow::Result<Group> {
+        if member == SERVER {
+            bail!("a learner is never the server's member");
+        }
+        if let Some(d) = db.parent() {
+            std::fs::create_dir_all(d).with_context(|| format!("making {}", d.display()))?;
+        }
+        if !holds_a_copy(db) {
+            let part = db.with_extension("copy");
+            fetch(&part).context("fetching a copy of kiln.db")?;
+            std::fs::rename(&part, db).with_context(|| format!("keeping the copy at {}", db.display()))?;
+        }
+        match Self::start(db, dir, member, Some(fetch.clone())) {
+            Ok(g) => Ok(g),
+            Err(Opening::LogPastCopy) => {
+                // A log that went on past the copy (a copy older than it): it starts again at the
+                // copy's point, and the group sends what follows.
+                std::fs::remove_file(dir.join("cluster.log")).ok();
+                Self::start(db, dir, member, Some(fetch)).map_err(|e| match e {
+                    Opening::LogPastCopy => anyhow::anyhow!("the learner's new log starts past its copy"),
+                    Opening::Failed(e) => e,
+                })
+            }
+            Err(Opening::Failed(e)) => Err(e),
+        }
+    }
+
+    fn start(db: &Path, dir: &Path, member: u64, fetch: Option<Fetch>) -> Result<Group, Opening> {
+        let failed = Opening::Failed;
+        std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display())).map_err(failed)?;
         let path = dir.join("cluster.log");
         let fresh = std::fs::metadata(&path).map_or(true, |m| m.len() == 0);
-        let align = Alignment::new(BLOCK).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let file = DeviceFile::open(&path, true, CachingRequest::PreferDirect, align).map_err(|e| anyhow::anyhow!("{}: {e:?}", path.display()))?;
-        let config = log_config(file.layout_block())?;
+        let align = Alignment::new(BLOCK).map_err(|e| failed(anyhow::anyhow!("{e:?}")))?;
+        let file = DeviceFile::open(&path, true, CachingRequest::PreferDirect, align).map_err(|e| failed(anyhow::anyhow!("{}: {e:?}", path.display())))?;
+        let config = log_config(file.layout_block()).map_err(failed)?;
         let log = if fresh {
-            Log::create(file, config, LOG_ID).map_err(|e| anyhow::anyhow!("making the cluster log at {}: {e:?}", path.display()))?
+            Log::create(file, config, LOG_ID).map_err(|e| failed(anyhow::anyhow!("making the cluster log at {}: {e:?}", path.display())))?
         } else {
-            Log::open(file, config, LOG_ID).map(|(log, _)| log).map_err(|e| anyhow::anyhow!("opening the cluster log at {}: {e:?}", path.display()))?
+            Log::open(file, config, LOG_ID).map(|(log, _)| log).map_err(|e| failed(anyhow::anyhow!("opening the cluster log at {}: {e:?}", path.display())))?
         };
-        let store = GroupStore::claim(&log, GROUP).map_err(|e| anyhow::anyhow!("claiming the cluster log's group: {e:?}"))?;
-        let machine = Machine::open(db)?;
+        let store = GroupStore::claim(&log, GROUP).map_err(|e| failed(anyhow::anyhow!("claiming the cluster log's group: {e:?}")))?;
+        let learner = fetch.is_some();
+        let machine = Machine::open(db, fetch).map_err(failed)?;
         let seq = machine.seq.clone();
+        let point = Arc::new(Mutex::new((machine.applied, machine.configuration.clone())));
         let limits = Limits::derive(Stated { message: LARGEST + (64 << 10) + hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES, members: 64, memory: 64 << 20, depth: 1 })
-            .map_err(|e| anyhow::anyhow!("the cluster group's limits: {e:?}"))?;
+            .map_err(|e| failed(anyhow::anyhow!("the cluster group's limits: {e:?}")))?;
         let settings = Settings {
-            core: Config { max_size_per_msg: (LARGEST + (64 << 10)) as u64, check_quorum: true, pre_vote: true, seed: SERVER, ..Config::new(SERVER, limits) },
+            core: Config { max_size_per_msg: (LARGEST + (64 << 10)) as u64, check_quorum: true, pre_vote: true, seed: member, ..Config::new(member, limits) },
             // Driven by events: what's proposed is written at the first lull, together.
             quiet: Duration::ZERO,
             elections: Elections::Suspicion,
         };
         let (tx, rx) = mpsc::sync_channel(QUEUED);
-        let (ready_tx, ready_rx) = mpsc::channel::<anyhow::Result<()>>();
+        let (out_tx, outgoing) = async_channel::bounded(OUTGOING);
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), Opening>>();
         let applied = Arc::new(AtomicU64::new(0));
-        let applied2 = applied.clone();
+        let (applied2, point2) = (applied.clone(), point.clone());
         let join = thread::Builder::new()
             .name("kiln-cluster".into())
             .spawn(move || {
                 let waker = Waker::from(Arc::new(Unpark(thread::current())));
                 let replica = match Replica::open(&settings, store, machine, Unbounded) {
                     Ok(r) => r,
+                    Err(OpenError::StartPastMachine { .. }) if learner => {
+                        ready_tx.send(Err(Opening::LogPastCopy)).ok();
+                        return;
+                    }
                     Err(e) => {
-                        ready_tx.send(Err(anyhow::anyhow!("opening the cluster group: {e:?}"))).ok();
+                        ready_tx.send(Err(Opening::Failed(anyhow::anyhow!("opening the cluster group: {e:?}")))).ok();
                         return;
                     }
                 };
-                let mut d = Driver { replica, _log: log, waker, rx, pending: std::collections::HashMap::new(), next: 1, start: Instant::now(), since: 0, broken: None, applied: applied2 };
+                let mut d = Driver {
+                    replica,
+                    _log: log,
+                    waker,
+                    rx,
+                    pending: std::collections::HashMap::new(),
+                    next: 1,
+                    start: Instant::now(),
+                    since: 0,
+                    broken: None,
+                    applied: applied2,
+                    point: point2,
+                    outgoing: out_tx,
+                    server: !learner,
+                    wanted: None,
+                    changing: None,
+                    beat: Instant::now(),
+                };
                 d.run(ready_tx);
             })
-            .context("starting the cluster group's thread")?;
+            .context("starting the cluster group's thread")
+            .map_err(failed)?;
         let thread = join.thread().clone();
         match ready_rx.recv_timeout(Duration::from_secs(60)) {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
-            Err(_) => bail!("the cluster group didn't start within 60 s"),
+            Err(_) => return Err(failed(anyhow::anyhow!("the cluster group didn't start within 60 s"))),
         }
-        Ok(Group { tx, thread, join: Some(join), seq, applied })
+        Ok(Group { tx, thread, join: Some(join), seq, applied, point, outgoing })
     }
 
     /// Where it stands: kiln.db's last write, and the last entry applied (`/healthz/server`).
     pub fn standing(&self) -> (u64, u64) {
         (self.seq.load(Ordering::SeqCst), self.applied.load(Ordering::SeqCst))
+    }
+
+    /// The last entry applied, with its term, and the group's configuration there: where a copy
+    /// of kiln.db made from now on stands (every entry up to it is in kiln.db before it's logged).
+    pub fn point(&self) -> (Point, ConfState) {
+        self.point.lock().clone()
+    }
+
+    /// The group's messages to the other members, as they come: the member, and the message.
+    pub fn outgoing(&self) -> async_channel::Receiver<(u64, Vec<u8>)> {
+        self.outgoing.clone()
+    }
+
+    /// A message to this member from another (its bytes as [`Group::outgoing`] gave them there).
+    pub fn step(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let m = Message::decode(bytes).map_err(|e| anyhow::anyhow!("a cluster group message that doesn't read: {e:?}"))?;
+        self.tx.try_send(Request::Step(Box::new(m))).map_err(|_| anyhow::anyhow!("the cluster group is busy or stopped"))?;
+        self.thread.unpark();
+        Ok(())
+    }
+
+    /// The learners the group should have: each runner holding a replica (the server's member).
+    pub fn learners(&self, members: BTreeSet<u64>) {
+        if self.tx.try_send(Request::Learners(members)).is_ok() {
+            self.thread.unpark();
+        }
+    }
+
+    /// A member no link reaches now (its runner is away).
+    pub fn unreachable(&self, member: u64) {
+        if self.tx.try_send(Request::Unreachable(member)).is_ok() {
+            self.thread.unpark();
+        }
     }
 
     /// The number the next write commits with (the store's writes come one at a time).
@@ -258,6 +423,18 @@ struct Driver {
     broken: Option<String>,
     /// The last entry applied, for the store to say.
     applied: Arc<AtomicU64>,
+    /// The last entry applied with its term, and the configuration there (for copies).
+    point: Arc<Mutex<(Point, ConfState)>>,
+    /// The group's messages to the other members.
+    outgoing: async_channel::Sender<(u64, Vec<u8>)>,
+    /// The server's member (the group's leader), or a runner's learner.
+    server: bool,
+    /// The learners the group should have, once the server has said.
+    wanted: Option<BTreeSet<u64>>,
+    /// A change of learners under way: the learner, added or not, and when it was proposed.
+    changing: Option<(u64, bool, Instant)>,
+    /// When the server's member last beat.
+    beat: Instant,
 }
 
 impl Driver {
@@ -265,40 +442,17 @@ impl Driver {
         u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
-    fn run(&mut self, ready: mpsc::Sender<anyhow::Result<()>>) {
-        // The sole voter elects itself.
-        if let Err(e) = self.replica.campaign() {
-            ready.send(Err(anyhow::anyhow!("campaigning: {e:?}"))).ok();
-            return;
-        }
-        let until = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Err(e) = self.drive() {
-                ready.send(Err(e)).ok();
+    fn run(&mut self, ready: mpsc::Sender<Result<(), Opening>>) {
+        if self.server {
+            if let Err(e) = self.lead() {
+                ready.send(Err(Opening::Failed(e))).ok();
                 return;
             }
-            if self.replica.is_leader() || Instant::now() >= until {
-                break;
-            }
-            thread::park_timeout(Duration::from_millis(1));
-        }
-        if !self.replica.is_leader() {
-            ready.send(Err(anyhow::anyhow!("the cluster group's sole voter didn't elect itself"))).ok();
+            self.replica.machine_mut().opened();
+        } else if let Err(e) = self.drive() {
+            ready.send(Err(Opening::Failed(e))).ok();
             return;
         }
-        // A barrier: once an entry of its own applies, so has everything before it (the log's
-        // writes kiln.db didn't hold), and the store serves what's committed.
-        let (reply, answer) = mpsc::sync_channel(1);
-        self.barrier(reply);
-        if let Err(e) = self.settle() {
-            ready.send(Err(e)).ok();
-            return;
-        }
-        if !matches!(answer.try_recv(), Ok(Ok(()))) {
-            ready.send(Err(anyhow::anyhow!("the cluster group's first entry didn't apply"))).ok();
-            return;
-        }
-        self.replica.machine_mut().opened();
         self.since = self.replica.applied().index;
         ready.send(Ok(())).ok();
         let mut stopping = false;
@@ -307,10 +461,22 @@ impl Driver {
                 match req {
                     Request::Append(seq, change) => self.append(seq, change),
                     Request::Flush(reply) => self.barrier(reply),
+                    Request::Step(m) => {
+                        if let Err(e) = self.replica.step(*m) {
+                            tracing::debug!("a cluster group message wasn't taken: {e:?}");
+                        }
+                    }
+                    Request::Learners(members) => self.wanted = Some(members),
+                    Request::Unreachable(member) => {
+                        self.replica.report_unreachable(member).ok();
+                    }
                     Request::Stop if !stopping => {
-                        // What was sent before goes into the log first.
-                        let (reply, _answer) = mpsc::sync_channel(1);
-                        self.barrier(reply);
+                        // What was sent before goes into the log first (the server's; a learner
+                        // proposes nothing).
+                        if self.server {
+                            let (reply, _answer) = mpsc::sync_channel(1);
+                            self.barrier(reply);
+                        }
                         stopping = true;
                     }
                     Request::Stop => {}
@@ -328,18 +494,22 @@ impl Driver {
                         Request::Flush(reply) => {
                             reply.send(Err(format!("the cluster group failed: {e:#}"))).ok();
                         }
-                        Request::Append(..) => {}
                         Request::Stop => return,
+                        _ => {}
                     }
                 }
                 return;
+            }
+            if self.server {
+                self.reconcile();
+                self.beat_learners();
             }
             // Compacting makes kiln.db durable (a commit that waits for the disk, holding its write
             // lock), so it's every so many writes, not by the image's size (on one node a marker).
             let applied = self.replica.applied().index;
             if self.replica.is_stalled() || applied.saturating_sub(self.since) >= COMPACT_ENTRIES || self.replica.compactable_bytes() >= COMPACT_BYTES {
                 let now = self.now();
-                if self.replica.compact(KEEP.min(applied), now, &self.waker).unwrap_or(false) {
+                if self.replica.compact(self.keep().min(applied), now, &self.waker).unwrap_or(false) {
                     self.since = applied;
                 }
             }
@@ -349,6 +519,71 @@ impl Driver {
             }
             let wait = self.replica.deadline().map(|d| Duration::from_nanos(d.saturating_sub(self.now()))).unwrap_or(Duration::from_millis(100)).min(Duration::from_millis(100));
             thread::park_timeout(wait.max(Duration::from_micros(50)));
+        }
+    }
+
+    /// The server's member takes the lead: the sole voter elects itself, then a barrier (an entry
+    /// of its own) applies, and with it everything before (the log's writes kiln.db didn't hold),
+    /// so the store serves what's committed.
+    fn lead(&mut self) -> anyhow::Result<()> {
+        self.replica.campaign().map_err(|e| anyhow::anyhow!("campaigning: {e:?}"))?;
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            self.drive()?;
+            if self.replica.is_leader() || Instant::now() >= until {
+                break;
+            }
+            thread::park_timeout(Duration::from_millis(1));
+        }
+        if !self.replica.is_leader() {
+            bail!("the cluster group's sole voter didn't elect itself");
+        }
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.barrier(reply);
+        self.settle()?;
+        if !matches!(answer.try_recv(), Ok(Ok(()))) {
+            bail!("the cluster group's first entry didn't apply");
+        }
+        Ok(())
+    }
+
+    /// Entries a compaction keeps behind what's applied: with learners, as many as fit
+    /// [`KEEP_LEARNERS_BYTES`] at the entries' mean size, for one a little behind.
+    fn keep(&self) -> u64 {
+        if self.replica.is_stalled() || self.replica.configuration().learners.is_empty() {
+            return KEEP;
+        }
+        let entries = self.replica.applied().index.saturating_sub(self.since).max(1);
+        let mean = (self.replica.compactable_bytes() / entries).max(1);
+        (KEEP_LEARNERS_BYTES / mean).clamp(KEEP, KEEP_LEARNERS)
+    }
+
+    /// Brings the group's learners to those wanted, one change at a time.
+    fn reconcile(&mut self) {
+        let Some(wanted) = &self.wanted else { return };
+        let conf = self.replica.configuration();
+        if let Some((member, add, at)) = self.changing {
+            let done = conf.learners.contains(&member) == add;
+            if !done && at.elapsed() < CHANGE_PATIENCE {
+                return;
+            }
+            self.changing = None;
+        }
+        let have: BTreeSet<u64> = conf.learners.iter().copied().collect();
+        let change = wanted.difference(&have).next().map(|m| (*m, true)).or_else(|| have.difference(wanted).next().map(|m| (*m, false)));
+        if let Some((member, add)) = change
+            && self.replica.change(Vec::new(), &crate::sync::group::learner(member, add)).is_ok()
+        {
+            tracing::info!(member, add, "the cluster group's learners change");
+            self.changing = Some((member, add, Instant::now()));
+        }
+    }
+
+    /// The server's member beats while it has learners: they hear what's committed.
+    fn beat_learners(&mut self) {
+        if self.beat.elapsed() >= BEAT && !self.replica.configuration().learners.is_empty() {
+            self.beat = Instant::now();
+            self.replica.beat().ok();
         }
     }
 
@@ -401,7 +636,7 @@ impl Driver {
         Ok(())
     }
 
-    /// Drives the replica until it rests, answering what applied.
+    /// Drives the replica until it rests, answering what applied and sending its messages.
     fn drive(&mut self) -> anyhow::Result<()> {
         let mut out: Output<Answer> = Output::default();
         for _ in 0..1024 {
@@ -412,11 +647,22 @@ impl Driver {
                     reply.send(result).ok();
                 }
             }
+            for m in out.messages.drain(..) {
+                let (to, snapshot) = (m.to, m.msg_type == MessageType::MsgSnapshot);
+                // A message the links can't take now is dropped: Raft sends what's needed again.
+                let sent = self.outgoing.try_send((to, m.encode_to_vec())).is_ok();
+                if snapshot {
+                    // The image is only where the group stands (the learner fetches the database).
+                    self.replica.report_snapshot(to, sent).ok();
+                }
+            }
             if !driven.more {
                 break;
             }
         }
-        self.applied.store(self.replica.applied().index, Ordering::SeqCst);
+        let at = self.replica.applied();
+        self.applied.store(at.index, Ordering::SeqCst);
+        *self.point.lock() = (at, self.replica.configuration().clone());
         Ok(())
     }
 }
@@ -427,6 +673,8 @@ type Answer = (u64, Result<(), String>);
 /// kiln.db as the group's state machine: entries applied on a connection of its own.
 struct Machine {
     conn: Connection,
+    /// Where kiln.db is (a learner's copy is fetched beside it).
+    path: PathBuf,
     known: std::collections::HashMap<String, TableInfo>,
     applied: Point,
     durable: Point,
@@ -435,28 +683,69 @@ struct Machine {
     seq: Arc<AtomicU64>,
     /// The last write the log held when the group opened (to say what kiln.db holds past it).
     logged: u64,
+    /// A learner's way to a copy of the database; none on the server, which never takes one.
+    fetch: Option<Fetch>,
+}
+
+/// Where kiln.db stands, as [`STATE`] says: its last entry applied (with its term), its last
+/// write, and the group's configuration there.
+fn stands(conn: &Connection) -> anyhow::Result<(Point, u64, ConfState)> {
+    let (index, term, seq, conf): (i64, i64, i64, Option<String>) =
+        conn.query_row(&format!("SELECT applied, term, seq, conf FROM {STATE}"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    let at = Point { index: u64::try_from(index).unwrap_or(0), term: u64::try_from(term).unwrap_or(0) };
+    // Before the group had learners, its configuration was the server alone, unsaid.
+    let conf = conf.and_then(|c| serde_json::from_str::<Conf>(&c).ok()).map_or_else(|| ConfState { voters: vec![SERVER], ..ConfState::default() }, |c| ConfState::from(&c));
+    Ok((at, u64::try_from(seq).unwrap_or(0), conf))
+}
+
+/// Says in [`STATE`] that kiln.db stands at `at` under `conf`, in a commit that waits for the disk
+/// (kiln.db's others don't): everything before it is durable too.
+pub(super) fn stand(conn: &Connection, at: Point, conf: &ConfState) -> anyhow::Result<()> {
+    conn.execute_batch("PRAGMA synchronous = FULL")?;
+    let done = (|| -> anyhow::Result<()> {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let wrote = conn.execute(
+            &format!("UPDATE {STATE} SET applied = ?1, term = ?2, conf = ?3 WHERE one = 1"),
+            rusqlite::params![i64::try_from(at.index)?, i64::try_from(at.term)?, serde_json::to_string(&Conf::from(conf))?],
+        );
+        match wrote {
+            Ok(_) => Ok(conn.execute_batch("COMMIT")?),
+            Err(e) => {
+                conn.execute_batch("ROLLBACK").ok();
+                Err(e.into())
+            }
+        }
+    })();
+    conn.execute_batch("PRAGMA synchronous = NORMAL").ok();
+    done
 }
 
 impl Machine {
     /// Opens kiln.db at `db` to apply entries: foreign keys off (an entry's rows hold its cascades
     /// already), and where it stands read from [`STATE`] (made, at 0, on the first start).
-    fn open(db: &Path) -> anyhow::Result<Machine> {
+    fn open(db: &Path, fetch: Option<Fetch>) -> anyhow::Result<Machine> {
         let conn = Connection::open(db).with_context(|| format!("opening {} for the cluster group", db.display()))?;
         conn.execute_batch(&format!(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = OFF; PRAGMA busy_timeout = 5000;
-             CREATE TABLE IF NOT EXISTS {STATE} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL, term INTEGER NOT NULL, seq INTEGER NOT NULL);
-             INSERT OR IGNORE INTO {STATE} VALUES (1, 0, 0, 0);"
+             CREATE TABLE IF NOT EXISTS {STATE} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL, term INTEGER NOT NULL, seq INTEGER NOT NULL, conf TEXT);
+             INSERT OR IGNORE INTO {STATE} (one, applied, term, seq) VALUES (1, 0, 0, 0);"
         ))?;
-        let (index, term, seq): (i64, i64, i64) = conn.query_row(&format!("SELECT applied, term, seq FROM {STATE}"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        let at = Point { index: u64::try_from(index).unwrap_or(0), term: u64::try_from(term).unwrap_or(0) };
+        // P1's table had no configuration (the server alone).
+        let has_conf: bool = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{STATE}') WHERE name = 'conf'"), [], |r| r.get::<_, i64>(0))? > 0;
+        if !has_conf {
+            conn.execute_batch(&format!("ALTER TABLE {STATE} ADD COLUMN conf TEXT"))?;
+        }
+        let (at, seq, configuration) = stands(&conn)?;
         Ok(Machine {
             conn,
+            path: db.to_path_buf(),
             known: std::collections::HashMap::new(),
             applied: at,
             durable: at,
-            configuration: ConfState { voters: vec![SERVER], ..ConfState::default() },
-            seq: Arc::new(AtomicU64::new(u64::try_from(seq).unwrap_or(0))),
+            configuration,
+            seq: Arc::new(AtomicU64::new(seq)),
             logged: 0,
+            fetch,
         })
     }
 
@@ -559,8 +848,48 @@ impl StateMachine for Machine {
         Some(16)
     }
 
-    fn install(&mut self, _image: &[u8], _at: Point, _configuration: &ConfState) -> Result<(), Fatal> {
-        Err(Fatal("a copy of the database comes to a learner in P2"))
+    fn install(&mut self, _image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {
+        // The image is only where the group stands: a learner fetches a copy of the database made
+        // now, which stands in for `at` (the entries after `at` it holds already are skipped by
+        // their `seq`), and takes it in whole, as its readers see it at once.
+        let Some(fetch) = self.fetch.clone() else { return Err(Fatal("only a learner takes a copy of the database")) };
+        let part = self.path.with_extension("copy");
+        let took = (|| -> anyhow::Result<u64> {
+            // The server may be busy or a moment away: a few tries before the learner gives up.
+            let mut tried = 0;
+            while let Err(e) = fetch(&part) {
+                tried += 1;
+                if tried >= FETCH_TRIES {
+                    return Err(e.context("fetching a copy of kiln.db"));
+                }
+                tracing::warn!(tried, "fetching a copy of kiln.db: {e:#}");
+                thread::sleep(Duration::from_secs(2 << tried));
+            }
+            {
+                let copy = Connection::open_with_flags(&part, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                rusqlite::backup::Backup::new(&copy, &mut self.conn)?.run_to_completion(4096, Duration::ZERO, None)?;
+            }
+            self.conn.execute_batch("PRAGMA journal_mode = WAL")?;
+            let (_, seq, _) = stands(&self.conn)?;
+            stand(&self.conn, at, configuration)?;
+            Ok(seq)
+        })();
+        std::fs::remove_file(&part).ok();
+        match took {
+            Ok(seq) => {
+                tracing::info!(index = at.index, seq, "a learner took a copy of kiln.db");
+                self.seq.store(seq, Ordering::SeqCst);
+                self.known.clear();
+                self.applied = at;
+                self.durable = at;
+                self.configuration = configuration.clone();
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("a learner couldn't take a copy of kiln.db: {e:#}");
+                Err(Fatal("a copy of kiln.db couldn't be taken"))
+            }
+        }
     }
 
     fn persist(&mut self) -> Result<(), Fatal> {
@@ -570,14 +899,7 @@ impl StateMachine for Machine {
         // kiln.db commits without waiting for the disk (synchronous NORMAL); one that does makes
         // everything before it durable too, so the log may start past it.
         let at = self.applied;
-        let done = self.conn.execute_batch("PRAGMA synchronous = FULL").map_err(anyhow::Error::from).and_then(|()| {
-            self.conn.execute_batch("BEGIN IMMEDIATE")?;
-            self.conn.execute(&format!("UPDATE {STATE} SET applied = ?1, term = ?2 WHERE one = 1"), rusqlite::params![i64::try_from(at.index)?, i64::try_from(at.term)?])?;
-            self.conn.execute_batch("COMMIT")?;
-            Ok(())
-        });
-        self.conn.execute_batch("PRAGMA synchronous = NORMAL").ok();
-        done.map_err(|_| Fatal("kiln.db couldn't be made durable"))?;
+        stand(&self.conn, at, &self.configuration).map_err(|_| Fatal("kiln.db couldn't be made durable"))?;
         self.durable = at;
         Ok(())
     }
@@ -726,6 +1048,94 @@ mod tests {
             seen += e.rows.len();
         }
         assert_eq!(seen, 7, "every row, once");
+        Ok(())
+    }
+
+    /// Waits up to 30 s for `ok`.
+    fn until(what: &str, mut ok: impl FnMut() -> anyhow::Result<bool>) -> anyhow::Result<()> {
+        let end = Instant::now() + Duration::from_secs(30);
+        while !ok()? {
+            if Instant::now() >= end {
+                bail!("timed out waiting for {what}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    /// The links between the server's member and a learner, in a thread: each one's messages to the
+    /// other, while `up` (a runner away misses them).
+    fn link(server: Store, learner: Arc<Group>, member: u64, up: Arc<std::sync::atomic::AtomicBool>, done: Arc<std::sync::atomic::AtomicBool>) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let Some(g) = server.group() else { return };
+            let (to_learner, to_server) = (g.outgoing(), learner.outgoing());
+            while !done.load(Ordering::SeqCst) {
+                let mut moved = false;
+                while let Ok((to, m)) = to_learner.try_recv() {
+                    moved = true;
+                    if to == member && up.load(Ordering::SeqCst) {
+                        learner.step(&m).ok();
+                    }
+                }
+                while let Ok((_, m)) = to_server.try_recv() {
+                    moved = true;
+                    if up.load(Ordering::SeqCst) {
+                        g.step(&m).ok();
+                    }
+                }
+                if !moved {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_learner_starts_from_a_copy_follows_the_log_and_takes_a_new_copy_once_left_behind() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let server = Store::open_grouped(&dir.path().join("kiln.db"), &dir.path().join("cluster"))?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        let g = server.group().context("grouped")?;
+        g.learners([member].into());
+        until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        let copies = Arc::new(AtomicU64::new(0));
+        let fetch: Fetch = {
+            let (server, copies) = (server.clone(), copies.clone());
+            Arc::new(move |dest: &Path| {
+                copies.fetch_add(1, Ordering::SeqCst);
+                crate::rt::block_on({
+                    let (s, d) = (server.clone(), dest.to_path_buf());
+                    async move { s.copy_for_learner(d).await }
+                })
+            })
+        };
+        let replica = dir.path().join("runner").join("kiln.db");
+        let learner = Arc::new(Group::learner(&replica, &dir.path().join("runner").join("cluster"), member, fetch)?);
+        assert_eq!(copies.load(Ordering::SeqCst), 1, "it started from a copy");
+        let read = |k: &str| -> anyhow::Result<Option<String>> {
+            let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
+        };
+        assert_eq!(read("before")?.as_deref(), Some("1"), "the copy holds what was written before it");
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone());
+        set(&server, "after", "2")?;
+        until("the write after the copy on the learner", || Ok(read("after")?.as_deref() == Some("2")))?;
+        assert_eq!(learner.standing().0, server.group_standing().map_or(0, |s| s.0), "the learner holds the server's last write");
+        // Away while the server writes past what the log keeps for it: back, it takes a new copy.
+        up.store(false, Ordering::SeqCst);
+        for i in 0..200 {
+            set(&server, &format!("away{i}"), "x")?;
+        }
+        server.flush_group()?;
+        up.store(true, Ordering::SeqCst);
+        until("the writes made while it was away", || Ok(read("away199")?.as_deref() == Some("x")))?;
+        assert_eq!(copies.load(Ordering::SeqCst), 2, "left behind by the log, it took a new copy");
+        set(&server, "later", "3")?;
+        until("a write after the new copy", || Ok(read("later")?.as_deref() == Some("3")))?;
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
         Ok(())
     }
 

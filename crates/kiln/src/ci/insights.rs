@@ -716,7 +716,7 @@ async fn critical(hub: &Hub, repo: &str, workflow: &str) -> anyhow::Result<Value
         })
         .await?;
     let Some((id, number)) = run else { return Ok(Value::Null) };
-    let g = super::runs_api::graph_json(hub, &id, None).await.map_err(|(_, e)| anyhow::anyhow!(e))?;
+    let g = super::runs_api::graph_json(&hub.store, &id, None).await.map_err(|(_, e)| anyhow::anyhow!(e))?;
     let path: Vec<String> = g.get("critical_path").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
     let span = |j: &str| -> i64 {
         g.get("nodes").and_then(Value::as_array).and_then(|n| n.iter().find(|x| x.get("job").and_then(Value::as_str) == Some(j))).map_or(0, |n| {

@@ -13,6 +13,7 @@ use crate::pipeline::PlannedJob;
 
 pub mod capture;
 pub mod group;
+pub mod learner;
 pub mod migrations;
 
 #[derive(Clone)]
@@ -26,6 +27,8 @@ struct Inner {
     conn: Mutex<Connection>,
     watch: Option<capture::Watch>,
     group: Option<group::Group>,
+    /// The database's file, with the cluster group (a learner's copy is made from it).
+    path: Option<std::path::PathBuf>,
     /// A folder of its own, removed with the store (tests through the group, [`Store::in_memory`]).
     scratch: Option<std::path::PathBuf>,
 }
@@ -43,6 +46,75 @@ impl Drop for Inner {
 /// Tables this node keeps for itself: its log search index, built from its own logs. Written with
 /// [`Store::call_local`], past the cluster group; a write through the group must not touch them.
 pub const LOCAL: &[&str] = &["ci_log_indexed", "ci_log_index_data", "ci_log_index_idx", "ci_log_index_content", "ci_log_index_docsize", "ci_log_index_config"];
+
+/// Writes a copy of the database at `db` to `dest`, from one snapshot of it: every table but this
+/// node's own ([`LOCAL`]) and the virtual ones (its log search), each row with its rowid, then
+/// their indexes, triggers and views. Only what replicates is read: a log search of gigabytes stays
+/// where it is.
+fn copy_tables(db: &Path, dest: &Path) -> anyhow::Result<()> {
+    std::fs::remove_file(dest).ok();
+    if let Some(d) = dest.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let src = Connection::open(db)?;
+    let kept = |name: &str, sql: &str| !name.starts_with("sqlite_") && !LOCAL.contains(&name) && !sql.to_ascii_uppercase().starts_with("CREATE VIRTUAL TABLE");
+    // What there is, as of the snapshot the rows are read in.
+    let schema = |c: &Connection| -> rusqlite::Result<Vec<(String, String, String, String)>> {
+        let mut st = c.prepare("SELECT type, name, tbl_name, sql FROM main.sqlite_schema WHERE sql IS NOT NULL ORDER BY rowid")?;
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect()
+    };
+    let (page_size, user_version): (i64, i64) = (src.query_row("PRAGMA page_size", [], |r| r.get(0))?, src.query_row("PRAGMA user_version", [], |r| r.get(0))?);
+    let tables: Vec<(String, String)> = schema(&src)?.into_iter().filter(|(kind, name, _, sql)| kind == "table" && kept(name, sql)).map(|(_, name, _, sql)| (name, sql)).collect();
+    {
+        let d = Connection::open(dest)?;
+        d.execute_batch(&format!("PRAGMA page_size = {page_size}; PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; PRAGMA user_version = {user_version};"))?;
+        for (_, sql) in &tables {
+            d.execute_batch(sql)?;
+        }
+    }
+    src.execute("ATTACH DATABASE ?1 AS copy", [dest.to_string_lossy()])?;
+    src.execute_batch("PRAGMA copy.journal_mode = OFF; PRAGMA copy.synchronous = OFF; BEGIN")?;
+    let copied = (|| -> anyhow::Result<Vec<(String, String, String, String)>> {
+        // In the snapshot: the schema again, so what's created after is what the rows were read with.
+        let objects = schema(&src)?;
+        let known = capture::copy_columns(&src)?;
+        for (name, _) in &tables {
+            let (cols, own_rowids) = known.get(name).with_context(|| format!("table {name}"))?;
+            // Rows keep their rowids: kiln reads them (runs' are GitHub's ids, jobs' order legs).
+            let cols = if *own_rowids { format!("rowid, {}", cols.join(", ")) } else { cols.join(", ") };
+            let q = name.replace('"', "\"\"");
+            src.execute(&format!("INSERT INTO copy.\"{q}\" ({cols}) SELECT {cols} FROM main.\"{q}\""), [])?;
+        }
+        // AUTOINCREMENT's counters as kiln.db has them: the inserts above left one for every such
+        // table, empty or not.
+        if src.query_row("SELECT COUNT(*) FROM copy.sqlite_schema WHERE name = 'sqlite_sequence'", [], |r| r.get::<_, i64>(0))? > 0 {
+            src.execute_batch("DELETE FROM copy.sqlite_sequence")?;
+            let local = LOCAL.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", ");
+            src.execute_batch(&format!("INSERT INTO copy.sqlite_sequence SELECT * FROM main.sqlite_sequence WHERE name NOT IN ({local})"))?;
+        }
+        Ok(objects)
+    })();
+    let objects = match copied {
+        Ok(o) => {
+            src.execute_batch("COMMIT")?;
+            o
+        }
+        Err(e) => {
+            src.execute_batch("ROLLBACK").ok();
+            return Err(e);
+        }
+    };
+    src.execute_batch("DETACH DATABASE copy")?;
+    let names: std::collections::HashSet<&str> = tables.iter().map(|(n, _)| n.as_str()).collect();
+    let d = Connection::open(dest)?;
+    for (kind, _, table, sql) in &objects {
+        if kind == "view" || (kind != "table" && names.contains(table.as_str())) {
+            d.execute_batch(sql)?;
+        }
+    }
+    d.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL;")?;
+    Ok(())
+}
 
 /// A transaction that nests: a SQLite savepoint. At the top it opens one as `BEGIN DEFERRED`
 /// would; inside another (the one a write runs in while the cluster group takes it, docs/p2p.md
@@ -342,7 +414,7 @@ impl Store {
     /// stopped, and setups that turn the group off (`[cluster] group = false`).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Self::connect(path)?;
-        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, scratch: None }) })
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }) })
     }
 
     /// The store at `path` with its writes through the cluster group, its log in `cluster`
@@ -351,7 +423,16 @@ impl Store {
         let conn = Self::connect(path)?;
         let group = group::Group::open(path, cluster).context("the cluster group")?;
         let watch = capture::Watch::install(&conn, LOCAL)?;
-        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: Some(watch), group: Some(group), scratch: None }) })
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: Some(watch), group: Some(group), path: Some(path.to_path_buf()), scratch: None }) })
+    }
+
+    /// A runner's replica of kiln.db (docs/p2p.md, P2), to read: its learner alone writes it, so
+    /// this connection only reads (`query_only`), and the schema is the copy's, as the server made
+    /// it.
+    pub fn open_replica(path: &Path) -> anyhow::Result<Self> {
+        let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }) })
     }
 
     fn connect(path: &Path) -> anyhow::Result<Connection> {
@@ -378,7 +459,7 @@ impl Store {
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
-        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, scratch: None }) })
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }) })
     }
 
     /// Run `f` with the connection on this thread: for what's read once as the server starts,
@@ -396,6 +477,31 @@ impl Store {
     /// With the cluster group, where it stands: kiln.db's last write and the last entry applied.
     pub fn group_standing(&self) -> Option<(u64, u64)> {
         self.inner.group.as_ref().map(group::Group::standing)
+    }
+
+    /// The database's size on disk, with its write-ahead log (with the cluster group).
+    pub fn file_bytes(&self) -> Option<u64> {
+        let path = self.inner.path.as_ref()?;
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        Some(std::fs::metadata(path).ok()?.len() + std::fs::metadata(wal).map_or(0, |m| m.len()))
+    }
+
+    /// The cluster group, with it: its messages to the runners' learners, and theirs to it.
+    pub fn group(&self) -> Option<&group::Group> {
+        self.inner.group.as_ref()
+    }
+
+    /// A copy of kiln.db for a runner's learner, written to `dest`: the database as it is now,
+    /// standing at the group's last applied entry (every entry up to it is in it, and one after it
+    /// the learner gets again is skipped by its `seq`), without this node's own tables.
+    pub async fn copy_for_learner(&self, dest: std::path::PathBuf) -> anyhow::Result<()> {
+        let (Some(g), Some(db)) = (&self.inner.group, self.inner.path.clone()) else { anyhow::bail!("kiln.db's writes don't go through the cluster group") };
+        let (at, conf) = g.point();
+        crate::rt::blocking(move || -> anyhow::Result<()> {
+            copy_tables(&db, &dest)?;
+            group::stand(&Connection::open(&dest)?, at, &conf)
+        })
+        .await?
     }
 
     /// Waits until every write so far is in the cluster group's log (tests; a clean stop).
@@ -1693,6 +1799,93 @@ mod tests {
         assert_eq!(s.queued_jobs(10).await?.len(), 1);
         Ok(())
     })
+    }
+
+    /// A learner's copy holds every table that replicates, row for row with its rowids, and their
+    /// indexes, and none of this node's own (its log search).
+    #[test]
+    fn a_learner_s_copy_is_the_database_but_this_node_s_own_tables() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("kiln.db");
+        let s = Store::open_grouped(&db, &dir.path().join("cluster"))?;
+        let copy = dir.path().join("copy.db");
+        crate::rt::block_on({
+            let (s, copy) = (s.clone(), copy.clone());
+            async move {
+                for i in 0..50 {
+                    s.kv_set(format!("k{i}"), format!("v{i}")).await?;
+                }
+                s.call(|c| {
+                    // A rowid table without an alias keeps its rowids, gaps and all.
+                    c.execute_batch("DELETE FROM kv WHERE k IN ('k3', 'k7')")?;
+                    Ok(())
+                })
+                .await?;
+                s.call_local(|c| Ok(c.execute_batch("INSERT INTO ci_log_indexed (leg, at, bytes) VALUES ('leg', 1, 2); INSERT INTO ci_log_index (text, leg, step, line) VALUES ('a line', 'leg', 0, 0);")?)).await?;
+                s.copy_for_learner(copy).await
+            }
+        })?;
+        let (a, b) = (Connection::open(&db)?, Connection::open(&copy)?);
+        let objects = |c: &Connection, kind: &str| -> anyhow::Result<Vec<String>> {
+            let mut st = c.prepare("SELECT name FROM sqlite_schema WHERE type = ?1 AND tbl_name NOT LIKE 'ci_log_inde%' ORDER BY name")?;
+            Ok(st.query_map([kind], |r| r.get(0))?.collect::<Result<_, _>>()?)
+        };
+        assert_eq!(objects(&a, "table")?, objects(&b, "table")?, "every table that replicates");
+        assert_eq!(objects(&a, "index")?, objects(&b, "index")?, "and their indexes");
+        let dump = |c: &Connection, t: &str| -> anyhow::Result<Vec<String>> {
+            let mut st = c.prepare(&format!("SELECT * FROM \"{t}\""))?;
+            let n = st.column_count();
+            let rows = st.query_map([], |r| Ok((0..n).map(|i| r.get_ref(i).map_or_else(|e| e.to_string(), |v| format!("{v:?}"))).collect::<Vec<_>>().join("|")))?;
+            let mut out: Vec<String> = rows.collect::<Result<_, _>>()?;
+            out.sort();
+            Ok(out)
+        };
+        for t in objects(&a, "table")? {
+            if t != group::STATE {
+                assert_eq!(dump(&a, &t)?, dump(&b, &t)?, "table {t}");
+            }
+        }
+        let rowids = |c: &Connection| -> anyhow::Result<Vec<(i64, String)>> {
+            let mut st = c.prepare("SELECT rowid, k FROM kv ORDER BY rowid")?;
+            Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?)
+        };
+        assert_eq!(rowids(&a)?, rowids(&b)?, "rows keep their rowids");
+        let local: i64 = b.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE tbl_name LIKE 'ci_log_inde%'", [], |r| r.get(0))?;
+        assert_eq!(local, 0, "this node's log search stays behind");
+        Ok(())
+    }
+
+    /// How long a learner's copy of a large store takes (`KILN_BENCH_DIR`, else the temporary
+    /// folder), with a log search the copy leaves behind: `cargo test -p kiln --lib
+    /// how_long_a_copy_takes -- --ignored --nocapture`, under the server's memory limit.
+    #[test]
+    #[ignore = "a measure, not a check: run by hand"]
+    fn how_long_a_copy_takes() -> anyhow::Result<()> {
+        let base = std::env::var("KILN_BENCH_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+        let dir = base.join(format!("kiln-copy-bench-{}", crate::util::new_id()));
+        let db = dir.join("kiln.db");
+        let rows: i64 = std::env::var("KILN_BENCH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(400_000);
+        {
+            let s = Store::open_grouped(&db, &dir.join("cluster"))?;
+            let c = Connection::open(&db)?;
+            let t = std::time::Instant::now();
+            c.execute_batch(&format!(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {rows})
+                 INSERT INTO kv (k, v) SELECT 'k' || i, hex(randomblob(250)) FROM n;
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {rows})
+                 INSERT INTO ci_log_index (text, leg, step, line) SELECT hex(randomblob(250)), 'leg', 0, i FROM n;"
+            ))?;
+            eprintln!("made {} MB in {:?}", std::fs::metadata(&db)?.len() >> 20, t.elapsed());
+            let copy = dir.join("copy.db");
+            let t = std::time::Instant::now();
+            crate::rt::block_on({
+                let (s, copy) = (s.clone(), copy.clone());
+                async move { s.copy_for_learner(copy).await }
+            })?;
+            eprintln!("copied {} MB of a {} MB store in {:?}", std::fs::metadata(&copy)?.len() >> 20, std::fs::metadata(&db)?.len() >> 20, t.elapsed());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     /// A concurrency group runs one run at a time: a newer run waits for the one under way, and a
