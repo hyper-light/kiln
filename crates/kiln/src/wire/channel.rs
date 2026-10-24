@@ -12,6 +12,8 @@
 //!   answer, and the receiver repeats every refusal after it.
 //! - **Reconnects.** When a link comes up, each side says through which item it has each stream
 //!   it receives (`Have`), and its sender sends again only what follows. Nothing goes until then.
+//!   Each side says it again every few seconds, so a `Have` lost below the channel doesn't hold a
+//!   link's sends up: a sender that's up takes another as answers only.
 //! - **Restarts.** A durable stream's sender keeps its unanswered items (and its receiver what it
 //!   has answered) where they outlive the process (`crate::wire::keep`), and picks up from there.
 //!   A memory stream's sender gets a new stream name with each start (its incarnation in the
@@ -197,13 +199,20 @@ impl Sender {
                 let mut events = Vec::new();
                 let mut said: BTreeMap<String, Has> = all.into_iter().map(|h| (h.stream.clone(), h)).collect();
                 let streams: Vec<String> = self.streams.keys().cloned().collect();
+                // Only a link's first says the receiver lost what it had (it started again): one
+                // said again may have been made before answers that reached here ahead of it.
+                let first = !self.up;
                 for stream in streams {
                     let has = said.remove(&stream).unwrap_or(Has { stream, upto: 0, nacks: Vec::new() });
-                    events.extend(self.answered(has, true));
+                    events.extend(self.answered(has, first));
                 }
-                for o in self.streams.values_mut() {
-                    for p in &mut o.pending {
-                        p.sent = None;
+                // The link's first: what wasn't answered goes again. Another on the same link (said
+                // again, as each side does every few seconds) is answers only.
+                if !self.up {
+                    for o in self.streams.values_mut() {
+                        for p in &mut o.pending {
+                            p.sent = None;
+                        }
                     }
                 }
                 self.up = true;
@@ -404,6 +413,36 @@ mod tests {
 
     fn items(frames: &[Frame]) -> Vec<Seq> {
         frames.iter().filter_map(|f| if let Frame::Item { seq, .. } = f { Some(*seq) } else { None }).collect()
+    }
+
+    #[test]
+    fn a_have_said_again_on_a_live_link_answers_and_sends_nothing_again() {
+        let base = Instant::now();
+        let mut tx = Sender::new(1 << 20, Duration::from_secs(10));
+        let mut rx = Receiver::new();
+        for n in 0..3u8 {
+            let _ = tx.push("s", vec![n]);
+        }
+        // The first Have is lost: nothing goes until the next.
+        let _lost = rx.have();
+        assert!(tx.poll(base).is_empty());
+        tx.on_frame(rx.have());
+        let first = tx.poll(base);
+        assert_eq!(items(&first), vec![1, 2, 3]);
+        // The receiver took the first two; its Acks are lost, and it says what it has again.
+        let _acks = deliver(&mut rx, first.into_iter().take(2).collect());
+        let events = tx.on_frame(rx.have());
+        assert_eq!(events.len(), 2, "answered by the Have: {events:?}");
+        assert!(tx.poll(t(base, 10)).is_empty(), "nothing goes again before its patience is up");
+        assert_eq!(items(&tx.poll(t(base, 10_001))), vec![3], "only the one still unanswered, once its patience is up");
+        // A Have made before an answer that came ahead of it says less than was answered: on a
+        // live link that's no sign the receiver lost what it had.
+        let stale = rx.have();
+        for a in deliver(&mut rx, tx.poll(t(base, 20_002))) {
+            tx.on_frame(a);
+        }
+        let events = tx.on_frame(stale);
+        assert!(!events.iter().any(|e| matches!(e, Event::Regressed { .. })), "{events:?}");
     }
 
     /// A sender's frames, applied by a receiver that takes everything: its answers.

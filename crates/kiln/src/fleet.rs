@@ -711,7 +711,7 @@ async fn tell(hub: &Arc<Hub>, t: &Target) {
         let Some(peer) = hub.instances.lock().newest_with(&r.name, crate::proto::CAP_UPDATES) else { continue };
         let from = r.from.clone().unwrap_or_else(|| format!("no build of it for {} yet", r.target.as_deref().unwrap_or("its platform")));
         let msg = crate::proto::ServerMsg::UpdateAvailable { commit: t.commit.clone(), build: r.target_build.clone().unwrap_or_default(), from };
-        hub.send_peer(peer, &msg).await;
+        hub.command_peers(&r.name, vec![peer], &msg).await.log_when_answered(crate::hub::LOG_WITHIN);
         hub.updates.fleet.told.lock().insert(key);
     }
 }

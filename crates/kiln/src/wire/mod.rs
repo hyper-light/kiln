@@ -9,8 +9,10 @@
 //! same as these tables do (`contract::docs_say_what_the_tables_say` holds them together).
 
 pub mod channel;
+pub mod commands;
 pub mod keep;
 pub mod link;
+pub mod sums;
 pub mod uplink;
 
 use crate::harness::core::Update;
@@ -103,11 +105,19 @@ const REFUSED: Class = Class::Command(Away::Refuse);
 /// table of the variants' names and classes in the same order (what docs/wire.md is checked
 /// against).
 macro_rules! classes {
-    ($(#[$doc:meta])* fn $f:ident($e:ty) -> $table:ident { $($p:pat => $c:expr,)+ }) => {
+    ($(#[$doc:meta])* fn $f:ident($e:ty) -> $table:ident, $named:ident { $($p:pat => $c:expr,)+ }) => {
         $(#[$doc])*
         pub fn $f(m: &$e) -> Class {
             match m {
                 $($p => $c,)+
+            }
+        }
+
+        /// A message's variant name, as the table has it: what a log says of it (never what it
+        /// carries).
+        pub fn $named(m: &$e) -> &'static str {
+            match m {
+                $($p => variant(stringify!($p)),)+
             }
         }
 
@@ -126,7 +136,7 @@ fn variant(pattern: &'static str) -> &'static str {
 
 classes! {
     /// A runner's messages to the server.
-    fn agent_class(AgentMsg) -> agent_classes {
+    fn agent_class(AgentMsg) -> agent_classes, agent_name {
         AgentMsg::Hello(..) => Class::Handshake,
         AgentMsg::Heartbeat { .. } => Class::Telemetry,
         AgentMsg::Sample(..) => Class::Telemetry,
@@ -181,7 +191,7 @@ classes! {
 
 classes! {
     /// The server's messages to a runner.
-    fn server_class(ServerMsg) -> server_classes {
+    fn server_class(ServerMsg) -> server_classes, server_name {
         ServerMsg::Welcome { .. } => Class::Handshake,
         ServerMsg::Refused { .. } => Class::Handshake,
         ServerMsg::Assign(..) => REFUSED,
@@ -238,6 +248,7 @@ classes! {
         ServerMsg::Caps { .. } => Class::Handshake,
         ServerMsg::Wire(..) => CHANNEL,
         ServerMsg::Cluster { .. } => CLUSTER,
+        ServerMsg::Kept { .. } => Class::State,
     }
 }
 
@@ -245,7 +256,7 @@ classes! {
     /// A person's (or kiln's own) commands to an agent session: the UI's socket, the API, kiln's
     /// MCP operations, carried to its machine in [`ServerMsg::HarnessCmd`]. Whether one waits for a
     /// machine that's away is its own to say, not `HarnessCmd`'s.
-    fn command_class(Command) -> command_classes {
+    fn command_class(Command) -> command_classes, command_name {
         Command::Send { .. } => PARKED,
         Command::QueueEdit { .. } => PARKED,
         Command::QueueRemove { .. } => PARKED,
@@ -287,7 +298,7 @@ classes! {
 classes! {
     /// A session's updates, from wherever it runs to the server (carried in [`AgentMsg::Harness`])
     /// and on to its viewers.
-    fn update_class(Update) -> update_classes {
+    fn update_class(Update) -> update_classes, update_name {
         Update::Open { .. } => Class::Stream,
         Update::Closed => Class::Stream,
         Update::State { .. } => Class::State,
@@ -367,6 +378,7 @@ const LEG_TERMINAL: &str = "/api/ci/legs/:id/terminal";
 /// each classed by [`command_class`].
 pub const SOCKETS: &[SocketMsg] = &[
     msg(SESSION, Way::Down, "open", Class::Stream),
+    msg(SESSION, Way::Down, "resumed", Class::Stream),
     msg(SESSION, Way::Down, "meta", Class::State),
     msg(SESSION, Way::Down, "state", Class::State),
     msg(SESSION, Way::Down, "state_patch", Class::State),

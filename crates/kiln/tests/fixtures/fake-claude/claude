@@ -3,7 +3,9 @@
 
 It answers kiln's control requests with success. Each user message it's sent gets a turn of
 FAKE_CLAUDE_LINES assistant messages ("line 00000", "line 00001" ...), FAKE_CLAUDE_EVERY_MS apart,
-then a result. It calls no model and reads no account.
+then a result. Each message's id is its own (this process's, this turn's, its line's), as Claude
+Code's are, so a second turn's lines are new events, not the first's again. It calls no model and
+reads no account.
 """
 import json
 import os
@@ -30,6 +32,7 @@ def main():
     for flag in ("--session-id", "--resume"):
         if flag in args and args.index(flag) + 1 < len(args):
             session = args[args.index(flag) + 1]
+    turn = 0
     for line in sys.stdin:
         try:
             m = json.loads(line)
@@ -43,11 +46,12 @@ def main():
                 resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": VERSION}
             out({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
         elif kind == "user":
+            turn += 1
             out({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "claude-opus-5-5", "permissionMode": "default", "claude_code_version": VERSION})
             for n in range(LINES):
                 out({
                     "type": "assistant",
-                    "message": {"id": f"msg_{n:05d}", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": f"line {n:05d}"}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}},
+                    "message": {"id": f"msg_{os.getpid()}_{turn}_{n:05d}", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": f"line {n:05d}"}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}},
                     "parent_tool_use_id": None,
                     "session_id": session,
                 })
