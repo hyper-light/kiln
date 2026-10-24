@@ -206,7 +206,8 @@ fn deployments_are_read_as_datadogs_dora_metrics_reads_them() -> anyhow::Result<
         b["series"].as_array().into_iter().flatten().flat_map(|s| s["values"].as_array().into_iter().flatten().filter_map(Value::as_f64)).sum()
     };
     until(&f, 30, "the deployments counted", || total("sum:dora.deployments{service:shop}.as_count()") == 5.0)?;
-    anyhow::ensure!(total("sum:dora.change_failures{service:shop,env:prod,team:checkout}.as_count()") == 3.0, "the change failures counted");
+    // A deployment is marked failed as the one that put it right comes, its point written after.
+    until(&f, 30, "the change failures counted", || total("sum:dora.change_failures{service:shop,env:prod,team:checkout}.as_count()") == 3.0)?;
     let events = |q: &str| -> anyhow::Result<usize> {
         let b = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": q, "from": from, "to": now_ms() + 60_000, "limit": 100 })))?;
         Ok(b["records"].as_array().map_or(0, Vec::len))

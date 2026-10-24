@@ -1,19 +1,18 @@
 //! Synthetic tests, live (docs/observe.md §10.4, §13): a kiln server and a runner as processes of
 //! their own, the locations; an HTTP endpoint the test serves (switched to answer 500 and back), a
-//! TLS one (`openssl s_server`, its certificate from a CA the test makes), and a port nothing
+//! TLS one (kiln's own TLS, its certificate from a CA the test makes), and a port nothing
 //! listens on. What a user relies on: each test runs from each location it names and is judged by
 //! its assertions; Datadog's series of its runs are written, by location; a location that starts
 //! failing, or recovers, is said once; a test that alerts owns a monitor that tells a webhook when
 //! enough locations fail and when they recover; run now, each location runs it at once; removed,
 //! its monitor goes with it.
 //!
-//! `cargo test -p kiln --test observe_synthetics -- --ignored` (it needs `openssl`).
+//! `cargo test -p kiln --test observe_synthetics -- --ignored`.
 #![cfg(unix)]
 
 mod common;
 
 use std::io::{Read as _, Write as _};
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -83,36 +82,55 @@ fn certificates() -> anyhow::Result<(String, String, String)> {
     Ok((ca_pem, leaf.pem(), key.serialize_pem()))
 }
 
-/// `openssl s_server` on `port`, serving its status page over TLS.
-struct TlsEndpoint(Child);
+/// A TLS endpoint on 127.0.0.1:`port`, kiln's own TLS (rustls) with a certificate of the test's
+/// CA, answering each request with a page (as `openssl s_server -www` did; LibreSSL's, macOS's,
+/// cannot bind one address), until dropped.
+struct TlsEndpoint {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
 
 impl TlsEndpoint {
-    fn start(dir: &std::path::Path, port: u16, cert: &str, key: &str) -> anyhow::Result<Self> {
-        std::fs::write(dir.join("cert.pem"), cert)?;
-        std::fs::write(dir.join("key.pem"), key)?;
-        let child = Command::new("openssl")
-            .args(["s_server", "-quiet", "-www", "-accept", &format!("127.0.0.1:{port}")])
-            .arg("-cert")
-            .arg(dir.join("cert.pem"))
-            .arg("-key")
-            .arg(dir.join("key.pem"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let start = Instant::now();
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            anyhow::ensure!(start.elapsed() < Duration::from_secs(10), "openssl s_server did not listen");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        Ok(Self(child))
+    fn start(port: u16, cert: &str, key: &str) -> anyhow::Result<Self> {
+        let server = Arc::new(kiln::http::tls::ServerTls::from_pem(cert, key)?);
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+        listener.set_nonblocking(true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                let server = server.clone();
+                std::thread::spawn(move || {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    // A configuration of its own: the connection's state machine borrows it.
+                    let Ok(config) = server.config() else { return };
+                    let Ok(conn) = hyper_quic::rustls::ServerConnection::new(&config) else { return };
+                    let mut tls = hyper_quic::rustls::StreamOwned::new(conn, config, stream);
+                    // The request (or none: a handshake alone, a certificate's check), then a page.
+                    let mut buf = [0u8; 4096];
+                    let _ = tls.read(&mut buf);
+                    let body = "<html><body>kiln's test TLS endpoint</body></html>";
+                    let _ = write!(tls, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    tls.conn.send_close_notify();
+                    let _ = tls.flush();
+                });
+            }
+        });
+        Ok(Self { stop, thread: Some(thread) })
     }
 }
 
 impl Drop for TlsEndpoint {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -160,10 +178,9 @@ fn count(f: &Fleet, query: &str, from: i64) -> anyhow::Result<u64> {
 fn synthetic_tests_run_from_each_location_alert_when_enough_fail_and_recover() -> anyhow::Result<()> {
     let t0 = now_ms();
     let endpoint = Endpoint::start()?;
-    let dir = tempfile::tempdir()?;
     let (ca, cert, key) = certificates()?;
     let tls_port = free_port()?;
-    let _tls = TlsEndpoint::start(dir.path(), tls_port, &cert, &key)?;
+    let _tls = TlsEndpoint::start(tls_port, &cert, &key)?;
     // A receiver for the monitor's notifications.
     let hook = std::net::TcpListener::bind("127.0.0.1:0")?;
     let hook_port = hook.local_addr()?.port();
