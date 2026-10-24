@@ -325,6 +325,14 @@ fn metric(port: u16, token: &str, name: &str) -> anyhow::Result<f64> {
     Ok(body.lines().find_map(|l| l.strip_prefix(name).and_then(|rest| rest.trim().parse::<f64>().ok())).unwrap_or(0.0))
 }
 
+/// A gauge of bytes in the server's metrics (a scrape refreshes the bus's).
+fn bytes(port: u16, token: &str, name: &str) -> anyhow::Result<u64> {
+    let (_, body) = common::http(port, "GET", "/metrics", token, None)?;
+    body.lines()
+        .find_map(|l| l.strip_prefix(name).and_then(|rest| rest.strip_prefix(' ')).and_then(|v| v.trim().parse::<u64>().ok()))
+        .ok_or_else(|| anyhow::anyhow!("no {name} in the metrics"))
+}
+
 /// The sum of a family's series, its labels whatever they are (`kiln_bus_refused_total{op="…"}`).
 fn total(port: u16, token: &str, name: &str) -> anyhow::Result<f64> {
     let (_, body) = common::http(port, "GET", "/metrics", token, None)?;
@@ -493,21 +501,25 @@ fn the_live_feed_in_the_sync_lab_shows_what_a_fresh_viewer_is_shown() -> anyhow:
     lab(Some("lab-runner"))
 }
 
-/// CP-T2.1, test 4: a full bus refuses a feed's frames and the resync marker after them, and every
-/// viewer of that feed starts over within 5 s of the refusal, none waiting on silently. The bus is
-/// small (3 MiB, a little over the least a Quiver node takes: two of its largest messages, 2,166,784
-/// bytes) and a first session, watched so its feed is kept, fills it with large frames; a
-/// topic makes room for a message by letting its own oldest go, never another topic's, so the
-/// second session's frames, and its resync marker, find no room and are refused.
+/// CP-T2.1, test 4: a full bus refuses a feed's frames, and every viewer of that feed starts over
+/// within 5 s of the refusal, none waiting on silently. The bus is small (3 MiB, a little over the
+/// least a Quiver node takes: two of its largest messages, 2,166,784 bytes) and a first session,
+/// watched so its feed is kept, fills it. A topic makes room for a message only by letting its own
+/// oldest go, a segment of 256 messages at a time, whose bytes come back as its readers pass it, so
+/// the filler leaves up to about a segment of its own free. The second session's frames are each
+/// made larger than what's free once the filler is done, so none fits however much of its own its
+/// topic lets go, and each is refused. Whether the resync marker after them finds room depends on
+/// what the filler left: a feed whose marker is refused too is `harness::live`'s
+/// `a_viewer_learns_its_feed_broke_without_a_frame_saying_so`.
 #[test]
 fn a_full_bus_refusing_a_feed_sends_every_viewer_of_it_back_within_5_s() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
-    // 160 messages of 16 KiB of text, each sent twice (its last part, then whole), about 5 MiB: more
-    // than the bus holds, so the filler's feed takes all of it.
-    let filler = stand_in_as(dir.path(), "filler", "filler.go", 160, 16384)?;
-    let starved = stand_in_as(dir.path(), "starved", "starved.go", MESSAGES, 0)?;
+    // 500 messages of 4 KiB of text, each sent twice (its last part, then whole): a feed keeps its
+    // last 2048 frames, about 4 MiB of these, more than the bus holds, so the filler fills it.
+    const FILLER: usize = 500;
+    let filler = stand_in_as(dir.path(), "filler", "filler.go", FILLER, 4096)?;
     let s = common::start(dir.path(), &Options { extra: "[terminal]\nenabled = true\n\n[bus]\nmemory = 3145728\n", ..Options::default() })?;
     let (port, admin) = (s.port, s.admin.clone());
 
@@ -515,10 +527,15 @@ fn a_full_bus_refusing_a_feed_sends_every_viewer_of_it_back_within_5_s() -> anyh
     let keeper = Viewer::watch(port, &filling, &admin, false)?;
     wait_for("the filler's viewer sent its snapshot", Duration::from_secs(30), || Ok(keeper.shown()?.synced))?;
     std::fs::write(dir.path().join("filler.go"), b"")?;
-    wait_for("the bus full", Duration::from_secs(60), || {
-        let (used, limit) = (metric(port, &admin, "kiln_bus_memory_bytes")?, metric(port, &admin, "kiln_bus_memory_limit_bytes")?);
-        Ok(limit > 0.0 && used >= limit * 0.9)
-    })?;
+    let last = format!("number {FILLER}x");
+    wait_for("the filler's last message on its viewer", Duration::from_secs(120), || Ok(keeper.shown()?.events.iter().any(|(_, e)| e.to_string().contains(&last))))?;
+    let (used, limit) = (bytes(port, &admin, "kiln_bus_memory_bytes")?, bytes(port, &admin, "kiln_bus_memory_limit_bytes")?);
+    let free = limit.saturating_sub(used);
+    // Each of the second session's frames carries its text: 64 KiB more than the bus has free, and
+    // well under the 1 MiB a frame may take.
+    let pad = usize::try_from(free)?.saturating_add(64 << 10);
+    anyhow::ensure!(pad < 900 << 10, "the filler left {free} bytes of the bus's {limit} free ({used} used): too much for one frame to overfill");
+    let starved = stand_in_as(dir.path(), "starved", "starved.go", 2, pad)?;
 
     let starving = session(port, &admin, "local", &work, &starved, "starved")?;
     let viewers = [Viewer::watch(port, &starving, &admin, false)?, Viewer::watch(port, &starving, &admin, true)?];
