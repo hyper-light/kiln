@@ -51,6 +51,9 @@ pub const EVENTS: &[&str] = &[
     "approval.waiting",
     "deploy.succeeded",
     "deploy.failed",
+    "deploy.held",
+    "deploy.rolled_back",
+    "deploy.rollback_failed",
     "leg.flaky",
     "land.ejected",
     "runner.offline",
@@ -78,6 +81,8 @@ pub const AGENT_EVENTS: &[&str] = &["agent.needs_you", "agent.finished", "agent.
 pub const RELEASE_EVENTS: &[&str] = &["release.started", "release.waiting_approval", "release.succeeded", "release.failed", "release.cancelled"];
 /// The events about a runner: the server's rules take them, a repository's can't.
 pub const RUNNER_EVENTS: &[&str] = &["runner.offline"];
+/// Events about a deploy of kiln itself (docs/resilience.md, G7): the server's rules take them.
+pub const SELF_DEPLOY_EVENTS: &[&str] = &["deploy.held", "deploy.rolled_back", "deploy.rollback_failed"];
 /// How long a runner is gone before `runner.offline` is said of it.
 const OFFLINE_AFTER: Duration = Duration::from_secs(120);
 /// How long a release's event, once sent through a channel, isn't sent through it again.
@@ -131,6 +136,9 @@ impl Rule {
         if !server && let Some(e) = self.on.iter().find(|e| RUNNER_EVENTS.contains(&e.as_str())) {
             return Err(format!("`{e}` is about a runner, not a repository: the server's rules take it (`[[ci.notify]]` in kiln.toml)"));
         }
+        if !server && let Some(e) = self.on.iter().find(|e| SELF_DEPLOY_EVENTS.contains(&e.as_str())) {
+            return Err(format!("`{e}` is about a deploy of kiln itself, not a repository: the server's rules take it (`[[ci.notify]]` in kiln.toml)"));
+        }
         if !server && let Some(e) = self.on.iter().find(|e| RELEASE_EVENTS.contains(&e.as_str())) {
             return Err(format!("`{e}` is about a release, not a repository: the server's rules take it (`[[ci.notify]]` in kiln.toml), and an app's own channels"));
         }
@@ -183,7 +191,7 @@ const MINE_MAX: usize = 50;
 /// `PUT` `{ rules, email? }` replaces them (and that address). A person's: the owner's are the
 /// server's (`[[ci.notify]]`), and an agent doesn't change its person's.
 pub async fn mine(hub: &Hub, caller: &crate::authz::Caller, put: Option<Value>) -> Result<Response, Fail> {
-    let events: Vec<&str> = EVENTS.iter().copied().filter(|e| !AGENT_EVENTS.contains(e) && !RUNNER_EVENTS.contains(e) && !RELEASE_EVENTS.contains(e)).collect();
+    let events: Vec<&str> = EVENTS.iter().copied().filter(|e| !AGENT_EVENTS.contains(e) && !RUNNER_EVENTS.contains(e) && !RELEASE_EVENTS.contains(e) && !SELF_DEPLOY_EVENTS.contains(e)).collect();
     let Some(uid) = caller.user.clone() else {
         if put.is_some() {
             return Err((StatusCode::BAD_REQUEST, "notification rules are a person's own: the owner's are the server's ([[ci.notify]] in kiln.toml)".into()));
@@ -1312,6 +1320,42 @@ pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
     }
 }
 
+/// A deploy of kiln itself that didn't simply take (docs/resilience.md, G7), told by the server
+/// that finishes its record: `deploy.held` (a check that holds failed; it was kept),
+/// `deploy.rolled_back`, or `deploy.rollback_failed` (the version put back couldn't start).
+/// Server rules see `deploy`: its `app`, `from`, `to` and `revision`.
+pub async fn self_deploy(hub: Arc<Hub>, event: &'static str, deploy: Value, message: String) {
+    hub.emit(&json!({ "type": event, "deploy": deploy, "message": message }));
+    let url = format!("{}/deployments", hub.cfg.server.public_url.trim_end_matches('/'));
+    let app = deploy.get("app").and_then(Value::as_str).unwrap_or("kiln").to_owned();
+    let title = match event {
+        "deploy.held" => format!("⚠ {app}: kiln's deploy was held"),
+        "deploy.rolled_back" => format!("✗ {app}: kiln's deploy was rolled back"),
+        _ => format!("✗ {app}: kiln's rollback couldn't start"),
+    };
+    let m = Msg {
+        title: title.clone(),
+        line: message.clone(),
+        url,
+        what: "the deploy",
+        dedup: format!("kiln:self-deploy:{app}"),
+        resolve: false,
+        webhook: json!({ "event": event, "title": title, "text": message, "deploy": deploy }),
+        people: Vec::new(),
+        refs: Vec::new(),
+        thread: None,
+    };
+    for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
+        if rule.check(true).is_err() || !takes_ctx(rule, event, "deploy", &deploy) {
+            continue;
+        }
+        let rule_name = format!("server#{}", n + 1);
+        for spec in &rule.to {
+            deliver(&hub, None, &rule_name, event, &format!("self-deploy:{app}"), &m, spec).await;
+        }
+    }
+}
+
 /// A person-facing event about a diff or change request (W19-R06): `review.requested` (`people`:
 /// the reviewers asked), `comment.reply` (the people in the thread) or `mention` (whom it
 /// mentions), done by `actor`, about review thread `thread` when it's one's. The repository's
@@ -1623,6 +1667,21 @@ mod tests {
         assert_eq!((landed.title.as_str(), landed.resolve), ("✓ web a rollback to 1.4.1 landed in production", true));
         assert_eq!(app_channel("#deploys"), "slack:#deploys", "a bare channel is Slack's");
         assert_eq!(app_channel("teams:ops"), "teams:ops");
+    }
+
+    /// A deploy of kiln itself that didn't take is told (docs/resilience.md, G7): the server's
+    /// rules take it, reading `deploy`; a repository's can't.
+    #[test]
+    fn kilns_own_deploys_go_through_the_servers_rules() {
+        let d = json!({ "app": "kiln-production", "from": "kiln:8adeadba", "to": "kiln:61b07ceb", "revision": "61b07ceb" });
+        let rule = |on: &str, cond: Option<&str>| Rule { on: vec![on.into()], cond: cond.map(str::to_owned), to: vec!["slack:#ops".into()], throttle: None };
+        for e in SELF_DEPLOY_EVENTS {
+            assert!(EVENTS.contains(e), "{e}");
+            assert!(rule(e, None).check(true).is_ok(), "{e}");
+        }
+        assert!(takes_ctx(&rule("deploy.rollback_failed", Some("deploy.to == 'kiln:61b07ceb'")), "deploy.rollback_failed", "deploy", &d));
+        assert!(!takes_ctx(&rule("deploy.held", None), "deploy.rolled_back", "deploy", &d));
+        assert!(parse_rules("- on: deploy.held\n  to: slack:#x\n").is_err_and(|e| e.contains("a deploy of kiln itself")));
     }
 
     /// W19-R06's other events: a deployment's end, a land queue's ejection, a runner gone. A

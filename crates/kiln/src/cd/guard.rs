@@ -550,7 +550,43 @@ fn note(a: &Args, result: &str, reason: &str, checks: &[Value], until: Option<i6
 }
 
 async fn annotate(c: &Cluster, a: &Args, result: &str, reason: &str, checks: &[Value], until: Option<i64>) -> Result<()> {
+    if result != "watching" {
+        Box::pin(say(c, a, result, reason)).await;
+    }
     patch(c, &a.namespace, &a.deployment, &json!({ "metadata": { "annotations": { ANNOTATION: note(a, result, reason, checks, until) } } })).await
+}
+
+/// How a deploy ended, as an Event on kiln's Deployment (docs/resilience.md, G7): seen by
+/// `kubectl get events` and the cluster's own alerting while no kiln is up to tell. Best effort.
+async fn say(c: &Cluster, a: &Args, result: &str, reason: &str) {
+    let (kind, why) = match result {
+        "ready" => ("Normal", "KilnDeployTook"),
+        "held" => ("Warning", "KilnDeployHeld"),
+        "rolled-back" | "rolling-back" => ("Warning", "KilnDeployRolledBack"),
+        "rolled-forward" => ("Warning", "KilnRollbackFailedRolledForward"),
+        _ => ("Warning", "KilnRollbackFailed"),
+    };
+    let now = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
+    let message = if reason.is_empty() { format!("{} {result}", a.expect) } else { format!("{} {result}: {reason}", a.expect) };
+    let event = json!({
+        "apiVersion": "v1",
+        "kind": "Event",
+        "metadata": { "generateName": format!("{}-guard-", a.deployment), "namespace": a.namespace },
+        "involvedObject": { "apiVersion": "apps/v1", "kind": "Deployment", "name": a.deployment, "namespace": a.namespace },
+        "type": kind,
+        "reason": why,
+        "message": message.chars().take(1000).collect::<String>(),
+        "source": { "component": "kiln-guard" },
+        "firstTimestamp": now,
+        "lastTimestamp": now,
+        "count": 1,
+    });
+    let path = format!("/api/v1/namespaces/{}/events", kiln_cd::kube::enc(&a.namespace));
+    match c.request(Method::POST, &path, Some("application/json"), Some(Bytes::from(event.to_string()))).await {
+        Ok((status, _)) if (200..300).contains(&status) => {}
+        Ok((status, bytes)) => eprintln!("telling {}'s events: {}", a.deployment, kiln_cd::kube::status_message(status, &bytes)),
+        Err(e) => eprintln!("telling {}'s events: {e:#}", a.deployment),
+    }
 }
 
 /// What a guard does once the version it put back has had its chance: it's up again; someone
@@ -748,6 +784,12 @@ impl Cd {
             }
         };
         let (succeeded, message) = outcome(&m, &live, None);
+        let said = seen(&m, &live).1.and_then(|g| g.get("result").and_then(Value::as_str).map(str::to_owned));
+        if self.holds(&m)
+            && let Some(event) = said.as_deref().and_then(notice)
+        {
+            crate::rt::spawn(crate::ci::notify::self_deploy(Arc::clone(&self.hub), event, json!({ "app": m.app, "from": m.from, "to": m.to, "revision": m.revision }), message.clone()));
+        }
         self.record_self_deploy(&m, succeeded, message).await;
     }
 
@@ -801,6 +843,17 @@ impl Cd {
         } else {
             tracing::warn!(app = %m.app, message = %message, "deployments: a self-deploy didn't take");
         }
+    }
+}
+
+/// The notification a guard's outcome asks for: a deploy of kiln that didn't simply take
+/// (docs/resilience.md, G7).
+fn notice(result: &str) -> Option<&'static str> {
+    match result {
+        "held" => Some("deploy.held"),
+        "rolled-back" => Some("deploy.rolled_back"),
+        "rolled-forward" | "rollback-failed" => Some("deploy.rollback_failed"),
+        _ => None,
     }
 }
 
@@ -1071,6 +1124,7 @@ mod tests {
     /// its work done, had gone: now it puts back the version that served.
     #[test]
     fn a_rollback_that_cant_start_goes_forward_again() {
+        assert_eq!(["ready", "watching", "held", "rolled-back", "rolled-forward", "rollback-failed"].map(notice), [None, None, Some("deploy.held"), Some("deploy.rolled_back"), Some("deploy.rollback_failed"), Some("deploy.rollback_failed")]);
         assert_eq!(after_rollback(Start::Up, true), AfterRollback::Back);
         assert_eq!(after_rollback(Start::Moved, true), AfterRollback::Moved);
         assert_eq!(after_rollback(Start::Failed("crash loop".into()), true), AfterRollback::Forward("crash loop".into()));
