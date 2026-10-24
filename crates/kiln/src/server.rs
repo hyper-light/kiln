@@ -159,7 +159,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::observe::host::start(obs.clone(), crate::os::hostname(), "server", std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
         crate::observe::containers::start(obs.clone(), crate::os::hostname(), std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
         crate::observe::indexes::start_usage(obs.clone(), crate::os::hostname(), crate::observe::indexes::USAGE_EVERY);
-        crate::observe::kiln::start_registry(obs.clone(), crate::os::hostname(), std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
+        crate::observe::kiln::start_registry(obs.clone(), crate::os::hostname(), std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)), Some(hub.net.clone()));
         if let Some(n) = cfg.observe.query_helpers {
             kiln_obs::query::eval::set_helpers(n as usize);
         }

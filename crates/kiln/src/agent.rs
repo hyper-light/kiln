@@ -768,7 +768,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::observe::indexes::start_usage(obs.clone(), name.clone(), crate::observe::indexes::USAGE_EVERY);
         // And its own registry (`crate::metrics`: what this process counts, its repositories' sync
         // and its moves among it), as the server's is read, of its host.
-        crate::observe::kiln::start_registry(obs.clone(), name.clone(), every);
+        crate::observe::kiln::start_registry(obs.clone(), name.clone(), every, Some(net.clone()));
         // Apps on this machine send OTLP here, as to a collector: OTLP/HTTP's port and OTLP/gRPC's,
         // each taking either; and Datadog's tracers, as to their Agent, on its port too.
         crate::observe::ddtrace::start(obs.clone(), name.clone(), shutdown.clone());

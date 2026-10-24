@@ -301,10 +301,78 @@ fn count_apps(counts: &mut std::collections::BTreeMap<(&'static str, &'static st
     }
 }
 
+/// How long the registry waits for the QUIC endpoint's sample: its thread answers on its next turn,
+/// a turn some microseconds unless a flood of frames is ahead of it.
+const QUIC_SAMPLE_WAIT: Duration = Duration::from_millis(500);
+
+/// What a node's QUIC endpoint measures ([`crate::net::QuicSample`]), as metrics under `kiln.quic`,
+/// tagged with the node (`host`) and, a connection's, its peer (`peer`: a runner's name on the
+/// server, `server` on a runner). Each connection's path now, as gauges (seconds and bytes; rates
+/// in bytes a second): its smoothed and least round trips (RFC 9002 §5), its probe timeout, its
+/// congestion window, slow-start threshold and pacing rate where the controller keeps them, its
+/// delivery rate, receive window and largest datagram. What the connection counted since it
+/// began, as counters (a reconnection's reset found at query time): packets sent and lost, bytes
+/// lost and acknowledged, congestion events, black holes, UDP datagrams and bytes each way, STREAM
+/// frames each way, RESET_STREAM frames each way, and frames that say this side or the peer was
+/// held by flow control (DATA_BLOCKED, STREAM_DATA_BLOCKED, STREAMS_BLOCKED). The endpoint's own:
+/// connections and exchanges open (gauges), streams refused, lane frames dropped, responses dropped
+/// (counters). Names follow qlog's recovery metrics (`draft-ietf-quic-qlog-quic-events`,
+/// `recovery:metrics_updated`: `smoothed_rtt`, `min_rtt`, `congestion_window`, `ssthresh`,
+/// `pacing_rate`).
+pub fn quic_points(out: &mut Vec<(SeriesKey, Vec<(i64, f64)>)>, host: &str, s: &crate::net::QuicSample, ts: i64) {
+    let own = [("host", host)];
+    point(out, "kiln.quic.connections", Kind::Gauge, &own, ts, s.connections as f64);
+    point(out, "kiln.quic.exchanges", Kind::Gauge, &own, ts, s.exchanges as f64);
+    point(out, "kiln.quic.streams_refused", Kind::Counter, &own, ts, s.streams_refused as f64);
+    point(out, "kiln.quic.frames_dropped", Kind::Counter, &own, ts, s.frames_dropped as f64);
+    point(out, "kiln.quic.responses_dropped", Kind::Counter, &own, ts, s.responses_dropped as f64);
+    for p in &s.peers {
+        let tags = [("host", host), ("peer", p.name.as_str())];
+        let (f, c) = (&p.path, &p.conn);
+        for (metric, v) in [
+            ("kiln.quic.smoothed_rtt", f.rtt.as_secs_f64()),
+            ("kiln.quic.min_rtt", f.min_rtt.as_secs_f64()),
+            ("kiln.quic.pto", f.probe_timeout.as_secs_f64()),
+            ("kiln.quic.congestion_window", f.cwnd as f64),
+            ("kiln.quic.delivery_rate", f.delivery_rate as f64),
+            ("kiln.quic.receive_window", f.receive_window as f64),
+            ("kiln.quic.max_datagram", f64::from(f.max_datagram)),
+        ] {
+            point(out, metric, Kind::Gauge, &tags, ts, v);
+        }
+        for (metric, v) in [("kiln.quic.ssthresh", f.ssthresh), ("kiln.quic.pacing_rate", f.pacing_rate)] {
+            if let Some(v) = v {
+                point(out, metric, Kind::Gauge, &tags, ts, v as f64);
+            }
+        }
+        let blocked = |x: &hyper_quic::FrameStats| x.data_blocked + x.stream_data_blocked + x.streams_blocked_bidi + x.streams_blocked_uni;
+        for (metric, v) in [
+            ("kiln.quic.packets_sent", c.path.sent_packets),
+            ("kiln.quic.packets_lost", c.path.lost_packets),
+            ("kiln.quic.bytes_lost", c.path.lost_bytes),
+            ("kiln.quic.bytes_acked", c.path.acked_bytes),
+            ("kiln.quic.congestion_events", c.path.congestion_events),
+            ("kiln.quic.black_holes", c.path.black_holes_detected),
+            ("kiln.quic.datagrams_sent", c.udp_tx.datagrams),
+            ("kiln.quic.datagrams_received", c.udp_rx.datagrams),
+            ("kiln.quic.bytes_sent", c.udp_tx.bytes),
+            ("kiln.quic.bytes_received", c.udp_rx.bytes),
+            ("kiln.quic.stream_frames_sent", c.frame_tx.stream),
+            ("kiln.quic.stream_frames_received", c.frame_rx.stream),
+            ("kiln.quic.resets_sent", c.frame_tx.reset_stream),
+            ("kiln.quic.resets_received", c.frame_rx.reset_stream),
+            ("kiln.quic.blocked_sent", blocked(&c.frame_tx)),
+            ("kiln.quic.blocked_received", blocked(&c.frame_rx)),
+        ] {
+            point(out, metric, Kind::Counter, &tags, ts, v as f64);
+        }
+    }
+}
+
 /// This node's registry (the server's, or a runner's), every `every`, as Prometheus would scrape
-/// `/metrics`, tagged with its machine; and, where kiln CD runs (the server), its apps counted by
-/// health and sync (`kiln.cd.apps`).
-pub fn start_registry(o: Observe, host: String, every: Duration) {
+/// `/metrics`, tagged with its machine; where kiln CD runs (the server), its apps counted by health
+/// and sync (`kiln.cd.apps`); and its QUIC endpoint's transport ([`quic_points`]), when it has one.
+pub fn start_registry(o: Observe, host: String, every: Duration, quic: Option<crate::net::NetHandle>) {
     if every.is_zero() {
         return;
     }
@@ -323,6 +391,9 @@ pub fn start_registry(o: Observe, host: String, every: Duration) {
                     point(&mut scraped.series, "kiln.cd.apps", Kind::Gauge, &[("host", host.as_str()), ("health", health), ("sync", sync)], ts, n as f64);
                 }
             }
+            if let Some(s) = quic.as_ref().and_then(|q| q.sample(QUIC_SAMPLE_WAIT)) {
+                quic_points(&mut scraped.series, &host, &s, crate::util::now_ms());
+            }
             o.write(scraped.series);
             std::thread::sleep(every.saturating_sub(started.elapsed()));
         }
@@ -336,6 +407,75 @@ pub fn start_registry(o: Observe, host: String, every: Duration) {
 mod tests {
     use super::*;
     use crate::store::Step;
+
+    /// A sample of the endpoint and one peer, as the metrics observe writes: each a gauge or a
+    /// counter as it is, tagged with the node and the peer, in seconds and bytes; a threshold the
+    /// controller keeps none of is not written.
+    #[test]
+    fn a_quic_sample_is_its_metrics_each_of_its_peer() {
+        use std::time::Duration;
+        let mut conn = hyper_quic::ConnectionStats::default();
+        conn.path.sent_packets = 120;
+        conn.path.lost_packets = 3;
+        conn.path.lost_bytes = 3_600;
+        conn.udp_tx.bytes = 140_000;
+        conn.udp_rx.datagrams = 90;
+        conn.frame_tx.stream = 77;
+        conn.frame_tx.data_blocked = 1;
+        conn.frame_tx.streams_blocked_bidi = 2;
+        let path = hyper_transport::PathFacts {
+            rtt: Duration::from_micros(12_500),
+            min_rtt: Duration::from_micros(9_000),
+            cwnd: 64_000,
+            max_datagram: 1_452,
+            delivery_rate: 5_120_000,
+            receive_window: 8 << 20,
+            pacing_rate: None,
+            ssthresh: Some(48_000),
+            warm_up_bytes: 0,
+            warming_up: false,
+            probe_timeout: Duration::from_millis(60),
+        };
+        let s =
+            crate::net::QuicSample { connections: 1, exchanges: 4, streams_refused: 2, frames_dropped: 0, responses_dropped: 0, peers: vec![crate::net::PeerSample { name: "r1".into(), path, conn }] };
+        let mut out = Vec::new();
+        quic_points(&mut out, "server-1", &s, 1_000);
+        let got: std::collections::BTreeMap<String, (Kind, Vec<(String, String)>, f64)> = out
+            .iter()
+            .filter_map(|(k, pts)| {
+                let p = kiln_obs::batch::parse_key(&k.key).ok()?;
+                let tags = p.tags.iter().map(|(a, b)| ((*a).to_owned(), (*b).to_owned())).collect();
+                Some((p.metric.to_owned(), (k.kind, tags, pts.first()?.1)))
+            })
+            .collect();
+        let peer = vec![("host".to_owned(), "server-1".to_owned()), ("peer".to_owned(), "r1".to_owned())];
+        let own = vec![("host".to_owned(), "server-1".to_owned())];
+        for (metric, kind, tags, v) in [
+            ("kiln.quic.smoothed_rtt", Kind::Gauge, &peer, 0.0125),
+            ("kiln.quic.min_rtt", Kind::Gauge, &peer, 0.009),
+            ("kiln.quic.pto", Kind::Gauge, &peer, 0.06),
+            ("kiln.quic.congestion_window", Kind::Gauge, &peer, 64_000.0),
+            ("kiln.quic.ssthresh", Kind::Gauge, &peer, 48_000.0),
+            ("kiln.quic.max_datagram", Kind::Gauge, &peer, 1_452.0),
+            ("kiln.quic.packets_sent", Kind::Counter, &peer, 120.0),
+            ("kiln.quic.packets_lost", Kind::Counter, &peer, 3.0),
+            ("kiln.quic.bytes_lost", Kind::Counter, &peer, 3_600.0),
+            ("kiln.quic.bytes_sent", Kind::Counter, &peer, 140_000.0),
+            ("kiln.quic.datagrams_received", Kind::Counter, &peer, 90.0),
+            ("kiln.quic.stream_frames_sent", Kind::Counter, &peer, 77.0),
+            ("kiln.quic.blocked_sent", Kind::Counter, &peer, 3.0),
+            ("kiln.quic.connections", Kind::Gauge, &own, 1.0),
+            ("kiln.quic.exchanges", Kind::Gauge, &own, 4.0),
+            ("kiln.quic.streams_refused", Kind::Counter, &own, 2.0),
+        ] {
+            let g = got.get(metric);
+            assert!(g.is_some(), "{metric} not written: {:?}", got.keys().collect::<Vec<_>>());
+            let Some(g) = g else { continue };
+            assert_eq!((g.0, &g.1), (kind, tags), "{metric}");
+            assert!((g.2 - v).abs() < 1e-12, "{metric}: {} not {v}", g.2);
+        }
+        assert!(!got.contains_key("kiln.quic.pacing_rate"), "a rate the controller keeps none of is not written");
+    }
 
     #[test]
     fn a_health_once_counted_is_counted_0_when_no_app_is_in_it() {
