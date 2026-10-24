@@ -54,6 +54,7 @@ pub mod proto;
 pub mod peers;
 pub mod push;
 pub mod reach;
+pub mod reads;
 pub mod records;
 pub mod research;
 pub mod runner;

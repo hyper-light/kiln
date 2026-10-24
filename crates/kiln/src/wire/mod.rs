@@ -85,6 +85,10 @@ impl Class {
 const FEED: Class = Class::Carried("conversation feed");
 /// Repo sync's Raft (`crate::sync`): hyper-raft acknowledges and resends its own messages.
 const RAFT: Class = Class::Carried("repo sync's Raft");
+/// The cluster group (`crate::store::learner`, docs/p2p.md P2): its Raft is hyper-raft's, which
+/// acknowledges and resends; a runner's learner is told to join on every connect, and a read that
+/// can't learn where the server is in time goes to the server.
+const CLUSTER: Class = Class::Carried("the cluster group");
 /// Reach's links (`crate::reach`): a link's two runners frame it end to end; the server relays.
 const REACH: Class = Class::Carried("reach link");
 /// Ports opened through the server (`crate::browser::ports`): a byte stream with its own window.
@@ -170,6 +174,7 @@ classes! {
         AgentMsg::Undeployed { .. } => Class::Answer,
         AgentMsg::Caps { .. } => Class::Handshake,
         AgentMsg::Wire(..) => CHANNEL,
+        AgentMsg::Cluster { .. } => CLUSTER,
     }
 }
 
@@ -231,6 +236,7 @@ classes! {
         ServerMsg::Undeploy { .. } => PARKED,
         ServerMsg::Caps { .. } => Class::Handshake,
         ServerMsg::Wire(..) => CHANNEL,
+        ServerMsg::Cluster { .. } => CLUSTER,
     }
 }
 

@@ -285,3 +285,40 @@ On the server alone the group has one voter, which commits alone.
   write, and the log's last entry.
 - **Off:** `[cluster] group = false` (or `KILN_CLUSTER_GROUP=0`) writes straight to kiln.db as before.
   The database is whole either way. `KILN_STORE_GROUP=1` runs the tests' stores through the group.
+
+### P2, as built
+
+Each runner holds a learner replica of the cluster group, and its front door answers the owner's
+reads from it (`crates/kiln/src/store/learner.rs`, `crates/kiln/src/frontdoor/replica.rs`,
+`crates/kiln/src/reads.rs`).
+
+- **Joining.** A runner that can hold one says so (`CAP_CLUSTER`). The server adds it as a learner,
+  one change at a time through the group, and tells its newest process which member it is (an id
+  from its machine's name) and the token its copies are fetched with. Other processes of the
+  machine let go of theirs, so one process at a time holds the replica's files.
+- **A copy, then the log.** A learner starts from a copy of kiln.db, `GET /api/cluster/copy`, made
+  with `VACUUM INTO` at the group's last applied entry. The server's own log index stays behind. Any
+  copy made later stands in for that point: an entry its `seq` holds already is skipped, as a restart
+  skips them. So a learner the log has moved past (a runner away while the log compacted) is sent an
+  image that only says where the group stands, and fetches a fresh copy. It takes that copy in whole,
+  with SQLite's backup, while its readers go on. While it has learners, the server keeps up to
+  64 MiB of the log behind what's applied for one a little behind, and beats once a second.
+- **Messages.** The group's messages go over each runner's link on the sync lane
+  (`ServerMsg::Cluster`, `AgentMsg::Cluster`), in parts past 512 KiB. A learner whose runner is away
+  misses them, and the log sends what it needs once it's back.
+- **Reads.** While a runner holds a replica, its front door serves requests one by one instead of
+  piping each connection to the server. The owner's `GET` of the runs, a run, a job and the
+  repositories, and the CI pages' own (`/api/ci/runs`, a run with its legs, its graph), is answered
+  from the replica, saying so with `kiln-read: <runner> <seq>`. Before
+  answering, the runner asks the server for kiln.db's last write and waits until its replica holds
+  it (2 s at most, else the server answers). So a read there is as current as the server's: a run
+  the page is told of has arrived. Everything else goes to the server as it came, WebSockets
+  included: anyone's but the owner's (the server holds the route table), writes, and what lives
+  in the server's memory. Whether credentials are the owner's, the server says (`/api/cluster/owner`),
+  and the runner keeps its word for 30 s. The server's routes answer from the same code
+  (`crate::reads`), so an answer is the same wherever it's read.
+- **Seen live:** `/healthz/server`'s `store` counts the learners and gives kiln.db's size.
+- **Off:** `[cluster] learners = false` (or `KILN_CLUSTER_LEARNERS=0`) adds none, and each runner,
+  as it reconnects, is told to let its replica go: its front door pipes to the server again. The
+  learners the group has stay in it, and lag. A replica that didn't catch up within its 2 s leaves
+  every read to the server for the next 30 s.

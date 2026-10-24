@@ -182,6 +182,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             child!("deploy", h => crate::deploy::run(h));
         }
         child!("sync", h => h.sync_loop());
+        child!("cluster", h => h.cluster_loop());
         child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
         child!("in-step", h => crate::updates::in_step_loop(h));
         child!("ui-server", h => crate::uiserver::run(h));

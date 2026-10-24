@@ -61,11 +61,15 @@ pub struct Cluster {
     /// its state machine, its log in `<data>/cluster`. Off (or `KILN_CLUSTER_GROUP=0`), writes go
     /// straight to kiln.db, as before it; the database is whole either way.
     pub group: bool,
+    /// The runners hold learner replicas of the group (P2), each fed by the server over its link,
+    /// from a copy of kiln.db. Off (or `KILN_CLUSTER_LEARNERS=0`), none is added; the learners the
+    /// group has stay in it, lagging.
+    pub learners: bool,
 }
 
 impl Default for Cluster {
     fn default() -> Self {
-        Self { group: true }
+        Self { group: true, learners: true }
     }
 }
 
@@ -521,6 +525,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("KILN_CLUSTER_GROUP") {
             cfg.cluster.group = !matches!(v.trim(), "0" | "false" | "off" | "no");
+        }
+        if let Ok(v) = std::env::var("KILN_CLUSTER_LEARNERS") {
+            cfg.cluster.learners = !matches!(v.trim(), "0" | "false" | "off" | "no");
         }
         if let Ok(v) = std::env::var("KILN_QUIC_ADVERTISE") {
             cfg.server.quic_advertise = v;

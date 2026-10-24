@@ -739,6 +739,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         });
         sync
     });
+    // The cluster group's learner: this machine's replica of kiln's records (docs/p2p.md, P2),
+    // started once the server says which member it is (never in a job pod or an outpost).
+    let cluster: Arc<parking_lot::Mutex<Option<Arc<crate::store::learner::Learner>>>> = Arc::default();
+    let cluster_starting = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Reach: links to other runners, and the runs this machine does for them (none in a job pod).
     // Agent sessions other runners hand this one (a session moving here) are taken over by its
     // session host, once there is one (below).
@@ -2223,6 +2227,80 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Sync { json, raft } => {
                         if let Some(s) = &sync {
                             s.heard(&json, raft);
+                        }
+                    }
+                    ServerMsg::Cluster { json, raft } => {
+                        use crate::store::learner::{Learner, Msg};
+                        match crate::store::learner::decode(&json) {
+                            Some(Msg::Join { member, token }) if !o.ephemeral && !o.outpost => {
+                                if cluster.lock().is_some() || cluster_starting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                    continue;
+                                }
+                                // Fetching its first copy of kiln.db takes a while: not on this loop.
+                                let (slot, starting, up) = (cluster.clone(), cluster_starting.clone(), uplink.0.clone());
+                                let (dir, me, server, http) = (o.state_dir.clone(), name.clone(), o.server_url.clone(), http.clone());
+                                crate::rt::spawn(async move {
+                                    // A few tries: the process before this one may still hold the
+                                    // replica's files for a moment.
+                                    let mut tries = 0;
+                                    let started = loop {
+                                        let (dir, me, server, http, token) = (dir.clone(), me.clone(), server.clone(), http.clone(), token.clone());
+                                        // A thread of its own: fetching a copy takes minutes on a large
+                                        // store, and the blocking pool is the runtime's.
+                                        let (tx, rx) = async_channel::bounded(1);
+                                        let spawned = std::thread::Builder::new().name("kiln-learner".into()).spawn(move || {
+                                            let _ = tx.send_blocking(Learner::start(&dir, &me, member, http, &server, &token));
+                                        });
+                                        let r = match spawned {
+                                            Ok(_) => rx.recv().await.map_err(|_| anyhow::anyhow!("the learner's thread ended")),
+                                            Err(e) => Err(anyhow::anyhow!("starting the learner's thread: {e}")),
+                                        };
+                                        tries += 1;
+                                        match r {
+                                            Ok(Ok(started)) => break Ok(started),
+                                            Ok(Err(e)) | Err(e) if tries >= 5 => break Err(e),
+                                            Ok(Err(e)) | Err(e) => {
+                                                tracing::debug!(error = %format!("{e:#}"), tries, "this machine's replica of kiln's records didn't start yet");
+                                                crate::rt::sleep(std::time::Duration::from_secs(15)).await;
+                                            }
+                                        }
+                                    };
+                                    match started {
+                                        Ok((learner, said)) => {
+                                            tracing::info!(member, "this machine holds a replica of kiln's records");
+                                            let learner = Arc::new(learner);
+                                            crate::store::learner::set_global(Some(Arc::clone(&learner)));
+                                            *slot.lock() = Some(learner);
+                                            crate::rt::spawn(async move {
+                                                while let Ok(m) = said.recv().await {
+                                                    if up.send(Up::Sync(m)).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        Err(e) => tracing::warn!(error = %format!("{e:#}"), "this machine's replica of kiln's records didn't start"),
+                                    }
+                                    starting.store(false, std::sync::atomic::Ordering::SeqCst);
+                                });
+                            }
+                            Some(Msg::Leave) => {
+                                // Another process of this machine holds it now: its files are let go
+                                // (stopping it waits for its thread: not on this loop).
+                                if let Some(old) = cluster.lock().take() {
+                                    crate::store::learner::set_global(None);
+                                    crate::rt::spawn(async move {
+                                        let _ = crate::rt::blocking(move || drop(old)).await;
+                                    });
+                                }
+                            }
+                            Some(m @ (Msg::Raft { .. } | Msg::At { .. })) => {
+                                let learner = cluster.lock().clone();
+                                if let Some(l) = learner {
+                                    l.heard(&m, raft);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     ServerMsg::Convo { json, data } => {

@@ -1324,7 +1324,7 @@ const SLOW_FEWEST: usize = 3;
 /// A run's critical path: how long it took, in seconds (each of its jobs from its first leg's
 /// start to its last's end), and its jobs.
 async fn critical_path(hub: &Hub, run: &str) -> Option<(i64, Vec<String>)> {
-    let g = super::runs_api::graph_json(hub, run, None).await.ok()?;
+    let g = super::runs_api::graph_json(&hub.store, run, None).await.ok()?;
     let path: Vec<String> = g.get("critical_path")?.as_array()?.iter().filter_map(Value::as_str).map(str::to_owned).collect();
     let nodes = g.get("nodes")?.as_array()?;
     let span =

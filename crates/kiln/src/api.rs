@@ -317,6 +317,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let hash = (*hash).to_owned();
             return sync_blob_get(&hub, &hash, &req);
         }
+        // A copy of kiln.db for a runner's learner of the cluster group (docs/p2p.md, P2).
+        (&Method::GET, ["api", "cluster", "copy"]) => return boxed(|| cluster_copy(&hub, &req)).await,
+        // Whether a request's credentials are the owner's: a runner's front door answers the owner's
+        // reads from its replica, and passes everyone else's here (docs/p2p.md, P2).
+        (&Method::GET, ["api", "cluster", "owner"]) => return Ok(srv::json(StatusCode::OK, &json!({ "owner": authed(&hub, req.headers()) }))),
         // The local store's presigned URLs (docs/blobs.md): the URL is the credential.
         (&Method::GET | &Method::HEAD | &Method::PUT, ["api", "blobs", _, ..]) => {
             let encoded = path.strip_prefix("/api/blobs/").unwrap_or_default().to_owned();
@@ -505,19 +510,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         },
         (&Method::GET, ["api", "metrics", "history"]) => Ok(history(&hub, &q)),
         (&Method::GET, ["api", "repos"]) => {
-            let mut repos = boxed(|| hub.store.repos()).await?;
-            repos.retain(|r| caller.can("runs.read", &crate::authz::Scope::Repo { repo: r.name.clone() }));
-            let public = hub.store.public_repos().await.unwrap_or_default();
-            let listed: Vec<serde_json::Value> = repos
-                .iter()
-                .map(|r| {
-                    let mut v = serde_json::to_value(r).unwrap_or_default();
-                    if let Some(o) = v.as_object_mut() {
-                        o.insert("public".into(), json!(public.contains(&r.id)));
-                    }
-                    v
-                })
-                .collect();
+            let listed = boxed(|| crate::reads::repos(&hub.store, |r| caller.can("runs.read", &crate::authz::Scope::Repo { repo: r.name.clone() }))).await?;
             Ok(srv::json(StatusCode::OK, &listed))
         }
         (&Method::POST, ["api", "repos"]) => boxed(|| add_repo(&hub, req)).await,
@@ -1518,6 +1511,55 @@ fn sync_machine(req: &Request) -> String {
     srv::query(req).get("machine").cloned().unwrap_or_default()
 }
 
+/// Copies of kiln.db for learners are made one at a time (each reads the whole database).
+static CLUSTER_COPIES: async_lock::Semaphore = async_lock::Semaphore::new(1);
+
+/// A copy of kiln.db for a runner's learner, made now and streamed: for the runner's token for its
+/// machine (`?machine=`), or the admin token. The copy goes once sent.
+async fn cluster_copy(hub: &Hub, req: &Request) -> R {
+    let machine = srv::query(req).get("machine").cloned().unwrap_or_default();
+    let theirs = !machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), crate::store::learner::token(&hub.admin_token, &machine).as_bytes()));
+    if !theirs && !authed(hub, req.headers()) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad cluster token"));
+    }
+    let dir = hub.cfg.data("cluster").join("copies");
+    let _one = CLUSTER_COPIES.acquire().await;
+    // Copies a stop left behind.
+    if let Ok(old) = std::fs::read_dir(&dir) {
+        for e in old.flatten() {
+            std::fs::remove_file(e.path()).ok();
+        }
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("making {}: {e}", dir.display())))?;
+    let path = dir.join(format!("{}.db", crate::util::new_id()));
+    let started = Instant::now();
+    if let Err(e) = hub.store.copy_for_learner(path.clone()).await {
+        std::fs::remove_file(&path).ok();
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")));
+    }
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    tracing::info!(machine, bytes = size, took_ms = started.elapsed().as_millis() as u64, "a copy of kiln.db for a runner's learner");
+    let (tx, rx) = async_channel::bounded::<Bytes>(16);
+    crate::rt::spawn(async move {
+        let p = path.clone();
+        let _ = crate::rt::blocking(move || -> std::io::Result<()> {
+            use std::io::Read as _;
+            let mut f = std::fs::File::open(&p)?;
+            let mut buf = vec![0u8; 256 << 10];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 || tx.send_blocking(Bytes::copy_from_slice(buf.get(..n).unwrap_or_default())).is_err() {
+                    return Ok(());
+                }
+            }
+        })
+        .await;
+        std::fs::remove_file(&path).ok();
+    });
+    let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(rx));
+    Ok(srv::with_header(r, header::CONTENT_LENGTH, &size.to_string()))
+}
+
 /// One of the contents synced repos name (`HEAD`: whether the server has it).
 fn sync_blob_get(hub: &Hub, hash: &str, req: &Request) -> R {
     let direction = if req.method() == Method::HEAD { "up" } else { "down" };
@@ -2391,43 +2433,13 @@ async fn trigger(hub: &Hub, id: &str, req: Request) -> R {
 
 /// `GET /api/runs`: runs newest first, of the repositories the caller may read (W10).
 async fn runs(hub: &Hub, q: &HashMap<String, String>, caller: &crate::authz::Caller) -> R {
-    let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
-    let before = q.get("before").and_then(|v| v.parse().ok());
-    // Another order than newest first pages by `offset` (W21-R03's sort).
-    if let Some(sort) = q.get("sort").filter(|s| matches!(s.as_str(), "oldest" | "longest" | "shortest")) {
-        let offset = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let among = crate::authz::gate::readable(hub, caller, "runs.read").await;
-        let list = hub.store.runs_sorted(among, q.get("repo").cloned(), sort, limit, offset).await?;
-        return Ok(srv::json(StatusCode::OK, &with_hosts(hub, &list).await?));
-    }
-    let list = match crate::authz::gate::readable(hub, caller, "runs.read").await {
-        None => hub.store.runs(q.get("repo").cloned(), limit, before).await?,
-        Some(names) => hub.store.runs_among(names, q.get("repo").cloned(), limit, before).await?,
-    };
-    Ok(srv::json(StatusCode::OK, &with_hosts(hub, &list).await?))
-}
-
-/// Runs, each with the runners and executors its legs ran on (W21-R03's facets).
-async fn with_hosts(hub: &Hub, runs: &[crate::store::Run]) -> anyhow::Result<Vec<serde_json::Value>> {
-    let hosts = hub.store.run_hosts(runs.iter().map(|r| r.id.clone()).collect()).await?;
-    let mut out = Vec::with_capacity(runs.len());
-    for r in runs {
-        let mut v = serde_json::to_value(r)?;
-        if let (Some(o), Some((runners, executors))) = (v.as_object_mut(), hosts.get(&r.id)) {
-            o.insert("runners".into(), json!(runners));
-            o.insert("executors".into(), json!(executors));
-        }
-        out.push(v);
-    }
-    Ok(out)
+    let among = crate::authz::gate::readable(hub, caller, "runs.read").await;
+    Ok(srv::json(StatusCode::OK, &crate::reads::runs(&hub.store, q, among).await?))
 }
 
 async fn run(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
-    let run = hub.store.run(id.to_owned()).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such run"))?;
-    // A CI run's attempt (docs/ci.md W05-R17); the current one by default.
-    let attempt = q.get("attempt").and_then(|a| a.parse().ok());
-    let jobs = hub.store.jobs_at(id.to_owned(), false, attempt).await?;
-    Ok(srv::json(StatusCode::OK, &json!({ "run": run, "jobs": jobs })))
+    let run = crate::reads::run(&hub.store, id, q).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such run"))?;
+    Ok(srv::json(StatusCode::OK, &run))
 }
 
 async fn cancel(hub: &Hub, id: &str) -> R {
@@ -2456,7 +2468,7 @@ async fn retry(hub: &Hub, id: &str, req: Request) -> R {
 }
 
 async fn job(hub: &Hub, id: &str) -> R {
-    let j = hub.store.job(id.to_owned()).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such job"))?;
+    let j = crate::reads::job(&hub.store, id).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such job"))?;
     Ok(srv::json(StatusCode::OK, &j))
 }
 
@@ -4903,8 +4915,15 @@ fn server_health(hub: &Hub) -> Response {
             "restarts": hub.generation.saturating_sub(1),
             "memory": memory,
             "runners": { "connected": connected, "before": before, "back": back(connected, before) },
-            // The cluster group (docs/p2p.md P1): kiln.db's last write, and the log's last entry.
-            "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({ "group": true, "seq": seq, "applied": applied })),
+            // The cluster group (docs/p2p.md P1, P2): kiln.db's last write, the log's last entry,
+            // the runners holding a replica, and kiln.db's size (what a runner's copy takes).
+            "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({
+                "group": true,
+                "seq": seq,
+                "applied": applied,
+                "learners": hub.store.group().map_or(0, |g| g.point().1.learners.len()),
+                "bytes": hub.store.file_bytes(),
+            })),
         }),
     )
 }

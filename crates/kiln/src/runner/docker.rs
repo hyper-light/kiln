@@ -584,9 +584,10 @@ pub fn split_options(s: &str) -> Vec<String> {
 }
 
 /// Host paths and where they are in the job container, longest first, and the server's
-/// loopback addresses as a container reaches them.
+/// loopback addresses as a container reaches them; and kiln's server's address, when it isn't on
+/// this host ([`PathMap::with_server`]).
 #[derive(Debug, Clone, Default)]
-pub struct PathMap(Vec<(PathBuf, String)>);
+pub struct PathMap(Vec<(PathBuf, String)>, Option<String>);
 
 /// The host, as containers reach it (`--add-host host.docker.internal:host-gateway`).
 pub const HOST_ALIAS: &str = "host.docker.internal";
@@ -608,15 +609,53 @@ pub fn use_host_network() {
     HOST_NETWORK.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Where `host.docker.internal` points: the host's gateway, or the host itself on its network.
-fn host_alias() -> String {
-    format!("{HOST_ALIAS}:{}", if host_network() { "127.0.0.1" } else { "host-gateway" })
+/// The names a leg's containers have for the host and for kiln's server (`--add-host`, a
+/// created container's `ExtraHosts`): `host.docker.internal` at the host's gateway (on the host's
+/// network, its loopback), and [`super::runtime::NOT_GHES_HOST`] where the server is, the host
+/// unless `server` says it's elsewhere. What a step's tool fetches from kiln through either
+/// (docker's build actions' git context, from BuildKit's own container) reaches it.
+pub fn container_hosts(host_net: bool, server: Option<&str>) -> Vec<String> {
+    let host = if host_net { "127.0.0.1" } else { "host-gateway" };
+    vec![format!("{HOST_ALIAS}:{host}"), format!("{}:{}", super::runtime::NOT_GHES_HOST, server.unwrap_or(host))]
+}
+
+/// kiln's server's address as a leg's containers reach it when it isn't on this host: `None` when
+/// it is (its URL's host a loopback address or `localhost`), or when its name doesn't resolve to
+/// an IPv4 address. Resolving blocks: call it off the runtime's threads.
+pub fn server_address(server_url: &str) -> Option<String> {
+    use std::net::ToSocketAddrs as _;
+    let rest = server_url.split_once("://").map_or(server_url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None => host.rsplit_once(':').map_or(host, |(h, _)| h),
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
+    let ip = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip,
+        Err(_) => (host, 0u16).to_socket_addrs().ok()?.map(|a| a.ip()).find(std::net::IpAddr::is_ipv4)?,
+    };
+    (ip.is_ipv4() && !ip.is_loopback()).then(|| ip.to_string())
 }
 
 impl PathMap {
     pub fn new(mut pairs: Vec<(PathBuf, String)>) -> PathMap {
         pairs.sort_by_key(|(h, _)| std::cmp::Reverse(h.as_os_str().len()));
-        PathMap(pairs)
+        PathMap(pairs, None)
+    }
+
+    /// The map with kiln's server at `address` (its [`server_address`]), when it isn't on this host.
+    pub fn with_server(mut self, address: Option<String>) -> PathMap {
+        self.1 = address;
+        self
+    }
+
+    /// kiln's server's address, when it isn't on this host.
+    pub fn server(&self) -> Option<&str> {
+        self.1.as_deref()
     }
 
     /// `s` (a path, or text holding paths) with the host's paths swapped for the container's. A
@@ -854,7 +893,10 @@ impl Containers {
                 let image = c.prepare(&spec.image, user, say).await?;
                 // A job's `container:` made for GitHub's runner user runs as this runner's.
                 let as_runner = if user.is_none() { as_runner(&c.cli, &image).await } else { None };
-                let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_job"), s("--label"), c.label.clone(), s("--workdir"), workdir.to_owned(), s("--network"), c.network.clone(), s("--add-host"), host_alias()];
+                let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_job"), s("--label"), c.label.clone(), s("--workdir"), workdir.to_owned(), s("--network"), c.network.clone()];
+                for h in container_hosts(shared, map.server()) {
+                    args.extend([s("--add-host"), h]);
+                }
                 args.extend(c.cli.owner_args());
                 if let Some(u) = &as_runner {
                     args.extend([s("--user"), u.clone()]);
@@ -1125,7 +1167,18 @@ pub async fn action_image(cli: &Cli, dir: &Path, image: &str, tag: &str, say: &(
 /// `docker run` for a Docker action's step, with GitHub's mounts: its arguments (the values
 /// come by name from `env`).
 #[allow(clippy::too_many_arguments)]
-pub fn action_run_args(name: &str, labels: &[String], user: Option<&str>, network: Option<&str>, mounts: &[String], env: &BTreeMap<String, String>, entrypoint: Option<&str>, image: &str, args: &[String]) -> Vec<String> {
+pub fn action_run_args(
+    name: &str,
+    labels: &[String],
+    user: Option<&str>,
+    network: Option<&str>,
+    mounts: &[String],
+    server: Option<&str>,
+    env: &BTreeMap<String, String>,
+    entrypoint: Option<&str>,
+    image: &str,
+    args: &[String],
+) -> Vec<String> {
     let mut a = vec![s("run"), s("--rm"), s("--name"), name.to_owned()];
     for l in labels {
         a.extend([s("--label"), l.clone()]);
@@ -1133,7 +1186,10 @@ pub fn action_run_args(name: &str, labels: &[String], user: Option<&str>, networ
     if let Some(u) = user {
         a.extend([s("--user"), u.to_owned()]);
     }
-    a.extend([s("--workdir"), s("/github/workspace"), s("--add-host"), host_alias()]);
+    a.extend([s("--workdir"), s("/github/workspace")]);
+    for h in container_hosts(network.is_none() && host_network(), server) {
+        a.extend([s("--add-host"), h]);
+    }
     if let Some(n) = network {
         a.extend([s("--network"), n.to_owned()]);
     } else if host_network() {
@@ -1208,6 +1264,22 @@ mod tests {
         assert_eq!(cli.through_ref(&format!("ghcr.io/acme/app@{d}")), Some(format!("kiln.example:7070/gh/acme/app@{d}")));
         assert_eq!(cli.through_ref("quay.io/acme/app:1"), None, "a registry kiln doesn't mirror");
         assert_eq!(Cli::new("docker", PathBuf::from("/tmp/x")).through("kiln.example", vec![]).through_ref("alpine"), None);
+    }
+
+    /// kiln's server where a leg's containers find it: where the host is when it's on the host,
+    /// its own address when it's elsewhere.
+    #[test]
+    fn a_legs_containers_find_the_server() {
+        assert_eq!(container_hosts(false, None), ["host.docker.internal:host-gateway", "kiln.localhost:host-gateway"]);
+        assert_eq!(container_hosts(true, None), ["host.docker.internal:127.0.0.1", "kiln.localhost:127.0.0.1"]);
+        assert_eq!(container_hosts(false, Some("10.0.0.5")), ["host.docker.internal:host-gateway", "kiln.localhost:10.0.0.5"]);
+        for on_host in ["http://127.0.0.1:42511", "http://localhost:7070/", "http://[::1]:7070", "https://LOCALHOST"] {
+            assert_eq!(server_address(on_host), None, "{on_host}");
+        }
+        assert_eq!(server_address("http://192.168.49.2:30070/api"), Some("192.168.49.2".to_owned()));
+        assert_eq!(server_address("https://user@10.1.2.3"), Some("10.1.2.3".to_owned()));
+        assert_eq!(server_address("http://[2001:db8::1]:8080"), None, "an IPv6 server isn't mapped");
+        assert_eq!(PathMap::new(Vec::new()).with_server(Some("10.0.0.5".to_owned())).server(), Some("10.0.0.5"));
     }
 
     #[test]
