@@ -198,7 +198,7 @@ fn write_loop(store: &store::Store, rx: &Receiver<Job>, queued: &AtomicU64, coun
             if up.profiles.is_empty() {
                 counts.not_pprof.fetch_add(1, Ordering::Relaxed);
                 if said_jfr.due() {
-                    tracing::warn!(family = %up.family, attachments = ?up.others, "a profile upload holds no pprof profile (Java's JFR recordings are not read): not kept");
+                    tracing::warn!(family = %up.family, attachments = ?up.others, "a profile upload holds no profile kiln reads (nothing sampled, or attachments of other kinds alone): not kept");
                 }
                 continue;
             }
@@ -338,13 +338,19 @@ pub async fn from_tracer(o: &super::Observe, host: &str, req: srv::Request) -> s
             Err(e) => return answer(StatusCode::BAD_REQUEST, Some(&e.to_string())),
         };
         if up.profiles.is_empty() {
-            // Nothing kiln reads (Java's JFR): taken, as an Agent would, and not sent on.
+            // Nothing kiln reads (an idle JVM's recording, nothing sampled): taken, as an Agent
+            // would, and not sent on.
             return answer(StatusCode::ACCEPTED, None);
         }
         let taken = match get() {
             Some(p) => {
                 up.add_tags(&tags);
                 p.offer(Job::Read(up))
+            }
+            // Its recordings' profiles sent on, read here once, not the recordings.
+            None if up.recordings > 0 => {
+                let (body, content_type) = intake::repack(&up);
+                o.offer_profile(pack(body, &content_type, &tags))
             }
             None => o.offer_profile(pack(std::mem::take(&mut up.body), &content_type, &tags)),
         };

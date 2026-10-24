@@ -1,8 +1,10 @@
 //! A profiler's upload (`docs/observe.md` §8.11), as Datadog's tracers send it: `multipart/form-data`
 //! of an `event` part (`event.json`) and a part a profile (pprof, gzip'd, zstd'd or in LZ4's frames:
-//! told by its first bytes, nothing in the request says which). Read and checked before anything is
-//! kept: its times, its profiler's tags, each profile inflated (bounded), read as pprof and its
-//! values summed; its bytes kept as they came, in the body the upload holds.
+//! told by its first bytes, nothing in the request says which) or Java's recording (JFR, `main.jfr`).
+//! Read and checked before anything is kept: its times, its profiler's tags, each profile inflated
+//! (bounded), read as pprof and its values summed; its bytes kept as they came, in the body the
+//! upload holds. A recording is turned into pprof profiles (`kiln_obs::profile::jfr`), which follow
+//! the request's bytes in that body; the recording itself is not kept.
 
 use std::ops::Range;
 
@@ -15,6 +17,9 @@ use super::multipart::{self, MultipartError};
 pub const MAX_PROFILE: usize = 64 << 20;
 /// Attachments an upload may hold, at the most (Go's profiler sends seven types at the most).
 pub const MAX_ATTACHMENTS: usize = 16;
+/// A Java recording inflated, at the most (dd-trace-java keeps 64 MiB of recordings by default, and
+/// uploads a minute's).
+pub const MAX_RECORDING: usize = 128 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IntakeError {
@@ -104,10 +109,13 @@ pub struct Upload {
     pub endpoint_counts: Vec<(String, u64)>,
     /// Each pprof attachment.
     pub profiles: Vec<Attachment>,
-    /// Attachments not pprof (Go's `metrics.json`, an execution trace, Java's JFR): their names,
-    /// not kept.
+    /// Attachments not pprof (Go's `metrics.json`, an execution trace; a Java recording, read into
+    /// profiles): their names, not kept.
     pub others: Vec<String>,
-    /// The request's body, every attachment's bytes in it.
+    /// Java recordings read into profiles.
+    pub recordings: usize,
+    /// The request's body, every attachment's bytes in it; the profiles made of its recordings after
+    /// them.
     pub body: Vec<u8>,
 }
 
@@ -155,12 +163,15 @@ pub fn read(content_type: &str, body: Vec<u8>) -> Result<Upload, IntakeError> {
         }
         // Each attachment the event names, once, in its order; a part the event does not name,
         // passed over (an older profiler's: `event` names them all).
+        // A part named as the attachment, else one whose file is (dd-trace-java's recording: the
+        // part `main`, its file `main.jfr`, named `main.jfr`).
         let mut found: Vec<(String, Range<usize>)> = Vec::with_capacity(attachments.len());
         for name in attachments {
             if name == "event" || found.iter().any(|(n, _)| n == name) {
                 continue;
             }
-            if let Some(p) = parts.iter().find(|p| p.name == name.as_str()) {
+            let named = parts.iter().find(|p| p.name == name.as_str()).or_else(|| parts.iter().find(|p| p.name != "event" && p.filename == Some(name.as_str())));
+            if let Some(p) = named {
                 found.push((name.clone(), p.at..p.at + p.body.len()));
             }
         }
@@ -182,29 +193,64 @@ pub fn read(content_type: &str, body: Vec<u8>) -> Result<Upload, IntakeError> {
         endpoint_counts: ev.endpoint_counts.unwrap_or_default().into_iter().collect(),
         profiles: Vec::with_capacity(found.len()),
         others: Vec::new(),
+        recordings: 0,
         body: Vec::new(),
     };
+    let mut body = body;
     // One buffer inflates every attachment in turn.
     let mut plain = Vec::new();
     for (name, sent) in found {
-        // What is plainly not pprof (Go's metrics.json, an execution trace, Java's JFR) is named and
-        // not kept; any other attachment is read as pprof, whatever its name (libdatadog's are
-        // not all `.pprof`), and one named `.pprof` that does not read refuses the upload.
-        if [".json", ".jfr", ".trace", ".txt"].iter().any(|x| name.ends_with(x)) {
+        // What is plainly neither pprof nor a recording (Go's metrics.json, an execution trace) is
+        // named and not kept; any other attachment is read, as a recording where its name or its
+        // bytes say it is one, else as pprof whatever its name (libdatadog's are not all `.pprof`).
+        // One named `.pprof` or `.jfr` that does not read refuses the upload.
+        if [".json", ".trace", ".txt"].iter().any(|x| name.ends_with(x)) {
             up.others.push(name);
             continue;
         }
+        let named_jfr = name.ends_with(".jfr");
         let bytes = body.get(sent.clone()).unwrap_or_default();
         let encoding = Encoding::of(bytes);
         let fail = |e: String| IntakeError::Profile(name.clone(), e);
-        let read = match encoding {
-            Encoding::Raw if bytes.len() > MAX_PROFILE => Err(format!("past {MAX_PROFILE} bytes")),
-            Encoding::Raw => kiln_obs::profile::pprof::read(bytes).map_err(|e| e.to_string()),
-            _ => inflate(bytes, &mut plain).and_then(|()| kiln_obs::profile::pprof::read(&plain).map_err(|e| e.to_string())),
+        let max = if named_jfr { MAX_RECORDING } else { MAX_PROFILE };
+        let inflated = match encoding {
+            Encoding::Raw if bytes.len() > max => Err(format!("past {max} bytes")),
+            Encoding::Raw => Ok(bytes),
+            _ => inflate_within(bytes, &mut plain, max).map(|()| plain.as_slice()),
         };
-        let p = match read {
+        let inflated = match inflated {
+            Ok(b) => b,
+            Err(e) if named_jfr || name.ends_with(".pprof") => return Err(fail(e)),
+            Err(_) => {
+                up.others.push(name);
+                continue;
+            }
+        };
+        if named_jfr || inflated.starts_with(&kiln_obs::profile::jfr::MAGIC) {
+            let made = match kiln_obs::profile::jfr::to_pprof(inflated) {
+                Ok(c) => c.profiles,
+                Err(e) if named_jfr => return Err(fail(e.to_string())),
+                Err(_) => {
+                    up.others.push(name);
+                    continue;
+                }
+            };
+            body.reserve(made.iter().map(|m| m.pprof.len()).sum());
+            for m in made {
+                // Its profiles by their kinds' names; a second recording's after its own name.
+                let named = if up.profiles.iter().any(|a| a.name == m.name) { format!("{}-{}", name.trim_end_matches(".jfr"), m.name) } else { m.name.to_owned() };
+                let at = body.len();
+                body.extend_from_slice(&m.pprof);
+                let types = m.types.iter().map(|&(t, u)| (t.to_owned(), u.to_owned())).collect();
+                up.profiles.push(Attachment { name: named, types, totals: m.totals, encoding: Encoding::Raw, sent: at..body.len(), plain_len: m.pprof.len() });
+            }
+            up.recordings += 1;
+            up.others.push(name);
+            continue;
+        }
+        let p = match kiln_obs::profile::pprof::read(inflated) {
             Ok(p) => p,
-            Err(e) if name.ends_with(".pprof") => return Err(fail(e)),
+            Err(e) if name.ends_with(".pprof") => return Err(fail(e.to_string())),
             Err(_) => {
                 up.others.push(name);
                 continue;
@@ -227,21 +273,79 @@ pub fn read(content_type: &str, body: Vec<u8>) -> Result<Upload, IntakeError> {
 /// A profile's bytes inflated into `out` (cleared first) as their first bytes say: gzip, zstd or
 /// LZ4's frames; else as they are; never past [`MAX_PROFILE`].
 pub fn inflate(b: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+    inflate_within(b, out, MAX_PROFILE)
+}
+
+/// [`inflate`] never past `max` bytes.
+fn inflate_within(b: &[u8], out: &mut Vec<u8>, max: usize) -> Result<(), String> {
     use std::io::Read as _;
     out.clear();
     match Encoding::of(b) {
         Encoding::Gzip => {
-            flate2::read::GzDecoder::new(b).take(MAX_PROFILE as u64 + 1).read_to_end(out).map_err(|e| format!("not gzip: {e}"))?;
-            if out.len() > MAX_PROFILE {
-                return Err(format!("past {MAX_PROFILE} bytes inflated"));
+            flate2::read::GzDecoder::new(b).take(max as u64 + 1).read_to_end(out).map_err(|e| format!("not gzip: {e}"))?;
+            if out.len() > max {
+                return Err(format!("past {max} bytes inflated"));
             }
         }
-        Encoding::Zstd => kiln_obs::zstd::decompress(b, out, MAX_PROFILE).map_err(|e| format!("not zstd: {e}"))?,
-        Encoding::Lz4 => kiln_obs::lz4::decompress_frames(b, out, MAX_PROFILE).map_err(|e| format!("not LZ4's frames: {e}"))?,
-        Encoding::Raw if b.len() > MAX_PROFILE => return Err(format!("past {MAX_PROFILE} bytes")),
+        Encoding::Zstd => kiln_obs::zstd::decompress(b, out, max).map_err(|e| format!("not zstd: {e}"))?,
+        Encoding::Lz4 => kiln_obs::lz4::decompress_frames(b, out, max).map_err(|e| format!("not LZ4's frames: {e}"))?,
+        Encoding::Raw if b.len() > max => return Err(format!("past {max} bytes")),
         Encoding::Raw => out.extend_from_slice(b),
     }
     Ok(())
+}
+
+/// `up` as an upload again (its event, then each profile it holds as it holds it): what a runner
+/// sends on of one whose recordings it read, so the server reads their profiles, not the recordings.
+pub fn repack(up: &Upload) -> (Vec<u8>, String) {
+    // A boundary no one sending a profile can know, so none can be in it.
+    let boundary = format!("kiln-{:032x}", rand::random::<u128>());
+    // A name as a part's header can say it.
+    let safe = |n: &str| n.replace(['"', '\\', '\r', '\n'], "_");
+    let time = |ns: i64| time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ns)).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_default();
+    let mut tags = String::new();
+    for (k, v) in &up.tags {
+        if !tags.is_empty() {
+            tags.push(',');
+        }
+        tags.push_str(k);
+        if !v.is_empty() {
+            tags.push(':');
+            tags.push_str(v);
+        }
+    }
+    let event = serde_json::json!({
+        "start": time(up.start_ns),
+        "end": time(up.end_ns),
+        "attachments": up.profiles.iter().map(|a| safe(&a.name)).collect::<Vec<_>>(),
+        "tags_profiler": tags,
+        "family": up.family,
+        "endpoint_counts": up.endpoint_counts.iter().map(|(e, n)| (e.clone(), serde_json::Value::from(*n))).collect::<serde_json::Map<String, serde_json::Value>>(),
+        "version": "4",
+    })
+    .to_string();
+    let mut body = Vec::with_capacity(event.len() + up.profiles.iter().map(|a| a.sent.len() + 160).sum::<usize>() + 320);
+    let mut part = |name: &str, content_type: &str, bytes: &[u8]| {
+        body.extend_from_slice(b"--");
+        body.extend_from_slice(boundary.as_bytes());
+        body.extend_from_slice(b"\r\nContent-Disposition: form-data; name=\"");
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(b"\"; filename=\"");
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(b"\"\r\nContent-Type: ");
+        body.extend_from_slice(content_type.as_bytes());
+        body.extend_from_slice(b"\r\n\r\n");
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    };
+    part("event", "application/json", event.as_bytes());
+    for a in &up.profiles {
+        part(&safe(&a.name), "application/octet-stream", up.sent(a));
+    }
+    body.extend_from_slice(b"--");
+    body.extend_from_slice(boundary.as_bytes());
+    body.extend_from_slice(b"--\r\n");
+    (body, format!("multipart/form-data; boundary={boundary}"))
 }
 
 #[cfg(test)]
@@ -351,6 +455,80 @@ pub(super) mod tests {
         let burn = by.iter().find(|(f, _, _)| g.name(*f).0 == "burn").map_or(0, |b| b.2);
         assert!(whole > 0 && burn * 2 > whole, "burn {burn} of {whole}");
         assert_eq!(a.totals[0], whole, "its CPU time summed at intake as in the graph");
+    }
+
+    /// An upload repacked (as a runner sends on one whose recordings it read) reads as it did:
+    /// its times to the nanosecond, its tags in their order, its endpoints, each profile's name,
+    /// types, values and bytes.
+    #[test]
+    fn an_upload_repacked_reads_as_it_did() {
+        let mut first = read("multipart/form-data; boundary=b0und", upload("b0und")).unwrap();
+        first.start_ns += 123_456_789;
+        first.tags.push(("bare".to_owned(), String::new()));
+        let (body, content_type) = repack(&first);
+        assert!(content_type.starts_with("multipart/form-data; boundary=kiln-"));
+        let again = read(&content_type, body).unwrap();
+        assert_eq!((again.start_ns, again.end_ns, &again.family, &again.tags, &again.endpoint_counts), (first.start_ns, first.end_ns, &first.family, &first.tags, &first.endpoint_counts));
+        assert_eq!(again.profiles.len(), 2);
+        for (a, b) in again.profiles.iter().zip(&first.profiles) {
+            assert_eq!((&a.name, &a.types, &a.totals, a.encoding, a.plain_len, again.sent(a)), (&b.name, &b.types, &b.totals, b.encoding, b.plain_len, first.sent(b)));
+        }
+    }
+
+    /// A recording is found by its file's name where its part has another (dd-trace-java's: the
+    /// part `main`, its file `main.jfr`); one so named that does not read refuses the upload, and
+    /// an attachment of another name whose bytes begin as a recording's and do not read is passed
+    /// over.
+    #[test]
+    fn a_recording_is_found_by_its_file_s_name_and_refused_where_it_does_not_read() {
+        let java = |name: &str, filename: &str, bytes: &[u8]| {
+            let mut b = format!("--b\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n\r\n").into_bytes();
+            b.extend_from_slice(bytes);
+            b.extend_from_slice(format!("\r\n--b\r\nContent-Disposition: form-data; name=\"event\"; filename=\"event.json\"\r\n\r\n{{\"start\":\"2026-10-23T17:39:00Z\",\"end\":\"2026-10-23T17:40:00Z\",\"attachments\":[\"{filename}\"],\"family\":\"java\"}}\r\n--b--").as_bytes());
+            b
+        };
+        let damaged = b"FLR\0\0\x02\0\0not a chunk";
+        assert!(matches!(read("multipart/form-data; boundary=b", java("main", "main.jfr", damaged)), Err(IntakeError::Profile(n, _)) if n == "main.jfr"));
+        let up = read("multipart/form-data; boundary=b", java("blob", "blob.bin", damaged)).unwrap();
+        assert_eq!((up.profiles.len(), up.recordings, up.others.as_slice()), (0, 0, &["blob.bin".to_owned()][..]));
+    }
+
+    /// An upload as dd-trace-java 1.67.1 sends one (`ProfileUploader`): the recording in the part
+    /// `main`, its file `main.jfr` (zstd'd: kiln-obs's fixture), `event` naming it `main.jfr`. Read
+    /// into the profiles kiln-obs makes of it, after the request's bytes in the body; the recording
+    /// named and not kept. Repacked, as a runner sends it on, it reads again as the same profiles,
+    /// pprof now, and no recording.
+    #[test]
+    fn a_java_profiler_s_recording_is_read_into_profiles_and_sent_on_as_them() {
+        let zst = include_bytes!("../../../../kiln-obs/src/fixtures/jfr/dd-trace-java-1.67.1-burn.jfr.zst");
+        let boundary = "d8e1c4b2-java-fixture";
+        let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"main\"; filename=\"main.jfr\"\r\nContent-Type: application/octet-stream\r\n\r\n").into_bytes();
+        body.extend_from_slice(zst);
+        body.extend_from_slice(format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"event\"; filename=\"event.json\"\r\nContent-Type: application/json\r\n\r\n").as_bytes());
+        body.extend_from_slice(
+            br#"{"attachments":["main.jfr"],"tags_profiler":"service:kiln-javacheck,env:e2e,version:1,language:jvm,runtime:jvm,profiler_version:1.67.1~5941040e7e","start":"2026-10-23T23:12:06.393376696Z","end":"2026-10-23T23:12:12.323786761Z","family":"java","version":"4"}"#,
+        );
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let request_len = body.len();
+        let up = read(&format!("multipart/form-data; boundary={boundary}"), body).unwrap();
+        assert_eq!((up.family.as_str(), up.tag("service"), up.recordings, up.others.as_slice()), ("java", Some("kiln-javacheck"), 1, &["main.jfr".to_owned()][..]));
+        let mut plain = Vec::new();
+        inflate_within(zst, &mut plain, MAX_RECORDING).unwrap();
+        let made = kiln_obs::profile::jfr::to_pprof(&plain).unwrap().profiles;
+        assert_eq!(up.profiles.len(), made.len());
+        for (a, m) in up.profiles.iter().zip(&made) {
+            assert_eq!((a.name.as_str(), a.encoding, a.totals.as_slice(), a.plain_len, up.sent(a)), (m.name, Encoding::Raw, m.totals.as_slice(), m.pprof.len(), m.pprof.as_slice()));
+            assert_eq!(a.types, m.types.iter().map(|(t, u)| ((*t).to_owned(), (*u).to_owned())).collect::<Vec<_>>());
+            assert!(a.sent.start >= request_len, "after the request's bytes");
+        }
+        assert_eq!((up.profiles[0].name.as_str(), up.profiles[0].totals.as_slice()), ("cpu.pprof", &[389, 3_890_000_000][..]));
+        let (body, content_type) = repack(&up);
+        assert!(body.len() < plain.len(), "its profiles smaller than its recording inflated: {} of {}", body.len(), plain.len());
+        let again = read(&content_type, body).unwrap();
+        assert_eq!((again.recordings, again.others.len(), again.start_ns, again.end_ns, &again.tags), (0, 0, up.start_ns, up.end_ns, &up.tags));
+        for (a, b) in again.profiles.iter().zip(&up.profiles) {
+            assert_eq!((&a.name, &a.types, &a.totals, again.sent(a)), (&b.name, &b.types, &b.totals, up.sent(b)));
+        }
     }
 
     /// Another's tags added where the upload has none of their keys: its own `host` kept.

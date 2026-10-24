@@ -5,7 +5,8 @@
 //! of nine, and their median; the CPU charged a run) with its allocations:
 //!
 //! - an upload read and checked (`intake::read`: taken apart, each profile inflated and read whole,
-//!   its types' values summed);
+//!   its types' values summed); a Java upload's recording read into its profiles (kiln-obs's
+//!   fixture, dd-trace-java's), repacked as a runner sends it on, and read again;
 //! - a profile read (`pprof::read`) and summed into a graph (`Flame::add`);
 //! - uploads kept (`Store::put`, a batch synced once) and the store opened again (its header files
 //!   read: what a server's start costs), with the bytes its index holds an upload;
@@ -216,6 +217,18 @@ fn upload(files: &[(&str, &[u8])], start_ms: i64, tags: &str) -> (String, Vec<u8
 
 const NOW_MS: i64 = 1_792_771_200_000;
 
+/// An upload as dd-trace-java sends one: its recording `jfr` in the part `main`, its file
+/// `main.jfr`, then `event`.
+fn java_upload(jfr: &[u8]) -> (String, Vec<u8>) {
+    let boundary = "kiln-bench-java-0f3a9c";
+    let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"main\"; filename=\"main.jfr\"\r\nContent-Type: application/octet-stream\r\n\r\n").into_bytes();
+    body.extend_from_slice(jfr);
+    body.extend_from_slice(format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"event\"; filename=\"event.json\"\r\nContent-Type: application/json\r\n\r\n").as_bytes());
+    body.extend_from_slice(br#"{"attachments":["main.jfr"],"tags_profiler":"service:checkout-java,env:prod,language:jvm","start":"2026-10-23T23:12:06.393Z","end":"2026-10-23T23:12:12.323Z","family":"java","version":"4"}"#);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
 fn main() {
     assert!(alloc::installed(), "the counting allocator");
     let uploads: usize = std::env::var("KOBS_UPLOADS").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
@@ -233,6 +246,20 @@ fn main() {
     let (ct_big, body_big) = upload(&[("cpu.pprof", &big_gz)], NOW_MS, "service:checkout,env:prod");
     let (t, a) = measure(|| intake::read(&ct_big, body_big.clone()).unwrap().profiles.len());
     line("an upload read (a busy service's CPU)", &t, &a, &format!("{:.0} MB/s inflated", big.len() as f64 / t.0.as_secs_f64() / 1e6));
+
+    // A Java upload as dd-trace-java sends it (kiln-obs's fixture: its recording, zstd'd), read into
+    // its profiles; repacked, as a runner sends it on; and the repacked read again, at the server.
+    let jfr = include_bytes!("../../kiln-obs/src/fixtures/jfr/dd-trace-java-1.67.1-burn.jfr.zst");
+    let (ct_java, body_java) = java_upload(jfr);
+    let (t, a) = measure(|| intake::read(&ct_java, body_java.clone()).unwrap().profiles.len());
+    let up = intake::read(&ct_java, body_java.clone()).unwrap();
+    let made: usize = up.profiles.iter().map(|p| p.plain_len).sum();
+    line("a Java upload read (its recording into its profiles)", &t, &a, &format!("{} KiB sent, {} profiles of {} KiB", body_java.len() >> 10, up.profiles.len(), made >> 10));
+    let (t, a) = measure(|| intake::repack(&up).0.len());
+    let (repacked, ct_repacked) = intake::repack(&up);
+    line("  repacked to send on", &t, &a, &format!("{} KiB", repacked.len() >> 10));
+    let (t, a) = measure(|| intake::read(&ct_repacked, repacked.clone()).unwrap().profiles.len());
+    line("  read again where it is sent", &t, &a, "");
 
     // A profile read, and summed.
     let (t, a) = measure(|| pprof::read(&big).unwrap().samples.len());

@@ -96,16 +96,20 @@ const LABELS: Record<string, string> = {
   "lock-acquire-wait": "Lock wait",
   "lock-release-hold": "Lock held",
   "exception-samples": "Exceptions",
+  "file-io-time": "File I/O time",
+  "file-io-events": "File I/O events",
+  "socket-io-time": "Socket I/O time",
+  "socket-io-events": "Socket I/O events",
 };
 /** Types first in the list, and the one shown unless another is asked for: CPU time's. */
 const FIRST = ["cpu", "cpu-time", "wall-time", "wall", "alloc_space", "alloc-space"];
 
 const keyOf = (t: ProfileType) => `${t.profile}:${t.type}`;
 
-/** A type's name: Go's mutex and block profiles share their types' (`contentions`, `delay`), told apart by their profile. */
+/** A type's name: Go's mutex and block profiles and a Java recording's locks share their types' (`contentions`, `delay`), told apart by their profile. */
 export function typeLabel(t: ProfileType): string {
   if (t.type === "contentions" || t.type === "delay") {
-    const of = t.profile.includes("mutex") ? "Mutex" : t.profile.includes("block") ? "Block" : t.profile;
+    const of = t.profile.includes("mutex") ? "Mutex" : t.profile.includes("block") ? "Block" : t.profile.includes("lock") ? "Lock" : t.profile;
     return `${of} ${t.type === "delay" ? "wait" : "contentions"}`;
   }
   return LABELS[t.type] ?? `${t.type} (${t.profile})`;
@@ -450,9 +454,12 @@ export function kindOf(name: string, file: string): Kind {
     if (first.includes(".")) return /\/pkg\/mod\/|\/vendor\//.test(file) ? "library" : "own";
     return "runtime";
   }
+  // A native frame (C, C++, the kernel's) of a Java recording, as kiln names it.
+  if (file === "[native]") return "runtime";
   if (/site-packages|dist-packages|node_modules|\/gems\/|\.m2\/|\/nuget\//.test(file)) return "library";
-  if (/\/lib\/python3|^<frozen|^node:|^internal\/|\/jdk\/|^java\.|^jdk\.|^System\.|\/usr\/lib\/ruby/.test(file || name)) return "runtime";
-  return file ? "own" : "other";
+  if (/\/lib\/python3|^<frozen|^node:|^internal\/|\/jdk\/|^java\.|^javax\.|^jdk\.|^sun\.|^com\.sun\.|^System\.|\/usr\/lib\/ruby/.test(file || name)) return "runtime";
+  // A Java frame (`package.Class.method`, no file): a recording says no more of where its class came from.
+  return file || /^[\w$]+(\.[\w$<>]+)+$/.test(name) ? "own" : "other";
 }
 
 /** Frames' hues by where their function comes from: kiln's three validated for any two to touch, and grey. */

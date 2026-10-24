@@ -5,7 +5,7 @@
 //! ([`std::hash::RandomState`]), so tag values from outside cannot be chosen to collide (hash
 //! flooding); they never leave the process, and nothing durable or replicated depends on a hash.
 
-use std::hash::{BuildHasher, RandomState};
+use std::hash::{BuildHasher, Hasher, RandomState};
 
 /// wyhash's primes (Wang Yi, wyhash final version 4).
 const P0: u64 = 0xa076_1d64_78bd_642f;
@@ -65,6 +65,65 @@ impl Keyed {
     }
 }
 
+/// [`Keyed`] as a [`BuildHasher`], for maps keyed by words (ids, pool keys, the like): a word
+/// written is one [`Keyed::word`], bytes [`Keyed::bytes`] folded in. Each map its own keys, from the
+/// operating system's randomness, as [`Keyed::new`]'s.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyedState(pub Keyed);
+
+/// [`KeyedState`]'s hasher.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyedHasher {
+    keyed: Keyed,
+    h: u64,
+}
+
+impl BuildHasher for KeyedState {
+    type Hasher = KeyedHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> KeyedHasher {
+        KeyedHasher { keyed: self.0, h: 0 }
+    }
+}
+
+impl Hasher for KeyedHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.h
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.h = self.keyed.word(self.h ^ self.keyed.bytes(bytes));
+    }
+
+    #[inline]
+    fn write_u8(&mut self, x: u8) {
+        self.write_u64(u64::from(x));
+    }
+
+    #[inline]
+    fn write_u16(&mut self, x: u16) {
+        self.write_u64(u64::from(x));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, x: u32) {
+        self.write_u64(u64::from(x));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, x: u64) {
+        self.h = self.keyed.word(self.h ^ x);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, x: usize) {
+        self.write_u64(x as u64);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +137,23 @@ mod tests {
         assert_ne!(a.bytes(b"host:web-1"), b.bytes(b"host:web-1"));
         assert_ne!(a.bytes(b""), a.bytes(b"\0"), "length is mixed in");
         assert_ne!(a.bytes(b"ab"), a.bytes(b"ba"));
+    }
+
+    /// A map on it: a word, a pair of words, bytes, each the same hash every time and another for
+    /// another key or another map's keys.
+    #[test]
+    fn as_a_map_s_hasher_equal_keys_hash_alike() {
+        let (a, b) = (KeyedState(Keyed::with_keys(1, 2)), KeyedState(Keyed::with_keys(3, 4)));
+        assert_eq!(a.hash_one(7u64), a.hash_one(7u64));
+        assert_ne!(a.hash_one(7u64), a.hash_one(8u64));
+        assert_ne!(a.hash_one(7u64), b.hash_one(7u64));
+        assert_ne!(a.hash_one((1u64, 2u64)), a.hash_one((2u64, 1u64)));
+        assert_eq!(a.hash_one("cpu.pprof"), a.hash_one("cpu.pprof"));
+        let mut m: hashbrown::HashMap<u64, u64, KeyedState> = hashbrown::HashMap::with_hasher(KeyedState::default());
+        for i in 0..10_000u64 {
+            m.insert(i * 4096, i);
+        }
+        assert!((0..10_000u64).all(|i| m.get(&(i * 4096)) == Some(&i)));
     }
 
     #[test]

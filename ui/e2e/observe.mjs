@@ -2710,6 +2710,51 @@ const scenarios = {
     await until("every upload again", async () => !page.url().includes("id="));
   },
 
+  /** Java's profiles (§8.11): a recording as dd-trace-java uploads it (`main.jfr`, zstd'd: the JDK's
+   * chunk and its profiler's), read into profiles where it is taken; its CPU's hottest function its
+   * own recursive one, shown as its own code; its lock waits and its exceptions among its types. */
+  async "a Java service's recording is read into its CPU, its lock waits and its exceptions"() {
+    const ingest = process.env.KILN_INGEST_TOKEN;
+    if (!ingest) return "skipped: no KILN_INGEST_TOKEN";
+    const service = `e2e-java-${run}`;
+    // kiln-obs's fixture: where the suite mounts it (JFR_DIR), else beside this file in the repository.
+    const jfrDir = process.env.JFR_DIR ? new URL(`file://${process.env.JFR_DIR.replace(/\/?$/, "/")}`) : new URL("../../crates/kiln-obs/src/fixtures/jfr/", import.meta.url);
+    const recording = fs.readFileSync(new URL("dd-trace-java-1.67.1-burn.jfr.zst", jfrDir));
+    const start = new Date(Date.now() - 60_000);
+    const form = new FormData();
+    // As dd-trace-java sends it: the part `main`, its file `main.jfr`, named so in the event.
+    form.append("main", new Blob([recording]), "main.jfr");
+    const event = {
+      start: start.toISOString(),
+      end: new Date(start.getTime() + 10_000).toISOString(),
+      attachments: ["main.jfr"],
+      tags_profiler: `service:${service},env:e2e,version:1,language:jvm,runtime:jvm`,
+      family: "java",
+      version: "4",
+    };
+    form.append("event", new Blob([JSON.stringify(event)], { type: "application/json" }), "event.json");
+    const r = await fetch(`${BASE}/api/v2/profile`, { method: "POST", headers: { "DD-API-KEY": ingest, "X-Datadog-Additional-Tags": `host:e2e-java-host-${run}` }, body: form });
+    expect(r.status === 202, `a recording taken: ${r.status} ${await r.text()}`);
+    await until("it listed", async () => (await api("GET", `/api/observe/v1/profiles?query=${encodeURIComponent(`service:${service}`)}`)).body?.matched === 1, 30_000);
+    await page.goto(`${BASE}/observe/profiles?q=${encodeURIComponent(`service:${service}`)}`);
+    const graph = page.getByRole("img", { name: /^A flame graph of/ });
+    await graph.waitFor();
+    await page.getByText(/^CPU time: [\d.]+ m?s in 1 upload/).waitFor();
+    // The hottest function by self: its recursive one, its own code (a Java frame has no file: kiln names it by its class).
+    const first = page.locator("table.data-table tbody tr").first();
+    expect(((await first.locator("button").textContent()) ?? "").includes("Burn.fib"), "Burn.fib the hottest by self");
+    await fitsAcross("a Java service's flame graph");
+    // Its lock waits: the threads taking turns on its monitor.
+    const type = page.getByLabel("Type", { exact: true });
+    const lockWait = (await type.locator("option").allTextContents()).find((o) => o.startsWith("Lock wait"));
+    expect(lockWait !== undefined, "its lock waits among its types");
+    await type.selectOption({ label: lockWait });
+    await page.getByText(/^Lock wait: [\d.]+ m?s in 1 upload/).waitFor();
+    expect(((await first.locator("button").textContent()) ?? "").includes("Burn.contend"), "its threads' waits by self");
+    const exceptions = (await type.locator("option").allTextContents()).find((o) => o.startsWith("Exceptions"));
+    expect(exceptions !== undefined, "its exceptions among its types");
+  },
+
   async "a container is listed against its limits, read from its page and its host's, and one stopped is told apart"() {
     const ingest = process.env.KILN_INGEST_TOKEN;
     if (!ingest) return "skipped: no KILN_INGEST_TOKEN";

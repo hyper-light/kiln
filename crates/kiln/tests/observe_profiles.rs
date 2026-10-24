@@ -11,8 +11,12 @@
 //!   flame graph's hottest path its own hashing loop, its allocations' its own allocating loop.
 //! - Python's (ddtrace 4.16: libdatadog's exporter) through Datadog's Agent (7.84) proxying to the
 //!   server's intake: the same of its loops, the Agent's host on each upload.
+//! - Java's (dd-trace-java 1.67.1: a JFR recording of the JDK's events and its own profiler's) to a
+//!   runner, read into profiles there: its CPU most of all its recursive function, its allocations
+//!   its own loop's, its lock waits its threads' on their monitor, its exceptions where it throws
+//!   them, its wall time.
 //!
-//! `cargo test -p kiln --test observe_profiles -- --ignored --nocapture` (the last two need Docker).
+//! `cargo test -p kiln --test observe_profiles -- --ignored --nocapture` (the last three need Docker).
 #![cfg(unix)]
 
 mod common;
@@ -322,7 +326,11 @@ fn a_go_service_s_own_profiler_through_a_runner_shows_its_own_hot_functions() ->
     // dd-trace-go says its own host (its machine's name), which an Agent's `host` does not
     // replace; its runtime's tags as it says them.
     anyhow::ensure!(
-        t.iter().any(|x| x.starts_with("host:")) && t.contains(&"env:e2e".to_owned()) && t.contains(&"version:1.0.0".to_owned()) && t.contains(&"profiler_version:v2.11.2".to_owned()) && at(&first, &["family"]) == "go",
+        t.iter().any(|x| x.starts_with("host:"))
+            && t.contains(&"env:e2e".to_owned())
+            && t.contains(&"version:1.0.0".to_owned())
+            && t.contains(&"profiler_version:v2.11.2".to_owned())
+            && at(&first, &["family"]) == "go",
         "its tags: {t:?}"
     );
     let g = Graph::ask(&f, "service:kiln-e2e-go", t0, "cpu.pprof", "cpu")?;
@@ -455,5 +463,146 @@ fn a_python_service_s_profiler_through_datadog_s_agent_shows_its_own_hot_functio
     let burn = g.total_of("burn");
     anyhow::ensure!(g.total() > 0 && burn * 2 >= g.total(), "its hashing loop the most of its CPU: {burn} of {}\n{:?}", g.total(), g.top().get(..5));
     eprintln!("  profiles   ddtrace 4.16's profiler through Datadog's Agent 7.84: {} uploads ({}), burn {:.0}% of CPU", u.len(), at(&cpu, &["profile"]), 100.0 * burn as f64 / g.total() as f64);
+    Ok(())
+}
+
+const JAVA_IMAGE: &str = "kiln-ddprof-java:e2e";
+/// dd-trace-java 1.67.1 as Maven Central has it, checked by its SHA-256 (its SHA-1 as Maven Central
+/// lists it, 4bfe4418814513dfd3f00bb60d6f4614257023eb, checked where this was taken).
+const JAVA_DOCKERFILE: &str = "FROM eclipse-temurin:21-jdk
+ADD --chmod=644 --checksum=sha256:beb620dc2e4783fd328a1ae23f8fd4fcb757ac23e5bb05efb04c6aa3e51a5e43 https://repo1.maven.org/maven2/com/datadoghq/dd-java-agent/1.67.1/dd-java-agent-1.67.1.jar /dd-java-agent.jar
+COPY Burn.java /app/
+RUN javac -d /app /app/Burn.java
+";
+/// A small app for a profiler to watch: its CPU in a recursive Fibonacci, its allocations and
+/// exceptions in its loop, two threads taking turns on a monitor (its lock waits), and their
+/// sleeps (wall time).
+const JAVA_APP: &str = r#"public class Burn {
+  static volatile long sink;
+  static final Object LOCK = new Object();
+
+  static long fib(int n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+
+  static void contend() {
+    while (true) {
+      synchronized (LOCK) {
+        try { Thread.sleep(20); } catch (InterruptedException e) { return; }
+      }
+    }
+  }
+
+  public static void main(String[] a) throws Exception {
+    for (int i = 0; i < 2; i++) {
+      Thread t = new Thread(Burn::contend, "contend-" + i);
+      t.setDaemon(true);
+      t.start();
+    }
+    java.util.List<byte[]> keep = new java.util.ArrayList<>();
+    long end = System.currentTimeMillis() + Long.parseLong(System.getenv("RUN_MS"));
+    for (long i = 0; System.currentTimeMillis() < end; i++) {
+      sink += fib(24);
+      if ((i & 15) == 0) {
+        keep.add(new byte[32 * 1024]);
+        if (keep.size() > 256) keep.clear();
+        try { throw new IllegalStateException("x"); } catch (IllegalStateException e) { sink++; }
+      }
+    }
+  }
+}
+"#;
+
+#[test]
+#[ignore = "needs Docker: runs a Java app under dd-trace-java's profiler, and a kiln server and runner as processes"]
+fn a_java_service_s_recordings_through_a_runner_show_its_own_hot_functions() -> anyhow::Result<()> {
+    let ctx = tempfile::tempdir()?;
+    std::fs::write(ctx.path().join("Burn.java"), JAVA_APP)?;
+    std::fs::write(ctx.path().join("Dockerfile"), JAVA_DOCKERFILE)?;
+    docker(&["build", "-q", "-t", JAVA_IMAGE, &ctx.path().display().to_string()])?;
+    let t0 = now_ms() - 60_000;
+    let mut f = Fleet::new()?;
+    let apm = free_port()?;
+    f.start_runner_with("java-host", &[("KILN_DD_TRACE_ADDR", &format!("127.0.0.1:{apm}"))])?;
+    until(
+        "the runner connected",
+        // A runner whose QUIC dial goes unanswered takes the HTTP tunnel after 20 s, and a loaded
+        // machine takes longer: connecting is not what this checks.
+        Duration::from_secs(120),
+        || {
+            Ok(common::raw(apm, "GET", "/info", "", b"").is_ok_and(|(c, _)| c == 200)
+                && at(&f.call("GET", "/api/observe/v1/status", None)?, &["machines"]).as_array().is_some_and(|m| m.iter().any(|m| at(m, &["up"]) == true)))
+        },
+        &|| f.logs(),
+    )?;
+    let app = Container(format!("kiln-ddprof-java-{}", std::process::id()));
+    docker(&[
+        "run",
+        "-d",
+        "--name",
+        &app.0,
+        "--network",
+        "host",
+        "-e",
+        "DD_AGENT_HOST=127.0.0.1",
+        "-e",
+        &format!("DD_TRACE_AGENT_PORT={apm}"),
+        "-e",
+        "DD_SERVICE=kiln-e2e-java",
+        "-e",
+        "DD_ENV=e2e",
+        "-e",
+        "DD_VERSION=3.0.0",
+        "-e",
+        "DD_PROFILING_ENABLED=true",
+        "-e",
+        "DD_PROFILING_START_DELAY=1",
+        "-e",
+        "DD_PROFILING_UPLOAD_PERIOD=10",
+        // Its wall-clock samples of every thread, not of those in a trace alone (its default: the
+        // app has no trace).
+        "-e",
+        "DD_PROFILING_DDPROF_WALL_CONTEXT_FILTER=false",
+        "-e",
+        "DD_INSTRUMENTATION_TELEMETRY_ENABLED=false",
+        "-e",
+        "DD_REMOTE_CONFIGURATION_ENABLED=false",
+        "-e",
+        "RUN_MS=40000",
+        JAVA_IMAGE,
+        "java",
+        "-javaagent:/dd-java-agent.jar",
+        "-cp",
+        "/app",
+        "Burn",
+    ])?;
+    let logs = || format!("--- app\n{}\n{}", app.logs(), f.logs());
+    until("two uploads of the service", Duration::from_secs(150), || Ok(list(&f, "service:kiln-e2e-java", t0)?.len() >= 2), &logs)?;
+    let u = list(&f, "service:kiln-e2e-java", t0)?;
+    let first = u.first().cloned().unwrap_or(Value::Null);
+    let t = tags(&first);
+    anyhow::ensure!(t.contains(&"env:e2e".to_owned()) && t.contains(&"version:3.0.0".to_owned()) && at(&first, &["family"]) == "java", "its tags: {t:?}");
+    // Its recordings' profiles, whatever else the tracer's settings add.
+    let types = f.call("GET", &format!("/api/observe/v1/profiles/types?from={t0}&to={}&query=service:kiln-e2e-java", now_ms() + 120_000), None)?;
+    let has = |profile: &str, kind: &str| at(&types, &["types"]).as_array().into_iter().flatten().any(|t| at(t, &["profile"]) == profile && at(t, &["type"]) == kind);
+    for (profile, kind) in [("cpu.pprof", "cpu"), ("wall.pprof", "wall"), ("alloc.pprof", "alloc_space"), ("lock.pprof", "delay"), ("exceptions.pprof", "exception-samples")] {
+        anyhow::ensure!(has(profile, kind), "{profile}'s {kind}: {types}");
+    }
+    let cpu = Graph::ask(&f, "service:kiln-e2e-java", t0, "cpu.pprof", "cpu")?;
+    let fib = cpu.total_of("Burn.fib");
+    anyhow::ensure!(cpu.total() > 0 && fib * 2 >= cpu.total(), "its recursive function the most of its CPU: {fib} of {}\n{:?}", cpu.total(), cpu.top().get(..5));
+    let alloc = Graph::ask(&f, "service:kiln-e2e-java", t0, "alloc.pprof", "alloc_space")?;
+    let main = alloc.total_of("Burn.main");
+    anyhow::ensure!(alloc.total() > 0 && main * 2 >= alloc.total(), "its loop the most of its allocations: {main} of {}\n{:?}", alloc.total(), alloc.top().get(..5));
+    let lock = Graph::ask(&f, "service:kiln-e2e-java", t0, "lock.pprof", "delay")?;
+    let waits = lock.total_of("Burn.contend");
+    anyhow::ensure!(waits * 2 >= lock.total() && waits > 0, "its threads waiting on its monitor: {waits} of {}\n{:?}", lock.total(), lock.top().get(..5));
+    let thrown = Graph::ask(&f, "service:kiln-e2e-java", t0, "exceptions.pprof", "exception-samples")?;
+    anyhow::ensure!(thrown.total_of("Burn.main") > 0, "its exceptions where it throws them: {:?}", thrown.top().get(..5));
+    eprintln!(
+        "  profiles   dd-trace-java 1.67.1's recordings through a runner: {} uploads; Burn.fib {:.0}% of CPU, Burn.main {:.0}% of allocations, {:.0} ms of lock waits",
+        u.len(),
+        100.0 * fib as f64 / cpu.total() as f64,
+        100.0 * main as f64 / alloc.total() as f64,
+        waits as f64 / 1e6
+    );
     Ok(())
 }

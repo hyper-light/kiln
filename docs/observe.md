@@ -45,7 +45,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-31 | Log indexes (§8.10): Datadog's indexes, exclusion filters (a rate, by an attribute's values or a trace), daily quotas (a warning, the quota reached, each an event; past it, records not kept for search until the day turns) and retention a part of the store each (§4.6: a file a part, each part's cutoff its own, replicated); routed where records are taken, every node told; what is not kept still seen live, archived and counted by metrics from logs; Datadog's estimated usage; the API, OpenAPI, the Indexes page and the explorer's pick of an index; checked live (§13) and measured (§12.35) | done |
 | O-32 | OpenTelemetry's containers (§10.11): Docker's, the kubelet's and the cluster's receivers' container metrics and the semantic conventions', read in their own names and units (cumulative time a rate, a working set for what Docker calls usage, limits in cores and bytes, devices and modes summed), a container kiln's check also sees one container, the kubelet's series joined by pod and name; each chart of its page drawn by the source that reported it; checked live against a real Collector and in browsers (§13), measured against O-30 (§12.34) | done |
 | O-33 | Continuous profiles (§8.11), Datadog's Continuous Profiler: what tracers' profilers upload (pprof in `multipart/form-data`, gzip'd, zstd'd or in LZ4's frames) taken where they send it (a runner's tracer port, sent on over the observe lane; the server's intake), kept by the server (segments of blobs and headers, an index of 40 bytes an upload), searched by tags, summed into flame graphs over a time (a snapshot's type averaged), compared path by path; its page (canvas flame graph, functions by self or by change, uploads); checked against Go's own profiles and live against dd-trace-go and ddtrace through a runner and Datadog's Agent; measured (§12.36) | done |
-| O-34 | Java's profiles: JFR recordings (dd-trace-java's `main.jfr`: the JDK's chunks and ddprof's) read and turned into the same profiles, its CPU, wall time, allocations, live heap, locks and exceptions | next |
+| O-34 | Java's profiles (§8.11): JFR recordings (dd-trace-java's `main.jfr`: the JDK's chunks and ddprof's, zstd'd, gzip'd, LZ4'd or not) read where they are taken into pprof profiles in Go's names: CPU (ddprof's or the JDK's), wall time, allocations, the live heap, lock waits, exceptions, file and socket I/O; a runner sends the profiles on, not the recording; frames named as Datadog's pages name them; checked against a reader written apart on dd-trace-java's own recordings (to the nanosecond), live against dd-trace-java 1.67.1 through a runner and in a browser; measured and profiled, rewritten (§12.37) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -1488,15 +1488,50 @@ specs: dd-trace-go's upload (`profiler/upload.go`, `profile.go`), google/pprof's
   of each block and of the content); one upload is what Datadog calls a profile, its types collected
   about the same time. Each is read whole before it is taken (its event, its times, every profile
   inflated within 64 MiB and read as pprof, its types' values summed): a tracer hears what is wrong
-  with it (400). An upload holding no pprof (Java's JFR recordings) is taken and not kept, counted.
+  with it (400). Java's recording (JFR) is read into profiles where it is taken (below). An upload
+  holding nothing kiln reads (an idle JVM's recording, nothing sampled) is taken and not kept,
+  counted.
   Checked against what the tracers send, captured on the loopback: dd-trace-go v2.11.2's (gzip'd
   profiles, `metrics.json` beside) and ddtrace 4.16's for Python (libdatadog 1.0.0's exporter: a
   zstd'd `profile.pprof` of 19 sample types, a zstd'd `code-provenance.json` beside it, and
   `endpoint_counts` sent as `null`, which kiln first refused, so no Python profile ever came in:
   every optional field of `event.json` is read as none when it is `null` now). Any attachment not
-  plainly another format (`.json`, `.jfr`, a trace) is read as pprof whatever its name; one named
-  `.pprof` that does not read refuses the upload. A tracer's container is its
-  `Datadog-Container-ID`, or libdatadog's `Datadog-Entity-ID` of a container id (`ci-…`).
+  plainly another format (`.json`, `.txt`, a trace) is read, as a recording where its name says
+  `.jfr` or its bytes begin as one (`FLR\0`), else as pprof whatever its name; one named `.pprof`
+  or `.jfr` that does not read refuses the upload. An attachment is the part of its name, else the
+  part whose file is of its name (dd-trace-java's: the part `main`, its file `main.jfr`). A tracer's
+  container is its `Datadog-Container-ID`, or libdatadog's `Datadog-Entity-ID` of a container id
+  (`ci-…`).
+- **Java's recordings** (`kiln_obs::profile::jfr`): dd-trace-java uploads a minute's JFR recording
+  (`main.jfr`, zstd'd unless set otherwise: gzip, LZ4's frames or none read alike, inflated within
+  128 MiB), the JDK's chunks (its execution samples, allocation samples, monitor waits, file and
+  socket I/O; and the tracer's own events, its exceptions sampled) and then its own profiler's
+  (ddprof's: CPU and wall time sampled, allocations and the live heap by Poisson sampling), chunks
+  concatenated. It
+  is read where it is taken, into pprof profiles in Go's names, so everything that reads pprof
+  reads them (the store, the queries, `go tool pprof`): `cpu.pprof` (`samples`, `cpu` ns),
+  `wall.pprof`, `alloc.pprof` (`alloc_objects`, `alloc_space`), `live.pprof` (`inuse_objects`,
+  `inuse_space`, a snapshot), `lock.pprof` (`contentions`, `delay`), `exceptions.pprof`,
+  `file-io.pprof`, `socket-io.pprof`; each kind from ddprof where both wrote it (the JDK's
+  execution samples are of Java threads in Java code alone). The recording itself is not kept (a
+  minute's is MiBs; its profiles a few hundred KiB), and a runner sends its profiles on, not it:
+  read once, at the edge. The format as the JDK, JMC, async-profiler and ddprof write and read it
+  (no spec beside them): each chunk read alone (its 68-byte header; its metadata, the classes its
+  events and pools are made of, bound by name, as ids mean other things in another chunk; its
+  constant pools, a chain of checkpoints from the newest back; its events, each skipped by its size
+  where it is not one kiln reads), JFR's varints (seven bits a byte for eight bytes, a ninth of
+  eight; padded forms the norm), strings in each of its six encodings; every count, length and
+  offset checked against what is left before anything is kept (chunks, strings, depth of the
+  metadata's tree, pool entries, frames all bounded), a chunk that does not read dropped and the
+  others kept. What an event weighs is its writer's, which the format does not say: ddprof's CPU
+  and wall samples a weight of sampling intervals (the interval from the chunk's settings, else its
+  configuration event, else 10 ms and 50 ms, its defaults), its allocation and live-heap samples a
+  weight of objects (Poisson sampling's: an estimate of the objects each sample stands for) and
+  bytes their size times it; the JDK's execution samples one period each, its allocation samples
+  their weight in bytes, its monitor waits and I/O their duration. Frames are named as Datadog's
+  profile pages name them (`package.Class.method`; a lambda's and a generated class's numbers left
+  out, or each class made at run time would be a function of its own), a native frame by its
+  symbol, its file `[native]`.
 - **Sent on** by a runner as the Agent does: the tags an Agent adds (`host:` this runner,
   `container_id:` the tracer's `Datadog-Container-ID`) beside it, over the observe lane to the
   server (`wire::Msg::Profile`, in the lane's 512 KiB parts, 16 MiB at the most), only while the
@@ -1568,10 +1603,7 @@ specs: dd-trace-go's upload (`profiler/upload.go`, `profile.go`), google/pprof's
   (parent, function) with kiln-obs's keyed hash (the node itself the key: four bytes a node); a
   graph bounded (a million nodes: a stack past it summed into its deepest node's own, the totals
   whole); graphs summed apart merged path by path.
-- Status: done (O-33). Checked against Go's own profiles and a ddtrace capture in unit tests; live
-  against dd-trace-go v2.11.2 through a runner and ddtrace 4.16 through Datadog's Agent 7.84 (§13); in
-  a browser; measured (§12.36). Java's profiles are JFR recordings, not pprof: taken and not kept yet
-  (the next milestone reads them).
+- Status: done (O-33, O-34). Java's recordings checked against dd-trace-java 1.67.1's own (its debug dumps, two kept as fixtures: the JDK's chunk and ddprof's, and the JDK's alone) and a reader written apart (`kiln-obs/src/fixtures/jfr/check`: jfrdump.py's reader, jfrsum.py's sums; kiln's the same to the nanosecond), live through a runner and in a browser (§13); measured (§12.37).
 
 ## 9. Monitors
 
@@ -4522,6 +4554,47 @@ Left for the next pass: a query reads an upload with 57 allocations (its header'
 state, `pprof::read`'s lists grown as it reads), and merging eight threads' graphs is serial (58 ms for two graphs of
 750,000 nodes).
 
+### 12.37 Java's recordings
+
+`cargo bench -p kiln-obs --bench jfr` (`KOBS_JFR` naming dd-trace-java's own recordings, its debug dumps of
+`main.jfr` uncompressed) and the Java lines of `cargo bench -p kiln --bench profiles` (2026-10-23, adacachy, release;
+the least of nine runs and their median, allocations of one; the machine shared, its load 30 to 70). A minute as
+ddprof records one, synthetic, its shape a large service's: methods in classes of eight packages, stacks 20 to 80
+deep sharing their callers as a framework's do, CPU, wall and allocation samples on them (half, a third, a sixth),
+most on a few. The reader as first written (std's maps on SipHash; each metadata string, field and class name, each
+symbol and frame name owned; each frame's name hashed and compared again for each kind) and as rewritten (§8.11: in
+place, classes by their place, a frame's function once a chunk, kiln-obs's keyed hash), the same bench, the same
+output to the byte:
+
+| A recording | Before | Rewritten | Its second pass |
+|---|---:|---:|---:|
+| A quiet service's minute (3,000 methods, 2,000 stacks, 10,000 events; 940 KiB) | 63.6 ms, 34,491 allocations | 10.0 ms, 543 | 7.2 ms (133 MB/s), 511, 2 page faults |
+| A busy service's (12,000 methods, 20,000 stacks, 100,000 events; 9.0 MiB) | 695 ms (13 MB/s), 157,707 | 104 ms, 651 | 57.5 ms (161 MB/s), 605, 886 |
+| A very busy one's (24,000 methods, 60,000 stacks, 400,000 events; 30 MiB) | 1,541 ms, 361,897 | 392 ms, 698 | 215 ms (148 MB/s), 643, 2,854 |
+| dd-trace-java's, `Burn.java`'s last upload (the JDK's chunk and ddprof's; 390 KiB) | 3.79 ms, 30,612 | 1.52 ms, 661 | 1.15 ms (347 MB/s), 682, 0 |
+| Its first upload (812 KiB) | 8.30 ms, 41,590 | 2.81 ms, 721 | 2.09 ms (399 MB/s), 728, 0 |
+| The JDK's chunk alone (389 KiB) | 3.82 ms, 29,605 | 1.33 ms, 429 | 0.93 ms (428 MB/s), 446, 0 |
+
+Profiled first (`perf record -g`, frame pointers): a quarter of the time was SipHash, three tenths libc's `memcmp`
+and `memcpy` (each frame's name compared and copied as a map's key, each stack's locations cloned as one), a tenth
+the frames' names interned again for each kind. Profiled again, rewritten: each kind still looked each frame up
+twice (its location by (method, line), its stack by its locations), the table of stacks grew by rehashing (7%), a
+field read went through its class's way when most are one varint. The second pass: each stack's locations of the
+chunk made once for every kind (each kind's own found by place, no lookup), the stacks' table made the chunk's
+size at once, a field of one varint read as one. Left: page faults where a recording is large (each call's buffers
+new, 886 for a busy minute: a reader keeping its buffers between uploads would leave them; a dd-trace-java upload of
+some hundreds of KiB has none). Where a recording goes (the Java upload `kiln-obs`'s fixture is, as
+dd-trace-java sends it):
+
+| A Java upload (110 KiB sent: its recording zstd'd) | Before | After |
+|---|---:|---:|
+| Read at the runner (inflated, read into six profiles, 63 KiB of pprof) | 4.75 ms, 30,716 allocations | 2.37 ms, 786 (its recording read in 1.15 ms of it, above; the rest its inflating) |
+| Repacked to send on (64 KiB: its profiles, not its recording) | 0.002 ms, 54 | the same |
+| Read again at the server (pprof, as any upload) | 0.13 ms, 396 | the same |
+
+A runner reads a recording once and the server what it became: the lane carries 64 KiB of an upload that came as
+110, and the server reads it in 0.16 ms, not 2.4.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -5335,6 +5408,24 @@ chosen), its profiles to download; nothing wider than a phone. 2026-10-23: passe
 (3.2–8.0 s each). Their first run found what no fixture of kiln's own had: libdatadog's `"endpoint_counts": null`
 refused every Python upload (each read as none now, a capture of a real one kept as a fixture), and dd-trace-go's
 own `host` tag (its machine's name), which the runner's does not replace.
+
+Java's (O-34), the same test file: a Java app (`Burn.java`: a recursive Fibonacci its main thread's
+CPU; an allocation and an exception every 16th turn of its loop; two threads taking turns on a
+monitor, each holding it 20 ms) under dd-trace-java 1.67.1's profiler (Maven Central's jar checked
+by its SHA-256; Temurin 21 in Docker; uploads every 10 s, wall-clock samples of every thread, not
+of those in a trace alone, its default), uploading to a kiln runner. Its recordings (`main.jfr`, the
+JDK's chunk and ddprof's, zstd'd) read into profiles at the runner and sent on as them, two uploads
+kept with its tags (`env`, `version`, family `java`); its types listed (`cpu.pprof`'s `cpu`,
+`wall.pprof`, `alloc.pprof`'s `alloc_space`, `lock.pprof`'s `delay`, `exceptions.pprof`'s
+`exception-samples`); its CPU its recursive function's for half of it at the least, its
+allocations its loop's, its lock waits its two threads' (`Burn.contend`), its exceptions where its
+loop throws them. 2026-10-23: passes (77 s; adacachy): `Burn.fib` 94% of its CPU, `Burn.main` 93% of
+its allocations, 19.4 s of lock waits. Its first recordings, taken to make the fixtures, showed what
+the app was not: its main thread waiting on the monitor between turns spent 1% of a core, its CPU
+profile the JIT compiler's and the tracer's own start (16 samples in 10 s); the monitor went to two
+threads of their own. In a browser: a recording sent to the server's intake as dd-trace-java sends
+it (the part `main`, its file `main.jfr`); its flame graph's summary, the hottest function by self
+`Burn.fib`; its lock waits chosen, `Burn.contend` the hottest; its exceptions among its types.
 
 **DORA metrics** (`crates/kiln/tests/observe_dora.rs`): a kiln server as a process of its own,
 mirroring a git repository (`[[repos]]`, a `file://` URL) made with known author times: a commit,
