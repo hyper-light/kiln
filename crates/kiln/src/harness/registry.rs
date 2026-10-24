@@ -1386,10 +1386,13 @@ impl Registry {
     }
 
     fn forget_holders(&self, ids: &[String]) {
-        let changed = {
+        let mut changed = false;
+        {
             let mut g = self.holders.lock();
-            ids.iter().fold(false, |c, id| g.remove(id).is_some() || c)
-        };
+            for id in ids {
+                changed |= g.remove(id).is_some();
+            }
+        }
         if changed {
             self.save_holders();
         }

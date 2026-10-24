@@ -246,7 +246,7 @@ fn pids_of_instance(procs: &[(u32, Vec<String>)], state_dir: &Path, instance: &s
 /// system one: the innermost `*.service` of its path, never the user manager's own.
 fn unit_in_cgroup(cgroup: &str) -> Option<(String, bool)> {
     let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
-    let unit = path.split('/').filter(|c| c.ends_with(".service") && !c.starts_with("user@")).last()?;
+    let unit = path.split('/').rfind(|c| c.ends_with(".service") && !c.starts_with("user@"))?;
     Some((unit.trim_end_matches(".service").to_owned(), path.starts_with("/system.slice/")))
 }
 
