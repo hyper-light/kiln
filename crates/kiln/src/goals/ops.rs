@@ -74,12 +74,16 @@ fn until_of(v: &Value, now: i64) -> Result<Option<i64>, Fail> {
 }
 
 async fn get(cx: Cx, v: Value) -> Out {
-    json_of(&super::get(&cx.hub, &agent_of(&v)?).await.map_err(fail)?)
+    let agent = agent_of(&v)?;
+    if cx.hub.harness.info(&agent).is_some() {
+        crate::harness::lineage::may_see(&cx.hub, &cx.caller, &agent).await?;
+    }
+    json_of(&super::get(&cx.hub, &agent).await.map_err(fail)?)
 }
 
 async fn add(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let goals: Vec<String> = v.get("goals").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
     if goals.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "`goals` is a list of at least one goal".into()));
@@ -92,7 +96,7 @@ async fn add(cx: Cx, v: Value) -> Out {
 
 async fn set(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let given: Vec<Given> = serde_json::from_value(v.get("goals").cloned().unwrap_or_else(|| json!([]))).map_err(|e| (StatusCode::BAD_REQUEST, format!("`goals`: {e}")))?;
     let s = super::set(&cx.hub, &agent, given).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.set".into(), agent).await;
@@ -101,7 +105,7 @@ async fn set(cx: Cx, v: Value) -> Out {
 
 async fn control(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let action: Action =
         serde_json::from_value(v.get("action").cloned().unwrap_or(Value::Null)).map_err(|_| (StatusCode::BAD_REQUEST, "`action` is start (or resume), pause, skip, done, clear or restore".into()))?;
     let until = until_of(&v, cx.hub.clock.unix_ms())?;
@@ -116,7 +120,7 @@ async fn control(cx: Cx, v: Value) -> Out {
 
 async fn done(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let by = By::of(&cx.hub, &cx.caller, &agent);
     let s = super::done(&cx.hub, &agent, opt(&v, "id").as_deref(), opt(&v, "evidence").as_deref(), &by).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.done".into(), format!("{agent}: {}", opt(&v, "id").unwrap_or_else(|| "the goal under way".into()))).await;
@@ -125,7 +129,7 @@ async fn done(cx: Cx, v: Value) -> Out {
 
 async fn update(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let id = opt(&v, "id").ok_or_else(|| (StatusCode::BAD_REQUEST, "`id` is the goal's id (goals_get lists them)".to_owned()))?;
     let change: Change = serde_json::from_value(v.clone()).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let by = By::of(&cx.hub, &cx.caller, &agent);
@@ -142,7 +146,7 @@ const DISPATCH_AGAIN_MS: i64 = 30 * 60_000;
 
 async fn plan(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     // A person's Make a plan (or another agent's): a goal the agent isn't on yet is planned now, by
     // a subagent of its own, beside what it's doing.
     let asked_by_another = cx.caller.agent.as_deref() != Some(agent.as_str());
@@ -192,7 +196,7 @@ fn dispatch_words(p: &super::Planned) -> String {
 
 async fn settings(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let plan_big = v.get("plan_big").and_then(Value::as_bool).ok_or_else(|| (StatusCode::BAD_REQUEST, "`plan_big` is true or false".to_owned()))?;
     let s = super::settings(&cx.hub, &agent, plan_big).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.settings".into(), format!("{agent}: plan big goals first {}", if plan_big { "on" } else { "off" })).await;
@@ -201,7 +205,7 @@ async fn settings(cx: Cx, v: Value) -> Out {
 
 async fn split(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let parts: Vec<String> = v.get("goals").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
     let s = super::split(&cx.hub, &agent, opt(&v, "id").as_deref(), parts).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.split".into(), format!("{agent}: {}", opt(&v, "id").unwrap_or_else(|| "the goal under way".into()))).await;
@@ -409,7 +413,7 @@ mod tests {
             hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
             let folder = tempfile::tempdir()?;
             let cwd = folder.path().to_string_lossy().into_owned();
-            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None };
+            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = |name: &str, kind: &str| Ask { kind: kind.into(), on: Some("local".into()), cwd: Some(cwd.clone()), mode: Some(if kind == "claude" { "default" } else { "untrusted" }.into()), name: Some(name.into()), count: Some(1), ..Ask::default() };
             let one = |v: Vec<crate::harness::session::Info>| v.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent started"));
             let a = one(start(&hub, &person, ask("A", "claude")).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?)?;

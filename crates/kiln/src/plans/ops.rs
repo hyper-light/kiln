@@ -153,7 +153,7 @@ async fn ready(cx: Cx, v: Value) -> Out {
     let p = super::get(&cx.hub, &id).await.map_err(fail)?;
     let goal = p.source.as_ref().and_then(|s| s.goal.clone());
     if let Some(g) = &goal {
-        crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &g.agent)?;
+        crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &g.agent).await?;
     }
     let then = v.get("then").and_then(Value::as_str).unwrap_or("goals");
     if !matches!(then, "goals" | "agents" | "review") {
@@ -255,7 +255,7 @@ async fn run(cx: Cx, v: Value) -> Out {
         for a in named.collect::<Vec<_>>() {
             let to = if matches!(a, "main" | "self" | "me") { cfg.main.clone() } else { Some(a.to_owned()) };
             if let Some(to) = to {
-                crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &to)?;
+                crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &to).await?;
             }
         }
         // An agent's steps run in its own harness unless it says which (and, being its children,
@@ -273,7 +273,7 @@ async fn run(cx: Cx, v: Value) -> Out {
         // Running it on an agent that runs is steering that agent: an agent steers only itself and
         // the agents it started.
         (Some(s), _) => {
-            crate::harness::lineage::may_steer(&cx.hub, &cx.caller, s)?;
+            crate::harness::lineage::may_steer(&cx.hub, &cx.caller, s).await?;
             Target::Session(s.to_owned())
         }
         (None, Some(n)) => {

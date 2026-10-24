@@ -234,16 +234,135 @@ pub async fn depth(hub: &Hub, id: &str) -> u32 {
     n
 }
 
-/// Whether agent `id` descends from agent `ancestor` (a child of it, or of one of its children…).
-/// Whether `caller` may steer agent `id`: send it messages, plans or goals, change or clear its
-/// goals, interrupt or end it. A person may steer any agent they reach; an agent only itself and
-/// the agents it started (and theirs).
-pub fn may_steer(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<(), Refused> {
-    let Some(me) = caller.agent.as_deref() else { return Ok(()) };
-    if me == id || descends(&hub.harness.list(), id, me) {
+/// How far a caller reaches one agent session (docs/agents.md, "Whose agents").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Access {
+    /// Not at all: kiln answers as if it ran no such agent.
+    None,
+    /// It may list it, read it and watch it (an agent that works for the same person).
+    See,
+    /// It may also send to it, steer it, change, interrupt or end it.
+    Act,
+}
+
+/// Whom a person calling acts as, in the form a session's opener is kept in (`owner`,
+/// `user:<id>`): the owner's tokens, narrowed or not, are the owner's. `None` for a job or a peer.
+pub fn person_of(caller: &crate::authz::Caller) -> Option<String> {
+    use crate::authz::gate::Kind;
+    match caller.kind {
+        Kind::Job | Kind::Peer => None,
+        Kind::Owner => Some("owner".to_owned()),
+        _ => Some(caller.user.as_deref().map_or_else(|| "owner".to_owned(), |u| format!("user:{u}"))),
+    }
+}
+
+/// The rule, on what kiln knows of the caller and of session `id` (`all`, the sessions kiln runs;
+/// `mine` and `theirs`, whom the calling agent and the session act for):
+/// - an agent acts on itself and the agents it started (and theirs), and sees the other agents
+///   that work for the same person;
+/// - the owner, and a person with `agents.manage` (`manager`), act on every agent;
+/// - any other person acts on the agents that act for them (their agents' children do too) and
+///   reaches no other.
+///
+/// A session kiln can't say whom it acts for is reached only by the owner and managers (on a kiln
+/// nobody else signs in to, every session acts for the owner: `crate::mcp::acts_for`).
+pub fn access_of(caller: &crate::authz::Caller, manager: bool, all: &[Info], id: &str, mine: Option<&str>, theirs: Option<&str>) -> Access {
+    if let Some(me) = caller.agent.as_deref() {
+        if me == id || descends(all, id, me) {
+            return Access::Act;
+        }
+        return match (mine, theirs) {
+            (Some(m), Some(t)) if m == t => Access::See,
+            _ => Access::None,
+        };
+    }
+    if caller.is_owner() || manager {
+        return Access::Act;
+    }
+    match (person_of(caller), theirs) {
+        (Some(p), Some(t)) if p == t => Access::Act,
+        _ => Access::None,
+    }
+}
+
+fn manages(caller: &crate::authz::Caller) -> bool {
+    caller.can("agents.manage", &crate::authz::Scope::Server)
+}
+
+/// How far `caller` reaches agent session `id`, as [`access_of`] has it.
+pub async fn access(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Access {
+    let mine = match caller.agent.as_deref() {
+        Some(me) => crate::mcp::acts_for(hub, me).await,
+        None => None,
+    };
+    let theirs = crate::mcp::whose(hub, id).await;
+    access_of(caller, manages(caller), &hub.harness.list(), id, mine.as_deref(), theirs.as_deref())
+}
+
+/// What a caller is told of an agent it doesn't reach: the same as of one kiln doesn't run.
+pub fn unseen() -> Refused {
+    (StatusCode::NOT_FOUND, "no such agent session".to_owned())
+}
+
+/// Whether `caller` sees agent `id`: lists it, reads it, watches it.
+pub async fn may_see(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<(), Refused> {
+    if access(hub, caller, id).await >= Access::See { Ok(()) } else { Err(unseen()) }
+}
+
+/// The sessions of `all` that `caller` sees, in their order.
+pub async fn seen(hub: &Hub, caller: &crate::authz::Caller, all: Vec<Info>) -> Vec<Info> {
+    reached(hub, caller, all, Access::See).await
+}
+
+/// The sessions of `all` that `caller` reaches at least as far as `least`, in their order.
+pub async fn reached(hub: &Hub, caller: &crate::authz::Caller, all: Vec<Info>, least: Access) -> Vec<Info> {
+    let manager = manages(caller);
+    if caller.agent.is_none() && (caller.is_owner() || manager) {
+        return all;
+    }
+    let mine = match caller.agent.as_deref() {
+        Some(me) => crate::mcp::acts_for(hub, me).await,
+        None => None,
+    };
+    let mut out = Vec::with_capacity(all.len());
+    for i in &all {
+        let theirs = crate::mcp::whose(hub, &i.id).await;
+        if access_of(caller, manager, &all, &i.id, mine.as_deref(), theirs.as_deref()) >= least {
+            out.push(i.clone());
+        }
+    }
+    out
+}
+
+/// The scope machine `target` is in: `local`, the server's own; `agent:<name>`, that runner's.
+pub fn machine_scope(target: &str) -> crate::authz::Scope {
+    match target.strip_prefix("agent:") {
+        Some(runner) => crate::authz::Scope::Runner { runner: runner.to_owned() },
+        None => crate::authz::Scope::Server,
+    }
+}
+
+/// Whether `caller` may run programs on machine `target` as its terminal does (`runners.terminal`
+/// there; the server's own scope for `local`): open an agent there, see and take over the sessions
+/// found running there, read its history (docs/agents.md, "Whose agents"). `what` says what the
+/// caller was doing, for the refusal.
+pub fn may_run_on(caller: &crate::authz::Caller, target: &str, what: &str) -> Result<(), Refused> {
+    let scope = machine_scope(target);
+    if caller.can("runners.terminal", &scope) {
         return Ok(());
     }
-    Err((StatusCode::FORBIDDEN, format!("an agent steers and ends only the agents it started (and theirs): {} isn't one of {}'s", short(id), short(me))))
+    Err((StatusCode::FORBIDDEN, format!("{} may not {what}: that needs runners.terminal on {}", caller.name, scope.text())))
+}
+
+/// Whether `caller` may steer agent `id`: send it messages, plans or goals, change or clear its
+/// goals, interrupt or end it. An agent steers only itself and the agents it started (and theirs);
+/// a person the agents that act for them, or every agent as the owner or with `agents.manage`.
+pub async fn may_steer(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<(), Refused> {
+    match (access(hub, caller, id).await, caller.agent.as_deref()) {
+        (Access::Act, _) => Ok(()),
+        (_, Some(me)) => Err((StatusCode::FORBIDDEN, format!("an agent steers and ends only the agents it started (and theirs): {} isn't one of {}'s", short(id), short(me)))),
+        (_, None) => Err(unseen()),
+    }
 }
 
 /// How an agent may send agent `id` a message.
@@ -256,11 +375,13 @@ pub enum Reach {
 }
 
 /// Whether `caller` may send agent `id` a message (docs/agents.md, "Messages between agents"): a
-/// person any agent they reach; an agent itself and the agents it started in any mode, as
-/// [`may_steer`] has it, and any other agent that works for the same person, as a queued message
-/// from it. Agents that work for someone else, or for someone kiln can't name, aren't sent to.
+/// person the agents they act on ([`access`]); an agent itself and the agents it started in any
+/// mode, as [`may_steer`] has it, and any other agent that works for the same person, as a queued
+/// message from it. Agents that work for someone else, or for someone kiln can't name, aren't sent to.
 pub async fn may_message(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<Reach, Refused> {
-    let Some(me) = caller.agent.as_deref() else { return Ok(Reach::Own) };
+    let Some(me) = caller.agent.as_deref() else {
+        return if access(hub, caller, id).await == Access::Act { Ok(Reach::Own) } else { Err(unseen()) };
+    };
     if me == id || descends(&hub.harness.list(), id, me) {
         return Ok(Reach::Own);
     }
@@ -270,6 +391,7 @@ pub async fn may_message(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> 
     }
 }
 
+/// Whether agent `id` descends from agent `ancestor` (a child of it, or of one of its children…).
 pub fn descends(all: &[Info], id: &str, ancestor: &str) -> bool {
     let mut at = id;
     for _ in 0..64 {
@@ -331,6 +453,10 @@ pub struct Starter {
     pub opener: Option<String>,
     pub actor: String,
     pub plan_run: Option<String>,
+    /// Who asked, when a person or an agent did: it needs `runners.terminal` on the machine the
+    /// agent is started on ([`may_run_on`]). None when kiln starts it (a plan's step, a goal's
+    /// planner, an attachment).
+    pub asker: Option<crate::authz::Caller>,
 }
 
 /// The server itself as a machine to pick (`local`), when it runs agents.
@@ -491,6 +617,9 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
     let count = ask.count.unwrap_or(1).clamp(1, 16);
     let default_target = by.parent.as_ref().map(|p| if p.target.is_empty() { "local".to_owned() } else { p.target.clone() });
     let target = pick(hub, ask.on.as_deref(), kind.id, default_target.as_deref())?;
+    if let Some(asker) = &by.asker {
+        may_run_on(asker, &target, "start an agent there")?;
+    }
     if volume {
         workspaces_on(hub, &target).await.map_err(|why| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
     }
@@ -522,9 +651,15 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
         ..Spec::default()
     };
     let infos = hub.harness.open(hub, &target, spec, count).await.map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
+    // person they act for's.
+    let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
     for i in &infos {
         if let Some(o) = &by.opener {
             let _ = hub.store.kv_set(crate::mcp::opener_key(&i.id), o.clone()).await;
+        }
+        if let Some(p) = &person {
+            let _ = hub.store.kv_set(crate::mcp::opened_by_key(&i.id), p.clone()).await;
         }
         if let Some(p) = &by.parent {
             let _ = hub.store.kv_set(parent_key(&i.id), p.id.clone()).await;
@@ -645,5 +780,53 @@ mod tests {
         assert!(!live.contains(&"d".to_owned()), "an ended child isn't live (its own children are)");
         assert!(live_descendants(&all, "x").is_empty());
         assert_eq!(descendants(&all, "a").len(), 4, "ended ones too, for ending them with their parent");
+    }
+
+    /// docs/agents.md, "Whose agents": who sees and who acts on which agent session.
+    #[test]
+    fn whose_agents_a_caller_reaches() {
+        use crate::authz::Caller;
+        use crate::authz::gate::{Kind, Rights};
+        let info = |id: &str, parent: Option<&str>| Info { id: id.into(), parent: parent.map(str::to_owned), ..Default::default() };
+        // `a` was opened by user u1; `a1` is its child; `b` was opened by user u2.
+        let all = vec![info("a", None), info("a1", Some("a")), info("b", None)];
+        let person = |user: &str| {
+            let mut c = Caller::with(Kind::User, &format!("user:{user}"), Some(Rights::default()), None);
+            c.user = Some(user.to_owned());
+            c
+        };
+        let agent = |session: &str, user: &str| {
+            let mut c = person(user);
+            c.kind = Kind::Agent;
+            c.agent = Some(session.to_owned());
+            c
+        };
+        let (u1, u2) = (Some("user:u1"), Some("user:u2"));
+
+        // The owner, and a person with agents.manage, act on every agent.
+        assert_eq!(access_of(&Caller::owner(), false, &all, "b", None, u2), Access::Act);
+        assert_eq!(access_of(&person("u3"), true, &all, "b", None, u2), Access::Act);
+        // A person acts on the agents that act for them, their children included, and no other.
+        assert_eq!(access_of(&person("u1"), false, &all, "a", None, u1), Access::Act);
+        assert_eq!(access_of(&person("u1"), false, &all, "a1", None, u1), Access::Act);
+        assert_eq!(access_of(&person("u1"), false, &all, "b", None, u2), Access::None);
+        // A session kiln can't say whom it acts for: the owner and managers only.
+        assert_eq!(access_of(&person("u1"), false, &all, "b", None, None), Access::None);
+        assert_eq!(access_of(&Caller::owner(), false, &all, "b", None, None), Access::Act);
+        assert_eq!(access_of(&person("u1"), true, &all, "b", None, None), Access::Act);
+        // The owner's own tokens are the owner's, narrowed or not.
+        let narrowed = Caller::with(Kind::Pat, "pat:t1", None, Some(Rights::default()));
+        assert_eq!(access_of(&narrowed, false, &all, "a", None, Some("owner")), Access::Act);
+        assert_eq!(access_of(&narrowed, false, &all, "b", None, u2), Access::None);
+        // A job reaches no agent.
+        let job = Caller::with(Kind::Job, "job:leg", Some(Rights::default()), None);
+        assert_eq!(access_of(&job, false, &all, "a", None, Some("owner")), Access::None);
+        // An agent acts on itself and its descendants, sees the other agents of its person, and
+        // reaches no one else's, whatever its person may do.
+        assert_eq!(access_of(&agent("a", "u1"), false, &all, "a", u1, u1), Access::Act);
+        assert_eq!(access_of(&agent("a", "u1"), false, &all, "a1", u1, u1), Access::Act);
+        assert_eq!(access_of(&agent("a1", "u1"), false, &all, "a", u1, u1), Access::See, "a child doesn't steer its parent");
+        assert_eq!(access_of(&agent("a", "u1"), true, &all, "b", u1, u2), Access::None, "a manager's agent reaches only its own and its person's");
+        assert_eq!(access_of(&agent("a", "u1"), false, &all, "b", u1, None), Access::None);
     }
 }
