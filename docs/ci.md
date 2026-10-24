@@ -39,6 +39,7 @@
   - [W21 UI](#w21-ui)
   - [W22 Conformance, end-to-end and performance testing](#w22-conformance-end-to-end-and-performance-testing)
   - [W23 CI providers](#w23-ci-providers)
+  - [W24 Incremental CI](#w24-incremental-ci-fingerprints-reuse-warm-state-and-shared-caches)
 - [4. API, events, CLI and MCP reference](#4-api-events-cli-and-mcp-reference)
 - [5. Milestones and the order of work](#5-milestones-and-the-order-of-work)
 - [Appendix A. GitHub Actions compatibility matrix](#appendix-a-github-actions-compatibility-matrix)
@@ -195,6 +196,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, the graph from the plan with matrix grids, progress and what jobs wait for, critical path, summaries, annotations, artifacts, pins); the leg page (notes, timing bar, attempts, outputs, terminal, Keep); the runs list's facets and sorts; the workflow editor (checks against its repository, the schema's keys, the plan preview and its matrix, the flow view, saving as the repository takes it); Insights (repositories, workflows, runners, tests, benchmarks); Settings → CI, → People, → Tokens and → You; the Runners page's pools (their scaling history), images and executors, and the image builder; comparing runs; log search; environments (board and pages); AC01 in kiln's CI (`ci/ui/run-all.sh`), AC02, AC03 (25–30 ms, 60 fps), AC04, the run's data flow; the editor's Agentfile lints left (shards' own: blocked on shards) |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 48 of F-21's 50 green, four of them needing accounts and passing in dry configurations against stand-ins (AWS's two, Google's, Codecov's); azure/login waits for a tenant, and attest-build-provenance for GitHub's Sigstore; AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
+| W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R28, AC01–AC12; milestones M0–M5 are kiln goals with plans |
 
 ---
 
@@ -7348,6 +7350,323 @@ credentials, W14's review pages, W19's insights and notifications, and W21.
   API); AC02 and AC03, which need test repositories on GitHub, GitLab and Bitbucket and their
   credentials (user-assisted).
 
+### W24 Incremental CI: fingerprints, reuse, warm state and shared caches
+
+**Scope.** The least work a change needs, for every kind of work kiln runs: CI legs, `kiln run`
+and agents' builds. Every unit of work (a run, a leg, a step, a tool's action, a test) is keyed by
+a fingerprint of what it depends on and recorded once in a ledger. A recorded success is reused;
+what can't be keyed exactly runs incrementally on kept ("warm") state; what tools produce goes
+into one content-addressed cache shared across the fleet; and the planner works out from the
+change what it could affect before anything runs. Every reuse, warm start and rebuild says why.
+W24 extends W08 (R09's cache tiers, R10's job-result reuse) and W05-R23's preferences, and is
+built on the CI engine alone.
+
+**Why.** As of 2026-10-24 (origin/main a34c9139), nothing keeps work between runs:
+
+- v1 deletes each job's workspace (`exec.rs`); the engine deletes each leg's
+  (`runner/runtime.rs`); pools discard each executor after one leg (`runner/pool.rs`).
+- v1's `cache:` lists and `toolchain_cache()` have no effect in v1 or in the engine.
+- `kiln run` deletes the other machine's build output at every sync (`reach/sync.rs`,
+  `Mirror::commit`).
+- kiln's own `.kiln/` workflows run on v1 (`[ci] kiln_workflows` is off), so W08's reuse and cache
+  tiers don't reach them.
+
+The cost: on one runner, 53 separate cargo target directories held 880 GiB, and builds took
+production down on 2026-10-19, 2026-10-21 and 2026-10-22. The evidence, every claim graded from
+its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
+
+**Decisions.** These are defaults; the person may change any of them.
+
+1. **The Remote Execution API's shapes are the core types.** Digests, Merkle trees of inputs and
+   action results take the shapes of `build.bazel.remote.execution.v2`. Bazel- and Buck2-family
+   clients then map one to one, and kiln's own steps are actions whose inputs are observed rather
+   than declared.
+2. **The CI engine only; v1 frozen.** Nothing of W24 goes into `exec.rs`, which is to become a
+   shim over `kiln_ci::wf` (§2.2). kiln's own `.kiln/` workflows move onto the engine first, since
+   W24 can reach only what the engine runs.
+3. **Person scopes, promotion by reproduction.** Agents' own builds write to their person's scope
+   and read trusted entries. An untrusted or person-scoped result becomes trusted only when a
+   trusted run reproduces it and writes its own entry, never by copying. Agents' results can't
+   poison what release jobs read, yet the work they did is reused once confirmed.
+4. **Protected units: verified by two runners, or cold.** Release and deploy legs use only
+   results that two independent trusted runners produced identically, else they run cold in a
+   hermetic boundary; their provenance says which. A single compromised runner can't slip an
+   artifact into a release.
+5. **Remote execution last.** It needs Hex's placement (CP-T7) and sandboxes; the data model is
+   ready for it from the start, so nothing built earlier has to change.
+
+**Requirements: the model**
+
+- **W24-R01 Fingerprints.** `kiln_ci::work::key`, pure: SHA-256 over a canonical encoding
+  prefixed with `kiln/work/v1` and the unit's kind, so granularities never collide and a version
+  bump invalidates everything. Its components:
+  - the definition: the job or step after evaluation, secrets by name only;
+  - the environment: declared `env:`, `memo.env` and each toolchain's known variables; kiln's
+    per-run variables only when the unit's text uses them or they're observed being read;
+  - the platform: OS, architecture, libc, executor, image digest and toolchain identity (a hash of
+    `rustc -vV`, a sysroot digest);
+  - the inputs: git tree ids of declared paths, computed from the mirror with no checkout, and
+    observed path sets;
+  - upstream output digests and the trust domain.
+
+  Keys use tree ids, never commit SHAs. A weak key holds what's known before the unit runs; its
+  strong key adds the digests of what it read.
+- **W24-R02 The ledger.** Results keyed by strong key: outcome, exit code, outputs (files, trees,
+  job and step output values) as content digests, logs and test reports, path set, provenance
+  (repository, run, leg, step, attempt, runner, commit, tree, duration, CPU), trust domain,
+  lineage, verifications and signatures. Families `work.result`, `work.weak` (a weak key's path
+  sets, at most 8), `work.pathset`, `work.snapshot`, `work.lane`, `work.graph`, `work.test` and
+  `work.verify`, keyed under `owner/repo|domain|`. They live in SQLite through a numbered migration
+  now and in Amphora through the `Records` seam later. Bytes stay in the content-addressed store
+  (`cas/<sha256>`, through `Blobs`).
+- **W24-R03 Early cutoff.** A unit's key takes its upstream units' output digests, never their
+  keys. A unit that reruns and produces byte-identical outputs leaves everything after it
+  reusable.
+- **W24-R04 Two-phase lookup.** For each weak key the ledger keeps up to 8 path sets of what
+  earlier runs read. A lookup computes each candidate's strong key from current digests (tracked
+  files' from git's index, at no cost) and takes the first recorded match. Path sets come from,
+  best first:
+  1. the tools' own records: cargo's dependency files and build-script directives, Go's actions
+     through `GOCACHEPROG`, `.tsbuildinfo`, coverage data;
+  2. in-process interposition: `LD_PRELOAD`, and `DYLD_INSERT_LIBRARIES` for toolchains macOS
+     doesn't harden;
+  3. seccomp user notification on Linux, unprivileged once `no_new_privs` is set;
+  4. declared inputs;
+  5. the whole tree, as a last resort.
+
+  The server adds what it saw a leg fetch (artifacts, package-proxy downloads). A leg the egress
+  proxy saw reach anywhere else is marked non-hermetic.
+- **W24-R05 Secrets and volatile values.** A unit that receives secrets isn't reused unless it
+  says `memo.secrets: hmac`: an HMAC under the server's key, so rotating the secret invalidates
+  it. Run ids, attempts, tokens and temporary paths never enter a key unless the unit's text uses
+  them.
+
+**Requirements: reuse and caches**
+
+- **W24-R06 Leg reuse.** Dispatch keys every leg that opts in and looks it up in the ledger before
+  queueing it. W08-R10's `reuse:` becomes sugar for `work.memo`: its `paths`, `env` and `max-age`
+  keep their meaning, and W08-AC06's tests keep passing unchanged. A leg the change can't affect
+  finishes `reused`, naming its source, never `skipped`, so required checks stay green with
+  provenance.
+- **W24-R07 Step reuse.** `memo: check` (nothing to restore: lint, tests) or `memo: { outputs }`
+  on a step. The runner looks the step up before running it, and a hit replays its log, exit
+  code, outputs and test reports. Outputs are materialized only when a later step misses. Only
+  successes are recorded; a failure, a cancellation or a timeout never is.
+- **W24-R08 The runner's cache service.** Each runner serves one cache to its legs, its `kiln run`
+  commands and its agents:
+  - a local store at `<work>/_cas`: whole files, content-defined chunks for large ones;
+  - endpoints on loopback and a unix socket, with tokens scoped to repository, domain and
+    read or write;
+  - writes going up to the server by scope, and existence checks scoped by repository, as
+    `ci/services/chunks.rs` already does.
+
+  It speaks the protocols tools already use: sccache over WebDAV, Bazel's HTTP cache (`/ac/`,
+  `/cas/`), Gradle's and ccache's HTTP caches, Turborepo's API, and `kiln gocacheprog` for Go.
+- **W24-R09 kiln rustc.** A rustc wrapper, sccache-compatible for library crates, that also
+  caches proc-macro, bin and test units, which sccache can't because they invoke the linker. They
+  are keyed by toolchain and linker digests, extern rlib digests, the dependency files' sources
+  and environment variables, and flags with paths remapped. Crates under edit stay incremental in
+  their warm workspace.
+- **W24-R10 Test results.** Keyed by the test binary's digest, its arguments, the environment and
+  files it read (Go's rule) and the platform. Passes are reused, failures never. Selection runs
+  the test binaries of affected packages whose digest changed; unchanged ones replay their
+  results. nextest archives build once and run across machines, balanced by W16-R06's timings, and
+  W16-R04's flaky marks use these keys.
+
+**Requirements: warm state**
+
+- **W24-R11 Warm workspaces.** A runner keeps workspaces per lane at stable paths,
+  `<work>/warm/<repo>/<lane>/<n>`, each leased to one leg at a time. A lane is a hash of the
+  repository, the job, the matrix values that matter, the toolchain identity and the profile. A
+  leg:
+  1. takes the workspace closest to its commit;
+  2. checks out in place (`git checkout --force`, so only changed files get new mtimes);
+  3. cleans everything but its kept folders, and runs.
+
+  A second leg of the lane gets a copy-on-write clone: reflink on btrfs and XFS, clonefile on APFS,
+  overlayfs elsewhere on Linux. NTFS keeps workspaces in place, without clones. An untrusted leg
+  works on a throwaway clone that never comes back. A workspace whose holder died is reset or
+  dropped. W02-R06's v1 `cache: [dirs]` become `work.warm` folders, as that requirement promised.
+- **W24-R12 Snapshots.** A trusted warm-up leg on trunk, or a trusted leg's workspace in the
+  background, is kept as a snapshot: a Merkle tree, with file modes and mtimes, over objects in
+  the content store. Only new objects are uploaded. A runner with no workspace for a lane:
+  1. builds one from its local objects, cloned where the filesystem can;
+  2. fetches only the missing chunks and sets mtimes from the snapshot;
+  3. checks out its commit in place.
+- **W24-R13 Warm microVMs.** Firecracker legs get a per-lane ext4 scratch image, cloned per leg and
+  discarded, so each starts clean and warm, and a booted guest restored from a diff memory snapshot
+  loaded lazily through userfaultfd. Pools (W13-R09) keep warm snapshots. shards uses its
+  saved-microVM copies, and Slates volumes once they can clone snapshots.
+- **W24-R14 Warm k8s.** Per-node `hostPath` workspaces with node affinity, or per-lane volumes
+  cloned through CSI snapshots where the cluster supports them.
+- **W24-R15 Budgets.** A byte budget per runner and per lane; least recently used workspaces go
+  first; a bloated workspace is reset to trunk's snapshot; below a disk floor nothing new is kept.
+  Accounting knows about clones where the filesystem reports shared extents.
+
+**Requirements: planning and scheduling**
+
+- **W24-R16 Package graphs.** `kiln_ci::work::graph` reads package graphs from manifests in the
+  mirror as pure code, through `PlanSource::graph()`: Cargo workspaces and `Cargo.lock`; npm, pnpm
+  and yarn workspaces; uv workspaces; `go.mod` and `go.work`. Finer graphs (`go list`,
+  `bazel query`, `cargo metadata`) come from cached actions on runners.
+- **W24-R17 affected().** An expression function: the run's changed files (W03-R12) mapped to
+  their packages, plus everything that depends on them. It is usable in dynamic matrices
+  (`matrix: { crate: ${{ affected('cargo') }} }`) and in conditions. Every run names its baseline:
+  - generally, the nearest ancestor with a complete trusted run of the workflow;
+  - for a diff, its trunk base;
+  - for a land candidate, its tested version plus trunk's changes since.
+- **W24-R18 Warm-aware placement.** W05-R23 gains a `warm` term: expected finish time = queue wait
+  + cold duration × (1 − warmth on that runner) + missing bytes ÷ bandwidth, from history and
+  workspace distance. `affinity: { job }` gets real workspaces behind it. A leg may wait for a busy
+  warm runner up to a share of what it would save, with `WaitReason::Warm { runner, saves_s, until
+  }`, explained in `ci.legs.routing`.
+- **W24-R19 Admission by load.** Runners report I/O pressure (Linux PSI) and free disk in their
+  facts. The scheduler holds heavy legs off a machine past its thresholds, saying why, and honours
+  the `Sandbox` seam's I/O weight. Hex's placement takes this over (CP-T7).
+- **W24-R20 Warm-up and the land queue.** After each land, a low-priority, preemptible warm-up
+  leg per lane and runner refreshes trunk's warm state. A land candidate (W14-R08) reuses trusted
+  entries for packages its diff didn't touch, and bisection steps share them; a diff's untrusted
+  results are never reused.
+
+**Requirements: trust**
+
+- **W24-R21 Domains and lineage.** The domains:
+  - `trusted`: default-branch pushes and the land queue;
+  - `protected`: release and deploy legs;
+  - `untrusted`: forks and outside contributors, and by default `diff` and `agent` events, as
+    W08-R14 has them;
+  - `person:<id>`: agents' own builds.
+
+  Reads go down only: untrusted and person scopes read trusted entries; trusted never reads either
+  (W18-R07). Every entry and workspace records the domains that wrote it. Promotion is by
+  reproduction only. Quotas per domain stop one domain from evicting another's entries.
+- **W24-R22 Signatures and provenance.** The producing runner signs each result with its identity
+  key; the server countersigns it into a trusted scope; readers check both. Entries are never
+  overwritten. A protected unit's provenance (W18) lists every reused unit with its producer and
+  its verifiers.
+- **W24-R23 Verification.** kiln re-executes a sample of hits: about 1 % of hermetic units, 5 % of
+  sandboxed ones, 10 % on the host. Units whose outputs differ are marked nondeterministic (shown,
+  with early cutoff turned off for them); a lineage whose outcome differs is quarantined.
+  Protected workflows run cold nightly, and `kiln rerun --cold` runs with no reuse, no warm state
+  and no cache.
+
+**Requirements: everywhere else**
+
+- **W24-R24 kiln run and agents.** `Mirror::commit` deletes only the paths it sent before and no
+  longer lists, so build output survives. Each copy is a warm workspace, and a command that opts
+  in returns the recorded result for an identical tree. Agents' harnesses get the cache variables
+  (`RUSTC_WRAPPER`, `GOCACHEPROG`, `TURBO_API`, …) under their person's scope, and a new worktree
+  gets a copy-on-write clone of the nearest warm build folder.
+- **W24-R25 GitHub Actions compatibility.** Overlays (W02-R07) add `work:` keys to GitHub
+  workflows without editing them. `actions/cache` keeps its semantics; its restore becomes a no-op
+  when the warm workspace's tree already equals the entry's.
+- **W24-R26 Remote execution.** kiln serves the Remote Execution API (CAS, action cache,
+  `Execute`) over `kiln-http`'s HTTP/2; gRPC needs trailers, which are raised rather than worked
+  around if missing. Actions queue in a pure `kiln_ci::work::exec`, are placed through
+  `Placement`, and run in `Sandbox` boundaries: host namespaces with no network for trusted
+  actions, microVMs for untrusted ones. Their inputs come only from the content store. `kiln
+  rustc` gains a remote mode, with toolchains shipped as trees.
+- **W24-R27 Peers.** A runner fetches blobs from LAN peers over reach's end-to-end links, each
+  checked by digest. The directory says which runner holds what, and local files seed transfers.
+- **W24-R28 Reports and why.**
+  - Every job and step says whether it ran, was reused (from which run, on which runner) or was
+    warm (which workspace, how far behind, files changed, units rebuilt according to cargo's
+    `fresh`), with cache hits and time saved.
+  - "Why did this rebuild?" compares each fingerprint component with the nearest earlier run.
+  - Insights show time saved, hit rates per layer, cold against warm durations, and time saved per
+    GiB kept, which drives eviction.
+  - Metrics: `kiln_work_lookups_total{layer,outcome}`, `kiln_work_saved_seconds_total`,
+    `kiln_warm_slots{state}`, `kiln_work_verify_mismatch_total`.
+  - Operations: `kiln work why|status|warm|verify|gc` on the CLI, `ci.work.*` for agents.
+
+**Design.**
+
+- **Pure decisions** in `crates/kiln-ci/src/work/` (`key`, `ledger`, `pathset`, `slots`, `graph`,
+  `tests`, `verify`, `exec`), with property tests and simulators. Elsewhere in `kiln-ci`:
+  - `plan` gains `affected()` and `LegSpec.work`;
+  - `sched` gains the `warm` term, patience, `WaitReason::Warm` and admission by load;
+  - `wf` and `expr` gain `work:`, a step's `memo:`, `tests:` and `affected()`;
+  - `insights` and `compare` gain time saved and fingerprint differences.
+- **The server**: `crates/kiln/src/ci/work/` holds the ledger, `/_kiln/work/v1/*`, the Remote
+  Execution API, the cache protocols for runners without the local service, cleanup and
+  verification scheduling. `ci/dispatch.rs` gets leg reuse on the ledger (replacing `reuse.rs`),
+  placement inputs and the land-queue rules.
+- **The runner**: `crates/kiln/src/runner/work/` holds the cache service, the local store, warm
+  workspaces, materializing, observation, `kiln rustc` and `kiln gocacheprog`. `runner/runtime.rs`
+  takes or builds a workspace when a leg starts, looks steps up, and snapshots and releases the
+  workspace when it ends. `reach/sync.rs` and `harness/*` change as R24 says.
+
+```yaml
+jobs:
+  rust:
+    toolchain: rust            # preset: warm [target], actions [rustc], tools [rustc, cargo]
+    work:
+      memo: { inputs: [crates/**, Cargo.lock], observe: true, max-age: 14d }
+      warm: { paths: [target], budget: 60Gi }
+      hermetic: sandboxed      # none | sandboxed | strict: who may share its results
+      verify: 5%
+    steps:
+      - run: cargo clippy --locked --all-targets -- -D warnings
+        memo: check
+      - run: cargo nextest run --locked
+        tests: { select: affected, cache: true }
+```
+
+**Interfaces.**
+
+- **Wire**, added after what's there: optional `AssignmentV2.work`;
+  `JobEventV2::Work { idx, outcome, key, saved_ms, detail }`; `RunnerFacts.work` (clone kind,
+  observation methods, store size, I/O pressure); the `CAP_WORK` capability bit and
+  `AgentMsg::WorkState` in `proto.rs`.
+- **Seams**: the ledger on `Records`; bytes on `Blobs` (Mantle, CP-T10); remote execution on
+  `Placement` and `Sandbox` (Hex, CP-T7).
+- **Takes** W03's changed files, W05's routing, W08's store and cache scopes, W13's executors,
+  W16's test reports and W18's trust.
+- **Gives** W14's land queue its reuse, W16 and W19 their keys and reports, and W20's agents
+  `ci.work.*`.
+
+**Acceptance criteria**
+
+- **W24-AC01 Fingerprint sensitivity.** Each of 10⁵ random single-component edits changes the key,
+  and edits outside the components never do. *Property test.*
+- **W24-AC02 Warm equals cold.** On 20 commits from kiln's history, warm and cold builds give the
+  same conclusions and test outcomes. *Differential integration test.*
+- **W24-AC03 kiln's own CI.** The `rust` job takes under 60 s for a docs-only change, and at most
+  30 % of M0's cold baseline for a one-file change in `crates/kiln`, median of 3 runs. *E2E on the
+  live server.*
+- **W24-AC04 Agents share builds.** A second agent's first build of kiln on the same machine
+  recompiles at most 5 % of units, counted from cargo's `fresh`. *Integration test.*
+- **W24-AC05 Disk.** Ten agents' target folders on btrfs or APFS hold at most 1.3 × one folder's
+  exclusive bytes. *Measurement.*
+- **W24-AC06 Poisoning.** A fork's build script that plants a poisoned rlib never reaches a trusted
+  leg, and the attempt is audited. *Adversarial E2E.*
+- **W24-AC07 Verification.** Corrupted results and injected nondeterminism (the `chaos` feature)
+  are each detected, and their lineage quarantined. *Chaos test.*
+- **W24-AC08 Tools' clients.** Pinned sccache, Go (`GOCACHEPROG`), Bazel, Gradle, ccache and
+  Turborepo clients each build a fixture twice against a runner, the second build served from the
+  cache, on Linux and macOS. *Conformance suite.*
+- **W24-AC09 Every reason.** 100 % of a run's jobs and steps say why they ran, were reused or were
+  warm, and the why-diff names exactly the changed component in a table of edits. *Unit tests and
+  E2E.*
+- **W24-AC10 Lookup latency.** Ledger lookups take p99 under 5 ms on the server and under 1 ms on
+  a runner. *Bench.*
+- **W24-AC11 Clone speed.** Cloning a 30 GiB warm workspace takes under 10 s on btrfs or APFS.
+  *Bench.*
+- **W24-AC12 Eviction.** Under quota pressure, eviction keeps the entries with the most time saved
+  per byte. *Simulation.*
+
+**Progress.** Specified (2026-10-24); nothing built yet. The milestones, each a goal with a kiln
+plan:
+
+| Milestone | What it delivers | Requirements |
+|---|---|---|
+| M0 | Baseline measured; `kiln run` keeps build output; v1 `cache:` folders on the engine; `.kiln/` planned on the engine | R11's v1 folders, R24's sync |
+| M1 | Ledger, leg and step reuse, warm workspaces on host and Docker, placement, reports | R01–R03, R06, R07, R11, R12, R15, R18, R28 |
+| M2 | The runner's cache service, agents, peers | R08, R24, R25, R27 |
+| M3 | Graphs, `affected()`, tests, the land queue, admission | R10, R16, R17, R19, R20 |
+| M4 | Observation, `kiln rustc`, trust, verification | R04, R05, R09, R21–R23 |
+| M5 | Warm microVMs and k8s, remote execution, the seams | R13, R14, R26 |
+
 ## 4. API, events, CLI and MCP reference
 
 All routes come from the one route table (W10-R05, W20-R01) and follow access.md's conventions:
@@ -7360,6 +7679,12 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | Method | Path | Op name | Capability | WS |
 | --- | --- | --- | --- | --- |
 | GET | `/api/ci/repos/:repo/workflows?ref=` | `ci.workflows.list` | runs.read | W02 |
+| POST | `/_kiln/work/v1/lookup`, `/_kiln/work/v1/record`, `/_kiln/work/v1/pathsets` | (leg and runner tokens) | work scopes | W24 |
+| POST, PUT, GET | `/_kiln/work/v1/missing`, `/_kiln/work/v1/blobs/:sha256`, `/_kiln/work/v1/trees/:sha256` | (leg and runner tokens) | work scopes | W24 |
+| GET | `/api/ci/work/why?unit=` | `ci.work.why` | runs.read | W24 |
+| GET | `/api/ci/work/status?runner=` | `ci.work.status` | runs.read | W24 |
+| POST | `/api/ci/work/warm`, `/api/ci/work/verify` | `ci.work.warm`, `ci.work.verify` | runs.write | W24 |
+| POST | `/api/ci/work/gc` | `ci.work.gc` | admin | W24 |
 | GET | `/api/ci/repos/:repo/workflows/:path?ref=` | `ci.workflows.get` (source, IR, diagnostics) | runs.read | W02 |
 | POST | `/api/ci/validate` | `ci.workflows.validate` | runs.read | W02 |
 | POST | `/api/ci/plan-preview` | `ci.workflows.plan_preview` | runs.read | W04 |
@@ -7486,9 +7811,13 @@ kiln metrics criterion|hyperfine|gobench|pytest-benchmark|gbench|k6 PATH
 kiln store verify|gc                    kiln ci bench [--scheduler|--expr|--parse|--cache|--logs]
 kiln tokens create|list|revoke          kiln login
 kiln repo provider <repo> [provider…]
+kiln work why <run|leg|step>            kiln work status|warm|verify|gc   kiln rerun <run> --cold
+kiln gocacheprog                        kiln rustc   (W24: the runner's cache helpers)
 ```
 
 ### 4.4 MCP names
+
+W24's operations: `ci.work.why`, `ci.work.status`, `ci.work.warm`, `ci.work.verify` and `ci.work.gc` (`kiln.ci.work.*` in code mode).
 
 Code mode: `kiln.ci.<area>.<verb>(input)` (e.g. `kiln.ci.runs.rerun({ run, mode: "failed" })`),
 diffs and review among them (`kiln.ci.diffs.*`), the hosts' pull requests (`kiln.host.pulls.*`),
@@ -7865,6 +8194,9 @@ in `.github/workflows`. Each key's semantics are in the requirement cited.
 | job | `needs: [{ job, matrix: same } \| { job, where }]` (O) | W04-R17 |
 | job | `outputs.<name>: { value, secret }`, `exports: { env }`, `env-from` (O) | W04-R20 to R22 |
 | job | `reuse: { paths, env, max-age }` (O) | W08-R10 |
+| job | `work: { memo, warm, hermetic, verify }` (O); `reuse:` is sugar for `work.memo` | W24 |
+| step | `memo: check \| { outputs, inputs, env, secrets: hmac }` (O) | W24 |
+| step | `tests: { select: affected \| all, cache }` (O) | W24 |
 | job | `cache: [{ key, restore-keys, paths, scope, policy, local }]`; v1 list of directories | W08-R09, W02-R06 |
 | job, step | `integrations: [names]`, `registries: [names]` (O) | W11-R03, W12-R03 |
 | job | `network: { egress }` (O) | W18-R08 |
@@ -7879,6 +8211,7 @@ in `.github/workflows`. Each key's semantics are in the requirement cited.
 | step | `test-results: { path, format }` (O) | W16-R01 |
 | step | `tty: true` (v1) | W06 |
 | expressions | the W01-R14 additions | W01-R14 |
+| expressions | `affected(ecosystem, …)`: the packages the change affects and everything depending on them | W24 |
 | files | `$KILN_OUTPUT_JSON`, `$KILN_RUN_ENV`, `$KILN_METRICS`, `$KILN_SHARD_ITEMS` | W04, W16 |
 
 Policy files read from trunk: `.kiln/review.yaml`, `owners.yaml`, `environments.yaml`,
