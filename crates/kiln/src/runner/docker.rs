@@ -216,7 +216,12 @@ pub fn host_user() -> Option<(u32, u32)> {
 /// global directories are theirs, so `cargo install` and `npm install -g` work as on GitHub.
 pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String> {
     let name = image.strip_prefix("kiln/runner-")?;
+    // `-android`: the full image and Android's SDK, opt-in (see below).
+    let (name, android) = name.strip_suffix("-android").map_or((name, false), |n| (n, true));
     let (name, slim) = name.strip_suffix("-slim").map_or((name, false), |n| (n, true));
+    if android && slim {
+        return None;
+    }
     // `ImageOS` as GitHub's hosted runners set it: setup-ruby, setup-beam and others pick their
     // prebuilt tools by it.
     // And the release's ICU, which PowerShell needs.
@@ -308,6 +313,30 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
              'apt-get update -qq && exec apt-get install -y --no-install-recommends $p' > /usr/local/bin/snap \\\n    \
              && chmod 0755 /usr/local/bin/snap\n",
         );
+        // Podman, Buildah and Skopeo, as GitHub's images have them. A leg whose steps run them
+        // goes where their containers can run, a microVM or a host, not a container executor's
+        // container (kiln_ci::sched::routing::runs_containers).
+        d.push_str("RUN apt-get update && apt-get install -y --no-install-recommends podman buildah skopeo fuse-overlayfs uidmap slirp4netns && rm -rf /var/lib/apt/lists/*\n");
+    }
+    if android {
+        // Android's SDK where GitHub's images have it, in an image only a routing rule that names
+        // it chooses: building it accepts the Android Software Development Kit License Agreement
+        // (developer.android.com/studio/terms), which `sdkmanager --licenses` asks for, so the
+        // administrator who names it accepts it, and the image says so. The command-line tools
+        // are checked against the SHA-1 Google's repository lists (repository2-3.xml), and
+        // `sdkmanager` checks NDK 27 and the platform tools against it as it installs them.
+        d.push_str(
+            "ENV ANDROID_HOME=/usr/local/lib/android/sdk ANDROID_SDK_ROOT=/usr/local/lib/android/sdk\n\
+             LABEL kiln.android-sdk-license=accepted\n\
+             RUN f=commandlinetools-linux-16111833_latest.zip \\\n    \
+             && curl -fsSL -o \"/tmp/$f\" \"https://dl.google.com/android/repository/$f\" && echo \"e025545c62a8e64c7559119566a569fb1dec5f60  /tmp/$f\" | sha1sum -c - \\\n    \
+             && mkdir -p \"$ANDROID_HOME/cmdline-tools\" && unzip -q \"/tmp/$f\" -d /tmp/android && mv /tmp/android/cmdline-tools \"$ANDROID_HOME/cmdline-tools/latest\" && rm -rf \"/tmp/$f\" /tmp/android \\\n    \
+             && yes | \"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager\" --licenses > /dev/null \\\n    \
+             && \"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager\" --install 'ndk;27.3.13750724' platform-tools > /dev/null\n\
+             ENV ANDROID_NDK=/usr/local/lib/android/sdk/ndk/27.3.13750724 ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/27.3.13750724 \\\n    \
+             ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/27.3.13750724 ANDROID_NDK_LATEST_HOME=/usr/local/lib/android/sdk/ndk/27.3.13750724 \\\n    \
+             PATH=$PATH:/usr/local/lib/android/sdk/cmdline-tools/latest/bin:/usr/local/lib/android/sdk/platform-tools\n",
+        );
     }
     if let Some((uid, gid)) = user.filter(|(uid, _)| *uid != 0) {
         // The base image's own user may hold the uid (Ubuntu's `ubuntu` is 1000).
@@ -322,6 +351,10 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
             // And the directories setup actions install into without sudo, as GitHub's images
             // let them (setup-dotnet's /usr/share/dotnet; conda's base environment).
             d.push_str(&format!("RUN mkdir -p /usr/share/dotnet && chown -R {uid}:{gid} /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet /usr/share/miniconda\n"));
+            if android {
+                // And the SDK, so `sdkmanager --install` works without sudo.
+                d.push_str(&format!("RUN chown -R {uid}:{gid} /usr/local/lib/android\n"));
+            }
         }
     }
     Some(d)
@@ -1325,6 +1358,7 @@ mod tests {
             "https://go.dev/dl/$f",
             "PATH=/usr/local/go/bin:",
             "break-system-packages",
+            "podman buildah skopeo",
         ] {
             assert!(full.contains(tool) && !d.contains(tool), "{tool}");
         }
@@ -1343,6 +1377,25 @@ mod tests {
         assert!(u.contains("install -d -o 1000 -g 1000 /home/runner/work"), "{u}");
         assert!(u.trim_end().ends_with("chown -R 1000:1000 /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet /usr/share/miniconda"), "{u}");
         assert_eq!(runner_dockerfile("kiln/runner-ubuntu-24.04", Some((0, 0))), runner_dockerfile("kiln/runner-ubuntu-24.04", None));
+        // `-android` (opt-in): the full image, then Android's SDK where GitHub's images have it,
+        // its licence's acceptance on the image; never a slim one (sdkmanager needs the JDK).
+        let android = runner_dockerfile("kiln/runner-ubuntu-24.04-android", None).unwrap_or_default();
+        assert!(android.starts_with(&full), "the full image, and more");
+        for want in [
+            "ANDROID_HOME=/usr/local/lib/android/sdk ANDROID_SDK_ROOT=/usr/local/lib/android/sdk\n",
+            "LABEL kiln.android-sdk-license=accepted\n",
+            "https://dl.google.com/android/repository/$f",
+            "echo \"e025545c62a8e64c7559119566a569fb1dec5f60  /tmp/$f\" | sha1sum -c -",
+            "sdkmanager\" --licenses",
+            "--install 'ndk;27.3.13750724' platform-tools",
+            "ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/27.3.13750724",
+            "PATH=$PATH:/usr/local/lib/android/sdk/cmdline-tools/latest/bin:",
+        ] {
+            assert!(android.contains(want) && !full.contains(want), "{want}: {android}");
+        }
+        assert!(android.lines().filter(|l| l.ends_with('\\')).all(|l| l.ends_with(" \\")), "continuations: {android}");
+        assert!(runner_dockerfile("kiln/runner-ubuntu-24.04-android", Some((1000, 1000))).is_some_and(|d| d.trim_end().ends_with("chown -R 1000:1000 /usr/local/lib/android")));
+        assert_eq!(runner_dockerfile("kiln/runner-ubuntu-24.04-slim-android", None), None);
     }
 
     #[test]

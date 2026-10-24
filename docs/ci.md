@@ -3928,6 +3928,25 @@ enforcement points to W18, agent isolation to W20.
   apt assumes yes, as GitHub's images set it. Cargo's and npm's global directories are the
   `runner` user's, so `cargo install` and `npm install -g` work. `kiln/runner-ubuntu-24.04-slim`
   is the basics alone. A new build removes its user's older ones.
+- *Done.* Podman, Buildah and Skopeo in the image, as GitHub's have them. Their containers can't
+  run in a container executor's container, so a leg whose `run:` steps call `podman` or
+  `buildah` (at a command's start, past `sudo` and `NAME=value`, not in a comment:
+  `runs_containers`) leaves the `docker` and `k8s` executors for the others its rules allow, else
+  a Firecracker microVM; a rule's `match.nests_containers` sends such legs where it says, as the
+  corpus lab's sends them to microVMs, the user's choice (rails' `rails-new-docker`;
+  `w13_a_leg_that_runs_podman_leaves_container_executors`). `POST /api/ci/routing/explain` takes
+  `nests_containers` too.
+- *Done.* `kiln/runner-ubuntu-24.04-android` (and `-26.04`, `-22.04`): the full image and
+  Android's SDK where GitHub's images have it (`ANDROID_HOME` and `ANDROID_SDK_ROOT`
+  `/usr/local/lib/android/sdk`; the command-line tools, latest, checked against the SHA-1 Google's
+  repository lists; NDK 27.3.13750724 and the platform tools through `sdkmanager`, which checks
+  them against it; `ANDROID_NDK`, `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT` and
+  `ANDROID_NDK_LATEST_HOME` set as GitHub's images set them; the SDK the `runner` user's). Only a
+  routing rule that names it chooses it: building it accepts the Android Software Development Kit
+  License Agreement (developer.android.com/studio/terms) that `sdkmanager --licenses` asks for,
+  so the administrator who names it accepts it, and the image is labelled so
+  (`kiln.android-sdk-license=accepted`). There's no slim one (sdkmanager needs the JDK)
+  (`runner_images_have_a_dockerfile`).
 - *Done.* R04's opt-in Docker access: a routing rule's `docker: socket` gives a trusted run's
   `docker` legs the host's Docker socket, reached through the socket's group. The image has the
   Docker CLI with buildx and compose. The leg's machine is a container the daemon doesn't look

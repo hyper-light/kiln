@@ -124,6 +124,11 @@ fn machine_label(l: &str) -> bool {
     matches!(l.to_ascii_lowercase().as_str(), "self-hosted" | "linux" | "windows" | "macos" | "x64" | "arm64" | "arm") || kiln_ci::sched::routing::github_label_rules().iter().any(|r| r.matches.labels.iter().any(|x| x.eq_ignore_ascii_case(l)))
 }
 
+/// Whether any of `steps` runs containers itself (`podman`, `buildah`), as routing asks.
+fn nests_containers(steps: &[kiln_ci::wf::ir::Step]) -> bool {
+    steps.iter().any(|s| s.run.as_ref().is_some_and(|r| kiln_ci::sched::routing::runs_containers(&r.src)) || nests_containers(&s.parallel))
+}
+
 /// A leg's route. On `kiln workflow run`'s own server (`local`, W17-R06) a leg keeps only the labels
 /// that say what machine it needs: the rest name the user's runners, and it runs on this one.
 fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, local: bool, untrusted: Option<kiln_ci::sched::routing::Untrusted>) -> LegRoute {
@@ -142,6 +147,7 @@ fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, local: bool
         requires: spec.requires.clone(),
         caps,
         untrusted,
+        nests_containers: job.is_some_and(|j| nests_containers(&j.steps)),
     }
 }
 
