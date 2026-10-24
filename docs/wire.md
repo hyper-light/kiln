@@ -30,7 +30,7 @@ acknowledgements come from that process, never from the transport under it.
 | ack | An acknowledgement, or a NACK, itself. |
 | stream | An item of an ordered stream: a session's timeline, a terminal's output, a job's events. Items are numbered and acknowledged cumulatively. After a reconnect they are sent again from where the receiver says it has them, and a snapshot is sent only when the sender no longer has what's missing. |
 | state | The newest of something that changes: an inventory, a session's state, a terminal's size. The newest wins, and it is sent again on every connect, so one lost to a cut comes once the link is back. |
-| carried (…) | A protocol of its own, carried on the link, that acknowledges and resends by itself: the conversation feed (`convo/feed.rs`), repo sync's Raft, reach's links, ports' windows, the tunnel, and the channel itself (`crate::wire::channel`, whose items carry other messages, each with its own class). |
+| carried (…) | A protocol of its own, carried on the link, that acknowledges and resends by itself: the conversation feed (`convo/feed.rs`), repo sync's Raft, the cluster group's learners (docs/p2p.md), reach's links, ports' windows, the tunnel, and the channel itself (`crate::wire::channel`, whose items carry other messages, each with its own class). |
 | telemetry | Measurements sent every few seconds. The next one stands in for a lost one, so there is no ACK. |
 | media | Live pictures and sound. A lost frame is overtaken by the next and never sent again. |
 
@@ -107,6 +107,7 @@ Messages to agents ride the same channel, and their answers are T3's inbox answe
 | `Undeployed` | answer | Answers `Undeploy`. | As its class says. |
 | `Caps` | handshake | What the runner can do, in 64 bits (`Build`'s 32 ran out): `CAP_WIRE` says it keeps the channel. | New: sent from plan step 3. |
 | `Wire` | carried (the channel) | A frame of the channel: numbered items carrying other messages, their ACKs and NACKs, wants, and what each side has after a reconnect. | New: `crate::wire::channel`. |
+| `Cluster` | carried (the cluster group) | The runner's learner of the cluster group (docs/p2p.md, P2): hyper-raft's messages, which it acknowledges and resends, and asks for where the server's records are before a read. | As its class says: a read whose ask goes unanswered in 2 s goes to the server. |
 
 ## Server to runner: `ServerMsg`
 
@@ -167,6 +168,7 @@ Messages to agents ride the same channel, and their answers are T3's inbox answe
 | `Undeploy` | command, parked | Take down a deployment. Answered by `Undeployed`. | Fire-and-forget until answered. |
 | `Caps` | handshake | What the server can do, in 64 bits, to a runner that said `CAP_WIRE`. | New: sent from plan step 3. |
 | `Wire` | carried (the channel) | A frame of the channel, as the runner's. | New: `crate::wire::channel`. |
+| `Cluster` | carried (the cluster group) | To the runner's learner: join or leave the group (said again on every connect), hyper-raft's messages, and where the server's records are. | As its class says. |
 
 ## Commands to a session: `Command`
 

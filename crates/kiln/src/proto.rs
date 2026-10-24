@@ -191,6 +191,11 @@ pub enum AgentMsg {
     /// after a reconnect. Only once both sides announced [`CAP_WIRE`]. Appended last: postcard
     /// encodes variants by index.
     Wire(crate::wire::channel::Frame),
+    /// The cluster group (docs/p2p.md, P2, on [`LANE_SYNC`]): `json` a
+    /// `crate::store::learner::Msg`, `raft` the bytes of the hyper-raft message it carries (empty
+    /// when none) from this runner's learner. Only from runners announcing [`CAP_CLUSTER`].
+    /// Appended last: postcard encodes variants by index.
+    Cluster { json: String, raft: Vec<u8> },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -288,6 +293,9 @@ pub const CAP_RECEIVED: u32 = 1 << 29;
 /// The runner takes down a deployment it made when its environment goes ([`ServerMsg::Undeploy`],
 /// docs/ci.md W15-R07), and says so ([`AgentMsg::Undeployed`]).
 pub const CAP_UNDEPLOY: u32 = 1 << 30;
+/// The runner holds a learner replica of the cluster group, kiln's records (docs/p2p.md, P2;
+/// [`AgentMsg::Cluster`], [`ServerMsg::Cluster`]). The last bit of the 32.
+pub const CAP_CLUSTER: u32 = 1 << 31;
 
 /// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability, the first past `Build`'s 32 bits: the
 /// peer keeps the channel (`crate::wire::channel`, docs/wire.md). What must arrive goes as
@@ -521,6 +529,10 @@ pub enum ServerMsg {
     /// A frame of the channel between the server and this runner, as [`AgentMsg::Wire`]. Appended
     /// last: postcard encodes variants by index.
     Wire(crate::wire::channel::Frame),
+    /// The cluster group (docs/p2p.md, P2, on [`LANE_SYNC`]): as [`AgentMsg::Cluster`], to the
+    /// runner's learner. Only to runners announcing [`CAP_CLUSTER`]. Appended last: postcard
+    /// encodes variants by index.
+    Cluster { json: String, raft: Vec<u8> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -624,6 +636,20 @@ mod tests {
             assert_eq!(decode::<ServerMsg>(&b)?, m);
         }
         assert!(CAP_WIRE.is_power_of_two() && CAP_WIRE > u64::from(u32::MAX), "CAP_WIRE is past Build's 32 bits");
+        Ok(())
+    }
+
+    #[test]
+    fn the_cluster_group_is_appended_after_the_channel() -> anyhow::Result<()> {
+        // After `Wire` in both (AgentMsg 46, ServerMsg 54), so a peer from before P2 skips it.
+        let agent = AgentMsg::Cluster { json: r#"{"kind":"leave"}"#.into(), raft: vec![9, 8, 7] };
+        let server = ServerMsg::Cluster { json: r#"{"kind":"raft"}"#.into(), raft: Vec::new() };
+        let (a, s) = (encode(&agent)?, encode(&server)?);
+        assert_eq!((a.first(), s.first()), (Some(&47), Some(&55)));
+        assert_eq!((decode::<AgentMsg>(&a)?, decode::<ServerMsg>(&s)?), (agent, server));
+        assert_eq!(CAP_CLUSTER.count_ones(), 1);
+        assert_eq!(CAP_CLUSTER & CAP_UNDEPLOY, 0);
+        assert_eq!(u64::from(CAP_CLUSTER) & CAP_WIRE, 0);
         Ok(())
     }
 

@@ -247,6 +247,8 @@ pub struct Hub {
     pub tasks: crate::sync::tasks::Tasks,
     /// Work kept in step between the machines that hold a repository (`crate::sync::share`).
     pub shares: crate::sync::share::Shares,
+    /// The runners' learners of the cluster group (docs/p2p.md, P2).
+    pub cluster: crate::store::learner::Learners,
     /// Notifications to people's devices (`crate::push`).
     pub push: crate::push::Service,
     /// Where kiln keeps its bytes (`crate::blobs`, docs/blobs.md): the server's data directory, or
@@ -345,6 +347,7 @@ impl Hub {
             places,
             tasks,
             shares: crate::sync::share::Shares::default(),
+            cluster: crate::store::learner::Learners::default(),
             push: crate::push::Service::default(),
             blobs,
         }))
@@ -387,6 +390,59 @@ impl Hub {
             }
         }
         Ok(())
+    }
+
+    /// Sends the cluster group's messages to the runners' learners (the newest process of each
+    /// machine that holds one), on the sync lane; a learner whose runner is away misses them.
+    pub async fn cluster_loop(self: Arc<Self>) -> anyhow::Result<()> {
+        let Some(out) = self.store.group().map(crate::store::group::Group::outgoing) else { return Ok(()) };
+        while let Ok((member, bytes)) = out.recv().await {
+            let peer = self.cluster.machine(member).and_then(|m| self.instances.lock().newest_with(&m, proto::CAP_CLUSTER));
+            let Some(peer) = peer else {
+                if let Some(g) = self.store.group() {
+                    g.unreachable(member);
+                }
+                continue;
+            };
+            for (msg, raft) in self.cluster.frames(bytes) {
+                if let Ok(b) = proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(&msg), raft }) {
+                    self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A runner process of `machine` that can hold a learner said so: the newest such process
+    /// holds the machine's (it's told its member and the token its copies are fetched with), and
+    /// every other one lets its go, so one process at a time has the replica's files.
+    async fn cluster_announced(&self, machine: &str) {
+        // The server's own runner, in its process, reads kiln.db as it is.
+        let own = self.cfg.local_agent.enabled && machine == crate::pki::sanitize_name(&self.cfg.local_agent_name());
+        let group = self.store.group().filter(|_| self.cfg.cluster.learners && !own);
+        let (newest, mut others) = {
+            let inst = self.instances.lock();
+            let newest = inst.newest_with(machine, proto::CAP_CLUSTER);
+            let others: Vec<PeerId> = inst.of(machine).into_iter().filter(|p| Some(*p) != newest && inst.get(*p).is_some_and(|i| i.caps & proto::CAP_CLUSTER != 0)).collect();
+            (newest, others)
+        };
+        // With learners off, the newest lets its replica go too: its front door pipes to the
+        // server again rather than wait for a replica that no longer follows.
+        if group.is_none() {
+            others.extend(newest);
+        }
+        let say = |m: &crate::store::learner::Msg| proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(m), raft: Vec::new() });
+        if let Ok(b) = say(&crate::store::learner::Msg::Leave) {
+            for p in others {
+                self.net.send(p, proto::LANE_SYNC, Kind::Control, b.clone()).await;
+            }
+        }
+        let (Some(g), Some(peer)) = (group, newest) else { return };
+        let member = self.cluster.announced(g, machine);
+        let token = crate::store::learner::token(&self.admin_token, machine);
+        if let Ok(b) = say(&crate::store::learner::Msg::Join { member, token }) {
+            self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
+        }
     }
 
     /// The runners that could keep a copy of the conversation store, as they are now: the
@@ -1228,6 +1284,9 @@ impl Hub {
                 if caps & proto::CAP_SYNC != 0 {
                     self.sync_announced(&agent).await;
                 }
+                if caps & proto::CAP_CLUSTER != 0 {
+                    self.cluster_announced(&agent).await;
+                }
                 if caps & proto::CAP_CONVO != 0 {
                     self.mirrors_seen();
                     self.harness.restore_due(self, &agent);
@@ -1246,6 +1305,17 @@ impl Hub {
                 self.emit(&serde_json::json!({ "type": "updates" }));
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
+            AgentMsg::Cluster { json, raft } => match (self.store.group(), crate::store::learner::decode(&json)) {
+                // Where kiln.db stands, for a read the runner answers once its replica holds it.
+                (Some(g), Some(crate::store::learner::Msg::Ask { id })) => {
+                    let at = crate::store::learner::Msg::At { id, seq: g.standing().0 };
+                    if let Ok(b) = proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(&at), raft: Vec::new() }) {
+                        self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
+                    }
+                }
+                (Some(g), Some(msg)) => self.cluster.heard(g, &agent, &msg, raft),
+                _ => {}
+            },
             AgentMsg::Convo { json, data } => {
                 // About the server's own store: a mirror's answer. A mirror's copy sent back to
                 // restore it from, when asked for. Else the runner's own store's feed.

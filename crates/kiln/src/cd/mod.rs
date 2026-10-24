@@ -539,7 +539,12 @@ impl Cd {
     /// head's aren't): its inputs and artifacts, in the head's place until the head's are. `None`:
     /// none of them is, or the head doesn't lead from what runs (then it waits for the head's).
     async fn newest_built(self: &Arc<Self>, def: &AppDef, id: &str, head: &str, (kube_version, api_versions): (Option<String>, Vec<String>)) -> Option<(Resolved, Vec<ArtifactRef>, Vec<PullSecret>)> {
-        let runs = self.statuses.read().get(id).and_then(|s| s.revision.as_deref().map(str::to_owned))?;
+        // What runs: its last deployment that succeeded (kept, so known after a restart too, before
+        // the app is compared), else what its status says.
+        let runs = self
+            .store
+            .read(|d| d.history.get(id).and_then(|h| h.iter().rev().find(|x| x.succeeded).and_then(|x| x.revision.clone())))
+            .or_else(|| self.statuses.read().get(id).and_then(|s| s.revision.as_deref().map(str::to_owned)))?;
         // The source whose commit is the app's revision.
         let i = def.sources.iter().position(|s| s.chart.is_none() && s.as_ref.is_none())?;
         let source = def.sources.get(i)?;

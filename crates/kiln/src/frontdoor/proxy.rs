@@ -95,6 +95,25 @@ pub struct Shared {
     /// The clusters this one is peered with: a connection for one's address (`peer-<slug>.…`)
     /// is forwarded from here, not passed to the upstream.
     pub peers: RwLock<Option<Arc<crate::peers::forward::Forwarder>>>,
+    /// While this runner holds a replica of kiln's records: the handler that serves requests one
+    /// by one (kept across connections, with what it learned of whose credentials are whose).
+    pub door: RwLock<Option<Arc<super::replica::Door>>>,
+}
+
+/// The handler for requests one by one while this runner holds a replica of kiln's records
+/// (docs/p2p.md, P2); `None`: none here, and connections are piped to the upstream whole.
+fn door_for(shared: &Shared, upstream: &Upstream) -> Option<Arc<super::replica::Door>> {
+    let Some(learner) = crate::store::learner::global() else {
+        // None now: the one before lets its replica go.
+        shared.door.write().take();
+        return None;
+    };
+    if let Some(d) = shared.door.read().as_ref().filter(|d| d.serves(&learner, upstream)) {
+        return Some(Arc::clone(d));
+    }
+    let d = Arc::new(super::replica::Door::new(upstream.clone(), learner).ok()?);
+    *shared.door.write() = Some(Arc::clone(&d));
+    Some(d)
 }
 
 /// Serves one peered cluster's address on a front-door connection.
@@ -263,7 +282,10 @@ async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result
     let remote = tcp.peer_addr().ok();
     let tls = shared.tls.read().clone().context("no certificate yet")?;
     let upstream = shared.upstream.read().clone().context("no upstream")?;
-    let offer: &[&[u8]] = if shared.h2.load(Ordering::Relaxed) { &[H2, HTTP11] } else { &[HTTP11] };
+    let door = door_for(shared, &upstream);
+    // Served one by one, the browser's protocol is the front door's own: HTTP/2 whatever the
+    // upstream speaks.
+    let offer: &[&[u8]] = if door.is_some() || shared.h2.load(Ordering::Relaxed) { &[H2, HTTP11] } else { &[HTTP11] };
     let client = crate::rt::timeout(HANDSHAKE, ServerTlsStream::accept(RtFuturesIo::new(tcp), tls.config_alpn(offer)?))
         .await
         .context("TLS handshake timed out")?
@@ -278,6 +300,15 @@ async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result
         Some(Arc::new(PeerDoor { forwarder: f, slug }))
     });
     if let Some(door) = peer {
+        if h2 {
+            srv::serve_h2(client, bytes::Bytes::new(), door, remote, true).await;
+        } else {
+            srv::serve_connection_with(client, door, remote, true).await;
+        }
+        return Ok(());
+    }
+    // A replica here: the owner's reads it holds are answered from it, the rest forwarded.
+    if let Some(door) = door {
         if h2 {
             srv::serve_h2(client, bytes::Bytes::new(), door, remote, true).await;
         } else {
