@@ -47,8 +47,9 @@ fn def(name: &str, query: &str, by: &[&str], compute: Compute) -> Option<LogMetr
 pub fn trace_metrics() -> Vec<LogMetric> {
     let entry_by = ["service", "resource_name", "@span.kind", "@env", "@version", "@http.status_code"];
     let exit_by = ["service", "resource_name", "@span.kind", "@env", "@peer.service"];
-    // An Agent's spans are counted from its stats.
-    let [entry, exit] = [ENTRY, EXIT].map(|q| format!("({q}) -source:{}", crate::ddtrace::SOURCE));
+    // An Agent's spans are counted from its stats; an LLM event of Datadog's intake is no request a
+    // service served (its LLM trace is kept apart from its APM trace, whose spans are counted).
+    let [entry, exit] = [ENTRY, EXIT].map(|q| format!("({q}) -source:{} -source:{}", crate::ddtrace::SOURCE, crate::llm::intake::SOURCE));
     let errors_in = |q: &str| format!("({q}) status:error");
     [
         def("trace.hits", &entry, &entry_by, Compute::Count),
@@ -416,6 +417,11 @@ impl MapBuilder {
     }
 
     pub fn take(&mut self, r: &RecordRef<'_>) {
+        // An LLM event of Datadog's intake: its LLM trace is kept apart from the APM trace whose
+        // spans draw the map.
+        if r.source == crate::llm::intake::SOURCE {
+            return;
+        }
         self.read += 1;
         // Named as the trace metrics' tags name them (cut as a tag's value is), so a group is found.
         let service = self.name(if r.service.is_empty() { "unknown" } else { crate::logs::metrics::tag_value(Some(r.service)) });

@@ -1047,6 +1047,15 @@ export interface Span {
   span_id: string | null;
 }
 
+/** A span aggregate's groups (docs/observe.md §8.7): each group's facets' values (an attribute's
+ * named `@` and its name), and its measure. */
+export interface SpanAggregate {
+  groups: { group: Record<string, string>; value: number | null }[];
+  rows_scanned: number;
+  blocks_pruned: number;
+  took_ms: number;
+}
+
 export interface SpanSearch {
   spans: Span[];
   blocks: { total: number; pruned: number };
@@ -1707,6 +1716,8 @@ export interface DoraList {
 export const observeApi = {
   spans: (body: { query: string; from: number; to: number; limit?: number }, signal?: AbortSignal) => request<SpanSearch>("POST", `${BASE}/spans/search`, body, { signal }),
   spanHistogram: (body: { query: string; from: number; to: number; step: number; by?: string[] }, signal?: AbortSignal) => request<LogHistogram>("POST", `${BASE}/spans/aggregate`, body, { signal }),
+  spanAggregate: (body: { query: string; from: number; to: number; by?: string[]; measure?: "count" | "cardinality" | "sum" | "avg" | "min" | "max"; of?: string }, signal?: AbortSignal) =>
+    request<SpanAggregate>("POST", `${BASE}/spans/aggregate`, body, { signal }),
   spanFacets: (body: { query: string; from: number; to: number; facets: string[]; top?: number }, signal?: AbortSignal) => request<LogFacets>("POST", `${BASE}/spans/facets`, body, { signal }),
   trace: (id: string, signal?: AbortSignal) => request<Trace>("GET", `${BASE}/traces/${enc(id)}`, undefined, { signal }),
   services: (from: number, to: number, env: string | undefined, signal?: AbortSignal) => request<Services>("GET", `${BASE}/apm/services?${rangeQuery(from, to, env)}`, undefined, { signal }),

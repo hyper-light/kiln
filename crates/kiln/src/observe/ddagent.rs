@@ -15,6 +15,10 @@
 //! - `POST /api/v0.2/stats`: its counts of every span before it sampled, as kiln's trace metrics;
 //! - `POST /api/v2/profile`: its tracers' profiles (its trace agent's, `apm_config.profiling_dd_url`),
 //!   or a tracer's without an Agent (`super::profiles`);
+//! - `POST /api/v2/llmobs` and `/api/intake/llm-obs/v1/trace/spans`: an LLM app's spans, as its
+//!   tracer sends them past an Agent (`DD_LLMOBS_OVERRIDE_ORIGIN` pointed at kiln), each a span of
+//!   its LLM trace (`kiln_obs::llm::intake`); `/api/intake/llm-obs/v2/eval-metric` (and v1's):
+//!   their evaluations, records beside them;
 //! - `GET /api/v1/validate`: whether its key is one;
 //!
 //! zstd (what it compresses with), deflate or gzip, or none. Anything else under Datadog's paths
@@ -47,7 +51,7 @@ pub fn api_key(req: &srv::Request) -> Option<String> {
 
 /// Whether `path` (its segments) is one of Datadog's, answered here.
 pub fn is_datadog(path: &[&str]) -> bool {
-    matches!(path, ["api", "v1" | "v2" | "v0.2" | "beta", ..] | ["intake", ..])
+    matches!(path, ["api", "v1" | "v2" | "v0.2" | "beta", ..] | ["intake", ..] | ["api", "intake", "llm-obs", ..])
 }
 
 thread_local! {
@@ -134,6 +138,8 @@ pub async fn answer(o: &Observe, path: &[&str], req: srv::Request) -> srv::Respo
         ["api", "v2", "logs"] => What::Logs,
         ["api", "v0.2", "traces"] => What::Traces,
         ["api", "v0.2", "stats"] => What::Stats,
+        ["api", "v2", "llmobs"] | ["api", "intake", "llm-obs", "v1", "trace", "spans"] => What::LlmSpans,
+        ["api", "intake", "llm-obs", "v1" | "v2", "eval-metric"] => What::LlmEvals,
         _ => What::Else,
     };
     if matches!(what, What::Else) {
@@ -173,6 +179,8 @@ enum What {
     Logs,
     Traces,
     Stats,
+    LlmSpans,
+    LlmEvals,
     Else,
 }
 
@@ -261,7 +269,45 @@ fn take(o: &Observe, what: What, body: &[u8]) -> srv::Response {
                 }
             }
         }
+        What::LlmSpans => llm_spans(o, body, ""),
+        What::LlmEvals => llm_evals(o, body, now),
         What::Else => accepted(),
+    }
+}
+
+/// An LLM app's spans (`kiln_obs::llm::intake`), `host` the Agent's that sent them on (none: the
+/// app's own): what the intake answers, 202.
+pub(super) fn llm_spans(o: &Observe, body: &[u8], host: &str) -> srv::Response {
+    thread_local! {
+        static DECODER: std::cell::RefCell<kiln_obs::llm::intake::Decoder> = std::cell::RefCell::new(kiln_obs::llm::intake::Decoder::new());
+    }
+    let mut spans = kiln_obs::otlp::traces::Spans::default();
+    let decode = |d: &mut kiln_obs::llm::intake::Decoder, spans: &mut kiln_obs::otlp::traces::Spans| {
+        // Rows into buffers the node's writes handed back, as other spans' are.
+        while d.spares() < 2 {
+            let b = o.bytes();
+            if b.capacity() == 0 {
+                break;
+            }
+            d.give_rows(b);
+        }
+        d.spans(body, host, spans)
+    };
+    let decoded = DECODER.with(|d| match d.try_borrow_mut() {
+        Ok(mut d) => decode(&mut d, &mut spans),
+        Err(_) => decode(&mut kiln_obs::llm::intake::Decoder::new(), &mut spans),
+    });
+    match decoded {
+        Ok(()) => offered(spans.segments.is_empty() || o.offer_spans(spans.segments)),
+        Err(e) => bad(&e.to_string()),
+    }
+}
+
+/// An LLM app's evaluations (`kiln_obs::llm::intake::evaluations`), records beside its spans.
+pub(super) fn llm_evals(o: &Observe, body: &[u8], now_ms: i64) -> srv::Response {
+    match kiln_obs::llm::intake::evaluations(body, now_ms.saturating_mul(1_000_000)) {
+        Ok(records) => offered(records.is_empty() || o.offer_logs(records)),
+        Err(e) => bad(&e.to_string()),
     }
 }
 
@@ -506,6 +552,7 @@ mod tests {
                 && is_datadog(&["api", "beta", "sketches"])
                 && is_datadog(&["api", "v1", "anything"])
                 && is_datadog(&["api", "v0.2", "traces"])
+                && is_datadog(&["api", "intake", "llm-obs", "v2", "eval-metric"])
         );
         assert!(!is_datadog(&["api", "observe", "v1", "status"]) && !is_datadog(&["api", "sync", "blobs", "x"]));
     }

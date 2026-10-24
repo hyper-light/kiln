@@ -61,6 +61,7 @@ import { Route as AppObserveHostsIndexRouteImport } from './routes/_app.observe.
 import { Route as AppObserveHostsNameRouteImport } from './routes/_app.observe.hosts.$name'
 import { Route as AppObserveIncidentsIndexRouteImport } from './routes/_app.observe.incidents.index'
 import { Route as AppObserveIncidentsIdRouteImport } from './routes/_app.observe.incidents.$id'
+import { Route as AppObserveLlmIndexRouteImport } from './routes/_app.observe.llm.index'
 import { Route as AppObserveMonitorsIndexRouteImport } from './routes/_app.observe.monitors.index'
 import { Route as AppObserveMonitorsIdRouteImport } from './routes/_app.observe.monitors.$id'
 import { Route as AppObserveNotebooksIndexRouteImport } from './routes/_app.observe.notebooks.index'
@@ -77,6 +78,7 @@ import { Route as AppRunsIdIndexRouteImport } from './routes/_app.runs.$id.index
 import { Route as AppRunsIdCompareRouteImport } from './routes/_app.runs.$id.compare'
 import { Route as AppDeploymentsAppsProjectNameRouteImport } from './routes/_app.deployments.apps.$project.$name'
 import { Route as AppObserveApmServicesNameRouteImport } from './routes/_app.observe.apm.services.$name'
+import { Route as AppObserveLlmTracesIdRouteImport } from './routes/_app.observe.llm.traces.$id'
 import { Route as AppRunsIdJobsJobIdRouteImport } from './routes/_app.runs.$id.jobs.$jobId'
 
 const AppRoute = AppRouteImport.update({
@@ -342,6 +344,11 @@ const AppObserveIncidentsIdRoute = AppObserveIncidentsIdRouteImport.update({
   path: '/observe/incidents/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppObserveLlmIndexRoute = AppObserveLlmIndexRouteImport.update({
+  id: '/observe/llm/',
+  path: '/observe/llm/',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppObserveMonitorsIndexRoute = AppObserveMonitorsIndexRouteImport.update({
   id: '/observe/monitors/',
   path: '/observe/monitors/',
@@ -426,6 +433,11 @@ const AppObserveApmServicesNameRoute =
     path: '/observe/apm/services/$name',
     getParentRoute: () => AppRoute,
   } as any)
+const AppObserveLlmTracesIdRoute = AppObserveLlmTracesIdRouteImport.update({
+  id: '/observe/llm/traces/$id',
+  path: '/observe/llm/traces/$id',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppRunsIdJobsJobIdRoute = AppRunsIdJobsJobIdRouteImport.update({
   id: '/runs/$id/jobs/$jobId',
   path: '/runs/$id/jobs/$jobId',
@@ -491,6 +503,7 @@ export interface FileRoutesByFullPath {
   '/observe/errors/': typeof AppObserveErrorsIndexRoute
   '/observe/hosts/': typeof AppObserveHostsIndexRoute
   '/observe/incidents/': typeof AppObserveIncidentsIndexRoute
+  '/observe/llm/': typeof AppObserveLlmIndexRoute
   '/observe/monitors/': typeof AppObserveMonitorsIndexRoute
   '/observe/notebooks/': typeof AppObserveNotebooksIndexRoute
   '/observe/pipelines/': typeof AppObservePipelinesIndexRoute
@@ -500,6 +513,7 @@ export interface FileRoutesByFullPath {
   '/runs/$id/': typeof AppRunsIdIndexRoute
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
   '/observe/apm/services/$name': typeof AppObserveApmServicesNameRoute
+  '/observe/llm/traces/$id': typeof AppObserveLlmTracesIdRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
 }
 export interface FileRoutesByTo {
@@ -561,6 +575,7 @@ export interface FileRoutesByTo {
   '/observe/errors': typeof AppObserveErrorsIndexRoute
   '/observe/hosts': typeof AppObserveHostsIndexRoute
   '/observe/incidents': typeof AppObserveIncidentsIndexRoute
+  '/observe/llm': typeof AppObserveLlmIndexRoute
   '/observe/monitors': typeof AppObserveMonitorsIndexRoute
   '/observe/notebooks': typeof AppObserveNotebooksIndexRoute
   '/observe/pipelines': typeof AppObservePipelinesIndexRoute
@@ -570,6 +585,7 @@ export interface FileRoutesByTo {
   '/runs/$id': typeof AppRunsIdIndexRoute
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
   '/observe/apm/services/$name': typeof AppObserveApmServicesNameRoute
+  '/observe/llm/traces/$id': typeof AppObserveLlmTracesIdRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
 }
 export interface FileRoutesById {
@@ -633,6 +649,7 @@ export interface FileRoutesById {
   '/_app/observe/errors/': typeof AppObserveErrorsIndexRoute
   '/_app/observe/hosts/': typeof AppObserveHostsIndexRoute
   '/_app/observe/incidents/': typeof AppObserveIncidentsIndexRoute
+  '/_app/observe/llm/': typeof AppObserveLlmIndexRoute
   '/_app/observe/monitors/': typeof AppObserveMonitorsIndexRoute
   '/_app/observe/notebooks/': typeof AppObserveNotebooksIndexRoute
   '/_app/observe/pipelines/': typeof AppObservePipelinesIndexRoute
@@ -642,6 +659,7 @@ export interface FileRoutesById {
   '/_app/runs/$id/': typeof AppRunsIdIndexRoute
   '/_app/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
   '/_app/observe/apm/services/$name': typeof AppObserveApmServicesNameRoute
+  '/_app/observe/llm/traces/$id': typeof AppObserveLlmTracesIdRoute
   '/_app/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
 }
 export interface FileRouteTypes {
@@ -705,6 +723,7 @@ export interface FileRouteTypes {
     | '/observe/errors/'
     | '/observe/hosts/'
     | '/observe/incidents/'
+    | '/observe/llm/'
     | '/observe/monitors/'
     | '/observe/notebooks/'
     | '/observe/pipelines/'
@@ -714,6 +733,7 @@ export interface FileRouteTypes {
     | '/runs/$id/'
     | '/deployments/apps/$project/$name'
     | '/observe/apm/services/$name'
+    | '/observe/llm/traces/$id'
     | '/runs/$id/jobs/$jobId'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -775,6 +795,7 @@ export interface FileRouteTypes {
     | '/observe/errors'
     | '/observe/hosts'
     | '/observe/incidents'
+    | '/observe/llm'
     | '/observe/monitors'
     | '/observe/notebooks'
     | '/observe/pipelines'
@@ -784,6 +805,7 @@ export interface FileRouteTypes {
     | '/runs/$id'
     | '/deployments/apps/$project/$name'
     | '/observe/apm/services/$name'
+    | '/observe/llm/traces/$id'
     | '/runs/$id/jobs/$jobId'
   id:
     | '__root__'
@@ -846,6 +868,7 @@ export interface FileRouteTypes {
     | '/_app/observe/errors/'
     | '/_app/observe/hosts/'
     | '/_app/observe/incidents/'
+    | '/_app/observe/llm/'
     | '/_app/observe/monitors/'
     | '/_app/observe/notebooks/'
     | '/_app/observe/pipelines/'
@@ -855,6 +878,7 @@ export interface FileRouteTypes {
     | '/_app/runs/$id/'
     | '/_app/deployments/apps/$project/$name'
     | '/_app/observe/apm/services/$name'
+    | '/_app/observe/llm/traces/$id'
     | '/_app/runs/$id/jobs/$jobId'
   fileRoutesById: FileRoutesById
 }
@@ -1229,6 +1253,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppObserveIncidentsIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/observe/llm/': {
+      id: '/_app/observe/llm/'
+      path: '/observe/llm'
+      fullPath: '/observe/llm/'
+      preLoaderRoute: typeof AppObserveLlmIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/observe/monitors/': {
       id: '/_app/observe/monitors/'
       path: '/observe/monitors'
@@ -1341,6 +1372,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppObserveApmServicesNameRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/observe/llm/traces/$id': {
+      id: '/_app/observe/llm/traces/$id'
+      path: '/observe/llm/traces/$id'
+      fullPath: '/observe/llm/traces/$id'
+      preLoaderRoute: typeof AppObserveLlmTracesIdRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/runs/$id/jobs/$jobId': {
       id: '/_app/runs/$id/jobs/$jobId'
       path: '/runs/$id/jobs/$jobId'
@@ -1409,6 +1447,7 @@ interface AppRouteChildren {
   AppObserveErrorsIndexRoute: typeof AppObserveErrorsIndexRoute
   AppObserveHostsIndexRoute: typeof AppObserveHostsIndexRoute
   AppObserveIncidentsIndexRoute: typeof AppObserveIncidentsIndexRoute
+  AppObserveLlmIndexRoute: typeof AppObserveLlmIndexRoute
   AppObserveMonitorsIndexRoute: typeof AppObserveMonitorsIndexRoute
   AppObserveNotebooksIndexRoute: typeof AppObserveNotebooksIndexRoute
   AppObservePipelinesIndexRoute: typeof AppObservePipelinesIndexRoute
@@ -1418,6 +1457,7 @@ interface AppRouteChildren {
   AppRunsIdIndexRoute: typeof AppRunsIdIndexRoute
   AppDeploymentsAppsProjectNameRoute: typeof AppDeploymentsAppsProjectNameRoute
   AppObserveApmServicesNameRoute: typeof AppObserveApmServicesNameRoute
+  AppObserveLlmTracesIdRoute: typeof AppObserveLlmTracesIdRoute
   AppRunsIdJobsJobIdRoute: typeof AppRunsIdJobsJobIdRoute
 }
 
@@ -1479,6 +1519,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppObserveErrorsIndexRoute: AppObserveErrorsIndexRoute,
   AppObserveHostsIndexRoute: AppObserveHostsIndexRoute,
   AppObserveIncidentsIndexRoute: AppObserveIncidentsIndexRoute,
+  AppObserveLlmIndexRoute: AppObserveLlmIndexRoute,
   AppObserveMonitorsIndexRoute: AppObserveMonitorsIndexRoute,
   AppObserveNotebooksIndexRoute: AppObserveNotebooksIndexRoute,
   AppObservePipelinesIndexRoute: AppObservePipelinesIndexRoute,
@@ -1488,6 +1529,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppRunsIdIndexRoute: AppRunsIdIndexRoute,
   AppDeploymentsAppsProjectNameRoute: AppDeploymentsAppsProjectNameRoute,
   AppObserveApmServicesNameRoute: AppObserveApmServicesNameRoute,
+  AppObserveLlmTracesIdRoute: AppObserveLlmTracesIdRoute,
   AppRunsIdJobsJobIdRoute: AppRunsIdJobsJobIdRoute,
 }
 

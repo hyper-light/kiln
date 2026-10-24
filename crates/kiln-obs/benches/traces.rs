@@ -5,8 +5,10 @@
 //! and the rows' bytes, raw and as LZ4 packs them into a write. Then the same of a Datadog Agent's
 //! payloads (`kiln_obs::ddtrace`: its indexed form, a ddtrace Flask app's traces of ten spans as
 //! one was recorded sending them) and of its stats (a grouped stat a service's resource, its
-//! sketches of some twenty bins). Then a trace found by its id in a span store of many blocks, by
-//! their filters: the blocks read, and the time.
+//! sketches of some twenty bins). Then an LLM agent's (`kiln_obs::llm::spans`: each trace its
+//! agent's step, two chats with their messages, a tool's call and an embedding, as OpenTelemetry's
+//! GenAI instrumentations write them), each call read, priced and given Datadog's fields. Then a trace
+//! found by its id in a span store of many blocks, by their filters: the blocks read, and the time.
 //!
 //! `cargo bench -p kiln-obs --bench traces`
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::cast_precision_loss, clippy::cast_possible_truncation)]
@@ -105,6 +107,81 @@ fn request(spans: usize, r: u64, at: u64) -> Vec<u8> {
                                     kv(e, 3, "exception.stacktrace", "Traceback (most recent call last):\n  File \"/app/cart.py\", line 88, in load\n    cur.execute(Q, (cart_id,))\npsycopg.errors.LockNotAvailable: could not obtain lock on row in relation \"carts\"\n");
                                 });
                             }
+                        }
+                    }
+                });
+            }
+        });
+    });
+    w.buf
+}
+
+/// A request of `spans` spans of an LLM agent, request `r` of a run: traces of five spans (its
+/// agent's step, a chat with OpenAI's model, a tool's call, a chat with Anthropic's, an embedding),
+/// their attributes OpenTelemetry's GenAI conventions' (1.37 on), each chat's messages some 900 bytes.
+fn llm_request(spans: usize, r: u64, at: u64) -> Vec<u8> {
+    let question = "You are a terse travel planner. Answer in one line, with the temperature in Celsius and the sky. ".repeat(3);
+    let input = format!(r#"[{{"role":"system","parts":[{{"type":"text","content":"{question}"}}]}},{{"role":"user","parts":[{{"type":"text","content":"What is the weather in Paris today, and should I take an umbrella to the museum this afternoon?"}}]}}]"#);
+    let output = r#"[{"role":"assistant","parts":[{"type":"tool_call","id":"call_1","name":"weather","arguments":{"city":"Paris"}}],"finish_reason":"tool_calls"}]"#;
+    let mut w = Writer::default();
+    w.message(1, |rs| {
+        rs.message(1, |res| {
+            kv(res, 1, "service.name", "travel-agent");
+            kv(res, 1, "deployment.environment.name", "production");
+            kv(res, 1, "host.name", "agent-5c8d9f7b6-q8wzt");
+            kv(res, 1, "telemetry.sdk.language", "python");
+        });
+        rs.message(2, |ss| {
+            ss.message(1, |s| s.str(1, "opentelemetry.instrumentation.openai_v2"));
+            for i in 0..spans as u64 {
+                let trace = r * 1_000_000 + i / 5 + 1;
+                let start = at + i * 1_000_000;
+                ss.message(2, |s| {
+                    s.bytes(1, &(u128::from(trace) * 0x9e37_79b9_7f4a_7c15).to_le_bytes());
+                    s.bytes(2, &(r * 1_000_000 + i + 1).to_le_bytes());
+                    if i % 5 > 0 {
+                        s.bytes(4, &(r * 1_000_000 + i - i % 5 + 1).to_le_bytes());
+                    }
+                    s.fixed64(7, start);
+                    s.fixed64(8, start + 400_000_000 + (i % 97) * 5_000_000);
+                    match i % 5 {
+                        0 => {
+                            s.str(5, "invoke_agent planner");
+                            kv(s, 9, "gen_ai.operation.name", "invoke_agent");
+                            kv(s, 9, "gen_ai.agent.name", "planner");
+                            kv(s, 9, "gen_ai.provider.name", "openai");
+                            kv(s, 9, "gen_ai.conversation.id", &format!("conv-{}", trace % 1000));
+                        }
+                        1 | 3 => {
+                            let (model, provider) = if i % 5 == 1 { ("gpt-4o-mini", "openai") } else { ("claude-opus-5-5", "anthropic") };
+                            s.str(5, &format!("chat {model}"));
+                            s.varint(6, 3);
+                            kv(s, 9, "gen_ai.operation.name", "chat");
+                            kv(s, 9, "gen_ai.provider.name", provider);
+                            kv(s, 9, "gen_ai.request.model", model);
+                            kv(s, 9, "gen_ai.response.model", model);
+                            kv(s, 9, "gen_ai.response.id", &format!("resp-{i}"));
+                            kv(s, 9, "gen_ai.response.finish_reasons", "[\"tool_calls\"]");
+                            kv_int(s, 9, "gen_ai.usage.input_tokens", 1200 + i % 300);
+                            kv_int(s, 9, "gen_ai.usage.output_tokens", 40 + i % 60);
+                            kv_int(s, 9, "gen_ai.usage.cache_read.input_tokens", 1000);
+                            kv(s, 9, "server.address", if i % 5 == 1 { "api.openai.com" } else { "api.anthropic.com" });
+                            kv(s, 9, "gen_ai.input.messages", &input);
+                            kv(s, 9, "gen_ai.output.messages", output);
+                        }
+                        2 => {
+                            s.str(5, "execute_tool weather");
+                            kv(s, 9, "gen_ai.operation.name", "execute_tool");
+                            kv(s, 9, "gen_ai.tool.name", "weather");
+                            kv(s, 9, "gen_ai.tool.call.id", "call_1");
+                        }
+                        _ => {
+                            s.str(5, "embeddings text-embedding-3-small");
+                            s.varint(6, 3);
+                            kv(s, 9, "gen_ai.operation.name", "embeddings");
+                            kv(s, 9, "gen_ai.provider.name", "openai");
+                            kv(s, 9, "gen_ai.request.model", "text-embedding-3-small");
+                            kv_int(s, 9, "gen_ai.usage.input_tokens", 8);
                         }
                     }
                 });
@@ -518,8 +595,8 @@ fn main() {
     }
     println!("{:<30} {:>6} {:>9} {:>10} {:>10} {:>11} {:>10} {:>8}", "request", "spans", "bytes", "rows B/s", "lz4 B/s", "decode ns/s", "allocs/s", "faults");
     let at = 1_800_000_000_000_000_000u64;
-    for spans in [512usize, 4096] {
-        let req = request(spans, 1, at);
+    for (spans, llm) in [(512usize, false), (4096, false), (510, true), (4095, true)] {
+        let req = if llm { llm_request(spans, 1, at) } else { request(spans, 1, at) };
         let mut d = Decoder::new();
         // The decoder's room grown by the first; buffers handed back as a node's batcher does.
         let mut out = Spans::default();
@@ -556,7 +633,7 @@ fn main() {
         let n = spans as f64;
         println!(
             "{:<30} {:>6} {:>9} {:>10.0} {:>10.0} {:>11.0} {:>10.4} {:>8}",
-            format!("{spans} spans, a web service's"),
+            format!("{spans} spans, {}", if llm { "an LLM agent's" } else { "a web service's" }),
             spans,
             req.len(),
             rows as f64 / n,

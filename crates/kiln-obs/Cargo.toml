@@ -22,16 +22,17 @@ hyper-block = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627
 # Calendar rollups' and calendar_shift's timezones (`query::calendar`): the tz database bundled in
 # the binary, not the machine's, so every machine answers alike; kiln-ci's, already in kiln's tree.
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tzdb-bundle-always"] }
+# LLM observability's price catalog (`llm::prices`): genai-prices' JSON read once as it starts, and
+# its models' patterns; kiln's, already in kiln's tree (the benches read NAB's labels and run
+# Loghub's preprocessing with them too).
+regex = "1"
+serde_json = "1.0.154"
 
 [dev-dependencies]
 tempfile = "3.27.0"
 # Only to measure LZ4 against deflate (benches/lz4.rs); kiln has it already.
 flate2 = "1.1.10"
 hyper-measure = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-# Only to read NAB's labels and results (benches/nab.rs); kiln has it already.
-serde_json = "1.0.154"
-# Only to run Loghub's benchmark with its own preprocessing (benches/loghub.rs); in the tree already.
-regex = "1"
 
 [[bench]]
 name = "codec"

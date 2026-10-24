@@ -12,7 +12,12 @@
 //!   traces a second kept of the node's tracers' (`KILN_DD_TARGET_TPS`; 0, every trace), each
 //!   service its share, a tracer's own rules and errors kept besides;
 //! - `GET /info`: what it takes, those two alone, so a tracer computes no stats of its own and drops
-//!   no trace for them;
+//!   no trace for them; and its event platform's proxy and spans' `meta_struct`, so an LLM app's
+//!   tracer sends its LLM events through this node (dd-trace-py's ride its APM spans' `meta_struct`,
+//!   read with them; those its APM traces don't carry it sends the proxy);
+//! - `POST /evp_proxy/v2/api/v2/llmobs` (`X-Datadog-EVP-Subdomain: llmobs-intake`): an LLM app's
+//!   spans, and `/evp_proxy/v2/api/intake/llm-obs/v2/eval-metric` (and v1's) their evaluations, taken
+//!   as the server takes them (`super::ddagent::llm_spans`), this node their Agent;
 //! - its other products' paths (telemetry, remote configuration, profiles, its event platform's
 //!   proxy) answered and passed over, so a tracer neither retries nor complains.
 //!
@@ -135,9 +140,9 @@ fn info() -> srv::Response {
         StatusCode::OK,
         &json!({
             "version": format!("kiln {}", env!("CARGO_PKG_VERSION")),
-            "endpoints": ["/v0.4/traces", "/v0.5/traces", "/profiling/v1/input"],
+            "endpoints": ["/v0.4/traces", "/v0.5/traces", "/profiling/v1/input", "/evp_proxy/v2/"],
             "client_drop_p0s": false,
-            "span_meta_structs": false,
+            "span_meta_structs": true,
             "long_running_spans": false,
             "config": { "default_env": "none" }
         }),
@@ -151,6 +156,17 @@ pub async fn answer(o: &Observe, req: srv::Request) -> srv::Response {
     if path == "/profiling/v1/input" {
         let host = NODE.get().map_or_else(crate::os::hostname, |(h, _, _)| h.clone());
         return super::profiles::from_tracer(o, &host, req).await;
+    }
+    // An LLM app's spans and evaluations, through the event platform's proxy.
+    let llm = match path.as_str() {
+        "/evp_proxy/v2/api/v2/llmobs" | "/evp_proxy/v2/api/intake/llm-obs/v1/trace/spans" => Some(true),
+        "/evp_proxy/v2/api/intake/llm-obs/v1/eval-metric" | "/evp_proxy/v2/api/intake/llm-obs/v2/eval-metric" => Some(false),
+        _ => None,
+    };
+    if let Some(spans) = llm
+        && req.method() == Method::POST
+    {
+        return llm_events(o, req, spans).await;
     }
     let v5 = match (req.method(), path.as_str()) {
         (&Method::GET, "/info") => return info(),
@@ -215,6 +231,35 @@ pub async fn answer(o: &Observe, req: srv::Request) -> srv::Response {
             Err(e) => srv::text(StatusCode::BAD_REQUEST, &e.to_string()),
         };
         drop((stats, roots));
+        o.give_bytes(plain);
+        r
+    })
+    .await;
+    done.unwrap_or_else(|e| srv::text(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")))
+}
+
+/// An LLM app's spans (`spans`) or evaluations, through the event platform's proxy: taken as the
+/// server takes them, this node their Agent (its host theirs).
+async fn llm_events(o: &Observe, req: srv::Request, spans: bool) -> srv::Response {
+    let encoding = srv::header_str(&req, &header::CONTENT_ENCODING).unwrap_or("").to_owned();
+    let body = match srv::body_bytes(req.into_body(), MAX_BODY + 1).await {
+        Ok(b) => b,
+        Err(_) => return srv::text(StatusCode::PAYLOAD_TOO_LARGE, "an LLM app's payload is taken up to 25 MiB"),
+    };
+    let o = o.clone();
+    let done = crate::rt::blocking(move || {
+        if o.busy() {
+            return srv::json(StatusCode::TOO_MANY_REQUESTS, &json!({ "error": "behind on writes" }));
+        }
+        let mut plain = o.bytes();
+        let r = match super::ddagent::unzip(&encoding, &body, &mut plain) {
+            Err(why) => srv::text(StatusCode::BAD_REQUEST, &why),
+            Ok(()) if spans => {
+                let host = NODE.get().map_or_else(crate::os::hostname, |(h, _, _)| h.clone());
+                super::ddagent::llm_spans(&o, &plain, &host)
+            }
+            Ok(()) => super::ddagent::llm_evals(&o, &plain, super::clock_ms()),
+        };
         o.give_bytes(plain);
         r
     })

@@ -20,7 +20,9 @@
 //!   message) as `error.type`, `error.message` and `error.stack` (as Datadog maps OpenTelemetry's
 //!   `exception.*`), `peer.service` on a client's or a producer's span (the system or the address it
 //!   calls, where not given: [`PEER_SOURCES`], Datadog's tracers' `out.host` among them), Datadog's `http.status_code` (from the semantic
-//!   conventions' `http.response.status_code`), and its events and links as JSON;
+//!   conventions' `http.response.status_code`), and its events and links as JSON; an LLM span's
+//!   Datadog's LLM fields, tokens and cost (`crate::llm::spans`: read whole before the span's
+//!   attributes are bounded, room kept for them);
 //! - its trace id and span id. A span without a valid one of each (16 and 8 bytes, not all zero, as
 //!   the specification has them) is not kept, and counted.
 //!
@@ -493,7 +495,11 @@ impl<'a> Cx<'a, '_> {
                 self.attrs.push(a);
             }
         }
-        merge_under(&mut self.attrs, own, MAX_TAGS - OWN, &[self.resource.as_slice()], &|k| FIXED.contains(&k), &mut out.dropped_attrs);
+        // An LLM span (`crate::llm::spans`), read whole before its attributes are bounded: room kept
+        // for kiln's LLM attributes.
+        let llm = crate::llm::spans::read_attrs(name, self.attrs.get(own..).unwrap_or_default(), &self.resource, &self.text);
+        let room = MAX_TAGS - OWN - llm.as_ref().map_or(0, |_| crate::llm::spans::OWN);
+        merge_under(&mut self.attrs, own, room, &[self.resource.as_slice()], &|k| FIXED.contains(&k), &mut out.dropped_attrs);
         // Where the span does not say them: the unified service tags, the error, the peer.
         let has = |attrs: &[Attr<'_>], k: &str| attrs.iter().any(|a| a.key == k);
         if !has(&self.attrs, "env")
@@ -534,6 +540,9 @@ impl<'a> Cx<'a, '_> {
             u64::try_from(now_ns).unwrap_or(0)
         };
         let ts = i64::try_from(ts).unwrap_or(i64::MAX);
+        if let Some(r) = &llm {
+            crate::llm::spans::put(&mut self.attrs, &mut self.text, r, res.service, ts);
+        }
         let (service, host) = (res.service.map_or("", |v| resolve(v, &self.text)), res.host.map_or("", |v| resolve(v, &self.text)));
         let severity = if status == STATUS_ERROR { SEVERITY_ERROR } else { SEVERITY_OK };
         write_row(&mut self.seg, self.spare, out, &mut self.attrs, &self.text, ts, severity, [service, host, source], name, trace, span);

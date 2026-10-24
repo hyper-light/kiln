@@ -28,7 +28,8 @@
 //!   `env` (its own, else its payload's, else the Agent's) and `version` (its own: a tracer sets
 //!   none on a span of a service not its own), `error.message` (older tracers' `error.msg`),
 //!   `http.status_code` (from `http.response.status_code`), `peer.service` on a client's or a
-//!   producer's span ([`PEER_SOURCES`]), and its events and links as JSON, as OTLP's.
+//!   producer's span ([`PEER_SOURCES`]), its events and links as JSON, and an LLM span's Datadog
+//!   LLM fields (`crate::llm::spans`), as OTLP's.
 //!
 //! **Stats.** The Agent counts every span it is sent before it samples (its concentrator), and
 //! sends on only the traces it keeps (ten a second by default, `apm_config.target_traces_per_second`),
@@ -690,6 +691,16 @@ impl<'a> Cx<'a, '_> {
         Ok(b)
     }
 
+    /// A span's LLM event (`meta_struct["_llmobs"]`) into its tags; one that does not read leaves
+    /// none of it.
+    fn llmobs(&mut self, bin: &'a [u8]) {
+        let (tags, text) = (self.tags.len(), self.text.len());
+        if crate::llm::intake::llmobs_struct(bin, &mut self.tags, &mut self.text).is_err() {
+            self.tags.truncate(tags);
+            self.text.truncate(text);
+        }
+    }
+
     /// An indexed span's fields, its attributes into `tags`.
     fn indexed_span(&mut self, msg: &'a [u8], trace: Option<[u8; 16]>, text_at: usize) -> Result<Span<'a>, OtlpError> {
         self.text.truncate(text_at);
@@ -765,6 +776,20 @@ impl<'a> Cx<'a, '_> {
                     }
                 }
                 (12, w) => s.ty = w.str().unwrap_or(""),
+                // Its LLM event, where it rides the span (`crate::llm::intake::llmobs_struct`).
+                (13, w) => {
+                    let (mut k, mut v) = ("", &[][..]);
+                    for g in Fields::new(w.bytes().unwrap_or(&[])) {
+                        match g? {
+                            (1, x) => k = x.str().unwrap_or(""),
+                            (2, x) => v = x.bytes().unwrap_or(&[]),
+                            _ => {}
+                        }
+                    }
+                    if k == "_llmobs" {
+                        self.llmobs(v);
+                    }
+                }
                 (14, w) => self.parts.push((LINK, w.bytes().unwrap_or(&[]))),
                 (15, w) => self.parts.push((EVENT, w.bytes().unwrap_or(&[]))),
                 _ => {}
@@ -818,7 +843,11 @@ impl<'a> Cx<'a, '_> {
                 put(a);
             }
         }
-        merge_under(&mut self.attrs, own, MAX_TAGS - OWN, &[self.chunk.as_slice(), self.payload.as_slice()], &|k| FIXED.contains(&k), &mut out.dropped_attrs);
+        // An LLM span (`crate::llm::spans`), read whole before its attributes are bounded: room kept
+        // for kiln's LLM attributes.
+        let llm = crate::llm::spans::read_attrs(s.name, self.attrs.get(own..).unwrap_or_default(), &[], &self.text);
+        let room = MAX_TAGS - OWN - llm.as_ref().map_or(0, |_| crate::llm::spans::OWN);
+        merge_under(&mut self.attrs, own, room, &[self.chunk.as_slice(), self.payload.as_slice()], &|k| FIXED.contains(&k), &mut out.dropped_attrs);
         // Where the span does not say them: the unified service tags, the error, the status, the
         // peer.
         let has = |attrs: &[Attr<'_>], k: &str| attrs.iter().any(|a| a.key == k);
@@ -856,6 +885,9 @@ impl<'a> Cx<'a, '_> {
         }
         // The row.
         let ts = if s.start != 0 { i64::try_from(s.start).unwrap_or(i64::MAX) } else { now_ns };
+        if let Some(r) = &llm {
+            crate::llm::spans::put(&mut self.attrs, &mut self.text, r, Some(Val::Str(s.service)), ts);
+        }
         let host = find(&self.tags, "_dd.hostname").map(|v| resolve(v, &self.text)).filter(|h| !h.is_empty()).unwrap_or(if pl.host.is_empty() { agent.host } else { pl.host });
         let severity = if s.error { SEVERITY_ERROR } else { SEVERITY_OK };
         let name = if s.resource.is_empty() { s.name } else { s.resource };
@@ -1325,6 +1357,17 @@ impl<'a> Cx<'a, '_> {
                             let k = text(r)?;
                             let v = r.f64()?;
                             metric(self, k, v, &mut marked);
+                        }
+                    }
+                    // Its LLM event, where it rides the span (`crate::llm::intake::llmobs_struct`).
+                    "meta_struct" => {
+                        for _ in 0..r.map()? {
+                            if text(r)? == "_llmobs" {
+                                let bin = r.bin()?;
+                                self.llmobs(bin);
+                            } else {
+                                r.skip()?;
+                            }
                         }
                     }
                     _ => r.skip()?,

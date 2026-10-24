@@ -50,6 +50,7 @@ const SECTIONS = [
   { to: "/observe/logs", label: "Logs" },
   { to: "/observe/apm", label: "APM" },
   { to: "/observe/profiles", label: "Profiles" },
+  { to: "/observe/llm", label: "LLM" },
   { to: "/observe/catalog", label: "Catalog" },
   { to: "/observe/errors", label: "Errors" },
   { to: "/observe/events", label: "Events" },
@@ -239,9 +240,23 @@ export function formatValue(v: number | null | undefined, unit?: string): string
       return `${compact(v)}%`;
     case "fraction":
       return `${compact(v * 100)}%`;
+    case "nanodollars":
+      return formatUsd(v / 1e9);
     default:
       return unit ? `${compact(v)} ${unit}` : compact(v);
   }
+}
+
+/** Dollars as a bill reads them: cents from a dollar up, three significant digits below
+ * ($0.000129, a call's). */
+export function formatUsd(v: number): string {
+  if (!Number.isFinite(v)) return "—";
+  const a = Math.abs(v);
+  if (a === 0) return "$0";
+  if (a >= 1000) return `${v < 0 ? "-" : ""}$${compact(a)}`;
+  if (a >= 1) return `${v < 0 ? "-" : ""}$${a.toFixed(2)}`;
+  const digits = Math.min(20, 2 - Math.floor(Math.log10(a)));
+  return `${v < 0 ? "-" : ""}$${a.toFixed(digits).replace(/0+$/, "").replace(/\.$/, "")}`;
 }
 
 /** A metric's seconds: a latency's ns, µs or ms below a second (0.052 → "52 ms"), seconds below a

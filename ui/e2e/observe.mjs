@@ -2755,6 +2755,76 @@ const scenarios = {
     expect(exceptions !== undefined, "its exceptions among its types");
   },
 
+  /** An LLM app's calls, as Datadog's Python tracer sent them (kiln-obs's fixture: a workflow,
+   * its planner agent, OpenAI's chat, a weather tool, Anthropic's model and an embedding), sent to
+   * the intake: its LLM page has its cost by model to the dollar's millionths, its newest trace,
+   * and the trace's steps as a tree, the chat's messages and cost where it is opened. */
+  async "an LLM app's calls are its LLM page: its cost by model, its trace and a step's messages"() {
+    const ingest = process.env.KILN_INGEST_TOKEN;
+    if (!ingest) return "skipped: no KILN_INGEST_TOKEN";
+    const app = `e2e-llm-${run}`;
+    const dir = process.env.LLMOBS_DIR ? new URL(`file://${process.env.LLMOBS_DIR.replace(/\/?$/, "/")}`) : new URL("../../crates/kiln-obs/src/fixtures/llmobs/", import.meta.url);
+    const events = JSON.parse(fs.readFileSync(new URL("dd-trace-py-4.16.0-llmobs.json", dir), "utf8"));
+    // Ids and times of its own (the browsers' runs share a server): its spans' ids remapped, its
+    // parents with them; its first step a minute ago.
+    const hex = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const ids = new Map();
+    const idOf = (old) => {
+      if (old === "undefined") return old;
+      if (!ids.has(old)) ids.set(old, BigInt(`0x${hex(8)}`).toString());
+      return ids.get(old);
+    };
+    const [trace, apmTrace] = [hex(16), hex(16)];
+    const first = Math.min(...events.flatMap((e) => e.spans.map((x) => x.start_ns)));
+    const shift = BigInt(Date.now() - 60_000) * 1_000_000n - BigInt(first);
+    for (const e of events)
+      for (const x of e.spans) {
+        x.span_id = idOf(x.span_id);
+        x.parent_id = idOf(x.parent_id);
+        x.trace_id = trace;
+        x._dd = { ...x._dd, span_id: x.span_id, trace_id: trace, apm_trace_id: apmTrace };
+        x.start_ns = Number(BigInt(x.start_ns) + shift);
+        x.session_id = `sess-${run}`;
+        x.tags = x.tags.map((t) => (t.startsWith("ml_app:") ? `ml_app:${app}` : t.startsWith("service:") ? `service:${app}` : t.startsWith("session_id:") ? `session_id:sess-${run}` : t));
+      }
+    const r = await fetch(`${BASE}/api/v2/llmobs`, { method: "POST", headers: { "DD-API-KEY": ingest, "content-type": "application/json" }, body: JSON.stringify(events) });
+    expect(r.status === 202, `its events taken: ${r.status} ${await r.text()}`);
+    const to = Date.now() + 60_000;
+    await until(
+      "its six steps searchable",
+      async () => (await api("POST", "/api/observe/v1/spans/search", { query: `@ml_app:${app} @meta.span.kind:*`, from: Date.now() - 600_000, to, limit: 20 })).body?.spans?.length === 6,
+      30_000,
+    );
+    await page.goto(`${BASE}/observe/llm?app=${encodeURIComponent(app)}`);
+    // Its models, each priced as the catalog prices it: the chat's cache reads at theirs.
+    const models = page.getByRole("table");
+    const row = (model) => models.locator("tr", { hasText: model });
+    await row("gpt-4o-mini-2024-07-18").waitFor();
+    expect(((await row("gpt-4o-mini-2024-07-18").textContent()) ?? "").includes("$0.000129"), "the chat's cost: 1,200 input tokens, 1,000 of them cached, and 40 out");
+    expect(((await row("claude-opus-5-5").textContent()) ?? "").includes("$0.0017"), "Anthropic's: its 1-hour cache writes at theirs");
+    await page.getByText("$0.00183", { exact: true }).waitFor();
+    await fitsAcross("an LLM app's page");
+    // Its session, chosen: its traces narrowed to it.
+    await page
+      .getByRole("list", { name: "Sessions" })
+      .getByRole("button", { name: new RegExp(`sess-${run}.*6 steps`) })
+      .click();
+    await page.getByRole("button", { name: `session sess-${run} ×` }).waitFor();
+    // Its newest trace, opened: its six steps, the chat's messages and cost.
+    await page
+      .getByRole("list", { name: "LLM traces" })
+      .getByRole("link", { name: /answer/ })
+      .click();
+    const steps = page.getByRole("list", { name: "Steps" });
+    await steps.waitFor();
+    expect((await steps.getByRole("listitem").count()) === 6, "its six steps");
+    await steps.getByRole("button", { name: /OpenAI\.createChatCompletion/ }).click();
+    await page.getByText("You are terse.", { exact: true }).waitFor();
+    await page.getByText("Paris: 18C and clear.", { exact: true }).waitFor();
+    await page.getByText(/^Priced as openai\/gpt-4o-mini/).waitFor();
+    await fitsAcross("an LLM trace's steps");
+  },
+
   async "a container is listed against its limits, read from its page and its host's, and one stopped is told apart"() {
     const ingest = process.env.KILN_INGEST_TOKEN;
     if (!ingest) return "skipped: no KILN_INGEST_TOKEN";

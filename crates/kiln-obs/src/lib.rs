@@ -25,6 +25,7 @@ pub mod head;
 pub mod image;
 pub mod index;
 pub mod json;
+pub mod llm;
 pub mod logs;
 pub mod lz4;
 pub mod machine;

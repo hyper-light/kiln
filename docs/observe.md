@@ -46,6 +46,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-32 | OpenTelemetry's containers (§10.11): Docker's, the kubelet's and the cluster's receivers' container metrics and the semantic conventions', read in their own names and units (cumulative time a rate, a working set for what Docker calls usage, limits in cores and bytes, devices and modes summed), a container kiln's check also sees one container, the kubelet's series joined by pod and name; each chart of its page drawn by the source that reported it; checked live against a real Collector and in browsers (§13), measured against O-30 (§12.34) | done |
 | O-33 | Continuous profiles (§8.11), Datadog's Continuous Profiler: what tracers' profilers upload (pprof in `multipart/form-data`, gzip'd, zstd'd or in LZ4's frames) taken where they send it (a runner's tracer port, sent on over the observe lane; the server's intake), kept by the server (segments of blobs and headers, an index of 40 bytes an upload), searched by tags, summed into flame graphs over a time (a snapshot's type averaged), compared path by path; its page (canvas flame graph, functions by self or by change, uploads); checked against Go's own profiles and live against dd-trace-go and ddtrace through a runner and Datadog's Agent; measured (§12.36) | done |
 | O-34 | Java's profiles (§8.11): JFR recordings (dd-trace-java's `main.jfr`: the JDK's chunks and ddprof's, zstd'd, gzip'd, LZ4'd or not) read where they are taken into pprof profiles in Go's names: CPU (ddprof's or the JDK's), wall time, allocations, the live heap, lock waits, exceptions, file and socket I/O; a runner sends the profiles on, not the recording; frames named as Datadog's pages name them; checked against a reader written apart on dd-trace-java's own recordings (to the nanosecond), live against dd-trace-java 1.67.1 through a runner and in a browser; measured and profiled, rewritten (§12.37) | done |
+| O-35 | LLM observability (§8.12), Datadog's (its "Agent Observability"): LLM spans recognized in OpenTelemetry's GenAI conventions (every version), OpenInference's, OpenLLMetry's and Claude Code's, given Datadog's fields; costed from genai-prices' catalog (Datadog's), held to its own package; Datadog's LLM intake and evaluations; `ml_obs.*` metrics; its page | under way |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Merges join their inputs' rollups rather than make them anew: 38% less merging time (§4.7, §12.16) | continuous |
 
 ## 1. Rules
@@ -1613,6 +1614,125 @@ specs: dd-trace-go's upload (`profiler/upload.go`, `profile.go`), google/pprof's
   graph bounded (a million nodes: a stack past it summed into its deepest node's own, the totals
   whole); graphs summed apart merged path by path.
 - Status: done (O-33, O-34). Java's recordings checked against dd-trace-java 1.67.1's own (its debug dumps, two kept as fixtures: the JDK's chunk and ddprof's, and the JDK's alone) and a reader written apart (`kiln-obs/src/fixtures/jfr/check`: jfrdump.py's reader, jfrsum.py's sums; kiln's the same to the nanosecond), live through a runner and in a browser (§13); measured (§12.37).
+
+### 8.12 LLM observability
+
+Datadog's LLM Observability (now its "Agent Observability"; `crate::observe::llm`,
+`kiln_obs::llm`): an application's calls to language models and what they cost, its agents' and
+tools' steps, read from the spans it already sends. Its sources' formats from their code and specs
+(research of 2026-10-23, every name checked against its source at a pinned commit): OpenTelemetry's
+GenAI semantic conventions (v1.41.0, their last release in the core repository, and the
+`semantic-conventions-genai` repository's main, where they moved, unreleased), Datadog's dd-trace-py
+4.16 (`ddtrace.llmobs`: its span events, its intake) and its docs (its OpenTelemetry mapping, its
+`ml_obs.*` metrics, its cost), Arize's OpenInference, Traceloop's OpenLLMetry, and Claude Code's own
+telemetry.
+
+- **Recognized** where a span is taken (OTLP's traces, Datadog's tracers' spans, Datadog's LLM
+  intake), as an error's issue is (`kiln_obs::llm::spans`): a span is an LLM span if it says one of
+  the conventions does (any `gen_ai.*` or `llm.*` attribute, `openinference.span.kind`,
+  `traceloop.span.kind`, `langfuse.observation.type`, Datadog's own `meta.span.kind`) or is Claude
+  Code's (`claude_code.*`); any other span is passed over by its attributes' keys alone, nothing
+  read. An LLM span is read whole, in one pass over its attributes, before they are bounded (an
+  instrumentation that flattens a conversation into hundreds of attributes keeps its tokens), and
+  room is kept for kiln's (24 at the most). It is given Datadog's fields as attributes beside its
+  own, each where it says none of the name, so Datadog's LLM queries read it as they read
+  Datadog's (`@meta.span.kind:llm`, `@meta.model_name:claude*`, `@metrics.total_tokens:>1000`):
+  `meta.span.kind` (Datadog's kinds: `llm`, `embedding`, `retrieval`, `tool`, `agent`, `workflow`,
+  `task`, by its operation as Datadog maps OpenTelemetry's: chat, text_completion,
+  generate_content, completion an `llm`; embeddings an `embedding`; execute_tool a `tool`;
+  invoke_agent, create_agent an `agent`; retrieval a `retrieval` (Datadog's docs leave it a
+  workflow); anything else a `workflow`; OpenInference's, OpenLLMetry's and Langfuse's kinds as
+  Datadog maps them; a span of no operation that names a model or tokens, OpenTelemetry's before
+  1.27, an `llm`; Claude Code's request an `llm`, its tool a `tool`, its interaction an `agent`, the
+  rest a `task`), `meta.model_name` (the response's model, else the request's), `meta.model_provider`
+  (the older `gen_ai.system`'s names read as the newer: `xai` as `x_ai`, `az.ai.*` as `azure.ai.*`,
+  `vertex_ai` and `gemini` as `gcp.*`, `mistral_ai` as main's `mistral`; a model's call that names
+  none `custom`, as Datadog's), `ml_app` (its service), `session_id` (`gen_ai.conversation.id`,
+  OpenInference's `session.id`), and its tokens as Datadog counts them: `metrics.input_tokens`
+  every input token (cache reads and writes in it: OpenTelemetry's, Datadog's and OpenInference's
+  count them in; Claude Code's leaves them out and they are added back; an input under its own
+  cache reads and writes, an instrumentation passing Anthropic's on, says it left them out),
+  `metrics.output_tokens`, `metrics.total_tokens`, `metrics.cache_read_input_tokens`,
+  `metrics.cache_write_input_tokens` (`cache_creation` in v1.40–1.41, `cache_write` after),
+  `metrics.non_cached_input_tokens`, `metrics.reasoning_output_tokens`. Each convention's names
+  read: OpenTelemetry's of every version since 1.26 (`prompt_tokens` before 1.27), OpenInference's
+  `llm.token_count.*`, OpenLLMetry's own and legacy `llm.usage.*`, Claude Code's `input_tokens`,
+  `cache_read_tokens`, `cache_creation_tokens` (on its own spans alone: the names are generic).
+  Datadog's tracer copies an LLM span's fields onto its APM span as `gen_ai.*` tags, marked
+  `_dd.llmobs.artificial_gen_ai_tags`: such a span is passed over (its LLM event comes apart, and
+  is read), unless it carries the event itself (below).
+- **Costed** as Datadog costs it: what a span says it cost (Datadog's `metrics.*_cost` in dollars,
+  OpenInference's `llm.cost.*`, OpenLIT's `gen_ai.usage.cost`, Claude Code's `cost_usd`) is taken as
+  it is (`cost_source:user`; parts it does not say are the catalog's); else its tokens priced from a
+  catalog (`cost_source:auto`, `kiln_obs::llm::prices`): pydantic's genai-prices (MIT), the catalog
+  Datadog's docs name, a snapshot of it kept in kiln (commit `b267c2e`, 2026-10-23: 47 providers,
+  2,081 models), each matched by its provider and its name's rules (equal, a prefix, a suffix,
+  a part, a pattern; a compact date in a name read as a dashed one), its prices per million tokens
+  of each of 59 units, tiers past a prompt's size (all of its tokens at the tier's price, the
+  catalog's cliff), prices of a date or a time of day (a span priced as it was when it ran), a
+  batch's and a service tier's (OpenAI's `openai.response.service_tier`). Each unit billed once, on
+  its own count (cache reads and writes out of the input, a 1-hour write out of the writes, each at
+  its price). A provider is named as the catalog names it where its rules would miss
+  OpenTelemetry's (`x_ai` its `x-ai`, `azure.ai.*` its `azure`, `gcp.gen_ai` its `google`); one not
+  named (Datadog's tracer's `unknown`, for a client of another address; `custom`) is found by the
+  address called (`server.address`), else by the model's name. Held to the catalog's own Python
+  package: a fixture of 4,000 of its answers (drawn from a run of 29,196: every model of the main
+  providers and three of each other's, each asked under the ids spans name its provider by, with
+  tokens of every kind, past and under tiers, dated across price changes, in each price context;
+  the whole run checked the same way), kiln's the same model, priced the same to the nanodollar, or
+  refused alike. Kept in nanodollars, as Datadog keeps them: `metrics.estimated_total_cost`,
+  `.estimated_input_cost`, `.estimated_output_cost` and Datadog's parts
+  (`.estimated_non_cached_input_cost`, `.estimated_cache_read_input_cost`,
+  `.estimated_cache_write_input_cost`, `.estimated_reasoning_output_cost`); the catalog's model
+  (`matched_model_name`, `matched_model_provider`); a cost not to be had said, not guessed
+  (`cost_unavailable`: Datadog's reasons, an unsupported provider or model name, missing token
+  counts).
+- **Datadog's own intake** (`kiln_obs::llm::intake`), as dd-trace-py 4.16 was recorded sending it
+  (fixtures of its three paths): `POST /api/v2/llmobs` on the server (`DD_LLMOBS_OVERRIDE_ORIGIN`
+  pointed at kiln) and the Agent's `/evp_proxy/v2/api/v2/llmobs` on every runner's tracer port,
+  whose `/info` now lists the proxy and spans' `meta_struct`: a tracer with APM on sends its LLM
+  events riding its APM spans (`meta_struct["_llmobs"]`, MessagePack, read into the span itself:
+  one row, Datadog's fields over the tags its tracer copied, its LLM trace and parent said as
+  `llmobs.trace_id` and `llmobs.parent_id`), and those its APM traces don't carry through the
+  proxy. An event of the intake is a span of its LLM trace, as Datadog keeps an app's LLM traces
+  apart from its APM traces (the APM spans its tracer sends beside them are marked
+  `_dd.llmobs.submitted`; `_dd.apm_trace_id` names their trace), source `llmobs`, its fields its
+  attributes under Datadog's names (`meta.input.messages`, `meta.output.value`, ... as JSON;
+  `meta.metadata.<key>`; `metrics.<key>`; each tag's `key:value`). Datadog's documented spans API
+  (`/api/intake/llm-obs/v1/trace/spans`) is read too. Evaluations
+  (`/api/intake/llm-obs/v2/eval-metric` and v1's, and the proxy's) are records beside the spans
+  they judge (source `llmobs.eval`, its span's ids, its label, type, value, assessment,
+  reasoning). A value is kept to 25,000 bytes as any span's is (Datadog keeps an event to 5 MB:
+  a long conversation's messages are cut).
+- **Metrics** Datadog derives (`ml_obs.*`, `kiln_obs::llm::metrics`), as metrics from spans,
+  counted on the server once a span's window is whole as trace metrics are (§8.7), their prefix
+  kiln's: `ml_obs.span`, `.duration`, `.error`; the tokens' distributions
+  (`ml_obs.span.llm.input.tokens`, `.output`, `.total`, `.input.cache_read`, `.input.cache_write`,
+  `.input.non_cached`, `.output.reasoning`, `ml_obs.span.embedding.input.tokens`); cost's
+  (`ml_obs.span.llm.total.cost` of calls and embeddings, `.input.cost` and its parts,
+  `.output.cost` and its reasoning's, `ml_obs.span.embedding.input.cost`, nanodollars);
+  `ml_obs.trace`, `.duration`, `.error` of an LLM trace's root (Datadog's tracer's: no LLM parent;
+  any other's: no parent); by `ml_app`, `model_name`, `model_provider`, `span_kind`, `env`,
+  `service`, `version`, `status`; tokens' by the catalog's match in place of the kind and status,
+  cost's by its source too (a metric from spans is grouped by eight facets at the most: the kind is
+  in a token metric's name, and a cost's matched provider is its model's). Datadog's legacy
+  `prompt`/`completion` names and its character counts are not made.
+  Claude Code's own metrics (`claude_code.cost.usage`, `claude_code.token.usage`, ...) come in as
+  any OTLP metric does.
+- **Asked and shown** (Observe → LLM, `ui/src/views/observe/llm.tsx`): its apps (one chosen by a
+  click); over the range, its calls, tokens, cost, share of errors and models; its cost and tokens
+  by model over time, its calls and errors, its calls' latency (p50, p95: the `ml_obs` metrics);
+  its models, each one's calls, input and output tokens, cost, errors and mean time (aggregates of
+  its spans); its newest LLM traces (its newest steps grouped by their LLM trace, each shown by its
+  first, so a trace under a request's span is listed too); a trace's steps as a tree (each under its
+  LLM parent: Datadog's tracer's says it, any other's is its span's parent where that is a step),
+  each one's kind, name, model, tokens, cost and time; a step opened: its tokens, cost (or why it
+  has none), status and error, its input and output as messages (Datadog's, OpenTelemetry's
+  `parts` with its system instructions, OpenInference's and OpenLLMetry's flattened ones, else its
+  value; the tools it calls), its evaluations, its match in the catalog, and its span in the APM
+  trace; its sessions (steps that say a session's id: each one's steps, cost and errors, the
+  costliest first), one chosen narrowing its traces to it.
+- Status: under way (O-35).
 
 ## 9. Monitors
 
@@ -5456,6 +5576,27 @@ threads of their own. In a browser: a recording sent to the server's intake as d
 it (the part `main`, its file `main.jfr`); its flame graph's summary, the hottest function by self
 `Burn.fib`; its lock waits chosen, `Burn.contend` the hottest; its exceptions among its types.
 
+**LLM Observability** (`crates/kiln/tests/observe_llm.rs`): a kiln server and a runner as
+processes of their own; an LLM app in Docker (a workflow of a session, a planner agent that asks
+OpenAI's chat model, calls a weather tool, asks Anthropic's model and embeds its question, then an
+evaluation of its answer) against a fake model server on its container's loopback (fixed answers:
+the chat 1,200 input tokens, 1,000 cached, 40 out; Anthropic 20 uncached, 1,000 read from its cache,
+100 written, 40 of them for an hour), traced four ways, each its own app: dd-trace-py 4.16 with LLM
+Observability on and APM on, sending to the runner as to its Agent (its `/info` lists the event
+platform's proxy and `meta_struct`), its events riding its APM spans; the same with APM off, its
+events through the runner's proxy, each a span of its LLM trace (source `llmobs`), the trace whole
+(six steps); OpenTelemetry's openai-v2 instrumentation (2.4b0, the latest conventions opted in)
+and OpenInference's (0.1.66), exporting OTLP to the runner. Each step its kind and name; each call
+priced to the nanodollar as its instrumentation says its tokens (Datadog's and OpenInference's
+chat 129,000: its cache reads at theirs; openai-v2's 204,000, saying none; Anthropic's 1,700,000:
+its 1-hour writes at theirs; an embedding's 160, but dd-trace's, its provider `unknown` (a client of
+another address) and its model held by two of the catalog's providers: unpriced, and said so); the
+evaluation a record of its span; `ml_obs.span`
+and `ml_obs.span.llm.total.cost` counting every call once. In a browser: the fixture of
+dd-trace-py's events sent to the server's intake (its ids and times its own): its LLM page's
+models priced ($0.000129 the chat, $0.0017 Anthropic's, $0.00183 in all); its newest trace opened,
+its six steps; the chat's messages and its match in the catalog; nothing wider than a phone.
+
 **DORA metrics** (`crates/kiln/tests/observe_dora.rs`): a kiln server as a process of its own,
 mirroring a git repository (`[[repos]]`, a `file://` URL) made with known author times: a commit,
 two more, a feature merged, the second reverted (`git revert`), a hotfix branch merged. Six
@@ -5711,8 +5852,14 @@ The soak also watches the server answer (every 500 ms, `/healthz` and observe's 
 request at the most): one that takes over 2 s has the server's threads' stacks taken (`eu-stack`,
 else `gdb`; `KOBS_STACKS` says where), and one that is not answered fails the run with them. One
 run of twelve (2026-10-19, before the watchdog) had a status request unanswered for 30 s at 502 s;
-the six runs since, watched, answered every request within 3.84 ms. What held it is not yet known:
-the next time, the stacks say. Where the server's anonymous memory lies is said at each third's
+the six runs since, watched, answered every request within 3.84 ms, and three more of 20 minutes
+each (2026-10-23, the machine at a load of 35 to 58 from other sessions) within 401 ms, 44 ms and
+18 ms: no stall in nine. What held it is not yet known: the next time, the stacks say. Those three
+found another wait: the wide dashboard query (`sum:load.v{*} by {host}`, §12.19), its slowest
+hundredth waiting 469 ms, 127 ms and then 1.71 s for the store (p99 944 ms, 577 ms, 1.66 s; the
+one-series query's waited none), late in each run, as the store holds more: its rounds (64 series a
+hold) each wait behind the writes queued for the store, a wait §12.19 measured as none on
+2026-10-19. A snapshot of the series it reads, taken under one hold, would end it (O-10, next). Where the server's anonymous memory lies is said at each third's
 end, so a climb the memory check finds names what grew.
 
 What floods leave (§12.11) is a high-water mark, not a leak: after one, the server held some 300 MiB

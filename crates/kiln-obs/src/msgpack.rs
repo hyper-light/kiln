@@ -179,6 +179,91 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    /// The next value written as JSON into `out`: a string escaped, bytes and extensions as their
+    /// length (`"<n bytes>"`), a float that is not finite `null`, a map's key that is no string its
+    /// JSON quoted (a container as a key `"?"`). The containers open are a stack, not a recursion,
+    /// so no nesting a payload holds can exhaust the stack.
+    pub fn json_into(&mut self, out: &mut String) -> Result<(), MsgpackError> {
+        use std::fmt::Write as _;
+        fn scalar(v: Value<'_>, out: &mut String) {
+            let _ = match v {
+                Value::Nil | Value::Array(_) | Value::Map(_) => write!(out, "null"),
+                Value::Bool(b) => write!(out, "{b}"),
+                Value::Int(i) => write!(out, "{i}"),
+                Value::Uint(u) => write!(out, "{u}"),
+                Value::F32(f) if f.is_finite() => write!(out, "{f}"),
+                Value::F64(f) if f.is_finite() => write!(out, "{f}"),
+                Value::F32(_) | Value::F64(_) => write!(out, "null"),
+                Value::Str(s) => {
+                    crate::otlp::metrics::push_json_str(out, s);
+                    Ok(())
+                }
+                Value::Bin(b) | Value::Ext(_, b) => write!(out, "\"<{} bytes>\"", b.len()),
+            };
+        }
+        // Each container open: a map's, its items left (a map's keys and values each one), whether
+        // one was written.
+        let mut open: Vec<(bool, u64, bool)> = Vec::new();
+        loop {
+            if let Some((map, left, first)) = open.last_mut() {
+                if *left == 0 {
+                    out.push(if *map { '}' } else { ']' });
+                    open.pop();
+                    if open.is_empty() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                let key = *map && *left % 2 == 0;
+                if key || !*map {
+                    if !*first {
+                        out.push(',');
+                    }
+                    *first = false;
+                }
+                *left -= 1;
+                if key {
+                    match self.value()? {
+                        Value::Str(k) => crate::otlp::metrics::push_json_str(out, k),
+                        Value::Array(n) => {
+                            for _ in 0..n {
+                                self.skip()?;
+                            }
+                            out.push_str("\"?\"");
+                        }
+                        Value::Map(n) => {
+                            for _ in 0..2 * u64::from(n) {
+                                self.skip()?;
+                            }
+                            out.push_str("\"?\"");
+                        }
+                        other => {
+                            let mut k = String::new();
+                            scalar(other, &mut k);
+                            crate::otlp::metrics::push_json_str(out, &k);
+                        }
+                    }
+                    out.push(':');
+                    continue;
+                }
+            }
+            match self.value()? {
+                Value::Array(n) => {
+                    out.push('[');
+                    open.push((false, u64::from(n), true));
+                }
+                Value::Map(n) => {
+                    out.push('{');
+                    open.push((true, 2 * u64::from(n), true));
+                }
+                v => scalar(v, out),
+            }
+            if open.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+
     fn wrong<T>(found: Value<'_>, wanted: &'static str) -> Result<T, MsgpackError> {
         Err(MsgpackError::Unexpected { found: found.name(), wanted })
     }
@@ -267,6 +352,27 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A value as JSON: nested maps and arrays, each scalar, a key that is no string quoted, bytes
+    /// as their length; what JSON reads back.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_value_is_written_as_json() {
+        // {"a": [1, -2, 1.5, nil, true, "x\"y"], 7: {"b": bin(3)}, "c": {}}
+        let b: Vec<u8> = [&[0x83u8, 0xa1, b'a', 0x96, 0x01, 0xfe, 0xcb][..], &1.5f64.to_be_bytes(), &[0xc0, 0xc3, 0xa3, b'x', b'"', b'y', 0x07, 0x81, 0xa1, b'b', 0xc4, 0x03, 1, 2, 3, 0xa1, b'c', 0x80]].concat();
+        let mut out = String::new();
+        let mut r = Reader::new(&b);
+        r.json_into(&mut out).unwrap();
+        assert!(r.is_empty());
+        assert_eq!(out, r#"{"a":[1,-2,1.5,null,true,"x\"y"],"7":{"b":"<3 bytes>"},"c":{}}"#);
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
+        // Deep nesting: no recursion.
+        let deep: Vec<u8> = std::iter::repeat_n(0x91u8, 100_000).chain([0x01]).collect();
+        let mut out = String::new();
+        Reader::new(&deep).json_into(&mut out).unwrap();
+        assert_eq!(out.len(), 200_001);
+    }
+
     use super::*;
 
     /// A writer of the forms the tests read, the widths the specification gives each.
