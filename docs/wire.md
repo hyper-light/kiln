@@ -190,9 +190,9 @@ queue let go.
 | `Cancel` | command, parked | A leg to stop. A leg still running when its runner is back must stop then. | On the channel ("Commands"): answered once applied. |
 | `Drain` | command, parked | Take no more jobs. | On the channel ("Commands"): answered once applied. |
 | `TermOpen` | command, refused while away | A terminal to open. | On the channel ("Commands"): answered once applied; refused at once while away. |
-| `TermInput` | command, refused while away | Keystrokes, never replayed later. | Fire-and-forget: lost with a dropped link. |
-| `TermResize` | state | A terminal's size: the newest wins. | Fire-and-forget. |
-| `TermClose` | command, parked | A terminal to close. | Fire-and-forget. |
+| `TermInput` | command, refused while away | Keystrokes, never replayed later. | On the channel ("Commands"): answered once typed; refused at once while away, never typed later. |
+| `TermResize` | state | A terminal's size: the newest wins. | On the channel ("Commands"), parked: the newest goes, answered once taken. |
+| `TermClose` | command, parked | A terminal to close. | On the channel ("Commands"): answered once applied. |
 | `TermAttach` | ask | Answered by `TermReplay`. | As its class says. |
 | `AiTranscript` | ask | Answered by `AiTranscript`. | As its class says. |
 | `HarnessOpen` | command, refused while away | An agent to start. One started later than asked would surprise. | Fire-and-forget: reported opened once queued. |

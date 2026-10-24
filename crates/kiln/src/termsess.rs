@@ -568,14 +568,18 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
                     s.out.send(Frame::Exit { code: None, error: Some("__reconnect__".to_owned()) });
                     break;
                 }
+                // Commands (`crate::wire::commands`), in order, each answered, none waited for:
+                // keystrokes follow one another closely. Keystrokes are live (refused at once while
+                // the machine is away, never typed later); a size is its newest, and a close waits
+                // for the machine to come back.
                 Ev::In(Some(Input::Data(data))) => {
-                    h.send_to_agent(&machine, LANE_TERM, &ServerMsg::TermInput { session: s.id.clone(), data }).await;
+                    h.command_start(&machine, &ServerMsg::TermInput { session: s.id.clone(), data }).await.log_when_answered(crate::hub::LOG_WITHIN);
                 }
                 Ev::In(Some(Input::Resize { cols, rows })) => {
-                    h.send_to_agent(&machine, LANE_TERM, &ServerMsg::TermResize { session: s.id.clone(), cols, rows }).await;
+                    h.command_start(&machine, &ServerMsg::TermResize { session: s.id.clone(), cols, rows }).await.log_when_answered(crate::hub::LOG_WITHIN);
                 }
                 Ev::In(None) | Ev::Close => {
-                    h.send_to_agent(&machine, LANE_TERM, &ServerMsg::TermClose { session: s.id.clone() }).await;
+                    h.command_start(&machine, &ServerMsg::TermClose { session: s.id.clone() }).await.log_when_answered(crate::hub::LOG_WITHIN);
                     s.finish(None, Some("session closed".to_owned()));
                     break;
                 }
