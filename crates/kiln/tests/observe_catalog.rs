@@ -13,7 +13,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use common::{Fleet, now_ms, raw};
+use common::{Fleet, file_url, now_ms, raw};
 use serde_json::{Value, json};
 
 const DEFINED: &str = r#"
@@ -106,7 +106,7 @@ fn services_are_defined_seen_and_scored() -> anyhow::Result<()> {
     std::fs::write(repo.join("service.datadog.yaml"), DEFINED)?;
     git(&repo, &["add", "service.datadog.yaml"]);
     git(&repo, &["commit", "-q", "-m", "Define the shop's services"]);
-    let url = format!("file://{}", repo.display());
+    let url = file_url(&repo);
     let mut f = Fleet::with_env(|_| format!("[[repos]]\nname = \"acme/shop\"\nclone_url = \"{url}\"\nbranches = [\"main\"]\npoll_seconds = 2\n"), &[("KILN_OBSERVE_CATALOG_EVERY_MS", "1000")])?;
     let ingest = std::fs::read_to_string(f.root.path().join("server/observe/ingest.token"))?.trim().to_owned();
 

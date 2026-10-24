@@ -13,7 +13,7 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use common::{Fleet, now_ms, raw};
+use common::{Fleet, file_url, now_ms, raw};
 use serde_json::{Value, json};
 
 const HOUR: i64 = 3_600;
@@ -122,7 +122,7 @@ fn deployments_are_read_as_datadogs_dora_metrics_reads_them() -> anyhow::Result<
     git(&repo, at(5), &["checkout", "-q", "main"]);
     git(&repo, at(5), &["merge", "-q", "--no-ff", "hotfix/login", "-m", "Merge branch 'hotfix/login'"]);
     let m2 = git(&repo, at(5), &["rev-parse", "HEAD"]);
-    let url = format!("file://{}", repo.display());
+    let url = file_url(&repo);
 
     let mut f = Fleet::with(|_| format!("[[repos]]\nname = \"acme/shop\"\nclone_url = \"{url}\"\nbranches = [\"main\"]\npoll_seconds = 3600\n"))?;
     let ingest = std::fs::read_to_string(f.root.path().join("server/observe/ingest.token"))?.trim().to_owned();

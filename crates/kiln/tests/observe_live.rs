@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 mod common;
-use common::{Fleet, Got, Mock, at, caught_up, now_ms, raw};
+use common::{Fleet, Got, Mock, at, caught_up, file_url, now_ms, raw};
 
 #[test]
 #[ignore = "starts a kiln server and two runners as processes"]
@@ -197,7 +197,7 @@ fn a_ci_run_is_in_the_metrics_the_events_and_a_trace_a_span_monitor_watches() ->
     git(repo_dir.path(), &["init", "-q", "-b", "main"])?;
     git(repo_dir.path(), &["add", "."])?;
     git(repo_dir.path(), &["commit", "-q", "-m", "a pipeline"])?;
-    let url = format!("file://{}", repo_dir.path().display());
+    let url = file_url(repo_dir.path());
     let mut f = Fleet::with(|_| format!("[[repos]]\nname = \"e2e\"\nclone_url = \"{url}\"\nbranches = [\"main\"]\npoll_seconds = 2\n"))?;
     f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
     f.start_runner("r1")?;

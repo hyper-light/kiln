@@ -21,6 +21,28 @@ pub fn at<'a>(v: &'a Value, path: &[&str]) -> &'a Value {
     path.iter().try_fold(v, |v, k| v.get(*k)).unwrap_or(&NULL)
 }
 
+/// `p` as a TOML string: a Windows path's backslashes escaped (a TOML string's own escapes).
+pub fn toml_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if matches!(c, '\\' | '"') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// The `file:` URL of local path `p`, as git takes one: `file:///srv/repo` on Unix,
+/// `file:///C:/Users/repo` on Windows.
+pub fn file_url(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    if s.starts_with('/') { format!("file://{s}") } else { format!("file:///{s}") }
+}
+
 pub fn free_port() -> anyhow::Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
@@ -121,7 +143,7 @@ http_addr = "127.0.0.1:{http}"
 quic_addr = "127.0.0.1:{quic}"
 public_url = "http://127.0.0.1:{http}"
 quic_advertise = "127.0.0.1:{quic}"
-data_dir = "{data}"
+data_dir = {data}
 
 [gitops]
 auto_pipelines = false
@@ -151,7 +173,7 @@ host_seconds = {host_seconds}
 
 {extra}
 "#,
-            data = data.display(),
+            data = toml_path(&data),
             cd = tables.cd,
             host_seconds = tables.host_seconds,
             extra = extra(root.path())
@@ -622,7 +644,7 @@ http_addr = "127.0.0.1:{port}"
 quic_addr = "127.0.0.1:{quic}"
 public_url = "http://127.0.0.1:{port}"
 quic_advertise = "127.0.0.1:{quic}"
-data_dir = "{data}"
+data_dir = {data}
 https = false
 
 [gitops]
@@ -632,7 +654,7 @@ auto_pipelines = false
 enabled = {agent}
 labels = ["local"]
 slots = 2
-work_dir = "{work}"
+work_dir = {work}
 
 [kubernetes]
 enabled = false
@@ -656,8 +678,8 @@ enabled = true
 
 {extra}
 "#,
-        data = data.display(),
-        work = work.display(),
+        data = toml_path(&data),
+        work = toml_path(&work),
         agent = o.agent,
         ci = o.ci,
         extra = o.extra,

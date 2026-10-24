@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Fleet, Mock, Tables, now_ms};
+use common::{Fleet, Mock, Tables, file_url, now_ms};
 use serde_json::{Value, json};
 
 const HOUR: i64 = 3_600;
@@ -259,7 +259,7 @@ fn what_kiln_cd_deploys_observe_counts_alerts_on_and_dora_measures() -> anyhow::
     std::fs::create_dir_all(&repo)?;
     git(&repo, now - 4 * HOUR, &["init", "-q", "-b", "main"]);
     let c1 = commit(&repo, now - 3 * HOUR, &[("deploy/config.yaml", CONFIG), ("deploy/web.yaml", &deployment(&image, 120))], "Add web");
-    let url = format!("file://{}", repo.display());
+    let url = file_url(&repo);
 
     let tables = Tables { cd: "enabled = true\npoll_seconds = 2", host_seconds: 2 };
     let f = Fleet::with_tables(&tables, |_| format!("[[repos]]\nname = \"acme/web\"\nclone_url = \"{url}\"\nbranches = [\"main\"]\npoll_seconds = 3600\n"), &[])?;
