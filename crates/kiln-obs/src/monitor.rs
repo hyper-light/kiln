@@ -552,7 +552,7 @@ pub fn evaluate(store: &Store, q: &Query, now: i64, delay_ms: i64) -> Result<Vec
 /// [`evaluate`] of a shared store, holding it as little as it may: a monitor of metrics read a part
 /// at a time (`eval::Lease`: a write waits for one part of its queries at the most), one of logs
 /// or spans from its records as they are, read with no hold of it.
-pub fn evaluate_shared(store: &std::sync::RwLock<Store>, q: &Query, now: i64, delay_ms: i64) -> Result<Vec<Value>, MonitorError> {
+pub fn evaluate_shared(store: &crate::lock::RwLock<Store>, q: &Query, now: i64, delay_ms: i64) -> Result<Vec<Value>, MonitorError> {
     match reads_records(q) {
         Some(spans) => {
             let at = {
@@ -1006,7 +1006,7 @@ mod tests {
             assert!(w % st == 0 && w / st >= (w / 10_000).min(10), "{w}: {st}");
         }
         // Of a shared store (its metrics read a part at a time, its logs as they are): the same.
-        let shared = std::sync::RwLock::new(s);
+        let shared = crate::lock::RwLock::new(s);
         for q in [
             "avg(last_5m):avg:cpu{*} by {host} > 90",
             "change(avg(last_5m),last_5m):avg:cpu{*} by {host} > 0",
@@ -1058,7 +1058,7 @@ mod tests {
         let got = evaluate(&s, &low, now, 0).unwrap();
         assert!(got.iter().all(|v| v.value > 40.0), "{got:?}");
         // Of a shared store, read a part at a time: the same.
-        let shared = std::sync::RwLock::new(s);
+        let shared = crate::lock::RwLock::new(s);
         for q in [&q, &low] {
             assert_eq!(evaluate_shared(&shared, q, now, 0).unwrap(), evaluate(&shared.read().unwrap(), q, now, 0).unwrap());
         }

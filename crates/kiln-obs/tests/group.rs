@@ -376,7 +376,7 @@ impl Cluster {
         self.nodes.values().filter_map(|n| n.live.as_ref()).all(|l| l.replica.applied().index == commit && l.replica.in_flight() == 0)
     }
 
-    fn store(&self, id: u64) -> std::sync::RwLockReadGuard<'_, Store> {
+    fn store(&self, id: u64) -> kiln_obs::lock::ReadGuard<'_, Store> {
         self.nodes[&id].live.as_ref().unwrap().replica.machine().read()
     }
 

@@ -27,6 +27,9 @@ jiff = { version = "0.2.38", default-features = false, features = ["std", "tzdb-
 # Loghub's preprocessing with them too).
 regex = "1"
 serde_json = "1.0.154"
+# The store's lock (`lock`): a waiting writer let in before readers that keep coming, on every
+# platform (std's lock does so on Linux alone); kiln's, already in kiln's tree.
+parking_lot = "0.12.5"
 
 [dev-dependencies]
 tempfile = "3.27.0"

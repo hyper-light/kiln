@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use hashbrown::HashTable;
 
@@ -39,6 +39,7 @@ use crate::hash::Keyed;
 use crate::head::{Appended, CHUNK_SAMPLES, HeadSeries, Heads};
 use crate::image::{FileKind, Image, ImageFile};
 use crate::index::{Defined, Index, IndexError, Selector, SeriesInfo};
+use crate::lock::{ReadGuard, RwLock, WriteGuard};
 use crate::logs::file::LogFile;
 use crate::logs::metrics::{BatchWindows, Touched};
 use crate::logs::search::Search;
@@ -2564,11 +2565,11 @@ fn within_logs(raw: Vec<u8>, rows: u32, horizon: i64, mut windows: Option<&mut B
     Ok((kept, n, ahead))
 }
 
-fn read_store(store: &RwLock<Store>) -> RwLockReadGuard<'_, Store> {
+fn read_store(store: &RwLock<Store>) -> ReadGuard<'_, Store> {
     store.read().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn write_store(store: &RwLock<Store>) -> RwLockWriteGuard<'_, Store> {
+fn write_store(store: &RwLock<Store>) -> WriteGuard<'_, Store> {
     store.write().unwrap_or_else(PoisonError::into_inner)
 }
 

@@ -17,9 +17,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead as _, Read as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use kiln_obs::lock::RwLock;
 use kiln_obs::logs::archive;
 use kiln_obs::logs::record::Record;
 use kiln_obs::machine::Shared;

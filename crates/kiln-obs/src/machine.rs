@@ -15,7 +15,9 @@
 //! this replica holding another state. The owner says why ([`Machine::fault`]).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, PoisonError};
+
+use crate::lock::{ReadGuard, RwLock, WriteGuard};
 
 use hyper_durable::{EntryRef, Fatal, StateMachine};
 use hyper_raft::proto::{ConfChangeV2, ConfState, EntryType};
@@ -31,8 +33,9 @@ pub const SNAPSHOTS: &str = "snap";
 pub const STAGING: &str = "install";
 
 /// A store as its machine and its readers share it: the machine writes under the lock an entry at
-/// a time, queries read under it. std's lock prefers a waiting writer to new readers, so queries
-/// never hold the group's applying off for longer than one query takes.
+/// a time, queries read under it. The lock prefers a waiting writer to new readers on every
+/// platform ([`crate::lock`]), so queries never hold the group's applying off for longer than one
+/// query takes.
 pub type Shared = Arc<RwLock<Store>>;
 
 pub struct Machine {
@@ -78,11 +81,11 @@ impl Machine {
 
     /// The store, read. A lock a panic poisoned still holds a whole store: nothing in it panics
     /// mid-write (the crate's lints), so the store is taken as it is.
-    pub fn read(&self) -> RwLockReadGuard<'_, Store> {
+    pub fn read(&self) -> ReadGuard<'_, Store> {
         self.store.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn write(&self) -> RwLockWriteGuard<'_, Store> {
+    fn write(&self) -> WriteGuard<'_, Store> {
         self.store.write().unwrap_or_else(PoisonError::into_inner)
     }
 

@@ -1155,7 +1155,7 @@ mod tests {
         for (from, to) in [(0, 300_000), (0, 3_600_000)] {
             let held = (seen(&st, &[], from, to).unwrap(), seen_of(&st, &some, from, to).unwrap(), timeline(&st, &hex(3 * 7_919), from, to, 60_000).unwrap());
             assert!(held.0.len() > 2 * crate::query::eval::ROUND, "{} series with errors", held.0.len());
-            let shared = std::sync::RwLock::new(std::mem::take(&mut st));
+            let shared = crate::lock::RwLock::new(std::mem::take(&mut st));
             let apart = (seen(&shared, &[], from, to).unwrap(), seen_of(&shared, &some, from, to).unwrap(), timeline(&shared, &hex(3 * 7_919), from, to, 60_000).unwrap());
             assert_eq!(apart, held, "{from}..{to}");
             st = shared.into_inner().unwrap();

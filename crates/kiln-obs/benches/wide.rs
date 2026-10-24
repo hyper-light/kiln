@@ -90,7 +90,7 @@ fn main() {
     }
     snaps.sort_by(f64::total_cmp);
     println!("a snapshot of its {} series: median {:.2} ms (most {:.2}), {:.1} MB copied", ids.len(), snaps[snaps.len() / 2] * 1e3, snaps[snaps.len() - 1] * 1e3, at.bytes() as f64 / 1e6);
-    let store = std::sync::RwLock::new(s);
+    let store = kiln_obs::lock::RwLock::new(s);
     let stop = AtomicBool::new(false);
     let (asked, (waits, holds)) = std::thread::scope(|scope| {
         let writer = scope.spawn(|| {

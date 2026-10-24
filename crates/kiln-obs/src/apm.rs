@@ -847,7 +847,7 @@ mod tests {
         let map = map_of(traces.get(..2).unwrap());
         let ms = window / 1_000_000;
         let f = figures(&st, &map, &[], ms, ms + 10_000, 1).unwrap();
-        assert_eq!(figures(&std::sync::RwLock::new(st), &map, &[], ms, ms + 10_000, 1).unwrap(), f, "of a shared store, read a round of series at a time");
+        assert_eq!(figures(&crate::lock::RwLock::new(st), &map, &[], ms, ms + 10_000, 1).unwrap(), f, "of a shared store, read a round of series at a time");
         let edges: Vec<(&str, &str, f64, f64, bool, bool)> = f.edges.iter().map(|e| (e.from.as_str(), e.to.as_str(), e.calls, e.errors, e.inferred, e.counted)).collect();
         assert_eq!(
             edges,
@@ -1002,7 +1002,7 @@ mod tests {
         // A range without its window: nothing.
         assert!(red(&st, false, &[], "service", ms + 10_000, ms + 20_000).unwrap().iter().all(|r| r.hits == 0.0));
         // Of a shared store, read a round of series at a time: the same.
-        let shared = std::sync::RwLock::new(st);
+        let shared = crate::lock::RwLock::new(st);
         assert_eq!(red(&shared, false, &[], "service", ms, ms + 10_000).unwrap(), services);
         assert_eq!(red(&shared, true, &[("service", "checkout")], "peer.service", ms, ms + 10_000).unwrap(), calls);
     }

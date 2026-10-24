@@ -2117,6 +2117,7 @@ dependencies = [
  "hyper-measure",
  "hyper-raft",
  "jiff",
+ "parking_lot",
  "regex",
  "serde_json",
  "sha2",

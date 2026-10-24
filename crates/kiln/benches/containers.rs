@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hyper_measure::{alloc, usage};
@@ -23,6 +23,7 @@ use kiln::observe::containers::inventory::{self, Inventory};
 use kiln::observe::containers::{Check, cgroup, http};
 use kiln_obs::batch::{Builder, Kind, SeriesKey};
 use kiln_obs::hash::Keyed;
+use kiln_obs::lock::RwLock;
 use kiln_obs::otlp::metrics::Decoded;
 use kiln_obs::store::Store;
 

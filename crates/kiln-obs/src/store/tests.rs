@@ -1042,7 +1042,8 @@ fn a_rewrite_planned_before_an_install_is_not_taken_in_after() {
 
 #[test]
 fn a_maintenance_thread_rewrites_while_the_store_applies_and_cuts() {
-    use std::sync::{Arc, RwLock};
+    use crate::lock::RwLock;
+    use std::sync::Arc;
     let entries = stream(21, 600);
     let d = tempfile::tempdir().unwrap();
     let shared = Arc::new(RwLock::new(Store::open(d.path(), Keyed::with_keys(1, 1)).unwrap()));
@@ -1097,7 +1098,8 @@ fn a_maintenance_thread_rewrites_while_the_store_applies_and_cuts() {
 #[test]
 fn files_changed_beside_queries_answer_as_one_store_and_open_again_alike() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Arc, RwLock};
+    use crate::lock::RwLock;
+    use std::sync::Arc;
     let entries = stream_with(23, 900, true);
     let d = tempfile::tempdir().unwrap();
     let shared = Arc::new(RwLock::new(Store::open(d.path(), Keyed::with_keys(1, 1)).unwrap()));

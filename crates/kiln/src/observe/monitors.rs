@@ -47,7 +47,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// The store, held to read: by one monitor's evaluation at a time, or to take its records as they
 /// are, so a write waits for no more than one (and no reader behind that write).
-fn held(store: &Shared) -> std::sync::RwLockReadGuard<'_, kiln_obs::store::Store> {
+fn held(store: &Shared) -> kiln_obs::lock::ReadGuard<'_, kiln_obs::store::Store> {
     store.read().unwrap_or_else(PoisonError::into_inner)
 }
 

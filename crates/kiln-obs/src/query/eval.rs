@@ -66,13 +66,13 @@ pub enum QueryError {
 /// asked again. Each series is read whole as of the snapshot that holds it.
 pub enum Lease<'a> {
     Held(&'a Store),
-    Shared { store: &'a std::sync::RwLock<Store>, generation: u64, waited_ns: std::sync::atomic::AtomicU64 },
+    Shared { store: &'a crate::lock::RwLock<Store>, generation: u64, waited_ns: std::sync::atomic::AtomicU64 },
 }
 
 /// A part's hold of the store ([`Lease::hold`]).
 pub enum Hold<'a> {
     Held(&'a Store),
-    Guard(std::sync::RwLockReadGuard<'a, Store>),
+    Guard(crate::lock::ReadGuard<'a, Store>),
 }
 
 impl std::ops::Deref for Hold<'_> {
@@ -102,7 +102,7 @@ thread_local! {
 
 impl<'a> Lease<'a> {
     /// A lease of `store`, of its series as they are numbered now.
-    pub fn shared(store: &'a std::sync::RwLock<Store>) -> Self {
+    pub fn shared(store: &'a crate::lock::RwLock<Store>) -> Self {
         let generation = store.read().unwrap_or_else(std::sync::PoisonError::into_inner).generation();
         Self::Shared { store, generation, waited_ns: std::sync::atomic::AtomicU64::new(0) }
     }
@@ -365,7 +365,7 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
 
 /// Evaluates a query of a shared store, a part at a time ([`Lease`]): its answer, and how long it
 /// waited for the store in all (ms).
-pub fn eval_shared(store: &std::sync::RwLock<Store>, req: &Request<'_>) -> Result<(Answer, f64), QueryError> {
+pub fn eval_shared(store: &crate::lock::RwLock<Store>, req: &Request<'_>) -> Result<(Answer, f64), QueryError> {
     shared(store, |lease| eval_with(lease, req))
 }
 
@@ -374,7 +374,7 @@ pub fn eval_shared(store: &std::sync::RwLock<Store>, req: &Request<'_>) -> Resul
 #[derive(Clone, Copy)]
 pub enum Source<'a> {
     Held(&'a Store),
-    Shared(&'a std::sync::RwLock<Store>),
+    Shared(&'a crate::lock::RwLock<Store>),
 }
 
 impl<'a> From<&'a Store> for Source<'a> {
@@ -383,8 +383,8 @@ impl<'a> From<&'a Store> for Source<'a> {
     }
 }
 
-impl<'a> From<&'a std::sync::RwLock<Store>> for Source<'a> {
-    fn from(s: &'a std::sync::RwLock<Store>) -> Self {
+impl<'a> From<&'a crate::lock::RwLock<Store>> for Source<'a> {
+    fn from(s: &'a crate::lock::RwLock<Store>) -> Self {
         Self::Shared(s)
     }
 }
@@ -407,7 +407,7 @@ impl Source<'_> {
 
 /// `f` with a shared lease of `store`, asked again if the series are numbered anew as it reads
 /// ([`AGAIN`] times), then with the store held throughout.
-pub(crate) fn shared<T>(store: &std::sync::RwLock<Store>, f: impl Fn(&Lease<'_>) -> Result<T, QueryError>) -> Result<(T, f64), QueryError> {
+pub(crate) fn shared<T>(store: &crate::lock::RwLock<Store>, f: impl Fn(&Lease<'_>) -> Result<T, QueryError>) -> Result<(T, f64), QueryError> {
     let mut waited = 0.0;
     for _ in 0..AGAIN {
         let lease = Lease::shared(store);
@@ -1647,7 +1647,7 @@ pub fn heatmap(store: &Store, req: &Request<'_>, rows: usize) -> Result<Heatmap,
 
 /// [`heatmap`] of a shared store, a part at a time ([`Lease`]): it, and how long it waited for the
 /// store in all (ms).
-pub fn heatmap_shared(store: &std::sync::RwLock<Store>, req: &Request<'_>, rows: usize) -> Result<(Heatmap, f64), QueryError> {
+pub fn heatmap_shared(store: &crate::lock::RwLock<Store>, req: &Request<'_>, rows: usize) -> Result<(Heatmap, f64), QueryError> {
     shared(store, |lease| heatmap_with(lease, req, rows))
 }
 
@@ -3354,7 +3354,7 @@ mod tests {
             .collect();
         b.logs(&logs);
         s.apply(&b.finish()).unwrap();
-        let lock = std::sync::RwLock::new(s);
+        let lock = crate::lock::RwLock::new(s);
         let queries = [
             ("sum:a{*} by {host}", 60_000),
             ("avg:a{*}", 60_000),
@@ -3398,7 +3398,7 @@ mod tests {
     /// one held after the change does: never a series' values under another's name.
     #[test]
     fn a_query_whose_series_are_numbered_anew_between_its_parts_answers_of_the_new_numbering() {
-        let store = std::sync::Arc::new(std::sync::RwLock::new(numbered(300)));
+        let store = std::sync::Arc::new(crate::lock::RwLock::new(numbered(300)));
         let mut r = Request::new("sum:m{*} by {s}", 0, 60_000);
         r.step = Some(60_000);
         assert_eq!(by_number(&eval_shared(&store, &r).unwrap().0), (0..300).map(|i| (i, f64::from(i))).collect::<Vec<_>>());
@@ -3424,7 +3424,7 @@ mod tests {
     /// under another's name, none missing.
     #[test]
     fn queries_read_beside_retention_answer_each_of_one_numbering() {
-        let store = std::sync::RwLock::new(numbered(600));
+        let store = crate::lock::RwLock::new(numbered(600));
         let mut r = Request::new("sum:m{*} by {s}", 0, 60_000);
         r.step = Some(60_000);
         let done = std::sync::atomic::AtomicBool::new(false);
@@ -3466,7 +3466,7 @@ mod tests {
             b.run(k.fp, (0..300i64).map(|j| (j * 10_000, f64::from(i) + j as f64)));
         }
         s.apply(&b.finish()).unwrap();
-        let store = std::sync::RwLock::new(s);
+        let store = crate::lock::RwLock::new(s);
         let mut r = Request::new("sum:w{*} by {host}", 0, 3_000_000);
         r.step = Some(60_000);
         let t = std::time::Instant::now();
@@ -3542,7 +3542,7 @@ mod tests {
             b.run(k.fp, (0..30).map(|m| (start + 3 * 3_600_000 + m * 60_000, rng.f64())));
         }
         s.apply(&b.finish()).unwrap();
-        let store = std::sync::RwLock::new(s);
+        let store = crate::lock::RwLock::new(s);
         for q in ["sum:a{*} by {host}", "avg:b{*} by {s}", "sum:c{*}.as_count()", "max:a{host:h1}"] {
             for step in [60_000, 3_600_000] {
                 let mut r = Request::new(q, start, start + 4 * 3_600_000);

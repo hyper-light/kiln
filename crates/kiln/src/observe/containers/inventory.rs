@@ -511,7 +511,7 @@ mod tests {
         b.define(&otel);
         b.run(otel.fp, [(now - 600_000, 1.0)]);
         s.apply(&b.finish()).unwrap();
-        let store: kiln_obs::machine::Shared = std::sync::Arc::new(std::sync::RwLock::new(s));
+        let store: kiln_obs::machine::Shared = std::sync::Arc::new(kiln_obs::lock::RwLock::new(s));
         let inv = make(&store, now);
         assert_eq!(inv.containers.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["aaa1", "bbb2"], "by name: checkout, worker");
         let a = &inv.containers[0];
@@ -539,7 +539,7 @@ mod tests {
         put(&[("host", "node-1"), ("container_id", "aaa1"), ("container_name", "web")], now - 15_000, 3e8);
         put(&[("host", "node-2"), ("container_id", "aaa1"), ("container_name", "web")], now - 15_000, 5e8);
         s.apply(&b.finish()).unwrap();
-        let store: kiln_obs::machine::Shared = Arc::new(std::sync::RwLock::new(s));
+        let store: kiln_obs::machine::Shared = Arc::new(kiln_obs::lock::RwLock::new(s));
         let inv = make(&store, now);
         assert_eq!(inv.containers.iter().map(|c| (c.id.as_str(), c.figures.cpu)).collect::<Vec<_>>(), [("aaa1", Some(4e8))], "node-1's newest, 3e8, and node-2's 5e8 on average");
     }
@@ -584,7 +584,7 @@ mod tests {
         put(&mut b, "container.cpu.usage", &[("host", "node-3"), ("container_id", "b0th"), ("container_name", "both")], Kind::Gauge, &[(t1, 3e8)]);
         put(&mut b, "container.cpu.usage.total", &[("host", "node-3"), ("container.id", "b0th")], Kind::Counter, &[(t0, 0.0), (t1, 7.5e9)]);
         s.apply(&b.finish()).unwrap();
-        let store: kiln_obs::machine::Shared = Arc::new(std::sync::RwLock::new(s));
+        let store: kiln_obs::machine::Shared = Arc::new(kiln_obs::lock::RwLock::new(s));
         let inv = make(&store, now);
         let by = |id: &str| inv.containers.iter().find(|c| c.id == id).unwrap();
         let d = by("d0c1");
@@ -630,7 +630,7 @@ mod tests {
         put("container.cpu.usage", &names("other", "api-1"), 0.75);
         put("container.cpu.usage", &names("shop", "api-2"), 0.875);
         s.apply(&b.finish()).unwrap();
-        let store: kiln_obs::machine::Shared = Arc::new(std::sync::RwLock::new(s));
+        let store: kiln_obs::machine::Shared = Arc::new(kiln_obs::lock::RwLock::new(s));
         let inv = make(&store, now);
         assert_eq!(inv.containers.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["c0ff"], "the kubelet's alone name no container of their own");
         let c = &inv.containers[0];

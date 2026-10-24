@@ -402,8 +402,12 @@ opens the store again.
 under the store's lock with its file's name reserved, built from the immutable files with no lock
 held, and taken in under the lock only if the store still holds every input (an install bumps an
 epoch). The thread is joined before a store is opened again on its folder. Queries share the store
-under a read lock; std's lock prefers a waiting writer, so a query holds applying off for no longer
-than one query takes.
+under a read lock that prefers a waiting writer on every platform (`kiln_obs::lock`), so a query
+holds applying off for no longer than one query takes. std's lock does so on Linux alone: on macOS
+(its queue) and Windows (an SRW lock) a reader taking it again the moment it let it go held a write
+off for good (2026-10-24: a test of writes beside queries ran 20 minutes on a Mac before it was
+stopped, its writer still waiting); `parking_lot`'s, task-fair, has a reader wait while a writer
+does, everywhere.
 
 **Writes.** A node gathers its points by series (`crate::observe::ingest`) and sends one write at a
 time, as the sessions assume, again and again until it is answered: a runner's go on the lane to the
