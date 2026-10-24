@@ -1270,10 +1270,17 @@ async fn delete(cx: Cx, v: Value) -> Out {
     let entry = cx.cd.apps.read().get(&id).cloned().ok_or_else(|| missing(format!("no app {id}")))?;
     // A shadowed app's objects are Argo CD's: kiln only stops comparing them.
     let cascade = !super::is_shadow(&entry.def) && str_in(&v, "cascade").map(|c| c != "orphan").unwrap_or(entry.def.cascade);
-    if matches!(entry.def.origin, Origin::Api | Origin::Argo { parent: None }) {
-        propose(&cx.cd, Command::DeleteApp(id.clone())).await?;
+    // The store's change of the deletion unregisters the app too, maybe first: it does so as this
+    // says (`Cd::deleting`), and whichever comes second finds it gone.
+    cx.cd.deleting.lock().insert(id.clone(), cascade);
+    if matches!(entry.def.origin, Origin::Api | Origin::Argo { parent: None })
+        && let Err(e) = propose(&cx.cd, Command::DeleteApp(id.clone())).await
+    {
+        cx.cd.deleting.lock().remove(&id);
+        return Err(e);
     }
     cx.cd.unregister(&id, cascade);
+    cx.cd.deleting.lock().remove(&id);
     audit(&cx, "cd.app.delete", format!("{id} cascade={cascade}")).await;
     Ok(json!({"deleted": id, "cascade": cascade}))
 }

@@ -171,6 +171,10 @@ pub struct Cd {
     /// The latest status of every app.
     pub statuses: RwLock<BTreeMap<String, Summary>>,
     dirty: Mutex<BTreeSet<String>>,
+    /// Apps this server is deleting through the API, each with whether its objects go too: the
+    /// store's change of a deletion carries no cascade (another member's deletion was that member's
+    /// to cascade), so whichever of the two unregisters the app first does it as this said.
+    deleting: Mutex<BTreeMap<String, bool>>,
     watched: Mutex<BTreeSet<(String, GroupKind)>>,
     connecting: Mutex<BTreeSet<String>>,
     /// Held while an app's inputs are checked against its pin and sent, so the source poll and a
@@ -1400,6 +1404,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         clusters: RwLock::new(BTreeMap::new()),
         statuses: RwLock::new(BTreeMap::new()),
         dirty: Mutex::new(BTreeSet::new()),
+        deleting: Mutex::new(BTreeMap::new()),
         watched: Mutex::new(BTreeSet::new()),
         connecting: Mutex::new(BTreeSet::new()),
         inputs_gate: Mutex::new(()),
@@ -1450,7 +1455,10 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
                             c2.register(def);
                         }
                     }
-                    kiln_cd::state::Change::AppDeleted(id) => c2.unregister(&id, false),
+                    kiln_cd::state::Change::AppDeleted(id) => {
+                        let cascade = c2.deleting.lock().remove(&id).unwrap_or(false);
+                        c2.unregister(&id, cascade);
+                    }
                     kiln_cd::state::Change::Cluster(_) => c2.connect_clusters().await,
                     kiln_cd::state::Change::ClusterDeleted(name) => {
                         c2.clusters.write().remove(&name);

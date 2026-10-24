@@ -16,7 +16,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Fleet, Tables, caught_up, now_ms};
+use common::{Fleet, Tables, now_ms};
 use serde_json::{Value, json};
 
 /// Waits up to `secs` for `done` to say yes, or fails saying `what`, what it last saw and the
@@ -62,6 +62,18 @@ fn noise(seed: &mut u64, n: usize) -> String {
     out
 }
 
+/// Whether `r1` is a learner, up, and its replica has applied `index` at the least, as its last
+/// report says. Not that it has applied all the leader has: every node writes what it measures
+/// every 2 s here, so a report (every 10 s) is always some entries behind the leader's index now.
+fn replicated(s: &Value, index: u64) -> bool {
+    let learners: Vec<u64> = s["learners"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
+    s["machines"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|m| m["machine"] == "r1" && m["up"] == true && m["member"].as_u64().is_some_and(|n| learners.contains(&n)) && m["status"]["applied"].as_u64().is_some_and(|a| a >= index))
+}
+
 /// Each end's view of the connection: the server's of `r1`, `r1`'s of the server.
 const ENDS: [(&str, &str); 2] = [("the server's", "{peer:r1}"), ("r1's", "{host:r1,peer:server}")];
 
@@ -72,8 +84,9 @@ fn each_end_of_the_quic_lane_reports_its_path_and_what_crossed_it() -> anyhow::R
     // Each node looks at its endpoint every 2 s.
     let mut f = Fleet::with_tables(&Tables { host_seconds: 2, ..Tables::default() }, |_| String::new(), &[])?;
     let runner = [("KILN_OBSERVE_HOST_SECONDS", "2")];
+    let started = f.status()?["applied"].as_u64().unwrap_or(0);
     f.start_runner_with("r1", &runner)?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until(Duration::from_secs(90), "r1 a learner, replicating", |s| replicated(s, started))?;
 
     // The path's figures are the path's, at either end.
     for (end, tags) in ENDS {
@@ -112,7 +125,8 @@ fn each_end_of_the_quic_lane_reports_its_path_and_what_crossed_it() -> anyhow::R
         f.call("POST", "/api/observe/v1/logs", Some(&Value::Array(recs)))?;
     }
     let raw = 8.0 * 32.0 * 8_192.0;
-    f.until(Duration::from_secs(60), "r1 caught up with the records", |s| caught_up(s, &["r1"]))?;
+    let written = f.status()?["applied"].as_u64().unwrap_or(0);
+    f.until(Duration::from_secs(60), "r1 holding the records", |s| replicated(s, written))?;
     until(&f, 60, "the records' bytes counted where they crossed", || {
         let (sent, _) = total(&f, "sum:kiln.quic.bytes_sent{peer:r1}.as_count()", t0)?;
         Ok((sent - sent_before >= raw, json!({ "sent": sent - sent_before, "raw": raw })))
@@ -138,8 +152,11 @@ fn each_end_of_the_quic_lane_reports_its_path_and_what_crossed_it() -> anyhow::R
         Ok((n == Some(0.0), json!(n)))
     })?;
     let gone = now_ms();
+    // Back after its connection was gone (past the idle timeout): replicating again, past where the
+    // group was as it came back.
+    let back = f.status()?["applied"].as_u64().unwrap_or(0);
     f.start_runner_with("r1", &runner)?;
-    f.until(Duration::from_secs(90), "r1 back and caught up", |s| caught_up(s, &["r1"]))?;
+    f.until(Duration::from_secs(90), "r1 back and replicating again", |s| replicated(s, back))?;
     until(&f, 60, "the new connection counted from its own start", || {
         let (sent, least) = total(&f, "sum:kiln.quic.packets_sent{peer:r1}.as_count()", gone)?;
         Ok((sent > 0.0 && least >= 0.0, json!({ "sent": sent, "least": least })))
