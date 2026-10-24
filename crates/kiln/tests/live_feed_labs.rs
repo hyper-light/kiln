@@ -186,8 +186,9 @@ struct Shown {
     frames: usize,
     /// Frames after its first snapshot: what came live.
     live: usize,
-    /// Snapshots it was sent (each begins with `open`): more than one means it started over.
-    opens: usize,
+    /// Catch-ups it was sent, each a snapshot (`open`) or what changed since what it had
+    /// (`resumed`, docs/wire.md "Revisions"): more than one means it started over.
+    catchups: usize,
 }
 
 impl Shown {
@@ -199,11 +200,17 @@ impl Shown {
         }
         match v.get("t").and_then(Value::as_str).unwrap_or_default() {
             "open" => {
-                self.opens += 1;
+                self.catchups += 1;
                 self.meta = Value::Null;
                 self.state = Value::Null;
                 self.changes = Value::Null;
                 self.events.clear();
+                self.synced = false;
+            }
+            // What changed since what it has: the newest meta, state and changes, and the events
+            // changed since, on what it shows, as the UI's session store adds a resume.
+            "resumed" => {
+                self.catchups += 1;
                 self.synced = false;
             }
             "meta" => self.meta = v.get("meta").cloned().unwrap_or_default(),
@@ -465,7 +472,7 @@ fn lab(runner: Option<&str>) -> anyhow::Result<()> {
         anyhow::ensure!(v.synced && v.live > MESSAGES && !v.closed, "the {who} viewer took {} frames, {} of them live", v.frames, v.live);
         // Live all the way: the one snapshot it attached with, never another, so what it shows
         // came over the feed, not from starting over.
-        anyhow::ensure!(v.opens == 1, "the {who} viewer started over: {} snapshots", v.opens);
+        anyhow::ensure!(v.catchups == 1, "the {who} viewer started over: {} catch-ups", v.catchups);
         let texts = v.texts();
         anyhow::ensure!(want.iter().all(|w| texts.contains(w)), "the {who} viewer misses messages: {texts:?}");
     }
@@ -548,20 +555,20 @@ fn a_full_bus_refusing_a_feed_sends_every_viewer_of_it_back_within_5_s() -> anyh
         Ok(true)
     })?;
     let refused = total(port, &admin, "kiln_bus_refused_total")?;
-    let opens = viewers.iter().map(|v| v.shown().map(|s| s.opens)).collect::<anyhow::Result<Vec<_>>>()?;
+    let catchups = viewers.iter().map(|v| v.shown().map(|s| s.catchups)).collect::<anyhow::Result<Vec<_>>>()?;
     std::fs::write(dir.path().join("starved.go"), b"")?;
     wait_for("the starved session's frames refused", Duration::from_secs(60), || Ok(total(port, &admin, "kiln_bus_refused_total")? > refused))?;
-    // Seen refused now, and refused no later: every viewer of it starts over (a snapshot more than
-    // it had) within 5 s.
+    // Seen refused now, and refused no later: every viewer of it starts over (a catch-up more than
+    // it had, what changed since its last revision or the session whole) within 5 s.
     wait_for("every viewer of the starved feed starting over", Duration::from_secs(5), || {
-        for (v, before) in viewers.iter().zip(&opens) {
-            if v.shown()?.opens <= *before {
+        for (v, before) in viewers.iter().zip(&catchups) {
+            if v.shown()?.catchups <= *before {
                 return Ok(false);
             }
         }
         Ok(true)
     })
-    .map_err(|e| anyhow::anyhow!("{e:#}\nthe viewers' snapshots: {:?}, before: {opens:?}\nthe server's log:\n{}", viewers.iter().map(|v| v.shown().map(|s| s.opens).unwrap_or(0)).collect::<Vec<_>>(), s.log()))?;
+    .map_err(|e| anyhow::anyhow!("{e:#}\nthe viewers' catch-ups: {:?}, before: {catchups:?}\nthe server's log:\n{}", viewers.iter().map(|v| v.shown().map(|s| s.catchups).unwrap_or(0)).collect::<Vec<_>>(), s.log()))?;
     for v in viewers {
         v.end()?;
     }
