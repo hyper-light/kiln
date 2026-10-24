@@ -110,3 +110,6 @@ Watch:
 - Learners are added, never removed: a runner deleted stays a learner, lagging.
 - Only the reads above are a replica's; the rest of the API is still the server's.
 - Reads for anyone but the owner go to the server (its route table judges them).
+- While the log has no room (stalled under a slow disk), the store's writes wait for it in order
+  (`Held`), up to 256 MiB. Past that, a write kiln.db holds goes without its entry, and the
+  server's log says so; a learner then lacks it until it takes a new copy.

@@ -96,6 +96,11 @@ const CHANGE_PATIENCE: Duration = Duration::from_secs(30);
 const OUTGOING: usize = 4096;
 /// How many times a learner tries to fetch a copy of the database before its replica stops.
 const FETCH_TRIES: u32 = 4;
+/// Writes kept, at most, while the log has no room for them ([`Held`]): past it a write kiln.db
+/// holds goes without its entry, and says so.
+const HELD_BYTES: u64 = 256 << 20;
+/// How long a stop waits for the log to have room for what's held.
+const STOP_PATIENCE: Duration = Duration::from_secs(30);
 
 /// Fetches a copy of the server's kiln.db into a file, made now (a learner's way to the database:
 /// the runner's HTTP client to the server).
@@ -327,6 +332,7 @@ impl Group {
                     wanted: None,
                     changing: None,
                     beat: Instant::now(),
+                    held: Held::default(),
                 };
                 d.run(ready_tx);
             })
@@ -422,6 +428,96 @@ impl Drop for Group {
     }
 }
 
+/// What waits to go into the log, in order, while it has no room. A replica stalled for room
+/// refuses every proposal and makes again only the writes it had taken, so a write the store sent
+/// then would be in kiln.db and never in the log: a hole no learner fills. So each part and barrier
+/// is offered from here, oldest first, and nothing goes before one the log had no room for.
+#[derive(Default)]
+struct Held {
+    items: std::collections::VecDeque<Item>,
+    /// The parts' bytes.
+    bytes: u64,
+}
+
+/// A thing for the log: a write's part (its `seq` and the entry's bytes), or a barrier (its id).
+enum Item {
+    Part(u64, Vec<u8>),
+    Barrier(u64),
+}
+
+/// What an [`Item`] was, to say what became of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum What {
+    Part(u64),
+    Barrier(u64),
+}
+
+/// Where held items go: the replica (a stand-in in tests).
+trait Proposer {
+    /// Whether it takes a proposal now (a replica stalled for room refuses each).
+    fn room(&self) -> bool;
+    /// Proposes `item`; an error is a refusal for good, not for room.
+    fn offer(&mut self, item: Item) -> Result<(), String>;
+}
+
+impl Proposer for Member {
+    fn room(&self) -> bool {
+        !self.is_stalled()
+    }
+
+    fn offer(&mut self, item: Item) -> Result<(), String> {
+        let proposed = match item {
+            Item::Part(_, data) => self.propose(Vec::new(), data),
+            Item::Barrier(id) => self.propose(id.to_le_bytes().to_vec(), Vec::new()),
+        };
+        proposed.map_err(|e| format!("{e:?}"))
+    }
+}
+
+impl Item {
+    fn what(&self) -> What {
+        match self {
+            Item::Part(seq, _) => What::Part(*seq),
+            Item::Barrier(id) => What::Barrier(*id),
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        match self {
+            Item::Part(_, data) => data.len() as u64,
+            Item::Barrier(_) => 0,
+        }
+    }
+}
+
+impl Held {
+    fn push(&mut self, item: Item) {
+        self.bytes = self.bytes.saturating_add(item.bytes());
+        self.items.push_back(item);
+    }
+
+    /// Offers what's held to `to`, oldest first, while it has room: what it refused for good, and
+    /// why.
+    fn drain(&mut self, to: &mut impl Proposer) -> Vec<(What, String)> {
+        let mut refused = Vec::new();
+        while to.room() {
+            let Some(item) = self.items.pop_front() else { break };
+            self.bytes = self.bytes.saturating_sub(item.bytes());
+            let what = item.what();
+            if let Err(why) = to.offer(item) {
+                refused.push((what, why));
+            }
+        }
+        refused
+    }
+
+    /// Everything held, given up (the group failed, or stopped with no room).
+    fn give_up(&mut self) -> Vec<What> {
+        self.bytes = 0;
+        self.items.drain(..).map(|i| i.what()).collect()
+    }
+}
+
 struct Driver {
     replica: Member,
     // Kept open for as long as the replica writes to it.
@@ -452,6 +548,8 @@ struct Driver {
     changing: Option<(u64, bool, Instant)>,
     /// When the server's member last beat.
     beat: Instant,
+    /// Writes' parts and barriers waiting for room in the log, in order.
+    held: Held,
 }
 
 impl Driver {
@@ -472,7 +570,7 @@ impl Driver {
         }
         self.since = self.replica.applied().index;
         ready.send(Ok(())).ok();
-        let mut stopping = false;
+        let mut stopping: Option<Instant> = None;
         loop {
             while let Ok(req) = self.rx.try_recv() {
                 match req {
@@ -487,14 +585,14 @@ impl Driver {
                     Request::Unreachable(member) => {
                         self.replica.report_unreachable(member).ok();
                     }
-                    Request::Stop if !stopping => {
+                    Request::Stop if stopping.is_none() => {
                         // What was sent before goes into the log first (the server's; a learner
                         // proposes nothing).
                         if self.server {
                             let (reply, _answer) = mpsc::sync_channel(1);
                             self.barrier(reply);
                         }
-                        stopping = true;
+                        stopping = Some(Instant::now());
                     }
                     Request::Stop => {}
                 }
@@ -505,6 +603,11 @@ impl Driver {
                     reply.send(Err(format!("the cluster group failed: {e:#}"))).ok();
                 }
                 self.broken = Some(format!("{e:#}"));
+                for what in self.held.give_up() {
+                    if let What::Part(seq) = what {
+                        tracing::error!(seq, "a write kiln.db holds isn't in the cluster log: {e:#}");
+                    }
+                }
                 // What the store sends from now on can't be logged: take it and say so.
                 while let Ok(req) = self.rx.recv() {
                     match req {
@@ -533,9 +636,16 @@ impl Driver {
             if let Ok((start, _)) = self.replica.log_mut().bounds() {
                 self.log_start.store(start.index, Ordering::SeqCst);
             }
-            if stopping && self.pending.is_empty() {
-                self.replica.machine_mut().persist().ok();
-                return;
+            // What waited for room goes in now there's some, in order.
+            self.propose_held();
+            if let Some(since) = stopping {
+                if since.elapsed() >= STOP_PATIENCE {
+                    self.give_up_held("the log had no room before the group stopped");
+                }
+                if self.pending.is_empty() {
+                    self.replica.machine_mut().persist().ok();
+                    return;
+                }
             }
             let wait = self.replica.deadline().map(|d| Duration::from_nanos(d.saturating_sub(self.now()))).unwrap_or(Duration::from_millis(100)).min(Duration::from_millis(100));
             thread::park_timeout(wait.max(Duration::from_micros(50)));
@@ -620,25 +730,52 @@ impl Driver {
                 return;
             }
         };
+        // Whole or not at all: a learner joins a write's parts before it applies them.
+        let bytes: u64 = parts.iter().map(|p| p.len() as u64).sum();
+        if self.held.bytes.saturating_add(bytes) > HELD_BYTES {
+            tracing::error!(seq, held = self.held.bytes, "a write kiln.db holds isn't in the cluster log: it has had no room for {} MiB of writes", HELD_BYTES >> 20);
+            return;
+        }
         for data in parts {
-            if let Err(e) = self.replica.propose(Vec::new(), data) {
-                tracing::error!(seq, "a write kiln.db holds isn't in the cluster log: {e:?}");
+            self.held.push(Item::Part(seq, data));
+        }
+        self.propose_held();
+    }
+
+    /// Offers the log what's held, oldest first, while it has room ([`Held`]), and says what it
+    /// refused for good.
+    fn propose_held(&mut self) {
+        for (what, why) in self.held.drain(&mut self.replica) {
+            self.refused(what, &why);
+        }
+    }
+
+    /// Gives up what's held, saying why: each write it held isn't in the log, each barrier fails.
+    fn give_up_held(&mut self, why: &str) {
+        for what in self.held.give_up() {
+            self.refused(what, why);
+        }
+    }
+
+    fn refused(&mut self, what: What, why: &str) {
+        match what {
+            What::Part(seq) => tracing::error!(seq, "a write kiln.db holds isn't in the cluster log: {why}"),
+            What::Barrier(id) => {
+                if let Some(reply) = self.pending.remove(&id) {
+                    reply.send(Err(format!("the cluster group refused an entry: {why}"))).ok();
+                }
             }
         }
     }
 
-    /// Proposes an entry of no change, answered once applied: everything before it is too.
+    /// Proposes an entry of no change, answered once applied: everything before it is too (it goes
+    /// in behind what's held).
     fn barrier(&mut self, reply: mpsc::SyncSender<Result<(), String>>) {
         let id = self.next;
         self.next += 1;
-        match self.replica.propose(id.to_le_bytes().to_vec(), Vec::new()) {
-            Ok(()) => {
-                self.pending.insert(id, reply);
-            }
-            Err(e) => {
-                reply.send(Err(format!("the cluster group refused an entry: {e:?}"))).ok();
-            }
-        }
+        self.pending.insert(id, reply);
+        self.held.push(Item::Barrier(id));
+        self.propose_held();
     }
 
     /// Drives until the barriers proposed are applied.
@@ -646,6 +783,7 @@ impl Driver {
         let until = Instant::now() + Duration::from_secs(120);
         while !self.pending.is_empty() {
             self.drive()?;
+            self.propose_held();
             if Instant::now() >= until {
                 bail!("the cluster group didn't apply its log within 120 s");
             }
@@ -1180,6 +1318,70 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// A log that has room for `left` more proposals, then none until given more; what it took,
+    /// in order; and one item it refuses for good.
+    struct Room {
+        left: usize,
+        took: Vec<What>,
+        refuse: Option<What>,
+    }
+
+    impl Proposer for Room {
+        fn room(&self) -> bool {
+            self.left > 0
+        }
+
+        fn offer(&mut self, item: Item) -> Result<(), String> {
+            self.left = self.left.saturating_sub(1);
+            if self.refuse == Some(item.what()) {
+                return Err("refused".into());
+            }
+            self.took.push(item.what());
+            Ok(())
+        }
+    }
+
+    /// The lab's stall (2026-10-24): a replica stalled for room refused the store's writes, and
+    /// each was in kiln.db and never in the log. Held, a write the log had no room for goes in
+    /// once there is, and before every write sent after it, its parts and the barriers too.
+    #[test]
+    fn a_write_the_log_had_no_room_for_goes_in_before_every_write_after_it() {
+        let mut held = Held::default();
+        let mut log = Room { left: 1, took: Vec::new(), refuse: None };
+        // Room for one: write 1 goes in; write 2 (two parts) and a flush's barrier wait.
+        for item in [Item::Part(1, vec![1; 10]), Item::Part(2, vec![2; 10]), Item::Part(2, vec![2; 5]), Item::Barrier(7)] {
+            held.push(item);
+        }
+        assert!(held.drain(&mut log).is_empty());
+        assert_eq!(log.took, [What::Part(1)]);
+        assert_eq!(held.bytes, 15, "write 2's parts are held");
+        // Write 3, sent while write 2 waits, waits behind it.
+        held.push(Item::Part(3, vec![3; 4]));
+        assert!(held.drain(&mut log).is_empty());
+        assert_eq!(log.took, [What::Part(1)], "nothing goes in without room");
+        // Room for two: write 2's parts, and the log is full again before the barrier.
+        log.left = 2;
+        assert!(held.drain(&mut log).is_empty());
+        assert_eq!(log.took, [What::Part(1), What::Part(2), What::Part(2)]);
+        // Room: the barrier, then write 3, in the order sent.
+        log.left = usize::MAX;
+        assert!(held.drain(&mut log).is_empty());
+        assert_eq!(log.took, [What::Part(1), What::Part(2), What::Part(2), What::Barrier(7), What::Part(3)]);
+        assert_eq!((held.items.len(), held.bytes), (0, 0));
+        // A refusal for good, not for room, is said, and what's after it still goes in.
+        log.refuse = Some(What::Part(4));
+        held.push(Item::Part(4, Vec::new()));
+        held.push(Item::Part(5, Vec::new()));
+        assert_eq!(held.drain(&mut log), [(What::Part(4), "refused".to_string())]);
+        assert_eq!(log.took.last(), Some(&What::Part(5)));
+        // Given up, everything held is said, in order.
+        log.left = 0;
+        held.push(Item::Part(6, vec![6]));
+        held.push(Item::Barrier(8));
+        assert_eq!(held.give_up(), [What::Part(6), What::Barrier(8)]);
+        assert_eq!((held.items.len(), held.bytes), (0, 0));
     }
 
     #[test]
