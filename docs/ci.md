@@ -2629,6 +2629,7 @@ reusing the results of jobs whose inputs have not changed.
         connection on to the server. Nothing in the container connects to the host, whose firewall
         need not let containers in, and the server may be anywhere the runner reaches;
       - a runner without a static kiln gives none, and such a build's git context still fails;
+      - the same way, the builder pulls through kiln's pull-through caches (W12-R02);
       - tests: `w08_r08_buildkit_containers_get_a_loopback_relay`, and
         `w08_r08_a_buildkit_container_reaches_kiln_through_its_relay` with Docker and
         `KILN_EGRESS_BINARY`.
@@ -3651,6 +3652,29 @@ package registries of the top ~25 languages and the top ~10 OCI registries; publ
   - Nimble's package list (nim-lang.org's), its packages through `http`.
   - Unit-tested (`w12_r04_immutables`, `w12_r04_composer_swift_conan_and_vcpkg`), and end to end
     against stand-ins for Packagist and ConanCenter (`w12_r04_composer_conan_and_vcpkg`).
+- *Done.* R02 for BuildKit's builders (2026-10-24). A builder a leg makes through its Docker socket
+  (buildx's `docker-container` driver, as `setup-buildx-action` makes it) resolves and pulls with
+  BuildKit's own resolver, which reads neither Docker's `registry-mirrors` nor the runner's
+  settings: in the conformance lab, buildx's builds failed on Docker Hub's `429 Too Many
+  Requests`. Where kiln mirrors registries:
+  - the builder reads kiln's config naming them, mounted at `/.kiln-buildkitd.toml` and given as
+    its `--config`: `[registry."<upstream>"] mirrors = ["kiln.localhost:<port>/<prefix>"]`, and
+    that host over plain HTTP;
+  - it reaches kiln there through its loopback relay (W08-R08). BuildKit asks the mirror with the
+    upstream's name in `ns` (`/v2/<prefix>/…?ns=docker.io`), and goes to the upstream itself when
+    the mirror can't answer;
+  - a workflow that configured BuildKit itself (buildx's `--config`), or a container whose
+    entrypoint isn't BuildKit's, keeps its own;
+  - kiln's registry tells what comes by the stand-in's name to get its token there too
+    (`realm="http://kiln.localhost:<port>/v2/token"`), not at a public URL the builder may not
+    reach or trust;
+  - the builder signs in with no credentials of kiln's, so a mirror that isn't `anonymous` sends
+    it to the upstream;
+  - tests: `w12_r02_buildkit_containers_pull_through_kiln`,
+    `w12_r02_the_stand_ins_challenge_names_the_stand_in`, and
+    `w12_r02_a_buildkit_builder_pulls_through_kiln` with Docker, buildx, BuildKit's image and
+    `KILN_EGRESS_BINARY`. In that test a builder buildx makes builds `FROM` an image that is only
+    at a mirror on the runner's loopback.
 - *Done.* R02 for a cluster's nodes: `GET /api/ci/registry/mirrors` (`ci.registry.mirrors`)
   says what a machine pulling through kiln is given: Docker's `registry-mirrors` (Docker Hub's
   mirror at its own `listen`) and, for each mirror, containerd's `certs.d/<upstream>/hosts.toml`
