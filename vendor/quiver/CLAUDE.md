@@ -83,7 +83,10 @@ depth-first on the call stack. Work is flat: loops with counted budgets and boun
 Linux, macOS and Windows, on x86_64 and aarch64. Platform code sits behind `cfg` with a portable path
 beside it, or a typed refusal naming the platform. `unsafe` is denied; where an OS interface needs it,
 its file is named here with the reason, and every block carries a `// SAFETY:` comment stating its
-invariant.
+invariant. The bench's profile (`crates/quiver-bench/benches/fanout/profile/`) has three:
+`alloc.rs`, the counting allocator (C's `malloc` family over glibc's own, a global allocator
+elsewhere); `perf.rs`, perf_event_open(2) and `read` of the CPU's counters; `os.rs`, getrusage(2)
+and gettid(2).
 
 ## 13. Lean code
 

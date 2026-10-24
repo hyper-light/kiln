@@ -12,6 +12,7 @@ use quiver::{Node, NodeConfig};
 use quiver_api::{Class, Next, Start, Subscription, Topic, Topics};
 
 use crate::follow::{Follow, Schedule, Seen, Window};
+use crate::profile::{Profiler, Role, Watch};
 use crate::report::{Run, tally};
 use crate::{Args, System, thread_cpu_s};
 
@@ -29,6 +30,7 @@ fn worker(
     shared: Arc<Shared>,
     busy: bool,
 ) -> (Seen, Vec<Follow>) {
+    crate::profile::take_role(Role::Subscriber);
     let mut seen = Seen::new();
     loop {
         let mut took = false;
@@ -65,8 +67,9 @@ fn worker(
     (seen, subs.into_iter().map(|(_, f)| f).collect())
 }
 
-/// One run; `minute` is told each minute of the schedule and what was published by then.
-pub fn run(a: &Args, seed: u64, mut minute: impl FnMut(u64, u64)) -> Run {
+/// One run, profiled by `profiler`; `minute` is told each minute of the schedule and what was
+/// published by then.
+pub fn run(a: &Args, seed: u64, profiler: &Profiler, mut minute: impl FnMut(u64, u64)) -> Run {
     let node = Node::new(NodeConfig {
         memory: 4 << 30,
         topics: 4,
@@ -118,6 +121,15 @@ pub fn run(a: &Args, seed: u64, mut minute: impl FnMut(u64, u64)) -> Run {
 
     // A millisecond in, so every worker is waiting.
     let mut schedule = Schedule::new(a, seed, 1_000_000, &shared.window);
+    let (from, until) = schedule.window();
+    let held = {
+        let (node, retain) = (node.clone(), a.retain);
+        std::sync::Arc::new(move || {
+            let s = node.stats();
+            (s.memory_used as u64, s.published.min(retain))
+        })
+    };
+    let pending = profiler.watch(Watch::new(shared.base, from, until).node(held));
     let mut payload = vec![0u8; a.payload];
     let mut refused = 0u64;
     let mut last_minute = 0u64;
@@ -140,6 +152,7 @@ pub fn run(a: &Args, seed: u64, mut minute: impl FnMut(u64, u64)) -> Run {
         ) {
             refused += 1;
         }
+        crate::profile::published();
         if Schedule::minute(at) > last_minute {
             last_minute = Schedule::minute(at);
             minute(last_minute, schedule.offered());
@@ -151,7 +164,8 @@ pub fn run(a: &Args, seed: u64, mut minute: impl FnMut(u64, u64)) -> Run {
         _ => f64::NAN,
     };
     // Every worker takes what was published (the fact waited on), then the topic ends.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // As long as a broker's subscribers get (`--drain`): what isn't taken by then is undelivered.
+    let deadline = Instant::now() + Duration::from_secs(a.drain);
     while shared
         .caught_up
         .iter()
@@ -197,5 +211,6 @@ pub fn run(a: &Args, seed: u64, mut minute: impl FnMut(u64, u64)) -> Run {
         broker_cpu_s: None,
         load_before,
         load_after: hyper_measure::usage::load(),
+        profile: pending.profile(),
     }
 }

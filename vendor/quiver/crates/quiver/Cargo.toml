@@ -13,8 +13,6 @@ name = "quiver"
 path = "src/main.rs"
 
 [dependencies]
-# Waits that wake on a publish, under any executor.
-event-listener = "5.4"
 # Focal's bus (vendor/focal-bus): each message is kept as its batch, and charged to its memory budget.
 # Every vendored name is pinned exactly: crates.io has unrelated crates under some such names, and a
 # newer compatible version there would be chosen over the [patch] (the root Cargo.toml).

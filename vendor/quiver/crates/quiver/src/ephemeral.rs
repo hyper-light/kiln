@@ -16,15 +16,15 @@
 //! what's kept is told so: a read is refused [`Refusal::Behind`], a subscription takes a lag notice
 //! ([`Next::Lag`]) and goes on from the oldest kept. A publish waits for no reader, so a stalled
 //! one holds up no one but itself.
+//!
+//! A reader with nothing to take waits on the topic's [`Bell`], which each publish and the close
+//! ring: waiting allocates nothing once its list has grown to the most waiters there have been.
 
 use std::collections::VecDeque;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
-use event_listener::{Event, EventListener};
 use focal_bus::batch::{Batch as FocalBatch, BatchBuilder, Producing};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use quiver_api::{Batch, MessageRef, Next, Offset, Refusal, Start, Subscription, Topic};
@@ -52,10 +52,21 @@ struct Stored {
     _charge: Allocation,
 }
 
+/// What a publish frames its message in, kept under the topic's lock from one publish to the next
+/// so framing allocates nothing once they've grown to the largest message (at most
+/// [`quiver_api::PAYLOAD_MAX`], its key and its framing).
+#[derive(Default)]
+struct Scratch {
+    record: Vec<u8>,
+    builder: BatchBuilder,
+}
+
 impl Stored {
-    /// `key` and `payload` framed as a Focal batch of one record for `stream`, charged to `budget`.
+    /// `key` and `payload` framed as a Focal batch of one record for `stream`, in `scratch`, kept
+    /// in a block of their own, charged to `budget`.
     fn frame(
         budget: &MemoryBudget,
+        scratch: &mut Scratch,
         stream: u64,
         at_us: u64,
         key: Option<&[u8]>,
@@ -66,16 +77,12 @@ impl Stored {
         let head = key.map_or(0, |k| {
             u64::try_from(k.len()).unwrap_or(u64::MAX).saturating_add(1)
         });
-        let mut record = Vec::with_capacity(
-            key_len
-                .saturating_add(payload.len())
-                .saturating_add(VARINT_MAX),
-        );
-        push_varint(&mut record, head);
+        let Scratch { record, builder } = scratch;
+        record.clear();
+        push_varint(record, head);
         let head_len = record.len();
         record.extend_from_slice(key.unwrap_or_default());
         record.extend_from_slice(payload);
-        let mut builder = BatchBuilder::new();
         builder.begin(&Producing {
             stream,
             producer: 0,
@@ -84,7 +91,7 @@ impl Stored {
             timestamp: at_us,
         });
         let built = builder
-            .push(at_us, &record)
+            .push(at_us, record)
             .and_then(|()| builder.finish())
             .map_err(|e| framing(&format!("as a Focal batch: {e}")))?;
         let charge = budget
@@ -204,6 +211,101 @@ impl Segment {
     }
 }
 
+/// Who waits on a topic for its next message or its close: their wakers, every one woken at each
+/// ring. The list keeps its capacity, so once it has grown to the most waiters there have been, a
+/// wait and a ring allocate nothing (a wait was a listener allocated each time, `event_listener`'s).
+/// A waiter is on the list once a ring at most: its [`Place`] says where, a second wait before the
+/// next ring only updates its waker, and one that found what it waited for after registering takes
+/// its waker back. A ring wakes under the list's lock, as `event_listener` does: the woken wait
+/// their turn to register again, by when more has been published for them, so each wakes for more
+/// and fewer wake at all. Waking outside the lock, 100 waiting subscribers at 100,000 messages a
+/// second on fedora woke 14.2 times a message, and the publisher, waking them, fell behind its
+/// schedule; under it, 9.5 to 9.7, beside `event_listener`'s 9.8 in the same minutes, its tail no
+/// worse. A ring with no one listed since the last costs a fence and a load, no lock.
+struct Bell {
+    /// Whether a waker was listed since the last ring.
+    listed: AtomicBool,
+    waiting: Mutex<Waiting>,
+}
+
+struct Waiting {
+    /// Rings so far: the one a waker on the list was put there in.
+    ring: u64,
+    wakers: Vec<Waker>,
+}
+
+/// A waiter's place on a bell's list: the ring it was put there in, and where.
+#[derive(Default)]
+struct Place(Option<(u64, usize)>);
+
+impl Bell {
+    fn new() -> Self {
+        Self {
+            listed: AtomicBool::new(false),
+            waiting: Mutex::new(Waiting {
+                ring: 0,
+                wakers: Vec::new(),
+            }),
+        }
+    }
+
+    /// Wakes every waiter on the list. Called after what it rings for is published.
+    fn ring(&self) {
+        // With `register`'s fence: either this sees a waker listed, or that waiter, looking again
+        // after its fence, sees what was published before this one.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if !self.listed.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut waiting = lock(&self.waiting);
+        // Under the lock: a waker listed after this sets it again.
+        self.listed.store(false, Ordering::Relaxed);
+        waiting.ring = waiting.ring.wrapping_add(1);
+        for waker in waiting.wakers.drain(..) {
+            waker.wake();
+        }
+    }
+
+    /// Puts `waker` on the list, or, if `place` is there from this ring, puts it in its place. A
+    /// waiter looks again after this: what was published before it registered, it sees then, and
+    /// what after, rings for it.
+    fn register(&self, waker: &Waker, place: &mut Place) {
+        {
+            let mut waiting = lock(&self.waiting);
+            match place.0 {
+                Some((ring, at)) if ring == waiting.ring && at < waiting.wakers.len() => {
+                    if let Some(listed) = waiting.wakers.get_mut(at)
+                        && !listed.will_wake(waker)
+                    {
+                        listed.clone_from(waker);
+                    }
+                }
+                _ => {
+                    place.0 = Some((waiting.ring, waiting.wakers.len()));
+                    waiting.wakers.push(waker.clone());
+                }
+            }
+            self.listed.store(true, Ordering::Relaxed);
+        }
+        // With `ring`'s fence: the look after this sees a publish whose ring missed this waker.
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
+
+    /// Takes back a waiter's waker that found what it waited for after it registered, so no ring
+    /// wakes a waiter that isn't waiting. Its place holds a waker that does nothing until the next
+    /// ring.
+    fn unregister(&self, place: &mut Place) {
+        if let Some((ring, at)) = place.0.take() {
+            let mut waiting = lock(&self.waiting);
+            if ring == waiting.ring
+                && let Some(listed) = waiting.wakers.get_mut(at)
+            {
+                listed.clone_from(Waker::noop());
+            }
+        }
+    }
+}
+
 /// What a topic keeps, under its lock.
 struct Tail {
     /// Kept segments, oldest first; the last takes the next message. Never empty.
@@ -219,6 +321,7 @@ struct Tail {
     bytes: u64,
     /// The last message's stamp.
     last_at_us: u64,
+    scratch: Scratch,
 }
 
 /// One topic of the ephemeral class.
@@ -230,7 +333,7 @@ pub(crate) struct Log {
     /// The offset the next message takes, as last published: read without the lock.
     end: AtomicU64,
     /// Rung at each publish and at the topic's close.
-    bell: Event,
+    bell: Bell,
     closed: AtomicBool,
     budget: MemoryBudget,
     /// Messages published, and lag notices its subscriptions took.
@@ -257,13 +360,14 @@ impl Log {
             end: 0,
             bytes: 0,
             last_at_us: 0,
+            scratch: Scratch::default(),
         };
         Self {
             topic,
             stream,
             tail: Mutex::new(tail),
             end: AtomicU64::new(0),
-            bell: Event::new(),
+            bell: Bell::new(),
             closed: AtomicBool::new(false),
             budget,
             published: AtomicU64::new(0),
@@ -297,20 +401,39 @@ impl Log {
                 return Err(Refusal::NoTopic(name.to_owned()));
             }
             let at_us = now_us.max(t.last_at_us);
-            let mut framed = Stored::frame(&self.budget, self.stream, at_us, key, payload, size);
+            let mut framed = self.frame(&mut t, at_us, key, payload, size);
             // The node's memory is full: this topic's oldest segments go, one at a time (its readers
             // are told what they missed), until the budget takes the message or the topic keeps
             // nothing. Each turn lets a segment go, so there are at most as many as it kept.
             while matches!(framed, Err(Refusal::Full { .. })) && self.let_go_oldest(&mut t) {
-                framed = Stored::frame(&self.budget, self.stream, at_us, key, payload, size);
+                framed = self.frame(&mut t, at_us, key, payload, size);
             }
             let offset = self.keep(&mut t, framed?)?;
             t.last_at_us = at_us;
             offset
         };
         self.published.fetch_add(1, Ordering::Relaxed);
-        self.bell.notify(usize::MAX);
+        self.bell.ring();
         Ok(offset)
+    }
+
+    fn frame(
+        &self,
+        t: &mut Tail,
+        at_us: u64,
+        key: Option<&[u8]>,
+        payload: &[u8],
+        size: u64,
+    ) -> Result<Stored, Refusal> {
+        Stored::frame(
+            &self.budget,
+            &mut t.scratch,
+            self.stream,
+            at_us,
+            key,
+            payload,
+            size,
+        )
     }
 
     /// Puts `stored` in the next slot, then lets the oldest go past the retention.
@@ -443,7 +566,7 @@ impl Log {
             t.first = t.end;
             t.bytes = 0;
         }
-        self.bell.notify(usize::MAX);
+        self.bell.ring();
     }
 
     /// Where a reader at `offset` starts: the offset (the first kept, if it's gone), the segment
@@ -488,17 +611,28 @@ impl Log {
 
     /// Completes once a message at `from` or later is there; refused once the topic is closed.
     pub(crate) async fn wait(&self, name: &str, from: Offset) -> Result<(), Refusal> {
-        loop {
-            // Listening first, then looking: a publish between the two is still heard.
-            let listener = self.bell.listen();
+        let mut place = Place::default();
+        let look = || {
             if self.closed() {
-                return Err(Refusal::NoTopic(name.to_owned()));
+                Some(Err(Refusal::NoTopic(name.to_owned())))
+            } else if self.end.load(Ordering::Acquire) > from {
+                Some(Ok(()))
+            } else {
+                None
             }
-            if self.end.load(Ordering::Acquire) > from {
-                return Ok(());
+        };
+        std::future::poll_fn(|cx| {
+            if let Some(done) = look() {
+                return Poll::Ready(done);
             }
-            listener.await;
-        }
+            self.bell.register(cx.waker(), &mut place);
+            let done = look();
+            if done.is_some() {
+                self.bell.unregister(&mut place);
+            }
+            done.map_or(Poll::Pending, Poll::Ready)
+        })
+        .await
     }
 
     /// A subscription from `start`, counted in `live` (given back as it's dropped).
@@ -514,7 +648,7 @@ impl Log {
             log: Arc::clone(self),
             segment,
             next,
-            listener: None,
+            place: Place::default(),
             live,
         })
     }
@@ -526,7 +660,8 @@ pub(crate) struct EphemeralSubscription {
     /// The segment holding `next`, or the last one before it while `next` isn't published.
     segment: Arc<Segment>,
     next: Offset,
-    listener: Option<EventListener>,
+    /// Its place on the topic's bell while it waits.
+    place: Place,
     live: Arc<AtomicUsize>,
 }
 
@@ -571,29 +706,16 @@ impl Drop for EphemeralSubscription {
 
 impl Subscription for EphemeralSubscription {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        let has = |s: &Self| !matches!(s.find(), Found::Nothing);
-        if has(self) {
-            self.listener = None;
+        if !matches!(self.find(), Found::Nothing) {
             return Poll::Ready(());
         }
-        let listener = self.listener.get_or_insert_with(|| self.log.bell.listen());
-        match Pin::new(listener).poll(cx) {
-            Poll::Ready(()) => {
-                self.listener = None;
-                if has(self) {
-                    return Poll::Ready(());
-                }
-                // Nothing for it after all: listen again, and be polled again to wait on it.
-                self.listener = Some(self.log.bell.listen());
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            // Listening now: a publish between the look above and the listen is caught here.
-            Poll::Pending if has(self) => {
-                self.listener = None;
-                Poll::Ready(())
-            }
-            Poll::Pending => Poll::Pending,
+        self.log.bell.register(cx.waker(), &mut self.place);
+        // Looking again: a publish between the look above and the register is seen here.
+        if matches!(self.find(), Found::Nothing) {
+            Poll::Pending
+        } else {
+            self.log.bell.unregister(&mut self.place);
+            Poll::Ready(())
         }
     }
 

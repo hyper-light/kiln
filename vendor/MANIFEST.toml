@@ -71,13 +71,14 @@ platform = "linux/arm64"
 files = { "ld-musl-aarch64.so.1" = "/lib/ld-musl-aarch64.so.1", "libstdc++.so.6" = "/usr/lib/libstdc++.so.6", "libgcc_s.so.1" = "/usr/lib/libgcc_s.so.1" }
 
 # Quiver, the topic store (docs/bus.md): kiln's bus, behind kiln-seams' `Bus`. Its own vendored
-# projects (Focal's bus, hyper-raft) are kiln's below, so kiln's copy of it leaves them out.
+# projects (Focal's bus, hyper-raft) are kiln's below, so kiln's copy of it leaves them out, and
+# its benchmarks' records, which are Quiver's evidence and no part of what kiln builds.
 [projects.quiver]
 kind = "git"
 repository = "https://github.com/hyper-light/quiver"
-commit = "2c49441c4a33b4d66732c2853f539114cd0065f4"
+commit = "88409ddda5307abe166f310760bbe3bd51f27878"
 path = "vendor/quiver"
-exclude = ["vendor"]
+exclude = ["vendor", "bench/records"]
 
 # Focal's event bus, which Quiver is built on, at the commit Quiver takes (Quiver's
 # docs/design/focal-bus.md); its recorded change is Quiver's.

@@ -1310,10 +1310,12 @@ dependencies = [
  "async-nats",
  "futures",
  "hyper-measure",
+ "libc",
  "quiver",
  "quiver-api",
  "rdkafka",
  "redis",
+ "serde_json",
  "tokio",
 ]
 

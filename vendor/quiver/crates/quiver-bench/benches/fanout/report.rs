@@ -1,5 +1,5 @@
 //! A run's results: its row as the record prints it, its line in the runs file (`--out`), and the
-//! comparison the `report` mode makes of those files.
+//! comparison the `report` mode makes of those files: latency, deliveries, and the profile.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -7,6 +7,7 @@ use std::path::Path;
 
 use crate::System;
 use crate::follow::{Follow, Schedule, Seen};
+use crate::profile::{self, Profile};
 
 /// One run's results.
 pub struct Run {
@@ -41,6 +42,8 @@ pub struct Run {
     pub broker_cpu_s: Option<f64>,
     pub load_before: Option<f64>,
     pub load_after: Option<f64>,
+    /// What its threads and its broker spent over the window (`profile/`).
+    pub profile: Option<Profile>,
 }
 
 /// What a run's subscribers missed of the window, counted into `seen`'s histogram past every
@@ -62,7 +65,7 @@ pub fn tally(seen: &mut Seen, follows: &[Follow], schedule: &Schedule) -> Tally 
         kept_up: 0,
     };
     for f in follows {
-        let m = f.missed(schedule.first, schedule.last);
+        let m = f.missed(schedule.first, schedule.last, schedule.offered());
         t.undelivered += m.undelivered;
         t.silent += m.silent;
         t.lags += f.lags;
@@ -141,7 +144,8 @@ const FIELDS: [&str; 17] = [
     "window_s",
 ];
 
-/// Appends `r` to the runs file at `path`, its header first if the file is new.
+/// Appends `r` to the runs file at `path`, its header first if the file is new: the run's fields,
+/// then every field a profile may give (empty where this run's has none).
 pub fn record(path: &Path, r: &Run) {
     let new = std::fs::metadata(path).map_or(true, |m| m.len() == 0);
     let mut file = std::fs::OpenOptions::new()
@@ -149,8 +153,14 @@ pub fn record(path: &Path, r: &Run) {
         .append(true)
         .open(path)
         .unwrap();
+    let names = profile::field_names();
     if new {
-        writeln!(file, "{}", FIELDS.join("\t")).unwrap();
+        let header: Vec<&str> = FIELDS
+            .iter()
+            .copied()
+            .chain(names.iter().map(String::as_str))
+            .collect();
+        writeln!(file, "{}", header.join("\t")).unwrap();
     }
     let ns = |v: Option<u64>| v.map_or_else(|| "undelivered".to_owned(), |v| v.to_string());
     let l = &r.seen.latency;
@@ -173,12 +183,21 @@ pub fn record(path: &Path, r: &Run) {
         ns(l.largest()),
         r.window_s.to_string(),
     ];
+    let profiled = r.profile.as_ref().map(Profile::fields).unwrap_or_default();
+    let fields: Vec<String> = fields
+        .into_iter()
+        .chain(
+            names
+                .iter()
+                .map(|n| profiled.get(n).cloned().unwrap_or_default()),
+        )
+        .collect();
     writeln!(file, "{}", fields.join("\t")).unwrap();
 }
 
-/// One line of a runs file.
+/// One line of a runs file, by its header's names.
 struct Line {
-    fields: BTreeMap<&'static str, String>,
+    fields: BTreeMap<String, String>,
 }
 
 impl Line {
@@ -203,7 +222,7 @@ fn read(path: &Path) -> Vec<Line> {
             fields: names
                 .iter()
                 .zip(l.split('\t'))
-                .filter_map(|(n, v)| FIELDS.iter().find(|f| *f == n).map(|f| (*f, v.to_owned())))
+                .map(|(n, v)| ((*n).to_owned(), v.to_owned()))
                 .collect(),
         })
         .collect()
@@ -281,6 +300,88 @@ pub fn compare(paths: &[std::path::PathBuf]) -> String {
         ));
     }
     out.push_str(&delivered(&loads));
+    out.push_str(&profiles(&loads));
+    out
+}
+
+/// Field `name` of `l` divided by its field `by`: the figure, or why there's none.
+fn per(l: &Line, name: &str, by: &str) -> String {
+    let v = l.get(name);
+    match (v.parse::<f64>(), l.get(by).parse::<f64>()) {
+        (Ok(v), Ok(n)) if n > 0.0 => profile::show(v / n),
+        _ if v.starts_with("refused") => "refused".to_owned(),
+        _ if v.starts_with("n/a") => "n/a".to_owned(),
+        _ => "-".to_owned(),
+    }
+}
+
+/// The profile of each system's best run (the latency table's), load by load: what it spent a
+/// delivery in this process (Quiver's node, or a broker's clients) and in the broker, its CPU
+/// counters' a delivery on its subscribers' threads, and the memory it held at its peak.
+fn profiles(loads: &BTreeMap<(String, u64, u64), BTreeMap<String, &Line>>) -> String {
+    let mut out = String::from(
+        "\n| subscribers' threads | rate /s | subscribers | system | CPU ns a delivery, process / broker | allocations a delivery, process / broker | bytes allocated a delivery, process / broker | minor page faults a delivery, process / broker | major page faults a delivery, process / broker | involuntary switches a delivery | subscribers' cycles a delivery | subscribers' instructions a delivery | subscribers' L1 data misses a delivery | subscribers' last-level misses a delivery | bytes to storage a message, process / broker | memory at its peak, process / broker |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+    );
+    let both = |l: &Line, key: &str, by: (&str, &str)| {
+        format!(
+            "{} / {}",
+            per(l, &format!("process_{key}"), by.0),
+            per(l, &format!("broker_{key}"), by.1)
+        )
+    };
+    let delivery = ("profile_deliveries", "broker_profile_deliveries");
+    let message = ("profile_messages", "broker_profile_messages");
+    let held = |l: &Line, key: &str| {
+        let cell = |v: &str| {
+            v.parse::<f64>().map_or_else(
+                |_| {
+                    if v.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        v.split(':').next().unwrap_or("-").to_owned()
+                    }
+                },
+                profile::show,
+            )
+        };
+        format!(
+            "{} / {}",
+            cell(l.get(&format!("process_{key}"))),
+            cell(l.get(&format!("broker_{key}")))
+        )
+    };
+    for ((busy, rate, subscribers), systems) in loads {
+        for system in [
+            System::Wake,
+            System::Quiver,
+            System::Nats,
+            System::Redis,
+            System::Kafka,
+        ] {
+            let Some(l) = systems.get(system.name()) else {
+                continue;
+            };
+            if l.get("profile_deliveries").is_empty() {
+                continue;
+            }
+            out.push_str(&format!(
+                "| {busy} | {rate} | {subscribers} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                system.name(),
+                both(l, "cpu_ns", delivery),
+                both(l, "allocations", delivery),
+                both(l, "alloc_bytes", delivery),
+                both(l, "minor_faults", delivery),
+                both(l, "major_faults", delivery),
+                per(l, "process_involuntary_switches", "profile_deliveries"),
+                per(l, "subscribers_cycles", "profile_deliveries"),
+                per(l, "subscribers_instructions", "profile_deliveries"),
+                per(l, "subscribers_l1d_read_misses", "profile_deliveries"),
+                per(l, "subscribers_llc_read_misses", "profile_deliveries"),
+                both(l, "storage_written", message),
+                held(l, "memory_peak"),
+            ));
+        }
+    }
     out
 }
 

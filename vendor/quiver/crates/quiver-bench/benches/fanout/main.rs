@@ -23,6 +23,9 @@
 //! - `soak` runs Quiver once for `--seconds` (an hour, for AC-T2.1.4), reporting every minute;
 //! - `report <runs files>` sets each system's best beside Quiver's, load by load.
 //!
+//! Every run carries its profile (`profile/`), and with `--budgets` is held to the budgets for its
+//! load (`budget.rs`).
+//!
 //! Benchmark code (CLAUDE.md: production is what's compiled outside tests, benches and examples):
 //! it may unwrap and index.
 
@@ -44,15 +47,19 @@
 
 #[cfg(target_os = "linux")]
 mod brokers;
+mod budget;
 mod embedded;
 mod follow;
 mod histogram;
+mod profile;
 mod report;
 mod wake;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
+use profile::Profiler;
 use report::Run;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -130,6 +137,12 @@ pub struct Args {
     out: Option<PathBuf>,
     /// The broker's container's cgroup, whose CPU the run reports.
     pub broker_cgroup: Option<PathBuf>,
+    /// The broker's Docker container, whose account and runtime the profile reads.
+    pub broker_container: Option<String>,
+    /// Where the broker's saved profiles go.
+    pub profiles: Option<PathBuf>,
+    /// The budgets each run is held to (`budget.rs`).
+    budgets: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
 
@@ -153,6 +166,9 @@ fn args() -> Args {
         drain: 30,
         out: None,
         broker_cgroup: None,
+        broker_container: None,
+        profiles: None,
+        budgets: None,
         files: Vec::new(),
     };
     let given: Vec<String> = std::env::args_os()
@@ -187,11 +203,14 @@ fn args() -> Args {
             "--drain" => a.drain = value().parse().unwrap(),
             "--out" => a.out = Some(PathBuf::from(value())),
             "--broker-cgroup" => a.broker_cgroup = Some(PathBuf::from(value())),
+            "--broker-container" => a.broker_container = Some(value()),
+            "--profiles" => a.profiles = Some(PathBuf::from(value())),
+            "--budgets" => a.budgets = Some(PathBuf::from(value())),
             file if a.mode == Mode::Report && !file.starts_with("--") => {
                 a.files.push(PathBuf::from(file));
             }
             other => panic!(
-                "unknown argument {other:?}: [fanout|soak|report FILE..] --system --endpoint --rate --subscribers --workers --seconds --warmup --payload --retain --runs --seed --max-load --busy --drain --out --broker-cgroup"
+                "unknown argument {other:?}: [fanout|soak|report FILE..] --system --endpoint --rate --subscribers --workers --seconds --warmup --payload --retain --runs --seed --max-load --busy --drain --out --broker-cgroup --broker-container --profiles --budgets"
             ),
         }
     }
@@ -244,23 +263,23 @@ fn machine() -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn broker(a: &Args, system: System, seed: u64, index: usize) -> Run {
-    brokers::run(a, system, seed, index)
+fn broker(a: &Args, system: System, seed: u64, index: usize, profiler: &Profiler) -> Run {
+    brokers::run(a, system, seed, index, profiler)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn broker(_: &Args, system: System, _: u64, _: usize) -> Run {
+fn broker(_: &Args, system: System, _: u64, _: usize, _: &Profiler) -> Run {
     panic!(
         "{}: the comparison runs on Linux, its brokers in Docker (bench/compare.sh)",
         system.name()
     )
 }
 
-fn main() {
+fn main() -> ExitCode {
     let a = args();
     if a.mode == Mode::Report {
         print!("{}", report::compare(&a.files));
-        return;
+        return ExitCode::SUCCESS;
     }
     let load = hyper_measure::usage::load().unwrap_or(0.0);
     assert!(
@@ -272,6 +291,10 @@ fn main() {
         a.mode == Mode::Fanout || a.system == System::Quiver,
         "the soak is Quiver's (AC-T2.1.4)"
     );
+    let budgets = a.budgets.as_deref().map(budget::read).unwrap_or_default();
+    // Before any of a run's threads, so their counters are theirs alone; this thread publishes.
+    let profiler = Profiler::start();
+    profile::take_role(profile::Role::Publisher);
     println!(
         "# quiver-bench {} {}",
         if a.mode == Mode::Soak {
@@ -314,7 +337,7 @@ fn main() {
     println!();
     if a.mode == Mode::Soak {
         println!("| minute | published | deliveries are counted at the end |\n|---|---|---|");
-        let r = embedded::run(&a, a.seed, |m, published| {
+        let r = embedded::run(&a, a.seed, &profiler, |m, published| {
             println!("| {m} | {published} | |")
         });
         println!();
@@ -325,19 +348,23 @@ fn main() {
             "frames lost: {}; doubled: {}; subscribers that kept up (no lag notice): {} of {}",
             r.silent, r.doubled, r.kept_up, r.subscribers
         );
+        if let Some(p) = &r.profile {
+            println!();
+            print!("{}", p.table());
+        }
         if let Some(out) = &a.out {
             report::record(out, &r);
         }
-        return;
+        return held(&budgets, &[r]);
     }
     println!("{}", report::header());
     let mut runs = Vec::new();
     for i in 0..a.runs {
         let seed = a.seed.wrapping_add(i as u64);
         let r = match a.system {
-            System::Quiver => embedded::run(&a, seed, |_, _| {}),
-            System::Wake => wake::run(&a, seed),
-            other => broker(&a, other, seed, i),
+            System::Quiver => embedded::run(&a, seed, &profiler, |_, _| {}),
+            System::Wake => wake::run(&a, seed, &profiler),
+            other => broker(&a, other, seed, i, &profiler),
         };
         println!("{}", report::row(&(i + 1).to_string(), &r));
         if let Some(out) = &a.out {
@@ -350,4 +377,37 @@ fn main() {
         .min_by_key(|r| r.seen.latency.quantile(0.99).unwrap_or(u64::MAX))
         .unwrap();
     println!("{}", report::row("best", best));
+    for (i, r) in runs.iter().enumerate() {
+        if let Some(p) = &r.profile {
+            println!();
+            println!("Run {}'s profile:", i + 1);
+            println!();
+            print!("{}", p.table());
+        }
+    }
+    held(&budgets, &runs)
+}
+
+/// Each run against the budgets for its load: their tables, and the process's exit, a failure if a
+/// run went over one.
+fn held(budgets: &[budget::Budget], runs: &[Run]) -> ExitCode {
+    let machine = machine();
+    let mut met = true;
+    for (i, r) in runs.iter().enumerate() {
+        let (table, ok) = budget::check(budgets, r, &machine);
+        if !table.is_empty() {
+            println!();
+            println!("Run {}'s budgets:", i + 1);
+            println!();
+            print!("{table}");
+        }
+        met &= ok;
+    }
+    if met {
+        ExitCode::SUCCESS
+    } else {
+        println!();
+        println!("FAILED: a run went over its budget");
+        ExitCode::FAILURE
+    }
 }

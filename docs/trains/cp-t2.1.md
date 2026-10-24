@@ -5,7 +5,7 @@ delivers, what deploying it does and how to watch it, its risks and its rollback
 open: the metric names Kiln Metrics hasn't answered and the decisions that are Ada's.
 
 **Where it stands (2026-10-23):**
-- **Not merged.** Branch `cp/t2-quiver`, local, has merged main at 243c2aa (948ea91). Main's
+- **Not merged.** Branch `cp/t2-quiver`, local, has merged main at 8adeadb (ccf213c). Main's
   kiln-http took hyper-rt from git at 767627f; it takes the vendored copy, so kiln holds one
   hyper-raft. Main's kiln.db Raft group (`store/group.rs`) builds and passes on 25cf889 too.
 - **Reviewed.** An adversarial review found, and this branch fixed:
@@ -27,14 +27,21 @@ open: the metric names Kiln Metrics hasn't answered and the decisions that are A
   - kiln's unit tests: 1,383 passed, none failed;
   - the live-feed labs (2) and the vendored test (9);
   - kiln-http's tests (39) and kiln-cd's (153).
-- **Measuring.** The comparison with NATS, Redis and Kafka is running on adacachy, on Ada's word,
-  beside production (load 33 to 92, so no record of AC-T2.1.2's bar), its systems interleaved
-  load by load; the hour's soak follows it. AC-T2.1.2 to AC-T2.1.4's records want a quiet machine.
-- **Quiver** is at d8e5d54. Its gate passed in kiln CI at df068e4 (run 5: fmt, clippy on Linux,
-  macOS and Windows, the production check, the tests, the vendor check), and hyper-light/quiver's
-  main is df068e4 (fast-forwarded on Ada's word, 2026-10-23). Since then: the bench interleaves its
-  systems and raises its file limit, vendored names are pinned exactly, docs say no more than the
-  code. kiln vendors d8e5d54.
+- **Measuring** (Quiver's bench/records/):
+  - The comparison with NATS, Redis and Kafka ran on adacachy on Ada's word, beside production, its
+    systems interleaved load by load: 180 runs at a load average of 21 to 143, so no record of
+    any bar. Under that load Quiver led the best competitor tenfold in 8 of 12 loads.
+  - The hour's soak on adacachy (load 36 to 62) lost no frame: 360 billion deliveries to 1,000
+    subscribers that all kept up (AC-T2.1.4), at Quiver 08d3dc9; it's running again at 88409dd,
+    the commit kiln now vendors.
+  - AC-T2.1.2 and AC-T2.1.3's records (p99 at most 300 µs at 100,000 messages a second to 1,000
+    subscribers) and the comparison's want a quiet machine: asked of the coordinator.
+- **Quiver** is at 88409dd, hyper-light/quiver's main, its gate passed in kiln CI (run 16: fmt,
+  clippy on Linux, macOS and Windows, the production check, the tests, the vendor check). Since
+  d8e5d54: every bench run's profile (allocations, page faults, switches, the CPU's counters,
+  memory, and each competitor's own); a subscriber's take and wait allocate nothing and a publish
+  allocates twice, half what it did, held by a bench gate (bench/budgets.tsv); a never-offered
+  message no longer counts as lost. kiln vendors 88409dd, leaving out Quiver's bench records.
 
 ## What it delivers
 
@@ -45,7 +52,9 @@ open: the metric names Kiln Metrics hasn't answered and the decisions that are A
     twice;
   - a viewer that falls behind gets a typed lag notice and starts over alone from a snapshot;
   - a publish never waits for a viewer, so a stalled viewer delays neither the session nor any
-    other viewer (AC-T2.1.5).
+    other viewer (AC-T2.1.5);
+  - a viewer waiting for the next frame waits on the topic's own list of waiters, which allocates
+    nothing once grown (Quiver's waits were a listener allocated each time).
 - **One hyper-raft, vendored.** kiln vendors Quiver, Focal's bus and hyper-raft
   (vendor/MANIFEST.toml, docs/vendoring.md). Its own transport, runtime and replicated stores
   (sync, CD) move with them from hyper-raft's git revision 767627f to the vendored 25cf889,
@@ -132,6 +141,11 @@ A rename Kiln Metrics asks for is one change: crates/kiln/src/metrics.rs, docs/b
   upgrade.
 - **The live feed:** a frame over 1 MiB is refused, which sends that feed's viewers back to a
   snapshot. The mirrors' frames are JSON of a session's state and events, far smaller.
+- **Quiver's waits are its own now.** A topic's waiters wait on its own list, rung under its lock
+  as `event_listener` (which it replaces) rang: against it, at 100,000 messages a second to 100
+  waiting subscribers, the same wake-ups a message (9.5 to 9.7 against 9.8) and a tail no worse
+  (p99 127 to 135 µs against 137 to 160; Quiver's bench/records/2026-10-23-fedora-step2/). Its
+  conformance suite and the stalled-subscriber test pass on it.
 - **Measured on fedora, not on production's machine.** The bench's machine is named in each
   record (bench/README.md in Quiver).
 

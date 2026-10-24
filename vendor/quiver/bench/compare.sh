@@ -5,8 +5,10 @@
 # the floor have none: they run in the generator's process); then RUNS rounds of every load, each
 # load's systems back to back on the generator's CPUs, their order turned each round, so on a
 # machine whose load moves every system's runs of a load come from the same minutes. Every run is
-# added to OUT/runs.tsv and printed to OUT/<system>.md; then OUT/report.md: each system's best run
-# beside Quiver's, load by load.
+# added to OUT/runs.tsv and printed to OUT/<system>.md with its profile (what its threads and its
+# broker spent over the window; the brokers' own profiles saved in OUT/profiles); then
+# OUT/report.md: each system's best run beside Quiver's, load by load. Before any of it, the
+# profile's allocation count is checked against a planted answer (bench/plant.sh, OUT/plant.md).
 #
 #   bench/compare.sh OUT
 #
@@ -17,14 +19,16 @@
 #   CLIENT_CPUS [0-7,16-31]: the generator's: its publisher and subscribers, and Quiver's node
 #   LOAD_LIMIT [2]: the load average the first run must start under; a smoke test of the harness
 #   on a busy machine raises it, and what it measures is no record
-# librdkafka's build needs a C and a C++ compiler and make (bench/README.md).
+# librdkafka's build needs a C and a C++ compiler and make (bench/README.md); Kafka's profile needs a
+# JDK's jcmd on this host.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 # A thousand subscribers' connections, and Kafka's consumers' sockets, need more files than a
 # session's soft limit (often 1,024): it's raised to the hard one.
 ulimit -n "$(ulimit -Hn)"
 out=${1:?usage: bench/compare.sh OUT}
-mkdir -p "$out"
+# An absolute path: cargo runs a bench from its package's folder.
+mkdir -p "$out" && out=$(cd "$out" && pwd)
 systems=${SYSTEMS:-wake quiver nats redis kafka}
 rates=${RATES:-100000}
 fanouts=${SUBSCRIBERS:-1 100 1000}
@@ -52,8 +56,9 @@ if ! awk -v l="$load" -v limit="$load_limit" 'BEGIN { exit !(l < limit) }'; then
 fi
 QUIVER_COMMIT=$(git rev-parse HEAD)
 export QUIVER_COMMIT
-# Built before the first run, so no build runs beside one.
+# Built before the first run, so no build runs beside one; the profile's count checked first.
 cargo bench --locked -q -p quiver-bench --bench fanout --no-run
+taskset -c "$client_cpus" bash bench/plant.sh "$out"
 
 # The brokers' containers, by system.
 declare -A containers=()
@@ -72,7 +77,8 @@ trap 'exit 143' TERM INT
 start() {
   local limits=(--rm --detach --network host --cpuset-cpus "$broker_cpus" --memory 8g --name "quiver-compare-$1-$$")
   case $1 in
-    nats) containers[nats]=$(docker run "${limits[@]}" "$nats_image" --addr 127.0.0.1 --port 14222) ;;
+    # Its profiling port on loopback too (the profile reads Go's allocator there).
+    nats) containers[nats]=$(docker run "${limits[@]}" "$nats_image" --addr 127.0.0.1 --port 14222 --profile 16060) ;;
     redis) containers[redis]=$(docker run "${limits[@]}" "$redis_image" redis-server --bind 127.0.0.1 --port 16380) ;;
     kafka)
       # One KRaft broker, as Focal's comparison sets one (its pubsub.yaml), on loopback.
@@ -136,7 +142,7 @@ for r in $(seq 1 "$runs"); do
             --max-load 1000 --out "$out/runs.tsv")
           if [ "$wait" = busy ]; then flags+=(--busy); fi
           if [ -n "${containers[$system]:-}" ]; then
-            flags+=(--broker-cgroup "/sys/fs/cgroup/system.slice/docker-${containers[$system]}.scope")
+            flags+=(--broker-container "${containers[$system]}" --profiles "$out/profiles")
           fi
           taskset -c "$client_cpus" cargo bench --locked -q -p quiver-bench --bench fanout -- \
             fanout "${flags[@]}" | tee -a "$out/$system.md"

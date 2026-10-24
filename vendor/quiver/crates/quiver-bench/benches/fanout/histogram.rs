@@ -59,11 +59,12 @@ impl Histogram {
     }
 
     /// The value at quantile `q` of every delivery owed: the upper end of the bucket its rank is in,
-    /// or `None` where the rank is past every delivery that came.
+    /// or `None` where the rank is past every delivery that came, or nothing was owed at all (a
+    /// run that measured nothing shows no tail, never a perfect one).
     pub fn quantile(&self, q: f64) -> Option<u64> {
         let owed = self.total + self.undelivered;
         if owed == 0 {
-            return Some(0);
+            return None;
         }
         let rank = ((q * owed as f64).ceil() as u64).clamp(1, owed);
         if rank > self.total {

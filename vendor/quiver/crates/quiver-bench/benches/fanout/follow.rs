@@ -115,6 +115,11 @@ impl Schedule {
         true
     }
 
+    /// The measured window, nanoseconds from the run's base: `[from, until)`.
+    pub fn window(&self) -> (u64, u64) {
+        (self.from, self.until)
+    }
+
     /// The messages published: those scheduled, less those never offered.
     pub fn offered(&self) -> u64 {
         self.issued - self.unoffered
@@ -125,6 +130,11 @@ impl Schedule {
         at / 60_000_000_000
     }
 }
+
+/// Gaps a subscriber's record holds before it grows: a subscriber that fell behind and was told so
+/// records a gap, and its record growing then would count as its thread's allocation, which the
+/// profile counts as the take's (a run that lags this often is no measure of its takes anyway).
+const GAPS: usize = 256;
 
 /// One subscriber's place in the numbers it takes.
 pub struct Follow {
@@ -154,7 +164,7 @@ impl Follow {
     pub fn new() -> Self {
         Self {
             next: 0,
-            missed: Vec::new(),
+            missed: Vec::with_capacity(GAPS),
             lagged: false,
             doubled: 0,
             lags: 0,
@@ -171,24 +181,30 @@ impl Follow {
         self.lagged = true;
     }
 
-    fn took(&mut self, number: u64) {
+    /// Took message `number`: whether it was new (a number taken again, or out of order, is
+    /// counted doubled and timed no more).
+    fn took(&mut self, number: u64) -> bool {
         if number < self.next {
             self.doubled += 1;
-            return;
+            return false;
         }
         if number > self.next {
             self.missed.push((self.next, number, self.lagged));
         }
         self.lagged = false;
         self.next = number + 1;
+        true
     }
 
-    /// What it never took of the window's numbers, `[first, last)`: what it skipped, and what it
-    /// hadn't taken when the run ended (never offered included).
-    pub fn missed(&self, first: u64, last: u64) -> Missed {
+    /// What it never took of the window's numbers, `[first, last)`, of which the first `offered`
+    /// were published: what it skipped and what was published that it hadn't taken when the run
+    /// ended, each lost unless a lag notice came before it; and what was never offered (its
+    /// system held the publisher back), undelivered but no frame lost.
+    pub fn missed(&self, first: u64, last: u64, offered: u64) -> Missed {
         let overlap = |a: u64, b: u64| b.min(last).saturating_sub(a.max(first));
         let mut m = Missed::default();
-        let tail = (self.next, last, self.lagged);
+        let published = offered.max(self.next);
+        let tail = (self.next, published, self.lagged);
         for &(a, b, told) in self.missed.iter().chain(std::iter::once(&tail)) {
             let n = overlap(a, b);
             m.undelivered += n;
@@ -196,6 +212,7 @@ impl Follow {
                 m.silent += n;
             }
         }
+        m.undelivered += overlap(published, last);
         m
     }
 
@@ -241,8 +258,15 @@ impl Seen {
         if number == PRIMING {
             return Taken::Priming;
         }
-        follow.took(number);
+        if !follow.took(number) {
+            return Taken::Message;
+        }
         self.deliveries += 1;
+        crate::profile::delivered();
+        // A test build's planted allocation, one a delivery (bench/plant.sh): the profile must
+        // show it, whichever thread the delivery is on.
+        #[cfg(feature = "plant")]
+        drop(std::hint::black_box(Box::new(number)));
         if window.contains(scheduled) {
             self.latency.record(at.saturating_sub(scheduled));
             self.measured += 1;

@@ -30,6 +30,9 @@ QUIVER_COMMIT=$(git rev-parse HEAD) cargo bench -p quiver-bench --bench fanout -
   notice before it is a frame lost silently. CPU is the process's, and the publisher's own thread's
   beside it: its open loop paces by spinning, a CPU that isn't Quiver's work
   (`/proc/thread-self/schedstat`).
+- **Which path.** A delivery here is a subscription's take, Quiver's shared, zero-copy path. kiln's
+  live feed reads by offset through kiln-seams' `Bus`, which copies each frame out and takes the
+  topic's lock to find its segment; kiln measures that path itself (`kiln_bus_delivery_seconds`).
 - **Its bar** (kiln's plan `01a157fdefc37396957ea10adb51a19f`): AC-T2.1.2, publish-to-deliver p99
   at most 300 µs at 100,000 messages a second on one node; AC-T2.1.3, kept with at least 1,000
   subscribers; AC-T2.1.4, no frame lost to a subscriber that keeps up over an hour (`soak`).
@@ -86,7 +89,71 @@ SYSTEMS="quiver nats" SUBSCRIBERS=100 WAITS=busy bench/compare.sh OUT    # one c
 ```
 
 The comparison needs Docker, and librdkafka's build needs `make` and a C and a C++ compiler: where
-there's no `c++` on the PATH, zig's serves (`zig c++`, as Quiver's gate installs zig).
+there's no `c++` on the PATH, zig's serves (`zig c++`, as Quiver's gate installs zig). Kafka's
+profile needs a JDK's `jcmd` on the host.
+
+## The profile
+
+Every run carries a profile of its measured window (`profile/`): what its threads and its broker
+spent, in all, per message and per delivery. The table is printed under the run's rows, every
+figure goes into the runs file (`--out`), and `report` sets each system's best run's beside the
+others', load by load. A figure the machine won't give says why: never a zero in its place.
+
+- **This process** is Quiver itself for Quiver (its node is a library in the generator's process,
+  as kiln runs it), and a broker's clients for a broker: the broker's own side is its own column.
+- **Allocations.** Every thread's allocations, reallocations (and those that moved their block),
+  frees and bytes asked for, each thread counting into a slot of its own (no lock, no contended
+  atomic). On Linux with glibc the count sits under `malloc` itself, this binary defining C's
+  allocator over glibc's own, so librdkafka's C allocations count beside Rust's; elsewhere a
+  counting global allocator counts Rust's. The slots also count each thread's publishes and
+  deliveries: a profile divides by what they counted between the same two readings.
+- **The kernel's account.** The process's CPU, minor and major page faults and voluntary and
+  involuntary context switches (getrusage), less the profiler's own thread's; the publisher's and
+  the subscribers' threads' own (`/proc/self/task/<tid>/`), with the time each spent runnable but
+  waiting for a CPU; resident memory at its peak in the window (`VmHWM`, reset as the window opens)
+  and at its end; the process's storage I/O (`/proc/self/io`'s bytes; its call counts leave out
+  a socket's `recv` and `send`, so they aren't shown).
+- **The CPU's counters** on the publisher's and the subscribers' threads (perf_event_open, user
+  space only, as `perf_event_paranoid` 2 allows): cycles, instructions, cache references and misses,
+  and L1 data, last-level and data-TLB read misses, scaled where the PMU multiplexed them, and on
+  a hybrid CPU summed over its core types. The publisher's include its pacing spin, and with
+  `--busy` a subscriber's thread polls, so its cycles are its time rather than its work. A counter
+  the kernel refuses is shown refused with its reason (AMD's cores count no last-level event per
+  thread: their L3 sits outside the core's PMU).
+- **Memory held.** Quiver's node's accounted memory, framing included, at its peak in the window,
+  and per message it held then.
+- **The broker**, read a quarter second before the window and after it, so no reading lands in
+  what's measured: its container's cgroup (CPU, page faults, memory charged at its peak and at the
+  end, storage bytes and operations from `io.stat`), and its runtime's own, each counting what it
+  counts. NATS: Go's `runtime.MemStats` from its profiling port (`--profile 16060`: objects
+  allocated and freed, bytes, collections and their pauses, the heap in use), the window's
+  allocation profile and the heap profile after it saved for `go tool pprof`. Redis: jemalloc's
+  allocation requests (`MEMORY MALLOC-STATS`, every arena merged) and `used_memory`, `MEMORY STATS`
+  and the allocator's statistics saved. Kafka: a Java Flight Recorder recording over the run
+  (`jcmd` from the host into its container's JVM): the bytes its threads allocated in the window
+  (their counters every 100 ms), its collections and pauses, the heap after the last; the recording
+  saved for JDK Mission Control or `jfr print`, its allocation samples with their stacks. Starting
+  the recording lands in the warm-up, and it costs Kafka the JDK's profiling settings' overhead
+  through the window (`profile.jfc`: "typically around 2 % overhead").
+- **Its check.** `bench/plant.sh OUT` runs Quiver and the floor briefly from the bench as built and
+  from a test build that plants one allocation in every delivery (`--features plant`): the profiles
+  must differ by one allocation and one free a delivery, all on the subscribers' threads, so the
+  count sees every thread. Their subscribers poll (`--busy`): a waiting Quiver subscriber allocates
+  once a wait, and how often it waits moves with the machine's load between two runs.
+  `compare.sh` runs it before its brokers start (`OUT/plant.md`).
+
+## The budgets
+
+`bench/budgets.tsv` holds what one run of a load may spend, figure by figure, a message or a
+delivery (kiln's CP-T2.1, step 2): a subscriber's take allocates nothing, waiting or polling; a
+publish allocates twice (the future `Topics::publish` answers with, and the block its batch is kept
+in) and reallocates nothing; at most 100 minor page faults a million messages after the warm-up;
+and on fedora the subscribers' last-level cache misses a delivery and a waiting one's CPU a
+delivery (a polling thread's CPU is its time, not its work). `--budgets FILE`
+holds each run to the budgets for its load and machine, printed under its profile, and fails the
+run's exit status if it went over one. `bench/budget.sh OUT` is the bench gate: each budgeted load
+for 60 s after 5 s of warm-up, failing where a run is over a budget by more than a tenth (over one of
+zero at all) or doesn't count a figure it's held to. Like every measure here, on a quiet machine.
 
 ## Records
 

@@ -29,6 +29,8 @@ use rdkafka::consumer::Consumer as _;
 use rdkafka::producer::Producer as _;
 
 use crate::follow::{Follow, PRIMING, Schedule, Seen, Taken, Window, stamp};
+use crate::profile::broker::Target;
+use crate::profile::{Pending, Profiler, Role, Watch};
 use crate::report::{Run, tally};
 use crate::{Args, System, thread_cpu_s};
 
@@ -181,6 +183,7 @@ fn subscribers(
     busy: bool,
     drain: Duration,
 ) -> (Seen, Vec<Follow>, u64) {
+    crate::profile::take_role(Role::Subscriber);
     let count = ids.len();
     let local = Rc::new(RefCell::new(Local {
         seen: Seen::new(),
@@ -386,12 +389,13 @@ impl Publisher {
     }
 }
 
-/// What the publisher did.
+/// What the publisher did, and the profile of its window.
 struct Published {
     schedule: Schedule,
     errors: u64,
     seconds: f64,
     cpu_s: f64,
+    profile: Pending,
 }
 
 async fn publish(
@@ -400,6 +404,8 @@ async fn publish(
     seed: u64,
     topic: &str,
     shared: &Shared,
+    profiler: &Profiler,
+    broker: Option<Target>,
 ) -> Result<Published, String> {
     let publisher = Publisher::connect(system, &a.endpoint, topic).await?;
     let mut flying = tokio::task::JoinSet::new();
@@ -443,6 +449,12 @@ async fn publish(
 
     // A millisecond on, the schedule.
     let mut schedule = Schedule::new(a, seed, shared.now() + 1_000_000, &shared.window);
+    let (from, until) = schedule.window();
+    let watch = Watch::new(shared.base, from, until);
+    let profile = profiler.watch(match broker {
+        Some(t) => watch.broker(t),
+        None => watch,
+    });
     let mut payload = vec![0u8; a.payload];
     let mut errors = 0;
     let began = Instant::now();
@@ -459,6 +471,7 @@ async fn publish(
         }
         stamp(&mut payload, at, number);
         errors += publisher.publish(topic, &payload, &mut flying).await;
+        crate::profile::published();
     }
     let seconds = began.elapsed().as_secs_f64();
     errors += publisher.finish(&mut flying).await?;
@@ -475,6 +488,7 @@ async fn publish(
         errors,
         seconds,
         cpu_s,
+        profile,
     })
 }
 
@@ -506,8 +520,8 @@ fn create_topic(endpoint: &str, topic: &str) -> Result<(), String> {
 }
 
 /// The broker's CPU so far, seconds, as its container's cgroup counts it.
-fn broker_cpu_s(a: &Args) -> Option<f64> {
-    let text = std::fs::read_to_string(a.broker_cgroup.as_ref()?.join("cpu.stat")).ok()?;
+fn broker_cpu_s(cgroup: Option<&std::path::Path>) -> Option<f64> {
+    let text = std::fs::read_to_string(cgroup?.join("cpu.stat")).ok()?;
     let usec: u64 = text
         .lines()
         .find_map(|l| l.strip_prefix("usage_usec "))?
@@ -517,9 +531,22 @@ fn broker_cpu_s(a: &Args) -> Option<f64> {
     Some(usec as f64 / 1e6)
 }
 
-/// Run `index` of `system`.
-pub fn run(a: &Args, system: System, seed: u64, index: usize) -> Run {
+/// Run `index` of `system`, profiled by `profiler`.
+pub fn run(a: &Args, system: System, seed: u64, index: usize, profiler: &Profiler) -> Run {
     let topic = format!("quiver-compare-{}-{index}", std::process::id());
+    let broker = a.broker_container.as_deref().map(|c| {
+        Target::new(
+            system,
+            c,
+            &a.endpoint,
+            a.profiles.clone(),
+            format!("{}-{}-{index}", system.name(), std::process::id()),
+        )
+    });
+    let cgroup = a
+        .broker_cgroup
+        .clone()
+        .or_else(|| broker.as_ref().and_then(|t| t.cgroup.clone()));
     if system == System::Kafka {
         create_topic(&a.endpoint, &topic).unwrap_or_else(|e| panic!("kafka: {e}"));
     }
@@ -536,7 +563,7 @@ pub fn run(a: &Args, system: System, seed: u64, index: usize) -> Run {
     let workers = a.workers.min(a.subscribers).max(1);
     let load_before = hyper_measure::usage::load();
     let cpu_before = hyper_measure::usage::this().ok();
-    let broker_before = broker_cpu_s(a);
+    let broker_before = broker_cpu_s(cgroup.as_deref());
     let handles: Vec<_> = (0..workers)
         .map(|w| {
             let (per, extra) = (a.subscribers / workers, a.subscribers % workers);
@@ -555,7 +582,7 @@ pub fn run(a: &Args, system: System, seed: u64, index: usize) -> Run {
         .enable_all()
         .build()
         .unwrap();
-    let published = runtime.block_on(publish(a, system, seed, &topic, &shared));
+    let published = runtime.block_on(publish(a, system, seed, &topic, &shared, profiler, broker));
     if let Err(e) = &published {
         shared.fail(e.clone());
     }
@@ -582,7 +609,7 @@ pub fn run(a: &Args, system: System, seed: u64, index: usize) -> Run {
         (Some(b), Some(a)) => a.since(&b).cpu_ns() as f64 / 1e9,
         _ => f64::NAN,
     };
-    let broker_cpu_s = match (broker_before, broker_cpu_s(a)) {
+    let broker_cpu_s = match (broker_before, broker_cpu_s(cgroup.as_deref())) {
         (Some(b), Some(a)) => Some(a - b),
         _ => None,
     };
@@ -610,5 +637,6 @@ pub fn run(a: &Args, system: System, seed: u64, index: usize) -> Run {
         broker_cpu_s,
         load_before,
         load_after: hyper_measure::usage::load(),
+        profile: p.profile.profile(),
     }
 }

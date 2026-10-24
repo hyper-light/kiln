@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-10-22. A piece is done when its tests pass in the gate (`scripts/gates.sh`: Linux, with the
+Updated 2026-10-23. A piece is done when its tests pass in the gate (`scripts/gates.sh`: Linux, with the
 macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
@@ -20,21 +20,32 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   each message a Focal batch charged to Focal's memory budget; reads from any offset kept,
   subscriptions that share what they read, a typed lag notice for a subscriber that falls behind,
   and no publish that waits on a reader (`docs/design/focal-bus.md`). It passes the suite; a stalled
-  subscriber among 100 delays no other (`crates/quiver/tests/stalled.rs`). Kiln's live feed of
-  every session rides it on kiln's branch `cp/t2-quiver`, not yet on kiln's main.
+  subscriber among 100 delays no other (`crates/quiver/tests/stalled.rs`). A subscriber's take and
+  wait allocate nothing, a publish allocates twice (the seam's boxed future and its batch's block),
+  and after the warm-up the class takes under 100 minor page faults a million messages, held by
+  the bench gate (`bench/budgets.tsv`, `bench/budget.sh`; `bench/records/2026-10-23-fedora-step2/`).
+  Kiln's live feed of every session rides it on kiln's branch `cp/t2-quiver`, not yet on kiln's
+  main.
 - **GroupStore mandated** (CP-T2.1, T-T2.1.2): hyper-durable's `RamStore` is for tests alone, and a
   build that names it outside one fails (`crates/quiver/tests/ram_store.rs`).
 - **The `quiver` binary** says what it is (`quiver --version`, `quiver --help`), and nothing more yet.
 - **The bench** (`crates/quiver-bench`, `bench/README.md`): the ephemeral class's fan-out and soak,
   and the comparison, class for class, with NATS core, Redis Pub/Sub and Kafka on the same machine
   (`bench/compare.sh`, each broker in Docker on CPUs of its own), every system on the same open-loop
-  schedule, measured by the same harness.
+  schedule, measured by the same harness; each run carries its profile (allocations, page faults,
+  context switches, the CPU's counters, memory held, storage I/O, and each broker's own runtime's
+  figures, per message and per delivery), its allocation count checked against a planted answer
+  (`bench/plant.sh`). Records in `bench/records/`.
 
 ## Next
 
 - **CP-T2.1's measurements**: the fan-out bench, the hour's soak and the comparison
-  (`bench/README.md`) on fedora, in a quiet window. The bar for the comparison: Quiver's p99 and
-  p99.9 an order of magnitude under the best competitor's, load by load.
+  (`bench/README.md`) on a quiet machine. The bar for the comparison: Quiver's p99 and p99.9 an
+  order of magnitude under the best competitor's, load by load (Q-1.1). A comparison on a loaded
+  adacachy (2026-10-23, `bench/records/2026-10-23-adacachy-comparison/`, no record) met it in 8 of
+  12 loads, all but one subscriber at 100,000 a second polling or waiting at either rate, and 100
+  subscribers waiting at 10,000. The hour's soak on adacachy lost no frame (AC-T2.1.4): 360 billion
+  deliveries to 1,000 subscribers that all kept up (`bench/records/2026-10-23-adacachy-soak/`).
 - **CP-T2.2**: The persisted class's 1.4 s tail fixed at its cause (a disk stall never costs leadership), cheaper elections, and kiln's CI and deploy events on the persisted class, on Focal's replicated part.
 - **CP-T2.3**: Typed acknowledgements stating the fate reached and its loss bound.
 

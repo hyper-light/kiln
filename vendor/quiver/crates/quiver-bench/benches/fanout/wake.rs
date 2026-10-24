@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::follow::{Follow, Schedule, Seen, Window, stamp};
+use crate::profile::{Profiler, Role, Watch};
 use crate::report::{Run, tally};
 use crate::{Args, System, thread_cpu_s};
 
@@ -30,6 +31,7 @@ struct Shared {
 }
 
 fn waiter(index: usize, shared: Arc<Shared>, busy: bool) -> (Seen, Follow) {
+    crate::profile::take_role(Role::Subscriber);
     let mut seen = Seen::new();
     let mut follow = Follow::new();
     let mut payload = [0u8; 16];
@@ -59,8 +61,9 @@ fn waiter(index: usize, shared: Arc<Shared>, busy: bool) -> (Seen, Follow) {
     (seen, follow)
 }
 
-/// One run: `--subscribers` waiters, each on a thread of its own, at most `--workers` of them.
-pub fn run(a: &Args, seed: u64) -> Run {
+/// One run, profiled by `profiler`: `--subscribers` waiters, each on a thread of its own, at most
+/// `--workers` of them.
+pub fn run(a: &Args, seed: u64, profiler: &Profiler) -> Run {
     let waiters = a.workers.min(a.subscribers).max(1);
     let shared = Arc::new(Shared {
         base: Instant::now(),
@@ -86,6 +89,8 @@ pub fn run(a: &Args, seed: u64) -> Run {
 
     // A millisecond in, so every waiter is waiting.
     let mut schedule = Schedule::new(a, seed, 1_000_000, &shared.window);
+    let (from, until) = schedule.window();
+    let pending = profiler.watch(Watch::new(shared.base, from, until));
     let began = Instant::now();
     let publisher_before = thread_cpu_s();
     loop {
@@ -100,6 +105,7 @@ pub fn run(a: &Args, seed: u64) -> Run {
         }
         shared.ring[(number % RING) as usize].store(at, Ordering::Release);
         shared.published.store(number + 1, Ordering::Release);
+        crate::profile::published();
         if !a.busy {
             for t in &threads {
                 t.unpark();
@@ -112,7 +118,8 @@ pub fn run(a: &Args, seed: u64) -> Run {
         _ => f64::NAN,
     };
     // Every waiter takes what was published (the fact waited on), then they stop.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // As long as a broker's subscribers get (`--drain`): what isn't taken by then is undelivered.
+    let deadline = Instant::now() + Duration::from_secs(a.drain);
     while shared
         .caught_up
         .iter()
@@ -160,5 +167,6 @@ pub fn run(a: &Args, seed: u64) -> Run {
         broker_cpu_s: None,
         load_before,
         load_after: hyper_measure::usage::load(),
+        profile: pending.profile(),
     }
 }
