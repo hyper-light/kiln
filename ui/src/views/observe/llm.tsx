@@ -6,7 +6,7 @@
  * a tree, the one picked opened to its messages, its tokens and its cost.
  */
 import * as React from "react";
-import { observeApi, type LogSearch, type PlacedSpan, type Span, type SpanAggregate, type SpanSearch, type Trace } from "@/api/observe";
+import { observeApi, type LogRecord, type LogSearch, type PlacedSpan, type Span, type SpanAggregate, type SpanSearch, type Trace } from "@/api/observe";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, PageIntro, Panel } from "@/components/ui/misc";
@@ -585,8 +585,67 @@ function StepEvaluations({ traceId, spanId, fromMs }: { traceId: string; spanId:
   );
 }
 
+/** A step's log events (its span's), from a minute before it to an hour after: OpenTelemetry's
+ * GenAI conventions send a call's messages so where its instrumentation keeps them off its span. */
+const stepEventsRes = (trace: string, span: string, fromMs: number): Res<LogSearch> => ({
+  key: `observe/llm/events/${trace}/${span}`,
+  fetch: (signal) => observeApi.logs({ query: `trace_id:${trace} span_id:${span}`, from: fromMs - 60_000, to: fromMs + 3_600_000, limit: 100 }, signal),
+});
+
+const callsOf = (v: unknown): Message["calls"] =>
+  (Array.isArray(v) ? (v as Record<string, unknown>[]) : []).map((c) => {
+    const f = (c?.function ?? c) as Record<string, unknown>;
+    return { name: str(f?.name), args: str(f?.arguments) };
+  });
+
+/** A step's messages on one side as its log events say them: the inference's details (1.37 on:
+ * `gen_ai.client.inference.operation.details`, its messages as attributes), else one event a
+ * message (1.28 to 1.36: `gen_ai.system.message`, `.user.message`, `.assistant.message`,
+ * `.tool.message` its input, `gen_ai.choice` its output, each its body). */
+function messagesOfEvents(records: LogRecord[], side: "input" | "output"): Message[] {
+  const events = [...records].sort((x, y) => x.ts_ns - y.ts_ns);
+  for (const r of events) {
+    if (r.attributes["event.name"] !== "gen_ai.client.inference.operation.details") continue;
+    const v = parseJson(r.attributes[`gen_ai.${side}.messages`]);
+    if (Array.isArray(v)) return v.map(messageOf).filter((m): m is Message => m !== null);
+  }
+  const out: Message[] = [];
+  for (const r of events) {
+    const name = r.attributes["event.name"] ?? "";
+    const body = (parseJson(r.message) ?? {}) as Record<string, unknown>;
+    const role = /^gen_ai\.(system|user|assistant|tool)\.message$/.exec(name)?.[1];
+    if (side === "input" && role) {
+      out.push({ role: str(body.role) || role, text: str(body.content ?? (typeof parseJson(r.message) === "object" ? "" : r.message)), calls: callsOf(body.tool_calls) });
+    } else if (side === "output" && name === "gen_ai.choice") {
+      const m = (body.message ?? {}) as Record<string, unknown>;
+      out.push({ role: str(m.role) || "assistant", text: str(m.content), calls: callsOf(m.tool_calls) });
+    }
+  }
+  return out;
+}
+
+function EventMessages({ trace, span, fromMs }: { trace: string; span: string; fromMs: number }) {
+  const records = useRes(stepEventsRes(trace, span, fromMs)).data.records;
+  return (
+    <div className="mt-5 grid grid-cols-1 gap-6 lg:grid-cols-2">
+      <section aria-label="Input">
+        <h3 className="mb-2 text-[12px] text-[#a7aab3]">Input</h3>
+        <Messages list={messagesOfEvents(records, "input")} />
+      </section>
+      <section aria-label="Output">
+        <h3 className="mb-2 text-[12px] text-[#a7aab3]">Output</h3>
+        <Messages list={messagesOfEvents(records, "output")} />
+      </section>
+    </div>
+  );
+}
+
 function StepDetail({ s, traceId }: { s: PlacedSpan; traceId: string }) {
   const a = s.attributes;
+  // Its start in whole milliseconds, as a search takes a time (a nanosecond's count is no exact
+  // number here: divided, it has a fraction the search refuses).
+  const startMs = Math.floor(s.ts_ns / 1e6);
+  const [input, output] = [messagesOf(a, "input"), messagesOf(a, "output")];
   const n = (k: string) => (a[k] !== undefined ? compact(Number(a[k])) : "—");
   const error = a["error.message"] ?? a["meta.error.message"];
   return (
@@ -602,19 +661,25 @@ function StepDetail({ s, traceId }: { s: PlacedSpan; traceId: string }) {
         ]}
       />
       {error && <p className="mt-4 font-mono text-[12px] break-words text-[#f27a7a]">{error}</p>}
-      <div className="mt-5 grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <section aria-label="Input">
-          <h3 className="mb-2 text-[12px] text-[#a7aab3]">Input</h3>
-          <Messages list={messagesOf(a, "input")} />
-        </section>
-        <section aria-label="Output">
-          <h3 className="mb-2 text-[12px] text-[#a7aab3]">Output</h3>
-          <Messages list={messagesOf(a, "output")} />
-        </section>
-      </div>
+      {input.length + output.length === 0 && s.trace_id && s.span_id ? (
+        <Loadable label="its messages" fallback={<RowsHold rows={2} rowHeight={32} />}>
+          <EventMessages trace={s.trace_id} span={s.span_id} fromMs={startMs} />
+        </Loadable>
+      ) : (
+        <div className="mt-5 grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <section aria-label="Input">
+            <h3 className="mb-2 text-[12px] text-[#a7aab3]">Input</h3>
+            <Messages list={input} />
+          </section>
+          <section aria-label="Output">
+            <h3 className="mb-2 text-[12px] text-[#a7aab3]">Output</h3>
+            <Messages list={output} />
+          </section>
+        </div>
+      )}
       {traceId && s.span_id && (
         <Loadable label="its evaluations" fallback={null}>
-          <StepEvaluations traceId={traceId} spanId={s.span_id} fromMs={s.ts_ns / 1e6} />
+          <StepEvaluations traceId={traceId} spanId={s.span_id} fromMs={startMs} />
         </Loadable>
       )}
       <p className="mt-5 text-[12px]">

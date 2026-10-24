@@ -28,11 +28,16 @@ use common::{Fleet, at, free_port, now_ms};
 use serde_json::{Value, json};
 
 const IMAGE: &str = "kiln-llm-apps:e2e";
+/// Datadog's tracer's evaluation as it sends it (kiln-obs's fixture), of app `kiln-capture`.
+const EVAL_PAYLOAD: &[u8] = include_bytes!("../../kiln-obs/src/fixtures/llmobs/dd-trace-py-4.16.0-eval-metric.json");
 const DOCKERFILE: &str = "FROM python:3.12-slim\nRUN pip install --no-cache-dir ddtrace==4.16.0 openai==3.37.0 anthropic==2.3.0 httpx opentelemetry-sdk==1.45.1 \
 opentelemetry-exporter-otlp-proto-http==1.45.1 opentelemetry-instrumentation-openai-v2==2.4b0 opentelemetry-util-genai==0.4b0 openinference-instrumentation-openai==0.1.66\n";
 
 const APP: &str = r#"
-import http.server, json, socketserver, sys, threading, time
+import http.server, json, logging, socketserver, sys, threading, time
+
+# What the tracer says of its sends (a payload refused, retried, given up on), where the test reads it.
+logging.basicConfig(stream=sys.stdout, level=logging.WARNING, format="LOG %(name)s %(levelname)s %(message)s")
 
 MODE = sys.argv[1]
 
@@ -165,8 +170,9 @@ fn metric_sum(f: &Fleet, q: &str, from: i64, to: i64) -> anyhow::Result<f64> {
 }
 
 /// The app run once, in `mode`, as app `app`: its Datadog tracer's Agent the runner's receiver on
-/// `apm`, its OTLP exporter the runner's on `otlp`; `env` besides. What it printed of its ids.
-fn run_app(mode: &str, app: &str, apm: u16, otlp: u16, env: &[(&str, &str)]) -> anyhow::Result<Value> {
+/// `apm`, its OTLP exporter the runner's on `otlp`; `env` besides. What it printed of its ids, and
+/// what its libraries logged (warnings and errors: a send refused, given up on).
+fn run_app(mode: &str, app: &str, apm: u16, otlp: u16, env: &[(&str, &str)]) -> anyhow::Result<(Value, String)> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("app.py"), APP)?;
     Command::new("chmod").args(["-R", "a+rX"]).arg(dir.path()).output()?;
@@ -192,7 +198,8 @@ fn run_app(mode: &str, app: &str, apm: u16, otlp: u16, env: &[(&str, &str)]) -> 
     let endpoint = format!("http://127.0.0.1:{otlp}/v1/traces");
     args.extend([IMAGE, "python", "-u", "/e2e/app.py", mode, &model, app, &endpoint].map(str::to_owned));
     let out = docker(&args.iter().map(String::as_str).collect::<Vec<_>>(), None)?;
-    out.lines().find_map(|l| l.strip_prefix("IDS ")).map(serde_json::from_str).transpose()?.ok_or_else(|| anyhow::anyhow!("the app's ids:\n{out}"))
+    let ids = out.lines().find_map(|l| l.strip_prefix("IDS ")).map(serde_json::from_str).transpose()?.ok_or_else(|| anyhow::anyhow!("the app's ids:\n{out}"))?;
+    Ok((ids, out.lines().filter(|l| l.starts_with("LOG ")).collect::<Vec<_>>().join("\n")))
 }
 
 /// Each call of `app`'s spans priced as the catalog prices it: `want` (each step's kind and name,
@@ -261,7 +268,7 @@ fn an_llm_app_s_calls_in_every_convention_are_kiln_s_llm_spans_priced_to_the_nan
         // catalog's providers': unpriced, and said so.
         ("embedding", "OpenAI.createEmbedding", None),
     ];
-    let exported = run_app("dd", "llm-dd-apm", apm, otlp, &[])?;
+    let (exported, logged) = run_app("dd", "llm-dd-apm", apm, otlp, &[])?;
     let got = priced(&f, "llm-dd-apm", t0, &dd)?;
     anyhow::ensure!(got.iter().all(|s| !attr(s, "llmobs.trace_id").is_empty()), "every step its LLM trace's: {got:#?}");
     let chat = got.iter().find(|s| attr(s, "meta.span.kind") == "llm" && attr(s, "meta.model_name").starts_with("gpt")).ok_or_else(|| anyhow::anyhow!("the chat"))?;
@@ -269,7 +276,30 @@ fn an_llm_app_s_calls_in_every_convention_are_kiln_s_llm_spans_priced_to_the_nan
         attr(chat, "metrics.cache_read_input_tokens") == "1000" && attr(chat, "matched_model_name") == "gpt-4o-mini" && attr(chat, "meta.input.messages").contains("You are terse."),
         "{chat:#}"
     );
-    let evals = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "source:llmobs.eval service:llm-dd-apm", "from": t0, "to": now_ms() + 60_000, "limit": 10 })))?;
+    // Its evaluation: a record of the span it judges, through the runner's proxy.
+    let search = |q: &str| f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": q, "from": t0, "to": now_ms() + 60_000, "limit": 20 })));
+    let mut evals = Value::Null;
+    until(
+        "the evaluation, a record",
+        Duration::from_secs(60),
+        || {
+            evals = search("source:llmobs.eval service:llm-dd-apm")?;
+            Ok(at(&evals, &["records"]).as_array().is_some_and(|r| !r.is_empty()))
+        },
+        &|| {
+            // Whether the runner takes one: the tracer's own payload, of now, posted as it posts it.
+            let probe = String::from_utf8_lossy(EVAL_PAYLOAD).replace("1792817084564", &now_ms().to_string());
+            let posted = common::raw(apm, "POST", "/evp_proxy/v2/api/intake/llm-obs/v2/eval-metric", "Content-Type: application/json\r\n", probe.as_bytes())
+                .map_or_else(|e| e.to_string(), |(c, b)| format!("{c} {}", String::from_utf8_lossy(&b)));
+            std::thread::sleep(Duration::from_secs(3));
+            format!(
+                "the app logged: {logged}\na probe posted to the runner: {posted}\nevaluations of any app: {}\nthe app's records: {}\n{}",
+                search("source:llmobs.eval").map(|v| v.to_string()).unwrap_or_default(),
+                search("service:llm-dd-apm").map(|v| v.to_string()).unwrap_or_default(),
+                f.logs()
+            )
+        },
+    )?;
     let eval = at(&evals, &["records"]).as_array().and_then(|r| r.first()).cloned().ok_or_else(|| anyhow::anyhow!("the evaluation: {evals}"))?;
     anyhow::ensure!(at(&eval, &["attributes", "label"]) == "accuracy" && at(&eval, &["attributes", "value"]) == "0.8" && at(&eval, &["attributes", "assessment"]) == "pass", "{eval:#}");
     anyhow::ensure!(at(&exported, &["trace_id"]).as_str().is_some_and(|t| got.iter().all(|s| attr(s, "llmobs.trace_id") == t)), "the evaluation's trace is its steps': {exported}");

@@ -2795,14 +2795,35 @@ const scenarios = {
       async () => (await api("POST", "/api/observe/v1/spans/search", { query: `@ml_app:${app} @meta.span.kind:*`, from: Date.now() - 600_000, to, limit: 20 })).body?.spans?.length === 6,
       30_000,
     );
+    // A judge's evaluation of the chat (the tracer's own payload, of its ids), sent after it.
+    const chat = events.flatMap((e) => e.spans).find((x) => x.name === "OpenAI.createChatCompletion");
+    const judged = JSON.parse(fs.readFileSync(new URL("dd-trace-py-4.16.0-eval-metric.json", dir), "utf8"));
+    for (const m of judged.data.attributes.metrics) {
+      m.join_on = { span: { span_id: chat.span_id, trace_id: trace } };
+      m.ml_app = app;
+      m.timestamp_ms = Date.now();
+      m.tags = m.tags.map((t) => (t.startsWith("ml_app:") ? `ml_app:${app}` : t));
+    }
+    const er = await fetch(`${BASE}/api/intake/llm-obs/v2/eval-metric`, { method: "POST", headers: { "DD-API-KEY": ingest, "content-type": "application/json" }, body: JSON.stringify(judged) });
+    expect(er.status === 202, `its evaluation taken: ${er.status} ${await er.text()}`);
+    await until(
+      "its evaluation searchable",
+      async () => (await api("POST", "/api/observe/v1/logs/search", { query: `source:llmobs.eval trace_id:${trace}`, from: Date.now() - 600_000, to, limit: 5 })).body?.records?.length === 1,
+      30_000,
+    );
     await page.goto(`${BASE}/observe/llm?app=${encodeURIComponent(app)}`);
-    // Its models, each priced as the catalog prices it: the chat's cache reads at theirs.
-    const models = page.getByRole("table");
+    // Its models, each priced as the catalog prices it: the chat's cache reads at theirs (its table,
+    // not the charts' legends, which a phone's width shows as tables of their own).
+    const models = page.locator("section", { has: page.getByRole("heading", { name: "Models", exact: true }) }).getByRole("table");
     const row = (model) => models.locator("tr", { hasText: model });
     await row("gpt-4o-mini-2024-07-18").waitFor();
     expect(((await row("gpt-4o-mini-2024-07-18").textContent()) ?? "").includes("$0.000129"), "the chat's cost: 1,200 input tokens, 1,000 of them cached, and 40 out");
     expect(((await row("claude-opus-5-5").textContent()) ?? "").includes("$0.0017"), "Anthropic's: its 1-hour cache writes at theirs");
-    await page.getByText("$0.00183", { exact: true }).waitFor();
+    // In all (the page's figures; its session's row says the same, its six steps the app's all).
+    await page
+      .getByRole("definition")
+      .filter({ hasText: /^\$0\.00183$/ })
+      .waitFor();
     await fitsAcross("an LLM app's page");
     // Its session, chosen: its traces narrowed to it.
     await page
@@ -2822,7 +2843,115 @@ const scenarios = {
     await page.getByText("You are terse.", { exact: true }).waitFor();
     await page.getByText("Paris: 18C and clear.", { exact: true }).waitFor();
     await page.getByText(/^Priced as openai\/gpt-4o-mini/).waitFor();
+    // Its evaluation, beside its messages: the judge's label, score, verdict and reason.
+    const judgement = page.getByRole("region", { name: "Evaluations" });
+    await judgement.getByText("matches the forecast", { exact: true }).waitFor();
+    const said = (await judgement.textContent()) ?? "";
+    expect(
+      ["accuracy", "0.8", "pass"].every((w) => said.includes(w)),
+      `the chat's evaluation: ${said}`,
+    );
     await fitsAcross("an LLM trace's steps");
+    // Datadog's ml_obs metrics, counted once their windows are whole: the app's cost there too (the
+    // chat's and Anthropic's call's; the embedding, of a provider unnamed, unpriced), and its
+    // dashboard.
+    await until(
+      "its cost in ml_obs",
+      async () => {
+        const r = await api("POST", "/api/observe/v1/query", {
+          query: `sum:ml_obs.span.llm.total.cost.sum{ml_app:${app}}.as_count()`,
+          from: Date.now() - 600_000,
+          to: Date.now() + 60_000,
+          step: 10_000,
+        });
+        const sum = (r.body?.series ?? []).flatMap((x) => x.values ?? []).reduce((a, v) => a + (v ?? 0), 0);
+        return Math.abs(sum - 1_829_000) < 1;
+      },
+      90_000,
+    );
+    await page.goto(`${BASE}/observe/dashboards/builtin:llm`);
+    await page.getByText("Cost by model", { exact: true }).waitFor();
+    await fitsAcross("the LLM dashboard");
+    // An OpenTelemetry call whose instrumentation kept its messages off its span, sending them as
+    // log events of it (the conventions' 1.28 to 1.36: a message an event, `gen_ai.choice` its
+    // answer): its step's messages read from them.
+    const otelApp = `e2e-llm-otel-${run}`;
+    const [otTrace, otSpan] = [hex(16), hex(8)];
+    const t0 = (BigInt(Date.now() - 30_000) * 1_000_000n).toString();
+    const t1 = (BigInt(Date.now() - 29_000) * 1_000_000n).toString();
+    const kv = (key, v) => ({ key, value: typeof v === "number" ? { intValue: String(v) } : { stringValue: v } });
+    const resource = { attributes: [kv("service.name", otelApp)] };
+    const spans = {
+      resourceSpans: [
+        {
+          resource,
+          scopeSpans: [
+            {
+              scope: { name: "opentelemetry.instrumentation.openai_v2" },
+              spans: [
+                {
+                  traceId: otTrace,
+                  spanId: otSpan,
+                  name: "chat gpt-4o-mini",
+                  kind: 3,
+                  startTimeUnixNano: t0,
+                  endTimeUnixNano: t1,
+                  attributes: [
+                    kv("gen_ai.operation.name", "chat"),
+                    kv("gen_ai.system", "openai"),
+                    kv("gen_ai.request.model", "gpt-4o-mini"),
+                    kv("gen_ai.usage.input_tokens", 12),
+                    kv("gen_ai.usage.output_tokens", 7),
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const event = (name, body) => ({
+      timeUnixNano: t0,
+      eventName: name,
+      traceId: otTrace,
+      spanId: otSpan,
+      body: {
+        kvlistValue: {
+          values: Object.entries(body).map(([k, v]) => ({ key: k, value: typeof v === "string" ? { stringValue: v } : { kvlistValue: { values: Object.entries(v).map(([k2, v2]) => kv(k2, v2)) } } })),
+        },
+      },
+      attributes: [kv("event.name", name), kv("gen_ai.system", "openai")],
+    });
+    const logs = {
+      resourceLogs: [
+        {
+          resource,
+          scopeLogs: [
+            {
+              scope: { name: "opentelemetry.instrumentation.openai_v2" },
+              logRecords: [event("gen_ai.user.message", { content: "Is it raining in Lyon?" }), event("gen_ai.choice", { message: { role: "assistant", content: "Dry in Lyon today." } })],
+            },
+          ],
+        },
+      ],
+    };
+    for (const [path, body] of [
+      ["/v1/traces", spans],
+      ["/v1/logs", logs],
+    ]) {
+      const r = await fetch(`${BASE}${path}`, { method: "POST", headers: { authorization: `Bearer ${ingest}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+      expect(r.status === 200, `${path} taken: ${r.status} ${await r.text()}`);
+    }
+    await until(
+      "its call and its events searchable",
+      async () =>
+        (await api("POST", "/api/observe/v1/spans/search", { query: `@ml_app:${otelApp}`, from: Date.now() - 600_000, to: Date.now() + 60_000, limit: 5 })).body?.spans?.length === 1 &&
+        (await api("POST", "/api/observe/v1/logs/search", { query: `trace_id:${otTrace}`, from: Date.now() - 600_000, to: Date.now() + 60_000, limit: 5 })).body?.records?.length === 2,
+      30_000,
+    );
+    await page.goto(`${BASE}/observe/llm/traces/${otTrace}`);
+    await page.getByText("Is it raining in Lyon?", { exact: true }).waitFor();
+    await page.getByText("Dry in Lyon today.", { exact: true }).waitFor();
   },
 
   async "a container is listed against its limits, read from its page and its host's, and one stopped is told apart"() {
@@ -2933,6 +3062,12 @@ for (const [name, f] of Object.entries(scenarios).filter(([n]) => !process.env.O
         .join("\n     ")}`,
     );
     console.log(`     the page's loads and navigations:\n       ${navs.join("\n       ")}`);
+    // What the page said when it failed, where a screenshot cannot come back from.
+    const said = await page
+      .locator("main")
+      .innerText({ timeout: 2_000 })
+      .catch(() => "");
+    console.log(`     the page said:\n       ${said.slice(0, 1_500).split("\n").join("\n       ")}`);
     // What the page showed when it failed (SHOTS: a folder to keep it in).
     await page.screenshot({ path: `${process.env.SHOTS ?? "/tmp"}/observe-e2e-${which}${phone ? "-phone" : ""}-${Object.keys(scenarios).indexOf(name)}.png`, fullPage: true }).catch(() => undefined);
   }

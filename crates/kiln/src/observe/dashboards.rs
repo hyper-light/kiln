@@ -261,7 +261,7 @@ fn search_widget(title: &str, kind: &str, search: &str, (x, y, w, h): (u32, u32,
 }
 
 /// kiln's own dashboards: its hosts, its CI, its CD, its repositories' sync, the store it keeps its
-/// bytes in, its agents, and their sessions' live feed.
+/// bytes in, its agents, their sessions' live feed, and LLM apps' calls (`ml_obs.*`).
 pub fn builtins() -> Vec<Dashboard> {
     let host = vec![TemplateVariable { name: "host".into(), tag: "host".into(), default: "*".into() }];
     vec![
@@ -375,7 +375,7 @@ pub fn builtins() -> Vec<Dashboard> {
                 widget("Goals sent", "timeseries", &["sum:kiln_goals_sent_total{*} by {kind}.as_count()"], (0, 0, 4, 4), json!({ "display": "bars" })),
                 widget("Goals ended", "timeseries", &["sum:kiln_goals_ended_total{*} by {status}.as_count()"], (4, 0, 4, 4), json!({ "display": "bars" })),
                 widget("Harness looks, by host", "timeseries", &["sum:kiln_harness_polls_total{$host} by {host}.as_count()"], (8, 0, 4, 4), json!({ "display": "bars" })),
-                widget("Records written, by host", "timeseries", &["sum:kiln_harness_records_written_total{$host} by {host}.as_count()"], (0, 4, 4, 4), json!({ "display": "bars" })),
+                widget("Session records written, by host", "timeseries", &["sum:kiln_harness_records_written_total{$host} by {host}.as_count()"], (0, 4, 4, 4), json!({ "display": "bars" })),
                 widget(
                     "Journal commits, and those that could not be written",
                     "timeseries",
@@ -384,6 +384,8 @@ pub fn builtins() -> Vec<Dashboard> {
                     json!({ "display": "bars" }),
                 ),
                 widget("A journal commit, p50 and p99 (s)", "timeseries", &["p50:kiln_harness_journal_commit_seconds{$host} by {host}", "p99:kiln_harness_journal_commit_seconds{$host} by {host}"], (8, 4, 4, 4), json!({ "unit": "s" })),
+                // Messages are the server's counts, of every machine's inboxes' answers (a runner's
+                // registry holds them at 0); how long a take was, each host's, where it was taken.
                 widget("Messages taken", "timeseries", &["sum:kiln_sends_accepted_total{*}.as_count()"], (0, 8, 4, 4), json!({ "display": "bars" })),
                 widget("Repeats, answered and not delivered again", "timeseries", &["sum:kiln_sends_repeated_total{*}.as_count()"], (4, 8, 4, 4), json!({ "display": "bars" })),
                 widget(
@@ -394,7 +396,43 @@ pub fn builtins() -> Vec<Dashboard> {
                     json!({ "display": "bars" }),
                 ),
                 widget("Messages refused, by reason", "timeseries", &["sum:kiln_sends_refused_total{*} by {reason}.as_count()"], (0, 12, 6, 4), json!({ "display": "bars" })),
-                widget("An inbox's take, p50 and p99 (s)", "timeseries", &["p50:kiln_sends_inbox_seconds{$host} by {host}", "p99:kiln_sends_inbox_seconds{$host} by {host}"], (6, 12, 6, 4), json!({ "unit": "s" })),
+                widget(
+                    "A message's take, by host: how long its session's inbox took, p50 and p99 (s)",
+                    "timeseries",
+                    &["p50:kiln_sends_take_seconds{$host} by {host}", "p99:kiln_sends_take_seconds{$host} by {host}"],
+                    (6, 12, 6, 4),
+                    json!({ "unit": "s" }),
+                ),
+            ],
+            builtin: true,
+            created: 0,
+            modified: 0,
+        },
+        Dashboard {
+            id: "builtin:llm".into(),
+            title: "LLM Observability".into(),
+            description: "Apps' calls to language models, from the spans they send in any convention: what they cost (as the catalog prices their tokens, or as they say), their tokens and how much the cache served, their calls, errors and latency, by model.".into(),
+            template_variables: vec![TemplateVariable { name: "ml_app".into(), tag: "ml_app".into(), default: "*".into() }],
+            widgets: vec![
+                widget("Cost", "query_value", &["sum:ml_obs.span.llm.total.cost.sum{$ml_app}.as_count()"], (0, 0, 3, 4), json!({ "unit": "nanodollars", "aggregator": "sum" })),
+                widget("Calls", "query_value", &["sum:ml_obs.span{$ml_app,span_kind:llm}.as_count()"], (3, 0, 3, 4), json!({ "aggregator": "sum" })),
+                widget("Cost by model", "timeseries", &["sum:ml_obs.span.llm.total.cost.sum{$ml_app} by {model_name}.as_count()"], (6, 0, 6, 4), json!({ "display": "bars", "unit": "nanodollars" })),
+                widget("Tokens by model", "timeseries", &["sum:ml_obs.span.llm.total.tokens.sum{$ml_app} by {model_name}.as_count()"], (0, 4, 6, 4), json!({ "display": "bars" })),
+                widget(
+                    "Input tokens: uncached, read from the cache, written to it",
+                    "timeseries",
+                    &[
+                        "sum:ml_obs.span.llm.input.non_cached.tokens.sum{$ml_app}.as_count()",
+                        "sum:ml_obs.span.llm.input.cache_read.tokens.sum{$ml_app}.as_count()",
+                        "sum:ml_obs.span.llm.input.cache_write.tokens.sum{$ml_app}.as_count()",
+                    ],
+                    (6, 4, 6, 4),
+                    json!({ "display": "bars" }),
+                ),
+                widget("Calls and errors, by kind", "timeseries", &["sum:ml_obs.span{$ml_app} by {span_kind}.as_count()", "sum:ml_obs.span.error{$ml_app} by {span_kind}.as_count()"], (0, 8, 6, 4), json!({ "display": "bars" })),
+                widget("A call's latency, p50 and p95 (s)", "timeseries", &["p50:ml_obs.span.duration{$ml_app,span_kind:llm} by {model_name}", "p95:ml_obs.span.duration{$ml_app,span_kind:llm} by {model_name}"], (6, 8, 6, 4), json!({ "unit": "s" })),
+                widget("Costliest apps", "toplist", &["sum:ml_obs.span.llm.total.cost.sum{*} by {ml_app}.as_count()"], (0, 12, 6, 4), json!({ "unit": "nanodollars" })),
+                widget("Traces and a trace's time, p95 (s)", "timeseries", &["sum:ml_obs.trace{$ml_app}.as_count()", "p95:ml_obs.trace.duration{$ml_app}"], (6, 12, 6, 4), json!({})),
             ],
             builtin: true,
             created: 0,
@@ -444,6 +482,61 @@ mod tests {
         anyhow::ensure!(d.put(bad).is_err(), "an unknown kind is refused");
         let reopened = Dashboards::open(dir.path());
         anyhow::ensure!(reopened.list().len() == builtins().len() * 2, "kept across a restart");
+        Ok(())
+    }
+
+    /// The agents dashboard's take panel answers from `kiln_sends_take_seconds` as kiln's registry
+    /// writes it (Prometheus's histogram, the bounds its sends count with), each host's registry
+    /// read as observe reads it, tagged with its host: each host's p50 and p99 of the takes between
+    /// two reads, in the bucket they fell in.
+    #[test]
+    fn the_take_panel_answers_each_host_from_its_registry_s_histogram() -> anyhow::Result<()> {
+        use kiln_obs::batch::Builder;
+        use kiln_obs::query::eval::{Request, eval};
+        const BOUNDS: [f64; 18] = [0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.003, 0.004, 0.005, 0.0075, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 10.0];
+        let agents = builtins().into_iter().find(|d| d.id == "builtin:agents").ok_or_else(|| anyhow::anyhow!("the agents dashboard"))?;
+        let take = agents.widgets.iter().find(|w| w.title.starts_with("A message's take")).ok_or_else(|| anyhow::anyhow!("its take panel"))?;
+        // The registry's text, its takes `n` at each of `at` (seconds).
+        let text = |takes: &[(f64, u64)]| {
+            let mut t = String::from("# HELP kiln_sends_take_seconds How long a session's inbox took to take a message, where it was taken.\n# TYPE kiln_sends_take_seconds histogram\n");
+            for b in BOUNDS {
+                let n: u64 = takes.iter().filter(|(at, _)| *at <= b).map(|(_, n)| n).sum();
+                t.push_str(&format!("kiln_sends_take_seconds_bucket{{le=\"{b}\"}} {n}\n"));
+            }
+            let (n, sum) = takes.iter().fold((0, 0.0), |(n, s), (at, k)| (n + k, s + at * *k as f64));
+            t.push_str(&format!("kiln_sends_take_seconds_bucket{{le=\"+Inf\"}} {n}\nkiln_sends_take_seconds_sum {sum}\nkiln_sends_take_seconds_count {n}\n"));
+            t
+        };
+        // A thousand takes on each host between two reads a minute apart: the server's all within
+        // half a millisecond, a runner's mostly within one, a fiftieth of them a third of a second.
+        let mut store = kiln_obs::store::Store::new(kiln_obs::hash::Keyed::with_keys(1, 2));
+        for (host, takes) in [("server-1", vec![(0.0004, 1000)]), ("web-1", vec![(0.0008, 980), (0.3, 20)])] {
+            for (at, takes) in [(30_000, Vec::new()), (90_000, takes)] {
+                let scraped = kiln_obs::prom::parse(&text(&takes), at, &[("host", host)]);
+                let mut b = Builder::new();
+                for (key, points) in &scraped.series {
+                    b.define(key);
+                    b.run(key.fp, points.iter().copied());
+                }
+                store.apply(&b.finish()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+        }
+        let mut said = Vec::new();
+        for q in &take.queries {
+            let filled = filled_with_any(q, &agents.template_variables);
+            let mut r = Request::new(&filled, 0, 120_000);
+            r.step = Some(60_000);
+            let a = eval(&store, &r).map_err(|e| anyhow::anyhow!("{filled}: {e}"))?;
+            for s in &a.series {
+                let host = s.tags.iter().find(|(k, _)| k == "host").map(|(_, v)| v.clone()).unwrap_or_default();
+                said.push((q.split(':').next().unwrap_or("").to_owned(), host, s.values.iter().copied().rev().find(|v| v.is_finite())));
+            }
+        }
+        let within = |p: &str, host: &str, lo: f64, hi: f64| said.iter().any(|(q, h, v)| q == p && h == host && v.is_some_and(|v| v > lo && v <= hi));
+        anyhow::ensure!(
+            within("p50", "server-1", 0.00025, 0.0005) && within("p99", "server-1", 0.00025, 0.0005) && within("p50", "web-1", 0.0005, 0.001) && within("p99", "web-1", 0.25, 0.5) && said.len() == 4,
+            "{said:?}"
+        );
         Ok(())
     }
 }

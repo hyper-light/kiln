@@ -92,9 +92,10 @@ fn main() {
     println!("a snapshot of its {} series: median {:.2} ms (most {:.2}), {:.1} MB copied", ids.len(), snaps[snaps.len() / 2] * 1e3, snaps[snaps.len() - 1] * 1e3, at.bytes() as f64 / 1e6);
     let store = std::sync::RwLock::new(s);
     let stop = AtomicBool::new(false);
-    let (asked, waits) = std::thread::scope(|scope| {
+    let (asked, (waits, holds)) = std::thread::scope(|scope| {
         let writer = scope.spawn(|| {
-            let mut waits = Vec::new();
+            // How long each write waited for the store, and how long it held it.
+            let (mut waits, mut holds) = (Vec::new(), Vec::new());
             let mut at = to + 60_000;
             while !stop.load(Ordering::Relaxed) {
                 let mut b = Builder::new();
@@ -105,12 +106,14 @@ fn main() {
                 let t = Instant::now();
                 let mut g = store.write().unwrap();
                 waits.push(t.elapsed().as_secs_f64());
+                let t = Instant::now();
                 g.apply(&batch).unwrap();
                 drop(g);
+                holds.push(t.elapsed().as_secs_f64());
                 at += 20;
                 std::thread::sleep(Duration::from_millis(20));
             }
-            waits
+            (waits, holds)
         });
         let mut asked = Vec::new();
         for _ in 0..rounds.max(25) {
@@ -128,8 +131,9 @@ fn main() {
     };
     let (mut took, mut waited): (Vec<f64>, Vec<f64>) = asked.iter().map(|&(t, w)| (t * 1e3, w)).unzip();
     let mut writes: Vec<f64> = waits.iter().map(|w| w * 1e3).collect();
+    let mut held: Vec<f64> = holds.iter().map(|h| h * 1e3).collect();
     println!(
-        "beside writes, read a part at a time: median {:.1} ms (most {:.1}); waited for the store median {:.2} ms (most {:.2}); writes waited p50 {:.3} ms, p99 {:.2}, most {:.2} ({} writes)",
+        "beside writes, read a part at a time: median {:.1} ms (most {:.1}); waited for the store median {:.2} ms (most {:.2}); writes waited p50 {:.3} ms, p99 {:.2}, most {:.2} ({} writes), each held the store p50 {:.3} ms, p99 {:.3}",
         pct(&mut took, 0.5),
         pct(&mut took, 1.0),
         pct(&mut waited, 0.5),
@@ -137,6 +141,8 @@ fn main() {
         pct(&mut writes, 0.5),
         pct(&mut writes, 0.99),
         pct(&mut writes, 1.0),
-        writes.len()
+        writes.len(),
+        pct(&mut held, 0.5),
+        pct(&mut held, 0.99)
     );
 }
