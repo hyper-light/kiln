@@ -440,6 +440,18 @@ impl Outbox {
         self.queues.values().all(VecDeque::is_empty)
     }
 
+    /// What fills `peer`'s `lane`: each message variant there (a frame's first byte) and how many
+    /// of its frames, the most first, at most four.
+    fn filled_with(&self, peer: PeerId, lane: u32) -> String {
+        let mut n: HashMap<u8, usize> = HashMap::new();
+        for (_, data) in self.queues.get(&(peer, lane)).into_iter().flatten() {
+            *n.entry(data.first().copied().unwrap_or(0)).or_default() += 1;
+        }
+        let mut most: Vec<(u8, usize)> = n.into_iter().collect();
+        most.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        most.iter().take(4).map(|(v, c)| format!("{v}×{c}")).collect::<Vec<_>>().join(", ")
+    }
+
     /// Lets go of what's queued for `peer`, counted as dropped for `reason`.
     fn forget(&mut self, peer: PeerId, reason: &'static str) {
         self.queues.retain(|(p, lane), q| {
@@ -581,7 +593,7 @@ async fn run_loop(
                                 // Its control lane's queue is full: rather than lose control
                                 // frames, the connection closes, and the channel's resume repairs
                                 // what it carried.
-                                tracing::warn!(peer, lane, frames = OUTBOX_FRAMES, "a control lane's queue is full, its peer stuck: its connection closes");
+                                tracing::warn!(peer, lane, frames = OUTBOX_FRAMES, filled_with = %outbox.filled_with(peer, lane), "a control lane's queue is full, its peer stuck: its connection closes");
                                 crate::metrics::net().dropped(peer, lane, "stuck", 1);
                                 outbox.forget(peer, "stuck");
                                 with_driver!(&mut driver, d => {
@@ -787,10 +799,11 @@ mod tests {
             assert_eq!(o.push(peer, bulk, Kind::Log, vec![1]), Push::Queued);
         }
         assert_eq!(grew(0, "shed"), 1, "a full lane that may lose frames sheds its oldest, counted");
-        for _ in 0..OUTBOX_FRAMES {
-            assert_eq!(o.push(peer, control, Kind::Control, vec![2]), Push::Queued);
+        for i in 0..OUTBOX_FRAMES {
+            assert_eq!(o.push(peer, control, Kind::Control, vec![if i == 0 { 5 } else { 2 }]), Push::Queued);
         }
         assert_eq!(o.push(peer, control, Kind::Control, vec![3]), Push::Stuck, "a full control lane sheds nothing");
+        assert_eq!(o.filled_with(peer, control), format!("2×{}, 5×1", OUTBOX_FRAMES - 1), "what filled it, said by message variant");
         assert_eq!(grew(0, "shed"), 1);
         o.forget(peer, "closed");
         assert_eq!(grew(1, "closed"), 2 * OUTBOX_FRAMES as u64, "what a closed connection had queued, counted");

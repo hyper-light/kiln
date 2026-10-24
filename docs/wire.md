@@ -91,7 +91,10 @@ Callers take it in one of two ways:
   knows at once (a leg whose runner is away goes back in the queue) and logs the rest.
 
 A runner process that started again has neither stream. Its parked commands not yet answered go
-again on a new generation, and its live ones end `unanswered`. A parked command waits for its
+again on a new generation, and its live ones end `unanswered`. It connects with the same
+certificate, so to the server it's the same peer: each link that comes up starts its commands over
+as a drop does, whether or not the server heard the old one go, and the new link's first `Have`
+says what the process has (nothing, for one that started again). A parked command waits for its
 runner a day at the most. A forgotten runner's waiting commands end `unreachable`. Commands live
 in the server's memory: one that restarts lets go of them, which their callers see as `unanswered`.
 
@@ -104,7 +107,7 @@ peer and lane. It counts every frame it lets go before the wire, by lane and rea
 | Reason | When |
 |---|---|
 | `shed` | A lane that may lose frames (every lane but control and sync: the channel's own items among them, which it sends again) had its queue full: its oldest frame went. |
-| `stuck` | The control or sync lane had its queue full. Its peer is stuck, so the connection is closed rather than a control frame lost, and what it held goes with it. |
+| `stuck` | The control or sync lane had its queue full. Its peer is stuck, so the connection is closed rather than a control frame lost, and what it held goes with it. The warning says which messages filled it (`filled_with`: each variant's index, and how many). |
 | `refused` | The transport wouldn't take the frame. |
 | `closed` | Its connection closed, or its peer wasn't connected, with the frame queued. |
 | `ended` | The net loop started over (a rebuild), or stopped, with the frame queued. |
@@ -112,7 +115,11 @@ peer and lane. It counts every frame it lets go before the wire, by lane and rea
 
 The channel makes up for what of these it carried, without waiting for a reconnect:
 - A receiver that sees an item past a gap drops it and asks for the stream again from the gap
-  (`Want`).
+  (`Want`): once for the gap, and again every 64 items past it in case that want was lost, rather
+  than for each. Its sender sends what follows the gap again at once; a want for the same items soon after (an older receiver's, made before they
+  got there again) sends them again only once 250 ms have passed.
+- A receiver behind its sender's `low` (it started again with less, and the stream went on) goes on
+  from there: every item through `low` is answered.
 - An item whose answer doesn't come within the stream's patience (15 s for session updates and
   terminal output) is sent again, and the receiver takes it once.
 - A closed connection resumes as every reconnect does (`Have`).

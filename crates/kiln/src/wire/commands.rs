@@ -158,9 +158,19 @@ impl Commands {
         self.peers.get(&peer).is_some_and(|p| p.up)
     }
 
-    /// Runner process `peer` keeps the channel: its commands go on it from now on.
+    /// Runner process `peer` keeps the channel, on a link that just came up: its commands go on
+    /// it from now on, once it says what it has. A link the server took for up went without the
+    /// server hearing it go (a runner that started again on the same certificate is the same
+    /// peer): as when it drops, its live commands end, and its parked ones wait for what the new
+    /// link's first `Have` says (one that started again has nothing: they go on a new generation).
     pub fn connected(&mut self, peer: PeerId) {
-        self.peer(peer);
+        let born = self.born;
+        let p = self.peer(peer);
+        if p.up {
+            p.up = false;
+            p.tx.down();
+            restart(p, Kind::Live, born);
+        }
     }
 
     /// Queues `body` (an encoded `ServerMsg`) as a command to `peer`: its answer comes on the
@@ -449,6 +459,43 @@ mod tests {
         }
         assert_eq!(answer(&mut second), Some(Answer::Taken));
         assert_eq!(r.took, vec![b"two".to_vec()], "only what it hadn't answered, from 1 on the new generation");
+    }
+
+    /// Its process killed and started again on the same certificate (the same peer), before the
+    /// server heard the old link go: the new one's commands start over as after a drop, and no
+    /// command goes to the new process as if it were the old one.
+    #[test]
+    fn a_runner_that_started_again_on_the_same_peer_unheard_starts_over() {
+        let base = Instant::now();
+        let mut c = Commands::new(7);
+        let mut r = Runner::new();
+        c.connected(1);
+        c.on_frame(1, r.rx.have());
+        let mut one = c.push(1, Kind::Parked, b"one".to_vec(), base);
+        for a in r.deliver(c.poll(base), |_| false) {
+            c.on_frame(1, a);
+        }
+        assert_eq!(answer(&mut one), Some(Answer::Taken));
+        // Sent, never answered: the process that had them is gone.
+        let mut two = c.push(1, Kind::Parked, b"two".to_vec(), t(base, 10));
+        let mut keys = c.push(1, Kind::Live, b"keys".to_vec(), t(base, 10));
+        let _gone_with_it = c.poll(t(base, 10));
+        // The new process: its link, then what it has (nothing).
+        c.connected(1);
+        assert_eq!(answer(&mut keys), Some(Answer::Unanswered { why: "the link to its runner dropped before it answered".into() }));
+        let mut r = Runner::new();
+        c.on_frame(1, r.rx.have());
+        let mut sent = 0;
+        for _ in 0..3 {
+            let frames = c.poll(t(base, 20));
+            sent += frames.len();
+            for a in r.deliver(frames, |_| false) {
+                c.on_frame(1, a);
+            }
+        }
+        assert_eq!(answer(&mut two), Some(Answer::Taken));
+        assert_eq!(r.took, vec![b"two".to_vec()], "the parked one again, from 1 on a new generation; the live one not at all");
+        assert_eq!(sent, 1, "sent once: no wants for what the old process had");
     }
 
     #[test]
