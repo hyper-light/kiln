@@ -404,11 +404,11 @@ impl Active {
 }
 
 /// What this node routes by now.
-fn active() -> &'static std::sync::RwLock<std::sync::Arc<Active>> {
-    static ACTIVE: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<Active>>> = std::sync::OnceLock::new();
+fn active() -> &'static kiln_obs::lock::RwLock<std::sync::Arc<Active>> {
+    static ACTIVE: std::sync::OnceLock<kiln_obs::lock::RwLock<std::sync::Arc<Active>>> = std::sync::OnceLock::new();
     ACTIVE.get_or_init(|| {
         let a = compile(&Saved::default().indexes, Vec::new());
-        std::sync::RwLock::new(std::sync::Arc::new(a))
+        kiln_obs::lock::RwLock::new(std::sync::Arc::new(a))
     })
 }
 

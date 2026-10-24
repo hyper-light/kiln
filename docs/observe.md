@@ -407,7 +407,8 @@ holds applying off for no longer than one query takes. std's lock does so on Lin
 (its queue) and Windows (an SRW lock) a reader taking it again the moment it let it go held a write
 off for good (2026-10-24: a test of writes beside queries ran 20 minutes on a Mac before it was
 stopped, its writer still waiting); `parking_lot`'s, task-fair, has a reader wait while a writer
-does, everywhere.
+does, everywhere. The pipelines, scanning groups and indexes each node applies, and the profile
+store's index, are held by it too: each is read over and over and must take a change.
 
 **Writes.** A node gathers its points by series (`crate::observe::ingest`) and sends one write at a
 time, as the sessions assume, again and again until it is answered: a runner's go on the lane to the

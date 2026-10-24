@@ -5,8 +5,9 @@
 //! pipelines.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError};
 
+use kiln_obs::lock::RwLock;
 use kiln_obs::logs::record::Record;
 use serde::{Deserialize, Serialize};
 

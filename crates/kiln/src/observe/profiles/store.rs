@@ -17,7 +17,9 @@ use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError, RwLock};
+use std::sync::{Mutex, PoisonError};
+
+use kiln_obs::lock::RwLock;
 
 use super::intake::{Encoding, MAX_PROFILE, Upload};
 
@@ -239,11 +241,11 @@ impl Index {
     }
 }
 
-fn read_lock<T>(l: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+fn read_lock<T>(l: &RwLock<T>) -> kiln_obs::lock::ReadGuard<'_, T> {
     l.read().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn write_lock<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+fn write_lock<T>(l: &RwLock<T>) -> kiln_obs::lock::WriteGuard<'_, T> {
     l.write().unwrap_or_else(PoisonError::into_inner)
 }
 
