@@ -8,7 +8,6 @@
 //! its monitor goes with it.
 //!
 //! `cargo test -p kiln --test observe_synthetics -- --ignored`.
-#![cfg(unix)]
 
 mod common;
 

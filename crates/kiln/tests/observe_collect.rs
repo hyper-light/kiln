@@ -304,7 +304,12 @@ fn containers_logs_and_the_journal_are_stored_with_what_they_name() -> anyhow::R
     std::fs::write(d.join("c0ffee-json.log"), lines)?;
     put_source(&f, "pods", &json!({ "type": "kubernetes", "paths": [format!("{}/k8s/pods/*/*/*.log", root.display())], "start": "beginning", "on": "r1" }))?;
     put_source(&f, "containers", &json!({ "type": "docker", "paths": [format!("{}/docker/*/*-json.log", root.display())], "start": "beginning", "on": "r1" }))?;
-    put_source(&f, "journal", &json!({ "type": "journald", "start": "beginning", "units": ["sshd.service"], "on": "r1" }))?;
+    // The journal is Linux's, and the test's journalctl a shell script: elsewhere, the containers'
+    // logs alone.
+    let journald = cfg!(unix);
+    if journald {
+        put_source(&f, "journal", &json!({ "type": "journald", "start": "beginning", "units": ["sshd.service"], "on": "r1" }))?;
+    }
     let pods = found(&f, t0, "source:kubernetes", 2)?;
     let joined = pods.iter().find(|r| at(r, &["message"]) == "first half, second half").cloned().unwrap_or(Value::Null);
     anyhow::ensure!(at(&joined, &["service"]) == "nginx" && at(&joined, &["attributes", "k8s.pod.name"]) == "web-1" && at(&joined, &["attributes", "k8s.namespace.name"]) == "shop" && at(&joined, &["attributes", "log.iostream"]) == "stdout", "{pods:#?}");
@@ -312,12 +317,17 @@ fn containers_logs_and_the_journal_are_stored_with_what_they_name() -> anyhow::R
     let docker = found(&f, t0, "source:docker", 2)?;
     anyhow::ensure!(docker.iter().all(|r| at(r, &["service"]) == "api" && at(r, &["attributes", "container.name"]) == "shop-api-1" && at(r, &["attributes", "container.image.name"]) == "shop/api:3"), "{docker:#?}");
     anyhow::ensure!(docker.iter().any(|r| at(r, &["message"]) == "WARN slow query" && at(r, &["status"]) == "warn"), "{docker:#?}");
-    let journal = found(&f, t0, "source:journald", 2)?;
-    anyhow::ensure!(journal.iter().any(|r| at(r, &["message"]) == "Failed password for root" && at(r, &["status"]) == "error" && at(r, &["service"]) == "sshd" && at(r, &["attributes", "systemd.unit"]) == "sshd.service"), "{journal:#?}");
-    for name in ["pods", "containers", "journal"] {
+    for name in ["pods", "containers"] {
         let st = state(&f, name, "r1", 0)?;
         anyhow::ensure!(at(&st, &["records"]).as_u64().is_some_and(|n| n > 0) && at(&st, &["error"]).is_null(), "{name}: {st:#}");
     }
+    if !journald {
+        return Ok(());
+    }
+    let journal = found(&f, t0, "source:journald", 2)?;
+    anyhow::ensure!(journal.iter().any(|r| at(r, &["message"]) == "Failed password for root" && at(r, &["status"]) == "error" && at(r, &["service"]) == "sshd" && at(r, &["attributes", "systemd.unit"]) == "sshd.service"), "{journal:#?}");
+    let st = state(&f, "journal", "r1", 0)?;
+    anyhow::ensure!(at(&st, &["records"]).as_u64().is_some_and(|n| n > 0) && at(&st, &["error"]).is_null(), "journal: {st:#}");
     // The runner stopped and started again, an entry more meanwhile: read from after its cursor,
     // none twice.
     f.stop_runner("r1");
@@ -480,6 +490,7 @@ fn pipelines_parse_logs_where_they_are_taken_on_every_machine() -> anyhow::Resul
 /// A stand-in for `wevtutil qe`: a channel's events are `$WEVT_DIR/<channel>.xml`, one a line, as
 /// the real one writes them. `/rd:true /c:1`: the newest; `/q:...EventRecordID>N...`: those after
 /// N, oldest first, `/c:M` of them at the most (the query's other terms it leaves to the test).
+#[cfg(unix)]
 const WEVTUTIL: &str = r#"#!/bin/sh
 [ "$1" = qe ] || exit 1
 file="$WEVT_DIR/$2.xml"
@@ -501,6 +512,7 @@ awk -v after="$after" -v count="$count" '
 "#;
 
 /// Event `id` of channel `System` as `wevtutil` renders it: its level and message.
+#[cfg(unix)]
 fn win_event(id: u64, level: u8, message: &str) -> String {
     let at = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(now_ms() - 1000) * 1_000_000).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     let t = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:07}Z", at.year(), u8::from(at.month()), at.day(), at.hour(), at.minute(), at.second(), at.nanosecond() / 100);
@@ -510,6 +522,7 @@ fn win_event(id: u64, level: u8, message: &str) -> String {
     )
 }
 
+#[cfg(unix)]
 fn append_events(path: &Path, ids: std::ops::Range<u64>) -> anyhow::Result<()> {
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     for id in ids {
@@ -520,6 +533,7 @@ fn append_events(path: &Path, ids: std::ops::Range<u64>) -> anyhow::Result<()> {
 }
 
 /// Each event's count of records stored (by its `seq`).
+#[cfg(unix)]
 fn win_counts(f: &Fleet, from: i64) -> anyhow::Result<BTreeMap<u64, u64>> {
     let a = f.call("POST", "/api/observe/v1/logs/aggregate", Some(&json!({ "query": "source:windows_event", "from": from, "to": now_ms() + 60_000, "by": ["@windows.event_data.seq"] })))?;
     let mut out = BTreeMap::new();
@@ -531,6 +545,7 @@ fn win_counts(f: &Fleet, from: i64) -> anyhow::Result<BTreeMap<u64, u64>> {
     Ok(out)
 }
 
+#[cfg(unix)]
 fn win_settled(f: &Fleet, from: i64, seqs: std::ops::Range<u64>) -> anyhow::Result<BTreeMap<u64, u64>> {
     let start = Instant::now();
     loop {
@@ -544,6 +559,9 @@ fn win_settled(f: &Fleet, from: i64, seqs: std::ops::Range<u64>) -> anyhow::Resu
     }
 }
 
+/// Read through a stand-in for `wevtutil` (a shell script, so on Unix): Windows's own, on Windows,
+/// would need a channel of the test's own, which only an administrator makes.
+#[cfg(unix)]
 #[test]
 #[ignore = "starts real processes"]
 fn windows_event_channels_are_read_once_each_through_a_stop_a_kill_and_a_clear() -> anyhow::Result<()> {
