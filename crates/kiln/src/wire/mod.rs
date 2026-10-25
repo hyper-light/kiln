@@ -271,6 +271,7 @@ classes! {
         Command::SetMode { .. } => REFUSED,
         Command::SetModel { .. } => REFUSED,
         Command::SetEffort { .. } => REFUSED,
+        Command::SetSpeed { .. } => REFUSED,
         Command::MoveTo { .. } => REFUSED,
         Command::Moving { .. } => REFUSED,
         Command::HandedOver { .. } => PARKED,

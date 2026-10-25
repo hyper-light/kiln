@@ -142,6 +142,10 @@ const LEVEL_GRACE_MS: i64 = 5_000;
 /// the model in use has, and for a model it does not list.
 pub(super) const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
+/// Fast mode, as `State::speed` says it: Claude Code's one speed past standard (its `fastMode`
+/// setting), on the models initialize says take it.
+const FAST: &str = "fast";
+
 /// A permission request we are holding for a person: the input exactly as the CLI sent it (the
 /// approval's copy is shortened for display; the answer must carry the original).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +200,14 @@ pub struct Claude {
     entries: Vec<(String, Option<String>)>,
     /// Effort levels per model, as initialize lists them.
     efforts: HashMap<String, Vec<String>>,
+    /// Whether each model runs in fast mode, as initialize lists them (`supportsFastMode`).
+    #[serde(default)]
+    fast: HashMap<String, bool>,
+    /// Fast mode as kiln last set it (`FAST` or "" standard: `Command::SetSpeed`, or the spec it
+    /// started from), which is what it runs at from its next turn. None: kiln never set it, so
+    /// it's as Claude Code says.
+    #[serde(default)]
+    speed: Option<String>,
     output_styles: Vec<String>,
     /// Its configuration directory (user skills and commands live under it).
     config_dir: String,
@@ -265,6 +277,8 @@ impl Claude {
             bypass_next: false,
             entries: Vec::new(),
             efforts: HashMap::new(),
+            fast: HashMap::new(),
+            speed: None,
             output_styles: Vec::new(),
             config_dir: String::new(),
             commands: Vec::new(),
@@ -295,6 +309,14 @@ impl Claude {
     #[must_use]
     pub fn with_config_dir(mut self, dir: String) -> Self {
         self.config_dir = dir;
+        self
+    }
+
+    /// Starts at this speed (`Spec::speed`), set once it has started: a session going on (a
+    /// restart, a move) keeps fast mode as it was.
+    #[must_use]
+    pub fn with_speed(mut self, speed: Option<String>) -> Self {
+        self.speed = speed.filter(|s| s.is_empty() || s == FAST);
         self
     }
 
@@ -383,7 +405,55 @@ impl Claude {
         // Effort levels of the model in use (by its id, an alias in it, or the default model's),
         // else the ones the CLI knows.
         core.meta.efforts = self.effort_levels(&core.state.model).iter().map(|e| opt(e, &capitalize(e), "")).collect();
+        // Fast mode, where the model in use takes it.
+        core.meta.speeds = if self.fast_on(&core.state.model) {
+            vec![opt(FAST, "Fast", "Up to 2.5x faster, at a higher price per token. Turned on part-way, the conversation so far is billed once at that price")]
+        } else {
+            Vec::new()
+        };
         core.touch_meta();
+    }
+
+    /// Whether `model` runs in fast mode, as initialize listed it: by its id or alias, else the
+    /// alias it contains ("opus[1m]"); with none yet, the default model.
+    fn fast_on(&self, model: &str) -> bool {
+        if model.is_empty() {
+            return self.fast.get("default").copied().unwrap_or(false);
+        }
+        let mut keys: Vec<&String> = self.fast.keys().filter(|k| !k.is_empty() && model.contains(k.as_str())).collect();
+        keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        self.fast.get(model).or_else(|| keys.first().and_then(|k| self.fast.get(*k))).copied().unwrap_or(false)
+    }
+
+    /// Fast mode as Claude Code says it is (`fast_mode_state` and `fast_mode_disabled_reason`,
+    /// in initialize's answer, each turn's init and its result): on, off, or cooling down after
+    /// its own rate limit; and what keeps it off, if anything a person could change.
+    fn fast_reported(&mut self, core: &mut Core, v: &Value) {
+        let Some(state) = str_of(v, "fast_mode_state") else { return };
+        let blocked = if state == "off" { str_of(v, "fast_mode_disabled_reason").and_then(fast_blocked) } else { None };
+        let cooldown = state == "cooldown";
+        let mut changed = core.state.speed_blocked != blocked || core.state.speed_cooldown != cooldown;
+        core.state.speed_blocked = blocked;
+        core.state.speed_cooldown = cooldown;
+        // What kiln set is what runs from the next turn on (one set mid-turn shows after it).
+        if self.speed.is_none() {
+            let speed = if matches!(state, "on" | "cooldown") { FAST } else { "" };
+            changed |= core.state.speed != speed;
+            speed.clone_into(&mut core.state.speed);
+        }
+        if changed {
+            core.touch_state();
+        }
+    }
+
+    /// Fast mode on (`FAST`) or off (""), as kiln sets it: a flag setting, so it holds for this
+    /// session alone.
+    fn set_fast(&mut self, core: &mut Core, speed: String) {
+        self.request(core, Pending::ApplySettings, json!({"subtype": "apply_flag_settings", "settings": {"fastMode": speed == FAST}}));
+        self.speed = Some(speed.clone());
+        core.state.speed = speed;
+        core.state.speed_cooldown = false;
+        core.touch_state();
     }
 
     /// The effort levels of `model` as initialize listed them: by its id or alias, an alias it
@@ -588,7 +658,7 @@ impl Claude {
         if core.meta.commands.is_empty() {
             core.meta.commands = sort_catalog(claude_catalog());
         }
-        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"]
+        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
@@ -700,6 +770,10 @@ impl Claude {
                 core.state.effort = effort;
                 core.touch_state();
             }
+            // Fast mode, as a setting of this session's (`-p` sessions opt in this way; a person's
+            // own default stays as it is): from the next turn, if one is under way.
+            Command::SetSpeed { speed } if speed.is_empty() || speed == FAST => self.set_fast(core, speed),
+            Command::SetSpeed { speed } => self.notice(core, Level::Warn, format!("{speed}: not a speed Claude Code has"), None),
             Command::Control { id, value } => self.control(core, &id, value),
             Command::Suggest { client, query } => {
                 self.request(core, Pending::Suggest(client), json!({"subtype": "file_suggestions", "query": query}));
@@ -1636,8 +1710,10 @@ impl Claude {
                 if let Some(models) = body.get("models").and_then(Value::as_array) {
                     for m in models {
                         let levels: Vec<String> = m.get("supportedEffortLevels").and_then(Value::as_array).map(|l| l.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                        let fast = m.get("supportsFastMode").and_then(Value::as_bool).unwrap_or(false);
                         for key in [str_of(m, "value"), str_of(m, "resolvedModel")].into_iter().flatten() {
                             self.efforts.insert(key.to_owned(), levels.clone());
+                            self.fast.insert(key.to_owned(), fast);
                         }
                     }
                     core.meta.models = models
@@ -1666,6 +1742,11 @@ impl Claude {
                 self.output_styles = body.get("available_output_styles").and_then(Value::as_array).map(|s| s.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
                 if let Some(s) = str_of(&body, "output_style") {
                     core.set_control("output_style", json!(s));
+                }
+                self.fast_reported(core, &body);
+                // Fast mode as the session had it (a restart, a move), before its first prompt.
+                if let Some(speed) = self.speed.clone() {
+                    self.set_fast(core, speed);
                 }
                 core.touch_meta();
                 self.refresh_controls(core);
@@ -2046,8 +2127,9 @@ impl Claude {
                 self.rebuild_skills(core);
                 // Commands bound to the CLI's terminal are known now.
                 self.refresh_catalog(core);
+                self.fast_reported(core, v);
                 core.touch_state();
-                // The model in use is known now: its effort levels.
+                // The model in use is known now: its effort levels and speeds.
                 self.refresh_controls(core);
             }
             "commands_changed" => {
@@ -2736,6 +2818,7 @@ impl Claude {
         }
         u.turns += 1;
         core.state.activity = None;
+        self.fast_reported(core, v);
         // Calls left without a result were cut off with the turn (a background task's call
         // returns at once, so it is not among them).
         let open: Vec<String> = self.tools.keys().cloned().collect();
@@ -3492,6 +3575,24 @@ pub fn strip_ansi(s: &str) -> String {
 fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// What keeps fast mode off, in Claude Code's own words, from its `fast_mode_disabled_reason`.
+/// None for what isn't in the way: kiln not having turned it on (`-p` sessions opt in), or a
+/// check still under way.
+fn fast_blocked(reason: &str) -> Option<String> {
+    let said = match reason {
+        "sdk_opt_in_required" | "pending" => return None,
+        "extra_usage_disabled" => "Fast mode requires usage credits, which are off for this account",
+        "free" => "Fast mode requires a paid subscription",
+        "preference" => "Fast mode has been disabled by your organization",
+        "model_not_allowed" => "Fast mode's model is not in your organization's allowed models",
+        "network_error" => "Fast mode is unavailable: Claude Code couldn't reach api.anthropic.com to check it",
+        "not_first_party" => "Fast mode is only available when using the Anthropic API directly",
+        "disabled_by_env" => "Fast mode is turned off in Claude Code's environment (CLAUDE_CODE_DISABLE_FAST_MODE)",
+        _ => "Fast mode is currently unavailable",
+    };
+    Some(said.to_owned())
 }
 
 fn fmt_tokens(n: u64) -> String {
@@ -5236,6 +5337,82 @@ mod tests {
         let reqs = requests(&mut core2);
         reply_to(&mut c2, &mut core2, &reqs, "initialize", json!({"commands": []}));
         assert_eq!(ids(&core2).len(), 5);
+    }
+
+    /// Fast mode (the head's bolt) on the models initialize says take it: set as a flag setting of
+    /// the session's, what keeps it off said in Claude Code's own words, its cooldown shown, and set
+    /// again before the first prompt of a session that goes on (a restart, a move).
+    #[test]
+    fn fast_mode_on_the_models_that_take_it() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        assert!(core.meta.features.iter().any(|f| f == "set_speed"));
+        let reqs = requests(&mut core);
+        reply_to(
+            &mut c,
+            &mut core,
+            &reqs,
+            "initialize",
+            json!({"commands": [], "fast_mode_state": "off", "fast_mode_disabled_reason": "sdk_opt_in_required", "models": [
+                {"value": "default", "resolvedModel": "claude-opus-5-5", "displayName": "Default", "supportsFastMode": true},
+                {"value": "sonnet", "resolvedModel": "claude-sonnet-5-5", "displayName": "Sonnet"},
+                {"value": "claude-opus-4-7", "displayName": "Opus 4.7"}
+            ]}),
+        );
+        let speeds = |core: &Core| core.meta.speeds.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        let applied = |reqs: &[(String, String, Value)]| reqs.iter().filter(|r| r.1 == "apply_flag_settings").filter_map(|r| r.2.pointer("/settings/fastMode").and_then(Value::as_bool)).collect::<Vec<_>>();
+        // No model yet: the default model's. A session not opted in yet has nothing in its way.
+        assert_eq!(speeds(&core), ["fast"]);
+        assert_eq!((core.state.speed.as_str(), core.state.speed_blocked.as_deref()), ("", None));
+        assert!(applied(&requests(&mut core)).is_empty());
+        // An alias with a context suffix finds its model; a model without fast mode has no speeds.
+        c.line(&mut core, &json!({"type": "system", "subtype": "init", "cwd": "/w", "session_id": "s", "model": "claude-opus-5-5[1m]", "permissionMode": "default"}).to_string());
+        assert_eq!(speeds(&core), ["fast"]);
+        for (model, fast) in [("claude-opus-4-7", false), ("sonnet", false), ("default", true)] {
+            c.command(&mut core, Command::SetModel { model: model.into(), kind: None });
+            let reqs = requests(&mut core);
+            reply_to(&mut c, &mut core, &reqs, "set_model", json!({}));
+            assert_eq!(!core.meta.speeds.is_empty(), fast, "{model}");
+        }
+        // On: a flag setting of this session's, shown at once.
+        c.command(&mut core, Command::SetSpeed { speed: "fast".into() });
+        assert_eq!(core.state.speed, "fast");
+        assert_eq!(applied(&requests(&mut core)), [true]);
+        // The account can't: said in its words, and what kiln set stays set.
+        let result = |state: &str, reason: Option<&str>| json!({"type": "result", "subtype": "success", "session_id": "s", "fast_mode_state": state, "fast_mode_disabled_reason": reason}).to_string();
+        c.line(&mut core, &result("off", Some("extra_usage_disabled")));
+        assert_eq!(core.state.speed_blocked.as_deref(), Some("Fast mode requires usage credits, which are off for this account"));
+        assert_eq!(core.state.speed, "fast");
+        // On, then cooling down after its own rate limit, then on again.
+        c.line(&mut core, &result("cooldown", None));
+        assert_eq!((core.state.speed_blocked.as_deref(), core.state.speed_cooldown), (None, true));
+        c.line(&mut core, &result("on", None));
+        assert!(!core.state.speed_cooldown);
+        // Off again; a speed Claude Code doesn't have changes nothing.
+        c.command(&mut core, Command::SetSpeed { speed: String::new() });
+        let reqs = requests(&mut core);
+        assert_eq!((core.state.speed.as_str(), applied(&reqs)), ("", vec![false]));
+        c.command(&mut core, Command::SetSpeed { speed: "ultrafast".into() });
+        let reqs = requests(&mut core);
+        assert_eq!((core.state.speed.as_str(), applied(&reqs)), ("", vec![]));
+
+        // Going on with fast mode on: set again before its first prompt.
+        let mut c2 = Claude::new(false).with_speed(Some("fast".into()));
+        let mut core2 = Core::new();
+        c2.start(&mut core2);
+        let reqs = requests(&mut core2);
+        reply_to(&mut c2, &mut core2, &reqs, "initialize", json!({"commands": [], "models": [], "fast_mode_state": "off", "fast_mode_disabled_reason": "sdk_opt_in_required"}));
+        let reqs = requests(&mut core2);
+        assert_eq!((core2.state.speed.as_str(), applied(&reqs)), ("fast", vec![true]));
+        // Never set from kiln: as Claude Code says.
+        let mut c3 = Claude::new(false);
+        let mut core3 = Core::new();
+        c3.start(&mut core3);
+        let reqs = requests(&mut core3);
+        reply_to(&mut c3, &mut core3, &reqs, "initialize", json!({"commands": [], "models": [], "fast_mode_state": "on"}));
+        let reqs = requests(&mut core3);
+        assert_eq!((core3.state.speed.as_str(), applied(&reqs)), ("fast", vec![]));
     }
 
     #[test]

@@ -38,7 +38,8 @@ finishes.
 ACP sessions prefer [config options](https://agentclientprotocol.com/protocol/v1/session-config-options)
 (`configOptions`) over the older `modes` and `models` fields. The first select
 in the `mode`, `model` and `thought_level` categories drives kiln's existing permission, model
-and effort selectors; additional options, including ones with no category or an unknown
+and effort selectors, and a select with the id `speed` (Devin's Standard and Fast, on the models
+that go faster) drives kiln's speed; additional options, including ones with no category or an unknown
 category, are ordinary session controls. Grouped choices keep their group names in the labels.
 Boolean options use the existing toggles, advertised with `session.configOptions.boolean`.
 Unrecognized option types are kept with the adapter's state but have no control. The agent's
@@ -797,6 +798,7 @@ console picks) and are answered with a `reply` update to that client.
 | `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, choices?` (or the older `answers?`) | see "Questions" below |
 | `interrupt`, `restart`, `snapshot` | | |
 | `set_mode` / `set_model` / `set_effort` | `mode` / `model` / `effort` | `state.mode` / `state.model` / `state.effort` |
+| `set_speed` | `speed`: `""` (standard) or one of `meta.speeds` (the model's faster speeds, slowest first) | `state.speed`, from the next turn when one is under way; `state.speed_blocked` says why it can't go faster (its account), `state.speed_cooldown` that fast mode's own rate limit is cooling down; feature `"set_speed"` (Claude Code's fast mode, Codex's service tiers, Devin's `speed` option) |
 | `stop_task` | `task` | the task's `status` (stopped) |
 | `stop_tasks` | | every live task stopped |
 | `suggest` | `client, query` | `{suggestions: [{path}], cwd}` |
@@ -1223,6 +1225,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (interrupts and continues an active turn) | ✓ (the agent's modes) | ? |
 | `set_model` mid-session | ✓ | ✓ (from the next turn) | ? (sent as session/set_model) | ? |
 | effort from the start (`meta.efforts`), `set_effort` | ✓ | ✓ (from the next turn) | — | — |
+| speed where the model goes faster (`meta.speeds`), `set_speed` | unit (fast mode, a setting of the session's alone; what keeps it off and its cooldown from each turn) | unit (each model's service tiers, with every turn) | unit (an agent's `speed` option, as Devin offers it) | ? |
 | one message's own model and effort | unit | ✓ | — | — |
 | attachments: images inline, files by path | ✓ | ✓ | ? (images when offered) | ? |
 | diffs, approval previews, cumulative changeset | ✓ | ✓ | ✓ | ? |

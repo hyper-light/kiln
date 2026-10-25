@@ -755,3 +755,52 @@ fn a_missing_nonempty_session_is_not_replaced_during_account_refresh() -> anyhow
     assert!(core.events().any(|e| matches!(&e.body, Body::Notice { level: Level::Error, text } if text.contains("session_not_found"))));
     Ok(())
 }
+
+/// Devin's `speed` option, on the models that go faster, is kiln's speed (the head's bolt) rather
+/// than a control of its own: standard is "", Fast is its own value, set with its own setter; a
+/// model without it has none; a session going on sets the speed it had once ready, before its
+/// first prompt.
+#[test]
+fn a_speed_option_is_the_sessions_speed() -> anyhow::Result<()> {
+    let speed = |current: &str| json!({"id": "speed", "name": "Speed", "category": "model_config", "type": "select", "currentValue": current, "options": [{"value": "standard", "name": "Standard"}, {"value": "fast", "name": "Fast"}]});
+    let with = |current: &str| {
+        let mut o = options("accept-edits", "default", "low");
+        o.push(speed(current));
+        o
+    };
+    let (mut a, mut core) = opened(with("standard"))?;
+    assert_eq!(core.meta.speeds.iter().map(|s| (s.id.as_str(), s.label.as_str())).collect::<Vec<_>>(), [("fast", "Fast")]);
+    assert_eq!(core.state.speed, "");
+    assert!(core.meta.features.iter().any(|f| f == "set_speed"));
+    assert!(core.meta.controls.iter().all(|c| c.id != "acp:speed"));
+    a.command(&mut core, Command::SetSpeed { speed: "fast".into() });
+    let setting = request(&mut core, "session/set_config_option")?;
+    assert_eq!(setting.get("params"), Some(&json!({"sessionId": "s1", "configId": "speed", "value": "fast"})));
+    reply(&mut a, &mut core, &setting, json!({"configOptions": with("fast")}));
+    assert_eq!(core.state.speed, "fast");
+    a.command(&mut core, Command::SetSpeed { speed: String::new() });
+    let setting = request(&mut core, "session/set_config_option")?;
+    assert_eq!(setting.pointer("/params/value"), Some(&json!("standard")));
+    reply(&mut a, &mut core, &setting, json!({"configOptions": with("standard")}));
+    assert_eq!(core.state.speed, "");
+    // A model without it: no speeds, and nothing to set.
+    update(&mut a, &mut core, options("accept-edits", "careful", "high"));
+    assert!(core.meta.speeds.is_empty() && !core.meta.features.iter().any(|f| f == "set_speed"));
+    a.command(&mut core, Command::SetSpeed { speed: "fast".into() });
+    assert!(written(&mut core).is_empty());
+
+    // Going on (a restart, a move): the speed it had, once ready, before its first prompt.
+    let mut a = Acp::from_spec(&Spec { kind: "devin".into(), speed: Some("fast".into()), ..Spec::default() });
+    let mut core = Core::new();
+    core.state.cwd = "/work".into();
+    let session = initialize(&mut a, &mut core, false)?;
+    send(&mut a, &mut core, "m1");
+    reply(&mut a, &mut core, &session, json!({"sessionId": "s1", "configOptions": with("standard")}));
+    let setting = request(&mut core, "session/set_config_option")?;
+    assert_eq!(setting.get("params"), Some(&json!({"sessionId": "s1", "configId": "speed", "value": "fast"})));
+    assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Queued));
+    reply(&mut a, &mut core, &setting, json!({"configOptions": with("fast")}));
+    request(&mut core, "session/prompt")?;
+    assert_eq!(core.state.speed, "fast");
+    Ok(())
+}
