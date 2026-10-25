@@ -261,7 +261,15 @@ fn synthetic_tests_run_from_each_location_alert_when_enough_fail_and_recover() -
     for (q, what) in [("avg:synthetics.http.connect.time{test:api}", "connect"), ("avg:synthetics.http.firstbyte.time{test:api}", "first byte"), ("avg:synthetics.http.redirect.time{test:api}", "the redirect"), ("avg:synthetics.ssl.time_to_expiry{test:tls}", "expiry"), ("avg:synthetics.dns.response.time{test:dns}", "DNS")] {
         anyhow::ensure!(by(&f, q, "test", t0 - 60_000, to)?.values().any(|v| v.iter().flatten().count() > 0), "no {what} series: {q}");
     }
-    anyhow::ensure!(count(&f, "source:kiln.event @event.type:synthetics @test:closed @result:failed", t0)? == 1, "a failing location said once");
+    // Said once: the event is in the logs a moment after the state it tells (more on Windows,
+    // where a connection to a closed port is refused only after its retries).
+    let said = || count(&f, "source:kiln.event @event.type:synthetics @test:closed @result:failed", t0);
+    let start = Instant::now();
+    while said()? == 0 && start.elapsed() < Duration::from_secs(15) {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let n = said()?;
+    anyhow::ensure!(n == 1, "a failing location said once: {n}");
 
     // Run now: the hourly test runs at once at both locations.
     let (code, _) = f.request("POST", "/api/observe/v1/synthetics/hourly/run", None)?;
