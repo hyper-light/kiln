@@ -7803,6 +7803,14 @@ microVMs keep their own workspaces (R13, R14); `actions/checkout` cleans a works
 unless given `clean: false`. AC11: kiln's `target` (29.2 GiB, 42,407 files) cloned in 1.39 s on
 fedora's btrfs through the runner (0.94 s with `cp` alone) and removed in 0.4 s.
 
+**Legs the change can't affect (M3, R06).** A job that opts in to reuse (`reuse:`, `work: { memo
+}`) whose `if:` or matrix `when:` is false only for what the change didn't touch (it would hold had
+the change touched every file: `changed()` true, `affected()` every package) isn't skipped: its legs
+are looked up in the ledger as any opted-in leg is, and finish reused from the result of their
+inputs, `reused_from` naming it, so a required check stays green with provenance. With no such
+result (a file the job lists changed outside every package, or none is recorded yet) the leg is
+skipped as its `if` said, saying why. End to end in `tests/affected.rs`.
+
 **Test results (M3, R10).** Built as pure code and on the ledger, awaiting the runner's side
 (`kiln_ci::work::tests`, `ci/work.rs`). A test binary is a unit: its package, name and arguments as
 its definition, its digest as its input, the environment, the platform and the trust domain; what
