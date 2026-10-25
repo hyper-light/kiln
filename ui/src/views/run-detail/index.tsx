@@ -23,6 +23,7 @@ import { IncidentCard } from "@/views/attach/card";
 import { EventIcon, LiveDuration, RelTime } from "../shared";
 import { AttemptSelect, CiLegExtras, CiRunActions, CiRunParts, CompareLink, criticalKeys, EditWorkflowLink, WorkflowInsightsLink } from "./ci";
 import { JobDag } from "./dag";
+import { MissingTools } from "./missing-tools";
 
 const LogViewer = React.lazy(() => import("./log-viewer"));
 
@@ -424,6 +425,7 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
         </div>
       </div>
       <div className="panel-body">
+        {(job.status === "failed" || job.status === "queued" || job.status === "pending") && <MissingTools job={job} />}
         <Facts
           items={[
             { label: "Agent", value: job.agent ?? "—" },

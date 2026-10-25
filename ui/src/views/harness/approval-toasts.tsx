@@ -11,11 +11,12 @@
 import * as React from "react";
 import "./approval-toasts.css";
 import { ArrowUpRight, X } from "lucide-react";
-import { harnessApi, type AgentInfo } from "@/api/harness";
+import { clientId, harnessApi, type AgentInfo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { Link, useLocation, useNavigate } from "@/lib/router";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
+import { Tries } from "@/lib/tries";
 import { cardsOf, heldWords, type Card } from "./cards";
 import { agentLabel } from "./derive";
 import { useClock } from "./dom";
@@ -177,6 +178,8 @@ const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 /** Goals it paused for you: the plan they wait on to look at, and Resume. */
 function HeldCard({ card }: { card: Card }) {
   const [busy, setBusy] = React.useState(false);
+  // Asked again (its answer lost, or it failed), the same resume under its key (CP-T3.2).
+  const [tries] = React.useState(() => new Tries(clientId));
   const navigate = useNavigate();
   const { a } = card;
   const held = a.held;
@@ -184,8 +187,11 @@ function HeldCard({ card }: { card: Card }) {
   // Resumed: the card goes now (the server lets go of the pause within moments).
   const resume = () => {
     setBusy(true);
-    void harnessApi.goalAction(a.id, "start").then(
-      () => putAway([card.key], a.id, "done"),
+    void harnessApi.goalAction(a.id, "start", undefined, tries.keyFor(a.id)).then(
+      () => {
+        tries.done();
+        putAway([card.key], a.id, "done");
+      },
       (e: unknown) => {
         toast.error(`Couldn't resume ${agentLabel(a)}'s goals`, errorMessage(e));
         setBusy(false);

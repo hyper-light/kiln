@@ -103,7 +103,7 @@ fn run(dir: &Path, pod: &Value) -> Option<Child> {
     cmd.args(args).current_dir(&work).env("HOME", &home).env("NO_COLOR", "1").stdin(Stdio::null()).stdout(log.try_clone().ok()?).stderr(log);
     // Not the test's server, nor this machine's login shell (a container's terminal opens the
     // image's).
-    for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG", "KILN_CHAOS", "KUBECONFIG", "SHELL"] {
+    for var in common::NOT_INHERITED.iter().copied().chain(["KUBECONFIG", "SHELL"]) {
         cmd.env_remove(var);
     }
     // Nor this machine's container engine: a pod has none, its own sidecars aside.
@@ -535,7 +535,7 @@ fn w17_r01_a_terminal_into_a_leg_in_a_pod() -> anyhow::Result<()> {
         let sleeping = steps.as_array().into_iter().flatten().any(|x| x.get("name").and_then(Value::as_str).is_some_and(|n| n.contains("sleep 120")) && x.get("status").and_then(Value::as_str) == Some("running"));
         Ok((!sleeping).then_some(one))
     })?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kiln"))
+    let mut child = common::kiln()
         .args(["debug", "terminal", &leg])
         .env("HOME", &home)
         .env("KILN_URL", format!("http://127.0.0.1:{}", s.port))

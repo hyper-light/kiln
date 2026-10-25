@@ -8,6 +8,12 @@ license.workspace = true
 # Fault injection for tests (docs/ci.md W22-AC04): `kiln agent --chaos`, `KILN_CHAOS`.
 chaos = []
 
+# The wire lab drives faults only a build with `chaos` has: asked for without it, cargo says so
+# rather than running nothing (docs/wire.md, "The lab").
+[[test]]
+name = "wire_lab"
+required-features = ["chaos"]
+
 [dependencies]
 kiln-cd = { path = "../kiln-cd" }
 kiln-ci = { path = "../kiln-ci" }
@@ -108,7 +114,18 @@ command-group = "5.0.1"
 workspace = true
 
 [dev-dependencies]
+kiln-sim = { path = "../kiln-sim" }
 tempfile = "3.27.0"
 # hyper-durable's RamStore, for sync's tests alone: kiln's copy compiles it only where a test asks
 # (vendor/hyper-raft/UPSTREAM.md).
 hyper-durable = { version = "=0.1.0", features = ["test-store"] }
+
+# What a session's inbox adds to a send (CP-T3.2, AC-T3.2.3): `cargo bench -p kiln --bench send_path`.
+[[bench]]
+name = "send_path"
+harness = false
+
+# A send end to end on a host (CP-T3.2), built alike on a branch and on main: `--bench send_e2e`.
+[[bench]]
+name = "send_e2e"
+harness = false

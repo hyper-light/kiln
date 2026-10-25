@@ -10,7 +10,7 @@ import "./mission.css";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { ArrowUpRight, ChevronRight, Plus } from "lucide-react";
 import { api } from "@/api/client";
-import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
+import { clientId, harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
@@ -20,6 +20,7 @@ import { useAgentsLive } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useLocalStorage, useMediaQuery, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { Tries } from "@/lib/tries";
 import { heldWords } from "./cards";
 import { agentLabel, hasOwnName, plain } from "./derive";
 import { pauseLine } from "./pause";
@@ -116,7 +117,13 @@ function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
 
 /** Goals it paused for you: the plan they wait on to look at, and Resume. */
 function HeldDecide({ a }: { a: AgentInfo }) {
-  const resume = () => void harnessApi.goalAction(a.id, "start").catch((e: unknown) => toast.error("Couldn't resume its goals", errorMessage(e)));
+  // Asked again (its answer lost, or it failed), the same resume under its key (CP-T3.2).
+  const [tries] = React.useState(() => new Tries(clientId));
+  const resume = () =>
+    void harnessApi.goalAction(a.id, "start", undefined, tries.keyFor(a.id)).then(
+      () => tries.done(),
+      (e: unknown) => toast.error("Couldn't resume its goals", errorMessage(e)),
+    );
   if (!a.held?.plan)
     return (
       <Button size="xs" onClick={resume}>

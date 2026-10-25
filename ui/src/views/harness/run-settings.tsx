@@ -13,12 +13,16 @@
  * A choice applies at once, Undo waits beside the turn timer for a few seconds, and the setting folds
  * away shortly after. Nothing pops up or covers the conversation.
  *
+ * Where the model goes faster (Claude Code's fast mode, Codex's tiers, Devin's speed), a bolt follows
+ * effort: a click moves to the model's next speed, and from its fastest back to standard.
+ *
  * `SendWith` is the composer's row for a single message: the same, max effort, or another model.
  */
 import * as React from "react";
 import type { ControlOption, ModelOption, ModeOption } from "@/api/harness";
 import { cn } from "@/lib/utils";
 import { useListener } from "./dom";
+import { boltLabel, boltState, lit, nextSpeed, speedName, type SpeedLine } from "./speed";
 import "./run-settings.css";
 
 type Kind = "mode" | "model" | "effort";
@@ -398,6 +402,58 @@ function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; o
   );
 }
 
+/* ------------------------------------------------------------------ the speed */
+
+/** The bolt, drawn as kiln's own small glyphs are: a 16 grid, a 1.4 stroke, round joins. */
+const BOLT = "M8.75 1.5 2.5 9.25H8l-.75 5.25 6.25-7.75H8z";
+
+/**
+ * The agent's speed, after effort: its outline at standard; filled, the prism running through it,
+ * when faster (a bolt for each step up); grey and still while fast mode cools down; only sketched
+ * when the account can't go faster. It's as wide as the model's fastest speed draws it, so the
+ * bolts it fills never move what follows.
+ */
+function SpeedBolt({ line, onPick }: { line: SpeedLine; onPick?: () => void }) {
+  const state = boltState(line);
+  const on = state === "on" || state === "cooldown" ? lit(line.speeds, line.speed) : 0;
+  const label = boltLabel(line);
+  const style = { "--n": line.speeds.length } as React.CSSProperties;
+  const glyph = (
+    <>
+      <svg className="rs-bolt-line" viewBox="0 0 16 16" aria-hidden="true">
+        <path d={BOLT} />
+      </svg>
+      {line.speeds.map((s, i) => (
+        <span key={s.id} className="rs-bolt-fill" data-on={i < on ? "" : undefined} style={{ "--i": i } as React.CSSProperties} aria-hidden="true">
+          <i className="rs-bolt-holo" />
+          <i className="rs-bolt-glint" />
+        </span>
+      ))}
+    </>
+  );
+  if (!onPick) {
+    return (
+      <span className="rs-bolt" data-state={state} style={style} role="img" aria-label={label} title={label}>
+        {glyph}
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="rs-bolt"
+      data-state={state}
+      style={style}
+      aria-label={label}
+      title={label}
+      aria-disabled={state === "blocked" || undefined}
+      onClick={state === "blocked" ? undefined : onPick}
+    >
+      {glyph}
+    </button>
+  );
+}
+
 /* ------------------------------------------------------------------ the line */
 
 /** Another harness on the agent's machine, and its models. */
@@ -426,6 +482,16 @@ export interface RunSettingsProps {
   efforts: ControlOption[];
   effort: string;
   onEffort?: (id: string) => void;
+  /** The speeds faster than standard the model in use runs at, slowest first: the bolt after effort (none: no bolt). */
+  speeds?: ControlOption[];
+  /** The speed it runs at: "" standard. */
+  speed?: string;
+  /** Leave out when the harness can't change its speed: the bolt then only shows it. */
+  onSpeed?: (id: string) => void;
+  /** Why it can't go faster now, as its harness said: the bolt is only sketched, and says this. */
+  speedBlocked?: string;
+  /** Fast mode's own rate limit is cooling down: the bolt is filled, grey and still. */
+  speedCooldown?: boolean;
   /** Which settings the harness takes up at the next turn rather than at once (said only while it works). */
   appliesNextTurn?: { mode?: boolean; model?: boolean; effort?: boolean };
   running?: boolean;
@@ -467,6 +533,11 @@ export function RunSettings({
   efforts,
   effort,
   onEffort,
+  speeds = [],
+  speed = "",
+  onSpeed,
+  speedBlocked,
+  speedCooldown,
   appliesNextTurn,
   running = false,
   className,
@@ -474,6 +545,8 @@ export function RunSettings({
 }: RunSettingsProps) {
   const [open, setOpen] = React.useState<Kind | null>(null);
   const [change, setChange] = React.useState<Change | null>(null);
+  /** The speed just clicked to: what the bolt shows until the agent has had time to say (clicks in a row go on from it). */
+  const [speedPick, setSpeedPick] = React.useState<string | null>(null);
   /** A mode that turns checks off, waiting for "Turn them off". */
   const [armed, setArmed] = React.useState<{ kind: Kind; id: string } | null>(null);
   /** Counts changes made since the setting opened; the fold timer restarts on each. */
@@ -523,6 +596,24 @@ export function RunSettings({
     },
     [change, held],
   );
+
+  // A speed just clicked to shows until the agent has had time to say what it runs at: its own
+  // timer, on the line (which stays while the bolt comes and goes with the model), set again by each click.
+  const settling = React.useCallback(
+    (line: HTMLParagraphElement | null) => {
+      if (!line || speedPick === null) return;
+      const t = window.setTimeout(() => setSpeedPick(null), UNDO_MS);
+      return () => window.clearTimeout(t);
+    },
+    [speedPick],
+  );
+  const speedLine: SpeedLine = { speeds, speed: speedPick ?? speed, blocked: speedBlocked, cooldown: speedCooldown };
+  const pickSpeed = () => {
+    const to = nextSpeed(speeds, speedLine.speed);
+    onSpeed?.(to);
+    setSpeedPick(to);
+    setSaid(`Speed: ${speedName(speeds, to)}${running ? ", from the next turn" : ""}`);
+  };
 
   // The setting folds away a little after a change, unless keyboard focus or a mouse is in it, or
   // a confirmation is waiting: the open setting's own timer, set again whenever one of those changes.
@@ -679,7 +770,7 @@ export function RunSettings({
       }}
     >
       <div ref={lasting} className="rs-top">
-        <p className="rs-line">
+        <p ref={settling} className="rs-line">
           <span className="rs-values">
             {parts.map((p, i) => (
               <React.Fragment key={p.k}>
@@ -707,6 +798,7 @@ export function RunSettings({
               </React.Fragment>
             ))}
           </span>
+          {speeds.length > 0 && <SpeedBolt line={speedLine} onPick={onSpeed ? pickSpeed : undefined} />}
         </p>
         <div className="rs-extra">
           {trailing && <><span className="rs-divider" aria-hidden="true">|</span>{trailing}</>}

@@ -40,8 +40,7 @@ function breakRuns(n: Element) {
  *  get places to wrap. */
 function labelTables() {
   const text = (n: RootContent): string => (n.type === "text" ? n.value : "children" in n ? n.children.map(text).join("") : "");
-  const kids = (n: Element | undefined, tag: string): Element[] =>
-    (n?.children ?? []).filter((c): c is Element => c.type === "element" && c.tagName === tag);
+  const kids = (n: Element | undefined, tag: string): Element[] => (n?.children ?? []).filter((c): c is Element => c.type === "element" && c.tagName === tag);
   const walk = (n: Root | Element) => {
     if (n.type === "element" && n.tagName === "table") {
       const labels = kids(kids(kids(n, "thead")[0], "tr")[0], "th").map(text);
@@ -151,10 +150,14 @@ const MARKDOWN: Components = {
   pre: ({ children }) => {
     const code = React.isValidElement<{ className?: string; children?: React.ReactNode }>(children) ? children : null;
     const body = String(code?.props.children ?? "").replace(/\n$/, "");
+    const lang = /language-(\S+)/.exec(code?.props.className ?? "")?.[1];
     return (
       <div className="hx-pre-wrap">
-        <CopyBlock text={body} />
-        <pre className="hx-pre" data-lang={/language-(\S+)/.exec(code?.props.className ?? "")?.[1]}>
+        <div className="hx-block-head">
+          <span className="hx-block-tag">{lang ?? "code"}</span>
+          <CopyBlock text={body} />
+        </div>
+        <pre className="hx-pre" data-lang={lang}>
           {children}
         </pre>
       </div>

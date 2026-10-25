@@ -157,8 +157,9 @@ async fn say(hub: &Arc<Hub>, id: &str, text: &str) {
 async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, now: bool, kind: Option<String>, model: Option<String>) -> Result<(), String> {
     let (there, note) = folder(hub, id, from, to, cwd, false).await?;
     match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note, now, kind, model, local: false }).await {
-        Sent::Ok => Ok(()),
-        _ => Err(format!("{from} is not connected")),
+        Sent::Ok | Sent::Taken => Ok(()),
+        Sent::Unreachable => Err(format!("{from} is not connected")),
+        s => Err(s.failure().map_or_else(|| format!("{from} didn't take it"), |(_, why)| why)),
     }
 }
 

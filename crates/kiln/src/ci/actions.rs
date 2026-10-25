@@ -366,6 +366,12 @@ fn native_source(hub: &Hub, owner: &str, repo: &str) -> anyhow::Result<String> {
 /// The commit `ref` names now, fetched into the mirror (W07-R02, W07-R03): a tag (peeled), a
 /// branch, or a full SHA. When the source can't be reached, a ref the mirror knows still works.
 pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
+    pin_ref(hub, r).await.map(|(sha, _)| sha)
+}
+
+/// [`pin`], and the ref as GitHub writes it, which it was found as: `refs/tags/v1`,
+/// `refs/heads/main`, or the commit's SHA.
+pub(crate) async fn pin_ref(hub: &Hub, r: &Remote) -> anyhow::Result<(String, String)> {
     let dir = r.mirror(hub);
     let d = dir.to_string_lossy().to_string();
     let url = if r.native { native_source(hub, &r.owner, &r.repo)? } else { source(hub, &r.owner, &r.repo)? };
@@ -395,11 +401,13 @@ pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
     if let Err(e) = fetched {
         tracing::warn!(action = %r.full(), error = %format!("{e:#}"), "action source unreachable; using the mirror");
     }
-    for candidate in [format!("refs/tags/{}^{{commit}}", r.git_ref), format!("refs/heads/{}^{{commit}}", r.git_ref), format!("{}^{{commit}}", r.git_ref)] {
-        if let Ok(o) = gitops::run_git(hub, &["-C", &d, "rev-parse", "--verify", "--quiet", &candidate], GIT_TIMEOUT).await {
+    for full in [format!("refs/tags/{}", r.git_ref), format!("refs/heads/{}", r.git_ref), r.git_ref.clone()] {
+        if let Ok(o) = gitops::run_git(hub, &["-C", &d, "rev-parse", "--verify", "--quiet", &format!("{full}^{{commit}}")], GIT_TIMEOUT).await {
             let sha = String::from_utf8_lossy(&o).trim().to_owned();
             if sha.len() == 40 {
-                return Ok(sha);
+                // A ref given as a commit stays the commit, as GitHub writes it.
+                let full = if full == r.git_ref && !full.starts_with("refs/") { sha.clone() } else { full };
+                return Ok((sha, full));
             }
         }
     }

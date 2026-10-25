@@ -134,6 +134,10 @@ pub struct Marker {
     /// What its guard watches once the new pods are up.
     #[serde(default)]
     pub watch: Watch,
+    /// Auto-rollback was off for the app (why): no guard was started, and nothing puts the
+    /// previous image back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unguarded: Option<String>,
 }
 
 /// Where a rollout of `expect` stands.
@@ -637,7 +641,22 @@ impl Cd {
             to,
             job: None,
             watch,
+            unguarded: None,
         };
+        // Auto-rollback off for kiln's app: kept as a deploy in flight, so the next server records
+        // it, but nothing watches to put the previous image back.
+        if let Some(why) = def.as_ref().map(|d| self.auto_rollback_of(&m.app, d)).filter(|a| !a.decision.on).map(|a| a.why()) {
+            m.watch = Watch::default();
+            m.unguarded = Some(why);
+            let value = serde_json::to_value(&m)?;
+            match self.store.submit(Command::PutSetting(SETTING.into(), value)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => bail!("keeping the self-deploy's record: {e}"),
+                Err(_) => bail!("the store stopped"),
+            }
+            tracing::warn!(from = %m.from, to = %m.to, why = ?m.unguarded, "deployments: deploying kiln itself with auto-rollback off: no guard watches the restart, and a version that can't start stays down");
+            return Ok(());
+        }
         let job = job(&m, &template);
         let path = format!("/apis/batch/v1/namespaces/{}/jobs", kiln_cd::kube::enc(&namespace));
         let (status, bytes) = cluster.request(Method::POST, &path, Some("application/json"), Some(Bytes::from(job.to_string()))).await?;
@@ -751,6 +770,15 @@ fn outcome(m: &Marker, live: &Value, ended: Option<&str>) -> (bool, String) {
     let (now, guard) = seen(m, live);
     let watched = guard.as_ref().and_then(|g| g.get("checks")).and_then(Value::as_array).map(|cs| cs.iter().filter_map(|c| c.get("check").and_then(Value::as_str)).collect::<Vec<_>>().join(", ")).filter(|s| !s.is_empty());
     let ready = guard.as_ref().and_then(|g| g.get("result")).and_then(Value::as_str) == Some("ready");
+    if let Some(why) = &m.unguarded {
+        return if now == m.to {
+            (true, format!("kiln restarted into {}; auto-rollback is off ({why}), so no guard watched it", m.to))
+        } else if now == m.from {
+            (false, format!("{} didn't take: kiln's Deployment runs {} again, put back by hand (auto-rollback is off: {why})", m.to, m.from))
+        } else {
+            (false, format!("kiln's Deployment runs {now}, neither the image deployed nor the one before: someone changed it since"))
+        };
+    }
     if now == m.to {
         let how = match (m.watch.window_s, ready, watched, ended) {
             (_, false, _, Some(newer)) => format!("; deploying {newer} ended its watch"),
@@ -975,7 +1003,21 @@ mod tests {
         let other = live("kiln:old", json!({ "result": "rolled-back", "to": "kiln:else", "reason": "no" }));
         assert_eq!(outcome(&m, &other, None).1, "kiln:new didn't take (it didn't start); the guard put kiln:old back");
         assert!(outcome(&m, &live("kiln:else", json!({})), None).1.contains("someone changed it since"));
-        let before_windows = Marker { watch: Watch::default(), ..m };
+        let before_windows = Marker { watch: Watch::default(), ..m.clone() };
         assert_eq!(outcome(&before_windows, &live("kiln:new", json!({})), None), (true, "kiln restarted into kiln:new".into()));
+        // Auto-rollback off: no guard watched, and whatever put the old image back was a person.
+        let unguarded = Marker { watch: Watch::default(), unguarded: Some("set for this app by ada".into()), ..m };
+        assert_eq!(outcome(&unguarded, &live("kiln:new", json!({})), None), (true, "kiln restarted into kiln:new; auto-rollback is off (set for this app by ada), so no guard watched it".into()));
+        let (ok, why) = outcome(&unguarded, &live("kiln:old", json!({})), None);
+        assert!(!ok && why.contains("put back by hand") && !why.contains("the guard put"), "{why}");
+    }
+
+    /// A marker an older server kept, before auto-rollback could be off, reads as guarded.
+    #[test]
+    fn an_older_marker_is_guarded() {
+        let old: Marker = serde_json::from_value(json!({ "app": "kiln", "op": 1, "revision": null, "key": null, "content": null, "commits": [], "artifacts": [], "trigger": "manual", "by": null, "started_ms": 1, "namespace": "kiln", "deployment": "kiln", "container": "kiln", "from": "a", "to": "b", "job": null })).unwrap_or_default();
+        assert_eq!(old.from, "a");
+        assert_eq!(old.unguarded, None);
+        assert!(!serde_json::to_string(&old).unwrap_or_default().contains("unguarded"), "nothing new written for a guarded deploy");
     }
 }

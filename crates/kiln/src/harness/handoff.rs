@@ -1389,7 +1389,7 @@ mod tests {
     fn kilns_timeline_in_words_for_a_harness_whose_record_kiln_doesnt_keep() -> anyhow::Result<()> {
         use crate::harness::model::{Event, ToolCall};
         let ev = |id: &str, parent: Option<&str>, body: Body| Event { id: id.into(), seq: 0, at: 0, parent: parent.map(str::to_owned), by: None, body };
-        let user = |text: &str, origin: Option<&str>| Body::User { text: text.into(), images: 0, client_id: None, origin: origin.map(str::to_owned), attachments: vec![] };
+        let user = |text: &str, origin: Option<&str>| Body::User { text: text.into(), images: 0, client_id: None, origin: origin.map(str::to_owned), attachments: vec![], reply_to: None };
         let tool: ToolCall = serde_json::from_value(json!({"tool_id": "t1", "name": "run_shell_command", "tool": "shell", "title": "cargo test", "input": {"command": "cargo test"}, "status": "error", "output": "1 failed", "exit_code": 101, "started": 0}))?;
         let events = vec![
             ev("u1", None, user("fix the build", Some("human"))),

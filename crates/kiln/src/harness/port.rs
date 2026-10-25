@@ -2,15 +2,15 @@
 //! registry, its own sessions and every runner's. The goal driver reaches agents through it (and
 //! its tests through `kiln_seams::harness::SimHarness`).
 //!
-//! Delivered here means what the registry means by it today: the command is on its way to the
-//! session's runner. That every command reaches its agent once, in order, acknowledged end to end,
-//! is CP-T3.2's and CP-T3.3's (sends deduplicated, then acknowledged); until they land, the registry
-//! passes the port's clauses but HARNESS-3 and HARNESS-5 (`tests` below).
+//! Delivered means the agent's inbox took the message (CP-T3.2: once, whatever retried it; a repeat
+//! is answered as the first was), or, from a runner from before inboxes, that it's on its way to the
+//! agent's machine. Acknowledged end to end, parked for a machine that's away, is CP-T3.3's.
 
 use futures::future::BoxFuture;
 use kiln_seams::harness::Sent;
 use serde_json::Value;
 
+use super::inbox::Refusal;
 use super::model::Command;
 use super::registry;
 use super::session::Info;
@@ -35,17 +35,23 @@ impl kiln_seams::HarnessPort for Hub {
     fn send<'a>(&'a self, id: &'a str, command: Command) -> BoxFuture<'a, Sent> {
         Box::pin(async move {
             match self.harness.command(self, id, command).await {
-                registry::Sent::Ok => Sent::Delivered,
-                registry::Sent::NoSession => Sent::NoSession,
-                registry::Sent::Unreachable => Sent::Unreachable,
+                registry::Sent::Ok | registry::Sent::Accepted(_) | registry::Sent::Taken | registry::Sent::Parked => Sent::Delivered,
+                registry::Sent::Rejected { code: crate::wire::channel::Refusal::Unknown, .. } => Sent::NoSession,
+                registry::Sent::Rejected { .. } | registry::Sent::Unanswered(_) => Sent::Unreachable,
+                // Its id was given to another message before: one sent under it got there (a retry
+                // whose words changed since its first try).
+                registry::Sent::Refused(Refusal::Reused { .. }) => Sent::Delivered,
+                registry::Sent::Refused(Refusal::Full { .. }) => Sent::Full,
+                registry::Sent::Refused(Refusal::NoSession { .. }) | registry::Sent::NoSession => Sent::NoSession,
+                registry::Sent::Refused(_) | registry::Sent::Unreachable => Sent::Unreachable,
             }
         })
     }
 }
 
-/// kiln's registry against kiln-seams' HarnessPort suite: the clauses it holds today (HARNESS-1,
-/// HARNESS-2, HARNESS-4), on sessions of the hub's own machine whose harness is a program that
-/// isn't there. HARNESS-3 and HARNESS-5 wait on CP-T3.2 and CP-T3.3.
+/// kiln's registry against kiln-seams' HarnessPort suite, every clause, on sessions of the hub's own
+/// machine whose harness is a program that isn't there: what reached an agent is what its inbox
+/// took (CP-T3.2).
 #[cfg(all(test, unix))]
 mod tests {
     use std::collections::HashMap;
@@ -62,16 +68,12 @@ mod tests {
     use crate::harness::session::{Info, Spec};
     use crate::hub::Hub;
 
-    /// The clauses kiln's registry holds until sends are acknowledged end to end.
-    const HOLDS_TODAY: [&str; 3] = ["HARNESS-1", "HARNESS-2", "HARNESS-4"];
-    /// The clauses that need what reached an agent, which isn't seen here until then (CP-T3.2,
-    /// CP-T3.3).
-    const WAIT_FOR_T3: [&str; 2] = ["HARNESS-3", "HARNESS-5"];
-
     /// The registry, its agents under the names the cases give them (it names its own).
     struct Named {
         hub: Arc<Hub>,
         ids: Mutex<HashMap<String, String>>,
+        /// The words of each message said, by its id.
+        said: Mutex<HashMap<String, String>>,
     }
 
     impl Named {
@@ -132,27 +134,41 @@ mod tests {
             })
         }
         fn say(&self, text: &str) -> Command {
-            Command::Send { id: crate::util::new_id(), text: text.to_owned(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None }
+            let id = crate::util::new_id();
+            self.port.said.lock().insert(id.clone(), text.to_owned());
+            Command::Send { id, text: text.to_owned(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }
         }
-        fn heard<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, Option<Vec<String>>> {
-            // What reached the agent isn't seen here until sends are acknowledged (CP-T3.3).
-            Box::pin(async { None })
+        fn heard<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Option<Vec<String>>> {
+            // What its inbox took, in order (CP-T3.2): what reached the agent.
+            Box::pin(async move {
+                let id = self.port.real(name);
+                let taken = self.port.hub.harness.local.inbox()?.taken(&id, 1000).await.ok()?;
+                let said = self.port.said.lock();
+                Some(taken.iter().map(|m| said.get(m).cloned().unwrap_or_else(|| m.clone())).collect())
+            })
         }
         fn id_of(&self, agent: &Info) -> String {
             self.port.ids.lock().iter().find(|(_, id)| **id == agent.id).map_or_else(|| agent.id.clone(), |(name, _)| name.clone())
         }
     }
 
-    /// The registry is kiln's HarnessPort: it holds HARNESS-1, -2 and -4 now, and HARNESS-3 and -5
-    /// fail only for want of seeing what reached an agent (CP-M2's AC-M2.2: "or will pass once
-    /// its track lands the real one").
+    /// The registry is kiln's HarnessPort: it holds every clause of kiln-seams' suite (CP-M2's
+    /// AC-M2.2). HARNESS-3 and -5, which need what reached an agent, hold since its inbox says so
+    /// (CP-T3.2).
     #[test]
-    fn kiln_s_registry_holds_the_harness_port_clauses_it_can_today_and_says_why_not_the_rest() -> anyhow::Result<()> {
+    fn kiln_s_registry_holds_every_harness_port_clause() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let cases = cases::<RegistryFixture>();
             // A hub of its own for each case.
             let hubs = futures::future::join_all(cases.iter().map(|_| crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true))).await;
             let mut hubs: std::collections::VecDeque<Arc<Hub>> = hubs.into_iter().collect::<anyhow::Result<_>>()?;
+            // Each takes what its own sessions say (their inboxes' answers among it), as a server does.
+            for hub in &hubs {
+                let h = Arc::clone(hub);
+                crate::rt::spawn(async move {
+                    let _ = crate::harness::registry::Registry::run_local(h).await;
+                });
+            }
             // Their folders, removed once it's done (a scratch hub leaves its own behind).
             let folders: Vec<std::path::PathBuf> = hubs.iter().map(|h| h.cfg.server.data_dir.clone()).collect();
             let last = hubs.back().cloned().ok_or_else(|| anyhow::anyhow!("no cases"))?;
@@ -161,7 +177,7 @@ mod tests {
                 // There are as many hubs as cases: the last is never handed out twice.
                 let hub = hubs.pop_front().unwrap_or_else(|| Arc::clone(&last));
                 let cwd = dir.path().to_path_buf();
-                async move { RegistryFixture { port: Named { hub, ids: Mutex::new(HashMap::new()) }, cwd } }
+                async move { RegistryFixture { port: Named { hub, ids: Mutex::new(HashMap::new()), said: Mutex::new(HashMap::new()) }, cwd } }
             };
             // Each case fails, named, if the registry hasn't answered it in 30 s (by kiln's runtime).
             let clock = crate::rt::clock();
@@ -171,10 +187,7 @@ mod tests {
             for f in folders.iter().filter(|f| f.starts_with(&tmp) && *f != &tmp) {
                 let _ = std::fs::remove_dir_all(f);
             }
-            anyhow::ensure!(report.passed == HOLDS_TODAY, "held: {:?}, failed: {:?}", report.passed, report.failed);
-            let failed: Vec<&str> = report.failed.iter().map(|(id, _)| *id).collect();
-            anyhow::ensure!(failed == WAIT_FOR_T3, "failed: {:?}", report.failed);
-            anyhow::ensure!(report.failed.iter().all(|(_, why)| why.ends_with("can't be seen here")), "failed otherwise: {:?}", report.failed);
+            anyhow::ensure!(report.failed.is_empty() && report.passed.len() == cases.len(), "held: {:?}, failed: {:?}", report.passed, report.failed);
             Ok(())
         })
     }

@@ -4,7 +4,7 @@
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -29,6 +29,23 @@ pub struct Talk {
 /// A runner of the server at `port`, named `name`, the stand-in harness first on its PATH and
 /// `chaos` its faults (a `kiln agent --chaos` spec; a build with the `chaos` feature): its log.
 pub fn runner(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk) -> anyhow::Result<(Runner, PathBuf)> {
+    let path = format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+    runner_env(dir, port, name, chaos, talk, &[("PATH", &path)])
+}
+
+/// [`runner`], with `env` in its environment (and its harnesses'): `FAKE_CLAUDE_FIRST_LINES`, say,
+/// the stand-in harness first on its PATH. Started again under the same name, it's the same runner,
+/// its state where it left it.
+pub fn runner_with(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk, env: &[(&str, &str)]) -> anyhow::Result<(Runner, PathBuf)> {
+    let path = format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+    let mut all = vec![("PATH", path.as_str())];
+    all.extend_from_slice(env);
+    runner_env(dir, port, name, chaos, talk, &all)
+}
+
+/// [`runner`], with `env` in its environment (its `PATH`, its `SHELL`): the stand-in harness is in
+/// `<dir>/bin`, on its PATH only if `env` puts it there.
+pub fn runner_env(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk, env: &[(&str, &str)]) -> anyhow::Result<(Runner, PathBuf)> {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin)?;
     let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-claude/claude");
@@ -39,8 +56,7 @@ pub fn runner(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk
     std::fs::create_dir_all(&home)?;
     let log_path = dir.join(format!("{name}.log"));
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    let mut cmd = super::kiln();
     cmd.args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name]);
     if let Some(c) = chaos {
         cmd.args(["--chaos", c]);
@@ -51,11 +67,10 @@ pub fn runner(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk
         .arg("--state-dir")
         .arg(dir.join(format!("{name}-state")))
         .env("HOME", &home)
-        .env("PATH", &path)
         .env("NO_COLOR", "1")
         .env("FAKE_CLAUDE_LINES", talk.lines.to_string())
         .env("FAKE_CLAUDE_EVERY_MS", talk.every_ms.to_string())
-        .env_remove("KILN_REACH_SOCK")
+        .envs(env.iter().copied())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .spawn()?;
@@ -93,7 +108,9 @@ pub fn open_session(port: u16, admin: &str, name: &str, cwd: &Path, within: Dura
     let open = json!({"target": format!("agent:{name}"), "spec": {"kind": "claude", "cwd": cwd.display().to_string(), "prompt": "stream"}});
     let deadline = Instant::now() + within;
     loop {
-        let (code, body) = super::http(port, "POST", "/api/harness/sessions", admin, Some(&open))?;
+        // Waited for longer than the server waits for its runner's answer (`hub::COMMAND_WITHIN`),
+        // so it's the server's answer that comes, not a timeout of the test's own.
+        let (code, body) = super::http_within(port, "POST", "/api/harness/sessions", admin, Some(&open), Duration::from_secs(75))?;
         let v: Value = serde_json::from_str(&body).unwrap_or_default();
         if code == 200
             && let Some(id) = v.pointer("/0/id").and_then(Value::as_str)
@@ -139,6 +156,28 @@ pub fn socket(port: u16, token: &str, path: &str) -> anyhow::Result<std::net::Tc
     }
     anyhow::ensure!(head.starts_with(b"HTTP/1.1 101"), "not upgraded: {}", String::from_utf8_lossy(&head));
     Ok(s)
+}
+
+/// Sends `text` on `s` as a client does, masked (RFC 6455, §5.2).
+pub fn send_text(s: &mut std::net::TcpStream, text: &str) -> anyhow::Result<()> {
+    let payload = text.as_bytes();
+    let mut f = vec![0x81u8];
+    match payload.len() {
+        n if n < 126 => f.push(0x80 | u8::try_from(n)?),
+        n if n < 1 << 16 => {
+            f.push(0x80 | 126);
+            f.extend(u16::try_from(n)?.to_be_bytes());
+        }
+        n => {
+            f.push(0x80 | 127);
+            f.extend(u64::try_from(n)?.to_be_bytes());
+        }
+    }
+    let mask = [0x37u8, 0xfa, 0x21, 0x3d];
+    f.extend(mask);
+    f.extend(payload.iter().zip(mask.iter().cycle()).map(|(b, m)| b ^ m));
+    s.write_all(&f)?;
+    Ok(())
 }
 
 /// A viewer's text frames from a session socket, up to the `synced` that ends what it's sent on

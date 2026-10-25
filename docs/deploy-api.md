@@ -594,6 +594,7 @@ leaves what it rolled back from running, and marks the registration degraded.
 | A rollback failed | **held**: not reverted, as that would bring back what it rolled back from |
 | A revert failed | **held**: kiln doesn't revert its own way back |
 | One asked with `no_revert` failed (a migration that can't run backwards; a secret rotated after a leak, which a revert would deliver again) | **held** |
+| One whose KilnCD app has auto-rollback off (set for the app or its repository, or its rollout's `auto-rollback: false`: cd.md, "Auto-rollback") failed | **held**, saying who turned it off |
 | One that runs a Job on its way in (a Helm `pre-install`/`pre-upgrade`/`post-*` hook, Argo CD's `PreSync`/`Sync`/`PostSync`: a migration) failed, as its preflight found it | **held**: what ran before may not run on what it changed; a hook marked `kiln.dev/reversible: "true"` (kiln-base: `jobs.<name>.reversible`, an expand-then-contract change) doesn't count |
 | A commit kiln didn't make (origin `git`) failed | **held**: git is its author's |
 | The provider took it and can't be asked since | nothing is done blind: it's judged when the provider answers, and **held** once it hasn't for `watch.unreachable` (default 6 h). On KilnCD, that's while the app's cluster doesn't answer (asked before anything is judged, a landing too, since KilnCD's last look may be all it has); a sync that failed for that is synced again once the cluster answers. The release's `watch.timeout` runs from when the provider answers again |

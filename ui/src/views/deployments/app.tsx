@@ -29,29 +29,15 @@ import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { FileDiffView } from "@/views/harness/diff";
 import { RelTime } from "@/views/shared";
 import { ResourceDetails, hasLogs, type Show } from "./details";
+import { AutoRollbackLine, AutoRollbackPanel, CommitMessage, RollbackPanel, TagChips, rollbackName } from "./rollback";
 import { RolloutPanel } from "./rollout";
 import { FIXES, age, compareNodes, compareText, facetsOf, fixOf, forest, isFiltered, keep, kindRank, troubled, whatDiffers, type Fix, type GroupItem } from "./model";
-import {
-  HealthPair,
-  KindBadge,
-  appKey,
-  NodeMarks,
-  OpPair,
-  StateGlyph,
-  SyncPair,
-  TRIGGER_WORD,
-  nodeLine,
-  objectKey,
-  objectLabel,
-  placeOf,
-  running,
-  shortRev,
-} from "./parts";
+import { HealthPair, KindBadge, appKey, NodeMarks, OpPair, StateGlyph, SyncPair, TRIGGER_WORD, nodeLine, objectKey, objectLabel, placeOf, running, shortRev } from "./parts";
 import { TreeGraph, TreeList, graphFits } from "./tree";
 import "./deployments.css";
 
 type View = "tree" | "list" | "pods";
-type Ask = null | "sync" | "diff" | "history" | "takeover" | "delete" | "follow";
+type Ask = null | "sync" | "rollback" | "autorollback" | "diff" | "history" | "takeover" | "delete" | "follow";
 type Notice = { tone: "ok" | "fail"; text: string } | null;
 /** A sync asked for from one kind of difference: those objects chosen, pruning for what git no longer has. */
 type SyncPreset = { fix: Fix; ids: string[] } | null;
@@ -156,12 +142,13 @@ const appRes = (id: string) => ({
   objects: { key: `${appKey(id)}tree`, fetch: (s: AbortSignal) => readObjects(id, s), opts: { pollMs: 5_000 } },
   history: { key: `${appKey(id)}history`, fetch: (s: AbortSignal) => cdApi.history(id, s) },
   rollouts: { key: `${appKey(id)}rollout`, fetch: (s: AbortSignal) => cdApi.rollouts(id, s), opts: { pollMs: 10_000 } },
+  targets: { key: `${appKey(id)}rollback-targets`, fetch: (s: AbortSignal) => cdApi.rollbackTargets(id, s) },
 });
 
 function DeploymentApp({ project, name }: { project: string; name: string }) {
   const id = `${project}/${name}`;
   const r = appRes(id);
-  warm(r.detail, r.objects, r.history, r.rollouts);
+  warm(r.detail, r.objects, r.history, r.rollouts, r.targets);
   const app = useRes(r.detail).data;
   if ("notFound" in app) {
     return (
@@ -260,7 +247,23 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
               <SyncPolicy a={a} busy={busy} onSet={(sync, said) => act(said, () => cdApi.put({ ...(a.definition ?? {}), sync }), true)} />
             </dd>
           </div>
+          <div className="cd-lines-policy">
+            <dt>Rollback</dt>
+            <dd>
+              <AutoRollbackLine a={a} open={ask === "autorollback"} onToggle={() => toggle("autorollback")} />
+            </dd>
+          </div>
         </dl>
+        {ask === "autorollback" && (
+          <AutoRollbackPanel
+            a={a}
+            name={name}
+            busy={busy}
+            onSetApp={(on, said) => act(said, () => cdApi.setAutoRollback(id, on), true)}
+            onSetRepo={(repo, on, said) => act(said, () => cdApi.setRepoAutoRollback(repo, on), true)}
+            onClose={() => setAsk(null)}
+          />
+        )}
         {a.shadow && <p className="cd-note">Shadowed from Argo CD: kiln compares it and never writes to it. Take it over to deploy it with kiln.</p>}
         {a.pinned && (
           <p className="cd-note">
@@ -285,6 +288,18 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
               disabled={busy || live}
             >
               Sync…
+            </Button>
+          )}
+          {!a.shadow && (
+            <Button
+              size="xs"
+              variant="secondary"
+              onClick={() => toggle("rollback")}
+              aria-expanded={ask === "rollback"}
+              disabled={busy || live}
+              title={live ? "A sync is under way: stop it first, or wait" : undefined}
+            >
+              Roll back…
             </Button>
           )}
           <Button size="xs" variant="secondary" onClick={() => act("Comparing it with git again.", () => cdApi.refresh(id, false))} disabled={busy}>
@@ -328,15 +343,18 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
           </Button>
         </div>
         {ask === "sync" && !a.shadow && (
-          <SyncPanel
-            key={preset?.fix ?? "all"}
-            a={a}
-            managed={managed}
-            preset={preset}
-            busy={busy}
-            onCancel={() => setAsk(null)}
-            onSync={(body, done) => act(done, () => cdApi.sync(id, body))}
-          />
+          <SyncPanel key={preset?.fix ?? "all"} a={a} managed={managed} preset={preset} busy={busy} onCancel={() => setAsk(null)} onSync={(body, done) => act(done, () => cdApi.sync(id, body))} />
+        )}
+        {ask === "rollback" && !a.shadow && (
+          <Loadable label="what it can go back to" fallback={<Hold height={260} label="Loading what it can go back to" className="cd-rollback-hold" />}>
+            <RollbackPanel
+              res={r.targets}
+              name={name}
+              busy={busy}
+              onCancel={() => setAsk(null)}
+              onRollback={(d, prune) => act(`Rolling ${name} back to ${rollbackName(d)} (deployment ${d.id}).`, () => cdApi.rollback(id, { to: d.id, prune }))}
+            />
+          </Loadable>
         )}
         {ask === "takeover" && (
           <Confirm
@@ -666,10 +684,7 @@ function SyncPanel({
   const own = a.definition?.sync.options;
   const [opts, setOpts] = React.useState<Record<string, boolean>>(() => Object.fromEntries(SYNC_OPTIONS.map((o) => [o.name, own?.[o.key] ?? false])));
   const changedOpts = SYNC_OPTIONS.filter((o) => opts[o.name] !== (own?.[o.key] ?? false)).length;
-  const list = React.useMemo(
-    () => managed.filter((n) => !n.hook).sort((x, y) => Number(y.sync === "OutOfSync") - Number(x.sync === "OutOfSync") || compareNodes(x, y)),
-    [managed],
-  );
+  const list = React.useMemo(() => managed.filter((n) => !n.hook).sort((x, y) => Number(y.sync === "OutOfSync") - Number(x.sync === "OutOfSync") || compareNodes(x, y)), [managed]);
   const [picked, setPicked] = React.useState<ReadonlySet<string>>(() => new Set(preset ? preset.ids : list.filter((n) => n.sync === "OutOfSync").map((n) => n.id)));
   const prunable = list.filter((n) => n.requires_pruning).length;
   const pick = (ids: string[]) => setPicked(new Set(ids));
@@ -704,8 +719,7 @@ function SyncPanel({
         {prunable ? ` (${prunable})` : ""}
       </label>
       <label className="cd-opt">
-        <input type="checkbox" className="check" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} /> Dry run: check every object with
-        the cluster, change nothing
+        <input type="checkbox" className="check" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} /> Dry run: check every object with the cluster, change nothing
       </label>
       <label className="cd-opt">
         <input type="checkbox" className="check" checked={some} onChange={(e) => setSome(e.target.checked)} /> Only the objects chosen below
@@ -796,10 +810,7 @@ function Resources({
   const [box, width] = useElementWidth<HTMLDivElement>();
 
   // What the view is over: the pods for Pods; for the others, children unless left out.
-  const base = React.useMemo(
-    () => (view === "pods" ? nodes.filter((n) => n.kind === "Pod" && n.group === "") : children ? nodes : nodes.filter((n) => n.managed)),
-    [nodes, view, children],
-  );
+  const base = React.useMemo(() => (view === "pods" ? nodes.filter((n) => n.kind === "Pod" && n.group === "") : children ? nodes : nodes.filter((n) => n.managed)), [nodes, view, children]);
   const facets = React.useMemo(() => facetsOf(base, q, chosen), [base, q, chosen]);
   const filtered = isFiltered(q, chosen);
   const { shown, matched } = React.useMemo(() => keep(base, q, chosen, view === "tree"), [base, q, chosen, view]);
@@ -900,11 +911,7 @@ function Resources({
           </button>
         )}
       </div>
-      {treeError && (
-        <p className="cd-warn">
-          The cluster couldn't be read ({treeError}); showing the objects kiln compares, without what they own.
-        </p>
-      )}
+      {treeError && <p className="cd-warn">The cluster couldn't be read ({treeError}); showing the objects kiln compares, without what they own.</p>}
       {errors.length > 0 && <p className="cd-warn">Not everything could be read: {errors.slice(0, 3).join("; ")}</p>}
       {truncated && <p className="cd-warn">The tree is cut at 5,000 objects.</p>}
       {problems.length > 0 && (
@@ -1099,7 +1106,13 @@ function PodList({
             <ul className="cd-llist">
               {g.pods.map((p) => (
                 <li key={p.id}>
-                  <Row n={p} now={now} selected={selected === p.id} onSelect={onSelect} sub={group === "node" ? (p.parents.map((u) => byId.get(u)?.name).find(Boolean) ?? "") : (p.node ?? "Not scheduled")} />
+                  <Row
+                    n={p}
+                    now={now}
+                    selected={selected === p.id}
+                    onSelect={onSelect}
+                    sub={group === "node" ? (p.parents.map((u) => byId.get(u)?.name).find(Boolean) ?? "") : (p.node ?? "Not scheduled")}
+                  />
                   {selected === p.id && details}
                 </li>
               ))}
@@ -1247,22 +1260,13 @@ function Differences({
   );
 }
 
-function HistoryList({
-  list,
-  busy,
-  onRollback,
-}: {
-  list: CdDeployment[];
-  busy: boolean;
-  onRollback?: (d: CdDeployment, prune: boolean) => Promise<void>;
-}) {
+function HistoryList({ list, busy, onRollback }: { list: CdDeployment[]; busy: boolean; onRollback?: (d: CdDeployment, prune: boolean) => Promise<void> }) {
   const [asking, setAsking] = React.useState<number | null>(null);
   const [prune, setPrune] = React.useState(false);
   if (list.length === 0) return <p className="cd-empty">No deployments yet.</p>;
   // What runs now is the newest that succeeded; any other success can be gone back to.
   const current = list.find((h) => h.succeeded);
-  const same = (x: CdDeployment, y: CdDeployment | undefined) =>
-    !!y && (x.commits?.length && y.commits?.length ? x.commits.join() === y.commits.join() : x.revision === y.revision);
+  const same = (x: CdDeployment, y: CdDeployment | undefined) => !!y && (x.commits?.length && y.commits?.length ? x.commits.join() === y.commits.join() : x.revision === y.revision);
   return (
     <div className="cd-history" role="list" aria-label="Deployments">
       {list.map((h) => {
@@ -1274,6 +1278,7 @@ function HistoryList({
               #{h.id} · {shortRev(h.revision) || "no revision"}
             </span>
             <span className="cd-history-what">
+              {h.tags?.length ? <TagChips tags={h.tags} /> : null}
               {h.commit?.subject ? <span className="cd-history-subject">{h.commit.subject}</span> : null}
               <span>
                 {TRIGGER_WORD[h.trigger] ?? h.trigger}
@@ -1313,7 +1318,7 @@ function HistoryList({
                       }}
                       disabled={busy}
                     >
-                      Roll back to #{h.id}
+                      Roll back to {h.tags?.[0] ?? `#${h.id}`}
                     </Button>
                     <Button size="xs" variant="ghost" onClick={() => setAsking(null)}>
                       Cancel
@@ -1325,6 +1330,7 @@ function HistoryList({
                   kiln renders deployment {h.id}
                   {h.revision ? ` (${shortRev(h.revision)})` : ""} again and syncs it. The app holds there until git changes it, then follows git again.
                 </p>
+                <CommitMessage c={h.commit} revision={h.revision} />
                 <label className="cd-opt">
                   <input type="checkbox" className="check" checked={prune} onChange={(e) => setPrune(e.target.checked)} /> Also delete what it didn't have (prune)
                 </label>

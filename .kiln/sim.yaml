@@ -1,0 +1,29 @@
+# kiln-sim nightly (CP-T6.1, docs/sim.md): each of kiln's models over a large budget of seeds, from
+# seeds no night before tried (KILN_SIM_FROM moves on a million a day), built for release. Every
+# change request already runs each model's own budget inside `cargo test` (ci.yaml's rust job). A
+# failure names its seed: `KILN_SIM_SEED=<seed> cargo test -p kiln --lib <test>` replays it alone,
+# with its last steps.
+name: sim
+on:
+  schedule: ["23 3 * * *"]
+  manual: true
+jobs:
+  nightly:
+    name: kiln-sim, nightly seeds
+    runs-on: [k8s]
+    toolchain: rust
+    # As ci.yaml's rust job: kiln's crate takes 7 GiB and more to compile.
+    resources: { cpu: "4", memory: 16Gi }
+    env:
+      CARGO_BUILD_JOBS: "4"
+      CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+    timeout-minutes: 240
+    steps:
+      - name: build (release)
+        run: cargo test --release --locked -p kiln --lib --no-run
+      - name: sync, 20,000 seeds
+        run: KILN_SIM_FROM=$(( $(date -u +%s) / 86400 * 1000000 )) KILN_SIM_SEEDS=20000 cargo test --release --locked -p kiln --lib sim::sync::tests::sync_converges_and_loses_nothing_under_the_nemesis -- --exact --nocapture
+      - name: moves, 20,000 seeds
+        run: KILN_SIM_FROM=$(( $(date -u +%s) / 86400 * 1000000 )) KILN_SIM_SEEDS=20000 cargo test --release --locked -p kiln --lib sim::moves::tests::a_moving_session_never_leaves_its_work_behind -- --exact --nocapture
+      - name: the goal driver, 2,000 seeds
+        run: KILN_SIM_FROM=$(( $(date -u +%s) / 86400 * 1000000 )) KILN_SIM_SEEDS=2000 cargo test --release --locked -p kiln --lib goals::sim::tests::goal_stacks_run_in_order_to_their_end_under_the_nemesis -- --exact --nocapture

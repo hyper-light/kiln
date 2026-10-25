@@ -125,6 +125,137 @@ button.rs-v:focus-visible {
   }
 }
 
+/* ---------------------------------------------------------------- the speed */
+/* The bolt, close after effort (no dot before it: it isn't a fourth word). It's as wide as the
+   model's fastest speed draws it (--n bolts, each 9px on from the one before), so filling one more
+   never moves what follows; 40px to tap. */
+.rs-bolt {
+  --n: 1;
+  --rs-bolt-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8.75 1.5 2.5 9.25H8l-.75 5.25 6.25-7.75H8z' fill='black' stroke='black' stroke-width='1.4' stroke-linejoin='round'/%3E%3C/svg%3E");
+  position: relative;
+  display: block;
+  flex: none;
+  width: calc(13px + (var(--n) - 1) * 9px);
+  height: 28px;
+  margin: 0 0 0 1.2ch;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #5d606a;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+span.rs-bolt,
+.rs-bolt[aria-disabled="true"] {
+  cursor: default;
+}
+.rs-bolt::before {
+  position: absolute;
+  inset: -6px -12px;
+  content: "";
+}
+.rs-bolt:focus-visible {
+  border-radius: 3px;
+  outline: 2px solid #bab0e3;
+  outline-offset: 3px;
+}
+@media (hover: hover) {
+  button.rs-bolt[data-state="off"]:hover {
+    color: #a1a4ad;
+  }
+}
+/* Standard: its outline, in the colour of kiln's glyphs that are off. The account can't: only sketched. */
+.rs-bolt-line {
+  position: absolute;
+  top: 7.5px;
+  left: 0;
+  width: 13px;
+  height: 13px;
+  overflow: visible;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.rs-bolt[data-state="blocked"] .rs-bolt-line {
+  stroke-dasharray: 1.6 2;
+}
+.rs-bolt:is([data-state="on"], [data-state="cooldown"]) .rs-bolt-line {
+  opacity: 0;
+}
+/* Faster: filled (the outline's own footprint, as a mask), the prism running through it fast with a
+   glint across; a step further, another bolt opening out of the one before into the room kept for
+   it. Only transforms and opacity move. */
+.rs-bolt-fill {
+  position: absolute;
+  top: 7.5px;
+  left: 0;
+  width: 13px;
+  height: 13px;
+  overflow: hidden;
+  isolation: isolate;
+  opacity: 0;
+  -webkit-mask: var(--rs-bolt-mask) center / 100% 100% no-repeat;
+  mask: var(--rs-bolt-mask) center / 100% 100% no-repeat;
+  transition:
+    transform 0.16s cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 0.16s ease-out;
+}
+.rs-bolt-fill[data-on] {
+  opacity: 1;
+  transform: translateX(calc(var(--i) * 9px));
+}
+.rs-bolt-holo,
+.rs-bolt-glint {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+}
+/* kiln's prism, as thinking's shimmer draws it: symmetric, so one tile on is where it began. */
+.rs-bolt-holo {
+  width: 300%;
+  background: linear-gradient(90deg, #b8d9d2 0%, #a6c4ed 18%, #b8a6d5 34%, #d6a2aa 50%, #b8a6d5 66%, #a6c4ed 82%, #b8d9d2 100%) 0 0 / 50% 100% repeat-x;
+  animation: rs-bolt-drift 1.2s linear infinite;
+}
+.rs-bolt-glint {
+  top: -2px;
+  bottom: -2px;
+  width: 70%;
+  background: linear-gradient(105deg, transparent 15%, rgb(255 255 255 / 92%) 50%, transparent 85%);
+  transform: translateX(-120%);
+  animation: rs-bolt-glint 1.62s cubic-bezier(0.45, 0, 0.25, 1) infinite;
+}
+.rs-bolt-fill + .rs-bolt-fill .rs-bolt-holo {
+  animation-delay: -0.6s;
+}
+.rs-bolt-fill + .rs-bolt-fill .rs-bolt-glint {
+  animation-delay: -0.36s;
+}
+@keyframes rs-bolt-drift {
+  to {
+    transform: translateX(-50%);
+  }
+}
+@keyframes rs-bolt-glint {
+  0% {
+    transform: translateX(-120%);
+  }
+  62%,
+  100% {
+    transform: translateX(170%);
+  }
+}
+/* Cooling down: still on, but at standard speed for now: grey and still. */
+.rs-bolt[data-state="cooldown"] .rs-bolt-fill {
+  background: #5d606a;
+}
+.rs-bolt[data-state="cooldown"] .rs-bolt-fill > i {
+  display: none;
+}
+
 /* ---------------------------------------------------------------- the open setting */
 .rs-panel {
   max-width: 440px;
@@ -475,8 +606,16 @@ button.rs-v:focus-visible {
   .rs-knob,
   .rs-word,
   .rs-undo,
+  .rs-bolt-fill,
   button.rs-v {
     transition: none;
+  }
+  /* The bolt shows the prism, still. */
+  .rs-bolt-holo {
+    animation: none;
+  }
+  .rs-bolt-glint {
+    display: none;
   }
 }
 /* Paused motion would freeze a fade at its first frame, so these don't animate at all. */
@@ -489,8 +628,14 @@ button.rs-v:focus-visible {
 :root[data-motion="paused"] .rs-knob,
 :root[data-motion="paused"] .rs-word,
 :root[data-motion="paused"] .rs-undo,
+:root[data-motion="paused"] .rs-bolt-fill,
 :root[data-motion="paused"] button.rs-v {
   transition: none;
+}
+/* The bolt's prism stops where it is, as thinking's shimmer does. */
+:root[data-motion="paused"] .rs-bolt-holo,
+:root[data-motion="paused"] .rs-bolt-glint {
+  animation-play-state: paused;
 }
 
 /* ---------------------------------------------------------------- contrast */
@@ -509,6 +654,9 @@ button.rs-v:focus-visible {
   .rs-word[aria-checked="true"],
   button.rs-v[aria-expanded="true"] {
     color: #ffffff;
+  }
+  .rs-bolt {
+    color: #a1a4ad;
   }
   .rs-rail,
   .rs-tick {
@@ -530,5 +678,12 @@ button.rs-v:focus-visible {
   .rs-tick {
     background: CanvasText;
     forced-color-adjust: none;
+  }
+  .rs-bolt-fill {
+    background: CanvasText;
+    forced-color-adjust: none;
+  }
+  .rs-bolt-fill > i {
+    display: none;
   }
 }

@@ -86,7 +86,7 @@ fn a_runners_commands_are_answered_through_lost_frames_and_a_cut_link() -> anyho
     std::fs::create_dir_all(dir.join("keeper-home"))?;
     let out = std::fs::File::create(dir.join("keeper.log"))?;
     let _keeper = Keeper(
-        Command::new(env!("CARGO_BIN_EXE_kiln"))
+        common::kiln()
             .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", "keeper", "--labels", "keep", "--slots", "1", "--no-terminal", "--chaos", "drop=60s,down=15s"])
             .arg("--work-dir")
             .arg(&work)

@@ -295,7 +295,9 @@ reads from it (`crates/kiln/src/store/learner.rs`, `crates/kiln/src/frontdoor/re
 - **Joining.** A runner that can hold one says so (`CAP_CLUSTER`). The server adds it as a learner,
   one change at a time through the group, and tells its newest process which member it is (an id
   from its machine's name) and the token its copies are fetched with. Other processes of the
-  machine let go of theirs, so one process at a time holds the replica's files.
+  machine let go of theirs, so one process at a time holds the replica's files. A newest process
+  whose older one holds them yet (finishing its last jobs before it retires) tries again until it
+  lets go: 15 s apart at first, then each minute, with the server's newest word to join.
 - **A copy, then the log.** A learner starts from a copy of kiln.db, `GET /api/cluster/copy`, made
   with `VACUUM INTO` at the group's last applied entry. The server's own log index stays behind. Any
   copy made later stands in for that point: an entry its `seq` holds already is skipped, as a restart
@@ -310,6 +312,10 @@ reads from it (`crates/kiln/src/store/learner.rs`, `crates/kiln/src/frontdoor/re
   newest takes it ("One runner a machine", `docs/releases.md`). While it has learners, the server
   keeps up to 64 MiB of the log behind what's applied for one a little behind, and beats once a
   second.
+- **Kept following.** Each minute the runner checks its replica: one whose group stopped, or that
+  stays behind the server's last write for five checks running, is stopped and started again,
+  saying why (nothing else would start it again, and its front door would leave every read to the
+  server).
 - **Messages.** The group's messages go over each runner's link on the sync lane
   (`ServerMsg::Cluster`, `AgentMsg::Cluster`), in parts past 512 KiB. A learner whose runner is away
   misses them, and the log sends what it needs once it's back.

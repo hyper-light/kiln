@@ -65,7 +65,7 @@ fn w20_r01_operations_over_http_and_the_cli() -> anyhow::Result<()> {
     // `kiln op`: the list, what one takes, and one run.
     let url = format!("http://127.0.0.1:{}", s.port);
     let kiln = |args: &[&str]| -> anyhow::Result<String> {
-        let o = Command::new(env!("CARGO_BIN_EXE_kiln")).args(args).args(["--url", &url, "--token", &s.admin]).env("HOME", dir.path()).output()?;
+        let o = common::kiln().args(args).args(["--url", &url, "--token", &s.admin]).env("HOME", dir.path()).output()?;
         anyhow::ensure!(o.status.success(), "kiln {args:?}: {}", String::from_utf8_lossy(&o.stderr));
         Ok(String::from_utf8_lossy(&o.stdout).into_owned())
     };
@@ -222,7 +222,7 @@ fn w20_ac03_authority() -> anyhow::Result<()> {
     let fixer = token(&s, json!({ "kind": "agent", "agent": "fixer", "user": "dev", "grants": ["developer@repo:acme/app"] }))?;
     let url = format!("http://127.0.0.1:{}", s.port);
     let cli = |token: &str, args: &[&str]| -> anyhow::Result<(bool, String)> {
-        let o = Command::new(env!("CARGO_BIN_EXE_kiln")).args(args).args(["--url", &url, "--token", token]).env("HOME", dir.path()).output()?;
+        let o = common::kiln().args(args).args(["--url", &url, "--token", token]).env("HOME", dir.path()).output()?;
         Ok((o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))))
     };
     let program = "return await kiln.ci.runs.rerun({ run: input.run })";
@@ -310,7 +310,7 @@ fn w20_ac01_every_command_section_4_3_lists() -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;
     let mut missing: Vec<String> = Vec::new();
     for c in &commands {
-        let o = Command::new(env!("CARGO_BIN_EXE_kiln")).args(c).arg("--help").env("HOME", home.path()).env_remove("KILN_URL").env_remove("KILN_ADMIN_TOKEN").output()?;
+        let o = common::kiln().args(c).arg("--help").env("HOME", home.path()).env_remove("KILN_URL").env_remove("KILN_ADMIN_TOKEN").output()?;
         if !o.status.success() {
             missing.push(c.join(" "));
         }
@@ -446,7 +446,7 @@ fn w20_ac01_resources_and_what_was_missing_underneath() -> anyhow::Result<()> {
     let chunk = walk(&dir.path().join("data/cas/chunks")).into_iter().next().ok_or_else(|| anyhow::anyhow!("no chunk on disk"))?;
     std::fs::write(&chunk, b"not what it was")?;
     let url = format!("http://127.0.0.1:{}", s.port);
-    let o = Command::new(env!("CARGO_BIN_EXE_kiln")).args(["store", "verify", "--url", &url, "--token", &s.admin]).env("HOME", dir.path()).output()?;
+    let o = common::kiln().args(["store", "verify", "--url", &url, "--token", &s.admin]).env("HOME", dir.path()).output()?;
     let said = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     let name = chunk.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     assert!(!o.status.success() && said.contains(&format!("corrupt: {name}")), "kiln store verify: {said}");

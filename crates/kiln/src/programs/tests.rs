@@ -334,7 +334,7 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         until("the workers' thresholds", || pause_at(&hex) == Some(80) && pause_at(&sends) == Some(95)).await?;
         let kept: BTreeMap<String, u8> = kv_json(&hub.store, thresholds_key("m1")).await?;
         assert_eq!(kept, BTreeMap::from([(hex.clone(), 80), (sends.clone(), 95)]));
-        assert!(matches!(hub.harness.command(&hub, &hex, Command::PauseAt { percent: Some(90) }).await, crate::harness::registry::Sent::Ok));
+        assert!(matches!(hub.harness.command(&hub, &hex, Command::PauseAt { percent: Some(90) }).await, crate::harness::registry::Sent::Taken));
         until("the person's threshold", || pause_at(&hex) == Some(90)).await?;
         enforce(&hub).await;
         assert_eq!((pause_at(&hex), pause_at(&sends)), (Some(90), Some(95)), "the person's stays");

@@ -192,7 +192,12 @@ interface Demo {
   refusal: string;
   /** Its effort, for harnesses with effort levels. */
   effort?: string;
+  /** Its speed ("" standard), for models that go faster. */
+  speed?: string;
 }
+
+/** MOCK_SPEED=cooldown: the Claude demo's fast mode is cooling down after its own rate limit; blocked: its account can't use fast mode. */
+const SPEED_STATE = process.env.MOCK_SPEED;
 
 function demo(id: string, kind: string, target: string, title: string, model: string, ask: string, refusal: string): Demo {
   const t = Date.now() - 6 * 60_000;
@@ -235,9 +240,17 @@ function demo(id: string, kind: string, target: string, title: string, model: st
           )
         : [{ id: model, label: model }],
     efforts: kind === "claude" ? ["low", "medium", "high", "xhigh", "max"].map((id) => ({ id, label: id === "xhigh" ? "XHigh" : id.charAt(0).toUpperCase() + id.slice(1) })) : undefined,
+    // Its speeds past standard: Claude Code's fast mode on Opus, Codex's tiers on its newest models.
+    speeds:
+      kind === "claude"
+        ? [{ id: "fast", label: "Fast", description: "Up to 2.5x faster, at a higher price per token" }]
+        : [
+            { id: "priority", label: "Fast", description: "2x speed, increased usage" },
+            { id: "ultrafast", label: "Ultrafast", description: "The fastest available responses for latency-sensitive work." },
+          ],
     commands: COMMANDS,
     agents: [],
-    features: kind === "claude" ? ["interrupt", "set_mode", "set_model", "set_effort", "steer"] : ["interrupt", "set_mode", "steer"],
+    features: kind === "claude" ? ["interrupt", "set_mode", "set_model", "set_effort", "set_speed", "steer"] : ["interrupt", "set_mode", "set_speed", "steer"],
   };
   const events: HEvent[] = [
     { id: `${id}-u1`, seq: 1, at: t, kind: "user", text: ask },
@@ -276,6 +289,9 @@ function stateOf(d: Demo): State {
     model: d.info.model,
     mode: d.info.mode,
     effort: d.effort ?? (d.meta.efforts?.length ? "max" : undefined),
+    speed: d.speed ?? (d.info.kind === "claude" && SPEED_STATE === "cooldown" ? "fast" : undefined),
+    ...(d.info.kind === "claude" && SPEED_STATE === "cooldown" && { speed_cooldown: true }),
+    ...(d.info.kind === "claude" && SPEED_STATE === "blocked" && { speed_blocked: "Fast mode requires usage credits, which are off for this account" }),
     title: d.info.title,
     approvals: [],
     queue: [],
@@ -319,17 +335,18 @@ export function handleDemoSession(ws: WebSocket, id: string): boolean {
   // As the server's socket does: the snapshot is complete.
   if (process.env.MOCK_NO_SYNCED !== "1") send({ t: "synced" });
   ws.on("message", (raw) => {
-    let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string };
+    let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string; speed?: string };
     try {
       c = JSON.parse(raw.toString()) as typeof c;
     } catch {
       return;
     }
     // How it runs: taken at once, as the real harnesses report back.
-    if (c.type === "set_mode" || c.type === "set_model" || c.type === "set_effort") {
+    if (c.type === "set_mode" || c.type === "set_model" || c.type === "set_effort" || c.type === "set_speed") {
       if (c.type === "set_mode" && c.mode) d.info.mode = c.mode;
       if (c.type === "set_model" && c.model) d.info.model = c.model;
       if (c.type === "set_effort" && c.effort) d.effort = c.effort;
+      if (c.type === "set_speed") d.speed = c.speed ?? "";
       setTimeout(() => {
         if (ws.readyState === ws.OPEN) send({ t: "state", state: stateOf(d) });
       }, 300);

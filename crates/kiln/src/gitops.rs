@@ -217,10 +217,39 @@ pub(crate) async fn commit_info(hub: &Hub, repo: &Repo, sha: &str) -> (String, S
     }
 }
 
+/// Where `repo`'s commits are read: kiln's own repository when kiln hosts it, whose diffs'
+/// versions (`refs/kiln/diffs/…`) its mirror never fetches, else its mirror.
+pub(crate) fn git_dir(hub: &Hub, repo: &Repo) -> PathBuf {
+    crate::ci::hosting::native_path(hub, repo).unwrap_or_else(|| mirror_path(hub, &repo.name))
+}
+
 pub(crate) async fn changed_files(hub: &Hub, repo: &Repo, old: &str, new: &str) -> Option<Vec<String>> {
-    let p = mirror_path(hub, &repo.name).to_string_lossy().to_string();
+    let p = git_dir(hub, repo).to_string_lossy().to_string();
     let o = run_git(hub, &["-C", &p, "diff", "--name-only", old, new], LS_REMOTE_TIMEOUT).await.ok()?;
     Some(String::from_utf8_lossy(&o).lines().map(str::to_owned).collect())
+}
+
+/// A pull request's counts in its payload (W03-R07), as GitHub's: the commits `base..head`, and
+/// the lines and files `base...head` changes (0 each that git can't say).
+pub(crate) async fn pr_counts(hub: &Hub, repo: &Repo, base: &str, head: &str) -> kiln_ci::trigger::context::Counts {
+    let mut c = kiln_ci::trigger::context::Counts::default();
+    if base.is_empty() || head.is_empty() {
+        return c;
+    }
+    let p = git_dir(hub, repo).to_string_lossy().to_string();
+    if let Ok(o) = run_git(hub, &["-C", &p, "rev-list", "--count", &format!("{base}..{head}")], LS_REMOTE_TIMEOUT).await {
+        c.commits = String::from_utf8_lossy(&o).trim().parse().unwrap_or(0);
+    }
+    if let Ok(o) = run_git(hub, &["-C", &p, "diff", "--numstat", &format!("{base}...{head}")], LS_REMOTE_TIMEOUT).await {
+        for l in String::from_utf8_lossy(&o).lines() {
+            // A binary file's lines are `-`: 0, as GitHub counts them.
+            let mut n = l.split('\t').map(|n| n.parse::<u64>().unwrap_or(0));
+            c.additions += n.next().unwrap_or(0);
+            c.deletions += n.next().unwrap_or(0);
+            c.changed_files += 1;
+        }
+    }
+    c
 }
 
 #[derive(Debug, Clone)]

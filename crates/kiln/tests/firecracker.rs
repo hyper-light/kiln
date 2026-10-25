@@ -201,7 +201,7 @@ fn w17_a_kept_leg_in_a_microvm() -> anyhow::Result<()> {
         Ok((!kept || about.pointer("/leg/conclusion") != Some(&json!("failure"))).then(|| about.to_string()))
     })?;
     // A terminal into it: its workspace, its environment, its secret masked.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kiln"))
+    let mut child = common::kiln()
         .args(["debug", "terminal", &leg])
         .env("HOME", &home)
         .env("KILN_URL", format!("http://127.0.0.1:{}", s.port))

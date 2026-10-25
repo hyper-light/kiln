@@ -5,8 +5,9 @@
  */
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
-import { MoreHorizontal, SlidersHorizontal, X } from "lucide-react";
+import { ArrowDownToLine, MoreHorizontal, SlidersHorizontal, X } from "lucide-react";
 import { harnessApi, type AgentInfo, type Attachment, type Command, type Control, type Meta, type State } from "@/api/harness";
+import { formatBytes } from "@/lib/format";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
@@ -150,7 +151,12 @@ function LimitRows({ agent, state, send }: { agent: AgentInfo | null; state: Sta
           <span className="hx-dim text-[12px]">At the limit, or once one is this full: the step under way finishes first, and it goes on once the limit resets.</span>
         </div>
         <div className="hx-ctl-input">
-          <select className="hx-select" aria-label="Pause" value={state?.pause_at ? String(state.pause_at) : ""} onChange={(e) => send({ type: "pause_at", percent: e.target.value ? Number(e.target.value) : null })}>
+          <select
+            className="hx-select"
+            aria-label="Pause"
+            value={state?.pause_at ? String(state.pause_at) : ""}
+            onChange={(e) => send({ type: "pause_at", percent: e.target.value ? Number(e.target.value) : null })}
+          >
             <option value="">At the limit</option>
             {[80, 90, 95].map((p) => (
               <option key={p} value={String(p)}>
@@ -165,8 +171,8 @@ function LimitRows({ agent, state, send }: { agent: AgentInfo | null; state: Sta
           <div className="hx-ctl-text">
             <span className="hx-ctl-label">At a limit</span>
             <span className="hx-dim text-[12px]">
-              Wait for the reset, or go on on another of your machines with room: the one chosen or whichever has room, in its own harness signed in to another account or one its conversation
-              can be carried into (Claude Code ⇄ Codex). Its conversation and repository go along.
+              Wait for the reset, or go on on another of your machines with room: the one chosen or whichever has room, in its own harness signed in to another account or one its conversation can be
+              carried into (Claude Code ⇄ Codex). Its conversation and repository go along.
             </span>
           </div>
           <div className="hx-ctl-input">
@@ -374,6 +380,15 @@ async function prepareImage(f: File): Promise<Blob> {
 
 const stamp = () => new Date().toTimeString().slice(0, 8).replace(/:/g, "");
 
+/** What a send carries for one attached file. */
+const asAttachment = (f: Attached): Attachment => (f.file_id ? { name: f.name, mime: f.mime, file_id: f.file_id } : { name: f.name, mime: f.mime, data_base64: f.data_base64 ?? "" });
+
+/** Previews of files attached in this page's lifetime, by upload id (a queued message's chips tap through to them). */
+const previews = new Map<string, string>();
+
+/** The local preview kept for an uploaded attachment (queue/held rows show the image full size). */
+export const attachedPreview = (fileId: string) => previews.get(fileId);
+
 /** Files and screenshots to send with a message: pasted, dropped anywhere on the page, or picked (Photos, Camera or Files on a phone). */
 export function useAttachments(accepts: "any" | "images" | "none") {
   const enabled = accepts !== "none";
@@ -381,11 +396,12 @@ export function useAttachments(accepts: "any" | "images" | "none") {
   const [pending, setPending] = React.useState(0);
   const [failed, setFailed] = React.useState<string | null>(null);
   const add = React.useCallback(
-    async (list: FileList | File[]) => {
-      if (accepts === "none") return;
+    async (list: FileList | File[]): Promise<Attachment[]> => {
+      if (accepts === "none") return [];
       const picked = [...list].filter((f) => accepts === "any" || f.type.startsWith("image/"));
       setPending((n) => n + picked.length);
       setFailed(null);
+      const added: Attached[] = [];
       // Each file uploads as soon as it is attached, so sending is instant.
       await Promise.all(
         picked.map(async (f) => {
@@ -408,6 +424,8 @@ export function useAttachments(accepts: "any" | "images" | "none") {
               if (blob.size > 8 * 1024 * 1024) throw new Error(`Couldn't upload ${name}`);
               att = { name, mime, size: blob.size, preview, data_base64: await toBase64(blob) };
             }
+            if (att.preview && att.file_id) previews.set(att.file_id, att.preview);
+            added.push(att);
             setFiles((cur) => [...cur, att]);
           } catch (e) {
             setFailed(e instanceof Error ? e.message : String(e));
@@ -416,6 +434,8 @@ export function useAttachments(accepts: "any" | "images" | "none") {
           }
         }),
       );
+      // What this batch turned into, for a caller that merges it straight into a queued message.
+      return added.map(asAttachment);
     },
     [accepts],
   );
@@ -433,22 +453,68 @@ export function useAttachments(accepts: "any" | "images" | "none") {
     setFailed(null);
   }, []);
   /** What a send carries. */
-  const payload = (): Attachment[] => files.map((f) => (f.file_id ? { name: f.name, mime: f.mime, file_id: f.file_id } : { name: f.name, mime: f.mime, data_base64: f.data_base64 ?? "" }));
+  const payload = (): Attachment[] => files.map(asAttachment);
+  // An attached image, full size, before it's sent (as a phone shows it): its name and size, Remove/Keep.
+  const [viewing, setViewing] = React.useState<Attached | null>(null);
   const chips =
     files.length || pending || failed ? (
-      <div className="hx-attach">
-        {files.map((f, i) => (
-          <span key={i} className="hx-attach-chip">
-            {f.preview ? <img src={f.preview} alt="" /> : null}
-            <span className="hx-trunc">{f.name}</span>
-            <button type="button" aria-label={`Remove ${f.name}`} onClick={() => remove(i)}>
-              <X size={11} />
-            </button>
-          </span>
-        ))}
-        {pending > 0 && <span className="hx-attach-chip hx-dim">Uploading {pending}…</span>}
-        {failed && <span className="hx-attach-chip hx-bad">{failed}</span>}
-      </div>
+      <>
+        <div className="hx-attach">
+          {files.map((f, i) => (
+            <span key={i} className={cn("hx-attach-chip", f.preview && "hx-attach-view")} onClick={() => f.preview && setViewing(f)} role={f.preview ? "button" : undefined}>
+              {f.preview ? <img src={f.preview} alt="" /> : null}
+              <span className="hx-trunc">{f.name}</span>
+              <button
+                type="button"
+                aria-label={`Remove ${f.name}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  remove(i);
+                }}
+              >
+                <X size={11} />
+              </button>
+            </span>
+          ))}
+          {pending > 0 && <span className="hx-attach-chip hx-dim">Uploading {pending}…</span>}
+          {failed && <span className="hx-attach-chip hx-bad">{failed}</span>}
+        </div>
+        {viewing?.preview && (
+          <div className="hx-cover" role="dialog" aria-modal="true" aria-label={viewing.name} onClick={() => setViewing(null)}>
+            <div className="hx-cover-card hx-viewer" onClick={(e) => e.stopPropagation()}>
+              <div className="hx-viewer-head">
+                <button type="button" className="hx-icon" aria-label="Close" onClick={() => setViewing(null)}>
+                  <X size={14} />
+                </button>
+                <span className="hx-viewer-name hx-trunc">{viewing.name}</span>
+                <span className="hx-dim">{formatBytes(viewing.size, 0)}</span>
+                <a className="hx-icon" href={viewing.preview} download={viewing.name} aria-label="Download" onClick={(e) => e.stopPropagation()}>
+                  <ArrowDownToLine size={14} />
+                </a>
+              </div>
+              <div className="hx-viewer-body">
+                <img src={viewing.preview} alt={viewing.name} />
+              </div>
+              <div className="hx-viewer-foot">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    const i = files.indexOf(viewing);
+                    if (i >= 0) remove(i);
+                    setViewing(null);
+                  }}
+                >
+                  Remove
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => setViewing(null)}>
+                  Keep attached
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+      </>
     ) : null;
   return { enabled, accepts, files, pending, add, clear, chips, payload };
 }

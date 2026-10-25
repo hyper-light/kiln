@@ -48,6 +48,9 @@ pub enum Body {
         /// Names of the files attached to it (images are counted in `images` too).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<String>,
+        /// The event it answers (a messenger-style reply), shown as its quote.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
     },
     Assistant {
         text: String,
@@ -379,6 +382,9 @@ pub struct QueueItem {
     pub attachments: Vec<Attachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overrides: Option<Overrides>,
+    /// The event it answers (a messenger-style reply): its quote rides with the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 /// What the timeline shows of a message's attachments: (images, file names).
@@ -474,6 +480,18 @@ pub struct Task {
     /// kiln can stop it (`stop_task`).
     #[serde(default)]
     pub stoppable: bool,
+    /// How a person's message reaches this subagent now (`Command::Send` with its `task`): queued
+    /// for when it finishes, steered into its turn, or sent now, its turn stopped. Empty: it takes
+    /// none (it ended, or its harness lets nothing in), and what's written goes to the agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub takes: Vec<SendMode>,
+    /// "parent": a message to it goes by way of the agent that started it, which passes it on
+    /// with its own tool (its harness takes nothing else from kiln).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    /// Messages waiting for it to finish what it's doing, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue: Vec<QueueItem>,
 }
 
 fn is_zero_u64(n: &u64) -> bool {
@@ -1032,6 +1050,18 @@ pub struct State {
     /// The effort / reasoning level in use, where the harness has one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub effort: String,
+    /// The speed it runs at: "" standard, else one of `Meta::speeds` (Claude Code's fast mode,
+    /// Codex's service tiers, an ACP agent's `speed` option).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub speed: String,
+    /// Why its faster speeds can't serve it now, in words, as its harness said (its account
+    /// doesn't allow them). None: nothing it said stands in the way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_blocked: Option<String>,
+    /// Fast, but at standard speed for now: fast mode's own rate limit was reached, and it goes
+    /// back to fast by itself once that cools down (Claude Code).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub speed_cooldown: bool,
     /// The live value of each control (`Meta::controls`), by id.
     #[serde(default)]
     pub control_values: std::collections::BTreeMap<String, serde_json::Value>,
@@ -1076,9 +1106,9 @@ pub struct State {
     /// limit cuts a turn off. None: only when a limit is reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_at: Option<u8>,
-    /// The most subagents it runs at once (Agent settings): its harness's own, and the agents it
-    /// starts through kiln, each. None: as many as its harness and kiln's `[agents] max_children`
-    /// let it.
+    /// The most subagents it has at work at once (Agent settings): its harness's own and the agents
+    /// it starts through kiln, one pool (`lineage::room`). None: no limit of its own (kiln's `[agents]
+    /// max_children`, only when its config sets one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_subagents: Option<u32>,
     /// A pause ends only when a person resumes it, not by itself at the reset.
@@ -1104,6 +1134,19 @@ pub struct State {
     /// something.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub kept: u32,
+    /// kiln's own messages its harness was handed lately (a goal stack's words, a parent's news),
+    /// each with a digest of the words it had then, the newest last: what the server judges its
+    /// words by, said in the same state as its queue (CP-T3.2, the fourteenth adversarial check's).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub given: Vec<Given>,
+}
+
+/// One of kiln's own messages its harness was handed (`State::given`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Given {
+    pub id: String,
+    /// `queued::stable` of the words it had then.
+    pub digest: String,
 }
 
 /// Where an agent goes on at a usage limit, when it does (`State::move_on_limit`), as a person
@@ -1290,7 +1333,7 @@ pub struct Meta {
     #[serde(default)]
     pub agents: Vec<String>,
     /// Features this adapter drives for this harness: "steer", "send_now", "queue_cancel",
-    /// "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions",
+    /// "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions",
     /// "resume", "attachments", "images", "overrides", "switch_harness" (a model of another
     /// harness: `Command::SetModel::kind`).
     #[serde(default)]
@@ -1298,6 +1341,10 @@ pub struct Meta {
     /// Effort / reasoning levels the harness offers (empty: none).
     #[serde(default)]
     pub efforts: Vec<ControlOption>,
+    /// The speeds faster than standard the model in use runs at, slowest first (empty: none, or
+    /// a harness without them): what `Command::SetSpeed` takes besides "" (standard).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speeds: Vec<ControlOption>,
     /// Every other control the harness offers.
     #[serde(default)]
     pub controls: Vec<Control>,
@@ -1331,10 +1378,20 @@ pub enum Command {
         attachments: Vec<Attachment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         overrides: Option<Overrides>,
+        /// The event it answers (a messenger-style reply): its quote rides with the prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+        /// To one of its subagents (its task's id, as `Task::takes` allows), not to the agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
     },
     QueueEdit {
         id: String,
         text: String,
+        /// Its new attachment set, when the edit changed it (a queued message gains or drops
+        /// files until it is sent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachments: Option<Vec<Attachment>>,
     },
     QueueRemove {
         id: String,
@@ -1388,6 +1445,11 @@ pub enum Command {
     SetEffort {
         effort: String,
     },
+    /// The speed it runs at: "" standard, else one of `Meta::speeds` (feature "set_speed").
+    SetSpeed {
+        #[serde(default)]
+        speed: String,
+    },
     /// Go on on runner `to`, in its folder `cwd` (a path there, or `~/…`), once the turn under way
     /// ends: the session moves there, conversation, timeline and queue alike (`harness::moving`).
     MoveTo {
@@ -1418,10 +1480,20 @@ pub enum Command {
     /// The server's word on a hand-over to the machine's newer runner process (a local
     /// [`Command::MoveTo`]): taken over there (no `error`: this process lets go of the session),
     /// or not (it goes on here). Never a person's; only to runners announcing
-    /// `proto::CAP_HANDOVER`.
+    /// `proto::CAP_HANDOVER`. With an `error`: `by_newest`, the newer process itself said no;
+    /// `unsure`, the server can't say whether it took it (it went away once its whole package
+    /// went to it): it waits, and is asked again (CP-T3.2: `super::handing`).
     HandedOver {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unsure: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        by_newest: bool,
+        /// With an `error`: no newer process of the machine runs to take it, so the process takes
+        /// the try back unless one took it before, as on a refusal (CP-T3.2, `super::handing`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        none_newer: bool,
     },
     /// Set a control's value, or run an action (its argument, if any, in `value`).
     Control {
@@ -1776,7 +1848,7 @@ mod tests {
         let back: Event = serde_json::from_value(v)?;
         assert_eq!(back, e);
         let c: Command = serde_json::from_str(r#"{"type":"send","id":"m1","text":"go","mode":"steer"}"#)?;
-        assert_eq!(c, Command::Send { id: "m1".into(), text: "go".into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
+        assert_eq!(c, Command::Send { id: "m1".into(), text: "go".into(), mode: SendMode::Steer, attachments: vec![], overrides: None, reply_to: None, task: None});
         let c: Command = serde_json::from_str(r#"{"type":"control","id":"compact","value":"keep the API notes"}"#)?;
         assert_eq!(c, Command::Control { id: "compact".into(), value: Some(serde_json::json!("keep the API notes")) });
         let c: Command = serde_json::from_str(r#"{"type":"send","id":"m2","text":"see","attachments":[{"name":"a.png","mime":"image/png","data_base64":"iVBO"}],"overrides":{"effort":"high"}}"#)?;

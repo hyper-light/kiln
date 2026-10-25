@@ -180,18 +180,18 @@ target, op, value, unit}`), `testing` (`{scenario, criteria}`) and `needs` (the 
 for, by number from 1). Keep a plan when the person should see, change or reuse it; for work
 only you will do, a goal stack is enough.
 
-Give steps `needs` when some don't depend on others: run with an agent per step, a step starts
-once each step it needs is met, and steps that don't wait for each other run side by side.
-Leave `needs` out of every step for steps run one after another. A step can't wait for itself
-or for a step that waits for it.
+Give steps `needs` when some don't depend on others: a step starts once each step it needs is
+met, and steps that don't wait for each other run side by side (with an agent per step, or on
+subagents of the agent it runs on). Leave `needs` out of every step for steps run one after
+another. A step can't wait for itself or for a step that waits for it.
 
 `plans_run` runs a kept plan (`id`) in one of four `mode`s:
 
 | mode | what happens |
 |---|---|
-| `message` | the whole plan in one message |
-| `steps` | each step its own message, one a turn |
-| `goals` | each step a goal in the agent's goal stack, with its acceptance criteria and tests in the goal (`split`: each step a goal stack of its own, its criteria and tests a goal each, before it) |
+| `message` | the whole plan in one message (with `needs`: the order its steps go in, those side by side on subagents of the agent's own) |
+| `steps` | each step its own message, one a turn (with `needs`: the steps side by side in one message, a subagent each) |
+| `goals` | each step a goal in the agent's goal stack, with its acceptance criteria and tests in the goal (`split`: each step a goal stack of its own, its criteria and tests a goal each, before it); with `needs`, the steps side by side go to subagents kiln starts for the agent |
 | `agents` | each step an agent of its own, held to the step as a goal; the next starts once the one before is met |
 
 `only` (step numbers, from 1) runs just some of a plan's steps, each keeping its number: the steps
@@ -201,6 +201,15 @@ they wait for outside them are taken as done (the run says which).
 goals, end your turn after `plans_run` in `goals` mode: the first step comes when you're free.
 Each step's goal says the step it was made from: `goals_split` turns the one under way into its
 acceptance criteria and tests, a goal each, before the step itself is checked.
+
+**Steps side by side on your stack** (a plan whose steps say what they wait for, run as goals or
+planned from your goal): where more than one step can be under way at once, kiln starts a subagent
+of yours for each ready step (your child, named "Step 3: …", held to the step on its own stack), as
+many at once as your Subagents setting lets, and gives you the steps there's no room for. Don't do
+a step a subagent has (`goals_get` shows its `subagent`): kiln marks it met when its subagent meets
+it, or gives it back to you if it doesn't. When you're told to run steps side by side yourself (one
+message, or a step a turn), give each a subagent of your own (your Agent or Task tool; without one,
+`agents_start`), at most the number it says at once, and check what each did before going on.
 
 **On an agent you started**: `session` is its id. **On a new agent**: `new` `{on, kind, cwd}`;
 it's your child.

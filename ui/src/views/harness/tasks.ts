@@ -5,7 +5,7 @@
  * workflows and background calls it left running never keep it working by themselves. The server
  * says the same (`stand` in harness/wait.rs, `SubagentBrief::of`, `Task::live`).
  */
-import type { AgentInfo, Status, SubagentBrief, Task } from "@/api/harness";
+import type { AgentInfo, SendMode, Status, SubagentBrief, Task } from "@/api/harness";
 import { taskLive } from "./derive";
 
 /** What a task is; machines from before `class` only say the harness's own task type. */
@@ -32,6 +32,22 @@ export const subagentRunning = (subagents: readonly Pick<Task, "status">[] | und
 
 /** What kiln took over when an agent's harness stopped (its own `left-<pid>` tasks): kiln stops it, whatever the harness. */
 export const LEFT = "left-";
+
+/** A subagent that takes a person's messages now (`takes`): over its thread, the composer writes to it, not the agent. */
+export const takesMessages = (t: Pick<Task, "takes"> | undefined): boolean => (t?.takes?.length ?? 0) > 0;
+
+/** The field's words over a subagent's thread: how what's written reaches it (`mode`: how, while it works; `viaParent`: its agent passes it on). */
+export function subagentPlaceholder(mode: SendMode | null, viaParent: boolean): string {
+  const how =
+    mode === "steer"
+      ? "Steer the subagent — it reads this at its next step"
+      : mode === "now"
+        ? "Stop the subagent and say…"
+        : mode === "queue"
+          ? "Queue a message for when the subagent finishes"
+          : "Message the subagent";
+  return viaParent ? `${how} (the main agent passes it on)` : how;
+}
 
 /**
  * Who can stop a task: kiln itself (what it took over), its harness (the task says so; a server

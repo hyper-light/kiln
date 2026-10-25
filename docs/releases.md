@@ -11,8 +11,9 @@ Build every platform** (or the Runners page, when a machine's platform has no bu
 1. Three jobs, at once, each building the UI first, then its binaries with `ci/release/build.sh`:
    - `linux`, on the server's own Linux runner: x86_64 and aarch64, static musl.
    - `windows`, on the same runner: x86_64, cross-built with zig.
-   - `macos`, on a Mac: Apple Silicon and Intel, built natively with the Mac's own toolchain and
-     SDK, minimum macOS 11. On Linux, `build.sh` can cross-build them too (zig, linking against
+   - `macos`, on a Mac: Apple silicon only (kiln doesn't run on Intel Macs), built natively with
+     the Mac's own toolchain and SDK, minimum macOS 11. It `requires` a Mac with cargo and node,
+     so it waits for one rather than going to a Mac without developer tools. On Linux, `build.sh` can cross-build them too (zig, linking against
      `ci/release/macos-stubs`: text stubs listing the symbols kiln imports from CoreFoundation,
      IOKit and libobjc, which macOS binds to the real libraries at load time). If a dependency
      starts importing something new, `ci/release/regen-macos-stubs.sh` rebuilds the stubs.
@@ -63,8 +64,14 @@ each runner's state as Prometheus gauges: `kiln_runner_up`, `kiln_runner_behind`
 `kiln_runner_update_policy{policy}` and `kiln_runner_version_info{version}`.
 
 A runner with no binary of the server's commit yet doesn't wait on another machine: it waits only
-while its own platform's job is building, and otherwise a Mac or Linux machine with a kiln checkout
-builds the commit itself (a Mac's build is kept for the other Macs).
+while its own platform's job is building, and otherwise the commit is built from the server's
+source right away. No checkout of kiln is needed anywhere. A machine with the tools (cargo and
+node, as its runner reports them) builds the commit itself; a Mac's build is kept, so the other
+Macs download it. A Mac without them (no developer tools) gets its build over the wire: a Mac
+that has them builds the commit natively, else a Linux machine cross-builds it
+(`ci/release/build.sh`: zig, against the macOS stubs). The binary comes back to the server, and the
+Mac downloads it in the same upgrade. One build of a commit serves every Mac: while one is under
+way, the other Macs wait for it rather than start another.
 
 ## How a runner is upgraded: blue/green
 
@@ -100,7 +107,11 @@ For tracing (OTel), each upgrade is a span under `kiln::upgrade` named `upgrade`
 `rolled_back` on the root) and `error`.
 
 The machine's local sockets, for `kiln spawn` and `kiln run`, are the same for every runner process
-of a machine. Shells opened before an upgrade keep using them.
+of a machine. Shells opened before an upgrade keep using them. The process that runs the machine's
+sessions serves them: a new build takes them once it has taken over, and the old one takes them
+back after a rollback. No other kiln process takes one a live process serves (a local `kiln
+server`'s own agent given the runner's name and state folder, say), and a socket left with nothing
+behind it (something took its file, then ended) is served again within seconds.
 
 **On a Mac, run `kiln signing setup` once.** macOS's local network privacy judges every program
 by its code signature. kiln's builds are ad hoc signed, so to macOS each upgrade is a program it
@@ -119,6 +130,31 @@ done once the runner reports the commit it was upgraded to, even on a binary sig
 Some runners still upgrade as before: those not under a supervisor (`kiln agent` run by hand), and
 Windows runners. On Unix they upgrade in place: the process re-executes itself, keeping its
 terminals and agent sessions. Otherwise they upgrade through `kiln install --agent --upgrade`.
+
+## Version skew
+
+How far a runner's kiln may be behind the server's is counted in commits of the release branch
+before the server's own (its first parents), by sha, under two tolerances:
+
+- **Full** (`[updates] skew_full`, 100 by default): a runner on the server's commit or one of the
+  `skew_full` before it does everything.
+- **Upgrade** (`skew_upgrade`, 1000 by default, never less than `skew_full`): a runner on one of
+  the commits past those, within `skew_upgrade`, connects so it can be brought up to date. Until
+  it is, it takes no new work: no jobs or legs, no new agents, no new terminals (kiln's own, for
+  upgrading it, still open).
+- Further behind, a runner is **refused**: it's told how far behind it is and how to catch up
+  (`kiln install --agent --upgrade` with a newer kiln, or a larger upgrade tolerance), and it
+  tries again a minute later.
+
+Main moves about 30 commits a day, so the defaults let a runner a few days behind do everything,
+and one a month behind catch up. A runner ahead of the server, on a commit off the release branch
+(a build on purpose) or of a local tree is left alone, as the fleet leaves it; so is one that says
+no commit (a kiln from before it said one), which is upgraded as any runner behind is. Where the
+server can't tell (it knows no commit of its own, or can't read its release repository), every
+runner does everything: kiln never shuts a fleet out on what it can't see.
+
+System → Updates sets both tolerances (kiln.toml's say until then; `GET`, `PUT` and `DELETE
+/api/updates/skew`), lists the commits each takes, and shows each runner's standing.
 
 ## One runner a machine
 
@@ -147,7 +183,11 @@ older process lets go only once the newest says it took the session over. If it 
 session goes on where it was, and the timeline says why. Should two processes ever both hold one
 session (an answer lost as a link dropped), the newer keeps it and the older lets go. Terminals stay
 with the process they run in until they close, and jobs finish where they run. Once an older
-process holds nothing, the newest retires it.
+process holds nothing, the newest retires it. While a new build of the runner takes the machine
+over (a blue/green upgrade), nothing is handed over: the newest process is then the one leaving,
+and a session it took would end with it. Sessions wait for the new build. A process that is
+handing everything over turns away a session that was already on its way to it, and that
+session goes on where it was until it's asked for again.
 
 **Nothing vanishes.** The server keeps which process of its machine holds each session, across
 restarts (`holders.json` beside its agents' names). A process that says what it runs speaks for its
@@ -165,23 +205,25 @@ row reads *upgrade failed* or *build failed*, with the upgrade's output under it
 - **Retry** tries the same way again now, without waiting for kiln's next automatic try (a failed
   automatic upgrade is tried again after 30 minutes, twice per commit).
 - **Download instead** / **Build it instead**: the other way, when it's open. A download needs a
-  binary of the newest kiln for the machine's platform; a build needs a kiln checkout on the
-  machine. A way that can't be taken now says why (no binary yet, a release run still building one,
-  no checkout, terminals turned off), so a runner kiln is waiting on can still be upgraded the
-  other way.
+  binary of the newest kiln for the machine's platform. A build needs a machine with the tools to
+  make it: the runner's own, or for a Mac without them, another Mac (or a Linux machine,
+  cross-building) whose build it then downloads. A way that can't be taken now says why (no binary
+  yet, a release run still building one, no machine with the tools for it, terminals turned off),
+  so a runner kiln is waiting on can still be upgraded the other way.
 - **Diagnose** (on every connected runner) looks at it, and lists in its row what's wrong, worst
   first, each with the repair that fixes it when kiln can make it (below).
 - **Ask an agent**, under a diagnosis, opens New agents on that machine with a first message
   written for it: what kiln knows (the build it runs and the one it was going to, the error, the
   upgrade's last lines, what the diagnosis found) and where to look (the runner's log, a build's
-  whole output in `~/.cache/kiln/self-build/build-<job>.log`, disk, memory, toolchains). It asks the
-  agent to fix the cause on the machine without stopping or reinstalling the runner, and to say what
-  it changed. Read and change the message before starting it; the agent asks before commands and
-  edits unless you choose otherwise.
+  whole output in `~/.cache/kiln/self-build/build-<job>.log` on the machine that built it, disk,
+  memory, toolchains). It asks the agent to fix the cause on the machine without stopping or
+  reinstalling the runner, and to say what it changed. Read and change the message before starting
+  it; the agent asks before commands and edits unless you choose otherwise.
 
 `POST /api/updates/runners/{name}` with `{"way": "download" | "build"}` does the same as the
 buttons (no body: the way kiln picks). `GET /api/updates` lists each runner's `ways`, each with `ok`
-and `why`.
+and `why`, and for a build another machine makes, `on` (that machine); an upgrade job made that way
+carries `on` too.
 
 ### Diagnosing and repairing a runner
 

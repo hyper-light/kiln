@@ -45,7 +45,7 @@ use hyper_durable::{Fatal, GroupStore, LogStore as _, OpenError, Output, Point, 
 use hyper_log::{Config as LogConfig, Facts, Log};
 use hyper_raft::proto::{ConfChangeV2, ConfState, Message, MessageType};
 use hyper_raft::wire::Record as _;
-use hyper_raft::{Config, Elections, Limits, Stated};
+use hyper_raft::{Config, Elections, Limits, Stated, Timing};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,14 @@ const KEEP_LEARNERS: u64 = if cfg!(test) { 16 } else { 65_536 };
 /// How often the server's member beats while it has learners: a learner hears what's committed
 /// when no write moves.
 const BEAT: Duration = Duration::from_secs(1);
+/// What the group's elections and the leader's own beat are timed by, until hyper-liveness measures
+/// the paths between kiln's nodes (P3e, `Replica::measure`). Without one, the leader's beat never
+/// runs: nothing counts how long a member hasn't answered, so a probe or an append lost on the way
+/// with nobody saying so is never sent again, and that member waits until the leader restarts
+/// (adacachy's learner, 2026-10-25, for hours). A follower draws no delay to campaign without one
+/// either. A campaign is drawn over half a second, a vote round is half a second (a leader with
+/// work in flight beats that often), and an election is expected to take two.
+const TIMING: Timing = Timing { span: Duration::from_millis(500), round: Duration::from_millis(500), election: Duration::from_secs(2) };
 /// A change of learners that hasn't applied in this long is proposed again.
 const CHANGE_PATIENCE: Duration = Duration::from_secs(30);
 /// The group's messages waiting for the links to the runners, at most (past them, they're
@@ -269,6 +277,8 @@ pub struct Group {
     log_start: Arc<AtomicU64>,
     /// The group's messages to the other members: to whom, and the message's bytes.
     outgoing: async_channel::Receiver<(u64, Vec<u8>)>,
+    /// Why its driver stopped, once it has (it applies nothing from then on).
+    stopped: Arc<Mutex<Option<String>>>,
 }
 
 /// What opening a member of the group found wrong.
@@ -363,12 +373,13 @@ impl Group {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), Opening>>();
         let applied = Arc::new(AtomicU64::new(0));
         let log_start = Arc::new(AtomicU64::new(0));
-        let (applied2, point2, log_start2) = (applied.clone(), point.clone(), log_start.clone());
+        let stopped = Arc::new(Mutex::new(None));
+        let (applied2, point2, log_start2, stopped2) = (applied.clone(), point.clone(), log_start.clone(), stopped.clone());
         let join = thread::Builder::new()
             .name("kiln-cluster".into())
             .spawn(move || {
                 let waker = Waker::from(Arc::new(Unpark(thread::current())));
-                let replica = match Replica::open(&settings, store, machine, Unbounded) {
+                let mut replica = match Replica::open(&settings, store, machine, Unbounded) {
                     Ok(r) => r,
                     Err(OpenError::StartPastMachine { .. }) if learner => {
                         ready_tx.send(Err(Opening::LogPastCopy)).ok();
@@ -379,6 +390,10 @@ impl Group {
                         return;
                     }
                 };
+                if let Err(e) = replica.set_timing(TIMING) {
+                    ready_tx.send(Err(Opening::Failed(anyhow::anyhow!("timing the cluster group's beat: {e:?}")))).ok();
+                    return;
+                }
                 let mut d = Driver {
                     replica,
                     _log: log,
@@ -392,6 +407,7 @@ impl Group {
                     applied: applied2,
                     point: point2,
                     log_start: log_start2,
+                    stopped: stopped2,
                     outgoing: out_tx,
                     server: !learner,
                     wanted: None,
@@ -409,12 +425,18 @@ impl Group {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(failed(anyhow::anyhow!("the cluster group didn't start within 60 s"))),
         }
-        Ok(Group { tx, thread, join: Some(join), seq, applied, point, log_start, outgoing })
+        Ok(Group { tx, thread, join: Some(join), seq, applied, point, log_start, outgoing, stopped })
     }
 
     /// Where it stands: kiln.db's last write, and the last entry applied (`/healthz/server`).
     pub fn standing(&self) -> (u64, u64) {
         (self.seq.load(Ordering::SeqCst), self.applied.load(Ordering::SeqCst))
+    }
+
+    /// Why the group's driver stopped, if it has: it applies nothing more (a runner starts its
+    /// learner again).
+    pub fn stopped(&self) -> Option<String> {
+        self.stopped.lock().clone()
     }
 
     /// The last entry applied, with its term, and the group's configuration there: where a copy
@@ -616,6 +638,8 @@ struct Driver {
     log_start: Arc<AtomicU64>,
     /// The group's messages to the other members.
     outgoing: async_channel::Sender<(u64, Vec<u8>)>,
+    /// Why it stopped, for [`Group::stopped`].
+    stopped: Arc<Mutex<Option<String>>>,
     /// The server's member (the group's leader), or a runner's learner.
     server: bool,
     /// The learners the group should have, once the server has said.
@@ -679,6 +703,7 @@ impl Driver {
                     reply.send(Err(format!("the cluster group failed: {e:#}"))).ok();
                 }
                 self.broken = Some(format!("{e:#}"));
+                *self.stopped.lock() = Some(format!("{e:#}"));
                 for what in self.held.give_up() {
                     if let What::Part(seq) = what {
                         tracing::error!(seq, "a write kiln.db holds isn't in the cluster log: {e:#}");
@@ -1030,7 +1055,7 @@ impl Machine {
                     return Err(e.context("fetching a copy of kiln.db"));
                 }
                 tracing::warn!(tried, "fetching a copy of kiln.db: {e:#}");
-                thread::sleep(Duration::from_secs(2 << tried));
+                thread::sleep(if cfg!(test) { Duration::from_millis(10) } else { Duration::from_secs(2 << tried) });
             }
             {
                 let copy = Connection::open_with_flags(&part, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -1677,6 +1702,220 @@ mod tests {
         set(&server, "last", "5")?;
         follow("last")?;
         assert_eq!(copies.load(Ordering::SeqCst), 3, "one a build before stood since is copied again");
+        Ok(())
+    }
+
+    /// The server restarts (a deploy) while a runner's learner goes on: the restarted server leads
+    /// a new term from its own files, and the learner follows it as it followed the one before
+    /// (production, 2026-10-25: adacachy's learner applied nothing after the server restarted).
+    #[test]
+    fn a_learner_follows_the_server_after_it_restarts() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (db, logs) = (dir.path().join("kiln.db"), dir.path().join("cluster"));
+        let server = Store::open_grouped(&db, &logs)?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        let g = server.group().context("grouped")?;
+        g.learners([member].into());
+        until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        // Copies come from whichever server runs now (none while it's stopped).
+        let current = Arc::new(Mutex::new(Some(server.clone())));
+        let fetch: Fetch = {
+            let current = current.clone();
+            Arc::new(move |dest: &Path| {
+                let (s, d) = (current.lock().clone().context("the server is stopped")?, dest.to_path_buf());
+                crate::rt::block_on(async move { s.copy_for_learner(d).await })
+            })
+        };
+        let replica = dir.path().join("runner").join("kiln.db");
+        let learner = Arc::new(Group::learner(&replica, &dir.path().join("runner").join("cluster"), member, fetch)?);
+        let read = |k: &str| -> anyhow::Result<Option<String>> {
+            let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
+        };
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone());
+        for i in 0..50 {
+            set(&server, &format!("w{i}"), "x")?;
+        }
+        until("the writes on the learner", || Ok(read("w49")?.as_deref() == Some("x")))?;
+        // The server stops (its links with it) and starts again on its files; the learner goes on.
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        *current.lock() = None;
+        drop(server);
+        let server = Store::open_grouped(&db, &logs)?;
+        *current.lock() = Some(server.clone());
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up, done.clone());
+        set(&server, "after", "2")?;
+        let followed = until("a write after the restart on the learner", || Ok(read("after")?.as_deref() == Some("2")));
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        followed
+    }
+
+    /// As in production on 2026-10-25: the server restarts, writes go on while the runner is away,
+    /// and the runner's learner starts again on its replica (no copy: this build kept it) once the
+    /// runner is back. It follows the restarted server from where its replica stands.
+    #[test]
+    fn a_learner_started_again_on_its_replica_follows_a_restarted_server() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (db, logs) = (dir.path().join("kiln.db"), dir.path().join("cluster"));
+        let server = Store::open_grouped(&db, &logs)?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        {
+            let g = server.group().context("grouped")?;
+            g.learners([member].into());
+            until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        }
+        let current = Arc::new(Mutex::new(Some(server.clone())));
+        let copies = Arc::new(AtomicU64::new(0));
+        let fetch: Fetch = {
+            let (current, copies) = (current.clone(), copies.clone());
+            Arc::new(move |dest: &Path| {
+                copies.fetch_add(1, Ordering::SeqCst);
+                let (s, d) = (current.lock().clone().context("the server is stopped")?, dest.to_path_buf());
+                crate::rt::block_on(async move { s.copy_for_learner(d).await })
+            })
+        };
+        let (replica, learner_logs) = (dir.path().join("runner").join("kiln.db"), dir.path().join("runner").join("cluster"));
+        let read = |k: &str| -> anyhow::Result<Option<String>> {
+            let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
+        };
+        let learner = Arc::new(Group::learner(&replica, &learner_logs, member, fetch.clone())?);
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up, done.clone());
+        for i in 0..50 {
+            set(&server, &format!("w{i}"), "x")?;
+        }
+        until("the writes on the learner", || Ok(read("w49")?.as_deref() == Some("x")))?;
+        // The server restarts; writes go on while the runner is away; then its learner starts again.
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        *current.lock() = None;
+        drop(server);
+        let server = Store::open_grouped(&db, &logs)?;
+        *current.lock() = Some(server.clone());
+        for i in 0..50 {
+            set(&server, &format!("gap{i}"), "y")?;
+        }
+        drop(learner);
+        let learner = Arc::new(Group::learner(&replica, &learner_logs, member, fetch)?);
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up, done.clone());
+        set(&server, "after", "2")?;
+        let followed = until("a write after both restarts on the learner", || Ok(read("after")?.as_deref() == Some("2")));
+        eprintln!("copies {}, learner standing {:?}, server {:?}", copies.load(Ordering::SeqCst), learner.standing(), server.group_standing());
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        followed?;
+        assert_eq!(read("gap49")?.as_deref(), Some("y"), "with the writes made while it was away");
+        Ok(())
+    }
+
+    /// The restarted server's first probe of a learner is lost on the way and nobody says so (it
+    /// went into a connection that was going): the leader sends it again a beat later, and the
+    /// learner follows (production, 2026-10-25: without a timing the leader never did, and
+    /// adacachy's learner waited for hours, until the next restart).
+    #[test]
+    fn a_learner_follows_a_restarted_server_whose_first_probe_was_lost() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (db, logs) = (dir.path().join("kiln.db"), dir.path().join("cluster"));
+        let server = Store::open_grouped(&db, &logs)?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        {
+            let g = server.group().context("grouped")?;
+            g.learners([member].into());
+            until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        }
+        let current = Arc::new(Mutex::new(Some(server.clone())));
+        let fetch: Fetch = {
+            let current = current.clone();
+            Arc::new(move |dest: &Path| {
+                let (s, d) = (current.lock().clone().context("the server is stopped")?, dest.to_path_buf());
+                crate::rt::block_on(async move { s.copy_for_learner(d).await })
+            })
+        };
+        let replica = dir.path().join("runner").join("kiln.db");
+        let read = |k: &str| -> anyhow::Result<Option<String>> {
+            let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
+        };
+        let learner = Arc::new(Group::learner(&replica, &dir.path().join("runner").join("cluster"), member, fetch)?);
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up, done.clone());
+        set(&server, "w", "x")?;
+        until("a write on the learner", || Ok(read("w")?.as_deref() == Some("x")))?;
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        *current.lock() = None;
+        drop(server);
+        // The restarted server's messages are dropped, unsaid, until its first probe has gone.
+        let server = Store::open_grouped(&db, &logs)?;
+        *current.lock() = Some(server.clone());
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone());
+        set(&server, "lost", "y")?;
+        thread::sleep(Duration::from_millis(500));
+        up.store(true, Ordering::SeqCst);
+        set(&server, "after", "2")?;
+        let followed = until("a write after the lost probe on the learner", || Ok(read("after")?.as_deref() == Some("2")));
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        followed
+    }
+
+    /// A learner whose group stops (here a gap it can't fetch a copy for) says so and why, and
+    /// applies nothing more: its runner starts it again rather than keep it (adacachy's, on
+    /// 2026-10-25, sat for hours applying nothing).
+    #[test]
+    fn a_learner_whose_group_stopped_says_why() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("kiln.db");
+        let server = Store::open_grouped(&db, &dir.path().join("cluster"))?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        let g = server.group().context("grouped")?;
+        g.learners([member].into());
+        until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        // The first copy comes; every one after fails.
+        let copies = Arc::new(AtomicU64::new(0));
+        let fetch: Fetch = {
+            let (server, copies) = (server.clone(), copies.clone());
+            Arc::new(move |dest: &Path| {
+                if copies.fetch_add(1, Ordering::SeqCst) > 0 {
+                    anyhow::bail!("the server is away");
+                }
+                crate::rt::block_on({
+                    let (s, d) = (server.clone(), dest.to_path_buf());
+                    async move { s.copy_for_learner(d).await }
+                })
+            })
+        };
+        let replica = dir.path().join("runner").join("kiln.db");
+        let learner = Arc::new(Group::learner(&replica, &dir.path().join("runner").join("cluster"), member, fetch)?);
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up, done.clone());
+        assert_eq!(learner.stopped(), None, "it follows");
+        // A write kiln.db holds and the log lacks: the learner meets a gap it can't copy over.
+        let lost = g.next_seq();
+        {
+            let c = Connection::open(&db)?;
+            c.execute("INSERT INTO kv (k, v) VALUES ('lost', 'l')", [])?;
+            c.execute(&format!("UPDATE {STATE} SET seq = ?1 WHERE one = 1"), [i64::try_from(lost)?])?;
+        }
+        g.seq.store(lost, Ordering::SeqCst);
+        set(&server, "next", "3")?;
+        let stopped = until("the learner's group stopped", || Ok(learner.stopped().is_some()));
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        stopped?;
+        assert!(learner.stopped().is_some_and(|why| !why.is_empty()), "it says why: {:?}", learner.stopped());
+        assert!(copies.load(Ordering::SeqCst) > u64::from(FETCH_TRIES), "it tried for a copy first");
         Ok(())
     }
 

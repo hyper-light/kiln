@@ -136,7 +136,9 @@ async fn wip_of(folder: &Path, me: &str) -> anyhow::Result<Option<(String, Strin
     let at = OsStr::new("kiln@localhost");
     let who = [("GIT_AUTHOR_NAME", kiln), ("GIT_AUTHOR_EMAIL", at), ("GIT_COMMITTER_NAME", kiln), ("GIT_COMMITTER_EMAIL", at)];
     let message = format!("Work in progress on {me}");
-    let commit = run_with(Some(folder), &["commit-tree", &tree, "-p", &head, "-m", &message], &who, STATUS_TIME).await?;
+    // Never signed, whatever this machine's git config says: a signing key would be asked for on
+    // every snapshot, and these refs are kiln's own.
+    let commit = run_with(Some(folder), &["commit-tree", "--no-gpg-sign", &tree, "-p", &head, "-m", &message], &who, STATUS_TIME).await?;
     Ok(Some((branch, commit.trim().to_owned())))
 }
 
@@ -417,8 +419,11 @@ mod tests {
         let out = std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
-            .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"])
             .args(args)
+            // Free of this machine's git config: one that signs tags or commits starts gpg.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()?;
         anyhow::ensure!(out.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())

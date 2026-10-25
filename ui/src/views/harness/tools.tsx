@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { ChevronRight, ExternalLink, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
-import type { McpServer, SessionStore, Skill, State } from "@/api/harness";
+import { clientId, type McpServer, type SessionStore, type Skill, type State } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
@@ -282,7 +282,7 @@ function SkillRow({ k, store }: { k: Skill; store: SessionStore }) {
           className="flex gap-2"
           onSubmit={(e) => {
             e.preventDefault();
-            store.send({ type: "skill_run", name: k.name, args: args.trim() || undefined });
+            store.send({ type: "skill_run", name: k.name, args: args.trim() || undefined, id: clientId() });
             setArgs("");
             setRunning(false);
           }}

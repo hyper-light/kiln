@@ -71,7 +71,7 @@ fn p5_kiln_base_as_an_oci_chart() -> anyhow::Result<()> {
     // An app's chart that depends on it there.
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo)?;
-    let out = Command::new(env!("CARGO_BIN_EXE_kiln"))
+    let out = common::kiln()
         .args(["app", "init", "web", "--image", "ghcr.io/acme/web"])
         .arg("--dir")
         .arg(&repo)

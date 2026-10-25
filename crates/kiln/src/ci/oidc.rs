@@ -755,7 +755,19 @@ pub async fn token(hub: &Arc<Hub>, req: &Request) -> Result<Response, Fail> {
     let executor = f.spec.pointer("/executor").and_then(Value::as_str).unwrap_or("host").to_owned();
     // The repository's subject, as it, its organization or the server customized it (W10-R09).
     let keys = subject_keys(hub, f.github.get("repository").and_then(Value::as_str).unwrap_or_default()).await.unwrap_or_default();
-    let facts = rules::Facts { github: &f.github, environment: environment.as_deref(), job_workflow_ref: None, job_workflow_sha: None, trusted: f.trusted, executor: &executor, runner: f.agent.as_deref().unwrap_or_default(), pool: None, job: &claims.sub };
+    // The workflow that defines the job: a called one's for its jobs (W06-R03), else the caller's.
+    let defined = |k: &str| f.spec.pointer(&format!("/defined_in/{k}")).and_then(Value::as_str).filter(|s| !s.is_empty());
+    let facts = rules::Facts {
+        github: &f.github,
+        environment: environment.as_deref(),
+        job_workflow_ref: defined("workflow_ref"),
+        job_workflow_sha: defined("workflow_sha"),
+        trusted: f.trusted,
+        executor: &executor,
+        runner: f.agent.as_deref().unwrap_or_default(),
+        pool: None,
+        job: &claims.sub,
+    };
     let c = rules::claims(&facts, &iss, &audience, &crate::util::new_id(), crate::util::now_unix(), rules::DEFAULT_TTL_SECS, (!keys.is_empty()).then_some(keys.as_slice()));
     let jwt = sign(hub, &c).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(srv::json(StatusCode::OK, &json!({ "count": jwt.len(), "value": jwt })))

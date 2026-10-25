@@ -2,7 +2,18 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentInfo, SubagentBrief, Task } from "../src/api/harness.ts";
 import { standOf, subagentsLine } from "../src/views/harness/mission-rows.ts";
-import { classOf, isSubagent, stopperOf, subagentRunning, subagentsAtWork, subagentTasksAtWork, throughSubagents, workingThrough } from "../src/views/harness/tasks.ts";
+import {
+  classOf,
+  isSubagent,
+  stopperOf,
+  subagentPlaceholder,
+  subagentRunning,
+  subagentsAtWork,
+  subagentTasksAtWork,
+  takesMessages,
+  throughSubagents,
+  workingThrough,
+} from "../src/views/harness/tasks.ts";
 
 const sub = (status: string, rest: Partial<SubagentBrief> = {}): SubagentBrief => ({ id: `sub-${status}`, description: `Audit (${status})`, status, started: 1000, ...rest });
 const task = (rest: Partial<Task>): Task => ({ id: "task", description: "Task", status: "running", started: 1000, ...rest });
@@ -111,4 +122,15 @@ test("tasks from machines before `class` are named by the harness's own task typ
   assert.equal(classOf({ class: "shell", kind: "local_agent" }), "shell");
   assert.equal(isSubagent({}), true);
   assert.equal(isSubagent({ class: "workflow" }), false);
+});
+
+test("over a subagent's thread the composer writes to it only while it takes messages, and says how they reach it", () => {
+  assert.equal(takesMessages({ takes: ["queue", "steer", "now"] }), true);
+  assert.equal(takesMessages({ takes: [] }), false);
+  assert.equal(takesMessages({}), false);
+  assert.equal(takesMessages(undefined), false);
+  assert.equal(subagentPlaceholder(null, false), "Message the subagent");
+  assert.equal(subagentPlaceholder("steer", false), "Steer the subagent — it reads this at its next step");
+  assert.equal(subagentPlaceholder("now", false), "Stop the subagent and say…");
+  assert.equal(subagentPlaceholder("queue", true), "Queue a message for when the subagent finishes (the main agent passes it on)");
 });

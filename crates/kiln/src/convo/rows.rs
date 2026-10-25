@@ -162,7 +162,7 @@ pub fn of(session: &str, update: &Update, now: i64) -> Vec<Row> {
         Update::Events { events } => events.iter().filter_map(|e| event(session, e)).map(|e| Row::Event(Box::new(e))).collect(),
         Update::Reset { from } => vec![Row::Reset { session: s(), from: *from, at: now }],
         Update::Closed => vec![Row::Closed { session: s(), at: now }],
-        Update::Stream { .. } | Update::Reply { .. } => Vec::new(),
+        Update::Stream { .. } | Update::Reply { .. } | Update::Inbox { .. } => Vec::new(),
     }
 }
 

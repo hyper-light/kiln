@@ -589,6 +589,9 @@ pub async fn repair(hub: &Arc<Hub>, name: &str, ask: &Ask) -> Result<Value, Fail
     if action == "clear-self-build-cache" && hub.updates.jobs().iter().any(|j| j.kind == "runner" && j.target == name && j.state == crate::updates::JobState::Running) {
         return Err((StatusCode::CONFLICT, format!("{name} is being upgraded: its build may be using the cache, so it stays until that's done")));
     }
+    if action == "clear-self-build-cache" && crate::fleet::builds_on(hub, name) {
+        return Err((StatusCode::CONFLICT, format!("{name} is building kiln for another machine with the cache, so it stays until that's done")));
+    }
     let a = action.to_owned();
     match hub.ask_runner(name, proto::CAP_DOCTOR, REPAIR_WAIT, move |req| ServerMsg::Repair { req, action: a }).await {
         Ok(Some(Some(json))) => {

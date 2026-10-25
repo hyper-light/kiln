@@ -112,7 +112,7 @@ pub fn listed(cd: bool) -> Vec<Info> {
 
 /// Operations on one agent that an agent calling them without `agent` means for itself: its own
 /// goal stack, and putting its own work up for review.
-const YOURS: &[&str] = &["goals.get", "goals.add", "goals.set", "goals.control", "goals.done", "goals.update", "goals.split", "goals.plan", "agents.change"];
+const YOURS: &[&str] = &["goals.get", "goals.add", "goals.set", "goals.control", "goals.done", "goals.update", "goals.order", "goals.split", "goals.plan", "agents.change"];
 
 /// `input` to operation `name` as `caller` means it: an agent's own id where it left out `agent`
 /// on one of [`YOURS`].
@@ -222,6 +222,26 @@ mod tests {
         // Listed whether deployments are on or not.
         assert!(listed(false).iter().any(|o| o.name == "agents.wait"));
         assert!(listed(false).iter().any(|o| o.name == "plans.create"));
+    }
+
+    /// CP-T3.2 (the twelfth adversarial check's): an operation that takes an idempotency key (or,
+    /// a step tried again, the try it replaces) says what a call without it is, and tells its caller
+    /// to pass it: an agent that asks again after a lost answer without it is a second prompt, or a
+    /// second agent. Every one that ends in a prompt takes one.
+    #[test]
+    fn a_keyed_operation_tells_its_caller_to_pass_its_key() {
+        let mut keyed = Vec::new();
+        for op in own() {
+            let input = (op.input)();
+            for field in ["key", "try"] {
+                let Some(said) = input.pointer(&format!("/properties/{field}/description")).and_then(Value::as_str) else { continue };
+                keyed.push(op.name);
+                assert!(said.contains("Without it") && said.contains("pass it"), "{}'s `{field}` doesn't tell its caller to pass it: {said}", op.name);
+            }
+        }
+        for name in ["agents.send", "goals.add", "goals.control", "goals.done", "plans.run", "plans.runs.retry"] {
+            assert!(keyed.contains(&name), "{name} takes no key");
+        }
     }
 
     /// An agent's own goal stack and change request need no id: left out, `agent` is the agent

@@ -60,10 +60,11 @@ curl -fsSL http://<server>:7070/install.sh | sh -s -- --token <join-token> --lab
 
 ## Platforms
 
-kiln builds and runs on Linux, macOS and Windows, on x86_64 and arm64. Every tagged release
-(`.github/workflows/release.yml`) publishes `kiln-<version>-<target>.tar.gz` / `.zip`, the bare
-binaries and `SHA256SUMS` for `x86_64`/`aarch64-unknown-linux-musl` (fully static),
-`x86_64`/`aarch64-apple-darwin` and `x86_64`/`aarch64-pc-windows-msvc`.
+kiln builds and runs on Linux and Windows, on x86_64 and arm64, and on Apple silicon Macs (not
+Intel ones). Every tagged release (`.github/workflows/release.yml`) publishes
+`kiln-<version>-<target>.tar.gz` / `.zip`, the bare binaries and `SHA256SUMS` for
+`x86_64`/`aarch64-unknown-linux-musl` (fully static), `aarch64-apple-darwin` and
+`x86_64`/`aarch64-pc-windows-msvc`.
 
 | | Linux | macOS | Windows |
 | --- | --- | --- | --- |

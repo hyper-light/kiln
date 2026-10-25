@@ -6,14 +6,19 @@
 //! or built itself) every other connected runner is told, and catches up however it can:
 //!
 //! 1. It downloads a binary of that commit for its platform, when kiln has one: the server's own,
-//!    one the release pipeline built, or one another machine of its platform built itself.
-//! 2. Else, on a machine with a checkout of kiln (the sign it builds kiln), it builds the commit
-//!    itself, from the server's archive of it, in a directory of its own
-//!    (`~/.cache/kiln/self-build`, a source tree per build beside one cache of compiled crates; the
-//!    checkout is never touched), and installs that build. A Mac
-//!    hands its binary back, so other Macs download it instead of building; a Linux build links
-//!    the machine's own C library, so it is that machine's alone.
-//! 3. Else it waits for a build of the commit, and says what for.
+//!    one the release pipeline built, or one a machine built for its platform.
+//! 2. Else a machine builds the commit from the server's archive of it, in a directory of its own
+//!    (`~/.cache/kiln/self-build`, a source tree per build beside one cache of compiled crates). No
+//!    checkout of kiln is needed anywhere: who builds is decided by the tools a machine has (cargo
+//!    and node, as its facts report them). A runner that has them builds the commit itself and
+//!    installs that build. A Mac hands its binary back, so the other Macs download it instead of
+//!    building; a Linux build links the machine's own C library, so it is that machine's alone.
+//! 3. A Mac that can't build kiln itself (one without developer tools) gets its build over the
+//!    wire: another Mac with the tools builds the commit natively, else a Linux machine cross-builds
+//!    it (`ci/release/build.sh`: zig, against the macOS stubs). The binary comes back to the server
+//!    and the Mac downloads it, in the same upgrade. One build of a commit for a platform serves
+//!    every machine of it: a runner that needs a build already under way waits for that one.
+//! 4. Else it waits for a build of the commit, and says what for.
 //!
 //! Nothing a runner runs is stopped: it takes a new binary in place once it is idle. A machine's
 //! commit is the one it reports ([`crate::proto::AgentMsg::Facts`]), else the one kiln knows its
@@ -43,8 +48,11 @@ const UNKNOWN_TTL: Duration = Duration::from_secs(2 * 60);
 const TRIES: u32 = 2;
 /// Between two tries.
 const RETRY: Duration = Duration::from_secs(30 * 60);
-/// A machine found without a kiln checkout isn't asked to build again for this long.
-const NO_CHECKOUT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// A machine whose build found it lacks a tool to build kiln isn't asked to build again for this
+/// long.
+const CANT_BUILD_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often a runner waiting for a build another machine makes looks for its binary.
+const JOIN_POLL: Duration = Duration::from_secs(2);
 /// How long the new runner has to report in after its install finished.
 const REPORT_IN: Duration = Duration::from_secs(90);
 /// Builds remembered with their commit.
@@ -53,12 +61,22 @@ const KEEP_BUILDS: usize = 400;
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What a build script prints for the server to read (`OK_MARK` and `FAIL_MARK` as an upgrade
-/// through a terminal prints them).
+/// through a terminal prints them): the SHA-256 of what it built, and that the machine can't
+/// build kiln (a tool missing), with why.
 const BUILT_MARK: &str = "KILN-BUILT";
-const NO_CHECKOUT_MARK: &str = "KILN-NO-CHECKOUT";
+const CANT_BUILD_MARK: &str = "KILN-CANT-BUILD";
 
-/// Where a machine looks for a checkout of kiln, besides where its agents work and its synced
-/// copies: the usual homes of source code.
+/// The tools a machine builds kiln with natively, as its facts name them (npm comes with node).
+const NATIVE_TOOLS: [&str; 2] = ["cargo", "node"];
+/// The tools a Linux machine cross-builds kiln for a Mac with: `ci/release/build.sh` fetches its
+/// own zig with python3.
+const CROSS_TOOLS: [&str; 3] = ["cargo", "node", "python3"];
+/// What building natively counts for when a machine is picked to build for another: more than any
+/// room a machine has, less than its being overloaded (`crate::reach::directory::OVERLOADED`).
+const NATIVE: f32 = 1.0e3;
+
+/// The usual homes of a checkout of kiln, which a runner reports where it has one
+/// (`crate::updates::kiln_checkout`). Nothing needs one to build kiln.
 pub(crate) const USUAL: [&str; 12] =
     ["Projects/kiln", "projects/kiln", "src/kiln", "code/kiln", "Code/kiln", "dev/kiln", "Developer/kiln", "git/kiln", "repos/kiln", "workspace/kiln", "work/kiln", "kiln"];
 
@@ -80,10 +98,12 @@ struct Known {
     at: i64,
 }
 
-/// A build a machine is doing of itself.
+/// A build of the newest kiln a machine is making: of itself, or for another machine's platform.
 #[derive(Debug, Clone)]
 struct Building {
+    /// Where it's built.
     machine: String,
+    /// The platform it's built for.
     target: String,
     commit: String,
     /// Its binary is kept here for the machines of its platform.
@@ -110,8 +130,8 @@ pub struct Fleet {
     building: Mutex<HashMap<String, Building>>,
     /// (machine, commit) → tries so far.
     tries: Mutex<HashMap<(String, String), Tries>>,
-    /// Machines found without a kiln checkout, and when.
-    no_checkout: Mutex<HashMap<String, Instant>>,
+    /// Machines whose build found they lack a tool to build kiln: when, and why.
+    cant_build: Mutex<HashMap<String, (Instant, String)>>,
     /// Commits looked up on the release branch.
     on_branch: Mutex<HashMap<String, Branch>>,
     /// Machines whose own kiln config refuses upgrades (`[updates] accept = false`).
@@ -272,7 +292,7 @@ pub fn binary_for(hub: &Hub, target: &str, commit: &str) -> Option<Binary> {
 
 // ------------------------------------------------------------------ the newest commit
 
-async fn release_repo(hub: &Hub) -> Option<crate::store::Repo> {
+pub(crate) async fn release_repo(hub: &Hub) -> Option<crate::store::Repo> {
     let name = &hub.cfg.updates.release_repo;
     hub.store.repos().await.ok()?.into_iter().find(|r| &r.name == name)
 }
@@ -299,7 +319,7 @@ async fn on_branch(hub: &Hub, repo: &crate::store::Repo, commit: &str) -> Option
     answer
 }
 
-async fn is_ancestor(hub: &Hub, mirror: &str, a: &str, b: &str) -> bool {
+pub(crate) async fn is_ancestor(hub: &Hub, mirror: &str, a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b) || crate::gitops::run_git(hub, &["-C", mirror, "merge-base", "--is-ancestor", a, b], GIT_TIMEOUT).await.is_ok()
 }
 
@@ -434,10 +454,26 @@ pub async fn standing(hub: &Hub, r: &RunnerInfo, t: &Target) -> Standing {
 pub enum Plan {
     /// It downloads this binary of the newest commit.
     Download(Binary),
-    /// It builds the newest commit itself (where its kiln checkout may be).
-    Build(Vec<String>),
+    /// A machine builds the newest commit for it, from the server's source ([`Builder`]).
+    Build(Builder),
+    /// A build of the newest commit for its platform is under way (upgrade job `job`, on machine
+    /// `on`): it downloads that build once it's kept here.
+    Join { job: String, on: String },
     /// Nothing it can do now: why, as the end of a sentence about the machine ("waits for …").
     Wait(String),
+}
+
+/// The machine that builds the newest kiln for a runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Builder {
+    pub machine: String,
+    /// The runner itself, which installs what it built; else another machine, which hands the
+    /// binary back to the server for the runner to download.
+    pub itself: bool,
+    /// Cross-built on Linux (`ci/release/build.sh`), rather than natively.
+    pub cross: bool,
+    /// Why the runner doesn't build it itself, when another machine does.
+    pub why: String,
 }
 
 /// A release run building what a runner waits for, and how far it is: what the runner's row says
@@ -477,15 +513,18 @@ impl ReleaseRun {
     }
 }
 
-/// A run of the release pipeline building `commit` right now (a job of it running), and where it
-/// is. With `target`, only one whose job for that platform is the one running.
-async fn release_building(hub: &Hub, commit: &str, target: Option<&str>) -> Option<ReleaseRun> {
+/// A run of the release pipeline building `commit` for `target` right now (its job for that
+/// platform running), and where it is. With `queued`, one whose job for it is yet to start counts
+/// too; never one whose job for it has ended (a run whose macOS job failed builds no Mac's binary,
+/// however long its other jobs go on).
+async fn release_building(hub: &Hub, commit: &str, target: &str, queued: bool) -> Option<ReleaseRun> {
     let u = &hub.cfg.updates;
     let repo = release_repo(hub).await?;
     let runs = hub.store.runs(Some(repo.id.clone()), 50, None).await.ok()?;
     for run in runs.into_iter().filter(|r| r.pipeline == u.release_pipeline && r.sha.eq_ignore_ascii_case(commit) && !r.status.is_terminal()) {
         let jobs = hub.store.jobs(run.id.clone(), false).await.unwrap_or_default();
-        if let Some(j) = jobs.iter().find(|j| j.status == crate::store::Status::Running && target.is_none_or(|t| j.key == platform_job(t))) {
+        let Some(j) = jobs.iter().find(|j| j.key == platform_job(target)) else { continue };
+        if j.status == crate::store::Status::Running || (queued && !j.status.is_terminal()) {
             let step = j.steps.iter().find(|s| s.status == crate::store::Status::Running);
             return Some(ReleaseRun {
                 run: run.id.clone(),
@@ -505,9 +544,9 @@ pub async fn waits_on(hub: &Hub, r: &RunnerInfo, t: &Target) -> Option<ReleaseRu
     if binary_for(hub, target, &t.commit).is_some() {
         return None;
     }
-    match release_building(hub, &t.commit, Some(target)).await {
+    match release_building(hub, &t.commit, target, false).await {
         Some(b) => Some(b),
-        None if can_build(hub, r).is_err() => release_building(hub, &t.commit, None).await,
+        None if build_plan(hub, r, target, &t.commit).is_err() => release_building(hub, &t.commit, target, true).await,
         None => None,
     }
 }
@@ -524,50 +563,150 @@ pub fn platform_job(target: &str) -> &'static str {
     }
 }
 
-/// Where a machine's kiln checkout may be: its synced copies of kiln, where its agents work (the
-/// build script climbs to the top of the repository), then the usual places (relative to its home).
-fn checkouts(hub: &Hub, machine: &str) -> Vec<String> {
-    let mut v: Vec<String> = Vec::new();
-    let mut add = |p: &str| {
-        let p = p.trim();
-        // Each goes in double quotes in the script: nothing there may end the quote or expand.
-        if !p.is_empty() && !p.contains(|c: char| "\"'`$\\\n\r".contains(c)) && !v.iter().any(|x| x == p) && v.len() < 24 {
-            v.push(p.to_owned());
-        }
-    };
-    if let Some(k) = reported(hub, machine)
-        && let Some(c) = &k.checkout
-    {
-        add(c);
-    }
-    let name = &hub.cfg.updates.release_repo;
-    let short_name = name.rsplit('/').next().unwrap_or(name);
-    for repo in hub.sync.view().repos {
-        if repo.name == *name || repo.name == short_name {
-            for c in repo.copies.iter().filter(|c| c.machine == machine) {
-                add(&c.path);
-            }
-        }
-    }
-    let at = format!("agent:{machine}");
-    for s in hub.harness.list().into_iter().filter(|s| s.target == at) {
-        add(&s.cwd);
-    }
-    v
+/// Whether a build for `target` serves every machine of that platform, so it's kept here and can be
+/// made on another machine: a Mac's does (natively on a Mac, or cross-built on Linux); a Linux
+/// machine's links its own C library, so it is that machine's alone.
+fn shared(target: &str) -> bool {
+    target.ends_with("-apple-darwin")
 }
 
-/// Whether `r` can build kiln itself; else why not.
-pub(crate) fn can_build(hub: &Hub, r: &RunnerInfo) -> Result<Vec<String>, String> {
+/// Which of `need` aren't among `tools` (a machine's facts: name → version).
+fn lacks<'a>(tools: &BTreeMap<String, String>, need: &[&'a str]) -> Vec<&'a str> {
+    need.iter().copied().filter(|t| !tools.contains_key(*t)).collect()
+}
+
+/// Why `machine` can't build kiln, as its last build found (a tool missing), while that holds.
+fn cant_build(hub: &Hub, machine: &str) -> Option<String> {
+    hub.updates.fleet.cant_build.lock().get(machine).filter(|(at, _)| at.elapsed() < CANT_BUILD_TTL).map(|(_, why)| why.clone())
+}
+
+/// Whether `r` builds kiln itself: it has the tools to (its facts say so; no checkout of kiln is
+/// needed: the source comes from the server); else why not.
+pub(crate) fn builds_itself(hub: &Hub, r: &RunnerInfo) -> Result<(), String> {
     if r.os != "linux" && r.os != "macos" {
         return Err("kiln builds itself only on Linux and macOS".to_owned());
     }
     if !r.terminal {
         return Err("terminals are turned off on it, and a build runs in one".to_owned());
     }
-    if hub.updates.fleet.no_checkout.lock().get(&r.name).is_some_and(|at| at.elapsed() < NO_CHECKOUT_TTL) {
-        return Err("no kiln checkout was found on it".to_owned());
+    if let Some(why) = cant_build(hub, &r.name) {
+        return Err(why);
     }
-    Ok(checkouts(hub, &r.name))
+    let missing = hub.agents.lock().get(&r.name).and_then(|a| a.facts.as_ref().map(|f| lacks(&f.tools, &NATIVE_TOOLS)));
+    match missing {
+        Some(m) if m.is_empty() => Ok(()),
+        Some(m) => Err(format!("it has no {} to build kiln with", m.join(" or "))),
+        None => Err("it hasn't said which tools it has".to_owned()),
+    }
+}
+
+/// A machine that could build kiln for another, as [`pick`] weighs it.
+#[derive(Debug, Clone)]
+struct Candidate {
+    name: String,
+    os: String,
+    /// The platform its own builds are for.
+    target: Option<String>,
+    tools: BTreeMap<String, String>,
+    /// Its room for more work (`crate::reach::directory::room`).
+    room: f32,
+}
+
+/// Of `candidates`, the one to build kiln for `target`, and whether it cross-builds: a machine of
+/// that platform with the tools builds natively; a Linux machine with the tools cross-builds a
+/// Mac's (`ci/release/build.sh`). Natively first, unless that machine is overloaded; then the one
+/// with the most room.
+fn pick(target: &str, candidates: &[Candidate]) -> Option<(String, bool)> {
+    candidates
+        .iter()
+        .filter_map(|c| {
+            if c.target.as_deref() == Some(target) && lacks(&c.tools, &NATIVE_TOOLS).is_empty() {
+                Some((c, false, c.room + NATIVE))
+            } else if shared(target) && c.os == "linux" && lacks(&c.tools, &CROSS_TOOLS).is_empty() {
+                Some((c, true, c.room))
+            } else {
+                None
+            }
+        })
+        .max_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(c, cross, _)| (c.name.clone(), cross))
+}
+
+/// Who builds the newest kiln for `r` (whose platform is `target`): `r` itself when it can; else,
+/// for a platform whose builds serve all its machines, another connected machine that can build
+/// it (natively, else cross-built on Linux), when `r` can take a download (a runner too old to
+/// upgrade itself takes one only through a terminal); else why not.
+pub(crate) fn builder(hub: &Hub, r: &RunnerInfo, target: &str) -> Result<Builder, String> {
+    let why = match builds_itself(hub, r) {
+        Ok(()) => return Ok(Builder { machine: r.name.clone(), itself: true, cross: false, why: String::new() }),
+        Err(why) => why,
+    };
+    if !shared(target) || (r.method != "native" && !r.terminal) {
+        return Err(why);
+    }
+    let candidates: Vec<Candidate> = hub
+        .agents
+        .lock()
+        .values()
+        .filter(|a| a.connected && !a.ephemeral && !a.outpost && !a.draining && a.terminal && a.name != r.name)
+        .filter_map(|a| {
+            let strain = a.sample.as_ref().map(|s| crate::reach::directory::strain(s.cpus, s.cpu_pct, s.load1, s.mem_total, s.mem_used)).unwrap_or_default();
+            Some(Candidate {
+                name: a.name.clone(),
+                os: a.os.clone(),
+                target: crate::updates::target_for(&a.os, &a.arch),
+                tools: a.facts.as_ref()?.tools.clone(),
+                room: crate::reach::directory::room(strain, a.busy, a.slots),
+            })
+        })
+        .collect();
+    let candidates: Vec<Candidate> = candidates.into_iter().filter(|c| cant_build(hub, &c.name).is_none()).collect();
+    match pick(target, &candidates) {
+        Some((machine, cross)) => Ok(Builder { machine, itself: false, cross, why }),
+        None => Err(format!("{why}, and no connected machine can build kiln for {target}")),
+    }
+}
+
+/// A build of `commit` for `target` under way whose binary will be kept here: its upgrade job and
+/// the machine building it.
+fn under_way(hub: &Hub, target: &str, commit: &str) -> Option<(String, String)> {
+    hub.updates.fleet.building.lock().iter().find(|(_, b)| b.keep && b.target == target && b.commit.eq_ignore_ascii_case(commit)).map(|(job, b)| (job.clone(), b.machine.clone()))
+}
+
+/// Whether `machine` is building kiln right now (for itself or another machine): its self-build
+/// cache is in use.
+pub fn builds_on(hub: &Hub, machine: &str) -> bool {
+    hub.updates.fleet.building.lock().values().any(|b| b.machine == machine)
+}
+
+/// How a runner gets the newest commit built ([`build_plan`]): [`Plan::Join`] or [`Plan::Build`].
+enum BuildPlan {
+    Join { job: String, on: String },
+    Build(Builder),
+}
+
+impl From<BuildPlan> for Plan {
+    fn from(p: BuildPlan) -> Self {
+        match p {
+            BuildPlan::Join { job, on } => Plan::Join { job, on },
+            BuildPlan::Build(b) => Plan::Build(b),
+        }
+    }
+}
+
+/// How `r` gets the newest commit (`commit`, for its platform `target`) built: by joining a build of
+/// it for its platform already under way, else by [`builder`]; else why not. Once kiln has a binary
+/// of it, only a build of the runner's own is worth making (a download that keeps failing).
+fn build_plan(hub: &Hub, r: &RunnerInfo, target: &str, commit: &str) -> Result<BuildPlan, String> {
+    let have = binary_for(hub, target, commit).is_some();
+    if !have && let Some((job, on)) = under_way(hub, target, commit) {
+        return Ok(BuildPlan::Join { job, on });
+    }
+    let b = builder(hub, r, target)?;
+    if have && !b.itself {
+        return Err(format!("{}; kiln has a build of {} for {target} to download", b.why, short(commit)));
+    }
+    Ok(BuildPlan::Build(b))
 }
 
 /// How `r` catches up with `t`.
@@ -581,14 +720,15 @@ pub async fn plan(hub: &Hub, r: &RunnerInfo, t: &Target) -> Plan {
     }
     let now = crate::util::now_unix();
     // The release build's job for its platform is under way: that binary comes soon.
-    if let Some(b) = release_building(hub, &t.commit, Some(target)).await {
+    if let Some(b) = release_building(hub, &t.commit, target, false).await {
         return Plan::Wait(format!("waits for the release build of {s} ({})", b.words(now)));
     }
-    // Otherwise a machine that can build itself does so now, rather than wait on a build of every
-    // platform at once on another machine, which can take hours.
-    match can_build(hub, r) {
-        Ok(c) => Plan::Build(c),
-        Err(why) => match release_building(hub, &t.commit, None).await {
+    // Otherwise a machine builds it now (one already building it for its platform serves it too),
+    // rather than wait on a build of every platform at once on another machine, which can take
+    // hours.
+    match build_plan(hub, r, target, &t.commit) {
+        Ok(p) => p.into(),
+        Err(why) => match release_building(hub, &t.commit, target, true).await {
             Some(b) => Plan::Wait(format!("waits for the release build of {s} ({})", b.words(now))),
             None => Plan::Wait(format!("waits for a build of {s} for {target}: {why}")),
         },
@@ -600,23 +740,28 @@ pub async fn ways(hub: &Hub, r: &RunnerInfo, t: &Target) -> Vec<crate::updates::
     use crate::updates::{Way, WayOpen};
     let s = short(&t.commit);
     let Some(target) = r.target.as_deref() else { return Vec::new() };
+    let way = |way, ok, why: String, on: Option<String>| WayOpen { way, ok, why, on };
     let download = match binary_for(hub, target, &t.commit) {
-        Some(_) if r.method != "native" && !r.terminal => {
-            WayOpen { way: Way::Download, ok: false, why: "its runner is too old to upgrade itself, and terminals are off on it".to_owned() }
-        }
-        Some(b) => WayOpen { way: Way::Download, ok: true, why: format!("downloads build {} of {s}", b.build) },
-        None => WayOpen {
-            way: Way::Download,
-            ok: false,
-            why: match release_building(hub, &t.commit, Some(target)).await {
+        Some(_) if r.method != "native" && !r.terminal => way(Way::Download, false, "its runner is too old to upgrade itself, and terminals are off on it".to_owned(), None),
+        Some(b) => way(Way::Download, true, format!("downloads build {} of {s}", b.build), None),
+        None => way(
+            Way::Download,
+            false,
+            match release_building(hub, &t.commit, target, false).await {
                 Some(b) => format!("no binary of {s} for {target} yet: release run #{} is building one", b.number),
                 None => format!("no binary of {s} for {target} yet"),
             },
-        },
+            None,
+        ),
     };
-    let build = match can_build(hub, r) {
-        Ok(_) => WayOpen { way: Way::Build, ok: true, why: format!("builds {s} on the machine, from the server's source") },
-        Err(why) => WayOpen { way: Way::Build, ok: false, why },
+    let build = match build_plan(hub, r, target, &t.commit) {
+        Ok(BuildPlan::Join { on, .. }) => way(Way::Build, true, format!("{on} is building {s} for {target} now: it downloads that build"), Some(on)),
+        Ok(BuildPlan::Build(b)) if b.itself => way(Way::Build, true, format!("builds {s} on the machine, from the server's source"), None),
+        Ok(BuildPlan::Build(b)) => {
+            let how = if b.cross { "cross-builds" } else { "builds" };
+            way(Way::Build, true, format!("{} {how} {s} for {target} from the server's source, and it downloads that build", b.machine), Some(b.machine))
+        }
+        Err(why) => way(Way::Build, false, why, None),
     };
     vec![download, build]
 }
@@ -628,7 +773,7 @@ pub fn plan_by(hub: &Hub, r: &RunnerInfo, t: &Target, way: crate::updates::Way) 
         crate::updates::Way::Download => {
             Plan::Download(binary_for(hub, target, &t.commit).ok_or_else(|| anyhow::anyhow!("no binary of {} for {target} yet", short(&t.commit)))?)
         }
-        crate::updates::Way::Build => Plan::Build(can_build(hub, r).map_err(|why| anyhow::anyhow!("{} can't build kiln itself: {why}", r.name))?),
+        crate::updates::Way::Build => build_plan(hub, r, target, &t.commit).map_err(|why| anyhow::anyhow!("kiln can't be built for {} now: {why}", r.name))?.into(),
     })
 }
 
@@ -644,7 +789,14 @@ pub async fn next(hub: &Hub, r: &RunnerInfo, t: &Target, standing: Standing) -> 
         Standing::Behind | Standing::Unknown => {}
     }
     if let Some(j) = hub.updates.running_for("runner", &r.name) {
-        return Some(("upgrading", if j.method == "build" { format!("is building {s} itself") } else { format!("is upgrading to {s}") }));
+        return Some((
+            "upgrading",
+            match (j.method, j.on) {
+                ("build", Some(on)) => format!("is upgrading to {s}, built by {on}"),
+                ("build", None) => format!("is building {s} itself"),
+                _ => format!("is upgrading to {s}"),
+            },
+        ));
     }
     let auto = r.policy == crate::updates::Policy::Auto;
     if r.locked {
@@ -660,7 +812,10 @@ pub async fn next(hub: &Hub, r: &RunnerInfo, t: &Target, standing: Standing) -> 
     let when = if auto { "" } else { " when you upgrade it" };
     Some(match plan(hub, r, t).await {
         Plan::Download(b) => ("download", format!("downloads build {} ({s}){when}", b.build)),
-        Plan::Build(_) => ("build", format!("builds {s} itself{when}")),
+        Plan::Build(b) if b.itself => ("build", format!("builds {s} itself{when}")),
+        Plan::Build(b) => ("build", format!("gets {s} {} by {}{when}", if b.cross { "cross-built" } else { "built" }, b.machine)),
+        Plan::Join { on, .. } if auto => ("wait", format!("waits for the build of {s} {on} is making, then downloads it")),
+        Plan::Join { on, .. } => ("build", format!("gets the build of {s} {on} is making{when}")),
         Plan::Wait(why) => ("wait", why),
     })
 }
@@ -727,8 +882,8 @@ async fn follow(hub: &Arc<Hub>, t: &Target) {
         }
         let started = match plan(hub, &r, t).await {
             Plan::Download(b) => Some(crate::updates::upgrade_with(hub, &r, &b, "kiln").await),
-            Plan::Build(c) => Some(self_build(hub, &r, &t.commit, c, "kiln").await),
-            Plan::Wait(_) => None,
+            Plan::Build(b) => Some(build(hub, &r, &t.commit, &b, "kiln").await),
+            Plan::Join { .. } | Plan::Wait(_) => None,
         };
         match started {
             Some(Ok(job)) => {
@@ -754,7 +909,7 @@ pub fn on_job_end(hub: &Hub, job: &Job, error: Option<&str>) {
     hub.updates.fleet.wake();
 }
 
-// ------------------------------------------------------------------ a machine builds itself
+// ------------------------------------------------------------------ a machine builds kiln
 
 /// The token a build job's machine fetches the source and hands back its binary with.
 pub fn token(hub: &Hub, job: &str) -> String {
@@ -794,35 +949,116 @@ pub async fn on_built(hub: &Arc<Hub>, job: &str, sha256: &str, bytes: Option<Vec
     Ok(())
 }
 
+/// What a build script builds, and what becomes of its binary ([`build_script`]).
+pub struct Script<'a> {
+    /// The upgrade job it is.
+    pub job: &'a str,
+    /// Where the machine can reach this server ([`crate::updates::server_bases`]).
+    pub bases: &'a [String],
+    /// What it fetches the source and hands the binary back with ([`token`]).
+    pub token: &'a str,
+    pub commit: &'a str,
+    /// The platform it builds for.
+    pub target: &'a str,
+    /// Cross-built on Linux (`ci/release/build.sh`), rather than natively.
+    pub cross: bool,
+    /// Its binary goes back to the server, kept for the machines of its platform.
+    pub keep: bool,
+    /// The machine installs what it built, for its runner process (`crate::updates::instance8`:
+    /// empty for the machine's usual one); else it builds for another machine, and handing the
+    /// binary back is the point.
+    pub install: Option<&'a str>,
+}
+
 /// The script a machine builds kiln with, through a terminal kiln opens on it (so a runner from
-/// before this builds too). It needs a kiln checkout (only as the sign the machine builds kiln:
-/// the source comes from the server, and the build goes to `~/.cache/kiln/self-build`), cargo,
-/// npm, tar and curl. Free of single quotes and backslashes, as [`crate::updates::terminal_script`].
-pub fn build_script(job: &str, bases: &[String], token: &str, commit: &str, candidates: &[String], keep: bool, inst8: &str) -> String {
+/// before this builds too). No checkout of kiln is needed: the source comes from the server, and
+/// the build goes to `~/.cache/kiln/self-build`. It needs cargo, npm, tar and curl (a Mac building
+/// natively, Apple's developer tools too; a Linux machine cross-building, rustup and python3), and
+/// says which it lacks ([`CANT_BUILD_MARK`]). Free of single quotes and backslashes, as
+/// [`crate::updates::terminal_script`].
+pub fn build_script(sc: &Script<'_>) -> String {
     let ok = crate::updates::OK_MARK;
     let fail = crate::updates::FAIL_MARK;
     let hidden = crate::updates::HIDDEN_MARK;
+    let (job, token, commit, target) = (sc.job, sc.token, sc.commit, sc.target);
     let s = short(commit);
-    let mut dirs: Vec<String> = candidates.iter().map(|c| format!("\"{c}\"")).collect();
-    dirs.extend(USUAL.iter().map(|u| format!("\"$HOME/{u}\"")));
-    let dirs = dirs.join(" ");
-    let bases = bases.join(" ");
-    let strip = if inst8.is_empty() { String::new() } else { format!("case \"$svc\" in *-{inst8}) svc=${{svc%-{inst8}}} ;; esac\n") };
-    let hand_back = if keep {
-        format!(
-            r#"if curl -fsS -X POST -H "Authorization: Bearer {token}" -H "Content-Type: application/octet-stream" --data-binary @"$bin" "$base/api/updates/jobs/{job}/binary?sha256=$sum" >/dev/null; then
-  echo "handed the binary to the server, for machines like this one"
-else
-  echo "could not hand the binary to the server: machines like this one build it themselves"
-fi"#
+    let bases = sc.bases.join(" ");
+    let (tools, what) = if sc.cross { ("cargo npm tar curl rustup python3", "ci/release/build.sh") } else { ("cargo npm tar curl", "cargo") };
+    let mac_tools = if sc.cross {
+        ""
+    } else {
+        r#"if [ "$(uname -s)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1; then
+  cant "this Mac has no developer tools (xcode-select --install installs them), so it cannot build kiln"
+fi
+"#
+    };
+    let svc = match sc.install {
+        Some(inst8) => {
+            let strip = if inst8.is_empty() { String::new() } else { format!("case \"$svc\" in *-{inst8}) svc=${{svc%-{inst8}}} ;; esac\n") };
+            format!(
+                r#"svc=kiln-agent
+if [ -r /proc/self/cgroup ]; then
+  cg=$(grep -m1 -E "^0::|name=systemd" /proc/self/cgroup | cut -d: -f3)
+  case "$cg" in
+    */kiln*.service) svc=$(basename "$cg" .service) ;;
+  esac
+fi
+{strip}"#
+            )
+        }
+        None => String::new(),
+    };
+    let (build, bin) = if sc.cross {
+        (
+            format!(
+                r#"if [ "$cargo" = "cargo +stable" ]; then export RUSTUP_TOOLCHAIN=stable; fi
+echo "cross-building kiln {s} for {target} with $(cargo --version 2>/dev/null): ci/release/build.sh, zig against the macOS stubs"
+{{ KILN_COMMIT={commit} CARGO_TARGET_DIR="$dir/target" KILN_DIST="$dir/dist-{job}" nice -n 10 ci/release/build.sh {target}; echo "$?" >"$dir/rc-{job}"; }} 2>&1 | tee "$log""#
+            ),
+            format!("$dir/dist-{job}/kiln-{target}"),
         )
     } else {
-        format!(r#"curl -fsS -X POST -H "Authorization: Bearer {token}" "$base/api/updates/jobs/{job}/binary?sha256=$sum" >/dev/null || true"#)
+        (
+            format!(
+                r#"echo "building kiln {s} with $($cargo --version 2>/dev/null)"
+{{ MACOSX_DEPLOYMENT_TARGET=11.0 KILN_COMMIT={commit} CARGO_TARGET_DIR="$dir/target" nice -n 10 $cargo build --release --locked -p kiln; echo "$?" >"$dir/rc-{job}"; }} 2>&1 | tee "$log""#
+            ),
+            "$dir/target/release/kiln".to_owned(),
+        )
+    };
+    let post = format!(r#"curl -fsS -X POST -H "Authorization: Bearer {token}" -H "Content-Type: application/octet-stream" --data-binary @"$bin" "$base/api/updates/jobs/{job}/binary?sha256=$sum" >/dev/null"#);
+    let hand_back = match (sc.keep, sc.install) {
+        (true, Some(_)) => format!(
+            r#"if {post}; then
+  echo "handed the binary to the server, for the other machines of {target}"
+else
+  echo "could not hand the binary to the server: the other machines of {target} need a build of their own"
+fi"#
+        ),
+        (true, None) => format!(
+            r#"{post} || fail "could not hand the binary to the server"
+echo "handed the binary to the server: the machines of {target} download it from there""#
+        ),
+        (false, _) => format!(r#"curl -fsS -X POST -H "Authorization: Bearer {token}" "$base/api/updates/jobs/{job}/binary?sha256=$sum" >/dev/null || true"#),
+    };
+    let end = match sc.install {
+        Some(_) => format!(
+            r#"echo "kiln install --agent --upgrade --service $svc"
+"$bin" install --agent --upgrade --service "$svc"
+rc=$?
+if [ "$rc" = 0 ]; then echo "{ok}"; else echo "{fail} install --agent --upgrade exited with $rc"; fi
+exit "$rc""#
+        ),
+        None => format!(
+            r#"rm -rf "$dir/dist-{job}"
+echo "{ok}""#
+        ),
     };
     format!(
         r#"{hidden}{job}
 set -u
 fail() {{ echo "{fail} $*"; exit 1; }}
+cant() {{ echo "{CANT_BUILD_MARK} $*"; exit 10; }}
 le=$("${{SHELL:-/bin/sh}}" -lic env </dev/null 2>/dev/null)
 lp=$(echo "$le" | sed -n "s/^PATH=//p" | tail -n 1)
 if [ -n "$lp" ]; then PATH="$lp:$PATH"; fi
@@ -832,25 +1068,10 @@ for v in RUSTUP_HOME CARGO_HOME; do
 done
 PATH="$PATH:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin"
 export PATH
-repo=""
-for d in {dirs}; do
-  [ -d "$d" ] || continue
-  top=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null || echo "$d")
-  if [ -f "$top/crates/kiln/Cargo.toml" ] && [ -f "$top/ui/package.json" ]; then repo="$top"; break; fi
+for t in {tools}; do
+  command -v "$t" >/dev/null 2>&1 || cant "this machine has no $t, so it cannot build kiln"
 done
-if [ -z "$repo" ]; then echo "{NO_CHECKOUT_MARK} no kiln checkout on this machine"; exit 10; fi
-echo "kiln checkout: $repo (left as it is: the build is of {s}, from the server)"
-for t in cargo npm tar curl; do
-  command -v "$t" >/dev/null 2>&1 || fail "this machine has no $t, so it cannot build kiln"
-done
-svc=kiln-agent
-if [ -r /proc/self/cgroup ]; then
-  cg=$(grep -m1 -E "^0::|name=systemd" /proc/self/cgroup | cut -d: -f3)
-  case "$cg" in
-    */kiln*.service) svc=$(basename "$cg" .service) ;;
-  esac
-fi
-{strip}dir="$HOME/.cache/kiln/self-build"
+{mac_tools}{svc}dir="$HOME/.cache/kiln/self-build"
 mkdir -p "$dir" || fail "cannot make $dir"
 base=""
 for b in {bases}; do
@@ -859,6 +1080,7 @@ for b in {bases}; do
 done
 [ -n "$base" ] || fail "could not fetch the source of {s} from the server"
 find "$dir" -maxdepth 1 -name "src*" -mmin +120 -exec rm -rf {{}} + 2>/dev/null
+find "$dir" -maxdepth 1 -name "dist-*" -mmin +120 -exec rm -rf {{}} + 2>/dev/null
 find "$dir" -maxdepth 1 -name "build-*.log" -mtime +7 -exec rm -f {{}} + 2>/dev/null
 src="$dir/src-{job}"
 rm -rf "$src" && mkdir -p "$src" && tar -xf "$dir/source-{job}.tar" -C "$src" || fail "could not unpack the source"
@@ -883,59 +1105,117 @@ if command -v rustup >/dev/null 2>&1; then
     echo "building with the Rust there is"
   fi
 fi
-echo "building kiln {s} with $($cargo --version 2>/dev/null)"
 log="$dir/build-{job}.log"
-{{ MACOSX_DEPLOYMENT_TARGET=11.0 KILN_COMMIT={commit} CARGO_TARGET_DIR="$dir/target" nice -n 10 $cargo build --release --locked -p kiln; echo "$?" >"$dir/rc-{job}"; }} 2>&1 | tee "$log"
+{build}
 rc=$(cat "$dir/rc-{job}" 2>/dev/null || echo 1)
 rm -f "$dir/rc-{job}"
 if [ "$rc" != 0 ]; then
-  echo "cargo exited with $rc. What it said that went wrong:"
+  echo "{what} exited with $rc. What it said that went wrong:"
   grep -E "^error|could not compile|Killed|signal: |No space left" "$log" | tail -n 40
-  grep -q -E "^error" "$log" || echo "cargo stopped without an error message: the machine may have run out of memory or slept, or the build was stopped"
+  grep -q -E "^error" "$log" || echo "{what} stopped without an error message: the machine may have run out of memory or slept, or the build was stopped"
   fail "kiln did not build (its full output is $log on this machine)"
 fi
-bin="$dir/target/release/kiln"
+bin="{bin}"
 if command -v sha256sum >/dev/null 2>&1; then sum=$(sha256sum "$bin" | cut -d" " -f1); else sum=$(shasum -a 256 "$bin" | cut -d" " -f1); fi
 echo "{BUILT_MARK} $sum"
 {hand_back}
-echo "kiln install --agent --upgrade --service $svc"
-"$bin" install --agent --upgrade --service "$svc"
-rc=$?
-if [ "$rc" = 0 ]; then echo "{ok}"; else echo "{fail} install --agent --upgrade exited with $rc"; fi
-exit "$rc"
+{end}
 "#
     )
 }
 
-/// Start `r` building `commit` itself and upgrading to it (`by`: who asked, for the audit log).
-pub async fn self_build(hub: &Arc<Hub>, r: &RunnerInfo, commit: &str, candidates: Vec<String>, by: &str) -> anyhow::Result<Job> {
+/// Start upgrading `r` to `commit` by a build of it (`by`: who asked, for the audit log): `b`
+/// makes it from the server's source, on `r` itself, which installs it; or on another machine,
+/// which hands the binary back to the server for `r` to download, in the same job. Nothing either
+/// machine runs is stopped.
+pub async fn build(hub: &Arc<Hub>, r: &RunnerInfo, commit: &str, b: &Builder, by: &str) -> anyhow::Result<Job> {
     let target = r.target.clone().ok_or_else(|| anyhow::anyhow!("kiln has no build for {} on {}", r.os, r.arch))?;
     let bases = crate::updates::server_bases(hub);
     anyhow::ensure!(!bases.is_empty(), "kiln has no public URL (server.public_url) the machine could fetch the source from");
-    // A Mac builds exactly the release target of its platform; a Linux build links glibc, not musl.
-    let keep = r.os == "macos" && target.ends_with("-apple-darwin");
+    let s = short(commit);
+    let keep = shared(&target);
     let mut job = crate::updates::new_job("runner", &r.name, "build", r.build.clone(), None);
     job.commit = Some(commit.to_owned());
+    job.on = (!b.itself).then(|| b.machine.clone());
     let id = job.id.clone();
-    hub.updates.fleet.building.lock().insert(id.clone(), Building { machine: r.name.clone(), target: target.clone(), commit: commit.to_owned(), keep });
     hub.updates.insert(job.clone());
-    hub.store.audit(by.into(), "upgrade.runner".into(), format!("{} builds {} itself ({target})", r.name, short(commit))).await;
-    hub.updates.say(hub, &id, format!("{} builds kiln {} itself: no binary of it for {target} yet; nothing it runs is stopped", r.name, short(commit)));
+    hub.updates.fleet.building.lock().insert(id.clone(), Building { machine: b.machine.clone(), target: target.clone(), commit: commit.to_owned(), keep });
+    if b.itself {
+        hub.store.audit(by.into(), "upgrade.runner".into(), format!("{} builds {s} itself ({target})", r.name)).await;
+        hub.updates.say(hub, &id, format!("{} builds kiln {s} itself: no binary of it for {target} yet; nothing it runs is stopped", r.name));
+    } else {
+        let how = if b.cross { "cross-builds" } else { "builds" };
+        hub.store.audit(by.into(), "upgrade.runner".into(), format!("{} {how} {s} for {} ({target})", b.machine, r.name)).await;
+        hub.updates.say(
+            hub,
+            &id,
+            format!("{} {how} kiln {s} for {target}: no binary of it yet, and {} can't build it itself ({}). It downloads the build once it's back here; nothing either machine runs is stopped", b.machine, r.name, b.why),
+        );
+    }
     let inst8 = crate::updates::instance8(r);
-    let script = build_script(&id, &bases, &token(hub, &id), commit, &candidates, keep, &inst8);
-    let (h, machine) = (Arc::clone(hub), r.name.clone());
-    crate::rt::spawn(async move { run_build(&h, &id, &machine, &script).await });
+    let script = build_script(&Script { job: &id, bases: &bases, token: &token(hub, &id), commit, target: &target, cross: b.cross, keep, install: b.itself.then_some(inst8.as_str()) });
+    let (h, machine, runner) = (Arc::clone(hub), b.machine.clone(), (!b.itself).then(|| r.name.clone()));
+    crate::rt::spawn(async move { run_build(&h, &id, &machine, &script, runner.as_deref()).await });
     Ok(job)
 }
 
-/// Runs a build script in a terminal on the machine and follows it.
-async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
+/// Start upgrading `r` to `commit` with the build of it for its platform that machine `on` is
+/// making already (upgrade job `building`): `r` downloads that build once it's kept here, in this
+/// job (`by`: who asked, for the audit log).
+pub async fn join(hub: &Arc<Hub>, r: &RunnerInfo, commit: &str, building: &str, on: &str, by: &str) -> anyhow::Result<Job> {
+    let target = r.target.clone().ok_or_else(|| anyhow::anyhow!("kiln has no build for {} on {}", r.os, r.arch))?;
+    let s = short(commit);
+    let mut job = crate::updates::new_job("runner", &r.name, "build", r.build.clone(), None);
+    job.commit = Some(commit.to_owned());
+    job.on = Some(on.to_owned());
+    let id = job.id.clone();
+    hub.updates.insert(job.clone());
+    hub.store.audit(by.into(), "upgrade.runner".into(), format!("{} gets the build of {s} {on} is making ({target})", r.name)).await;
+    hub.updates.say(hub, &id, format!("{on} is building kiln {s} for {target} already: {} downloads that build once it's back here; nothing it runs is stopped", r.name));
+    let (h, machine, commit, building) = (Arc::clone(hub), r.name.clone(), commit.to_owned(), building.to_owned());
+    crate::rt::spawn(async move { await_build(&h, &id, &machine, &target, &commit, &building).await });
+    Ok(job)
+}
+
+/// Job `id` waits for the binary of `commit` for `target` that upgrade job `building` makes, then
+/// upgrades `machine` to it.
+async fn await_build(hub: &Arc<Hub>, id: &str, machine: &str, target: &str, commit: &str, building: &str) {
+    let u = &hub.updates;
+    let started = Instant::now();
+    loop {
+        if !u.running(id) {
+            return;
+        }
+        if let Some(b) = binary_for(hub, target, commit) {
+            crate::updates::upgrade_into(hub, id, machine, &b).await;
+            return;
+        }
+        match u.job(building) {
+            Some(j) if j.state == crate::updates::JobState::Running => {}
+            j => {
+                let why = j.and_then(|j| j.error).unwrap_or_else(|| "its machine didn't hand a binary back".to_owned());
+                u.finish(hub, id, Err(format!("the build it waited for ended without a binary of {}: {why}", short(commit))));
+                return;
+            }
+        }
+        let limit = crate::updates::waits(hub).await.build();
+        if started.elapsed() > limit {
+            u.time_out(hub, id, "build", format!("the build it waited for didn't finish in {}", crate::updates::said(limit)));
+            return;
+        }
+        crate::rt::sleep(JOIN_POLL).await;
+    }
+}
+
+/// Runs a build script in a terminal on `machine` and follows it: a build the machine installs,
+/// or one for runner `then`, which downloads it once it's kept here.
+async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: Option<&str>) {
     use crate::termsess::Frame;
     let u = &hub.updates;
     let session = crate::termsess::open_agent(hub, machine.to_owned(), Some(format!("sh -c '{script}'")), 200, 50);
     let mut att = session.attach();
     let mut screen = crate::updates::Screen::default();
-    let (mut ok_marked, mut no_checkout) = (false, false);
+    let (mut ok_marked, mut cant) = (false, None::<String>);
     let mut lost = false;
     let mut feed = |text: &str| {
         for shown in screen.feed(text) {
@@ -943,7 +1223,7 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
                 crate::updates::Shown::Line(line) => line,
                 // cargo's progress bar, as it is now (it draws over itself, never ending its line).
                 crate::updates::Shown::Progress(p) => {
-                    if !crate::updates::marked(&p) && !p.starts_with(BUILT_MARK) && !p.starts_with(NO_CHECKOUT_MARK) {
+                    if !crate::updates::marked(&p) && !p.starts_with(BUILT_MARK) && !p.starts_with(CANT_BUILD_MARK) {
                         u.progress(hub, id, p.trim());
                     }
                     continue;
@@ -962,15 +1242,15 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
                 u.end_progress(hub, id);
                 continue;
             }
-            if line.starts_with(NO_CHECKOUT_MARK) {
-                no_checkout = true;
-            }
             if let Some(sum) = line.strip_prefix(BUILT_MARK) {
                 u.set_to_build(hub, id, &crate::updates::build_id(sum.trim()));
                 u.end_progress(hub, id);
                 continue;
             }
-            let line = line.strip_prefix(crate::updates::FAIL_MARK).or_else(|| line.strip_prefix(NO_CHECKOUT_MARK)).map_or(line, str::trim);
+            if let Some(why) = line.strip_prefix(CANT_BUILD_MARK) {
+                cant = Some(why.trim().to_owned());
+            }
+            let line = line.strip_prefix(crate::updates::FAIL_MARK).or_else(|| line.strip_prefix(CANT_BUILD_MARK)).map_or(line, str::trim);
             u.say(hub, id, line);
         }
     };
@@ -1010,8 +1290,8 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
         }
     };
     session.detach();
-    if no_checkout {
-        hub.updates.fleet.no_checkout.lock().insert(machine.to_owned(), Instant::now());
+    if let Some(why) = &cant {
+        hub.updates.fleet.cant_build.lock().insert(machine.to_owned(), (Instant::now(), why.clone()));
     }
     if let Err(e) = result
         && !ok_marked
@@ -1020,7 +1300,15 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
             session.close();
             u.time_out(hub, id, "build", e);
         } else {
-            u.finish(hub, id, Err(if no_checkout { "no kiln checkout on this machine to build from".to_owned() } else { e }));
+            u.finish(hub, id, Err(cant.unwrap_or(e)));
+        }
+        return;
+    }
+    if let Some(runner) = then {
+        let built = hub.updates.fleet.building.lock().remove(id);
+        match built.and_then(|b| binary_for(hub, &b.target, &b.commit)) {
+            Some(bin) => crate::updates::upgrade_into(hub, id, runner, &bin).await,
+            None => u.finish(hub, id, Err(format!("{machine} built it, but its binary didn't reach this server"))),
         }
         return;
     }
@@ -1062,45 +1350,271 @@ mod tests {
         assert!(!is_commit("e8c17e5 "));
     }
 
-    #[test]
-    fn the_build_script_quotes_nothing_it_shouldnt() {
-        let s = build_script("job1", &["https://kiln.example".to_owned()], "tok", "e8c17e544623c019c78fce08ee0931a79d5d09db", &["/home/ada/src/kiln".to_owned()], true, "");
-        // It goes inside `sh -c '…'`: no single quotes, no backslashes.
-        assert!(!s.contains('\'') && !s.contains('\\'), "{s}");
-        assert!(s.starts_with(crate::updates::HIDDEN_MARK));
-        assert!(s.contains("\"/home/ada/src/kiln\" \"$HOME/Projects/kiln\""));
-        assert!(s.contains("/api/updates/jobs/job1/source"));
-        assert!(s.contains("--data-binary @\"$bin\""));
-        assert!(s.contains("KILN_COMMIT=e8c17e544623c019c78fce08ee0931a79d5d09db"));
-        // A recent Rust: the machine's may be older than kiln's dependencies need.
-        assert!(s.contains("rustup toolchain install stable") && s.contains("$cargo build"));
-        let linux = build_script("job1", &["https://kiln.example".to_owned()], "tok", "e8c17e5", &[], false, "01a14794");
-        assert!(!linux.contains("--data-binary"), "a Linux build isn't handed back");
-        assert!(linux.contains("*-01a14794) svc=${svc%-01a14794}"));
+    fn script<'a>(target: &'a str, cross: bool, keep: bool, install: Option<&'a str>) -> String {
+        let bases = ["https://kiln.example".to_owned()];
+        build_script(&Script { job: "job1", bases: &bases, token: "tok", commit: "e8c17e544623c019c78fce08ee0931a79d5d09db", target, cross, keep, install })
     }
 
-    /// The script under sh: with no checkout anywhere it says so and stops before building.
+    #[test]
+    fn the_build_script_quotes_nothing_it_shouldnt() {
+        let mac = script("aarch64-apple-darwin", false, true, Some(""));
+        let linux = script("x86_64-unknown-linux-gnu", false, false, Some("01a14794"));
+        let for_another = script("aarch64-apple-darwin", false, true, None);
+        let cross = script("aarch64-apple-darwin", true, true, None);
+        for s in [&mac, &linux, &for_another, &cross] {
+            // It goes inside `sh -c '…'`: no single quotes, no backslashes.
+            assert!(!s.contains('\'') && !s.contains('\\'), "{s}");
+            assert!(s.starts_with(crate::updates::HIDDEN_MARK));
+            assert!(s.contains("/api/updates/jobs/job1/source"));
+            assert!(s.contains("KILN_COMMIT=e8c17e544623c019c78fce08ee0931a79d5d09db"));
+            // A recent Rust: the machine's may be older than kiln's dependencies need.
+            assert!(s.contains("rustup toolchain install stable"));
+            assert!(!s.contains("checkout"), "no checkout of kiln is looked for: {s}");
+        }
+        assert!(mac.contains("--data-binary @\"$bin\"") && mac.contains("$cargo build") && mac.contains("install --agent --upgrade"));
+        assert!(mac.contains("xcode-select -p"), "a Mac building natively needs Apple's developer tools");
+        assert!(!linux.contains("--data-binary"), "a Linux build isn't handed back");
+        assert!(linux.contains("*-01a14794) svc=${svc%-01a14794}"));
+        assert!(for_another.contains("--data-binary @\"$bin\"") && for_another.contains("|| fail \"could not hand the binary to the server\""));
+        assert!(!for_another.contains("install --agent") && !for_another.contains("svc="));
+        assert!(cross.contains("ci/release/build.sh aarch64-apple-darwin") && cross.contains("KILN_DIST=\"$dir/dist-job1\""));
+        assert!(cross.contains("bin=\"$dir/dist-job1/kiln-aarch64-apple-darwin\"") && cross.contains("export RUSTUP_TOOLCHAIN=stable"));
+        assert!(cross.contains("for t in cargo npm tar curl rustup python3") && !cross.contains("xcode-select"));
+    }
+
+    /// The script under sh: with no checkout of kiln anywhere it goes on to the tools, then to
+    /// fetching the source from the server (refused here), never looking for one.
     #[cfg(unix)]
     #[test]
-    fn the_build_script_stops_without_a_checkout() -> anyhow::Result<()> {
-        let home = tempfile::tempdir()?;
-        let s = build_script("j", &["http://127.0.0.1:9".to_owned()], "t", "e8c17e5", &["/nonexistent/kiln".to_owned()], false, "");
-        let run = || std::process::Command::new("sh").arg("-c").arg(&s).env("HOME", home.path()).env("SHELL", "/bin/sh").output();
-        let out = run()?;
+    fn the_build_script_needs_no_checkout() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (home, tools) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        for (name, body) in [("cargo", "exit 0"), ("npm", "exit 0"), ("curl", "exit 22")] {
+            let p = tools.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n"))?;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let s = script("aarch64-apple-darwin", false, true, None);
+        let path = format!("{}:/usr/bin:/bin", tools.path().display());
+        let out = std::process::Command::new("/bin/sh").arg("-c").arg(&s).env("HOME", home.path()).env("SHELL", "/bin/sh").env("PATH", path).output()?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert_eq!(out.status.code(), Some(10), "{text}");
-        assert!(text.contains(NO_CHECKOUT_MARK), "{text}");
-        // A checkout found: it goes on to check the tools (and fails fetching from a closed port).
-        let kiln = home.path().join("Projects/kiln");
-        std::fs::create_dir_all(kiln.join("crates/kiln"))?;
-        std::fs::create_dir_all(kiln.join("ui"))?;
-        std::fs::write(kiln.join("crates/kiln/Cargo.toml"), "")?;
-        std::fs::write(kiln.join("ui/package.json"), "{}")?;
-        let out = run()?;
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert!(text.contains("kiln checkout:"), "{text}");
-        assert!(!text.contains(NO_CHECKOUT_MARK), "{text}");
-        assert_ne!(out.status.code(), Some(0), "{text}");
+        assert_eq!(out.status.code(), Some(1), "{text}");
+        assert!(text.contains("fetching the source of e8c17e544623 from https://kiln.example"), "{text}");
+        assert!(text.contains(&format!("{} could not fetch the source", crate::updates::FAIL_MARK)), "{text}");
+        assert!(!text.contains(CANT_BUILD_MARK) && !text.contains("checkout"), "{text}");
         Ok(())
+    }
+
+    fn candidate(name: &str, os: &str, target: &str, tools: &[&str], room: f32) -> Candidate {
+        Candidate { name: name.into(), os: os.into(), target: Some(target.into()), tools: tools.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(), room }
+    }
+
+    /// A Mac with no developer tools gets its build from a Mac that has them, natively, before a
+    /// Linux machine that cross-builds it; from Linux when that Mac is overloaded or there is none;
+    /// from nowhere when nothing has the tools.
+    #[test]
+    fn a_mac_s_build_is_made_where_the_tools_are() {
+        let mac = "aarch64-apple-darwin";
+        let laptop = candidate("laptop", "macos", mac, &["cargo", "node", "git"], 10.0);
+        let linux = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node", "python3"], 60.0);
+        let studio = candidate("studio", "macos", mac, &["git", "docker"], 80.0);
+        assert_eq!(pick(mac, &[studio.clone(), linux.clone(), laptop.clone()]), Some(("laptop".to_owned(), false)), "natively, on the Mac with the tools");
+        let pressed = Candidate { room: 10.0 - crate::reach::directory::OVERLOADED, ..laptop.clone() };
+        assert_eq!(pick(mac, &[pressed, linux.clone()]), Some(("linux".to_owned(), true)), "an overloaded Mac gives way to a Linux machine");
+        assert_eq!(pick(mac, &[studio.clone(), linux.clone()]), Some(("linux".to_owned(), true)), "cross-built when no Mac can");
+        let roomier = Candidate { name: "linux-2".into(), room: 90.0, ..linux.clone() };
+        assert_eq!(pick(mac, &[linux.clone(), roomier]), Some(("linux-2".to_owned(), true)), "the Linux machine with the most room");
+        let no_python = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node"], 60.0);
+        assert_eq!(pick(mac, &[studio.clone(), no_python]), None, "cross-building needs python3 for zig");
+        assert_eq!(pick("x86_64-pc-windows-msvc", &[linux, studio]), None, "only a Mac's build is cross-built for it");
+    }
+
+    fn live(name: &str, os: &str, arch: &str, tools: &[&str]) -> crate::hub::AgentLive {
+        crate::hub::AgentLive {
+            name: name.into(),
+            peer: None,
+            labels: Vec::new(),
+            slots: 2,
+            hostname: name.into(),
+            os: os.into(),
+            arch: arch.into(),
+            version: "0.2.0".into(),
+            ephemeral: false,
+            connected: true,
+            last_seen: 0,
+            enrolled_at: 0,
+            running: Vec::new(),
+            busy: 0,
+            draining: false,
+            sample: None,
+            battery: None,
+            dropped: Vec::new(),
+            dropped_toward: Vec::new(),
+            terminal: true,
+            outpost: false,
+            dedicated_job: None,
+            exclusive: false,
+            lost_at: None,
+            facts: Some(Box::new(kiln_ci::facts::RunnerFacts {
+                os: os.into(),
+                arch: arch.into(),
+                tools: tools.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(),
+                ..Default::default()
+            })),
+            instances: Vec::new(),
+            transport: None,
+            skew: crate::skew::Skew::default(),
+        }
+    }
+
+    const NEWEST: &str = "e511eabdeab2118ab480c14c27ca460807e0c372";
+
+    /// A hub with the fleet of 2026-10-24: a Mac Studio with no developer tools, a MacBook with
+    /// cargo and node, and a Linux machine with what cross-building takes.
+    async fn fleet() -> anyhow::Result<Arc<Hub>> {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        for a in [live("studio", "macos", "aarch64", &["git", "docker"]), live("macbook", "macos", "aarch64", &["cargo", "node", "git"]), live("linux", "linux", "x86_64", &["cargo", "node", "python3"])] {
+            hub.agents.lock().insert(a.name.clone(), a);
+        }
+        Ok(hub)
+    }
+
+    async fn runner(hub: &Arc<Hub>, name: &str) -> anyhow::Result<RunnerInfo> {
+        crate::updates::runners(hub).await.into_iter().find(|r| r.name == name).ok_or_else(|| anyhow::anyhow!("no runner {name}"))
+    }
+
+    fn newest() -> Target {
+        Target { commit: NEWEST.into(), from: "server".into(), since: 0 }
+    }
+
+    fn built_by(p: &Plan) -> Option<(String, bool, bool)> {
+        match p {
+            Plan::Build(b) => Some((b.machine.clone(), b.itself, b.cross)),
+            _ => None,
+        }
+    }
+
+    /// No checkout of kiln decides who builds: the MacBook builds itself (it has cargo and node),
+    /// the Studio (no developer tools) gets the MacBook's build over the wire, and with no Mac to
+    /// build it, a Linux machine cross-builds it. A Linux machine without the tools waits: its build
+    /// would be its own alone.
+    #[test]
+    fn who_builds_is_decided_by_the_tools_not_a_checkout() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = fleet().await?;
+            let t = newest();
+            let studio = runner(&hub, "studio").await?;
+            assert_eq!(built_by(&plan(&hub, &runner(&hub, "macbook").await?, &t).await), Some(("macbook".to_owned(), true, false)));
+            match plan(&hub, &studio, &t).await {
+                Plan::Build(b) => {
+                    assert_eq!((b.machine.as_str(), b.itself, b.cross), ("macbook", false, false));
+                    assert_eq!(b.why, "it has no cargo or node to build kiln with");
+                }
+                other => anyhow::bail!("the Studio's plan: {other:?}"),
+            }
+            let ways = ways(&hub, &studio, &t).await;
+            let build = ways.iter().find(|w| w.way == crate::updates::Way::Build).ok_or_else(|| anyhow::anyhow!("no build way"))?;
+            assert!(build.ok && build.on.as_deref() == Some("macbook"), "{ways:?}");
+            assert_eq!(build.why, "macbook builds e511eabdeab2 for aarch64-apple-darwin from the server's source, and it downloads that build");
+            assert!(ways.iter().any(|w| w.way == crate::updates::Way::Download && !w.ok));
+            if let Some(m) = hub.agents.lock().get_mut("macbook") {
+                m.draining = true;
+            }
+            assert_eq!(built_by(&plan(&hub, &studio, &t).await), Some(("linux".to_owned(), false, true)), "no Mac to build it: cross-built");
+            if let Some(f) = hub.agents.lock().get_mut("linux").and_then(|l| l.facts.as_mut()) {
+                f.tools.remove("python3");
+            }
+            match plan(&hub, &studio, &t).await {
+                Plan::Wait(why) => assert_eq!(
+                    why,
+                    "waits for a build of e511eabdeab2 for aarch64-apple-darwin: it has no cargo or node to build kiln with, and no connected machine can build kiln for aarch64-apple-darwin"
+                ),
+                other => anyhow::bail!("nowhere to build: {other:?}"),
+            }
+            hub.agents.lock().insert("box".into(), live("box", "linux", "x86_64", &["git"]));
+            assert!(matches!(plan(&hub, &runner(&hub, "box").await?, &t).await, Plan::Wait(_)), "a Linux build is its machine's own: never made elsewhere");
+            Ok(())
+        })
+    }
+
+    /// One build of a commit for a platform serves every machine of it: while one is under way,
+    /// the others (the machine building it too) wait for it rather than build again. A machine
+    /// whose build found it lacks a tool isn't asked again.
+    #[test]
+    fn a_build_under_way_serves_the_whole_platform() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = fleet().await?;
+            let t = newest();
+            let building = Building { machine: "macbook".into(), target: "aarch64-apple-darwin".into(), commit: NEWEST.into(), keep: true };
+            hub.updates.fleet.building.lock().insert("job-1".into(), building);
+            for name in ["studio", "macbook"] {
+                match plan(&hub, &runner(&hub, name).await?, &t).await {
+                    Plan::Join { job, on } => assert_eq!((job.as_str(), on.as_str()), ("job-1", "macbook")),
+                    other => anyhow::bail!("{name}: {other:?}"),
+                }
+            }
+            let ways = ways(&hub, &runner(&hub, "studio").await?, &t).await;
+            assert!(ways.iter().any(|w| w.way == crate::updates::Way::Build && w.ok && w.why == "macbook is building e511eabdeab2 for aarch64-apple-darwin now: it downloads that build"), "{ways:?}");
+            assert!(builds_on(&hub, "macbook") && !builds_on(&hub, "studio"));
+            hub.updates.fleet.building.lock().clear();
+            hub.updates.fleet.cant_build.lock().insert("macbook".into(), (Instant::now(), "this Mac has no developer tools".into()));
+            let macbook = runner(&hub, "macbook").await?;
+            assert_eq!(builds_itself(&hub, &macbook), Err("this Mac has no developer tools".to_owned()));
+            assert_eq!(built_by(&plan(&hub, &macbook, &t).await), Some(("linux".to_owned(), false, true)));
+            assert_eq!(built_by(&plan(&hub, &runner(&hub, "studio").await?, &t).await), Some(("linux".to_owned(), false, true)));
+            Ok(())
+        })
+    }
+
+    /// A Mac's build kept for its platform: what a runner waiting for it then downloads.
+    async fn keep_mac_build(hub: &Arc<Hub>) -> anyhow::Result<Binary> {
+        let mut bytes = vec![0u8; 2 << 20];
+        if let Some(head) = bytes.get_mut(..4) {
+            head.copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        }
+        crate::updates::keep_built(hub, "aarch64-apple-darwin", bytes, "macbook", NEWEST).await
+    }
+
+    async fn ended(hub: &Arc<Hub>, id: &str) -> anyhow::Result<Job> {
+        for _ in 0..200 {
+            if let Some(j) = hub.updates.job(id).filter(|j| j.state != crate::updates::JobState::Running) {
+                return Ok(j);
+            }
+            crate::rt::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::bail!("job {id} didn't end")
+    }
+
+    /// A runner that joins a build under way goes on, in its own job, to download what came back:
+    /// here it gets as far as asking its runner (whose terminals are off, so that's where it stops).
+    /// One whose build ended without a binary ends saying why.
+    #[test]
+    fn a_runner_joining_a_build_downloads_it_once_kept() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = fleet().await?;
+            if let Some(s) = hub.agents.lock().get_mut("studio") {
+                s.terminal = false;
+            }
+            let studio = runner(&hub, "studio").await?;
+            let other = crate::updates::new_job("runner", "studio-2", "build", None, None);
+            hub.updates.insert(other.clone());
+            hub.updates.fleet.building.lock().insert(other.id.clone(), Building { machine: "macbook".into(), target: "aarch64-apple-darwin".into(), commit: NEWEST.into(), keep: true });
+            let job = join(&hub, &studio, NEWEST, &other.id, "macbook", "test").await?;
+            assert_eq!((job.on.as_deref(), job.method), (Some("macbook"), "build"));
+            crate::rt::sleep(Duration::from_millis(300)).await;
+            assert!(hub.updates.running(&job.id), "it waits for the build");
+            let kept = keep_mac_build(&hub).await?;
+            let j = ended(&hub, &job.id).await?;
+            assert!(j.log.iter().any(|l| l.starts_with("macbook is building kiln e511eabdeab2 for aarch64-apple-darwin already")), "{:?}", j.log);
+            assert!(j.error.as_deref().is_some_and(|e| e.contains("terminals turned off")), "it went on to download {}: {:?}", kept.build, j.error);
+            let failed = crate::updates::new_job("runner", "studio-3", "build", None, None);
+            hub.updates.insert(failed.clone());
+            let other = Target { commit: "0123456789abcdef0123456789abcdef01234567".into(), ..newest() };
+            let job = join(&hub, &studio, &other.commit, &failed.id, "macbook", "test").await?;
+            hub.updates.finish(&hub, &failed.id, Err("kiln did not build".into()));
+            let j = ended(&hub, &job.id).await?;
+            assert_eq!(j.error.as_deref(), Some("the build it waited for ended without a binary of 0123456789ab: kiln did not build"));
+            Ok(())
+        })
     }
 }

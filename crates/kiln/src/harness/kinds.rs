@@ -9,7 +9,7 @@ use super::antigravity::Agy;
 use super::claude::Claude;
 use super::codex::Codex;
 use super::core::Core;
-use super::model::Command;
+use super::model::{Command, QueueItem, SendMode};
 use super::session::Spec;
 
 pub struct Kind {
@@ -64,7 +64,12 @@ impl Kind {
 
     /// Installed on this machine.
     pub fn available(&self) -> bool {
-        crate::os::which(self.program).is_some()
+        self.find().is_some()
+    }
+
+    /// Its executable, on [`search_path`].
+    pub fn find(&self) -> Option<std::path::PathBuf> {
+        crate::os::which_in(self.program, &search_path()?)
     }
 
     /// kiln can run it as a structured session (else only as a terminal program).
@@ -74,7 +79,7 @@ impl Kind {
 
     pub fn adapter(&self, spec: &Spec) -> Adapter {
         match self.protocol {
-            Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)))),
+            Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)).with_speed(spec.speed.clone()))),
             Protocol::CodexAppServer => Adapter::Codex(Box::new(Codex::from_spec(spec))),
             Protocol::AgyStreamJson => Adapter::Agy(Box::new(Agy::new(spec))),
             Protocol::Acp(_) | Protocol::Terminal => Adapter::Acp(Box::new(Acp::from_spec(spec))),
@@ -89,7 +94,7 @@ impl Kind {
         }
         let program = match &spec.program {
             Some(p) => std::path::PathBuf::from(p),
-            None => crate::os::which(self.program).ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?,
+            None => self.find().ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?,
         };
         let mut p = Process::new(program);
         let cwd = super::session::resolve_cwd(spec.cwd.as_deref());
@@ -159,7 +164,7 @@ impl Kind {
         }
         let program = match &spec.program {
             Some(p) => std::path::PathBuf::from(p),
-            None => crate::os::which(self.program).ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?,
+            None => self.find().ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?,
         };
         let mut p = Process::new(program);
         let cwd = spec.cwd.clone().unwrap_or_else(|| crate::os::home_dir().to_string_lossy().into_owned());
@@ -205,9 +210,35 @@ pub fn acp_servers(spec: &Spec, session: &str) -> Vec<serde_json::Value> {
     Vec::new()
 }
 
+/// Where harnesses are looked for, and the PATH they run with: this process's, then the folders
+/// only its user's login shell has (`crate::reach::serve::login_env`, which a runner asks as it
+/// starts and every ten minutes). A runner's service keeps the PATH of the terminal it was
+/// installed from: a harness installed since in a folder that PATH lacks (Claude Code's and
+/// Codex's installers put theirs in `~/.local/bin`) is on its user's PATH alone.
+pub fn search_path() -> Option<std::ffi::OsString> {
+    let users = crate::reach::serve::login_path();
+    joined_path(std::env::var_os("PATH").as_deref(), users.as_deref().map(std::ffi::OsStr::new))
+}
+
+/// `first`'s folders, then the whole paths of `then` it hasn't (a relative one would be the
+/// runner's folder's), as one PATH (none without a folder).
+fn joined_path(first: Option<&std::ffi::OsStr>, then: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    let mut dirs: Vec<std::path::PathBuf> = first.map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
+    for dir in then.into_iter().flat_map(|p| std::env::split_paths(p).collect::<Vec<_>>()) {
+        if dir.is_absolute() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    std::env::join_paths(dirs).ok().filter(|p| !p.is_empty())
+}
+
 /// The session's environment over the machine's: what its shell had (minus the shell's own
 /// terminal plumbing), without what a Claude Code session sets for its children.
 fn set_env(p: &mut Process, spec: &Spec) {
+    // The PATH it was found on, so what it starts (its interpreter, its tools) is found too.
+    if let Some(path) = search_path() {
+        p.env("PATH", path);
+    }
     // `kiln run` in the agent's shell reaches other runners through this machine's runner.
     if let Some(sock) = crate::reach::local::socket() {
         p.env("KILN_REACH_SOCK", sock);
@@ -297,6 +328,7 @@ impl Adapter {
             Self::Acp(a) => a.start(core),
             Self::Agy(a) => a.start(core),
         }
+        self.settle_subagents(core);
     }
 
     pub fn line(&mut self, core: &mut Core, line: &str) {
@@ -306,15 +338,69 @@ impl Adapter {
             Self::Acp(a) => a.line(core, line),
             Self::Agy(a) => a.line(core, line),
         }
+        self.settle_subagents(core);
     }
 
     pub fn command(&mut self, core: &mut Core, c: Command) {
-        match self {
-            Self::Claude(a) => a.command(core, c),
-            Self::Codex(a) => a.command(core, c),
-            Self::Acp(a) => a.command(core, c),
-            Self::Agy(a) => a.command(core, c),
+        // A message waiting for one of its subagents is changed where it waits, or goes to it now.
+        match super::subagent::queue_command(core, c) {
+            super::subagent::Queued::Done => {}
+            super::subagent::Queued::Send(task, m, mode) => self.send_task(core, &task, m, mode),
+            super::subagent::Queued::Not(Command::Send { id, text, mode, attachments, reply_to, task: Some(task), .. }) => {
+                self.send_task(core, &task, QueueItem { id, text, at: Core::now(), attachments, overrides: None, reply_to }, mode);
+            }
+            super::subagent::Queued::Not(c) => match self {
+                Self::Claude(a) => a.command(core, c),
+                Self::Codex(a) => a.command(core, c),
+                Self::Acp(a) => a.command(core, c),
+                Self::Agy(a) => a.command(core, c),
+            },
         }
+        self.settle_subagents(core);
+    }
+
+    /// A person's message to its subagent `task`, the way that one takes one now (`Task::takes`),
+    /// through its harness's adapter; one it can't take is shown not sent, and why.
+    fn send_task(&mut self, core: &mut Core, task: &str, mut m: QueueItem, asked: SendMode) {
+        m.text = m.text.trim_end().to_owned();
+        if m.text.is_empty() && m.attachments.is_empty() {
+            return;
+        }
+        let Some(t) = core.state.tasks.iter().find(|t| t.id == task).cloned() else {
+            core.state.delivery.insert(m.id.clone(), super::model::Delivery::Cancelled);
+            core.upsert(&format!("subagent-unsent-{}", m.id), None, super::model::Body::Notice { level: super::model::Level::Warn, text: "Not sent: kiln no longer knows that subagent.".to_owned() });
+            return;
+        };
+        let Some(mode) = super::subagent::mode_for(&t, asked) else {
+            let why = if t.subagent() && !t.live() && t.status != "completed" { "it has ended." } else { "its harness takes no message for it from kiln." };
+            super::subagent::refuse(core, task, &m, why);
+            return;
+        };
+        match self {
+            Self::Claude(a) => a.send_task(core, &t, m, mode),
+            Self::Codex(a) => a.send_task(core, &t, m, mode),
+            Self::Acp(_) | Self::Agy(_) => super::subagent::refuse(core, task, &m, "its harness takes no message for it from kiln."),
+        }
+    }
+
+    /// How a message reaches each of its subagents now (`Task::takes`, `Task::via`), as its harness
+    /// allows; what waited for one that takes none any more is said not sent.
+    fn settle_subagents(&self, core: &mut Core) {
+        match self {
+            Self::Claude(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
+            Self::Codex(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
+            Self::Acp(_) | Self::Agy(_) => super::subagent::settle(core, |_, _| (Vec::new(), None)),
+        }
+    }
+
+    /// What waits for its subagents goes to each that can take it now (one at a time each).
+    fn drain_subagents(&mut self, core: &mut Core) {
+        match self {
+            Self::Claude(a) => a.drain_subagents(core),
+            Self::Codex(a) => a.drain_subagents(core),
+            Self::Acp(_) | Self::Agy(_) => {}
+        }
+        self.settle_subagents(core);
     }
 
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
@@ -327,6 +413,7 @@ impl Adapter {
         // Whatever the harness and whatever its adapter knew: what it ran ends with its process
         // (a switch, a stop, a restart or a crash), its subagents' and shells' calls with it.
         core.end_harness_work();
+        self.settle_subagents(core);
     }
 
     /// A run (`Effect::Run` or `Effect::Fetch`) ended: its exit code (None: it could not start
@@ -360,6 +447,7 @@ impl Adapter {
             Self::Agy(a) => a.tick(core),
             Self::Acp(a) => a.tick(core),
         }
+        self.drain_subagents(core);
     }
 
     /// Ask the harness whether a pause's limit has reset (its answer goes to `pause::checked`). One
@@ -390,6 +478,8 @@ impl Adapter {
             Self::Acp(a) => a.go_on(core, p),
             Self::Agy(a) => a.go_on(core, p),
         }
+        // What waited for its subagents meanwhile goes too.
+        self.drain_subagents(core);
     }
 
     /// Start with a conversation carried over from another harness, in the harness's own form
@@ -645,6 +735,37 @@ mod tests {
         let (modes, default) = kind.modes();
         assert_eq!(default, "accept-edits");
         assert_eq!(modes.iter().map(|m| (m.id.as_str(), m.dangerous)).collect::<Vec<_>>(), [("accept-edits", false), ("smart", false), ("ask", false), ("plan", false), ("bypass", true)]);
+        Ok(())
+    }
+
+    /// A runner's service keeps the PATH it was installed with: a harness installed since in a
+    /// folder only its user's PATH has (`~/.local/bin`) is found on the two together, the
+    /// runner's folders first and each once (the user's relative ones left out), and runs with
+    /// them.
+    #[test]
+    fn a_harness_on_its_users_path_alone_is_found_and_runs_with_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (own, users) = (dir.path().join("usr/bin"), dir.path().join("home/.local/bin"));
+        std::fs::create_dir_all(&own)?;
+        std::fs::create_dir_all(&users)?;
+        let claude = users.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\n")?;
+        crate::os::make_executable(&claude)?;
+        let runner = std::env::join_paths([&own])?;
+        assert_eq!(crate::os::which_in("claude", &runner), None);
+        let both = joined_path(Some(&runner), Some(&std::env::join_paths([users.as_path(), std::path::Path::new("bin"), &own])?));
+        assert_eq!(both, Some(std::env::join_paths([&own, &users])?));
+        assert_eq!(both.as_deref().and_then(|p| crate::os::which_in("claude", p)), Some(claude.clone()));
+        assert_eq!(joined_path(Some(&runner), None), Some(runner));
+        assert_eq!(joined_path(None, None), None);
+        // Started, it has the PATH it was looked for on: this process's folders first.
+        let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no Claude Code harness"))?;
+        let spec = Spec { kind: "claude".into(), program: Some(claude.to_string_lossy().into_owned()), cwd: Some(dir.path().to_string_lossy().into_owned()), ..Spec::default() };
+        let launch = kind.launch(&spec, "session")?;
+        let dirs = |p: Option<&std::ffi::OsStr>| p.map(|p| std::env::split_paths(p).collect::<Vec<_>>()).unwrap_or_default();
+        let ran = dirs(launch.get_envs().find(|(k, _)| *k == "PATH").and_then(|(_, v)| v));
+        let mine = dirs(std::env::var_os("PATH").as_deref());
+        assert!(!ran.is_empty() && ran.starts_with(&mine), "{ran:?} starts with {mine:?}");
         Ok(())
     }
 

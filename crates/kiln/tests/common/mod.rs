@@ -4,6 +4,8 @@
 
 #[cfg(unix)]
 pub mod agents;
+#[cfg(unix)]
+pub mod lab;
 
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -13,6 +15,44 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+/// What a kiln of the fleet tells the processes it starts, and what a person's shell may hold: its
+/// supervisor's socket and generation, the runner a new build takes over from and the upgrade it's
+/// part of, this machine's reach, the person's config, server, tokens, runner name, state, log and
+/// faults. A test run under a runner inherits them. A kiln the test starts is its own, so none of them goes on to it:
+/// a test's runner that took the runner it runs under for one it takes over from would hold every
+/// message it's sent, and one that kept its supervisor's socket would ask the real supervisor to
+/// start the builds it's told to upgrade to.
+pub const NOT_INHERITED: &[&str] = &[
+    "KILN_SUPERVISOR",
+    "KILN_SUPERVISED",
+    "KILN_GENERATION",
+    "KILN_SUPERVISE_CHILD",
+    "KILN_TAKE_OVER_FROM",
+    "KILN_UPGRADE_ID",
+    "KILN_REACH_SOCK",
+    "KILN_REACH_FROM",
+    "KILN_CONFIG",
+    "KILN_URL",
+    "KILN_ADMIN_TOKEN",
+    "KILN_SERVER",
+    "KILN_JOIN_TOKEN",
+    "KILN_AGENT_NAME",
+    "KILN_STATE_DIR",
+    "KILN_INSTANCE",
+    "KILN_LOG",
+    "KILN_CHAOS",
+];
+
+/// This build's `kiln`, as a test starts it: with none of [`NOT_INHERITED`] (what the test sets
+/// itself goes on).
+pub fn kiln() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    for var in NOT_INHERITED {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// A port free now.
 pub fn free_port() -> anyhow::Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
@@ -20,8 +60,13 @@ pub fn free_port() -> anyhow::Result<u16> {
 
 /// One HTTP/1.1 request: the status and the body.
 pub fn http(port: u16, method: &str, path: &str, token: &str, body: Option<&Value>) -> anyhow::Result<(u16, String)> {
+    http_within(port, method, path, token, body, Duration::from_secs(30))
+}
+
+/// [`http`], its answer waited for up to `within`.
+pub fn http_within(port: u16, method: &str, path: &str, token: &str, body: Option<&Value>, within: Duration) -> anyhow::Result<(u16, String)> {
     let mut s = TcpStream::connect(("127.0.0.1", port))?;
-    s.set_read_timeout(Some(Duration::from_secs(30)))?;
+    s.set_read_timeout(Some(within))?;
     let payload = body.map(Value::to_string).unwrap_or_default();
     write!(s, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len())?;
     let mut raw = Vec::new();
@@ -190,11 +235,8 @@ fn start_full(dir: &Path, o: &Options<'_>, https: bool, cd: bool, env: &[(&str, 
 fn server_command(dir: &Path, log: std::fs::File) -> anyhow::Result<Command> {
     let home = dir.join("home");
     std::fs::create_dir_all(&home)?;
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    let mut cmd = kiln();
     cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"]).env("HOME", &home).env("NO_COLOR", "1").stdout(log.try_clone()?).stderr(log);
-    for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG", "KILN_CHAOS"] {
-        cmd.env_remove(var);
-    }
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     Ok(cmd)

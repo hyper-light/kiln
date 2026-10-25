@@ -126,7 +126,7 @@ function Run({ v, onChange }: { v: PlanRunView; onChange: (v: PlanRunView) => vo
       {v.state !== "running" && error && <span className="plan-error">{error}</span>}
       <ol className="run-steps">
         {v.steps.map((s) => (
-          <Step key={s.n} s={s} stack={v.stack} busy={busy} onAct={(a) => void act(`${s.n}:${a}`, () => plansApi.step(v.id, s.n, a))} />
+          <Step key={s.n} s={s} stack={v.stack} busy={busy} onAct={(a) => void act(`${s.n}:${a}`, () => plansApi.step(v.id, s.n, a, s.tries))} />
         ))}
       </ol>
     </>

@@ -292,7 +292,7 @@ fn w05_r05_hellos_before_the_rebuild() -> anyhow::Result<()> {
     std::fs::create_dir_all(dir.join("keeper-home"))?;
     let out = std::fs::File::create(dir.join("keeper.log"))?;
     let _keeper = Keeper(
-        Command::new(env!("CARGO_BIN_EXE_kiln"))
+        common::kiln()
             .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", "keeper", "--labels", "keep", "--slots", "1", "--no-terminal"])
             .arg("--work-dir")
             .arg(dir.join("keeper-work"))

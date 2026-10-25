@@ -17,7 +17,8 @@
 //! - **People** promote, pause, resume, abort, retry and answer approvals through the API.
 //! - **After an abort** (`auto-rollback`, the default) the app goes back to the deployment that ran
 //!   before and holds there until git changes it. Without it, traffic stays on blue and the app
-//!   reads as degraded until a person retries or git moves on.
+//!   reads as degraded until a person retries or git moves on. A person's word for the app or its
+//!   repository (`cd::rollback`) beats the deploy file's.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -590,7 +591,7 @@ impl Cd {
         tracing::info!(app = %app, to, "deployments: a rollout aborted; the app goes back to the deployment that ran before");
         crate::rt::spawn(async move {
             for _ in 0..30 {
-                match super::ops::roll_back(&cd, &app, Some(to), None, "kiln (its rollout aborted)").await {
+                match super::ops::roll_back(&cd, &app, Some(to), None, None, "kiln (its rollout aborted)").await {
                     Ok(_) => return,
                     // The sync that started the rollout is still running.
                     Err((StatusCode::CONFLICT, _)) => {
@@ -643,12 +644,14 @@ impl Host for Cd {
             cd.reread(rec);
         }
         let aborted = |r: &Rollout| matches!(r.state, State::Aborted { .. });
-        if aborted(&rec.rollout)
-            && !aborted(was)
-            && rec.rollout.plan.auto_rollback
-            && let Some(to) = rec.back_to
-        {
-            cd.roll_back_after(rec, to);
+        if aborted(&rec.rollout) && !aborted(was) {
+            // The rollout's own `auto-rollback`, unless a person set the app's or its repository's.
+            let auto = cd.auto_rollback(&rec.app, Some(rec.rollout.plan.auto_rollback));
+            match rec.back_to {
+                Some(to) if auto.decision.on => cd.roll_back_after(rec, to),
+                Some(to) => tracing::info!(app = %rec.app, to, why = %auto.why(), "deployments: a rollout aborted; auto-rollback is off, so the app stays where it is"),
+                None => {}
+            }
         }
     }
 }

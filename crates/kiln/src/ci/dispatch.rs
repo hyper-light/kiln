@@ -333,6 +333,13 @@ fn request_of(job: Option<&kiln_ci::wf::ir::Job>, cfg: &crate::config::ci::Ci) -
     asked.and_then(|a| a.resources().ok()).or_else(|| cfg.scheduler.default_request.resources().ok()).unwrap_or_default()
 }
 
+/// What a leg's executor holds it to (W05-R03): in resource mode, the memory it was given, which a
+/// container executor makes its job container's limit (tools that size themselves by their
+/// cgroup, CodeQL's analysis among them, then fit the leg, not the machine); nothing in slot mode.
+fn executor_options(mode: &str, request: &kiln_ci::sched::state::Resources) -> serde_json::Value {
+    if mode == "resources" && request.mem > 0 { serde_json::json!({ "memory": request.mem }) } else { serde_json::Value::Null }
+}
+
 /// The hub's handle on the dispatcher.
 pub struct Handle {
     tx: async_channel::Sender<Msg>,
@@ -975,7 +982,7 @@ impl Dispatch {
 
     async fn runner_facts(&mut self, agent: &str) {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
-        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: a.slots, capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
+        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
         self.commands(cmds).await;
     }
@@ -993,7 +1000,7 @@ impl Dispatch {
             self.hub.command_start(agent, &ServerMsg::Cancel { job: leg, reason: "the leg was given up while this runner was away".into() }).await.log_when_answered(crate::hub::LOG_WITHIN);
         }
         // The hub keeps at least 1 for runners that take jobs; 0 (an outpost) takes no legs.
-        let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots, capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
+        let r = RunnerIn { id: agent.to_owned(), view, slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());
         cmds.extend(self.lose(gone, "the runner lost it").await);
         self.commands(cmds).await;
@@ -2182,7 +2189,7 @@ impl Dispatch {
             executor: wire::ExecutorSpec {
                 image: if matches!(executor.as_deref(), Some("docker" | "firecracker")) { image } else { None },
                 kind: executor.unwrap_or_else(|| "host".into()),
-                options: serde_json::Value::Null,
+                options: executor_options(&self.hub.cfg.ci.scheduler.mode, &request_of(job, &self.hub.cfg.ci)),
                 slot: None,
             },
             container: spec.container.clone(),
@@ -2209,6 +2216,8 @@ impl Dispatch {
             workflow_defaults: wf.defaults.clone(),
             job_defaults: job.map(|j| j.defaults.clone()).unwrap_or_default(),
             outputs: job.map(|j| j.outputs.iter().map(|o| (o.name.clone(), o.value.clone())).collect()).unwrap_or_default(),
+            // The workflow file that defines the job (W06-R03), for `job.workflow_*`.
+            job_workflow: Some(spec.defined_in.clone()).filter(|d| !d.workflow_file_path.is_empty()),
             environment_url: job.and_then(|j| j.environment.as_ref()).and_then(|e| e.url.clone()),
             environment: l.spec.environment.as_ref().filter(|e| !e.name.is_empty()).map(|e| wire::Bound { name: e.name.clone(), kind: None, preview: e.preview.clone() }),
             contexts: wire::Contexts {
@@ -2771,6 +2780,7 @@ fn rebuild_spec(wf: &Arc<Workflow>, v: &serde_json::Value) -> LegSpec {
     spec.continue_on_error = v.get("continue_on_error").and_then(serde_json::Value::as_bool).unwrap_or(false);
     spec.container = v.get("container").and_then(|c| c.as_str().map(str::to_owned));
     spec.cache_cap = v.get("cache_cap").and_then(|c| c.as_str().map(str::to_owned));
+    spec.defined_in = v.get("defined_in").and_then(|d| serde_json::from_value(d.clone()).ok()).unwrap_or_default();
     spec
 }
 
@@ -2804,6 +2814,7 @@ fn placeholder_spec(wf: &Arc<Workflow>, job: &str) -> LegSpec {
         emulated: false,
         reads: Vec::new(),
         cache_cap: None,
+        defined_in: plan::DefinedIn::default(),
         workflow: Arc::clone(wf),
         job_index: index,
     }
@@ -2967,6 +2978,12 @@ fn graphql_of(api: &str) -> String {
     }
 }
 
+/// The slots a runner offers legs: none while its kiln is to be upgraded (`crate::skew`), as an
+/// outpost offers none.
+fn work_slots(a: &crate::hub::AgentLive) -> u32 {
+    if a.skew.takes_work() { a.slots } else { 0 }
+}
+
 #[cfg(test)]
 mod tests {
     /// W05-R17: a rerun's `github.triggering_actor` is whoever reran it, as GitHub names people; an
@@ -2977,5 +2994,15 @@ mod tests {
         assert_eq!(super::login_of("agent:abcdefgh for user:lead"), "lead");
         assert_eq!(super::login_of("agent:abcdefgh@mac for user:lead"), "lead");
         assert_eq!(super::login_of("octocat"), "octocat", "GitHub's Re-run, by its login");
+    }
+
+    /// W05-R03: in resource mode a leg's executor is told the memory it was given, to hold it to;
+    /// in slot mode, and without a memory request, nothing.
+    #[test]
+    fn w05_r03_a_legs_memory_is_its_executors_limit() {
+        let asked = kiln_ci::sched::state::Resources { cpu: 4.0, mem: 16 << 30, disk: 0, gpu: 0 };
+        assert_eq!(super::executor_options("resources", &asked), serde_json::json!({ "memory": 17179869184u64 }));
+        assert_eq!(super::executor_options("slots", &asked), serde_json::Value::Null);
+        assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { mem: 0, ..asked }), serde_json::Value::Null);
     }
 }

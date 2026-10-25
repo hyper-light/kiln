@@ -1,0 +1,14 @@
+[package]
+name = "kiln-sim"
+description = "kiln's deterministic simulator (CP-T6.1): a seeded scheduler on kiln-seams' simulated clock and tasks, a network and disks under a nemesis, and the seed runs kiln CI makes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+futures = "0.3.34"
+kiln-seams = { path = "../kiln-seams" }
+parking_lot = "0.12.5"
+
+[lints]
+workspace = true

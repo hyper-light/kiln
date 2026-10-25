@@ -19,6 +19,8 @@ pub enum SpecError {
     NoSteps(String),
     #[error("matrix for job `{job}` expands to {count} combinations (limit {limit})")]
     MatrixTooLarge { job: String, count: usize, limit: usize },
+    #[error("job `{job}`'s requires `{expr}`: {why}")]
+    Requires { job: String, expr: String, why: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -130,8 +132,8 @@ pub struct JobSpec {
     /// here, where it's ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bench_gate: Option<serde_yaml::Value>,
-    /// The CI engine's routing constraints (docs/ci.md W05-R22): kept so a file both run stays
-    /// valid here, where a job goes where its `runs-on` labels say.
+    /// Constraints on a runner's facts (docs/ci.md W05-R22: `tools has node`, `disk.free >= 50Gi`),
+    /// a string or a list: a job goes only to a runner that meets each, as the CI engine routes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires: Option<serde_yaml::Value>,
     pub steps: Vec<StepSpec>,
@@ -195,6 +197,9 @@ pub struct PlannedJob {
     pub artifacts: Vec<String>,
     pub cache: Vec<String>,
     pub condition: Option<String>,
+    /// What a runner's facts must meet for the job to go there ([`JobSpec::requires`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
     pub steps: Vec<StepSpec>,
 }
 
@@ -280,10 +285,29 @@ pub fn parse(src: &str) -> Result<Pipeline, SpecError> {
     Ok(p)
 }
 
+/// A job's `requires`, as written: a string is one, a list each of its strings.
+pub fn requirements(v: Option<&serde_yaml::Value>) -> Vec<String> {
+    match v {
+        Some(serde_yaml::Value::String(r)) => vec![r.clone()],
+        Some(serde_yaml::Value::Sequence(rs)) => rs.iter().map(yaml_scalar).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn validate(p: &Pipeline) -> Result<(), SpecError> {
     for (id, job) in &p.jobs {
         if job.steps.is_empty() {
             return Err(SpecError::NoSteps(id.clone()));
+        }
+        match &job.requires {
+            None | Some(serde_yaml::Value::String(_) | serde_yaml::Value::Sequence(_)) => {}
+            Some(other) => {
+                let expr = yaml_scalar(other);
+                return Err(SpecError::Requires { job: id.clone(), expr, why: "give a constraint, or a list of them".into() });
+            }
+        }
+        for r in requirements(job.requires.as_ref()).iter().filter(|r| !r.contains("${{")) {
+            kiln_ci::sched::routing::Constraint::parse(r).map_err(|why| SpecError::Requires { job: id.clone(), expr: r.clone(), why })?;
         }
         for need in &job.needs {
             if !p.jobs.contains_key(need) {
@@ -409,9 +433,10 @@ pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
             exclusive: j.kiln.exclusive,
             artifacts: j.kiln.artifacts.clone(),
             cache: j.kiln.cache.iter().map(|c| c.as_str().map(str::to_owned).ok_or_else(|| format!("{} holds more than directories", at("cache")))).collect::<Result<_, _>>()?,
-            // The engine's; v1 doesn't gate on benchmarks, nor route by facts.
+            // The engine's; v1 doesn't gate on benchmarks.
             bench_gate: None,
-            requires: None,
+            requires: (!j.kiln.requires.is_empty())
+                .then(|| serde_yaml::Value::Sequence(j.kiln.requires.iter().map(|t| serde_yaml::Value::String(t.src.clone())).collect())),
             steps,
         };
         jobs.insert(j.id.clone(), spec);
@@ -492,6 +517,7 @@ pub fn plan(p: &Pipeline, base: &Context) -> Result<Vec<PlannedJob>, SpecError> 
                 artifacts: job.artifacts.clone(),
                 cache: job.cache.clone(),
                 condition: job.condition.as_ref().map(|c| ctx.interpolate(c)),
+                requires: requirements(job.requires.as_ref()).iter().map(|r| ctx.interpolate(r)).collect(),
                 steps,
             });
         }
@@ -621,6 +647,20 @@ jobs:
         let built = jobs.iter().any(|j| j.steps.iter().any(|s| s.run.contains("release # abc")));
         assert!(built);
         assert!(ctx.eval(bench.and_then(|b| b.condition.as_deref()).unwrap_or("false")));
+        Ok(())
+    }
+
+    /// A job's `requires` reach its plan, for dispatch to route by: a string as one, a list as
+    /// each, filled in as its labels are. One that isn't a constraint is refused with the pipeline.
+    #[test]
+    fn a_job_s_requires_reach_its_plan() -> Result<(), SpecError> {
+        let p = parse("name: r\njobs:\n  mac:\n    runs-on: [macos]\n    matrix: { tool: [node] }\n    requires: [\"os == macos\", \"tools has ${{ matrix.tool }}\"]\n    steps: [{run: x}]\n  one:\n    requires: tools has cargo\n    steps: [{run: x}]\n")?;
+        let jobs = plan(&p, &Context::default())?;
+        let of = |id: &str| jobs.iter().find(|j| j.spec_id == id).map(|j| j.requires.clone()).unwrap_or_default();
+        assert_eq!(of("mac"), vec!["os == macos".to_owned(), "tools has node".to_owned()]);
+        assert_eq!(of("one"), vec!["tools has cargo".to_owned()]);
+        let bad = parse("name: r\njobs:\n  a:\n    requires: [\"tools has\"]\n    steps: [{run: x}]\n");
+        assert!(matches!(bad, Err(SpecError::Requires { .. })), "{bad:?}");
         Ok(())
     }
 

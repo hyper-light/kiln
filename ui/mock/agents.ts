@@ -154,6 +154,40 @@ const family = new Map<string, Member>(
   if (m) m.info.approvals = [{ id: migrApproval.id, tool: migrApproval.tool, tool_name: migrApproval.tool_name, title: migrApproval.title, at: migrApproval.at }];
 }
 
+// /agents/fan-lead "Replication lead": its goal "Replicated log" runs its plan's steps side by side
+// (docs/goals.md, "A plan's steps side by side"; goals.ts), a subagent of its own for each step
+// that's ready, one of them asking you something; and a goal of its own (not a plan's step) out on a
+// subagent too. It coordinates them, at work itself on nothing.
+const fanApproval: Approval = {
+  id: "fan-s3-ap1",
+  tool_name: "Bash",
+  tool: "shell",
+  title: "cargo run --bin chaos -- --partition 2",
+  command: "cargo run --bin chaos -- --partition 2",
+  input: { command: "cargo run --bin chaos -- --partition 2" },
+  cwd: CWD,
+  at: Date.now() - 45_000,
+};
+for (const m of [
+  member("fan-lead", "claude", "local", "Replication lead", "idle", "default", "Replicate the metadata store's log over QUIC, then rotate the release signing key.", "Its steps are out on subagents; I'll check each as it comes back."),
+  member("fan-s2", "claude", "agent:metal-ryzen-01", "Step 2: Leader election over QUIC", "running", "default", 'Step 2 of 5 of the plan "Replicated log": Leader election over QUIC', "Electing a leader across three nodes.", {
+    parent: "fan-lead",
+    doing: "Running cargo test -p hyper-raft election",
+  }),
+  { ...member("fan-s3", "codex", "agent:metal-epyc-01", "Step 3: Follower catch-up", "waiting", "untrusted", 'Step 3 of 5 of the plan "Replicated log": Follower catch-up', "I'll partition a follower and let it catch up.", { parent: "fan-lead" }), approval: fanApproval },
+  member("fan-s4", "claude", "agent:metal-ryzen-02", "Step 4: Snapshot transfer", "running", "default", 'Step 4 of 5 of the plan "Replicated log": Snapshot transfer', "Streaming a snapshot to a lagging follower.", {
+    parent: "fan-lead",
+    doing: "Streaming a 10 GB snapshot",
+  }),
+  member("fan-sign", "claude", "local", "Rotate the release signing key", "running", "default", "Rotate the release signing key and re-sign 0.2.1's binaries", "Re-signing the binaries.", { parent: "fan-lead", doing: "Signing kiln-x86_64-linux" }),
+]) {
+  family.set(m.info.id, m);
+}
+{
+  const m = family.get("fan-s3");
+  if (m) m.info.approvals = [{ id: fanApproval.id, tool: fanApproval.tool, tool_name: fanApproval.tool_name, title: fanApproval.title, at: fanApproval.at }];
+}
+
 // Release prep proposed a plan (plan mode), kept by kiln (pages.ts `pl_proposed`), and works through its to-do list.
 {
   const m = family.get("fam-orch");
@@ -699,6 +733,47 @@ const META: Meta = {
   features: ["interrupt", "set_mode", "steer"],
 };
 
+/** How a person's message reaches one of its subagents, as its harness lets one in (harness/subagent.rs): a Codex one on its own thread, a Claude Code one by way of its agent (not once stopped). */
+function withTakes(m: Member, t: Task): Task {
+  if (t.class !== "agent" || !t.tool_id) return t;
+  const live = t.status === "running" || t.status === "pending" || t.status === "paused";
+  if (m.info.kind === "codex") return { ...t, takes: live ? ["queue", "steer", "now"] : ["queue"] };
+  if (t.status === "stopped" || t.status === "killed") return t;
+  return { ...t, takes: live && t.background ? ["queue", "steer"] : ["queue"], via: "parent" };
+}
+
+/** A person's message to subagent `task`: in its thread, or waiting in its queue for it to finish. */
+function tellSubagent(m: Member, task: string, id: string, text: string, mode: string) {
+  const t = m.tasks?.find((x) => x.id === task);
+  if (!t?.tool_id) return;
+  const live = t.status === "running" || t.status === "pending" || t.status === "paused";
+  const out: unknown[] = [];
+  if (mode === "queue" && live) t.queue = [...(t.queue ?? []), { id, text, at: Date.now() }];
+  else {
+    const e = { id, seq: Math.max(0, ...m.events.map((x) => x.seq)) + 1, at: Date.now(), parent: t.tool_id, kind: "user", text, client_id: id } as HEvent;
+    m.events.push(e);
+    out.push({ t: "events", events: [e] });
+  }
+  out.unshift({ t: "state", state: stateOf(m) });
+  for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) for (const u of out) ws.send(JSON.stringify(u));
+}
+
+/** A command about a message waiting in one of its subagents' queues (harness/subagent.rs): edited, moved or taken out there, or sent to it now. */
+function subagentQueue(m: Member, c: { type?: string; id?: string; text?: string; index?: number }) {
+  const t = m.tasks?.find((x) => x.queue?.some((q) => q.id === c.id));
+  const queue = t?.queue ?? [];
+  const at = queue.findIndex((q) => q.id === c.id);
+  const q = queue[at];
+  if (!t || !q) return;
+  if (c.type === "queue_edit" && c.text !== undefined) q.text = c.text;
+  else if (c.type === "queue_move" && c.index !== undefined) queue.splice(Math.max(0, Math.min(c.index, queue.length - 1)), 0, ...queue.splice(at, 1));
+  else if (c.type === "queue_remove" || c.type === "queue_steer" || c.type === "queue_send_now") queue.splice(at, 1);
+  else return;
+  if (c.type === "queue_steer" || c.type === "queue_send_now") return tellSubagent(m, t.id, q.id, q.text, "steer");
+  const state = JSON.stringify({ t: "state", state: stateOf(m) });
+  for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
+}
+
 function stateOf(m: Member): State {
   return {
     status: m.info.status,
@@ -711,7 +786,7 @@ function stateOf(m: Member): State {
     approvals: m.approval ? [m.approval] : [],
     queue: [],
     delivery: {},
-    tasks: m.tasks ?? [],
+    tasks: (m.tasks ?? []).map((t) => withTakes(m, t)),
     todos: m.info.id === "fam-orch" ? ORCH_TODOS : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
@@ -728,8 +803,10 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   ws.on("close", () => seen.delete(ws));
   ws.on("message", (raw) => {
     try {
-      const c = JSON.parse(raw.toString()) as { type?: string; task?: string };
+      const c = JSON.parse(raw.toString()) as { type?: string; task?: string; id?: string; text?: string; mode?: string; index?: number };
       if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
+      if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
+      if (c.type?.startsWith("queue_")) subagentQueue(m, c);
     } catch {
       // Not a command.
     }

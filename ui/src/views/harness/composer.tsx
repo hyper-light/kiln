@@ -9,17 +9,20 @@
  */
 import * as React from "react";
 import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Navigation, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
-import { clientId, FORCE_STOP_AFTER_MS, useSession, useStopAt, type QueueItem, type SendMode, type SessionStore, type SlashCommand } from "@/api/harness";
+import { clientId, FORCE_STOP_AFTER_MS, useSession, useStopAt, type Attachment, type QueueItem, type SendMode, type SessionStore, type SlashCommand } from "@/api/harness";
 import { useNow } from "@/lib/hooks";
 import { Tip } from "@/components/ui/tooltip";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { Attachments } from "./controls";
+import { attachedPreview, useAttachments, type Attachments } from "./controls";
+import type { ReplyTarget } from "./timeline";
 import { CommandList, findCommand, matchCommands, parseSlash, ReplyPanel, runCommand, slashAt, type Reply } from "./palette";
 import { commandNames, Marked } from "./marks";
 import { SendWith } from "./run-settings";
 import { MicButton } from "./voice";
 import { modelLabel } from "./derive";
 import { useDrafts, useHeld, useSendMode, type Held } from "./state";
+import { stopperOf, subagentPlaceholder, takesMessages } from "./tasks";
 
 export const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
@@ -33,16 +36,29 @@ const fine = () => typeof window !== "undefined" && window.matchMedia?.("(pointe
 interface RowActs {
   onEdit: (text: string) => void;
   onRemove: () => void;
+  /** Its files change while it waits: the whole new set. */
+  onAttach?: (attachments: Attachment[]) => void;
   onMove?: (index: number) => void;
   onSteer?: () => void;
   onNow?: () => void;
 }
 
-/** One waiting message: its words (tap to read them whole), and what can be done with it. */
-function QueueRow({ text, index, count, onEdit, onRemove, onMove, onSteer, onNow }: { text: string; index: number; count: number } & RowActs) {
+/** Where a queued image's preview comes from: this session's upload, else its inline bytes. */
+const queueAttachSrc = (a: Attachment): string | undefined => {
+  if (!a.mime.startsWith("image/")) return undefined;
+  if (a.file_id) return attachedPreview(a.file_id);
+  return a.data_base64 ? `data:${a.mime};base64,${a.data_base64}` : undefined;
+};
+
+/** One waiting message: its words (tap to read them whole), its files (add or drop until it goes), and what can be done with it. */
+function QueueRow({ q, index, count, onEdit, onAttach, onRemove, onMove, onSteer, onNow }: { q: { id: string; text: string; attachments?: Attachment[] }; index: number; count: number } & RowActs) {
+  const text = q.text;
+  const attach = useAttachments("any");
+  const picker = React.useRef<HTMLInputElement>(null);
   const [editing, setEditing] = React.useState(false);
   const [whole, setWhole] = React.useState(false);
   const [draft, setDraft] = React.useState(text);
+  const [viewImg, setViewImg] = React.useState<{ name: string; src: string } | null>(null);
   // Changed elsewhere (another device): what's edited starts from that.
   const [was, setWas] = React.useState(text);
   if (was !== text) {
@@ -75,6 +91,53 @@ function QueueRow({ text, index, count, onEdit, onRemove, onMove, onSteer, onNow
         <button type="button" className={cn("qd-text", whole && "qd-whole")} onClick={() => setWhole(!whole)} aria-expanded={whole}>
           {text}
         </button>
+      )}
+      {(q.attachments?.length || onAttach) && (
+        <span className="hx-attach qd-attach">
+          {(q.attachments ?? []).map((a, i) => {
+            const src = queueAttachSrc(a);
+            return (
+              <span key={i} className={cn("hx-attach-chip", src && "hx-attach-view")} onClick={() => src && setViewImg({ name: a.name, src })} role={src ? "button" : undefined}>
+                {src ? <img src={src} alt="" /> : null}
+                <span className="hx-trunc">{a.name}</span>
+                {onAttach && (
+                  <button
+                    type="button"
+                    aria-label={`Remove ${a.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onAttach((q.attachments ?? []).filter((_, j) => j !== i));
+                    }}
+                  >
+                    <X size={11} />
+                  </button>
+                )}
+              </span>
+            );
+          })}
+          {onAttach && (
+            <>
+              <input
+                ref={picker}
+                type="file"
+                multiple
+                hidden
+                onChange={(ev) => {
+                  const list = ev.target.files;
+                  ev.target.value = "";
+                  if (!list?.length) return;
+                  void attach.add(list).then((added) => {
+                    attach.clear();
+                    if (added.length) onAttach([...(q.attachments ?? []), ...added]);
+                  });
+                }}
+              />
+              <button type="button" className="hx-attach-chip hx-attach-add" aria-label="Attach files" onClick={() => picker.current?.click()}>
+                <Paperclip size={11} />
+              </button>
+            </>
+          )}
+        </span>
       )}
       <span className="qd-acts">
         <Tip content="Edit">
@@ -116,6 +179,37 @@ function QueueRow({ text, index, count, onEdit, onRemove, onMove, onSteer, onNow
           </button>
         </Tip>
       </span>
+      {viewImg && (
+        <div className="hx-cover" role="dialog" aria-modal="true" aria-label={viewImg.name} onClick={() => setViewImg(null)}>
+          <div className="hx-cover-card hx-viewer" onClick={(e) => e.stopPropagation()}>
+            <div className="hx-viewer-head">
+              <button type="button" className="hx-icon" aria-label="Close" onClick={() => setViewImg(null)}>
+                <X size={14} />
+              </button>
+              <span className="hx-viewer-name hx-trunc">{viewImg.name}</span>
+            </div>
+            <div className="hx-viewer-body">
+              <img src={viewImg.src} alt={viewImg.name} />
+            </div>
+            <div className="hx-viewer-foot">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  const i = (q.attachments ?? []).findIndex((a) => a.name === viewImg.name);
+                  if (i >= 0) onAttach?.((q.attachments ?? []).filter((_, j) => j !== i));
+                  setViewImg(null);
+                }}
+              >
+                Remove
+              </Button>
+              <Button size="sm" variant="secondary" onClick={() => setViewImg(null)}>
+                Keep attached
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </li>
   );
 }
@@ -124,7 +218,7 @@ function QueueRow({ text, index, count, onEdit, onRemove, onMove, onSteer, onNow
  * What waits: one line until opened; it folds again a few seconds after you leave it. `label`:
  * where it waits ("Queued", "Kept here"); `hint`: when it goes; `acts`: what each one can do.
  */
-function Queued({ queue, label, hint, acts }: { queue: { id: string; text: string }[]; label: string; hint: string; acts: (id: string) => RowActs }) {
+function Queued({ queue, label, hint, acts }: { queue: { id: string; text: string; attachments?: Attachment[] }[]; label: string; hint: string; acts: (id: string) => RowActs }) {
   const [open, setOpen] = React.useState(false);
   const timer = React.useRef(0);
   const root = React.useRef<HTMLDivElement>(null);
@@ -175,7 +269,7 @@ function Queued({ queue, label, hint, acts }: { queue: { id: string; text: strin
       {open && (
         <ol ref={folding} className="qd-list">
           {queue.map((q, i) => (
-            <QueueRow key={q.id} text={q.text} index={i} count={queue.length} {...acts(q.id)} />
+            <QueueRow key={q.id} q={q} index={i} count={queue.length} {...acts(q.id)} />
           ))}
         </ol>
       )}
@@ -235,6 +329,29 @@ const StopTurn = React.memo(function StopTurn({ store }: { store: SessionStore }
   );
 });
 
+/** Stop the subagent shown (its turn; one whose harness can't pause it ends): as Stop does the agent's. */
+const StopSubagent = React.memo(function StopSubagent({ store, task }: { store: SessionStore; task: string }) {
+  const [at, setAt] = React.useState<number | null>(null);
+  const now = useNow();
+  const asked = at != null && now - at < 15_000;
+  return (
+    <Tip content="Stop the subagent (Esc)">
+      <button
+        type="button"
+        className="cp-stop"
+        disabled={asked}
+        onClick={() => {
+          if (store.send({ type: "stop_task", task })) setAt(Date.now());
+        }}
+        aria-label={asked ? "Stopping…" : "Stop the subagent"}
+      >
+        <Square size={10} fill="currentColor" />
+        <span className="cp-label">{asked ? "Stopping…" : "Stop"}</span>
+      </button>
+    </Tip>
+  );
+});
+
 /**
  * What was kept here for `agent` goes, in order, if it can take it now (connected, its machine
  * there). Those that went are dropped at once, after: a send that fails stops the rest.
@@ -244,9 +361,11 @@ function sendHeld(store: SessionStore, agent: string) {
   if (s.conn !== "open" || s.state?.status === "disconnected") return;
   const went: string[] = [];
   for (const m of useHeld.getState().held[agent] ?? []) {
-    // As it was to go: a "now" kept through a reconnection still stops what runs.
+    // As it was to go: a "now" kept through a reconnection still stops what runs. One for a
+    // subagent keeps its way too (the agent sends it the nearest way that one takes then).
     const running = s.state?.status === "running" || s.state?.status === "waiting";
-    if (!store.send({ type: "send", id: m.id, text: m.text, mode: running ? (m.mode ?? "queue") : "queue", attachments: m.attachments, overrides: m.overrides })) break;
+    const mode = m.task || running ? (m.mode ?? "queue") : "queue";
+    if (!store.send({ type: "send", id: m.id, text: m.text, mode, attachments: m.attachments, overrides: m.overrides, reply_to: m.reply_to, ...(m.task ? { task: m.task } : {}) })) break;
     went.push(m.id);
   }
   if (went.length) useHeld.getState().drop(agent, ...went);
@@ -256,25 +375,34 @@ const NO_QUEUE: QueueItem[] = [];
 const NO_HELD: Held[] = [];
 const NO_FEATURES: string[] = [];
 const NO_COMMANDS: SlashCommand[] = [];
+const NO_MODES: SendMode[] = [];
 
 export function Composer({
   store,
   agent,
   attachments,
   toMain,
+  task,
   onView,
   onTerminal,
+  replyTo,
+  onClearReply,
 }: {
   store: SessionStore;
   /** The agent's id: what's written to it is kept under it until it's sent. */
   agent: string;
   attachments: Attachments;
-  /** Shown over a subagent's thread: what's typed here goes to the main agent. */
+  /** Shown over a subagent's thread: what's typed here goes to the main agent (unless that subagent takes messages). */
   toMain?: boolean;
+  /** The subagent whose thread is shown (its task's id, or its call's): a message goes to it, as it takes one now (`Task.takes`). */
+  task?: string | null;
   /** A command that opens a kiln panel (model, mcp, changes, tasks…). */
   onView?: (view: string) => void;
   /** Open a terminal beside the agent: its shell (`!command`), or its harness's own screen (a command only that screen does). */
   onTerminal?: (open: { what: "shell" | "screen"; command?: string }) => void;
+  /** What the next message answers (a messenger-style reply, from a message's ⋯ menu). */
+  replyTo?: ReplyTarget | null;
+  onClearReply?: () => void;
 }) {
   const text = useDrafts((s) => s.drafts[agent] ?? "");
   const setDraft = useDrafts((s) => s.setDraft);
@@ -296,6 +424,11 @@ export function Composer({
   const model = useSession(store, (s) => s.state?.model ?? "");
   const effort = useSession(store, (s) => s.state?.effort ?? "");
   const meta = useSession(store, (s) => s.meta);
+  // Over a subagent's thread: one that takes messages now gets what's written here, its way.
+  const sub = useSession(store, (s) => (task ? s.state?.tasks.find((t) => t.id === task || t.tool_id === task) : undefined));
+  const subTakes = sub?.takes ?? NO_MODES;
+  const toSub = takesMessages(sub) ? sub : undefined;
+  const shownQueue = toSub ? (toSub.queue ?? NO_QUEUE) : queue;
   const [suggest, setSuggest] = React.useState<{ kind: "/" | "@"; items: { label: string; hint?: string }[]; index: number } | null>(null);
   const ta = React.useRef<HTMLTextAreaElement | null>(null);
   /** The marked copy of the text under the field (its own text is clear). */
@@ -303,12 +436,13 @@ export function Composer({
   // Where the caret is, as the field last said; null: at the end (text put in, not typed).
   const [caret, setCaret] = React.useState<number | null>(null);
   const features = meta?.features ?? NO_FEATURES;
-  const running = status === "running" || status === "waiting";
-  const modes = React.useMemo(() => MODES.filter((m) => !m.feature || features.includes(m.feature)), [features]);
+  const running = toSub ? toSub.status === "running" || toSub.status === "pending" || toSub.status === "paused" : status === "running" || status === "waiting";
+  const modes = React.useMemo(() => MODES.filter((m) => (toSub ? subTakes.includes(m.id) : !m.feature || features.includes(m.feature))), [features, toSub, subTakes]);
   // How you chose to send stays chosen; an agent that can't send that way queues.
   const mode: SendMode = modes.some((m) => m.id === chosen) ? chosen : "queue";
   const canAttach = attachments.enabled;
-  const canOverride = features.includes("overrides");
+  const canOverride = !toSub && features.includes("overrides");
+  const subStops = Boolean(toSub && running && stopperOf(toSub, features));
   const { files, add, clear, chips, pending } = attachments;
   const picker = React.useRef<HTMLInputElement>(null);
   const [override, setOverride] = React.useState<{ model?: string; effort?: string }>({});
@@ -437,8 +571,7 @@ export function Composer({
     else if (out.kind === "terminal") {
       if (onTerminal) onTerminal({ what: "screen", command: out.command });
       else setNote(`/${entry.name} is done in the harness's own screen, in a terminal`);
-    }
-    else if (out.kind === "reply") {
+    } else if (out.kind === "reply") {
       setReply("loading");
       out.promise.then(setReply, (e: unknown) => setReply({ title: `/${entry.name}`, text: "", error: e instanceof Error ? e.message : String(e) }));
     }
@@ -490,17 +623,19 @@ export function Composer({
 
   const sendText = (body: string) => {
     if ((!body && files.length === 0) || pending > 0) return;
-    const m = { id: clientId(), text: body, attachments: files.length ? attachments.payload() : undefined, overrides: override.model || override.effort ? override : undefined };
+    const m = { id: clientId(), text: body, attachments: files.length ? attachments.payload() : undefined, overrides: override.model || override.effort ? override : undefined, reply_to: replyTo?.id };
     // It can't take it now (or what was kept here hasn't all gone yet): kept here, sent once it
     // can, in order — never lost, never blocked. "Now" and "steer" don't wait behind what's kept:
     // they're for the turn under way.
     const go = running ? mode : "queue";
     const behind = held.length > 0 && go === "queue";
-    if (behind || !(reachable && store.send({ type: "send", ...m, mode: go }))) useHeld.getState().hold(agent, { ...m, mode: go, at: Date.now() });
+    const to = toSub ? { task: toSub.id } : {};
+    if (behind || !(reachable && store.send({ type: "send", ...m, mode: go, ...to }))) useHeld.getState().hold(agent, { ...m, mode: go, at: Date.now(), ...to });
     write("");
     clear();
     setOverride({});
     setWithOpen(false);
+    onClearReply?.();
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -550,9 +685,10 @@ export function Composer({
       submit();
       return;
     }
-    if (e.key === "Escape" && running && features.includes("interrupt") && !text) {
+    if (e.key === "Escape" && running && !text && (toSub ? subStops : features.includes("interrupt"))) {
       e.preventDefault();
-      store.stop();
+      if (toSub) store.send({ type: "stop_task", task: toSub.id });
+      else store.stop();
     }
   };
 
@@ -566,21 +702,43 @@ export function Composer({
           acts={(id) => ({ onEdit: (t) => useHeld.getState().edit(agent, id, t), onRemove: () => useHeld.getState().drop(agent, id) })}
         />
       )}
-      {queue.length > 0 && (
+      {shownQueue.length > 0 && (
         <Queued
-          queue={queue}
+          queue={shownQueue}
           label="Queued"
-          hint={paused === "auto" ? "sent in order once the limit resets" : paused ? "sent in order once you resume it" : "sent in order when it finishes"}
+          hint={
+            paused === "auto"
+              ? "sent in order once the limit resets"
+              : paused
+                ? "sent in order once you resume it"
+                : toSub
+                  ? "sent in order when the subagent finishes"
+                  : "sent in order when it finishes"
+          }
           acts={(id) => ({
             onEdit: (text) => store.send({ type: "queue_edit", id, text }),
+            onAttach: (atts) => {
+              const q = queue.find((x) => x.id === id);
+              if (q) store.send({ type: "queue_edit", id, text: q.text, attachments: atts });
+            },
             onRemove: () => store.send({ type: "queue_remove", id }),
             onMove: (index) => store.send({ type: "queue_move", id, index }),
-            onSteer: features.includes("queue_steer") && !paused ? () => store.send({ type: "queue_steer", id }) : undefined,
-            onNow: features.includes("send_now") && !paused ? () => store.send({ type: "queue_send_now", id }) : undefined,
+            onSteer: (toSub ? subTakes.includes("steer") : features.includes("queue_steer")) && !paused ? () => store.send({ type: "queue_steer", id }) : undefined,
+            onNow: (toSub ? subTakes.includes("now") : features.includes("send_now")) && !paused ? () => store.send({ type: "queue_send_now", id }) : undefined,
           })}
         />
       )}
 
+      {replyTo && (
+        <div className="cp-reply" role="note">
+          <CornerDownLeft size={12} aria-hidden="true" />
+          <span className="cp-reply-who">{replyTo.who}</span>
+          <span className="cp-reply-text">{replyTo.text}</span>
+          <button type="button" className="hx-icon" aria-label="Stop replying" onClick={onClearReply}>
+            <X size={12} />
+          </button>
+        </div>
+      )}
       {reply && <ReplyPanel reply={reply} onClose={() => setReply(null)} />}
       {palItems.length > 0 && <CommandList items={palItems} index={palIndex} onPick={pick} onHover={setPalIndex} />}
       {note && (
@@ -642,17 +800,19 @@ export function Composer({
                 ? `${disabled ? "Not connected" : `${machine || "Its machine"} is offline`}: what you send waits here and goes once ${away}`
                 : paused
                   ? `Queue a message: it goes once ${paused === "auto" ? "the limit resets" : "you resume it"}`
-                  : toMain
-                  ? "Message the main agent"
-                  : running
-                    ? mode === "steer"
-                      ? "Steer it — it reads this at its next step"
-                      : mode === "now"
-                        ? approvals > 0
-                          ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
-                          : "Stop and say…"
-                        : "Queue a message for when it finishes"
-                    : "Tell the agent what to do"
+                  : toSub
+                    ? subagentPlaceholder(running ? mode : null, toSub.via === "parent")
+                    : toMain
+                      ? "Message the main agent"
+                      : running
+                        ? mode === "steer"
+                          ? "Steer it — it reads this at its next step"
+                          : mode === "now"
+                            ? approvals > 0
+                              ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
+                              : "Stop and say…"
+                            : "Queue a message for when it finishes"
+                        : "Tell the agent what to do"
             }
             onChange={(e) => write(e.target.value, e.target.selectionStart)}
             onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
@@ -660,7 +820,7 @@ export function Composer({
               if (mirror.current) mirror.current.scrollTop = e.currentTarget.scrollTop;
             }}
             onKeyDown={onKeyDown}
-            aria-label="Message to the agent"
+            aria-label={toSub ? "Message to the subagent" : "Message to the agent"}
             enterKeyHint="send"
             autoCapitalize="sentences"
           />
@@ -690,7 +850,7 @@ export function Composer({
           <MicButton field={ta} setText={write} onNote={setNote} disabled={disabled} />
           {running && modes.length > 1 && <SendModes modes={modes} mode={mode} onMode={setMode} />}
           <span className="cp-gap" />
-          {running && features.includes("interrupt") && <StopTurn store={store} />}
+          {toSub ? subStops && <StopSubagent store={store} task={toSub.id} /> : running && features.includes("interrupt") && <StopTurn store={store} />}
           <button
             type="button"
             className="cp-send"

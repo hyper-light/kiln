@@ -71,6 +71,9 @@ pub enum Request {
         text: String,
         #[serde(default)]
         mode: SendMode,
+        /// An idempotency key (CP-T3.2): sent again with it, it's the same message, delivered once.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     /// One of kiln's operations (`agents.start`, `agents.wait`, …), asked of the kiln server for
     /// whoever asks: an agent kiln runs here, else the person in kiln shell `terminal`.
@@ -165,13 +168,13 @@ pub async fn answer(host: &Host, req: Request, peer: Option<u32>, forward: Optio
             let sessions: Vec<Value> = a.pointer("/result/agents").and_then(Value::as_array).into_iter().flatten().map(|i| json!({"id": i.get("id"), "name": i.get("name"), "kind": i.get("kind")})).collect();
             json!({"ok": true, "sessions": sessions})
         }
-        Request::Send { id, text, mode } if agent.is_some() => {
+        Request::Send { id, text, mode, key } if agent.is_some() => {
             let mode = match mode {
                 SendMode::Queue => "queue",
                 SendMode::Steer => "steer",
                 SendMode::Now => "now",
             };
-            as_agent("agents.send", json!({"agent": id, "text": text, "mode": mode})).await
+            as_agent("agents.send", json!({"agent": id, "text": text, "mode": mode, "key": key})).await
         }
         Request::Stop { id: Some(id), .. } if agent.is_some() => as_agent("agents.stop", json!({"agent": id})).await,
         Request::Interrupt { id: Some(id), .. } if agent.is_some() => as_agent("agents.interrupt", json!({"agent": id})).await,
@@ -200,7 +203,8 @@ fn peer_pid(_s: &std::os::unix::net::UnixStream) -> Option<u32> {
 /// named after the agent so a server and runners on one machine do not collide. `home` is the
 /// runner's state directory: every runner process of a machine (an upgrade's new build beside
 /// the old one) has the same socket, served by the one that runs the machine's sessions, so the
-/// path a terminal was given goes on working after an upgrade.
+/// path a terminal was given goes on working after an upgrade. Another process given the same
+/// name and directory (a local server's own agent) never takes it from a live one ([`Kept`]).
 pub fn path(name: &str, home: &std::path::Path) -> PathBuf {
     let safe: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).take(32).collect();
     // Two kiln processes on one machine (a server and runners, or test instances) never share one.
@@ -276,20 +280,169 @@ pub fn handle(host: &Host, req: Request) -> Value {
             let n = ids.iter().filter(|i| host.command(i, Command::Interrupt)).count();
             json!({"ok": true, "interrupted": n})
         }
-        Request::Send { id, text, mode } => {
+        Request::Send { id, text, mode, key } => {
             let ids = pick(&Some(id), &None);
             let Some(target) = ids.first() else { return json!({"ok": false, "error": "no such agent"}) };
-            let ok = host.command(target, Command::Send { id: crate::util::new_id(), text, mode, attachments: Vec::new(), overrides: None });
-            json!({"ok": ok})
+            // With a key, the same message each time it's sent (CP-T3.2).
+            let message = key.as_deref().map_or_else(crate::util::new_id, |k| crate::util::derive_id(&["socket.send", target, k]));
+            let ok = host.command(target, Command::Send { id: message.clone(), text, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None });
+            json!({"ok": ok, "message": message})
         }
         Request::Op { .. } => json!({"ok": false, "error": "kiln's operations go to the kiln server"}),
     }
 }
 
 /// Serve `host` on the socket at `path` until this process exits (a runner's: kiln's operations
-/// go through its link to the server). Unix only.
-pub fn serve(host: &Arc<Host>, path: PathBuf) -> anyhow::Result<PathBuf> {
-    serve_with(host, path, None)
+/// go through its link to the server). `take`: this process takes the path over even from a live
+/// one (a runner's new build once it has the machine's sessions, or its old one taking them
+/// back), else it serves it once nothing else does ([`Kept`]). Unix only.
+pub fn serve(host: &Arc<Host>, path: PathBuf, take: bool) -> anyhow::Result<PathBuf> {
+    serve_with(host, path, None, take)
+}
+
+/// What became of a socket's path since this process bound it there.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// The file this process bound is there still.
+    Ours,
+    /// Another live process serves it.
+    Theirs,
+    /// Nothing answers there: no file, or the socket of a process that has ended.
+    Dead,
+}
+
+/// The file at `path` (its device and inode), if there is one.
+#[cfg(unix)]
+fn file_id(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Whether a live process answers at `path`. Without waiting: a connection the listener hasn't
+/// taken yet (its queue full) is a live one's.
+#[cfg(unix)]
+fn answers(path: &std::path::Path) -> bool {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr};
+    use std::os::fd::AsRawFd as _;
+    let Ok(addr) = UnixAddr::new(path) else { return false };
+    let Ok(fd) = nix::sys::socket::socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None) else { return false };
+    if nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK)).is_err() {
+        return false;
+    }
+    matches!(nix::sys::socket::connect(fd.as_raw_fd(), &addr), Ok(()) | Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINPROGRESS))
+}
+
+/// Where `path` stands for a process that bound the file `ours` there (`None`: it bound none).
+#[cfg(unix)]
+pub(crate) fn held(path: &std::path::Path, ours: Option<(u64, u64)>) -> Held {
+    match file_id(path) {
+        Some(f) if Some(f) == ours => Held::Ours,
+        Some(_) if answers(path) => Held::Theirs,
+        _ => Held::Dead,
+    }
+}
+
+/// A listener on `path`, in a directory only this user enters, and the file it's bound to; `None`
+/// when another live process serves the path and this one doesn't `take` it. A second kiln process
+/// given the machine's runner's name and state directory (a local server's own agent, restarted
+/// as a new kiln was installed) must never cut the runner off from the agents and terminals it
+/// serves. A file nothing answers on was left by a process that has ended, and goes.
+#[cfg(unix)]
+pub(crate) fn bind(path: &std::path::Path, take: bool) -> anyhow::Result<Option<(std::os::unix::net::UnixListener, (u64, u64))>> {
+    use std::os::unix::fs::PermissionsExt as _;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    if !take && answers(path) {
+        return Ok(None);
+    }
+    let _ = std::fs::remove_file(path);
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    let id = file_id(path).ok_or_else(|| anyhow::anyhow!("{} was gone as soon as it was bound", path.display()))?;
+    Ok(Some((listener, id)))
+}
+
+/// How often a quiet socket looks at its path; and while another process serves it.
+#[cfg(unix)]
+const LOOK: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(unix)]
+const LOOK_THEIRS: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A socket path this process serves, or will. Looked at while it's quiet: once it's left dead
+/// (its file gone, or the socket of a process that has ended) this process binds it again; while
+/// another live process serves it, it's left to that one until it ends. So a machine's runner gets
+/// its sockets back from whatever took them and then went, and no two processes take one from each
+/// other.
+#[cfg(unix)]
+pub(crate) struct Kept {
+    path: PathBuf,
+    what: &'static str,
+    listener: Option<std::os::unix::net::UnixListener>,
+    ours: Option<(u64, u64)>,
+    looked: std::time::Instant,
+    theirs: bool,
+}
+
+#[cfg(unix)]
+impl Kept {
+    /// Bound now (`take`: as [`bind`] says), or once nothing else serves it. `what` names it in the
+    /// log.
+    pub(crate) fn new(path: PathBuf, take: bool, what: &'static str) -> anyhow::Result<Self> {
+        let bound = bind(&path, take)?;
+        if bound.is_none() {
+            tracing::info!(path = %path.display(), "{what}: another kiln process serves this machine's socket; this one serves it once that one stops");
+        }
+        let theirs = bound.is_none();
+        let (listener, ours) = bound.map_or((None, None), |(l, id)| (Some(l), Some(id)));
+        Ok(Self { path, what, listener, ours, looked: std::time::Instant::now(), theirs })
+    }
+
+    pub(crate) fn listener(&self) -> Option<&std::os::unix::net::UnixListener> {
+        self.listener.as_ref()
+    }
+
+    /// [`Kept::look`], if it's time to.
+    pub(crate) fn check(&mut self) -> bool {
+        if self.looked.elapsed() < if self.theirs { LOOK_THEIRS } else { LOOK } {
+            return false;
+        }
+        self.look()
+    }
+
+    /// Look at the path now, and bind it again if it's dead: true when this process serves it
+    /// anew.
+    pub(crate) fn look(&mut self) -> bool {
+        self.looked = std::time::Instant::now();
+        match held(&self.path, self.ours) {
+            Held::Ours => {
+                self.theirs = false;
+                false
+            }
+            Held::Theirs => {
+                self.theirs = true;
+                false
+            }
+            Held::Dead => match bind(&self.path, false) {
+                Ok(Some((l, id))) => {
+                    tracing::info!(path = %self.path.display(), "{}: nothing answered at this machine's socket; this process serves it again", self.what);
+                    (self.listener, self.ours, self.theirs) = (Some(l), Some(id), false);
+                    true
+                }
+                Ok(None) => {
+                    self.theirs = true;
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(path = %self.path.display(), error = %format!("{e:#}"), "{}: this machine's socket couldn't be bound again", self.what);
+                    false
+                }
+            },
+        }
+    }
 }
 
 static SERVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -303,25 +456,21 @@ pub fn served() -> Option<&'static str> {
 
 /// The same, kiln's operations answered by `forward` (the server's own socket).
 #[cfg(unix)]
-pub fn serve_with(host: &Arc<Host>, path: PathBuf, forward: Option<Forward>) -> anyhow::Result<PathBuf> {
+pub fn serve_with(host: &Arc<Host>, path: PathBuf, forward: Option<Forward>, take: bool) -> anyhow::Result<PathBuf> {
     use std::os::fd::{AsRawFd as _, OwnedFd};
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::os::unix::net::UnixListener;
 
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
-    // A socket left by a previous process of ours (it cannot be in use: the name is ours).
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let mut kept = Kept::new(path.clone(), take, "`kiln spawn`")?;
     let _ = SERVED.set(path.to_string_lossy().into_owned());
-    listener.set_nonblocking(true)?;
     let host = Arc::clone(host);
     crate::rt::spawn(async move {
-        let fd = listener.as_raw_fd();
         loop {
+            let Some(listener) = kept.listener() else {
+                // Another process serves it: looked at now and then, served once it's gone.
+                crate::rt::sleep(std::time::Duration::from_secs(1)).await;
+                kept.check();
+                continue;
+            };
+            let fd = listener.as_raw_fd();
             match listener.accept() {
                 Ok((stream, _)) => {
                     let (host, forward) = (Arc::clone(&host), forward.clone());
@@ -352,10 +501,12 @@ pub fn serve_with(host: &Arc<Host>, path: PathBuf, forward: Option<Forward>) -> 
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Woken when a connection waits, and looked at again each second regardless:
-                    // a wakeup missed costs a second, never an asker left waiting.
+                    // a wakeup missed costs a second, never an asker left waiting. Quiet, it
+                    // looks at its path too.
                     if let Ok(Err(_)) = crate::rt::timeout(std::time::Duration::from_secs(1), hyper_rt::readiness::readable(fd)).await {
                         crate::rt::sleep(std::time::Duration::from_millis(200)).await;
                     }
+                    kept.check();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
@@ -370,7 +521,7 @@ pub fn serve_with(host: &Arc<Host>, path: PathBuf, forward: Option<Forward>) -> 
 
 /// No local socket on Windows yet: `kiln spawn` is not available there.
 #[cfg(not(unix))]
-pub fn serve_with(_host: &Arc<Host>, _path: PathBuf, _forward: Option<Forward>) -> anyhow::Result<PathBuf> {
+pub fn serve_with(_host: &Arc<Host>, _path: PathBuf, _forward: Option<Forward>, _take: bool) -> anyhow::Result<PathBuf> {
     anyhow::bail!("kiln spawn needs Unix sockets")
 }
 
@@ -422,7 +573,7 @@ mod tests {
                 }
                 *s.pid.lock() = Some(std::process::id());
                 let path = dir.join("h.sock");
-                serve_with(&hub.harness.local, path.clone(), Some(crate::harness::ops::forward(Arc::clone(&hub))))?;
+                serve_with(&hub.harness.local, path.clone(), Some(crate::harness::ops::forward(Arc::clone(&hub))), false)?;
                 let nowhere = "/nonexistent/kiln-socket-test";
                 let refused = ask(path.clone(), json!({"op": "spawn", "kind": "claude", "mode": "bypassPermissions", "cwd": nowhere})).await?;
                 anyhow::ensure!(refused.get("ok") == Some(&json!(false)) && refused.get("error").and_then(Value::as_str).is_some_and(|e| e.contains("above its own ask")), "{refused}");
@@ -444,6 +595,61 @@ mod tests {
             Ok(r) => r,
             Err(_) => anyhow::bail!("the socket hung"),
         }
+    }
+
+    /// Every connection waiting on `l`, taken: how many.
+    #[cfg(unix)]
+    fn drain(l: &std::os::unix::net::UnixListener) -> usize {
+        std::iter::from_fn(|| l.accept().ok()).count()
+    }
+
+    /// A second kiln process given the runner's name and state directory (a local server's own
+    /// agent, as on adacachy on 2026-10-25) leaves a socket another live process serves to that
+    /// one; a runner's new build taking the machine over takes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_a_live_process_serves_is_left_to_it_unless_taken_over() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("h.sock");
+        let (first, first_id) = bind(&path, false)?.ok_or_else(|| anyhow::anyhow!("the free path wasn't bound"))?;
+        anyhow::ensure!(bind(&path, false)?.is_none(), "a socket a live process serves was taken");
+        anyhow::ensure!(held(&path, Some(first_id)) == Held::Ours);
+        let _asker = std::os::unix::net::UnixStream::connect(&path)?;
+        anyhow::ensure!(drain(&first) >= 1, "the first process lost its socket");
+        let (second, second_id) = bind(&path, true)?.ok_or_else(|| anyhow::anyhow!("not taken over"))?;
+        anyhow::ensure!(held(&path, Some(second_id)) == Held::Ours && held(&path, Some(first_id)) == Held::Theirs);
+        let _asker = std::os::unix::net::UnixStream::connect(&path)?;
+        anyhow::ensure!(drain(&second) >= 1 && drain(&first) == 0, "the socket taken over didn't move");
+        Ok(())
+    }
+
+    /// A socket left dead (what took it has ended) is served again by the process keeping it the
+    /// next time it looks; one another live process serves is left to that one until it ends.
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_socket_left_dead_is_served_again() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("h.sock");
+        let mut kept = Kept::new(path.clone(), false, "test")?;
+        anyhow::ensure!(kept.listener().is_some() && !kept.look(), "the free path wasn't served");
+        // Something takes the path and ends: its file stays, and nothing answers there.
+        drop(bind(&path, true)?);
+        anyhow::ensure!(held(&path, kept.ours) == Held::Dead);
+        anyhow::ensure!(kept.look(), "the dead path wasn't served again");
+        let _asker = std::os::unix::net::UnixStream::connect(&path)?;
+        anyhow::ensure!(kept.listener().is_some_and(|l| drain(l) >= 1), "the socket served again took no connection");
+        // While another live process serves it, it's that one's; once that one ends, it's back.
+        let other = bind(&path, true)?;
+        anyhow::ensure!(!kept.look() && held(&path, kept.ours) == Held::Theirs, "a live process's socket was taken back");
+        drop(other);
+        anyhow::ensure!(kept.look(), "not served again once the other process ended");
+        // A process that starts while another serves the path waits, and serves it once that one ends.
+        let (live, _) = bind(&path, true)?.ok_or_else(|| anyhow::anyhow!("not taken over"))?;
+        let mut later = Kept::new(path.clone(), false, "test")?;
+        anyhow::ensure!(later.listener().is_none(), "a live process's socket was taken at start");
+        drop(live);
+        anyhow::ensure!(later.look() && later.listener().is_some(), "not served once the path was free");
+        Ok(())
     }
 
     #[test]

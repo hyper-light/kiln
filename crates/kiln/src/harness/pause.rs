@@ -489,9 +489,19 @@ pub fn let_through(core: &mut Core, c: Command) -> Option<Command> {
     if !matches!(c, Command::Send { .. }) || !at_threshold(core) {
         return Some(c);
     }
-    if let Command::Send { id, text, attachments, overrides, .. } = c {
-        core.state.queue.push(QueueItem { id, text, at: Core::now(), attachments, overrides });
-        core.touch_state();
+    if let Command::Send { id, text, attachments, overrides, task, .. } = c {
+        let m = QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to: None };
+        match task {
+            // One for a subagent waits in its queue, for when the pause ends.
+            Some(task) if core.state.tasks.iter().any(|t| t.id == task && t.takes.contains(&super::model::SendMode::Queue)) => {
+                super::subagent::hold(core, &task, QueueItem { overrides: None, ..m });
+            }
+            Some(task) => super::subagent::refuse(core, &task, &m, "its harness takes no message for it from kiln."),
+            None => {
+                core.state.queue.push(m);
+                core.touch_state();
+            }
+        }
     }
     None
 }
@@ -568,7 +578,7 @@ pub const KILN_ID: &str = "kiln-";
 /// The cut-off turn goes on once the harness can take it (it ended, or a turn is under way): kiln's
 /// message waits at the front of the queue.
 pub fn continue_later(core: &mut Core, text: &str) {
-    core.state.queue.insert(0, QueueItem { id: format!("{KILN_ID}{}", crate::util::new_id()), text: text.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None });
+    core.state.queue.insert(0, QueueItem { id: format!("{KILN_ID}{}", crate::util::new_id()), text: text.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
     core.touch_state();
 }
 
@@ -790,7 +800,7 @@ mod tests {
         core.state.limits = vec![window("five_hour", 96.0, later)];
         core.state.status = Status::Running;
         core.state.turn_started = Some(Core::now() - 1_000);
-        core.upsert("u1", None, Body::User { text: "port the parser".into(), images: 0, client_id: Some("u1".into()), origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("u1", None, Body::User { text: "port the parser".into(), images: 0, client_id: Some("u1".into()), origin: Some("human".into()), attachments: Vec::new(), reply_to: None });
         core.upsert("t1", None, shell(ToolStatus::Running));
         // No stop point: it works on.
         assert!(!stop_mid_turn(&mut core));
@@ -980,7 +990,7 @@ mod tests {
     #[test]
     fn a_message_sent_while_paused_waits_in_the_queue() {
         let mut core = Core::new();
-        let send = |id: &str| Command::Send { id: id.into(), text: "go on".into(), mode: Default::default(), attachments: vec![], overrides: None };
+        let send = |id: &str| Command::Send { id: id.into(), text: "go on".into(), mode: Default::default(), attachments: vec![], overrides: None, reply_to: None, task: None };
         assert!(let_through(&mut core, send("m1")).is_some());
         hold(&mut core, LIMIT, "harness", Hit::default(), None);
         assert!(let_through(&mut core, send("m2")).is_none());
@@ -1040,7 +1050,7 @@ mod tests {
     #[test]
     fn a_continue_that_cant_go_now_waits_first_in_the_queue() {
         let mut core = Core::new();
-        core.state.queue.push(QueueItem { id: "m2".into(), text: "then the tests".into(), at: 1, attachments: vec![], overrides: None });
+        core.state.queue.push(QueueItem { id: "m2".into(), text: "then the tests".into(), at: 1, attachments: vec![], overrides: None, reply_to: None });
         continue_later(&mut core, CONTINUE);
         assert!(core.state.queue.first().is_some_and(|q| q.id.starts_with(KILN_ID) && q.text == CONTINUE));
         assert_eq!(core.state.queue.len(), 2);
