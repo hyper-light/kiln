@@ -267,6 +267,55 @@ impl Layout {
     }
 }
 
+/// Where a kiln-dialect leg's `TMPDIR` is (W02-R06): in its own temp, on the work volume, emptied
+/// with it before every leg.
+fn v1_tmp(l: &Layout) -> PathBuf {
+    l.temp.join("tmp")
+}
+
+/// The event as v1 named it (W02-R06): GitHub's `workflow_dispatch` is v1's `manual`, a tag's
+/// `push` its `tag`; the rest (`push`, `schedule`, kiln's own events) are named alike.
+fn v1_event(github: &serde_json::Value) -> String {
+    let s = |k: &str| github.get(k).and_then(serde_json::Value::as_str).unwrap_or_default();
+    match (s("event_name"), s("ref_type")) {
+        ("workflow_dispatch", _) => "manual".into(),
+        ("push", "tag") => "tag".into(),
+        (e, _) => e.into(),
+    }
+}
+
+/// The variables v1's runner gave every step (W02-R06, docs/pipelines.md), for a kiln-dialect
+/// leg: what kiln's own workflows read (`kiln:$KILN_SHA`, `$KILN_AGENT`). Beneath the job's own
+/// `env`, as every default is. `KILN_JOB` and `KILN_ATTEMPT` keep the engine's meaning.
+fn v1_env(a: &AssignmentV2, runner: &str, l: &Layout) -> Vec<(&'static str, String)> {
+    let g = &a.contexts.github;
+    let s = |k: &str| match g.get(k) {
+        Some(serde_json::Value::String(v)) => v.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    let sha = Some(s("sha")).filter(|v| !v.is_empty()).unwrap_or_else(|| a.sha.clone());
+    let tmp = v1_tmp(l).to_string_lossy().into_owned();
+    let mut v = vec![
+        ("KILN", "true".to_owned()),
+        ("KILN_REPO", a.repo.clone()),
+        ("KILN_SHA", sha),
+        ("KILN_BRANCH", s("ref_name")),
+        ("KILN_EVENT", v1_event(g)),
+        ("KILN_RUN_ID", a.run_id.clone()),
+        ("KILN_RUN_NUMBER", s("run_number")),
+        ("KILN_JOB_ID", a.job_id.clone()),
+        ("KILN_WORKSPACE", l.workspace.to_string_lossy().into_owned()),
+        ("KILN_AGENT", runner.to_owned()),
+    ];
+    // Windows tools find their temp folder through TEMP and TMP rather than TMPDIR.
+    if cfg!(windows) {
+        v.extend([("TEMP", tmp.clone()), ("TMP", tmp.clone())]);
+    }
+    v.push(("TMPDIR", tmp));
+    v
+}
+
 /// In a microVM's leg (W13-R05): its forwarder to the host's egress proxy, and what that proxy
 /// refuses, as the host says it.
 fn microvm_egress() -> Option<(String, async_channel::Receiver<String>)> {
@@ -1097,6 +1146,11 @@ impl Leg {
         if shard_items(a).is_some() {
             set("KILN_SHARD_ITEMS", l.temp.join("_kiln").join("shard-items").to_string_lossy().into_owned());
         }
+        if st.dialect == Dialect::Kiln {
+            for (k, val) in v1_env(a, &self.runner_name, l) {
+                set(k, val);
+            }
+        }
         // The server's own certificate authority beside the machine's roots (§2.6): Node adds
         // it to its own; git, curl, Python and OpenSSL take the bundle. A job's own say wins.
         // In the machine's own store, only Node and Python's requests (which read bundles of
@@ -1182,10 +1236,14 @@ impl Leg {
         let (ws, temp, cmds) = (layout.workspace.clone(), layout.temp.clone(), layout.commands.clone());
         let event = serde_json::to_vec(&a.contexts.github.get("event").cloned().unwrap_or_default()).unwrap_or_default();
         let items = shard_items(a);
+        let tmp = (dialect == Dialect::Kiln).then(|| v1_tmp(&layout));
         crate::rt::blocking(move || -> std::io::Result<()> {
             let _ = std::fs::remove_dir_all(&temp);
             std::fs::create_dir_all(&ws)?;
             std::fs::create_dir_all(&cmds)?;
+            if let Some(t) = tmp {
+                std::fs::create_dir_all(t)?;
+            }
             std::fs::create_dir_all(temp.join("_github_workflow"))?;
             if let Some(text) = items {
                 std::fs::create_dir_all(temp.join("_kiln"))?;
@@ -5464,6 +5522,82 @@ jobs:
         let (r, logs, _) = run_leg("on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: test -z \"$KILN_SHARD_ITEMS\"\n", &[])?;
         assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
         Ok(())
+    }
+
+    /// The variables a leg's step printed (`env`), by name.
+    #[cfg(unix)]
+    fn printed_env(log: &str) -> BTreeMap<String, String> {
+        log.lines().filter_map(|l| l.trim_end_matches('\r').split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect()
+    }
+
+    /// W02-R06 on the engine: a kiln-dialect leg's steps see v1's job variables with v1's values
+    /// (`KILN_SHA` the commit, `KILN_BRANCH` the ref's name, `KILN_AGENT` the runner, `TMPDIR` in
+    /// the leg's work directory); the job's own `env` wins over them; the engine's `KILN_JOB` keeps
+    /// its meaning; and a GitHub-dialect leg gets none of them.
+    #[cfg(unix)]
+    #[test]
+    fn w02_r06_v1_job_variables() -> anyhow::Result<()> {
+        const ADDED: [&str; 11] = ["KILN", "KILN_REPO", "KILN_SHA", "KILN_BRANCH", "KILN_EVENT", "KILN_RUN_ID", "KILN_RUN_NUMBER", "KILN_JOB_ID", "KILN_WORKSPACE", "KILN_AGENT", "TMPDIR"];
+        let sha = "4f1c0de4f1c0de4f1c0de4f1c0de4f1c0de4f1c0";
+        let tweak = move |a: &mut AssignmentV2| {
+            a.run_id = "run-7".into();
+            a.sha = sha.into();
+            a.contexts.github = serde_json::json!({"event_name": "push", "ref": "refs/heads/main", "ref_name": "main", "ref_type": "branch", "sha": sha, "run_number": "42", "repository": "acme/app", "event": {}});
+        };
+        let wf = "on: push\njobs:\n  t:\n    steps:\n      - run: env\n      - run: test -d \"$TMPDIR\" && mktemp >/dev/null && echo tag=kiln:$KILN_SHA\n";
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Kiln, &|_| Ok(()), &tweak)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        let env = printed_env(logs.get(&0).map_or("", String::as_str));
+        let got = |k: &str| env.get(k).map(String::as_str);
+        let ws = got("GITHUB_WORKSPACE").ok_or_else(|| anyhow::anyhow!("no GITHUB_WORKSPACE: {env:?}"))?;
+        let runner_ws = Path::new(ws).parent().ok_or_else(|| anyhow::anyhow!("no parent"))?;
+        for (k, want) in [
+            ("KILN", "true"),
+            ("KILN_REPO", "acme/app"),
+            ("KILN_SHA", sha),
+            ("KILN_BRANCH", "main"),
+            ("KILN_EVENT", "push"),
+            ("KILN_RUN_ID", "run-7"),
+            ("KILN_RUN_NUMBER", "42"),
+            ("KILN_JOB_ID", "leg-1"),
+            ("KILN_WORKSPACE", ws),
+            ("KILN_AGENT", "test-runner"),
+            ("KILN_JOB", "leg-1"),
+        ] {
+            assert_eq!(got(k), Some(want), "{k}: {env:?}");
+        }
+        assert_eq!(got("KILN_SHA"), got("GITHUB_SHA"), "KILN_SHA is github.sha");
+        let tmp = got("TMPDIR").ok_or_else(|| anyhow::anyhow!("no TMPDIR: {env:?}"))?;
+        assert!(Path::new(tmp).starts_with(runner_ws), "TMPDIR {tmp} is in the leg's work directory {}", runner_ws.display());
+        assert!(logs.get(&1).is_some_and(|l| l.contains(&format!("tag=kiln:{sha}"))), "image.yaml's tag is the commit: {logs:?}");
+
+        // The job's own `env` wins.
+        let wf = "on: push\njobs:\n  t:\n    env: { KILN_BRANCH: mine, TMPDIR: /var/tmp }\n    steps:\n      - run: env\n";
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Kiln, &|_| Ok(()), &tweak)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        let env = printed_env(logs.get(&0).map_or("", String::as_str));
+        assert_eq!((env.get("KILN_BRANCH").map(String::as_str), env.get("TMPDIR").map(String::as_str)), (Some("mine"), Some("/var/tmp")), "{env:?}");
+
+        // A GitHub-dialect leg: none of them, but what this process had already.
+        let wf = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: env\n";
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Gha, &|_| Ok(()), &tweak)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        let env = printed_env(logs.get(&0).map_or("", String::as_str));
+        for k in ADDED {
+            assert_eq!(env.get(k).cloned(), std::env::var(k).ok(), "{k} isn't added in the GitHub dialect: {env:?}");
+        }
+        Ok(())
+    }
+
+    /// W02-R06: the event as v1 named it.
+    #[test]
+    fn w02_r06_v1_event_names() {
+        let ev = |j: serde_json::Value| v1_event(&j);
+        assert_eq!(ev(serde_json::json!({"event_name": "workflow_dispatch", "ref_type": "branch"})), "manual");
+        assert_eq!(ev(serde_json::json!({"event_name": "push", "ref_type": "tag"})), "tag");
+        assert_eq!(ev(serde_json::json!({"event_name": "push", "ref_type": "branch"})), "push");
+        assert_eq!(ev(serde_json::json!({"event_name": "schedule"})), "schedule");
+        assert_eq!(ev(serde_json::json!({"event_name": "diff"})), "diff");
     }
 
     /// W04-R20 to R22 on the runner: typed outputs, exported environment, `run.env`, and a secret

@@ -849,6 +849,7 @@ editor. Includes `kiln validate` and `POST /api/ci/validate`.
   | implicit source checkout | `checkout: auto` (GHA dialect: none; workflows use `actions/checkout`) |
   | `timeout-minutes` default 60 | kept for the kiln dialect; GHA dialect default 360 |
   | `$KILN_OUTPUT` | the same file as `$GITHUB_OUTPUT` |
+  | v1's job variables | every step of a kiln-dialect leg gets them, beneath the job's own `env` (which wins, as over every default); a GHA-dialect leg gets none: `KILN=true`, `KILN_REPO` (`owner/name`), `KILN_SHA` (`github.sha`), `KILN_BRANCH` (`github.ref_name`: a tag run's tag), `KILN_EVENT` (v1's name: `workflow_dispatch` is `manual`, a tag's `push` is `tag`, the rest as `github.event_name`), `KILN_RUN_ID`, `KILN_RUN_NUMBER` (`github.run_number`), `KILN_JOB_ID` (the leg), `KILN_WORKSPACE` (`$GITHUB_WORKSPACE`), `KILN_AGENT` (the runner's name, `runner.name`), and `TMPDIR` (with `TEMP` and `TMP` on Windows) in the leg's own temp on the work volume (`$RUNNER_TEMP/tmp`, emptied before every leg), not the machine's `/tmp`. Where v1 and the engine name a variable differently, the engine's wins, so nothing the engine's own steps and tools read changes meaning: `KILN_JOB` stays the leg's id (v1's was the job's key; `GITHUB_JOB` has it) and `KILN_ATTEMPT` the leg's attempt, as v1's was |
 
 - **W02-R07 Overlays.** An overlay adds kiln keys to a GHA workflow without editing it, so the
   workflow keeps running on GitHub. It may contain the workflow-level kiln keys and
