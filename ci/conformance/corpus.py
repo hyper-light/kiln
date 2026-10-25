@@ -96,6 +96,8 @@ KNOWN = [
     (r"Failed to create check: HttpError: Resource not accessible by integration: the job's token lacks `checks: write`", "it makes a check with the job's token and no `permissions:`, which takes the repository's default: the corpus's copy has GitHub's restricted default, where the upstream's (an older repository's) writes"),
     (r"Preview tarball for commit \w+ was not published within", "it waits for the preview tarball the upstream's Vercel deployment publishes for the pull request's commit, which nothing publishes for the corpus's copy"),
     (r"Missing CI authentication variable: VERCEL_PROJECT_ID", "it pulls a Vercel OIDC token with the repository's Vercel project settings, which the corpus's copy hasn't"),
+    # arrow's jobs on its own RunsOn machines, by instance family (GPU and large-memory ones).
+    (r"waits: no runner meets its requirements \(runs-on \[runs-on=\d+/", "it asks for the upstream's own runners (RunsOn's machines by instance family, `runs-on=…/family=…`), which only the upstream has"),
     # arrow's ODBC Linux job failed on GitHub at the commit too, in the same step (run 38902346589:
     # "Execute Docker Build"); here one remote test of its Dremio, the rest passing.
     (r"`odbc-linux`: Execute Docker Build: .*ubuntu-cpp-odbc` exited with a non-zero exit code", "it failed on GitHub at the commit too, in the same step (arrow's run 38902346589, ODBC Linux's Execute Docker Build)"),
