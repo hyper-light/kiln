@@ -517,7 +517,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_ssh_agent_a_login_shell_started_is_stopped_and_not_handed_on() -> anyhow::Result<()> {
-        let Ok(out) = std::process::Command::new("ssh-agent").arg("-s").stdin(std::process::Stdio::null()).output() else {
+        // Its socket in a folder of the test's own: OpenSSH 10 puts it under $HOME/.ssh/agent, and
+        // where HOME is deep that path passes a Unix socket's 108 bytes, so no agent starts.
+        let dir = tempfile::tempdir()?;
+        let Ok(out) = std::process::Command::new("ssh-agent").arg("-s").arg("-a").arg(dir.path().join("agent")).stdin(std::process::Stdio::null()).output() else {
             eprintln!("skipped: no ssh-agent here");
             return Ok(());
         };
