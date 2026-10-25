@@ -117,12 +117,13 @@ what it took, and says through where it has it.
      batch reads no more of the store than the batch takes: a page of rows stops at its bytes.
   4. A batch that doesn't follow what the server has, or doesn't come whole, is answered with the
      number the server has and the batch it answers (`about`). The runner goes on from there, unless
-     the batch that starts there is on its way already: an answer about a batch sent before it went
-     on from there (that one didn't follow either), or a hello's answer come late. Each batch says
-     where the runner was last told to go on from (`told`). A runner from before says neither and
-     goes on from every answer, so the server tells it once until a batch of it is taken. Answered
-     each time, such a runner sent the same batches again for every answer, and each was answered
-     the same: on 2026-10-24 a store on a busy server took nothing for 12 minutes.
+     the batch that starts there is on its way already and the answer is about one sent before it
+     (which didn't follow either) or is a hello's answer come late. An answer about a batch it sent
+     since says those before it were lost, and it goes on from there. Each batch says where the
+     runner was last told to go on from (`told`). A runner from before says neither and goes on
+     from every answer, so the server tells it once until a batch of it is taken. Answered each
+     time, such a runner sent the same batches again for every answer, and each was answered the
+     same: on 2026-10-24 a store on a busy server took nothing for 12 minutes.
 - **Nothing is lost.** A runner killed, a server killed mid-turn, or a runner away for days: the
   server's number says where to go on, and the runner's store still has everything after it.
   Applying is idempotent: events upsert by id, record lines by number.
