@@ -24,8 +24,21 @@ const which = process.env.BROWSER ?? "chromium";
 const phone = process.env.PHONE === "1";
 const run = Date.now().toString(36);
 
+/** A request to kiln, sent again when kiln answers 503 with a Retry-After (a write refused while its
+ * store is behind, observe starting) once that wait is over, as Datadog's clients and OTel's
+ * exporters do, for a minute at the most. */
+const fetchKiln = async (url, init) => {
+  const end = Date.now() + 60_000;
+  for (;;) {
+    const r = await fetch(url, init);
+    const after = Number(r.headers.get("retry-after"));
+    if (r.status !== 503 || !(after > 0) || Date.now() + after * 1000 > end) return r;
+    await r.arrayBuffer();
+    await new Promise((ok) => setTimeout(ok, after * 1000));
+  }
+};
 const api = async (method, path, body) => {
-  const r = await fetch(BASE + path, { method, headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const r = await fetchKiln(BASE + path, { method, headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
   const text = await r.text();
   return { status: r.status, body: text ? JSON.parse(text) : null };
 };
@@ -614,7 +627,7 @@ const scenarios = {
       ["web-2", 0, s - 30, "connected"],
       ["web-1", 2, s - 20, "connection refused"],
     ];
-    const sent = await fetch(`${BASE}/api/v1/check_run`, {
+    const sent = await fetchKiln(`${BASE}/api/v1/check_run`, {
       method: "POST",
       headers: { "DD-API-KEY": ingest, "content-type": "application/json" },
       body: JSON.stringify(runs.map(([host_name, status, timestamp, message]) => ({ check, host_name, status, timestamp, message, tags: ["env:e2e"] }))),
@@ -1787,7 +1800,7 @@ const scenarios = {
     if (!ingest) return "skipped: no KILN_INGEST_TOKEN";
     const host = `e2e-host-${run}`;
     const post = async (path, body) => {
-      const r = await fetch(`${BASE}${path}`, { method: "POST", headers: { "DD-API-KEY": ingest, "content-type": "application/json" }, body: JSON.stringify(body) });
+      const r = await fetchKiln(`${BASE}${path}`, { method: "POST", headers: { "DD-API-KEY": ingest, "content-type": "application/json" }, body: JSON.stringify(body) });
       expect(r.status === 202 || r.status === 200, `${path}: ${r.status}`);
     };
     await post("/intake/", {
@@ -2590,7 +2603,7 @@ const scenarios = {
       sum("container.memory.usage.limit", "By", false, () => 256 * MiB),
     ];
     const body = { resourceMetrics: [{ resource: { attributes: attrs }, scopeMetrics: [{ scope: { name: "otelcol/dockerstatsreceiver" }, metrics }] }] };
-    const sent = await fetch(`${BASE}/v1/metrics`, { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+    const sent = await fetchKiln(`${BASE}/v1/metrics`, { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify(body) });
     expect(sent.status === 200, `sent as OTLP: ${sent.status}`);
     await until(
       "listed in kiln's units",
@@ -2638,7 +2651,7 @@ const scenarios = {
         version: "4",
       };
       form.append("event", new Blob([JSON.stringify(event)], { type: "application/json" }), "event.json");
-      const r = await fetch(`${BASE}/api/v2/profile`, { method: "POST", headers: { "DD-API-KEY": ingest, "X-Datadog-Additional-Tags": `host:e2e-prof-host-${run}` }, body: form });
+      const r = await fetchKiln(`${BASE}/api/v2/profile`, { method: "POST", headers: { "DD-API-KEY": ingest, "X-Datadog-Additional-Tags": `host:e2e-prof-host-${run}` }, body: form });
       expect(r.status === 202, `an upload taken: ${r.status} ${await r.text()}`);
     }
     await until("both listed", async () => (await api("GET", `/api/observe/v1/profiles?query=${encodeURIComponent(`service:${service}`)}`)).body?.matched === 2, 30_000);
@@ -2676,7 +2689,7 @@ const scenarios = {
         version: "4",
       };
       form.append("event", new Blob([JSON.stringify(event)], { type: "application/json" }), "event.json");
-      const r = await fetch(`${BASE}/api/v2/profile`, { method: "POST", headers: { "DD-API-KEY": ingest }, body: form });
+      const r = await fetchKiln(`${BASE}/api/v2/profile`, { method: "POST", headers: { "DD-API-KEY": ingest }, body: form });
       expect(r.status === 202, `the other service's upload: ${r.status}`);
     }
     await until("the other listed", async () => (await api("GET", `/api/observe/v1/profiles?query=${encodeURIComponent(`service:${base}`)}`)).body?.matched === 1, 30_000);
@@ -2733,7 +2746,7 @@ const scenarios = {
       version: "4",
     };
     form.append("event", new Blob([JSON.stringify(event)], { type: "application/json" }), "event.json");
-    const r = await fetch(`${BASE}/api/v2/profile`, { method: "POST", headers: { "DD-API-KEY": ingest, "X-Datadog-Additional-Tags": `host:e2e-java-host-${run}` }, body: form });
+    const r = await fetchKiln(`${BASE}/api/v2/profile`, { method: "POST", headers: { "DD-API-KEY": ingest, "X-Datadog-Additional-Tags": `host:e2e-java-host-${run}` }, body: form });
     expect(r.status === 202, `a recording taken: ${r.status} ${await r.text()}`);
     await until("it listed", async () => (await api("GET", `/api/observe/v1/profiles?query=${encodeURIComponent(`service:${service}`)}`)).body?.matched === 1, 30_000);
     await page.goto(`${BASE}/observe/profiles?q=${encodeURIComponent(`service:${service}`)}`);
@@ -2787,7 +2800,7 @@ const scenarios = {
         x.session_id = `sess-${run}`;
         x.tags = x.tags.map((t) => (t.startsWith("ml_app:") ? `ml_app:${app}` : t.startsWith("service:") ? `service:${app}` : t.startsWith("session_id:") ? `session_id:sess-${run}` : t));
       }
-    const r = await fetch(`${BASE}/api/v2/llmobs`, { method: "POST", headers: { "DD-API-KEY": ingest, "content-type": "application/json" }, body: JSON.stringify(events) });
+    const r = await fetchKiln(`${BASE}/api/v2/llmobs`, { method: "POST", headers: { "DD-API-KEY": ingest, "content-type": "application/json" }, body: JSON.stringify(events) });
     expect(r.status === 202, `its events taken: ${r.status} ${await r.text()}`);
     const to = Date.now() + 60_000;
     await until(
@@ -2804,7 +2817,7 @@ const scenarios = {
       m.timestamp_ms = Date.now();
       m.tags = m.tags.map((t) => (t.startsWith("ml_app:") ? `ml_app:${app}` : t));
     }
-    const er = await fetch(`${BASE}/api/intake/llm-obs/v2/eval-metric`, { method: "POST", headers: { "DD-API-KEY": ingest, "content-type": "application/json" }, body: JSON.stringify(judged) });
+    const er = await fetchKiln(`${BASE}/api/intake/llm-obs/v2/eval-metric`, { method: "POST", headers: { "DD-API-KEY": ingest, "content-type": "application/json" }, body: JSON.stringify(judged) });
     expect(er.status === 202, `its evaluation taken: ${er.status} ${await er.text()}`);
     await until(
       "its evaluation searchable",
@@ -2939,7 +2952,7 @@ const scenarios = {
       ["/v1/traces", spans],
       ["/v1/logs", logs],
     ]) {
-      const r = await fetch(`${BASE}${path}`, { method: "POST", headers: { authorization: `Bearer ${ingest}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+      const r = await fetchKiln(`${BASE}${path}`, { method: "POST", headers: { authorization: `Bearer ${ingest}`, "content-type": "application/json" }, body: JSON.stringify(body) });
       expect(r.status === 200, `${path} taken: ${r.status} ${await r.text()}`);
     }
     await until(
@@ -2978,7 +2991,7 @@ const scenarios = {
     const at = (times, name, id) => (metric, v) => ({ metric, type: "gauge", host, tags: tags(name, id), points: times.map((s) => [t - s, v]) });
     const now = at([20, 5], api1, apiId);
     const gone = at([600, 300], batch, batchId);
-    const r = await fetch(`${BASE}/api/v1/series`, {
+    const r = await fetchKiln(`${BASE}/api/v1/series`, {
       method: "POST",
       headers: { "DD-API-KEY": ingest, "content-type": "application/json" },
       body: JSON.stringify({
