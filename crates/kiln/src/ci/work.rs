@@ -1525,10 +1525,12 @@ mod tests {
                 register(c, &untrusted, &no_op, &witness)?;
                 anyhow::ensure!(rules(c, &trusted)?.rules().count() == 0);
                 anyhow::ensure!(lookup(c, &trusted, &step("make\ntrue", &[]), &same)?.is_none());
-                // Untrusted lookups read trusted entries (R21): one written to their scope joins
-                // the class of its outputs there.
-                let both = record(c, &untrusted, &step("make", &[]), &lock(), &made_out("sha256:bin", "main"))?;
-                anyhow::ensure!(member(c, &untrusted, &both)?.map(|m| m.class) == member(c, &untrusted, &u)?.map(|m| m.class));
+                // Untrusted lookups read trusted entries (R21), where they are: writes stay home, so a
+                // trusted result isn't written among untrusted entries and joins no class there;
+                // `lookup_as` reads it in the trusted entries instead.
+                anyhow::ensure!(record(c, &untrusted, &step("make", &[]), &lock(), &made_out("sha256:bin", "main")).is_err());
+                let read_down = lookup_as(c, None, "acme/app", &Domain::Untrusted, &step("make", &[]), &same)?.hit;
+                anyhow::ensure!(read_down.as_ref().is_some_and(|h| h.domain == Domain::Trusted && h.key == t), "{read_down:?}");
                 Ok(())
             })
             .await
