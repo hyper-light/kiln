@@ -2183,7 +2183,8 @@ fn w24_r18_a_warm_jobs_leg_says_where_it_runs_warm() -> anyhow::Result<()> {
     let warm = wait_for(35, "the leg's runner warm for it", || {
         let (_, body) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/routing"), &s.admin, None)?;
         let v: Value = serde_json::from_str(&body)?;
-        Ok(v.pointer("/runners/0/warm").filter(|w| w.get("lane").and_then(Value::as_str) == Some(lane.as_str()) && w.get("behind").and_then(Value::as_u64) == Some(1)).cloned())
+        let runners = v.get("runners").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(runners.iter().filter_map(|r| r.get("warm")).find(|w| w.get("lane").and_then(Value::as_str) == Some(lane.as_str()) && w.get("behind").and_then(Value::as_u64) == Some(1)).cloned())
     })?;
     let num = |k: &str| warm.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
     // No warm run here yet: the prior's half, shrunk for the one file changed (100 ÷ 101).
