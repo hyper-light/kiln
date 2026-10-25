@@ -1906,10 +1906,15 @@ struct Reading<'a> {
 }
 
 /// Bytes of heads a snapshot of a query's series copies at the most ([`Lease::snapshot`]), under its
-/// one hold of the store: some milliseconds at memory's speed, what a write waits for it; the soak's
-/// widest query (4,000 series of a minute's head each, some 14 MB, `docs/observe.md` §12.19) is one
-/// snapshot. More series are read a snapshot of this many bytes at a time.
-pub(crate) const SNAPSHOT_BYTES: usize = 32 << 20;
+/// one hold of the store; more series are read a snapshot of this many bytes at a time. Derived
+/// (`docs/observe.md` §12.19): a write that comes as a snapshot is taken waits for it, so a snapshot
+/// holds the store no longer than a write's own hold does at its p99 (a reader then adds no wait a
+/// writer does not already add). Measured beside the widest dashboard query's writes (`benches/wide`,
+/// 2026-10-24, an M4 Max): a write held the store 0.226 ms at its p99, and a snapshot copied 6.3 MB
+/// in 0.6 ms at its slowest, 10.5 MB a millisecond: 2.4 MB, 2 MiB below it. Both scale with the
+/// machine, their product (the bytes one write's hold copies) far less. A query split into more
+/// snapshots costs no more copying (the same bytes, in more holds) and a few microseconds a hold.
+pub(crate) const SNAPSHOT_BYTES: usize = 2 << 20;
 
 /// What a query reads its series from: the store its caller holds throughout, or a snapshot of them.
 #[derive(Clone, Copy)]
