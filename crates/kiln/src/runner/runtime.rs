@@ -486,6 +486,24 @@ struct State {
     kiln_bin: Option<PathBuf>,
     /// The leg's egress proxy (W18-R08), when it has a network policy.
     egress: Option<std::sync::Arc<super::egress::Pool>>,
+    /// Its warm workspace, when its job keeps one (W24-R11).
+    warm: Option<Warmed>,
+}
+
+/// A warm leg's workspace (W24-R11), as its checkout needs it.
+#[derive(Clone)]
+struct Warmed {
+    /// The slot, or untrusted leg's throwaway clone, it works in; `None` when it runs cold.
+    dir: Option<PathBuf>,
+    /// What its log says of it.
+    said: String,
+    /// Its kept folders, in its workspace.
+    kept: Vec<String>,
+}
+
+/// A full commit SHA, as a checkout in place takes it (a ref is fetched to `FETCH_HEAD` first).
+fn is_sha(r: &str) -> bool {
+    matches!(r.len(), 40 | 64) && r.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A background step that finished, and what it changed: applied to the leg at its `wait`, in
@@ -826,13 +844,18 @@ impl Leg {
     pub async fn run(self) -> JobResult {
         let job = self.a.job_id.clone();
         let started = Instant::now();
-        let layout = self.layout();
-        let ws = layout.runner_workspace;
+        // A warm leg works in a slot of its lane, held until its workspace is let go (W24-R11).
+        let warmed = self.lease_warm().await;
+        let layout = match warmed.as_ref().and_then(|w| w.dir.clone()) {
+            Some(dir) => Layout::within(&self.work_dir, dir, &self.a.repo, self.hosted_image()),
+            None => self.layout(),
+        };
+        let ws = layout.runner_workspace.clone();
         super::workspaces::claim(&self.work_dir, &ws).await;
         // A pool's executor's lease, which its container mounted; else the leg's own.
         let leased = self.warm.lock().as_mut().and_then(|w| w.tools.take());
         let tools = leased.unwrap_or_else(|| super::workspaces::ToolCache::take(&layout.tool_cache));
-        let r = std::panic::AssertUnwindSafe(self.run_inner(tools.path())).catch_unwind().await;
+        let r = std::panic::AssertUnwindSafe(self.run_inner(Layout { tool_cache: tools.path(), ..layout }, warmed)).catch_unwind().await;
         drop(tools);
         let (status, error) = match r {
             Ok(Ok(s)) => (s, None),
@@ -846,6 +869,41 @@ impl Leg {
         }
         let _ = started;
         JobResult { job, status, exit_code: None, error, peak_rss: None, cpu_seconds: None }
+    }
+
+    /// A leg whose job keeps a warm workspace (`work: { warm }`, W24-R11) leases one of its lane's
+    /// on this runner: on the host, and in the `docker` executor's own container. A pool's
+    /// executor, a pod and a microVM come with workspaces of their own (W24-R13, R14).
+    async fn lease_warm(&self) -> Option<Warmed> {
+        let a = &self.a;
+        let w = a.warm.as_ref()?;
+        let pooled = self.warm.lock().is_some();
+        if pooled || !matches!(a.executor.kind.as_str(), "" | "host" | "docker") || in_microvm() || std::env::var_os("KILN_POD_CONTAINERS").is_some() {
+            return None;
+        }
+        let (kept, refused) = super::warm::kept_paths(&w.paths);
+        let mut said: String = refused.iter().map(|p| format!("`{p}` isn't kept: a kept folder is a path inside the workspace.\n")).collect();
+        let sha = if a.sha.is_empty() { a.contexts.github.get("sha").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned() } else { a.sha.clone() };
+        let name = a.repo.rsplit('/').next().unwrap_or("repo").to_owned();
+        let ask = super::warm::Ask { repo: a.repo.clone(), lane: super::warm::lane_of(a), leg: a.job_id.clone(), sha, trusted: a.trusted, kept: kept.clone(), budget: w.budget, name };
+        let work = self.work_dir.clone();
+        let dir = match crate::rt::blocking(move || super::warm::lease(&work, &ask)).await {
+            Ok(Ok(super::warm::Leased::Warm(l))) => {
+                said.push_str(&l.said);
+                let dir = l.dir.clone();
+                super::warm::hold(&self.work_dir, l);
+                Some(dir)
+            }
+            Ok(Ok(super::warm::Leased::Cold(why))) => {
+                said.push_str(&why);
+                None
+            }
+            Ok(Err(e)) | Err(e) => {
+                said.push_str(&format!("No warm workspace: {e:#}. The leg runs cold."));
+                None
+            }
+        };
+        Some(Warmed { dir, said, kept })
     }
 
     /// The leg's layout: its own directory, or its pool's executor's (W13-R09).
@@ -1164,10 +1222,9 @@ impl Leg {
         matches!(written, Ok(Ok(()))).then_some((ca_file, bundle))
     }
 
-    async fn run_inner(&self, tool_cache: PathBuf) -> anyhow::Result<Status> {
+    async fn run_inner(&self, layout: Layout, warm: Option<Warmed>) -> anyhow::Result<Status> {
         let a = &self.a;
         let dialect = if a.dialect == "kiln" { Dialect::Kiln } else { Dialect::Gha };
-        let layout = Layout { tool_cache, ..self.layout() };
         let (ws, temp, cmds) = (layout.workspace.clone(), layout.temp.clone(), layout.commands.clone());
         let event = serde_json::to_vec(&a.contexts.github.get("event").cloned().unwrap_or_default()).unwrap_or_default();
         let items = shard_items(a);
@@ -1275,6 +1332,7 @@ impl Leg {
             refresh: None,
             kiln_bin: None,
             egress: None,
+            warm,
         };
         // The job's environment: the workflow's, `env-from`, then the job's (W04-R21, W06-R04).
         for (k, v) in &a.env_from {
@@ -1364,6 +1422,14 @@ impl Leg {
         if a.checkout == "auto" && !self.implicit_checkout(&mut st).await {
             st.failed = true;
         }
+        // A warm leg that checks nothing out itself: its workspace cleared but for its kept folders,
+        // as a checkout in place leaves one (W24-R11).
+        if a.checkout != "auto"
+            && let Some(w) = st.warm.clone()
+            && !self.clear_warm(&st, &w).await
+        {
+            st.failed = true;
+        }
         // The OOM killer's count before any step runs, so a step it kills shows (W05-R15).
         let _ = self.oom_rose(&mut st).await;
         self.pre_steps(&mut st, deadline).await;
@@ -1451,6 +1517,9 @@ impl Leg {
         let idx = st.next_idx;
         st.next_idx += 1;
         self.start(idx, "Check out the commit", "internal", None).await;
+        if let Some(w) = &st.warm {
+            self.note(idx, &w.said).await;
+        }
         let sha = self.a.contexts.github.get("sha").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
         let r = self.checkout(st, idx, &Checkout { path: String::new(), git_ref: sha, depth: 1, sparse: Vec::new(), cone: true, filter: None }).await;
         if let Err(e) = &r {
@@ -1459,6 +1528,25 @@ impl Leg {
         let c = if r.is_ok() { Conclusion::Success } else { Conclusion::Failure };
         self.event(&JobEventV2::StepFinished { idx, outcome: c, conclusion: c, exit_code: None, outputs: BTreeMap::new() }).await;
         r.is_ok()
+    }
+
+    /// A warm leg whose job checks nothing out itself (W24-R11): what's said of its workspace, in
+    /// its log, then everything in it but its kept folders and `.git` cleared, as a checkout in
+    /// place would leave it. Whether it was.
+    async fn clear_warm(&self, st: &State, w: &Warmed) -> bool {
+        self.note(0, &w.said).await;
+        if w.dir.is_none() {
+            return true;
+        }
+        let (ws, kept) = (st.layout.workspace.clone(), w.kept.clone());
+        match crate::rt::blocking(move || super::warm::clear_but(&ws, &kept, true)).await.and_then(|r| r.map_err(anyhow::Error::from)) {
+            Ok(()) => true,
+            Err(e) => {
+                super::warm::quarantine(&st.layout.runner_workspace);
+                self.note(0, &format!("Error: the warm workspace couldn't be cleared: {e:#}")).await;
+                false
+            }
+        }
     }
 
     /// Checks `c.git_ref` out from the server's mirror into the workspace (or `c.path` below it),
@@ -1485,54 +1573,107 @@ impl Leg {
                 fetch.push(f);
             }
             fetch.extend(["origin", &sha]);
-            // A repository already there (the leg's own checkout, an earlier step's) is fetched
-            // into, its `origin` pointed at the server, as `actions/checkout` reuses one.
-            let mut has_origin = Command::new("git");
-            has_origin.args(["-C", &w, "remote", "get-url", "origin"]);
-            let reuse = ws.join(".git").exists() && crate::proc::output(has_origin, Duration::from_secs(30)).await.is_ok_and(|o| o.status.success());
-            let origin = if reuse { vec!["-C", w.as_str(), "remote", "set-url", "origin", &remote] } else { vec!["-C", w.as_str(), "remote", "add", "origin", &remote] };
-            let mut steps: Vec<Vec<&str>> = vec![vec!["init", "--quiet", &w], origin];
-            if !c.sparse.is_empty() {
-                let mut set = vec!["-C", w.as_str(), "sparse-checkout", "set"];
-                if !c.cone {
-                    set.push("--no-cone");
-                }
-                set.extend(c.sparse.iter().map(String::as_str));
-                steps.push(set);
-            }
-            steps.push(fetch);
-            steps.push(vec!["-C", &w, "checkout", "--quiet", "--detach", "FETCH_HEAD"]);
-            std::fs::create_dir_all(&ws)?;
-            for args in steps {
-                // As typed in the workspace: without `-C <workspace>`.
-                let shown: Vec<&str> = if args.first() == Some(&"-C") { args.iter().skip(2).copied().collect() } else { args.iter().copied().filter(|x| *x != w.as_str()).collect() };
-                self.note(idx, &format!("git {}", shown.join(" "))).await;
-                let mut again = Again::new();
-                loop {
-                    let mut cmd = Command::new("git");
-                    cmd.args(&args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_CONFIG_COUNT", "1").env("GIT_CONFIG_KEY_0", "http.extraheader").env("GIT_CONFIG_VALUE_0", &header);
-                    let out = crate::proc::output(cmd, Duration::from_secs(1800)).await?;
-                    if out.status.success() {
-                        break;
+            // A warm leg's own workspace (W24-R11): checked out in place over the repository its
+            // slot holds, the commit fetched only when it lacks it (from this runner's mirror when
+            // that has it); without a repository yet it's cleared but for its kept folders first.
+            let warm = st.warm.as_ref().filter(|x| x.dir.is_some() && ws == st.layout.workspace && c.sparse.is_empty() && c.filter.is_none());
+            let mut in_place = warm.is_some() && ws.join(".git").is_dir();
+            loop {
+                if let Some(x) = warm.filter(|_| !in_place) {
+                    let (dir, kept) = (ws.clone(), x.kept.clone());
+                    if let Err(e) = crate::rt::blocking(move || super::warm::clear_but(&dir, &kept, false)).await.and_then(|r| r.map_err(anyhow::Error::from)) {
+                        super::warm::quarantine(&st.layout.runner_workspace);
+                        return Err(e.context("the warm workspace couldn't be cleared"));
                     }
-                    let said = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-                    // The server away a moment (restarting): its fetch is tried again, as
-                    // `actions/checkout` tries its own.
-                    if args.get(2) == Some(&"fetch")
-                        && unreachable(&said)
-                        && let Some(wait) = again.next()
-                    {
-                        self.note(idx, &format!("The server didn't answer ({}); trying again in {}s", said.lines().last().unwrap_or_default(), wait.as_secs())).await;
-                        crate::rt::sleep(wait).await;
-                        continue;
+                }
+                let (have, mirror) = if in_place && is_sha(&sha) {
+                    let (dir, at, work, repo) = (ws.clone(), sha.clone(), self.work_dir.clone(), a.repo.clone());
+                    crate::rt::blocking(move || {
+                        let have = super::warm::has_commit(&dir, &at);
+                        (have, if have { None } else { super::warm::mirror_with(&work, &repo, &at) })
+                    })
+                    .await
+                    .unwrap_or((false, None))
+                } else {
+                    (false, None)
+                };
+                // A repository already there (the leg's own checkout, an earlier step's) is fetched
+                // into, its `origin` pointed at the server, as `actions/checkout` reuses one.
+                let mut has_origin = Command::new("git");
+                has_origin.args(["-C", &w, "remote", "get-url", "origin"]);
+                let reuse = ws.join(".git").exists() && crate::proc::output(has_origin, Duration::from_secs(30)).await.is_ok_and(|o| o.status.success());
+                let origin = if reuse { vec!["-C", w.as_str(), "remote", "set-url", "origin", &remote] } else { vec!["-C", w.as_str(), "remote", "add", "origin", &remote] };
+                let mut steps: Vec<Vec<&str>> = if in_place { vec![origin] } else { vec![vec!["init", "--quiet", &w], origin] };
+                if !c.sparse.is_empty() {
+                    let mut set = vec!["-C", w.as_str(), "sparse-checkout", "set"];
+                    if !c.cone {
+                        set.push("--no-cone");
                     }
-                    anyhow::bail!("git {}: {said}", args.get(2).copied().unwrap_or_default());
+                    set.extend(c.sparse.iter().map(String::as_str));
+                    steps.push(set);
+                }
+                if !in_place || (!have && mirror.is_none()) {
+                    steps.push(fetch.clone());
+                }
+                if !in_place {
+                    steps.push(vec!["-C", &w, "checkout", "--quiet", "--detach", "FETCH_HEAD"]);
+                }
+                std::fs::create_dir_all(&ws)?;
+                for args in steps {
+                    // As typed in the workspace: without `-C <workspace>`.
+                    let shown: Vec<&str> = if args.first() == Some(&"-C") { args.iter().skip(2).copied().collect() } else { args.iter().copied().filter(|x| *x != w.as_str()).collect() };
+                    self.note(idx, &format!("git {}", shown.join(" "))).await;
+                    let mut again = Again::new();
+                    loop {
+                        let mut cmd = Command::new("git");
+                        cmd.args(&args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_CONFIG_COUNT", "1").env("GIT_CONFIG_KEY_0", "http.extraheader").env("GIT_CONFIG_VALUE_0", &header);
+                        let out = crate::proc::output(cmd, Duration::from_secs(1800)).await?;
+                        if out.status.success() {
+                            break;
+                        }
+                        let said = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+                        // The server away a moment (restarting): its fetch is tried again, as
+                        // `actions/checkout` tries its own.
+                        if args.get(2) == Some(&"fetch")
+                            && unreachable(&said)
+                            && let Some(wait) = again.next()
+                        {
+                            self.note(idx, &format!("The server didn't answer ({}); trying again in {}s", said.lines().last().unwrap_or_default(), wait.as_secs())).await;
+                            crate::rt::sleep(wait).await;
+                            continue;
+                        }
+                        anyhow::bail!("git {}: {said}", args.get(2).copied().unwrap_or_default());
+                    }
+                }
+                let Some(x) = warm.filter(|_| in_place) else { return Ok(()) };
+                // In place: only the files that differ are written, the rest keep their mtimes, and
+                // everything but the kept folders is cleaned. A ref (not a SHA) was fetched first.
+                let target = if is_sha(&sha) { sha.clone() } else { "FETCH_HEAD".to_owned() };
+                let (dir, kept, from) = (ws.clone(), x.kept.clone(), mirror.clone());
+                match crate::rt::blocking(move || super::warm::check_out(&dir, &target, &kept, from.as_deref())).await.and_then(|r| r) {
+                    Ok(done) => {
+                        let short = |s: &str| s.get(..12).unwrap_or(s).to_owned();
+                        let over = done.from.as_deref().map_or_else(String::new, |f| format!(" over {}", short(f)));
+                        let via = if mirror.is_some() { " from this runner's mirror" } else { "" };
+                        let kept = if x.kept.is_empty() { String::new() } else { format!("; kept: {}", x.kept.join(", ")) };
+                        self.note(idx, &format!("Checked out {}{via} in place{over}: {} files changed{kept}.", short(&sha), done.changed)).await;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        self.note(idx, &format!("The warm workspace couldn't be checked out in place ({e:#}): it starts over, its kept folders left.")).await;
+                        in_place = false;
+                    }
                 }
             }
-            return Ok(());
         }
         // No git: the commit's tarball from the REST facade, its top directory stripped.
         anyhow::ensure!(c.sparse.is_empty() && c.filter.is_none(), "sparse and partial checkouts need git, which isn't installed here");
+        // A warm leg's workspace first cleared but for its kept folders (W24-R11): the tarball
+        // brings back what the commit has.
+        if let Some(x) = st.warm.as_ref().filter(|x| x.dir.is_some() && ws == st.layout.workspace) {
+            let (dir, kept) = (ws.clone(), x.kept.clone());
+            crate::rt::blocking(move || super::warm::clear_but(&dir, &kept, false)).await??;
+        }
         let url = format!("{}/api/v3/repos/{}/tarball/{sha}", st.server_url.trim_end_matches('/'), a.repo);
         self.note(idx, &format!("git isn't installed here: downloading {} at {}", a.repo, sha.get(..12).unwrap_or(&sha))).await;
         let mut again = Again::new();
@@ -5532,5 +5673,53 @@ jobs:
         if let Some(cpu) = sys.cpus().first().map(|c| c.brand().trim().to_owned()).filter(|c| !c.is_empty()) {
             assert!(parts.contains(&cpu.as_str()), "the CPU, {cpu}: {f}");
         }
+    }
+
+    /// W24-R11 through the runtime: a job whose `work.warm` keeps `target` runs its next leg on
+    /// this runner in the same workspace, held while it runs and handed back as it ends. The leg
+    /// finds what the last one built and nothing else it left: a job that checks nothing out
+    /// itself is cleared but for its kept folders.
+    #[cfg(unix)]
+    #[test]
+    fn w24_r11_a_warm_jobs_next_leg_finds_what_the_last_one_built() -> anyhow::Result<()> {
+        let src = "on: push\njobs:\n  b:\n    runs-on: x\n    steps:\n      - run: |\n          echo \"saw=$(cat target/f 2>/dev/null || echo none)\"\n          test -e stray || echo no-stray\n          echo \"at=$PWD\"\n          mkdir -p target && echo \"$KILN_JOB\" > target/f && touch stray\n";
+        let (w, d) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", src, Dialect::Gha);
+        anyhow::ensure!(d.iter().all(|x| !x.is_error()), "{d:?}");
+        let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
+        let tmp = tempfile::tempdir()?;
+        let run = |leg: &str| -> anyhow::Result<(JobResult, String)> {
+            let a = AssignmentV2 {
+                job_id: leg.into(),
+                repo: "acme/app".into(),
+                dialect: "gha".into(),
+                steps: job.steps.clone(),
+                timeout_minutes: 5,
+                trusted: true,
+                warm: Some(kiln_ci::wire::Warm { paths: vec!["target".into()], budget: None }),
+                contexts: kiln_ci::wire::Contexts { github: serde_json::json!({"event_name": "push", "sha": "abc", "repository": "acme/app", "workflow_ref": "acme/app/.github/workflows/t.yml@refs/heads/main", "event": {}}), ..Default::default() },
+                ..AssignmentV2::default()
+            };
+            let (tx, rx) = async_channel::unbounded();
+            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+            let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
+            let mut log = String::new();
+            while let Ok(m) = rx.try_recv() {
+                if let crate::exec::Up::Log(c) = m {
+                    log.push_str(&String::from_utf8_lossy(&c.data));
+                }
+            }
+            Ok((result, log))
+        };
+        let (first, log) = run("leg-w1")?;
+        assert_eq!(first.status, Status::Succeeded, "{log}");
+        assert!(log.contains("a new slot 0") && log.contains("saw=none") && log.contains("no-stray"), "{log}");
+        let at = |log: &str| log.lines().find_map(|l| l.trim().strip_prefix("at=")).map(str::to_owned);
+        let slot = at(&log);
+        assert!(slot.as_deref().is_some_and(|p| p.contains("/warm/")), "the leg works in a slot: {log}");
+        let (second, log) = run("leg-w2")?;
+        assert_eq!(second.status, Status::Succeeded, "{log}");
+        assert!(log.contains("slot 0 of the job's lane") && log.contains("saw=leg-w1") && log.contains("no-stray"), "{log}");
+        assert_eq!(at(&log), slot, "at the slot's stable path");
+        Ok(())
     }
 }

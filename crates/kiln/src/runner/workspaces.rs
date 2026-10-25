@@ -154,9 +154,18 @@ pub async fn claim(work: &Path, ws: &Path) {
 }
 
 /// A leg is done with `ws` (or a kept one's keep ran out): it is removed, and the sweep leaves
-/// it be no longer.
+/// it be no longer. A warm one goes back to its lane instead (docs/ci.md W24-R11).
 pub async fn release(ws: &Path) {
     let held = IN_USE.lock().remove(ws);
+    if super::warm::let_go(ws).await {
+        let lock = lock_path(ws);
+        let _ = crate::rt::blocking(move || {
+            let _ = std::fs::remove_file(lock);
+            drop(held);
+        })
+        .await;
+        return;
+    }
     let ws = ws.to_path_buf();
     let _ = crate::rt::blocking(move || {
         remove(&ws);

@@ -328,6 +328,13 @@ pub fn mirror_of(work: &Path, repo: &str) -> Option<PathBuf> {
     m.join("HEAD").is_file().then_some(m)
 }
 
+/// This runner's mirror of `repo`, when it has commit `sha`: where a slot fetches it from without
+/// asking the server.
+pub fn mirror_with(work: &Path, repo: &str, sha: &str) -> Option<PathBuf> {
+    let m = mirror_of(work, repo)?;
+    (!sha.is_empty() && git(&m, &["cat-file", "-e", format!("{sha}^{{commit}}").as_str()]).is_ok()).then_some(m)
+}
+
 /// How many commits apart each free slot's base is from `sha`: none for its own commit, else as
 /// this runner's mirror counts them (both sides of their merge base), where it has both.
 fn distances(work: &Path, repo: &str, sha: &str, found: &[Slot]) -> BTreeMap<u32, u64> {
@@ -700,6 +707,39 @@ pub fn sweep(work: &Path, budget: &Budget) -> Vec<String> {
         went.push(format!("slot {n} of {}: {why}", lane.display()));
     }
     went
+}
+
+/// The warm workspaces this process's legs hold, by directory, each with its runner's work
+/// directory.
+static HELD: LazyLock<parking_lot::Mutex<HashMap<PathBuf, (PathBuf, Lease)>>> = LazyLock::new(Default::default);
+
+/// A leg holds `lease` until its workspace is let go ([`let_go`]).
+pub fn hold(work: &Path, lease: Lease) {
+    HELD.lock().insert(lease.dir.clone(), (work.to_path_buf(), lease));
+}
+
+/// A held workspace that couldn't be checked out in place or cleared: never leased again, it goes
+/// at the next sweep.
+pub fn quarantine(dir: &Path) {
+    if let Some((_, l)) = HELD.lock().get_mut(dir) {
+        l.quarantine = true;
+    }
+}
+
+/// The workspace at `dir` let go (its leg ended, or a kept leg's keep ran out). When it's a warm
+/// one held here it goes back to its lane (a throwaway clone is removed), then the slot is
+/// measured and what's over budget goes, in the background. Whether it was one.
+pub async fn let_go(dir: &Path) -> bool {
+    let Some((work, lease)) = HELD.lock().remove(dir) else { return false };
+    let at = work.clone();
+    let measured = crate::rt::blocking(move || release(&at, lease)).await.ok().flatten();
+    crate::rt::spawn(async move {
+        let went = crate::rt::blocking(move || settle(&work, measured, &budget(&work))).await.unwrap_or_default();
+        for what in went {
+            tracing::info!(slot = %what, "a warm workspace went");
+        }
+    });
+    true
 }
 
 /// After a release (blocking): the slot measured, what's over budget dropped, and what drops left

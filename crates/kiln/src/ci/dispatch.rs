@@ -2265,6 +2265,8 @@ impl Dispatch {
             limits: wire::Limits::default(),
             network: egress_of(job.and_then(|j| j.kiln.network.as_ref()), r.trusted, &self.hub.cfg.ci.untrusted.allow_hosts, leg),
             trusted: r.trusted,
+            // The job's warm workspace (`work: { warm }`, W24-R11), kept by its runner per lane.
+            warm: job.and_then(|j| kiln_ci::work::slots::warm(j.kiln.work.as_ref())),
         }
     }
 
