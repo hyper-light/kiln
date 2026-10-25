@@ -654,10 +654,47 @@ pub fn severity_of(message: &str) -> u8 {
 /// string.
 pub const LEVEL_FIELDS: [&str; 5] = ["level", "severity", "levelname", "log.level", "status"];
 
+/// Whether the character at `i` of `m` parts its words (whitespace, Unicode's, or a `|`), and the
+/// bytes it takes (none past the end): an ASCII one by its byte, another decoded.
+#[inline]
+fn parting(m: &str, i: usize) -> (bool, usize) {
+    match m.as_bytes().get(i) {
+        Some(&b) if b < 0x80 => (b == b' ' || b == b'|' || (0x09..=0x0D).contains(&b), 1),
+        Some(_) => m.get(i..).and_then(|r| r.chars().next()).map_or((false, 1), |c| (c.is_whitespace(), c.len_utf8())),
+        None => (false, 0),
+    }
+}
+
+/// A message's words as [`severity_of_words`] reads them: parted at whitespace (Unicode's) and
+/// `|`, none empty; a byte at a time where they are ASCII (a log line's first words mostly are).
+struct Words<'a> {
+    m: &'a str,
+    at: usize,
+}
+
+impl<'a> Iterator for Words<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        loop {
+            match parting(self.m, self.at) {
+                (_, 0) => return None,
+                (true, n) => self.at += n,
+                (false, _) => break,
+            }
+        }
+        let start = self.at;
+        while let (false, n @ 1..) = parting(self.m, self.at) {
+            self.at += n;
+        }
+        self.m.get(start..self.at)
+    }
+}
+
 /// [`severity_of`] of a message's first words alone: a level in capitals, or a `level=` one.
 pub fn severity_of_words(m: &str) -> u8 {
     let m = m.trim_start();
-    for word in m.split(|c: char| c.is_whitespace() || c == '|').filter(|w| !w.is_empty()).take(4) {
+    for word in (Words { m, at: 0 }).take(4) {
         // A word without `=` is a level only in capitals: one whose first letter or digit is not
         // one is passed at once (most words: an address, a date, a path).
         if !word.as_bytes().contains(&b'=') && !word.bytes().find(u8::is_ascii_alphanumeric).is_some_and(|b| b.is_ascii_uppercase()) {
@@ -1149,6 +1186,15 @@ mod tests {
             9
         }
         let words = [
+            // What parts words, and what does not (U+001C is no whitespace).
+            "\u{a0}",
+            "\u{2003}",
+            "\u{3000}",
+            "\u{85}",
+            "\u{b}",
+            "\u{c}",
+            "\r\n",
+            "\u{1c}",
             "ERROR",
             "error",
             "[WARN]",

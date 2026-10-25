@@ -779,6 +779,21 @@ pub(crate) fn query_pairs(q: &str, prefix: Option<&str>, out: &mut Attrs) {
 /// A URL's parts, as Datadog's URL parser names them, into `out` (under `prefix` where there is
 /// one): `scheme`, `host`, `port`, `path` (its ending slashes trimmed where `trim_path` says, as the
 /// parser's `normalize_ending_slashes` does), `queryString.<key>`.
+/// Where `://` first is in `url`: from each `:`, whether two `/` follow (the two-way searcher
+/// `str::find` makes for it costs more to set up than a URL takes to read, §12.17's profile).
+fn scheme_end(url: &str) -> Option<usize> {
+    let b = url.as_bytes();
+    let mut from = 0;
+    while let Some(i) = memchr::memchr(b':', b.get(from..)?) {
+        let at = from + i;
+        if b.get(at + 1..at + 3) == Some(b"//") {
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    None
+}
+
 pub(crate) fn url_parts(url: &str, prefix: Option<&str>, trim_path: bool, out: &mut Attrs) {
     let put = |out: &mut Attrs, k: &str, v: &str| {
         out.push_with(
@@ -789,7 +804,7 @@ pub(crate) fn url_parts(url: &str, prefix: Option<&str>, trim_path: bool, out: &
             },
         );
     };
-    let (scheme, rest) = match url.split_once("://") {
+    let (scheme, rest) = match scheme_end(url).and_then(|i| Some((url.get(..i)?, url.get(i + 3..)?))) {
         Some((s, r)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c)) => (Some(s), r),
         _ => (None, url),
     };
@@ -1028,7 +1043,8 @@ pub(crate) fn int_into(n: i64, out: &mut String) {
     if n < 0 {
         out.push('-');
     }
-    out.extend(digits.iter().map(|&d| char::from(d)));
+    // ASCII digits, written at once (not a character at a time).
+    out.push_str(std::str::from_utf8(digits).unwrap_or_default());
 }
 
 /// An integer's text as `i64`'s parse and its text say it (a `+` and leading zeros gone) onto
@@ -1939,6 +1955,18 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
             user_agent(ua, None, &mut ours);
             let before = user_agent_before(ua);
             assert_eq!(ours.iter().collect::<Vec<_>>(), before.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>(), "{ua:?}");
+        }
+    }
+
+    /// A URL's scheme ends where `str::find` says `://` first is: on random text of colons, slashes
+    /// and what is neither.
+    #[test]
+    fn a_url_s_scheme_ends_where_find_says() {
+        let mut rng = kiln_obs::testkit::Rng::new(5);
+        let parts = [":", "/", "//", "://", "a", "é", ":/", "x:", "::"];
+        for _ in 0..20_000 {
+            let s: String = (0..rng.below(8)).map(|_| parts[rng.below(parts.len() as u64) as usize]).collect();
+            assert_eq!(scheme_end(&s), s.find("://"), "{s:?}");
         }
     }
 
