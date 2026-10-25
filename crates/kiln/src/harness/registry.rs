@@ -1674,9 +1674,9 @@ impl Registry {
     /// for a machine, every file sent ahead in pieces (the message then refers to them by id).
     async fn route_attachments(&self, hub: &Hub, id: &str, loc: &Location, c: Command) -> Result<Command, Sent> {
         use base64::Engine as _;
-        let Command::Send { id: mid, text, mode, attachments, overrides } = c else { return Ok(c) };
+        let Command::Send { id: mid, text, mode, attachments, overrides, reply_to, task } = c else { return Ok(c) };
         if attachments.is_empty() {
-            return Ok(Command::Send { id: mid, text, mode, attachments, overrides });
+            return Ok(Command::Send { id: mid, text, mode, attachments, overrides, reply_to, task });
         }
         let b64 = base64::engine::general_purpose::STANDARD;
         let mut out = Vec::new();
@@ -1729,7 +1729,7 @@ impl Registry {
             }
             out.push(a);
         }
-        Ok(Command::Send { id: mid, text, mode, attachments: out, overrides })
+        Ok(Command::Send { id: mid, text, mode, attachments: out, overrides, reply_to, task })
     }
 
     /// A harness signed in on a machine (kiln's /login): each of that machine's sessions of it is

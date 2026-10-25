@@ -39,7 +39,7 @@ pub(super) fn warm_models() {
     if !STATE.lock().begin(Instant::now()) {
         return;
     }
-    let Some(program) = crate::os::which("devin") else {
+    let Some(program) = Kind::get("devin").and_then(Kind::find) else {
         STATE.lock().finish(Instant::now(), false);
         return;
     };
