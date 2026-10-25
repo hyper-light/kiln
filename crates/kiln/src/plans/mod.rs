@@ -484,21 +484,89 @@ pub fn markdown(p: &Plan) -> String {
     out
 }
 
-/// The message that hands an agent the whole plan, under its title (unless it opens with it).
-pub fn message(p: &Plan) -> String {
+/// The message that hands an agent the whole plan, under its title (unless it opens with it); for a
+/// plan whose steps say what they wait for, the order they go in, those side by side on subagents
+/// of the agent's own, at most `at_once` at a time (its Subagents setting).
+pub fn message(p: &Plan, at_once: Option<u32>) -> String {
     let all = markdown(p);
     let body = all.trim();
     let first = body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let order = order_words(p, at_once).map(|o| format!(" {o}")).unwrap_or_default();
     if first.starts_with('#') && title_of(first) == p.title {
-        format!("Carry out this plan, step by step, and say when it is done.\n\n{body}")
+        format!("Carry out this plan, step by step, and say when it is done.{order}\n\n{body}")
     } else {
-        format!("Carry out this plan, step by step, and say when it is done.\n\n# {}\n\n{body}", p.title)
+        format!("Carry out this plan, step by step, and say when it is done.{order}\n\n# {}\n\n{body}", p.title)
     }
 }
 
 /// The message that hands an agent one step of a plan.
 pub fn step_message(p: &Plan, i: usize, n: usize, step: &str) -> String {
     format!("Step {} of {} of the plan \"{}\": {}\n\nDo this step only, then say what you did.", i + 1, n, p.title, step)
+}
+
+/// The message that hands an agent steps of a plan that don't wait for each other (`at`: each one's
+/// index from 0, with its text, of `n`), to run side by side on subagents of its own, at most
+/// `at_once` at a time (its Subagents setting): one message, so the steps after them wait for it.
+pub fn side_by_side_message(p: &Plan, at: &[(usize, &str)], n: usize, at_once: Option<u32>) -> String {
+    let nums: Vec<usize> = at.iter().map(|(i, _)| *i).collect();
+    let steps = at.iter().map(|(i, s)| format!("Step {}: {s}", i + 1)).collect::<Vec<_>>().join("\n\n");
+    format!(
+        "Steps {} of {n} of the plan \"{}\" don't wait for each other: run them side by side, a subagent of yours for each ({SUBAGENT_TOOLS}){}. Brief each with its step, and keep each to its step's own files.\n\n{steps}\n\nDo these steps only: wait for every subagent, check what each did, then say what each did.",
+        numbers(&nums),
+        p.title,
+        at_most(at_once)
+    )
+}
+
+/// How an agent starts subagents of its own, whatever its harness.
+const SUBAGENT_TOOLS: &str = "your Agent or Task tool; without one, start agents with agents_start";
+
+/// Steps (indexes from 0) as their numbers are said: "2", "2 and 3", "2, 3 and 4".
+fn numbers(i: &[usize]) -> String {
+    let n: Vec<String> = i.iter().map(|i| (i + 1).to_string()).collect();
+    match n.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// How many subagents at once, as a message says it (none: as many as the agent likes).
+fn at_most(at_once: Option<u32>) -> String {
+    match at_once {
+        Some(1) => ", one at a time (your Subagents setting)".to_owned(),
+        Some(n) => format!(", at most {n} at once (your Subagents setting)"),
+        None => String::new(),
+    }
+}
+
+/// The order a plan's steps go in, for the agent that carries out the whole plan: its steps in
+/// rounds as they say they wait for each other ([`rounds`]), each round's steps side by side on
+/// subagents of its own (at most `at_once` at a time). None when its steps say nothing of waiting,
+/// or none of them run side by side.
+fn order_words(p: &Plan, at_once: Option<u32>) -> Option<String> {
+    let n = p.items.len().min(STEPS);
+    let rounds = picked_rounds(&p.items, n, &(0..n).collect::<Vec<_>>());
+    if rounds.iter().all(|r| r.len() < 2) {
+        return None;
+    }
+    let order = rounds.iter().map(|r| if r.len() > 1 { format!("{} side by side", numbers(r)) } else { numbers(r) }).collect::<Vec<_>>().join(", then ");
+    Some(format!(
+        "Its steps say what they wait for, so they go in this order: {order}. Run the steps side by side on subagents of yours, one a step ({SUBAGENT_TOOLS}){}, and check what each did before the steps that wait for them.",
+        at_most(at_once)
+    ))
+}
+
+/// The steps `picked` (indexes from 0, of `n`) in the rounds they run in, as the plan's steps say
+/// what they wait for (`needs`; a step outside `picked` taken as done): each round's steps wait only
+/// for steps of the rounds before, so they run side by side. A plan whose steps say nothing of
+/// waiting has each step a round of its own, in order.
+pub fn picked_rounds(items: &[Item], n: usize, picked: &[usize]) -> Vec<Vec<usize>> {
+    if !items.iter().take(n).any(|it| !it.needs.is_empty()) {
+        return picked.iter().map(|&i| vec![i]).collect();
+    }
+    let needs: Vec<Vec<usize>> = waits(items, n, false).into_iter().enumerate().map(|(i, d)| if picked.contains(&i) { d.into_iter().filter(|j| picked.contains(j)).collect() } else { Vec::new() }).collect();
+    rounds(&needs).into_iter().map(|r| r.into_iter().filter(|i| picked.contains(i)).collect::<Vec<_>>()).filter(|r| !r.is_empty()).collect()
 }
 
 fn clean_tags(tags: Vec<String>) -> R<Vec<String>> {
@@ -835,8 +903,14 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, pick: &Pick, b
     if pick.only.is_some() && mode == Mode::Message {
         return Err(Error::Bad("`only` picks steps: run them as steps, goals or agents".into()));
     }
+    // The most subagents the agent runs at once (its Subagents setting): its steps side by side go to
+    // subagents of its own, within it (docs/agentic.md P2). A new agent has no setting of its own.
+    let at_once = match &target {
+        Target::Session(s) => hub.harness.info(s).and_then(|i| i.max_subagents),
+        Target::New { .. } => None,
+    };
     let messages: Vec<String> = match mode {
-        Mode::Message | Mode::Goals | Mode::Agents => vec![message(&p)],
+        Mode::Message | Mode::Goals | Mode::Agents => vec![message(&p, at_once)],
         Mode::Steps => {
             let steps: Vec<&String> = p.steps.iter().take(STEPS).collect();
             if steps.is_empty() {
@@ -847,7 +921,17 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, pick: &Pick, b
             if picked.is_empty() {
                 return Err(Error::Bad(format!("none of those steps is in this plan: it has {n}")));
             }
-            picked.iter().filter_map(|&i| Some(step_message(&p, i, n, steps.get(i)?))).collect()
+            // A message a round: steps that don't wait for each other in one, side by side.
+            picked_rounds(&p.items, n, &picked)
+                .iter()
+                .filter_map(|r| match r.as_slice() {
+                    [one] => Some(step_message(&p, *one, n, steps.get(*one)?)),
+                    many => {
+                        let at: Vec<(usize, &str)> = many.iter().filter_map(|&i| Some((i, steps.get(i)?.as_str()))).collect();
+                        Some(side_by_side_message(&p, &at, n, at_once))
+                    }
+                })
+                .collect()
         }
     };
     let (session, rest) = match target {
@@ -1100,9 +1184,9 @@ mod tests {
             phase: "ready".into(),
             research: None,
         };
-        assert!(message(&p).contains("# T\n\n- a\n- b"));
+        assert!(message(&p, None).contains("# T\n\n- a\n- b"));
         let headed = Plan { body: "# T\n\n- a\n- b".into(), ..p.clone() };
-        assert_eq!(message(&headed).matches("# T").count(), 1);
+        assert_eq!(message(&headed, None).matches("# T").count(), 1);
         assert!(step_message(&p, 1, 2, "b").starts_with("Step 2 of 2 of the plan \"T\": b"));
     }
 
@@ -1137,7 +1221,7 @@ mod tests {
         let md = markdown(&p);
         assert!(md.starts_with("Why: the scanner grew.\n\n## 1. Split the scanner\n\nMove number scanning"), "{md}");
         assert!(md.contains("**Acceptance criteria**\n\n- scan_number exists\n- scan time is at most 2 ms") && md.contains("**Tests**\n\n- hex literals — passes when 0x1F reads as 31") && md.contains("## 2. Ship it"), "{md}");
-        assert!(message(&p).contains("# Lexer\n\nWhy: the scanner grew."));
+        assert!(message(&p, None).contains("# Lexer\n\nWhy: the scanner grew."));
         assert!(it.text().starts_with("Split the scanner\n\nMove number scanning") && it.text().contains("Acceptance criteria:\n- scan_number exists\n- scan time is at most 2 ms\n\nTests:\n- hex literals"), "{}", it.text());
         assert_eq!(
             it.goal(),
@@ -1194,4 +1278,41 @@ mod tests {
         assert_eq!(read.needs, [1, 2]);
     }
 
+    /// docs/agentic.md P2: run on an agent as one message or a step a turn, a plan whose steps say
+    /// what they wait for goes in rounds: the steps of a round, side by side, go to subagents of the
+    /// agent's own, at most its Subagents setting at once (a step a turn: one message a round, so the
+    /// steps after them wait for it). A plan whose steps say nothing of waiting goes as before, a
+    /// step at a time; and steps picked (`only`) wait only for each other.
+    #[test]
+    fn p2_steps_side_by_side_go_to_the_agent_s_subagents_at_most_its_setting_at_once() {
+        let it = |t: &str, needs: &[usize]| Item { title: t.into(), needs: needs.to_vec(), ..Item::default() };
+        let items = vec![it("Schema", &[]), it("API", &[1]), it("UI", &[1]), it("Docs", &[]), it("Ship", &[2, 3])];
+        assert_eq!(picked_rounds(&items, 5, &[0, 1, 2, 3, 4]), [vec![0, 3], vec![1, 2], vec![4]]);
+        assert_eq!(picked_rounds(&items, 5, &[1, 2, 4]), [vec![1, 2], vec![4]], "step 1, not picked, is taken as done");
+        let chain = vec![it("a", &[]), it("b", &[]), it("c", &[])];
+        assert_eq!(picked_rounds(&chain, 3, &[0, 2]), [vec![0], vec![2]], "saying nothing of waiting: a step at a time, in order");
+        let p = Plan {
+            id: "p".into(),
+            title: "Search".into(),
+            body: String::new(),
+            steps: items.iter().map(Item::text).collect(),
+            items,
+            tags: vec![],
+            source: None,
+            share: None,
+            version: 1,
+            created_at: 0,
+            updated_at: 0,
+            runs: 0,
+            phase: "ready".into(),
+            research: None,
+        };
+        let whole = message(&p, Some(2));
+        assert!(whole.contains("they go in this order: 1 and 4 side by side, then 2 and 3 side by side, then 5.") && whole.contains("at most 2 at once (your Subagents setting)"), "{whole}");
+        assert!(!message(&Plan { items: chain, ..p.clone() }, Some(2)).contains("side by side"), "nothing to say of a plan whose steps say nothing of waiting");
+        let two = side_by_side_message(&p, &[(1, "API"), (2, "UI")], 5, Some(1));
+        assert!(two.starts_with("Steps 2 and 3 of 5 of the plan \"Search\" don't wait for each other: run them side by side, a subagent of yours for each"), "{two}");
+        assert!(two.contains("one at a time (your Subagents setting)") && two.contains("Step 2: API\n\nStep 3: UI") && two.ends_with("then say what each did."), "{two}");
+        assert!(!side_by_side_message(&p, &[(1, "API"), (2, "UI")], 5, None).contains("Subagents setting"), "no setting of its own: no limit said");
+    }
 }

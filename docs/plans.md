@@ -25,8 +25,9 @@ its research lead back to the agent it's kept with.
 
   A step **runs after** the steps it waits for (tick them under **Runs after**): run with an
   agent per step, it starts once each of them is met, and steps that don't wait for each other run
-  side by side. Moving or removing a step keeps what the others wait for. A step can't wait for
-  itself, or for a step that waits for it.
+  side by side; run on an agent, the steps side by side go to subagents of its own (below). Moving
+  or removing a step keeps what the others wait for. A step can't wait for itself, or for a step
+  that waits for it.
 - **Kept by kiln**: the plan an agent proposes in plan mode (Claude Code's plan, waiting for approval
   or approved) is kept as one of the plans by itself: one an agent, a new version each time it
   proposes another, its title from its words (`source.proposed`; a plan longer than 16 KB keeps its
@@ -75,6 +76,22 @@ From the plan: **Run it**, on an agent that runs or on a new one (machine, harne
   tests, a goal each, pursued first, then the step itself for its check.
 - **One agent per step**: below.
 
+A plan whose steps say what they wait for runs on an agent as its graph says (docs/agentic.md P2),
+the steps that don't wait for each other side by side on subagents of the agent's own, as many at
+once as its Subagents setting lets (**Subagents → At once**, one pool for all its subagents at
+work; none set, no limit):
+
+- **One message** says the order its steps go in ("1, then 2, 3 and 4 side by side, then 5") and
+  asks the agent to give each step side by side a subagent of its own (its Agent or Task tool;
+  without one, agents it starts), at most its setting at once.
+- **Step by step** sends the steps that don't wait for each other in one message, in rounds: each
+  round's steps side by side, a subagent each, the next round's message waiting for that turn.
+- **Goals** go as docs/goals.md, "A plan's steps side by side", says: kiln starts a subagent for
+  each step that can be under way beside the others, follows it, and takes its step as met when the
+  subagent meets it; the agent takes the steps there's no room for.
+
+A plan whose steps say nothing of waiting runs one step after another, as before.
+
 With steps picked, only those run, each keeping its number; the steps they wait for outside them
 are taken as done (the run says which), and one message isn't offered. As goals, **Each step as a
 goal stack of its own** (on by default for steps with acceptance criteria or tests) puts each
@@ -112,8 +129,9 @@ waits for instead (**after 2, 3**).
   `needs` in the API). Steps that don't wait for each other run side by side: the run's page says
   which. In a plan whose steps say nothing of it, each step waits for the one before, or, run
   **side by side** (`parallel`), none waits at all. `max_parallel` caps how many are at work at
-  once; an agent that runs a plan also has at most `[agents] max_children` agents of its own at
-  once, and further steps wait for room.
+  once; an agent that runs a plan also has at most as many subagents at work at once as its
+  Subagents setting says (one pool, whatever each does; none set, no limit), and further steps
+  wait for room.
 - **One folder.** Steps side by side in one folder share it, and the run says so: brief each
   step to keep to its own files, or give steps folders or machines of their own (`steps`). Until
   agents have workspaces of their own (docs/agentic.md, W: held with Slates), nothing keeps them
@@ -165,7 +183,8 @@ run until it's ready.
    says:
    - `goals` (the default): the plan's steps become the goal's parts on the same agent, each a
      goal saying the step it's made from (`goals_split` turns one into its acceptance criteria and
-     tests);
+     tests), the steps that don't wait for each other side by side on subagents of the agent's own
+     (docs/goals.md, "A plan's steps side by side");
    - `review`: the same, and the goal stack pauses for a person to look at the plan first; resuming
      it carries on;
    - `agents`: the plan runs with an agent per step, as its graph says; the goal waits for the run

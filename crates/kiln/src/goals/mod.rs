@@ -26,6 +26,7 @@
 
 pub mod keep;
 pub mod ops;
+mod subagents;
 
 use std::collections::HashMap;
 use std::pin::pin;
@@ -152,6 +153,15 @@ pub struct Item {
     /// once the run is done.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waits_on: Option<String>,
+    /// The subagent a plan's step was handed to, to run side by side with the plan's other steps
+    /// (`goals::subagents`): an agent of this one's own, started for it, held to the step there. While
+    /// it's still to go here, it isn't started on this agent; met there, it's met here, and keeps
+    /// who met it. The step's parts have it too while it's at them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<String>,
+    /// It came back from its subagent unmet: this agent takes it, not another subagent.
+    #[serde(skip)]
+    back: bool,
 }
 
 /// The plan step a goal was made from (`crate::plans`): its plan, the version run, its number (from
@@ -333,7 +343,7 @@ fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
         )
         .optional()?;
     let mut st = c.prepare(
-        "SELECT id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at, part_of, plan_id, plan_version, plan_step, plan_run, sent_id, planned_as, part_kind, waits_on, delegated_to FROM goal_items WHERE agent = ?1 ORDER BY pos",
+        "SELECT id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at, part_of, plan_id, plan_version, plan_step, plan_run, sent_id, planned_as, part_kind, waits_on, delegated_to, subagent, subagent_back FROM goal_items WHERE agent = ?1 ORDER BY pos",
     )?;
     let items = st
         .query_map(params![agent], |r| {
@@ -358,6 +368,8 @@ fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
                 waits_on: r.get(19)?,
                 step: plan.map(|plan| StepRef { plan, version: version.unwrap_or(0), n: at.and_then(|i| usize::try_from(i).ok()).unwrap_or(0) + 1, run }),
                 on: r.get(20)?,
+                subagent: r.get(21)?,
+                back: r.get(22)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -964,6 +976,9 @@ pub async fn split(hub: &Hub, agent: &str, id: Option<&str>, parts: Vec<String>)
     if !matches!(target.status.as_str(), "pending" | "active") {
         return Err(Error::Bad(format!("that goal is {} already: there's nothing left of it to split", target.status)));
     }
+    if target.subagent.is_some() {
+        return Err(Error::Bad("that step is under way on a subagent, which splits it there: goals_get shows where it stands".into()));
+    }
     // A part splits only when it's a plan's step (into its criteria and tests, or parts of its own).
     if target.part_of.is_some() && target.part_kind.as_deref() != Some("plan") {
         return Err(Error::Bad("that goal is a part of another already: add goals before it instead (goals_add with `before`)".into()));
@@ -1362,6 +1377,11 @@ where
                     tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
                 }
             }
+            // A plan's steps side by side: the steps out on subagents followed, and those ready
+            // handed out (`subagents`), each change under the stacks' lock as it goes.
+            if let Some(hub) = self.planner {
+                subagents::tick(hub, self.metrics).await;
+            }
             resume_lifted(self).await;
             // What the stacks said that an edit may not have got to their agents: said again.
             {
@@ -1383,6 +1403,12 @@ where
                 .unwrap_or_default();
             let held = paused_for_usage(self.store).await;
             let quiet: Vec<String> = all.iter().filter(|i| i.pause.is_some() || held.contains(&i.id)).map(|i| i.id.clone()).collect();
+            // Driven too: the subagents kiln started for plans' steps, which it follows itself
+            // (`subagents`): not kept going, and no news of them for the agent they work for.
+            let mut running = running;
+            if let Some(hub) = self.planner {
+                running.extend(subagents::held(hub).await);
+            }
             for info in keep_going(&all, &running, &waiting, &quiet) {
                 keep::tick(self.port, info, now, crate::harness::told::children_working(&all, &info.id)).await;
             }
@@ -1523,13 +1549,13 @@ async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result
 
 /// The goal next to start whose parts kiln made (a plan's steps, its planning and its run; a
 /// step's criteria and tests) are all met, and why it's met with them; none while a goal is under
-/// way. A goal whose planning is its only part met isn't: its steps come next. As in [`decide`], a
-/// goal under way on another agent (a program's worker's) isn't this one's next.
+/// way. A goal whose planning is its only part met isn't: its steps come next. As in [`decide_on`],
+/// a goal under way on another agent (a program's worker's) or a subagent isn't this one's next.
 fn met_by_parts(stack: &Stack) -> Option<(String, String)> {
     if stack.items.iter().any(|i| i.status == "active") {
         return None;
     }
-    let next = stack.items.iter().find(|i| i.status == "pending" && i.on.is_none())?;
+    let next = stack.items.iter().find(|i| i.status == "pending" && i.on.is_none() && i.subagent.is_none())?;
     let parts: Vec<&Item> = stack.items.iter().filter(|i| i.part_of.as_deref() == Some(next.id.as_str())).collect();
     let kiln_made = |i: &&Item| matches!(i.part_kind.as_deref(), Some("plan" | "planning" | "run" | "checks"));
     if parts.is_empty() || !parts.iter().all(kiln_made) || !parts.iter().all(|i| i.status == "met") || parts.iter().all(|i| i.part_kind.as_deref() == Some("planning")) {
@@ -1593,6 +1619,9 @@ async fn plan_locked(hub: &Hub, info: &Info, agent: &str, id: Option<&str>, titl
     }
     if matches!(target.part_kind.as_deref(), Some("checks" | "planning" | "run" | "own")) {
         return Err(Error::Bad("that goal is a part of another: plan the goal it's a part of".into()));
+    }
+    if target.subagent.is_some() {
+        return Err(Error::Bad("that step is under way on a subagent: goals_get shows where it stands".into()));
     }
     let as_plan_error = |e: crate::plans::Error| match e {
         crate::plans::Error::Bad(m) | crate::plans::Error::Refused(_, m) => Error::Bad(m),
@@ -1778,10 +1807,17 @@ enum Next {
     Done,
 }
 
-/// What a running stack does next, at `now`. `children`: agents it started are at work. `push`:
-/// you just started or resumed the stack, skipped its goal or changed what's under way, so what's
-/// next goes now, whatever the agent is doing.
+/// [`decide_on`] a stack with no plan steps side by side (the driver's own tests).
+#[cfg(test)]
 fn decide(stack: &Stack, info: Option<&Info>, now: i64, children: bool, push: bool) -> Next {
+    decide_on(stack, &subagents::Graph::default(), info, now, children, push)
+}
+
+/// What a running stack does next, at `now`, its plan steps going as `graph` says (what waits for
+/// what, what's out on subagents or about to go to them: `subagents::next_up`). `children`: agents
+/// it started are at work. `push`: you just started or resumed the stack, skipped its goal or
+/// changed what's under way, so what's next goes now, whatever the agent is doing.
+fn decide_on(stack: &Stack, graph: &subagents::Graph, info: Option<&Info>, now: i64, children: bool, push: bool) -> Next {
     // An agent kiln doesn't know right now is waited for: its runner is reconnecting, or the
     // server has just started. (A closed agent's stack goes when it's closed.)
     let Some(info) = info else { return Next::Wait };
@@ -1831,9 +1867,10 @@ fn decide(stack: &Stack, info: Option<&Info>, now: i64, children: bool, push: bo
         let worked = item.busy_at > 0 && info.last_activity.saturating_sub(item.busy_at) >= WORKED_MS;
         return Next::Remind { id, text: item.text.clone(), how, worked, stopped: info.status == Status::Exited, fresh };
     }
-    // A goal under way on another agent (delegated: docs/programs.md) isn't this one's to start,
-    // and while one is open the stack isn't done.
-    match stack.items.iter().find(|i| i.status == "pending" && i.on.is_none()) {
+    // A goal under way on another agent (delegated: docs/programs.md) or a subagent isn't this one's
+    // to start, nor a plan's step still waiting for others, and while one is open the stack isn't
+    // done.
+    match subagents::next_up(stack, graph) {
         Some(i) if free => Next::Start { id: i.id.clone(), text: i.text.clone() },
         Some(_) => Next::Wait,
         None if stack.items.iter().any(|i| i.status == "pending") => Next::Wait,
@@ -2027,7 +2064,12 @@ where
         stack = stack_of(store, agent).await?;
     }
     let all = port.agents();
-    let children = crate::harness::told::children_working(&all, agent);
+    // Agents it started at work hold its next goal back (it ended its turn to let them), but for the
+    // subagents kiln started for its plan's steps (`subagents`): its stack goes on beside those.
+    let children = {
+        let subs: Vec<&str> = stack.items.iter().filter_map(|i| i.subagent.as_deref()).collect();
+        all.iter().any(|c| c.parent.as_deref() == Some(agent) && !subs.contains(&c.id.as_str()) && crate::harness::wait::stand(c) == "working")
+    };
     // Its program's usage rule (docs/programs.md; the critical path's master plan, §5): above 95%
     // of a weekly window every stack of the program pauses, above 80% no new goal starts.
     let rule = crate::programs::rule(store, &all, agent).await;
@@ -2056,7 +2098,19 @@ where
         }
         return Ok(());
     }
-    let mut next = decide(&stack, info.as_ref(), now, children, push);
+    // Its plans' steps as their graphs say (docs/agentic.md P2): those that can be under way at once
+    // that are about to go to subagents (`subagents::tick`) are left for them. A graph that can't be
+    // read leaves its steps in the stack's order.
+    let mut graph = subagents::graph_of(store, &stack).await.unwrap_or_else(|e| {
+        tracing::warn!(%agent, error = %format!("{e:#}"), "a plan's steps: their graph not read");
+        subagents::Graph::default()
+    });
+    if let (Some(hub), Some(i)) = (d.planner, info.as_ref())
+        && !rule.holds_new_goals()
+    {
+        subagents::leave(&mut graph, hub, &stack, i, now).await;
+    }
+    let mut next = decide_on(&stack, &graph, info.as_ref(), now, children, push);
     // A big goal of the agent's own about to start, on a stack that plans those first: planned
     // first, as Make a plan does (researched inside and out, its steps written), its planning going
     // to the agent in its place and its steps after. One that can't be planned goes as it is.
@@ -2069,7 +2123,7 @@ where
             Ok((p, _)) => {
                 tracing::info!(%agent, goal = %id, plan = %p.plan, "a big goal planned first");
                 stack = stack_of(store, agent).await?;
-                next = decide(&stack, info.as_ref(), now, children, push);
+                next = decide_on(&stack, &graph, info.as_ref(), now, children, push);
             }
             Err(e) => tracing::warn!(%agent, goal = %id, error = %e, "planning a big goal first"),
         }

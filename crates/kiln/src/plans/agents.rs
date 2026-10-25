@@ -35,7 +35,7 @@ use serde_json::Value;
 use super::{Error, Item, Plan, R};
 use crate::goals::{At, By, Change, NewGoal, StepRef};
 use crate::harness::lineage::{Ask, Starter};
-use crate::harness::model::{Command, Status};
+use crate::harness::model::Command;
 use crate::hub::Hub;
 
 /// Steps one run has at the most.
@@ -167,7 +167,13 @@ pub fn goal_of(p: &Plan, i: usize, n: usize) -> String {
         Some(it) => it.goal(),
         None => p.steps.get(i).cloned().unwrap_or_default(),
     };
-    let line = format!("Step {} of {} of the plan \"{}\": {}", i + 1, n, p.title.trim(), step).split_whitespace().collect::<Vec<_>>().join(" ");
+    step_goal(&p.title, i, n, &step)
+}
+
+/// Step `i` (from 0) of `n` of the plan `title`, held to as a goal: where it stands in the plan, then
+/// `step` (the step as a goal).
+pub fn step_goal(title: &str, i: usize, n: usize, step: &str) -> String {
+    let line = format!("Step {} of {} of the plan \"{}\": {}", i + 1, n, title.trim(), step).split_whitespace().collect::<Vec<_>>().join(" ");
     if line.chars().count() > GOAL { format!("{}…", line.chars().take(GOAL).collect::<String>()) } else { line }
 }
 
@@ -617,15 +623,12 @@ async fn let_go(hub: &Hub, run: &str, row: &Row, interrupt: bool) {
 }
 
 /// How many more steps may start now: (steps at all, steps that start an agent) within the run's
-/// `max_parallel` (`at_work` are at work) and the agents its parent may run at once (`[agents]
-/// max_children`).
-fn room(hub: &Hub, head: &Head, at_work: usize) -> (usize, usize) {
+/// `max_parallel` (`at_work` are at work) and the room left in its parent's pool of subagents at
+/// work (its Subagents setting, whatever each does; none set, no limit: `lineage::room`).
+async fn room(hub: &Hub, head: &Head, at_work: usize) -> (usize, usize) {
     let all = head.config.max_parallel.filter(|m| *m > 0).map_or(usize::MAX, |m| m.saturating_sub(at_work));
-    let agents = match head.config.parent.as_deref() {
-        Some(p) => {
-            let max = usize::try_from(hub.cfg.agents.max_children).unwrap_or(usize::MAX);
-            max.saturating_sub(hub.harness.list().iter().filter(|i| i.parent.as_deref() == Some(p) && i.status != Status::Exited).count())
-        }
+    let agents = match head.config.parent.as_deref().and_then(|p| hub.harness.info(p)) {
+        Some(p) => crate::harness::lineage::room(hub, &p).await,
         None => usize::MAX,
     };
     (all, agents)
@@ -685,7 +688,7 @@ async fn advance_locked(hub: &Arc<Hub>, run: &str) -> R<()> {
     }
     let met: Vec<usize> = rows.iter().filter(|r| r.status == "met").filter_map(|r| usize::try_from(r.idx).ok()).collect();
     let mut at_work = rows.iter().filter(|r| matches!(r.status.as_str(), "started" | "taken")).count();
-    let (mut all, mut agents) = room(hub, &head, at_work);
+    let (mut all, mut agents) = room(hub, &head, at_work).await;
     let mut no_room = false;
     for row in rows.iter_mut().filter(|r| r.status == "waiting" && r.needs.iter().all(|d| met.contains(d))) {
         let own = row.given_to.is_none();
@@ -709,8 +712,17 @@ async fn advance_locked(hub: &Arc<Hub>, run: &str) -> R<()> {
         }
     }
     if at_work == 0 {
-        let why = match head.config.parent.as_deref().and_then(|p| hub.harness.info(p)) {
-            Some(p) if no_room => format!("{} runs as many agents as it may at once ([agents] max_children): end some it no longer needs, then retry the run's next step", p.name),
+        let parent = head.config.parent.as_deref().and_then(|p| hub.harness.info(p));
+        // No room while its parent has other subagents at work (one pool, whatever each does:
+        // docs/agentic.md P2): its steps wait for one to finish, rather than the run stopping.
+        if no_room
+            && let Some(p) = &parent
+            && crate::harness::lineage::busy(hub, p).await
+        {
+            return Ok(());
+        }
+        let why = match parent {
+            Some(p) if no_room => format!("{} may have no subagents at work ({}): raise that, then retry the run's next step", p.name, crate::harness::lineage::limit_words(hub, &p).await),
             _ => held_up(&rows),
         };
         set_run(hub, run, "stopped", Some(why)).await?;
@@ -1091,6 +1103,33 @@ mod tests {
                 meet(&hub, &run, 2).await?;
                 advance(&hub, &run).await?;
                 anyhow::ensure!(stands(&view(&hub, &run).await?) == strs(&["working", "met", "working"]));
+                Ok(())
+            })
+        })
+    }
+
+    /// docs/agentic.md P2: run by an agent held to fewer subagents than `[agents] max_children` (its
+    /// Subagents setting), steps side by side wait for room within it, rather than fail to start.
+    #[test]
+    fn p2_side_by_side_waits_for_room_within_the_parent_s_subagents_setting() -> anyhow::Result<()> {
+        on_a_hub(|hub| {
+            Box::pin(async move {
+                let folder = tempfile::tempdir()?;
+                let cwd = folder.path().to_string_lossy().into_owned();
+                let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(cwd.clone()), mode: Some("default".into()), name: Some("Main".into()), max_subagents: Some(1), ..Default::default() };
+                let main = hub.harness.open(&hub, "local", spec, 1).await?.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("no agent"))?;
+                for _ in 0..200 {
+                    if hub.harness.info(&main).is_some_and(|i| i.max_subagents == Some(1)) {
+                        break;
+                    }
+                    crate::rt::sleep(Duration::from_millis(20)).await;
+                }
+                let items = ["One", "Two", "Three"].iter().map(|t| Item { title: (*t).to_owned(), ..Item::default() }).collect();
+                let p = super::super::create(&hub, super::super::New { title: "Fan out".into(), items, ..Default::default() }, "admin").await?;
+                let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some(cwd), ..Place::default() };
+                let cfg = Config { place, parallel: true, main: Some(main.clone()), parent: Some(main), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
+                let v = view(&hub, &start(&hub, &p, cfg).await?.run).await?;
+                anyhow::ensure!(stands(&v) == strs(&["working", "waiting", "waiting"]), "{:?} {:?}", stands(&v), v.steps.iter().map(|s| &s.reason).collect::<Vec<_>>());
                 Ok(())
             })
         })

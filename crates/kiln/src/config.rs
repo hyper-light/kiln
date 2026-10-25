@@ -232,13 +232,15 @@ pub struct Conversations {
 pub struct Agents {
     /// How many agents deep a chain may go below the one a person started (that one is 0).
     pub max_depth: u32,
-    /// How many children still running one agent may have at once.
-    pub max_children: u32,
+    /// The most subagents at work one agent may have at once, whatever its own Subagents setting
+    /// says. None (the default): as many as that setting says, and with none, no limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_children: Option<u32>,
 }
 
 impl Default for Agents {
     fn default() -> Self {
-        Self { max_depth: 3, max_children: 24 }
+        Self { max_depth: 3, max_children: None }
     }
 }
 

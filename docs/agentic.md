@@ -115,8 +115,10 @@ Ending a parent lists its live children and offers to end them too.
 
 **O3 No more than its parent.** A child's permission mode is at most its parent's (plan < ask <
 accept edits < auto < bypass); bypass needs the parent's own `allow_bypass`; its `reach` is within
-the parent's. Depth (default 3) and live children per agent (default 24) are limited
-(`[agents] max_depth`, `max_children`). Every call is audited as `agent:<id>` for its person.
+the parent's. Depth is limited (default 3, `[agents] max_depth`), and so are an agent's subagents
+at work, to its own Subagents setting: one pool whatever each does, with no limit when it has none
+(a server may still set `[agents] max_children` for every agent). Every call is audited as
+`agent:<id>` for its person.
 
 **O4 Everywhere.** The operations work through MCP for every agent kiln starts on any machine, and
 `kiln agents wait`, `kiln agents result` and `kiln spawn --on` from any kiln shell.
@@ -150,6 +152,19 @@ that's there already (`{agent: "main"}`: the agent that ran the plan): its goal 
 agent's own goal stack and the run follows it there. The agent holding a step, its own or the
 main agent, turns it into a goal stack with `goals_split` (its acceptance criteria and tests, a
 goal each) and says each met with `goals_done` (docs/goals.md, "Agents work their own stack").
+
+Since 2026-10-24 a plan run on an agent goes as its graph says too. As goals (a run as **Goals**, or
+a goal's plan, its steps its parts), a step's goal waits for the steps it waits for, and where more
+than one step can be under way at once kiln hands each ready step to a subagent of the agent's own,
+started for it and held to it on its own goal stack, as many at once as there's room for in the
+agent's pool; the agent takes the steps there's no room for, and a step not met by its subagent
+comes back to it (docs/goals.md, "A plan's steps side by side"). As one message or a step a turn,
+the agent is told which steps go side by side and to give each a subagent of its own, at most its
+setting at once. A run with an agent per step waits for room in its parent's pool too, rather than
+stopping while others in it are at work. The pool: every subagent the agent has at work, whatever
+each does (the agents it started that work, wait on a person or are held to a goal still to go,
+and its harness's own), at most its Subagents setting, with no limit when it has none; one idle
+with its work done (a met step's agent kept for review) holds no place.
 
 **P3 The run.** A plan run has its own page: each step with its agent, where it stands (waiting,
 working, needs you, met, unmet), and what it changed; stop the run, retry a step, take a step over.

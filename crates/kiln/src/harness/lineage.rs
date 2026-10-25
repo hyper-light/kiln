@@ -9,7 +9,9 @@
 //!   it starts); bypass needs the parent's own `allow_bypass`; a parent whose commands run only on
 //!   its own machine (`reach` off) has children that do too, on that machine.
 //! - **Limits.** Chains go at most `[agents] max_depth` deep below the agent a person started, and
-//!   one agent has at most `[agents] max_children` children running at once.
+//!   one agent has at most as many subagents at work at once as its own Subagents setting says, one
+//!   pool whatever each does ([`room`]); with no setting, no limit (unless kiln's config sets
+//!   `[agents] max_children`).
 //! - **Where.** `on` is a machine's name, or what it needs (`linux/amd64`, `+gpu`, `cpus>=16`),
 //!   picked as reach picks: of the machines that suit and have the harness, the idlest.
 
@@ -569,6 +571,140 @@ fn same_machine(info: &Info, target: &str) -> bool {
     info.target == target || (target == "local" && info.target.is_empty())
 }
 
+/// How many subagents `parent` has at work, and the most it may have at once: one pool, whatever
+/// each does (docs/agents.md, "Agents that run agents"; docs/agentic.md P2). At work: the agents it
+/// started that work, wait on a person, or are held to a goal still to go on a goal stack that runs
+/// (between turns too), and its harness's own still going; one idle with its work done (a met
+/// step's agent kept for review), or ended, holds no place. The most: its own Subagents setting, or
+/// `[agents] max_children` when kiln's config sets one lower; neither set, there's no most at all.
+struct AtOnce {
+    at_work: usize,
+    max: Option<usize>,
+    /// Its own setting, when that's the most.
+    own: Option<usize>,
+}
+
+/// Whether `child`, an agent its parent started, holds a place in its parent's pool (`held`: the
+/// agents held to a goal still to go on a goal stack that runs).
+fn in_pool(child: &Info, held: &[String]) -> bool {
+    child.status != Status::Exited && (matches!(super::wait::stand(child), "working" | "needs_you") || held.contains(&child.id))
+}
+
+/// How many of `parent`'s harness's own subagents are still going, as its Agent tool's hook counts
+/// them (`Task::live`).
+fn own_at_work(parent: &Info) -> usize {
+    parent.subagents.iter().filter(|s| matches!(s.status.as_str(), "running" | "pending" | "paused")).count()
+}
+
+/// The most subagents at work at once that `own` (an agent's Subagents setting) and `kiln` (`[agents]
+/// max_children`) let it have, and its own when that's the most. Neither set: no most at all.
+fn most(own: Option<u32>, kiln: Option<u32>) -> (Option<usize>, Option<usize>) {
+    let n = |m: Option<u32>| m.and_then(|m| usize::try_from(m).ok());
+    match (n(own), n(kiln)) {
+        (Some(o), Some(k)) if k < o => (Some(k), None),
+        (Some(o), _) => (Some(o), Some(o)),
+        (None, k) => (k, None),
+    }
+}
+
+/// Of agents `ids`, those held to a goal still to go on a goal stack that runs (docs/goals.md): at
+/// work between turns too, as their stacks keep them at it.
+async fn on_goals(hub: &Hub, ids: Vec<String>) -> Vec<String> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let Ok(list) = serde_json::to_string(&ids) else { return Vec::new() };
+    let held = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT agent FROM goal_stacks s WHERE state = 'running' AND agent IN (SELECT value FROM json_each(?1))
+                 AND EXISTS (SELECT 1 FROM goal_items i WHERE i.agent = s.agent AND i.status IN ('pending', 'active'))",
+            )?;
+            let v = st.query_map([list], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(v)
+        })
+        .await;
+    held.unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "agents held to goals: not read");
+        Vec::new()
+    })
+}
+
+async fn at_once(hub: &Hub, parent: &Info) -> AtOnce {
+    let children: Vec<Info> = hub.harness.list().into_iter().filter(|i| i.parent.as_deref() == Some(parent.id.as_str()) && i.status != Status::Exited).collect();
+    let held = on_goals(hub, children.iter().map(|c| c.id.clone()).collect()).await;
+    let started = children.iter().filter(|c| in_pool(c, &held)).count();
+    let (max, own) = most(parent.max_subagents, hub.cfg.agents.max_children);
+    AtOnce { at_work: started.saturating_add(own_at_work(parent)), max, own }
+}
+
+/// How many more agents `parent` may start now ([`hold`]'s count): the most it may have at work at
+/// once, less those at work; with no most, no end to them (`usize::MAX`). A plan's steps side by
+/// side wait for room (docs/agentic.md P2).
+pub async fn room(hub: &Hub, parent: &Info) -> usize {
+    let a = at_once(hub, parent).await;
+    a.max.map_or(usize::MAX, |m| m.saturating_sub(a.at_work))
+}
+
+/// Whether `parent` has subagents at work now, as [`room`] counts them: the room it lacks comes
+/// back as they finish.
+pub async fn busy(hub: &Hub, parent: &Info) -> bool {
+    at_once(hub, parent).await.at_work > 0
+}
+
+/// The room an agent has for subagents, for what hands it work to go side by side (docs/agentic.md
+/// P2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Room {
+    /// None, ever: it's as deep as agents may go (`[agents] max_depth`), or its limit is 0. It does
+    /// its work itself.
+    Never,
+    /// No limit: neither its Subagents setting nor kiln's config sets one.
+    Any,
+    /// This many more may be at work now (0: until one of those at work finishes).
+    Left(usize),
+}
+
+impl Room {
+    /// As many more as may start now (`usize::MAX`: no end to them).
+    pub fn more(self) -> usize {
+        match self {
+            Self::Never => 0,
+            Self::Any => usize::MAX,
+            Self::Left(n) => n,
+        }
+    }
+}
+
+/// [`Room`] for an agent with `at_work` subagents at work, at most `max` at once; `deep`: it's as
+/// deep as agents may go.
+fn room_in(deep: bool, max: Option<usize>, at_work: usize) -> Room {
+    match max {
+        _ if deep => Room::Never,
+        Some(0) => Room::Never,
+        Some(m) => Room::Left(m.saturating_sub(at_work)),
+        None => Room::Any,
+    }
+}
+
+/// The room `parent` has for subagents now ([`Room`]), counted as [`room`] counts it.
+pub async fn room_of(hub: &Hub, parent: &Info) -> Room {
+    let deep = depth(hub, &parent.id).await >= hub.cfg.agents.max_depth;
+    let a = at_once(hub, parent).await;
+    room_in(deep, a.max, a.at_work)
+}
+
+/// The limit `parent` starts agents within, in words: its own Subagents setting when that's the
+/// most, else kiln's `[agents] max_children`; neither set, none.
+pub async fn limit_words(hub: &Hub, parent: &Info) -> String {
+    match at_once(hub, parent).await {
+        AtOnce { own: Some(n), .. } => format!("its Subagents setting: {n} at once"),
+        AtOnce { max: Some(n), .. } => format!("[agents] max_children: {n} at once"),
+        AtOnce { max: None, .. } => "no limit".to_owned(),
+    }
+}
+
 /// What a parent's children may be, checked before any starts: its depth, how many it runs, its
 /// mode and its reach. Returns the child's mode and reach.
 pub async fn hold(hub: &Hub, parent: &Info, ask: &Ask, target: &str, count: usize) -> Result<(Option<String>, Option<String>), Refused> {
@@ -580,17 +716,14 @@ pub async fn hold(hub: &Hub, parent: &Info, ask: &Ask, target: &str, count: usiz
             parent.name, d, limits.max_depth
         )));
     }
-    let all = hub.harness.list();
-    let running = all.iter().filter(|i| i.parent.as_deref() == Some(parent.id.as_str()) && i.status != Status::Exited).count();
-    let kiln_max = usize::try_from(limits.max_children).unwrap_or(usize::MAX);
-    // Its own, when lower: the most subagents it runs at once (its Agent settings).
-    let own = parent.max_subagents.and_then(|m| usize::try_from(m).ok()).filter(|m| *m < kiln_max);
-    let max = own.unwrap_or(kiln_max);
-    if running.saturating_add(count) > max {
-        let s = if running == 1 { "" } else { "s" };
+    let AtOnce { at_work, max, own } = at_once(hub, parent).await;
+    if let Some(max) = max
+        && at_work.saturating_add(count) > max
+    {
+        let s = if at_work == 1 { "" } else { "s" };
         return Err(refuse(match own {
-            Some(_) => format!("{} runs {running} agent{s} it started, and its settings let it run at most {max} at once: end some first, or raise that in its Agent settings", parent.name),
-            None => format!("{} runs {running} agent{s} it started, and one agent runs at most {max} at once ([agents] max_children): end some first", parent.name),
+            Some(_) => format!("{} has {at_work} subagent{s} at work, and its settings let it have at most {max} at once: wait for one to finish, or raise that in its Agent settings", parent.name),
+            None => format!("{} has {at_work} subagent{s} at work, and one agent has at most {max} at once ([agents] max_children): wait for one to finish", parent.name),
         }));
     }
     let mode = child_mode(&ask.kind, ask.mode.as_deref(), ceiling(parent), !parent.no_bypass).map_err(refuse)?;
@@ -780,6 +913,62 @@ mod tests {
         assert!(!live.contains(&"d".to_owned()), "an ended child isn't live (its own children are)");
         assert!(live_descendants(&all, "x").is_empty());
         assert_eq!(descendants(&all, "a").len(), 4, "ended ones too, for ending them with their parent");
+    }
+
+    /// docs/agentic.md P2 (Ada's decisions 4 and 6, 2026-10-24): one pool of subagents at work per
+    /// agent, whatever each does. An agent it started holds a place while it works, waits on a
+    /// person, or is held to a goal still to go (between turns too); idle with its work done (a met
+    /// step's agent kept for review), or ended, it holds none. Its harness's own hold one while they
+    /// go. The most is its own Subagents setting; with none there's no most at all, unless kiln's
+    /// config sets `[agents] max_children`, which holds it when lower.
+    #[test]
+    fn p2_one_pool_of_subagents_at_work_and_no_setting_is_no_limit() {
+        let held = ["pool-between".to_owned()];
+        let child = |id: &str, status: Status| info(id, Some("p"), status);
+        for (id, status) in [("pool-working", Status::Running), ("pool-starting", Status::Starting), ("pool-asks", Status::Waiting), ("pool-between", Status::Idle)] {
+            assert!(in_pool(&child(id, status), &held), "{id}");
+        }
+        assert!(!in_pool(&child("pool-done", Status::Idle), &held), "idle, its work done");
+        assert!(!in_pool(&child("pool-between", Status::Exited), &held), "ended, though its stack still holds the goal");
+        let sub = |status: &str| super::super::session::SubagentBrief { id: status.into(), tool_id: None, description: String::new(), status: status.into(), parent_task: None, started: 0, ended: None };
+        let parent = Info { subagents: ["running", "pending", "paused", "completed", "failed"].into_iter().map(sub).collect(), ..info("p", None, Status::Running) };
+        assert_eq!(own_at_work(&parent), 3, "its harness's own still going");
+        assert_eq!(most(None, None), (None, None), "no setting: no limit at all");
+        assert_eq!(most(Some(3), None), (Some(3), Some(3)));
+        assert_eq!(most(Some(3), Some(24)), (Some(3), Some(3)));
+        assert_eq!(most(Some(30), Some(24)), (Some(24), None), "kiln's config, set lower, holds it");
+        assert_eq!(most(None, Some(24)), (Some(24), None));
+        // What hands work out side by side: none ever as deep as agents may go, or at a limit of 0
+        // (its work its own), else the room left, which comes back as those at work finish.
+        assert_eq!(room_in(false, None, 7), Room::Any);
+        assert_eq!(room_in(false, Some(3), 1), Room::Left(2));
+        assert_eq!(room_in(false, Some(3), 5), Room::Left(0), "full: until one finishes");
+        assert_eq!(room_in(false, Some(0), 0), Room::Never);
+        assert_eq!(room_in(true, None, 0), Room::Never);
+        assert_eq!((Room::Never.more(), Room::Any.more(), Room::Left(2).more()), (0, usize::MAX, 2));
+    }
+
+    /// The agents held to a goal still to go on a goal stack that runs, as the store has them: not
+    /// one whose stack is paused, one whose goals are all over, nor one with no stack.
+    #[test]
+    fn p2_agents_held_to_goals_are_read_from_their_stacks() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            hub.store
+                .call(|c| {
+                    for (agent, state, status) in [("on", "running", "active"), ("next", "running", "pending"), ("held", "paused", "pending"), ("over", "running", "met")] {
+                        c.execute("INSERT INTO goal_stacks (agent, state, created_at, updated_at) VALUES (?1, ?2, 0, 0)", rusqlite::params![agent, state])?;
+                        c.execute("INSERT INTO goal_items (id, agent, pos, text, status) VALUES (?1, ?1, 0, 'a goal', ?2)", rusqlite::params![agent, status])?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            let mut held = on_goals(&hub, ["on", "next", "held", "over", "none"].map(str::to_owned).to_vec()).await;
+            held.sort();
+            anyhow::ensure!(held == ["next", "on"], "{held:?}");
+            anyhow::ensure!(on_goals(&hub, Vec::new()).await.is_empty());
+            Ok(())
+        })
     }
 
     /// docs/agents.md, "Whose agents": who sees and who acts on which agent session.
