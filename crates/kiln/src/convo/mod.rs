@@ -35,9 +35,14 @@ pub fn open(dir: &std::path::Path, upkeep: store::Upkeep) -> Option<store::Store
     open_file(dir, FILE, upkeep)
 }
 
+/// Whether conversation stores are turned off on this machine (`KILN_CONVERSATIONS=off`).
+pub fn off() -> bool {
+    std::env::var("KILN_CONVERSATIONS").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))
+}
+
 /// The store kept in file `file` of `dir` (see [`open`]).
 pub fn open_file(dir: &std::path::Path, file: &str, upkeep: store::Upkeep) -> Option<store::Store> {
-    if std::env::var("KILN_CONVERSATIONS").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")) {
+    if off() {
         tracing::info!("the conversation store is off (KILN_CONVERSATIONS)");
         return None;
     }

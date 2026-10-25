@@ -32,8 +32,15 @@ pub const READY_WITHIN: Duration = Duration::from_secs(180);
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Frame {
-    /// green → blue: connected to the server and welcomed; it takes over now.
-    Ready { pid: u32, instance: String },
+    /// green → blue: connected to the server and welcomed; it takes over now. `stores`: it takes
+    /// blue's conversation stores over too ([`Frame::Stores`]); a build from before doesn't say,
+    /// and keeps one of its own.
+    Ready {
+        pid: u32,
+        instance: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stores: bool,
+    },
     /// blue → green: an agent session, its harness process still running (descriptors: its stdin,
     /// stdout and stderr), or (`handed` none) to start again from its record.
     Session { id: String, record: Box<crate::harness::host::Saved>, handed: Option<Box<crate::harness::session::Handed>> },
@@ -50,7 +57,16 @@ pub enum Frame {
     Forward { data: String },
     /// green → blue: taken over, or why not.
     Ack { id: String, ok: bool, error: Option<String> },
+    /// blue → green, first, to a green that takes them (`Ready::stores`): blue's conversation
+    /// store and its copy of the server's (a mirror's), let go of and moved into green's folder
+    /// (`own`, `mirror`: their files there), for green to go on with under the same ids and
+    /// numbers, so nothing is sent to the server again (None: none to hand over; green opens one
+    /// of its own). Answered with an Ack, id [`STORES`].
+    Stores { own: Option<String>, mirror: Option<String> },
 }
+
+/// The id green's Ack of [`Frame::Stores`] carries.
+pub const STORES: &str = "stores";
 
 /// Where a runner whose own directory is `own_dir` waits for the new build to take over from it:
 /// in the user's runtime directory (Unix socket paths are short), named after that directory.
@@ -174,7 +190,9 @@ mod unix {
         /// Wait (blocking) for green (process `pid`) to connect and say it's ready, until
         /// `deadline`, as long as it runs. The connection to hand it everything over, and the
         /// instance it runs as.
-        pub fn ready(&self, pid: u32, deadline: Instant) -> Result<(Conn, String)> {
+        /// The new build's connection once it says it's ready, its instance, and whether it takes
+        /// this runner's conversation stores over ([`Frame::Ready`]).
+        pub fn ready(&self, pid: u32, deadline: Instant) -> Result<(Conn, String, bool)> {
             loop {
                 match self.listener.accept() {
                     Ok((stream, _)) => {
@@ -182,7 +200,7 @@ mod unix {
                         stream.set_read_timeout(Some(Duration::from_secs(60)))?;
                         let conn = Conn { stream };
                         match conn.recv() {
-                            Ok((Frame::Ready { pid: said, instance }, _)) if said == pid => return Ok((conn, instance)),
+                            Ok((Frame::Ready { pid: said, instance, stores }, _)) if said == pid => return Ok((conn, instance, stores)),
                             // Not the process started for this: not listened to.
                             Ok((Frame::Ready { pid: said, .. }, _)) => tracing::warn!(said, expected = pid, "a runner that isn't the new build tried to take over; ignored"),
                             Ok(_) => tracing::warn!("a connection to the handover socket didn't open by saying it's ready; ignored"),
