@@ -6,7 +6,7 @@
  */
 import * as React from "react";
 import { ArrowDown, ArrowUpRight, ChevronRight, CircleAlert, Copy, CornerDownRight, Download, FileDown, GitBranch, GitFork, Info, Pencil, Reply, SquarePlus, TriangleAlert, Undo2 } from "lucide-react";
-import { useSession, type Approval, type Command, type Delivery, type HEvent, type Meta, type QueueItem, type SessionStore, type Task } from "@/api/harness";
+import { useSession, type Approval, type Command, type Compacting, type Delivery, type HEvent, type Meta, type QueueItem, type SessionStore, type Task } from "@/api/harness";
 import { useNavigate } from "@/lib/router";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -23,6 +23,7 @@ import {
   taskDuration,
   taskLive,
   taskOfCall,
+  tokens,
   turnsFrom,
   type Item,
   type Step,
@@ -47,7 +48,7 @@ import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { researchCall } from "@/api/research";
 import { ResearchCard } from "@/views/research/research";
 import { copyText } from "@/views/terminal/clipboard";
-import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
+import { Beam, Condense, formatThought, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
 import { latestThought, thinkingStarted, thoughtIsLive, thoughtShown, type ThoughtItem } from "./thinking";
 import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
@@ -987,6 +988,8 @@ const ItemView = React.memo(function ItemView({
       return <Thought item={item} live={active && Boolean(latestThought(item).streaming)} since={since} />;
     case "notice":
       return <Notice e={item.event} repeats={item.repeats} />;
+    case "compaction":
+      return <CompactionMark e={item.event} />;
     case "page":
       // The page, or where it'll be while it's being kept; a call that failed says why, as a step.
       return pageOf(item.event) || item.event.status === "running" || item.event.status === "pending" ? (
@@ -1005,7 +1008,7 @@ const ItemView = React.memo(function ItemView({
 
 /** Whether the end of a live turn shows it at work: a reply or a thought streaming, a call running. */
 function moving(items: Item[], turnStarted?: number): boolean {
-  const last = items.findLast((item) => item.type !== "notice");
+  const last = items.findLast((item) => item.type !== "notice" && item.type !== "compaction");
   if (!last) return false;
   if (last.type === "note") return Boolean(last.event.streaming);
   if (last.type === "thought") return thoughtIsLive(last, true, turnStarted) && thoughtShown(last);
@@ -1027,6 +1030,63 @@ function LiveTail({ doing, since }: { doing?: string; since?: number }) {
         <Optic state="thinking" />
         <ThinkingLabel doing={doing} since={since} />
       </span>
+    </div>
+  );
+}
+
+/** How long it has gone on, ticking (kept out of what's announced). */
+function Since({ since }: { since: number }) {
+  const now = useNow();
+  return (
+    <span className="sg-num" aria-hidden="true">
+      {formatThought(Math.max(0, (now - since) / 1000))}
+    </span>
+  );
+}
+
+/** A compaction under way, where the turn's live line is: what it does, the context it compacts
+ *  and for how long; the optic draws in, and the conversation's spectrum is condensed into the bar
+ *  its marker keeps, in the same place, once it's done. */
+function CompactingRow({ c }: { c: Compacting }) {
+  return (
+    <div className="hx-compaction" data-state="live" role="status">
+      <span className="sg-thinking-line hx-compaction-line">
+        <span className="sg-think-glyph" aria-hidden="true">
+          <Optic state="compacting" />
+        </span>
+        <PrismLabel live sweep>
+          Compacting the conversation
+        </PrismLabel>
+        <span className="hx-compaction-facts">
+          {c.tokens ? `${tokens(c.tokens)} tokens · ` : ""}
+          <Since since={c.since} />
+        </span>
+      </span>
+      <Condense live />
+    </div>
+  );
+}
+
+/** A compaction's marker: the row the live one settles into, in the words its harness's adapter
+ *  wrote, its bar held still as the boundary it is (above it, the agent works from a summary);
+ *  one that didn't compact in the warning's tone. */
+function CompactionMark({ e }: { e: Extract<HEvent, { kind: "notice" }> }) {
+  const warn = e.level !== "info";
+  return (
+    <div
+      className="hx-compaction"
+      data-state="done"
+      data-tone={warn ? "warn" : undefined}
+      data-ev={e.id}
+      title={warn ? undefined : "The conversation was summarized to free context: from here on the agent works from that summary"}
+    >
+      <span className="sg-thinking-line hx-compaction-line">
+        <span className="sg-think-glyph" aria-hidden="true">
+          <Optic state="done" />
+        </span>
+        <PrismLabel>{e.text}</PrismLabel>
+      </span>
+      <Condense warn={warn} />
     </div>
   );
 }
@@ -1065,6 +1125,7 @@ const TurnView = React.memo(function TurnView({
   delivery,
   live,
   doing,
+  compacting,
   turnStarted,
   onOpenTask,
   meta,
@@ -1085,6 +1146,8 @@ const TurnView = React.memo(function TurnView({
   live: boolean;
   /** What the agent says it's doing, while the turn is live. */
   doing?: string;
+  /** A compaction of this thread's conversation under way (the last turn's, at its end). */
+  compacting?: Compacting;
   turnStarted?: number;
   onOpenTask?: (t: string) => void;
   meta?: Meta | null;
@@ -1109,7 +1172,7 @@ const TurnView = React.memo(function TurnView({
   const end = allSteps ? turn.items.length : hidden + STEPS_WINDOW;
   const sought = findNow !== null && turn.items.some((it, i) => (i < hidden || i >= end) && itemHolds(it, findNow.id));
   const items = sought ? turn.items : turn.items.slice(hidden, end);
-  const currentItem = turn.items.findLast((item) => item.type !== "notice");
+  const currentItem = turn.items.findLast((item) => item.type !== "notice" && item.type !== "compaction");
   const since = thinkingStarted(turn, turnStarted);
   // At work with nothing moving at its end: said once the end has held still a moment (from the
   // start, before anything has moved, at once).
@@ -1148,7 +1211,7 @@ const TurnView = React.memo(function TurnView({
             spawn={spawn}
           />
         ))}
-        {live && !turn.outcome && !movedLately && <LiveTail doing={doing} since={since} />}
+        {compacting ? <CompactingRow c={compacting} /> : live && !turn.outcome && !movedLately && <LiveTail doing={doing} since={since} />}
       </div>
       {turn.outcome && (
         <div className="hx-outcome" data-ev={turn.outcome.id}>
@@ -1566,6 +1629,8 @@ export const Timeline = React.memo(function Timeline({
     [findQ, findNow, grows, holds, from, to, read, restore],
   );
   const running = parent ? task?.status === "running" : state?.status === "running";
+  // A compaction of this thread's conversation under way, while its harness can still be heard.
+  const compacting = state?.compacting && (state.compacting.parent ?? undefined) === parent && state.status !== "exited" && state.status !== "disconnected" ? state.compacting : undefined;
   const tasks = state?.tasks ?? NO_TASKS;
   // What you answered here goes from sight at once (answered.ts).
   const approvals = stillAsked(state?.approvals ?? NO_APPROVALS, done);
@@ -1654,6 +1719,7 @@ export const Timeline = React.memo(function Timeline({
               delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
               live={running && from + j === turns.length - 1}
               doing={running && from + j === turns.length - 1 ? state?.doing : undefined}
+              compacting={from + j === turns.length - 1 ? compacting : undefined}
               turnStarted={running && from + j === turns.length - 1 ? (parent ? task?.started : (state?.turn_started ?? undefined)) : undefined}
               onOpenTask={onOpenTask}
               meta={meta}
