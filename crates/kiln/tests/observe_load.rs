@@ -1134,9 +1134,11 @@ fn a_trace_flood_is_taken_or_refused_never_lost_counted_once_and_replicas_agree(
         let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": q, "from": from, "to": to, "step": 10_000 })))?;
         Ok(at(&a, &["series"]).as_array().into_iter().flatten().filter(|s| at(s, &["tags", "service"]).as_str().is_some_and(|v| v.starts_with("load-svc-"))).flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum())
     };
+    // Counted within a quarter of each second (the counter's budget): 1.5 M spans took 76 s on
+    // adacachy, 2.1 M past 120 s with other work beside it. Every one is waited for.
     let counted_at = Instant::now();
     let (mut hits, mut outbound) = (0.0, 0.0);
-    while counted_at.elapsed() < Duration::from_secs(120) {
+    while counted_at.elapsed() < Duration::from_secs(300) {
         hits = metric("sum:trace.hits{*} by {service}.as_count()")?;
         outbound = metric("sum:trace.outbound.hits{*} by {service}.as_count()")?;
         if hits >= taken_traces as f64 && outbound >= 2.0 * taken_traces as f64 {
