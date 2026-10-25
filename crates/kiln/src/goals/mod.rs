@@ -1246,7 +1246,7 @@ fn reminder_command(how: &str, text: &str, stopped: bool) -> Command {
 
 /// A message of the stack's (its id says so: `queued::GOAL`).
 fn send(text: String) -> Command {
-    Command::Send { id: crate::harness::queued::made(GOAL), text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None }
+    Command::Send { id: crate::harness::queued::made(GOAL), text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None, task: None }
 }
 
 /// The same goal: the same words, however they're spaced (a goal is kept as one line).

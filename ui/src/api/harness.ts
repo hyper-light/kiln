@@ -167,6 +167,12 @@ export interface Task {
   wakes?: string;
   /** Whether a stop can work. */
   stoppable?: boolean;
+  /** Subagents: how a person's message reaches it now (a `send` with its `task`); none: it takes none, and the composer writes to the agent. */
+  takes?: SendMode[];
+  /** "parent": a message to it goes by way of the agent that started it (its harness takes none from kiln itself). */
+  via?: string;
+  /** Messages waiting for it to finish what it's doing. */
+  queue?: QueueItem[];
 }
 
 /** A harness's own subagent, tracked within its parent's session without another executor. */
@@ -787,7 +793,7 @@ export interface Spec {
 export type WorkspacesAvailable = Record<string, { available: boolean; why_not?: string }>;
 
 export type Command =
-  | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string } }
+  | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string }; task?: string }
   | { type: "control"; id: string; value?: unknown }
   | { type: "mcp_enable"; name: string; enabled: boolean }
   | { type: "mcp_reconnect"; name: string }

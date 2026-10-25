@@ -699,6 +699,31 @@ const META: Meta = {
   features: ["interrupt", "set_mode", "steer"],
 };
 
+/** How a person's message reaches one of its subagents, as its harness lets one in (harness/subagent.rs): a Codex one on its own thread, a Claude Code one by way of its agent (not once stopped). */
+function withTakes(m: Member, t: Task): Task {
+  if (t.class !== "agent" || !t.tool_id) return t;
+  const live = t.status === "running" || t.status === "pending" || t.status === "paused";
+  if (m.info.kind === "codex") return { ...t, takes: live ? ["queue", "steer", "now"] : ["queue"] };
+  if (t.status === "stopped" || t.status === "killed") return t;
+  return { ...t, takes: live && t.background ? ["queue", "steer"] : ["queue"], via: "parent" };
+}
+
+/** A person's message to subagent `task`: in its thread, or waiting in its queue for it to finish. */
+function tellSubagent(m: Member, task: string, id: string, text: string, mode: string) {
+  const t = m.tasks?.find((x) => x.id === task);
+  if (!t?.tool_id) return;
+  const live = t.status === "running" || t.status === "pending" || t.status === "paused";
+  const out: unknown[] = [];
+  if (mode === "queue" && live) t.queue = [...(t.queue ?? []), { id, text, at: Date.now() }];
+  else {
+    const e = { id, seq: Math.max(0, ...m.events.map((x) => x.seq)) + 1, at: Date.now(), parent: t.tool_id, kind: "user", text, client_id: id } as HEvent;
+    m.events.push(e);
+    out.push({ t: "events", events: [e] });
+  }
+  out.unshift({ t: "state", state: stateOf(m) });
+  for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) for (const u of out) ws.send(JSON.stringify(u));
+}
+
 function stateOf(m: Member): State {
   return {
     status: m.info.status,
@@ -711,7 +736,7 @@ function stateOf(m: Member): State {
     approvals: m.approval ? [m.approval] : [],
     queue: [],
     delivery: {},
-    tasks: m.tasks ?? [],
+    tasks: (m.tasks ?? []).map((t) => withTakes(m, t)),
     todos: m.info.id === "fam-orch" ? ORCH_TODOS : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
@@ -728,8 +753,9 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   ws.on("close", () => seen.delete(ws));
   ws.on("message", (raw) => {
     try {
-      const c = JSON.parse(raw.toString()) as { type?: string; task?: string };
+      const c = JSON.parse(raw.toString()) as { type?: string; task?: string; id?: string; text?: string; mode?: string };
       if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
+      if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
     } catch {
       // Not a command.
     }

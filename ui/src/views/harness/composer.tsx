@@ -20,6 +20,7 @@ import { SendWith } from "./run-settings";
 import { MicButton } from "./voice";
 import { modelLabel } from "./derive";
 import { useDrafts, useHeld, useSendMode, type Held } from "./state";
+import { stopperOf, subagentPlaceholder, takesMessages } from "./tasks";
 
 export const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
@@ -235,6 +236,29 @@ const StopTurn = React.memo(function StopTurn({ store }: { store: SessionStore }
   );
 });
 
+/** Stop the subagent shown (its turn; one whose harness can't pause it ends): as Stop does the agent's. */
+const StopSubagent = React.memo(function StopSubagent({ store, task }: { store: SessionStore; task: string }) {
+  const [at, setAt] = React.useState<number | null>(null);
+  const now = useNow();
+  const asked = at != null && now - at < 15_000;
+  return (
+    <Tip content="Stop the subagent (Esc)">
+      <button
+        type="button"
+        className="cp-stop"
+        disabled={asked}
+        onClick={() => {
+          if (store.send({ type: "stop_task", task })) setAt(Date.now());
+        }}
+        aria-label={asked ? "Stopping…" : "Stop the subagent"}
+      >
+        <Square size={10} fill="currentColor" />
+        <span className="cp-label">{asked ? "Stopping…" : "Stop"}</span>
+      </button>
+    </Tip>
+  );
+});
+
 /**
  * What was kept here for `agent` goes, in order, if it can take it now (connected, its machine
  * there). Those that went are dropped at once, after: a send that fails stops the rest.
@@ -244,9 +268,11 @@ function sendHeld(store: SessionStore, agent: string) {
   if (s.conn !== "open" || s.state?.status === "disconnected") return;
   const went: string[] = [];
   for (const m of useHeld.getState().held[agent] ?? []) {
-    // As it was to go: a "now" kept through a reconnection still stops what runs.
+    // As it was to go: a "now" kept through a reconnection still stops what runs. One for a
+    // subagent keeps its way too (the agent sends it the nearest way that one takes then).
     const running = s.state?.status === "running" || s.state?.status === "waiting";
-    if (!store.send({ type: "send", id: m.id, text: m.text, mode: running ? (m.mode ?? "queue") : "queue", attachments: m.attachments, overrides: m.overrides })) break;
+    const mode = m.task || running ? (m.mode ?? "queue") : "queue";
+    if (!store.send({ type: "send", id: m.id, text: m.text, mode, attachments: m.attachments, overrides: m.overrides, ...(m.task ? { task: m.task } : {}) })) break;
     went.push(m.id);
   }
   if (went.length) useHeld.getState().drop(agent, ...went);
@@ -256,12 +282,14 @@ const NO_QUEUE: QueueItem[] = [];
 const NO_HELD: Held[] = [];
 const NO_FEATURES: string[] = [];
 const NO_COMMANDS: SlashCommand[] = [];
+const NO_MODES: SendMode[] = [];
 
 export function Composer({
   store,
   agent,
   attachments,
   toMain,
+  task,
   onView,
   onTerminal,
 }: {
@@ -269,8 +297,10 @@ export function Composer({
   /** The agent's id: what's written to it is kept under it until it's sent. */
   agent: string;
   attachments: Attachments;
-  /** Shown over a subagent's thread: what's typed here goes to the main agent. */
+  /** Shown over a subagent's thread: what's typed here goes to the main agent (unless that subagent takes messages). */
   toMain?: boolean;
+  /** The subagent whose thread is shown (its task's id, or its call's): a message goes to it, as it takes one now (`Task.takes`). */
+  task?: string | null;
   /** A command that opens a kiln panel (model, mcp, changes, tasks…). */
   onView?: (view: string) => void;
   /** Open a terminal beside the agent: its shell (`!command`), or its harness's own screen (a command only that screen does). */
@@ -296,6 +326,11 @@ export function Composer({
   const model = useSession(store, (s) => s.state?.model ?? "");
   const effort = useSession(store, (s) => s.state?.effort ?? "");
   const meta = useSession(store, (s) => s.meta);
+  // Over a subagent's thread: one that takes messages now gets what's written here, its way.
+  const sub = useSession(store, (s) => (task ? s.state?.tasks.find((t) => t.id === task || t.tool_id === task) : undefined));
+  const subTakes = sub?.takes ?? NO_MODES;
+  const toSub = takesMessages(sub) ? sub : undefined;
+  const shownQueue = toSub ? (toSub.queue ?? NO_QUEUE) : queue;
   const [suggest, setSuggest] = React.useState<{ kind: "/" | "@"; items: { label: string; hint?: string }[]; index: number } | null>(null);
   const ta = React.useRef<HTMLTextAreaElement | null>(null);
   /** The marked copy of the text under the field (its own text is clear). */
@@ -303,12 +338,13 @@ export function Composer({
   // Where the caret is, as the field last said; null: at the end (text put in, not typed).
   const [caret, setCaret] = React.useState<number | null>(null);
   const features = meta?.features ?? NO_FEATURES;
-  const running = status === "running" || status === "waiting";
-  const modes = React.useMemo(() => MODES.filter((m) => !m.feature || features.includes(m.feature)), [features]);
+  const running = toSub ? toSub.status === "running" || toSub.status === "pending" || toSub.status === "paused" : status === "running" || status === "waiting";
+  const modes = React.useMemo(() => MODES.filter((m) => (toSub ? subTakes.includes(m.id) : !m.feature || features.includes(m.feature))), [features, toSub, subTakes]);
   // How you chose to send stays chosen; an agent that can't send that way queues.
   const mode: SendMode = modes.some((m) => m.id === chosen) ? chosen : "queue";
   const canAttach = attachments.enabled;
-  const canOverride = features.includes("overrides");
+  const canOverride = !toSub && features.includes("overrides");
+  const subStops = Boolean(toSub && running && stopperOf(toSub, features));
   const { files, add, clear, chips, pending } = attachments;
   const picker = React.useRef<HTMLInputElement>(null);
   const [override, setOverride] = React.useState<{ model?: string; effort?: string }>({});
@@ -496,7 +532,8 @@ export function Composer({
     // they're for the turn under way.
     const go = running ? mode : "queue";
     const behind = held.length > 0 && go === "queue";
-    if (behind || !(reachable && store.send({ type: "send", ...m, mode: go }))) useHeld.getState().hold(agent, { ...m, mode: go, at: Date.now() });
+    const to = toSub ? { task: toSub.id } : {};
+    if (behind || !(reachable && store.send({ type: "send", ...m, mode: go, ...to }))) useHeld.getState().hold(agent, { ...m, mode: go, at: Date.now(), ...to });
     write("");
     clear();
     setOverride({});
@@ -550,9 +587,10 @@ export function Composer({
       submit();
       return;
     }
-    if (e.key === "Escape" && running && features.includes("interrupt") && !text) {
+    if (e.key === "Escape" && running && !text && (toSub ? subStops : features.includes("interrupt"))) {
       e.preventDefault();
-      store.stop();
+      if (toSub) store.send({ type: "stop_task", task: toSub.id });
+      else store.stop();
     }
   };
 
@@ -566,17 +604,25 @@ export function Composer({
           acts={(id) => ({ onEdit: (t) => useHeld.getState().edit(agent, id, t), onRemove: () => useHeld.getState().drop(agent, id) })}
         />
       )}
-      {queue.length > 0 && (
+      {shownQueue.length > 0 && (
         <Queued
-          queue={queue}
+          queue={shownQueue}
           label="Queued"
-          hint={paused === "auto" ? "sent in order once the limit resets" : paused ? "sent in order once you resume it" : "sent in order when it finishes"}
+          hint={
+            paused === "auto"
+              ? "sent in order once the limit resets"
+              : paused
+                ? "sent in order once you resume it"
+                : toSub
+                  ? "sent in order when the subagent finishes"
+                  : "sent in order when it finishes"
+          }
           acts={(id) => ({
             onEdit: (text) => store.send({ type: "queue_edit", id, text }),
             onRemove: () => store.send({ type: "queue_remove", id }),
             onMove: (index) => store.send({ type: "queue_move", id, index }),
-            onSteer: features.includes("queue_steer") && !paused ? () => store.send({ type: "queue_steer", id }) : undefined,
-            onNow: features.includes("send_now") && !paused ? () => store.send({ type: "queue_send_now", id }) : undefined,
+            onSteer: (toSub ? subTakes.includes("steer") : features.includes("queue_steer")) && !paused ? () => store.send({ type: "queue_steer", id }) : undefined,
+            onNow: (toSub ? subTakes.includes("now") : features.includes("send_now")) && !paused ? () => store.send({ type: "queue_send_now", id }) : undefined,
           })}
         />
       )}
@@ -642,17 +688,19 @@ export function Composer({
                 ? `${disabled ? "Not connected" : `${machine || "Its machine"} is offline`}: what you send waits here and goes once ${away}`
                 : paused
                   ? `Queue a message: it goes once ${paused === "auto" ? "the limit resets" : "you resume it"}`
-                  : toMain
-                  ? "Message the main agent"
-                  : running
-                    ? mode === "steer"
-                      ? "Steer it — it reads this at its next step"
-                      : mode === "now"
-                        ? approvals > 0
-                          ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
-                          : "Stop and say…"
-                        : "Queue a message for when it finishes"
-                    : "Tell the agent what to do"
+                  : toSub
+                    ? subagentPlaceholder(running ? mode : null, toSub.via === "parent")
+                    : toMain
+                      ? "Message the main agent"
+                      : running
+                        ? mode === "steer"
+                          ? "Steer it — it reads this at its next step"
+                          : mode === "now"
+                            ? approvals > 0
+                              ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
+                              : "Stop and say…"
+                            : "Queue a message for when it finishes"
+                        : "Tell the agent what to do"
             }
             onChange={(e) => write(e.target.value, e.target.selectionStart)}
             onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
@@ -690,7 +738,7 @@ export function Composer({
           <MicButton field={ta} setText={write} onNote={setNote} disabled={disabled} />
           {running && modes.length > 1 && <SendModes modes={modes} mode={mode} onMode={setMode} />}
           <span className="cp-gap" />
-          {running && features.includes("interrupt") && <StopTurn store={store} />}
+          {toSub ? subStops && <StopSubagent store={store} task={toSub.id} /> : running && features.includes("interrupt") && <StopTurn store={store} />}
           <button
             type="button"
             className="cp-send"

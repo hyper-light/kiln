@@ -132,7 +132,7 @@ mod tests {
             })
         }
         fn say(&self, text: &str) -> Command {
-            Command::Send { id: crate::util::new_id(), text: text.to_owned(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None }
+            Command::Send { id: crate::util::new_id(), text: text.to_owned(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, task: None }
         }
         fn heard<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, Option<Vec<String>>> {
             // What reached the agent isn't seen here until sends are acknowledged (CP-T3.3).

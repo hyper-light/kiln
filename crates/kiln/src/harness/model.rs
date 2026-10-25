@@ -474,6 +474,18 @@ pub struct Task {
     /// kiln can stop it (`stop_task`).
     #[serde(default)]
     pub stoppable: bool,
+    /// How a person's message reaches this subagent now (`Command::Send` with its `task`): queued
+    /// for when it finishes, steered into its turn, or sent now, its turn stopped. Empty: it takes
+    /// none (it ended, or its harness lets nothing in), and what's written goes to the agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub takes: Vec<SendMode>,
+    /// "parent": a message to it goes by way of the agent that started it, which passes it on
+    /// with its own tool (its harness takes nothing else from kiln).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    /// Messages waiting for it to finish what it's doing, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue: Vec<QueueItem>,
 }
 
 fn is_zero_u64(n: &u64) -> bool {
@@ -1331,6 +1343,9 @@ pub enum Command {
         attachments: Vec<Attachment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         overrides: Option<Overrides>,
+        /// To one of its subagents (its task's id, as `Task::takes` allows), not to the agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
     },
     QueueEdit {
         id: String,
@@ -1776,7 +1791,7 @@ mod tests {
         let back: Event = serde_json::from_value(v)?;
         assert_eq!(back, e);
         let c: Command = serde_json::from_str(r#"{"type":"send","id":"m1","text":"go","mode":"steer"}"#)?;
-        assert_eq!(c, Command::Send { id: "m1".into(), text: "go".into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
+        assert_eq!(c, Command::Send { id: "m1".into(), text: "go".into(), mode: SendMode::Steer, attachments: vec![], overrides: None, task: None });
         let c: Command = serde_json::from_str(r#"{"type":"control","id":"compact","value":"keep the API notes"}"#)?;
         assert_eq!(c, Command::Control { id: "compact".into(), value: Some(serde_json::json!("keep the API notes")) });
         let c: Command = serde_json::from_str(r#"{"type":"send","id":"m2","text":"see","attachments":[{"name":"a.png","mime":"image/png","data_base64":"iVBO"}],"overrides":{"effort":"high"}}"#)?;

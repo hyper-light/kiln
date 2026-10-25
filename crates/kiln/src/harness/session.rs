@@ -519,11 +519,11 @@ fn reach_words(reach: Option<&str>) -> String {
 /// A command as the adapter should see it (attachments stored first).
 async fn prepare(files: &Files, c: Command) -> Command {
     match c {
-        Command::Send { id, text, mode, attachments, overrides } if !attachments.is_empty() => {
+        Command::Send { id, text, mode, attachments, overrides, task } if !attachments.is_empty() => {
             let files = files.clone();
             let msg = id.clone();
             let stored = crate::rt::blocking(move || store_attachments(&files, &msg, attachments)).await.unwrap_or_default();
-            Command::Send { id, text, mode, attachments: stored, overrides }
+            Command::Send { id, text, mode, attachments: stored, overrides, task }
         }
         other => other,
     }
@@ -2499,7 +2499,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     core.touch_state();
                     adapter.start(&mut core);
                     if first && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
-                        adapter.command(&mut core, Command::Send { id: crate::util::new_id(), text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None });
+                        adapter.command(&mut core, Command::Send { id: crate::util::new_id(), text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None, task: None });
                     }
                     for c in carry.drain(..) {
                         adapter.command(&mut core, c);
@@ -2980,6 +2980,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                     Command::StopTasks => {
                         stop_left(&s, None).await;
+                        on_change();
+                    }
+                    // For a subagent: it ended with its harness, so it isn't started again for it.
+                    c @ Command::Send { task: Some(_), .. } => {
+                        adapter.command(&mut s.core.lock(), c);
                         on_change();
                     }
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {

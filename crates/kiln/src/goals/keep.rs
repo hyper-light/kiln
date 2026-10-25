@@ -222,7 +222,7 @@ where
         decide(info, seen, now)
     };
     if let Next::Keep { why, .. } = next {
-        let c = Command::Send { id: format!("{KEEP_ID}{now}"), text: message(&why), mode: SendMode::Queue, attachments: Vec::new(), overrides: None };
+        let c = Command::Send { id: format!("{KEEP_ID}{now}"), text: message(&why), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, task: None };
         tracing::info!(agent = %info.id, why = ?why, "keep going");
         let _ = port.send(&info.id, c).await;
     }

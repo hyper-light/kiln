@@ -9,7 +9,7 @@ use super::antigravity::Agy;
 use super::claude::Claude;
 use super::codex::Codex;
 use super::core::Core;
-use super::model::Command;
+use super::model::{Command, QueueItem, SendMode};
 use super::session::Spec;
 
 pub struct Kind {
@@ -297,6 +297,7 @@ impl Adapter {
             Self::Acp(a) => a.start(core),
             Self::Agy(a) => a.start(core),
         }
+        self.settle_subagents(core);
     }
 
     pub fn line(&mut self, core: &mut Core, line: &str) {
@@ -306,15 +307,69 @@ impl Adapter {
             Self::Acp(a) => a.line(core, line),
             Self::Agy(a) => a.line(core, line),
         }
+        self.settle_subagents(core);
     }
 
     pub fn command(&mut self, core: &mut Core, c: Command) {
-        match self {
-            Self::Claude(a) => a.command(core, c),
-            Self::Codex(a) => a.command(core, c),
-            Self::Acp(a) => a.command(core, c),
-            Self::Agy(a) => a.command(core, c),
+        // A message waiting for one of its subagents is changed where it waits, or goes to it now.
+        match super::subagent::queue_command(core, c) {
+            super::subagent::Queued::Done => {}
+            super::subagent::Queued::Send(task, m, mode) => self.send_task(core, &task, m, mode),
+            super::subagent::Queued::Not(Command::Send { id, text, mode, attachments, task: Some(task), .. }) => {
+                self.send_task(core, &task, QueueItem { id, text, at: Core::now(), attachments, overrides: None }, mode);
+            }
+            super::subagent::Queued::Not(c) => match self {
+                Self::Claude(a) => a.command(core, c),
+                Self::Codex(a) => a.command(core, c),
+                Self::Acp(a) => a.command(core, c),
+                Self::Agy(a) => a.command(core, c),
+            },
         }
+        self.settle_subagents(core);
+    }
+
+    /// A person's message to its subagent `task`, the way that one takes one now (`Task::takes`),
+    /// through its harness's adapter; one it can't take is shown not sent, and why.
+    fn send_task(&mut self, core: &mut Core, task: &str, mut m: QueueItem, asked: SendMode) {
+        m.text = m.text.trim_end().to_owned();
+        if m.text.is_empty() && m.attachments.is_empty() {
+            return;
+        }
+        let Some(t) = core.state.tasks.iter().find(|t| t.id == task).cloned() else {
+            core.state.delivery.insert(m.id.clone(), super::model::Delivery::Cancelled);
+            core.upsert(&format!("subagent-unsent-{}", m.id), None, super::model::Body::Notice { level: super::model::Level::Warn, text: "Not sent: kiln no longer knows that subagent.".to_owned() });
+            return;
+        };
+        let Some(mode) = super::subagent::mode_for(&t, asked) else {
+            let why = if t.subagent() && !t.live() && t.status != "completed" { "it has ended." } else { "its harness takes no message for it from kiln." };
+            super::subagent::refuse(core, task, &m, why);
+            return;
+        };
+        match self {
+            Self::Claude(a) => a.send_task(core, &t, m, mode),
+            Self::Codex(a) => a.send_task(core, &t, m, mode),
+            Self::Acp(_) | Self::Agy(_) => super::subagent::refuse(core, task, &m, "its harness takes no message for it from kiln."),
+        }
+    }
+
+    /// How a message reaches each of its subagents now (`Task::takes`, `Task::via`), as its harness
+    /// allows; what waited for one that takes none any more is said not sent.
+    fn settle_subagents(&self, core: &mut Core) {
+        match self {
+            Self::Claude(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
+            Self::Codex(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
+            Self::Acp(_) | Self::Agy(_) => super::subagent::settle(core, |_, _| (Vec::new(), None)),
+        }
+    }
+
+    /// What waits for its subagents goes to each that can take it now (one at a time each).
+    fn drain_subagents(&mut self, core: &mut Core) {
+        match self {
+            Self::Claude(a) => a.drain_subagents(core),
+            Self::Codex(a) => a.drain_subagents(core),
+            Self::Acp(_) | Self::Agy(_) => {}
+        }
+        self.settle_subagents(core);
     }
 
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
@@ -327,6 +382,7 @@ impl Adapter {
         // Whatever the harness and whatever its adapter knew: what it ran ends with its process
         // (a switch, a stop, a restart or a crash), its subagents' and shells' calls with it.
         core.end_harness_work();
+        self.settle_subagents(core);
     }
 
     /// A run (`Effect::Run` or `Effect::Fetch`) ended: its exit code (None: it could not start
@@ -360,6 +416,7 @@ impl Adapter {
             Self::Agy(a) => a.tick(core),
             Self::Acp(a) => a.tick(core),
         }
+        self.drain_subagents(core);
     }
 
     /// Ask the harness whether a pause's limit has reset (its answer goes to `pause::checked`). One
@@ -390,6 +447,8 @@ impl Adapter {
             Self::Acp(a) => a.go_on(core, p),
             Self::Agy(a) => a.go_on(core, p),
         }
+        // What waited for its subagents meanwhile goes too.
+        self.drain_subagents(core);
     }
 
     /// Start with a conversation carried over from another harness, in the harness's own form

@@ -66,7 +66,7 @@ fn an_adopted_session_imports_a_learned_default_only_when_it_has_none() {
 }
 
 fn send(a: &mut Acp, core: &mut Core, id: &str) {
-    a.command(core, Command::Send { id: id.into(), text: format!("work {id}"), mode: SendMode::Queue, attachments: Vec::new(), overrides: None });
+    a.command(core, Command::Send { id: id.into(), text: format!("work {id}"), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, task: None });
 }
 
 fn options(mode: &str, model: &str, effort: &str) -> Vec<Value> {

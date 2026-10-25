@@ -489,9 +489,19 @@ pub fn let_through(core: &mut Core, c: Command) -> Option<Command> {
     if !matches!(c, Command::Send { .. }) || !at_threshold(core) {
         return Some(c);
     }
-    if let Command::Send { id, text, attachments, overrides, .. } = c {
-        core.state.queue.push(QueueItem { id, text, at: Core::now(), attachments, overrides });
-        core.touch_state();
+    if let Command::Send { id, text, attachments, overrides, task, .. } = c {
+        let m = QueueItem { id, text, at: Core::now(), attachments, overrides };
+        match task {
+            // One for a subagent waits in its queue, for when the pause ends.
+            Some(task) if core.state.tasks.iter().any(|t| t.id == task && t.takes.contains(&super::model::SendMode::Queue)) => {
+                super::subagent::hold(core, &task, QueueItem { overrides: None, ..m });
+            }
+            Some(task) => super::subagent::refuse(core, &task, &m, "its harness takes no message for it from kiln."),
+            None => {
+                core.state.queue.push(m);
+                core.touch_state();
+            }
+        }
     }
     None
 }
@@ -980,7 +990,7 @@ mod tests {
     #[test]
     fn a_message_sent_while_paused_waits_in_the_queue() {
         let mut core = Core::new();
-        let send = |id: &str| Command::Send { id: id.into(), text: "go on".into(), mode: Default::default(), attachments: vec![], overrides: None };
+        let send = |id: &str| Command::Send { id: id.into(), text: "go on".into(), mode: Default::default(), attachments: vec![], overrides: None, task: None };
         assert!(let_through(&mut core, send("m1")).is_some());
         hold(&mut core, LIMIT, "harness", Hit::default(), None);
         assert!(let_through(&mut core, send("m2")).is_none());

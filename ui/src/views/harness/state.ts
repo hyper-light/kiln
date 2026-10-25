@@ -134,6 +134,8 @@ export interface Held {
   overrides?: { model?: string; effort?: string };
   /** How it was to go: "now" and "steer" keep that when it goes (older ones: queued). */
   mode?: SendMode;
+  /** For one of its subagents (its task's id). */
+  task?: string;
 }
 
 interface HeldState {

@@ -174,7 +174,7 @@ async fn dispatch(hub: &crate::hub::Hub, agent: &str, p: &super::Planned) -> Res
     let tasks = hub.harness.state(agent).map(|s| s.tasks).unwrap_or_default();
     may_send(&tasks, &p.plan, asked, now).map_err(str::to_owned)?;
     let id = format!("{}plan-{}", crate::harness::pause::KILN_ID, crate::util::new_id());
-    let send = crate::harness::model::Command::Send { id, text: dispatch_words(p), mode: crate::harness::model::SendMode::Steer, attachments: Vec::new(), overrides: None };
+    let send = crate::harness::model::Command::Send { id, text: dispatch_words(p), mode: crate::harness::model::SendMode::Steer, attachments: Vec::new(), overrides: None, task: None };
     match hub.harness.command(hub, agent, send).await {
         crate::harness::registry::Sent::Ok => {
             let _ = hub.store.kv_set(key, now.to_string()).await;

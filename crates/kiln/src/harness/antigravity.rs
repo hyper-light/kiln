@@ -193,7 +193,7 @@ impl Agy {
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         match cmd {
-            Command::Send { id, text, mode, attachments, overrides } => self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides }, mode),
+            Command::Send { id, text, mode, attachments, overrides, .. } => self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides }, mode),
             Command::QueueEdit { id, text } => {
                 if let Some(q) = core.state.queue.iter_mut().find(|q| q.id == id) {
                     q.text = text;
@@ -800,7 +800,7 @@ mod tests {
     }
 
     fn send(a: &mut Agy, core: &mut Core, id: &str, text: &str, mode: SendMode) {
-        a.command(core, Command::Send { id: id.into(), text: text.into(), mode, attachments: vec![], overrides: None });
+        a.command(core, Command::Send { id: id.into(), text: text.into(), mode, attachments: vec![], overrides: None, task: None });
     }
 
     #[test]

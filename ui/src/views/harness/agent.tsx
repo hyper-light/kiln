@@ -293,7 +293,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           footer={footer}
         />
       </PlanSourceContext.Provider>
-      <Dock store={store} id={id} attachments={attachments} toMain={task !== null} onView={openView} onTerminal={openBeside} onOpenTask={openTask} onRemove={() => setConfirmStop(true)} send={send} />
+      <Dock store={store} id={id} attachments={attachments} toMain={task !== null} task={task} onView={openView} onTerminal={openBeside} onOpenTask={openTask} onRemove={() => setConfirmStop(true)} send={send} />
     </div>
   );
 
@@ -438,6 +438,7 @@ function Dock({
   id,
   attachments,
   toMain,
+  task,
   onView,
   onTerminal,
   onOpenTask,
@@ -448,6 +449,8 @@ function Dock({
   id: string;
   attachments: Attachments;
   toMain: boolean;
+  /** The subagent whose thread is shown: the composer writes to it, as it takes messages. */
+  task: string | null;
   onView: (view: string) => void;
   onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void;
   onOpenTask: (toolId: string) => void;
@@ -485,7 +488,7 @@ function Dock({
         </div>
       ) : null}
       <PausedLine store={store} send={send} onLogin={() => onView("login")} />
-      <Composer store={store} agent={id} attachments={attachments} toMain={toMain} onView={onView} onTerminal={onTerminal} />
+      <Composer store={store} agent={id} attachments={attachments} toMain={toMain} task={task} onView={onView} onTerminal={onTerminal} />
     </div>
   );
 }

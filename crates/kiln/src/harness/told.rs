@@ -247,7 +247,7 @@ impl Told {
                 None if quiet.contains(&parent) => {}
                 None => {
                     let id = super::queued::made(NEWS);
-                    out.push((parent, Command::Send { id: id.clone(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None }));
+                    out.push((parent, Command::Send { id: id.clone(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, task: None }));
                     n.msg = Some(Kept::sent(id, text, info, now));
                     n.said.clone_from(&n.lines);
                     n.held.clone_from(&n.lines);
