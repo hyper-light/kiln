@@ -19,7 +19,7 @@ mod common;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use common::{Fleet, at, free_port, now_ms};
+use common::{Fleet, at, docker, free_port, now_ms};
 use serde_json::{Value, json};
 
 const AGENT: &str = "gcr.io/datadoghq/agent:7.84.4";
@@ -132,22 +132,6 @@ if sys.argv[1] == "all":
 else:
     {"shop": shop, "cart": cart}[sys.argv[1]]()
 "#;
-
-fn docker(args: &[&str], stdin: Option<&str>) -> anyhow::Result<String> {
-    use std::io::Write as _;
-    let mut c = Command::new("docker");
-    c.args(args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-    if stdin.is_some() {
-        c.stdin(std::process::Stdio::piped());
-    }
-    let mut child = c.spawn()?;
-    if let (Some(text), Some(mut i)) = (stdin, child.stdin.take()) {
-        i.write_all(text.as_bytes())?;
-    }
-    let out = child.wait_with_output()?;
-    anyhow::ensure!(out.status.success(), "docker {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
 
 /// The Agent in a container, its trace agent's receiver on `apm` (on this machine's network, or
 /// published to it: [`common::DockerNet`]).

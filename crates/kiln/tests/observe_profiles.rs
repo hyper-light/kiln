@@ -198,10 +198,9 @@ fn profiles_sent_to_a_runner_and_to_the_server_are_kept_searched_and_summed() ->
     Ok(())
 }
 
+/// `docker` with these arguments: a build given up on and made again as [`common::docker`] does.
 fn docker(args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("docker").args(args).output()?;
-    anyhow::ensure!(out.status.success(), "docker {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    common::docker(args, None)
 }
 
 /// A container, removed when dropped.

@@ -666,6 +666,68 @@ impl Service {
     }
 }
 
+/// How long an image's build may take before it is given up on and made again.
+pub const BUILD_WITHIN: Duration = Duration::from_secs(600);
+
+/// `docker` with these arguments (and `stdin`, when given), its output. A build is given up on
+/// past [`BUILD_WITHIN`], the CLI and what it started (buildx) killed, and made once more: a
+/// build's session can wedge in Docker Desktop (one waited 31 minutes on a Mac Studio for its base
+/// image's manifest; the next build, with the first killed, went through at once).
+pub fn docker(args: &[&str], stdin: Option<&str>) -> anyhow::Result<String> {
+    let build = args.first() == Some(&"build");
+    match docker_within(args, stdin, build.then_some(BUILD_WITHIN)) {
+        Err(e) if build && e.to_string().contains("given up on") => {
+            eprintln!("  {e}: building again");
+            docker_within(args, stdin, Some(BUILD_WITHIN))
+        }
+        other => other,
+    }
+}
+
+/// `docker` with these arguments, killed past `within` when given (its process group on Unix, its
+/// process tree on Windows, so a CLI's plugin goes with it).
+fn docker_within(args: &[&str], stdin: Option<&str>, within: Option<Duration>) -> anyhow::Result<String> {
+    let mut c = Command::new("docker");
+    c.args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut c, 0);
+    let mut child = c.spawn()?;
+    if let (Some(text), Some(mut i)) = (stdin, child.stdin.take()) {
+        i.write_all(text.as_bytes())?;
+    }
+    let drain = |p: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut s = Vec::new();
+            if let Some(mut p) = p {
+                let _ = p.read_to_end(&mut s);
+            }
+            s
+        })
+    };
+    let out = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let err = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let start = Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if let Some(w) = within.filter(|w| start.elapsed() > *w) {
+            let pid = child.id().to_string();
+            #[cfg(unix)]
+            let _ = Command::new("kill").args(["-KILL", "--", &format!("-{pid}")]).status();
+            #[cfg(windows)]
+            let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid]).output();
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("docker {args:?} given up on after {w:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let (stdout, stderr) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
+    anyhow::ensure!(status.success(), "docker {args:?}: {}\n{}", String::from_utf8_lossy(&stderr), String::from_utf8_lossy(&stdout));
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
 /// `%XX` as its byte: a query's value as it was before it was encoded.
 pub fn decode(s: &str) -> String {
     let b = s.as_bytes();

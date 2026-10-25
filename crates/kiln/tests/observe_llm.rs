@@ -23,7 +23,7 @@ mod common;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use common::{Fleet, at, free_port, now_ms};
+use common::{Fleet, at, docker, free_port, now_ms};
 use serde_json::{Value, json};
 
 const IMAGE: &str = "kiln-llm-apps:e2e";
@@ -125,22 +125,6 @@ else:
     p.shutdown()
     print("IDS {}", flush=True)
 "#;
-
-fn docker(args: &[&str], stdin: Option<&str>) -> anyhow::Result<String> {
-    use std::io::Write as _;
-    let mut c = Command::new("docker");
-    c.args(args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-    if stdin.is_some() {
-        c.stdin(std::process::Stdio::piped());
-    }
-    let mut child = c.spawn()?;
-    if let (Some(text), Some(mut i)) = (stdin, child.stdin.take()) {
-        i.write_all(text.as_bytes())?;
-    }
-    let out = child.wait_with_output()?;
-    anyhow::ensure!(out.status.success(), "docker {args:?}: {}\n{}", String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
 
 fn until(what: &str, within: Duration, mut done: impl FnMut() -> anyhow::Result<bool>, logs: &dyn Fn() -> String) -> anyhow::Result<()> {
     let start = Instant::now();
