@@ -2247,7 +2247,7 @@ impl Dispatch {
                         .into_iter()
                         .chain(j.steps.iter().cloned())
                         .chain(j.kiln.test_results.as_ref().and_then(kiln_ci::results::discover::job_step))
-                        .chain(kiln_ci::store::v1_artifacts_step(&j.kiln.artifacts))
+                        .chain(kiln_ci::store::v1_artifacts_step(&j.kiln.artifacts, &spec.key))
                         .chain(j.kiln.attest.as_ref().and_then(kiln_ci::attest::job_step))
                         .chain(j.kiln.deploy.as_ref().and_then(kiln_ci::env::deploy_step))
                         .collect()
@@ -2561,6 +2561,16 @@ impl Dispatch {
             && let Err(e) = super::reuse::remember(&self.hub, leg, &l.run, &hash, &report_json(&report)).await
         {
             tracing::warn!(leg = %leg, error = %format!("{e:#}"), "a result couldn't be kept for reuse");
+        }
+        // `[updates]`: a leg of kiln's own release pipeline left the binaries runners upgrade to
+        // (its `artifacts:`), kept beside the dispatcher, which reading them would hold up.
+        if c == PlanC::Success && self.runs.get(&l.run).is_some_and(|r| r.repo.name == self.hub.cfg.updates.release_repo) {
+            let (hub, leg, run) = (Arc::clone(&self.hub), leg.to_owned(), l.run.clone());
+            crate::rt::spawn(async move {
+                if let Ok(Some(run)) = hub.store.run(run).await {
+                    hub.adopt_release(&leg, &run).await;
+                }
+            });
         }
         let Some(run) = self.runs.get_mut(&l.run) else { return Ok(()) };
         run.seq += 1;

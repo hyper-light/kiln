@@ -540,19 +540,38 @@ impl Hub {
         }))
     }
 
-    /// A job of kiln's own release pipeline succeeded (`[updates]`): the binaries it built are what
-    /// each other platform's runners upgrade to now.
+    /// A job of kiln's own release pipeline succeeded (`[updates]`), a v1 job or a leg of the CI
+    /// engine's run: the binaries it built are what each other platform's runners upgrade to now.
     pub(crate) async fn adopt_release(&self, job: &str, run: &crate::store::Run) {
+        // The engine's run of a tag is a `push` of it.
+        let tagged;
+        let run = if run.event == "push" && run.branch != self.cfg.updates.release_branch && crate::updates::pushed_tag(self, &run.id).await {
+            tagged = crate::store::Run { event: "tag".into(), ..run.clone() };
+            &tagged
+        } else {
+            run
+        };
         // The server's commit, or the newest one a runner runs (`crate::fleet`).
         let newest = self.updates.fleet.target().map(|t| t.commit).unwrap_or_default();
         if !crate::updates::adopts(&self.cfg.updates, run, crate::api::COMMIT) && (newest.is_empty() || !crate::updates::adopts(&self.cfg.updates, run, &newest)) {
             return;
         }
-        let path = crate::api::artifact_path(self, job);
-        if !path.exists() {
-            return;
+        // v1's job keeps its artifacts as a tarball; the engine's leg uploaded them to CI's store.
+        let v1 = crate::api::artifact_path(self, job);
+        let (path, copied) = if v1.exists() {
+            (v1, false)
+        } else {
+            match crate::updates::leg_artifacts(self, job).await {
+                Ok(Some(p)) => (p, true),
+                Ok(None) => return,
+                Err(e) => return tracing::warn!(run = run.number, leg = job, error = %format!("{e:#}"), "the release pipeline's artifacts couldn't be read"),
+            }
+        };
+        let adopted = crate::updates::adopt_into(self, &path, run).await;
+        if copied {
+            let _ = std::fs::remove_file(&path);
         }
-        match crate::updates::adopt_into(self, &path, run).await {
+        match adopted {
             Ok(kept) if !kept.is_empty() => {
                 let targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
                 tracing::info!(run = run.number, targets = ?targets, "runners' binaries built by the release pipeline");
