@@ -2095,3 +2095,30 @@ export interface CdValidation {
     error?: string;
   }[];
 }
+
+/** An agent installing what a job lacks (`/api/jobs/:id/tools`), and how far it's got. */
+export interface ToolFix {
+  agent: string;
+  runner: string;
+  tools: string[];
+  state: "working" | "needs_you" | "checking" | "retried" | "waiting" | "still_missing" | "stopped";
+  note: string | null;
+  by: string;
+  started_at: number;
+}
+
+/** What a job lacks: tools its failed step's log says weren't there, or for a job waiting on its
+ *  `requires`, each runner its labels fit and what that runner doesn't meet. */
+export interface JobTools {
+  job: string;
+  missing: {
+    tools: string[];
+    on: string | null;
+    why: string | null;
+    /** Why no agent can install them where it failed (it ran in a pod; its runner is away, or hosts no agents). */
+    no_agent: string | null;
+    /** `fixable`: an agent there can fix it: installing `tools` is all it lacks (not so for `os == macos`), and it hosts agents (else `no_agent` says why not). */
+    runners: { runner: string; unmet: string[]; tools: string[]; fixable: boolean; no_agent: string | null }[];
+  };
+  fix: ToolFix | null;
+}

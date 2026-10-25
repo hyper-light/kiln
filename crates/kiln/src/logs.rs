@@ -140,6 +140,12 @@ impl Logs {
         crate::rt::blocking(move || std::fs::read(p).unwrap_or_default()).await.unwrap_or_default()
     }
 
+    /// The last `max` bytes of a step's log on disk (all of it when it's shorter).
+    pub async fn tail(&self, job: &str, idx: u32, max: u64) -> Vec<u8> {
+        let p = self.step_path(job, idx);
+        crate::rt::blocking(move || tail_of(&p, max).unwrap_or_default()).await.unwrap_or_default()
+    }
+
     /// Size of the backlog already on disk (for the UI's "download" affordance).
     pub async fn size(&self, job: &str, idx: u32) -> u64 {
         let p = self.step_path(job, idx);
@@ -164,6 +170,17 @@ impl Logs {
     }
 }
 
+/// [`Logs::tail`]'s read, from where the last `max` bytes start.
+fn tail_of(p: &std::path::Path, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(p)?;
+    let len = f.metadata()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(max)))?;
+    let mut out = Vec::new();
+    f.take(max).read_to_end(&mut out)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +199,10 @@ mod tests {
         let on_disk = logs.read("job1", 0).await;
         assert!(on_disk.starts_with(b"hello world"));
         assert!(String::from_utf8_lossy(&on_disk).contains("limit reached"));
+        // Its end, for what a failed step lacked (toolfix): the last bytes, or all of a short one.
+        assert_eq!(Some(logs.tail("job1", 0, 5).await.as_slice()), on_disk.get(on_disk.len().saturating_sub(5)..));
+        assert_eq!(logs.tail("job1", 0, 1 << 20).await, on_disk);
+        assert!(logs.tail("job2", 0, 5).await.is_empty());
         let mut n = 0;
         while let Ok(ev) = rx.recv().await {
             n += 1;

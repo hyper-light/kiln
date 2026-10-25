@@ -3879,8 +3879,8 @@ support (G-11, G-18, G-25, G-27, G-28).
   `kiln/runner-ubuntu-24.04` (the commonly used tools of GitHub's Ubuntu image: build essentials,
   git, curl, jq, Node, Python, Go, Rust, Java, Docker CLI, …), a larger `-full` variant, today's
   toolchain images, and example Agentfiles.
-- **W13-R12 Platforms** (G-18): host runners on Linux (x86_64, aarch64), macOS (arm64, x86_64)
-  and Windows (x86_64, arm64); Docker on Linux, macOS (Docker Desktop, Colima, Podman) and Windows
+- **W13-R12 Platforms** (G-18): host runners on Linux (x86_64, aarch64), macOS (arm64; kiln
+  doesn't run on Intel Macs) and Windows (x86_64, arm64); Docker on Linux, macOS (Docker Desktop, Colima, Podman) and Windows
   with Linux containers; Firecracker on Linux with KVM; shards where shards runs, which gives Apple
   silicon Macs Linux arm64 microVMs; QEMU emulation as a declared fact (W04-R13).
 

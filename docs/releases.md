@@ -11,8 +11,9 @@ Build every platform** (or the Runners page, when a machine's platform has no bu
 1. Three jobs, at once, each building the UI first, then its binaries with `ci/release/build.sh`:
    - `linux`, on the server's own Linux runner: x86_64 and aarch64, static musl.
    - `windows`, on the same runner: x86_64, cross-built with zig.
-   - `macos`, on a Mac: Apple Silicon and Intel, built natively with the Mac's own toolchain and
-     SDK, minimum macOS 11. On Linux, `build.sh` can cross-build them too (zig, linking against
+   - `macos`, on a Mac: Apple silicon only (kiln doesn't run on Intel Macs), built natively with
+     the Mac's own toolchain and SDK, minimum macOS 11. It `requires` a Mac with cargo and node,
+     so it waits for one rather than going to a Mac without developer tools. On Linux, `build.sh` can cross-build them too (zig, linking against
      `ci/release/macos-stubs`: text stubs listing the symbols kiln imports from CoreFoundation,
      IOKit and libobjc, which macOS binds to the real libraries at load time). If a dependency
      starts importing something new, `ci/release/regen-macos-stubs.sh` rebuilds the stubs.

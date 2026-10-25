@@ -541,6 +541,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| retry(&hub, &id, req)).await
         }
         (&Method::GET, ["api", "jobs", id]) => boxed(|| job(&hub, id)).await,
+        // What a job lacks, and an agent to install it (crate::toolfix).
+        (&Method::GET, ["api", "jobs", id, "tools"]) => boxed(|| crate::toolfix::report(&hub, id)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "jobs", id, "tools", "fix"]) => {
+            let (id, ask) = ((*id).to_owned(), boxed(|| srv::body_json::<crate::toolfix::Ask>(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?);
+            boxed(|| crate::toolfix::fix(Arc::clone(&hub), caller.clone(), &id, ask)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+        }
         (&Method::GET, ["api", "jobs", id, "logs"]) => boxed(|| job_logs(&hub, id, &q)).await,
         (&Method::GET, ["api", "jobs", id, "logs", "ws"]) => {
             let (id, step) = ((*id).to_owned(), q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0));
@@ -2984,11 +2990,11 @@ pub const COMMIT: &str = env!("KILN_COMMIT");
 /// `kiln-<version>-<target>` (`.exe` on Windows) of release `v<version>`.
 pub const RELEASES: &str = "https://github.com/hyper-light/kiln/releases/download";
 
-/// The targets the release workflow builds.
-pub const RELEASE_TARGETS: [&str; 6] = [
+/// The targets the release workflow builds. Macs are Apple silicon only: kiln doesn't run on Intel
+/// Macs.
+pub const RELEASE_TARGETS: [&str; 5] = [
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
-    "x86_64-apple-darwin",
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
     "aarch64-pc-windows-msvc",
