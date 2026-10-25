@@ -7817,6 +7817,17 @@ side, which builds only the affected packages' test binaries, reports their dige
 read, and runs what selection says (a step's `tests: { select: affected, cache: true }`), and
 nextest's archives across machines.
 
+**The land queue's reuse (M3, R20).** Decided as pure code, awaiting the queue's wiring
+(`kiln_ci::work::queue`). A package's inputs on a candidate are its state on the trunk and the
+batch's diffs that can affect it (R17's graph). A package no diff affects reuses the trunk's trusted
+entry; a bisection step that keeps every diff affecting a package shares the batch's (or another
+step's) entry for it; an untrusted diff's own results, or a person's, are never taken, though they
+have the very inputs: the candidate runs those packages itself, as trusted, and its results are the
+ones kept. Only passes are kept, so a package that failed runs again on every step that keeps the
+diffs affecting it. Each decision says why. Tested on decisions, and over random ledgers: only
+trusted entries with exactly a package's inputs are ever reused. Left: W14-R08's candidates and
+bisection steps (`ci/land.rs`) keyed and looked up this way.
+
 ## 4. API, events, CLI and MCP reference
 
 All routes come from the one route table (W10-R05, W20-R01) and follow access.md's conventions:

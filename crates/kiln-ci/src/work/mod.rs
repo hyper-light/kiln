@@ -7,9 +7,11 @@
 //!   a Dockerfile to them (W24-R29).
 //! - [`slots`]: warm workspaces, decided: lanes, leases, clones, budgets (W24-R11, R15).
 //! - [`tests`]: test binaries' results as units of work, and which run or replay (W24-R10).
+//! - [`queue`]: what a land candidate and its bisection reuse (W24-R20).
 
 pub mod graph;
 pub mod key;
 pub mod ops;
+pub mod queue;
 pub mod slots;
 pub mod tests;
