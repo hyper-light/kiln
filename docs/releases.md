@@ -101,7 +101,11 @@ For tracing (OTel), each upgrade is a span under `kiln::upgrade` named `upgrade`
 `rolled_back` on the root) and `error`.
 
 The machine's local sockets, for `kiln spawn` and `kiln run`, are the same for every runner process
-of a machine. Shells opened before an upgrade keep using them.
+of a machine. Shells opened before an upgrade keep using them. The process that runs the machine's
+sessions serves them: a new build takes them once it has taken over, and the old one takes them
+back after a rollback. No other kiln process takes one a live process serves (a local `kiln
+server`'s own agent given the runner's name and state folder, say), and a socket left with nothing
+behind it (something took its file, then ended) is served again within seconds.
 
 **On a Mac, run `kiln signing setup` once.** macOS's local network privacy judges every program
 by its code signature. kiln's builds are ad hoc signed, so to macOS each upgrade is a program it
