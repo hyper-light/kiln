@@ -169,7 +169,17 @@ remote_write:
     anyhow::ensure!(held.len() >= 5, "Prometheus's samples of the /metrics handler's requests over 20 s: {scraped:?}");
     let rose = held.last().zip(held.first()).map_or(0.0, |(l, f)| l - f) + 1.0;
     for way in ["v1", "v2", "runner"] {
-        let n: f64 = by(&f, &format!("sum:prometheus_http_requests_total{{handler:/metrics,rw:{way}}}.as_count()"), "rw", window.0, window.1, 20_000)?.values().flatten().flatten().sum();
+        let count = || -> anyhow::Result<f64> {
+            Ok(by(&f, &format!("sum:prometheus_http_requests_total{{handler:/metrics,rw:{way}}}.as_count()"), "rw", window.0, window.1, 20_000)?.values().flatten().flatten().sum())
+        };
+        // What Prometheus sends comes in batches, seconds behind its own samples (more on a loaded
+        // machine: 7 of 9 when read at once on adacachy): counted once it has come, and never past.
+        let start = Instant::now();
+        let mut n = count()?;
+        while n < rose - 1.0 && start.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(500));
+            n = count()?;
+        }
         anyhow::ensure!((n - rose).abs() <= 1.0, "{way}: the /metrics handler counted {n} requests in 20 s, Prometheus's samples {rose} ({held:?})");
     }
     // A histogram answers percentiles from its buckets, as Prometheus's histogram_quantile does.
