@@ -3503,7 +3503,7 @@ mod tests {
                 }))
             };
             let body = |n: u64| match n % 5 {
-                0 => Body::User { text: format!("ask {n}"), images: 1, client_id: Some("c".into()), origin: None, attachments: vec!["/a.png".into()] },
+                0 => Body::User { text: format!("ask {n}"), images: 1, client_id: Some("c".into()), origin: None, attachments: vec!["/a.png".into()], reply_to: None },
                 1 => Body::Assistant { text: format!("line {n} \u{2713}"), streaming: false },
                 2 => Body::Thinking { text: format!("think {n}"), streaming: false, redacted: n.is_multiple_of(2) },
                 3 => tool(n, ToolStatus::Done),

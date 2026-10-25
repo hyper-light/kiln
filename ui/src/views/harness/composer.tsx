@@ -9,11 +9,13 @@
  */
 import * as React from "react";
 import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Navigation, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
-import { clientId, FORCE_STOP_AFTER_MS, useSession, useStopAt, type QueueItem, type SendMode, type SessionStore, type SlashCommand } from "@/api/harness";
+import { clientId, FORCE_STOP_AFTER_MS, useSession, useStopAt, type Attachment, type QueueItem, type SendMode, type SessionStore, type SlashCommand } from "@/api/harness";
 import { useNow } from "@/lib/hooks";
 import { Tip } from "@/components/ui/tooltip";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { Attachments } from "./controls";
+import { attachedPreview, useAttachments, type Attachments } from "./controls";
+import type { ReplyTarget } from "./timeline";
 import { CommandList, findCommand, matchCommands, parseSlash, ReplyPanel, runCommand, slashAt, type Reply } from "./palette";
 import { commandNames, Marked } from "./marks";
 import { SendWith } from "./run-settings";
@@ -33,16 +35,29 @@ const fine = () => typeof window !== "undefined" && window.matchMedia?.("(pointe
 interface RowActs {
   onEdit: (text: string) => void;
   onRemove: () => void;
+  /** Its files change while it waits: the whole new set. */
+  onAttach?: (attachments: Attachment[]) => void;
   onMove?: (index: number) => void;
   onSteer?: () => void;
   onNow?: () => void;
 }
 
-/** One waiting message: its words (tap to read them whole), and what can be done with it. */
-function QueueRow({ text, index, count, onEdit, onRemove, onMove, onSteer, onNow }: { text: string; index: number; count: number } & RowActs) {
+/** Where a queued image's preview comes from: this session's upload, else its inline bytes. */
+const queueAttachSrc = (a: Attachment): string | undefined => {
+  if (!a.mime.startsWith("image/")) return undefined;
+  if (a.file_id) return attachedPreview(a.file_id);
+  return a.data_base64 ? `data:${a.mime};base64,${a.data_base64}` : undefined;
+};
+
+/** One waiting message: its words (tap to read them whole), its files (add or drop until it goes), and what can be done with it. */
+function QueueRow({ q, index, count, onEdit, onAttach, onRemove, onMove, onSteer, onNow }: { q: { id: string; text: string; attachments?: Attachment[] }; index: number; count: number } & RowActs) {
+  const text = q.text;
+  const attach = useAttachments("any");
+  const picker = React.useRef<HTMLInputElement>(null);
   const [editing, setEditing] = React.useState(false);
   const [whole, setWhole] = React.useState(false);
   const [draft, setDraft] = React.useState(text);
+  const [viewImg, setViewImg] = React.useState<{ name: string; src: string } | null>(null);
   // Changed elsewhere (another device): what's edited starts from that.
   const [was, setWas] = React.useState(text);
   if (was !== text) {
@@ -75,6 +90,53 @@ function QueueRow({ text, index, count, onEdit, onRemove, onMove, onSteer, onNow
         <button type="button" className={cn("qd-text", whole && "qd-whole")} onClick={() => setWhole(!whole)} aria-expanded={whole}>
           {text}
         </button>
+      )}
+      {(q.attachments?.length || onAttach) && (
+        <span className="hx-attach qd-attach">
+          {(q.attachments ?? []).map((a, i) => {
+            const src = queueAttachSrc(a);
+            return (
+              <span key={i} className={cn("hx-attach-chip", src && "hx-attach-view")} onClick={() => src && setViewImg({ name: a.name, src })} role={src ? "button" : undefined}>
+                {src ? <img src={src} alt="" /> : null}
+                <span className="hx-trunc">{a.name}</span>
+                {onAttach && (
+                  <button
+                    type="button"
+                    aria-label={`Remove ${a.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onAttach((q.attachments ?? []).filter((_, j) => j !== i));
+                    }}
+                  >
+                    <X size={11} />
+                  </button>
+                )}
+              </span>
+            );
+          })}
+          {onAttach && (
+            <>
+              <input
+                ref={picker}
+                type="file"
+                multiple
+                hidden
+                onChange={(ev) => {
+                  const list = ev.target.files;
+                  ev.target.value = "";
+                  if (!list?.length) return;
+                  void attach.add(list).then((added) => {
+                    attach.clear();
+                    if (added.length) onAttach([...(q.attachments ?? []), ...added]);
+                  });
+                }}
+              />
+              <button type="button" className="hx-attach-chip hx-attach-add" aria-label="Attach files" onClick={() => picker.current?.click()}>
+                <Paperclip size={11} />
+              </button>
+            </>
+          )}
+        </span>
       )}
       <span className="qd-acts">
         <Tip content="Edit">
@@ -116,6 +178,37 @@ function QueueRow({ text, index, count, onEdit, onRemove, onMove, onSteer, onNow
           </button>
         </Tip>
       </span>
+      {viewImg && (
+        <div className="hx-cover" role="dialog" aria-modal="true" aria-label={viewImg.name} onClick={() => setViewImg(null)}>
+          <div className="hx-cover-card hx-viewer" onClick={(e) => e.stopPropagation()}>
+            <div className="hx-viewer-head">
+              <button type="button" className="hx-icon" aria-label="Close" onClick={() => setViewImg(null)}>
+                <X size={14} />
+              </button>
+              <span className="hx-viewer-name hx-trunc">{viewImg.name}</span>
+            </div>
+            <div className="hx-viewer-body">
+              <img src={viewImg.src} alt={viewImg.name} />
+            </div>
+            <div className="hx-viewer-foot">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  const i = (q.attachments ?? []).findIndex((a) => a.name === viewImg.name);
+                  if (i >= 0) onAttach?.((q.attachments ?? []).filter((_, j) => j !== i));
+                  setViewImg(null);
+                }}
+              >
+                Remove
+              </Button>
+              <Button size="sm" variant="secondary" onClick={() => setViewImg(null)}>
+                Keep attached
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </li>
   );
 }
@@ -124,7 +217,7 @@ function QueueRow({ text, index, count, onEdit, onRemove, onMove, onSteer, onNow
  * What waits: one line until opened; it folds again a few seconds after you leave it. `label`:
  * where it waits ("Queued", "Kept here"); `hint`: when it goes; `acts`: what each one can do.
  */
-function Queued({ queue, label, hint, acts }: { queue: { id: string; text: string }[]; label: string; hint: string; acts: (id: string) => RowActs }) {
+function Queued({ queue, label, hint, acts }: { queue: { id: string; text: string; attachments?: Attachment[] }[]; label: string; hint: string; acts: (id: string) => RowActs }) {
   const [open, setOpen] = React.useState(false);
   const timer = React.useRef(0);
   const root = React.useRef<HTMLDivElement>(null);
@@ -175,7 +268,7 @@ function Queued({ queue, label, hint, acts }: { queue: { id: string; text: strin
       {open && (
         <ol ref={folding} className="qd-list">
           {queue.map((q, i) => (
-            <QueueRow key={q.id} text={q.text} index={i} count={queue.length} {...acts(q.id)} />
+            <QueueRow key={q.id} q={q} index={i} count={queue.length} {...acts(q.id)} />
           ))}
         </ol>
       )}
@@ -246,7 +339,7 @@ function sendHeld(store: SessionStore, agent: string) {
   for (const m of useHeld.getState().held[agent] ?? []) {
     // As it was to go: a "now" kept through a reconnection still stops what runs.
     const running = s.state?.status === "running" || s.state?.status === "waiting";
-    if (!store.send({ type: "send", id: m.id, text: m.text, mode: running ? (m.mode ?? "queue") : "queue", attachments: m.attachments, overrides: m.overrides })) break;
+    if (!store.send({ type: "send", id: m.id, text: m.text, mode: running ? (m.mode ?? "queue") : "queue", attachments: m.attachments, overrides: m.overrides, reply_to: m.reply_to })) break;
     went.push(m.id);
   }
   if (went.length) useHeld.getState().drop(agent, ...went);
@@ -264,6 +357,8 @@ export function Composer({
   toMain,
   onView,
   onTerminal,
+  replyTo,
+  onClearReply,
 }: {
   store: SessionStore;
   /** The agent's id: what's written to it is kept under it until it's sent. */
@@ -275,6 +370,9 @@ export function Composer({
   onView?: (view: string) => void;
   /** Open a terminal beside the agent: its shell (`!command`), or its harness's own screen (a command only that screen does). */
   onTerminal?: (open: { what: "shell" | "screen"; command?: string }) => void;
+  /** What the next message answers (a messenger-style reply, from a message's ⋯ menu). */
+  replyTo?: ReplyTarget | null;
+  onClearReply?: () => void;
 }) {
   const text = useDrafts((s) => s.drafts[agent] ?? "");
   const setDraft = useDrafts((s) => s.setDraft);
@@ -437,8 +535,7 @@ export function Composer({
     else if (out.kind === "terminal") {
       if (onTerminal) onTerminal({ what: "screen", command: out.command });
       else setNote(`/${entry.name} is done in the harness's own screen, in a terminal`);
-    }
-    else if (out.kind === "reply") {
+    } else if (out.kind === "reply") {
       setReply("loading");
       out.promise.then(setReply, (e: unknown) => setReply({ title: `/${entry.name}`, text: "", error: e instanceof Error ? e.message : String(e) }));
     }
@@ -490,7 +587,7 @@ export function Composer({
 
   const sendText = (body: string) => {
     if ((!body && files.length === 0) || pending > 0) return;
-    const m = { id: clientId(), text: body, attachments: files.length ? attachments.payload() : undefined, overrides: override.model || override.effort ? override : undefined };
+    const m = { id: clientId(), text: body, attachments: files.length ? attachments.payload() : undefined, overrides: override.model || override.effort ? override : undefined, reply_to: replyTo?.id };
     // It can't take it now (or what was kept here hasn't all gone yet): kept here, sent once it
     // can, in order — never lost, never blocked. "Now" and "steer" don't wait behind what's kept:
     // they're for the turn under way.
@@ -501,6 +598,7 @@ export function Composer({
     clear();
     setOverride({});
     setWithOpen(false);
+    onClearReply?.();
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -573,6 +671,10 @@ export function Composer({
           hint={paused === "auto" ? "sent in order once the limit resets" : paused ? "sent in order once you resume it" : "sent in order when it finishes"}
           acts={(id) => ({
             onEdit: (text) => store.send({ type: "queue_edit", id, text }),
+            onAttach: (atts) => {
+              const q = queue.find((x) => x.id === id);
+              if (q) store.send({ type: "queue_edit", id, text: q.text, attachments: atts });
+            },
             onRemove: () => store.send({ type: "queue_remove", id }),
             onMove: (index) => store.send({ type: "queue_move", id, index }),
             onSteer: features.includes("queue_steer") && !paused ? () => store.send({ type: "queue_steer", id }) : undefined,
@@ -581,6 +683,16 @@ export function Composer({
         />
       )}
 
+      {replyTo && (
+        <div className="cp-reply" role="note">
+          <CornerDownLeft size={12} aria-hidden="true" />
+          <span className="cp-reply-who">{replyTo.who}</span>
+          <span className="cp-reply-text">{replyTo.text}</span>
+          <button type="button" className="hx-icon" aria-label="Stop replying" onClick={onClearReply}>
+            <X size={12} />
+          </button>
+        </div>
+      )}
       {reply && <ReplyPanel reply={reply} onClose={() => setReply(null)} />}
       {palItems.length > 0 && <CommandList items={palItems} index={palIndex} onPick={pick} onHover={setPalIndex} />}
       {note && (
@@ -643,16 +755,16 @@ export function Composer({
                 : paused
                   ? `Queue a message: it goes once ${paused === "auto" ? "the limit resets" : "you resume it"}`
                   : toMain
-                  ? "Message the main agent"
-                  : running
-                    ? mode === "steer"
-                      ? "Steer it — it reads this at its next step"
-                      : mode === "now"
-                        ? approvals > 0
-                          ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
-                          : "Stop and say…"
-                        : "Queue a message for when it finishes"
-                    : "Tell the agent what to do"
+                    ? "Message the main agent"
+                    : running
+                      ? mode === "steer"
+                        ? "Steer it — it reads this at its next step"
+                        : mode === "now"
+                          ? approvals > 0
+                            ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
+                            : "Stop and say…"
+                          : "Queue a message for when it finishes"
+                      : "Tell the agent what to do"
             }
             onChange={(e) => write(e.target.value, e.target.selectionStart)}
             onSelect={(e) => setCaret(e.currentTarget.selectionStart)}

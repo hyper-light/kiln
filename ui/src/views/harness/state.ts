@@ -134,6 +134,8 @@ export interface Held {
   overrides?: { model?: string; effort?: string };
   /** How it was to go: "now" and "steer" keep that when it goes (older ones: queued). */
   mode?: SendMode;
+  /** The event it answers (a messenger-style reply). */
+  reply_to?: string;
 }
 
 interface HeldState {

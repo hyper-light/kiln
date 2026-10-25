@@ -131,7 +131,7 @@ async fn send(cx: Cx, v: Value) -> Out {
     // From an agent, its id says who sent it: the receiver's agents_wait hands it over.
     let message = cx.caller.agent.as_deref().map_or_else(crate::util::new_id, super::queued::from_agent);
     wait::sent(&id, info.last_turn.as_ref().map(|t| t.at));
-    match cx.hub.harness.command(&cx.hub, &id, Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None }).await {
+    match cx.hub.harness.command(&cx.hub, &id, Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None, reply_to: None}).await {
         Sent::Ok => Ok(json!({"sent": true, "message": message})),
         Sent::NoSession => Err((StatusCode::NOT_FOUND, format!("no agent {id}"))),
         Sent::Unreachable => Err((StatusCode::BAD_GATEWAY, format!("{}'s machine isn't connected right now: try again once it's back", info.name))),

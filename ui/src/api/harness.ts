@@ -65,8 +65,8 @@ export interface ToolCall {
 }
 
 export type Body =
-  | { kind: "user"; text: string; images?: number; attachments?: string[]; client_id?: string; origin?: string }
-  | { kind: "assistant"; text: string; streaming?: boolean }
+  | { kind: "user"; text: string; images?: number; attachments?: string[]; client_id?: string; origin?: string; reply_to?: string }
+  | { kind: "assistant"; text: string; streaming?: boolean; reply_to?: string }
   | { kind: "thinking"; text: string; streaming?: boolean; redacted?: boolean }
   | ({ kind: "tool" } & ToolCall)
   | { kind: "notice"; level: Level; text: string };
@@ -132,6 +132,9 @@ export interface QueueItem {
   id: string;
   text: string;
   at: number;
+  attachments?: Attachment[];
+  overrides?: { model?: string; effort?: string };
+  reply_to?: string;
 }
 
 export interface Task {
@@ -787,7 +790,7 @@ export interface Spec {
 export type WorkspacesAvailable = Record<string, { available: boolean; why_not?: string }>;
 
 export type Command =
-  | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string } }
+  | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string }; reply_to?: string }
   | { type: "control"; id: string; value?: unknown }
   | { type: "mcp_enable"; name: string; enabled: boolean }
   | { type: "mcp_reconnect"; name: string }
@@ -797,7 +800,7 @@ export type Command =
   | { type: "skill_view"; name: string; client: string }
   | { type: "skill_run"; name: string; args?: string }
   | { type: "set_effort"; effort: string }
-  | { type: "queue_edit"; id: string; text: string }
+  | { type: "queue_edit"; id: string; text: string; attachments?: Attachment[] }
   | { type: "queue_remove"; id: string }
   | { type: "queue_move"; id: string; index: number }
   | { type: "queue_send_now"; id: string }
@@ -965,8 +968,10 @@ export const harnessApi = {
   /** Its live pages. */
   streams: (id: string) => call<StreamView[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/streams`),
   /** Open a live page: an address, or (`start`) the project's app; in a profile. */
-  openStream: (id: string, body: { url?: string; start?: boolean; profile?: string; engine?: string; device?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string }) =>
-    call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
+  openStream: (
+    id: string,
+    body: { url?: string; start?: boolean; profile?: string; engine?: string; device?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string },
+  ) => call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
   closeStream: (id: string, stream: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}/streams/${stream}`),
   /** Open the app on a port of its machine on this person's own device: a link to follow there. */
   openOnDevice: (id: string, body: { port: number; path?: string }) => call<Opened>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/opened`, body),

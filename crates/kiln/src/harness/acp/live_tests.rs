@@ -37,7 +37,7 @@ async fn until(s: &Session, label: &str, ready: impl Fn(&Core) -> bool + Send + 
 }
 
 fn send(s: &Session, id: &str, text: &str) {
-    assert!(s.command(Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None }));
+    assert!(s.command(Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None}));
 }
 
 #[test]
@@ -141,7 +141,8 @@ fn installed_devin_steers_running_and_queued_messages_into_one_turn() -> anyhow:
             text: "Steering update: stop listing numbers and reply KILN_NATIVE_STEERING_OK. Do not use tools or access files.".into(),
             mode: SendMode::Steer,
             attachments: Vec::new(),
-            overrides: None
+            overrides: None,
+            reply_to: None
         }));
         send(s, "queued-steer", "Another steering update for the same test: your final reply must end with KILN_NATIVE_STEERING_OK. Do not use tools or access files.");
         assert!(s.command(Command::QueueSteer { id: "queued-steer".into() }));

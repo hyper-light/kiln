@@ -66,7 +66,7 @@ fn an_adopted_session_imports_a_learned_default_only_when_it_has_none() {
 }
 
 fn send(a: &mut Acp, core: &mut Core, id: &str) {
-    a.command(core, Command::Send { id: id.into(), text: format!("work {id}"), mode: SendMode::Queue, attachments: Vec::new(), overrides: None });
+    a.command(core, Command::Send { id: id.into(), text: format!("work {id}"), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None});
 }
 
 fn options(mode: &str, model: &str, effort: &str) -> Vec<Value> {
@@ -178,7 +178,7 @@ fn grouped_models_and_uncategorized_options_use_existing_selectors_and_controls(
     ];
     let (mut a, mut core) = opened(config.clone())?;
     assert_eq!(core.meta.models.iter().map(|m| (m.id.as_str(), m.label.as_str())).collect::<Vec<_>>(), [("small", "Recommended · Small"), ("large", "Recommended · Large")]);
-    assert_eq!(core.meta.controls.iter().map(|c| (c.id.as_str(), c.label.as_str(), c.kind)).collect::<Vec<_>>(), [("acp:style", "Style", ControlKind::Select), ("acp:format", "Format", ControlKind::Select)]);
+    assert_eq!(core.meta.controls.iter().map(|c| (c.id.as_str(), c.label.as_str(), c.kind)).collect::<Vec<_>>(), [("acp:style", "Style", ControlKind::Select), ("acp:format", "Format", ControlKind::Select), ("rewind_files", "Restore files to here", ControlKind::Action), ("rewind", "Rewind conversation to here", ControlKind::Action), ("branch", "Branch from here", ControlKind::Action), ("fork", "Fork the conversation", ControlKind::Action)]);
     for (id, value) in [("acp:style", "long"), ("acp:format", "markdown")] {
         a.command(&mut core, Command::Control { id: id.into(), value: Some(json!(value)) });
         let setting = request(&mut core, "session/set_config_option")?;
@@ -373,7 +373,8 @@ fn unknown_types_and_malformed_values_are_kept_without_becoming_controls() -> an
     ];
     config.extend(options("ask", "default", "low"));
     let (mut a, mut core) = opened(config.clone())?;
-    assert!(core.meta.controls.is_empty());
+    // None of the malformed values became a control (what's declared is kiln's go-back set).
+    assert!(!core.meta.controls.iter().any(|c| c.id.starts_with("acp:")));
     assert_eq!(core.state.model, "default");
     for id in ["future", "bad-toggle", "bad-model"] {
         a.command(&mut core, Command::Control { id: format!("acp:{id}"), value: Some(json!("a")) });

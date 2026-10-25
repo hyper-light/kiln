@@ -150,7 +150,7 @@ impl Told {
             Some(m) => {
                 m.text = text;
                 n.said.clone_from(&n.lines);
-                Some(Command::QueueEdit { id: m.id.clone(), text: m.text.clone() })
+                Some(Command::QueueEdit { id: m.id.clone(), text: m.text.clone(), attachments: None })
             }
             None => None,
         };
@@ -240,14 +240,14 @@ impl Told {
             match n.msg.as_mut() {
                 Some(m) if m.text == text => {}
                 Some(m) => {
-                    out.push((parent, Command::QueueEdit { id: m.id.clone(), text: text.clone() }));
+                    out.push((parent, Command::QueueEdit { id: m.id.clone(), text: text.clone(), attachments: None }));
                     m.text = text;
                     n.said.clone_from(&n.lines);
                 }
                 None if quiet.contains(&parent) => {}
                 None => {
                     let id = super::queued::made(NEWS);
-                    out.push((parent, Command::Send { id: id.clone(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None }));
+                    out.push((parent, Command::Send { id: id.clone(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None}));
                     n.msg = Some(Kept::sent(id, text, info, now));
                     n.said.clone_from(&n.lines);
                     n.held.clone_from(&n.lines);
@@ -454,7 +454,7 @@ mod tests {
     fn apply(p: &mut Info, c: &Command) {
         match c {
             Command::Send { id, text, .. } => p.queue.push(Queued::of(id, text)),
-            Command::QueueEdit { id, text } => {
+            Command::QueueEdit { id, text, .. } => {
                 if let Some(q) = p.queue.iter_mut().find(|q| q.id == *id) {
                     *q = Queued::of(id, text);
                 }
@@ -635,7 +635,7 @@ mod tests {
         anyhow::ensure!(t.plan(&all(&p, &kids), now, &[], &[]).is_empty(), "nothing new to say");
         now += 10_000;
         let sent = settle(&mut t, &p, &mut kids, &[(0, "u1 is done.")], now);
-        let [Command::QueueEdit { id, text }] = sent.as_slice() else { anyhow::bail!("{sent:?}") };
+        let [Command::QueueEdit { id, text, .. }] = sent.as_slice() else { anyhow::bail!("{sent:?}") };
         anyhow::ensure!(id == old && text.starts_with(before) && text.contains("u1 is done."), "{text}");
         sent.iter().for_each(|c| apply(&mut p, c));
         // Once the parent takes it, what came before goes with it.
@@ -668,7 +668,7 @@ mod tests {
         };
         // It waited for x1: x1's line comes out, the rest stay, in the same message.
         let Some((to, c)) = t.saw(&x1) else { anyhow::bail!("x1's line stayed in the news") };
-        let Command::QueueEdit { id: edited, text } = &c else { anyhow::bail!("{c:?}") };
+        let Command::QueueEdit { id: edited, text, .. } = &c else { anyhow::bail!("{c:?}") };
         anyhow::ensure!(to == "q3" && *edited == id && !text.contains("x1 is done.") && text.contains("x2 is done.") && text.contains("x3 is done."), "{text}");
         apply(&mut p, &c);
         // It read x2's result: one line left, said on its own.
