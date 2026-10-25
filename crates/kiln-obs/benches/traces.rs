@@ -1027,8 +1027,37 @@ fn map_bench() {
 /// Observability's and Error Tracking's: every metric of spans kiln counts itself): a web service's
 /// spans, a thousand a second for five minutes, taken as a node's writes, then every window of ten
 /// seconds counted, by the whole set, by the trace metrics alone and by one of them; the time a
-/// span, the allocations a window. `metrics` alone: `cargo bench -p kiln-obs --bench traces -- metrics`.
+/// span, the allocations a window. Then the same of a web service's and an LLM agent's spans in the
+/// same requests (one in ten an LLM agent's), so every block holds both: none of the LLM metrics'
+/// searches is ruled out by a block. `metrics` alone: `cargo bench -p kiln-obs --bench traces -- metrics`.
 fn metrics_bench() {
+    use kiln_obs::logs::metrics::WINDOW;
+    let mut all = kiln_obs::apm::trace_metrics();
+    let trace = all.clone();
+    all.extend(kiln_obs::llm::metrics::metrics());
+    all.extend(kiln_obs::errors::metrics(true));
+    let one = vec![trace[0].clone()];
+    let web = |r: u64, at: u64| request(512, r, at);
+    let mixed = |r: u64, at: u64| {
+        // Two resources' spans in one request: protobuf's repeated field, the messages one after
+        // the other.
+        let mut req = request(462, r, at);
+        req.extend(llm_request(50, r, at));
+        req
+    };
+    for (case, make) in [("a web service", &web as &dyn Fn(u64, u64) -> Vec<u8>), ("a web service and an LLM agent", &mixed)] {
+        let (store, spans, windows) = span_store(make);
+        println!("\n{spans} spans of {case}, {} windows of {} s", windows.len(), WINDOW / 1_000_000_000);
+        println!("{:<34} {:>8} {:>12} {:>10} {:>10} {:>14} {:>10}", "counted (median of 5)", "metrics", "ms/window", "ns/span", "points", "allocs/window", "rows/span");
+        for (what, set) in [("every metric of spans kiln counts", &all), ("the trace metrics", &trace), (trace[0].name.as_str(), &one)] {
+            count_windows(&store, spans, &windows, what, set);
+        }
+    }
+}
+
+/// A store of 586 requests' spans (`make`, request `r` at `at`), a request each 512 ms, taken as a
+/// node's writes: the store, its spans, and the windows they fall in.
+fn span_store(make: &dyn Fn(u64, u64) -> Vec<u8>) -> (kiln_obs::store::Store, u64, Vec<i64>) {
     use kiln_obs::batch::Builder;
     use kiln_obs::logs::metrics::{WINDOW, window_of};
     const REQUESTS: u64 = 586;
@@ -1039,7 +1068,7 @@ fn metrics_bench() {
     let (mut d, mut b, mut spans) = (Decoder::new(), Builder::new(), 0u64);
     for r in 0..REQUESTS {
         let mut o = Spans::default();
-        d.decode(&request(512, r, at + r * 512_000_000), 0, &mut o).unwrap();
+        d.decode(&make(r, at + r * 512_000_000), 0, &mut o).unwrap();
         for (raw, n) in &o.segments {
             b.spans(raw, *n);
             spans += u64::from(*n);
@@ -1047,41 +1076,38 @@ fn metrics_bench() {
         store.apply_entry(r + 1, &kiln_obs::command::write(7, r + 1, written, &b.finish())).unwrap();
         d.give(o);
     }
-    let mut all = kiln_obs::apm::trace_metrics();
-    let trace = all.clone();
-    all.extend(kiln_obs::llm::metrics::metrics());
-    all.extend(kiln_obs::errors::metrics(true));
-    let one = vec![trace[0].clone()];
-    let windows: Vec<i64> = (window_of(at as i64)..=window_of(end as i64 - 1)).step_by(WINDOW as usize).collect();
-    println!("{spans} spans of a web service, {} windows of {} s", windows.len(), WINDOW / 1_000_000_000);
-    println!("{:<34} {:>8} {:>12} {:>10} {:>10} {:>14} {:>10}", "counted (median of 5)", "metrics", "ms/window", "ns/span", "points", "allocs/window", "rows/span");
-    for (what, set) in [("every metric of spans kiln counts", &all), ("the trace metrics", &trace), (trace[0].name.as_str(), &one)] {
-        let (mut runs, mut allocs, mut points, mut rows) = (Vec::new(), u64::MAX, 0usize, 0u64);
-        for _ in 0..5 {
-            let (mut p, mut n) = (0usize, 0u64);
-            alloc::begin();
-            let t = Instant::now();
-            for &w in &windows {
-                let c = store.count_span_metrics(set, w).unwrap().unwrap();
-                p += c.series.len();
-                n += c.rows_scanned;
-            }
-            runs.push(t.elapsed().as_nanos() as u64);
-            allocs = allocs.min(alloc::end().calls());
-            (points, rows) = (p, n);
+    let windows = (window_of(at as i64)..=window_of(end as i64 - 1)).step_by(WINDOW as usize).collect();
+    (store, spans, windows)
+}
+
+/// Every window counted by `set`, five times: the median's time a span, the fewest allocations a
+/// window, and the rows read a span.
+fn count_windows(store: &kiln_obs::store::Store, spans: u64, windows: &[i64], what: &str, set: &[kiln_obs::logs::metrics::LogMetric]) {
+    let (mut runs, mut allocs, mut points, mut rows) = (Vec::new(), u64::MAX, 0usize, 0u64);
+    for _ in 0..5 {
+        let (mut p, mut n) = (0usize, 0u64);
+        alloc::begin();
+        let t = Instant::now();
+        for &w in windows {
+            let c = store.count_span_metrics(set, w).unwrap().unwrap();
+            p += c.series.len();
+            n += c.rows_scanned;
         }
-        // Rows read: a block across a window's edge is read for each window it reaches, one every
-        // search rules out not at all.
-        let ns = median(runs);
-        println!(
-            "{:<34} {:>8} {:>12.3} {:>10.0} {:>10} {:>14.1} {:>10.3}",
-            what,
-            set.len(),
-            ns as f64 / 1e6 / windows.len() as f64,
-            ns as f64 / spans as f64,
-            points,
-            allocs as f64 / windows.len() as f64,
-            rows as f64 / spans as f64
-        );
+        runs.push(t.elapsed().as_nanos() as u64);
+        allocs = allocs.min(alloc::end().calls());
+        (points, rows) = (p, n);
     }
+    // Rows read: a block across a window's edge is read for each window it reaches, one every
+    // search rules out not at all.
+    let ns = median(runs);
+    println!(
+        "{:<34} {:>8} {:>12.3} {:>10.0} {:>10} {:>14.1} {:>10.3}",
+        what,
+        set.len(),
+        ns as f64 / 1e6 / windows.len() as f64,
+        ns as f64 / spans as f64,
+        points,
+        allocs as f64 / windows.len() as f64,
+        rows as f64 / spans as f64
+    );
 }
