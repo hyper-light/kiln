@@ -7951,7 +7951,9 @@ let go for the content store to collect (`ci/work.rs`'s `evict`, `w24_ac12_the_s
 
 **How AC03 will be measured.** On the live server, once `.kiln/ci.yaml` runs on the engine (`[ci]
 kiln_workflows`, the change above) with leg and step reuse, warm workspaces (M1) and R10's test
-selection in its `rust` job. From a trunk commit whose trusted run of `ci.yaml` is complete (its
+selection in its `rust` job. `.kiln/ac03.yaml` is that job, for the measure: on a trusted push to a
+`w24/ac03/...` branch, on a bare-metal runner (pods keep no warm workspace before M5), clippy a
+`memo` step over the Rust sources and the tests a `tests:` step. From a trunk commit whose trusted run of `ci.yaml` is complete (its
 warm state and ledger entries are the baseline), three pushes of a docs-only change (`docs/ci.md`
 touched) and three of a one-file change in `crates/kiln` (`crates/kiln/src/lib.rs` touched, as
 M0's), each its own commit on that parent, pushed to a branch of kiln's own repository (trusted)

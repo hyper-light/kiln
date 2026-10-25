@@ -1,0 +1,25 @@
+# W24-AC03 (docs/ci.md, "How AC03 will be measured"): kiln's own rust job with W24's reuse, warm
+# workspaces and test selection, measured against M0's baseline. It runs on a trusted push to a
+# `w24/ac03/...` branch, on a bare-metal runner (pods keep no warm workspace before M5), so each
+# scenario's three commits run alike: a docs-only change and a one-file change in crates/kiln.
+on:
+  push:
+    branches: ["w24/ac03/**"]
+jobs:
+  rust:
+    name: rust lint + test (W24-AC03)
+    runs-on: [baremetal, linux]
+    work: { warm: [target] }
+    env:
+      CARGO_BUILD_JOBS: "8"
+      RUST_TEST_THREADS: "4"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    timeout-minutes: 60
+    steps:
+      # Reused while the Rust sources and the toolchain's files are as they were (W24-R07).
+      - name: clippy (no-panic lint wall)
+        memo: { inputs: [crates, vendor, Cargo.toml, Cargo.lock, rust-toolchain.toml] }
+        run: cargo clippy --locked --all-targets -- -D warnings
+      # The test binaries that changed run; the others replay their passes (W24-R10).
+      - name: tests
+        tests: { cargo: [--locked, --workspace] }
