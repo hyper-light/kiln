@@ -29,7 +29,7 @@ import { StandTitle, type Stand } from "@/views/plans/status";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Link } from "@/lib/router";
-import { canPlan, canPlanNow, fromLines, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo, type Planner } from "./goal-stack";
+import { canPlan, canPlanNow, fromLines, outOn, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo, type Planner } from "./goal-stack";
 import { GoalPlan } from "./goal-plan";
 import { useFold } from "./fold";
 import { cn } from "@/lib/utils";
@@ -138,7 +138,10 @@ function usePlanned(goal: GoalItem, items: GoalItem[], paused: boolean, agent: s
       return { n, title, needs: waits[i] ?? [], stand: r.stand, who };
     }
     const part = items.find((x) => x.part_of === goal.id && x.part_kind === "plan" && x.step?.n === n);
-    return { n, title, needs: waits[i] ?? [], stand: stepStand(goal, items, n, paused) ?? "waiting", who: own, checks: checksOf(part, items) };
+    // Out on a subagent, side by side with the plan's other steps: who it is, and whether it waits on you.
+    const sub = part && outOn(part) ? sessions.find((x) => x.id === part.subagent) : undefined;
+    const stand = sub && !paused && (sub.approvals.length > 0 || sub.status === "waiting") ? "needs_you" : (stepStand(goal, items, n, paused) ?? "waiting");
+    return { n, title, needs: waits[i] ?? [], stand, who: sub ? whoOf(sub) : own, checks: checksOf(part, items) };
   });
   return { plan: p, run, steps, planning };
 }
@@ -435,7 +438,13 @@ function GoalPanel({
           </p>
           {/* Big goals planned first (docs/goals.md): a person's setting, on unless turned off. */}
           <label className="gs-option">
-            <input type="checkbox" className="check" checked={stack?.plan_big ?? true} disabled={busy} onChange={(e) => void act(() => harnessApi.goalSettings(agent, { plan_big: e.target.checked }))} />
+            <input
+              type="checkbox"
+              className="check"
+              checked={stack?.plan_big ?? true}
+              disabled={busy}
+              onChange={(e) => void act(() => harnessApi.goalSettings(agent, { plan_big: e.target.checked }))}
+            />
             <span>
               Plan big goals first
               <span className="gs-option-hint">A goal longer than a couple of sentences is researched and planned before it&rsquo;s worked on, with the plan&rsquo;s steps run under it.</span>
@@ -486,14 +495,16 @@ function GoalPanel({
                     </li>
                   ) : null}
                   {shown.map((g) => {
-                    // A goal whose parts come first is under way while they are (its steps, or its run's agents, at work).
-                    const doing = g.status === "pending" ? partsOf(g, items).find((i) => i.status === "active") : undefined;
-                    const status = doing ? "active" : g.status;
+                    // A plan's step a subagent has, side by side with the plan's others: under way there.
+                    const sub = outOn(g);
+                    // A goal whose parts come first is under way while they are (its steps, or its run's agents, at work; or its steps' subagents).
+                    const doing = g.status === "pending" && !sub ? partsOf(g, items).find((i) => i.status === "active" || !!outOn(i)) : undefined;
+                    const status = doing || sub ? "active" : g.status;
                     // The goal under way while you've paused the stack: paused, not under way.
                     const held = status === "active" && stack?.state === "paused";
-                    // One handed to another agent (a program's track's worker): under way there.
-                    const away = g.status === "pending" && !doing ? g.on : undefined;
-                    const stand = standOf({ ...g, status }, held, doing?.waits_on ? true : working && !g.waits_on);
+                    // One handed to another agent (a program's track's worker), or to a subagent: under way there.
+                    const away = g.status === "pending" && !doing ? (g.on ?? sub) : undefined;
+                    const stand = standOf({ ...g, status }, held, doing?.waits_on || sub || (doing && outOn(doing)) ? true : working && !g.waits_on);
                     const planner = planners.get(g.id);
                     // Asked for, or at it: not to ask again.
                     const planning = planner?.kind === "asked" || planner?.kind === "planning";
@@ -528,7 +539,9 @@ function GoalPanel({
                           <GoalWords text={g.text.split(" — ")[0] ?? g.text} stand={stand} />
                           {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
                           <span className="gs-word">
-                            {held ? "paused" : away ? (
+                            {held ? (
+                              "paused"
+                            ) : away ? (
                               <>
                                 under way on{" "}
                                 <Link to={`/agents/${encodeURIComponent(away)}`}>

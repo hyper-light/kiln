@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { GoalItem, GoalStack, HEvent, Task } from "../src/api/harness.ts";
-import { callWords, canPlan, canPlanNow, fromLines, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo } from "../src/views/harness/goal-stack.ts";
+import { callWords, canPlan, canPlanNow, fromLines, outOn, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo } from "../src/views/harness/goal-stack.ts";
 
 const goal = (id: string, text: string, status: GoalItem["status"] = "pending"): GoalItem => ({ id, text, status });
 const stack = (rest: Partial<GoalStack> = {}): GoalStack => ({ agent: "a1", state: "running", items: [], updated_at: 1, ...rest });
@@ -133,6 +133,28 @@ test("a planned goal's steps stand as their parts do: under way while one of its
   assert.equal(canPlan(items[0]!), false, "a plan's step isn't planned on its own");
   assert.equal(canPlan({ ...g, planned_as: "p" }), false, "nor a goal planned already");
   assert.equal(canPlan({ ...g, status: "met" }), false, "nor one met");
+});
+
+test("P2: a plan's step a subagent has, side by side with its others, stands under way there; met, it keeps who met it", () => {
+  const g = goal("g", "Ship the replication");
+  const step = (id: string, n: number, status: GoalItem["status"], subagent?: string): GoalItem => ({
+    ...goal(id, `Step ${n}`, status),
+    part_of: "g",
+    part_kind: "plan",
+    step: { plan: "p", version: 1, n },
+    subagent,
+  });
+  const items = [step("s1", 1, "met"), step("s2", 2, "pending", "sub-2"), step("s3", 3, "pending", "sub-3"), step("s4", 4, "met", "sub-4"), step("s5", 5, "pending"), g];
+  assert.deepEqual(
+    [1, 2, 3, 4, 5].map((n) => stepStand(g, items, n, false)),
+    ["met", "working", "working", "met", "waiting"],
+  );
+  assert.equal(stepStand(g, items, 2, true), "paused", "the stack paused: its subagents pause with it");
+  assert.deepEqual(
+    items.map((i) => outOn(i) ?? null),
+    [null, "sub-2", "sub-3", null, null, null],
+    "only steps still to go are out on their subagents",
+  );
 });
 
 test("a goal being planned, its planning waiting its turn, can be planned now by a subagent; one under way or planned can't", () => {

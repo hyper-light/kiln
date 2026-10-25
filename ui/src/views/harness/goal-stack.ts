@@ -116,14 +116,20 @@ const PART_STAND = { pending: "waiting", active: "working", met: "met", unmet: "
 
 /**
  * Where step `n` of the plan `goal` became stands, as its part on the stack says: under way while it
- * is, or while one of its own parts (its criteria and tests) is; none when it isn't on the stack.
+ * is, while one of its own parts (its criteria and tests) is, or while a subagent has it (side by side
+ * with the plan's other steps); none when it isn't on the stack.
  */
 export function stepStand(goal: GoalItem, items: readonly GoalItem[], n: number, paused: boolean): Stand | undefined {
   const part = items.find((i) => i.part_of === goal.id && i.part_kind === "plan" && i.step?.n === n);
   if (!part) return undefined;
-  const busy = part.status === "active" || (part.status === "pending" && items.some((i) => i.part_of === part.id && i.status === "active"));
+  const busy = part.status === "active" || (part.status === "pending" && (!!part.subagent || items.some((i) => i.part_of === part.id && i.status === "active")));
   if (busy) return paused ? "paused" : "working";
   return PART_STAND[part.status];
+}
+
+/** A goal still to go that a subagent has: a plan's step, side by side with the plan's others (its subagent's id). */
+export function outOn(g: GoalItem): string | undefined {
+  return g.status === "pending" ? g.subagent : undefined;
 }
 
 export function stoppedBy(stack: GoalStack | null): GoalItem | undefined {

@@ -202,7 +202,8 @@ another, as before. A step alone (nothing beside it ready or under way) is the a
   cleared: its subagent ends. Its own stack doesn't wait for them as it waits for agents it started
   itself.
 - What comes after the plan's steps waits for them, and the goal they're the parts of is met once
-  they all are, as before.
+  they all are, as before. The panel shows a step a subagent has as under way, and who has it
+  ("Claude Code · fedora"); a step that waits on a person there, as needing you.
 
 A plan whose steps say nothing of waiting goes one after another, as before. Run as one message or
 a step a turn, there's no stack to follow: the agent is told which steps go side by side and to give

@@ -473,6 +473,8 @@ export interface GoalItem {
   planned_as?: string;
   /** The plan run it waits for. */
   waits_on?: string;
+  /** The subagent a plan's step was handed to, side by side with the plan's other steps (docs/goals.md, "A plan's steps side by side"): under way there while it's still to go here; once met, who met it. */
+  subagent?: string;
 }
 
 /** An agent's goals, one after another: each goes once the one before is met. */
@@ -965,8 +967,10 @@ export const harnessApi = {
   /** Its live pages. */
   streams: (id: string) => call<StreamView[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/streams`),
   /** Open a live page: an address, or (`start`) the project's app; in a profile. */
-  openStream: (id: string, body: { url?: string; start?: boolean; profile?: string; engine?: string; device?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string }) =>
-    call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
+  openStream: (
+    id: string,
+    body: { url?: string; start?: boolean; profile?: string; engine?: string; device?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string },
+  ) => call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
   closeStream: (id: string, stream: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}/streams/${stream}`),
   /** Open the app on a port of its machine on this person's own device: a link to follow there. */
   openOnDevice: (id: string, body: { port: number; path?: string }) => call<Opened>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/opened`, body),
