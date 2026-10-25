@@ -23,7 +23,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
 | O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; macOS's unified log (`log stream`, and `log show` from its place after a restart) and the Windows Event Log's channels (`wevtutil`, each channel's record id its place); each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live (a Mac's unified log; the Event Log against a stand-in for `wevtutil`, and on a Windows machine) and in browsers (§13), measured (§12.17); a JSON line read in place, no tree of it made (36 allocations a line to 18, 40% more lines a second); a line no pipeline reads, text or JSON, handed over as its row, in the order read beside records, a write's rows one item (a JSON line 18 allocations to 0.01, a text line 9 to 0.01; 50–100% more lines a second through the batcher, §12.17) | done |
-| O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Allocations a record through kiln's nginx pipeline 75 to 49, a date read without a second expression, a date past 2262 no longer overflowing (§12.17). grok's own matcher, its groups in one pass (held to `regex` by differential tests), a line a pipeline reads written as its row where it is read with its strings' room kept: through kiln's nginx pipeline 282–292 k to 585–615 k lines a second, 48 allocations a line to 0.02 (§12.17). A record of one buffer (§8.2): a line a pipeline reads costs no string of its own, every processor held to the code before it by tests; what it saves measured against that code next (§12.17) | in progress |
+| O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Allocations a record through kiln's nginx pipeline 75 to 49, a date read without a second expression, a date past 2262 no longer overflowing (§12.17). grok's own matcher, its groups in one pass (held to `regex` by differential tests), a line a pipeline reads written as its row where it is read with its strings' room kept: through kiln's nginx pipeline 282–292 k to 585–615 k lines a second, 48 allocations a line to 0.02 (§12.17). A record of one buffer (§8.2): a line a pipeline reads costs no string of its own, every processor held to the code before it by tests; against that code, 4% more nginx lines a second and 16% more scanned JSON, its allocations 5 a line to 1 (§12.17). Next, from its profile: grok's matcher (25% of a line) and attributes found by a hashed name (§12.17) | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, Opsgenie, email through an SMTP relay (checked live against Mailpit: STARTTLS, a login, a CA of its own), signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); Azure's event hubs read as they come over Kafka's protocol (a consumer of its own, offsets kept by kiln, each record once through restarts and a broker's), checked live against Apache Kafka's broker (§10.3) | in progress |
@@ -46,8 +46,8 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-32 | OpenTelemetry's containers (§10.11): Docker's, the kubelet's and the cluster's receivers' container metrics and the semantic conventions', read in their own names and units (cumulative time a rate, a working set for what Docker calls usage, limits in cores and bytes, devices and modes summed), a container kiln's check also sees one container, the kubelet's series joined by pod and name; each chart of its page drawn by the source that reported it; checked live against a real Collector and in browsers (§13), measured against O-30 (§12.34) | done |
 | O-33 | Continuous profiles (§8.11), Datadog's Continuous Profiler: what tracers' profilers upload (pprof in `multipart/form-data`, gzip'd, zstd'd or in LZ4's frames) taken where they send it (a runner's tracer port, sent on over the observe lane; the server's intake), kept by the server (segments of blobs and headers, an index of 40 bytes an upload), searched by tags, summed into flame graphs over a time (a snapshot's type averaged), compared path by path; its page (canvas flame graph, functions by self or by change, uploads); checked against Go's own profiles and live against dd-trace-go and ddtrace through a runner and Datadog's Agent; measured (§12.36) | done |
 | O-34 | Java's profiles (§8.11): JFR recordings (dd-trace-java's `main.jfr`: the JDK's chunks and ddprof's, zstd'd, gzip'd, LZ4'd or not) read where they are taken into pprof profiles in Go's names: CPU (ddprof's or the JDK's), wall time, allocations, the live heap, lock waits, exceptions, file and socket I/O; a runner sends the profiles on, not the recording; frames named as Datadog's pages name them; checked against a reader written apart on dd-trace-java's own recordings (to the nanosecond), live against dd-trace-java 1.67.1 through a runner and in a browser; measured and profiled, rewritten (§12.37) | done |
-| O-35 | LLM observability (§8.12), Datadog's (its "Agent Observability"): LLM spans recognized in OpenTelemetry's GenAI conventions (every version), OpenInference's, OpenLLMetry's and Claude Code's, given Datadog's fields; costed from genai-prices' catalog (Datadog's), held to its own package; Datadog's LLM intake and evaluations; `ml_obs.*` metrics; its page; checked live through a runner (Datadog's tracer with APM on and off, its evaluations, OpenTelemetry's GenAI instrumentation, OpenInference's: §13) and in browsers (Chromium and WebKit, a desktop's width and a phone's), 2026-10-24. Next: what recognizing them costs the trace decoders, measured against the decoders before (§12) | under way |
-| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Merges join their inputs' rollups rather than make them anew: 38% less merging time (§4.7, §12.16). A query's series copied under one hold and read with the store let go (snapshot reads), and a store lock fair to writers on every platform (std's on macOS and Windows let readers that come back starve a writer, §4): measured against the build before them next, and the snapshot's bytes derived from that measure (§12.19) | continuous |
+| O-35 | LLM observability (§8.12), Datadog's (its "Agent Observability"): LLM spans recognized in OpenTelemetry's GenAI conventions (every version), OpenInference's, OpenLLMetry's and Claude Code's, given Datadog's fields; costed from genai-prices' catalog (Datadog's), held to its own package; Datadog's LLM intake and evaluations; `ml_obs.*` metrics; its page; checked live through a runner (Datadog's tracer with APM on and off, its evaluations, OpenTelemetry's GenAI instrumentation, OpenInference's: §13) and in browsers (Chromium and WebKit, a desktop's width and a phone's), 2026-10-24. What recognizing them costs the trace decoders, measured against the decoders before (§12.23): a span that is no LLM call decodes as it did, an LLM call's some 0.7 µs more | done |
+| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Merges join their inputs' rollups rather than make them anew: 38% less merging time (§4.7, §12.16). A query's series copied under one hold and read with the store let go (snapshot reads), and a store lock fair to writers on every platform (std's on macOS and Windows let readers that come back starve a writer, §4): measured: writes beside the widest query wait 7.02 ms at their p99 before, 0.11 now; a snapshot's bytes derived from a write's own p99 hold, 2 MiB, its worst wait then a write's own hold (§12.19) | continuous |
 
 ## 1. Rules
 
@@ -3916,6 +3916,23 @@ reload as its copy returns: some 20 cycles a string), the row's encoding 5%. The
 buffer, its attributes' text side by side (the processors, the search's filters and the scanner
 reading it; §8.2), measured against the code before it next.
 
+Then a line a pipeline reads is a record of one buffer (§8.2, 17a8f4a7), measured against the
+build before it (14dcedde): `benches/collect`, 300,000 lines a pass, each binary three times in
+turn on an M4 Max Mac Studio otherwise idle (load 2.4 to 4.8), 2026-10-24, medians:
+
+| case | lines/s before | lines/s now | allocations a line | page faults |
+| --- | --- | --- | --- | --- |
+| text, kiln's nginx pipeline | 689,793 | 719,736 (+4%) | 0.02, 0.02 | 818, 613 |
+| JSON, scanned (an email each) | 791,091 | 913,938 (+16%) | 5.01, 1.01 | 29, 87 |
+| text, scanned (none found) | 2,056,909 | 2,184,190 (+6%) | 0.01, 0.01 | 158, 161 |
+
+Where a line's time goes now (macOS's `sample` at 1 ms over 3 M lines through the nginx pipeline,
+2,750 samples at the top of the stack): grok's matcher searching, 25%; moving bytes (`memmove`),
+15%; a record's attributes put in place (`RecordBuf::put_attrs`), 10%, and found by their names
+(`memcmp`, `RecordBuf::attr`), 11%; the row written, 5%; grok's values extracted, 5%; a severity
+read from the message's words, 5%; the user-agent parser, 3%. Next: the matcher, and attributes
+found by a name's hash rather than compared one by one.
+
 ### 12.18 Metrics from logs
 
 2026-10-19 on this machine, loaded (load average 50–130: other sessions compiling), so compared
@@ -3944,6 +3961,11 @@ for each of its windows): 0.2 ms each ten seconds. A dense one costs its records
 a second, five metrics take some 4–5% of a core. Of that (perf), a third is checking each row's
 text is UTF-8 as it is read, the rest reading rows and evaluating the searches; a distribution's
 allocations are its series' keys, a window's, not a record's.
+
+A fleet's records (`KOBS_CASE=fleet`: 100,000 a second for 30 s, the services of 20, 200 and 2,000
+hosts), 2026-10-24 on the M4 Max, three runs: applied at 3.08 M, 3.00 M and 3.06 M records a second,
+0.014, 0.051 and 0.111 allocations a record (the groups grow with the hosts); counting a window of
+them, 91 ns a row for one metric and 173 for five.
 
 ### 12.19 A dashboard's widest query
 
@@ -4034,6 +4056,35 @@ it waited for nothing in either. The writes taken meanwhile waited less in their
 against 1.8–3.9), and the wide query itself read faster in both (its p50 18–32 ms against 42–45),
 which was not foreseen and is not yet explained. Every run stored every point once, its replicas
 agreeing, its memory level.
+
+Then a query of metrics reads a snapshot of its series' heads (copied under one hold, read with the
+store let go: §4, 14dcedde) and the store's lock is fair to writers on every platform (5c055ff4),
+measured against the build before both (0bd3ee0, this tree's bench less the snapshot's own timing):
+`benches/wide`, 4,000 series of 15 minutes, the query beside a write of a point a series every
+20 ms, each binary three times in turn on the M4 Max Mac Studio (load 2.5 to 4.4), 2026-10-24:
+
+| | before | now |
+| --- | --- | --- |
+| the query, median | 117.4 ms | 118.1 ms |
+| beside writes, median | 116.9 ms | 118.8 ms |
+| writes' wait for the store, p50 | 3.68 ms | 0.00 ms |
+| writes' wait for the store, p99 | 7.02 ms | 0.11 ms |
+| a write's hold of the store, p99 | 0.123 ms | 0.226 ms |
+
+A snapshot of the query's 4,000 series copies 6.3 MB of heads in 0.21 ms at the median and 0.6 at
+its slowest. The writes no longer wait behind the query's reading; their own hold grew by some
+0.1 ms at its p99, the fair lock handing the store to the readers waiting as it is let go.
+
+How much a snapshot holds (`query::eval::SNAPSHOT_BYTES`) is derived from that: a write that comes
+as a snapshot is taken waits for it, so a snapshot should hold the store no longer than a write's
+own hold does at its p99, and a reader then adds no wait a writer does not already add. A write's
+p99 hold, 0.226 ms, at a snapshot's slowest copy, 10.5 MB a millisecond, is 2.4 MB: 2 MiB below
+it (it was 32 MiB). Splitting a query into more snapshots copies the same bytes, in more holds of a
+few microseconds' cost each. Measured, 300 queries a run beside some 420 writes, each budget twice
+in turn: the query's median 119.0 and 118.9 ms at 32 MiB, 118.3 and 118.9 ms at 2 MiB; the writes'
+wait at their p99 0.44 and 0.77 ms at 32 MiB, 0.30 and 0.00 ms at 2 MiB, and at the most 1.12 and
+1.47 ms against 0.36 and 0.31 ms: a write's own hold at its p99 (0.23 to 0.32 ms), what the budget
+was set to equal.
 
 ### 12.20 DogStatsD
 
@@ -4181,6 +4232,23 @@ own block and a median of 20 others read (p99 31, the most 37): the 1% each filt
 whichever trace. Before the filters were salted by their block (§8.7), the median was 7 and the most
 654: filters of one size set the same bits for the tokens every block holds (the service, `server`,
 the names), so a query whose places fell on them passed most of them.
+
+What recognizing LLM spans (§8.12) costs the decoder, measured against the decoder before them
+(4c58ee8, run on this tree's bench, its LLM agent's requests too, which it takes as any spans):
+`benches/traces`, each binary three times in turn on the M4 Max Mac Studio, 2026-10-24, medians:
+
+| request | decoded before | decoded now | row bytes a span | allocations a span |
+| --- | --- | --- | --- | --- |
+| 512 spans, a web service's | 676 ns a span | 664 | 685, 685 | 0.002, 0.002 |
+| 4,096 spans, a web service's | 562 | 592 | 685, 685 | 0.0129, 0.0129 |
+| 4,100 spans, an Agent's | 469 | 500 | 270, 270 | 0.0005, 0.0005 |
+| 510 spans, an LLM agent's | 541 | 1,261 | 760, 1,142 | 0.002, 0.002 |
+| 4,095 spans, an LLM agent's | 542 | 1,277 | 761, 1,143 | 0.017, 0.042 |
+
+A span that is no LLM call decodes as it did (within the runs' spread of some 5%); an LLM call's
+costs some 0.7 µs more, its model, provider, tokens, cost and messages read and priced, and its row
+half again as long for the fields it gains: a call that took seconds, read in a microsecond and a
+quarter.
 
 ### 12.24 Error Tracking
 
