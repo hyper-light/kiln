@@ -7803,6 +7803,20 @@ microVMs keep their own workspaces (R13, R14); `actions/checkout` cleans a works
 unless given `clean: false`. AC11: kiln's `target` (29.2 GiB, 42,407 files) cloned in 1.39 s on
 fedora's btrfs through the runner (0.94 s with `cp` alone) and removed in 0.4 s.
 
+**Test results (M3, R10).** Built as pure code and on the ledger, awaiting the runner's side
+(`kiln_ci::work::tests`, `ci/work.rs`). A test binary is a unit: its package, name and arguments as
+its definition, its digest as its input, the environment, the platform and the trust domain; what
+it read makes its test key. A pass goes in under that key through the ledger's one path
+(`record_test`, onto `work.result` and `work.weak`); a failure, a crash or a timeout never does.
+Every run counts in its test key's flaky marks (`work.test`), so a test that failed and passed with
+nothing it depends on changed is flaky, and its replay says so (W16-R04). Selection
+(`select_tests`) replays a binary whose key has a pass, runs one whose digest or reads changed, and
+replays the newest pass of a binary not rebuilt (its package unaffected) while every file that pass
+read holds, since a test may read files outside its package; each says why. Left: the runner's
+side, which builds only the affected packages' test binaries, reports their digests and what they
+read, and runs what selection says (a step's `tests: { select: affected, cache: true }`), and
+nextest's archives across machines.
+
 ## 4. API, events, CLI and MCP reference
 
 All routes come from the one route table (W10-R05, W20-R01) and follow access.md's conventions:
