@@ -1451,12 +1451,15 @@ mod tests {
                 }
             }
             // A search: the project's open issues of the label JQL names, the newest first.
+            // The JQL as Jira reads it: the project's issues of the label, those not done alone when
+            // it says so.
             let jql = param(path, "jql");
             let label = jql.split("labels = \"").nth(1).and_then(|r| r.split('"').next()).unwrap_or("");
-            if !jql.starts_with("project = \"OPS\" AND ") || !jql.contains("statusCategory != Done") {
+            if !jql.starts_with("project = \"OPS\" AND ") {
                 return (400, json!({ "errorMessages": [format!("Error in the JQL Query: {jql}")] }).to_string());
             }
-            let found: Vec<Value> = all.iter().rev().filter(|i| !i.done && i.labels.iter().any(|l| l == label)).map(|i| json!({ "id": "1", "key": i.key })).take(1).collect();
+            let open_only = jql.contains("statusCategory != Done");
+            let found: Vec<Value> = all.iter().rev().filter(|i| (!open_only || !i.done) && i.labels.iter().any(|l| l == label)).map(|i| json!({ "id": "1", "key": i.key })).take(1).collect();
             (200, json!({ "issues": found }).to_string())
         };
         Ok((Standin::start(Arc::new(answer))?, issues))
@@ -1561,15 +1564,24 @@ mod tests {
             let mut all = lock(&kept);
             match (method, route) {
                 ("GET", "/api/now/table/incident") => {
+                    // The encoded query's terms as an instance reads them: an incident is active until
+                    // it is closed or canceled (7, 8), so a resolved one (6) still is.
                     let q = param(path, "sysparm_query");
-                    let parts: Vec<&str> = q.split('^').collect();
-                    let correlation = parts.iter().find_map(|p| p.strip_prefix("correlation_id=")).unwrap_or("");
-                    let not_in: Vec<&str> = parts.iter().find_map(|p| p.strip_prefix("stateNOT IN")).map(|s| s.split(',').collect()).unwrap_or_default();
-                    if parts.last() != Some(&"ORDERBYDESCsys_created_on") || not_in != ["6", "7", "8"] {
-                        return (400, json!({ "error": { "message": format!("not the query expected: {q}") } }).to_string());
+                    let (mut correlation, mut not_in, mut active) = (None, Vec::new(), None);
+                    for term in q.split('^') {
+                        if let Some(v) = term.strip_prefix("correlation_id=") {
+                            correlation = Some(v.to_owned());
+                        } else if let Some(v) = term.strip_prefix("stateNOT IN") {
+                            not_in = v.split(',').map(str::to_owned).collect();
+                        } else if let Some(v) = term.strip_prefix("active=") {
+                            active = Some(v == "true");
+                        } else if !term.starts_with("ORDERBY") {
+                            return (400, json!({ "error": { "message": format!("Invalid query term: {term}") } }).to_string());
+                        }
                     }
-                    let found: Vec<Value> =
-                        all.iter().rev().filter(|i| i.correlation == correlation && !not_in.contains(&i.state.as_str())).map(|i| json!({ "sys_id": i.sys_id, "number": i.number })).take(1).collect();
+                    let held =
+                        |i: &Incident| correlation.as_deref() == Some(i.correlation.as_str()) && !not_in.contains(&i.state) && active.is_none_or(|a| a == !["7", "8"].contains(&i.state.as_str()));
+                    let found: Vec<Value> = all.iter().rev().filter(|i| held(i)).map(|i| json!({ "sys_id": i.sys_id, "number": i.number })).take(1).collect();
                     (200, json!({ "result": found }).to_string())
                 }
                 ("POST", "/api/now/table/incident") => {
