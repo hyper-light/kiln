@@ -181,6 +181,9 @@ pub struct Spec {
     /// For a `docker` executor's container: its tool cache gets what the image keeps of GitHub's
     /// ([`SEED_TOOLS`], W13-R04).
     pub seed_tools: bool,
+    /// The CPUs the leg was given (W05-R03, resource mode: [`super::cpus`]), a list (`0-3`): its
+    /// job container and services run on them alone, so `nproc` says the leg's.
+    pub cpuset: Option<String>,
 }
 
 /// `sysctl` as far as a container goes, its `/proc/sys` read-only: a write of what a setting is
@@ -1091,6 +1094,10 @@ impl Containers {
                 for v in &spec.volumes {
                     args.extend([s("-v"), v.clone()]);
                 }
+                // The leg's CPUs, which a hosted runner's services share with its job (W05-R03).
+                if let Some(cpus) = &spec.cpuset {
+                    args.extend([s("--cpuset-cpus"), cpus.clone()]);
+                }
                 args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
                 args.push(image);
                 let id = c.cli.run(&args, &env, CALL).await?;
@@ -1150,6 +1157,9 @@ impl Containers {
                 }
                 if let Some(bytes) = spec.memory {
                     args.extend([s("--memory"), bytes.to_string(), s("--memory-swap"), bytes.to_string()]);
+                }
+                if let Some(cpus) = &spec.cpuset {
+                    args.extend([s("--cpuset-cpus"), cpus.clone()]);
                 }
                 if !shared {
                     for p in &spec.ports {
@@ -1466,6 +1476,30 @@ mod tests {
         })?;
         assert!(failed, "a service with no image can't start");
         assert!(left.is_empty(), "the leg's network is gone: {left}");
+        Ok(())
+    }
+
+    /// W05-R03: a job container and its services given CPUs of the leg's own run on them alone:
+    /// `nproc` says the leg's in each.
+    #[test]
+    fn w05_r03_a_containers_cpus_are_its_legs() -> anyhow::Result<()> {
+        let Some(bin) = find() else { return Ok(()) };
+        let tmp = tempfile::tempdir()?;
+        let leg = format!("test-cpuset-{}", std::process::id());
+        let cli = Cli::new(&bin, tmp.path().join("config")).owned_by(tmp.path());
+        let job = Spec { image: "alpine:latest".into(), cpuset: Some("0".into()), ..Spec::default() };
+        // A shell kept up by its open input, as a service stays up.
+        let db = Spec { options: Some("-i".into()), ..job.clone() };
+        let cpus = crate::rt::block_on(async move {
+            let c = Containers::start(cli.clone(), &leg, PathMap::new(Vec::new()), "/", Some(job), vec![("db".into(), db)], None, &|_| {}).await?;
+            let mut n = Vec::new();
+            for id in c.job.iter().map(|j| j.id.clone()).chain(c.services.iter().map(|v| v.id.clone())) {
+                n.push(cli.run(&[s("exec"), id, s("nproc")], &BTreeMap::new(), CALL).await.map(|o| o.trim().to_owned()));
+            }
+            c.stop().await;
+            n.into_iter().collect::<anyhow::Result<Vec<String>>>()
+        })?;
+        assert_eq!(cpus, ["1", "1"], "the job container's, then its service's");
         Ok(())
     }
 

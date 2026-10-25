@@ -1981,13 +1981,26 @@ W20.
     machine's CPUs times 1.5 ran one after the other on a runner with two slots, and a small one
     ran beside one of them. Unit-tested: requests as written (`w05_r03_requests_as_written`).
   - The executor holds a leg to the memory it was given (the assignment's `executor.options`): a
-    container executor's job container has it as its limit (W13-R04, 2026-10-24). CPUs aren't
-    capped: a quota stalls a test's many threads where a hosted runner's machine wouldn't. Tools
-    still see the machine's CPUs and size their work by them (`make -j$(nproc)`, cargo's jobs),
-    so a leg given less memory than that takes runs out of it, where a hosted runner's few CPUs
-    and its memory go together. *Left*: CPUs of the leg's own to count (a cpuset as large as its
-    request), so a leg can be a hosted runner's size; until then the corpus lab stays in slot
-    mode.
+    container executor's job container has it as its limit (W13-R04, 2026-10-24).
+  - And to its CPUs (2026-10-25): a leg runs on CPUs of its own, as many as it asked for (whole
+    ones: half of one is one), a cpuset and not a quota, which stalls a test's many threads
+    where a hosted runner's machine wouldn't. The runner keeps a pool of the CPUs it may run on
+    itself (its `Cpus_allowed_list`: its affinity within its cgroup's cpuset); each leg takes
+    those no other leg holds while there are any, then the least held, and gives them back when
+    it ends. A job container and its services get them as `--cpuset-cpus` (a hosted runner's
+    services share its machine), and a host step starts within them through `taskset` (Linux;
+    elsewhere a leg sees the machine's). So `nproc` says the leg's, and what sizes its work by it
+    (`make -j$(nproc)`, cargo's jobs, a test runner's workers) does as on a hosted runner's
+    machine of that size, its memory going with it: ruff's formatter check and TypeScript's API
+    tests had started a worker per CPU of the lab's 32 (corpus pass 1024b). Checked by
+    `w05_r03_legs_take_cpus_of_their_own`, `w05_r03_a_host_leg_runs_on_its_cpus` and, with
+    Docker, `w05_r03_a_containers_cpus_are_its_legs`. Not in a pod: a one-leg runner there
+    (`kiln agent --ephemeral`, a job's or a `k8s` pool's) has the CPUs its cluster gives it, its
+    node's, which the node's other pods share, so the dispatcher leaves the leg's CPUs out (each
+    pod would take the same first ones); a microVM leg has its microVM's vCPUs. *Left*: the
+    containers a leg's steps start through its Docker socket see the machine's CPUs, where a
+    hosted runner's share its machine's few; two runners on one machine give out the same CPUs,
+    each as if alone.
 - *Left.* AC11 on the live cluster.
 - *Done* (2026-10-23), R16's retry where only the runner that lost the leg could take it, which
   waited for good. Of the options put to the user (wait; prefer another runner and take the same

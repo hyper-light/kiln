@@ -335,9 +335,20 @@ fn request_of(job: Option<&kiln_ci::wf::ir::Job>, cfg: &crate::config::ci::Ci) -
 
 /// What a leg's executor holds it to (W05-R03): in resource mode, the memory it was given, which a
 /// container executor makes its job container's limit (tools that size themselves by their
-/// cgroup, CodeQL's analysis among them, then fit the leg, not the machine); nothing in slot mode.
+/// cgroup, CodeQL's analysis among them, then fit the leg, not the machine), and its CPUs, which
+/// the runner gives it of its own ([`crate::runner::cpus`]); nothing in slot mode.
 fn executor_options(mode: &str, request: &kiln_ci::sched::state::Resources) -> serde_json::Value {
-    if mode == "resources" && request.mem > 0 { serde_json::json!({ "memory": request.mem }) } else { serde_json::Value::Null }
+    let mut o = serde_json::Map::new();
+    if mode == "resources" {
+        if request.mem > 0 {
+            o.insert("memory".into(), serde_json::json!(request.mem));
+        }
+        // Whole CPUs, as a cpuset gives them: half of one is one.
+        if request.cpu > 0.0 {
+            o.insert("cpus".into(), serde_json::json!(request.cpu.ceil() as u64));
+        }
+    }
+    if o.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(o) }
 }
 
 /// The hub's handle on the dispatcher.
@@ -1954,6 +1965,13 @@ impl Dispatch {
         if let Some(b) = a.environment.as_mut() {
             b.kind = super::environments::ensure(&self.hub, &r.repo, &b.name).await.ok().and_then(|d| d.kind);
         }
+        // A one-leg runner in a pod (`kiln agent --ephemeral`: a job's, a `k8s` pool's) has the
+        // CPUs its cluster gives it, its node's, which the node's other pods share: CPUs of the
+        // leg's own taken there would be the same first ones in each pod (W05-R03).
+        let pod = self.hub.pod_executors.lock().contains_key(runner) || self.hub.agents.lock().get(runner).is_some_and(|g| g.ephemeral);
+        if pod && let Some(o) = a.executor.options.as_object_mut() {
+            o.remove("cpus");
+        }
         // An action it uses that couldn't be resolved (W07-R03) fails it as it starts, as GitHub
         // fails a job at "Set up job"; the run's other jobs go on.
         if let Some(m) = l.spec.def().and_then(|j| unresolved(&j.steps, &r.actions)) {
@@ -3001,8 +3019,10 @@ mod tests {
     #[test]
     fn w05_r03_a_legs_memory_is_its_executors_limit() {
         let asked = kiln_ci::sched::state::Resources { cpu: 4.0, mem: 16 << 30, disk: 0, gpu: 0 };
-        assert_eq!(super::executor_options("resources", &asked), serde_json::json!({ "memory": 17179869184u64 }));
+        assert_eq!(super::executor_options("resources", &asked), serde_json::json!({ "memory": 17179869184u64, "cpus": 4 }));
         assert_eq!(super::executor_options("slots", &asked), serde_json::Value::Null);
-        assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { mem: 0, ..asked }), serde_json::Value::Null);
+        assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { mem: 0, ..asked }), serde_json::json!({ "cpus": 4 }));
+        assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { cpu: 0.5, mem: 0, ..asked }), serde_json::json!({ "cpus": 1 }), "whole CPUs");
+        assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { cpu: 0.0, mem: 0, ..asked }), serde_json::Value::Null);
     }
 }
