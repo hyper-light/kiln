@@ -898,7 +898,9 @@ one busy file does not starve the rest, 500 open at once at most (the most recen
 cursor of the last record written (Fluent Bit's and Vector's journald sources read it so); its
 entries' severity is their syslog priority's (OpenTelemetry's mapping), their service the syslog
 identifier or unit, with the unit, process and boot as attributes. Where there is no journal (macOS,
-Windows, a container without systemd's) its status says so.
+Windows, a container without systemd's) its status says so. Its reader (as macOS's `log` and
+Windows's `wevtutil` are) runs in a process group of its own and is stopped with it, so what a
+reader starts goes with it (a stand-in `journalctl`'s `tail` outlived one killed alone).
 
 **Syslog** is received as Datadog's Agent and rsyslog receive it: a message a UDP datagram, and
 over TCP each message counted (`<length> <message>`) or ended by a newline or a NUL (RFC 6587's
