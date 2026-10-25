@@ -197,8 +197,11 @@ pub struct PlannedJob {
     pub artifacts: Vec<String>,
     pub cache: Vec<String>,
     pub condition: Option<String>,
-    /// What a runner's facts must meet for the job to go there ([`JobSpec::requires`]).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// What a runner's facts must meet for the job to go there ([`JobSpec::requires`]). Always
+    /// written, none or some: a planned job goes to runners in postcard (`ServerMsg::Assign`), whose
+    /// fields are read by place, so one skipped when empty had a runner read the steps in its place
+    /// and refuse the job as malformed. `default` reads plans stored before it.
+    #[serde(default)]
     pub requires: Vec<String>,
     pub steps: Vec<StepSpec>,
 }

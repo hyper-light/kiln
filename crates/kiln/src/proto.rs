@@ -699,6 +699,51 @@ mod tests {
         Ok(())
     }
 
+    /// A job's assignment reads back as it was sent, whatever its job requires: none (most jobs),
+    /// or some. With an empty `requires` left out of the encoding, a runner of the same build read
+    /// the job's steps as it and refused every such Assign as malformed.
+    #[test]
+    fn an_assignment_reads_back_whatever_its_job_requires() -> anyhow::Result<()> {
+        for requires in [Vec::new(), vec!["os == linux".to_owned(), "tools has node".to_owned()]] {
+            let spec = crate::pipeline::PlannedJob {
+                key: "hello".into(),
+                spec_id: "hello".into(),
+                display: "hello".into(),
+                needs: Vec::new(),
+                labels: vec!["baremetal".into()],
+                image: None,
+                toolchain: None,
+                env: Default::default(),
+                timeout_minutes: 60,
+                retries: 0,
+                exclusive: false,
+                resources: Default::default(),
+                artifacts: Vec::new(),
+                cache: Vec::new(),
+                condition: None,
+                requires: requires.clone(),
+                steps: vec![crate::pipeline::StepSpec { name: Some("say".into()), run: "echo hello".into(), ..Default::default() }],
+            };
+            let m = ServerMsg::Assign(Box::new(Assignment {
+                job_id: "j".into(),
+                run_id: "r".into(),
+                repo: "e2e".into(),
+                clone_url: String::new(),
+                sha: "a2aa1c1a".into(),
+                branch: "main".into(),
+                event: "manual".into(),
+                run_number: 1,
+                attempt: 1,
+                spec,
+                secrets: Vec::new(),
+                job_token: "t".into(),
+                server_url: "http://127.0.0.1:7070".into(),
+            }));
+            assert_eq!(decode::<ServerMsg>(&encode(&m)?)?, m, "requires {requires:?}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn appended_variants_keep_their_indexes() -> anyhow::Result<()> {
         // Older peers decode by variant index: the new ones must come after every existing one.

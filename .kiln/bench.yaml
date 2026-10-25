@@ -4,10 +4,17 @@ name: bench
 on:
   push: { branches: [main], paths: ["crates/**"] }
   manual: true
+# One bench run at a time per event and branch (W25): the newest push waits for the run under way
+# and replaces an older one waiting, so a backlog comes down to the newest commit, and a person's
+# manual run isn't dropped for a push.
+concurrency: { group: "bench-${{ event }}-${{ branch }}", cancel-in-progress: false }
 jobs:
   quic-transport:
     name: QUIC transport bench (hardware)
-    runs-on: [baremetal, bench]
+    # Any open Linux machine that builds kiln (its steps read /proc and GNU date): v1 places it on
+    # the runner meeting `requires` with the most room, and `exclusive` keeps that runner its own.
+    runs-on: [baremetal]
+    requires: ["os == linux", "tools has cargo", "tools has python3"]
     exclusive: true
     timeout-minutes: 30
     steps:
@@ -25,18 +32,22 @@ jobs:
   ci-bench:
     # The CI engine's performance targets (docs/ci.md §1.5, W22-AC08): a miss fails the step; a
     # result more than 10 % worse than its history fails the job (W16's interval rule).
+    # Any open Linux or macOS machine that builds kiln; `same-fingerprint` compares a result only
+    # with earlier ones from the same hardware, wherever the bench lands.
     name: CI engine targets (hardware)
-    runs-on: [baremetal, bench]
+    runs-on: [baremetal]
+    requires: ["os in [linux, macos]", "tools has cargo"]
     exclusive: true
     timeout-minutes: 60
     bench-gate: { metric: "ci.bench.*", max-regression: 10%, same-fingerprint: true, action: fail }
     steps:
       - name: build (release)
-        run: cargo build --release --locked -p kiln
+        # A Mac runner's launchd PATH has none of the usual tools in it.
+        run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && cargo build --release --locked -p kiln
       - name: kiln ci bench
         run: target/release/kiln ci bench --out target/ci-bench.json
   noise:
-    # The bench's own machine: the point is that it waits for the exclusive bench there.
+    # The `bench`-labelled runner: it waits there whenever an exclusive bench holds that runner.
     runs-on: [baremetal, bench]
     steps:
       - run: echo "independent work; must not overlap the exclusive bench"; sleep 5
