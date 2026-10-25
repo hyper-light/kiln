@@ -1,8 +1,11 @@
 # Plans
 
-A plan is what an agent will do, kept apart from any one session: written in kiln or saved from an
-agent's plan, changed (each change a version), shared by a link, and run at will on any agent of
-any harness kiln runs (Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, ...).
+A plan is what an agent will do, kept with the agent session it belongs to: written in its Plan
+tab, made by the agent or from one of its goals, or saved from the plan it proposed; changed (each
+change a version), shared by a link, and run on that agent or any other of any harness kiln runs
+(Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, ...). Each agent's Plan tab lists its own
+plans (**Your plans**); there's no list of every plan apart from them. A plan's page, its runs and
+its research lead back to the agent it's kept with.
 
 ## Keeping one
 
@@ -24,14 +27,14 @@ any harness kiln runs (Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, ...
   agent per step, it starts once each of them is met, and steps that don't wait for each other run
   side by side. Moving or removing a step keeps what the others wait for. A step can't wait for
   itself, or for a step that waits for it.
-- **Agents → Plans → New plan**: the same, with tags, and the plan's text in markdown as well.
 - **Kept by kiln**: the plan an agent proposes in plan mode (Claude Code's plan, waiting for approval
   or approved) is kept as one of the plans by itself: one an agent, a new version each time it
   proposes another, its title from its words (`source.proposed`; a plan longer than 16 KB keeps its
   head and tail). **Save plan** keeps another: a plan waiting for approval in the conversation, or
   an agent's to-do list. A plan keeps where it came from (agent, harness, machine, folder); naming
   only the agent (`source.session`) is enough, kiln fills in the rest.
-- **Agents** keep theirs with kiln's MCP tools: `plans_create` (and `plans_list`, `plans_get`,
+- **Agents** keep theirs with kiln's MCP tools, each with its own session unless it names another
+  (`source.session`): `plans_create` (and `plans_list`, `plans_get`,
   `plans_update`, `plans_versions`, `plans_run`, `plans_delete`), or `kiln.plans.*` in code mode.
   An agent on a runner has `plans_create`, `plans_list`, `plans_get`, `plans_update`, `plans_run`
   and the `plans_runs_*` tools as tools of its own (the rest in code mode). An agent that runs a

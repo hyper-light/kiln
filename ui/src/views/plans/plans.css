@@ -1,60 +1,9 @@
 /* Plans (views/plans): plain sections in the page's flow; standard fields, selects, checkboxes. */
 
-.plans-tools {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 8px 12px;
-  margin-bottom: 18px;
-}
-.plans-filter {
-  min-width: 0;
-  flex: 1 1 320px;
-}
-.plans-sort {
-  flex: 0 0 180px;
-}
-.plans-list {
-  display: grid;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  border-top: 1px solid var(--color-line);
-}
-.plans-row {
-  display: grid;
-  gap: 4px;
-  padding: 12px 0;
-  border-bottom: 1px solid var(--color-line);
-}
-.plans-row-title {
-  color: var(--color-bright);
-  font-size: 15px;
-  font-weight: 500;
-  overflow-wrap: anywhere;
-}
-.plans-row-title:hover {
-  color: var(--color-link);
-}
-.plans-row-meta,
 .plan-dim {
   color: var(--color-meta);
   font-size: 12.5px;
 }
-.plans-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.plans-tag {
-  padding: 1px 8px;
-  border: 1px solid var(--color-line-strong);
-  border-radius: 999px;
-  color: var(--color-secondary);
-  font-family: var(--font-mono);
-  font-size: 11px;
-}
-
 .plan-page {
   display: grid;
   gap: 14px;
@@ -301,7 +250,6 @@ a.plan-row-main:hover {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .plans-page *,
   .plan-page * {
     transition: none !important;
   }

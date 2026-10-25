@@ -266,10 +266,6 @@ a.rs-loc:hover {
 .rs-link:hover {
   color: var(--color-bright);
 }
-/* All of it, on the Plans page. */
-.plans-research {
-  margin-top: 28px;
-}
 @media (max-width: 480px) {
   .rs-claim-row {
     flex-direction: column;
