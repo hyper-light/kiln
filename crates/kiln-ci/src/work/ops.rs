@@ -32,6 +32,7 @@ use sha2::{Digest as _, Sha256};
 use super::key::{self, Key, Kind, Unit};
 
 pub mod dockerfile;
+pub mod schema;
 mod shell;
 
 #[cfg(test)]
