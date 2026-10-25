@@ -97,6 +97,11 @@ C, no SIMD, no FTS.
     Code's session id, or a Codex rollout's file name.
   - `drops(rev, session, what, source, n, at)`: what was dropped.
   - `peers(peer, rev, at)`: through where this store has each peer's feed.
+- **Migrations an older kiln lives with.** A new build that takes a runner's store over migrates
+  it, and a rollback hands it back to the older build, which skips the migrations it doesn't know
+  (see "A runner's upgrade"). So each migration leaves a store an older kiln still reads and
+  writes: tables added, columns added with defaults. Migration 3's rebuild of `records` wouldn't
+  have (it came before stores were handed over).
 - **Restarts.** A session restored after a restart (`host::restore`) takes its timeline and state
   from the store (`Core::adopt`), as a move does, instead of rebuilding them from the harness's
   transcript. The harness still resumes its own conversation.
@@ -393,11 +398,14 @@ compact = true       # make the store's file compact once a third of it is free 
   says so first (`Frame::Stores`, the new build saying it takes them: `Ready.stores`). The new
   build opens them there, the same ids and numbers, so the server's feed of the store, and its
   feed to the copy, go on where they are and nothing is sent again. The mirror's feed follows the
-  process the machine promotes. A rollback moves the files back before the new build's folder
-  goes, and the old runner goes on with them. A build from before neither says nor takes: an
-  upgrade from one opens a store of its own in the new build, which writes what each session it
-  takes over has, and its feed sends all of it to the server, which has it already, as it is,
-  and writes nothing of it (a lookup a row). Before this, every upgrade did that (609k rows from
+  process the machine promotes. A new build that can't go on with them rolls the upgrade back. A
+  rollback moves the files back before the new build's folder goes (one that couldn't be moved
+  back keeps the folder), and the old runner goes on with them. An old runner that ends before
+  it says (it died, or their link broke) leaves the new build the store in its own folder: the
+  files it had moved there, or a new one. A build from before neither says nor takes: an upgrade
+  from one opens a store of its own in the new build, which writes what each session it takes
+  over has, and its feed sends all of it to the server, which has it already, as it is, and
+  writes nothing of it (a lookup a row). Before this, every upgrade did that (609k rows from
   adacachy on 2026-10-25), and a mirror's new copy took the server's whole store again (5.7 GB).
 
 ## Status

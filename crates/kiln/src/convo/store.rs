@@ -269,7 +269,8 @@ pub trait Engine: Send + 'static {
     /// the writer looks every few seconds. `count`: its sessions counted too.
     fn look(&mut self, count: bool) -> anyhow::Result<Look>;
     /// Ready to be let go ([`Store::close`]): everything written goes into the file itself, its
-    /// log emptied, for another process to open it next.
+    /// log emptied, for another process to open it next; a compaction under way stops, its copy
+    /// gone (it would stay behind as the file moves).
     fn release(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -623,7 +624,10 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
             }
             Ok(Msg::Close(reply)) => {
                 commit(&mut engine, &mut pending);
-                let _ = reply.send(engine.release());
+                // Its files closed before it says so: whoever moves them next finds them let go of.
+                let released = engine.release();
+                drop(engine);
+                let _ = reply.send(released);
                 return;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -839,6 +843,13 @@ mod tests {
         st.send("a1", &said("m1", 1, "kept across the upgrade"));
         let (id, top) = (st.id().to_owned(), st.top()?);
         st.close()?;
+        // Its files closed by the time it says so: nothing here holds them as they move.
+        #[cfg(target_os = "linux")]
+        {
+            let file = std::fs::canonicalize(&from)?.to_string_lossy().into_owned();
+            let open: Vec<std::path::PathBuf> = std::fs::read_dir("/proc/self/fd")?.filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok()).filter(|p| p.to_string_lossy().starts_with(&file)).collect();
+            assert!(open.is_empty(), "still open once let go of: {open:?}");
+        }
         // Let go of: nothing more is taken, and asking fails at once.
         st.send("a1", &said("m2", 2, "too late"));
         assert!(st.top().is_err());

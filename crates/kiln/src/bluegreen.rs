@@ -34,7 +34,7 @@ pub const READY_WITHIN: Duration = Duration::from_secs(180);
 pub enum Frame {
     /// green → blue: connected to the server and welcomed; it takes over now. `stores`: it takes
     /// blue's conversation stores over too ([`Frame::Stores`]); a build from before doesn't say,
-    /// and keeps one of its own.
+    /// and keeps one of its own (one that keeps no conversations doesn't say either).
     Ready {
         pid: u32,
         instance: String,

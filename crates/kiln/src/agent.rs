@@ -711,8 +711,10 @@ async fn roll_back(
     }
     let mut problems = Vec::new();
     // Its conversation stores first, before what comes back writes into them: moved back out of
-    // the new build's folder (removed below) and opened again, the same ids and numbers.
+    // the new build's folder (removed below) and opened again, the same ids and numbers. One that
+    // couldn't be moved back keeps that folder.
     let store = mv.stores.as_ref().and_then(|g| take_stores_back(g, &mut problems));
+    let stranded = !problems.is_empty();
     for (i, item) in mv.items.into_iter().enumerate() {
         match item {
             Item::Terminal { session, state, fd, pid } => {
@@ -740,7 +742,9 @@ async fn roll_back(
             }
         }
     }
-    let _ = std::fs::remove_dir_all(crate::upgrade::instance_dir(state_dir, &mv.instance));
+    if !stranded {
+        let _ = std::fs::remove_dir_all(crate::upgrade::instance_dir(state_dir, &mv.instance));
+    }
     if problems.is_empty() {
         span.record("result", "ok");
     } else {
@@ -797,7 +801,7 @@ fn take_stores_back(g: &Given, problems: &mut Vec<String>) -> Option<crate::conv
             && !from.exists()
             && let Err(e) = crate::convo::move_file(to, from)
         {
-            problems.push(format!("conversation store {}: {e:#}", from.display()));
+            problems.push(format!("conversation store {}: {e:#} (it stays at {})", from.display(), to.display()));
         }
     }
     let st = crate::convo::open(&g.own_dir, crate::config::Conversations::default().upkeep())?;
@@ -872,14 +876,15 @@ async fn gone_within(pid: u32, patience: Duration) -> bool {
 /// (The new build's runner, blue/green.) Take over from the runner being upgraded, at `path`: say
 /// it's ready, take each agent session and terminal it hands over (saying how each went), then the
 /// server's frames about them that reached it meanwhile, until that runner ends. Terminals are
-/// taken on this runner's loop (`tx`), which also hears once everything is in.
+/// taken on this runner's loop (`tx`), which also hears once everything is in. `takes_stores`: it
+/// waits for that runner's conversation stores (it keeps conversations).
 #[cfg(unix)]
-async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: async_channel::Sender<Bg>, me: String) -> anyhow::Result<()> {
+async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: async_channel::Sender<Bg>, me: String, takes_stores: bool) -> anyhow::Result<()> {
     use crate::bluegreen::Frame;
     use base64::Engine as _;
     let conn = Arc::new(crate::rt::blocking(move || crate::bluegreen::connect(&path)).await??);
     let c = Arc::clone(&conn);
-    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance: me, stores: true }, &[])).await??;
+    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance: me, stores: takes_stores }, &[])).await??;
     tracing::info!(upgrade = %std::env::var("KILN_UPGRADE_ID").unwrap_or_default(), "connected to the runner being upgraded: taking over");
     // Read on a thread of its own: once everything is in, the connection stays open (idle) until
     // the old runner ends.
@@ -897,8 +902,9 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
     let (mut sessions, mut terminals, mut refused) = (0usize, 0usize, 0usize);
     let mut done = false;
     // Whether it knows which conversation store it goes on with: the runner it takes over from says
-    // first (`Frame::Stores`); one from before says nothing, and this one opens its own then.
-    let mut stores = false;
+    // first (`Frame::Stores`); one from before says nothing, and this one opens its own then. One
+    // that takes none knows already.
+    let mut stores = !takes_stores;
     while let Ok(got) = frx.recv().await {
         let (frame, fds) = match got {
             Ok(f) => f,
@@ -1665,7 +1671,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let said = give_stores(&held, own, copy, &moves);
                                 match conn.send(&said, &[]).and_then(|()| conn.recv()) {
                                     Ok((Frame::Ack { ok: true, .. }, _)) => {}
-                                    Ok((Frame::Ack { error, .. }, _)) => tracing::warn!(error = %error.unwrap_or_default(), "the new build couldn't go on with this runner's conversation stores; it opened its own"),
+                                    // It couldn't go on with them: the upgrade goes no further, and
+                                    // they come back here (a rollback) rather than go unkept.
+                                    Ok((Frame::Ack { error, .. }, _)) => broke = Some(format!("the new build couldn't go on with this runner's conversation stores: {}", error.unwrap_or_default())),
                                     Ok(_) => broke = Some("the new build answered out of turn".to_owned()),
                                     Err(e) => broke = Some(format!("{e:#}")),
                                 }
@@ -1879,6 +1887,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Bg::TakeOverEnded => {
                         if !std::mem::replace(&mut sockets_served, true) {
                             serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                        }
+                        // It ended before the runner it upgraded said which conversation store this
+                        // one goes on with (that one died, or their link broke, before its first
+                        // frame): the store in its own folder, with what that one moved there if it
+                        // got that far.
+                        if stores_wait {
+                            let (done, _) = futures::channel::oneshot::channel();
+                            let _ = bg_tx.try_send(Bg::Stores { own: None, done });
                         }
                         // Its link to the runner it upgraded ended after it took everything over, and
                         // no word of its promotion: that one is gone (one that takes its sessions
@@ -2381,9 +2397,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // connected and welcomed, it says it's ready, and takes everything.
                         #[cfg(unix)]
                         if let Some(path) = take_over.take() {
-                            let (h, tx, me) = (harness.clone(), bg_tx.clone(), instance_id.clone());
+                            let (h, tx, me, takes) = (harness.clone(), bg_tx.clone(), instance_id.clone(), stores_wait);
                             crate::rt::spawn(async move {
-                                if let Err(e) = take_over_from(path, h, tx.clone(), me).await {
+                                if let Err(e) = take_over_from(path, h, tx.clone(), me, takes).await {
                                     tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");
                                 }
                                 let _ = tx.send(Bg::TakeOverEnded).await;
