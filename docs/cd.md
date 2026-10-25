@@ -234,6 +234,30 @@ render is in flight waits for it, so a rollback never deploys the render it repl
 repository kiln hosts, rollback will also open the revert as a diff, so trunk catches up with
 what runs (not yet).
 
+A rollback names its deployment by id (`to`), or by what it ran (`revision`): a commit (whole, or
+its first 7 or more hex digits), a tag of one of the app's git sources (KilnCD's mirror holds its
+tags), or a revision as recorded (a chart's version). Only a deployment that succeeded and was
+kept with its sources' commits can be gone back to; when a commit ran more than once, the newest
+deployment of it that succeeded. Seven digits that begin two deployed commits are refused, with
+both named. `cd.apps.rollback_targets` lists what an app can go back to, newest first, the way the
+app's page offers it: every such deployment, what runs now and repeats of one render left out,
+each with its commit (author, time, the whole message) and the tags that name it. How far back is
+the app's history (`history_limit`, 10 by default; failures go first when it's full). The choosing
+is `kiln_cd::rollback`, pure; the server resolves a tag to its commit first.
+
+**Auto-rollback.** When a deploy fails, kiln goes back on its own: an app whose rollout aborted
+goes back to the deployment before (cd-targets.md §5), kiln's own restart that didn't take has its
+previous image put back by the guard (cd-targets.md §10), and a release that failed after its
+commit is reverted (deploy-api.md §8.1). A person can turn this off, or on, for one app or for every
+app of a repository (the repository whose `.kiln/deploy.yaml` made the app, else its first git
+source's). The app's word beats its repository's, and either beats the deploy file's
+`rollout: { auto-rollback }`; said nowhere, it's on. Off, what failed stays as it is until someone
+rolls it back: the rollout's traffic stays on blue with the app degraded, the release is held for
+a person, and kiln deploying itself starts no guard, so a version of kiln that can't start stays
+down. Each change is audited (`cd.auto_rollback`); the settings are kept in the store's settings
+(`auto-rollback/app/<id>`, `auto-rollback/repo/<url>`). Agents may change one app's where they may
+deploy it; a repository's is a person's.
+
 ## Environments and promotion
 
 Environments come from trunk's `.kiln/environments.yaml`, the file pipelines already use for
@@ -381,8 +405,11 @@ The API lives under `/api/cd`. It follows [access.md](access.md)'s conventions: 
 | GET | `/api/cd/apps/:app/tree?fresh=` | the app's objects and every live object they own (ReplicaSets, Pods, ControllerRevisions, Jobs, EndpointSlices), joined on owner uids: each node's uid, parents, health, sync, age, ready counts, restarts, images, containers and a few info pairs |
 | GET | `/api/cd/apps/:app/diff` | rendered against live, per resource |
 | GET | `/api/cd/apps/:app/manifests` | what the app renders now, as kiln applies it (another revision's: not yet) |
-| POST | `/api/cd/apps/:app/{refresh,sync,rollback,follow,terminate}` | |
-| GET | `/api/cd/apps/:app/history` | deployments |
+| POST | `/api/cd/apps/:app/{refresh,sync,rollback,follow,terminate}` | `rollback` takes `{ to }` (a deployment's id) or `{ revision }` (a commit, a tag, a chart version), and `prune` |
+| GET | `/api/cd/apps/:app/history` | deployments, each with its commit and the tags that name it |
+| GET | `/api/cd/apps/:app/rollback-targets` | what a rollback can go to, newest first, and what runs now |
+| GET / PUT | `/api/cd/apps/:app/auto-rollback` | whether kiln goes back on its own, and who said so (`from`: `app`, `repo`, `deploy-file`, `default`); PUT `{ on: true \| false \| null }` sets or clears the app's |
+| GET / PUT | `/api/cd/repos/auto-rollback` | auto-rollback by repository; PUT `{ repo, on: true \| false \| null }` |
 | GET | `/api/cd/apps/:app/resources/:key` | one object of the tree: its node, live manifest, desired manifest and diff (managed objects), labels, annotations, conditions and owners. `:key` is `group~kind~namespace~name` |
 | GET | `/api/cd/apps/:app/resources/:key/events` | its Kubernetes events, newest first |
 | GET | `/api/cd/apps/:app/resources/:key/logs?container=&pod=&tail_lines=&since_seconds=&previous=` | the last lines of a pod's log, or of a workload's pods merged by time; `/logs/ws` follows them over a WebSocket |
@@ -434,6 +461,15 @@ with a select. The console's one filter field (kind, health, sync, namespace, na
 every view; in the tree a match keeps its owners in view. An object opens in the page: summary,
 live and desired manifests, diff, events, and logs for pods and what runs them (container, pod,
 since, lines; follow, wrap, times, previous run, copy).
+
+**Roll back…** opens in place under the actions: what runs now, then every deployment it can go
+back to (one row each, the same height: its commit, the tags that name it, its message's first
+line, when), found by tag, commit or words of its message; the one chosen shows its whole commit
+message beside the list (under it on a phone), with prune and the button that goes, named for its
+tag or commit. The list and the message each keep one height, so finding and choosing move
+nothing on the page. **Rollback** in the head's lines says whether kiln goes back on its own and
+who said so; **Change…** opens the app's and its repository's switches in place. History's rows
+carry their tags, and a row's rollback shows its commit's whole message.
 
 ## State, replication and scale
 
@@ -534,7 +570,8 @@ and the network come on top, and are measured separately as they are built.
 | `.kiln/deploy.yaml` and environments | read from kiln's repositories at trunk each round (apps registered when they change, removed with the file); artifacts, published images, agents' rights: [cd-targets.md](cd-targets.md) |
 | `/api/cd`, `kiln cd` | built |
 | MCP at `/api/mcp` (and `kiln mcp` over stdio): code mode in QuickJS, a tool per operation, skills; every agent kiln starts gets code mode on its runner (docs/reach.md §7) | built |
-| Rollback: to any deployment kept, held until git changes the app (API, CLI, MCP, UI) | built |
+| Rollback: to any deployment kept, held until git changes the app (API, CLI, MCP, UI); by commit or tag, and what an app can go back to with each commit's message and tags (API, MCP, UI) | built; by commit or tag from the CLI (`kiln cd rollback <app> [n]` takes an id): not yet |
+| Auto-rollback on or off for an app or a repository, over the deploy file's `auto-rollback`, for aborted rollouts, kiln's own guard and failed releases (API, MCP, UI) | built |
 | Plans of a commit, a stack or a pull request: the apps it touches, each diff's own change and the stack's, a sync's steps against what runs, the render and `Prune=false` checks (API, CLI, MCP, and Deployments → Plan a deploy) | built; kiln's own diffs, the land queue, previews, statuses and comments on pull requests, policy checks: not yet |
 | UI: the fleet list (windowed, filtered and sorted on the server, live; the console's filter field with counts per value, namespace included; the fleet's counts; row checkboxes for syncing or refreshing many) and an app's page (revision, last sync, source; the resource tree as a graph or an indented list, a list, pods by owner or node; one filter over every view; an object's summary, manifests, diff, events and logs, followed live; sync of chosen objects, rollback, refresh and hard refresh, take over, stop, delete, each confirmed in place) | built; environments board, previews, fleets, resource actions, the tree over a WebSocket: not yet |
 | Notifications, windows, projects and RBAC, previews | not yet |

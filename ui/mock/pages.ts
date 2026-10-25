@@ -9,6 +9,8 @@ import type {
   Agent,
   CdApp,
   CdAppDetail,
+  CdAutoRollback,
+  CdAutoRollbackSetting,
   CdDeployment,
   CdDiff,
   CdEvent,
@@ -66,6 +68,54 @@ interface MockApp {
   detail: CdAppDetail;
   history: CdDeployment[];
   rollouts?: CdRollout[];
+  /** Auto-rollback set for the app. */
+  autoRollback?: CdAutoRollbackSetting | null;
+}
+
+/** Auto-rollback set for every app of a repository, by its URL. */
+const repoAutoRollback = new Map<string, CdAutoRollbackSetting>();
+
+const COMMIT_SUBJECTS = [
+  "Raise worker memory limit to 1Gi",
+  "Roll the api image forward to 1.42.0",
+  "Add a canary step at 25% for checkout",
+  "Tune HPA thresholds after the Friday spike",
+  "Pin the ingress controller's chart to 4.11",
+  "Move the session cache to its own namespace and give it a PodDisruptionBudget so node drains stop taking every replica at once",
+  'Revert "Enable HTTP/3 on the edge"',
+];
+const COMMIT_BODIES = [
+  "",
+  "The worker was OOM-killed twice an hour under the nightly import.\nA heap profile shows the parser holding whole batches; 1Gi fits\nthe largest batch we've seen with room to spare.\n\nRefs: OPS-2211",
+  "1.42.0 fixes the slow /search queries (an index the planner skipped).\n\n- api: 1.41.3 → 1.42.0\n- migrations: none\n- config: unchanged\n\nRolled out to staging yesterday; p99 dropped from 840 ms to 190 ms.",
+  "Checkout takes 25% for 10 minutes, measured against the error rate\nand p95 latency, before the rest.",
+  "Scale-up reacted too late on Friday: CPU sat at 92% for six minutes\nbefore the first new pod. Target 60% instead of 80%, and a shorter\nstabilization window up.\n\nCo-Authored-By: Mira K <mira@example.com>",
+  "This reverts commit 4be7e1c0. HTTP/3 broke clients behind two corporate proxies that drop UDP 443 without an ICMP reply, so they waited out the whole handshake timeout before falling back. We'll try again with Alt-Svc only on a canary hostname.",
+  "",
+];
+
+/** An app's auto-rollback, as the server works it out: its own, its repository's, its deploy file's, else on. */
+function autoRollbackOf(a: MockApp): CdAutoRollback {
+  const repo = a.detail.origin.kind === "deploy" ? a.detail.origin.repo : (a.detail.definition?.sources[0]?.repo ?? null);
+  const repoSetting = repo ? (repoAutoRollback.get(repo) ?? null) : null;
+  const app = a.autoRollback ?? null;
+  const name = (u: string) => u.replace(/^https:\/\/(github\.com\/)?/, "");
+  const by = (s: CdAutoRollbackSetting | null) => (s?.by ? ` by ${s.by}` : "");
+  if (app) return { on: app.on, from: "app", why: `set for this app${by(app)}`, app, repo, repo_setting: repoSetting, deploy_file: null };
+  if (repoSetting) return { on: repoSetting.on, from: "repo", why: `set for ${name(repo ?? "")}${by(repoSetting)}`, app, repo, repo_setting: repoSetting, deploy_file: null };
+  return { on: true, from: "default", why: "kiln's default", app, repo, repo_setting: null, deploy_file: null };
+}
+
+/** What a rollback can go to: what succeeded, newest first, what runs now and repeats left out. */
+function rollbackTargets(a: MockApp) {
+  const current = a.history.find((d) => d.succeeded) ?? null;
+  const seen = new Set<string>(current?.revision ? [current.revision] : []);
+  const targets = a.history.filter((d) => {
+    if (!d.succeeded || !d.revision || seen.has(d.revision)) return false;
+    seen.add(d.revision);
+    return true;
+  });
+  return { app: a.detail.app, current, targets, kept: 10, shadow: a.detail.shadow };
 }
 
 const apps = new Map<string, MockApp>();
@@ -143,20 +193,40 @@ const apps = new Map<string, MockApp>();
           body: "",
         },
       };
-      const history: CdDeployment[] = Array.from({ length: 6 }, (_, i) => ({
-        app: id,
-        id: 6 - i,
-        op: 6 - i,
-        revision: i === 0 ? revision : hex(r, 40),
-        trigger: pick(r, ["manual", "auto", "self-heal"]),
-        by: r() < 0.4 ? "ada" : null,
-        succeeded: !(i === 2 && r() < 0.4),
-        message: i === 2 ? "one or more objects failed to apply" : "",
-        applied: resources,
-        pruned: i === 1 ? 1 : 0,
-        at_ms: Date.now() - (i + 1) * 9 * 3_600_000,
-        commit: { sha: revision, author: "ada", email: "dev@example.com", at_ms: Date.now() - (i + 1) * 9 * 3_600_000, subject: `Change ${6 - i} to ${name}`, body: "" },
-      }));
+      // Twelve deployments, newest first: tagged releases among them, messages of every length,
+      // one failure, and one render deployed twice.
+      const history: CdDeployment[] = Array.from({ length: 12 }, (_, i) => {
+        const rev = i === 0 ? revision : hex(r, 40);
+        const at = Date.now() - (i + 1) * 9 * 3_600_000;
+        const subject = i === 0 ? (detail.revision_info?.subject ?? "") : (COMMIT_SUBJECTS[(i + n) % COMMIT_SUBJECTS.length] ?? `Change ${12 - i} to ${name}`);
+        return {
+          app: id,
+          id: 12 - i,
+          op: 12 - i,
+          revision: rev,
+          commits: [rev],
+          trigger: pick(r, ["manual", "auto", "self-heal"]),
+          by: r() < 0.4 ? "ada" : null,
+          succeeded: i !== 2,
+          message: i === 2 ? "one or more objects failed to apply" : "",
+          applied: resources,
+          pruned: i === 1 ? 1 : 0,
+          at_ms: at,
+          commit: {
+            sha: rev,
+            author: pick(r, ["ada", "mira.k", "jonas", "ines"]),
+            email: "dev@example.com",
+            at_ms: at - 1_800_000,
+            subject,
+            body: COMMIT_BODIES[(i + n) % COMMIT_BODIES.length] ?? "",
+          },
+          tags: i % 3 === 1 ? [`v1.${40 - i}.0`, ...(i === 4 ? [`release-${40 - i}`] : [])] : [],
+        };
+      });
+      // Deployment 6 deployed again what 7 did.
+      const twin = history[6];
+      const again = history[5];
+      if (twin && again) Object.assign(again, { revision: twin.revision, commits: twin.commits, commit: twin.commit, tags: twin.tags });
       apps.set(id, { app, detail, history });
     }
   }
@@ -194,7 +264,10 @@ const apps = new Map<string, MockApp>();
     };
     const detail: CdAppDetail = {
       ...app,
-      definition: { sources: [{ repo: "https://github.com/hyper-light/thumbs", path: ".kiln/deploy.yaml", revision: "main", chart: null, as_ref: null }], sync: { auto: true, prune: true, self_heal: true, allow_empty: false } },
+      definition: {
+        sources: [{ repo: "https://github.com/hyper-light/thumbs", path: ".kiln/deploy.yaml", revision: "main", chart: null, as_ref: null }],
+        sync: { auto: true, prune: true, self_heal: true, allow_empty: false },
+      },
       commits: [revision],
       children: [],
       revision_info: { sha: revision, author: "ada", email: "dev@example.com", at_ms: at - 360_000, subject: "Resize thumbnails in WebP", body: "" },
@@ -204,7 +277,12 @@ const apps = new Map<string, MockApp>();
   const run = (name: string, against: "preview" | "production", passed: number, failed: number, verdict: CdRollout["checks"][number]["verdict"], why = "", asked = false) => ({
     name,
     against,
-    measurements: [...Array(passed).fill("pass"), ...Array(failed).fill("fail")].map((v, i) => ({ at_ms: at - (passed + failed - i) * 20_000, verdict: v, value: { status: v === "pass" ? 200 : 503 }, message: v === "pass" ? "" : "503 from /healthz" })),
+    measurements: [...Array(passed).fill("pass"), ...Array(failed).fill("fail")].map((v, i) => ({
+      at_ms: at - (passed + failed - i) * 20_000,
+      verdict: v,
+      value: { status: v === "pass" ? 200 : 503 },
+      message: v === "pass" ? "" : "503 from /healthz",
+    })),
     tally: { passed, failed, inconclusive: 0, errors: 0, streak: passed, errors_in_a_row: 0 },
     asked: asked ? { id: 9, at_ms: at - 2_000 } : null,
     next_ms: at + 20_000,
@@ -391,8 +469,25 @@ function tree(id: string): CdTree | null {
     info: [{ name: "Ready", value: "3/3" }],
   });
   const off = a.sync === "OutOfSync";
-  managed("Service", a.name, "", off ? { sync: "OutOfSync", tracked_by: `default/${a.name}-argo`, shared_with: [`default/${a.name}-argo`], marks_only: true, why: `app default/${a.name}-argo's tracking is on it: a sync takes it over` } : {});
-  managed("ConfigMap", `${a.name}-config`, "", { health: null, info: [{ name: "Keys", value: "4" }], ...(off ? { sync: "OutOfSync" as const, marks_only: true, why: ".metadata.labels.kiln.dev/app is missing live" } : {}) });
+  managed(
+    "Service",
+    a.name,
+    "",
+    off
+      ? {
+          sync: "OutOfSync",
+          tracked_by: `default/${a.name}-argo`,
+          shared_with: [`default/${a.name}-argo`],
+          marks_only: true,
+          why: `app default/${a.name}-argo's tracking is on it: a sync takes it over`,
+        }
+      : {},
+  );
+  managed("ConfigMap", `${a.name}-config`, "", {
+    health: null,
+    info: [{ name: "Keys", value: "4" }],
+    ...(off ? { sync: "OutOfSync" as const, marks_only: true, why: ".metadata.labels.kiln.dev/app is missing live" } : {}),
+  });
   if (off) {
     managed("PodDisruptionBudget", a.name, "policy", { health: "Missing", sync: "OutOfSync", missing: true, why: "not in the cluster" });
     managed("ConfigMap", `${a.name}-old`, "", { health: null, sync: "OutOfSync", requires_pruning: true, why: "not in git: requires pruning" });
@@ -547,7 +642,9 @@ function diffOf(id: string): CdDiff[] {
   const a = apps.get(id)?.app;
   if (!a || a.sync !== "OutOfSync") return [];
   const ns = a.namespace;
-  const marks = (app: string) => [{ old_start: 4, old_lines: 3, new_start: 4, new_lines: 3, lines: ["   labels:", `-    app.kubernetes.io/instance: ${app}`, `+    kiln.dev/app: 0123456789abcdef`, `   name: ${a.name}`] }];
+  const marks = (app: string) => [
+    { old_start: 4, old_lines: 3, new_start: 4, new_lines: 3, lines: ["   labels:", `-    app.kubernetes.io/instance: ${app}`, `+    kiln.dev/app: 0123456789abcdef`, `   name: ${a.name}`] },
+  ];
   return [
     {
       key: { group: "apps", kind: "Deployment", namespace: ns, name: a.name },
@@ -556,10 +653,39 @@ function diffOf(id: string): CdDiff[] {
       predicted: "",
       hunks: [{ old_start: 7, old_lines: 3, new_start: 7, new_lines: 3, lines: [" spec:", "-  replicas: 2", "+  replicas: 3", "   revisionHistoryLimit: 5"] }],
     },
-    { key: { group: "", kind: "Service", namespace: ns, name: a.name }, why: `app default/${a.name}-argo's tracking is on it: a sync takes it over`, live: "", predicted: "", hunks: marks(`${a.name}-argo`), tracked_by: `default/${a.name}-argo`, marks_only: true },
-    { key: { group: "", kind: "ConfigMap", namespace: ns, name: `${a.name}-config` }, why: ".metadata.labels.kiln.dev/app is missing live", live: "", predicted: "", hunks: marks(""), marks_only: true },
-    { key: { group: "policy", kind: "PodDisruptionBudget", namespace: ns, name: a.name }, why: "not in the cluster", live: "", predicted: "", hunks: [{ old_start: 0, old_lines: 0, new_start: 1, new_lines: 2, lines: ["+kind: PodDisruptionBudget", `+name: ${a.name}`] }], missing: true },
-    { key: { group: "", kind: "ConfigMap", namespace: ns, name: `${a.name}-old` }, why: "not in git: requires pruning", live: "", predicted: "", hunks: [{ old_start: 1, old_lines: 2, new_start: 0, new_lines: 0, lines: ["-kind: ConfigMap", `-name: ${a.name}-old`] }], requires_pruning: true },
+    {
+      key: { group: "", kind: "Service", namespace: ns, name: a.name },
+      why: `app default/${a.name}-argo's tracking is on it: a sync takes it over`,
+      live: "",
+      predicted: "",
+      hunks: marks(`${a.name}-argo`),
+      tracked_by: `default/${a.name}-argo`,
+      marks_only: true,
+    },
+    {
+      key: { group: "", kind: "ConfigMap", namespace: ns, name: `${a.name}-config` },
+      why: ".metadata.labels.kiln.dev/app is missing live",
+      live: "",
+      predicted: "",
+      hunks: marks(""),
+      marks_only: true,
+    },
+    {
+      key: { group: "policy", kind: "PodDisruptionBudget", namespace: ns, name: a.name },
+      why: "not in the cluster",
+      live: "",
+      predicted: "",
+      hunks: [{ old_start: 0, old_lines: 0, new_start: 1, new_lines: 2, lines: ["+kind: PodDisruptionBudget", `+name: ${a.name}`] }],
+      missing: true,
+    },
+    {
+      key: { group: "", kind: "ConfigMap", namespace: ns, name: `${a.name}-old` },
+      why: "not in git: requires pruning",
+      live: "",
+      predicted: "",
+      hunks: [{ old_start: 1, old_lines: 2, new_start: 0, new_lines: 0, lines: ["-kind: ConfigMap", `-name: ${a.name}-old`] }],
+      requires_pruning: true,
+    },
   ];
 }
 
@@ -635,7 +761,22 @@ export function planning(goal: { agent: string; id: string; text: string }): str
   const id = `pl_${Math.random().toString(36).slice(2, 8)}`;
   const now = Math.floor(Date.now() / 1000);
   const title = goal.text.split(/[.:—]/)[0]!.trim().slice(0, 80);
-  PLANS.unshift({ ...PLANS[0]!, id, title, body: goal.text, items: [], steps: [], tags: [], version: 1, runs: 0, updated_at: now, share: undefined, phase: "planning", research: undefined, source: { goal } } as unknown as (typeof PLANS)[number]);
+  PLANS.unshift({
+    ...PLANS[0]!,
+    id,
+    title,
+    body: goal.text,
+    items: [],
+    steps: [],
+    tags: [],
+    version: 1,
+    runs: 0,
+    updated_at: now,
+    share: undefined,
+    phase: "planning",
+    research: undefined,
+    source: { goal },
+  } as unknown as (typeof PLANS)[number]);
   return id;
 }
 
@@ -671,7 +812,16 @@ const PLANS = [
     version: 1,
     created_at: T0 - 7_200,
     updated_at: T0 - 3_600,
-    steps: ["Store: search by agent and time", "Op: conversations.search", "Agents use it in code mode", "UI: search in Mission Control", "Docs and the kiln-agents skill", "Bench: a million events under 50 ms", "WebKit and phone check", "Ship it"],
+    steps: [
+      "Store: search by agent and time",
+      "Op: conversations.search",
+      "Agents use it in code mode",
+      "UI: search in Mission Control",
+      "Docs and the kiln-agents skill",
+      "Bench: a million events under 50 ms",
+      "WebKit and phone check",
+      "Ship it",
+    ],
     runs: 0,
     phase: "ready",
     research: null,
@@ -736,12 +886,22 @@ const PLANS = [
     title: "QUIC replication",
     body: "Goal: Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
     items: [
-      { title: "Replicate over QUIC", description: "Carry the metadata store's raft log over hyper-quic.", examples: "", acceptance: [{ kind: "qualitative", text: "The replication suite passes on three nodes." }], testing: [], basis: ["f1", "f2"] },
+      {
+        title: "Replicate over QUIC",
+        description: "Carry the metadata store's raft log over hyper-quic.",
+        examples: "",
+        acceptance: [{ kind: "qualitative", text: "The replication suite passes on three nodes." }],
+        testing: [],
+        basis: ["f1", "f2"],
+      },
       {
         title: "Bench with replication on",
         description: "",
         examples: "",
-        acceptance: [{ kind: "qualitative", text: "Fills stay at least 4x ahead of RocksDB." }, { kind: "qualitative", text: "Gets and seeks stay at least 4x ahead of Splinter." }],
+        acceptance: [
+          { kind: "qualitative", text: "Fills stay at least 4x ahead of RocksDB." },
+          { kind: "qualitative", text: "Gets and seeks stay at least 4x ahead of Splinter." },
+        ],
         testing: [],
         needs: [1],
         basis: ["f3"],
@@ -749,7 +909,11 @@ const PLANS = [
       { title: "Document the replication protocol", description: "", examples: "", acceptance: [], testing: [], needs: [1], basis: ["f1"] },
     ],
     tags: ["from a goal"],
-    source: { session: "fam-orch", agent: "Release prep", goal: { agent: "fam-orch", id: "g-quic", text: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB" } },
+    source: {
+      session: "fam-orch",
+      agent: "Release prep",
+      goal: { agent: "fam-orch", id: "g-quic", text: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB" },
+    },
     share: null,
     version: 1,
     created_at: T0 - 3 * 3600,
@@ -887,12 +1051,19 @@ const RESEARCH = {
       {
         id: "f3",
         claim: "QUIC's per-stream ordering keeps tail latency within 10% of TCP under load.",
-        cites: [
-          { source: "s4", quote: "p99 stayed within 8% of TCP at 40k req/s", check: { state: "not_found", at: Date.now() - 3 * 3600_000, said: "the page doesn't hold those words" } },
-        ],
+        cites: [{ source: "s4", quote: "p99 stayed within 8% of TCP at 40k req/s", check: { state: "not_found", at: Date.now() - 3 * 3600_000, said: "the page doesn't hold those words" } }],
         against: [{ claim: "Head-of-line blocking returns when one stream carries everything.", cites: [{ source: "s5", check: { state: "found", at: Date.now() - 3 * 3600_000 } }] }],
         at: Date.now() - 3 * 3600_000,
-        confidence: conf(13, "1 independent source (a blog); 0 of 1 quotes found where cited, 1 not; 1 counterclaim, the strongest moderate", { independent: 1, cites: 1, found: 0, failed: 1, reliability: 0.5, citation: 0.3, against: 0.2, support: 0.15 }),
+        confidence: conf(13, "1 independent source (a blog); 0 of 1 quotes found where cited, 1 not; 1 counterclaim, the strongest moderate", {
+          independent: 1,
+          cites: 1,
+          found: 0,
+          failed: 1,
+          reliability: 0.5,
+          citation: 0.3,
+          against: 0.2,
+          support: 0.15,
+        }),
         against_weights: [0.2],
       },
     ],
@@ -1073,7 +1244,7 @@ function failedJobs(ctx: PagesCtx): UpdateJob[] {
         "   Compiling kiln v0.2.0 (/Users/ada/.cache/kiln/self-build/src-9d2f61c08b7e4a55/crates/kiln)",
         "cargo exited with 101. What it said that went wrong:",
         "error: linking with `cc` failed: exit status: 1",
-        "error: could not compile `kiln` (bin \"kiln\") due to 1 previous error",
+        'error: could not compile `kiln` (bin "kiln") due to 1 previous error',
         "failed: kiln did not build (its full output is /Users/ada/.cache/kiln/self-build/build-9d2f61c08b7e4a55.log on this machine)",
       ],
       error: "kiln did not build (its full output is /Users/ada/.cache/kiln/self-build/build-9d2f61c08b7e4a55.log on this machine)",
@@ -1486,6 +1657,12 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     a.app.auto = def.sync.auto;
     return (void json(res, 200, { app: a.detail.app }), true);
   }
+  if (p === "/api/cd/repos/auto-rollback" && m === "PUT") {
+    const { repo, on } = await ctx.body<{ repo: string; on: boolean | null }>(req);
+    if (on === null) repoAutoRollback.delete(repo);
+    else repoAutoRollback.set(repo, { on, by: "ada", at_ms: Date.now() });
+    return (void json(res, 200, { repo, setting: on === null ? null : { on, by: "ada" } }), true);
+  }
   if (p === "/api/cd/plans/repos") return (void json(res, 200, { repos: PLAN_REPOS }), true);
   if (p === "/api/cd/plans" && m === "POST") {
     const ask = await ctx.body<{ head?: string; commit?: string; pr?: number }>(req);
@@ -1497,10 +1674,26 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     const rest = mm[3] ?? "";
     const a = apps.get(id);
     if (!a) return (err(res, 404, `no app ${id}`), true);
+    if (rest === "/auto-rollback" && m === "PUT") {
+      const { on } = await ctx.body<{ on: boolean | null }>(req);
+      a.autoRollback = on === null ? null : { on, by: "ada", at_ms: Date.now() };
+      return (void json(res, 200, autoRollbackOf(a)), true);
+    }
+    if (rest === "/rollback" && m === "POST") {
+      const { to } = await ctx.body<{ to?: number }>(req);
+      const d = rollbackTargets(a).targets.find((t) => t.id === to);
+      if (!d) return (err(res, 400, `${id} has no deployment ${to} to roll back to`), true);
+      const pin = { to: d.id, revision: d.revision, by: "ada", at_ms: Date.now() };
+      a.detail.pinned = pin;
+      a.app.pinned = pin;
+      return (void json(res, 200, { rolling_back: id, to: d.id, revision: d.revision, commits: d.commits, tag: null }), true);
+    }
     if (m !== "GET") return (void json(res, 200, {}), true);
-    if (rest === "") return (void json(res, 200, a.detail), true);
+    if (rest === "") return (void json(res, 200, { ...a.detail, auto_rollback: autoRollbackOf(a) }), true);
     if (rest === "/tree") return (void json(res, 200, tree(id)), true);
     if (rest === "/history") return (void json(res, 200, { history: a.history }), true);
+    if (rest === "/rollback-targets") return (void json(res, 200, rollbackTargets(a)), true);
+    if (rest === "/auto-rollback") return (void json(res, 200, autoRollbackOf(a)), true);
     if (rest === "/rollout") return (void json(res, 200, { app: id, rollouts: a.rollouts ?? [] }), true);
     if (rest === "/diff") return (void json(res, 200, { diffs: diffOf(id) }), true);
     if (rest === "/resources") return (void json(res, 200, { resources: [] }), true);
@@ -1533,7 +1726,14 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     const session = url.searchParams.get("session");
     const proposed = url.searchParams.get("proposed") === "1";
     const of = (pl: (typeof PLANS)[number]) => (pl as { source?: { session?: string; proposed?: boolean } | null }).source;
-    return (void json(res, 200, PLANS.filter((pl) => (!session || of(pl)?.session === session) && (!proposed || of(pl)?.proposed))), true);
+    return (
+      void json(
+        res,
+        200,
+        PLANS.filter((pl) => (!session || of(pl)?.session === session) && (!proposed || of(pl)?.proposed)),
+      ),
+      true
+    );
   }
   if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/runs)?$/)) && m === "GET") {
     const pl = PLANS.find((x) => x.id === decodeURIComponent(mm![1]!));
@@ -1566,7 +1766,8 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     for await (const c of req) chunks.push(c as Buffer);
     const b = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as { mode?: string; only?: number[]; split?: boolean; session?: string };
     const n = b.only?.length ?? (pl.items?.length || pl.steps?.length || 0);
-    if (b.mode === "agents") return (void json(res, 200, { run: "pr_agents1", steps: n, note: b.only?.length ? `Not in this run, taken as done: the steps step ${b.only[0]} waits for.` : null }), true);
+    if (b.mode === "agents")
+      return (void json(res, 200, { run: "pr_agents1", steps: n, note: b.only?.length ? `Not in this run, taken as done: the steps step ${b.only[0]} waits for.` : null }), true);
     return (void json(res, 200, { session: b.session ?? "fam-orch", sent: n, run: "pr_goals1", split: b.mode === "goals" && b.split ? n : 0 }), true);
   }
   if ((mm = p.match(/^\/api\/shared\/plans\/([^/]+)$/))) {

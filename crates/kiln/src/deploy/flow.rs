@@ -2303,6 +2303,9 @@ async fn failed(d: &Deploy, mut r: Release, why: String) -> anyhow::Result<()> {
     if let Aftermath::Hold(reason) = aftermath(&r) {
         return hold(d, r, &why, &reason).await;
     }
+    if let Some(off) = auto_rollback_off(d, &r).await {
+        return hold(d, r, &why, &off).await;
+    }
     match revert(d, &r, &why).await {
         Ok((Some(sha), _)) => match start_revert(d, &r, &sha).await {
             Ok(back) => {
@@ -2315,6 +2318,16 @@ async fn failed(d: &Deploy, mut r: Release, why: String) -> anyhow::Result<()> {
         Ok((None, _)) => finish(d, r, State::Failed, Some(format!("{why}; nothing of its commit was left to revert"))).await,
         Err(e) => hold(d, r, &why, &format!("its commit couldn't be reverted ({e})")).await,
     }
+}
+
+/// Why a failed release isn't reverted: auto-rollback is off for its app in KilnCD (set for the
+/// app, its repository, or by its rollout's `auto-rollback`; docs/cd.md, "Auto-rollback").
+async fn auto_rollback_off(d: &Deploy, r: &Release) -> Option<String> {
+    let cd = crate::cd::get()?;
+    let a = store::app(&*d.records, &r.app).await.ok().flatten()?;
+    let id = kilncd::app_id(&a, &r.environment);
+    let auto = cd.auto_rollback(&id, None);
+    (!auto.decision.on).then(|| format!("auto-rollback is off for {id} ({})", auto.why()))
 }
 
 /// A release its provider refused, or never got: nothing of it was applied, and git goes back

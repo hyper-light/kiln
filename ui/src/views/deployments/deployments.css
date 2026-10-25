@@ -92,7 +92,6 @@
   cursor: pointer;
 }
 
-
 /* ---------------------------------------------------------------- the fleet */
 .cd-list {
   border-top: 1px solid #2b2d32;
@@ -1380,6 +1379,258 @@ button.cd-gnode:hover {
   grid-column: 1 / -1;
   margin-top: 8px;
 }
+/* The tags that name a commit, beside it. */
+.cd-tags {
+  display: inline-flex;
+  min-width: 0;
+  flex: none;
+  align-items: center;
+  align-self: flex-start;
+  gap: 4px;
+  overflow: hidden;
+}
+.cd-tag {
+  height: 18px;
+  padding: 0 7px;
+  border-color: rgb(186 176 227 / 26%);
+  color: #c9c1ec;
+}
+/* A commit's whole message: its first line, then the rest as it was written. */
+.cd-commit {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.cd-commit-subject {
+  color: #e4e5e7;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.cd-commit-body {
+  color: #c1c3ca;
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- roll back, asked in place */
+/* As wide as the page: the list beside the chosen one's message. */
+.cd-rollback {
+  width: 100%;
+  max-width: 1040px;
+  justify-items: stretch;
+}
+.cd-rollback-hold {
+  max-width: 1040px;
+  border-radius: 6px;
+}
+.cd-rb-now {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 10px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.cd-rb-now-label {
+  flex: none;
+  color: #8f939e;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.cd-rb-now .cd-mono {
+  flex: none;
+}
+.cd-rb-now .cd-tags {
+  align-self: center;
+}
+.cd-rb-now-text {
+  min-width: 0;
+  overflow: hidden;
+  color: #a1a4ad;
+  text-overflow: ellipsis;
+}
+.cd-rb-none {
+  padding: 8px 0;
+}
+.cd-rb {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+.cd-rb-find {
+  max-width: 420px;
+}
+/* The list and the message, each one height (--cd-rb-h: as tall as the list's rows), so nothing
+   under them moves as rows are found or chosen. */
+.cd-rb-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+.cd-rb-list,
+.cd-rb-detail {
+  height: var(--cd-rb-h, 348px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid #25272c;
+  border-radius: 6px;
+  background: #08090a;
+}
+.cd-rb-row {
+  display: grid;
+  height: 58px;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  border-bottom: 1px solid #1d1f23;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+.cd-rb-row:hover {
+  background: rgb(255 255 255 / 2.5%);
+}
+.cd-rb-row[data-picked] {
+  background: rgb(186 176 227 / 6%);
+  box-shadow: inset 2px 0 0 #bab0e3;
+}
+.cd-rb-what {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+.cd-rb-line {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.cd-rb-sha,
+.cd-rb-id {
+  flex: none;
+}
+.cd-rb-subject {
+  overflow: hidden;
+  color: #e4e5e7;
+  font-size: 12.5px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cd-rb-at {
+  white-space: nowrap;
+}
+.cd-rb-nomatch,
+.cd-rb-hint {
+  margin: 0;
+  padding: 16px 14px;
+  color: #8f939e;
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.cd-rb-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+}
+.cd-rb-detail > * {
+  flex: none;
+}
+.cd-rb-detail .cd-rb-hint {
+  padding: 4px 0;
+}
+.cd-rb-detail-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+.cd-rb-detail-head .cd-tags {
+  flex-wrap: wrap;
+  align-self: center;
+  overflow: visible;
+}
+.cd-rb-count {
+  margin: 0;
+}
+/* A radio: the checkbox's drawing, round, with the prism when chosen. */
+.cd-radio {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  border: 1.5px solid #4a4c55;
+  border-radius: 50%;
+  background: transparent;
+  appearance: none;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.cd-radio:hover {
+  border-color: #6b6e78;
+}
+.cd-radio:checked {
+  border-color: transparent;
+  background: radial-gradient(circle, #08090a 0 2.5px, transparent 3px), linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
+}
+.cd-radio:focus-visible {
+  outline: 2px solid #bab0e3;
+  outline-offset: 2px;
+}
+
+/* Auto-rollback, changed in place under the app's lines. */
+.cd-autorb {
+  max-width: 760px;
+  margin-top: 4px;
+}
+.cd-autorb-field {
+  display: grid;
+  max-width: 100%;
+  justify-items: start;
+}
+.cd-autorb-field .field-label {
+  margin-bottom: 6px;
+}
+.cd-autorb-field .field-hint {
+  margin-top: 4px;
+}
+
+@container (max-width: 640px) {
+  /* One column on a phone: the list, then the chosen one's message, each its own height. */
+  .cd-rb-body {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+  .cd-rb-detail {
+    height: 260px;
+  }
+  .cd-rb-find {
+    max-width: none;
+  }
+  .cd-rb-row {
+    gap: 10px;
+    padding: 0 10px;
+  }
+  .cd-rb-now-text {
+    display: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cd-rb-row,
+  .cd-radio {
+    transition: none;
+  }
+}
+
 @container (max-width: 640px) {
   .cd-history-row {
     display: flex;

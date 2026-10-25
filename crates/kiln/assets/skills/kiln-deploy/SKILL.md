@@ -54,12 +54,23 @@ return { ok: p.ok, diffs: p.diffs.map(d => ({ commit: d.commit.subject, ok: d.ok
 
 Undo a bad deploy from its history, not by hand:
 
-1. `kiln.cd.apps.history({ app })` lists deployments, newest first, each with an `id`.
-2. `kiln.cd.apps.rollback({ app })` goes back to the one before what runs now (`to: <id>` picks
-   one; `prune: true` also deletes what it didn't have). It waits for that render, then syncs.
+1. `kiln.cd.apps.rollback_targets({ app })` lists what it can go back to, newest first: each
+   deployment that succeeded (`id`, `revision`), its commit (`commit.subject`, `commit.body`) and
+   the `tags` that name it; `current` is what runs now. `kiln.cd.apps.history({ app })` is every
+   deployment, failures included.
+2. `kiln.cd.apps.rollback({ app })` goes back to the one before what runs now. `to: <id>` picks
+   one; `revision: "v1.4.2"` or `revision: "3f2a9c1"` picks the one that ran that tag or commit
+   (only what kiln deployed and kept: anything else is refused, and says so). `prune: true` also
+   deletes what it didn't have. It waits for that render, then syncs.
 3. The app holds there: automation won't redeploy the bad commit. When git changes the app (the
    fix lands), it follows git again by itself; `kiln.cd.apps.follow({ app })` lets go sooner.
    `kiln.cd.apps.get({ app }).pinned` says whether it is held, and since when.
+
+**Auto-rollback.** `kiln.cd.apps.get({ app }).auto_rollback` (or `kiln.cd.apps.auto_rollback`)
+says whether kiln goes back on its own when a deploy fails, and who said so. Turning it off for
+an app (`kiln.cd.apps.set_auto_rollback({ app, on: false })`, `on: null` to clear) is what a
+person asked for, never a way around a failing rollout; a repository's
+(`kiln.cd.repos.set_auto_rollback`) is a person's alone.
 
 ## Rules
 

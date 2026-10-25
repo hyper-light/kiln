@@ -2,26 +2,9 @@ import type { AgentInfo } from "./harness";
 // Types mirror docs/api.md (and crates/kiln/src/store.rs). Timestamps are unix
 // seconds unless the field name ends in `_ms`. Ids are opaque strings.
 
-export type Status =
-  | "pending"
-  | "queued"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "cancelled"
-  | "skipped"
-  | "timed_out";
+export type Status = "pending" | "queued" | "running" | "succeeded" | "failed" | "cancelled" | "skipped" | "timed_out";
 
-export const STATUSES: Status[] = [
-  "pending",
-  "queued",
-  "running",
-  "succeeded",
-  "failed",
-  "cancelled",
-  "skipped",
-  "timed_out",
-];
+export const STATUSES: Status[] = ["pending", "queued", "running", "succeeded", "failed", "cancelled", "skipped", "timed_out"];
 
 export type RunEvent = "push" | "pull_request" | "tag" | "manual" | "schedule";
 
@@ -1155,6 +1138,45 @@ export interface CdAppDetail extends CdApp {
   children: string[];
   /** Who wrote the revision it is at, when, and what it says. */
   revision_info: CdCommit | null;
+  /** Whether kiln goes back on its own after a failure (older servers: absent). */
+  auto_rollback?: CdAutoRollback;
+}
+
+/** Auto-rollback set by a person, for an app or a repository. */
+export interface CdAutoRollbackSetting {
+  on: boolean;
+  by: string | null;
+  /** ms since the epoch. */
+  at_ms: number;
+}
+
+/**
+ * Whether kiln goes back on its own when an app's deploy fails (its rollout aborts, kiln's own
+ * restart doesn't take, a release fails after its commit), and who said so: the app's setting
+ * beats its repository's, which beats the deploy file's `rollout: { auto-rollback }`.
+ */
+export interface CdAutoRollback {
+  on: boolean;
+  from: "app" | "repo" | "deploy-file" | "default";
+  /** Why, in a few words: `set for this app by ada`. */
+  why: string;
+  app: CdAutoRollbackSetting | null;
+  /** The repository the app follows, when it has one. */
+  repo: string | null;
+  repo_setting: CdAutoRollbackSetting | null;
+  /** Its deploy file's rollout's `auto-rollback`, where it has a rollout. */
+  deploy_file: boolean | null;
+}
+
+/** What an app can be rolled back to, and what runs now. */
+export interface CdRollbackTargets {
+  app: string;
+  current: CdDeployment | null;
+  /** Newest first: each deployment that succeeded and can be rendered again, one per render. */
+  targets: CdDeployment[];
+  /** Deployments the app's history keeps. */
+  kept: number;
+  shadow: boolean;
 }
 
 /** An app's own sync options (Argo CD's), as its definition sets them: none, true or false. */
@@ -1359,6 +1381,8 @@ export interface CdDeployment {
   at_ms: number;
   /** What the deployed commit says. */
   commit?: CdCommit;
+  /** The tags that name what it ran. */
+  tags?: string[];
 }
 
 /** A rollout's step (docs/cd-targets.md §5). */

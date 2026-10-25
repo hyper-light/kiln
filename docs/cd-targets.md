@@ -569,7 +569,8 @@ revision traffic back, the Service's selector back. Switching back never gives u
 platform refuses, kiln tries again 10 seconds later, and the panel says why. The sync that started
 the rollout stays recorded as it ran: it applied what git says. The app reads `Degraded`, and the
 rollout's record says which check failed and what it measured. With `auto-rollback: true` (the
-default), the app then goes back to the deployment that ran before and holds there, as a rollback
+default; a person's setting for the app or its repository beats it, cd.md "Auto-rollback"), the
+app then goes back to the deployment that ran before and holds there, as a rollback
 does in cd.md, until git changes it again; retrying that rollout means letting the app follow git
 again. Without it, traffic stays on blue until a person retries or git moves on, and syncing the
 app again puts traffic moved by hand back on blue.
