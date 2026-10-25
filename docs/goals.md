@@ -146,9 +146,15 @@ doesn't need a person for any of it:
   into what it's doing, to dispatch a subagent of its own (its Agent or Task tool; without one, an
   agent it starts) with the plan's and its research's ids, and to go on with its own work. Its
   planning part waits its turn saying so, and is met once the subagent says the plan is ready. A
-  goal being planned whose planning still waits its turn has **Plan it now**, which does the same;
-  one subagent a plan, and another after half an hour only. The agent planning a goal of its own
-  plans it itself.
+  goal being planned whose planning still waits its turn has **Plan it now**, which does the same.
+  The panel shows the planning live, from the agent's session (the subagent is the one whose brief
+  names the plan): **Asked** until a subagent starts, then **Planning**, with the step's light
+  turning, how far it has got in dots (**Research**, **Steps** once it has written them,
+  **Ready**), its latest call, how many it made, for how long, and **Open** for its thread. A
+  subagent that stops with the plan not ready shows **Stopped**, the dot it stopped at in amber, why
+  in its own words, and **Plan it again**. One subagent a plan at a time: another goes once the last
+  one stopped, or half an hour after kiln asked when none started. The agent planning a goal of its
+  own plans it itself.
 - **Changing one goal: `goals_update`** by its `id`, without giving the whole list: other words
   (`text`: the goal under way goes again as they say), moved (`next`, right after the goal under
   way; `before` or `after` another goal still to go: put before the goal under way, it goes next
