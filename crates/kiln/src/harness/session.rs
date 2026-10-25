@@ -1844,9 +1844,9 @@ async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<Synced>, S
     loop {
         let Some(looked) = sync.look_now(folder).await else { return Ok(None) };
         let st = sync.standing(folder).await.unwrap_or_default();
-        if looked.looked && looked.proposed == 0 && st.unsent == 0 && st.behind == 0 {
+        if let Some(mark) = crate::sync::runner::left_at(&looked, &st) {
             left_behind(cwd, &st).await?;
-            return Ok(Some(Synced { mark: crate::sync::runner::Mark { repo: looked.repo, index: st.reached }, folder: st.folder, name: st.name }));
+            return Ok(Some(Synced { mark, folder: st.folder, name: st.name }));
         }
         let why = match (&st.error, st.connected) {
             (Some(e), _) => format!(" ({e})"),
@@ -2070,7 +2070,7 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
     let mut said = String::new();
     loop {
         let now = match sync.standing(folder).await {
-            Some(st) if st.repo == mark.repo && st.reached >= mark.index => {
+            Some(st) if crate::sync::runner::arrived(&st, mark) => {
                 let waited = started.elapsed();
                 note(format!("Its folder's last changes are here (in {}s); it goes on", waited.as_secs()), Level::Info);
                 crate::metrics::sync().move_files_wait.observe(waited.as_secs_f64());

@@ -13,6 +13,7 @@ pub mod activity;
 pub mod blobs;
 pub mod contents;
 pub mod disk;
+pub mod fs;
 pub mod git;
 pub mod group;
 pub mod places;
@@ -28,10 +29,12 @@ pub mod wire;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 pub use blobs::Blobs;
+use fs::Fs;
 use scan::{Entry, Limits};
 
 /// What a path holds.
@@ -210,6 +213,10 @@ pub struct State {
     /// through this index ([`Copy::adopt`]); none once it has, or for a copy that joined as it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopt: Option<u64>,
+    /// Paths whose version a step brought was kept back, changed here then (`Outcome::Kept`): the
+    /// log's version comes once the change here is proposed, or gone ([`Copy::catch_up`]).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub behind: BTreeSet<String>,
 }
 
 /// What applying a change did here.
@@ -239,6 +246,18 @@ pub struct Copy {
     /// Contents the server no longer has: versions later steps replaced, for a copy far behind.
     /// Such a version is never written here; the later one is.
     pub gone: HashSet<String>,
+    /// The filesystem its folder is on (the machine's own; a simulated one in kiln-sim's models).
+    pub fs: Arc<dyn Fs>,
+    /// Folders whose names changed since its state was last saved: its own (a file renamed in or
+    /// removed, a folder made or removed) and the contents store's its contents went into. Synced
+    /// before the state is ([`Copy::sync_dirs`]), so a power loss can't undo what the saved state
+    /// says the folder holds, or take the contents its steps carry. One entry a folder.
+    pub touched: BTreeSet<PathBuf>,
+    /// A test build's planted bug (kiln-sim's T-T6.1.1): what sync writes into the folder renamed
+    /// in with its bytes unsynced and its folder never synced, as before the first bug kiln-sim
+    /// found was fixed. A power loss then tears, zeroes or loses it.
+    #[cfg(test)]
+    pub planted_unsynced: bool,
 }
 
 /// Whether a path from a step may be written here: relative, `/`-separated, without `.`, `..` or
@@ -297,7 +316,69 @@ fn set(map: &mut BTreeMap<String, Version>, path: &str, v: Option<Version>) {
 
 impl Copy {
     pub fn new(root: &Path, me: &str, member: u64, limits: Limits, state: State) -> Self {
-        Self { root: root.to_owned(), me: me.to_owned(), member, limits, state, skipped: Vec::new(), gone: HashSet::new() }
+        Self::on(fs::std_fs(), root, me, member, limits, state)
+    }
+
+    /// A copy whose folder is on `fs`.
+    pub fn on(fs: Arc<dyn Fs>, root: &Path, me: &str, member: u64, limits: Limits, state: State) -> Self {
+        Self {
+            root: root.to_owned(),
+            me: me.to_owned(),
+            member,
+            limits,
+            state,
+            skipped: Vec::new(),
+            gone: HashSet::new(),
+            fs,
+            touched: BTreeSet::new(),
+            #[cfg(test)]
+            planted_unsynced: false,
+        }
+    }
+
+    /// Whether T-T6.1.1's bug is planted.
+    #[cfg(test)]
+    fn planted(&self) -> bool {
+        self.planted_unsynced
+    }
+
+    /// Whether T-T6.1.1's bug is planted: never, outside a test build.
+    #[cfg(not(test))]
+    fn planted(&self) -> bool {
+        false
+    }
+
+    /// Makes the changes of names in the folders this copy changed durable: what the copy's state
+    /// may then say the folder holds survives a power loss. A folder gone since needs nothing (the
+    /// one it was in is among them); one that failed is tried again next time.
+    pub fn sync_dirs(&mut self) -> io::Result<()> {
+        let dirs = std::mem::take(&mut self.touched);
+        let mut rest = dirs.into_iter();
+        while let Some(dir) = rest.next() {
+            match self.fs.sync_dir(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    self.touched.insert(dir);
+                    self.touched.extend(rest);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Notes that the names in the folder holding `path` changed (and, with `above`, that each
+    /// folder above it, up to the copy's root, is to be synced too).
+    fn touch(&mut self, path: &Path, above: bool) {
+        let mut dir = path.parent();
+        while let Some(d) = dir.filter(|d| d.starts_with(&self.root)) {
+            self.touched.insert(d.to_owned());
+            if !above || *d == self.root {
+                break;
+            }
+            dir = d.parent();
+        }
     }
 
     /// What this copy's file at `path` holds now (none: no file); a ref's, what it names.
@@ -306,18 +387,18 @@ impl Copy {
             return refs::now(&self.root, path);
         }
         let full = self.root.join(path);
-        let meta = match std::fs::symlink_metadata(&full) {
+        let meta = match self.fs.meta(&full) {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        if meta.file_type().is_symlink() {
-            return Ok(Some(Version::Link { target: std::fs::read_link(&full)?.to_string_lossy().replace('\\', "/") }));
+        if meta.is_symlink() {
+            return Ok(Some(Version::Link { target: self.fs.read_link(&full)?.to_string_lossy().replace('\\', "/") }));
         }
         if !meta.is_file() {
             return Ok(None);
         }
-        Ok(Some(Version::File { hash: blobs::hash_file(&full)?, exec: scan::executable(&meta) }))
+        Ok(Some(Version::File { hash: blobs::hash_file_on(self.fs.as_ref(), &full)?, exec: meta.exec }))
     }
 
     /// Whether every folder on the way to `path` is a real folder under the root: a link among them
@@ -327,8 +408,8 @@ impl Copy {
         let parts: Vec<&str> = path.split('/').collect();
         for part in parts.iter().take(parts.len().saturating_sub(1)) {
             at.push(part);
-            match std::fs::symlink_metadata(&at) {
-                Ok(m) if m.file_type().is_symlink() => return false,
+            match self.fs.meta(&at) {
+                Ok(m) if m.is_symlink() => return false,
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return true,
                 Err(_) => return false,
@@ -345,14 +426,21 @@ impl Copy {
             return Ok(Vec::new());
         }
         let mode = self.limits.mode;
-        let (mut found, skipped) = if mode.files() { scan::scan(&self.root, &self.state.seen, &self.limits)? } else { (BTreeMap::new(), Vec::new()) };
+        let (mut found, skipped) = if mode.files() { scan::scan(self.fs.as_ref(), &self.root, &self.state.seen, &self.limits)? } else { (BTreeMap::new(), Vec::new()) };
         self.skipped = skipped;
+        // What the log holds of files the folder fell behind on, brought now that nothing here
+        // stands in its way; read again at the next look.
+        if mode.files() {
+            for path in self.catch_up(&found, blobs)? {
+                found.remove(&path);
+            }
+        }
         // Refs wait while git is in the middle of something here.
         let with_refs = mode.git() && refs::is_repo(&self.root) && !refs::busy(&self.root);
         if with_refs {
             self.catch_up_refs(blobs);
             for (path, version) in refs::read(&self.root, mode.files())? {
-                found.insert(path, Entry { size: 0, mtime_ns: 0, version });
+                found.insert(path, Entry { size: 0, mtime_ns: 0, version, racy: false });
             }
         }
         let mut paths: BTreeSet<String> = found.keys().cloned().collect();
@@ -369,7 +457,7 @@ impl Copy {
                 continue;
             }
             // Not listed but still there (left out: too big, excluded, unreadable): not deleted.
-            if here.is_none() && !refs::is_ref(&path) && std::fs::symlink_metadata(self.root.join(&path)).is_ok() {
+            if here.is_none() && !refs::is_ref(&path) && self.fs.meta(&self.root.join(&path)).is_ok() {
                 continue;
             }
             // Refs only where they sync, and not while git is busy.
@@ -389,6 +477,16 @@ impl Copy {
             self.settle_refs(&mut changes);
             self.bundle_refs(&mut changes, blobs)?;
         }
+        // The store's folders holding what the new steps carry, whoever put it there (a look
+        // before a crash may have, its folders never synced): synced with this copy's before the
+        // state that names them is saved, or a power loss could keep the steps and lose what they
+        // carry.
+        for c in &changes {
+            if let Some(Version::File { hash, .. }) = &c.to {
+                blobs.hold(hash);
+            }
+        }
+        self.touched.extend(blobs.take_touched());
         self.state.seen = found;
         for c in &changes {
             self.state.pending.insert(c.path.clone(), c.to.clone());
@@ -409,7 +507,7 @@ impl Copy {
     /// log index it takes the group's files through). A clone of the source's commit then becomes
     /// the source's working tree, uncommitted work and all, with no conflict copies.
     pub fn adopt(&mut self, at: u64) -> io::Result<()> {
-        let (found, skipped) = if self.limits.mode.files() { scan::scan(&self.root, &BTreeMap::new(), &self.limits)? } else { (BTreeMap::new(), Vec::new()) };
+        let (found, skipped) = if self.limits.mode.files() { scan::scan(self.fs.as_ref(), &self.root, &BTreeMap::new(), &self.limits)? } else { (BTreeMap::new(), Vec::new()) };
         self.skipped = skipped;
         self.state.synced = found.iter().map(|(p, e)| (p.clone(), e.version.clone())).collect();
         // Its refs too: the log's replace them as it brings them.
@@ -450,6 +548,61 @@ impl Copy {
         }
         self.state.adopt = None;
         Ok(out)
+    }
+
+    /// Brings the log's version of each path a step's version was kept back from (changed here then)
+    /// once the change here is gone (undone, or a file made here deleted) without being proposed:
+    /// the folder is then as this copy last synced it, so no look would ever propose it, and the
+    /// step that changed it was taken, so none would bring it either. `found` is what the look found
+    /// here. The paths brought; one whose contents aren't here yet waits for them
+    /// ([`Copy::behind_needs`]).
+    fn catch_up(&mut self, found: &BTreeMap<String, Entry>, blobs: &Blobs) -> io::Result<Vec<String>> {
+        let mut brought = Vec::new();
+        let behind: Vec<String> = self.state.behind.iter().cloned().collect();
+        for path in behind {
+            // Proposed: its step meets the log's version, and the rule decides.
+            if self.state.pending.contains_key(&path) {
+                continue;
+            }
+            let log = self.state.tree.files.get(&path).cloned();
+            let synced = self.state.synced.get(&path).cloned();
+            let here = found.get(&path).map(|e| e.version.clone());
+            if log == synced || here == log {
+                set(&mut self.state.synced, &path, log);
+                self.state.behind.remove(&path);
+                continue;
+            }
+            // Still changed here: the look proposes it.
+            if here != synced || !self.parents_real(&path) {
+                continue;
+            }
+            if let Some(Version::File { hash, .. }) = &log
+                && (!blobs.has(hash) || self.gone.contains(hash))
+            {
+                continue;
+            }
+            self.write(&path, log.as_ref(), blobs)?;
+            set(&mut self.state.synced, &path, log);
+            self.state.behind.remove(&path);
+            brought.push(path);
+        }
+        Ok(brought)
+    }
+
+    /// The contents the paths the folder fell behind on wait for ([`Copy::catch_up`]).
+    pub fn behind_needs(&self, blobs: &Blobs) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .state
+            .behind
+            .iter()
+            .filter_map(|p| match self.state.tree.files.get(p) {
+                Some(Version::File { hash, .. }) if !blobs.has(hash) && !self.gone.contains(hash) => Some(hash.clone()),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// The number of this member's next step: one past what it sent, or past what the log took
@@ -498,8 +651,20 @@ impl Copy {
     }
 
     /// Applies a committed step, in log order (`needs` says which blobs it reads). A step taken
-    /// before changes nothing.
+    /// before changes nothing. All or nothing to the copy's state: when writing its files fails
+    /// part-way (a full disk, an I/O error), the state is put back as it was before it, so the step
+    /// is applied again, whole, next time, its files already written found in place; taken by the
+    /// tree with the rest unwritten, they'd never be written at all.
     pub fn apply(&mut self, step: &Step, blobs: &Blobs) -> io::Result<Vec<Outcome>> {
+        let undo = Undo::of(&self.state, step, self.ours(step));
+        let applied = self.apply_whole(step, blobs);
+        if applied.is_err() {
+            undo.restore(&mut self.state);
+        }
+        applied
+    }
+
+    fn apply_whole(&mut self, step: &Step, blobs: &Blobs) -> io::Result<Vec<Outcome>> {
         let ours = self.ours(step);
         if ours {
             // The log has it: it isn't sent again.
@@ -550,8 +715,9 @@ impl Copy {
                             }
                         } else {
                             // Changed again since: kept, and proposed as a change of what lost, so it can't
-                            // silently undo what won.
+                            // silently undo what won; undone instead, the log's version comes after all.
                             set(&mut self.state.synced, &c.path, c.to.clone());
+                            self.state.behind.insert(c.path.clone());
                         }
                     }
                     out.push(Outcome::Conflict { path: c.path.clone(), copy });
@@ -730,11 +896,17 @@ impl Copy {
         }
         let here = self.now(path)?;
         if here.as_ref() == to {
-            // Here already (the same file on both machines).
+            // Here already: the same file on both machines, or what a process here wrote (or
+            // deleted) before a crash, its folders maybe never synced: synced before the state
+            // says it's here, as a write's are.
+            let full = self.root.join(path);
+            self.touch(&full, true);
             set(&mut self.state.synced, path, to.cloned());
             return Ok(Outcome::Applied { path: path.to_owned() });
         }
         if self.state.pending.contains_key(path) || here != self.state.synced.get(path).cloned() {
+            // Its version comes once the change here is proposed (it meets it in the log), or gone.
+            self.state.behind.insert(path.to_owned());
             return Ok(Outcome::Kept { path: path.to_owned() });
         }
         self.write(path, to, blobs)?;
@@ -742,8 +914,20 @@ impl Copy {
         Ok(Outcome::Applied { path: path.to_owned() })
     }
 
-    /// Makes this copy's `path` hold `v` (none: removes it), atomically for a file.
-    fn write(&self, path: &str, v: Option<&Version>, blobs: &Blobs) -> io::Result<()> {
+    /// Makes the folders `full` goes in.
+    fn make_parents(&self, full: &Path) -> io::Result<()> {
+        match full.parent() {
+            Some(parent) => self.fs.create_dir_all(parent),
+            None => Ok(()),
+        }
+    }
+
+    /// Makes this copy's `path` hold `v` (none: removes it), atomically for a file: its bytes
+    /// durable before its name, and the folders whose names changed noted to be synced before the
+    /// copy's state says the folder holds it ([`Copy::sync_dirs`]). For a file or a link, that's
+    /// its folder and each above it: one made for it, by this write, by a try that failed, or by a
+    /// process before a crash, may not be durable in its own folder yet.
+    fn write(&mut self, path: &str, v: Option<&Version>, blobs: &Blobs) -> io::Result<()> {
         let full = self.root.join(path);
         let gone = |r: io::Result<()>| match r {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -751,36 +935,46 @@ impl Copy {
         };
         match v {
             None => {
-                gone(std::fs::remove_file(&full))?;
+                gone(self.fs.remove_file(&full))?;
+                self.touch(&full, false);
                 // Folders left empty go too, as git leaves none behind.
-                let mut dir = full.parent();
+                let mut dir = full.parent().map(Path::to_path_buf);
                 while let Some(d) = dir.filter(|d| *d != self.root && d.starts_with(&self.root)) {
-                    if std::fs::remove_dir(d).is_err() {
+                    if self.fs.remove_dir(&d).is_err() {
                         break;
                     }
-                    dir = d.parent();
+                    self.touch(&d, false);
+                    dir = d.parent().map(Path::to_path_buf);
                 }
                 Ok(())
             }
             Some(Version::File { hash, exec }) => {
                 let src = blobs.path(hash).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a SHA-256"))?;
-                if let Some(parent) = full.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let tmp = full.with_file_name(format!("{}{}.tmp", scan::TEMP_PREFIX, crate::util::new_id()));
-                std::fs::copy(&src, &tmp)?;
-                let made = set_exec(&tmp, *exec).and_then(|()| std::fs::rename(&tmp, &full));
+                self.make_parents(&full)?;
+                let tmp = full.with_file_name(format!("{}{}.tmp", scan::TEMP_PREFIX, self.fs.temp_id()));
+                self.fs.copy(&src, &tmp)?;
+                // Its bytes durable before its name: renamed in unsynced, a power loss can leave the
+                // name holding nothing, or a torn page, which the next look would take for an edit
+                // made here and spread to every copy.
+                let planted = self.planted();
+                let made = self
+                    .fs
+                    .set_exec(&tmp, *exec)
+                    .and_then(|()| if planted { Ok(()) } else { self.fs.sync_file(&tmp) })
+                    .and_then(|()| self.fs.rename(&tmp, &full));
                 if made.is_err() {
-                    let _ = std::fs::remove_file(&tmp);
+                    let _ = self.fs.remove_file(&tmp);
+                } else if !planted {
+                    self.touch(&full, true);
                 }
                 made
             }
             Some(Version::Link { target }) => {
-                if let Some(parent) = full.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                gone(std::fs::remove_file(&full))?;
-                link(target, &full)
+                self.make_parents(&full)?;
+                gone(self.fs.remove_file(&full))?;
+                self.fs.symlink(target, &full)?;
+                self.touch(&full, true);
+                Ok(())
             }
             // Refs are set through git (`apply_ref`), never written as files.
             Some(Version::Ref { .. }) => Err(io::Error::other(format!("{path} is a ref"))),
@@ -788,28 +982,77 @@ impl Copy {
     }
 }
 
-#[cfg(unix)]
-fn set_exec(path: &Path, exec: bool) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mut p = std::fs::metadata(path)?.permissions();
-    let mode = p.mode();
-    p.set_mode(if exec { mode | 0o111 } else { mode & !0o111 });
-    std::fs::set_permissions(path, p)
+/// What applying a step may change of a copy's state, as it was before ([`Copy::apply`]): the tree's,
+/// synced and pending versions of its paths and of the names their conflict copies would take,
+/// its member's last number, and, for a step of the copy's own, its unsent steps.
+struct Undo {
+    seq: Option<(u64, Option<u64>)>,
+    files: Vec<(String, Option<Version>)>,
+    synced: Vec<(String, Option<Version>)>,
+    pending: Vec<(String, Option<Option<Version>>)>,
+    behind: Vec<(String, bool)>,
+    sent: Option<Vec<Step>>,
 }
 
-#[cfg(not(unix))]
-fn set_exec(_path: &Path, _exec: bool) -> io::Result<()> {
-    Ok(())
-}
+impl Undo {
+    fn of(st: &State, step: &Step, ours: bool) -> Self {
+        let mut paths: Vec<String> = Vec::new();
+        for c in &step.changes {
+            paths.push(c.path.clone());
+            if c.to.is_some() {
+                paths.push(conflict_name(&c.path, &step.by, step.at));
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        Self {
+            seq: (step.seq != 0).then(|| (step.member, st.tree.seqs.get(&step.member).copied())),
+            files: paths.iter().map(|p| (p.clone(), st.tree.files.get(p).cloned())).collect(),
+            synced: paths.iter().map(|p| (p.clone(), st.synced.get(p).cloned())).collect(),
+            pending: paths.iter().map(|p| (p.clone(), st.pending.get(p).cloned())).collect(),
+            behind: paths.iter().map(|p| (p.clone(), st.behind.contains(p))).collect(),
+            sent: ours.then(|| st.sent.clone()),
+        }
+    }
 
-#[cfg(unix)]
-fn link(target: &str, at: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(target, at)
-}
-
-#[cfg(not(unix))]
-fn link(_target: &str, _at: &Path) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "links aren't synced on this system yet"))
+    fn restore(self, st: &mut State) {
+        if let Some((member, seq)) = self.seq {
+            match seq {
+                Some(s) => {
+                    st.tree.seqs.insert(member, s);
+                }
+                None => {
+                    st.tree.seqs.remove(&member);
+                }
+            }
+        }
+        for (p, v) in self.files {
+            set(&mut st.tree.files, &p, v);
+        }
+        for (p, v) in self.synced {
+            set(&mut st.synced, &p, v);
+        }
+        for (p, v) in self.pending {
+            match v {
+                Some(v) => {
+                    st.pending.insert(p, v);
+                }
+                None => {
+                    st.pending.remove(&p);
+                }
+            }
+        }
+        for (p, was) in self.behind {
+            if was {
+                st.behind.insert(p);
+            } else {
+                st.behind.remove(&p);
+            }
+        }
+        if let Some(sent) = self.sent {
+            st.sent = sent;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -868,11 +1111,35 @@ mod tests {
         /// Every synced file of a copy, path → contents.
         fn files(c: &Copy) -> anyhow::Result<BTreeMap<String, String>> {
             let mut out = BTreeMap::new();
-            for p in scan::list(&c.root, &Limits::default())? {
+            for p in scan::list(&fs::Std, &c.root, &Limits::default())? {
                 out.insert(p.clone(), Self::read(c, &p).unwrap_or_default());
             }
             Ok(out)
         }
+    }
+
+    /// CP-T6.1, AC-T6.1.3 (the first bug's fix): a file sync writes is made durable through a
+    /// handle to read: a blob a strict umask made read-only still goes into the other copy (its
+    /// bytes synced before its name).
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_blob_still_goes_into_the_folder() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut t = Two::new()?;
+        Two::write(&t.a, "notes.txt", "kept read-only")?;
+        t.propose('a', 1_000)?;
+        for step in &t.log {
+            for c in &step.changes {
+                if let Some(Version::File { hash, .. }) = &c.to
+                    && let Some(blob) = t.blobs.path(hash)
+                {
+                    std::fs::set_permissions(blob, std::fs::Permissions::from_mode(0o400))?;
+                }
+            }
+        }
+        t.sync()?;
+        assert_eq!(Two::read(&t.b, "notes.txt").as_deref(), Some("kept read-only"));
+        Ok(())
     }
 
     /// Runs git in `dir`: what it printed; a failure fails the test.

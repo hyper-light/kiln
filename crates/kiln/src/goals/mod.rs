@@ -26,6 +26,8 @@
 
 pub mod keep;
 pub mod ops;
+#[cfg(test)]
+mod sim;
 
 use std::collections::HashMap;
 use std::pin::pin;
@@ -1314,9 +1316,8 @@ impl<P> Driver<'_, P>
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
-    /// Every [`TICK`] by its clock, until it's shut down: each running stack stepped, goals set
-    /// in agents adopted, agents no stack drives kept going. Each agent's adoption and step is one
-    /// change to the stacks (`CHANGING`), as each of yours is.
+    /// Every [`TICK`] by its clock, until it's shut down: a round of the stacks (`round`), then the
+    /// agents no stack drives kept going.
     pub async fn drive(&self) -> anyhow::Result<()> {
         let mut ticks: u64 = 0;
         loop {
@@ -1324,63 +1325,11 @@ where
                 return Ok(());
             }
             ticks = ticks.wrapping_add(1);
-            for info in self.port.agents() {
-                let _one = CHANGING.lock().await;
-                if let Err(e) = adopt(self, &info).await {
-                    tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
-                }
-            }
-            // Stacks paused for a while whose time is up: running again, what's next going at once.
-            let now = self.clock.unix_ms();
-            let due: Vec<String> = self
-                .store
-                .call(move |c| {
-                    let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND resume_at > 0 AND resume_at <= ?1")?;
-                    let v = st.query_map(params![now], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-                    Ok(v)
-                })
-                .await
-                .unwrap_or_default();
-            for agent in &due {
-                let _one = CHANGING.lock().await;
-                if let Err(e) = resume_due(self, agent).await {
-                    tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
-                }
-            }
-            let running: Vec<String> = self
-                .store
-                .call(|c| {
-                    let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running'")?;
-                    let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-                    Ok(v)
-                })
-                .await
-                .unwrap_or_default();
-            for agent in &running {
-                let _one = CHANGING.lock().await;
-                if let Err(e) = step(self, agent, false).await {
-                    tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
-                }
-            }
-            resume_lifted(self).await;
-            // What the stacks said that an edit may not have got to their agents: said again.
-            {
-                let _one = CHANGING.lock().await;
-                resay(self.port, self.clock.unix_ms()).await;
-            }
+            let (running, waiting) = self.round(&CHANGING).await;
             // The agents no goal stack drives: kept going when they stop part-way (`keep`), but
             // for those `keep_going` leaves alone.
             let now = self.clock.unix_ms();
             let all = self.port.agents();
-            let waiting: Vec<String> = self
-                .store
-                .call(|c| {
-                    let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND resume_at > 0")?;
-                    let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-                    Ok(v)
-                })
-                .await
-                .unwrap_or_default();
             let held = paused_for_usage(self.store).await;
             let quiet: Vec<String> = all.iter().filter(|i| i.pause.is_some() || held.contains(&i.id)).map(|i| i.id.clone()).collect();
             for info in keep_going(&all, &running, &waiting, &quiet) {
@@ -1410,6 +1359,70 @@ where
                 }
             }
         }
+    }
+
+    /// One round of the stacks, as each [`TICK`] has: goals set in agents adopted, stacks paused
+    /// for a while whose time is up running again, each running stack stepped, stacks paused for
+    /// usage going on once their limit lifts (`resume_lifted`), and what an edit may not have got
+    /// to an agent said again (`resay`). Each agent's
+    /// adoption, resumption and step is one change to the stacks, under `changing` (`CHANGING`, as
+    /// each of yours is; kiln-sim's model has its own). The stacks running, and those paused for a
+    /// while.
+    async fn round(&self, changing: &async_lock::Mutex<()>) -> (Vec<String>, Vec<String>) {
+        for info in self.port.agents() {
+            let _one = changing.lock().await;
+            if let Err(e) = adopt(self, &info).await {
+                tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
+            }
+        }
+        // Stacks paused for a while whose time is up: running again, what's next going at once.
+        let now = self.clock.unix_ms();
+        let due: Vec<String> = self
+            .store
+            .call(move |c| {
+                let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND resume_at > 0 AND resume_at <= ?1")?;
+                let v = st.query_map(params![now], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+                Ok(v)
+            })
+            .await
+            .unwrap_or_default();
+        for agent in &due {
+            let _one = changing.lock().await;
+            if let Err(e) = resume_due(self, agent).await {
+                tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
+            }
+        }
+        let running: Vec<String> = self
+            .store
+            .call(|c| {
+                let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running'")?;
+                let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+                Ok(v)
+            })
+            .await
+            .unwrap_or_default();
+        for agent in &running {
+            let _one = changing.lock().await;
+            if let Err(e) = step(self, agent, false).await {
+                tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
+            }
+        }
+        resume_lifted(self, changing).await;
+        // What the stacks said that an edit may not have got to their agents: said again.
+        {
+            let _one = changing.lock().await;
+            resay(self.port, self.clock.unix_ms()).await;
+        }
+        let waiting: Vec<String> = self
+            .store
+            .call(|c| {
+                let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND resume_at > 0")?;
+                let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+                Ok(v)
+            })
+            .await
+            .unwrap_or_default();
+        (running, waiting)
     }
 
     /// Waits one [`TICK`] by its clock: false when it's shut down first.
@@ -1901,7 +1914,7 @@ async fn paused_for_usage(store: &crate::store::Store) -> Vec<String> {
 /// harness said of it before (the clear the pause sent) doesn't count. A stack you paused stays
 /// paused: each goes on only if it's still paused for usage when it does, under the stacks' lock
 /// (`CHANGING`), so a pause of yours made meanwhile holds.
-async fn resume_lifted<P>(d: &Driver<'_, P>)
+async fn resume_lifted<P>(d: &Driver<'_, P>, changing: &async_lock::Mutex<()>)
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
@@ -1914,7 +1927,7 @@ where
         if crate::programs::rule(d.store, &all, &agent).await != crate::programs::Rule::Ok {
             continue;
         }
-        let _one = CHANGING.lock().await;
+        let _one = changing.lock().await;
         let said_at = all.iter().find(|i| i.id == agent).and_then(|i| i.objective.as_ref()).map_or(0, |o| o.at);
         let now = d.clock.unix_ms();
         let (a, like) = (agent.clone(), format!("{}%", crate::programs::PAUSED_FOR_USAGE));
@@ -3190,20 +3203,20 @@ mod stack_tests {
             let cleared = crate::harness::model::Objective { text: "LAB-T7.1 Hex set up".into(), status: "cleared".into(), reason: None, at: clock.unix_ms() };
             assert!(port.update(id, |i| i.objective = Some(cleared.clone())));
             assert!(port.update(id, |i| i.limits = weekly(90.0)));
-            resume_lifted(&driver).await;
+            resume_lifted(&driver, &CHANGING).await;
             assert_eq!(state().await?.0, "paused", "between 80% and 95% it stays paused");
             // At 80% or under: it goes on, its goal still under way and sent to the agent again at
             // once; the clear doesn't end it.
             clock.advance(Duration::from_secs(60));
             assert!(port.update(id, |i| i.limits = weekly(40.0)));
-            resume_lifted(&driver).await;
+            resume_lifted(&driver, &CHANGING).await;
             assert_eq!(state().await?, ("running".to_owned(), None));
             assert_eq!((goal().await?, sends()), (Some("active".to_owned()), 2), "its goal goes on, sent again");
             step(&driver, id, false).await?;
             assert_eq!(goal().await?, Some("active".to_owned()), "not ended as skipped by the pause's clear");
             // Paused by you: never resumed for usage.
             store.call(|c| touch(c, "hex-t7", Some("paused"), Some(PAUSED_BY_YOU), 1)).await?;
-            resume_lifted(&driver).await;
+            resume_lifted(&driver, &CHANGING).await;
             assert_eq!(state().await?.0, "paused");
             Ok(())
         })

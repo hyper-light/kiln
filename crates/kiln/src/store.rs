@@ -19,6 +19,11 @@ pub mod migrations;
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<Inner>,
+    /// A test build's store whose calls run on the calling task, each after yielding once
+    /// ([`Store::in_memory_inline`]): what kiln-sim's models drive under their seeded scheduler, a
+    /// crash able to come at each call's wait.
+    #[cfg(test)]
+    inline: bool,
 }
 
 /// The store's connection, and with the cluster group what its writes go through.
@@ -414,7 +419,7 @@ impl Store {
     /// stopped, and setups that turn the group off (`[cluster] group = false`).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Self::connect(path)?;
-        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }) })
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }), #[cfg(test)] inline: false })
     }
 
     /// The store at `path` with its writes through the cluster group, its log in `cluster`
@@ -423,7 +428,7 @@ impl Store {
         let conn = Self::connect(path)?;
         let group = group::Group::open(path, cluster).context("the cluster group")?;
         let watch = capture::Watch::install(&conn, LOCAL)?;
-        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: Some(watch), group: Some(group), path: Some(path.to_path_buf()), scratch: None }) })
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: Some(watch), group: Some(group), path: Some(path.to_path_buf()), scratch: None }), #[cfg(test)] inline: false })
     }
 
     /// A runner's replica of kiln.db (docs/p2p.md, P2), to read: its learner alone writes it, so
@@ -432,7 +437,7 @@ impl Store {
     pub fn open_replica(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
-        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }) })
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }), #[cfg(test)] inline: false })
     }
 
     fn connect(path: &Path) -> anyhow::Result<Connection> {
@@ -459,7 +464,18 @@ impl Store {
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
-        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }) })
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }), #[cfg(test)] inline: false })
+    }
+
+    /// An in-memory store whose calls run on the calling task, each after yielding once: kiln-sim's
+    /// models drive it under their seeded scheduler, so a crash can come at each call (CP-T6.1).
+    /// Never the cluster group's, whatever `KILN_STORE_GROUP` says.
+    #[cfg(test)]
+    pub fn in_memory_inline() -> anyhow::Result<Self> {
+        let mut conn = Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA)?;
+        migrations::apply(&mut conn)?;
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }), inline: true })
     }
 
     /// Run `f` with the connection on this thread: for what's read once as the server starts,
@@ -521,6 +537,20 @@ impl Store {
         F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(test)]
+        if self.inline {
+            let mut yielded = false;
+            futures::future::poll_fn(|cx| {
+                if std::mem::replace(&mut yielded, true) {
+                    return std::task::Poll::Ready(());
+                }
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            })
+            .await;
+            let mut g = self.inner.conn.lock();
+            return f(&mut g);
+        }
         let inner = self.inner.clone();
         crate::rt::blocking(move || {
             let mut g = inner.conn.lock();
