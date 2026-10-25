@@ -24,6 +24,10 @@
 //!   the claims that put it there ([`separate`]): every key they reached keeps only what its own
 //!   outputs show and is quarantined, as is everything that took one of them by class (its
 //!   lineage), so none of them serves a class-based hit again.
+//! - **Where classes are kept.** [`EGraph`] keeps them in memory; the work ledger keeps them as rows
+//!   (W24-R02's `work.eclass`). Both are [`Classes`], and [`split`] runs on either alike, so what a
+//!   mismatch quarantines is decided here whichever keeps them; [`producing`] decides what a unit's
+//!   outputs make of its key for both.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -169,6 +173,44 @@ impl Member {
     pub fn anchored(&self) -> bool {
         self.produced.is_some() && self.produced.as_deref() == self.class.output()
     }
+
+    /// Whether a claim may join it to others: it isn't quarantined or nondeterministic.
+    pub fn claimable(&self) -> bool {
+        !self.quarantined && !self.nondeterministic
+    }
+
+    /// How a unit that names it as an upstream unit takes it by class ([`ClassId::rep`]): not at
+    /// all once a split has quarantined it.
+    pub fn rep(&self) -> Option<String> {
+        (!self.quarantined).then(|| self.class.rep())
+    }
+
+    /// Whether a lookup may take a result through it by class (W24-R30): it takes claims, and its
+    /// class has outputs.
+    pub fn serves(&self) -> bool {
+        self.claimable() && self.class.output().is_some()
+    }
+}
+
+/// What `key`'s member is once its unit is seen producing `produced` (W24-R30): a key with none
+/// yet becomes `writer`'s, in the class of those outputs; one with a member keeps it, now with those
+/// outputs, in their class. Refused when its unit produced other outputs before, or its class holds
+/// others: verification settles which ([`split`]).
+pub fn producing(key: &Key, m: Option<&Member>, writer: &str, produced: &str) -> Result<Member, Refused> {
+    if !digest_ok(produced) {
+        return Err(Refused::Digest(produced.to_owned()));
+    }
+    let class = ClassId::Output(produced.to_owned());
+    let Some(m) = m else {
+        return Ok(Member { class, writer: writer.to_owned(), produced: Some(produced.to_owned()), quarantined: false, nondeterministic: false });
+    };
+    if m.nondeterministic {
+        return Err(Refused::Nondeterministic(*key));
+    }
+    if let Some(held) = m.produced.as_deref().or(m.class.output()).filter(|held| *held != produced) {
+        return Err(Refused::Conflict { held: held.to_owned(), seen: produced.to_owned() });
+    }
+    Ok(Member { class, produced: Some(produced.to_owned()), ..m.clone() })
 }
 
 /// Why two keys are one class with no outputs of both to show it: a claim.
@@ -262,6 +304,74 @@ pub fn separate(tree: &BTreeMap<Key, Member>, claims: &BTreeSet<(Key, Key)>, at:
     Split { members, dropped: claims.clone() }
 }
 
+/// Where an e-graph's classes are kept: [`EGraph`] in memory, or the work ledger's rows (W24-R02's
+/// `work.eclass`). [`tree`] and [`split`] run on either alike.
+pub trait Classes {
+    type Error: From<Refused>;
+    /// A key's member, if it has one.
+    fn entry(&self, k: &Key) -> Result<Option<Member>, Self::Error>;
+    /// The keys claimed equal to `k`.
+    fn claimed(&self, k: &Key) -> Result<BTreeSet<Key>, Self::Error>;
+    /// The keys of the units that took `k` by class: its lineage.
+    fn lineage(&self, k: &Key) -> Result<BTreeSet<Key>, Self::Error>;
+    /// Makes a split so: its members as it has them, its claims dropped.
+    fn apply(&mut self, split: &Split) -> Result<(), Self::Error>;
+}
+
+/// The keys the claims join to `at` within its class, `at` among them, and the claims among them,
+/// each pair once.
+pub fn tree<G: Classes + ?Sized>(g: &G, at: &Key) -> Result<(BTreeMap<Key, Member>, BTreeSet<(Key, Key)>), G::Error> {
+    let (mut tree, mut edges) = (BTreeMap::new(), BTreeSet::new());
+    let mut queue = VecDeque::from([*at]);
+    while let Some(k) = queue.pop_front() {
+        if tree.contains_key(&k) {
+            continue;
+        }
+        let Some(m) = g.entry(&k)? else { continue };
+        tree.insert(k, m);
+        for other in g.claimed(&k)? {
+            edges.insert(if k < other { (k, other) } else { (other, k) });
+            queue.push_back(other);
+        }
+    }
+    Ok((tree, edges))
+}
+
+/// Splits `at`'s class where verification saw its unit produce `observed` instead of the class's
+/// outputs, or (`None`) where a lineage reaches it ([`separate`]), then every class whose units
+/// took one of the keys it quarantined by class, in turn. Returns every key quarantined; nothing
+/// when `observed` is the class's own outputs.
+pub fn split<G: Classes + ?Sized>(g: &mut G, at: &Key, observed: Option<&str>) -> Result<BTreeSet<Key>, G::Error> {
+    let m = g.entry(at)?.ok_or(Refused::Unknown(*at))?;
+    if let Some(o) = observed {
+        if !digest_ok(o) {
+            return Err(Refused::Digest(o.to_owned()).into());
+        }
+        if m.class.output() == Some(o) {
+            return Ok(BTreeSet::new());
+        }
+    }
+    let mut quarantined = BTreeSet::new();
+    let mut queue = VecDeque::from([(*at, observed.map(str::to_owned))]);
+    while let Some((k, seen)) = queue.pop_front() {
+        if seen.is_none() && quarantined.contains(&k) {
+            continue;
+        }
+        let (reached, claims) = tree(g, &k)?;
+        let parts = separate(&reached, &claims, &k, seen.as_deref());
+        g.apply(&parts)?;
+        for m in parts.members.keys() {
+            quarantined.insert(*m);
+            for p in g.lineage(m)? {
+                if !quarantined.contains(&p) {
+                    queue.push_back((p, None));
+                }
+            }
+        }
+    }
+    Ok(quarantined)
+}
+
 /// An e-graph of one trust domain: a union-find over keys with each class's analysis, the claims
 /// that joined keys without outputs, and units as terms for congruence.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -305,10 +415,10 @@ impl EGraph {
         &self.classes
     }
 
-    /// How a unit that names `k` as an upstream unit takes it by class ([`ClassId::rep`]): not at
+    /// How a unit that names `k` as an upstream unit takes it by class ([`Member::rep`]): not at
     /// all when it's quarantined or not here.
     pub fn rep(&self, k: &Key) -> Option<String> {
-        self.members.get(k).filter(|m| !m.quarantined).map(|m| m.class.rep())
+        self.members.get(k).and_then(Member::rep)
     }
 
     fn admit(&self, writer: &str) -> Result<(), Refused> {
@@ -336,20 +446,10 @@ impl EGraph {
             return Err(Refused::Digest(produced.to_owned()));
         }
         self.admit(writer)?;
-        if let Some(m) = self.members.get(&key) {
-            if m.nondeterministic {
-                return Err(Refused::Nondeterministic(key));
-            }
-            if let Some(held) = m.produced.as_deref().or(m.class.output()).filter(|held| *held != produced) {
-                return Err(Refused::Conflict { held: held.to_owned(), seen: produced.to_owned() });
-            }
-        }
-        let class = self.add(key, writer)?;
-        if let Some(m) = self.members.get_mut(&key) {
-            m.produced = Some(produced.to_owned());
-        }
-        let to = ClassId::Output(produced.to_owned());
-        self.relabel(&class, &to);
+        let now = producing(&key, self.members.get(&key), writer, produced)?;
+        let (from, to) = (self.add(key, writer)?, now.class.clone());
+        self.members.insert(key, now);
+        self.relabel(&from, &to);
         Ok(to)
     }
 
@@ -444,53 +544,34 @@ impl EGraph {
     }
 
     /// The keys the claims join to `at` within its class, `at` among them, and the claims among
-    /// them, each pair once.
+    /// them, each pair once ([`tree`]).
     pub fn tree(&self, at: &Key) -> (BTreeMap<Key, Member>, BTreeSet<(Key, Key)>) {
-        let (mut tree, mut edges) = (BTreeMap::new(), BTreeSet::new());
-        let mut queue = VecDeque::from([*at]);
-        while let Some(k) = queue.pop_front() {
-            let Some(m) = self.members.get(&k).filter(|_| !tree.contains_key(&k)) else { continue };
-            tree.insert(k, m.clone());
-            for other in self.claims.get(&k).into_iter().flat_map(BTreeMap::keys) {
-                edges.insert(if k < *other { (k, *other) } else { (*other, k) });
-                queue.push_back(*other);
-            }
-        }
-        (tree, edges)
+        tree(self, at).unwrap_or_default()
     }
 
     /// Splits `at`'s class where verification saw its unit produce `observed`, or (`None`) where a
-    /// lineage reaches it ([`separate`]), then every class whose terms took one of the keys it
-    /// quarantined by class, in turn. Returns every key quarantined; nothing when `observed` is the
-    /// class's own outputs.
+    /// lineage reaches it ([`split`]): its lineage is the terms that name a key by key.
     pub fn split(&mut self, at: &Key, observed: Option<&str>) -> Result<BTreeSet<Key>, Refused> {
-        let m = self.members.get(at).ok_or(Refused::Unknown(*at))?;
-        if let Some(o) = observed {
-            if !digest_ok(o) {
-                return Err(Refused::Digest(o.to_owned()));
-            }
-            if m.class.output() == Some(o) {
-                return Ok(BTreeSet::new());
-            }
-        }
-        let mut quarantined = BTreeSet::new();
-        let mut queue = VecDeque::from([(*at, observed.map(str::to_owned))]);
-        while let Some((k, seen)) = queue.pop_front() {
-            if seen.is_none() && quarantined.contains(&k) {
-                continue;
-            }
-            let (tree, claims) = self.tree(&k);
-            let split = separate(&tree, &claims, &k, seen.as_deref());
-            self.apply(&split);
-            for m in split.members.keys() {
-                quarantined.insert(*m);
-                queue.extend(self.parents.get(m).into_iter().flatten().filter(|p| !quarantined.contains(*p)).map(|p| (*p, None)));
-            }
-        }
-        Ok(quarantined)
+        split(self, at, observed)
+    }
+}
+
+impl Classes for EGraph {
+    type Error = Refused;
+
+    fn entry(&self, k: &Key) -> Result<Option<Member>, Refused> {
+        Ok(self.members.get(k).cloned())
     }
 
-    fn apply(&mut self, split: &Split) {
+    fn claimed(&self, k: &Key) -> Result<BTreeSet<Key>, Refused> {
+        Ok(self.claims.get(k).map(|c| c.keys().copied().collect()).unwrap_or_default())
+    }
+
+    fn lineage(&self, k: &Key) -> Result<BTreeSet<Key>, Refused> {
+        Ok(self.parents.get(k).cloned().unwrap_or_default())
+    }
+
+    fn apply(&mut self, split: &Split) -> Result<(), Refused> {
         for (a, b) in &split.dropped {
             for (x, y) in [(a, b), (b, a)] {
                 let empty = match self.claims.get_mut(x) {
@@ -521,6 +602,7 @@ impl EGraph {
             }
             self.members.insert(*k, m.clone());
         }
+        Ok(())
     }
 }
 
@@ -954,8 +1036,40 @@ mod tests {
         def.split('\n').filter(|op| op.trim() != "true").collect::<Vec<_>>().join("\n")
     }
 
+    /// A DAG's nodes as terms of `g`, each over its inputs by key, and those that ran recorded with
+    /// what they produce: the leaves (`leaf0` and `leaf2` alike, as `leaf1` and `leaf3` are) and
+    /// the inner nodes whose unit ran, their outputs worked out from their inputs' without the rules
+    /// (which keep what a script does). Each node: its key, definition, inputs, what it produces,
+    /// and whether that was seen.
+    fn grow(g: &mut EGraph, nodes: &[(u8, Vec<Index>, bool)], with_rules: bool) -> Result<Vec<(Key, String, Vec<usize>, String, bool)>, Refused> {
+        let mut built: Vec<(Key, String, Vec<usize>, String, bool)> = Vec::new();
+        for (i, (def, inputs, ran)) in nodes.iter().enumerate() {
+            let inputs: Vec<usize> = if i == 0 { Vec::new() } else { inputs.iter().map(|x| x.index(i)).collect() };
+            let (definition, truth) = if inputs.is_empty() {
+                (format!("leaf{def}"), format!("sha256:leaf{}", def % 2))
+            } else {
+                let definition = DEFS.get(usize::from(*def)).copied().unwrap_or_default().to_owned();
+                let mut h = Sha256::new();
+                h.update(if with_rules { meaning(&definition) } else { definition.clone() });
+                for (n, j) in inputs.iter().enumerate() {
+                    h.update(format!("/in{n}={}", built.get(*j).map(|b| b.3.as_str()).unwrap_or_default()));
+                }
+                (definition, format!("sha256:{}", Key(h.finalize().into()).hex()))
+            };
+            let upstream: Vec<(String, String)> = inputs.iter().enumerate().filter_map(|(n, j)| built.get(*j).map(|b| (format!("in{n}"), refer(&b.0)))).collect();
+            let u = unit(&definition, &upstream.iter().map(|(n, v)| (n.as_str(), v.clone())).collect::<Vec<_>>());
+            let own = g.add_term("trusted", &u)?;
+            let seen = inputs.is_empty() || *ran;
+            if seen {
+                g.record(own, "trusted", &truth)?;
+            }
+            built.push((own, definition, inputs, truth, seen));
+        }
+        Ok(built)
+    }
+
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(2_000))]
+        #![proptest_config(ProptestConfig::with_cases(5_000))]
 
         /// W24-R30: congruence closure on random DAGs. After rebuilding, two nodes are one class
         /// exactly when the smallest congruence holding the outputs seen says so, found here by
@@ -968,30 +1082,7 @@ mod tests {
             let rules = if with_rules { sound()? } else { Rules::default() };
             let same_op = |a: &str, b: &str| if with_rules { meaning(a) == meaning(b) } else { a == b };
             let mut g = EGraph::new("trusted");
-            // Each node: its key, definition, inputs, what it produces, whether that was seen.
-            let mut built: Vec<(Key, String, Vec<usize>, String, bool)> = Vec::new();
-            for (i, (def, inputs, ran)) in nodes.iter().enumerate() {
-                let inputs: Vec<usize> = if i == 0 { Vec::new() } else { inputs.iter().map(|x| x.index(i)).collect() };
-                let (definition, truth) = if inputs.is_empty() {
-                    (format!("leaf{def}"), format!("sha256:leaf{}", def % 2))
-                } else {
-                    let definition = DEFS.get(usize::from(*def)).copied().unwrap_or_default().to_owned();
-                    let mut h = Sha256::new();
-                    h.update(if with_rules { meaning(&definition) } else { definition.clone() });
-                    for (n, j) in inputs.iter().enumerate() {
-                        h.update(format!("/in{n}={}", built.get(*j).map(|b| b.3.as_str()).unwrap_or_default()));
-                    }
-                    (definition, format!("sha256:{}", Key(h.finalize().into()).hex()))
-                };
-                let upstream: Vec<(String, String)> = inputs.iter().enumerate().filter_map(|(n, j)| built.get(*j).map(|b| (format!("in{n}"), refer(&b.0)))).collect();
-                let u = unit(&definition, &upstream.iter().map(|(n, v)| (n.as_str(), v.clone())).collect::<Vec<_>>());
-                let own = g.add_term("trusted", &u)?;
-                let seen = inputs.is_empty() || *ran;
-                if seen {
-                    g.record(own, "trusted", &truth)?;
-                }
-                built.push((own, definition, inputs, truth, seen));
-            }
+            let built = grow(&mut g, &nodes, with_rules)?;
             prop_assert!(g.rebuild(&rules).is_empty());
             let mut naive = Naive::new();
             for i in 0..built.len() {
@@ -1217,6 +1308,97 @@ mod tests {
         let again = g.split(&x2, Some(&out(3)))?;
         assert!(again.contains(&x2) && g.member(&x2).is_some_and(|m| m.nondeterministic));
         assert!(matches!(g.record(x2, "trusted", &out(3)), Err(Refused::Nondeterministic(_))));
+        Ok(())
+    }
+
+    /// Classes kept as the work ledger keeps them: a row per member, claims and lineage as pairs,
+    /// and no index of classes.
+    #[derive(Debug, Default, PartialEq)]
+    struct Rows {
+        members: BTreeMap<Key, Member>,
+        claims: BTreeSet<(Key, Key)>,
+        lineage: BTreeSet<(Key, Key)>,
+    }
+
+    impl Rows {
+        fn of(g: &EGraph) -> Rows {
+            Rows {
+                members: g.members.clone(),
+                claims: g.claims.iter().flat_map(|(a, others)| others.keys().map(move |b| (*a, *b))).collect(),
+                lineage: g.parents.iter().flat_map(|(up, took)| took.iter().map(move |t| (*up, *t))).collect(),
+            }
+        }
+    }
+
+    impl Classes for Rows {
+        type Error = Refused;
+
+        fn entry(&self, k: &Key) -> Result<Option<Member>, Refused> {
+            Ok(self.members.get(k).cloned())
+        }
+
+        fn claimed(&self, k: &Key) -> Result<BTreeSet<Key>, Refused> {
+            Ok(self.claims.iter().filter(|(a, _)| a == k).map(|(_, b)| *b).collect())
+        }
+
+        fn lineage(&self, k: &Key) -> Result<BTreeSet<Key>, Refused> {
+            Ok(self.lineage.iter().filter(|(up, _)| up == k).map(|(_, t)| *t).collect())
+        }
+
+        fn apply(&mut self, split: &Split) -> Result<(), Refused> {
+            for (a, b) in &split.dropped {
+                self.claims.remove(&(*a, *b));
+                self.claims.remove(&(*b, *a));
+            }
+            self.members.extend(split.members.iter().map(|(k, m)| (*k, m.clone())));
+            Ok(())
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+        /// W24-R30: a split decides alike wherever classes are kept. On a random DAG's e-graph,
+        /// rebuilt, and on the same classes kept as the ledger keeps them (rows, no index of
+        /// classes), splitting one node with whatever verification saw (other outputs, its own, or
+        /// nothing as a lineage reaches it) quarantines the same keys and leaves the same members,
+        /// claims and lineage.
+        #[test]
+        fn w24_r30_a_split_decides_alike_wherever_classes_are_kept(nodes in dag(), with_rules in any::<bool>(), at in any::<Index>(), seen in proptest::option::of(0..4u8)) {
+            let (mut g, rules) = (EGraph::new("trusted"), if with_rules { sound()? } else { Rules::default() });
+            let built = grow(&mut g, &nodes, with_rules)?;
+            prop_assert!(g.rebuild(&rules).is_empty());
+            let Some((at, truth)) = built.get(at.index(built.len())).map(|b| (b.0, b.3.clone())) else { return Ok(()) };
+            let observed = seen.map(|s| if s == 3 { truth } else { out(s) });
+            let mut rows = Rows::of(&g);
+            let by_rows = split(&mut rows, &at, observed.as_deref());
+            let by_graph = g.split(&at, observed.as_deref());
+            prop_assert_eq!(&by_rows, &by_graph);
+            prop_assert_eq!(rows, Rows::of(&g));
+        }
+    }
+
+    /// What a unit's outputs make of its key ([`producing`]), and what a member serves.
+    #[test]
+    fn w24_r30_what_outputs_make_of_a_key() -> Result<(), Refused> {
+        let first = producing(&k(1), None, "trusted", &out(1))?;
+        assert_eq!((first.class.output(), first.writer.as_str()), (Some(out(1).as_str()), "trusted"));
+        assert!(first.anchored() && first.claimable() && first.serves());
+        assert_eq!(first.rep(), Some(out(1)), "taken by class, it's its outputs");
+        assert_eq!(producing(&k(1), Some(&first), "untrusted", &out(1))?, first, "the same outputs again: as it was, its writer kept");
+        assert_eq!(producing(&k(1), Some(&first), "trusted", &out(2)), Err(Refused::Conflict { held: out(1), seen: out(2) }));
+        let claimed = Member { produced: None, ..first.clone() };
+        assert!(!claimed.anchored() && claimed.serves(), "claimed into a class with outputs, it serves by class");
+        assert_eq!(producing(&k(1), Some(&claimed), "trusted", &out(2)), Err(Refused::Conflict { held: out(1), seen: out(2) }), "its class holds other outputs");
+        let alone = Member { class: ClassId::Pending(k(1)), quarantined: true, ..claimed };
+        assert!(!alone.serves() && !alone.claimable() && alone.rep().is_none());
+        let back = producing(&k(1), Some(&alone), "trusted", &out(2))?;
+        assert!(back.anchored() && back.quarantined, "its own outputs put it in their class; quarantined still, it serves no class-based hit");
+        assert!(!back.serves());
+        let odd = Member { nondeterministic: true, ..first };
+        assert_eq!(producing(&k(1), Some(&odd), "trusted", &out(1)), Err(Refused::Nondeterministic(k(1))));
+        assert!(!odd.claimable() && !odd.serves());
+        assert_eq!(producing(&k(1), None, "trusted", "a|b"), Err(Refused::Digest("a|b".into())));
         Ok(())
     }
 
