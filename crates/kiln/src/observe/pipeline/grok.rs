@@ -72,7 +72,7 @@ enum Filter {
     QueryString,
     Url,
     Scale(f64),
-    UserAgent,
+    UserAgent(UaKeys),
 }
 
 #[derive(Debug, Clone)]
@@ -309,7 +309,8 @@ fn atomic(r: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn filter_of(name: &str, args: &[String]) -> Result<Filter, String> {
+/// A token's filter, by its name and arguments; `under`, the name its value is kept under.
+fn filter_of(name: &str, args: &[String], under: Option<&str>) -> Result<Filter, String> {
     Ok(match name {
         "number" => Filter::Number,
         "integer" => Filter::Integer,
@@ -322,7 +323,7 @@ fn filter_of(name: &str, args: &[String]) -> Result<Filter, String> {
         "decodeuricomponent" => Filter::DecodeUri,
         "querystring" => Filter::QueryString,
         "url" => Filter::Url,
-        "useragent" => Filter::UserAgent,
+        "useragent" => Filter::UserAgent(UaKeys::new(under)),
         "scale" => Filter::Scale(args.first().and_then(|a| a.parse().ok()).ok_or("scale(factor): a number")?),
         other => return Err(format!("a filter kiln does not have: {other}")),
     })
@@ -347,7 +348,7 @@ impl Compiler<'_> {
             let after = rest.get(at + 2..).unwrap_or_default();
             let (t, used) = token(after).ok_or_else(|| format!("a token that does not close: %{{{}", after.chars().take(40).collect::<String>()))?;
             rest = after.get(used..).unwrap_or_default();
-            let filter = t.filter.as_ref().map(|(f, a)| filter_of(f, a)).transpose()?;
+            let filter = t.filter.as_ref().map(|(f, a)| filter_of(f, a, t.name.as_deref())).transpose()?;
             match matcher(&t.matcher, &t.args)? {
                 Some((fragment, conv)) => match &t.name {
                     Some(name) => {
@@ -592,7 +593,7 @@ fn extract(cap: &Cap, raw: &str, now_ns: i64, out: &mut Attrs, val: &mut String)
         Some(Filter::KeyValue { sep }) => key_values(value, sep, name, out),
         Some(Filter::QueryString) => query_pairs(value.trim_start_matches('?'), name, out),
         Some(Filter::Url) => url_parts(value, name, false, out),
-        Some(Filter::UserAgent) => user_agent(value, name, out),
+        Some(Filter::UserAgent(keys)) => user_agent(value, keys, out),
     }
 }
 
@@ -931,15 +932,9 @@ fn begins_with(b: &[u8], w: &[u8]) -> bool {
 /// A user agent's browser, operating system and device, as far as its words tell (the families
 /// Datadog's parser names, not its full database). Its words found in one pass: at each byte, the
 /// words that may begin with it (a word found is not looked for again).
-pub(crate) fn user_agent(ua: &str, prefix: Option<&str>, out: &mut Attrs) {
+pub(crate) fn user_agent(ua: &str, keys: &UaKeys, out: &mut Attrs) {
     let put = |out: &mut Attrs, k: &str, v: &str| {
-        out.push_with(
-            |t| key_into(t, prefix, k),
-            |t| {
-                t.push_str(v);
-                true
-            },
-        );
+        out.push(k, v);
     };
     let b = ua.as_bytes();
     let mut found = 0u32;
@@ -991,9 +986,9 @@ pub(crate) fn user_agent(ua: &str, prefix: Option<&str>, out: &mut Attrs) {
         None
     };
     if let Some((family, v)) = browser {
-        put(out, "browser.family", family);
+        put(out, &keys.browser_family, family);
         if let Some(v) = v {
-            put(out, "browser.major", v);
+            put(out, &keys.browser_major, v);
         }
     }
     let os = if has(WINDOWS) {
@@ -1010,7 +1005,7 @@ pub(crate) fn user_agent(ua: &str, prefix: Option<&str>, out: &mut Attrs) {
         None
     };
     if let Some(os) = os {
-        put(out, "os.family", os);
+        put(out, &keys.os_family, os);
     }
     let device = if bot {
         "Bot"
@@ -1021,7 +1016,28 @@ pub(crate) fn user_agent(ua: &str, prefix: Option<&str>, out: &mut Attrs) {
     } else {
         "Desktop"
     };
-    put(out, "device.category", device);
+    put(out, &keys.device_category, device);
+}
+
+/// The keys the user-agent parser writes, under its prefix (`{prefix}.browser.family`, …): made
+/// once, where its processor or grok's filter is compiled, each written as one string a line.
+#[derive(Debug, Clone)]
+pub(crate) struct UaKeys {
+    browser_family: String,
+    browser_major: String,
+    os_family: String,
+    device_category: String,
+}
+
+impl UaKeys {
+    pub(crate) fn new(prefix: Option<&str>) -> Self {
+        let key = |k: &str| {
+            let mut t = String::new();
+            key_into(&mut t, prefix, k);
+            t
+        };
+        Self { browser_family: key("browser.family"), browser_major: key("browser.major"), os_family: key("os.family"), device_category: key("device.category") }
+    }
 }
 
 /// An integer's decimal text onto `out`, without the formatter's machinery.
@@ -1533,7 +1549,7 @@ pub(crate) mod before {
                     }
                 }
             }
-            Some(Filter::UserAgent) => {
+            Some(Filter::UserAgent(_)) => {
                 let mut parts = Vec::new();
                 user_agent(&value, &mut parts);
                 for (k, v) in parts {
@@ -1714,7 +1730,7 @@ pub(crate) mod before {
     /// `user_agent_before` by its own test), as strings of their own.
     pub(crate) fn user_agent(ua: &str, out: &mut Vec<(&'static str, String)>) {
         let mut a = Attrs::default();
-        super::user_agent(ua, None, &mut a);
+        super::user_agent(ua, &super::UaKeys::new(None), &mut a);
         for (k, v) in a.iter() {
             let key: &'static str = ["browser.family", "browser.major", "os.family", "device.category"].into_iter().find(|w| *w == k).unwrap_or("");
             out.push((key, v.to_owned()));
@@ -1952,7 +1968,7 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
         }
         for ua in &uas {
             let mut ours = Attrs::default();
-            user_agent(ua, None, &mut ours);
+            user_agent(ua, &UaKeys::new(None), &mut ours);
             let before = user_agent_before(ua);
             assert_eq!(ours.iter().collect::<Vec<_>>(), before.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>(), "{ua:?}");
         }

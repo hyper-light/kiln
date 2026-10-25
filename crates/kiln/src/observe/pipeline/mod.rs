@@ -180,7 +180,8 @@ enum Proc {
     TraceId(Vec<String>),
     Attr { sources: Vec<String>, target: String, format: Format, preserve: bool, overwrite: bool },
     Url { sources: Vec<String>, target: String, trim_slashes: bool },
-    UserAgent { sources: Vec<String>, target: String, encoded: bool },
+    /// Its keys made once (`target.browser.family`, …).
+    UserAgent { sources: Vec<String>, target: String, encoded: bool, keys: grok::UaKeys },
     Category { target: String, categories: Vec<(Search, String)> },
     Arithmetic { expr: expr::Expr, target: String, replace_missing: bool },
     Builder { template: Vec<Piece>, target: String, replace_missing: bool },
@@ -280,7 +281,9 @@ fn compile(name: &str, filter: &FilterDef, processors: &[ProcessorDef], depth: u
                 overwrite: *override_on_conflict,
             },
             KindDef::UrlParser { sources, target, normalize_ending_slashes } => Proc::Url { sources: nonempty(sources, "sources")?, target: target.clone(), trim_slashes: *normalize_ending_slashes },
-            KindDef::UserAgentParser { sources, target, is_encoded } => Proc::UserAgent { sources: nonempty(sources, "sources")?, target: target.clone(), encoded: *is_encoded },
+            KindDef::UserAgentParser { sources, target, is_encoded } => {
+                Proc::UserAgent { sources: nonempty(sources, "sources")?, target: target.clone(), encoded: *is_encoded, keys: grok::UaKeys::new(Some(target)) }
+            }
             KindDef::CategoryProcessor { target, categories } => {
                 let mut cats = Vec::new();
                 for c in categories {
@@ -704,16 +707,16 @@ fn run<R: Target>(p: &Proc, r: &mut R, now_ns: i64, s: &mut Scratch) {
             grok::url_parts(v, Some(target), *trim_slashes, &mut s.out);
             r.put(&s.out);
         }
-        Proc::UserAgent { sources, target, encoded } => {
+        Proc::UserAgent { sources, encoded, keys, .. } => {
             // Read where it is (decoded first when it says).
             s.out.clear();
             match first(r, sources) {
                 Some((_, v)) if *encoded => {
                     s.val.clear();
                     grok::decode_uri_into(v, &mut s.val);
-                    grok::user_agent(&s.val, Some(target), &mut s.out);
+                    grok::user_agent(&s.val, keys, &mut s.out);
                 }
-                Some((_, v)) => grok::user_agent(v, Some(target), &mut s.out),
+                Some((_, v)) => grok::user_agent(v, keys, &mut s.out),
                 None => return,
             }
             r.put(&s.out);
@@ -1006,7 +1009,7 @@ mod tests {
                         }
                     }
                 }
-                Proc::UserAgent { sources, target, encoded } => {
+                Proc::UserAgent { sources, target, encoded, .. } => {
                     // Read where it is (decoded first when it says): its parts are their own strings.
                     s.agent.clear();
                     match first(r, sources) {
