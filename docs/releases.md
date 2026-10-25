@@ -182,7 +182,11 @@ older process lets go only once the newest says it took the session over. If it 
 session goes on where it was, and the timeline says why. Should two processes ever both hold one
 session (an answer lost as a link dropped), the newer keeps it and the older lets go. Terminals stay
 with the process they run in until they close, and jobs finish where they run. Once an older
-process holds nothing, the newest retires it.
+process holds nothing, the newest retires it. While a new build of the runner takes the machine
+over (a blue/green upgrade), nothing is handed over: the newest process is then the one leaving,
+and a session it took would end with it. Sessions wait for the new build. A process that is
+handing everything over turns away a session that was already on its way to it, and that
+session goes on where it was until it's asked for again.
 
 **Nothing vanishes.** The server keeps which process of its machine holds each session, across
 restarts (`holders.json` beside its agents' names). A process that says what it runs speaks for its

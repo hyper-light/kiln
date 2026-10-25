@@ -369,6 +369,13 @@ impl Instances {
         self.by_peer.get(&peer).is_some_and(|i| i.wide & crate::proto::CAP_HANDOVER != 0 && !(i.id.is_some() && i.created_at < 0))
     }
 
+    /// Whether machine `name` is being upgraded blue/green: a new build of its runner is connected
+    /// and hasn't taken over yet. Its newest process meanwhile is the one handing everything to it,
+    /// and leaving.
+    pub fn upgrading(&self, name: &str) -> bool {
+        self.by_peer.values().any(|i| i.name == name && i.id.is_some() && i.created_at < 0)
+    }
+
     /// Every connected peer of every machine with more than one instance, with its machine.
     pub fn crowded(&self) -> Vec<(String, PeerId)> {
         let mut by_name: HashMap<&str, Vec<PeerId>> = HashMap::new();
@@ -486,8 +493,10 @@ mod tests {
         m.join(4, "box", hello("d"), 4);
         m.set_wide(4, CAP_HANDOVER);
         assert!(!m.hands_over(4));
+        assert!(m.upgrading("box") && !m.upgrading("other"), "its machine is being upgraded meanwhile");
         assert_eq!(m.reannounce(4, &ih("green", 200)), Some(vec![2]), "the one drained before stays so");
         assert!(m.hands_over(4), "once it took over, it's a process like the others");
+        assert!(!m.upgrading("box"));
     }
 
     #[test]
