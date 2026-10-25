@@ -183,6 +183,11 @@ impl Learner {
     pub fn standing(&self) -> (u64, u64) {
         self.group.standing()
     }
+
+    /// Why the replica's group stopped applying, if it has (its runner starts it again).
+    pub fn stopped(&self) -> Option<String> {
+        self.group.stopped()
+    }
 }
 
 /// The server's side of the runners' learners: which machine each is, and the parts of their
