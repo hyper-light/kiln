@@ -112,11 +112,16 @@ pub const SESSIONS_ENDED_AFTER: &str = "SELECT id, closed_at FROM sessions WHERE
 /// The machine whose feed brought the session.
 pub const SESSION_MACHINE: &str = "UPDATE sessions SET machine = ?2 WHERE id = ?1";
 
+/// An event as it is now. One that comes again as it is kept (a restart, a runner's new store
+/// sending what the server has) writes nothing, and keeps its number: no feed sends it again.
 pub const EVENT_UPSERT: &str = "INSERT INTO events (session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
     ON CONFLICT (session, id) DO UPDATE SET
         seq = excluded.seq, at = excluded.at, parent = excluded.parent, by = excluded.by, kind = excluded.kind,
         level = excluded.level, tool = excluded.tool, status = excluded.status, text = excluded.text, body = excluded.body,
-        rev = excluded.rev";
+        rev = excluded.rev
+    WHERE events.seq IS NOT excluded.seq OR events.at IS NOT excluded.at OR events.parent IS NOT excluded.parent OR events.by IS NOT excluded.by
+        OR events.kind IS NOT excluded.kind OR events.level IS NOT excluded.level OR events.tool IS NOT excluded.tool
+        OR events.status IS NOT excluded.status OR events.text IS NOT excluded.text OR events.body IS NOT excluded.body";
 /// A session's events from number `?2` on (a reset: `?2` is 0 for all of them).
 pub const EVENTS_RESET: &str = "DELETE FROM events WHERE session = ?1 AND seq >= ?2";
 /// A session's last `?2` events, newest first (the caller turns them around).
@@ -134,8 +139,11 @@ pub const SEARCH_SESSION: &str = "SELECT rowid, seq, at, kind, tool, status, tex
 /// An event a search found, whole.
 pub const EVENT_BY_ROWID: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE rowid = ?1";
 
+/// A line of a harness's record. One that comes again as it is kept writes nothing, and keeps its
+/// number (as [`EVENT_UPSERT`]).
 pub const RECORD_UPSERT: &str = "INSERT INTO records (session, source, n, line_end, line, rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-    ON CONFLICT (session, source, n) DO UPDATE SET line_end = excluded.line_end, line = excluded.line, rev = excluded.rev";
+    ON CONFLICT (session, source, n) DO UPDATE SET line_end = excluded.line_end, line = excluded.line, rev = excluded.rev
+    WHERE records.line_end IS NOT excluded.line_end OR records.line IS NOT excluded.line";
 pub const RECORDS_RESET: &str = "DELETE FROM records WHERE session = ?1 AND source = ?2";
 /// Each file of a session's record, with its last line kept: where following it goes on.
 pub const RECORD_SOURCES: &str = "SELECT source, MAX(n) FROM records WHERE session = ?1 GROUP BY source";
