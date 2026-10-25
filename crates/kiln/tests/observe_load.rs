@@ -1134,8 +1134,10 @@ fn a_trace_flood_is_taken_or_refused_never_lost_counted_once_and_replicas_agree(
         let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": q, "from": from, "to": to, "step": 10_000 })))?;
         Ok(at(&a, &["series"]).as_array().into_iter().flatten().filter(|s| at(s, &["tags", "service"]).as_str().is_some_and(|v| v.starts_with("load-svc-"))).flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum())
     };
-    // Counted within a quarter of each second (the counter's budget): 1.5 M spans took 76 s on
-    // adacachy, 2.1 M past 120 s with other work beside it. Every one is waited for.
+    // Counted within a quarter of each second (the counter's budget): before counting was made 18
+    // times faster (`docs/observe.md` §12.23), 1.7 M spans took 76 s on an M4 Max Mac Studio and
+    // 2.1 M were not counted in 120 s on adacachy, other work beside them; since, 1.9 M and 1.6 M
+    // take 18 s, the last window's settle among it (a debug build). Every one is waited for.
     let counted_at = Instant::now();
     let (mut hits, mut outbound) = (0.0, 0.0);
     while counted_at.elapsed() < Duration::from_secs(300) {
