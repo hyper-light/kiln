@@ -44,13 +44,14 @@
   --st-t: #8b8e96;
 }
 
-/* The rule: a canvas taller than the line it was, so what floats about the string has room; it
-   takes the same room in the page (12 points and 9 under it), the string where the line was. */
+/* The rule: a canvas taller than the line it was, so what floats about the string and its swings
+   have room; it takes the same room in the page (16 points over it and 7 under it given back),
+   the string at rest where the line was, and the badges under it don't move. */
 .st-rule {
   display: block;
   width: 100%;
-  height: 28px;
-  margin: -8px 0 1px;
+  height: 44px;
+  margin: -16px 0 -7px;
   pointer-events: none;
 }
 

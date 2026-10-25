@@ -719,8 +719,10 @@ async fn install_objects(cluster: &Cluster, ns: &str, (image, pull): (&str, &str
         "env": [{ "name": "KILN_CONFIG", "value": "/etc/kiln/kiln.toml" }, field("POD_NAME", "metadata.name"), field("POD_NAMESPACE", "metadata.namespace"), field("NODE_NAME", "spec.nodeName")],
         "ports": [{ "name": "http", "containerPort": 7070, "protocol": "TCP" }, { "name": "quic", "containerPort": 7071, "protocol": "UDP" }],
         "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] } },
-        "readinessProbe": { "httpGet": { "path": "/readyz", "port": "http" }, "periodSeconds": 5, "failureThreshold": 3 },
-        "livenessProbe": { "httpGet": { "path": "/healthz", "port": "http" }, "initialDelaySeconds": 30, "periodSeconds": 10, "failureThreshold": 6 },
+        // Kubernetes waits 1s for a probe by default: a server slowed by its disk, not dead, was
+        // killed for it (docs/resilience.md, O3). The chart waits as long.
+        "readinessProbe": { "httpGet": { "path": "/readyz", "port": "http" }, "periodSeconds": 5, "timeoutSeconds": 3, "failureThreshold": 3 },
+        "livenessProbe": { "httpGet": { "path": "/healthz", "port": "http" }, "initialDelaySeconds": 30, "periodSeconds": 10, "timeoutSeconds": 5, "failureThreshold": 6 },
         "volumeMounts": [
             { "name": "data", "mountPath": "/var/lib/kiln" },
             { "name": "config", "mountPath": "/etc/kiln/kiln.toml", "subPath": "kiln.toml", "readOnly": true },

@@ -191,6 +191,8 @@ export interface Inbox {
   waiting_for_others: InboxThread[];
   review_requested: { repo: string; diff: string; title: string; author: string; your_state: string }[];
   your_diffs: { repo: string; diff: string; title: string; state: string }[];
+  /** Pull requests on the hosts kiln's repositories are on that ask your review there (W23-R06). */
+  elsewhere?: { repo: string; host: HostName; number: number; title: string; author: string; url: string; updated_at: number | null }[];
 }
 
 export interface Stack {
@@ -251,6 +253,82 @@ export const reviewApi = {
   /** A file's bytes at a version, old or new side (images). */
   blobUrl: (key: string, version: number, path: string, side: "old" | "new") => apiPath(`/api/diffs/${enc(key)}/versions/${version}/blob?path=${enc(path)}&side=${side}`),
 };
+
+export type HostName = "github" | "gitlab" | "bitbucket";
+
+/** A pull request (GitLab's merge request) on a repository's host, in one shape (W23-R06). */
+export interface HostPull {
+  host: HostName;
+  number: number;
+  title: string;
+  body: string;
+  author: string;
+  state: "open" | "merged" | "closed" | string;
+  draft: boolean;
+  head: string;
+  sha: string;
+  base: string;
+  base_sha: string;
+  url: string;
+  updated_at: number | null;
+  mergeable: boolean | null;
+  reviewers: string[];
+}
+
+export interface HostCheck {
+  run: string;
+  provider: string;
+  name: string | null;
+  status: string;
+  conclusion: string | null;
+  url: string | null;
+  number: number;
+}
+
+export interface HostComment {
+  id: string;
+  author: string;
+  body: string;
+  at: number | null;
+}
+
+export interface HostThread {
+  id: string;
+  path: string | null;
+  line: number | null;
+  side: "left" | "right" | null;
+  resolved: boolean | null;
+  comments: HostComment[];
+}
+
+export interface HostPullDetail extends HostPull {
+  files: { path: string; old_path: string | null; status: string; additions: number | null; deletions: number | null; patch: string | null }[];
+  conversation: HostComment[];
+  threads: HostThread[];
+  reviews: { author: string; state: string; body: string; at: number | null }[];
+  merge_methods: string[];
+  /** Every provider's runs of its head commit, from kiln's own tables. */
+  checks: { state?: "success" | "failure" | "pending" | "none"; checks?: HostCheck[]; error?: string };
+}
+
+/** Who acted on the host: you, with the account you signed in with, or kiln's credentials there. */
+type Acted = { as: "person" | "kiln" };
+
+export const hostPullsApi = {
+  list: (repo: string, signal?: AbortSignal) => request<{ repo: string; pulls: HostPull[] }>("GET", `/api/ci/repos/${enc(repo)}/pulls`, undefined, { signal }).then((r) => r.pulls),
+  get: (repo: string, n: number, signal?: AbortSignal) => request<HostPullDetail>("GET", `/api/ci/repos/${enc(repo)}/pulls/${n}`, undefined, { signal }),
+  comment: (repo: string, n: number, body: { body: string; path?: string; line?: number; side?: "left" | "right"; reply_to?: string }) =>
+    request<Acted>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/comments`, body),
+  review: (repo: string, n: number, verdict: "approve" | "request_changes" | "comment", body: string) => request<Acted>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/reviews`, { verdict, body }),
+  merge: (repo: string, n: number, method: string) => request<Acted & { merged: boolean; commit: string | null }>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/merge`, { method }),
+};
+
+export const hostPullsRes = (repo: string): Res<HostPull[]> => ({ key: `review/host/${repo}`, fetch: (s) => hostPullsApi.list(repo, s) });
+export const hostPullRes = (repo: string, n: number): Res<HostPullDetail> => ({ key: `review/host/${repo}/${n}`, fetch: (s) => hostPullsApi.get(repo, n, s) });
+
+export const HOST_WORD: Record<HostName, string> = { github: "GitHub", gitlab: "GitLab", bitbucket: "Bitbucket" };
+/** How each host writes a change's number. */
+export const hostNumber = (host: HostName, n: number) => (host === "gitlab" ? `!${n}` : `#${n}`);
 
 /** Events that change what review pages show. */
 const REVIEW_EVENTS = ["diff", "diff_version", "review", "comment", "queue", "landed", "diff_run", "run", "inbox"];

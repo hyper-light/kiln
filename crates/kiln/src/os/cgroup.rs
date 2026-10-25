@@ -77,6 +77,20 @@ pub fn memory() -> Option<Memory> {
     imp::memory()
 }
 
+/// The most memory this process may use as its cgroups hold it: the least limit of its own
+/// cgroup and those above it (a slice's `MemoryMax=` holds the services under it, whose own is
+/// `max`); none without one, or off Linux.
+pub fn memory_limit() -> Option<u64> {
+    imp::memory_limit()
+}
+
+/// cgroup v2: the least `memory.max` of `dir` and the cgroups above it, up to `root` (the
+/// hierarchy's mount, a container's own cgroup namespace's root among them).
+#[cfg(any(target_os = "linux", test))]
+fn least_limit(root: &std::path::Path, dir: &std::path::Path) -> Option<u64> {
+    dir.ancestors().take_while(|d| d.starts_with(root)).filter_map(|d| std::fs::read_to_string(d.join("memory.max")).ok()).filter_map(|t| limit(&t)).min()
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use std::fs::read_to_string;
@@ -99,11 +113,22 @@ mod imp {
         let f = |n: &str| read_to_string(dir.join(n)).ok();
         super::from_v1(&f("memory.usage_in_bytes")?, &f("memory.limit_in_bytes").unwrap_or_default(), &f("memory.stat").unwrap_or_default(), &f("memory.oom_control").unwrap_or_default(), f("memory.max_usage_in_bytes").as_deref())
     }
+
+    pub fn memory_limit() -> Option<u64> {
+        if let Some(dir) = v2_dir().filter(|d| d.join("memory.current").exists()) {
+            return super::least_limit(Path::new("/sys/fs/cgroup"), &dir);
+        }
+        super::limit(&read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok()?)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
     pub fn memory() -> Option<super::Memory> {
+        None
+    }
+
+    pub fn memory_limit() -> Option<u64> {
         None
     }
 }
@@ -134,5 +159,30 @@ mod tests {
         let m = from_v1("536870912", "1073741824", "", "", None);
         assert_eq!(m.as_ref().map(|m| m.limit), Some(Some(1073741824)));
         assert_eq!(m.and_then(|m| m.share()), Some(0.5));
+    }
+
+    /// W05-R03: the most a runner may use is the least limit above it: its scope's over its own
+    /// `max`, a container's at its own root, none where nothing sets one.
+    #[test]
+    fn w05_r03_a_runners_memory_is_the_least_limit_above_it() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("host");
+        let own = root.join("user.slice/kiln-lab.scope/kiln");
+        std::fs::create_dir_all(&own)?;
+        std::fs::write(root.join("user.slice/memory.max"), "max\n")?;
+        std::fs::write(root.join("user.slice/kiln-lab.scope/memory.max"), "42949672960\n")?;
+        std::fs::write(own.join("memory.max"), "max\n")?;
+        assert_eq!(least_limit(&root, &own), Some(42949672960), "the scope's, over its own max");
+        std::fs::write(own.join("memory.max"), "1073741824\n")?;
+        assert_eq!(least_limit(&root, &own), Some(1073741824), "the least of them");
+        let ns = tmp.path().join("container");
+        std::fs::create_dir_all(&ns)?;
+        std::fs::write(ns.join("memory.max"), "17179869184\n")?;
+        assert_eq!(least_limit(&ns, &ns), Some(17179869184), "a container's own cgroup namespace");
+        let none = tmp.path().join("none");
+        std::fs::create_dir_all(none.join("a"))?;
+        std::fs::write(none.join("a/memory.max"), "max\n")?;
+        assert_eq!(least_limit(&none, &none.join("a")), None);
+        Ok(())
     }
 }

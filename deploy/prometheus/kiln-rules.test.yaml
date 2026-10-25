@@ -1,0 +1,79 @@
+# Unit tests for kiln-rules.yaml, fed the series of 2026-10-24's incidents (docs/resilience.md):
+#   docker run --rm -v "$PWD/deploy/prometheus:/r:ro" --entrypoint promtool prom/prometheus:v3.5.0 test rules /r/kiln-rules.test.yaml
+rule_files:
+  - kiln-rules.yaml
+
+evaluation_interval: 30s
+
+tests:
+  # (a) The poll storm: 24 repositories, ~240 failed polls a second.
+  - interval: 30s
+    input_series:
+      - series: 'kiln_gitops_polls_total{job="kiln",result="error"}'
+        values: '0+7200x20'
+      - series: 'kiln_gitops_polls_total{job="kiln",result="unchanged"}'
+        values: '0+12x20'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: KilnGitopsPollStorm
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: KilnGitopsPollStorm
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: kiln is polling repositories far faster than their intervals
+              description: "240 polls a second: a retry loop, not a schedule. It floods the host's resolver and GitHub."
+
+  # A healthy schedule: 24 repositories a minute is no storm.
+  - interval: 30s
+    input_series:
+      - series: 'kiln_gitops_polls_total{job="kiln",result="unchanged"}'
+        values: '0+12x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: KilnGitopsPollStorm
+        exp_alerts: []
+
+  # (c) The rollback crash loop: the pod waits in CrashLoopBackOff with no ready replica, and the
+  # server never exposes its own counters.
+  - interval: 30s
+    input_series:
+      - series: 'kube_pod_container_status_waiting_reason{namespace="kiln",pod="kiln-74fd644854-j9q8j",container="kiln",reason="CrashLoopBackOff"}'
+        values: '0 0 1x20'
+      - series: 'kube_deployment_status_replicas_available{namespace="kiln",deployment="kiln"}'
+        values: '1 1 0x20'
+      - series: 'kube_pod_container_status_restarts_total{namespace="kiln",pod="kiln-74fd644854-j9q8j",container="kiln"}'
+        values: '0 0 1 2 3 4 5 6 7 8x12'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: KilnPodCrashLooping
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: kiln
+              pod: kiln-74fd644854-j9q8j
+            exp_annotations:
+              summary: kiln's pod is in CrashLoopBackOff
+              description: "kiln/kiln-74fd644854-j9q8j keeps exiting at start. `kubectl logs --previous` says why; a rollback onto a newer schema crash-loops this way."
+      - eval_time: 4m
+        alertname: KilnDeploymentUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: kiln
+              deployment: kiln
+            exp_annotations:
+              summary: kiln has no available pod
+              description: "kiln/kiln has had no ready pod for 2 minutes."
+      - eval_time: 6m
+        alertname: KilnPodRestarting
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: kiln
+              pod: kiln-74fd644854-j9q8j
+            exp_annotations:
+              summary: kubelet keeps restarting kiln's container
+              description: "kiln/kiln-74fd644854-j9q8j restarted 8 times in 15 minutes (failed liveness probes or exits)."

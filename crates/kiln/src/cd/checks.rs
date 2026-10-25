@@ -57,7 +57,7 @@ pub(crate) fn judge(spec: &CheckSpec, result: &Value, rollout: &Value, default: 
     };
     if let Some(f) = &spec.fail {
         match holds(f) {
-            Ok(true) => return (Verdict::Fail, format!("fail: {f} holds")),
+            Ok(true) => return (Verdict::Fail, format!("fail: {f} holds{}", observed(f, result, rollout))),
             Ok(false) => {}
             Err(e) => return (Verdict::Error, format!("fail: {e}")),
         }
@@ -65,12 +65,35 @@ pub(crate) fn judge(spec: &CheckSpec, result: &Value, rollout: &Value, default: 
     match &spec.pass {
         Some(p) => match holds(p) {
             Ok(true) => (Verdict::Pass, String::new()),
-            Ok(false) if spec.fail.is_some() => (Verdict::Inconclusive, "neither pass: nor fail: holds".into()),
-            Ok(false) => (Verdict::Fail, format!("pass: {p} doesn't hold")),
+            Ok(false) if spec.fail.is_some() => (Verdict::Inconclusive, format!("neither pass: nor fail: holds{}", observed(&format!("{p} {}", spec.fail.as_deref().unwrap_or("")), result, rollout))),
+            Ok(false) => (Verdict::Fail, format!("pass: {p} doesn't hold{}", observed(p, result, rollout))),
             Err(e) => (Verdict::Error, format!("pass: {e}")),
         },
         None => (Verdict::Pass, String::new()),
     }
+}
+
+/// What an expression read, for a verdict's reason: each `result.…` and `rollout.…` path it names
+/// with its value (` (result.json.memory.share = 0.93)`), so a failure says what was seen and not
+/// only what was asked (docs/resilience.md, G6). Nothing when it names none.
+fn observed(src: &str, result: &Value, rollout: &Value) -> String {
+    let part = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.';
+    let mut seen: Vec<String> = Vec::new();
+    let mut prev: Option<char> = None;
+    for (i, c) in src.char_indices() {
+        let starts = prev.is_none_or(|p| !part(p));
+        prev = Some(c);
+        let Some(rest) = src.get(i..).filter(|_| starts) else { continue };
+        let Some(root) = ["result.", "rollout."].into_iter().find(|r| rest.starts_with(r)) else { continue };
+        let path = rest.split(|c: char| !part(c)).next().unwrap_or_default().trim_end_matches('.');
+        if seen.iter().any(|s| s.strip_prefix(path).is_some_and(|t| t.starts_with(" = "))) {
+            continue;
+        }
+        let base = if root == "result." { result } else { rollout };
+        let v = path.split('.').skip(1).try_fold(base, |v, k| v.get(k));
+        seen.push(format!("{path} = {}", v.map_or_else(|| "nothing".to_owned(), |v| v.to_string())));
+    }
+    if seen.is_empty() { String::new() } else { format!(" ({})", seen.join(", ")) }
 }
 
 /// A check's strings with `${{ rollout.* }}` filled in.
@@ -187,6 +210,24 @@ mod tests {
         assert_eq!(judge(&s, &result, &r, ok.clone()).0, Verdict::Fail, "rollout.* in criteria");
         let s = spec("http: {}\nfail: \"${{ result.status == \"");
         assert_eq!(judge(&s, &result, &r, ok).0, Verdict::Error, "a broken expression is an error");
+    }
+
+    /// A verdict's reason says what was seen: the 2026-10-24 rollback's said only that
+    /// `share > 0.8` held, never what the share was.
+    #[test]
+    fn a_reason_says_what_it_saw() {
+        let r = json!({ "weight": 20 });
+        let result = json!({ "status": 200, "json": { "memory": { "share": 0.93, "used": 1_996_488_704u64 }, "restarts": 0 } });
+        let ok = (Verdict::Pass, String::new());
+        let s = spec("http: {}\nfail: \"${{ result.json.memory.share > 0.8 }}\"");
+        assert_eq!(judge(&s, &result, &r, ok.clone()).1, "fail: ${{ result.json.memory.share > 0.8 }} holds (result.json.memory.share = 0.93)");
+        let s = spec("http: {}\nfail: \"${{ result.json.restarts > 0 || result.json.memory.share > 0.9 && rollout.weight > 10 }}\"");
+        assert_eq!(judge(&s, &result, &r, ok.clone()).0, Verdict::Fail);
+        assert!(judge(&s, &result, &r, ok.clone()).1.ends_with("(result.json.restarts = 0, result.json.memory.share = 0.93, rollout.weight = 20)"));
+        let s = spec("http: {}\npass: \"${{ result.json.missing == 1 }}\"");
+        assert!(judge(&s, &result, &r, ok.clone()).1.ends_with("(result.json.missing = nothing)"), "a path with nothing there says so");
+        let s = spec("http: {}\nfail: \"${{ 1 > 2 }}\"\npass: \"${{ true }}\"");
+        assert_eq!(judge(&s, &result, &r, ok).1, "", "a pass says nothing");
     }
 
     #[test]

@@ -60,12 +60,16 @@ checks:
     http: { url: "http://kiln.kiln.svc.cluster.local:7070/healthz/server" }
     every: 10s
     fail: "${{ result.json.restarts > 0 || result.json.memory.oom_kills > 0 }}"
-  # Its memory stays well under its pod's limit.
+  # Its memory stays under its pod's limit. On 2026-10-24 two samples over 0.8 of a 2Gi limit,
+  # minutes apart, rolled kiln:61b07ceb back into a crash loop while it served (its start
+  # really peaks at 5.4 GB; the limit is 16Gi now). So it holds, never rolls back, and only for
+  # memory that stays high (docs/resilience.md, G3-G5). An OOM kill still fails `steady`.
   memory:
     http: { url: "http://kiln.kiln.svc.cluster.local:7070/healthz/server" }
     every: 15s
-    failures: 1
-    fail: "${{ result.json.memory.share > 0.8 }}"
+    severity: hold
+    fail-after: { for: 2m }
+    fail: "${{ result.json.memory.share > 0.9 }}"
   # It runs the commit deployed (an image built without KILN_COMMIT knows none).
   commit:
     http: { url: "http://kiln.kiln.svc.cluster.local:7070/healthz/server" }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cells, frame, HEIGHT, LIVE, LIVELINESS, reachOf, SHORT_OF_MIDDLE, stretches, stringOf, type Shown } from "../src/views/harness/stands-light.ts";
+import { cells, frame, HEIGHT, LIVE, LIVELINESS, MEDIUM, reachOf, SHORT_OF_MIDDLE, stretches, stringOf, type Shown } from "../src/views/harness/stands-light.ts";
 
 // Mission Control's status rule (stands-light.ts): the string, its particles and its stretches,
 // as stands.tsx draws them each frame.
@@ -21,34 +21,64 @@ test("the stretches fill the rule in order, each its share of the agents, a gap 
   assert.ok(len("finished") > len("working") && len("working") > len("needs") && near(len("crashed"), len("paused")), "longer for more agents");
 });
 
-test("one string runs the whole rule unbroken, held at its two ends, and goes round every 8 s", () => {
+test("one string runs the whole rule unbroken, held at its two ends, and never comes round the same", () => {
   const parts = stretches(ALL, COUNTS, W);
-  for (const t of TIMES) {
+  for (const t of [...TIMES, 13.6, 21.2, 37.5]) {
     const s = stringOf(parts, W, t);
     assert.ok(near(s.at(0), 0) && near(s.at(W), 0, 1e-6), `held at its ends at ${t}s`);
+    // Its steepest wave and the ripples on it together, gaps and all, stay well under half a
+    // point of rise in a quarter point: no break anywhere.
     let worst = 0;
     for (let x = 0; x < W; x += 0.25) worst = Math.max(worst, Math.abs(s.at(x + 0.25) - s.at(x)));
-    // Its steepest wave (working's finest undamped: 0.2 high, 19.7 long) and the rest together
-    // stay well under half a point of rise in a quarter point.
     assert.ok(worst < 0.5, `no break at ${t}s: its steepest quarter-point step is ${worst.toFixed(3)}`);
-    // The same height either side of each gap, give or take its slope across five points, as one string would be.
-    parts.slice(1).forEach((p, j) => {
-      const a = parts[j]!;
-      assert.ok(Math.abs(s.at(a.x1) - s.at(p.x0)) < 1.6, `${a.stand} meets ${p.stand} across its gap at ${t}s`);
-    });
-    const later = stringOf(parts, W, t + 8);
-    for (let x = 0; x <= W; x += 13) assert.ok(near(s.at(x), later.at(x), 1e-6), `the same 8 s on, at ${x}`);
+    // Its waves' periods wander and its ripples come at random: 8 s on, and 16, it's elsewhere.
+    for (const on of [8, 16]) {
+      const later = stringOf(parts, W, t + on);
+      let apart = 0;
+      for (let x = 0; x <= W; x += 3) apart = Math.max(apart, Math.abs(s.at(x) - later.at(x)));
+      assert.ok(apart > 0.2, `${on} s after ${t}s it isn't where it was (${apart.toFixed(3)} at most)`);
+    }
   }
+});
+
+test("a ripple runs through each stretch as its medium has it, quicker the livelier", () => {
+  assert.deepEqual([...LIVELINESS].sort((a, b) => MEDIUM[b] - MEDIUM[a]), [...LIVELINESS]);
+  const parts = stretches(ALL, COUNTS, W);
+  const s = stringOf(parts, W, 0);
+  // Through the middle of each stretch, away from its gaps' easing, it takes a point 1/MEDIUM seconds.
+  for (const p of parts) {
+    if (p.x1 - p.x0 < 30) continue;
+    const a = p.x0 + 13;
+    const b = p.x1 - 13;
+    const each = (s.arrival(b) - s.arrival(a)) / (b - a);
+    assert.ok(Math.abs(each * MEDIUM[p.stand] - 1) < 0.02, `${p.stand}: ${(1 / each).toFixed(1)} points a second, its medium ${MEDIUM[p.stand]}`);
+  }
+  // From end to end, it takes the stretches' lengths through their media, and the gaps' (each
+  // through its neighbours' media, somewhere between the two).
+  const through = parts.reduce((sum, p) => sum + (p.x1 - p.x0) / MEDIUM[p.stand], 0);
+  const gaps = parts.slice(1).map((p, j) => [(p.x0 - parts[j]!.x1) / Math.max(MEDIUM[p.stand], MEDIUM[parts[j]!.stand]), (p.x0 - parts[j]!.x1) / Math.min(MEDIUM[p.stand], MEDIUM[parts[j]!.stand])] as const);
+  const [least, most] = gaps.reduce(([a, b], [g0, g1]) => [a + g0, b + g1], [0, 0]);
+  assert.ok(s.arrival(W) > (through + least) * 0.97 && s.arrival(W) < (through + most) * 1.03, `${s.arrival(W).toFixed(2)} s across, through the stretches ${through.toFixed(2)} s and the gaps ${least.toFixed(2)} to ${most.toFixed(2)} s`);
+});
+
+test("however hard it's struck, the string keeps to its box", () => {
+  const parts = stretches(["working", "ready", "needs"], [3, 2, 1], W);
+  let most = 0;
+  for (let t = 0; t < 200; t += 0.2) {
+    const s = stringOf(parts, W, t);
+    for (let x = 0; x <= W; x += 4) most = Math.max(most, Math.abs(s.at(x)));
+  }
+  assert.ok(most < 9.5 && most > 2, `its swings stay in the box, the hardest ${most.toFixed(2)} points`);
 });
 
 test("each state damps the string as much as it's still: working the least, then ready, needs you, paused, finished, stopped; offline holds it still", () => {
   assert.deepEqual([...LIVELINESS].sort((a, b) => LIVE[b] - LIVE[a]), [...LIVELINESS]);
-  // Alone across the rule: how far its middle swings, and how fast, over its 8 s.
+  // Alone across the rule: how far its middle swings, and how fast, over 30 s of its weather and ripples.
   const swing = (s: Shown) => {
     const parts = stretches([s], [1], 300);
     let most = 0;
     let fastest = 0;
-    for (let t = 0; t < 8; t += 0.05) {
+    for (let t = 0; t < 30; t += 0.05) {
       const now = stringOf(parts, 300, t);
       const next = stringOf(parts, 300, t + 0.05);
       for (let x = 100; x <= 200; x += 5) {
@@ -67,8 +97,9 @@ test("each state damps the string as much as it's still: working the least, then
   assert.equal(swing("offline").most, 0);
 });
 
-test("every particle stays in the rule's box, a fine point, seen", () => {
+test("every particle stays in the rule's box, most of them fine points and a few larger, each seen", () => {
   const parts = stretches(ALL, COUNTS, W);
+  const radii: number[] = [];
   for (const t of TIMES) {
     const f = frame(parts, W, t);
     assert.ok(f.dots.length > 5 * 500, "a fine, close line");
@@ -76,10 +107,15 @@ test("every particle stays in the rule's box, a fine point, seen", () => {
       const [x, y, r, a] = [f.dots[k]!, f.dots[k + 1]!, f.dots[k + 2]!, f.dots[k + 3]!];
       assert.ok(x >= -0.5 && x <= W + 0.5, `x ${x} on the rule`);
       assert.ok(y - r >= 0 && y + r <= HEIGHT, `y ${y.toFixed(2)} in the box`);
-      assert.ok(r > 0 && r < 1.5 && a > 0 && a <= 1, "a fine point, seen");
+      assert.ok(r > 0 && r < 2.5 && a > 0 && a <= 1, `a point, seen: r ${r.toFixed(2)}, a ${a.toFixed(2)}`);
+      radii.push(r);
     }
     for (let k = 0; k < f.soft.length; k += 6) assert.ok(f.soft[k + 1]! >= 0 && f.soft[k + 1]! <= HEIGHT, "soft light about the string");
   }
+  radii.sort((a, b) => a - b);
+  const p95 = radii[Math.floor(0.95 * (radii.length - 1))]!;
+  assert.ok(p95 < 0.8, `most are fine points: 95 in 100 under ${p95.toFixed(2)} points`);
+  assert.ok(radii[radii.length - 1]! > 1, "and a few are larger");
 });
 
 test("working's particles float widest about the string, finished's close to it, offline's on it", () => {

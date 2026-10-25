@@ -468,6 +468,9 @@ struct State {
     pod_services: Option<serde_json::Value>,
     /// The workflow file that defines the job (W06-R03's `job.workflow_*`).
     job_workflow: Option<kiln_ci::plan::DefinedIn>,
+    /// The CPUs the leg was given (W05-R03, resource mode), held until it ends: its background
+    /// steps' copies of its state share them.
+    cpus: Option<std::sync::Arc<super::cpus::Lease>>,
     /// The problem matchers steps added (W06-R06).
     matchers: matchers::Job,
     /// A background step's own stop (`cancel:`, W06-R17).
@@ -1274,6 +1277,15 @@ impl Leg {
             docker_sock: None,
             pod_services: None,
             job_workflow: a.job_workflow.clone(),
+            // This machine's CPUs, for its steps and its containers: a microVM's are its vCPUs.
+            cpus: a
+                .executor
+                .options
+                .get("cpus")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|_| matches!(a.executor.kind.as_str(), "" | "host" | "docker"))
+                .and_then(|n| super::cpus::take(usize::try_from(n).unwrap_or(0)))
+                .map(std::sync::Arc::new),
             matchers: matchers::Job::default(),
             stop: None,
             masks_added: Vec::new(),
@@ -2052,9 +2064,9 @@ impl Leg {
             seccomp_unconfined: false,
             user: None,
             workspace_size: None,
-            tmp_volume: false,
             memory: None,
             seed_tools: false,
+            cpuset: st.cpus.as_ref().map(|l| l.list()),
         })
     }
 
@@ -2188,6 +2200,12 @@ impl Leg {
             let own = crate::githost::host_of(if a.runtime.registry_url.is_empty() { &a.runtime.facade_url } else { &a.runtime.registry_url });
             let mut c = w.containers;
             c.cli = c.cli.through(&own, a.runtime.mirrors.clone());
+            // Its pool started it without the leg's CPUs and memory (W05-R03): given them now. A
+            // leg that can't be held to them still runs, and says so.
+            let cpus = st.cpus.as_ref().map(|l| l.list());
+            if let Err(e) = c.hold(cpus.as_deref(), a.executor.options.get("memory").and_then(serde_json::Value::as_u64)).await {
+                self.note(idx, &format!("The pool's executor couldn't be held to the leg's CPUs and memory: {e:#}")).await;
+            }
             st.containers = Some(c);
             return Ok(());
         }
@@ -2235,7 +2253,6 @@ impl Leg {
                     docker_proxy,
                     seccomp_unconfined: socket,
                     env,
-                    tmp_volume: true,
                     seed_tools: true,
                     ..super::docker::Spec::default()
                 })
@@ -2246,6 +2263,8 @@ impl Leg {
         let job = job.map(|j| super::docker::Spec { workspace_size: super::chaos::for_leg(a.attempt).and_then(|c| c.disk_mib).map(|mib| u64::from(mib) << 20), ..j });
         // The memory the leg was given in resource mode (W05-R03), its job container's limit.
         let job = job.map(|j| super::docker::Spec { memory: a.executor.options.get("memory").and_then(serde_json::Value::as_u64), ..j });
+        // And the CPUs it was given, its job container's own (`--cpuset-cpus`).
+        let job = job.map(|j| super::docker::Spec { cpuset: st.cpus.as_ref().map(|l| l.list()), ..j });
         // W18-R08: a job in a container is contained, its one way out the relay to the runner's
         // proxy. A runner without a static kiln for the relay can't contain it: an untrusted leg
         // stops here; a trusted one runs as it would without its policy, and says so.
@@ -2500,7 +2519,15 @@ impl Leg {
             }
             cli.exec_command(&j.id, j.user.as_deref(), &j.map.translate(&wd.to_string_lossy()), &inner, &j.map.translate(&prog), &args)
         } else {
-            let mut c = shell_program(&prog, &args, shell);
+            // On the host, within the CPUs the leg was given (W05-R03), as `taskset` starts it.
+            let mut c = match (&st.cpus, super::cpus::taskset()) {
+                (Some(l), Some(t)) => {
+                    let mut c = Command::new(t);
+                    c.arg("-c").arg(l.list()).arg(&prog).args(&args);
+                    c
+                }
+                _ => shell_program(&prog, &args, shell),
+            };
             c.current_dir(wd).envs(&env);
             c
         };
@@ -5061,6 +5088,21 @@ runs:
         })?;
         assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
         assert!(logs.get(&0).is_some_and(|l| l.contains("in /__w/_temp")), "{logs:?}");
+        Ok(())
+    }
+
+    /// W05-R03: a leg in resource mode runs on CPUs of its own, as many as it asked for: on the
+    /// host its steps start within them (`taskset`), so `nproc` says the leg's (Linux).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn w05_r03_a_host_leg_runs_on_its_cpus() -> anyhow::Result<()> {
+        if super::super::cpus::taskset().is_none() {
+            return Ok(());
+        }
+        let wf = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: echo \"cpus $(nproc)\"\n";
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Gha, &|_| Ok(()), &|a: &mut AssignmentV2| a.executor.options = serde_json::json!({ "cpus": 1 }))?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        assert!(logs.get(&0).is_some_and(|l| l.contains("cpus 1")), "{logs:?}");
         Ok(())
     }
 

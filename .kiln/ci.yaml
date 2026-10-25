@@ -5,9 +5,12 @@ on:
   push: { branches: [main] }
   pull_request: {}
   manual: true
+# One run per branch at a time, and it finishes: pushes come faster than a run ends on busy
+# machines, and cancelling the one under way left nothing finished. The newest push waits for it
+# (an older one waiting is dropped, as GitHub's single queue does).
 concurrency:
   group: "kiln-${{ branch }}"
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   rust:
     name: rust lint + test

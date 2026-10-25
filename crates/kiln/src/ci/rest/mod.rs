@@ -6,7 +6,7 @@
 //!   - the artifact endpoints that `download-artifact` uses across runs (W08-R08);
 //!   - `workflow_dispatch` and `repository_dispatch` (W03-R11);
 //!   - the repository's reads from the server's mirror ([`repos`]): repository, commits,
-//!     branches, refs, contents, tarballs and zipballs, compare;
+//!     branches, refs, contents, tarballs and zipballs, compare; and a person's permission there;
 //!   - what jobs record ([`records`]): commit statuses, check runs, releases and their assets,
 //!     dependency snapshots, deployments and their statuses (and the environments they go to);
 //!   - the dependency graph's compare ([`deps`]), for `dependency-review-action`;
@@ -137,6 +137,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             (&Method::GET, ["tarball", r @ ..]) => repos::archive(&s, &r.join("/"), false).await,
             (&Method::GET, ["zipball", r @ ..]) => repos::archive(&s, &r.join("/"), true).await,
             (&Method::GET, ["compare", bh @ ..]) => Ok(repos::compare(&s, &bh.join("/")).await),
+            // A person's access here, as actions check it before they act for the run's actor.
+            (&Method::GET, ["collaborators", login, "permission"]) => repos::collaborator_permission(&s, login).await,
             (&Method::POST, ["statuses", sha]) => records::create_status(&s, sha, &body(req).await?).await,
             (&Method::POST, ["check-runs"]) => records::create_check(&s, &body(req).await?).await,
             (&Method::PATCH, ["check-runs", id]) => records::update_check(&s, id, &body(req).await?).await,

@@ -245,6 +245,17 @@ impl Instances {
         self.newest_of(name).filter(|p| self.by_peer.get(p).is_some_and(|i| i.caps & caps == caps))
     }
 
+    /// Which of `name`'s processes holds what one process of a machine holds at a time (its replica
+    /// of kiln's records: `caps` [`crate::proto::CAP_CLUSTER`]): its newest, if it can, and the
+    /// others that can, which let theirs go. A blue/green upgrade's new build joins ranked oldest,
+    /// so it lets go until it's promoted, and holds it from then on.
+    pub fn holder_of(&self, name: &str, caps: u32) -> (Option<PeerId>, Vec<PeerId>) {
+        let newest = self.newest_with(name, caps);
+        let mut others: Vec<PeerId> = self.by_peer.iter().filter(|(p, i)| i.name == name && Some(**p) != newest && i.caps & caps == caps).map(|(p, _)| *p).collect();
+        others.sort_unstable();
+        (newest, others)
+    }
+
     /// [`crate::proto::AgentMsg::Facts`]: the kiln an instance says it runs.
     pub fn set_kiln(&mut self, peer: PeerId, kiln: kiln_ci::facts::KilnFacts) {
         if let Some(i) = self.by_peer.get_mut(&peer) {
@@ -490,6 +501,29 @@ mod tests {
         assert_eq!(inst.reannounce(2, &ih("green", 100)), Some(vec![]), "drained once");
         // Before its hello, an announcement is the one its hello comes with.
         assert_eq!(inst.reannounce(3, &ih("other", 5)), None);
+    }
+
+    /// A machine's replica is its newest process's (docs/p2p.md, P2): a blue/green upgrade's new
+    /// build lets it go until it takes over, then holds it, and the runner it took over from lets
+    /// go. So the server says who holds it again as a new build is promoted (hub.rs
+    /// `newest_changed`), not only as a process says what it can do.
+    #[test]
+    fn a_new_build_holds_its_machines_replica_once_it_has_taken_over() {
+        use crate::proto::CAP_CLUSTER;
+        let mut inst = Instances::default();
+        inst.announce(1, ih("main", 0));
+        inst.join(1, "m", hello("1"), 0);
+        inst.set_build(1, "old".into(), CAP_CLUSTER);
+        assert_eq!(inst.holder_of("m", CAP_CLUSTER), (Some(1), vec![]));
+        inst.announce(2, ih("green", -1));
+        inst.join(2, "m", hello("2"), 0);
+        inst.set_build(2, "new".into(), CAP_CLUSTER);
+        assert_eq!(inst.holder_of("m", CAP_CLUSTER), (Some(1), vec![2]), "before it takes over, the new build lets the replica go");
+        assert_eq!(inst.reannounce(2, &ih("green", 100)), Some(vec![1]));
+        assert_eq!(inst.holder_of("m", CAP_CLUSTER), (Some(2), vec![1]), "promoted, it holds it, and the old runner lets go");
+        // A newest process that can't hold one: none holds it, and the one that could lets go.
+        inst.set_build(2, "new".into(), 0);
+        assert_eq!(inst.holder_of("m", CAP_CLUSTER), (None, vec![1]));
     }
 
     #[test]

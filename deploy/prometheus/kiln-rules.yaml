@@ -138,6 +138,32 @@ groups:
         annotations:
           summary: kiln server is crash-looping
           description: "More than 5 supervisor restarts in 30 minutes."
+      # From outside the process (docs/resilience.md, C2): a server that can't start never exposes
+      # kiln_supervisor_restarts_total, so on 2026-10-24 a rollback crash-looped for minutes with
+      # KilnCrashLooping silent. kube-state-metrics (kube-prometheus-stack) sees the pod itself.
+      - alert: KilnPodCrashLooping
+        expr: max by (namespace, pod) (kube_pod_container_status_waiting_reason{container="kiln",reason="CrashLoopBackOff"}) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: kiln's pod is in CrashLoopBackOff
+          description: "{{ $labels.namespace }}/{{ $labels.pod }} keeps exiting at start. `kubectl logs --previous` says why; a rollback onto a newer schema crash-loops this way."
+      - alert: KilnDeploymentUnavailable
+        expr: max by (namespace, deployment) (kube_deployment_status_replicas_available{deployment="kiln"}) < 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: kiln has no available pod
+          description: "{{ $labels.namespace }}/{{ $labels.deployment }} has had no ready pod for 2 minutes."
+      - alert: KilnPodRestarting
+        expr: sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total{container="kiln"}[15m])) > 2
+        labels:
+          severity: warning
+        annotations:
+          summary: kubelet keeps restarting kiln's container
+          description: "{{ $labels.namespace }}/{{ $labels.pod }} restarted {{ $value | printf \"%.0f\" }} times in 15 minutes (failed liveness probes or exits)."
       - alert: KilnPanicsCaught
         expr: increase(kiln_panics_caught_total{job="kiln"}[15m]) > 0
         labels:
@@ -157,6 +183,17 @@ groups:
         annotations:
           summary: Most GitOps polls are failing
           description: "{{ $value | humanizePercentage }} of repository polls failed over 15 minutes (network, token or GitHub outage)."
+      # A storm, not an outage (docs/resilience.md, M2): 24 repositories polled every minute make
+      # about 0.4 polls a second. On 2026-10-24 a feedback loop made 240 a second; the ratio above
+      # took 15 minutes to say anything, and said "outage".
+      - alert: KilnGitopsPollStorm
+        expr: sum(rate(kiln_gitops_polls_total{job="kiln"}[2m])) > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: kiln is polling repositories far faster than their intervals
+          description: "{{ $value | printf \"%.0f\" }} polls a second: a retry loop, not a schedule. It floods the host's resolver and GitHub."
       - alert: KilnGithubRateLimitLow
         # Ratio, not an absolute: unauthenticated GitHub allows only 60/h, which kiln barely uses
         # (polling is `git ls-remote`, not the API).

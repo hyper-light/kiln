@@ -160,7 +160,7 @@ async fn start(work: &Path, ask: &Ask) -> anyhow::Result<Warm> {
         (work.join("_externals"), "/__e".into()),
     ]);
     let cli = Cli::new(&bin, config).owned_by(work);
-    let spec = Spec { image: image.clone(), user: docker::host_user(), tmp_volume: true, seed_tools: true, ..Spec::default() };
+    let spec = Spec { image: image.clone(), user: docker::host_user(), seed_tools: true, ..Spec::default() };
     let said = parking_lot::Mutex::new(Vec::<String>::new());
     let containers = docker::Containers::start(cli, &ask.executor, map, &same(&dir), Some(spec), Vec::new(), None, &|m: String| said.lock().push(m)).await?;
     tracing::info!(executor = %ask.executor, pool = %ask.pool, image = %image, "pool executor ready");

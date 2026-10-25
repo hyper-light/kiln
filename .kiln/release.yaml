@@ -5,16 +5,18 @@
 # commit, and serves them at /dl/kiln/<target>, so remote upgrades and `install.sh` /
 # `install.ps1` work on Linux, macOS and Windows with nothing but this server. A server running a
 # commit with no binaries yet builds it again itself (System → Builds: Build every platform),
-# and a v* tag builds too. A newer push to the branch replaces a build still under way; a server's
-# own build of its commit (a manual run) replaces only another such, so pushes coming faster than a
-# Mac builds can't keep the commit the server runs from ever having all its binaries.
+# and a v* tag builds too. The build under way always finishes (W25): a newer push to the branch
+# waits for it and replaces an older push still waiting, and a server's own build of its commit (a
+# manual run) does the same among manual builds only, so pushes coming faster than a Mac builds
+# can't keep the commit the server runs from ever having all its binaries. v1's
+# `cancel-in-progress` is one boolean for the group, so tag builds queue the same way.
 # ci/release/publish.sh still hands dist/ to another server by hand.
 name: release
 on:
   push: { branches: [main] }
   tag: { branches: ["v*"] }
   manual: true
-concurrency: { group: "release-${{ event }}-${{ branch }}", cancel-in-progress: true }
+concurrency: { group: "release-${{ event }}-${{ branch }}", cancel-in-progress: false }
 jobs:
   linux:
     name: Linux (x86-64, ARM64)

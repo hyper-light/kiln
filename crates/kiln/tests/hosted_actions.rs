@@ -37,26 +37,49 @@ fn until(s: &Server, secs: u64, what: &str, mut f: impl FnMut() -> anyhow::Resul
     }
 }
 
-/// Whether github.com answers here.
 /// W13-R04: a `docker` leg in kiln's runner image has its hosted runner's user: `runner`, by
 /// `USER` and `LOGNAME` too, as a hosted runner's steps have them. ORT's action makes its
 /// container's paths with `${PROJECT_PATH/$USER/ort}`: without `USER` they stayed the host's, and
 /// the corpus's elixir found "path does not exist".
 #[test]
 fn w13_r04_a_hosted_legs_steps_say_their_user() -> anyhow::Result<()> {
+    let Some((s, run, log)) = in_image("kiln/runner-ubuntu-24.04", "echo \"user=$USER logname=$LOGNAME home=$HOME ort=${GITHUB_WORKSPACE/$USER/ort}\"")? else { return Ok(()) };
+    assert_eq!(run.get("conclusion"), Some(&json!("success")), "{run}\n{log}\n{}", s.log());
+    assert!(log.contains("user=runner logname=runner home=/home/runner ort=/home/ort/work/app/app"), "{log}");
+    Ok(())
+}
+
+/// W13-R04, the plan's step 7: kiln's opt-in Android image (the user accepted the SDK's licence,
+/// 2026-10-23) has NDK 27 where GitHub's images have it, its LLVM toolchain the one uv's Android
+/// job builds with, and `ANDROID_NDK_*` naming it as GitHub's images do. Built here once
+/// (`kiln workflow run` of a job routed to it builds it), it's checked by a leg in it.
+#[test]
+fn w13_r04_the_android_image_has_ndk_27s_toolchain() -> anyhow::Result<()> {
+    let ndk = "/usr/local/lib/android/sdk/ndk/27.3.13750724";
+    let step = "echo \"home=$ANDROID_HOME ndk=$ANDROID_NDK ndk_home=$ANDROID_NDK_HOME ndk_root=$ANDROID_NDK_ROOT latest=$ANDROID_NDK_LATEST_HOME\" && ls -d \"$ANDROID_HOME\"/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang && sdkmanager --version && adb version | head -1";
+    let Some((s, run, log)) = in_image("kiln/runner-ubuntu-24.04-android", step)? else { return Ok(()) };
+    assert_eq!(run.get("conclusion"), Some(&json!("success")), "{run}\n{log}\n{}", s.log());
+    assert!(log.contains(&format!("home=/usr/local/lib/android/sdk ndk={ndk} ndk_home={ndk} ndk_root={ndk} latest={ndk}")), "{log}");
+    assert!(log.contains(&format!("{ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang")), "{log}");
+    Ok(())
+}
+
+/// A push of a workflow whose one job runs `step` in `image` (a `docker` leg) on a server of its
+/// own: the server, the run and its log; none when there's no Docker or the image isn't built.
+fn in_image(image: &str, step: &str) -> anyhow::Result<Option<(Server, Value, String)>> {
     if !docker_works() {
         eprintln!("skipped: no Docker here");
-        return Ok(());
+        return Ok(None);
     }
     let images = Command::new("docker").args(["images", "--format", "{{.Repository}}"]).output()?;
-    if !String::from_utf8_lossy(&images.stdout).lines().any(|l| l == "kiln/runner-ubuntu-24.04") {
-        eprintln!("skipped: kiln's runner image isn't built on this machine");
-        return Ok(());
+    if !String::from_utf8_lossy(&images.stdout).lines().any(|l| l == image) {
+        eprintln!("skipped: {image} isn't built on this machine");
+        return Ok(None);
     }
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
     // On this machine's network: the server listens on its loopback only.
-    let rule = "[[ci.routing]]\nmatch = { labels = [\"hosted\"] }\nexecutor = [\"docker\"]\nimage = \"kiln/runner-ubuntu-24.04\"\n";
-    let s = common::start_env(dir.path(), &Options { agent: true, ci: "", extra: rule }, false, &[("KILN_CONTAINER_NETWORK", "host")])?;
+    let rule = format!("[[ci.routing]]\nmatch = {{ labels = [\"hosted\"] }}\nexecutor = [\"docker\"]\nimage = \"{image}\"\n");
+    let s = common::start_env(dir.path(), &Options { agent: true, ci: "", extra: &rule }, false, &[("KILN_CONTAINER_NETWORK", "host")])?;
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "{st} {body}");
     let home = dir.path().join("githome");
@@ -74,17 +97,16 @@ fn w13_r04_a_hosted_legs_steps_say_their_user() -> anyhow::Result<()> {
         Ok(body.contains("\"last_polled_at\":null").then_some(body))
     })?;
     std::fs::create_dir_all(work.join(".github/workflows"))?;
-    let who = "on: push\njobs:\n  who:\n    runs-on: hosted\n    steps:\n      - run: echo \"user=$USER logname=$LOGNAME home=$HOME ort=${GITHUB_WORKSPACE/$USER/ort}\"\n";
-    std::fs::write(work.join(".github/workflows/who.yml"), who)?;
+    let workflow = format!("on: push\njobs:\n  step:\n    runs-on: hosted\n    steps:\n      - run: {}\n", serde_json::to_string(step)?);
+    std::fs::write(work.join(".github/workflows/step.yml"), workflow)?;
     git(&home, &work, &["add", "."])?;
-    git(&home, &work, &["commit", "-qm", "who"])?;
+    git(&home, &work, &["commit", "-qm", "step"])?;
     git(&home, &work, &["push", "-q", "origin", "main"])?;
     let (run, log) = finished(&s, "push", 900)?;
-    assert_eq!(run.get("conclusion"), Some(&json!("success")), "{run}\n{log}\n{}", s.log());
-    assert!(log.contains("user=runner logname=runner home=/home/runner ort=/home/ort/work/app/app"), "{log}");
-    Ok(())
+    Ok(Some((s, run, log)))
 }
 
+/// Whether github.com answers here.
 fn github() -> bool {
     Command::new("curl").args(["-fsSI", "--max-time", "10", "https://github.com/actions/checkout"]).output().is_ok_and(|o| o.status.success())
 }

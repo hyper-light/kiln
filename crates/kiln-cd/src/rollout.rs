@@ -20,6 +20,13 @@
 //!   wins: failed, then erred, then inconclusive. A failure or an error aborts; an inconclusive
 //!   check stops its checks and pauses for a person. `dry-run` checks are measured and shown,
 //!   and never decide.
+//! - **When failures fail a check** (docs/resilience.md, G4): `failures: N` counts them over the
+//!   whole window; `fail-after` instead says `{ in-a-row: N }`, `{ of: N, in: 2m }` (N of the
+//!   measurements in the last two minutes) or `{ for: 1m }` (failing throughout a minute), so one
+//!   spike, or two far apart, doesn't decide.
+//! - **What a failure does** (G3): `severity: rollback` (the default) fails the rollout; `hold`
+//!   stops it where it is and keeps what runs, for a person; `warn` shows it and decides nothing.
+//!   A check that rolls back outranks one that holds.
 //! - **Background checks** (`watch:`) measure from a step to the end.
 //! - **Blue/green** runs its `before` checks against green's preview while blue keeps all the
 //!   traffic, promotes (by itself, after a while, or when a person says so), optionally ramps,
@@ -39,7 +46,7 @@ use serde_json::{Value, json};
 use crate::apps::duration_ms;
 
 /// Measurements a check keeps, the latest (Argo Rollouts keeps ten); its tally counts them all.
-const KEEP_MEASUREMENTS: usize = 10;
+const KEEP_MEASUREMENTS: usize = 64;
 /// A measurement that erred is taken again this soon (Argo Rollouts' retry interval).
 const ERROR_RETRY_MS: u64 = 10_000;
 /// Errors in a row a check tolerates unless it says (Argo Rollouts' `consecutiveErrorLimit`).
@@ -247,11 +254,71 @@ pub struct CheckSpec {
     /// Measured and shown; never decides.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
+    /// What its failure does: roll back (the default), hold for a person, or only warn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<Severity>,
+    /// When failures fail it, in place of `failures`' count over the whole window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_after: Option<FailAfter>,
     /// `${{ }}` expressions over `result` and `rollout`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fail: Option<String>,
+}
+
+/// What a check's failure does (docs/resilience.md, G3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Severity {
+    /// It fails the rollout: what runs goes back.
+    #[default]
+    Rollback,
+    /// It stops the rollout and keeps what runs, for a person to decide.
+    Hold,
+    /// It's shown and decides nothing.
+    Warn,
+}
+
+/// `fail-after`: when failures fail a check, as written.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct FailAfter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_a_row: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub of: Option<u32>,
+    #[serde(default, rename = "in", skip_serializing_if = "Option::is_none")]
+    pub within: Option<String>,
+    #[serde(default, rename = "for", skip_serializing_if = "Option::is_none")]
+    pub lasting: Option<String>,
+}
+
+/// When failures fail a check, compiled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailRule {
+    /// More than `failures` over the whole window.
+    #[default]
+    Total,
+    /// This many in a row.
+    InARow(u32),
+    /// `n` of the measurements in the last `within_ms`.
+    Of { n: u32, within_ms: u64 },
+    /// Failing throughout this long.
+    For(u64),
+}
+
+impl FailAfter {
+    fn rule(&self) -> Result<FailRule, String> {
+        let span = |what: &str, t: &str| duration_ms(t).filter(|ms| *ms > 0).ok_or_else(|| format!("fail-after's {what} `{t}` isn't a duration (30s, 5m, 1h)"));
+        match (self.in_a_row, self.of, self.within.as_deref(), self.lasting.as_deref()) {
+            (Some(n), None, None, None) if n > 0 => Ok(FailRule::InARow(n)),
+            (None, Some(n), Some(w), None) if n > 0 => Ok(FailRule::Of { n, within_ms: span("in", w)? }),
+            (None, None, None, Some(f)) => Ok(FailRule::For(span("for", f)?)),
+            _ => Err("fail-after says one of: { in-a-row: N }, { of: N, in: 2m }, { for: 1m } (N at least 1)".into()),
+        }
+    }
 }
 
 impl CheckSpec {
@@ -299,6 +366,11 @@ impl CheckSpec {
                 _ => None,
             },
         };
+        let fail_rule = match (&self.fail_after, self.failures) {
+            (Some(_), Some(_)) => return Err("a check says failures or fail-after, not both".into()),
+            (Some(f), None) => f.rule()?,
+            (None, _) => FailRule::Total,
+        };
         Ok(Timing {
             count,
             every_ms: d(&self.every, "every", 10_000)?,
@@ -310,6 +382,8 @@ impl CheckSpec {
             streak: self.streak.unwrap_or(0),
             dry_run: self.dry_run,
             lapse_fails: kind == "approve",
+            severity: self.severity.unwrap_or_default(),
+            fail_rule,
         })
     }
 }
@@ -333,6 +407,10 @@ pub struct Timing {
     pub dry_run: bool,
     /// An answer that doesn't come in time fails it (an approval nobody gave); any other errs.
     pub lapse_fails: bool,
+    #[serde(default)]
+    pub severity: Severity,
+    #[serde(default)]
+    pub fail_rule: FailRule,
 }
 
 // ------------------------------------------------------------------ compiled steps
@@ -563,6 +641,11 @@ pub struct Tally {
     /// Passes in a row, and errors in a row, up to the latest.
     pub streak: u32,
     pub errors_in_a_row: u32,
+    /// Failures in a row up to the latest, and when the first of them was measured.
+    #[serde(default)]
+    pub failed_in_a_row: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing_since_ms: Option<u64>,
 }
 
 impl Tally {
@@ -617,7 +700,7 @@ impl CheckRun {
 
     /// Whether its verdict decides anything: a dry run's never does.
     fn counts(&self) -> bool {
-        !self.timing.dry_run
+        !self.timing.dry_run && self.timing.severity != Severity::Warn
     }
 
     fn due(&self, now: u64) -> bool {
@@ -631,12 +714,18 @@ impl CheckRun {
                 t.passed += 1;
                 t.streak += 1;
                 t.errors_in_a_row = 0;
+                t.failed_in_a_row = 0;
+                t.failing_since_ms = None;
             }
             Verdict::Fail | Verdict::Inconclusive => {
                 if m.verdict == Verdict::Fail {
                     t.failed += 1;
+                    t.failed_in_a_row += 1;
+                    t.failing_since_ms.get_or_insert(m.at_ms);
                 } else {
                     t.inconclusive += 1;
+                    t.failed_in_a_row = 0;
+                    t.failing_since_ms = None;
                 }
                 t.streak = 0;
                 t.errors_in_a_row = 0;
@@ -656,6 +745,24 @@ impl CheckRun {
         self.judge();
     }
 
+    /// Whether its failures fail it, by its rule, and how they did.
+    fn failed_enough(&self) -> Option<String> {
+        let (t, n) = (self.timing, self.tally);
+        match t.fail_rule {
+            FailRule::Total => (n.failed > t.failures).then(|| format!("failures: {} of {} tolerated", n.failed, t.failures)),
+            FailRule::InARow(k) => (n.failed_in_a_row >= k).then(|| format!("{} in a row", n.failed_in_a_row)),
+            FailRule::Of { n: k, within_ms } => {
+                let latest = self.measurements.last()?.at_ms;
+                let recent = self.measurements.iter().filter(|m| m.verdict == Verdict::Fail && m.at_ms + within_ms > latest).count() as u32;
+                (recent >= k).then(|| format!("{recent} in the last {}", span(within_ms)))
+            }
+            FailRule::For(ms) => {
+                let (since, latest) = (n.failing_since_ms?, self.measurements.last()?.at_ms);
+                (n.failed_in_a_row > 0 && latest.saturating_sub(since) >= ms).then(|| format!("failing for {}", span(latest - since)))
+            }
+        }
+    }
+
     /// What the last measurement with this verdict said.
     fn last(&self, v: Verdict) -> String {
         self.measurements.iter().rev().find(|m| m.verdict == v).map(|m| if m.message.is_empty() { m.value.to_string() } else { m.message.clone() }).unwrap_or_default()
@@ -664,8 +771,8 @@ impl CheckRun {
     /// Its verdict from its tally, the worst first, as Argo assesses a metric.
     fn judge(&mut self) {
         let (t, n) = (self.timing, self.tally);
-        let (verdict, why) = if n.failed > t.failures {
-            (Verdict::Fail, format!("failed: {} (failures: {} of {} tolerated)", self.last(Verdict::Fail), n.failed, t.failures))
+        let (verdict, why) = if let Some(how) = self.failed_enough() {
+            (Verdict::Fail, format!("failed: {} ({how})", self.last(Verdict::Fail)))
         } else if n.errors_in_a_row > t.errors {
             (Verdict::Error, format!("couldn't measure {} times in a row: {}", n.errors_in_a_row, self.last(Verdict::Error)))
         } else if n.inconclusive > t.inconclusive {
@@ -691,7 +798,7 @@ impl CheckRun {
     }
 
     fn summary(&self) -> Value {
-        json!({ "check": self.name, "verdict": self.verdict, "why": self.why, "tally": self.tally, "dry_run": self.timing.dry_run })
+        json!({ "check": self.name, "verdict": self.verdict, "why": self.why, "tally": self.tally, "dry_run": self.timing.dry_run, "severity": self.timing.severity })
     }
 }
 
@@ -725,6 +832,8 @@ pub enum Watched {
     Passed,
     /// A check failed, erred or couldn't tell: which, and why.
     Failed(String),
+    /// A check that holds failed, erred or couldn't tell: keep what runs, for a person.
+    Held(String),
 }
 
 impl Window {
@@ -777,9 +886,13 @@ impl Window {
                 c.record(now, Measurement { at_ms: now, verdict, value: Value::Null, message: format!("no answer within {}", span(t)) });
             }
         }
-        for v in [Verdict::Fail, Verdict::Error, Verdict::Inconclusive] {
-            if let Some(c) = self.runs.iter().find(|c| c.counts() && c.verdict == Some(v)) {
-                return Watched::Failed(format!("{}: {}", c.name, c.why));
+        // One that rolls back outranks one that holds.
+        for severity in [Severity::Rollback, Severity::Hold] {
+            for v in [Verdict::Fail, Verdict::Error, Verdict::Inconclusive] {
+                if let Some(c) = self.runs.iter().find(|c| c.counts() && c.timing.severity == severity && c.verdict == Some(v)) {
+                    let why = format!("{}: {}", c.name, c.why);
+                    return if severity == Severity::Hold { Watched::Held(why) } else { Watched::Failed(why) };
+                }
             }
         }
         if now >= self.started_ms + self.window_ms {
@@ -2062,6 +2175,70 @@ mod tests {
     }
 
     /// A window of checks with no rollout around it, as the guard of kiln's own deploy measures.
+    /// When failures decide, and what they do (docs/resilience.md, G3 and G4). On 2026-10-24
+    /// two readings of memory over 0.8, minutes apart, rolled a serving kiln back
+    /// (`failures: 1`, counted over the whole window).
+    #[test]
+    fn failures_decide_by_their_rule_and_severity() {
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let run = |w: &mut Window, fails: &dyn Fn(u64) -> bool| -> (Watched, u64) {
+            let mut now = w.started_ms;
+            loop {
+                for (_, _, id) in w.due(now) {
+                    let verdict = if fails(now) { Verdict::Fail } else { Verdict::Pass };
+                    w.measured(id, Measurement { at_ms: now, verdict, value: json!(null), message: "share 0.93".into() }, now);
+                }
+                match w.verdict(now) {
+                    Watched::Watching => now = w.next_ms().max(now + 1),
+                    v => return (v, now),
+                }
+            }
+        };
+        let cs = checks(concat!(
+            "row: { http: { url: x }, every: 10s, fail-after: { in-a-row: 3 } }\n",
+            "recent: { http: { url: x }, every: 10s, fail-after: { of: 3, in: 1m } }\n",
+            "lasting: { http: { url: x }, every: 10s, fail-after: { for: 1m } }\n",
+            "held: { http: { url: x }, every: 10s, severity: hold }\n",
+            "warned: { http: { url: x }, every: 10s, severity: warn }\n",
+            "total: { http: { url: x }, every: 10s, failures: 1 }\n",
+            "first: { http: { url: x }, every: 10s }\n",
+        ));
+        let window = |c: &[&str]| Window::new(&names(c), &cs, 600_000, 1_000);
+        // Two spikes minutes apart (measured at 1s, 11s, 21s, …).
+        let spikes = |t: u64| t == 31_000 || t == 301_000;
+        for c in ["row", "recent", "lasting"] {
+            assert_eq!(run(&mut window(&[c]), &spikes).0, Watched::Passed, "{c}: spikes don't decide");
+        }
+        let (v, _) = run(&mut window(&["total"]), &spikes);
+        assert!(matches!(&v, Watched::Failed(why) if why.contains("failures: 2 of 1 tolerated")), "{v:?}");
+        // A real problem from two minutes in.
+        let from = |t: u64| t >= 121_000;
+        let (v, at) = run(&mut window(&["row"]), &from);
+        assert!(matches!(&v, Watched::Failed(why) if why == "row: failed: share 0.93 (3 in a row)"), "{v:?}");
+        assert_eq!(at, 141_000);
+        let (v, at) = run(&mut window(&["recent"]), &from);
+        assert!(matches!(&v, Watched::Failed(why) if why.ends_with("(3 in the last 1m)")), "{v:?}");
+        assert_eq!(at, 141_000);
+        let (v, at) = run(&mut window(&["lasting"]), &from);
+        assert!(matches!(&v, Watched::Failed(why) if why.ends_with("(failing for 1m)")), "{v:?}");
+        assert_eq!(at, 181_000);
+        // A hold keeps what runs; a warning decides nothing, and says what it is.
+        let (v, _) = run(&mut window(&["held"]), &from);
+        assert!(matches!(&v, Watched::Held(why) if why.starts_with("held: failed")), "{v:?}");
+        let mut w = window(&["warned"]);
+        assert_eq!(run(&mut w, &from).0, Watched::Passed);
+        assert_eq!(w.summary().first().and_then(|c| c.get("severity")), Some(&json!("warn")));
+        // Deciding at once, one that rolls back outranks one that holds.
+        let (v, _) = run(&mut window(&["held", "first"]), &from);
+        assert!(matches!(&v, Watched::Failed(why) if why.starts_with("first:")), "{v:?}");
+        // fail-after says one thing, and never beside failures.
+        for bad in ["{ http: { url: x }, failures: 1, fail-after: { in-a-row: 2 } }", "{ http: { url: x }, fail-after: { of: 2 } }", "{ http: { url: x }, fail-after: { in-a-row: 0 } }", "{ http: { url: x }, fail-after: { for: soon } }"] {
+            let cs = checks(&format!("bad: {bad}\n"));
+            let mut w = Window::new(&names(&["bad"]), &cs, 600_000, 0);
+            assert!(matches!(w.verdict(0), Watched::Failed(why) if why.contains("can't run")), "{bad}");
+        }
+    }
+
     #[test]
     fn a_window_of_checks() {
         let cs = checks(concat!(
