@@ -5,13 +5,16 @@
 //! it (`runs.trust`, what its assignment's `trusted` says), never as a request says it, so an
 //! untrusted leg's results never reach a trusted one (W24-R21).
 //!
-//! - `POST lookup` `{ weak, step, max_age }`: 204 when nothing stands for the key; else 200 with
-//!   the strong key, the step's recorded outputs (`kiln_ci::work::memo::Replay`, encoded) and its
+//! - `POST lookup` `{ unit, step, max_age }`: the step's unit (`kiln_ci::work::key::Unit`), its
+//!   trust the leg's as the server has it, keyed and found on the ledger's one path
+//!   (`work::lookup`, W24-R30). 204 when nothing stands for it; else 200 with the strong key it was
+//!   found under, the step's recorded outputs (`kiln_ci::work::memo::Replay`, encoded) and its
 //!   source (run, its number, leg, step, runner, when, how long it took). The leg's step takes the
 //!   source step's log, summary, annotations and test reports over, as a reused leg takes its
 //!   source's (W08-R10). Only a success stands: one within `max_age`, whose leg is still kept and
 //!   whose files are still kept.
-//! - `POST record` `{ weak, step, ms, max_age, outputs }`: a step's success, kept: 201 `{ key }`.
+//! - `POST record` `{ unit, step, ms, max_age, outputs }`: a step's success, kept on the same path
+//!   (`work::record`): 201 `{ key }`.
 //!   Its files' tree (`outputs.files`) and every file in it must be in the store already; they're
 //!   kept while a lookup could reuse it (`work.object`, until its `max_age` is up), then
 //!   [`sweep`] lets them go and the store collects them.
@@ -24,7 +27,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use http::{Method, StatusCode, header};
-use kiln_ci::work::key::{Key, PathSet};
+use kiln_ci::work::key::{Key, PathSet, Unit};
 use kiln_ci::work::memo::{self, Digest, Replay};
 use rusqlite::{OptionalExtension as _, params};
 use serde::Deserialize;
@@ -58,11 +61,6 @@ fn is_digest(d: &str) -> bool {
     d.len() == 64 && d.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// A key as hex.
-fn key_of(hex: &str) -> Option<Key> {
-    hex::decode(hex).ok()?.try_into().ok().map(Key)
-}
-
 /// The leg a token is for, as the server has it.
 struct LegOf {
     id: String,
@@ -77,6 +75,14 @@ struct LegOf {
     key: String,
     branch: String,
     run_attempt: i64,
+}
+
+impl LegOf {
+    /// A unit a request sends, in this leg's trust domain as the server has it, whatever the
+    /// request says (W24-R21): what the ledger keys (W24-R30).
+    fn unit(&self, sent: Unit) -> Unit {
+        Unit { trust: self.domain.to_owned(), ..sent }
+    }
 }
 
 async fn leg_of(hub: &Hub, claims: &token::Claims) -> anyhow::Result<Option<LegOf>> {
@@ -118,18 +124,19 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
 
 #[derive(Deserialize)]
 struct LookupIn {
-    weak: String,
+    /// The step's unit (W24-R01): the ledger keys it (W24-R30).
+    unit: Unit,
     step: u32,
     #[serde(default)]
     max_age: Option<u64>,
 }
 
-/// What stands for a step's key: the newest success in the scope, within `max_age`, its leg still
+/// What stands for a step's unit: the newest success in the scope, within `max_age`, its leg still
 /// kept (a pruned run takes its logs with it), and its files still kept: its tree's `work.object`
 /// not yet due (each file in it is kept at least as long, [`keep_object`]) and in the store.
 async fn lookup(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fail> {
-    let l: LookupIn = srv::body_json(req.into_body(), 64 << 10).await.map_err(bad)?;
-    let weak = key_of(&l.weak).ok_or_else(|| bad("`weak` is a key: 64 hex digits"))?;
+    let l: LookupIn = srv::body_json(req.into_body(), 16 << 20).await.map_err(bad)?;
+    let unit = leg.unit(l.unit);
     let now = crate::util::now_unix();
     let since = now.saturating_sub(i64::try_from(l.max_age.unwrap_or(memo::MAX_AGE)).unwrap_or(i64::MAX));
     let scope = leg.scope.clone();
@@ -137,7 +144,7 @@ async fn lookup(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, F
         .store
         .call(move |c| {
             let same = |p: &PathSet| p.clone();
-            let Some((key, rec)) = work::lookup(c, &scope, &weak, &same)? else { return Ok(None) };
+            let Some(work::Hit { key, recorded: rec, .. }) = work::lookup(c, &scope, &unit, &same)? else { return Ok(None) };
             if rec.outcome != "success" || rec.provenance.finished_at < since {
                 return Ok(None);
             }
@@ -214,7 +221,8 @@ async fn take_over(hub: &Arc<Hub>, leg: &LegOf, idx: u32, rec: &Recorded) -> any
 
 #[derive(Deserialize)]
 struct RecordIn {
-    weak: String,
+    /// The step's unit (W24-R01): the ledger keys it (W24-R30).
+    unit: Unit,
     step: u32,
     #[serde(default)]
     ms: u64,
@@ -265,7 +273,7 @@ async fn read_object(hub: &Hub, digest: &str, max: u64) -> anyhow::Result<Option
 /// in one transaction, so a collection never takes one in between.
 async fn record(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fail> {
     let r: RecordIn = srv::body_json(req.into_body(), 16 << 20).await.map_err(bad)?;
-    let weak = key_of(&r.weak).ok_or_else(|| bad("`weak` is a key: 64 hex digits"))?;
+    let unit = leg.unit(r.unit);
     let replay = Replay::decode(&r.outputs).map_err(bad)?;
     let mut objects: Vec<String> = Vec::new();
     if let Some(d) = &replay.files {
@@ -306,7 +314,7 @@ async fn record(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, F
                     return Ok(Err(format!("{o} isn't stored: upload it first")));
                 }
             }
-            let key = work::record(&tx, &scope, &weak, &PathSet::new(), &result)?;
+            let key = work::record(&tx, &scope, &unit, &PathSet::new(), &result)?;
             for o in &objects {
                 keep_object(&tx, &scope, o, &key, until)?;
             }
@@ -452,6 +460,14 @@ pub(crate) mod tests {
         crate::ci::integrations::alibaba::tests::serve(Arc::new(Work(hub)))
     }
 
+    /// A step's unit as a runner sends it (W24-R30), told apart by its definition. It says it's
+    /// trusted: the server keys it in its leg's domain whatever it says (W24-R21).
+    fn step_unit(definition: &str) -> Value {
+        use kiln_ci::work::key::{Kind, Platform};
+        let u = Unit { kind: Kind::Step, definition: definition.into(), secrets: Default::default(), env: BTreeMap::new(), platform: Platform::default(), inputs: BTreeMap::new(), upstream: BTreeMap::new(), trust: "trusted".into() };
+        serde_json::to_value(u).unwrap_or_default()
+    }
+
     async fn post(base: &str, token: &str, what: &str, body: &Value) -> anyhow::Result<(u16, Value)> {
         let c = crate::http::client::Client::public()?;
         let resp = c.post(&format!("{base}/_kiln/work/v1/{what}")).bearer(token).json(body).timeout(std::time::Duration::from_secs(30)).send().await?;
@@ -459,9 +475,9 @@ pub(crate) mod tests {
         Ok((status, resp.json(1 << 20).await.unwrap_or(Value::Null)))
     }
 
-    /// W24-R07, R21: a step's success is kept in its leg's scope and found by the same key; another
-    /// domain, another repository or another key finds nothing; a lookup takes the source step's
-    /// log over; an untrusted leg can't say it's trusted.
+    /// W24-R07, R21: a step's success is kept in its leg's scope and found for the same unit;
+    /// another domain, another repository or another unit finds nothing; a lookup takes the source
+    /// step's log over; an untrusted leg can't say it's trusted, nor can its unit.
     #[test]
     fn w24_r07_steps_are_kept_and_found_in_their_scope() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -472,36 +488,36 @@ pub(crate) mod tests {
             let other = leg(&hub, "acme/other", "run4", "leg4", true).await?;
             let base = serve(Arc::clone(&hub))?;
             hub.logs.append("leg1", 2, b"built 1\r\n");
-            let weak = "ab".repeat(32);
+            let unit = step_unit("ab");
             let outputs = Replay { outputs: BTreeMap::from([("v".to_owned(), "1".to_owned())]), ..Replay::default() }.encode();
-            let (st, v) = post(&base, &first, "lookup", &json!({ "weak": weak, "step": 2 })).await?;
+            let (st, v) = post(&base, &first, "lookup", &json!({ "unit": unit, "step": 2 })).await?;
             anyhow::ensure!(st == 204, "nothing yet: {st} {v}");
-            let (st, v) = post(&base, &first, "record", &json!({ "weak": weak, "step": 2, "ms": 1500, "outputs": outputs })).await?;
+            let (st, v) = post(&base, &first, "record", &json!({ "unit": unit, "step": 2, "ms": 1500, "outputs": outputs })).await?;
             anyhow::ensure!(st == 201 && v.get("key").and_then(Value::as_str).is_some_and(|k| k.len() == 64), "{st} {v}");
-            let (st, v) = post(&base, &second, "lookup", &json!({ "weak": weak, "step": 0 })).await?;
+            let (st, v) = post(&base, &second, "lookup", &json!({ "unit": unit, "step": 0 })).await?;
             anyhow::ensure!(st == 200, "{st} {v}");
             anyhow::ensure!(v.pointer("/source/run") == Some(&json!("run1")) && v.pointer("/source/number") == Some(&json!(1)) && v.pointer("/source/step") == Some(&json!(2)) && v.pointer("/source/ms") == Some(&json!(1500)), "{v}");
             anyhow::ensure!(v.pointer("/outputs/output.v") == Some(&json!("1")), "{v}");
             let log = hub.logs.read("leg2", 0).await;
             anyhow::ensure!(log == b"built 1\r\n", "the source's log: {}", String::from_utf8_lossy(&log));
             for (who, t) in [("an untrusted leg", &untrusted), ("another repository", &other)] {
-                let (st, v) = post(&base, t, "lookup", &json!({ "weak": weak, "step": 0 })).await?;
+                let (st, v) = post(&base, t, "lookup", &json!({ "unit": unit, "step": 0 })).await?;
                 anyhow::ensure!(st == 204, "{who}: {st} {v}");
             }
-            let (st, _) = post(&base, &second, "lookup", &json!({ "weak": "cd".repeat(32), "step": 0 })).await?;
+            let (st, _) = post(&base, &second, "lookup", &json!({ "unit": step_unit("cd"), "step": 0 })).await?;
             anyhow::ensure!(st == 204, "another key");
             // An untrusted leg's record lands in its own domain, whatever it says.
-            let (st, v) = post(&base, &untrusted, "record", &json!({ "weak": "ef".repeat(32), "step": 0, "outputs": {}, "trusted": true })).await?;
+            let (st, v) = post(&base, &untrusted, "record", &json!({ "unit": step_unit("ef"), "step": 0, "outputs": {}, "trusted": true })).await?;
             anyhow::ensure!(st == 201, "{st} {v}");
-            let (st, _) = post(&base, &second, "lookup", &json!({ "weak": "ef".repeat(32), "step": 0 })).await?;
+            let (st, _) = post(&base, &second, "lookup", &json!({ "unit": step_unit("ef"), "step": 0 })).await?;
             anyhow::ensure!(st == 204, "a trusted leg never reads an untrusted result");
-            let (st, _) = post(&base, &untrusted, "lookup", &json!({ "weak": "ef".repeat(32), "step": 1 })).await?;
+            let (st, _) = post(&base, &untrusted, "lookup", &json!({ "unit": step_unit("ef"), "step": 1 })).await?;
             anyhow::ensure!(st == 200, "an untrusted leg reads its own domain's");
             // A tree that isn't stored can't be recorded; a bad token gets nothing at all.
             let files = Replay { files: Some(memo::Digest::of(b"no such tree")), ..Replay::default() }.encode();
-            let (st, v) = post(&base, &first, "record", &json!({ "weak": "12".repeat(32), "step": 1, "outputs": files })).await?;
+            let (st, v) = post(&base, &first, "record", &json!({ "unit": step_unit("12"), "step": 1, "outputs": files })).await?;
             anyhow::ensure!(st == 400, "{st} {v}");
-            let (st, _) = post(&base, "not-a-token", "lookup", &json!({ "weak": weak, "step": 0 })).await?;
+            let (st, _) = post(&base, "not-a-token", "lookup", &json!({ "unit": unit, "step": 0 })).await?;
             anyhow::ensure!(st == 401, "{st}");
             Ok(())
         })
@@ -541,14 +557,14 @@ pub(crate) mod tests {
             let (st, v) = post(&base, &first, "missing", &json!({ "digests": digests })).await?;
             anyhow::ensure!(st == 200 && missing(&v) == 3, "all three to send: {st} {v}");
             let files = Replay { outputs: BTreeMap::from([("made".to_owned(), "yes".to_owned())]), files: Some(td.clone()), ..Replay::default() }.encode();
-            let (weak, step) = ("ab".repeat(32), json!(0));
-            let (st, v) = post(&base, &first, "record", &json!({ "weak": weak, "step": step, "outputs": files })).await?;
+            let (unit, step) = (step_unit("ab"), json!(0));
+            let (st, v) = post(&base, &first, "record", &json!({ "unit": unit, "step": step, "outputs": files })).await?;
             anyhow::ensure!(st == 400, "its files aren't there yet: {st} {v}");
             anyhow::ensure!(put(&base, &first, &td.hash, b"not the tree".to_vec()).await? == 400, "a body that isn't its digest's");
             for (d, body) in &objects {
                 anyhow::ensure!(put(&base, &first, &d.hash, body.clone()).await? == 200, "{}", d.hash);
             }
-            let (st, v) = post(&base, &first, "record", &json!({ "weak": weak, "step": step, "max_age": 3600, "outputs": files })).await?;
+            let (st, v) = post(&base, &first, "record", &json!({ "unit": unit, "step": step, "max_age": 3600, "outputs": files })).await?;
             anyhow::ensure!(st == 201, "{st} {v}");
             // Kept in its scope: nothing more to send there; everything elsewhere, as if never seen.
             let (_, v) = post(&base, &second, "missing", &json!({ "digests": digests })).await?;
@@ -557,18 +573,18 @@ pub(crate) mod tests {
             anyhow::ensure!(missing(&v) == 3, "another repository is never told: {v}");
             anyhow::ensure!(get(&base, &second, &td.hash).await? == (200, tree.clone()), "its tree reads back in its scope");
             anyhow::ensure!(get(&base, &other, &td.hash).await?.0 == 404, "and nowhere else");
-            let (st, v) = post(&base, &second, "lookup", &json!({ "weak": weak, "step": 0, "max_age": 3600 })).await?;
+            let (st, v) = post(&base, &second, "lookup", &json!({ "unit": unit, "step": 0, "max_age": 3600 })).await?;
             anyhow::ensure!(st == 200 && v.pointer("/outputs/files") == Some(&json!(td.to_string())) && v.pointer("/outputs/output.made") == Some(&json!("yes")), "{st} {v}");
             // The longest `max_age` of the results that refer to a file keeps it.
-            let (st, _) = post(&base, &first, "record", &json!({ "weak": "cd".repeat(32), "step": 1, "max_age": 30 * 86_400, "outputs": files })).await?;
+            let (st, _) = post(&base, &first, "record", &json!({ "unit": step_unit("cd"), "step": 1, "max_age": 30 * 86_400, "outputs": files })).await?;
             anyhow::ensure!(st == 201, "{st}");
-            let (st, _) = post(&base, &first, "record", &json!({ "weak": "ef".repeat(32), "step": 2, "max_age": 60, "outputs": files })).await?;
+            let (st, _) = post(&base, &first, "record", &json!({ "unit": step_unit("ef"), "step": 2, "max_age": 60, "outputs": files })).await?;
             anyhow::ensure!(st == 201, "{st}");
             let due: Option<i64> = hub.store.call(|c| Ok(c.query_row("SELECT MIN(at) FROM work_records WHERE family = 'work.object'", [], |r| r.get(0))?)).await?;
             anyhow::ensure!(due.is_some_and(|at| at > crate::util::now_unix() + 29 * 86_400), "kept for the longest: {due:?}");
             // Once no result can be reused, the lookup finds nothing and the upkeep lets the files go.
             hub.store.call(|c| Ok(c.execute("UPDATE work_records SET at = 0 WHERE family = 'work.object'", [])?)).await?;
-            let (st, _) = post(&base, &second, "lookup", &json!({ "weak": weak, "step": 0 })).await?;
+            let (st, _) = post(&base, &second, "lookup", &json!({ "unit": unit, "step": 0 })).await?;
             anyhow::ensure!(st == 204, "its files are due to go: {st}");
             anyhow::ensure!(sweep(&hub).await? == 3, "the tree and its two files");
             let (_, v) = post(&base, &second, "missing", &json!({ "digests": digests })).await?;

@@ -1,12 +1,12 @@
-//! Step reuse on the runner (docs/ci.md W24-R07): a step that says `memo:` is keyed before it runs
-//! (`kiln_ci::work::memo`) and looked up in the server's work ledger (`/_kiln/work/v1/`,
-//! `crate::ci::services::memo`) with the leg's runtime token, as `kiln/cache@v1` reaches the
-//! server's cache (`runner::cache`). A hit isn't run: the server gives the step its source's log,
-//! summary, annotations and test reports, and here its outputs, the variables it set, what it put
-//! on `PATH` and its `run.env` lines are replayed; the files it kept (`memo.outputs`) are put in
-//! place only once a later step runs. A miss runs, and a success is kept: its files as a tree in
-//! the content store, then its result. A failure, a cancellation or a timeout never is. Each memo
-//! step says in its log which of these it was, and why.
+//! Step reuse on the runner (docs/ci.md W24-R07): a step that says `memo:` is made a unit before it
+//! runs (`kiln_ci::work::memo`), which the server's work ledger keys and looks up on its one path
+//! (W24-R30; `/_kiln/work/v1/`, `crate::ci::services::memo`) with the leg's runtime token, as
+//! `kiln/cache@v1` reaches the server's cache (`runner::cache`). A hit isn't run: the server gives
+//! the step its source's log, summary, annotations and test reports, and here its outputs, the
+//! variables it set, what it put on `PATH` and its `run.env` lines are replayed; the files it kept
+//! (`memo.outputs`) are put in place only once a later step runs. A miss runs, and a success is
+//! kept: its files as a tree in the content store, then its result. A failure, a cancellation or a
+//! timeout never is. Each memo step says in its log which of these it was, and why.
 //!
 //! Only the leg's own steps are keyed: a background step or a composite action's step runs as any
 //! other, but what earlier hits left is put in place before it does.
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use kiln_ci::wf::ir::Step;
 use kiln_ci::wire::Conclusion;
-use kiln_ci::work::key::{self, Key, Platform};
+use kiln_ci::work::key::{self, Platform, Unit};
 use kiln_ci::work::memo::{self, Definition, Digest, Entry, Facts, Memo, Replay, Tree};
 use serde_json::{Value, json};
 
@@ -100,7 +100,8 @@ pub(super) enum Prepared {
 
 /// A memo step that runs, and the leg as it found it, to tell what it changed.
 pub(super) struct Keyed {
-    weak: Key,
+    /// Its unit, as the server's ledger keys it (W24-R30).
+    unit: Unit,
     memo: Memo,
     started: Instant,
     env: BTreeMap<String, String>,
@@ -184,8 +185,10 @@ impl Leg {
             } else {
                 match self.memo_key(st, step, &m, env, wd, shell, script, with).await {
                     Err(why) => self.note(idx, &format!("memo: {why}: the step runs")).await,
-                    Ok(weak) => {
-                        let ask = json!({ "weak": weak.hex(), "step": idx, "max_age": m.max_age });
+                    Ok(unit) => {
+                        // The ledger keys the unit on its one path (W24-R30); its weak key names it here.
+                        let weak = key::weak(&unit);
+                        let ask = json!({ "unit": unit, "step": idx, "max_age": m.max_age });
                         match self.work_post("lookup", &ask, Duration::from_secs(60)).await {
                             Ok((200, v)) => {
                                 let replay = serde_json::from_value::<BTreeMap<String, String>>(v.get("outputs").cloned().unwrap_or_default()).map_err(|e| e.to_string()).and_then(|o| Replay::decode(&o));
@@ -206,7 +209,7 @@ impl Leg {
                             Err(e) => self.note(idx, &format!("memo: the work ledger couldn't be reached ({e:#}): the step runs")).await,
                         }
                         if st.memo.off.is_none() {
-                            keyed = Some(Box::new(Keyed { weak, memo: m, started: Instant::now(), env: st.env.clone(), path: st.path.entries().to_vec(), run_env: st.run_env.len(), masks: st.masks_added.len() }));
+                            keyed = Some(Box::new(Keyed { unit, memo: m, started: Instant::now(), env: st.env.clone(), path: st.path.entries().to_vec(), run_env: st.run_env.len(), masks: st.masks_added.len() }));
                         }
                     }
                 }
@@ -218,11 +221,12 @@ impl Leg {
         }
     }
 
-    /// The step's work key (W24-R01): a step's unit over the step evaluated, the environment the
-    /// rules keep, the platform, its inputs' git trees, what came before it and its trust. Why not,
-    /// when it can't be keyed: it receives secrets (W24-R05), or its inputs can't be known.
+    /// The step's unit (W24-R01), which the server's ledger keys (W24-R30): the step evaluated, the
+    /// environment the rules keep, the platform, its inputs' git trees, what came before it and its
+    /// trust. Why not, when it can't be keyed: it receives secrets (W24-R05), or its inputs can't be
+    /// known.
     #[allow(clippy::too_many_arguments)]
-    async fn memo_key(&self, st: &State, step: &Step, m: &Memo, env: &BTreeMap<String, String>, wd: &Path, shell: Option<&str>, script: Option<&str>, with: &BTreeMap<String, String>) -> Result<Key, String> {
+    async fn memo_key(&self, st: &State, step: &Step, m: &Memo, env: &BTreeMap<String, String>, wd: &Path, shell: Option<&str>, script: Option<&str>, with: &BTreeMap<String, String>) -> Result<Unit, String> {
         let a = &self.a;
         if !step.kiln.with_secrets.is_empty() || step.uses.as_ref().and_then(|u| a.actions.get(u)).is_some_and(|x| !x.secrets.is_empty()) {
             return Err("it's given secrets, so it isn't reused (W24-R05's `memo.secrets: hmac` isn't built yet)".into());
@@ -291,7 +295,7 @@ impl Leg {
         }
         let inputs = self.memo_inputs(st, &declared_inputs, &m.outputs).await?;
         let facts = Facts { definition, env: all, declared, platform, inputs, upstream, trusted: a.trusted };
-        Ok(key::weak(&memo::unit(&facts)))
+        Ok(memo::unit(&facts))
     }
 
     /// The step's inputs (W24-R01): its declared paths' git trees at the workspace's `HEAD`, and what
@@ -424,9 +428,9 @@ impl Leg {
             return;
         }
         let ms = u64::try_from(k.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let body = json!({ "weak": k.weak.hex(), "step": idx, "ms": ms, "max_age": k.memo.max_age, "outputs": replay.encode() });
+        let body = json!({ "unit": k.unit, "step": idx, "ms": ms, "max_age": k.memo.max_age, "outputs": replay.encode() });
         match self.work_post("record", &body, Duration::from_secs(120)).await {
-            Ok((201, _)) => self.note(idx, &format!("memo: kept for reuse (key {})", short(&k.weak.hex()))).await,
+            Ok((201, _)) => self.note(idx, &format!("memo: kept for reuse (key {})", short(&key::weak(&k.unit).hex()))).await,
             Ok((status, v)) => self.note(idx, &format!("memo: not kept for reuse: the server said HTTP {status}: {}", said(&v))).await,
             Err(e) => self.note(idx, &format!("memo: not kept for reuse: the work ledger couldn't be reached ({e:#})")).await,
         }
