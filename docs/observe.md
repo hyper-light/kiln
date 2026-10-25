@@ -23,7 +23,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
 | O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; macOS's unified log (`log stream`, and `log show` from its place after a restart) and the Windows Event Log's channels (`wevtutil`, each channel's record id its place); each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live (a Mac's unified log; the Event Log against a stand-in for `wevtutil`, and on a Windows machine) and in browsers (§13), measured (§12.17); a JSON line read in place, no tree of it made (36 allocations a line to 18, 40% more lines a second); a line no pipeline reads, text or JSON, handed over as its row, in the order read beside records, a write's rows one item (a JSON line 18 allocations to 0.01, a text line 9 to 0.01; 50–100% more lines a second through the batcher, §12.17) | done |
-| O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Allocations a record through kiln's nginx pipeline 75 to 49, a date read without a second expression, a date past 2262 no longer overflowing (§12.17). grok's own matcher, its groups in one pass (held to `regex` by differential tests), a line a pipeline reads written as its row where it is read with its strings' room kept: through kiln's nginx pipeline 282–292 k to 585–615 k lines a second, 48 allocations a line to 0.02 (§12.17). A record of one buffer (§8.2): a line a pipeline reads costs no string of its own, every processor held to the code before it by tests; against that code, 4% more nginx lines a second and 16% more scanned JSON, its allocations 5 a line to 1 (§12.17). Next, from its profile: grok's matcher (25% of a line) and attributes found by a hashed name (§12.17) | in progress |
+| O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Allocations a record through kiln's nginx pipeline 75 to 49, a date read without a second expression, a date past 2262 no longer overflowing (§12.17). grok's own matcher, its groups in one pass (held to `regex` by differential tests), a line a pipeline reads written as its row where it is read with its strings' room kept: through kiln's nginx pipeline 282–292 k to 585–615 k lines a second, 48 allocations a line to 0.02 (§12.17). A record of one buffer (§8.2): a line a pipeline reads costs no string of its own, every processor held to the code before it by tests; against that code, 4% more nginx lines a second and 16% more scanned JSON, its allocations 5 a line to 1 (§12.17). From its profile, a pass measured as a chain of commits (§12.17): a record's keys found by their tags, grok's literals and a user agent's words compared in place, its matcher straight on through instructions of one way: 25% more lines a second through kiln's nginx pipeline (667 k to 835 k on an M4 Max), grok's matcher 15% less a line; its census (104.7 instructions an access line, 1.1 ways back) held under bounds by a test | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, Opsgenie, email through an SMTP relay (checked live against Mailpit: STARTTLS, a login, a CA of its own), signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); Azure's event hubs read as they come over Kafka's protocol (a consumer of its own, offsets kept by kiln, each record once through restarts and a broker's), checked live against Apache Kafka's broker (§10.3) | in progress |
@@ -3941,6 +3941,39 @@ Where a line's time goes now (macOS's `sample` at 1 ms over 3 M lines through th
 read from the message's words, 5%; the user-agent parser, 3%. Next: the matcher, and attributes
 found by a name's hash rather than compared one by one.
 
+From that profile, a pass (2026-10-25), each change held to the code before it by its tests and
+measured as a chain: each commit's release bench built in turn in one target dir (its tree exported
+with its files' times set as it is read: a tree of `git archive`'s commit times built where a newer
+build was found its changed crates fresh and was not rebuilt, and an A/B so made measured another
+change than it named), then each run in turn, three rounds, on an M4 Max Mac Studio (its load 3.5
+to 9), medians:
+
+| change | nginx pipeline lines/s | | grok alone, a combined line |
+| --- | --- | --- | --- |
+| before (6cea5ad9) | 667,527 | | 604 ns |
+| a record's keys found by their tags (length and last three bytes) and a bit of each among 128; grok's literals compared a byte at a time, not by `memcmp`; a user agent's words likewise, asked for by places found as it is compiled (0c42dcec) | 762,199 | +14.2% | 602 ns |
+| a line's first words parted a byte at a time; a URL's `://` found from its colons, not by a two-way searcher set up for each; an integer's digits written at once (3e1c70a9) | 774,144 | +1.6% | 597 ns |
+| a row's strings of 16 bytes or fewer appended as one block (e804ffb5) | 749,135 | −3.2% | 597 ns |
+| the user-agent parser's keys made once, where it is compiled (6ccc0db5) | 760,471 | +1.5% | 583 ns |
+| grok's matcher straight on through instructions of one way: its bounds and its table asked at the places a search may come to again alone (6888d0fa) | 834,911 | +9.8% | 516 ns |
+
+Through kiln's nginx pipeline 25% more lines a second; grok's matcher alone 15% less a line (the
+common rule's 518 to 445 ns, the error rule's 621 to 576). JSON scanned and text scanned did not
+move (they read neither the keys nor the matcher). The row's blocks are within their spreads'
+reach of nothing (689,867–753,969 against 704,870–776,673), so a second chain measures them again,
+with the matcher's changes from the profile below.
+
+What the matcher does for an access line (its census, a test build's counts over the bench's
+lines): 104.7 instructions (23 literals, 28 runs, 22 saves, 16 splits, 6 characters, 5 jumps, 4
+look-arounds, 1 match), 101.7 bytes taken by runs, ways back kept 4.3 (goes) and 21 (slots to
+restore), and taken 1.1: it hardly backtracks, and its time is its instructions'. Linux's `perf`
+(arm64, in a container of Docker Desktop's VM on a Mac Studio, `cpu-clock` at 4 kHz, 11,435 samples;
+the matcher inlined into `Grok::parse_with`, 64% of the bench, the values' extraction 14%) put its
+samples on: the dispatch on an instruction's kind, 21% (a chain of comparisons: the kind was held
+in its fields' spare values); a run's bytes, 12%; its step count, 11% (a variable whose address its
+run and its ways back were given: a load and a store each instruction, each waiting on the last);
+where a split's ways may begin, 5%; saves, 3.5%; literals, 3%.
+
 ### 12.18 Metrics from logs
 
 2026-10-19 on this machine, loaded (load average 50–130: other sessions compiling), so compared
@@ -4901,7 +4934,12 @@ apps, Error Tracking, and the profilers (Go, Python through the Agent, Java: 4).
 containers' scenario there found what a runner read of Docker Desktop's containers through the
 engine's stats: no CPU limit, no OOM kills (now read from a container's settings and the engine's
 events, §10.10); with them both of its scenarios pass, the check's and the Collector's (90 s, at
-1cd0cc4d). Not run there: DogStatsD's Unix socket (Windows has no Unix datagram sockets),
+1cd0cc4d). Then the whole set again at d873d6fb: kiln-obs's tests (357) and kiln's observe, CD and
+transport tests (287); every live file above, kiln CD's and Docker's among them, passes there but
+two checks of the tests' own: a runner just caught up refused one OTLP/gRPC export as behind on its
+writes (UNAVAILABLE, which an exporter tries again: the scenario now does), and Prometheus scraped
+itself 7 times in 20 s where its check counted on 8 to 12 (now held to Prometheus's own samples).
+Not run there: DogStatsD's Unix socket (Windows has no Unix datagram sockets),
 macOS's unified log, and the full disk's (it runs this machine's build in a Linux container).
 
 **Live** (`crates/kiln/tests/observe_live.rs`, `cargo test -p kiln --test observe_live -- --ignored`):
