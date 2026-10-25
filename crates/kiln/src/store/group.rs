@@ -106,6 +106,9 @@ const FETCH_TRIES: u32 = 4;
 const HELD_BYTES: u64 = 256 << 20;
 /// How long a stop waits for the log to have room for what's held.
 const STOP_PATIENCE: Duration = Duration::from_secs(30);
+/// How long a learner waits for another process to let its replica go (a machine's older runner
+/// process, told to let its learner go as the newest takes it).
+const ALONE_PATIENCE: Duration = Duration::from_secs(30);
 
 /// Fetches a copy of the server's kiln.db into a file, made now (a learner's way to the database:
 /// the runner's HTTP client to the server).
@@ -143,6 +146,23 @@ fn remove(file: &Path) -> anyhow::Result<()> {
     match std::fs::remove_file(file) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(anyhow::Error::from(e).context(format!("removing {}", file.display()))),
         _ => Ok(()),
+    }
+}
+
+/// Waits until no other process has the database at `db` open. SQLite leaves WAL mode only then,
+/// its WAL checkpointed and gone: so nothing of theirs writes to the replica or its log after this,
+/// nor takes the WAL of a copy put in its place as it closes (SQLite removes a WAL by name). A file
+/// that isn't a database is nobody's.
+fn alone(db: &Path) -> anyhow::Result<()> {
+    let since = Instant::now();
+    loop {
+        let left = Connection::open(db).and_then(|c| c.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get::<_, String>(0)));
+        match left {
+            Ok(mode) if mode.eq_ignore_ascii_case("delete") => return Ok(()),
+            Err(rusqlite::Error::SqliteFailure(e, _)) if !matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => return Ok(()),
+            _ if since.elapsed() >= ALONE_PATIENCE => bail!("another process still has {} open", db.display()),
+            _ => thread::sleep(Duration::from_millis(250)),
+        }
     }
 }
 
@@ -277,6 +297,11 @@ impl Group {
         }
         if let Some(d) = db.parent() {
             std::fs::create_dir_all(d).with_context(|| format!("making {}", d.display()))?;
+        }
+        // A machine's older runner process lets its replica go as the newest takes it (the server
+        // tells both at once): nothing here touches the replica, its log or its WAL until it has.
+        if db.exists() {
+            alone(db)?;
         }
         if !holds_a_copy(db) {
             // None yet, or one an earlier build kept: a copy made now, its log starting again at it
@@ -1652,6 +1677,48 @@ mod tests {
         set(&server, "last", "5")?;
         follow("last")?;
         assert_eq!(copies.load(Ordering::SeqCst), 3, "one a build before stood since is copied again");
+        Ok(())
+    }
+
+    /// A machine's older runner process lets its replica go as the newest takes it, told both at
+    /// once: the newest's learner leaves the replica alone until the older has closed it, and then
+    /// copies it again (it was kept by a build before the mark).
+    #[test]
+    fn a_learner_waits_for_another_process_to_let_its_replica_go() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let server = Store::open_grouped(&dir.path().join("kiln.db"), &dir.path().join("cluster"))?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        let g = server.group().context("grouped")?;
+        g.learners([member].into());
+        until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        let copies = Arc::new(AtomicU64::new(0));
+        let fetch: Fetch = {
+            let (server, copies) = (server.clone(), copies.clone());
+            Arc::new(move |dest: &Path| {
+                copies.fetch_add(1, Ordering::SeqCst);
+                crate::rt::block_on({
+                    let (s, d) = (server.clone(), dest.to_path_buf());
+                    async move { s.copy_for_learner(d).await }
+                })
+            })
+        };
+        let (replica, logs) = (dir.path().join("runner").join("kiln.db"), dir.path().join("runner").join("cluster"));
+        drop(Group::learner(&replica, &logs, member, fetch.clone())?);
+        assert_eq!(copies.load(Ordering::SeqCst), 1, "it started from a copy");
+        // The older process, from a build before the mark, with the replica open.
+        let older = Connection::open(&replica)?;
+        older.execute_batch(&format!("DROP TABLE {MARK}"))?;
+        let starting = {
+            let (replica, logs, fetch) = (replica.clone(), logs.clone(), fetch.clone());
+            thread::spawn(move || Group::learner(&replica, &logs, member, fetch).map(drop))
+        };
+        thread::sleep(Duration::from_secs(2));
+        assert!(!starting.is_finished(), "it waits while another process has the replica open");
+        assert_eq!(copies.load(Ordering::SeqCst), 1, "and takes no copy meanwhile");
+        drop(older);
+        starting.join().map_err(|_| anyhow::anyhow!("the learner's start panicked"))??;
+        assert_eq!(copies.load(Ordering::SeqCst), 2, "let go, the replica is copied again");
         Ok(())
     }
 

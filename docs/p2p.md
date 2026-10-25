@@ -305,7 +305,9 @@ reads from it (`crates/kiln/src/store/learner.rs`, `crates/kiln/src/frontdoor/re
   write the log lacks: the server stopped before it got there) takes a fresh copy before it applies
   anything after it. A replica kept by a build from before that, which went on past such a gap
   without the write, is copied again as its learner starts: `cluster_mark` says where this build
-  last left it, and a replica standing anywhere else is copied. While it has learners, the server
+  last left it, and a replica standing anywhere else is copied. A learner touches its replica only
+  once no other process has it open: a machine's older runner process lets its learner go as the
+  newest takes it ("One runner a machine", `docs/releases.md`). While it has learners, the server
   keeps up to 64 MiB of the log behind what's applied for one a little behind, and beats once a
   second.
 - **Messages.** The group's messages go over each runner's link on the sync lane
