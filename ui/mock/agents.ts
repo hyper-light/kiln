@@ -724,6 +724,22 @@ function tellSubagent(m: Member, task: string, id: string, text: string, mode: s
   for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) for (const u of out) ws.send(JSON.stringify(u));
 }
 
+/** A command about a message waiting in one of its subagents' queues (harness/subagent.rs): edited, moved or taken out there, or sent to it now. */
+function subagentQueue(m: Member, c: { type?: string; id?: string; text?: string; index?: number }) {
+  const t = m.tasks?.find((x) => x.queue?.some((q) => q.id === c.id));
+  const queue = t?.queue ?? [];
+  const at = queue.findIndex((q) => q.id === c.id);
+  const q = queue[at];
+  if (!t || !q) return;
+  if (c.type === "queue_edit" && c.text !== undefined) q.text = c.text;
+  else if (c.type === "queue_move" && c.index !== undefined) queue.splice(Math.max(0, Math.min(c.index, queue.length - 1)), 0, ...queue.splice(at, 1));
+  else if (c.type === "queue_remove" || c.type === "queue_steer" || c.type === "queue_send_now") queue.splice(at, 1);
+  else return;
+  if (c.type === "queue_steer" || c.type === "queue_send_now") return tellSubagent(m, t.id, q.id, q.text, "steer");
+  const state = JSON.stringify({ t: "state", state: stateOf(m) });
+  for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
+}
+
 function stateOf(m: Member): State {
   return {
     status: m.info.status,
@@ -753,9 +769,10 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   ws.on("close", () => seen.delete(ws));
   ws.on("message", (raw) => {
     try {
-      const c = JSON.parse(raw.toString()) as { type?: string; task?: string; id?: string; text?: string; mode?: string };
+      const c = JSON.parse(raw.toString()) as { type?: string; task?: string; id?: string; text?: string; mode?: string; index?: number };
       if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
       if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
+      if (c.type?.startsWith("queue_")) subagentQueue(m, c);
     } catch {
       // Not a command.
     }

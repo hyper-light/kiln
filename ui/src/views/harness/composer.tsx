@@ -708,7 +708,7 @@ export function Composer({
               if (mirror.current) mirror.current.scrollTop = e.currentTarget.scrollTop;
             }}
             onKeyDown={onKeyDown}
-            aria-label="Message to the agent"
+            aria-label={toSub ? "Message to the subagent" : "Message to the agent"}
             enterKeyHint="send"
             autoCapitalize="sentences"
           />
