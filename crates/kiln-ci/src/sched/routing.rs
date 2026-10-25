@@ -500,6 +500,25 @@ pub struct Preference {
     /// Runners carrying this label.
     pub label: Option<String>,
     pub weight: Option<f64>,
+    /// `warm: true` (W24-R18): the runners where the leg is expected to finish first, from what
+    /// each holds warm for its lane (`sched::warm`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub warm: bool,
+    /// `affinity: { job: <id> }` (W05-R23): as `warm`, from that job's workspaces in the leg's
+    /// repository and workflow (W24-R18).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<Affinity>,
+    /// With `warm` or `affinity`: the share (0 to 1) of what a busy warm runner would save that
+    /// the leg may wait for it (W24-R18); the server's when unset, and 0 never to wait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patience: Option<f64>,
+}
+
+/// `affinity: { job: <id> }`: the job whose warm workspaces a leg goes after (W05-R23, W24-R18).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Affinity {
+    pub job: String,
 }
 
 /// What selects the legs a routing rule applies to.
@@ -1027,7 +1046,7 @@ mod tests {
         let a = RunnerView { name: "a".into(), facts: linux(100 << 30), ..RunnerView::default() };
         let b = RunnerView { name: "b".into(), facts: linux(400 << 30), labels: vec!["fast".into()], ..RunnerView::default() };
         assert!(scores(&[], &[&a, &b]).is_empty());
-        let s = scores(&[Preference { fact: Some("disk.free".into()), higher: true, weight: Some(2.0), label: None }, Preference { label: Some("fast".into()), ..Preference::default() }], &[&a, &b]);
+        let s = scores(&[Preference { fact: Some("disk.free".into()), higher: true, weight: Some(2.0), label: None, ..Preference::default() }, Preference { label: Some("fast".into()), ..Preference::default() }], &[&a, &b]);
         assert_eq!(s, vec![0.0, 3.0]);
     }
 }
