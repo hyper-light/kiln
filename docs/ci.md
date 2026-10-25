@@ -7842,6 +7842,29 @@ declared legs are heavy). Simulated in `w24_r19_admission_by_load_in_the_schedul
 as fresh as the last probe (on connect, every 10 minutes, on request), so a refresh of the load
 alone between probes; and the UI's sentence for the wait.
 
+**Eviction (M3, AC12).** Decided as pure code (`kiln_ci::work::evict`): each domain over its quota
+keeps the entries with the most time saved per byte (their unit's duration times their hits plus
+one, over their bytes), the longest run of them that fits, and evicts the rest; a domain within its
+quota evicts nothing, whatever the others hold (R21). AC12, simulated: over random entries (2,000
+cases) every domain fits its quota, keeps only entries at least as dense as each it evicts, and
+evicts no other domain's; over a stream of 6,000 lookups (240 units of 1 MiB to 4 GiB taking 2 s to
+30 min, wanted by a Zipf law, in two domains each held to a tenth of its entries' bytes) it saved
+1.5 to 2.3 times the time least-recently-used eviction saved in the same bytes, for each of five
+seeds. Left: the server's sweep of the ledger's entries and their `cas/` blobs by domain quota.
+
+**How AC03 will be measured.** On the live server, once `.kiln/ci.yaml` runs on the engine (`[ci]
+kiln_workflows`, the change above) with leg and step reuse, warm workspaces (M1) and R10's test
+selection in its `rust` job. From a trunk commit whose trusted run of `ci.yaml` is complete (its
+warm state and ledger entries are the baseline), three pushes of a docs-only change (`docs/ci.md`
+touched) and three of a one-file change in `crates/kiln` (`crates/kiln/src/lib.rs` touched, as
+M0's), each its own commit on that parent, pushed to a branch of kiln's own repository (trusted)
+while nothing else is queued on the `rust` job's runner. The measure is the `rust` leg's wall time,
+`finished_at − started_at` from `/api/ci/runs/:id`'s legs (queueing excluded), the median of each
+scenario's three. It passes under 60 s for the docs-only change and at most 663 s (30 % of M0's
+cold 2211 s) for the one-file change. Each run's reports say why each step ran, was reused or was
+warm (R28), which tells a miss from a slow hit; the figures go in the baseline's table above, with
+their commits, runner and date.
+
 ## 4. API, events, CLI and MCP reference
 
 All routes come from the one route table (W10-R05, W20-R01) and follow access.md's conventions:
