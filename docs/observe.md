@@ -5394,7 +5394,10 @@ s and 493 ms at p99 before (the monitors' one hold, a writer behind it), 5.5 and
 count by status's 11.6 and 12.3 ms, 5.9 and 34; the flood taken at 213 k and 236 k records a second,
 254 k and 188 k after (the second run's machine was busier: its answers' p99 9.5 ms against 1.3 to
 1.5 in the others, its count by status's reading 2.2 s at p99, starved); the thread that applies
-54.4 thousand instructions a record before, 34.2 after (§12.8).
+54.4 thousand instructions a record before, 34.2 after (§12.8). Its three metrics from logs, once
+counting was made faster (§12.23; adacachy, 2026-10-25, before at e1d39d2c and after at 79485048,
+debug builds): 698,500 rows read in 4.9 s, every record counted once 1.0 s after the flood, against
+520,500 in 6.9 s and 6.1 s after before.
 
 **Clock skew** (`observe_live.rs`): a runner whose clock is an hour ahead
 (`KILN_OBSERVE_CLOCK_SKEW_MS` moves the clock observe uses; a real one takes root to move) is
