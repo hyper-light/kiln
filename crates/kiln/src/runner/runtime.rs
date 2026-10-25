@@ -2338,6 +2338,7 @@ impl Leg {
             docker_socket: false,
             docker_proxy: None,
             seccomp_unconfined: false,
+            cap_add: Vec::new(),
             user: None,
             workspace_size: None,
             memory: None,
@@ -2522,12 +2523,15 @@ impl Leg {
                 // Given the host's Docker, the leg could start any container it likes: a seccomp
                 // filter on its own would guard nothing, and it keeps debuggers from what they do
                 // on a hosted runner's machine (lldb's and gdb's `personality` to turn ASLR off).
+                // So do the capabilities profilers run with, which a hosted runner's root has
+                // (CodSpeed's memtrack, W13-R04).
                 Some(super::docker::Spec {
                     image: image.clone(),
                     user: super::docker::host_user(),
                     docker_socket: socket,
                     docker_proxy,
                     seccomp_unconfined: socket,
+                    cap_add: if socket { super::docker::PROFILER_CAPS.iter().map(|c| (*c).to_owned()).collect() } else { Vec::new() },
                     env,
                     seed_tools: true,
                     ..super::docker::Spec::default()
