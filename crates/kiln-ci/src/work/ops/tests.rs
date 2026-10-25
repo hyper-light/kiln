@@ -934,3 +934,26 @@ fn w24_r29_every_dockerfile_in_the_repository_lowers() -> Result<()> {
     println!("base images to resolve: {}", unresolved.into_iter().collect::<Vec<_>>().join(", "));
     Ok(())
 }
+
+/// W25 on W24-R29: a service is an operation of its own kind, keyed by what it runs and the ports
+/// it listens on; an exec bound to it at a hostname keys on it, so changing the service changes
+/// the exec's key.
+#[test]
+fn w25_a_service_keys_and_what_binds_to_it_keys_on_it() -> Result<()> {
+    let mut g = Graph::default();
+    let img = g.add(image("postgres:16"), Vec::new())?;
+    let db = |port: u16| Op::Service(Service { command: Command::Argv(vec!["postgres".into()]), env: BTreeMap::new(), cwd: "/".into(), user: "postgres".into(), ports: vec![Port { port, protocol: Protocol::Tcp }], platform: amd64() });
+    let s1 = g.add(db(5432), vec![Input::new("rootfs", img)])?;
+    let s2 = g.add(db(5433), vec![Input::new("rootfs", img)])?;
+    ensure!(s1 != s2, "the port is part of what a service is");
+    let test = |svc: NodeId, g: &mut Graph| -> Result<NodeId> {
+        let exec = Op::Exec(Exec { command: Command::Argv(vec!["psql".into(), "-h".into(), "db".into()]), env: BTreeMap::new(), cwd: "/".into(), user: String::new(), mounts: Vec::new(), network: Network::Default, security: Security::Sandbox, platform: amd64(), proxy: BTreeMap::new() });
+        Ok(g.add(exec, vec![Input::new("rootfs", img), Input::new("service.db", svc)])?)
+    };
+    let (e1, e2) = (test(s1, &mut g)?, test(s2, &mut g)?);
+    let none = |_: &Input| None;
+    ensure!(g.key(&e1, none) != g.key(&e2, none), "an exec bound to another service keys apart");
+    let canonical = g.nodes.get(&s1).map(|n| n.op.canonical()).unwrap_or_default();
+    ensure!(canonical.starts_with("service ") && canonical.contains("5432/tcp"), "{canonical}");
+    Ok(())
+}

@@ -9,6 +9,9 @@
 //!   layers trees one over another.
 //! - Image config edits ([`ConfigEdit`]), chained from a base image's config.
 //! - An OCI image: its config and its chain of layers ([`Export`]).
+//! - A long-running process the others reach at a hostname ([`Service`], W25's services): an
+//!   [`Exec`] bound to one takes its node as an input of role `service.<hostname>`, so the
+//!   service's definition enters the exec's key.
 //!
 //! A [`Graph`] holds them as a DAG whose edges are named ([`Input::role`]). A node's id is a digest
 //! of its operation's canonical text ([`Op::canonical`]) and its inputs' roles and ids: the same
@@ -377,6 +380,34 @@ pub struct Export {
     pub epoch: Option<i64>,
 }
 
+/// A port a [`Service`] listens on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Port {
+    pub port: u16,
+    pub protocol: Protocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    Tcp,
+    Udp,
+}
+
+/// A long-running process over its input tree (`rootfs`), reached by the operations bound to it
+/// at a hostname (W25, Dagger's `Service`): what it runs, its environment, folder and user, and
+/// the ports it listens on. It makes no tree of its own; what binds to it keys on its node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Service {
+    pub command: Command,
+    pub env: BTreeMap<String, String>,
+    pub cwd: String,
+    /// Empty for the image's default user.
+    pub user: String,
+    pub ports: Vec<Port>,
+    pub platform: Platform,
+}
+
 /// One operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -394,6 +425,7 @@ pub enum Op {
     Merge,
     Config(ConfigEdit),
     Export(Export),
+    Service(Service),
 }
 
 /// Canonical text: a kind, then each field as ` name=value` in a fixed order, every string
@@ -551,6 +583,7 @@ impl Op {
             Op::Merge => "merge",
             Op::Config(_) => "config",
             Op::Export(_) => "export",
+            Op::Service(_) => "service",
         }
     }
 
@@ -621,6 +654,10 @@ impl Op {
                 ConfigEdit::Onbuild(t) => Text::new("config.onbuild").s("trigger", t).0,
             },
             Op::Export(x) => Text::new("export").s("platform", &x.platform.to_string()).on("epoch", x.epoch).0,
+            Op::Service(v) => {
+                let ports: Vec<String> = v.ports.iter().map(|p| format!("{}/{}", p.port, if p.protocol == Protocol::Udp { "udp" } else { "tcp" })).collect();
+                Text::new("service").l("args", &v.command.argv()).m("env", &v.env).s("cwd", &v.cwd).s("user", &v.user).l("ports", &ports).s("platform", &v.platform.to_string()).0
+            }
         }
     }
 }
