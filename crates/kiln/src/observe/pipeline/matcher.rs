@@ -861,15 +861,12 @@ impl Program {
         let budget = stride.saturating_mul(4).saturating_add(256);
         let bound = budget.saturating_add(self.ids.saturating_mul(stride).saturating_mul(64));
         let mut steps = 0usize;
-        // What a run and a way back did, added to `steps` at each place: `steps` kept in a register
-        // (none takes its address; it was a load and a store each instruction, §12.17's profile).
-        let mut work = 0usize;
         let (mut pc, mut at) = (0usize, 0usize);
         loop {
             // A place a search may come to again (a split's way, a run's end, a way back's): its
             // work counted against its bounds, and passed where it was tried before (every way that
             // comes to a place twice comes through one of these).
-            steps += 1 + std::mem::take(&mut work);
+            steps += 1;
             if steps > budget {
                 if !seen.on {
                     let bits = self.ids.saturating_mul(stride);
@@ -936,7 +933,7 @@ impl Program {
                         }
                         Inst::Run { set, min, max, greedy, keep } => {
                             let Some(set) = self.sets.get(set as usize) else { return Found::No };
-                            break self.run(pc, set, (min, max, greedy, keep), hay, at, stack, &mut seen, &mut work);
+                            break self.run(pc, set, (min, max, greedy, keep), hay, at, stack, &mut seen, &mut steps);
                         }
                         Inst::Split { a, b } => {
                             let (a, b) = (a as usize, b as usize);
@@ -959,7 +956,7 @@ impl Program {
             }
             (pc, at) = match went {
                 Some(x) => x,
-                None => match self.back(hay, stack, slots, &mut seen, &mut work) {
+                None => match self.back(hay, stack, slots, &mut seen, &mut steps) {
                     Some(x) => x,
                     None => return Found::No,
                 },
