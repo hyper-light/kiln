@@ -857,15 +857,11 @@ impl Program {
         let budget = stride.saturating_mul(4).saturating_add(256);
         let bound = budget.saturating_add(self.ids.saturating_mul(stride).saturating_mul(64));
         let mut steps = 0usize;
-        let mut next = Some((0usize, 0usize));
+        let (mut pc, mut at) = (0usize, 0usize);
         loop {
-            let (pc, at) = match next {
-                Some(x) => x,
-                None => match self.back(hay, stack, slots, &mut seen, &mut steps) {
-                    Some(x) => x,
-                    None => return Found::No,
-                },
-            };
+            // A place a search may come to again (a split's way, a run's end, a way back's): its
+            // work counted against its bounds, and passed where it was tried before (every way that
+            // comes to a place twice comes through one of these).
             steps += 1;
             if steps > budget {
                 if !seen.on {
@@ -880,61 +876,86 @@ impl Program {
                     return Found::Unsure;
                 }
             }
-            if !seen.first(pc, at) {
-                next = None;
-                continue;
+            let mut went = None;
+            if seen.first(pc, at) {
+                // Straight on from there while each instruction has one way on: none of them a
+                // place that is come to again but through the first.
+                went = loop {
+                    let Some(&inst) = self.insts.get(pc) else { return Found::No };
+                    count(
+                        match inst {
+                            Inst::Lit { .. } => 0,
+                            Inst::One(_) => 1,
+                            Inst::Run { .. } => 2,
+                            Inst::Split { .. } => 3,
+                            Inst::Jmp(_) => 4,
+                            Inst::Save(_) => 5,
+                            Inst::Look(_) => 6,
+                            Inst::Match => 7,
+                        },
+                        1,
+                    );
+                    match inst {
+                        Inst::Lit { at: l, len: n } => {
+                            let lit = self.lits.get(l as usize..(l + n) as usize).unwrap_or_default();
+                            if !holds_lit(hay, at, lit) {
+                                break None;
+                            }
+                            at += lit.len();
+                        }
+                        Inst::One(set) => match self.sets.get(set as usize).and_then(|s| s.at(hay, at)) {
+                            Some(n) => at += n,
+                            None => break None,
+                        },
+                        Inst::Jmp(t) => {
+                            pc = t as usize;
+                            steps += 1;
+                            continue;
+                        }
+                        Inst::Save(slot) => {
+                            if let Some(x) = slots.get_mut(slot as usize) {
+                                // Nothing to go back to: nothing to restore.
+                                if !stack.is_empty() {
+                                    stack.push(Frame::Restore { slot, was: *x });
+                                    count(RESTORE_KEPT, 1);
+                                }
+                                *x = at as u32;
+                            }
+                        }
+                        Inst::Look(l) => {
+                            if !holds(l, hay, at) {
+                                break None;
+                            }
+                        }
+                        Inst::Run { set, min, max, greedy, keep } => {
+                            let Some(set) = self.sets.get(set as usize) else { return Found::No };
+                            break self.run(pc, set, (min, max, greedy, keep), hay, at, stack, &mut seen, &mut steps);
+                        }
+                        Inst::Split { a, b } => {
+                            let (a, b) = (a as usize, b as usize);
+                            break match (self.admit(a).at(hay, at), self.admit(b).at(hay, at)) {
+                                (true, true) => {
+                                    stack.push(Frame::Go { pc: b as u32, at: at as u32 });
+                                    count(GO_KEPT, 1);
+                                    Some((a, at))
+                                }
+                                (true, false) => Some((a, at)),
+                                (false, true) => Some((b, at)),
+                                (false, false) => None,
+                            };
+                        }
+                        Inst::Match => return Found::Yes,
+                    }
+                    pc += 1;
+                    steps += 1;
+                };
             }
-            let Some(&inst) = self.insts.get(pc) else { return Found::No };
-            count(
-                match inst {
-                    Inst::Lit { .. } => 0,
-                    Inst::One(_) => 1,
-                    Inst::Run { .. } => 2,
-                    Inst::Split { .. } => 3,
-                    Inst::Jmp(_) => 4,
-                    Inst::Save(_) => 5,
-                    Inst::Look(_) => 6,
-                    Inst::Match => 7,
+            (pc, at) = match went {
+                Some(x) => x,
+                None => match self.back(hay, stack, slots, &mut seen, &mut steps) {
+                    Some(x) => x,
+                    None => return Found::No,
                 },
-                1,
-            );
-            next = match inst {
-                Inst::Lit { at: l, len: n } => {
-                    let lit = self.lits.get(l as usize..(l + n) as usize).unwrap_or_default();
-                    holds_lit(hay, at, lit).then_some((pc + 1, at + lit.len()))
-                }
-                Inst::One(set) => self.sets.get(set as usize).and_then(|s| s.at(hay, at)).map(|n| (pc + 1, at + n)),
-                Inst::Run { set, min, max, greedy, keep } => {
-                    let Some(set) = self.sets.get(set as usize) else { return Found::No };
-                    self.run(pc, set, (min, max, greedy, keep), hay, at, stack, &mut seen, &mut steps)
-                }
-                Inst::Split { a, b } => {
-                    let (a, b) = (a as usize, b as usize);
-                    match (self.admit(a).at(hay, at), self.admit(b).at(hay, at)) {
-                        (true, true) => {
-                            stack.push(Frame::Go { pc: b as u32, at: at as u32 });
-                            count(GO_KEPT, 1);
-                            Some((a, at))
-                        }
-                        (true, false) => Some((a, at)),
-                        (false, true) => Some((b, at)),
-                        (false, false) => None,
-                    }
-                }
-                Inst::Jmp(t) => Some((t as usize, at)),
-                Inst::Save(slot) => {
-                    if let Some(x) = slots.get_mut(slot as usize) {
-                        // Nothing to go back to: nothing to restore.
-                        if !stack.is_empty() {
-                            stack.push(Frame::Restore { slot, was: *x });
-                            count(RESTORE_KEPT, 1);
-                        }
-                        *x = at as u32;
-                    }
-                    Some((pc + 1, at))
-                }
-                Inst::Look(l) => holds(l, hay, at).then_some((pc + 1, at)),
-                Inst::Match => return Found::Yes,
             };
         }
     }
