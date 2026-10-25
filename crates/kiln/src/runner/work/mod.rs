@@ -1,0 +1,16 @@
+//! W24 on the runner (docs/ci.md W24, Design): what a runner keeps so work isn't done twice.
+//!
+//! - [`store`]: the local content store at `<work>/_cas` (W24-R08).
+//! - [`token`]: the cache service's tokens, scoped to a repository, a trust domain and read or
+//!   write (W24-R08, R21).
+//! - [`service`]: the cache service on loopback and a unix socket, for the runner's legs, its
+//!   `kiln run` commands and its agents (W24-R08).
+//! - [`upstream`]: where the service's writes go up to and its misses are looked for: the server,
+//!   by scope (W24-R08).
+//! - [`client`]: a small blocking client of the service.
+
+pub mod client;
+pub mod service;
+pub mod store;
+pub mod token;
+pub mod upstream;
