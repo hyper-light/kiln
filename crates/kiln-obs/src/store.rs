@@ -1716,6 +1716,16 @@ impl Store {
         self.logs_scoped(&|_| true)
     }
 
+    /// [`Store::logs_every`], a window whole ([`LogsAt::count_metrics`]) by the retention of the
+    /// parts still kept alone, not of those `removed` (an index removed: its part's cutoff is
+    /// stated now, and again each minute while it holds rows, to let them go at once; judged by
+    /// it, every window before then was cut short, and dropped uncounted).
+    pub fn logs_counted(&self, removed: &[u16]) -> LogsAt {
+        let floor = |p: u16| self.part_cutoff(p).saturating_mul(1_000_000);
+        let complete_ns = self.logs.parts().into_iter().filter(|p| !removed.contains(p)).map(floor).max().unwrap_or(self.logs_cutoff.saturating_mul(1_000_000));
+        LogsAt { snap: self.logs.snapshot().scoped(&|p| Some(floor(p))), complete_ns }
+    }
+
     /// As [`Store::logs_at`], of the parts `keep` says (a search of some indexes).
     pub fn logs_scoped(&self, keep: &dyn Fn(u16) -> bool) -> LogsAt {
         let floor = |p: u16| self.part_cutoff(p).saturating_mul(1_000_000);

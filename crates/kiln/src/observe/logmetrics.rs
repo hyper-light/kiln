@@ -529,6 +529,8 @@ impl LogMetrics {
     /// leave the window to count again.
     pub fn tick(&self, store: &kiln_obs::machine::Shared, touched: &Touched, offer: &dyn Fn(Vec<(kiln_obs::batch::SeriesKey, Vec<(i64, f64)>)>) -> bool) {
         let metrics = lock(&self.compiled).clone();
+        // Removed indexes' parts: a window is not held back for what their removal let go.
+        let removed = super::indexes::http::kept().map(|i| i.removed_parts()).unwrap_or_default();
         let started = Instant::now();
         loop {
             let now = super::clock_ms();
@@ -543,7 +545,7 @@ impl LogMetrics {
             let Some(w) = st.due(now) else { return };
             drop(st);
             // Every part's records: those not kept for search are counted too (Datadog's).
-            let at = if self.spans { s.spans_at() } else { s.logs_every() };
+            let at = if self.spans { s.spans_at() } else { s.logs_counted(&removed) };
             drop(s);
             let counting = Instant::now();
             let counted = at.count_metrics(&metrics, w);

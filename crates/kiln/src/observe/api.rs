@@ -309,10 +309,12 @@ async fn log_metric_test(t: LogMetricTest, spans: bool) -> Result<Response, Fail
         let mut series: std::collections::BTreeMap<Vec<u8>, Vec<(i64, f64)>> = std::collections::BTreeMap::new();
         let (mut records, mut rows) = (0u64, 0u64);
         let mut w = window_of(from.saturating_mul(1_000_000));
-        // The records as they are, counted with the store let go: writes go on throughout.
+        // The records as they are, counted with the store let go: writes go on throughout; a
+        // window not held back for what removed indexes let go (`logs_counted`).
+        let removed = super::indexes::http::kept().map(|i| i.removed_parts()).unwrap_or_default();
         let at = {
             let s = store.read().unwrap_or_else(PoisonError::into_inner);
-            if spans { s.spans_at() } else { s.logs_every() }
+            if spans { s.spans_at() } else { s.logs_counted(&removed) }
         };
         while w <= to.saturating_mul(1_000_000) {
             let counted = at.count_metrics(&metrics, w).map_err(|e| e.to_string())?;

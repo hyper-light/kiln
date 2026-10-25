@@ -503,6 +503,40 @@ fn parts_of_the_logs_are_kept_read_and_retained_apart() {
     assert_eq!((count(&s.logs_at(), "main"), count(&s.logs_at(), "audit"), count(&s.logs_every(), "dropped")), (10, 4, 10));
 }
 
+/// A window is counted for metrics from logs by the retention of the parts still kept: an index
+/// removed (its part's cutoff stated now, to let its rows go at once) does not make every window
+/// before then look cut short, as it did judged by every part (`logs_every`: none counted while
+/// the removed part held rows, so Error Tracking found no issue); a part kept whose own retention
+/// reaches into a window still holds that window back.
+#[test]
+fn a_removed_index_does_not_hold_metrics_from_logs_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    let rec = |i: i64, what: &str| Record { ts: i * 1_000_000_000, severity: 17, service: "api".into(), host: "h".into(), source: "app".into(), message: format!("{what} {i}"), ..Record::default() };
+    let mut b = Builder::new();
+    // Three windows of ten seconds, a record a second in main and in an index's part.
+    for i in 0..30 {
+        for (part, what) in [(crate::logs::store::MAIN, "main"), (INDEX, "gone")] {
+            let mut raw = Vec::new();
+            crate::logs::record::put_row(&mut raw, &rec(i, what), 0);
+            b.log_rows_in(part, &raw, 1);
+        }
+    }
+    s.apply(&b.finish()).unwrap();
+    let metric = crate::logs::metrics::LogMetric { name: "records".into(), search: crate::logs::search::parse("*").unwrap(), by: Vec::new(), compute: crate::logs::metrics::Compute::Count, since: 0 };
+    let counted = |at: &LogsAt, w: i64| at.count_metrics(std::slice::from_ref(&metric), w * 1_000_000_000).unwrap().map(|c| c.tallies[0].records);
+    // The index removed: its part's cutoff stated now (40 s), its rows no longer read.
+    s.apply_entry(2, &crate::command::retain_part(INDEX, 40_000, 0)).unwrap();
+    for w in [0, 10, 20] {
+        assert_eq!(counted(&s.logs_every(), w), None, "judged by the removed part, {w}–{} s looked cut short", w + 10);
+        assert_eq!(counted(&s.logs_counted(&[INDEX]), w), Some(10), "main's ten records of {w}–{} s, the removed part's none", w + 10);
+    }
+    // Main's own retention reaching into a window still holds it back.
+    s.apply_entry(3, &crate::command::retain_part(crate::logs::store::MAIN, 15_000, 0)).unwrap();
+    assert_eq!(counted(&s.logs_counted(&[INDEX]), 0), None, "main's cutoff (15 s) reaches into 0–10 s");
+    assert_eq!(counted(&s.logs_counted(&[INDEX]), 20), Some(10));
+}
+
 /// Everything a replica answers, by the series' own keys: every series' samples, the names and
 /// values autocomplete gives, the replicated state, every log record in search order, and the
 /// answers to queries, to the bit.

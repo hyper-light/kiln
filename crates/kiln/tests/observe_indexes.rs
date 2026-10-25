@@ -188,6 +188,24 @@ fn records_are_kept_by_their_index_excluded_or_over_its_quota_as_datadog_keeps_t
     anyhow::ensure!(code == 400, "its name not used again: {code}");
     anyhow::ensure!(f.call("GET", &format!("{CONFIG}/index-order"), None)?["index_names"] == json!(["payments", "main"]));
 
+    // Counted on after it: a metric from logs of what comes after, records two a second across
+    // three of the leader's retention rounds (each states the removed part's cutoff now, a minute
+    // apart, while it holds rows), each counted once. Judged by the removed part, every window not
+    // counted before a round was dropped as cut short: some half of them (Error Tracking's metric
+    // among them, so an error's issue was never made).
+    f.call("POST", "/api/observe/v1/log_metrics", Some(&json!({ "name": "e2e.after.records", "compute": { "aggregation_type": "count" }, "filter": { "query": "service:after" } })))?;
+    // A metric counts from the window after it is made.
+    std::thread::sleep(Duration::from_secs(11));
+    let (started, mut sent) = (Instant::now(), 0u64);
+    while started.elapsed() < Duration::from_secs(150) {
+        let batch: Vec<Value> = (0..2).map(|i| json!({ "message": format!("after {}", sent + i), "service": "after", "status": "info" })).collect();
+        anyhow::ensure!(f.request("POST", "/api/observe/v1/logs", Some(&Value::Array(batch)))?.0 == 202);
+        sent += 2;
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    wait(&f, "every record after the removal counted", Duration::from_secs(90), || Ok(total(&f, "sum:e2e.after.records{*}.as_count()")? >= sent as f64))?;
+    anyhow::ensure!(total(&f, "sum:e2e.after.records{*}.as_count()")? == sent as f64, "each once: {sent} sent");
+
     // Stopped and started: the indexes and what they kept as they were.
     let before = (search(&f, "service:web", t0, None)?.len(), search(&f, "service:runner-app", t0, None)?.len(), search(&f, "service:payments", t0, None)?.len());
     f.stop_gently();
