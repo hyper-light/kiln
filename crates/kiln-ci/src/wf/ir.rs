@@ -464,6 +464,10 @@ pub struct StepKiln {
     pub test_results: Option<YVal>,
     pub integrations: Vec<String>,
     pub tty: bool,
+    /// `memo:` (W24-R07), as written: read by `work::memo::Memo`. Left out of the model's JSON
+    /// when unset, so a step without it hashes as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<YVal>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -1065,6 +1065,17 @@ impl Fe<'_> {
                 "test-results" => kiln.test_results = Some(self.yval(v)),
                 "integrations" => kiln.integrations = self.str_list(v, &at),
                 "tty" => kiln.tty = self.bool(v, &at).unwrap_or(false),
+                // W24-R07: `check`, or a mapping of `memo`'s keys.
+                "memo" => {
+                    if v.as_map().is_some() {
+                        let _ = self.entries(v, keys::MEMO, &at);
+                    }
+                    let memo = self.yval(v);
+                    if let Err(e) = crate::work::memo::Memo::from_yval(&memo) {
+                        self.err("KCI1015", e, v.range, &at);
+                    }
+                    kiln.memo = Some(memo);
+                }
                 _ => {}
             }
         }

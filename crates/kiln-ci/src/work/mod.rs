@@ -12,11 +12,13 @@
 //! - [`eclass`]: equivalence classes over keys, as an e-graph's: union-find, congruence, rewrite
 //!   rules with witnesses, splits (W24-R30).
 //! - [`why`]: what each unit did, and why one ran: fingerprints compared (W24-R28).
+//! - [`memo`]: a step's `memo:`, its key, what a success leaves and its files as trees (W24-R07).
 
 pub mod eclass;
 pub mod evict;
 pub mod graph;
 pub mod key;
+pub mod memo;
 pub mod ops;
 pub mod queue;
 pub mod slots;

@@ -292,6 +292,16 @@ pub const STEP: &[Key] = &[
     kiln("test-results", Ty::Any, "kiln: test reports this step writes (W16-R01)."),
     kiln("integrations", Ty::StrList, "kiln: integrations this step authenticates to (W11-R03)."),
     kiln_only("tty", Ty::Bool, "kiln v1: run under a pseudo-terminal."),
+    kiln("memo", Ty::StrOrMap(MEMO), "kiln: reuse the step's earlier success while its inputs are unchanged: `check` (nothing to restore), or `{ inputs, outputs, env, max-age }` (W24-R07)."),
+];
+
+/// A step's `memo:` (W24-R07).
+pub const MEMO: &[Key] = &[
+    kiln("inputs", Ty::StrList, "Paths and globs whose git trees the step depends on (the whole tree when none)."),
+    kiln("outputs", Ty::StrList, "Paths in the workspace the step leaves for later steps: kept, and put in place when a later step runs."),
+    kiln("env", Ty::StrList, "Variables the step depends on besides those the workflow declares."),
+    kiln("max-age", Ty::Str, "How long a result stays reusable (`14d` by default)."),
+    kiln("secrets", Ty::Str, "`hmac`: a step that receives secrets keyed by their HMAC (W24-R05)."),
 ];
 
 pub const JOB: &[Key] = &[

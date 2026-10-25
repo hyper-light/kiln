@@ -230,6 +230,10 @@ pub fn apply(wf: &mut Workflow, ov: &Overlay) -> Vec<Diag> {
                     if !sk.integrations.is_empty() {
                         step.kiln.integrations = sk.integrations.clone();
                     }
+                    // W24-R25: an overlay makes a GitHub workflow's step a memo step (W24-R07).
+                    if sk.memo.is_some() {
+                        step.kiln.memo = sk.memo.clone();
+                    }
                 }
                 None => diags.push(Diag::warning("KCI4010", format!("the overlay sets step `{sid}` of job `{}`, which has no step with that id", oj.id), *range).at(format!("jobs.{}.steps.{sid}", oj.id))),
             }
