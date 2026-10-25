@@ -131,7 +131,7 @@ fn nests_containers(steps: &[kiln_ci::wf::ir::Step]) -> bool {
 
 /// A leg's route. On `kiln workflow run`'s own server (`local`, W17-R06) a leg keeps only the labels
 /// that say what machine it needs: the rest name the user's runners, and it runs on this one.
-fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, local: bool, untrusted: Option<kiln_ci::sched::routing::Untrusted>) -> LegRoute {
+pub(crate) fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, local: bool, untrusted: Option<kiln_ci::sched::routing::Untrusted>) -> LegRoute {
     let job = spec.def();
     let uses = job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| !u.starts_with("docker://"))));
     let docker = spec.container.is_some() || !spec.services.is_empty() || job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| u.starts_with("docker://"))));
@@ -294,8 +294,9 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         group,
         retry,
         cost: r.costs.get(&spec.job).copied(),
-        // On a `k8s` pool, a pod of its own, its containers in it (W13-R07).
-        own_executor: job.is_some_and(|j| j.container.is_some() || !j.services.is_empty()),
+        // On a `k8s` pool, a pod of its own, its containers in it (W13-R07); a kiln-dialect leg
+        // that sets its `toolchain:`, `image:` or `resources:`, v1's job pod (W02-R06).
+        own_executor: job.is_some_and(|j| j.container.is_some() || !j.services.is_empty() || (spec.workflow.dialect == Some(kiln_ci::expr::Dialect::Kiln) && super::pools::sets_pod(j))),
         request: request_of(job, cfg),
         ..LegIn::default()
     }
@@ -1920,7 +1921,18 @@ impl Dispatch {
             let (image, env) = one(c, Site::JobServices, Site::JobServiceEnv, &format!("services.{id}"))?;
             services.push(super::pools::PodService { id: id.clone(), image, env, ports: ports(c)? });
         }
-        Ok(super::pools::LegPod { image, env, services })
+        let containers = job.container.is_some() || !services.is_empty();
+        // A kiln-dialect leg that sets its `toolchain:`, `image:` or `resources:` gets v1's job pod
+        // (W02-R06): `image:` (else `toolchain:`'s) unless its `container:` is the job container.
+        if dialect == expr::Dialect::Kiln && super::pools::sets_pod(job) {
+            let image = match (image, &job.kiln.image) {
+                (Some(i), _) => Some(i),
+                (None, Some(t)) => Some(render(t, Site::KilnJob, "image")?).filter(|i| !i.trim().is_empty()),
+                (None, None) => None,
+            };
+            return Ok(super::pools::LegPod { env, services, containers, ..super::pools::kiln_pod(job, image, l.spec.timeout_minutes) });
+        }
+        Ok(super::pools::LegPod { image, env, services, containers, ..super::pools::LegPod::default() })
     }
 
     /// Sends a leg to its runner (W05, W06).

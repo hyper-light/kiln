@@ -343,6 +343,92 @@ fn w13_r07_k8s_pool_runs_each_leg_in_a_pod() -> anyhow::Result<()> {
     Ok(())
 }
 
+const KILN_WORKFLOW: &str = r#"name: build
+on:
+  push: { branches: [main] }
+jobs:
+  rust:
+    runs-on: [pod]
+    toolchain: rust
+    resources: { cpu: "2", memory: 3Gi }
+    steps:
+      - run: echo "rust in $RUNNER_NAME"
+  bare:
+    runs-on: [pod]
+    steps:
+      - run: echo "bare in $RUNNER_NAME"
+"#;
+
+const PLAIN_WORKFLOW: &str = r#"on: push
+jobs:
+  plain:
+    runs-on: pod
+    steps:
+      - run: echo "plain in $RUNNER_NAME"
+"#;
+
+/// docs/ci.md W02-R06, W13-R07: a kiln-dialect leg on a `k8s` pool runs in a pod made for it, as
+/// v1 makes a job's: its toolchain's image, its own CPU and memory, v1's deadline. A kiln-dialect
+/// leg that sets none of `toolchain:`, `image:` and `resources:`, and a GitHub leg, on the same
+/// pool keep the pool's pod (the pool's image, the server's default requests).
+#[test]
+fn w02_r06_a_kiln_dialect_leg_on_a_k8s_pool_gets_v1s_pod() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let kube = Kube::start(dir.path())?;
+    let kubeconfig = kube.kubeconfig(dir.path())?;
+    let ci = "kiln_workflows = true\ngithub_workflows = \"on\"\n\n[[ci.pools]]\nname = \"pods\"\nexecutor = \"k8s\"\nlabels = [\"pod\"]\nmax = 2\nidle_timeout = \"30s\"\n";
+    let extra = "[kubernetes]\nenabled = true\nnamespace = \"ci\"\nagent_image = \"kiln-agent:test\"\n";
+    let s = start_env(dir.path(), &Options { agent: false, ci, extra }, false, &[("KUBECONFIG", &kubeconfig.to_string_lossy())])?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::write(work.join(".kiln/build.yaml"), KILN_WORKFLOW)?;
+    std::fs::write(work.join(".github/workflows/plain.yml"), PLAIN_WORKFLOW)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "pods"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    let mut runs: Vec<Value> = Vec::new();
+    until(&s, 240, "the runs", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        runs = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok((runs.len() < 2 || runs.iter().any(|r| r.get("finished_at").is_none_or(Value::is_null))).then(|| body.clone()))
+    })?;
+    let pods_log = std::fs::read_dir(dir.path().join("pods"))
+        .map(|d| d.flatten().map(|e| std::fs::read_to_string(e.path().join("log")).unwrap_or_default()).collect::<Vec<_>>().join("\n---\n"))
+        .unwrap_or_default();
+    for r in &runs {
+        assert_eq!(r.get("conclusion"), Some(&json!("success")), "{r}\n{pods_log}\n{}", s.log());
+    }
+    let seen = kube.seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
+    let job = |p: &Value, at: &str| p.pointer(&format!("/spec/containers/0{at}")).cloned().unwrap_or_default();
+    let rust = seen.created.iter().find(|p| job(p, "/image") == json!("docker.io/library/rust:1-bookworm")).ok_or_else(|| anyhow::anyhow!("no rust pod: {:?}", seen.created))?;
+    assert_eq!(job(rust, "/resources"), json!({ "requests": { "cpu": "2", "memory": "3Gi" }, "limits": { "memory": "3Gi" } }), "{rust}");
+    assert_eq!(rust.pointer("/spec/activeDeadlineSeconds"), Some(&json!(60 * 60 + 900)), "{rust}");
+    let plain: Vec<&Value> = seen.created.iter().filter(|p| job(p, "/image") != json!("docker.io/library/rust:1-bookworm")).collect();
+    assert_eq!(plain.len(), 2, "the bare kiln leg's and the GitHub leg's: {:?}", seen.created);
+    for p in plain {
+        assert_eq!(job(p, "/image"), json!("docker.io/library/debian:bookworm"), "{p}");
+        assert_eq!(job(p, "/resources/requests"), json!({ "cpu": "1", "memory": "2Gi" }), "{p}");
+        assert!(p.pointer("/spec/activeDeadlineSeconds").is_none_or(Value::is_null), "{p}");
+        assert!(!job(p, "/env").to_string().contains("CARGO_HOME"), "{p}");
+    }
+    assert_eq!(seen.created.len(), 3, "{:?}", seen.created);
+    Ok(())
+}
+
 const LONG_WORKFLOW: &str = r#"on: push
 jobs:
   long:

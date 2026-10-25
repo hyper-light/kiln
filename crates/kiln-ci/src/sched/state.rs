@@ -86,8 +86,10 @@ pub struct LegIn {
     /// Expected runner-seconds (history, W19).
     pub cost: Option<f64>,
     pub prefer: Vec<Preference>,
-    /// It has a `container:` or `services:`: on a hosted pool (`k8s`), it runs in an executor
-    /// made for it (a pod of that container, those services beside it, W13-R07).
+    /// It has a `container:` or `services:`, or is a kiln-dialect leg that sets `toolchain:`,
+    /// `image:` or `resources:`: on a hosted pool (`k8s`), it runs in an executor made for it (a
+    /// pod of that container, those services beside it, W13-R07; a kiln-dialect leg's, v1's job
+    /// pod, W02-R06).
     pub own_executor: bool,
 }
 

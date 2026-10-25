@@ -392,11 +392,7 @@ pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
             None => {}
         }
         let resources = match &j.kiln.resources {
-            Some(YVal::Map(m)) => {
-                let get = |k: &str| m.iter().find(|(x, _)| x == k).map(|(_, v)| yaml_scalar(&yaml_value(v)));
-                Resources { cpu: get("cpu"), memory: get("memory") }
-            }
-            Some(_) => return Err(format!("{} is not a mapping", at("resources"))),
+            Some(r) => resources_of(r).ok_or_else(|| format!("{} is not a mapping", at("resources")))?,
             None => Resources::default(),
         };
         let retries = match j.kiln.retry.as_ref().and_then(|r| r.get("max")) {
@@ -444,6 +440,15 @@ pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
     let p = Pipeline { name: wf.name.clone().unwrap_or_default(), on, env: map(&wf.env), concurrency, jobs };
     validate(&p).map_err(|e| e.to_string())?;
     Ok(p)
+}
+
+/// A kiln-dialect job's `resources:` as v1 reads them: its `cpu` and `memory`, as YAML wrote them
+/// (`2`, `"500m"`, `16Gi`). `None` when it isn't a mapping. A `k8s` pool's pod for the job reads
+/// them so too (docs/ci.md W02-R06, W13-R07).
+pub fn resources_of(r: &kiln_ci::wf::ir::YVal) -> Option<Resources> {
+    let kiln_ci::wf::ir::YVal::Map(m) = r else { return None };
+    let get = |k: &str| m.iter().find(|(x, _)| x == k).map(|(_, v)| yaml_scalar(&yaml_value(v)));
+    Some(Resources { cpu: get("cpu"), memory: get("memory") })
 }
 
 /// A value of the new model as v1 read it: whole numbers are integers, as YAML wrote them.
