@@ -116,11 +116,12 @@ pub fn domain(trusted: bool) -> &'static str {
     if trusted { "trusted" } else { "untrusted" }
 }
 
-/// A leg's work key (docs/ci.md W24-R06): a leg's unit whose definition is its input hash, which
-/// covers its definition, pins, images, platform, listed variables and listed paths' trees.
-pub fn work_key(hash: &str, trusted: bool) -> kiln_ci::work::key::Key {
-    use kiln_ci::work::key::{Kind, Platform, Unit, weak};
-    weak(&Unit {
+/// A leg's work unit (docs/ci.md W24-R06): a leg whose definition is its input hash, which covers
+/// its definition, pins, images, platform, listed variables and listed paths' trees. The work
+/// ledger keys it, on the one path its records and lookups share (W24-R30).
+pub fn work_unit(hash: &str, trusted: bool) -> kiln_ci::work::key::Unit {
+    use kiln_ci::work::key::{Kind, Platform, Unit};
+    Unit {
         kind: Kind::Leg,
         definition: format!("w08-r10 {hash}"),
         secrets: Default::default(),
@@ -129,7 +130,7 @@ pub fn work_key(hash: &str, trusted: bool) -> kiln_ci::work::key::Key {
         inputs: Default::default(),
         upstream: Default::default(),
         trust: domain(trusted).to_owned(),
-    })
+    }
 }
 
 /// Whether a succeeded leg can still be taken over: it's there, succeeded, and its artifacts all are.
@@ -147,16 +148,19 @@ fn stands(c: &rusqlite::Connection, leg: &str, now: i64) -> rusqlite::Result<boo
 /// the results kept before the ledger.
 pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u64) -> anyhow::Result<Option<(String, String)>> {
     let (hash, since) = (hash.to_owned(), crate::util::now_unix().saturating_sub(i64::try_from(max_age).unwrap_or(i64::MAX)));
-    let (scope, weak) = (crate::ci::work::scope(repo, domain(trusted)), work_key(&hash, trusted));
+    let (scope, unit) = (crate::ci::work::scope(repo, domain(trusted)), work_unit(&hash, trusted));
     hub.store
         .call(move |c| {
             let now = crate::util::now_unix();
             let same = |p: &kiln_ci::work::key::PathSet| p.clone();
-            if let Some((_, found)) = crate::ci::work::lookup(c, &scope, &weak, &same)?
-                && found.provenance.finished_at >= since
-                && stands(c, &found.provenance.leg, now)?
+            if let Some(hit) = crate::ci::work::lookup(c, &scope, &unit, &same)?
+                && hit.recorded.provenance.finished_at >= since
+                && stands(c, &hit.recorded.provenance.leg, now)?
             {
-                return Ok(Some((found.provenance.leg.clone(), found.outputs.get("report").cloned().unwrap_or_default())));
+                if let Some(by) = &hit.class {
+                    tracing::info!(leg = %hit.recorded.provenance.leg, class = ?by.class, why = ?by.why, "a leg's result is reused by its class (W24-R30)");
+                }
+                return Ok(Some((hit.recorded.provenance.leg.clone(), hit.recorded.outputs.get("report").cloned().unwrap_or_default())));
             }
             Ok(c.query_row(
                 "SELECT r.leg_id, r.report FROM ci_reuse r JOIN jobs j ON j.id = r.leg_id
@@ -171,8 +175,8 @@ pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u
         .await
 }
 
-/// A leg that succeeded under `hash`: kept for those that come after, in the work ledger under its
-/// work key (W24-R06) and in W08-R10's own table.
+/// A leg that succeeded under `hash`: kept for those that come after, in the work ledger as its
+/// work unit's (W24-R06) and in W08-R10's own table.
 pub async fn remember(hub: &Hub, repo: &str, trusted: bool, leg: &str, run: &str, hash: &str, report: &str) -> anyhow::Result<()> {
     let (repo, leg, run, hash, report) = (repo.to_owned(), leg.to_owned(), run.to_owned(), hash.to_owned(), report.to_owned());
     hub.store
@@ -186,7 +190,7 @@ pub async fn remember(hub: &Hub, repo: &str, trusted: bool, leg: &str, run: &str
                 domain: domain(trusted).to_owned(),
                 ..Default::default()
             };
-            crate::ci::work::record(c, &crate::ci::work::scope(&repo, domain(trusted)), &work_key(&hash, trusted), &kiln_ci::work::key::PathSet::new(), &result)?;
+            crate::ci::work::record(c, &crate::ci::work::scope(&repo, domain(trusted)), &work_unit(&hash, trusted), &kiln_ci::work::key::PathSet::new(), &result)?;
             Ok(())
         })
         .await
