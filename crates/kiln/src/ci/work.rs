@@ -25,13 +25,22 @@
 //! - `r|<name>`: a rewrite rule, with its witness;
 //! - `w|<canonical weak key>|<path set>`: the path sets of the units whose canonical form that
 //!   key is and isn't their own, newest first, the newest [`PATH_SETS`] kept.
+//!
+//! Trust (W24-R21, R22) is enforced here, on the decisions of [`kiln_ci::work::trust`]: each scope
+//! takes only its own domain's results, and only those built on what its domain reads ([`write`]);
+//! an entry is never overwritten, a second runner's identical result is kept beside it as a
+//! verification and a different one as evidence ([`Written`]); a lookup reads the domains its unit
+//! may read, the most trusted first, and takes only what [`trust::admit`] does ([`lookup_as`]);
+//! quotas evict each domain's entries alone ([`evict`]). What breaks the trust rules, a result
+//! refused or a misplaced or forged entry passed over, is written to the audit log (AC06).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use kiln_ci::work::eclass::{self, ClassId, Classes as _, Member, Refused, Rule, Rules, Split, Why, Witness};
 use kiln_ci::work::key::{self, Key, PathSet, Unit};
 use kiln_ci::work::tests as test_results;
-use kiln_ci::work::tests::{Binary, Choice, Context, Found, Kept, Marks, Ran};
+use kiln_ci::work::tests::{Binary, Choice, Context, Kept, Marks, Ran};
+use kiln_ci::work::trust::{self, Comparison, Domain, Found, Outcome, Passed, Quotas, Usage};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +65,9 @@ pub enum Family {
     /// keyed `<scope><sha256>`, its `at` when no result referring to it is reusable any more: the
     /// store keeps it while it's here (`services::cas::collect`), `services::memo::sweep` lets it go.
     Object,
+    /// What's known of an entry beside it (W24-R22, R23): its reproductions, conflicts and
+    /// verdicts, under `<scope><strong>|<kind>|…`.
+    Verify,
 }
 
 impl Family {
@@ -69,6 +81,7 @@ impl Family {
             Family::Test => "work.test",
             Family::EClass => "work.eclass",
             Family::Object => "work.object",
+            Family::Verify => "work.verify",
         }
     }
 }
@@ -84,6 +97,12 @@ pub fn scope(repo: &str, domain: &str) -> String {
 /// The trust domain a scope's entries belong to: `<domain>` of `owner/repo|<domain>|`.
 pub fn domain_of(scope: &str) -> &str {
     scope.strip_suffix('|').and_then(|s| s.rsplit_once('|')).map_or("", |(_, d)| d)
+}
+
+/// The domain a scope (`owner/repo|domain|`) is of, when it's one.
+pub fn scope_domain(scope: &str) -> Option<Domain> {
+    let (_, domain) = scope.strip_suffix('|')?.rsplit_once('|')?;
+    Domain::parse(domain).ok()
 }
 
 /// What a unit produced (W24-R02).
@@ -102,9 +121,19 @@ pub struct Recorded {
     /// The trust domain that wrote it, and those its inputs came from (W24-R21).
     pub domain: String,
     pub lineage: Vec<String>,
-    /// The runners that reproduced it (W24-R23), and its signatures (W24-R22).
+    /// The runners that reproduced it (W24-R23), and its signatures (W24-R22). A reproduction is a
+    /// row of its own beside the entry, which is never rewritten: what a writer gives here isn't
+    /// kept, and a lookup fills it in from those rows.
     pub verified_by: Vec<String>,
     pub signatures: Vec<String>,
+    /// The bytes its outputs hold in the content store, for quotas (W24-R21).
+    pub size: u64,
+}
+
+impl Recorded {
+    fn outcome(&self) -> Outcome<'_> {
+        Outcome { outcome: &self.outcome, exit: self.exit, outputs: &self.outputs }
+    }
 }
 
 /// Where and how a result was made.
@@ -140,6 +169,13 @@ pub fn put(c: &Connection, family: Family, key: &str, value: &[u8], at: i64) -> 
         params![family.name(), key, value, at],
     )?;
     Ok(())
+}
+
+/// A row written only where its key holds none (W24-R22: an entry is never overwritten), and
+/// whether it was: the database itself refuses the second write, however the writers race.
+pub fn put_new(c: &Connection, family: Family, key: &str, value: &[u8], at: i64) -> rusqlite::Result<bool> {
+    let n = c.execute("INSERT INTO work_records (family, key, value, at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (family, key) DO NOTHING", params![family.name(), key, value, at])?;
+    Ok(n > 0)
 }
 
 /// A row's value.
@@ -219,36 +255,149 @@ pub fn keyed(c: &Connection, scope: &str, unit: &Unit) -> anyhow::Result<Keyed> 
     Ok(Keyed { weak: key::weak(unit), canonical, took })
 }
 
-/// Records what a unit produced (W24-R02, R30): its path set kept by digest and listed under its
-/// weak key (the newest [`PATH_SETS`] kept), its result under its strong key, and that key in the
-/// class of its outputs' digest, with its canonical key claimed into it when that isn't its own.
-/// Only successes are to be recorded (W24-R07). Refused, with nothing written, when `scope`'s
-/// lookups may not read what the result's domain writes (W24-R21). Returns the strong key.
-pub fn record(c: &Connection, scope: &str, unit: &Unit, read: &PathSet, result: &Recorded) -> anyhow::Result<Key> {
-    let writer = writer(scope, result)?;
+/// A row of [`Family::Verify`] beside an entry (W24-R22, R23).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Verification {
+    /// `reproduced` (another runner gave the same result) or `conflict` (another result, refused).
+    pub kind: String,
+    pub runner: String,
+    pub run: String,
+    pub leg: String,
+    pub attempt: u32,
+    /// When, in seconds since the epoch.
+    pub at: i64,
+    /// How the result compared with the entry's.
+    pub comparison: Option<Comparison>,
+    /// A conflicting result, kept as evidence.
+    pub result: Option<Recorded>,
+}
+
+/// What recording did (W24-R21, R22).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Written {
+    /// A new entry under its strong key.
+    New(Key),
+    /// The entry the key holds has the same outcome and outputs: by another runner, a reproduction,
+    /// kept beside it as a verification (W24-R23); by the same runner, nothing new.
+    Reproduced { strong: Key, by_another: bool },
+    /// The key holds another result: entries are never overwritten, so this one is refused and
+    /// kept beside the entry as evidence for verification to judge (W24-R23).
+    Conflict { strong: Key, comparison: Comparison },
+    /// Not the scope's to take (W24-R21): another domain's result, or one built on what the
+    /// scope's domain doesn't read. Nothing is written to the ledger, and the audit log says so.
+    Refused(String),
+}
+
+fn verify_prefix(scope: &str, strong: &Key) -> String {
+    format!("{scope}{}|", strong.hex())
+}
+
+/// The runners that produced an entry: the one that recorded it, then each that reproduced it.
+fn runners(c: &Connection, scope: &str, strong: &Key, entry: &Recorded) -> anyhow::Result<Vec<String>> {
+    let mut out = vec![entry.provenance.runner.clone()];
+    for (_, v, _) in scan(c, Family::Verify, &format!("{}by|", verify_prefix(scope, strong)))? {
+        let v: Verification = serde_json::from_slice(&v)?;
+        if !out.contains(&v.runner) {
+            out.push(v.runner);
+        }
+    }
+    Ok(out)
+}
+
+/// A row of the audit log (W19-R05) for what the ledger refused or passed over as a breach of the
+/// trust rules (W24-R21, AC06). It's no request's, so it's a row of its own.
+fn audit(c: &Connection, principal: &str, action: &str, target: &str, detail: &str) -> rusqlite::Result<()> {
+    let principal = if principal.is_empty() { "kiln" } else { principal };
+    c.execute("INSERT INTO audit2 (ts, principal, action, target, result, detail) VALUES (?1, ?2, ?3, ?4, 'refused', ?5)", params![crate::util::now_unix(), principal, action, target, detail])?;
+    Ok(())
+}
+
+/// Why `result` isn't `scope`'s to take (W24-R21), when it isn't.
+fn refusal(scope: &str, result: &Recorded) -> Option<String> {
+    let Some(domain) = scope_domain(scope) else { return Some(format!("`{scope}` isn't a scope (owner/repo|domain|)")) };
+    match Domain::parse(&result.domain) {
+        Ok(writer) if writer.may_write(&domain) => trust::lineage_fits(&domain, &result.lineage).err(),
+        Ok(writer) => Some(format!("a {writer} result can't be recorded among {domain}'s entries: promotion is by reproduction only (W24-R21)")),
+        Err(e) => Some(format!("its domain: {e}")),
+    }
+}
+
+/// Records what a unit produced (W24-R02, R21, R22, R30), keyed on the ledger's one path
+/// ([`keyed`]): its path set kept by digest and listed under its weak key (the newest
+/// [`PATH_SETS`] kept), its result under its strong key, once, and that key in the class of the
+/// outputs it was recorded with, its canonical key claimed into it when that isn't its own. Only
+/// successes are to be recorded (W24-R07).
+///
+/// The scope takes only its own domain's results, built on nothing its domain doesn't read
+/// ([`trust::lineage_fits`]): a result of another domain gets there by reproduction, never by
+/// copying. A refusal writes nothing to the ledger and a row to the audit log (AC06).
+///
+/// An entry is never overwritten: the result row is inserted only where its key holds none
+/// ([`put_new`]). Recorded again with the same outcome and outputs, it gains a verification by the
+/// new runner; with another result, the write is refused and kept as evidence, and the key's class
+/// splits where it is, as verification's mismatch would split it (W24-R30). Refusing a different
+/// result, rather than keeping both, leaves each strong key one result to serve: two would make
+/// every lookup choose, and a forged second one could be chosen. Replacing it, as the ledger did
+/// before, would let the last writer decide what everyone after reuses.
+pub fn write(c: &Connection, scope: &str, unit: &Unit, read: &PathSet, result: &Recorded) -> anyhow::Result<Written> {
+    if let Some(why) = refusal(scope, result) {
+        let p = &result.provenance;
+        audit(c, &p.runner, "work.record", scope, &format!("{why} (run {}, leg {}, attempt {})", p.run, p.leg, p.attempt))?;
+        tracing::warn!(scope, why = %why, run = %p.run, leg = %p.leg, "a result refused by the work ledger (W24-R21)");
+        return Ok(Written::Refused(why));
+    }
     let tx = crate::store::tx(c)?;
     let keyed = keyed(&tx, scope, unit)?;
+    let weak = &keyed.weak;
     let now = crate::util::now_unix();
+    let strong = key::strong(weak, read);
     let set = serde_json::to_vec(read)?;
     let id = crate::util::sha256_hex(&set);
     put(&tx, Family::PathSet, &id, &set, now)?;
-    list(&tx, Family::Weak, &weak_prefix(scope, &keyed.weak), &id)?;
-    let strong = key::strong(&keyed.weak, read);
-    put(&tx, Family::Result, &format!("{scope}{}", strong.hex()), &serde_json::to_vec(result)?, now)?;
-    join(&mut Rows { c: &tx, scope }, &keyed, &strong, read, &id, &writer, &digest(result))?;
+    list(&tx, Family::Weak, &weak_prefix(scope, weak), &id)?;
+    let at = format!("{scope}{}", strong.hex());
+    let entry = Recorded { verified_by: Vec::new(), ..result.clone() };
+    let written = if put_new(&tx, Family::Result, &at, &serde_json::to_vec(&entry)?, now)? {
+        Written::New(strong)
+    } else {
+        let kept = get(&tx, Family::Result, &at)?.ok_or_else(|| anyhow::anyhow!("{strong}'s entry went while it was recorded again"))?;
+        let kept: Recorded = serde_json::from_slice(&kept)?;
+        let p = &result.provenance;
+        let verification = |kind: &str, comparison: Option<Comparison>, evidence: Option<Recorded>| Verification { kind: kind.to_owned(), runner: p.runner.clone(), run: p.run.clone(), leg: p.leg.clone(), attempt: p.attempt, at: now, comparison, result: evidence };
+        match trust::compare(&kept.outcome(), &result.outcome()) {
+            Comparison::Same => {
+                let known = runners(&tx, scope, &strong, &kept)?;
+                let by_another = !p.runner.is_empty() && !known.contains(&p.runner);
+                if by_another {
+                    put(&tx, Family::Verify, &format!("{}by|{}", verify_prefix(scope, &strong), p.runner), &serde_json::to_vec(&verification("reproduced", Some(Comparison::Same), None))?, now)?;
+                }
+                Written::Reproduced { strong, by_another }
+            }
+            comparison => {
+                let evidence = Recorded { verified_by: Vec::new(), ..result.clone() };
+                let row = format!("{}conflict|{}|{}|{}|{}", verify_prefix(scope, &strong), p.runner, p.run, p.leg, p.attempt);
+                put(&tx, Family::Verify, &row, &serde_json::to_vec(&verification("conflict", Some(comparison.clone()), Some(evidence)))?, now)?;
+                tracing::warn!(scope, strong = %strong, ?comparison, run = %p.run, leg = %p.leg, "a result differs from the entry its key holds; the entry stands (W24-R22)");
+                Written::Conflict { strong, comparison }
+            }
+        }
+    };
+    join(&mut Rows { c: &tx, scope }, &keyed, &strong, read, &id, &result.domain, &digest(result))?;
     tx.commit()?;
-    Ok(strong)
+    Ok(written)
 }
 
-/// The trust domain that wrote `result` into `scope`: the result's, else the scope's own (W24-R21).
-/// Refused when the scope's lookups may not read what that domain writes.
-fn writer(scope: &str, result: &Recorded) -> anyhow::Result<String> {
-    let reader = domain_of(scope);
-    let writer = if result.domain.is_empty() { reader } else { result.domain.as_str() };
-    if !eclass::reads(reader, writer) {
-        return Err(Refused::Domain { reader: reader.to_owned(), writer: writer.to_owned() }.into());
+/// [`write`], for callers that only need the strong key (W24-R22). A new entry and a reproduction
+/// give it; a conflict (the key holds another result, which stands, this one kept as evidence) and
+/// a refusal (not the scope's to take, audited) are errors saying so, so a caller that kept the
+/// result elsewhere too (W08-R10's own table) learns it isn't the one reused here.
+pub fn record(c: &Connection, scope: &str, unit: &Unit, read: &PathSet, result: &Recorded) -> anyhow::Result<Key> {
+    match write(c, scope, unit, read, result)? {
+        Written::New(strong) | Written::Reproduced { strong, .. } => Ok(strong),
+        Written::Conflict { strong, comparison } => anyhow::bail!("{strong} already holds another result ({comparison:?}); entries are never overwritten (W24-R22)"),
+        Written::Refused(why) => anyhow::bail!("{why}"),
     }
-    Ok(writer.to_owned())
 }
 
 /// Puts a recorded key in the class of its outputs (W24-R30), notes what its unit took by class,
@@ -299,12 +448,15 @@ fn join(rows: &mut Rows, keyed: &Keyed, strong: &Key, read: &PathSet, set: &str,
     Ok(())
 }
 
-/// A result found for a unit (W24-R04, R30).
+/// A result found for a unit (W24-R04, R21, R30).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
     /// The strong key it was found under: the unit's own, or its canonical form's. A unit after it
     /// that takes its outputs before they're materialized names it by this key ([`eclass::refer`]).
     pub key: Key,
+    /// The domain whose entries held it.
+    pub domain: Domain,
+    /// The entry, its `verified_by` filled in.
     pub recorded: Recorded,
     /// How it was found by class, when it wasn't under the unit's own key: what verification
     /// re-checks (W24-R23).
@@ -325,19 +477,68 @@ pub struct ByClass {
     pub took: Vec<Key>,
 }
 
-/// Finds a unit's result (W24-R04, R30). First under its strong key: its weak key's path sets,
-/// newest first, each made a strong key from what is at its paths now (`now` reads them), and the
-/// first with a recorded result. Then by class, under its canonical key: the path sets of the units
-/// whose canonical form it keys, each made the canonical form's strong key the same way, and the
-/// first whose member serves a class-based hit, with its class's result.
-pub fn lookup(c: &Connection, scope: &str, unit: &Unit, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<Option<Hit>> {
-    let keyed = keyed(c, scope, unit)?;
-    for id in path_sets(c, scope, &keyed.weak)? {
-        let Some(read) = path_set(c, &id)? else { continue };
-        let strong = key::strong(&keyed.weak, &now(&read));
-        if let Some(found) = get(c, Family::Result, &format!("{scope}{}", strong.hex()))? {
-            return Ok(Some(Hit { key: strong, recorded: serde_json::from_slice(&found)?, class: None }));
+/// What a lookup found (W24-R04, R21, AC06).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lookup {
+    pub hit: Option<Hit>,
+    /// Each entry it found and didn't take, and why, for the unit's report (W24-R28); those that
+    /// break the trust rules are in the audit log too.
+    pub passed_over: Vec<String>,
+}
+
+/// The entries a weak key's path sets lead to in `scope`, newest first, each with the strong key
+/// that found it, until `take` says which to stop at.
+fn candidates(c: &Connection, scope: &str, weak: &Key, now: &dyn Fn(&PathSet) -> PathSet, take: &mut dyn FnMut(Key, Recorded) -> anyhow::Result<Option<Hit>>) -> anyhow::Result<Option<Hit>> {
+    for id in path_sets(c, scope, weak)? {
+        let Some(set) = get(c, Family::PathSet, &id)? else { continue };
+        let recorded: PathSet = serde_json::from_slice(&set)?;
+        let strong = key::strong(weak, &now(&recorded));
+        if let Some(found) = get(c, Family::Result, &format!("{scope}{}", strong.hex()))?
+            && let Some(hit) = take(strong, serde_json::from_slice(&found)?)?
+        {
+            return Ok(Some(hit));
         }
+    }
+    Ok(None)
+}
+
+/// Whether a unit of `reader` takes `entry`, found under `strong` among `domain`'s entries: its
+/// hit, or why not. A breach of the trust rules is audited (AC06).
+fn judge(c: &Connection, scope: &str, domain: &Domain, reader: &Domain, strong: Key, mut entry: Recorded) -> anyhow::Result<Result<Hit, Passed>> {
+    let runners = runners(c, scope, &strong, &entry)?;
+    let found = Found { scope: domain, writer: &entry.domain, lineage: &entry.lineage, runners: runners.iter().map(String::as_str).collect(), quarantined: None };
+    if let Err(why) = trust::admit(reader, &found) {
+        if why.is_breach() {
+            audit(c, "kiln", "work.lookup", &format!("{scope}{strong}"), &format!("passed over for a {reader} unit: {why}"))?;
+            tracing::warn!(scope, strong = %strong, why = %why, "an entry that breaks the trust rules passed over (W24-R21)");
+        }
+        return Ok(Err(why));
+    }
+    entry.verified_by = runners.into_iter().skip(1).collect();
+    Ok(Ok(Hit { key: strong, domain: domain.clone(), recorded: entry, class: None }))
+}
+
+/// The ledger's one lookup path (W24-R04, R21, R30): a unit, keyed in `scope` ([`keyed`]), found
+/// among `domain`'s entries as a unit of `reader` takes them ([`judge`]). First under its strong
+/// key: its weak key's path sets, newest first, each made a strong key from what is at its paths
+/// now (`now` reads them), and the first recorded result `reader` takes. Then by class, under its
+/// canonical key: the path sets of the units whose canonical form it keys, each made the canonical
+/// form's strong key the same way, and the first whose member serves a class-based hit, with its
+/// class's result, if `reader` takes that. What it passes over goes to `passed`.
+#[allow(clippy::too_many_arguments)]
+fn find(c: &Connection, scope: &str, domain: &Domain, reader: &Domain, unit: &Unit, now: &dyn Fn(&PathSet) -> PathSet, passed: &mut dyn FnMut(Key, Passed)) -> anyhow::Result<Option<Hit>> {
+    let keyed = keyed(c, scope, unit)?;
+    let own = candidates(c, scope, &keyed.weak, now, &mut |strong, entry| {
+        Ok(match judge(c, scope, domain, reader, strong, entry)? {
+            Ok(hit) => Some(hit),
+            Err(why) => {
+                passed(strong, why);
+                None
+            }
+        })
+    })?;
+    if own.is_some() {
+        return Ok(own);
     }
     let rows = Rows { c, scope };
     let canonical = &keyed.canonical.key;
@@ -361,10 +562,70 @@ pub fn lookup(c: &Connection, scope: &str, unit: &Unit, now: &dyn Fn(&PathSet) -
         if p.member.class.output() != Some(digest(&recorded).as_str()) {
             continue;
         }
+        let hit = match judge(c, scope, domain, reader, source, recorded)? {
+            Ok(hit) => hit,
+            Err(why) => {
+                passed(source, why);
+                continue;
+            }
+        };
         let class = ByClass { class: p.member.class, source, why: keyed.canonical.why.clone(), took: keyed.took.clone() };
-        return Ok(Some(Hit { key: at, recorded, class: Some(class) }));
+        return Ok(Some(Hit { key: at, class: Some(class), ..hit }));
     }
     Ok(None)
+}
+
+/// Finds a unit's result in `scope` (W24-R04, R30), as a unit of the scope's own domain takes it
+/// ([`trust::admit`]: one its domain wrote, not built on what's below it; for a protected scope,
+/// one two runners produced), on the ledger's one path ([`find`]): under its strong key, then by
+/// class. The entry's `verified_by` is filled in.
+pub fn lookup(c: &Connection, scope: &str, unit: &Unit, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<Option<Hit>> {
+    let Some(domain) = scope_domain(scope) else { return Ok(None) };
+    find(c, scope, &domain, &domain, unit, now, &mut |strong, why| tracing::debug!(scope, strong = %strong, why = %why, "an entry passed over"))
+}
+
+/// Two-phase lookup for a unit of `reader`'s domain (W24-R04, R21): each domain it reads, the most
+/// trusted first ([`Domain::lookups`]), keyed as that domain keys the unit (its trust component
+/// that domain) on the ledger's one path ([`find`]), and the first entry [`trust::admit`] takes.
+/// What it passes over, and why, it says.
+pub fn lookup_as(c: &Connection, repo: &str, reader: &Domain, unit: &Unit, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<Lookup> {
+    let mut out = Lookup::default();
+    for domain in reader.lookups() {
+        let sc = scope(repo, &domain.to_string());
+        let theirs = Unit { trust: domain.to_string(), ..unit.clone() };
+        let passed = &mut out.passed_over;
+        let hit = find(c, &sc, &domain, reader, &theirs, now, &mut |strong, why| passed.push(format!("{domain} entry {strong}: {why}")))?;
+        if hit.is_some() {
+            out.hit = hit;
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// What quotas say must go (W24-R21, AC12): `repo`'s entries, each domain weighed alone by
+/// [`trust::evict`] (a byte is the entry's row and its outputs, a hit saves its unit's time), its
+/// results deleted with what's beside them. The keys of the entries gone.
+pub fn evict(c: &Connection, repo: &str, quotas: &Quotas) -> anyhow::Result<Vec<String>> {
+    let prefix = format!("{repo}|");
+    let mut keys = Vec::new();
+    let mut usage = Vec::new();
+    for (k, v, at) in scan(c, Family::Result, &prefix)? {
+        let Some(domain) = k.strip_prefix(&prefix).and_then(|rest| rest.split_once('|')).and_then(|(d, _)| Domain::parse(d).ok()) else { continue };
+        let entry: Recorded = serde_json::from_slice(&v).unwrap_or_default();
+        usage.push(Usage { domain, bytes: (v.len() as u64).saturating_add(entry.size), saved_ms: entry.provenance.ms, hits: 0, last_used: at });
+        keys.push(k);
+    }
+    let mut gone = Vec::new();
+    for i in trust::evict(&usage, quotas) {
+        let Some(k) = keys.get(i) else { continue };
+        delete(c, Family::Result, k)?;
+        for (v, _, _) in scan(c, Family::Verify, &format!("{k}|"))? {
+            delete(c, Family::Verify, &v)?;
+        }
+        gone.push(k.clone());
+    }
+    Ok(gone)
 }
 
 /// What verification saw re-running a hit's unit (W24-R23): `observed`, its outputs' digest
@@ -552,7 +813,7 @@ pub fn record_test(c: &Connection, scope: &str, b: &Binary, cx: &Context, read: 
 /// pass found for its unit by [`lookup`] (only for a binary with its digest), with the flaky tests
 /// of the key it was found under as they are now; and its identity's newest pass, with whether what
 /// that read holds. `now` gives a path set as it is now.
-pub fn found_test(c: &Connection, scope: &str, b: &Binary, cx: &Context, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<Found> {
+pub fn found_test(c: &Connection, scope: &str, b: &Binary, cx: &Context, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<test_results::Found> {
     let mut by_key = None;
     if b.digest.is_some()
         && let Some(hit) = lookup(c, scope, &test_results::unit(b, cx), now)?
@@ -562,13 +823,13 @@ pub fn found_test(c: &Connection, scope: &str, b: &Binary, cx: &Context, now: &d
     }
     let last: Option<(Kept, PathSet)> = get(c, Family::Test, &last_at(scope, b, cx))?.map(|v| serde_json::from_slice(&v)).transpose()?;
     let last_holds = last.as_ref().is_some_and(|(_, read)| now(read) == *read);
-    Ok(Found { by_key, last: last.map(|(k, _)| k), last_holds })
+    Ok(test_results::Found { by_key, last: last.map(|(k, _)| k), last_holds })
 }
 
 /// Which of a run's test binaries run and which replay their passes (W24-R10), each saying why:
 /// [`kiln_ci::work::tests::select`] over what the ledger has for each ([`found_test`]).
 pub fn select_tests(c: &Connection, scope: &str, binaries: &[Binary], cx: &Context, affected: &BTreeSet<String>, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<Vec<(Binary, Choice)>> {
-    let found: Vec<Found> = binaries.iter().map(|b| found_test(c, scope, b, cx, now)).collect::<anyhow::Result<_>>()?;
+    let found: Vec<test_results::Found> = binaries.iter().map(|b| found_test(c, scope, b, cx, now)).collect::<anyhow::Result<_>>()?;
     let answer = |b: &Binary| binaries.iter().position(|x| x == b).and_then(|i| found.get(i)).cloned().unwrap_or_default();
     Ok(test_results::select(binaries, affected, &answer))
 }
@@ -612,7 +873,7 @@ mod tests {
     }
 
     /// A success whose output is `out`.
-    fn made(out: &str, run: &str) -> Recorded {
+    fn made_out(out: &str, run: &str) -> Recorded {
         Recorded { outputs: BTreeMap::from([("out".to_owned(), out.to_owned())]), ..ok(run) }
     }
 
@@ -788,15 +1049,15 @@ mod tests {
             s.call(|c| {
                 let sc = scope("acme/app", "trusted");
                 let fetch = |docs: &str, src: &str| Unit { inputs: BTreeMap::from([("docs".to_owned(), docs.to_owned()), ("src".to_owned(), src.to_owned())]), ..step("fetch", &[]) };
-                let a = record(c, &sc, &fetch("d1", "s1"), &lock(), &made("sha256:src1", "r1"))?;
-                let b = record(c, &sc, &fetch("d2", "s1"), &lock(), &made("sha256:src1", "r2"))?;
-                let other = record(c, &sc, &fetch("d1", "s2"), &lock(), &made("sha256:src2", "r3"))?;
+                let a = record(c, &sc, &fetch("d1", "s1"), &lock(), &made_out("sha256:src1", "r1"))?;
+                let b = record(c, &sc, &fetch("d2", "s1"), &lock(), &made_out("sha256:src1", "r2"))?;
+                let other = record(c, &sc, &fetch("d1", "s2"), &lock(), &made_out("sha256:src2", "r3"))?;
                 let class = |k: &Key| member(c, &sc, k).map(|m| m.map(|m| m.class));
-                let d = digest(&made("sha256:src1", "r1"));
+                let d = digest(&made_out("sha256:src1", "r1"));
                 anyhow::ensure!(a != b && class(&a)? == Some(ClassId::Output(d.clone())) && class(&b)? == class(&a)?, "one class: {:?} {:?}", class(&a)?, class(&b)?);
                 anyhow::ensure!(class(&other)? != class(&a)?, "other outputs, another class");
                 // A build over a's outputs ran; one over b, named by key, takes b by class.
-                record(c, &sc, &step("make", &[("src", d.clone())]), &lock(), &made("sha256:bin1", "r1"))?;
+                record(c, &sc, &step("make", &[("src", d.clone())]), &lock(), &made_out("sha256:bin1", "r1"))?;
                 let hit = lookup(c, &sc, &step("make", &[("src", eclass::refer(&b))]), &same)?.context("a congruent result")?;
                 let by = hit.class.as_ref().context("found by class")?;
                 let why = Why::Canonical { rules: Vec::new(), by_class: vec!["src".into()] };
@@ -820,7 +1081,7 @@ mod tests {
             s.call(|c| {
                 let sc = scope("acme/app", "trusted");
                 let (make, variant) = (step("add a\nadd b\nmake", &[]), step("add b\nadd a\ntrue\nmake", &[]));
-                let k = record(c, &sc, &make, &lock(), &made("sha256:bin", "r1"))?;
+                let k = record(c, &sc, &make, &lock(), &made_out("sha256:bin", "r1"))?;
                 anyhow::ensure!(lookup(c, &sc, &variant, &same)?.is_none(), "no rules: plain keys");
                 let (no_op, witness) = rule("drop-true", Rewrite::Drop { op: Pattern::Is("true".into()) }, "make\ntrue", "make");
                 anyhow::ensure!(register(c, &sc, &no_op, &Witness { cases: Vec::new(), ..witness.clone() }).is_err(), "a witness with no case");
@@ -837,7 +1098,7 @@ mod tests {
                 anyhow::ensure!(lookup(c, &sc, &make, &same)?.is_some_and(|h| h.key == k && h.class.is_none()), "the unit itself, under its own key");
                 // Recorded, the variant's own key joins the class, claimed to the normal form's; a
                 // third way of writing it finds the class too.
-                let v = record(c, &sc, &variant, &lock(), &made("sha256:bin", "r2"))?;
+                let v = record(c, &sc, &variant, &lock(), &made_out("sha256:bin", "r2"))?;
                 anyhow::ensure!(member(c, &sc, &v)?.map(|m| m.class) == member(c, &sc, &k)?.map(|m| m.class));
                 let third = step("true\nadd b\nadd a\nmake", &[]);
                 anyhow::ensure!(lookup(c, &sc, &third, &same)?.is_some_and(|h| h.class.is_some()));
@@ -863,9 +1124,9 @@ mod tests {
                 let (echo, witness) = rule("drop-echo", Rewrite::Drop { op: Pattern::Starts("echo ".into()) }, "make\necho done", "make");
                 register(c, &sc, &echo, &witness)?;
                 let make = step("make", &[]);
-                let k = record(c, &sc, &make, &lock(), &made("sha256:bin", "r1"))?;
-                let d = digest(&made("sha256:bin", "r1"));
-                record(c, &sc, &step("test", &[("bin", d.clone())]), &lock(), &made("sha256:passed", "r1"))?;
+                let k = record(c, &sc, &make, &lock(), &made_out("sha256:bin", "r1"))?;
+                let d = digest(&made_out("sha256:bin", "r1"));
+                record(c, &sc, &step("test", &[("bin", d.clone())]), &lock(), &made_out("sha256:passed", "r1"))?;
                 // A unit that echoes into its outputs is taken for `make`, and a test over it, named
                 // by key, for the test over make's outputs.
                 let echoes = step("make\necho stamp >> bin", &[]);
@@ -876,11 +1137,11 @@ mod tests {
                 // A lint recorded over it by key is its lineage, and the lint over make's outputs is
                 // claimed into the lint's class.
                 let lint_over = step("lint", &[("bin", eclass::refer(&hit.key))]);
-                let l = record(c, &sc, &lint_over, &lock(), &made("sha256:clean", "r1"))?;
+                let l = record(c, &sc, &lint_over, &lock(), &made_out("sha256:clean", "r1"))?;
                 let lint = step("lint", &[("bin", d.clone())]);
                 anyhow::ensure!(lookup(c, &sc, &lint, &same)?.is_some_and(|h| h.class.is_some()));
                 // Verification runs the echoing unit: other outputs.
-                let observed = digest(&made("sha256:bin+stamp", "verify"));
+                let observed = digest(&made_out("sha256:bin+stamp", "verify"));
                 let quarantined = verified(c, &sc, &hit, &observed)?;
                 anyhow::ensure!(quarantined.contains(&k) && quarantined.contains(&l), "{quarantined:?}");
                 anyhow::ensure!(lookup(c, &sc, &echoes, &same)?.is_none(), "the class serves no class-based hit");
@@ -890,12 +1151,12 @@ mod tests {
                 anyhow::ensure!(lookup(c, &sc, &lint_over, &same)?.is_some_and(|h| h.key == l && h.class.is_none()), "as does the lint's");
                 anyhow::ensure!(member(c, &sc, &k)?.is_some_and(|m| m.quarantined && m.anchored()));
                 // The verification's run, recorded, is the echoing unit's own class, claimed into none.
-                let e = record(c, &sc, &echoes, &lock(), &made("sha256:bin+stamp", "verify"))?;
+                let e = record(c, &sc, &echoes, &lock(), &made_out("sha256:bin+stamp", "verify"))?;
                 anyhow::ensure!(lookup(c, &sc, &echoes, &same)?.is_some_and(|h| h.key == e && h.class.is_none()));
                 anyhow::ensure!(member(c, &sc, &e)?.is_some_and(|m| m.class == ClassId::Output(observed.clone()) && !m.quarantined));
                 // Verification sees make's own result differ: make is nondeterministic.
                 let again = lookup(c, &sc, &make, &same)?.context("make's own result")?;
-                let quarantined = verified(c, &sc, &again, &digest(&made("sha256:other", "v2")))?;
+                let quarantined = verified(c, &sc, &again, &digest(&made_out("sha256:other", "v2")))?;
                 anyhow::ensure!(quarantined.contains(&k) && member(c, &sc, &k)?.is_some_and(|m| m.nondeterministic));
                 anyhow::ensure!(verified(c, &sc, &again, &digest(&again.recorded))?.is_empty(), "what agrees changes nothing");
                 Ok(())
@@ -914,10 +1175,10 @@ mod tests {
             s.call(|c| {
                 let (trusted, untrusted) = (scope("acme/app", "trusted"), scope("acme/app", "untrusted"));
                 anyhow::ensure!(domain_of(&trusted) == "trusted" && domain_of(&scope("acme/app", "person:ada")) == "person:ada");
-                let forked = |out: &str| Recorded { domain: "untrusted".into(), ..made(out, "fork") };
+                let forked = |out: &str| Recorded { domain: "untrusted".into(), ..made_out(out, "fork") };
                 anyhow::ensure!(record(c, &trusted, &step("make", &[]), &lock(), &forked("sha256:bin")).is_err());
                 anyhow::ensure!(scan(c, Family::Result, &trusted)?.is_empty() && scan(c, Family::EClass, &trusted)?.is_empty(), "nothing of it written");
-                let t = record(c, &trusted, &step("make", &[]), &lock(), &made("sha256:bin", "main"))?;
+                let t = record(c, &trusted, &step("make", &[]), &lock(), &made_out("sha256:bin", "main"))?;
                 let u = record(c, &untrusted, &Unit { trust: "untrusted".into(), ..step("make --fast", &[]) }, &lock(), &forked("sha256:bin"))?;
                 anyhow::ensure!(member(c, &untrusted, &t)?.is_none() && member(c, &trusted, &u)?.is_none(), "each domain's classes hold its own");
                 anyhow::ensure!(lookup(c, &trusted, &step("test", &[("bin", eclass::refer(&u))]), &same)?.is_none());
@@ -927,7 +1188,7 @@ mod tests {
                 anyhow::ensure!(lookup(c, &trusted, &step("make\ntrue", &[]), &same)?.is_none());
                 // Untrusted lookups read trusted entries (R21): one written to their scope joins
                 // the class of its outputs there.
-                let both = record(c, &untrusted, &step("make", &[]), &lock(), &made("sha256:bin", "main"))?;
+                let both = record(c, &untrusted, &step("make", &[]), &lock(), &made_out("sha256:bin", "main"))?;
                 anyhow::ensure!(member(c, &untrusted, &both)?.map(|m| m.class) == member(c, &untrusted, &u)?.map(|m| m.class));
                 Ok(())
             })
@@ -1085,7 +1346,7 @@ mod tests {
                         // their scripts do over what they're given.
                         let runs_over = |upstream: &[(&str, String)]| -> Recorded {
                             let inputs: Vec<String> = if *name == "fetch" { vec![format!("src{}", run.src)] } else { upstream.iter().map(|(_, d)| d.clone()).collect() };
-                            made(&truth(name, script, &inputs), &format!("r{n}"))
+                            made_out(&truth(name, script, &inputs), &format!("r{n}"))
                         };
                         let real = runs_over(&truly);
                         t.lookups += 1;
@@ -1141,5 +1402,204 @@ mod tests {
         anyhow::ensure!(with.verified == with.by_class && with.wrong == 0, "verification re-checked every class-based hit, and none was wrong: {with:?}");
         anyhow::ensure!(replay(&history, true)? == with, "the replay is deterministic");
         Ok(())
+    }
+
+    /// A result of `domain`, made on `runner`, with `outputs`.
+    fn made(domain: &str, runner: &str, outputs: &[(&str, &str)]) -> Recorded {
+        Recorded {
+            outcome: "success".into(),
+            exit: Some(0),
+            outputs: outputs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+            provenance: Provenance { runner: runner.into(), run: format!("run-{runner}"), leg: "build".into(), attempt: 1, ms: 60_000, ..Provenance::default() },
+            domain: domain.into(),
+            ..Recorded::default()
+        }
+    }
+
+    /// `unit` as `domain` keys it: its trust component that domain.
+    fn unit_as(u: &Unit, domain: &str) -> Unit {
+        Unit { trust: domain.into(), ..u.clone() }
+    }
+
+    /// `unit` keyed as `domain` keys it.
+    fn weak_as(u: &Unit, domain: &str) -> Key {
+        key::weak(&unit_as(u, domain))
+    }
+
+    fn in_store(f: impl FnOnce(&Connection) -> anyhow::Result<()> + Send + 'static) -> anyhow::Result<()> {
+        let s = crate::store::Store::in_memory()?;
+        crate::rt::block_on(async move { s.call(move |c| f(c)).await })
+    }
+
+    /// W24-R22: an entry is never overwritten. The same result again is a reproduction, another
+    /// runner's kept beside it as a verification; another result is refused and kept as evidence.
+    #[test]
+    fn w24_r22_entries_are_never_overwritten() -> anyhow::Result<()> {
+        in_store(|c| {
+            let sc = scope("acme/app", "trusted");
+            let u = unit(1);
+            let read = reads(1, 0);
+            let first = made("trusted", "r1", &[("bin", "sha256:aa")]);
+            let strong = match write(c, &sc, &u, &read, &first)? {
+                Written::New(k) => k,
+                other => anyhow::bail!("{other:?}"),
+            };
+            // A writer's own say on who verified it isn't kept.
+            let claimed = Recorded { verified_by: vec!["r9".into()], ..made("trusted", "r2", &[("bin", "sha256:aa")]) };
+            anyhow::ensure!(write(c, &sc, &u, &read, &claimed)? == Written::Reproduced { strong, by_another: true });
+            anyhow::ensure!(write(c, &sc, &u, &read, &made("trusted", "r1", &[("bin", "sha256:aa")]))? == Written::Reproduced { strong, by_another: false });
+            let same = |p: &PathSet| p.clone();
+            let found = lookup(c, &sc, &u, &same)?.map(|h| h.recorded).ok_or_else(|| anyhow::anyhow!("no hit"))?;
+            anyhow::ensure!(found.provenance.runner == "r1" && found.verified_by == ["r2"], "{found:?}");
+            // Another output, then another outcome: refused, the entry as it was.
+            let poisoned = made("trusted", "r3", &[("bin", "sha256:bad")]);
+            anyhow::ensure!(write(c, &sc, &u, &read, &poisoned)? == Written::Conflict { strong, comparison: Comparison::Outputs { names: vec!["bin".into()] } });
+            let failed = Recorded { outcome: "failure".into(), exit: Some(1), ..made("trusted", "r4", &[("bin", "sha256:aa")]) };
+            anyhow::ensure!(matches!(write(c, &sc, &u, &read, &failed)?, Written::Conflict { comparison: Comparison::Outcome { .. }, .. }));
+            anyhow::ensure!(record(c, &sc, &u, &read, &poisoned).is_err_and(|e| e.to_string().contains("never overwritten")));
+            let kept = lookup(c, &sc, &u, &same)?.map(|h| h.recorded).ok_or_else(|| anyhow::anyhow!("no hit"))?;
+            anyhow::ensure!(kept.outputs.get("bin").map(String::as_str) == Some("sha256:aa"), "{kept:?}");
+            let evidence = scan(c, Family::Verify, &format!("{}conflict|", verify_prefix(&sc, &strong)))?;
+            anyhow::ensure!(evidence.len() == 2, "both conflicts kept: {}", evidence.len());
+            let first_conflict: Verification = serde_json::from_slice(&evidence.iter().find(|(k, _, _)| k.contains("|r3|")).ok_or_else(|| anyhow::anyhow!("r3's conflict"))?.1)?;
+            anyhow::ensure!(first_conflict.result.as_ref().and_then(|r| r.outputs.get("bin")).map(String::as_str) == Some("sha256:bad"));
+            Ok(())
+        })
+    }
+
+    /// W24-R21: each scope takes only its own domain's results, built on what its domain reads.
+    #[test]
+    fn w24_r21_scopes_take_only_their_own_domains_results() -> anyhow::Result<()> {
+        in_store(|c| {
+            let (u, read) = (unit(2), reads(2, 0));
+            let trusted = scope("acme/app", "trusted");
+            for (result, why) in [
+                (made("untrusted", "fork", &[]), "promotion is by reproduction"),
+                (made("person:ada", "laptop", &[]), "promotion is by reproduction"),
+                (Recorded { lineage: vec!["untrusted".into()], ..made("trusted", "r1", &[]) }, "reads go down only"),
+                (made("nobody", "r1", &[]), "trust domain"),
+            ] {
+                match write(c, &trusted, &u, &read, &result)? {
+                    Written::Refused(w) => anyhow::ensure!(w.contains(why), "{w}"),
+                    other => anyhow::bail!("{result:?} was {other:?}"),
+                }
+            }
+            anyhow::ensure!(scan(c, Family::Result, "acme/app|")?.is_empty() && scan(c, Family::Weak, "acme/app|")?.is_empty(), "nothing written");
+            anyhow::ensure!(matches!(write(c, "acme/app", &u, &read, &made("trusted", "r1", &[]))?, Written::Refused(_)), "not a scope");
+            let ada = scope("acme/app", "person:ada");
+            let theirs = Recorded { lineage: vec!["trusted".into(), "person:ada".into()], ..made("person:ada", "laptop", &[]) };
+            anyhow::ensure!(matches!(write(c, &ada, &unit_as(&u, "person:ada"), &read, &theirs)?, Written::New(_)));
+            Ok(())
+        })
+    }
+
+    /// W24-R21: a lookup reads the domains its unit may read, the most trusted first, each keyed
+    /// as that domain keys the unit; a protected unit takes only what two runners produced.
+    #[test]
+    fn w24_r21_lookups_read_down_only() -> anyhow::Result<()> {
+        in_store(|c| {
+            let (u, read) = (unit(3), reads(3, 0));
+            let same = |p: &PathSet| p.clone();
+            let put_as = |domain: &str, runner: &str, out: &str| write(c, &scope("acme/app", domain), &unit_as(&u, domain), &read, &made(domain, runner, &[("bin", out)]));
+            put_as("untrusted", "fork", "sha256:fork")?;
+            put_as("person:ada", "laptop", "sha256:ada")?;
+            let found = |reader: &Domain| -> anyhow::Result<Option<(Domain, String)>> {
+                Ok(lookup_as(c, "acme/app", reader, &u, &same)?.hit.map(|h| (h.domain, h.recorded.outputs.get("bin").cloned().unwrap_or_default())))
+            };
+            let (t, p, unt, ada, bo) = (Domain::Trusted, Domain::Protected, Domain::Untrusted, Domain::Person("ada".into()), Domain::Person("bo".into()));
+            anyhow::ensure!(found(&t)?.is_none(), "trusted never reads untrusted or person entries");
+            anyhow::ensure!(found(&unt)? == Some((unt.clone(), "sha256:fork".into())));
+            anyhow::ensure!(found(&ada)? == Some((ada.clone(), "sha256:ada".into())));
+            anyhow::ensure!(found(&bo)?.is_none(), "people don't read each other's");
+            put_as("trusted", "r1", "sha256:main")?;
+            for reader in [&t, &unt, &ada, &bo] {
+                anyhow::ensure!(found(reader)? == Some((t.clone(), "sha256:main".into())), "{reader} takes the trusted entry first");
+            }
+            // Protected: one runner isn't enough; a second one's reproduction is.
+            let once = lookup_as(c, "acme/app", &p, &u, &same)?;
+            anyhow::ensure!(once.hit.is_none() && once.passed_over.iter().any(|w| w.contains("two independent")), "{once:?}");
+            put_as("trusted", "r2", "sha256:main")?;
+            let twice = lookup_as(c, "acme/app", &p, &u, &same)?.hit.ok_or_else(|| anyhow::anyhow!("no hit"))?;
+            anyhow::ensure!(twice.domain == t && twice.recorded.verified_by == ["r2"], "{twice:?}");
+            Ok(())
+        })
+    }
+
+    /// The audit log's rows of `action`: principal, target and detail, oldest first.
+    fn audited(c: &Connection, action: &str) -> anyhow::Result<Vec<(String, String, String)>> {
+        let mut q = c.prepare("SELECT principal, COALESCE(target, ''), detail FROM audit2 WHERE action = ?1 AND result = 'refused' ORDER BY id")?;
+        let rows = q.query_map([action], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// W24-AC06, through the ledger: a fork's build plants a poisoned rlib. Its entry never
+    /// satisfies a trusted lookup, however it gets placed, and every attempt says why and is
+    /// audited.
+    #[test]
+    fn w24_ac06_a_forks_poisoned_rlib_never_reaches_a_trusted_leg() -> anyhow::Result<()> {
+        in_store(|c| {
+            let (u, read) = (unit(4), reads(4, 0));
+            let same = |p: &PathSet| p.clone();
+            let poison = [("target/debug/deps/libfoo.rlib", "sha256:poisoned")];
+            let fork = scope("acme/app", "untrusted");
+            anyhow::ensure!(matches!(write(c, &fork, &unit_as(&u, "untrusted"), &read, &made("untrusted", "fork-runner", &poison))?, Written::New(_)));
+            for reader in [Domain::Trusted, Domain::Protected] {
+                anyhow::ensure!(lookup_as(c, "acme/app", &reader, &u, &same)?.hit.is_none(), "{reader} took the fork's entry");
+            }
+            anyhow::ensure!(audited(c, "work.record")?.is_empty() && audited(c, "work.lookup")?.is_empty(), "nothing amiss yet");
+            // Recorded straight into trusted entries: refused, and audited as the fork runner's.
+            let trusted = scope("acme/app", "trusted");
+            let (tu, tw) = (unit_as(&u, "trusted"), weak_as(&u, "trusted"));
+            anyhow::ensure!(matches!(write(c, &trusted, &tu, &read, &made("untrusted", "fork-runner", &poison))?, Written::Refused(_)));
+            let refused = audited(c, "work.record")?;
+            anyhow::ensure!(refused.len() == 1 && refused.iter().all(|(who, target, why)| who == "fork-runner" && *target == trusted && why.contains("promotion is by reproduction only") && why.contains("run run-fork-runner")), "{refused:?}");
+            // Copied there as it is, past write's checks (a bug, a restored backup): passed over.
+            let strong = key::strong(&tw, &read);
+            let row = get(c, Family::Result, &format!("{fork}{}", key::strong(&weak_as(&u, "untrusted"), &read).hex()))?.ok_or_else(|| anyhow::anyhow!("the fork's row"))?;
+            let id = crate::util::sha256_hex(&serde_json::to_vec(&read)?);
+            put(c, Family::Weak, &format!("{}{id}", weak_prefix(&trusted, &tw)), id.as_bytes(), 1)?;
+            put(c, Family::Result, &format!("{trusted}{}", strong.hex()), &row, 1)?;
+            let copied = lookup_as(c, "acme/app", &Domain::Trusted, &u, &same)?;
+            anyhow::ensure!(copied.hit.is_none() && copied.passed_over.iter().any(|w| w.contains("written by untrusted")), "{copied:?}");
+            anyhow::ensure!(lookup(c, &trusted, &tu, &same)?.is_none());
+            let passed = audited(c, "work.lookup")?;
+            anyhow::ensure!(passed.len() == 2 && passed.iter().all(|(who, target, why)| who == "kiln" && *target == format!("{trusted}{strong}") && why.contains("written by untrusted")), "both lookups audited: {passed:?}");
+            // Rewritten to claim it's trusted, its lineage still the fork's: passed over.
+            let forged = Recorded { lineage: vec!["untrusted".into()], ..made("trusted", "fork-runner", &poison) };
+            put(c, Family::Result, &format!("{trusted}{}", strong.hex()), &serde_json::to_vec(&forged)?, 1)?;
+            anyhow::ensure!(lookup_as(c, "acme/app", &Domain::Trusted, &u, &same)?.passed_over.iter().any(|w| w.contains("reads go down only")));
+            anyhow::ensure!(audited(c, "work.lookup")?.last().is_some_and(|(_, _, why)| why.contains("reads go down only")));
+            // A trusted entry of its own stands: the poison written over it is refused and kept as evidence.
+            delete(c, Family::Result, &format!("{trusted}{}", strong.hex()))?;
+            write(c, &trusted, &tu, &read, &made("trusted", "r1", &[("target/debug/deps/libfoo.rlib", "sha256:honest")]))?;
+            anyhow::ensure!(matches!(write(c, &trusted, &tu, &read, &made("trusted", "r1", &poison))?, Written::Conflict { .. }));
+            let hit = lookup_as(c, "acme/app", &Domain::Trusted, &u, &same)?.hit.ok_or_else(|| anyhow::anyhow!("no hit"))?;
+            anyhow::ensure!(hit.recorded.outputs.get("target/debug/deps/libfoo.rlib").map(String::as_str) == Some("sha256:honest"));
+            Ok(())
+        })
+    }
+
+    /// W24-R21: quotas evict each domain's entries alone: untrusted entries over their quota go,
+    /// the least time saved per byte first, and trusted ones stay.
+    #[test]
+    fn w24_r21_quotas_evict_only_the_domain_over_quota() -> anyhow::Result<()> {
+        in_store(|c| {
+            for n in 0..6u64 {
+                let r = Recorded { size: 1_000, provenance: Provenance { ms: 1_000 * (n + 1), runner: "r".into(), ..Provenance::default() }, ..made("untrusted", "r", &[]) };
+                write(c, &scope("acme/app", "untrusted"), &unit_as(&unit(10 + n), "untrusted"), &reads(10 + n, 0), &r)?;
+                let t = Recorded { size: 1_000, ..made("trusted", "r", &[]) };
+                write(c, &scope("acme/app", "trusted"), &unit_as(&unit(20 + n), "trusted"), &reads(20 + n, 0), &t)?;
+            }
+            let quotas = Quotas { trusted: 1 << 30, protected: 1 << 30, untrusted: 3_500, person: 1 << 30 };
+            let gone = evict(c, "acme/app", &quotas)?;
+            anyhow::ensure!(!gone.is_empty() && gone.iter().all(|k| k.starts_with("acme/app|untrusted|")), "{gone:?}");
+            anyhow::ensure!(scan(c, Family::Result, "acme/app|trusted|")?.len() == 6, "trusted entries all stay");
+            let left = scan(c, Family::Result, "acme/app|untrusted|")?;
+            let bytes: u64 = left.iter().map(|(_, v, _)| v.len() as u64 + 1_000).sum();
+            anyhow::ensure!(bytes <= 3_500, "untrusted within its quota: {bytes}");
+            let slowest: Vec<u64> = left.iter().filter_map(|(_, v, _)| serde_json::from_slice::<Recorded>(v).ok()).map(|r| r.provenance.ms).collect();
+            anyhow::ensure!(slowest.iter().all(|ms| *ms >= 4_000), "the ones that save the most stay: {slowest:?}");
+            Ok(())
+        })
     }
 }
