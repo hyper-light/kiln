@@ -49,9 +49,11 @@ pub fn version_in(text: &str) -> Option<String> {
     None
 }
 
-/// What `program args…` prints (out and err), when it runs and succeeds in time.
+/// What `program args…` prints (out and err), when it runs and succeeds in time. It's looked for
+/// where a leg's steps look (W13-R03): the runner's PATH, then the folders only its user's login
+/// shell has (`crate::harness::kinds::search_path`).
 async fn output(program: &str, args: &[&str]) -> Option<String> {
-    let path = crate::os::which(program)?;
+    let path = crate::os::which_in(program, &crate::harness::kinds::search_path()?)?;
     let mut c = std::process::Command::new(path);
     c.args(args);
     let o = crate::proc::output(c, TOOL_TIMEOUT).await.ok()?;
@@ -254,6 +256,9 @@ fn machine(work_dir: &Path) -> RunnerFacts {
 
 /// Every fact of this runner, its probes run now.
 pub async fn gather(work_dir: &Path, declared: &Declared) -> RunnerFacts {
+    // Tools are found where legs' steps find them (`output`), the folders only the user's login
+    // shell has among them: that shell is asked first, unless it answered in the last ten minutes.
+    crate::reach::serve::login_env().await;
     let dir = work_dir.to_path_buf();
     let mut f = crate::rt::blocking(move || machine(&dir)).await.unwrap_or_default();
     // A test build posing as a runner of another platform (`--chaos platform=`, docs/ci.md
