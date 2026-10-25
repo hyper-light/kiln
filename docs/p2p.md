@@ -312,6 +312,10 @@ reads from it (`crates/kiln/src/store/learner.rs`, `crates/kiln/src/frontdoor/re
   newest takes it ("One runner a machine", `docs/releases.md`). While it has learners, the server
   keeps up to 64 MiB of the log behind what's applied for one a little behind, and beats once a
   second.
+- **Kept following.** Each minute the runner checks its replica: one whose group stopped, or that
+  stays behind the server's last write for five checks running, is stopped and started again,
+  saying why (nothing else would start it again, and its front door would leave every read to the
+  server).
 - **Messages.** The group's messages go over each runner's link on the sync lane
   (`ServerMsg::Cluster`, `AgentMsg::Cluster`), in parts past 512 KiB. A learner whose runner is away
   misses them, and the log sends what it needs once it's back.

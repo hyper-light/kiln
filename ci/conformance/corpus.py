@@ -75,6 +75,65 @@ KNOWN = [
     # The corpus submits the whole tree against an empty trunk: a check that compares a pull
     # request with its base finds nothing there to compare.
     (r"xtask-bump-check", "it compares the pull request with its base, an empty trunk in the corpus"),
+    # A step that checks out the pull request's merge base and finds the empty trunk there (ruff's
+    # memory_report builds it to compare).
+    (r"F-03: an empty trunk", "it reads the pull request's base (its merge base), the corpus's empty trunk"),
+    # ruff's ecosystem check builds its base first, checked out (`HEAD is now at … F-03: an empty
+    # trunk`) steps before the build that finds no Cargo.toml.
+    (r"Build baseline version: error: could not find `Cargo\.toml`", "it builds the pull request's base to compare, and the base is the corpus's empty trunk"),
+    # ruff's publish dry run resolves its crates against crates.io as it is today: ruff_cache 0.0.19
+    # came out on 2026-10-22, after the corpus's commit (2026-10-16), which GitHub ran.
+    (r"multiple different versions of crate `ruff_cache` in the dependency graph", "its publish dry run resolves against crates.io as it is now, which has ruff_cache 0.0.19 (out 2026-10-22, after the commit of 2026-10-16 that GitHub ran): the registry moved on"),
+    # Home Assistant's: its recorder's database versions against endoflife.date as it is now; its
+    # translations to Lokalise and its wheels' SSH key with the repository's secrets.
+    (r"is out of date with the latest MariaDB or MySQL release data from endoflife\.date", "it compares the repository's list of database versions with endoflife.date's today, which has releases since the commit"),
+    (r"API request error 400 Invalid `X-Api-Token` header", "it uploads translations to Lokalise with the repository's secret (its API token), which the corpus's copy hasn't"),
+    (r'Load key "\.ssh/[\w.-]+": error in libcrypto', "it loads an SSH key from the repository's secret, which the corpus's copy hasn't (its cleanup's `docker rm -f` then finds no container to remove)"),
+    # next.js's: its link checker makes a check with the job's token and no `permissions:`, the
+    # repository's default (an older repository's writes on GitHub; the corpus's copy has GitHub's
+    # restricted default, and the upstream's own only its admins can read); a preview tarball its
+    # Vercel deployment publishes; evals with its Vercel project.
+    (r"Failed to create check: HttpError: Resource not accessible by integration: the job's token lacks `checks: write`", "it makes a check with the job's token and no `permissions:`, which takes the repository's default: the corpus's copy has GitHub's restricted default, where the upstream's (an older repository's) writes"),
+    (r"Preview tarball for commit \w+ was not published within", "it waits for the preview tarball the upstream's Vercel deployment publishes for the pull request's commit, which nothing publishes for the corpus's copy"),
+    (r"Missing CI authentication variable: VERCEL_PROJECT_ID", "it pulls a Vercel OIDC token with the repository's Vercel project settings, which the corpus's copy hasn't"),
+    # arrow's jobs on its own RunsOn machines, by instance family (GPU and large-memory ones).
+    (r"waits: no runner meets its requirements \(runs-on \[runs-on=\d+/", "it asks for the upstream's own runners (RunsOn's machines by instance family, `runs-on=…/family=…`), which only the upstream has"),
+    # arrow's ODBC Linux job failed on GitHub at the commit too, in the same step (run 38902346589:
+    # "Execute Docker Build"); here one remote test of its Dremio, the rest passing.
+    (r"`odbc-linux`: Execute Docker Build: .*ubuntu-cpp-odbc` exited with a non-zero exit code", "it failed on GitHub at the commit too, in the same step (arrow's run 38902346589, ODBC Linux's Execute Docker Build)"),
+    # arrow's archery reads past releases' tags and commits (apache-arrow-0.17.0's 771): the
+    # corpus's copy has the upstream's version tags alone, on its empty trunk.
+    (r"No item found with id apache-arrow-|test_release\.py::test_(release_commits|maintenance_patch_selection)", "it reads past releases' tags and commits in the repository's history (apache-arrow-0.17.0's 771), which the corpus's copy hasn't: the upstream's version tags alone, on its empty trunk"),
+    # rails' Markdown API check reads the files the pull request adds: the corpus's adds them all.
+    (r"Check Markdown APIs in new files", "it checks the files a pull request adds, and the corpus's adds every file to an empty trunk"),
+    # TypeScript's tag-vscode-typescript: the pushed commit's parent, the empty trunk too.
+    (r"exists on disk, but not in 'HEAD\^'", "it reads the pushed commit's parent (`HEAD^`), the corpus's empty trunk"),
+    # neovim's lintcommit: the pull request's commits are the corpus's own.
+    (r"Invalid commit type \"F-03\"", "it lints the pull request's commit messages, and the corpus's commit is its own (`F-03: …`), not a conventional commit"),
+    # rust-analyzer's: its metrics go to another repository with its secret; its crates to
+    # crates.io by trusted publishing, which takes GitHub's ID tokens; its docs to `gh-pages` with
+    # the job's token and no `permissions:`, the repository's default (GitHub's older repositories
+    # write; kiln's copy has GitHub's restricted default); its fuzz job runs only for a push changing
+    # fuzz.yml, which the corpus's whole-tree push is (GitHub ran none at the commit), and its crates
+    # resolve today.
+    (r"Combine json: fatal: Could not read from remote repository", "it pushes its metrics to another repository with the repository's secret, which the corpus's copy hasn't"),
+    (r"Unsupported JWT issuer: http://\S+/oidc", "it publishes to crates.io by trusted publishing, which takes GitHub's ID tokens, not kiln's issuer"),
+    (r"pushing branches needs `diffs\.submit` \(a job's token: `contents: write`\)", "it pushes a branch with the job's token and no `permissions:`, which takes the repository's default: the corpus's copy has GitHub's restricted default (read), where repositories made on GitHub before 2023 write"),
+    (r"unicode-properties and unicode-ident must use the same Unicode version", "it runs for a push that changes fuzz.yml, which the corpus's push of the whole tree is (GitHub ran none at the commit), and its crates, resolved today, disagree on their Unicode version"),
+    # tauri's: audits against today's advisory databases (they passed on GitHub daily to
+    # 2026-10-19); a license check of the files a pull request adds (every one, in the corpus);
+    # crates published, and a Cloudflare worker deployed, with the repository's secrets.
+    (r"Critical vulnerabilities were found, marking check as failed|Run pnpm audit: Severity: \d+ ", "it audits the dependencies against today's advisory database, which has advisories published since GitHub's audits of the commit passed"),
+    (r"check header license on new files:", "it checks the files the pull request adds, which in the corpus is every file (its base is the empty trunk)"),
+    (r"credential provider `cargo:token` failed action `login`", "it publishes crates with the repository's crates.io token, which the corpus's copy hasn't"),
+    (r"it's necessary to set a CLOUDFLARE_API_TOKEN environment variable", "it deploys to Cloudflare with the repository's secret (CLOUDFLARE_API_TOKEN), which the corpus's copy hasn't"),
+    # bevy's and deno's: super-linter lints the files a pull request changes (every one, in the
+    # corpus); cargo-deny's advisory database is today's; nightly Rust is today's (bevy_render
+    # built with the commit's day's); a pull request's title is the corpus's own.
+    (r"Super-linter detected linting errors", "it lints the files the pull request changes, which in the corpus is every file (its base is the empty trunk)"),
+    (r"error\[(unmaintained|vulnerability|unsound|yanked)\]:", "it checks the dependencies against today's advisory database, which has advisories published since the commit"),
+    (r"error: overflow evaluating the requirement", "nightly Rust as of the lab's run fails a trait bound the commit's day's nightly took: the toolchain moved on"),
+    (r"Please fix the PR title according to https://www\.conventionalcommits\.org", "it lints the pull request's title, which is the corpus's own (`F-03: …`), not a conventional commit"),
     # What publishes with the repository's own secrets, which the corpus's copy hasn't.
     (r"you are not authenticated for buf\.build", "it publishes to the Buf registry with the repository's secret (BUF_TOKEN), which the corpus's copy hasn't"),
     (r"Docker config file not found|could not find api key for server quay\.io", "it pushes to Docker Hub and quay.io with the repository's secrets, which the corpus's copy hasn't"),
@@ -95,6 +154,18 @@ KNOWN = [
     (r"computeStartCompletePosition test", "CodeMirror's parser works to a time budget, which prometheus's completion test ran out of in the slow lab (its suite took 19 s, 2 s quiet): timing, to be run again when quiet"),
     (r"Condition never satisfied", "a test's timed wait (testify's `Eventually`: prometheus's waits seconds for its server), in the slow lab: timing, to be run again when quiet"),
     (r"panic: test timed out after 10m0s", "a package's tests ran past `go test`'s ten minutes in the lab, which runs at nice 19 with idle I/O and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
+    # nextest's slow-test timeout (ruff's release tests, its examples compiled as they run; the same
+    # tests passed in the other round).
+    (r"TIMEOUT \[\s*\d+(\.\d+)?s\]", "a test ran past nextest's timeout in the lab, which runs at nice 19 with idle I/O and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
+    # check-jsonschema (ruff's prek hooks) fetched GitHub's workflow schema from raw.githubusercontent.com
+    # and got no JSON; the same URL answers 200 with the schema since (2026-10-24 22:30).
+    (r"schemafile could not be parsed as JSON", "a download of a JSON schema from raw.githubusercontent.com came back as no JSON, where the same URL answers with the schema since: the network (GitHub limits raw downloads by address, which the lab's legs share), a flake to run again"),
+    # A leg's own pull through the host's Docker (ruff's musllinux wheels test in alpine and
+    # tonistiigi/binfmt), which this machine's daemon makes from Docker Hub itself.
+    (r"registry-1\.docker\.io/v2/\S+: 429 Too Many Requests", "Docker Hub refused a pull for its limit by address, which the lab's legs share: the pull was the host's own Docker's, and this machine's daemon is the user's, with no `registry-mirrors` to kiln's mirror (W12-R02 configures a runner's daemon); kiln's own pulls and BuildKit's go through the mirror"),
+    # CodeQL's analysis takes the memory it sees, all of a slot-mode leg's machine (neovim's push,
+    # pass 1024b: --ram=120788, 118 GB), and the lab's machine had production and more on it.
+    (r"database run-queries --ram=\d{6,}", "CodeQL's analysis sized itself to the memory it saw, the whole of the lab's machine (a slot-mode leg's), and was killed when that wasn't free: the lab's machine runs production and other work beside its legs, where a hosted runner's is the job's alone (resource mode gives a leg memory of its own, W05-R03)"),
     # The lab's firewall keeps containers on networks of their own from its server, so its legs
     # share the host's network (`KILN_CONTAINER_NETWORK=host`), where what listens on the host
     # answers. Prometheus's Triton test expects nothing at 127.0.0.1:443.
@@ -102,9 +173,23 @@ KNOWN = [
     # gh matches a checkout's remotes to GH_HOST by host name alone, without its port: the lab's
     # facade is on port 42511 (a GitHub Enterprise Server is always on 443).
     (r"none of the git remotes configured for this repository correspond to the GH_HOST", "gh matches the checkout's remote to GH_HOST by host name alone, and the lab's facade is on port 42511, not 443 as a GitHub Enterprise Server is; a facade on 443 matches"),
+    # On that network a leg has the host's name, which the LAN's resolver answers for: cpython's
+    # `getfqdn` test looked it up twice and got the short name once, the LAN's name once.
+    (r"AssertionError: '([\w-]+)' != '\1\.[\w.-]+'", "a leg here shares the host's network and its name, which the LAN's resolver answers for, and two lookups of it differed (its short name, then the LAN's FQDN); a hosted runner's machine has a name and resolver of its own"),
     # Two legs at once on that network share one EPMD (Erlang's port mapper), and name their
     # nodes alike: elixir's `primary@<host>`.
     (r"seems to be in use by another Erlang node", "two of its legs at once share the lab's host network, so their Erlang nodes share one port mapper and one name; a hosted runner's own machine has one each"),
+    # laravel's services publish fixed ports (3306 for every MySQL and MariaDB, 5432, 6379), which
+    # on that network are the host's: two legs at once, and the second's database can't bind, or
+    # one's tests meet the other's tables, queued jobs and keys (pass 1024b: mysql:9.7 and
+    # redis:7.0 of one leg held the host's 3306 and 6379). Its database tests then wait on each
+    # other's locks past their 10 minutes (0.8 to 1.6 minutes on GitHub at the commit), and its
+    # Redis Cluster job finds the other's cluster on the same ports.
+    (r"\[kiln\] Error: (mysql|mariadb|postgres|pgsql|redis|beanstalkd?)\w* is unhealthy|Table 'migrations' already exists|Table 'laravel\.\w+' doesn't exist|Unknown table 'laravel\.|Undefined property: Illuminate\\Tests\\Integration\\Queue\\JobChaining|JobChainingTest::testChainBatchFailureAllowed|`redis[^`]*`: Execute (Queue|Redis) tests: Failed asserting|`(mysql|mariadb|pgsql|mssql)_\d+`: Execute tests: .*exceeded the maximum execution time|Node 127\.0\.0\.1:\d+ is not empty|`redis-cluster[^`]*`: Create Redis Cluster: error: Final attempt failed", "two of its legs at once share the lab's host network, and their services' fixed ports (MySQL's 3306, Redis's 6379) are the host's: one leg's database couldn't bind, or its tests met the other's tables and queued jobs; a hosted runner's machine has its ports to itself"),
+    # prometheus's test servers take ports the host says are free, checked in their own process
+    # only (`testutil.RandomUnprivilegedPort`): two legs at once on that network, and a reload went
+    # to the other leg's server, whose lifecycle API is off (403; pass 1023d, push).
+    (r"Unexpected status code when reloading Prometheus", "two of its legs at once share the lab's host network, and a test's reload reached the other leg's Prometheus on the port both took (403, its lifecycle API off); a hosted runner's own machine has its ports to itself"),
     # buildx's remote+multinode workers: two such legs at once on that network (pass 1023d,
     # 03:38-04:03 and 03:43-04:08) and one's mirror registry answered on localhost without the
     # manifest its build resolved; the other passed. To run again on networks of their own.
@@ -151,10 +236,11 @@ class Api:
         self.server = server.rstrip("/")
         self.token = token
 
-    def call(self, method, path, body=None):
-        """The server's answer. A server that doesn't answer (the lab frozen by its pacer while the
-        machine's disks are busy) is asked again for up to 15 minutes. A retried change the first
-        try made already (404 for a DELETE, 409 for a POST) is done."""
+    def call(self, method, path, body=None, raw=False):
+        """The server's answer (as text with `raw`: a step's log). A server that doesn't answer (the
+        lab frozen by its pacer while the machine's disks are busy) is asked again for up to 15
+        minutes. A retried change the first try made already (404 for a DELETE, 409 for a POST) is
+        done."""
         data = json.dumps(body).encode() if body is not None else None
         for attempt in range(31):
             req = urllib.request.Request(self.server + path, data=data, method=method, headers={"Authorization": "Bearer " + self.token})
@@ -162,8 +248,10 @@ class Api:
                 req.add_header("Content-Type", "application/json")
             try:
                 with urllib.request.urlopen(req, timeout=60) as r:
-                    raw = r.read()
-                    return json.loads(raw) if raw else None
+                    got = r.read()
+                    if raw:
+                        return got.decode(errors="replace")
+                    return json.loads(got) if got else None
             except urllib.error.HTTPError as e:
                 if attempt and method != "GET" and e.code in (404, 409):
                     return None
@@ -282,13 +370,26 @@ def version_tags(work, repo, commit, dest):
     return nearest, tags
 
 
+# A local reusable workflow a job calls (W04-R24): `uses: ./.github/workflows/<file>` or `$/…`.
+CALLS = re.compile(r"^\s*(?:-\s*)?uses:\s*['\"]?(?:\./|\$/)\.github/workflows/([^'\"\s@#/]+)", re.M)
+
+
 def only_corpus(dest, repo):
-    """A commit keeping only the workflows F-03 took of `repo` (the one made before, when there
-    is one: its runs are the ones to read); its sha."""
+    """A commit keeping only the workflows F-03 took of `repo` and the local reusable workflows
+    they call, transitively (uv's ci.yml is plan.yml, test.yml and others); its sha. One made
+    before is made again from the upstream's commit, as only its tree is read (those made before
+    2026-10-24 dropped the reusable workflows: uv's and neovim's)."""
     if git(dest, "log", "-1", "--format=%s") == "F-03: its corpus workflows alone":
-        return git(dest, "rev-parse", "HEAD")
-    keep = set(os.listdir(os.path.join(CORPUS, repo.replace("/", "_"))))
+        git(dest, "reset", "-q", "--hard", "HEAD~1")
     wf = os.path.join(dest, ".github", "workflows")
+    keep = set(os.listdir(os.path.join(CORPUS, repo.replace("/", "_"))))
+    todo = [f for f in keep if os.path.isfile(os.path.join(wf, f))]
+    while todo:
+        with open(os.path.join(wf, todo.pop()), errors="replace") as h:
+            for c in CALLS.findall(h.read()):
+                if c not in keep and os.path.isfile(os.path.join(wf, c)):
+                    keep.add(c)
+                    todo.append(c)
     for f in os.listdir(wf) if os.path.isdir(wf) else []:
         if f not in keep and re.search(r"\.ya?ml$", f):
             git(dest, "rm", "-q", "--cached", os.path.join(".github", "workflows", f))
@@ -316,7 +417,7 @@ def wait_reason(w):
 
 
 # A line that says what went wrong (not a shell's `set -x` trace of what ran after).
-ERRORISH = re.compile(r"(?i)\b(error|fatal|not found|failed|panicked|no such|cannot|denied|refused|exception)\b")
+ERRORISH = re.compile(r"(?i)\b(error|fatal|not found|failed|panicked|no such|cannot|denied|refused|\w*exception)\b")
 
 
 # A test runner's own words for a failed test, before the generic last line (make's, an exit code):
@@ -348,11 +449,38 @@ def leg_detail(api, leg):
                 panicked = next((i for i in range(at + 1, min(at + 8, len(lines))) if "panicked at" in lines[i]), None)
                 test = f"{m.group(1)}: {lines[panicked + 1]}" if panicked is not None and panicked + 1 < len(lines) else m.group(1)
             said = f"{test} ({said})"
-    # A line the known failures name, wherever it is in the step's log, goes with it.
-    known = next((x for x in lines if any(re.search(pat, x) for pat, _ in KNOWN) and x not in said), None)
-    if known and not any(re.search(pat, said) for pat, _ in KNOWN):
-        said = f"{said[:180]} — {known[:110]}"
+    # A line the known failures name, wherever it is in the step's log, goes with it: in the
+    # excerpt, else in the step's last lines, which an excerpt from a warning early on can stop
+    # short of (neovim's CodeQL: 40 lines from ld.so's, its analysis killed at the 184th), and
+    # a test suite's summary can stand between (cpython's: 113 lines after its failure).
+    known = known_line(lines, said)
+    if known is None and (f or {}).get("step") is not None:
+        try:
+            log = api.call("GET", f"/api/ci/legs/{leg['id']}/logs?step={f['step']}", raw=True) or ""
+        except RuntimeError:
+            log = ""
+        known = known_line([re.sub(r"\x1b\[[0-9;]*m", "", x).strip() for x in log.splitlines()[-200:]], said)
+    if known and not any(re.search(pat, said) for pat, _ in KNOWN + LEFT):
+        said = f"{said[:150]} — {known}"
+    # A long line whose known part is past where the note is cut (a digest's 64 characters ahead
+    # of Docker Hub's 429) keeps that part.
+    m = next((m for pat, _ in KNOWN + LEFT if (m := re.search(pat, said)) and m.end() > 300), None)
+    if m:
+        window = said[max(0, m.start() - 30) : m.end() + 20]
+        said = f"{said[: max(0, 296 - len(window))]} … {window}"
     return (f or {}).get("step_name") or "", said[:300]
+
+
+def known_line(lines, said):
+    """The first of `lines` a known failure, or one kiln's work has left, names that `said` hasn't
+    already, cut to what names it when it's long, so the note it joins still matches."""
+    for x in lines:
+        if not x or x in said:
+            continue
+        for pat, _ in KNOWN + LEFT:
+            if m := re.search(pat, x):
+                return x if len(x) <= 140 else x[max(0, m.start() - 30) : m.end() + 30]
+    return None
 
 
 # The empty tree: git has it without its being stored.
@@ -509,6 +637,29 @@ ELSEWHERE = re.compile(r"` waits: no runner meets its requirements \(.*\b(os == 
 
 # Failures that are kiln's, of work docs/ci.md has left: what each is, and where it's tracked.
 LEFT = [
+    # neovim's offline build: Ubuntu's AppArmor setting, then namespaces of its own.
+    (r"cannot stat /proc/sys/kernel/apparmor_restrict_unprivileged_userns", "it sets a kernel setting of Ubuntu's AppArmor (`sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`), then makes namespaces of its own (`unshare --net`): a `docker` executor's container is no machine for either (its `/proc/sys` is read-only, this host's kernel has no AppArmor), and the host executor would change the host's own; a Firecracker microVM leg with Ubuntu's kernel runs it (W13-R05, left: the lab has no Firecracker)"),
+    # cpython's test-hypothesis mounts its sources read-only (`sudo mount --bind -o ro`).
+    (r"dmesg\(1\) may have more information after failed mount system call", "it mounts (`sudo mount --bind`: cpython's read-only source tree), which a `docker` executor's container can't (no `CAP_SYS_ADMIN`), where a hosted runner's machine can; a Firecracker microVM leg runs it (W13-R05, left: the lab has no Firecracker)"),
+    # laravel's SQL Server legs: PHP's sqlsrv talks through Microsoft's ODBC driver, which GitHub's
+    # images have (mssql-tools18 and msodbcsql18, their EULA accepted in the image's build).
+    (r"This extension requires the Microsoft ODBC Driver for SQL Server", "it reaches SQL Server through Microsoft's ODBC driver, which GitHub's image has and kiln's hasn't: installing it accepts Microsoft's licence (its EULA), the user's call, as Android's SDK's is (W13-R04, left)"),
+    # cpython's Android build: Android's SDK at `ANDROID_HOME`, as bevy's below.
+    (r"The ANDROID_HOME environment variable is required", "it builds for Android with Android's SDK at `ANDROID_HOME`: GitHub's image has one, kiln's only its opt-in `-android` image, whose SDK licence the user accepts (the plan's step 7, left)"),
+    # bevy's Android build: cargo-ndk needs Android's NDK, in GitHub's image and only in kiln's
+    # opt-in `-android` one, whose SDK licence the user accepts.
+    (r"Could not find any NDK", "it builds for Android with cargo-ndk, which needs Android's NDK: GitHub's image has one, kiln's only in its opt-in `-android` image, whose SDK licence the user accepts (the plan's step 7, left)"),
+    # buildx's update-deps: another repository's releases (moby/moby's) through the facade.
+    (r"(HttpError: |error: )Not Found - https://github\.com/hyper-light/kiln/blob/main/docs/ci\.md#w14", "it reads a repository kiln doesn't have through the facade's REST API (`GITHUB_API_URL`: buildx's update-deps lists moby/moby's releases), which kiln answers Not Found: its git fetches go on to GitHub (W14-R11), its API reads don't; legs' reads of github.com's API wait for W18's egress proxy and a GitHub credential (W22, left)"),
+    # Two that passed on GitHub's 4-CPU runner at the same commit, and failed twice here, where a
+    # leg sees the machine's 32: ruff's formatter check (tracing-indicatif's progress bars under
+    # its threads) and TypeScript's API tests (`node --test` runs a file per CPU, 31 here).
+    (r"footer progress bar was hidden despite there being pending progress bars", "a progress-bar library's own check failed under the threads ruff starts for the 32 CPUs a leg here sees, where GitHub's runner has 4 and passed: a leg sees the machine's CPUs, not a hosted runner's few (W05-R03, left), to be run again"),
+    (r"panic: EOF \[recovered, repanicked\]", "TypeScript's API server lost its client mid-call, with `node --test` running a test file for each of the 32 CPUs a leg here sees, where GitHub's runner has 4 and passed: a leg sees the machine's CPUs, not a hosted runner's few (W05-R03, left), to be run again"),
+    # PyO3/maturin-action reads maturin's releases from api.github.com with the job's token.
+    (r"HttpClientError: Bad credentials|Build wheels: error: Bad credentials|BadCredentialsException: 401", "an action or tool reads api.github.com with the job's token (PyO3/maturin-action: maturin's releases; arrow's archery: its release changelog), which github.com refuses: legs' authenticated reads of github.com wait for W18's egress proxy and a GitHub credential (W22, left)"),
+    # rails' devcontainer smoke test logs in to ghcr.io with the job's token, as GitHub's works there.
+    (r'Get "https://ghcr\.io/v2/": denied', "it logs in to GitHub's container registry with the job's token (`docker/login-action`, ghcr.io), which ghcr.io refuses, where GitHub's job token works there: a leg's GHCR login waits for a GitHub credential, through W18's egress proxy or W12-R03's `registries: [ghcr]` (W22, left)"),
     # zizmor's online audits pass GH_TOKEN, the job's, to a container that reads github.com.
     (r"401 Unauthorized\) for url \(https://github\.com/", "a tool sends the job's token to github.com itself (zizmor's online audits), which refuses kiln's: legs' authenticated reads of github.com wait for W18's egress proxy and a GitHub credential (W22, left)"),
     # scorecard-action checks a push's repository remotely (a pull request's, locally), through

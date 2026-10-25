@@ -3025,8 +3025,10 @@ fn w03_ac07_a_diffs_versions_are_pull_request_events() -> anyhow::Result<()> {
     std::fs::create_dir_all(work.join(".github/workflows"))?;
     std::fs::write(
         work.join(".github/workflows/pr.yml"),
-        "on: pull_request\njobs:\n  show:\n    runs-on: local\n    steps:\n      - run: |\n          echo \"saw ${{ github.event.action }} of ${{ github.event.number }}: ${{ github.event.pull_request.head.sha }} onto ${{ github.event.pull_request.base.ref }}\"\n",
+        "on: pull_request\njobs:\n  show:\n    runs-on: local\n    steps:\n      - run: |\n          echo \"saw ${{ github.event.action }} of ${{ github.event.number }}: ${{ github.event.pull_request.head.sha }} onto ${{ github.event.pull_request.base.ref }} (${{ github.event.pull_request.commits }} commit, +${{ github.event.pull_request.additions }} -${{ github.event.pull_request.deletions }} in ${{ github.event.pull_request.changed_files }})\"\n",
     )?;
+    // Its paths filter reads what each version changes (W03-R05): neither touches `docs/`.
+    std::fs::write(work.join(".github/workflows/docs.yml"), "on:\n  pull_request:\n    paths: ['docs/**']\njobs:\n  docs:\n    runs-on: local\n    steps:\n      - run: echo docs\n")?;
     std::fs::write(work.join("README.md"), "prs\n")?;
     must(git(&home, &work, &["add", "."]), "add")?;
     must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
@@ -3043,7 +3045,9 @@ fn w03_ac07_a_diffs_versions_are_pull_request_events() -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(300);
     let saw = loop {
         let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/prs&event=pull_request&limit=10", &s.admin, None)?;
-        let done: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).collect();
+        let runs = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        anyhow::ensure!(!runs.iter().any(|r| text(r, "workflow").ends_with("docs.yml")), "docs.yml ran for versions that don't touch docs/: {body}");
+        let done: Vec<Value> = runs.into_iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).collect();
         if done.len() >= 2 {
             let mut logs = Vec::new();
             for r in &done {
@@ -3062,8 +3066,9 @@ fn w03_ac07_a_diffs_versions_are_pull_request_events() -> anyhow::Result<()> {
         anyhow::ensure!(Instant::now() < deadline, "two pull_request runs didn't finish: {body}\n{}", s.log());
         std::thread::sleep(Duration::from_millis(500));
     };
-    assert!(saw.iter().any(|l| l.contains(&format!("saw opened of 1: {v1} onto main"))), "v1 opened it: {saw:?}");
-    assert!(saw.iter().any(|l| l.contains(&format!("saw synchronize of 1: {v2} onto main"))), "v2 synchronized it: {saw:?}");
+    // GitHub's counts, which a workflow sizes its fetch by (cpython's `--depth=$(( commits + 1 ))`).
+    assert!(saw.iter().any(|l| l.contains(&format!("saw opened of 1: {v1} onto main (1 commit, +1 -0 in 1)"))), "v1 opened it: {saw:?}");
+    assert!(saw.iter().any(|l| l.contains(&format!("saw synchronize of 1: {v2} onto main (1 commit, +1 -0 in 1)"))), "v2 synchronized it: {saw:?}");
     Ok(())
 }
 

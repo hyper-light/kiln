@@ -461,6 +461,123 @@ fn replica_wait(tries: u32) -> Duration {
     Duration::from_secs(if tries < REPLICA_PATIENCE { 15 } else { 60 })
 }
 
+/// How often a runner checks that its replica follows the server, and how many checks running it
+/// may stay behind the server's last write before it's started again.
+const REPLICA_CHECK: Duration = Duration::from_secs(60);
+const REPLICA_BEHIND: u32 = 5;
+
+/// This machine's replica of kiln's records (docs/p2p.md, P2): where it's kept once started, and
+/// what starting it takes.
+#[derive(Clone)]
+struct ReplicaStart {
+    slot: Arc<parking_lot::Mutex<Option<Arc<crate::store::learner::Learner>>>>,
+    starting: Arc<std::sync::atomic::AtomicBool>,
+    /// The server's last word to join the group as a learner (`None` once it said Leave).
+    join: Arc<parking_lot::Mutex<Option<(u64, String)>>>,
+    up: async_channel::Sender<Up>,
+    dir: PathBuf,
+    me: String,
+    server: String,
+    http: Arc<Client>,
+}
+
+impl ReplicaStart {
+    /// Starts the replica with the server's newest word to join, unless one is starting already:
+    /// on a task of its own (fetching a first copy takes a while).
+    fn start(&self) {
+        use crate::store::learner::Learner;
+        if self.starting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let r = self.clone();
+        crate::rt::spawn(async move {
+            let going = r.up.clone();
+            let (dir, me, server, http) = (r.dir.clone(), r.me.clone(), r.server.clone(), r.http.clone());
+            let started = start_replica(
+                &r.join,
+                move || going.is_closed(),
+                move |member, token| {
+                    let (dir, me, server, http) = (dir.clone(), me.clone(), server.clone(), http.clone());
+                    async move {
+                        // A thread of its own: fetching a copy takes minutes on a large store, and the
+                        // blocking pool is the runtime's.
+                        let (tx, rx) = async_channel::bounded(1);
+                        std::thread::Builder::new()
+                            .name("kiln-learner".into())
+                            .spawn(move || {
+                                let _ = tx.send_blocking(Learner::start(&dir, &me, member, http, &server, &token));
+                            })
+                            .map_err(|e| anyhow::anyhow!("starting the learner's thread: {e}"))?;
+                        rx.recv().await.map_err(|_| anyhow::anyhow!("the learner's thread ended"))?
+                    }
+                },
+                replica_wait,
+            )
+            .await;
+            match started {
+                Ok(((learner, said), member)) => {
+                    tracing::info!(member, "this machine holds a replica of kiln's records");
+                    let learner = Arc::new(learner);
+                    crate::store::learner::set_global(Some(Arc::clone(&learner)));
+                    *r.slot.lock() = Some(learner);
+                    let up = r.up.clone();
+                    crate::rt::spawn(async move {
+                        while let Ok(m) = said.recv().await {
+                            if up.send(Up::Sync(m)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "this machine's replica of kiln's records didn't start"),
+            }
+            r.starting.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    /// Keeps the replica following the server: one whose group stopped, or that stays behind the
+    /// server's last write for [`REPLICA_BEHIND`] checks running, is stopped and started again with
+    /// the newest word to join. Nothing else would start it again, and its front door would leave
+    /// every read to the server for good (adacachy's, on 2026-10-25, applied nothing for hours after
+    /// the server restarted).
+    async fn watch(self) {
+        let mut behind = 0u32;
+        loop {
+            crate::rt::sleep(REPLICA_CHECK).await;
+            if self.up.is_closed() {
+                return;
+            }
+            let Some(learner) = self.slot.lock().clone() else {
+                behind = 0;
+                continue;
+            };
+            let why = if let Some(why) = learner.stopped() {
+                format!("its cluster group stopped: {why}")
+            } else if learner.current(Duration::from_secs(30)).await {
+                behind = 0;
+                continue;
+            } else {
+                behind += 1;
+                if behind < REPLICA_BEHIND {
+                    continue;
+                }
+                format!("it stayed behind the server's last write for {behind} checks running")
+            };
+            behind = 0;
+            let (seq, applied) = learner.standing();
+            drop(learner);
+            tracing::warn!(seq, applied, "this machine's replica of kiln's records stopped following the server and starts again: {why}");
+            // Taken away as at a Leave (its files let go, waiting for its thread), then started.
+            let old = self.slot.lock().take();
+            if let Some(old) = old {
+                crate::store::learner::set_global(None);
+                let _ = crate::rt::blocking(move || drop(old)).await;
+            }
+            self.start();
+        }
+    }
+}
+
 #[cfg(test)]
 mod replica_tests {
     use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
@@ -876,6 +993,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
     });
     let uplink = Uplink(up_tx);
+    let replica = ReplicaStart {
+        slot: cluster.clone(),
+        starting: cluster_starting.clone(),
+        join: cluster_join.clone(),
+        up: uplink.0.clone(),
+        dir: o.state_dir.clone(),
+        me: name.clone(),
+        server: o.server_url.clone(),
+        http: http.clone(),
+    };
+    if !o.ephemeral && !o.outpost {
+        crate::rt::spawn(replica.clone().watch());
+    }
     // Agent sessions handed to this machine's newer runner process go by way of the server.
     crate::harness::handing::install(uplink.0.clone());
     // Its facts, probed again every 10 minutes (docs/ci.md W13-R01); once on each connection.
@@ -2413,58 +2543,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::Cluster { json, raft } => {
-                        use crate::store::learner::{Learner, Msg};
+                        use crate::store::learner::Msg;
                         match crate::store::learner::decode(&json) {
                             Some(Msg::Join { member, token }) if !o.ephemeral && !o.outpost => {
                                 // A replica being started goes on with the newest word to join.
                                 *cluster_join.lock() = Some((member, token));
-                                if cluster.lock().is_some() || cluster_starting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                if cluster.lock().is_some() {
                                     continue;
                                 }
-                                // Fetching its first copy of kiln.db takes a while: not on this loop.
-                                let (slot, starting, up, join) = (cluster.clone(), cluster_starting.clone(), uplink.0.clone(), cluster_join.clone());
-                                let (dir, me, server, http) = (o.state_dir.clone(), name.clone(), o.server_url.clone(), http.clone());
-                                crate::rt::spawn(async move {
-                                    let going = up.clone();
-                                    let started = start_replica(
-                                        &join,
-                                        move || going.is_closed(),
-                                        move |member, token| {
-                                            let (dir, me, server, http) = (dir.clone(), me.clone(), server.clone(), http.clone());
-                                            async move {
-                                                // A thread of its own: fetching a copy takes minutes on a large store, and the
-                                                // blocking pool is the runtime's.
-                                                let (tx, rx) = async_channel::bounded(1);
-                                                std::thread::Builder::new()
-                                                    .name("kiln-learner".into())
-                                                    .spawn(move || {
-                                                        let _ = tx.send_blocking(Learner::start(&dir, &me, member, http, &server, &token));
-                                                    })
-                                                    .map_err(|e| anyhow::anyhow!("starting the learner's thread: {e}"))?;
-                                                rx.recv().await.map_err(|_| anyhow::anyhow!("the learner's thread ended"))?
-                                            }
-                                        },
-                                        replica_wait,
-                                    )
-                                    .await;
-                                    match started {
-                                        Ok(((learner, said), member)) => {
-                                            tracing::info!(member, "this machine holds a replica of kiln's records");
-                                            let learner = Arc::new(learner);
-                                            crate::store::learner::set_global(Some(Arc::clone(&learner)));
-                                            *slot.lock() = Some(learner);
-                                            crate::rt::spawn(async move {
-                                                while let Ok(m) = said.recv().await {
-                                                    if up.send(Up::Sync(m)).await.is_err() {
-                                                        break;
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        Err(e) => tracing::warn!(error = %format!("{e:#}"), "this machine's replica of kiln's records didn't start"),
-                                    }
-                                    starting.store(false, std::sync::atomic::Ordering::SeqCst);
-                                });
+                                replica.start();
                             }
                             Some(Msg::Leave) => {
                                 // A replica being started stops trying.

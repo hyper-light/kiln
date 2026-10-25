@@ -530,7 +530,8 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
 
 /// The events a new version is (W03-R09): `pull_request` (`opened` for v1, `synchronize` after)
 /// and, for a diff, kiln's `diff`, with it in the payload's `kiln.diff` (`kiln.change_request`).
-fn events_of(repo: &Repo, ctx: &context::Repo, trunk: &str, base_sha: &str, author: &(String, &'static str), f: &Fresh, changed: Option<Vec<String>>) -> (Event, Event) {
+#[allow(clippy::too_many_arguments)]
+fn events_of(repo: &Repo, ctx: &context::Repo, trunk: &str, base_sha: &str, author: &(String, &'static str), f: &Fresh, changed: Option<Vec<String>>, counts: context::Counts) -> (Event, Event) {
     let pr = PullRequest {
         number: u64::from(f.number),
         title: Some(f.title.clone()),
@@ -543,6 +544,7 @@ fn events_of(repo: &Repo, ctx: &context::Repo, trunk: &str, base_sha: &str, auth
         base: Side { branch: trunk.to_owned(), sha: base_sha.to_owned(), repo: ctx.clone() },
         created_at: None,
         updated_at: None,
+        counts,
     };
     let mut e = Event {
         name: "pull_request".into(),
@@ -583,7 +585,8 @@ pub(crate) async fn checks(hub: &Hub, repo: &Repo, trunk: &str, base_sha: &str, 
     }
     let ctx = super::events::facts(hub, repo).await.repo;
     let changed = gitops::changed_files(hub, repo, &f.parent, &f.sha).await;
-    let (pr, diff) = events_of(repo, &ctx, trunk, base_sha, author, f, changed);
+    let counts = gitops::pr_counts(hub, repo, &f.parent, &f.sha).await;
+    let (pr, diff) = events_of(repo, &ctx, trunk, base_sha, author, f, changed, counts);
     let commit = super::load::load(hub, repo, &f.sha).await?;
     for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
         let both = [&pr, &diff];
@@ -645,7 +648,8 @@ pub(crate) async fn conversation(hub: &Hub, v: &Value) -> anyhow::Result<()> {
     let facts = super::events::facts(hub, &repo).await;
     let f = Fresh { number: d.number, n: latest.n, sha: latest.commit.clone(), parent: latest.parent.clone(), title: d.title.clone(), summary: d.summary.clone(), message: String::new(), draft: d.state == "draft", rebase_only: latest.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await, started_by: latest.started_by.clone() };
     let author = (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" });
-    let (pr, _) = events_of(&repo, &facts.repo, &d.trunk, &latest.base, &author, &f, None);
+    let counts = gitops::pr_counts(hub, &repo, &f.parent, &f.sha).await;
+    let (pr, _) = events_of(&repo, &facts.repo, &d.trunk, &latest.base, &author, &f, None, counts);
     // `user:ada` is GitHub's `ada`; an agent's name is its first word.
     let login = who.split_once(':').map_or(who.as_str(), |(_, n)| n).split(' ').next().unwrap_or_default().to_owned();
     let now = crate::deploy::repo::rfc3339(crate::util::now_unix());
@@ -772,7 +776,8 @@ pub(crate) async fn activity(hub: &Hub, repo: &Repo, d: &Diff, action: &str, by:
     let (title, summary) = (d.title.clone(), d.summary.clone());
     let f = Fresh { number: d.number, n: v.n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: String::new(), draft: d.state == "draft", rebase_only: v.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await, started_by: v.started_by.clone() };
     let author = (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" });
-    let (mut e, _) = events_of(repo, &ctx, &d.trunk, &v.base, &author, &f, None);
+    let counts = gitops::pr_counts(hub, repo, &f.parent, &f.sha).await;
+    let (mut e, _) = events_of(repo, &ctx, &d.trunk, &v.base, &author, &f, None, counts);
     e.action = action.into();
     if let Some(p) = e.payload.as_object_mut() {
         p.insert("action".into(), json!(action));

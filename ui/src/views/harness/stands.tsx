@@ -1,16 +1,16 @@
 /**
  * How your agents stand, in a row of its own under Mission control's head: a rule with a stretch
  * for each way they stand, as long as its share of them, and under it each one's badge and count
- * (on a desktop its name too). The rule is one wave across every stretch, as lively in each as its
- * agents, each stretch in its own colour and mark and reaching for the next across the gap between
- * them (stands-wave.ts). It's drawn each frame while it's on screen and motion plays; paused (Kiln's
- * toggle, or reduced motion) it holds still.
+ * (on a desktop its name too). The rule is one string of light across every stretch, damped in
+ * each as much as its agents are still, each stretch particles in its own ring's colours, reaching
+ * for the next across the gap between them (stands-light.ts). It's drawn each frame while it's on
+ * screen and motion plays; paused (Kiln's toggle, or reduced motion) it holds still.
  */
 import * as React from "react";
 import "./stands.css";
 import { useMotionPreference } from "@/components/shell/motion";
 import type { MissionRow, MissionStand as Stand } from "./mission-rows";
-import { cells, draw, easeOut, GROW_MS, HEIGHT, LOOK, PRISM, stretches, type Shown } from "./stands-wave";
+import { cells, easeOut, frame, GROW_MS, HEIGHT, LOOK, newFrame, paint, RING, stretches, type Shown } from "./stands-light";
 
 /** The ways counted, in the order they read (ended agents aren't). */
 const SHOWN: readonly Shown[] = ["needs", "crashed", "paused", "working", "finished", "ready", "offline"];
@@ -121,18 +121,21 @@ const parseCounts = (counts: string) =>
       }),
   );
 
+/** The moment a still rule is drawn at: the string at rest in a gentle shape. */
+const STILL = 1.3;
+
 /**
- * The rule (stands-wave.ts), wired to its SVG as it's attached: drawn each frame (at most every
- * 25 ms) while it's on screen and motion plays; still, it's drawn at rest, and again only as it's
+ * The rule (stands-light.ts), wired to its canvas as it's attached: drawn each frame (at most every
+ * 33 ms) while it's on screen and motion plays; still, it's drawn at rest, and again only as it's
  * resized or its counts change. A change of `counts` eases its stretches to their new lengths.
  */
 function Rule({ counts }: { counts: string }) {
-  const id = cleanId(React.useId());
   const { paused } = useMotionPreference();
   const grow = React.useRef<Grow>({ from: new Map(), to: new Map(), at: -GROW_MS });
   const attach = React.useCallback(
-    (svg: SVGSVGElement | null) => {
-      if (!svg) return;
+    (canvas: HTMLCanvasElement | null) => {
+      const ctx = canvas?.getContext("2d");
+      if (!canvas || !ctx) return;
       const g = grow.current;
       const begun = performance.now();
       g.from = countsAt(g, begun);
@@ -142,19 +145,29 @@ function Rule({ counts }: { counts: string }) {
       let raf = 0;
       let last = -Infinity;
       let visible = true;
-      let width = svg.getBoundingClientRect().width;
-      const frame = (now: number) => {
+      let width = canvas.getBoundingClientRect().width;
+      const kept = newFrame();
+      const draw = (now: number) => {
         const shown = countsAt(g, now);
         const stands = SHOWN.filter((s) => shown.has(s));
         if (width <= 0 || stands.length === 0) return;
-        draw(svg, stretches(stands, stands.map((s) => shown.get(s) ?? 0), width), width, paused ? 0 : now / 1000, id);
+        const dpr = Math.min(3, window.devicePixelRatio || 1);
+        const w = Math.round(width * dpr);
+        const h = Math.round(HEIGHT * dpr);
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, width, HEIGHT);
+        paint(ctx, frame(stretches(stands, stands.map((s) => shown.get(s) ?? 0), width), width, paused ? STILL : now / 1000, kept));
       };
       const tick = (now: number) => {
         raf = 0;
         if (!visible) return;
-        if (now - last >= 25) {
+        if (now - last >= 33) {
           last = now;
-          frame(now);
+          draw(now);
         }
         if (!paused || now - g.at < GROW_MS) raf = requestAnimationFrame(tick);
       };
@@ -163,15 +176,15 @@ function Rule({ counts }: { counts: string }) {
       };
       const sized = new ResizeObserver((entries) => {
         width = entries[0]?.contentRect.width ?? width;
-        frame(performance.now());
+        draw(performance.now());
       });
       const seen = new IntersectionObserver((entries) => {
         visible = entries.some((e) => e.isIntersecting);
         if (visible) start();
       });
-      sized.observe(svg);
-      seen.observe(svg);
-      frame(begun);
+      sized.observe(canvas);
+      seen.observe(canvas);
+      draw(begun);
       start();
       return () => {
         cancelAnimationFrame(raf);
@@ -179,9 +192,9 @@ function Rule({ counts }: { counts: string }) {
         seen.disconnect();
       };
     },
-    [counts, paused, id],
+    [counts, paused],
   );
-  return <svg ref={attach} className="st-rule" viewBox={`0 0 100 ${HEIGHT}`} preserveAspectRatio="none" aria-hidden="true" />;
+  return <canvas ref={attach} className="st-rule" aria-hidden="true" />;
 }
 
 /** What each state is, plainly, in its colour (14 × 14). Working's arc turns, needs you's bubble brightens and dims, ready's light breathes; the rest are still (stands.css). */
@@ -191,13 +204,13 @@ function Badge({ stand }: { stand: Shown }) {
   const line = { stroke: c, strokeLinecap: "round" as const, strokeLinejoin: "round" as const, fill: "none" };
   const box = { viewBox: "0 0 14 14", "aria-hidden": true as const };
   switch (stand) {
-    case "working": // at work: an arc turning, in the prism
+    case "working": // at work: an arc turning, in its ring's colours
       return (
         <svg className="st-mark st-turning" {...box}>
           <defs>
             <linearGradient id={id} x1="0" x2="1" y1="0" y2="1">
-              {PRISM.map((p, k) => (
-                <stop key={p} offset={k / (PRISM.length - 1)} stopColor={p} />
+              {RING.map(([colour, at]) => (
+                <stop key={at} offset={at} stopColor={colour} />
               ))}
             </linearGradient>
           </defs>
@@ -249,7 +262,7 @@ function Badge({ stand }: { stand: Shown }) {
 /**
  * A count: a cell a digit wide for each place, two at least, so 9 going to 10 moves nothing beside
  * it. Only a place whose digit changes rolls, up as the count rises and down as it falls
- * (stands-wave.ts `cells`): each change makes its digits anew, so the roll plays once, and the old
+ * (stands-light.ts `cells`): each change makes its digits anew, so the roll plays once, and the old
  * digit ends hidden (stands.css).
  */
 function Count({ n, align }: { n: number; align: "start" | "end" }) {
