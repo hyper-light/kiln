@@ -126,7 +126,16 @@ struct Peer {
     link: bool,
     /// The link is up and the runner has said what it has.
     up: bool,
+    /// It said it keeps the channel (`CAP_WIRE`), on this link or one before.
+    wire: bool,
+    /// It connected and hasn't said yet whether it keeps the channel, since then: its commands
+    /// wait for that, a live one too ([`Commands::coming`]).
+    coming: Option<Instant>,
 }
+
+/// How long a runner process that connected has to say it keeps the channel (its `Caps`, which
+/// follow its hello at once) before it's taken for one from before the channel.
+pub const COMING_FOR: Duration = Duration::from_secs(3);
 
 /// Every runner process's command streams, on the server.
 pub struct Commands {
@@ -148,13 +157,48 @@ impl Commands {
 
     fn peer(&mut self, peer: PeerId) -> &mut Peer {
         let (room, patience) = (self.room, self.patience);
-        self.peers.entry(peer).or_insert_with(|| Peer { tx: Sender::new(room, patience), parked: Stream::new("p"), live: Stream::new("l"), link: false, up: false })
+        self.peers.entry(peer).or_insert_with(|| Peer { tx: Sender::new(room, patience), parked: Stream::new("p"), live: Stream::new("l"), link: false, up: false, wire: false, coming: None })
     }
 
     /// Whether runner process `peer` takes commands on the channel (it said so, or sent a frame of
     /// it).
     pub fn keeps(&self, peer: PeerId) -> bool {
-        self.peers.contains_key(&peer)
+        self.peers.get(&peer).is_some_and(|p| p.wire || p.coming.is_some())
+    }
+
+    /// Runner process `peer` connected: it says in a moment whether it keeps the channel (its
+    /// `Caps`). Until it does, its commands wait for it, a live one too, rather than being refused
+    /// as if it were away, or going the way a runner's from before the channel do.
+    pub fn coming(&mut self, peer: PeerId, now: Instant) {
+        let p = self.peer(peer);
+        if !p.link {
+            p.coming = Some(now);
+        }
+    }
+
+    /// Runner process `peer` doesn't keep the channel: it said so, or it didn't say it does within
+    /// [`COMING_FOR`]. What waited for it, each with the answer to give it, goes the way a
+    /// runner's from before the channel gets it. One that said it does on a link before goes on
+    /// as one that's away.
+    pub fn not_wire(&mut self, peer: PeerId) -> Vec<(Vec<u8>, oneshot::Sender<Answer>)> {
+        let born = self.born;
+        match self.peers.get_mut(&peer) {
+            Some(p) if p.wire => {
+                p.coming = None;
+                if !p.link {
+                    restart(p, Kind::Live, born, false);
+                }
+                Vec::new()
+            }
+            Some(_) => self.peers.remove(&peer).map(|p| p.parked.waiting.into_values().chain(p.live.waiting.into_values()).map(|w| (w.body, w.answer)).collect()).unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The runner processes that connected and didn't say within [`COMING_FOR`] whether they keep
+    /// the channel.
+    pub fn overdue(&self, now: Instant) -> Vec<PeerId> {
+        self.peers.iter().filter(|(_, p)| p.coming.is_some_and(|at| now.saturating_duration_since(at) >= COMING_FOR)).map(|(peer, _)| *peer).collect()
     }
 
     /// Whether runner process `peer`'s link is up and it said what it has.
@@ -177,6 +221,8 @@ impl Commands {
             restart(p, Kind::Live, born, true);
         }
         p.link = true;
+        p.wire = true;
+        p.coming = None;
     }
 
     /// Queues `body` (an encoded `ServerMsg`) as a command to `peer`: its answer comes on the
@@ -186,7 +232,7 @@ impl Commands {
         let (tx, rx) = oneshot::channel();
         let born = self.born;
         let p = self.peer(peer);
-        if kind == Kind::Live && !p.link {
+        if kind == Kind::Live && !p.link && p.coming.is_none() {
             let _ = tx.send(Answer::Unreachable { why: "its runner is away".into() });
             return rx;
         }
@@ -212,6 +258,9 @@ impl Commands {
         let have = matches!(frame, Frame::Have(_));
         let p = self.peer(peer);
         let events = p.tx.on_frame(frame);
+        // A frame of the channel says it keeps it.
+        p.wire = true;
+        p.coming = None;
         if have {
             p.link = true;
             p.up = true;
@@ -255,6 +304,7 @@ impl Commands {
         let went = p.up;
         p.link = false;
         p.up = false;
+        p.coming = None;
         p.tx.down();
         restart(p, Kind::Live, born, went);
     }
@@ -426,6 +476,59 @@ mod tests {
         }
         assert_eq!(answer(&mut cancel), Some(Answer::Taken));
         assert_eq!(r.took, vec![b"cancel a".to_vec()]);
+    }
+
+    /// The race's other half: a runner that connected again on its certificate (the same peer,
+    /// its record from the link before saying it's away) is sent a live command between its hello
+    /// and its Caps. It waits for them, rather than being refused as away.
+    #[test]
+    fn a_live_command_before_its_runner_says_it_keeps_the_channel_waits_for_that() {
+        let base = Instant::now();
+        let mut c = Commands::new(7);
+        let mut r = Runner::new();
+        c.connected(1);
+        c.down(1);
+        c.coming(1, base);
+        let mut assign = c.push(1, Kind::Live, b"assign".to_vec(), base);
+        assert_eq!(answer(&mut assign), None, "not refused: it's here, saying what it keeps");
+        c.connected(1);
+        c.on_frame(1, r.rx.have());
+        for a in r.deliver(c.poll(t(base, 5)), |_| false) {
+            c.on_frame(1, a);
+        }
+        assert_eq!(answer(&mut assign), Some(Answer::Taken));
+        assert_eq!(r.took, vec![b"assign".to_vec()]);
+        // One that never says so in time, having said it keeps the channel before, is as away.
+        c.down(1);
+        c.coming(1, base);
+        let mut late = c.push(1, Kind::Live, b"late".to_vec(), base);
+        assert!(c.not_wire(1).is_empty(), "nothing goes the old way for it");
+        assert!(matches!(answer(&mut late), Some(Answer::Unreachable { .. })), "it never went");
+        assert!(c.keeps(1), "its parked ones still wait for it");
+        assert!(matches!(answer(&mut c.push(1, Kind::Live, b"later".to_vec(), base)), Some(Answer::Unreachable { .. })), "away now");
+    }
+
+    /// A runner from before the channel never says it keeps it: what waited for it goes the way
+    /// such a runner's does once [`COMING_FOR`] passes, and it's taken for what it is.
+    #[test]
+    fn what_waited_for_a_runner_from_before_the_channel_goes_its_way() {
+        let base = Instant::now();
+        let mut c = Commands::new(7);
+        c.coming(2, base);
+        assert!(c.keeps(2), "it may keep it: it hasn't said");
+        let mut retire = c.push(2, Kind::Parked, b"retire".to_vec(), base);
+        let mut assign = c.push(2, Kind::Live, b"assign".to_vec(), base);
+        assert!(c.overdue(t(base, 1000)).is_empty(), "within its time to say");
+        assert_eq!(c.overdue(base + COMING_FOR), vec![2]);
+        let waited = c.not_wire(2);
+        let mut bodies: Vec<Vec<u8>> = waited.iter().map(|(b, _)| b.clone()).collect();
+        bodies.sort();
+        assert_eq!(bodies, vec![b"assign".to_vec(), b"retire".to_vec()]);
+        assert!(!c.keeps(2), "not taken for one that keeps the channel");
+        for (_, answer) in waited {
+            let _ = answer.send(Answer::Sent);
+        }
+        assert_eq!((answer(&mut retire), answer(&mut assign)), (Some(Answer::Sent), Some(Answer::Sent)));
     }
 
     /// w20_ac05's race: a leg assigned the moment its runner connected, before it said what it
