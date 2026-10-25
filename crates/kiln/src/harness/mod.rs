@@ -17,11 +17,13 @@
 //! * [`wait`] — where agents stand, and waiting for them to settle.
 //! * [`queued`] — what waits in an agent's queue, and the messages kiln keeps there itself.
 //! * [`transcript`] — Claude Code transcripts as the timeline (history on resume, sessions elsewhere).
+//! * [`builds`] — agents' builds on the runner's work: the cache variables, warm build folders.
 
 pub mod acp;
 pub mod antigravity;
 pub mod archive;
 pub mod broadcast;
+pub mod builds;
 pub mod carry;
 pub mod claude;
 pub mod cli;
