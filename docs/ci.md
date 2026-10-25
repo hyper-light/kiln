@@ -7769,6 +7769,22 @@ Production's engine is off, so it can't plan them itself.
 confirmed case-insensitive. The production change, for the person to make (not deployed): `[ci]
 enabled = true` and `kiln_workflows = true`, after the `k8s` pool above.
 
+**Warm workspaces (M1, step 5).** Built for host and `docker` legs, awaiting review (R11, R15;
+`kiln_ci::work::slots`, `runner/warm.rs`). A job's `work: { warm: [target] }` (or `{ paths,
+budget: 60Gi }`; overlays may set it) keeps its workspace on its runner per lane, at
+`<work>/warm/<repo>/<lane>/<n>`, the lane hashed from the repository, the workflow's file and job,
+the matrix and the executor's image. A leg takes the free slot nearest its commit, checks out in
+place (only changed files are written; the rest keep their mtimes) and cleans all but its kept
+folders, saying in its log which slot it took and the commit it was at. Taking a lane's last free
+slot first clones a copy-on-write spare of it (reflink, or clonefile on APFS; never a copy) for a
+second leg of the lane, since a clone of a slot being written could pair a new fingerprint with an
+old output. Without clones a second leg gets a new slot or runs cold. Untrusted legs work on a
+throwaway clone, a dead holder's slot is reset to its repository or dropped, and `KILN_WARM_MAX`
+and `KILN_WARM_FLOOR` bound what's kept, least recently used going first. Pools, pods and
+microVMs keep their own workspaces (R13, R14); `actions/checkout` cleans a workspace itself
+unless given `clean: false`. AC11: kiln's `target` (29.2 GiB, 42,407 files) cloned in 1.39 s on
+fedora's btrfs through the runner (0.94 s with `cp` alone) and removed in 0.4 s.
+
 ## 4. API, events, CLI and MCP reference
 
 All routes come from the one route table (W10-R05, W20-R01) and follow access.md's conventions:
