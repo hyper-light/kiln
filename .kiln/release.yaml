@@ -37,6 +37,17 @@ jobs:
         run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build
       - name: build
         run: nice -n 10 ci/release/build.sh x86_64-pc-windows-msvc
+        # The binary is signed when these are set (ci/release/sign-windows.sh, docs/releases.md):
+        # unsigned, Windows 11's Smart App Control refuses a new build until Microsoft knows it.
+        # Only this step sees them, not npm's install scripts in the one before.
+        env:
+          WINDOWS_SIGNING_ENDPOINT: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+          WINDOWS_SIGNING_ACCOUNT: ${{ vars.WINDOWS_SIGNING_ACCOUNT }}
+          WINDOWS_SIGNING_PROFILE: ${{ vars.WINDOWS_SIGNING_PROFILE }}
+          WINDOWS_SIGNING_TOKEN: ${{ secrets.WINDOWS_SIGNING_TOKEN }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
     artifacts: ["dist/*"]
 
   macos:
