@@ -22,7 +22,7 @@ pub struct Record {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::trace;
+pub use linux::{trace, trace_preload};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -133,6 +133,41 @@ mod linux {
         let records = supervisor.join().map_err(|_| anyhow::anyhow!("the tracer's supervisor stopped"))?;
         drop(filter);
         Ok((status?, records?))
+    }
+
+    /// Runs `cmd` with the interposition library `shim` (`LD_PRELOAD`, the `kiln-preload` crate):
+    /// how it exited, and what it noted, the variables it read among them. What doesn't go through
+    /// the C library (a static Go program, a direct system call) escapes it.
+    pub fn trace_preload(cmd: &mut Command, shim: &Path) -> anyhow::Result<(ExitStatus, Vec<Record>)> {
+        let (mut read, write) = std::io::pipe()?;
+        let wfd = write.as_raw_fd();
+        cmd.env("LD_PRELOAD", shim).env("KILN_TRACE_FD", wfd.to_string());
+        // A pipe is made close-on-exec: its write end stays open across the command's exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::fcntl(wfd, libc::F_SETFD, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let reader = std::thread::spawn(move || -> std::io::Result<String> {
+            let mut text = String::new();
+            read.read_to_string(&mut text)?;
+            Ok(text)
+        });
+        let spawned = cmd.spawn();
+        drop(write);
+        let status = spawned.and_then(|mut c| c.wait());
+        let text = reader.join().map_err(|_| anyhow::anyhow!("the tracer's reader stopped"))??;
+        let records = text
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.splitn(3, '\t');
+                Some(Record { pid: f.next()?.parse().ok()?, call: f.next()?.to_owned(), path: f.next()?.to_owned() })
+            })
+            .collect();
+        Ok((status?, records))
     }
 
     /// The supervisor: takes the child's listener, then answers every notification until no
@@ -279,6 +314,38 @@ mod linux {
             anyhow::ensure!(status.success(), "rustc under the tracer: {status}");
             anyhow::ensure!(recs.iter().any(|r| r.call.starts_with("open") && Path::new(&r.path) == src), "rustc's read of its source: {:?}", recs.iter().filter(|r| r.path.contains("lib.rs")).collect::<Vec<_>>());
             anyhow::ensure!(recs.iter().any(|r| r.call == "execve"), "the exec is seen too");
+            Ok(())
+        }
+
+        /// The interposition library, built from its crate into `dir`.
+        fn shim(dir: &Path) -> anyhow::Result<PathBuf> {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kiln-preload/Cargo.toml");
+            let out = Command::new(cargo).args(["build", "--offline", "--locked", "--message-format=json", "--manifest-path"]).arg(&manifest).env("CARGO_TARGET_DIR", dir.join("target")).output()?;
+            anyhow::ensure!(out.status.success(), "building kiln-preload: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .flat_map(|v| v.get("filenames").and_then(serde_json::Value::as_array).cloned().unwrap_or_default())
+                .filter_map(|f| f.as_str().map(PathBuf::from))
+                .find(|p| p.extension().is_some_and(|e| e == "so"))
+                .ok_or_else(|| anyhow::anyhow!("kiln-preload built no library"))
+        }
+
+        /// W24-R05: the interposition library notes what a dynamically linked rustc reads, the
+        /// variables among it, which seccomp can't see.
+        #[test]
+        fn w24_r05_the_preload_library_notes_rustcs_reads() -> anyhow::Result<()> {
+            let d = tempfile::tempdir()?;
+            let so = shim(d.path())?;
+            let src = d.path().join("lib.rs");
+            std::fs::write(&src, "pub fn f() -> u32 { 1 }\n")?;
+            let mut rustc = Command::new("rustc");
+            rustc.args(["--crate-type", "lib", "--emit", "metadata", "--crate-name", "preloaded", "-o"]).arg(d.path().join("preloaded.rmeta")).arg("lib.rs").current_dir(d.path());
+            let (status, recs) = trace_preload(&mut rustc, &so)?;
+            anyhow::ensure!(status.success(), "rustc with the library: {status}");
+            anyhow::ensure!(recs.iter().any(|r| r.call.starts_with("open") && Path::new(&r.path) == src), "rustc's read of its source: {:?}", recs.iter().take(20).collect::<Vec<_>>());
+            anyhow::ensure!(recs.iter().any(|r| r.call == "getenv"), "and the variables it reads");
             Ok(())
         }
     }

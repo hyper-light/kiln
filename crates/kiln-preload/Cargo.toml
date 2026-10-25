@@ -1,0 +1,15 @@
+[package]
+name = "kiln-preload"
+description = "The tracer's interposition library (docs/ci.md W24-R05): loaded with LD_PRELOAD, it notes the paths a process opens, looks up, lists and runs, and the variables it reads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2.190"
+
+[lints]
+workspace = true
