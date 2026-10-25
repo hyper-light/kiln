@@ -15,6 +15,19 @@ pub fn put(out: &mut Vec<u8>, mut v: u64) {
 /// Reads a varint from the front of `at`, advancing it; `None` when it ends early or overflows.
 #[inline]
 pub fn get(at: &mut &[u8]) -> Option<u64> {
+    // A byte below 0x80 is the whole of it, as nearly every length and time's change in a row is:
+    // read without the loop, so the call is small enough to be inlined where rows are read (§12.23).
+    if let Some((&b, rest)) = at.split_first()
+        && b < 0x80
+    {
+        *at = rest;
+        return Some(u64::from(b));
+    }
+    get_long(at)
+}
+
+/// [`get`] of a varint of more than a byte (or of none).
+fn get_long(at: &mut &[u8]) -> Option<u64> {
     let mut v: u64 = 0;
     let mut shift = 0u32;
     for (i, &b) in at.iter().enumerate().take(MAX_LEN) {
@@ -66,6 +79,7 @@ mod tests {
         }
         assert!(at.is_empty());
         assert_eq!(get(&mut &[0x80u8, 0x80][..]), None, "ends early");
+        assert_eq!(get(&mut &[][..]), None, "none");
         assert_eq!(get(&mut &[0xff; 11][..]), None, "too long");
         assert_eq!(get(&mut &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02][..]), None, "overflows");
         for v in [0i64, -1, 1, i64::MIN, i64::MAX, -12345] {
