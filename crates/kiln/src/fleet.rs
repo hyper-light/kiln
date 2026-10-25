@@ -272,7 +272,7 @@ pub fn binary_for(hub: &Hub, target: &str, commit: &str) -> Option<Binary> {
 
 // ------------------------------------------------------------------ the newest commit
 
-async fn release_repo(hub: &Hub) -> Option<crate::store::Repo> {
+pub(crate) async fn release_repo(hub: &Hub) -> Option<crate::store::Repo> {
     let name = &hub.cfg.updates.release_repo;
     hub.store.repos().await.ok()?.into_iter().find(|r| &r.name == name)
 }
@@ -299,7 +299,7 @@ async fn on_branch(hub: &Hub, repo: &crate::store::Repo, commit: &str) -> Option
     answer
 }
 
-async fn is_ancestor(hub: &Hub, mirror: &str, a: &str, b: &str) -> bool {
+pub(crate) async fn is_ancestor(hub: &Hub, mirror: &str, a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b) || crate::gitops::run_git(hub, &["-C", mirror, "merge-base", "--is-ancestor", a, b], GIT_TIMEOUT).await.is_ok()
 }
 

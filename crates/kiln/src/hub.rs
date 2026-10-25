@@ -227,6 +227,9 @@ pub struct AgentLive {
     /// How its connection reaches the server, while connected (`GET /api/agents`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<crate::tunnel::Transport>,
+    /// How far its (newest process's) kiln is behind the server's (`crate::skew`): to be upgraded,
+    /// it takes no new work.
+    pub skew: crate::skew::Skew,
 }
 
 /// Output from a remote (agent) terminal session, routed to its websocket.
@@ -644,7 +647,7 @@ impl Hub {
         }
     }
 
-    fn emit_agent(&self, a: &AgentLive) {
+    pub(crate) fn emit_agent(&self, a: &AgentLive) {
         self.emit(&serde_json::json!({"type": "agent", "agent": a}));
     }
 
@@ -708,6 +711,7 @@ impl Hub {
                     facts: None,
                     instances: vec![],
                     transport: None,
+                    skew: crate::skew::Skew::default(),
                 },
             })
             .collect();
@@ -1613,6 +1617,8 @@ impl Hub {
             AgentMsg::Facts { json } => match serde_json::from_str::<kiln_ci::facts::RunnerFacts>(&json) {
                 Ok(f) => {
                     if let Some(k) = f.kiln.clone() {
+                        // How far behind the server's kiln it is: to be upgraded, it takes no new work.
+                        self.skew_check(&agent, peer, Some(k.commit.clone()));
                         crate::fleet::remember(self, &k.build, &k.target, &k.commit);
                         self.instances.lock().set_kiln(peer, k);
                         self.updates.late_by_commit(self, &agent);
@@ -1920,6 +1926,7 @@ impl Hub {
             facts: None,
             instances: Vec::new(),
             transport: None,
+            skew: crate::skew::Skew::default(),
         };
         let prev = self.agents.lock().get(&name).cloned();
         // Its facts stay until its new connection's probe reports.
@@ -2476,7 +2483,7 @@ impl Hub {
         let g = self.agents.lock();
         let exclusive = job.spec.as_ref().is_some_and(|s| s.exclusive);
         g.values()
-            .filter(|a| a.connected && !a.draining && !a.exclusive)
+            .filter(|a| a.connected && !a.draining && !a.exclusive && a.skew.takes_work())
             .filter(|a| !a.running.contains(&job.id))
             .filter(|a| {
                 declined
