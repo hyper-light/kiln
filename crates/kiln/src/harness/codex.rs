@@ -775,9 +775,10 @@ impl Codex {
                 self.request(core, Pending::ChildSteer { thread: t.id.clone(), m: m.clone() }, "turn/steer", json!({"threadId": t.id, "expectedTurnId": turn, "input": items, "clientUserMessageId": m.id}));
                 super::subagent::show(core, &t.id, &m, Delivery::Sent);
             }
-            // Its turn stops; this one starts the next, before what waits for it.
+            // Its turn stops; this one starts the next, before what waits for it (sent: it can't be
+            // taken back from there).
             (SendMode::Now, Some(turn)) => {
-                super::subagent::show(core, &t.id, &m, Delivery::Queued);
+                super::subagent::show(core, &t.id, &m, Delivery::Sent);
                 if let Some(c) = self.children.get_mut(&t.id) {
                     c.now = Some(m);
                 }
@@ -5501,6 +5502,8 @@ mod tests {
         // Queued: it waits for this turn to end. Now: this turn stops, and it starts the next.
         a.command(&mut core, to_kid("m2", "then the tests", SendMode::Queue));
         a.command(&mut core, to_kid("m3", "stop, check the lexer first", SendMode::Now));
+        // Sent: it can't be taken back while its turn stops (there's no queue it waits in).
+        assert_eq!(core.state.delivery.get("m3"), Some(&Delivery::Sent));
         let w = written(&mut core);
         assert_eq!(interrupts(&w), vec![pair("kid", "kid-turn")]);
         assert!(!w.iter().any(|v| v.get("method") == Some(&json!("turn/start"))));

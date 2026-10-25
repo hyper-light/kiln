@@ -212,6 +212,14 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_to_a_subagents_message_keeps_its_quote_in_its_thread() {
+        let mut core = Core::new();
+        core.state.tasks.push(sub("a1", vec![SendMode::Queue]));
+        show(&mut core, "a1", &QueueItem { reply_to: Some("e7".into()), ..msg("m1", "about that") }, Delivery::Sent);
+        assert!(core.get("m1").is_some_and(|e| e.parent.as_deref() == Some("call-a1") && matches!(&e.body, Body::User { reply_to, .. } if reply_to.as_deref() == Some("e7"))));
+    }
+
+    #[test]
     fn what_waited_for_a_subagent_that_ended_is_said_not_sent() {
         let mut core = Core::new();
         core.state.tasks.push(sub("a1", vec![SendMode::Queue]));
