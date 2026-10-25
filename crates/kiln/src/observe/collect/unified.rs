@@ -5,8 +5,10 @@
 //! before it, so nothing falls between), of the events the log keeps on disk (the default level
 //! and above: info and debug ones are held in memory), and the stream's events the catch-up held
 //! dropped. An
-//! event is known by its boot, its mach time (the machine's monotonic clock) and its thread (no two
-//! of a thread's events share a mach time), and taken once: never by order alone, as `log stream`
+//! event is known by its boot (`log stream` leaves its events' empty and `log show` names it: this
+//! boot's, `kern.bootsessionuuid`), its mach time (the machine's monotonic clock; both name it
+//! alike) and its thread (no two of a thread's events share a mach time), and taken once: never by
+//! order alone, as `log stream`
 //! gives different processes' events out of their mach order (two `logger`s a millisecond apart
 //! came the other way round, 2026-10-25, and the one behind was dropped as read). Its place is the
 //! last event written and those written in the [`WINDOW_NS`] before it: after a restart an event
@@ -18,8 +20,8 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use kiln_obs::logs::record::Record;
@@ -127,6 +129,16 @@ impl Seen {
     }
 }
 
+/// This boot's id, as `log show` names its events' (`kern.bootsessionuuid`): `log stream` leaves
+/// theirs empty (macOS 26), so an event both read is known as one. Empty where it can't be asked.
+fn this_boot() -> &'static str {
+    static BOOT: OnceLock<String> = OnceLock::new();
+    BOOT.get_or_init(|| {
+        let out = Command::new("sysctl").args(["-n", "kern.bootsessionuuid"]).output();
+        out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default()
+    })
+}
+
 fn log_tool() -> String {
     std::env::var("KILN_LOG_TOOL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "log".into())
 }
@@ -214,7 +226,8 @@ pub(crate) fn event(c: &Compiled, line: &str, now_ns: i64) -> Option<(Option<Rec
     let field = |k: &str| o.get(k).and_then(Value::as_str).filter(|s| !s.is_empty());
     let ts_ns = field("timestamp").and_then(time)?;
     let thread = o.get("threadID").and_then(Value::as_u64).unwrap_or(0);
-    let mark = Mark { boot: field("bootUUID").unwrap_or_default().to_owned(), mach: o.get("machTimestamp").and_then(Value::as_u64)?, ts_ns, thread };
+    let boot = field("bootUUID").map_or_else(|| this_boot().to_owned(), str::to_owned);
+    let mark = Mark { boot, mach: o.get("machTimestamp").and_then(Value::as_u64)?, ts_ns, thread };
     let mut message = field("eventMessage").unwrap_or_default().to_owned();
     if !c.keep(&mut message) {
         return Some((None, mark));
@@ -353,7 +366,7 @@ impl Run<'_> {
 
     /// Where a catch-up reads from: the second before a window before its window's first event (a
     /// place read back knows its window's events by their mach times, their own times not kept).
-    fn from_s(&self) -> Option<i64> {
+    fn catch_up_from(&self) -> Option<i64> {
         let first = self.recent.iter().chain(self.written.iter()).map(|m| m.ts_ns).min()?;
         Some((first - WINDOW_NS).div_euclid(1_000_000_000) - 1)
     }
@@ -450,7 +463,7 @@ pub(crate) fn run(c: &Compiled, saved_to: &Path, stop: &Stop, state: &Mutex<Stat
         let started = Instant::now();
         // What came since the last event written (or, the source asking, everything kept): read
         // whole first; the stream's events it held are dropped as the stream is read.
-        let from = run.from_s();
+        let from = run.catch_up_from();
         if from.is_some() || (first && c.start == Start::Beginning) {
             tracing::debug!(source = %c.name, from = ?from, "the unified log read since its last event");
             match spawn(&show_args(c, from, now_s() + 1)) {
@@ -554,9 +567,20 @@ mod tests {
         assert_eq!((r.severity, r.service.as_str(), r.source.as_str(), r.host.as_str(), r.message.as_str()), (17, "Example", "unified_log", "mbp", "connection refused"));
         let attr = |k: &str| r.attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
         assert_eq!((attr("macos.subsystem"), attr("macos.category"), attr("process.pid"), attr("team")), (Some("com.example.app"), Some("net"), Some("67508"), Some("mac")));
+        // `log stream`'s events name no boot: this boot's, as `log show` names theirs.
+        let (_, streamed) = event(&c, &LINE.replace("E571B146-3D40-47EB-A907-AF472B516F9D", ""), i64::MAX / 2).unwrap();
+        assert_eq!(streamed.boot, this_boot());
         // Not a log event, and not JSON: nothing (the stream's first line says its filter).
         assert!(event(&c, &LINE.replace("\"logEvent\"", "\"activityCreateEvent\""), 0).is_none());
         assert!(event(&c, "Filtering the log data using \"subsystem == \\\"x\\\"\"", 0).is_none());
+    }
+
+    /// On a Mac, this boot's id is the one `log show` gives its events (a UUID).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn this_boot_is_named_as_log_show_names_it() {
+        let b = this_boot();
+        assert!(b.len() == 36 && b.bytes().filter(|&c| c == b'-').count() == 4, "{b:?}");
     }
 
     #[test]
@@ -601,7 +625,7 @@ mod tests {
         let boot = "E571B146-3D40-47EB-A907-AF472B516F9D";
         let place = Saved { last: Some(Mark { boot: boot.into(), mach: 500, ts_ns: 5_000_000_000, thread: 1 }), recent: vec![(300, 2), (400, 1), (500, 1)] };
         let mut run = Run::new(&c, &state, &place);
-        assert_eq!(run.from_s(), Some(3), "a window before the window, and a second more");
+        assert_eq!(run.catch_up_from(), Some(3), "a window before the window, and a second more");
         // The catch-up (`log show`), then the stream (its first events the catch-up's last).
         for (mach, thread, n) in [(100, 1, 1), (300, 2, 3), (350, 3, 35), (400, 1, 4), (500, 1, 5), (600, 1, 6)] {
             run.line(&line(mach, thread, n), i64::MAX / 2);

@@ -922,8 +922,9 @@ back (its connection is not read) until there is.
 
 **macOS's unified log** is read through `log stream --style ndjson --type log`, at the source's
 level and its predicate, events as they come (each within some 20–40 ms of being logged, measured
-on a laptop through a pipe). An event is known by its boot, its mach time (the machine's monotonic
-clock) and its thread, and taken once, never by order alone: the stream gives different processes'
+on a laptop through a pipe). An event is known by its boot (the stream leaves it empty and `log
+show` names it: this boot's, `kern.bootsessionuuid`), its mach time (the machine's monotonic clock,
+alike in both) and its thread, and taken once, never by order alone: the stream gives different processes'
 events out of their mach order (two `logger`s a millisecond apart came the other way round, and
 until 2026-10-25 the one behind was dropped as read, a line in some hundreds lost in the live
 scenario). Its place is the last event written and those written in the second before it (2,048 at
