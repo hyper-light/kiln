@@ -154,6 +154,40 @@ const family = new Map<string, Member>(
   if (m) m.info.approvals = [{ id: migrApproval.id, tool: migrApproval.tool, tool_name: migrApproval.tool_name, title: migrApproval.title, at: migrApproval.at }];
 }
 
+// /agents/fan-lead "Replication lead": its goal "Replicated log" runs its plan's steps side by side
+// (docs/goals.md, "A plan's steps side by side"; goals.ts), a subagent of its own for each step
+// that's ready, one of them asking you something; and a goal of its own (not a plan's step) out on a
+// subagent too. It coordinates them, at work itself on nothing.
+const fanApproval: Approval = {
+  id: "fan-s3-ap1",
+  tool_name: "Bash",
+  tool: "shell",
+  title: "cargo run --bin chaos -- --partition 2",
+  command: "cargo run --bin chaos -- --partition 2",
+  input: { command: "cargo run --bin chaos -- --partition 2" },
+  cwd: CWD,
+  at: Date.now() - 45_000,
+};
+for (const m of [
+  member("fan-lead", "claude", "local", "Replication lead", "idle", "default", "Replicate the metadata store's log over QUIC, then rotate the release signing key.", "Its steps are out on subagents; I'll check each as it comes back."),
+  member("fan-s2", "claude", "agent:metal-ryzen-01", "Step 2: Leader election over QUIC", "running", "default", 'Step 2 of 5 of the plan "Replicated log": Leader election over QUIC', "Electing a leader across three nodes.", {
+    parent: "fan-lead",
+    doing: "Running cargo test -p hyper-raft election",
+  }),
+  { ...member("fan-s3", "codex", "agent:metal-epyc-01", "Step 3: Follower catch-up", "waiting", "untrusted", 'Step 3 of 5 of the plan "Replicated log": Follower catch-up', "I'll partition a follower and let it catch up.", { parent: "fan-lead" }), approval: fanApproval },
+  member("fan-s4", "claude", "agent:metal-ryzen-02", "Step 4: Snapshot transfer", "running", "default", 'Step 4 of 5 of the plan "Replicated log": Snapshot transfer', "Streaming a snapshot to a lagging follower.", {
+    parent: "fan-lead",
+    doing: "Streaming a 10 GB snapshot",
+  }),
+  member("fan-sign", "claude", "local", "Rotate the release signing key", "running", "default", "Rotate the release signing key and re-sign 0.2.1's binaries", "Re-signing the binaries.", { parent: "fan-lead", doing: "Signing kiln-x86_64-linux" }),
+]) {
+  family.set(m.info.id, m);
+}
+{
+  const m = family.get("fan-s3");
+  if (m) m.info.approvals = [{ id: fanApproval.id, tool: fanApproval.tool, tool_name: fanApproval.tool_name, title: fanApproval.title, at: fanApproval.at }];
+}
+
 // Release prep proposed a plan (plan mode), kept by kiln (pages.ts `pl_proposed`), and works through its to-do list.
 {
   const m = family.get("fam-orch");

@@ -203,7 +203,9 @@ another, as before. A step alone (nothing beside it ready or under way) is the a
   itself.
 - What comes after the plan's steps waits for them, and the goal they're the parts of is met once
   they all are, as before. The panel shows a step a subagent has as under way, and who has it
-  ("Claude Code · fedora"); a step that waits on a person there, as needing you.
+  ("Claude Code · fedora"); a step that waits on a person there, as needing you. A goal out on a
+  subagent, or with steps out on subagents, is under way with its ring's light turning, whatever the
+  agent itself is doing; everything at work at once moves, each its own way.
 
 A plan whose steps say nothing of waiting goes one after another, as before. Run as one message or
 a step a turn, there's no stack to follow: the agent is told which steps go side by side and to give

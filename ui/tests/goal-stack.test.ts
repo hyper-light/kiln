@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { GoalItem, GoalStack, HEvent, Task } from "../src/api/harness.ts";
-import { callWords, canPlan, canPlanNow, fromLines, outOn, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo } from "../src/views/harness/goal-stack.ts";
+import { callWords, canPlan, canPlanNow, fromLines, lineOf, outOn, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo } from "../src/views/harness/goal-stack.ts";
 
 const goal = (id: string, text: string, status: GoalItem["status"] = "pending"): GoalItem => ({ id, text, status });
 const stack = (rest: Partial<GoalStack> = {}): GoalStack => ({ agent: "a1", state: "running", items: [], updated_at: 1, ...rest });
@@ -251,4 +251,28 @@ test("a planner's calls, in plain words: what it's at, and what kiln's own tools
   assert.equal(c({ tool: "mcp", server: "kiln", tool_short: "plans_update", input: { items: [{ title: "Measure" }, { title: "Fix" }] } }), "Wrote 2 steps: Measure · Fix");
   assert.equal(c({ tool: "mcp", server: "kiln", tool_short: "plans_ready" }), "Said the plan is ready");
   assert.equal(c({ tool: "mcp", server: "github", tool_short: "search", title: "github · search" }), "search: github · search", "another server's: its tool and title");
+});
+
+test("P2: work at once lights every line it's on: a goal out on a subagent, one whose steps are, and one whose own step and subagents' steps go side by side", () => {
+  const part = (id: string, status: GoalItem["status"], extra: Partial<GoalItem> = {}): GoalItem => ({ ...goal(id, id, status), part_of: "g", ...extra });
+  const g = goal("g", "Replicate the log");
+  // Handed to a subagent itself: under way there, its light turning, whatever the agent is doing.
+  assert.deepEqual(lineOf({ ...g, subagent: "s1" }, [], false), { status: "active", away: "s1", busy: true });
+  // Its steps out on subagents, the agent coordinating (between turns): under way, its light turning.
+  const out = [part("s2", "pending", { subagent: "sub-2" }), part("s3", "pending", { subagent: "sub-3" })];
+  assert.deepEqual(lineOf(g, out, false), { status: "active", away: undefined, busy: true });
+  // The agent's own step beside its subagents': still turning while the agent is between turns.
+  assert.equal(lineOf(g, [part("s1", "active"), ...out], false).busy, true, "the subagents are at it");
+  // Its own step alone: turning only while the agent works; a step waiting on its run, always.
+  assert.equal(lineOf(g, [part("s1", "active")], false).busy, false);
+  assert.equal(lineOf(g, [part("s1", "active")], true).busy, true);
+  assert.equal(lineOf(g, [part("s1", "active", { waits_on: "pr_1" })], false).busy, true);
+  // A goal under way on the agent itself, as before; one handed to a program's worker: under way there, still.
+  assert.deepEqual(lineOf(goal("a", "a", "active"), [], true), { status: "active", away: undefined, busy: true });
+  assert.deepEqual(lineOf({ ...g, on: "worker" }, [], true), { status: "pending", away: "worker", busy: false });
+  // Nothing at work in it: waiting, still.
+  assert.deepEqual(lineOf(g, [part("s5", "pending")], true), { status: "pending", away: undefined, busy: false });
+  // A goal out on a subagent isn't one to plan here: its subagent has it.
+  assert.equal(canPlan({ ...g, subagent: "s1" }), false);
+  assert.equal(canPlan({ ...g, subagent: "s1", status: "met" }), false);
 });

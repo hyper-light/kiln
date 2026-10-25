@@ -29,7 +29,7 @@ import { StandTitle, type Stand } from "@/views/plans/status";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Link } from "@/lib/router";
-import { canPlan, canPlanNow, fromLines, outOn, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo, type Planner } from "./goal-stack";
+import { canPlan, canPlanNow, fromLines, lineOf, outOn, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo, type Planner } from "./goal-stack";
 import { GoalPlan } from "./goal-plan";
 import { useFold } from "./fold";
 import { cn } from "@/lib/utils";
@@ -42,14 +42,19 @@ const WORD: Record<GoalItem["status"], string> = { met: "met", active: "under wa
 /** Longer than this, a goal's words fold to their first lines. */
 const LONG_GOAL = 220;
 
-/** A goal's words, in the prism's shimmer while it's worked on: a long one folds to its first lines, opened on asking. */
-function GoalWords({ text, stand }: { text: string; stand: Stand }) {
+/**
+ * A goal's words, in the prism's shimmer while it's worked on, its own way (`flow`: the goal's id), so
+ * goals at work at once move as one field, none in step: a long one folds to its first lines, opened on asking.
+ */
+function GoalWords({ text, stand, flow }: { text: string; stand: Stand; flow: string }) {
   const [open, setOpen] = React.useState(false);
   const long = text.length > LONG_GOAL;
   return (
     <>
       <span className="gs-words" data-folded={long && !open ? "" : undefined}>
-        <StandTitle stand={stand}>{text}</StandTitle>
+        <StandTitle stand={stand} flow={flow}>
+          {text}
+        </StandTitle>
       </span>
       {long && (
         <button type="button" className="gs-fold" aria-expanded={open} onClick={() => setOpen(!open)}>
@@ -495,16 +500,12 @@ function GoalPanel({
                     </li>
                   ) : null}
                   {shown.map((g) => {
-                    // A plan's step a subagent has, side by side with the plan's others: under way there.
-                    const sub = outOn(g);
-                    // A goal whose parts come first is under way while they are (its steps, or its run's agents, at work; or its steps' subagents).
-                    const doing = g.status === "pending" && !sub ? partsOf(g, items).find((i) => i.status === "active" || !!outOn(i)) : undefined;
-                    const status = doing || sub ? "active" : g.status;
+                    // Under way here, on a subagent, or in its parts (its steps on the agent or its subagents, its run's agents),
+                    // as many at once as there are; handed to another agent (a program's track's worker, or its subagent): under way there.
+                    const { status, away, busy } = lineOf(g, partsOf(g, items), working);
                     // The goal under way while you've paused the stack: paused, not under way.
                     const held = status === "active" && stack?.state === "paused";
-                    // One handed to another agent (a program's track's worker), or to a subagent: under way there.
-                    const away = g.status === "pending" && !doing ? (g.on ?? sub) : undefined;
-                    const stand = standOf({ ...g, status }, held, doing?.waits_on || sub || (doing && outOn(doing)) ? true : working && !g.waits_on);
+                    const stand = standOf({ ...g, status }, held, busy);
                     const planner = planners.get(g.id);
                     // Asked for, or at it: not to ask again.
                     const planning = planner?.kind === "asked" || planner?.kind === "planning";
@@ -530,13 +531,13 @@ function GoalPanel({
                     const again = planner?.kind === "ended" && planButton ? planButton : undefined;
                     return (
                       <li key={g.id} className="gs-link" data-status={held ? "paused" : away ? "active" : status}>
-                        {/* Its number in the stack, ringed by where it stands: the one at work in the turning light. */}
+                        {/* Its number in the stack, ringed by where it stands: those at work, as many as there are at once, in the turning light. */}
                         <span className="gs-node" data-stand={stand} data-wide={(numbers.get(g.id) ?? 0) > 9 ? "" : undefined} title={WORD[status]}>
                           {numbers.get(g.id)}
                         </span>
                         <span className="gs-text">
                           {/* A plan's step as a goal reads "title — description — Done when: …": its title first, the rest under it. */}
-                          <GoalWords text={g.text.split(" — ")[0] ?? g.text} stand={stand} />
+                          <GoalWords text={g.text.split(" — ")[0] ?? g.text} stand={stand} flow={g.id} />
                           {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
                           <span className="gs-word">
                             {held ? (
