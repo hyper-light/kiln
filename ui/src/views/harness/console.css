@@ -815,6 +815,31 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .hx-live-tail {
   padding: 10px 0 2px;
 }
+/* A compaction: under way where the turn's live line is (what it does, the context it compacts,
+   its clock, the rule condensing); done, the same row held still, its bar the boundary. The two
+   are the same height, so settling moves nothing. */
+.hx-compaction {
+  padding: 10px 0 4px;
+}
+.hx-compaction-line {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+.hx-compaction-facts {
+  color: #7b7e88;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.hx-compaction .sg-condense {
+  margin-top: 7px;
+}
+.hx-compaction[data-tone="warn"] .sg-label {
+  color: var(--color-warn);
+}
+.hx-compaction[data-tone="warn"] .sg-optic > span {
+  border-color: #d8bb95;
+  opacity: 0.55;
+}
 .hx-turn .hx-note,
 .hx-turn .hx-outcome {
   color: #d9dade;
