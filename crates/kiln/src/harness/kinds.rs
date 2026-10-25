@@ -346,8 +346,8 @@ impl Adapter {
         match super::subagent::queue_command(core, c) {
             super::subagent::Queued::Done => {}
             super::subagent::Queued::Send(task, m, mode) => self.send_task(core, &task, m, mode),
-            super::subagent::Queued::Not(Command::Send { id, text, mode, attachments, task: Some(task), .. }) => {
-                self.send_task(core, &task, QueueItem { id, text, at: Core::now(), attachments, overrides: None }, mode);
+            super::subagent::Queued::Not(Command::Send { id, text, mode, attachments, reply_to, task: Some(task), .. }) => {
+                self.send_task(core, &task, QueueItem { id, text, at: Core::now(), attachments, overrides: None, reply_to }, mode);
             }
             super::subagent::Queued::Not(c) => match self {
                 Self::Claude(a) => a.command(core, c),

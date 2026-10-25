@@ -802,7 +802,7 @@ async fn enforce_all(hub: &Hub) -> anyhow::Result<()> {
 /// session takes it; else why not, to be tried again.
 pub async fn deliver(hub: &Hub, to: &str, mut n: Notice) -> Notice {
     let message = crate::util::new_id();
-    let send = Command::Send { id: message.clone(), text: n.text.clone(), mode: crate::harness::model::SendMode::Queue, attachments: Vec::new(), overrides: None, task: None };
+    let send = Command::Send { id: message.clone(), text: n.text.clone(), mode: crate::harness::model::SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
     match hub.harness.command(hub, to, send).await {
         crate::harness::registry::Sent::Ok => {
             n.delivered = true;

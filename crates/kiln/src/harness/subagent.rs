@@ -36,9 +36,12 @@ pub fn queue_command(core: &mut Core, c: Command) -> Queued {
     let Some((task, at)) = core.state.tasks.iter().enumerate().find_map(|(i, t)| t.queue.iter().position(|q| q.id == id).map(|at| (i, at))) else { return Queued::Not(c) };
     let Some(t) = core.state.tasks.get_mut(task) else { return Queued::Not(c) };
     let sent = match c {
-        Command::QueueEdit { text, .. } => {
+        Command::QueueEdit { text, attachments, .. } => {
             if let Some(q) = t.queue.get_mut(at) {
                 q.text = text;
+                if let Some(a) = attachments {
+                    q.attachments = a;
+                }
             }
             None
         }
@@ -80,7 +83,7 @@ pub fn show(core: &mut Core, task: &str, m: &QueueItem, d: Delivery) {
     let (images, attachments) = super::model::attachment_summary(&m.attachments);
     core.state.delivery.insert(m.id.clone(), d);
     core.note_sent(&m.id);
-    core.upsert(&m.id, parent, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some("human".into()), attachments });
+    core.upsert(&m.id, parent, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some("human".into()), attachments, reply_to: m.reply_to.clone() });
     core.touch_state();
 }
 
@@ -186,7 +189,7 @@ mod tests {
     }
 
     fn msg(id: &str, text: &str) -> QueueItem {
-        QueueItem { id: id.into(), text: text.into(), at: 1, attachments: Vec::new(), overrides: None }
+        QueueItem { id: id.into(), text: text.into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None }
     }
 
     #[test]
@@ -195,7 +198,7 @@ mod tests {
         core.state.tasks.push(sub("a1", vec![SendMode::Queue, SendMode::Steer]));
         assert!(hold(&mut core, "a1", msg("m1", "one")));
         assert!(hold(&mut core, "a1", msg("m2", "two")));
-        assert!(matches!(queue_command(&mut core, Command::QueueEdit { id: "m1".into(), text: "first".into() }), Queued::Done));
+        assert!(matches!(queue_command(&mut core, Command::QueueEdit { id: "m1".into(), text: "first".into(), attachments: None }), Queued::Done));
         assert!(matches!(queue_command(&mut core, Command::QueueMove { id: "m2".into(), index: 0 }), Queued::Done));
         let order: Vec<&str> = core.state.tasks.iter().flat_map(|t| t.queue.iter().map(|q| q.text.as_str())).collect();
         assert_eq!(order, ["two", "first"]);
