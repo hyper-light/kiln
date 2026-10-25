@@ -1007,10 +1007,14 @@ impl Program {
                 n += 1;
             }
         } else if max == NONE {
-            // No count to keep: as far as its characters go.
-            while let Some(&b) = hay.get(q) {
+            // No count to keep: as far as its characters go, a byte at a time while they are ASCII
+            // members (one comparison a byte), a wider one as its first byte says.
+            loop {
+                while hay.get(q).is_some_and(|&b| set.table.get(usize::from(b)) == Some(&ONE)) {
+                    q += 1;
+                }
+                let Some(&b) = hay.get(q) else { break };
                 match set.table.get(usize::from(b)).copied().unwrap_or(OUT) {
-                    ONE => q += 1,
                     WHOLE => q += width(b),
                     ASK => match set.at(hay, q) {
                         Some(w) => q += w,
