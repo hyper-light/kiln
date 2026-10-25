@@ -4,9 +4,16 @@ CP-T10.1's part of merge train 1 (the critical path's CP-M4; its master plan's Â
 delivers, what deploying it does and how to watch it, its risks and its rollback, and what's still
 open: the change to events Kiln Metrics asked for, and the decisions that are Ada's.
 
-**Where it stands (2026-10-22):**
-- **Merged** on main at 25159ff, landed at 03:17Z on Ada's word as a fast-forward from 40cd59b.
-- **Not deployed:** production runs kiln:6063b42.
+**Where it stands:**
+- **Merged** on main at 25159ff, landed at 03:17Z on 2026-10-22 on Ada's word as a fast-forward
+  from 40cd59b.
+- **Live:**
+  - It went out with later commits of main. kiln:a53a8bc, which contains 25159ff, was running at
+    02:01Z on 2026-10-24.
+  - The five deploys in KilnCD's history carry it too: afb958fe, e138e723, e511eabd, 591c2b8d and
+    98c053da.
+  - Production runs kiln:98c053da since 10:24:50Z on 2026-10-25, and its guard passed at 10:35:32Z.
+  - What production showed then is under "Checked in production".
 - **Gated** on fedora, on 25159ff exactly, from 03:05 to 03:16:49Z, with every step passing:
   - clippy;
   - the tests: 1,550 passed, none failed;
@@ -70,6 +77,21 @@ On production's `/metrics` (public there), its logs and its dashboard:
     archived warns with `event = "put"`.
 - **The dashboard:** the "Blobs" row of the Kiln overview dashboard
   (deploy/grafana/dashboards/kiln-overview.json).
+
+### Checked in production
+
+On 2026-10-25, at about 10:39Z, 15 minutes after kiln:98c053da started (read-only):
+- **`/metrics`, since that start:**
+  - `outcome="unavailable"`: none;
+  - `kiln_blobs_archives_given_up_total`: 0;
+  - on the local store, 4 puts wrote 379,533,572 bytes, and there were 5 gets, 10 heads (one
+    refused: an object that wasn't there) and 1 list.
+- **The kiln pod's log** (kiln-7447cfb69f-vg9db, 10:24:53Z to 10:36:38Z): no `kiln.blobs` line
+  at all, so no warning.
+- **Archives:** 18 of the 45 sessions open then had archived records, read through
+  `GET /api/harness/sessions/<id>/transcripts`. Those were sessions that had closed before and
+  reopened: 90 pieces, 566,491 lines, 522,779,479 bytes kept.
+- **Disk:** adacachy, which holds production's volume, is 47% used (3.75 of 8.0 TB).
 
 ## Metric names, agreed with Kiln Metrics
 
@@ -180,13 +202,12 @@ are in docs/blobs.md, "Configuring it" and "Moving a server to S3":
 
 ## Ada's open decisions
 
-1. **Deploying 25159ff to production.** The coordinator is raising it.
-2. **The capability gate** for this migration (under "Risks"): accept it without one, or ask for
-   one first.
-3. **Production's bytes:** the plan's course is to stay on the local store until Mantle
+1. **The capability gate** (under "Risks"): this migration went live without one. Accept that,
+   or require one for T10's later migrations.
+2. **Production's bytes:** the plan's course is to stay on the local store until Mantle
    (CP-T10.2). The other choice is moving to an S3 sooner: which S3, with its credentials in a
    file.
-4. **Mantle's nine** (docs/mantle.md, "Decisions for Ada"), for CP-T10.2 and after:
+3. **Mantle's nine** (docs/mantle.md, "Decisions for Ada"), for CP-T10.2 and after:
    1. whether Mantle exports an API to embed a node in a host process, and in what form (R1);
    2. the thread budget a host grants it (R1);
    3. a whole object's SHA-256 as `x-amz-checksum-sha256` with `FULL_OBJECT`: on Mantle's native
@@ -201,11 +222,13 @@ are in docs/blobs.md, "Configuring it" and "Moving a server to S3":
 
 Ada has decided:
 - landing on main ("Just merge it to main");
-- keeping archives 365 days.
+- keeping archives 365 days;
+- deploying it, which happened with the deploys since 2026-10-22 ("Where it stands").
 
 ## Open with others
 
 - **Mantle's agent** tells T10 when its HTTP/1.1 listener serves. Then kiln's `Blobs` suite runs
   against it, and failing clauses are Mantle's to fix (docs/mantle.md, "Agreed next").
-- **The measured mix:** once production exports `kiln_blobs_*`, kiln sends Mantle's agent the
-  request mix by operation, size and latency, for its listener's benchmark.
+- **The measured mix:** production exports `kiln_blobs_*` now. Once they've covered a few days of
+  work, kiln sends Mantle's agent the request mix by operation, size and latency, for its
+  listener's benchmark. That's T10's next goal.
