@@ -6,12 +6,15 @@
 //!   chunk the change didn't touch. Every read is checked against the name; a copy that isn't
 //!   what its name says is moved aside and reads as missing.
 //! - **Entries**: a tool's name for an object (sccache's key, Bazel's action digest, a Turborepo
-//!   hash) in a namespace, under a [`Scope`]: a repository and a trust domain (W24-R21).
+//!   hash) in a namespace, under a [`Scope`]: a repository and a trust domain (W24-R21). They're
+//!   the work ledger's (`crate::ci::work`, in `ledger.db`): each is a unit of kind `action` whose
+//!   definition is the tool's own key ([`entry_key`]), recorded and looked up on the ledger's one
+//!   path, as every key is (W24-R30).
 //! - **Holdings**: the objects each scope put, so an existence check answers for the asker's own
 //!   scopes only. Bytes are kept once whoever sends them, but a repository never learns what
 //!   another stored: it sends the bytes again (`ci/services/chunks.rs` refuses probing alike).
 //!
-//! The index lives in memory and in an append-only journal (`index.log`), read back when the store
+//! Holdings live in memory and in an append-only journal (`index.log`), read back when the store
 //! opens and rewritten then when it holds mostly lines since replaced.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -20,10 +23,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use kiln_ci::store::cdc;
+use kiln_ci::work::key::{self, Key, Kind, PathSet, Platform, Unit};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::ci::work::{Provenance, Recorded};
 use crate::runner::cache::Local;
 
 /// Objects up to this size are kept whole, larger ones in content-defined chunks: one no larger
@@ -85,44 +90,69 @@ pub fn is_digest(d: &str) -> bool {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 enum Line {
-    /// An entry set (`entry` present) or removed.
-    Entry {
-        scope: Scope,
-        ns: String,
-        name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        entry: Option<Entry>,
-    },
     /// An object a scope put.
     Hold { scope: Scope, digest: String },
 }
 
 #[derive(Debug, Default)]
 struct Index {
-    entries: HashMap<Scope, HashMap<(String, String), Entry>>,
     held: HashMap<Scope, HashSet<String>>,
 }
 
 impl Index {
     fn apply(&mut self, line: Line) {
-        match line {
-            Line::Entry { scope, ns, name, entry: Some(e) } => {
-                self.entries.entry(scope).or_default().insert((ns, name), e);
-            }
-            Line::Entry { scope, ns, name, entry: None } => {
-                if let Some(m) = self.entries.get_mut(&scope) {
-                    m.remove(&(ns, name));
-                }
-            }
-            Line::Hold { scope, digest } => {
-                self.held.entry(scope).or_default().insert(digest);
-            }
-        }
+        let Line::Hold { scope, digest } = line;
+        self.held.entry(scope).or_default().insert(digest);
     }
 
     fn lines(&self) -> usize {
-        self.entries.values().map(HashMap::len).sum::<usize>() + self.held.values().map(HashSet::len).sum::<usize>()
+        self.held.values().map(HashSet::len).sum::<usize>()
     }
+}
+
+/// A tool's name for an object as a unit of work (W24-R30: every key on the ledger's one path):
+/// an action whose definition is the tool's own key in its namespace, in the scope's domain.
+pub fn entry_key(ns: &str, name: &str, domain: &str) -> Key {
+    key::weak(&Unit {
+        kind: Kind::Action,
+        definition: format!("kiln/cas {ns}\n{name}"),
+        secrets: Default::default(),
+        env: Default::default(),
+        platform: Platform::default(),
+        inputs: Default::default(),
+        upstream: Default::default(),
+        trust: domain.to_owned(),
+    })
+}
+
+/// An entry as the ledger records it: its object and size among the outputs, what the tool sent
+/// with it as `meta:<header>`, when it was put as when it finished. A removed entry is recorded
+/// with no object.
+fn recorded(e: Option<&Entry>, domain: &str, at: i64) -> Recorded {
+    let mut outputs = BTreeMap::new();
+    if let Some(e) = e {
+        outputs.insert("object".to_owned(), e.digest.clone());
+        outputs.insert("size".to_owned(), e.size.to_string());
+        for (k, v) in &e.meta {
+            outputs.insert(format!("meta:{k}"), v.clone());
+        }
+    }
+    let outcome = if e.is_some() { "success" } else { "removed" };
+    Recorded { outcome: outcome.to_owned(), outputs, provenance: Provenance { finished_at: at, ..Provenance::default() }, domain: domain.to_owned(), ..Recorded::default() }
+}
+
+fn entry_of(r: &Recorded) -> Option<Entry> {
+    let digest = r.outputs.get("object").filter(|d| is_digest(d))?.clone();
+    let size = r.outputs.get("size").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let meta = r.outputs.iter().filter_map(|(k, v)| k.strip_prefix("meta:").map(|k| (k.to_owned(), v.clone()))).collect();
+    Some(Entry { digest, size, at: r.provenance.finished_at, meta })
+}
+
+/// What `scope` records for `ns`/`name` on the ledger: an entry, a removal (`Some(None)`), or
+/// nothing.
+fn ledger_entry(c: &rusqlite::Connection, scope: &Scope, ns: &str, name: &str) -> anyhow::Result<Option<Option<Entry>>> {
+    let same = |p: &PathSet| p.clone();
+    Ok(crate::ci::work::lookup(c, &scope.key(), &entry_key(ns, name, &scope.domain), &same)?.map(|(_, r)| entry_of(&r)))
 }
 
 /// The store.
@@ -131,6 +161,8 @@ pub struct Store {
     chunks: Local,
     index: RwLock<Index>,
     journal: Mutex<std::fs::File>,
+    /// The work ledger the entries are on (`ledger.db`).
+    ledger: crate::store::Store,
 }
 
 impl std::fmt::Debug for Store {
@@ -162,12 +194,6 @@ impl Store {
         if read > 1024 && read > index.lines() * 2 {
             let tmp = root.join("index.log.tmp");
             let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-            for (scope, m) in &index.entries {
-                for ((ns, name), e) in m {
-                    serde_json::to_writer(&mut out, &Line::Entry { scope: scope.clone(), ns: ns.clone(), name: name.clone(), entry: Some(e.clone()) })?;
-                    out.write_all(b"\n")?;
-                }
-            }
             for (scope, set) in &index.held {
                 for digest in set {
                     serde_json::to_writer(&mut out, &Line::Hold { scope: scope.clone(), digest: digest.clone() })?;
@@ -179,11 +205,18 @@ impl Store {
             std::fs::rename(&tmp, &log)?;
         }
         let journal = std::fs::OpenOptions::new().create(true).append(true).open(&log).with_context(|| format!("open {}", log.display()))?;
-        Ok(Store { chunks: Local { dir: root.join("chunks"), max: u64::MAX }, root, index: RwLock::new(index), journal: Mutex::new(journal) })
+        let ledger = crate::store::Store::open(&root.join("ledger.db")).context("the runner's work ledger")?;
+        Ok(Store { chunks: Local { dir: root.join("chunks"), max: u64::MAX }, root, index: RwLock::new(index), journal: Mutex::new(journal), ledger })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// This runner's work ledger (`crate::ci::work`'s tables, in `ledger.db`): the entries here,
+    /// and `kiln run`'s results (`crate::reach::reuse`).
+    pub fn ledger(&self) -> &crate::store::Store {
+        &self.ledger
     }
 
     /// Where a temporary file is made: in the store, so it's renamed into place.
@@ -383,41 +416,54 @@ impl Store {
         Ok(())
     }
 
-    /// The first of `scopes` with an entry for `name` in `ns`, and the entry.
-    pub fn entry(&self, scopes: &[Scope], ns: &str, name: &str) -> Option<(Scope, Entry)> {
-        let index = self.index.read();
-        let key = (ns.to_owned(), name.to_owned());
-        scopes.iter().find_map(|s| index.entries.get(s).and_then(|m| m.get(&key)).map(|e| (s.clone(), e.clone())))
+    /// The first of `scopes` with an entry for `name` in `ns`, and the entry: looked up on the
+    /// ledger (`crate::ci::work::lookup`). A scope that removed its entry passes to the next.
+    pub async fn entry(&self, scopes: &[Scope], ns: &str, name: &str) -> anyhow::Result<Option<(Scope, Entry)>> {
+        let (scopes, ns, name) = (scopes.to_vec(), ns.to_owned(), name.to_owned());
+        self.ledger
+            .call(move |c| {
+                for s in scopes {
+                    if let Some(Some(e)) = ledger_entry(c, &s, &ns, &name)? {
+                        return Ok(Some((s, e)));
+                    }
+                }
+                Ok(None)
+            })
+            .await
     }
 
-    /// Sets `name` in `ns` of `scope` to `entry` (the object is held by the scope too). Whether it
-    /// changed anything.
-    pub fn set_entry(&self, scope: &Scope, ns: &str, name: &str, entry: Entry) -> anyhow::Result<bool> {
-        let key = (ns.to_owned(), name.to_owned());
-        {
-            let index = self.index.read();
-            let same = index.entries.get(scope).and_then(|m| m.get(&key)).is_some_and(|e| e.digest == entry.digest && e.meta == entry.meta);
-            if same {
-                return Ok(false);
-            }
-        }
+    /// Sets `name` in `ns` of `scope` to `entry` (the object is held by the scope too), recorded
+    /// on the ledger (`crate::ci::work::record`). Whether it changed anything.
+    pub async fn set_entry(&self, scope: &Scope, ns: &str, name: &str, entry: Entry) -> anyhow::Result<bool> {
         self.hold(scope, &entry.digest)?;
-        self.journal(&Line::Entry { scope: scope.clone(), ns: ns.to_owned(), name: name.to_owned(), entry: Some(entry.clone()) })?;
-        self.index.write().entries.entry(scope.clone()).or_default().insert(key, entry);
-        Ok(true)
+        let (s, ns, name) = (scope.clone(), ns.to_owned(), name.to_owned());
+        self.ledger
+            .call(move |c| {
+                if let Some(Some(e)) = ledger_entry(c, &s, &ns, &name)?
+                    && e.digest == entry.digest
+                    && e.meta == entry.meta
+                {
+                    return Ok(false);
+                }
+                crate::ci::work::record(c, &s.key(), &entry_key(&ns, &name, &s.domain), &PathSet::new(), &recorded(Some(&entry), &s.domain, entry.at))?;
+                Ok(true)
+            })
+            .await
     }
 
-    /// Removes `name` from `ns` of `scope`; whether it was there.
-    pub fn remove_entry(&self, scope: &Scope, ns: &str, name: &str) -> anyhow::Result<bool> {
-        let key = (ns.to_owned(), name.to_owned());
-        if !self.index.read().entries.get(scope).is_some_and(|m| m.contains_key(&key)) {
-            return Ok(false);
-        }
-        self.journal(&Line::Entry { scope: scope.clone(), ns: ns.to_owned(), name: name.to_owned(), entry: None })?;
-        if let Some(m) = self.index.write().entries.get_mut(scope) {
-            m.remove(&key);
-        }
-        Ok(true)
+    /// Removes `name` from `ns` of `scope` (recorded as removed: the ledger keeps no gap in a
+    /// key's history); whether it was there.
+    pub async fn remove_entry(&self, scope: &Scope, ns: &str, name: &str) -> anyhow::Result<bool> {
+        let (s, ns, name) = (scope.clone(), ns.to_owned(), name.to_owned());
+        self.ledger
+            .call(move |c| {
+                if !matches!(ledger_entry(c, &s, &ns, &name)?, Some(Some(_))) {
+                    return Ok(false);
+                }
+                crate::ci::work::record(c, &s.key(), &entry_key(&ns, &name, &s.domain), &PathSet::new(), &recorded(None, &s.domain, crate::util::now_unix()))?;
+                Ok(true)
+            })
+            .await
     }
 
     /// The first of `scopes` that holds the object, if it's here.
@@ -510,30 +556,45 @@ mod tests {
         Ok(())
     }
 
-    /// W24-R08: entries and holdings are per scope, and survive the store opening again.
+    /// W24-R08, R30: entries are per scope, on the work ledger, and survive the store opening
+    /// again; so do holdings. A removed entry lets the next scope's show.
     #[test]
     fn w24_r08_entries_and_holdings_are_per_scope_and_kept() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let (a, b) = (Scope::new("acme/app", "trusted"), Scope::new("acme/other", "trusted"));
-        let digest = {
-            let store = Store::open(dir.path())?;
-            let (d, n) = store.put_bytes(b"compiled")?;
-            let e = Entry { digest: d.clone(), size: n, at: 1, meta: BTreeMap::from([("x-artifact-tag".to_owned(), "sig".to_owned())]) };
-            assert!(store.set_entry(&a, "sccache", "k1", e.clone())?);
-            assert!(!store.set_entry(&a, "sccache", "k1", e.clone())?, "the same again changes nothing");
-            assert_eq!(store.entry(std::slice::from_ref(&a), "sccache", "k1").map(|(_, e)| e.digest), Some(d.clone()));
-            assert!(store.entry(std::slice::from_ref(&b), "sccache", "k1").is_none());
-            assert_eq!(store.holder(&[b.clone(), a.clone()], &d), Some(a.clone()));
-            assert_eq!(store.holder(std::slice::from_ref(&b), &d), None, "another repository's object isn't its to know of");
-            store.set_entry(&a, "sccache", "gone", e)?;
-            assert!(store.remove_entry(&a, "sccache", "gone")?);
-            d
-        };
-        let store = Store::open(dir.path())?;
-        let (scope, e) = store.entry(&[b.clone(), a.clone()], "sccache", "k1").ok_or_else(|| anyhow::anyhow!("kept across opening"))?;
-        assert_eq!((scope, e.digest.as_str(), e.meta.get("x-artifact-tag").map(String::as_str)), (a.clone(), digest.as_str(), Some("sig")));
-        assert!(store.entry(std::slice::from_ref(&a), "sccache", "gone").is_none());
-        assert_eq!(store.holder(std::slice::from_ref(&a), &digest), Some(a));
-        Ok(())
+        let root = dir.path().to_path_buf();
+        crate::rt::block_on(async move {
+            let (a, b, t) = (Scope::new("acme/app", "untrusted"), Scope::new("acme/other", "trusted"), Scope::new("acme/app", "trusted"));
+            let digest = {
+                let store = Store::open(&root)?;
+                let (d, n) = store.put_bytes(b"compiled")?;
+                let e = Entry { digest: d.clone(), size: n, at: 1, meta: BTreeMap::from([("x-artifact-tag".to_owned(), "sig".to_owned())]) };
+                anyhow::ensure!(store.set_entry(&a, "sccache", "k1", e.clone()).await?);
+                anyhow::ensure!(!store.set_entry(&a, "sccache", "k1", e.clone()).await?, "the same again changes nothing");
+                anyhow::ensure!(store.entry(std::slice::from_ref(&a), "sccache", "k1").await?.map(|(_, e)| e.digest) == Some(d.clone()));
+                anyhow::ensure!(store.entry(std::slice::from_ref(&b), "sccache", "k1").await?.is_none());
+                anyhow::ensure!(store.entry(std::slice::from_ref(&t), "sccache", "k1").await?.is_none(), "another domain's ledger holds nothing of it");
+                anyhow::ensure!(store.holder(&[b.clone(), a.clone()], &d) == Some(a.clone()));
+                anyhow::ensure!(store.holder(std::slice::from_ref(&b), &d).is_none(), "another repository's object isn't its to know of");
+                // Removed from its own scope, the trusted entry under it shows.
+                let (td, tn) = store.put_bytes(b"trusted build")?;
+                store.set_entry(&t, "sccache", "gone", Entry { digest: td.clone(), size: tn, at: 2, meta: BTreeMap::new() }).await?;
+                store.set_entry(&a, "sccache", "gone", e).await?;
+                anyhow::ensure!(store.entry(&[a.clone(), t.clone()], "sccache", "gone").await?.map(|(s, _)| s) == Some(a.clone()));
+                anyhow::ensure!(store.remove_entry(&a, "sccache", "gone").await? && !store.remove_entry(&a, "sccache", "gone").await?);
+                anyhow::ensure!(store.entry(&[a.clone(), t.clone()], "sccache", "gone").await?.map(|(s, e)| (s, e.digest)) == Some((t.clone(), td)));
+                // On the ledger: a unit whose definition is the tool's key.
+                let same = |p: &PathSet| p.clone();
+                let (sk, wk) = (a.key(), entry_key("sccache", "k1", "untrusted"));
+                anyhow::ensure!(store.ledger().call(move |c| crate::ci::work::lookup(c, &sk, &wk, &same)).await?.is_some(), "recorded on the ledger");
+                d
+            };
+            let store = Store::open(&root)?;
+            let (scope, e) = store.entry(&[b.clone(), a.clone()], "sccache", "k1").await?.ok_or_else(|| anyhow::anyhow!("kept across opening"))?;
+            anyhow::ensure!((scope, e.digest.as_str(), e.meta.get("x-artifact-tag").map(String::as_str), e.at) == (a.clone(), digest.as_str(), Some("sig"), 1));
+            anyhow::ensure!(store.entry(std::slice::from_ref(&a), "sccache", "gone").await?.is_none());
+            anyhow::ensure!(store.holder(std::slice::from_ref(&a), &digest) == Some(a));
+            anyhow::ensure!(entry_key("sccache", "k1", "trusted") != entry_key("sccache", "k1", "untrusted") && entry_key("go", "k1", "trusted") != entry_key("sccache", "k1", "trusted"));
+            Ok(())
+        })
     }
 }

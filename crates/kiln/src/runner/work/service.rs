@@ -17,8 +17,9 @@
 //!
 //! - `GET|HEAD|PUT /objects/<sha256>`: an object by its digest (a PUT's bytes are checked).
 //! - `POST /missing` `{ digests }`: those the token's scopes don't hold → `{ missing }`.
-//! - `GET|HEAD|PUT|DELETE /entries/<namespace>/<name>`: a name for an object; a hit says its
-//!   digest (`x-kiln-digest`) and when it was put (`last-modified`).
+//! - `GET|HEAD|PUT|DELETE /entries/<namespace>/<name>`: a name for an object, on the work ledger
+//!   ([`super::store`], W24-R30); a hit says its digest (`x-kiln-digest`) and when it was put
+//!   (`last-modified`).
 //! - `GET /whoami`: the token's scopes.
 
 use std::collections::{BTreeMap, HashMap};
@@ -310,7 +311,7 @@ impl Service {
         if scopes.is_empty() {
             return Ok(None);
         }
-        if let Some((scope, e)) = self.store.entry(&scopes, ns, name)
+        if let Some((scope, e)) = self.store.entry(&scopes, ns, name).await?
             && self.store.has(&e.digest)
         {
             return Ok(Some((scope, e)));
@@ -335,7 +336,7 @@ impl Service {
             let _ = std::fs::remove_file(&tmp);
             let (digest, size) = kept??;
             let e = Entry { digest, size, at: crate::util::now_unix(), meta: BTreeMap::new() };
-            self.store.set_entry(&own, ns, name, e.clone())?;
+            self.store.set_entry(&own, ns, name, e.clone()).await?;
             return Ok(Some((own, e)));
         }
         Ok(None)
@@ -467,10 +468,10 @@ impl Service {
     }
 
     /// `ns`/`name` set to the object `digest` in the token's scope, and sent up through its grant.
-    pub(crate) fn set(&self, c: &Claims, ns: &str, name: &str, digest: &str, size: u64, meta: BTreeMap<String, String>) -> anyhow::Result<Entry> {
+    pub(crate) async fn set(&self, c: &Claims, ns: &str, name: &str, digest: &str, size: u64, meta: BTreeMap<String, String>) -> anyhow::Result<Entry> {
         let scope = c.writes().ok_or_else(|| anyhow::anyhow!("this token doesn't write"))?;
         let e = Entry { digest: digest.to_owned(), size, at: crate::util::now_unix(), meta };
-        if self.store.set_entry(&scope, ns, name, e.clone())? {
+        if self.store.set_entry(&scope, ns, name, e.clone()).await? {
             self.send_up(c, Up { scope, ns: ns.to_owned(), name: name.to_owned(), digest: digest.to_owned(), size });
         }
         Ok(e)
@@ -569,12 +570,12 @@ impl Service {
                     Ok(k) => k,
                     Err(r) => return Ok(r),
                 };
-                self.set(&c, ns, &name.join("/"), &digest, size, BTreeMap::new())?;
+                self.set(&c, ns, &name.join("/"), &digest, size, BTreeMap::new()).await?;
                 Ok(srv::json(StatusCode::CREATED, &json!({ "digest": digest, "size": size })))
             }
             (&Method::DELETE, ["entries", ns, name @ ..]) if !name.is_empty() => {
                 let Some(scope) = c.writes() else { return Ok(msg(StatusCode::FORBIDDEN, "this token doesn't write")) };
-                let gone = self.store.remove_entry(&scope, ns, &name.join("/"))?;
+                let gone = self.store.remove_entry(&scope, ns, &name.join("/")).await?;
                 Ok(srv::status(if gone { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }))
             }
             _ => Ok(msg(StatusCode::NOT_FOUND, "not a path of this runner's cache")),
@@ -1009,8 +1010,8 @@ pub(crate) mod tests {
             .await??;
             // Kept in the untrusted reader's own scope: its view of the server never becomes a
             // trusted entry here.
-            anyhow::ensure!(svc.store().entry(&[Scope::new("acme/app", "untrusted")], "turbo", "remote").is_some(), "kept here");
-            anyhow::ensure!(svc.store().entry(&[Scope::new("acme/app", "trusted")], "turbo", "remote").is_none(), "never as trusted");
+            anyhow::ensure!(svc.store().entry(&[Scope::new("acme/app", "untrusted")], "turbo", "remote").await?.is_some(), "kept here");
+            anyhow::ensure!(svc.store().entry(&[Scope::new("acme/app", "trusted")], "turbo", "remote").await?.is_none(), "never as trusted");
             let r = on_thread(move || call(&mut conn(at), "GET", "/_kiln/cas/v1/entries/turbo/big", Some(&tr), b"")).await??;
             anyhow::ensure!(r.status == 200 && r.body == big, "a large entry streams back whole ({} bytes)", r.body.len());
             Ok(())

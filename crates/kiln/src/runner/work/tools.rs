@@ -80,12 +80,12 @@ async fn entry_request(svc: &Arc<Service>, c: &Claims, req: Request, ns: &str, n
                 Ok(k) => k,
                 Err(r) => return Ok(r),
             };
-            svc.set(c, ns, name, &digest, size, meta)?;
+            svc.set(c, ns, name, &digest, size, meta).await?;
             Ok(srv::status(StatusCode::CREATED))
         }
         Method::DELETE => {
             let Some(scope) = c.writes() else { return Ok(msg(StatusCode::FORBIDDEN, "this token doesn't write")) };
-            let gone = svc.store().remove_entry(&scope, ns, name)?;
+            let gone = svc.store().remove_entry(&scope, ns, name).await?;
             Ok(srv::status(if gone { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }))
         }
         _ => Ok(srv::with_header(msg(StatusCode::METHOD_NOT_ALLOWED, "not a method of this cache"), header::ALLOW, "GET, HEAD, PUT, DELETE")),
@@ -247,7 +247,7 @@ async fn turbo(svc: &Arc<Service>, req: Request, rest: &[&str]) -> anyhow::Resul
                 Ok(k) => k,
                 Err(r) => return Ok(r),
             };
-            svc.set(&c, "turbo", hash, &digest, size, meta)?;
+            svc.set(&c, "turbo", hash, &digest, size, meta).await?;
             Ok(srv::json(StatusCode::ACCEPTED, &json!({ "urls": [hash] })))
         }
         (&Method::GET | &Method::HEAD, ["artifacts", hash]) => entry_request(svc, &c, req, "turbo", hash, BTreeMap::new()).await,
