@@ -2262,6 +2262,7 @@ name = "kiln-ci"
 version = "0.2.0"
 dependencies = [
  "aho-corasick",
+ "anyhow",
  "base64 0.23.1",
  "fancy-regex",
  "jiff",
