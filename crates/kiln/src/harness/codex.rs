@@ -5996,7 +5996,7 @@ mod tests {
         }
         // A turn, and the tier it asked for (null: none).
         let turn = |c: &mut Codex, core: &mut Core, id: &str| -> anyhow::Result<Value> {
-            c.command(core, Command::Send { id: id.into(), text: "go".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+            c.command(core, Command::Send { id: id.into(), text: "go".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
             let w = written(core);
             let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn for {id}"))?;
             respond(c, core, &w, "turn/start", json!({"turn": {"id": format!("t-{id}"), "status": "inProgress", "items": []}}));
