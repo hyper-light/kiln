@@ -82,7 +82,7 @@ fn w05_ac09_a_restart_rebuilds_the_queue() -> anyhow::Result<()> {
     let home = dir.path().join("runner-home");
     std::fs::create_dir_all(&home)?;
     let log = std::fs::File::create(dir.path().join("runner.log"))?;
-    let child = Command::new(env!("CARGO_BIN_EXE_kiln"))
+    let child = common::kiln()
         .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", "keeper", "--labels", "keep", "--slots", "2", "--no-terminal"])
         .arg("--work-dir")
         .arg(dir.path().join("runner-work"))
@@ -392,7 +392,7 @@ fn w05_r05_a_runner_gone_over_a_restart_loses_its_legs() -> anyhow::Result<()> {
     let home = dir.path().join("runner-home");
     std::fs::create_dir_all(&home)?;
     let log = std::fs::File::create(dir.path().join("runner.log"))?;
-    let child = Command::new(env!("CARGO_BIN_EXE_kiln"))
+    let child = common::kiln()
         .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", "goner", "--labels", "gone", "--slots", "1", "--no-terminal"])
         .arg("--work-dir")
         .arg(dir.path().join("runner-work"))

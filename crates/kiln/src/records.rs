@@ -1,9 +1,15 @@
-//! Records (docs/seams.md, "Records") kept in kiln's store: the seam's durable implementation until
-//! Amphora's (CP-T1.5) takes its place, as `SimRecords` is the one in memory. Every version of a
-//! row is kept by family, key and the commit that wrote it, so a snapshot read and the change feed
-//! come from one table; [`StoreRecords::compact`] forgets the history before a revision, as a
-//! compaction does. Only what the seam offers is here (families, keys, values and conditions), so
-//! CP-T1.5's copy, family by family through the seam, carries every row as it is.
+//! kiln's records through kiln-seams' `Records` (docs/seams.md, "Records"; the critical path's
+//! master plan §3, "Seams"): what kiln keeps goes through that trait, so the store under it can
+//! change without the code over it changing. Until Amphora's lands (CP-T1.5), kiln has two of its
+//! own, as `SimRecords` is the one in memory: a host keeps its records in a file of kiln's embedded
+//! Turso ([`turso::TursoRecords`]; [`open`] is the one place that chooses it, so moving to Amphora
+//! is a change to its one line), and the server keeps its own in kiln's store ([`StoreRecords`]).
+//!
+//! [`StoreRecords`] keeps every version of a row by family, key and the commit that wrote it, so a
+//! snapshot read and the change feed come from one table; [`StoreRecords::compact`] forgets the
+//! history before a revision, as a compaction does. Only what the seam offers is here (families,
+//! keys, values and conditions), so CP-T1.5's copy, family by family through the seam, carries
+//! every row as it is.
 //!
 //! kiln's store runs one call at a time, so commits are linearizable as they are. Beside the
 //! tables, what a wait needs is kept in memory too (the head, the feed's horizon, each family's
@@ -12,6 +18,7 @@
 //! revision the tables don't hold.
 
 use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -20,6 +27,17 @@ use parking_lot::Mutex;
 use rusqlite::{OptionalExtension, params};
 
 use crate::store::Store;
+
+pub mod turso;
+
+/// A host's records file, in its folder (beside its conversation store).
+pub const FILE: &str = "records.db";
+
+/// The records kept at `path`, in the store kiln keeps a host's records in: Turso's, until
+/// Amphora's.
+pub fn open(path: &Path) -> anyhow::Result<Arc<dyn Records>> {
+    Ok(Arc::new(turso::TursoRecords::open(path)?))
+}
 
 /// What's kept in memory beside the tables.
 #[derive(Default)]

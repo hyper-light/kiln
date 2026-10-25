@@ -784,7 +784,7 @@ mod hub_tests {
         let items = needs.iter().enumerate().map(|(k, n)| crate::plans::Item { title: titles.get(k).copied().unwrap_or("Step").to_owned(), needs: n.to_vec(), ..crate::plans::Item::default() }).collect();
         let p = crate::plans::create(&hub, crate::plans::New { title: "Fan out".into(), items, ..crate::plans::New::default() }, "admin").await?;
         let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
-        crate::plans::run(&hub, &p.id, crate::plans::Target::Session(main.clone()), crate::plans::Mode::Goals, &crate::plans::Pick::default(), &person).await?;
+        crate::plans::run(&hub, &p.id, crate::plans::Target::Session(main.clone()), crate::plans::Mode::Goals, &crate::plans::Pick::default(), &person, None).await?;
         Ok((hub, main, folder))
     }
 

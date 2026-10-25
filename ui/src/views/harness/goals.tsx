@@ -15,7 +15,7 @@
  */
 import * as React from "react";
 import { ChevronRight, ListTree } from "lucide-react";
-import { harnessApi, type GoalItem, type GoalStack, type SessionStore } from "@/api/harness";
+import { clientId, harnessApi, type GoalItem, type GoalStack, type SessionStore } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { Loadable } from "@/components/ui/loading";
@@ -28,6 +28,7 @@ import { effectiveNeeds } from "@/views/plans/graph-layout";
 import { StandTitle, type Stand } from "@/views/plans/status";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
+import { Tries } from "@/lib/tries";
 import { Link } from "@/lib/router";
 import { canPlan, canPlanNow, fromLines, lineOf, outOn, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo, type Planner } from "./goal-stack";
 import { GoalPlan } from "./goal-plan";
@@ -330,6 +331,10 @@ function GoalPanel({
   onStack?: (s: GoalStack) => void;
 }) {
   const [adding, setAdding] = React.useState("");
+  /** The goal being added and its key, until it's added (CP-T3.2). */
+  const [tries] = React.useState(() => new Tries(clientId));
+  /** The control asked for and its key, until it goes through (CP-T3.2). */
+  const [asks] = React.useState(() => new Tries(clientId));
   // The edit box's words, and the goals it began with (what its lines go back to).
   const [editing, setEditing] = React.useState<{ text: string; goals: GoalItem[] } | null>(null);
   const [asking, setAsking] = React.useState(false);
@@ -371,6 +376,13 @@ function GoalPanel({
     return out;
   }, [read, tasks, queue, said]);
 
+  /** Start, pause, skip, clear or restore, under a key kept while the same is asked again (its answer
+   * lost, or it failed): asked again, it does nothing more, whatever changed since (CP-T3.2). */
+  const control = async (action: Parameters<typeof harnessApi.goalAction>[1], goal?: string) => {
+    const s = await harnessApi.goalAction(agent, action, goal, asks.keyFor(JSON.stringify({ agent, action, goal })));
+    asks.done();
+    return s;
+  };
   const act = async (f: () => Promise<GoalStack>) => {
     setBusy(true);
     setError(null);
@@ -387,8 +399,16 @@ function GoalPanel({
   };
   const add = async () => {
     const text = adding.trim();
-    // A stack that was done goes on with it.
-    if (text && (await act(() => harnessApi.addGoals(agent, [text], stack?.state === "done")))) setAdding("");
+    if (!text) return;
+    // A stack that was done goes on with it. Asked again (its answer lost, or it failed), the
+    // same goal under its key, never a second: the key is for what was asked, not for the stack,
+    // which the first try may have changed.
+    const start = stack?.state === "done";
+    const key = tries.keyFor(JSON.stringify({ agent, text }));
+    if (await act(() => harnessApi.addGoals(agent, [text], start, key))) {
+      tries.done();
+      setAdding("");
+    }
   };
   const saveEdit = async () => {
     if (editing === null) return;
@@ -397,7 +417,7 @@ function GoalPanel({
       await act(async () => {
         const s = await harnessApi.setGoals(agent, goals);
         // The goal under way, its line taken out: skipped, if it's still the one under way.
-        return dropped && s.items.some((i) => i.id === dropped.id && i.status === "active") ? harnessApi.goalAction(agent, "skip") : s;
+        return dropped && s.items.some((i) => i.id === dropped.id && i.status === "active") ? control("skip", dropped.id) : s;
       })
     )
       setEditing(null);
@@ -608,7 +628,7 @@ function GoalPanel({
               {(items.length > 0 || cleared > 0) && (
                 <div className="gs-actions">
                   {startWord && (
-                    <Button size="sm" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "start"))}>
+                    <Button size="sm" disabled={busy} onClick={() => void act(() => control("start"))}>
                       {startWord}
                     </Button>
                   )}
@@ -620,7 +640,7 @@ function GoalPanel({
                       onClick={() =>
                         void act(async () => {
                           await harnessApi.setGoals(agent, [{ text: unmet.text }, ...pending.map((p) => ({ id: p.id, text: p.text }))]);
-                          return harnessApi.goalAction(agent, "start");
+                          return control("start");
                         })
                       }
                     >
@@ -628,12 +648,12 @@ function GoalPanel({
                     </Button>
                   )}
                   {stack?.state === "running" && (
-                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "pause"))}>
+                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act(() => control("pause"))}>
                       Pause
                     </Button>
                   )}
                   {active && (
-                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "skip"))}>
+                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => void act(() => control("skip", active.id))}>
                       Skip this one
                     </Button>
                   )}
@@ -651,7 +671,7 @@ function GoalPanel({
                     </Button>
                   )}
                   {cleared > 0 && (
-                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "restore"))}>
+                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act(() => control("restore"))}>
                       Bring back {cleared} cleared {cleared === 1 ? "goal" : "goals"}
                     </Button>
                   )}
@@ -664,7 +684,7 @@ function GoalPanel({
                         disabled={busy}
                         onClick={() => {
                           setAsking(false);
-                          void act(() => harnessApi.goalAction(agent, "clear"));
+                          void act(() => control("clear"));
                         }}
                       >
                         Clear

@@ -714,7 +714,16 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "plans", "runs"]) => boxed(|| own_op(&hub, &caller, "plans.runs.list", query_value(&q))).await,
         (&Method::GET, ["api", "plans", "runs", run]) => boxed(|| own_op(&hub, &caller, "plans.runs.get", json!({ "run": run }))).await,
         (&Method::POST, ["api", "plans", "runs", run, "stop"]) => boxed(|| own_op(&hub, &caller, "plans.runs.stop", json!({ "run": run }))).await,
-        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "retry"]) => boxed(|| own_op(&hub, &caller, "plans.runs.retry", json!({ "run": run, "step": n }))).await,
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "retry"]) => {
+            // With the try it replaces, when the body says it (CP-T3.2).
+            let (run, n) = ((*run).to_owned(), (*n).to_owned());
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("run".into(), json!(run));
+                o.insert("step".into(), json!(n));
+            }
+            boxed(|| own_op(&hub, &caller, "plans.runs.retry", body)).await
+        }
         // Taking a step over, and saying it's met, are a person's: no operation does them.
         (&Method::POST, ["api", "plans", "runs", run, "steps", n, what @ ("take" | "met")]) => {
             let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
@@ -736,9 +745,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "plans", id, "restore"]) => boxed(|| plans_restore(&hub, id, req)).await,
         (&Method::POST, ["api", "plans", id, "run"]) => {
             let id = (*id).to_owned();
+            // Its idempotency key may come as the standard header (CP-T3.2).
+            let key = idempotency_key(&req);
             let mut body = boxed(|| body_value(req)).await?;
             if let Some(o) = body.as_object_mut() {
                 o.insert("id".into(), json!(id));
+                if let Some(k) = key.filter(|_| !o.contains_key("key")) {
+                    o.insert("key".into(), json!(k));
+                }
             }
             boxed(|| own_op(&hub, &caller, "plans.run", body)).await
         }
@@ -793,9 +807,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "harness", "agents", id, "workspace"]) => boxed(|| own_op(&hub, &caller, "agents.workspace", json!({ "agent": id }))).await,
         (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
+            // A send's idempotency key may come as the standard header (CP-T3.2).
+            let key = idempotency_key(&req);
             let mut body = boxed(|| body_value(req)).await?;
             if let Some(o) = body.as_object_mut() {
                 o.insert("agent".into(), json!(id));
+                if let Some(k) = key.filter(|_| *what == "send" && !o.contains_key("key")) {
+                    o.insert("key".into(), json!(k));
+                }
             }
             boxed(|| own_op(&hub, &caller, &name, body)).await
         }
@@ -895,11 +914,18 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
                 "settings" => ("goals.settings", None),
                 action => ("goals.control", Some(("action", (*action).to_owned()))),
             };
+            // A control or an end asked for under its `Idempotency-Key` header: its key (CP-T3.2).
+            let header = idempotency_key(&req).filter(|_| matches!(name, "goals.control" | "goals.done"));
             let mut body = boxed(|| body_value(req)).await?;
             if let Some(o) = body.as_object_mut() {
                 o.insert("agent".into(), json!(id));
                 if let Some((k, v)) = field {
                     o.insert(k.into(), json!(v));
+                }
+                if let Some(k) = header
+                    && !o.contains_key("key")
+                {
+                    o.insert("key".into(), json!(k));
                 }
             }
             boxed(|| own_op(&hub, &caller, name, body)).await
@@ -4260,14 +4286,26 @@ async fn goals_set(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     Ok(srv::json(StatusCode::OK, &s))
 }
 
-/// Goals lined up after the agent's others (`crate::goals::add_at`): `{goals, start?, parallel?}`,
-/// each goal its words or `{text, needs}` (`crate::goals::ops::goals_of`).
+/// Goals lined up after the agent's others (`crate::goals::add_at`): `{goals, start?, parallel?, key?}`,
+/// each goal its words or `{text, needs}` (`crate::goals::ops::goals_of`). Its idempotency key
+/// (CP-T3.2; `key`, or its `Idempotency-Key` header): asked again under it, the goals it added are
+/// found, never added twice.
 async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
     may_steer_goals(hub, caller, id).await?;
+    let header = idempotency_key(&req);
     let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let by = crate::goals::By::of(hub, caller, id);
     let goals = crate::goals::ops::goals_of(&b, &by.name()).map_err(|m| err(StatusCode::BAD_REQUEST, m))?;
     let start = b.get("start").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let key = match b.get("key") {
+        None | Some(serde_json::Value::Null) => header,
+        Some(serde_json::Value::String(k)) => Some(k.trim().to_owned()).filter(|k| !k.is_empty()).or(header),
+        Some(_) => return Err(err(StatusCode::BAD_REQUEST, "`key` is a string")),
+    };
+    if key.as_ref().is_some_and(|k| k.len() > crate::harness::ops::KEY_MAX || k.chars().any(char::is_control)) {
+        return Err(err(StatusCode::BAD_REQUEST, format!("a key is 1 to {} bytes with no control characters", crate::harness::ops::KEY_MAX)));
+    }
+    let goals = crate::goals::keyed(&crate::harness::ops::key_scope(caller), id, key.as_deref(), goals);
     let s = crate::goals::add_at(hub, id, goals, start, &crate::goals::At::End).await.map_err(goals_err)?;
     hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
@@ -4399,9 +4437,12 @@ async fn acted_on(hub: &Hub, req: &Request) -> Vec<crate::harness::session::Info
 }
 
 async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
-    let among = acted_on(hub, &req).await;
-    let b: crate::harness::broadcast::Broadcast = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let report = crate::harness::broadcast::run(hub, &b, &among).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let (header, by, among) = (idempotency_key(&req), key_scope(&req), acted_on(hub, &req).await);
+    let mut b: crate::harness::broadcast::Broadcast = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if b.key.is_none() {
+        b.key = header;
+    }
+    let report = crate::harness::broadcast::run(hub, &b, &by, &among).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let what = b.text.as_deref().map_or_else(|| b.approvals.as_deref().map_or_else(|| "a command".to_owned(), |a| format!("{a} what waits")), |t| t.chars().take(80).collect());
     hub.store.audit("admin".into(), "agent.broadcast".into(), format!("{} to {} agents ({} sent, {} skipped, {} failed): {what}", report.id, report.results.len(), report.sent, report.skipped, report.failed)).await;
     Ok(srv::json(StatusCode::OK, &report))
@@ -4460,10 +4501,75 @@ async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
     ))
 }
 
-async fn harness_command(hub: &Hub, id: &str, req: Request) -> R {
-    let c: crate::harness::model::Command = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    match hub.harness.command(hub, id, c).await {
-        crate::harness::registry::Sent::Ok => Ok(srv::status(StatusCode::NO_CONTENT)),
+/// Whose a request's idempotency key is: the agent it comes from (if one) and the person it acts
+/// for. Another caller's same key is another message (CP-T3.2).
+fn key_scope(req: &Request) -> String {
+    let caller = req.extensions().get::<crate::authz::Caller>().cloned().unwrap_or_else(crate::authz::Caller::owner);
+    crate::harness::ops::key_scope(&caller)
+}
+
+/// A request's `Idempotency-Key` header, when it has one (CP-T3.2).
+fn idempotency_key(req: &Request) -> Option<String> {
+    req.headers().get("idempotency-key").and_then(|v| v.to_str().ok()).map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned)
+}
+
+/// `POST /api/harness/sessions/:id/command`: one command for one session. A message's `id` is its
+/// idempotency key, made once by its sender (or, with an `Idempotency-Key` header, made from that):
+/// sent again, it's the same message, delivered once, and answered as it was the first time.
+async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
+    let key = idempotency_key(&req);
+    if key.as_ref().is_some_and(|k| k.len() > crate::harness::ops::KEY_MAX || k.chars().any(char::is_control)) {
+        return Err(err(StatusCode::BAD_REQUEST, format!("an Idempotency-Key is 1 to {} bytes with no control characters", crate::harness::ops::KEY_MAX)));
+    }
+    let caller = req.extensions().get::<crate::authz::Caller>().cloned().unwrap_or_else(crate::authz::Caller::owner);
+    let mut c: crate::harness::model::Command = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if let Some(k) = &key {
+        let made = crate::util::derive_id(&["api.command", &crate::harness::ops::key_scope(&caller), id, k]);
+        match &mut c {
+            crate::harness::model::Command::Send { id: mid, .. } => *mid = made,
+            // Delivered like a message: through the session's inbox too.
+            crate::harness::model::Command::SkillRun { id: mid, .. } => *mid = Some(made),
+            _ => {}
+        }
+    }
+    let message = crate::harness::registry::message_id(&c);
+    // Any other command under a key is taken once (docs/wire.md, "The UI's sockets"): asked again
+    // under it, it's answered as it was the first time. A message is its inbox's to take once.
+    let sent = match key.filter(|_| !crate::harness::session::is_message(&c)) {
+        Some(k) => {
+            use crate::harness::asked::Taken;
+            let scope = crate::harness::ops::key_scope(&caller);
+            let kind = hub.harness.kind_of(hub, id, &c);
+            let rx = match hub.harness.asked.take(id, &scope, &k, kind, Instant::now()) {
+                (_, Taken::New(rx)) => {
+                    hub.harness.send_asked(hub, id, &scope, &k, c).await;
+                    rx
+                }
+                (_, Taken::Waiting(rx)) => rx,
+                (_, Taken::Answered(sent)) => return answer_command(sent, message),
+            };
+            rx.await.unwrap_or_else(|_| crate::harness::registry::Sent::Unanswered("the server let go of it before its answer came".into()))
+        }
+        None => hub.harness.command(hub, id, c).await,
+    };
+    answer_command(sent, message)
+}
+
+/// The API's answer to a command: what became of it, as an HTTP status.
+fn answer_command(sent: crate::harness::registry::Sent, message: Option<String>) -> R {
+    match sent {
+        crate::harness::registry::Sent::Ok | crate::harness::registry::Sent::Taken => Ok(srv::status(StatusCode::NO_CONTENT)),
+        // Waits for its runner, which is away: it goes once the runner is back.
+        crate::harness::registry::Sent::Parked => Ok(srv::json(StatusCode::ACCEPTED, &json!({"parked": true}))),
+        crate::harness::registry::Sent::Accepted(a) => Ok(srv::json(StatusCode::OK, &crate::harness::registry::accepted(&message, &a))),
+        crate::harness::registry::Sent::Refused(r) => {
+            let (code, why) = crate::harness::ops::refused(&r);
+            Err(err(code, why))
+        }
+        s @ (crate::harness::registry::Sent::Rejected { .. } | crate::harness::registry::Sent::Unanswered(_)) => {
+            let (code, why) = s.failure().unwrap_or((StatusCode::CONFLICT, "its runner refused it".to_owned()));
+            Err(err(code, why))
+        }
         crate::harness::registry::Sent::NoSession => Err(err(StatusCode::NOT_FOUND, "no such agent session")),
         crate::harness::registry::Sent::Unreachable => Err(err(StatusCode::CONFLICT, "the session's machine is not connected")),
     }
@@ -4488,6 +4594,9 @@ async fn harness_upload(hub: &Hub, q: &HashMap<String, String>, req: Request) ->
 struct HarnessBroadcast {
     ids: Vec<String>,
     command: crate::harness::model::Command,
+    /// An idempotency key: sent again with it, each agent's message is the same one (CP-T3.2).
+    #[serde(default)]
+    key: Option<String>,
 }
 
 /// `POST /api/harness/command`: one command for the sessions listed, through the same sending as
@@ -4495,11 +4604,13 @@ struct HarnessBroadcast {
 /// rest of the report says why the others weren't.
 async fn harness_command_many(hub: &Arc<Hub>, req: Request) -> R {
     use crate::harness::broadcast::{Broadcast, To};
-    let among = acted_on(hub, &req).await;
+    let (header, by, among) = (idempotency_key(&req), key_scope(&req), acted_on(hub, &req).await);
     let b: HarnessBroadcast = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // Each agent's message is made from a key: the one given, else the message's own id.
+    let key = b.key.clone().or(header).or_else(|| crate::harness::registry::message_id(&b.command));
     let command = serde_json::to_value(&b.command).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let to = To { ids: b.ids, ..To::default() };
-    let report = crate::harness::broadcast::run(hub, &Broadcast { to, text: None, attachments: Vec::new(), mode: None, command: Some(command), approvals: None }, &among)
+    let report = crate::harness::broadcast::run(hub, &Broadcast { to, text: None, attachments: Vec::new(), mode: None, command: Some(command), approvals: None, key }, &by, &among)
         .await
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let sent: Vec<&str> = report.results.iter().filter(|o| o.result == "sent").map(|o| o.id.as_str()).collect();
@@ -4813,6 +4924,8 @@ impl Takes {
 fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
     let takes = Takes::of(req.uri().query());
     let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+    // Whose its commands' ids are: a caller's, as an Idempotency-Key's are.
+    let scope = caller.as_ref().map_or_else(String::new, crate::harness::ops::key_scope);
     let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
@@ -4823,7 +4936,7 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
             None => false,
         };
         let who = caller.map_or_else(|| "admin".to_owned(), |c| c.name);
-        if let Err(e) = harness_attach(hub, id, socket, takes, acts, who).await {
+        if let Err(e) = harness_attach(hub, id, socket, takes, scope, acts, who).await {
             tracing::debug!(error = %format!("{e:#}"), "agent session websocket ended");
         }
     });
@@ -4858,6 +4971,61 @@ async fn send_snapshot(tx: &mut ws::Sender, frames: Vec<String>, packed: bool) -
     Ok(())
 }
 
+/// A socket command's row of its own (the socket's request is a GET), as its caller: which command,
+/// not what it says.
+async fn audit_command(hub: &Hub, who: &str, id: &str, c: &crate::harness::model::Command) {
+    let kind = serde_json::to_value(c).ok().and_then(|v| v.get("type").and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_default();
+    hub.store.audit(who.to_owned(), "agent.command".into(), format!("{id}: {kind}")).await;
+}
+
+/// What a viewer sent on its socket: a command under the id its client made (`{"t": "cmd", "id",
+/// "c"}`), or a command as clients from before ids send it, bare.
+enum FromViewer {
+    Under { id: String, c: crate::harness::model::Command },
+    Bare(crate::harness::model::Command),
+}
+
+/// What a viewer sent, read; or why it couldn't be, with the command's id when that much could be
+/// read.
+fn from_viewer(text: &str) -> Result<FromViewer, (Option<String>, String)> {
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| (None, e.to_string()))?;
+    if v.get("t").and_then(serde_json::Value::as_str) != Some("cmd") {
+        return serde_json::from_value(v).map(FromViewer::Bare).map_err(|e| (None, e.to_string()));
+    }
+    let id = v.get("id").and_then(serde_json::Value::as_str).filter(|i| !i.is_empty() && i.len() <= crate::harness::ops::KEY_MAX && !i.chars().any(char::is_control));
+    let Some(id) = id.map(str::to_owned) else {
+        return Err((None, format!("a command's id is 1 to {} bytes with no control characters", crate::harness::ops::KEY_MAX)));
+    };
+    let Some(c) = v.get("c").cloned() else { return Err((Some(id), "no command (`c`)".into())) };
+    match serde_json::from_value(c) {
+        Ok(c) => Ok(FromViewer::Under { id, c }),
+        Err(e) => Err((Some(id), e.to_string())),
+    }
+}
+
+/// The frame that answers command `cmd` (of `kind`) once `rx` says what became of it.
+fn answer_of(cmd: String, rx: futures::channel::oneshot::Receiver<crate::harness::registry::Sent>, kind: crate::harness::asked::Kind) -> futures::future::BoxFuture<'static, Option<String>> {
+    use futures::FutureExt as _;
+    async move {
+        let sent = rx.await.unwrap_or_else(|_| crate::harness::registry::Sent::Unanswered("the server let go of it before its answer came".into()));
+        Some(crate::harness::asked::frame(&cmd, &sent, kind))
+    }
+    .boxed()
+}
+
+/// What a viewer is told of a command that didn't get through: refused by its session's inbox (a
+/// message is never dropped without a word), or why it didn't reach it. Nothing when it went.
+fn refusal_frame(sent: crate::harness::registry::Sent) -> Option<String> {
+    use crate::harness::registry::Sent;
+    match sent {
+        Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => None,
+        Sent::Refused(r) => Some(json!({"t": "error", "error": r.to_string(), "refused": r}).to_string()),
+        s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => s.failure().map(|(_, why)| json!({"t": "error", "error": why}).to_string()),
+        Sent::NoSession => Some(json!({"t": "error", "error": "this session is gone"}).to_string()),
+        Sent::Unreachable => Some(json!({"t": "error", "error": "the session's machine is not connected"}).to_string()),
+    }
+}
+
 /// Live frames a viewer reads from its session's feed at once: at most this many of the bus's
 /// largest messages (1 MiB) held for it at a time.
 const FEED_READ: usize = 16;
@@ -4889,7 +5057,7 @@ enum Live {
 /// offset the snapshot was taken at, so none is missed or seen twice. A viewer that falls behind
 /// what the feed keeps is refused `Behind` (the bus's lag notice) and starts over from a snapshot,
 /// as it does at the feed's resync marker; nothing it does holds up the session or another viewer.
-async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes, acts: bool, who: String) -> anyhow::Result<()> {
+async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes, scope: String, acts: bool, who: String) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     use kiln_seams::Bus as _;
     use kiln_seams::bus::Refusal;
@@ -4905,6 +5073,10 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     let mut at = att.at;
     // The feed's refusals as of the snapshot it has.
     let mut refusals = att.refusals;
+    // Commands sent, their answers still to come (the frame each comes to, if any): waited for
+    // beside everything else, so what's live and what the viewer sends next (a stop) never waits
+    // for them.
+    let mut answers = futures::stream::FuturesUnordered::<futures::future::BoxFuture<'static, Option<String>>>::new();
     // The newest revision of the copy this viewer has: what it catches up from when it starts
     // over, and what a live frame it already has (a catch-up held it) is told by (docs/wire.md,
     // "Revisions").
@@ -4937,6 +5109,11 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
         // Set when what the feed holds for this viewer isn't what it should take next.
         let mut start_over = false;
         futures::select_biased! {
+            frame = answers.select_next_some() => {
+                if let Some(frame) = frame {
+                    tx.send(ws::text(frame)).await?;
+                }
+            }
             w = live.fuse() => match w {
                 Live::Ready => match hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ).await {
                     Ok(batch) => {
@@ -4998,24 +5175,46 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                 Live::Quiet => start_over = viewer.refusals() != refusals,
             },
             m = rx.next().fuse() => match m {
-                Some(Ok(Message::Text(_))) if !acts => {
-                    tx.send(ws::text(json!({"t": "error", "error": "you may watch this agent but not command it: an agent commands only itself and the agents it started"}).to_string())).await?;
+                // Watching isn't commanding: refused, under its id when it came under one.
+                Some(Ok(Message::Text(t))) if !acts => {
+                    let why = "you may watch this agent but not command it: an agent commands only itself and the agents it started";
+                    match from_viewer(t.as_str()) {
+                        Ok(FromViewer::Under { id: cmd, .. }) => tx.send(ws::text(crate::harness::asked::nack(Some(&cmd), "refused", why))).await?,
+                        _ => tx.send(ws::text(json!({"t": "error", "error": why}).to_string())).await?,
+                    }
                 }
-                Some(Ok(Message::Text(t))) => match serde_json::from_str::<crate::harness::model::Command>(t.as_str()) {
-                    Ok(c) => {
-                        // A row of its own (the socket's request is a GET): which command, not what
-                        // it says.
-                        let kind = serde_json::to_value(&c).ok().and_then(|v| v.get("type").and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_default();
-                        hub.store.audit(who.clone(), "agent.command".into(), format!("{id}: {kind}")).await;
-                        match hub.harness.command(&hub, &id, c).await {
-                            crate::harness::registry::Sent::Ok => {}
-                            crate::harness::registry::Sent::NoSession => tx.send(ws::text(json!({"t": "error", "error": "this session is gone"}).to_string())).await?,
-                            crate::harness::registry::Sent::Unreachable => {
-                                tx.send(ws::text(json!({"t": "error", "error": "the session's machine is not connected"}).to_string())).await?;
+                // Sent now, in the order the viewer sent them; each answer comes later.
+                Some(Ok(Message::Text(t))) => match from_viewer(t.as_str()) {
+                    // Under its client's id (docs/wire.md, "The UI's sockets"): taken once however
+                    // often it comes, and answered on this socket once, `ack` or `nack`.
+                    Ok(FromViewer::Under { id: cmd, c }) => {
+                        use crate::harness::asked::{Taken, frame};
+                        let kind = hub.harness.kind_of(&hub, &id, &c);
+                        match hub.harness.asked.take(&id, &scope, &cmd, kind, Instant::now()) {
+                            (kind, Taken::New(rx)) => {
+                                audit_command(&hub, &who, &id, &c).await;
+                                hub.harness.send_asked(&hub, &id, &scope, &cmd, c).await;
+                                answers.push(answer_of(cmd, rx, kind));
                             }
+                            (kind, Taken::Waiting(rx)) => answers.push(answer_of(cmd, rx, kind)),
+                            (kind, Taken::Answered(sent)) => tx.send(ws::text(frame(&cmd, &sent, kind))).await?,
                         }
                     }
-                    Err(e) => tx.send(ws::text(json!({"t": "error", "error": format!("bad command: {e}")}).to_string())).await?,
+                    // As clients from before ids send them: refusals said as errors, nothing for
+                    // the rest.
+                    Ok(FromViewer::Bare(c)) => {
+                        audit_command(&hub, &who, &id, &c).await;
+                        let pending = hub.harness.dispatch(&hub, &id, c.clone()).await;
+                        let (h, session) = (Arc::clone(&hub), id.clone());
+                        answers.push(async move { refusal_frame(h.harness.resolve(&h, &session, c, pending).await) }.boxed());
+                    }
+                    Err((cmd, why)) => {
+                        // Told as clients from before ids are, too, when it came as theirs do.
+                        if cmd.is_none() {
+                            tx.send(ws::text(json!({"t": "error", "error": format!("bad command: {why}")}).to_string())).await?;
+                        }
+                        tx.send(ws::text(crate::harness::asked::unreadable(cmd.as_deref(), &why))).await?;
+                    }
                 },
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
                 _ => {}

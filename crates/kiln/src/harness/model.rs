@@ -1134,6 +1134,19 @@ pub struct State {
     /// something.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub kept: u32,
+    /// kiln's own messages its harness was handed lately (a goal stack's words, a parent's news),
+    /// each with a digest of the words it had then, the newest last: what the server judges its
+    /// words by, said in the same state as its queue (CP-T3.2, the fourteenth adversarial check's).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub given: Vec<Given>,
+}
+
+/// One of kiln's own messages its harness was handed (`State::given`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Given {
+    pub id: String,
+    /// `queued::stable` of the words it had then.
+    pub digest: String,
 }
 
 /// Where an agent goes on at a usage limit, when it does (`State::move_on_limit`), as a person
@@ -1467,10 +1480,20 @@ pub enum Command {
     /// The server's word on a hand-over to the machine's newer runner process (a local
     /// [`Command::MoveTo`]): taken over there (no `error`: this process lets go of the session),
     /// or not (it goes on here). Never a person's; only to runners announcing
-    /// `proto::CAP_HANDOVER`.
+    /// `proto::CAP_HANDOVER`. With an `error`: `by_newest`, the newer process itself said no;
+    /// `unsure`, the server can't say whether it took it (it went away once its whole package
+    /// went to it): it waits, and is asked again (CP-T3.2: `super::handing`).
     HandedOver {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unsure: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        by_newest: bool,
+        /// With an `error`: no newer process of the machine runs to take it, so the process takes
+        /// the try back unless one took it before, as on a refusal (CP-T3.2, `super::handing`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        none_newer: bool,
     },
     /// Set a control's value, or run an action (its argument, if any, in `value`).
     Control {

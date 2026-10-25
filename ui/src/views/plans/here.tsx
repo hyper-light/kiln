@@ -7,6 +7,7 @@
  */
 import * as React from "react";
 import { Link } from "@/lib/router";
+import { clientId } from "@/api/harness";
 import { planHref, plansApi, type Plan, type PlanItem, type PlanMode, type PlanRan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
@@ -15,6 +16,7 @@ import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
+import { Tries } from "@/lib/tries";
 import { sessionPlansRes } from "./data";
 import { PlanItemsEditor } from "./items";
 import "./plans.css";
@@ -53,6 +55,8 @@ function Here({ session }: { session: string }) {
   const [note, setNote] = React.useState<string | null>(null);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  /** The run asked and its key, until it's sent (CP-T3.2). */
+  const [tries] = React.useState(() => new Tries(clientId));
   const plans = res.data;
   const plan = plans.find((p) => p.id === picked) ?? plans[0];
 
@@ -87,7 +91,11 @@ function Here({ session }: { session: string }) {
     setError(null);
     setRan(null);
     try {
-      setRan(await plansApi.run(plan.id, { session }, steps(plan) ? mode : "message"));
+      const how = steps(plan) ? mode : "message";
+      // Asked again (its answer lost, or it failed), the same run under its key, never a second.
+      const key = tries.keyFor(JSON.stringify({ plan: plan.id, version: plan.version, session, mode: how }));
+      setRan(await plansApi.run(plan.id, { session }, how, {}, key));
+      tries.done();
     } catch (e) {
       setError(errorMessage(e));
     } finally {

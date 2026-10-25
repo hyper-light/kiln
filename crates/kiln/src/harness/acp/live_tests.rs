@@ -15,7 +15,7 @@ impl Drop for Running {
 
 fn open(spec: Spec, dir: &std::path::Path) -> anyhow::Result<Running> {
     let (tx, _rx) = async_channel::unbounded();
-    let files = Files { dir: dir.join("attachments"), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}) };
+    let files = Files { dir: dir.join("attachments"), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}), carried: Arc::new(|_: String| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_: String, _: bool| Box::pin(async { Ok(()) })), settle: Arc::new(|_: String, _: String, _: bool| Box::pin(async { Ok(None) })) };
     Ok(Running(session::start(crate::util::new_id(), spec, tx, Arc::new(|| {}), files)?))
 }
 

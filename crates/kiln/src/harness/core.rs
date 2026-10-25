@@ -91,6 +91,9 @@ pub enum Update {
     Stream { id: String, text: String },
     /// The answer to one client's request (file suggestions ...).
     Reply { client: String, value: serde_json::Value },
+    /// What became of a message sent to the session (CP-T3.2): its inbox took it (or had: the first
+    /// time's answer), or refused it. For its sender; nothing a viewer shows or a store keeps.
+    Inbox { said: Box<super::inbox::Said> },
     /// The timeline starts over (a snapshot follows). `from`: the number of the snapshot's first
     /// event. What came before it isn't in memory any more but is still the timeline's: a store
     /// keeps it, and drops only its events from there on that the snapshot doesn't bring again (a
@@ -557,12 +560,17 @@ impl Core {
         crate::util::now_ms()
     }
 
-    /// A message went to the agent: one kiln sent to keep it going counts toward `State::kept`;
-    /// anyone else's starts the count again.
-    pub fn note_sent(&mut self, client_id: &str) {
+    /// A message went to the agent, saying `text`: one kiln sent to keep it going counts toward
+    /// `State::kept`; anyone else's starts the count again. One of kiln's own is noted given
+    /// (`State::given`), with what it said then, in the state that shows it gone from the queue.
+    pub fn note_sent(&mut self, client_id: &str, text: &str) {
         let kept = if client_id.starts_with(KEEP_ID) { self.state.kept.saturating_add(1) } else { 0 };
         if kept != self.state.kept {
             self.state.kept = kept;
+            self.touch_state();
+        }
+        if super::queued::own(client_id) && !self.state.given.iter().any(|g| g.id == client_id) {
+            super::queued::note_given(&mut self.state.given, client_id, super::queued::stable(text));
             self.touch_state();
         }
     }
@@ -906,10 +914,23 @@ mod tests {
         Body::Assistant { text: text.into(), streaming: false }
     }
 
+    /// CP-T3.2 (the fourteenth adversarial check's): kiln's own message handed to the harness is
+    /// noted given (`State::given`) with what it said then, once, in the state its queue goes in;
+    /// another's message isn't.
+    #[test]
+    fn kiln_s_own_message_handed_is_noted_given_once() {
+        let mut core = Core::new();
+        core.note_sent("goal-1", "/goal tests pass");
+        core.note_sent("goal-1", "/goal tests pass, sent again");
+        core.note_sent("m-person", "hello");
+        let digest = crate::harness::queued::stable("/goal tests pass");
+        assert_eq!(core.state.given, vec![crate::harness::model::Given { id: "goal-1".into(), digest }]);
+    }
+
     #[test]
     fn a_turn_end_says_what_the_turn_did() {
         let mut core = Core::new();
-        core.note_sent("u1");
+        core.note_sent("u1", "");
         core.upsert("u1", None, Body::User { text: "go".into(), images: 0, client_id: Some("u1".into()), origin: Some("human".into()), attachments: Vec::new(), reply_to: None });
         core.upsert("a1", None, said("Running it."));
         core.upsert("t1", None, tool(ToolStatus::Done));
@@ -956,12 +977,12 @@ mod tests {
         let mut core = Core::new();
         assert_eq!(origin_of("kiln-keep-1"), "kiln");
         assert_eq!(origin_of("m1"), "human");
-        core.note_sent(&format!("{KEEP_ID}1"));
-        core.note_sent(&format!("{KEEP_ID}2"));
+        core.note_sent(&format!("{KEEP_ID}1"), "");
+        core.note_sent(&format!("{KEEP_ID}2"), "");
         assert_eq!(core.state.kept, 2);
         core.end_turn(None, "cut", Some("stop_sequence"));
         assert_eq!(core.state.last_turn.as_ref().map(|t| t.kept), Some(2));
-        core.note_sent("m2");
+        core.note_sent("m2", "");
         assert_eq!(core.state.kept, 0);
     }
 

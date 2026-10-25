@@ -376,7 +376,7 @@ clone_url = "http://127.0.0.1:{bb}/acme/bb.git"
     assert_eq!(st, 422, "a provider the repository can't have: {v}");
     // The same from the CLI (W23-R07): `kiln repo provider` says, and chooses.
     let cli = |args: &[&str]| -> anyhow::Result<String> {
-        let o = std::process::Command::new(env!("CARGO_BIN_EXE_kiln"))
+        let o = common::kiln()
             .args(args)
             .env("HOME", dir.path())
             .env("KILN_URL", format!("http://127.0.0.1:{port}"))

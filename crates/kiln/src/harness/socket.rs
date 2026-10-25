@@ -71,6 +71,9 @@ pub enum Request {
         text: String,
         #[serde(default)]
         mode: SendMode,
+        /// An idempotency key (CP-T3.2): sent again with it, it's the same message, delivered once.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     /// One of kiln's operations (`agents.start`, `agents.wait`, …), asked of the kiln server for
     /// whoever asks: an agent kiln runs here, else the person in kiln shell `terminal`.
@@ -165,13 +168,13 @@ pub async fn answer(host: &Host, req: Request, peer: Option<u32>, forward: Optio
             let sessions: Vec<Value> = a.pointer("/result/agents").and_then(Value::as_array).into_iter().flatten().map(|i| json!({"id": i.get("id"), "name": i.get("name"), "kind": i.get("kind")})).collect();
             json!({"ok": true, "sessions": sessions})
         }
-        Request::Send { id, text, mode } if agent.is_some() => {
+        Request::Send { id, text, mode, key } if agent.is_some() => {
             let mode = match mode {
                 SendMode::Queue => "queue",
                 SendMode::Steer => "steer",
                 SendMode::Now => "now",
             };
-            as_agent("agents.send", json!({"agent": id, "text": text, "mode": mode})).await
+            as_agent("agents.send", json!({"agent": id, "text": text, "mode": mode, "key": key})).await
         }
         Request::Stop { id: Some(id), .. } if agent.is_some() => as_agent("agents.stop", json!({"agent": id})).await,
         Request::Interrupt { id: Some(id), .. } if agent.is_some() => as_agent("agents.interrupt", json!({"agent": id})).await,
@@ -277,11 +280,13 @@ pub fn handle(host: &Host, req: Request) -> Value {
             let n = ids.iter().filter(|i| host.command(i, Command::Interrupt)).count();
             json!({"ok": true, "interrupted": n})
         }
-        Request::Send { id, text, mode } => {
+        Request::Send { id, text, mode, key } => {
             let ids = pick(&Some(id), &None);
             let Some(target) = ids.first() else { return json!({"ok": false, "error": "no such agent"}) };
-            let ok = host.command(target, Command::Send { id: crate::util::new_id(), text, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None });
-            json!({"ok": ok})
+            // With a key, the same message each time it's sent (CP-T3.2).
+            let message = key.as_deref().map_or_else(crate::util::new_id, |k| crate::util::derive_id(&["socket.send", target, k]));
+            let ok = host.command(target, Command::Send { id: message.clone(), text, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None });
+            json!({"ok": ok, "message": message})
         }
         Request::Op { .. } => json!({"ok": false, "error": "kiln's operations go to the kiln server"}),
     }

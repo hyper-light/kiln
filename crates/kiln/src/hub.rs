@@ -178,6 +178,11 @@ pub struct Pending {
 }
 
 impl Pending {
+    /// A parked command whose runner is away: it goes once the runner is back.
+    pub fn is_away(&self) -> bool {
+        self.away
+    }
+
     /// Its answer, when it has one already: none of its runner's processes could take it, or
     /// none can answer.
     pub fn at_once(&self) -> Option<&crate::wire::commands::Answer> {
@@ -227,6 +232,25 @@ impl Pending {
         crate::rt::spawn(async move {
             let _ = self.answer(within).await;
         });
+    }
+}
+
+/// Which of a runner process's command streams `msg` rides (docs/wire.md, "Commands"): live for
+/// a command refused while its runner is away, parked for one that waits for it. A `HarnessCmd`
+/// rides as the command it carries says. None: not a command.
+fn stream_of(msg: &ServerMsg) -> Option<crate::wire::commands::Kind> {
+    use crate::wire::commands::Kind as Stream;
+    use crate::wire::{Away, Class};
+    let class = match (crate::wire::server_class(msg), msg) {
+        (Class::Command(Away::AsItsCommand), ServerMsg::HarnessCmd { json, .. }) => {
+            serde_json::from_str::<crate::harness::model::Command>(json).map_or(Class::Command(Away::Park), |c| crate::wire::command_class(&c))
+        }
+        (c, _) => c,
+    };
+    match class {
+        Class::Command(Away::Refuse) => Some(Stream::Live),
+        Class::Command(Away::Park | Away::AsItsCommand) | Class::State => Some(Stream::Parked),
+        _ => None,
     }
 }
 
@@ -323,6 +347,9 @@ pub struct Hub {
     pub cmds: Mutex<crate::wire::commands::Commands>,
     /// The process each machine that's away last had: its parked commands wait for it there.
     away_peers: Mutex<HashMap<String, PeerId>>,
+    /// Commands queued where nothing could wait to send them ([`Hub::command_soon`]): the commands
+    /// loop sends them now rather than on its next tick.
+    commands_due: Notify,
     /// The AI coding sessions each connected machine last reported.
     pub ai_sessions: Mutex<HashMap<String, Vec<crate::aisessions::AiSession>>>,
     /// Transcript requests waiting for their machine's answer, by request number.
@@ -467,6 +494,7 @@ impl Hub {
             // never mistakes another's commands for these.
             cmds: Mutex::new(crate::wire::commands::Commands::new(rand::random::<u64>() >> 11)),
             away_peers: Mutex::new(HashMap::new()),
+            commands_due: Notify::new(),
             ai_sessions: Mutex::new(HashMap::new()),
             ai_requests: Mutex::new(HashMap::new()),
             ai_seq: AtomicU64::new(1),
@@ -995,33 +1023,66 @@ impl Hub {
     /// Sends `msg` to machine `agent` as a command, to the processes [`Hub::peers_for`] picks: its
     /// answer to come (a caller that mustn't wait for it, the scheduler say, takes it later).
     pub async fn command_start(&self, agent: &str, msg: &ServerMsg) -> Pending {
-        use crate::wire::{Away, Class};
+        let peers = self.command_targets(agent, msg);
+        self.command_peers(agent, peers, msg).await
+    }
+
+    /// [`Hub::command_start`] where nothing can wait (a sync path, under a lock): the command is
+    /// queued now, and the commands loop sends it at once. A runner from before the channel gets
+    /// it if its lane has room.
+    pub fn command_soon(&self, agent: &str, msg: &ServerMsg) -> Pending {
+        let peers = self.command_targets(agent, msg);
+        let pending = self.queue_command(agent, peers, msg, |p, body| self.net.try_send(p, LANE_CONTROL, Kind::Control, body));
+        self.commands_due.notify();
+        pending
+    }
+
+    /// The runner processes a command to machine `agent` goes to ([`Hub::peers_for`]): for a
+    /// parked one to a machine that's away, the process it last had, which comes back under the
+    /// same certificate.
+    fn command_targets(&self, agent: &str, msg: &ServerMsg) -> Vec<PeerId> {
         let mut peers = self.peers_for(agent, msg);
-        // A parked command to a machine that's away waits for the process it last had, which
-        // comes back under the same certificate.
-        if peers.is_empty() && matches!(crate::wire::server_class(msg), Class::Command(Away::Park) | Class::State) {
+        if peers.is_empty() && stream_of(msg) == Some(crate::wire::commands::Kind::Parked) {
             let last = self.away_peers.lock().get(agent).copied();
             peers.extend(last.filter(|p| self.cmds.lock().keeps(*p)));
         }
-        self.command_peers(agent, peers, msg).await
+        peers
     }
 
     /// Sends `msg` as a command to runner processes `peers` of machine `agent`. One that keeps the
     /// channel gets it on its command stream (parked or live, as the message's class says) and
     /// answers it once it applied it; one from before the channel gets it as it always did.
     pub async fn command_peers(&self, agent: &str, peers: Vec<PeerId>, msg: &ServerMsg) -> Pending {
+        // A runner from before the channel gets it as it always did, sent after the rest.
+        let mut legacy: Vec<(PeerId, Vec<u8>)> = Vec::new();
+        let mut pending = self.queue_command(agent, peers, msg, |p, body| {
+            legacy.push((p, body));
+            true
+        });
+        if !legacy.is_empty() {
+            let mut sent = false;
+            for (p, body) in legacy {
+                sent |= self.net.send(p, LANE_CONTROL, Kind::Control, body).await;
+            }
+            if !sent {
+                use crate::wire::commands::Answer;
+                pending.at_once = if pending.waits.is_empty() { Answer::Unreachable { why: format!("{agent} is not connected") } } else { Answer::Taken };
+            }
+        }
+        self.flush_commands().await;
+        pending
+    }
+
+    /// Queues command `msg` to runner processes `peers` of machine `agent`: on its command stream
+    /// for one that keeps the channel, else handed to `legacy` (which says whether it went).
+    fn queue_command(&self, agent: &str, peers: Vec<PeerId>, msg: &ServerMsg, mut legacy: impl FnMut(PeerId, Vec<u8>) -> bool) -> Pending {
         use crate::wire::commands::{Answer, Kind as Stream};
-        use crate::wire::{Away, Class};
         let what = crate::wire::server_name(msg);
         let at_once = |a: Answer| Pending { agent: agent.to_owned(), what, waits: Vec::new(), at_once: a, away: false };
         if peers.is_empty() {
             return at_once(Answer::Unreachable { why: format!("{agent} is not connected") });
         }
-        let stream = match crate::wire::server_class(msg) {
-            Class::Command(Away::Refuse) => Some(Stream::Live),
-            Class::Command(Away::Park | Away::AsItsCommand) | Class::State => Some(Stream::Parked),
-            _ => None,
-        };
+        let stream = stream_of(msg);
         let body = match proto::encode(msg) {
             Ok(b) => b,
             Err(e) => return at_once(Answer::Unreachable { why: format!("it couldn't be encoded: {e}") }),
@@ -1046,11 +1107,10 @@ impl Hub {
                 }
                 None => {
                     away = false;
-                    sent |= self.net.send(p, LANE_CONTROL, Kind::Control, body.clone()).await;
+                    sent |= legacy(p, body.clone());
                 }
             }
         }
-        self.flush_commands().await;
         let first = if sent {
             Answer::Sent
         } else if !waits.is_empty() {
@@ -1097,6 +1157,7 @@ impl Hub {
         loop {
             futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
+                () = self.commands_due.notified().fuse() => {}
                 () = tick.tick().fuse() => {}
             }
             // Runners that never said they keep the channel: from before it, what waited for them
@@ -1469,6 +1530,14 @@ impl Hub {
         if let Some(a) = self.agents.lock().get_mut(&agent) {
             a.last_seen = now;
         }
+        // A runner process that keeps the channel says so (its Caps) right after its Build, before
+        // anything else on its control lane. One that says its facts or its upgrade preference
+        // first is from before the channel: what waited for it goes its way now, however long the
+        // server took to hear it (docs/wire.md, "Commands").
+        if matches!(msg, AgentMsg::Facts { .. } | AgentMsg::UpdatePrefs { .. }) && self.cmds.lock().is_coming(peer) {
+            let waited = self.cmds.lock().not_wire(peer);
+            self.send_waited(peer, waited).await;
+        }
         match msg {
             AgentMsg::Hello(_) | AgentMsg::Instance(_) => {}
             AgentMsg::Heartbeat { .. } | AgentMsg::JobStarted { .. } => {}
@@ -1785,7 +1854,13 @@ impl Hub {
                     // doesn't count either way).
                     let lets_go = self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
                     let msg = if lets_go { ServerMsg::HarnessRelease { session } } else { ServerMsg::HarnessClose { session } };
-                    self.send_peer(peer, &msg).await;
+                    self.command_peers(&agent, vec![peer], &msg).await.log_when_answered(LOG_WITHIN);
+                }
+                // An inbox's answer counts wherever it came from (it's for the message sent there),
+                // and says nothing of where the session runs: whoever waits for it is told, and
+                // the session's messages still go where it runs.
+                Ok(u @ crate::harness::core::Update::Inbox { .. }) => {
+                    self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.clone()), &session, u, false);
                 }
                 // The rest of what a copy left behind says (its machine was told to let go of it):
                 // none of it counts, and it doesn't take the session's messages from where it runs.
@@ -1909,6 +1984,12 @@ impl Hub {
             return Ok(());
         }
         let now = crate::util::now_unix();
+        // It says in a moment whether it keeps the channel (its Caps follow its hello and Build):
+        // until then its commands wait for that (docs/wire.md, "Commands"), from before it can be
+        // sent any. A job pod never says.
+        if !h.ephemeral {
+            self.cmds.lock().coming(peer, Instant::now());
+        }
         // A machine may connect more than one runner process (a new one beside an old one that
         // keeps its terminals, see `crate::instances`). The same process on a new connection
         // replaces its stale one.
@@ -2069,11 +2150,6 @@ impl Hub {
             },
         )
         .await;
-        // It says in a moment whether it keeps the channel (its Caps follow its hello): until then
-        // its commands wait for that (docs/wire.md, "Commands"). A job pod never says.
-        if !live.ephemeral {
-            self.cmds.lock().coming(peer, Instant::now());
-        }
         tracing::info!(agent = %name, labels = ?live.labels, slots = live.slots, "agent connected");
         self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: name.clone(), running: h.running.clone() });
         // Older processes of this machine take no new jobs; what they run, they keep.
@@ -2875,6 +2951,59 @@ pub(crate) mod tests {
         let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
         Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
+    }
+
+    /// CP-T3.2: an inbox's answer from a runner that no longer holds the session (a copy left
+    /// behind there) counts for whoever waits for it, and leaves the session where it runs: its
+    /// machine and owner as they were, so its messages still go there.
+    #[test]
+    fn an_inbox_answer_from_another_machine_leaves_the_session_where_it_runs() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            hub.peers.lock().insert(1, "box-a".into());
+            hub.peers.lock().insert(2, "box-b".into());
+            let say = |u: &crate::harness::core::Update| serde_json::to_string(u).map(|json| AgentMsg::Harness { session: "s1".into(), json });
+            let spec = serde_json::json!({"kind": "claude", "cwd": "/w"}).to_string();
+            let open = crate::harness::host::refusal("s1", &spec, "").into_iter().find(|u| matches!(u, crate::harness::core::Update::Open { .. })).ok_or_else(|| anyhow::anyhow!("no announcement"))?;
+            hub.on_agent_msg(1, say(&open)?).await?;
+            anyhow::ensure!(hub.harness.runs_on("s1", "box-a"), "it runs on box-a");
+            let refused = crate::harness::inbox::Said { message: "m1".into(), answer: Err(crate::harness::inbox::Refusal::Moved { session: "s1".into(), epoch: 0 }) };
+            hub.on_agent_msg(2, say(&crate::harness::core::Update::Inbox { said: Box::new(refused) })?).await?;
+            assert!(hub.harness.runs_on("s1", "box-a"), "it still runs on box-a");
+            assert_eq!(hub.instances.lock().owner(&crate::instances::Owned::Agent("s1".into())), Some(1), "box-a's runner still holds it");
+            Ok(())
+        })
+    }
+
+    /// A runner process from before the channel is known by what it says, not by the clock: its
+    /// upgrade preference before any Caps sends what waited for it its way at once. One that keeps
+    /// the channel isn't taken for one from before it while the server is slow to hear its Caps.
+    #[test]
+    fn a_runner_from_before_the_channel_is_known_by_what_it_says_not_by_the_clock() -> anyhow::Result<()> {
+        use crate::wire::commands::{Answer, COMING_FOR, Kind};
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            hub.peers.lock().insert(1, "box-a".into());
+            hub.peers.lock().insert(2, "box-b".into());
+            let now = Instant::now();
+            for peer in [1, 2] {
+                hub.cmds.lock().coming(peer, now);
+            }
+            let mut old = hub.cmds.lock().push(1, Kind::Parked, b"close s1".to_vec(), now);
+            let mut new = hub.cmds.lock().push(2, Kind::Parked, b"close s2".to_vec(), now);
+            // Heard long after its hello, a runner that keeps the channel still has time to say so.
+            anyhow::ensure!(hub.cmds.lock().overdue(now + Duration::from_secs(10)).is_empty(), "taken for old on the clock");
+            // box-a says its upgrade preference before any Caps: from before the channel.
+            hub.on_agent_msg(1, AgentMsg::UpdatePrefs { accept: true }).await?;
+            anyhow::ensure!(!hub.cmds.lock().is_coming(1), "still waiting for box-a's Caps");
+            anyhow::ensure!(matches!(old.try_recv(), Ok(Some(Answer::Sent | Answer::Unreachable { .. }))), "what waited for box-a didn't go its way");
+            // box-b says its Caps: what waited for it goes on the channel.
+            hub.on_agent_msg(2, AgentMsg::Caps { caps: proto::CAP_WIRE }).await?;
+            anyhow::ensure!(!hub.cmds.lock().is_coming(2) && hub.cmds.lock().keeps(2), "box-b doesn't keep the channel");
+            anyhow::ensure!(matches!(new.try_recv(), Ok(None)), "box-b's command was answered before it went");
+            anyhow::ensure!(hub.cmds.lock().overdue(now + COMING_FOR).is_empty(), "box-b was taken for old after all");
+            Ok(())
+        })
     }
 
     #[test]

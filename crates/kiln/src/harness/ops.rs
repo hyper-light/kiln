@@ -128,14 +128,70 @@ async fn send(cx: Cx, v: Value) -> Out {
             return Err((StatusCode::FORBIDDEN, format!("an agent steers into a turn and sends now only to the agents it started (and theirs), and {} isn't one of them: send it a queued message instead", lineage::short(&id))));
         }
     };
-    // From an agent, its id says who sent it: the receiver's agents_wait hands it over.
-    let message = cx.caller.agent.as_deref().map_or_else(crate::util::new_id, super::queued::from_agent);
+    // With a key the message's id is made from it (and from who sends it, and to whom): a retry
+    // with the same key is the same message, which its agent's inbox takes once (CP-T3.2). From an
+    // agent, its id says who sent it too: the receiver's agents_wait hands it over.
+    let made = match key_of(&v)? {
+        Some(key) => keyed_id(&cx, "agents.send", &id, &key),
+        None => crate::util::new_id(),
+    };
+    let message = match cx.caller.agent.as_deref() {
+        Some(sender) => super::queued::from_agent_as(sender, &made),
+        None => made,
+    };
     wait::sent(&id, info.last_turn.as_ref().map(|t| t.at));
-    match cx.hub.harness.command(&cx.hub, &id, Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None}).await {
-        Sent::Ok => Ok(json!({"sent": true, "message": message})),
+    match cx.hub.harness.command(&cx.hub, &id, Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None }).await {
+        Sent::Ok | Sent::Taken => Ok(json!({"sent": true, "message": message})),
+        // Its machine is away: it goes once that's back, once.
+        Sent::Parked => Ok(json!({"sent": true, "parked": true, "message": message})),
+        Sent::Accepted(a) => Ok(super::registry::accepted(&message, &a)),
+        Sent::Refused(r) => Err(refused(&r)),
+        s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => Err(s.failure().unwrap_or((StatusCode::CONFLICT, "its runner refused it".to_owned()))),
         Sent::NoSession => Err((StatusCode::NOT_FOUND, format!("no agent {id}"))),
         Sent::Unreachable => Err((StatusCode::BAD_GATEWAY, format!("{}'s machine isn't connected right now: try again once it's back", info.name))),
     }
+}
+
+/// Longest idempotency key.
+pub const KEY_MAX: usize = 256;
+
+/// A send's idempotency key (`key`; over HTTP the `Idempotency-Key` header too), when it has one.
+pub fn key_of(v: &Value) -> Result<Option<String>, Fail> {
+    let Some(k) = v.get("key").and_then(Value::as_str).map(str::trim).filter(|k| !k.is_empty()) else { return Ok(None) };
+    if k.len() > KEY_MAX || k.chars().any(char::is_control) {
+        return Err((StatusCode::BAD_REQUEST, format!("`key` is 1 to {KEY_MAX} bytes with no control characters")));
+    }
+    Ok(Some(k.to_owned()))
+}
+
+/// The id of the message `what` sends `agent` under `key`, for `cx`'s caller: the same on every
+/// retry, and its own for each caller (another's key can't name its message).
+pub fn keyed_id(cx: &Cx, what: &str, agent: &str, key: &str) -> String {
+    crate::util::derive_id(&[what, &key_scope(&cx.caller), agent, key])
+}
+
+/// Whose an idempotency key is (CP-T3.2): an agent's by its id, as its name says the machine it's
+/// on, which changes as it moves (a retry after a move is the same request); a person's by theirs;
+/// else the caller's name.
+pub fn key_scope(caller: &crate::authz::Caller) -> String {
+    match (&caller.agent, &caller.user) {
+        (Some(agent), _) => format!("agent:{agent}"),
+        (None, Some(user)) => format!("user:{user}"),
+        (None, None) => caller.name.clone(),
+    }
+}
+
+/// What a session's inbox refusing a message is, answered.
+pub fn refused(r: &super::inbox::Refusal) -> Fail {
+    use super::inbox::Refusal as R;
+    let status = match r {
+        R::StaleEpoch { .. } | R::Behind { .. } | R::Moved { .. } | R::Reused { .. } => StatusCode::CONFLICT,
+        R::Invalid { .. } => StatusCode::BAD_REQUEST,
+        R::Full { .. } => StatusCode::TOO_MANY_REQUESTS,
+        R::NoSession { .. } => StatusCode::NOT_FOUND,
+        R::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, r.to_string())
 }
 
 /// A message from another agent that works for the same person, as its receiver reads it.
@@ -163,6 +219,13 @@ fn body_of(text: &str) -> &str {
     text.split_once("\n\n").filter(|(said, _)| said.starts_with("Agent ") && said.ends_with(ANSWER_END)).map_or(text, |(_, body)| body)
 }
 
+/// The words of a message from another agent ([`body_of`]), for its inbox: what kiln says first
+/// changes as its sender does (renamed, or moved to another machine), and a retry under its key is
+/// the same message. Any other message as it is.
+pub fn peer_words(text: &str) -> &str {
+    body_of(text)
+}
+
 /// The messages other agents sent the agent that waits, waiting behind the turn its wait began in
 /// (`wait::mail`), handed over: each taken for this wait alone and out of its queue (one that can't
 /// be stays, for after its turn), with who sent it and its words.
@@ -174,7 +237,7 @@ async fn hand_over(hub: &crate::hub::Hub, me: &wait::Waiter) -> Vec<Value> {
     }
     for q in hub.harness.queue(&me.id).into_iter().filter(|q| mail.contains(&q.id)) {
         let Some(from) = super::queued::sender_of(&q.id).map(str::to_owned) else { continue };
-        if !wait::claim(&q.id) || !matches!(hub.harness.command(hub, &me.id, Command::QueueRemove { id: q.id.clone() }).await, Sent::Ok) {
+        if !wait::claim(&q.id) || !hub.harness.command(hub, &me.id, Command::QueueRemove { id: q.id.clone() }).await.went() {
             continue;
         }
         let name = hub.harness.info(&from).map(|i| i.name);
@@ -361,7 +424,9 @@ async fn interrupt(cx: Cx, v: Value) -> Out {
     let id = info.id.clone();
     may_steer(&cx, &id).await?;
     match cx.hub.harness.command(&cx.hub, &id, Command::Interrupt).await {
-        Sent::Ok => Ok(json!({"interrupted": true})),
+        Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => Ok(json!({"interrupted": true})),
+        Sent::Refused(r) => Err(refused(&r)),
+        s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => Err(s.failure().unwrap_or((StatusCode::CONFLICT, "its runner refused it".to_owned()))),
         Sent::NoSession => Err((StatusCode::NOT_FOUND, format!("no agent {id}"))),
         Sent::Unreachable => Err((StatusCode::BAD_GATEWAY, format!("{}'s machine isn't connected right now", info.name))),
     }
@@ -472,10 +537,20 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.send",
-            summary: "Send an agent a message. To an agent you started (and theirs): `queue` (after its turn, the default), `steer` (into the turn under way) or `now` (stopping it). To any other agent that works for the same person: `queue` only, and it's told the message is from you and how to answer you.",
+            summary: "Send an agent a message. To an agent you started (and theirs): `queue` (after its turn, the default), `steer` (into the turn under way) or `now` (stopping it). To any other agent that works for the same person: `queue` only, and it's told the message is from you and how to answer you. Give a `key` to send it safely again: a call with the same key is the same message, which the agent gets once, and every such call is answered as the first was.",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}, "text": {"type": "string"}, "mode": {"type": "string", "enum": ["queue", "steer", "now"]}}), &["agent", "text"]),
+            input: || {
+                schema(
+                    json!({
+                        "agent": {"type": "string", "description": AGENT},
+                        "text": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["queue", "steer", "now"]},
+                        "key": {"type": "string", "description": "An idempotency key of yours, made once for this message (1 to 256 bytes): sent again with it (its answer lost), the message is the same one, delivered once. Without it, each call is another message: pass it whenever you may send it again."}
+                    }),
+                    &["agent", "text"],
+                )
+            },
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "send"]))),
             run: |cx, v| Box::pin(send(cx, v)),
         },
@@ -621,6 +696,22 @@ mod tests {
         assert!(ids_of(&json!({})).is_err());
         assert_eq!(number(&json!({"timeout_s": "12"}), "timeout_s"), Some(12.0));
         assert!(flag(&json!({"any": "true"}), "any") && flag(&json!({"any": true}), "any") && !flag(&json!({}), "any"));
+    }
+
+    /// CP-T3.2: a key is its caller's: an agent's by its id, the same on whichever machine it runs
+    /// (its name says the machine); a person's by theirs, whatever they're called.
+    #[test]
+    fn a_key_is_whose_it_is_wherever_they_call_from() {
+        let caller = |name: &str, agent: Option<&str>, user: Option<&str>| {
+            let mut c = crate::authz::Caller::owner();
+            name.clone_into(&mut c.name);
+            c.agent = agent.map(str::to_owned);
+            c.user = user.map(str::to_owned);
+            c
+        };
+        assert_eq!(key_scope(&caller("agent:01a1@box-a for admin", Some("01a1"), None)), key_scope(&caller("agent:01a1@box-b for admin", Some("01a1"), None)));
+        assert_eq!(key_scope(&caller("ada", None, Some("u1"))), key_scope(&caller("Ada L", None, Some("u1"))));
+        assert_ne!(key_scope(&caller("x", Some("01a1"), None)), key_scope(&caller("x", None, Some("01a1"))), "an agent's key isn't a person's");
     }
 }
 
@@ -768,6 +859,209 @@ mod end_to_end {
             let person = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let sent = call(person, "agents.send", json!({"agent": b, "text": "go on", "mode": "steer"})).await;
             anyhow::ensure!(!matches!(sent, Err((http::StatusCode::FORBIDDEN, _))), "a person steering: {sent:?}");
+            Ok(())
+        })
+    }
+
+    /// An agent kiln runs on the server whose harness keeps every line it's sent, in `heard`.
+    #[cfg(unix)]
+    async fn recording(hub: &Arc<Hub>, dir: &std::path::Path) -> anyhow::Result<(String, std::path::PathBuf)> {
+        use std::os::unix::fs::PermissionsExt;
+        let heard = dir.join("heard.jsonl");
+        let program = dir.join("recording-claude");
+        std::fs::write(&program, format!("#!/bin/sh\nexec cat >> '{}'\n", heard.display()))?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+        let spec = Spec { kind: "claude".into(), cwd: Some(dir.to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+        let id = hub.harness.open(hub, "local", spec, 1).await?.first().map(|i| i.id.clone()).ok_or_else(|| anyhow::anyhow!("no agent"))?;
+        // Its harness running, its adapter started.
+        for _ in 0..500 {
+            if hub.harness.local.get(&id).is_some_and(|s| s.pid.lock().is_some() && !s.core.lock().meta.features.is_empty()) {
+                return Ok((id, heard));
+            }
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        anyhow::bail!("the recording harness never started")
+    }
+
+    /// The prompts a recording harness was sent, by their message ids.
+    #[cfg(unix)]
+    fn prompts(heard: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(heard)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v.get("type") == Some(&json!("user")))
+            .filter_map(|v| v.get("uuid").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    /// CP-T3.2, T-T3.2.1: `agents_send` called twice with one key: one prompt reaches the harness,
+    /// and both calls get its answer (the second marked a repeat). Without a key, two calls are two
+    /// messages.
+    #[cfg(unix)]
+    #[test]
+    fn agents_send_twice_with_one_key_is_one_prompt_and_both_get_its_answer() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let dir = tempfile::tempdir()?;
+            let (id, heard) = recording(&hub, dir.path()).await?;
+            let person = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let send = |key: Option<&str>| {
+                let mut input = json!({"agent": id, "text": "deploy the fix"});
+                if let (Some(k), Some(o)) = (key, input.as_object_mut()) {
+                    o.insert("key".into(), json!(k));
+                }
+                call(person.clone(), "agents.send", input)
+            };
+            let first = send(Some("deploy-1")).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let again = send(Some("deploy-1")).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let message = first.get("message").and_then(Value::as_str).unwrap_or_default().to_owned();
+            anyhow::ensure!(!message.is_empty() && again.get("message") == first.get("message"), "the same message: {first} {again}");
+            // The same answer, the first time's, the second marked a repeat.
+            let answer = |v: &Value, k: &str| v.pointer(&format!("/accepted/{k}")).cloned();
+            for k in ["seq", "at", "epoch", "session", "message"] {
+                anyhow::ensure!(answer(&first, k).is_some() && answer(&first, k) == answer(&again, k), "{k}: {first} {again}");
+            }
+            anyhow::ensure!(answer(&first, "repeat").is_none() && answer(&again, "repeat") == Some(json!(true)), "{first} {again}");
+            // One prompt reached the harness, and no second copy waits behind it.
+            for _ in 0..500 {
+                if !prompts(&heard).is_empty() {
+                    break;
+                }
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
+            anyhow::ensure!(prompts(&heard) == [message.clone()], "the harness was sent {:?}", prompts(&heard));
+            let queued: Vec<String> = hub.harness.local.get(&id).map(|s| s.core.lock().state.queue.iter().map(|q| q.id.clone()).collect()).unwrap_or_default();
+            anyhow::ensure!(!queued.contains(&message), "a copy waits in its queue: {queued:?}");
+            // Without a key, each call is a message of its own.
+            let a = send(None).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let b = send(None).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(a.get("message") != b.get("message") && b.pointer("/accepted/repeat").is_none(), "{a} {b}");
+            // A key reused for other words is refused, saying so.
+            let refused = call(person.clone(), "agents.send", json!({"agent": id, "text": "something else", "key": "deploy-1"})).await;
+            anyhow::ensure!(matches!(&refused, Err((http::StatusCode::CONFLICT, why)) if why.contains("already used")), "{refused:?}");
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2, AC-T3.2.1: an agent's agents_send under a key, retried under it after the agent
+    /// moved to another machine (its calls come through that machine's runner now, under another
+    /// name), is the same message: answered as a repeat, never a second prompt.
+    #[test]
+    fn a_keyed_send_retried_after_its_sender_moved_is_the_same_message() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let to = parent(&hub, "default", true).await?;
+            let from = parent(&hub, "default", true).await?;
+            let before = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &from, Some("box-a")).await.map_err(anyhow::Error::msg)? };
+            let after = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &from, Some("box-b")).await.map_err(anyhow::Error::msg)? };
+            let input = json!({"agent": to, "text": "deploy the fix", "key": "deploy-1"});
+            let first = call(before, "agents.send", input.clone()).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let again = call(after, "agents.send", input).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
+            let taken = inbox.taken(&to, 100).await?;
+            anyhow::ensure!(
+                again.get("message") == first.get("message") && again.pointer("/accepted/repeat") == Some(&json!(true)) && taken.len() == 1,
+                "a retry under its key after its sender moved was another message: {first} then {again}; its agent's inbox took {taken:?}"
+            );
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2, AC-T3.2.1: an agent's plans.run under a key (its steps, on itself), asked for again
+    /// under the key after the agent moved to another machine, is the same run: its messages reach
+    /// it once.
+    #[test]
+    fn a_keyed_plan_run_retried_after_its_agent_moved_is_the_same_run() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let me = parent(&hub, "default", true).await?;
+            let p = crate::plans::create(&hub, crate::plans::New { title: "Tidy".into(), body: "- one\n- two\n".into(), ..Default::default() }, "admin").await?;
+            let before = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &me, Some("box-a")).await.map_err(anyhow::Error::msg)? };
+            let after = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &me, Some("box-b")).await.map_err(anyhow::Error::msg)? };
+            let input = json!({"id": p.id, "mode": "steps", "key": "tidy-1"});
+            let first = call(before, "plans.run", input.clone()).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let again = call(after, "plans.run", input).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
+            let taken = inbox.taken(&me, 100).await?;
+            anyhow::ensure!(again.get("run") == first.get("run") && taken.len() == 2, "asked again under its key after its agent moved: {first} then {again}; its inbox took {} messages: {taken:?}", taken.len());
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2 (the bar: typed refusals, never silent drops): a key is one request. plans.run asked
+    /// again under its key for other steps, or in another mode, is refused 409, saying so, and
+    /// sends nothing; so is a run of one agent per step asked again under its key for other steps.
+    #[test]
+    fn a_key_given_to_another_plan_run_is_refused() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let me = parent(&hub, "default", true).await?;
+            let p = crate::plans::create(&hub, crate::plans::New { title: "Tidy".into(), body: "- one\n- two\n".into(), ..Default::default() }, "admin").await?;
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let first = call(person.clone(), "plans.run", json!({"id": p.id, "session": me, "mode": "steps", "only": [1], "key": "k"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
+            for other in [json!({"id": p.id, "session": me, "mode": "steps", "only": [2], "key": "k"}), json!({"id": p.id, "session": me, "mode": "message", "only": [1], "key": "k"})] {
+                let refused = call(person.clone(), "plans.run", other.clone()).await;
+                anyhow::ensure!(matches!(&refused, Err((c, m)) if c.as_u16() == 409 && m.contains("another request")), "{other} after {first}: {refused:?}");
+            }
+            let taken = inbox.taken(&me, 100).await?;
+            anyhow::ensure!(taken.len() == 1, "only step 1's message went: {taken:?}");
+            // The same request again is the same run, answered as it was.
+            let again = call(person.clone(), "plans.run", json!({"id": p.id, "session": me, "mode": "steps", "only": [1], "key": "k"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(again == first, "{first} then {again}");
+            // One agent per step: the same key, other steps.
+            let cwd = tempfile::tempdir()?;
+            let new = json!({"on": "local", "kind": "claude", "cwd": cwd.path().to_string_lossy()});
+            call(person.clone(), "plans.run", json!({"id": p.id, "new": new, "mode": "agents", "only": [1], "key": "a"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let refused = call(person, "plans.run", json!({"id": p.id, "new": new, "mode": "agents", "only": [2], "key": "a"})).await;
+            anyhow::ensure!(matches!(&refused, Err((c, m)) if c.as_u16() == 409 && m.contains("another request")), "{refused:?}");
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2 (the fourth adversarial check's): a key is one request whatever its mode: a key
+    /// given to a run of one agent per step is refused (409) for the same plan run as steps on an
+    /// agent, and one given to a run as steps is refused for one agent per step.
+    #[test]
+    fn a_key_given_to_a_plan_run_in_one_mode_is_refused_in_another() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let me = parent(&hub, "default", true).await?;
+            let p = crate::plans::create(&hub, crate::plans::New { title: "Tidy".into(), body: "- one\n- two\n".into(), ..Default::default() }, "admin").await?;
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let cwd = tempfile::tempdir()?;
+            let new = json!({"on": "local", "kind": "claude", "cwd": cwd.path().to_string_lossy()});
+            call(person.clone(), "plans.run", json!({"id": p.id, "new": new, "mode": "agents", "key": "k"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let other = call(person.clone(), "plans.run", json!({"id": p.id, "session": me, "mode": "steps", "key": "k"})).await;
+            anyhow::ensure!(matches!(&other, Err((c, m)) if c.as_u16() == 409 && m.contains("another request")), "the same key in another mode ran: {other:?}");
+            call(person.clone(), "plans.run", json!({"id": p.id, "session": me, "mode": "steps", "key": "j"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let other = call(person, "plans.run", json!({"id": p.id, "new": new, "mode": "agents", "key": "j"})).await;
+            anyhow::ensure!(matches!(&other, Err((c, m)) if c.as_u16() == 409 && m.contains("another request")), "the same key in another mode ran: {other:?}");
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2, AC-T3.2.4: a message the server sends for an epoch its agent has left is refused
+    /// by the agent's inbox, naming the epoch it's at; the server learns it, sends it again for that
+    /// epoch, once, and it's taken. Sent again after, it's a repeat.
+    #[test]
+    fn a_message_for_an_epoch_its_agent_left_goes_again_for_the_one_it_is_at() -> anyhow::Result<()> {
+        use crate::harness::registry::Sent;
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let id = parent(&hub, "default", true).await?;
+            let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("the server's sessions have no inboxes"))?;
+            // Its inbox has gone on to epoch 3 (as a session that moved back here would have it);
+            // the server last heard 0.
+            inbox.open(&id, 3).await?;
+            anyhow::ensure!(hub.harness.epoch_of(&id) == 0);
+            let send = || crate::harness::model::Command::Send { id: "m1".into(), text: "hello".into(), mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+            let sent = hub.harness.command(&hub, &id, send()).await;
+            anyhow::ensure!(matches!(&sent, Sent::Accepted(a) if a.epoch == 3 && !a.repeat), "{sent:?}");
+            anyhow::ensure!(hub.harness.epoch_of(&id) == 3, "the server knows the epoch it's at now");
+            let again = hub.harness.command(&hub, &id, send()).await;
+            anyhow::ensure!(matches!(&again, Sent::Accepted(a) if a.epoch == 3 && a.repeat), "{again:?}");
             Ok(())
         })
     }
@@ -955,6 +1249,25 @@ mod end_to_end {
             anyhow::ensure!(two.as_ref().is_err_and(|(_, m)| m.contains("its settings")), "{two:?}");
             Ok(())
         })
+    }
+
+    /// CP-T3.2: a message from another agent is its words, for its inbox: renamed or moved between a
+    /// send and its retry under the same key, its sender's message is the same one (a repeat, not
+    /// another message under its id).
+    #[test]
+    fn a_fellow_agents_message_is_its_words_whatever_kiln_says_of_its_sender() {
+        let me = "01a1488745a977f58e4224bc796f3308";
+        let on = |name: &str, machine: &str| crate::harness::session::Info { name: name.into(), kind: "claude".into(), target: format!("agent:{machine}"), ..Default::default() };
+        let first = super::peer_text(Some(&on("Mantle", "adacachy")), me, "Which commit?\n\nThe one with the API.");
+        let again = super::peer_text(Some(&on("Mantle T10", "fedora")), me, "Which commit?\n\nThe one with the API.");
+        assert_ne!(first, again);
+        assert_eq!(super::peer_words(&first), "Which commit?\n\nThe one with the API.");
+        assert_eq!(super::peer_words(&first), super::peer_words(&again));
+        assert_eq!(super::peer_words(&super::peer_text(None, me, "hi")), "hi");
+        // A person's message is as it is, whatever it says.
+        for text in ["Agent Smith is here.\n\nHello", "hello", "Agent \n\n"] {
+            assert_eq!(super::peer_words(text), text);
+        }
     }
 
     #[test]

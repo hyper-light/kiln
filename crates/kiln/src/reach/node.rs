@@ -81,6 +81,44 @@ impl std::fmt::Debug for Adoption {
 
 /// The most a hand-over may carry.
 pub const ADOPT_MAX: usize = 512 << 20;
+
+/// What begins a runner's refusal of a hand-over it looked at and didn't take (`Host::adopt`, and
+/// this node's own refusals of one it never had all of): the session isn't there. Any other refusal
+/// (from a runner from before it) can't say so after a try whose answer was lost.
+pub const NOT_TAKEN: &str = "not taken: ";
+/// A hand-over a runner had all of, dropped before it said how taking it over went (it stopped).
+pub const DROPPED: &str = "it was dropped before it was taken over";
+
+/// How handing a session to another runner went, short of its taking it over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotAdopted {
+    /// It isn't there: refused, or not all of it went.
+    Refused(String),
+    /// All of it went and no answer came (the link closed, or the runner took too long): it may run
+    /// there now.
+    Unknown(String),
+}
+
+impl std::fmt::Display for NotAdopted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) => f.write_str(why),
+            Self::Unknown(why) => write!(f, "no answer came, and it may run there now: {why}"),
+        }
+    }
+}
+
+/// How one try at a hand-over fell short.
+enum Missed {
+    /// The link closed before all of it went (tried again).
+    Interrupted(String),
+    /// It couldn't be sent: no link, or the runner stopped taking it on the way.
+    Failed(String),
+    /// All of it went, and no answer came.
+    Unanswered(String),
+    /// The runner said why it can't take it.
+    Refused(String),
+}
 /// Bytes of a hand-over per message.
 const ADOPT_PIECE: usize = 1 << 20;
 
@@ -233,29 +271,48 @@ impl Handle {
     }
 
     /// Hand `data` to `peer` to take over (an agent session moving there), and wait until it has,
-    /// or says why it can't. A link that drops on the way starts it over (a few times).
-    pub async fn adopt(&self, peer: &str, data: &[u8]) -> Result<(), String> {
+    /// or says why it can't. A link that drops on the way starts it over (a few times), and so does
+    /// one that went all the way without an answer: told then that the session runs there already,
+    /// the try before took it over. `again`: a hand-over of it went all the way without an answer
+    /// before this one (so told it runs there already, it was taken over). Never an answer, it's
+    /// [`NotAdopted::Unknown`]: it may run there.
+    pub async fn adopt(&self, peer: &str, data: &[u8], again: bool) -> Result<(), NotAdopted> {
         if data.len() > ADOPT_MAX {
-            return Err(format!("{} MB is more than a hand-over carries", data.len() >> 20));
+            return Err(NotAdopted::Refused(format!("{} MB is more than a hand-over carries", data.len() >> 20)));
         }
-        let mut last_err = String::new();
+        let (mut last, mut maybe) = (String::new(), again);
+        // Short of an answer, what's known: it's there, or it may be.
+        let short = |maybe: bool, why: String| if maybe { NotAdopted::Unknown(why) } else { NotAdopted::Refused(why) };
         for attempt in 0..3u64 {
             if attempt > 0 {
                 crate::rt::sleep(Duration::from_millis(500 * attempt)).await;
             }
             match self.adopt_once(peer, data).await {
                 Ok(()) => return Ok(()),
-                Err(e) if e.starts_with("interrupted") => last_err = e,
-                Err(e) => return Err(e),
+                // It looked, and it isn't there (it answers a hand-over it took before as taken,
+                // whatever became of the session since).
+                Err(Missed::Refused(why)) if why.starts_with(NOT_TAKEN) => return Err(NotAdopted::Refused(why.strip_prefix(NOT_TAKEN).unwrap_or(&why).to_owned())),
+                // A runner from before NOT_TAKEN, after a try whose answer was lost: it runs the
+                // session, so that try took it over; refused for anything else, it may have too
+                // (since gone on, or ended there).
+                Err(Missed::Refused(why)) if maybe && why == crate::harness::host::RUNS_HERE => return Ok(()),
+                Err(Missed::Refused(why)) if maybe => return Err(NotAdopted::Unknown(why)),
+                Err(Missed::Refused(why)) => return Err(NotAdopted::Refused(why)),
+                Err(Missed::Unanswered(why)) => {
+                    maybe = true;
+                    last = why;
+                }
+                Err(Missed::Interrupted(why)) => last = why,
+                Err(Missed::Failed(why)) => return Err(short(maybe, why)),
             }
         }
-        Err(last_err)
+        Err(short(maybe, last))
     }
 
-    async fn adopt_once(&self, peer: &str, data: &[u8]) -> Result<(), String> {
-        self.connect(peer).await.map_err(|e| format!("{e:#}"))?;
+    async fn adopt_once(&self, peer: &str, data: &[u8]) -> Result<(), Missed> {
+        self.connect(peer).await.map_err(|e| Missed::Failed(format!("{e:#}")))?;
         let (tx, rx) = async_channel::unbounded::<Say>();
-        let id = self.ask(|reply| Local::AdoptFollow { peer: peer.to_owned(), says: tx, reply }).await.map_err(|e| format!("{e:#}"))?;
+        let id = self.ask(|reply| Local::AdoptFollow { peer: peer.to_owned(), says: tx, reply }).await.map_err(|e| Missed::Failed(format!("{e:#}")))?;
         let wait = |d: Duration| {
             let rx = rx.clone();
             async move {
@@ -274,18 +331,23 @@ impl Handle {
             self.send(peer, Ask::Adopt { id, offset: sent, data: piece.to_vec(), last }).await;
             sent += piece.len() as u64;
             while !last && sent.saturating_sub(got) > wire::WINDOW {
-                match wait(Duration::from_secs(60)).await? {
+                let said = wait(Duration::from_secs(60)).await.map_err(|e| if e.starts_with("interrupted") { Missed::Interrupted(e) } else { Missed::Failed(e) })?;
+                match said {
                     Say::AdoptGot { bytes, .. } => got = bytes,
-                    Say::Adopted { error, .. } => return Err(error.unwrap_or_else(|| "taken over before it all arrived".into())),
+                    // The link lost on the way (said as it's lost, `interrupted: ...`).
+                    Say::Adopted { error: Some(e), .. } if e.starts_with("interrupted") => return Err(Missed::Interrupted(e)),
+                    Say::Adopted { error, .. } => return Err(Missed::Refused(error.unwrap_or_else(|| "taken over before it all arrived".into()))),
                     _ => {}
                 }
             }
         }
-        // Taking it over starts the session over there: give it time.
+        // All of it went. Taking it over starts the session over there: give it time.
         loop {
-            match wait(Duration::from_secs(180)).await? {
+            match wait(Duration::from_secs(180)).await.map_err(Missed::Unanswered)? {
                 Say::Adopted { error: None, .. } => return Ok(()),
-                Say::Adopted { error: Some(e), .. } => return Err(e),
+                // The link lost before the answer came, or the runner stopped before it said.
+                Say::Adopted { error: Some(e), .. } if e.starts_with("interrupted") || e == DROPPED => return Err(Missed::Unanswered(e)),
+                Say::Adopted { error: Some(e), .. } => return Err(Missed::Refused(e)),
                 _ => {}
             }
         }
@@ -890,8 +952,9 @@ impl Node {
             for (key, s) in p.syncs.drain() {
                 let _ = s.send(SyncSay::Failed { key, error: why.to_owned() }).await;
             }
+            // Said as a link lost: nothing there said no.
             for (id, s) in p.adopts.drain() {
-                let _ = s.send(Say::Adopted { id, error: Some(why.to_owned()) }).await;
+                let _ = s.send(Say::Adopted { id, error: Some(format!("interrupted: {why}")) }).await;
             }
         }
     }
@@ -1280,9 +1343,9 @@ impl Node {
             s.adopting.insert(id, Vec::new());
         }
         let refusal = match s.adopting.get_mut(&id) {
-            None => Some("a hand-over that never began".to_owned()),
-            Some(buf) if buf.len() as u64 != offset => Some(format!("a piece at {offset} where {} was due", buf.len())),
-            Some(buf) if buf.len() + data.len() > ADOPT_MAX => Some("more than a hand-over carries".to_owned()),
+            None => Some(format!("{NOT_TAKEN}a hand-over that never began")),
+            Some(buf) if buf.len() as u64 != offset => Some(format!("{NOT_TAKEN}a piece at {offset} where {} was due", buf.len())),
+            Some(buf) if buf.len() + data.len() > ADOPT_MAX => Some(format!("{NOT_TAKEN}more than a hand-over carries")),
             Some(buf) => {
                 let before = buf.len() >> 20;
                 buf.extend_from_slice(&data);
@@ -1305,7 +1368,7 @@ impl Node {
         }
         let Some(data) = self.served.get_mut(key).and_then(|s| s.adopting.remove(&id)) else { return };
         let Some(adopt) = self.cfg.adopt.clone() else {
-            self.say_on(&link, &Say::Adopted { id, error: Some(format!("{} doesn't take over agent sessions", self.cfg.name)) }).await;
+            self.say_on(&link, &Say::Adopted { id, error: Some(format!("{NOT_TAKEN}{} doesn't take over agent sessions", self.cfg.name)) }).await;
             return;
         };
         // Taking it over may take a while (a harness starting): off this task.
@@ -1314,12 +1377,12 @@ impl Node {
         let from = key.0.clone();
         crate::rt::spawn(async move {
             let error = if adopt.send(Adoption { from, data, reply }).await.is_err() {
-                Some("nothing here takes it over".to_owned())
+                Some(format!("{NOT_TAKEN}nothing here takes it over"))
             } else {
                 match answer.await {
                     Ok(Ok(())) => None,
                     Ok(Err(e)) => Some(e),
-                    Err(_) => Some("it was dropped before it was taken over".to_owned()),
+                    Err(_) => Some(DROPPED.to_owned()),
                 }
             };
             let _ = tx.send(In::Adopted { key, id, error }).await;

@@ -19,6 +19,25 @@ pub fn new_id() -> String {
     uuid::Uuid::now_v7().simple().to_string()
 }
 
+/// An id made from `parts` (a namespace, then what it names), the same every time they're the same
+/// and as unlikely to meet another as a random one (a UUIDv8 of their SHA-256): how a retry finds
+/// the id its first try made, from the key its sender gave (CP-T3.2, an idempotency key).
+pub fn derive_id(parts: &[&str]) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    for p in parts {
+        // Each part's length first, so no two lists of parts read the same.
+        h.update(u64::try_from(p.len()).unwrap_or(u64::MAX).to_le_bytes());
+        h.update(p.as_bytes());
+    }
+    let digest = h.finalize();
+    let mut bytes = [0u8; 16];
+    for (b, d) in bytes.iter_mut().zip(digest.iter()) {
+        *b = *d;
+    }
+    uuid::Builder::from_custom_bytes(bytes).into_uuid().simple().to_string()
+}
+
 /// 32 random bytes, URL-safe base64. Used for tokens and secrets.
 /// 32 random bytes, base64url: never beginning with `-`, which a command line would take for a
 /// flag (`kiln agent --token -Hq3…`).
@@ -112,6 +131,19 @@ pub fn hmac_hex(key: &[u8], msg: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// CP-T3.2: an id made from a key is the same each time it's made from it, a UUID like any
+    /// other id, and another for other parts (however they're split).
+    #[test]
+    fn an_id_made_from_a_key_is_the_same_each_time_and_apart_from_others() {
+        let a = super::derive_id(&["agents.send", "caller", "agent", "key-1"]);
+        assert_eq!(a, super::derive_id(&["agents.send", "caller", "agent", "key-1"]));
+        assert_eq!(a.len(), 32);
+        assert!(uuid::Uuid::parse_str(&a).is_ok_and(|u| u.get_version_num() == 8));
+        assert_ne!(a, super::derive_id(&["agents.send", "caller", "agent", "key-2"]));
+        assert_ne!(super::derive_id(&["ab", "c"]), super::derive_id(&["a", "bc"]), "split differently, different");
+        assert_ne!(super::derive_id(&["a"]), super::new_id());
+    }
+
     #[test]
     fn a_token_never_begins_with_a_dash() {
         // One in 64 would, without the care.

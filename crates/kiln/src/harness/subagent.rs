@@ -82,7 +82,7 @@ pub fn show(core: &mut Core, task: &str, m: &QueueItem, d: Delivery) {
     let parent = core.state.tasks.iter().find(|t| t.id == task).and_then(|t| t.tool_id.clone());
     let (images, attachments) = super::model::attachment_summary(&m.attachments);
     core.state.delivery.insert(m.id.clone(), d);
-    core.note_sent(&m.id);
+    core.note_sent(&m.id, &m.text);
     core.upsert(&m.id, parent, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some("human".into()), attachments, reply_to: m.reply_to.clone() });
     core.touch_state();
 }

@@ -123,6 +123,10 @@ async fn add(cx: Cx, v: Value) -> Out {
     crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let goals = goals_of(&v, &By::of(&cx.hub, &cx.caller, &agent).name()).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
     let start = v.get("start").and_then(Value::as_bool).unwrap_or(true);
+    // Under a key (CP-T3.2), asked again (its answer lost), the goals it added are found, never
+    // added twice.
+    let key = crate::harness::ops::key_of(&v)?;
+    let goals = super::keyed(&crate::harness::ops::key_scope(&cx.caller), &agent, key.as_deref(), goals);
     let s = super::add_at(&cx.hub, &agent, goals, start, &at_of(&v)?).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.add".into(), agent).await;
     json_of(&s)
@@ -168,7 +172,12 @@ async fn control(cx: Cx, v: Value) -> Out {
         return Err((StatusCode::BAD_REQUEST, "`why`, `resume_in_s` and `resume_at` go with pause".into()));
     }
     let by = By::of(&cx.hub, &cx.caller, &agent);
-    let s = super::control_as(&cx.hub, &agent, action, &by, Pausing { why: opt(&v, "why"), until, review: None }).await.map_err(fail)?;
+    // The goal it's for (skip, done): asked again once that goal has ended, nothing more ends.
+    let goal = opt(&v, "id");
+    // Asked again under its key (its answer lost): answered with the stack as it is (CP-T3.2).
+    let key = crate::harness::ops::key_of(&v)?;
+    let asked = super::asked_id(&crate::harness::ops::key_scope(&cx.caller), &agent, &format!("{action:?}"), goal.as_deref(), key.as_deref());
+    let s = super::control_asked(&cx.hub, &agent, action, &by, Pausing { why: opt(&v, "why"), until, review: None }, goal.as_deref(), asked.as_deref()).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.control".into(), format!("{agent}: {action:?}")).await;
     json_of(&s)
 }
@@ -177,7 +186,9 @@ async fn done(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
     crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let by = By::of(&cx.hub, &cx.caller, &agent);
-    let s = super::done(&cx.hub, &agent, opt(&v, "id").as_deref(), opt(&v, "evidence").as_deref(), &by).await.map_err(fail)?;
+    let (goal, key) = (opt(&v, "id"), crate::harness::ops::key_of(&v)?);
+    let asked = super::asked_id(&crate::harness::ops::key_scope(&cx.caller), &agent, &format!("{:?}", Action::Done), goal.as_deref(), key.as_deref());
+    let s = super::done_asked(&cx.hub, &agent, goal.as_deref(), opt(&v, "evidence").as_deref(), &by, asked.as_deref()).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.done".into(), format!("{agent}: {}", opt(&v, "id").unwrap_or_else(|| "the goal under way".into()))).await;
     json_of(&s)
 }
@@ -228,12 +239,18 @@ async fn dispatch(hub: &crate::hub::Hub, agent: &str, p: &super::Planned) -> Res
     let asked = hub.store.kv_get(key.clone()).await.ok().flatten().and_then(|at| at.parse::<i64>().ok());
     let tasks = hub.harness.state(agent).map(|s| s.tasks).unwrap_or_default();
     may_send(&tasks, &p.plan, asked, now).map_err(str::to_owned)?;
-    let id = format!("{}plan-{}", crate::harness::pause::KILN_ID, crate::util::new_id());
+    // Its id made once (CP-T3.2): from the plan and when kiln last asked for it, so asked for twice
+    // at once it's one message, which its agent's inbox takes once.
+    let id = format!("{}plan-{}", crate::harness::pause::KILN_ID, crate::util::derive_id(&["goals.plan.dispatch", &p.plan, &asked.map(|a| a.to_string()).unwrap_or_default()]));
     let send = crate::harness::model::Command::Send { id, text: dispatch_words(p), mode: crate::harness::model::SendMode::Steer, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
     match hub.harness.command(hub, agent, send).await {
-        crate::harness::registry::Sent::Ok => {
+        crate::harness::registry::Sent::Ok | crate::harness::registry::Sent::Accepted(_) | crate::harness::registry::Sent::Taken | crate::harness::registry::Sent::Parked => {
             let _ = hub.store.kv_set(key, now.to_string()).await;
             Ok(())
+        }
+        crate::harness::registry::Sent::Refused(why) => Err(format!("its agent's inbox refused it ({why}), so it's planned when the stack gets to it")),
+        s @ (crate::harness::registry::Sent::Rejected { .. } | crate::harness::registry::Sent::Unanswered(_)) => {
+            Err(format!("{}, so it's planned when the stack gets to it", s.failure().map_or_else(|| "its agent's runner refused it".to_owned(), |(_, why)| why)))
         }
         crate::harness::registry::Sent::NoSession => Err("the agent isn't running, so it's planned when the stack gets to it".into()),
         crate::harness::registry::Sent::Unreachable => Err("the agent's machine can't be reached, so it's planned when the stack gets to it".into()),
@@ -331,7 +348,8 @@ pub fn list_ops() -> Vec<Op> {
                         "start": {"type": "boolean"},
                         "next": {"type": "boolean", "description": "Right after the goal under way, before the rest."},
                         "before": {"type": "string", "description": "Before this goal still to go (its id). Before the goal under way, they go first and it waits after them."},
-                        "after": {"type": "string", "description": "After this goal still to go (its id)."}
+                        "after": {"type": "string", "description": "After this goal still to go (its id)."},
+                        "key": {"type": "string", "description": "An idempotency key, made once for this request (1 to 256 bytes): asked again under it (its answer lost), the goals it added are found and none is added twice. Without it, each call adds its goals again: pass it whenever you may ask again."}
                     }),
                     &["goals"],
                 )
@@ -367,6 +385,8 @@ pub fn list_ops() -> Vec<Op> {
                         "agent": {"type": "string", "description": AGENT},
                         "action": {"type": "string", "enum": ["start", "resume", "pause", "skip", "done", "clear", "restore"]},
                         "why": {"type": "string", "description": "pause: why, shown with the stack (what it waits for)."},
+                        "id": {"type": "string", "description": "skip, done: the goal it's for (the goal under way, by its id); asked again once that goal has ended, nothing more ends."},
+                        "key": {"type": "string", "description": "An idempotency key, made once for this request (1 to 256 bytes): asked again under it (its answer lost), it's answered with the stack as it is and does nothing more, whatever changed since. Without it, a resume or a skip asked again after the stack changed is done again: pass it whenever you may ask again."},
                         "resume_in_s": {"type": "number", "description": "pause: resume by itself this many seconds from now (at most 30 days)."},
                         "resume_at": {"type": ["integer", "string"], "description": "pause: resume by itself then: unix ms, or an RFC 3339 time."}
                     }),
@@ -386,7 +406,8 @@ pub fn list_ops() -> Vec<Op> {
                     json!({
                         "agent": {"type": "string", "description": AGENT},
                         "id": {"type": "string", "description": "The goal that's met; left out, the goal under way."},
-                        "evidence": {"type": "string", "description": "What shows it's met, a line or two: kept with the goal for the person to see."}
+                        "evidence": {"type": "string", "description": "What shows it's met, a line or two: kept with the goal for the person to see."},
+                        "key": {"type": "string", "description": "An idempotency key, made once for this request (1 to 256 bytes): asked again under it (its answer lost), it's answered with the stack as it is and ends nothing more, whatever ended since. Without it, asked again late it may end the goal under way then: pass it (or the goal's `id`) whenever you may ask again."}
                     }),
                     &[],
                 )
@@ -586,6 +607,458 @@ mod tests {
         }
     }
 
+    /// CP-T3.2: a plan run under an idempotency key, run again with it, is the same run: on an
+    /// agent that runs its messages go once (its inbox takes each once) and it's answered as it
+    /// was; one that starts an agent starts one, once; one that adds goals adds them once.
+    #[test]
+    fn a_plan_run_again_under_its_key_is_the_same_run() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |c| {
+                c.terminal.enabled = true;
+                c.conversations.off = true;
+            })
+            .await?;
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = crate::harness::registry::Registry::run_local(h).await;
+            });
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let folder = tempfile::tempdir()?;
+            let cwd = folder.path().to_string_lossy().into_owned();
+            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
+            let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd.clone()), name: Some("A".into()), count: Some(1), ..Ask::default() };
+            let a = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?;
+            let p = crate::plans::create(&hub, crate::plans::New { title: "Tidy".into(), body: "- one\n- two\n".into(), ..Default::default() }, "admin").await?;
+            let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let run = |input: Value| {
+                let me = me.clone();
+                async move { call(me, "plans.run", input).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}")) }
+            };
+            // Steps on an agent that runs: twice under one key, one run, its two messages once.
+            let first = run(json!({"id": p.id, "session": a.id, "mode": "steps", "key": "tidy-1"})).await?;
+            let again = run(json!({"id": p.id, "session": a.id, "mode": "steps", "key": "tidy-1"})).await?;
+            assert_eq!(first, again, "answered as it was");
+            assert_eq!(first.get("sent"), Some(&json!(2)));
+            let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
+            assert_eq!(inbox.taken(&a.id, 100).await?.len(), 2, "its two messages, once each");
+            // Without a key, another run.
+            let other = run(json!({"id": p.id, "session": a.id, "mode": "steps"})).await?;
+            assert_ne!(other.get("run"), first.get("run"));
+            // On a new agent: one agent, once.
+            let agents = hub.harness.list().len();
+            let made = run(json!({"id": p.id, "new": {"target": "local", "kind": "claude", "cwd": cwd}, "mode": "message", "key": "tidy-2"})).await?;
+            let made_again = run(json!({"id": p.id, "new": {"target": "local", "kind": "claude", "cwd": cwd}, "mode": "message", "key": "tidy-2"})).await?;
+            assert_eq!(made, made_again);
+            assert_eq!(hub.harness.list().len(), agents + 1, "one agent started");
+            // As goals: added once.
+            let goals = run(json!({"id": p.id, "session": a.id, "mode": "goals", "key": "tidy-3"})).await?;
+            let goals_again = run(json!({"id": p.id, "session": a.id, "mode": "goals", "key": "tidy-3"})).await?;
+            assert_eq!(goals, goals_again);
+            assert_eq!(crate::goals::get(&hub, &a.id).await?.items.len(), 2, "its two goals, once");
+            // One agent per step: twice under one key, one run (its first step's agent once).
+            let agents = hub.harness.list().len();
+            let steps = run(json!({"id": p.id, "new": {"on": "local", "kind": "claude", "cwd": cwd}, "mode": "agents", "key": "tidy-4"})).await?;
+            let steps_again = run(json!({"id": p.id, "new": {"on": "local", "kind": "claude", "cwd": cwd}, "mode": "agents", "key": "tidy-4"})).await?;
+            assert_eq!(steps.get("run"), steps_again.get("run"), "the same run");
+            assert_eq!(steps_again.get("steps"), Some(&json!(2)));
+            assert_eq!(hub.harness.list().len(), agents + 1, "its first step's agent, once");
+            // A run that failed before it did anything isn't held against its key: run again under
+            // it, it's tried again (and fails the same way), not refused as under way.
+            for input in [
+                json!({"id": p.id, "new": {"target": "no-such-runner", "kind": "claude", "cwd": cwd}, "mode": "message", "key": "tidy-5"}),
+                json!({"id": p.id, "session": "no-such-agent", "mode": "goals", "key": "tidy-6"}),
+            ] {
+                let first = run(input.clone()).await.map_err(|e| e.to_string());
+                let again = run(input).await.map_err(|e| e.to_string());
+                anyhow::ensure!(first.is_err() && again == first, "{first:?}, then {again:?}");
+            }
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2 (the ninth adversarial check's): goals.add (the goals panel's Add, an agent's
+    /// goals_add) asked again under its key (its answer lost) adds its goals once: added twice,
+    /// each would go to the agent as a message of its own (the same words, a second prompt).
+    /// Another key is another request: its goals are added, the same words or not.
+    #[test]
+    fn goals_add_asked_again_under_its_key_adds_its_goals_once() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |c| {
+                c.terminal.enabled = true;
+                c.conversations.off = true;
+            })
+            .await?;
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = crate::harness::registry::Registry::run_local(h).await;
+            });
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let folder = tempfile::tempdir()?;
+            let cwd = folder.path().to_string_lossy().into_owned();
+            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
+            let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };
+            let a = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?;
+            let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let input = |key: &str| json!({"agent": a.id, "goals": ["the parser takes every input", "the lexer too"], "start": false, "key": key});
+            let texts = |s: crate::goals::Stack| s.items.iter().map(|i| i.text.clone()).collect::<Vec<_>>();
+            call(me.clone(), "goals.add", input("add-1")).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let once = texts(crate::goals::get(&hub, &a.id).await?);
+            call(me.clone(), "goals.add", input("add-1")).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let again = texts(crate::goals::get(&hub, &a.id).await?);
+            anyhow::ensure!(once.len() == 2 && again == once, "goals.add asked again under its key: {once:?}, then {again:?}");
+            call(me.clone(), "goals.add", input("add-2")).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let other = texts(crate::goals::get(&hub, &a.id).await?);
+            anyhow::ensure!(other.len() == 4, "another key, its goals added: {other:?}");
+            // Goals given with what they wait for (main's G1), asked again under their key: added
+            // once, waiting as first said.
+            let waiting = json!({"agent": a.id, "goals": [{"text": "the docs say so", "needs": []}, {"text": "the notes too", "needs": [1]}], "start": false, "key": "add-3"});
+            call(me.clone(), "goals.add", waiting.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let once = texts(crate::goals::get(&hub, &a.id).await?);
+            call(me.clone(), "goals.add", waiting).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let s = crate::goals::get(&hub, &a.id).await?;
+            let docs = s.items.iter().find(|i| i.text == "the docs say so").map(|i| i.id.clone());
+            let notes = s.items.iter().find(|i| i.text == "the notes too").and_then(|i| i.needs.clone());
+            anyhow::ensure!(once.len() == 6 && texts(s.clone()) == once, "goals with needs asked again under their key: {once:?}, then {:?}", texts(s));
+            anyhow::ensure!(notes == docs.map(|d| vec![d]), "what it waits for: {notes:?}");
+            Ok(())
+        })
+    }
+
+    /// A hub whose agent's harness is a program that isn't there (it stands stopped, and a message
+    /// waits in its queue), as the tests above have it.
+    async fn stopped_agent() -> anyhow::Result<(Arc<crate::hub::Hub>, String, tempfile::TempDir)> {
+        let hub = crate::hub::tests::scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |c| {
+            c.terminal.enabled = true;
+            c.conversations.off = true;
+        })
+        .await?;
+        let h = Arc::clone(&hub);
+        crate::rt::spawn(async move {
+            let _ = crate::harness::registry::Registry::run_local(h).await;
+        });
+        hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+        let folder = tempfile::tempdir()?;
+        let cwd = folder.path().to_string_lossy().into_owned();
+        let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
+        let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };
+        let a = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?;
+        Ok((hub, a.id, folder))
+    }
+
+    /// What agent `id`'s inbox took, once it has taken `n` (or after a while), each message then
+    /// taken out of its queue as its harness would take it, and the agent stopped again.
+    async fn taken_by(hub: &Arc<crate::hub::Hub>, id: &str, n: usize) -> anyhow::Result<Vec<String>> {
+        let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
+        let mut taken = Vec::new();
+        for _ in 0..100 {
+            taken = inbox.taken(id, 100).await?;
+            if taken.len() >= n {
+                break;
+            }
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        for m in &taken {
+            let _ = hub.harness.command(hub, id, crate::harness::model::Command::QueueRemove { id: m.clone() }).await;
+        }
+        for _ in 0..200 {
+            if hub.harness.info(id).is_some_and(|i| i.status == crate::harness::model::Status::Exited && i.queue.is_empty()) {
+                break;
+            }
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(taken)
+    }
+
+    /// CP-T3.2 (the tenth adversarial check's): goals.add under a key with `start` (MCP goals_add's
+    /// default; the goals panel's on a stack that was done), asked again after its answer was lost,
+    /// prompts the agent no second time: its inbox takes the first goal's message once.
+    #[test]
+    fn goals_add_with_start_asked_again_under_its_key_is_no_second_prompt() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = stopped_agent().await?;
+            let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let input = json!({"agent": id, "goals": ["the parser takes every input", "the lexer too"], "start": true, "key": "add-1"});
+            call(me.clone(), "goals.add", input.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let once = taken_by(&hub, &id, 1).await?;
+            call(me.clone(), "goals.add", input).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let again = taken_by(&hub, &id, 2).await?;
+            let s = crate::goals::get(&hub, &id).await?;
+            anyhow::ensure!(once.len() == 1 && again == once, "goals.add asked again under its key: its inbox took {once:?}, then {again:?}; the stack {:?}", s.items.iter().map(|i| (i.status.clone(), i.text.clone())).collect::<Vec<_>>());
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2 (the tenth adversarial check's): Resume (goals.control start: the goals panel's,
+    /// Mission Control's and the held card's button, an agent's goals_control) asked again after
+    /// its answer was lost prompts the agent no second time.
+    #[test]
+    fn a_resume_asked_again_is_no_second_prompt() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = stopped_agent().await?;
+            let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            call(me.clone(), "goals.add", json!({"agent": id, "goals": ["the parser takes every input"], "start": true})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let first = taken_by(&hub, &id, 1).await?;
+            call(me.clone(), "goals.control", json!({"agent": id, "action": "pause"})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            call(me.clone(), "goals.control", json!({"agent": id, "action": "resume"})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let resumed = taken_by(&hub, &id, 2).await?;
+            call(me.clone(), "goals.control", json!({"agent": id, "action": "resume"})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let again = taken_by(&hub, &id, 3).await?;
+            anyhow::ensure!(again == resumed, "a resume asked again: its inbox took {first:?} for the goal, {resumed:?} once resumed, then {again:?} after the resume was asked again");
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2 (the tenth adversarial check's): goals.done for the goal under way (no `id`, as kiln
+    /// tells agents to say their goal is met), asked again after its answer was lost, ends that goal
+    /// alone: not the next one too, nor sends the one after it. A skip named by its goal, asked
+    /// again, skips no more.
+    #[test]
+    fn goals_done_or_skip_asked_again_ends_one_goal() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = stopped_agent().await?;
+            let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            call(me.clone(), "goals.add", json!({"agent": id, "goals": ["one", "two", "three", "four"], "start": true})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            taken_by(&hub, &id, 1).await?;
+            let done = json!({"agent": id, "evidence": "the tests pass"});
+            call(me.clone(), "goals.done", done.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let after = taken_by(&hub, &id, 2).await?;
+            let again = call(me.clone(), "goals.done", done).await;
+            let taken = taken_by(&hub, &id, 3).await?;
+            let st = |s: &crate::goals::Stack| s.items.iter().map(|i| (i.text.clone(), i.status.clone())).collect::<Vec<_>>();
+            let s = crate::goals::get(&hub, &id).await?;
+            anyhow::ensure!(
+                s.items.iter().filter(|i| i.status == "met").count() == 1 && taken == after,
+                "goals.done asked again: answered {:?}; the stack {:?}; its inbox took {after:?} after the first, {taken:?} after the second",
+                again.map(|_| "ok").map_err(|(c, m)| format!("{c}: {m}")),
+                st(&s)
+            );
+            // The goal under way skipped by its id, and the skip asked again: one skipped.
+            let two = s.items.iter().find(|i| i.status == "active").map(|i| i.id.clone()).unwrap_or_default();
+            let skip = json!({"agent": id, "action": "skip", "id": two});
+            call(me.clone(), "goals.control", skip.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            taken_by(&hub, &id, 3).await?;
+            call(me.clone(), "goals.control", skip).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let s = crate::goals::get(&hub, &id).await?;
+            anyhow::ensure!(s.items.iter().filter(|i| i.status == "skipped").count() == 1 && s.items.iter().any(|i| i.text == "three" && i.status == "active"), "a skip asked again: {:?}", st(&s));
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2 (the eleventh adversarial check's): goals.add under a key with `start`, its answer
+    /// lost, asked again under the key after the stack was paused in between (by the person, its
+    /// agent or kiln's usage rules) is the same request: answered with the stack as it is, paused,
+    /// and no second prompt.
+    #[test]
+    fn goals_add_with_start_asked_again_after_a_pause_is_no_second_prompt() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = stopped_agent().await?;
+            let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let input = json!({"agent": id, "goals": ["the parser takes every input"], "start": true, "key": "add-1"});
+            call(me.clone(), "goals.add", input.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let once = taken_by(&hub, &id, 1).await?;
+            call(me.clone(), "goals.control", json!({"agent": id, "action": "pause"})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            call(me.clone(), "goals.add", input).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let again = taken_by(&hub, &id, 2).await?;
+            let s = crate::goals::get(&hub, &id).await?;
+            anyhow::ensure!(once.len() == 1 && again == once && s.state == "paused", "goals.add asked again under its key after a pause: its inbox took {once:?}, then {again:?}; the stack is {} now", s.state);
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2 (the eleventh adversarial check's): goals.done for the goal under way as kiln tells
+    /// agents to say it (no `id`), its answer lost, asked again by the agent after the person
+    /// skipped the next goal (by its id, as the goals panel does) ends nothing more: the agent's own
+    /// end with those words is what it asks again, whatever ended since. On a clock that moves, each
+    /// end at a time of its own (under one that stands still, every end is the newest).
+    #[test]
+    fn goals_done_asked_again_after_another_end_ends_nothing_more() -> anyhow::Result<()> {
+        within(async {
+            let clock = kiln_seams::clock::SimClock::new();
+            let hub = crate::hub::tests::scratch_hub_on(Arc::new(clock.clone()), |c| {
+                c.terminal.enabled = true;
+                c.conversations.off = true;
+            })
+            .await?;
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = crate::harness::registry::Registry::run_local(h).await;
+            });
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let folder = tempfile::tempdir()?;
+            let cwd = folder.path().to_string_lossy().into_owned();
+            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
+            let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };
+            let id = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?.id;
+            let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let agent = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &id, None).await.map_err(anyhow::Error::msg)? };
+            call(me.clone(), "goals.add", json!({"agent": id, "goals": ["one", "two", "three", "four"], "start": true})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            taken_by(&hub, &id, 1).await?;
+            clock.advance(Duration::from_secs(3));
+            // The agent says its goal is met (no `id`); its answer is lost.
+            let done = json!({"agent": id, "evidence": "the tests pass"});
+            call(agent.clone(), "goals.done", done.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            taken_by(&hub, &id, 2).await?;
+            clock.advance(Duration::from_secs(3));
+            // Meanwhile the person skips the next goal by its id (the goals panel's Skip).
+            let two = crate::goals::get(&hub, &id).await?.items.iter().find(|i| i.status == "active").map(|i| i.id.clone()).unwrap_or_default();
+            call(me.clone(), "goals.control", json!({"agent": id, "action": "skip", "id": two})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let before = taken_by(&hub, &id, 3).await?;
+            clock.advance(Duration::from_secs(3));
+            // The agent's call, asked again (its answer lost), 9 s after the first.
+            let again = call(agent.clone(), "goals.done", done).await;
+            let after = taken_by(&hub, &id, 4).await?;
+            let s = crate::goals::get(&hub, &id).await?;
+            let st: Vec<(String, String)> = s.items.iter().map(|i| (i.text.clone(), i.status.clone())).collect();
+            anyhow::ensure!(
+                s.items.iter().any(|i| i.text == "three" && i.status == "active") && after == before,
+                "goals.done asked again after the person skipped the next goal: answered {:?}; the stack {st:?}; its inbox took {} messages before the retry, {} after",
+                again.map(|_| "ok").map_err(|(c, m)| format!("{c}: {m}")),
+                before.len(),
+                after.len()
+            );
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2 (the twelfth adversarial check's): a resume under a key, its answer lost, asked again
+    /// under the key after the stack was paused again (by its agent, or kiln's usage rules) prompts
+    /// the agent no second time: it's answered with the stack as it is, paused; under another key, it
+    /// resumes. A person's done under a key (no words: asked again unkeyed, it would end the goal
+    /// under way then), asked again after the next goal was skipped, ends nothing more.
+    #[test]
+    fn a_control_or_an_end_asked_again_under_its_key_does_nothing_more() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = stopped_agent().await?;
+            let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let ask = |input: Value| {
+                let me = me.clone();
+                async move { call(me, if input.get("action").is_some() { "goals.control" } else { "goals.done" }, input).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}")) }
+            };
+            call(me.clone(), "goals.add", json!({"agent": id, "goals": ["one", "two", "three"], "start": true})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            taken_by(&hub, &id, 1).await?;
+            ask(json!({"agent": id, "action": "pause"})).await?;
+            ask(json!({"agent": id, "action": "resume", "key": "r1"})).await?;
+            let resumed = taken_by(&hub, &id, 2).await?;
+            ask(json!({"agent": id, "action": "pause"})).await?;
+            ask(json!({"agent": id, "action": "resume", "key": "r1"})).await?;
+            let again = taken_by(&hub, &id, 3).await?;
+            let s = crate::goals::get(&hub, &id).await?;
+            anyhow::ensure!(again == resumed && s.state == "paused", "a resume asked again under its key after a pause: its inbox took {} messages, then {}; the stack is {}", resumed.len(), again.len(), s.state);
+            ask(json!({"agent": id, "action": "resume", "key": "r2"})).await?;
+            let other = taken_by(&hub, &id, 3).await?;
+            anyhow::ensure!(other.len() == resumed.len() + 1, "a resume under another key: its inbox took {} messages", other.len());
+            // A person's done (no words) under its key; the next goal skipped by its id; the done
+            // asked again under its key.
+            ask(json!({"agent": id, "key": "d1"})).await?;
+            taken_by(&hub, &id, 4).await?;
+            let two = crate::goals::get(&hub, &id).await?.items.iter().find(|i| i.status == "active").map(|i| i.id.clone()).unwrap_or_default();
+            ask(json!({"agent": id, "action": "skip", "id": two})).await?;
+            let before = taken_by(&hub, &id, 5).await?;
+            ask(json!({"agent": id, "key": "d1"})).await?;
+            let after = taken_by(&hub, &id, 6).await?;
+            let s = crate::goals::get(&hub, &id).await?;
+            let st: Vec<(String, String)> = s.items.iter().map(|i| (i.text.clone(), i.status.clone())).collect();
+            anyhow::ensure!(s.items.iter().any(|i| i.text == "three" && i.status == "active") && after == before, "a done asked again under its key: the stack {st:?}; its inbox took {} messages, then {}", before.len(), after.len());
+            Ok(())
+        })
+    }
+
+    /// Agent `id`'s harness at work in a turn its machine began at `t` (by that machine's clock), as
+    /// its runner reports it to the server.
+    /// The agent's session at a turn begun at `t` (by its machine's clock), as the server sees it:
+    /// said again while a state its session sent before this (a queue command's, on its way) comes in
+    /// after it, until the server has held it a while.
+    async fn in_turn(hub: &Arc<crate::hub::Hub>, id: &str, t: i64) -> anyhow::Result<()> {
+        let s = hub.harness.local.get(id).ok_or_else(|| anyhow::anyhow!("no session {id}"))?;
+        let mut steady = 0;
+        for _ in 0..250 {
+            if hub.harness.info(id).is_some_and(|i| i.turn_started == Some(t)) {
+                steady += 1;
+                if steady >= 25 {
+                    return Ok(());
+                }
+            } else {
+                steady = 0;
+                let state = {
+                    let mut core = s.core.lock();
+                    core.state.turn_started = Some(t);
+                    core.state.clone()
+                };
+                hub.harness.ingest(hub, &crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(state) });
+            }
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        anyhow::bail!("the server doesn't see the turn")
+    }
+
+    /// CP-T3.2 (the twelfth adversarial check's): the agent's goals.done (no `id`), its answer lost,
+    /// asked again from the same turn while its machine's clock runs 5 s ahead of the server's, ends
+    /// nothing more: the end keeps the turn it was made in, by that machine's clock, and the retry is
+    /// matched to it there. Then, its clock set back (NTP stepping it) and a later turn begun, the
+    /// same words end the goal under way.
+    #[test]
+    fn goals_done_asked_again_is_matched_to_its_turn_whatever_the_agent_s_clock() -> anyhow::Result<()> {
+        use kiln_seams::clock::Clock as _;
+        within(async {
+            let clock = kiln_seams::clock::SimClock::new();
+            let hub = crate::hub::tests::scratch_hub_on(Arc::new(clock.clone()), |c| {
+                c.terminal.enabled = true;
+                c.conversations.off = true;
+            })
+            .await?;
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = crate::harness::registry::Registry::run_local(h).await;
+            });
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let folder = tempfile::tempdir()?;
+            let cwd = folder.path().to_string_lossy().into_owned();
+            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
+            let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };
+            let id = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?.id;
+            let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let agent = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &id, None).await.map_err(anyhow::Error::msg)? };
+            call(me.clone(), "goals.add", json!({"agent": id, "goals": ["one", "two", "three", "four"], "start": true})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            taken_by(&hub, &id, 1).await?;
+            // Its turn begins, by its machine's clock 5 s ahead of the server's.
+            let begun = clock.unix_ms();
+            in_turn(&hub, &id, begun + 5_000).await?;
+            clock.advance(Duration::from_secs(3));
+            let done = json!({"agent": id, "evidence": "the tests pass"});
+            call(agent.clone(), "goals.done", done.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let first = taken_by(&hub, &id, 2).await?;
+            clock.advance(Duration::from_secs(3));
+            // Asked again from that turn, its answer lost.
+            let again = call(agent.clone(), "goals.done", done.clone()).await;
+            let after = taken_by(&hub, &id, 3).await?;
+            let st = |s: &crate::goals::Stack| s.items.iter().map(|i| (i.text.clone(), i.status.clone())).collect::<Vec<_>>();
+            let s = crate::goals::get(&hub, &id).await?;
+            anyhow::ensure!(
+                s.items.iter().filter(|i| i.status == "met").count() == 1 && s.items.iter().any(|i| i.text == "two" && i.status == "active") && after == first,
+                "goals.done asked again from its turn, the agent's clock ahead: answered {:?}; the stack {:?}; its inbox took {} messages, then {}",
+                again.map(|_| "ok").map_err(|(c, m)| format!("{c}: {m}")),
+                st(&s),
+                first.len(),
+                after.len()
+            );
+            // Its clock set back 15 s, and a later turn begun (its start before the first end by
+            // the server's clock): the same words end the goal under way, and the next goes.
+            in_turn(&hub, &id, clock.unix_ms() - 10_000).await?;
+            clock.advance(Duration::from_secs(3));
+            call(agent.clone(), "goals.done", done).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let later = taken_by(&hub, &id, 3).await?;
+            let s = crate::goals::get(&hub, &id).await?;
+            anyhow::ensure!(
+                s.items.iter().any(|i| i.text == "two" && i.status == "met") && s.items.iter().any(|i| i.text == "three" && i.status == "active") && later.len() == first.len() + 1,
+                "goals.done from a later turn, the agent's clock set back: the stack {:?}; its inbox took {} messages, then {}",
+                st(&s),
+                first.len(),
+                later.len()
+            );
+            Ok(())
+        })
+    }
+
     /// On a hub with a simulated clock: goals' times are its (CP-M2, AC-M2.1).
     #[test]
     fn an_agent_steers_the_goals_and_plans_of_itself_and_its_own_only() -> anyhow::Result<()> {
@@ -638,7 +1111,7 @@ mod tests {
             // Plan runs of one agent per step: it stops its own, never a person's.
             let place = crate::plans::agents::Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some(cwd.clone()), ..Default::default() };
             let config = crate::plans::agents::Config { place, opener: Some("owner".into()), actor: "admin".into(), ..Default::default() };
-            let theirs = crate::plans::agents::start(&hub, &p, config).await?.run;
+            let theirs = crate::plans::agents::start(&hub, &p, config, None).await?.run;
             assert_eq!(code(call(as_a.clone(), "plans.runs.stop", json!({"run": theirs})).await), Some(403));
             assert_eq!(code(call(as_a.clone(), "plans.runs.retry", json!({"run": theirs, "step": 1})).await), Some(403));
             let mine = call(as_a.clone(), "plans.run", json!({"id": p.id, "mode": "agents", "new": {"on": "local", "kind": "claude", "cwd": cwd}})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
