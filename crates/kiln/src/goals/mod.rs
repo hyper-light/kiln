@@ -627,7 +627,8 @@ fn nodes_of(items: &[Item], plans: &subagents::Graph) -> Vec<graph::Node> {
                 (None, None, Some(KILN)) => graph::Needs::InTurn,
                 (None, None, _) => graph::Needs::Unknown,
             },
-            back: i.back,
+            takes: if i.back { graph::Takes::Agent } else { graph::Takes::Anyone },
+            ..graph::Node::default()
         })
         .collect()
 }

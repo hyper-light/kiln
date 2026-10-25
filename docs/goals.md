@@ -258,16 +258,18 @@ has ended (met, or skipped), and goals with nothing left to wait for are ready t
 - of one goal (`goals_update` with `needs`), or of several at once (`goals_order`:
   `{goals: [{id, needs}]}`), for goals still to go and not under way.
 
-A goal waits for its parts, and a part waits for what its goal says it waits for. A loop of
-waiting is refused, naming the goals that would be in it, and nothing changes. A goal taken out
-leaves the goals that waited for it waiting for what it waited for, so the order it kept holds.
-What each goal waits for is kept with it, with who said so (`needs_by`). Bring back keeps both.
+A goal waits for its parts, and a part waits for what its goal says it waits for; a part that says
+what it waits for also takes its goal's place in the stack's order. A loop of waiting is refused,
+naming the goals that would be in it, and nothing changes. A goal taken out leaves the goals that
+waited for it waiting for what it waited for, so the order it kept holds. What each goal waits for
+is kept with it, with who said so (`needs_by`). Bring back keeps both.
 
-A goal that says nothing waits for the goal still to go before it, passing over one handed to
-another agent, so a stack whose goals say nothing runs in its order, as it always has. Of the goals
-ready, the agent takes up the first: by round over the whole stack (a goal that waits for nothing
-is in round 0, and one that waits for others is a round after the latest of them), then in the
-stack's order.
+A goal that says nothing goes in turn: it waits for every goal still to go before it, passing over
+one handed to another agent, so a stack whose goals say nothing runs in its order, as it always
+has, and one after goals that may end out of order (they say what they wait for) waits for each of
+them. Of the goals ready, the agent takes up the first: by round over the whole stack (a goal that
+waits for nothing is in round 0, and one that waits for others is a round after the latest of
+them), then in the stack's order.
 
 Goals ready together going to subagents of the agent's, side by side, is being built
 (docs/agentic.md G). `goals/settings` `{side_by_side}` is a person's switch for that, on unless

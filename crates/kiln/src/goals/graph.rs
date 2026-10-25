@@ -8,16 +8,22 @@
 //!   stack. Second, what it is: a part waits for what its goal waits for, and a goal waits for its
 //!   parts. A goal that says nothing is *unordered*. While subagents can take goals, the agent says
 //!   what each one needs before it goes anywhere ([`Out::order`]): order is inferred first, then
-//!   goals fan out. When subagents can't take goals, an unordered goal waits for the goal still to
-//!   go before it, as every goal did before goals ran side by side. So does a goal kiln couldn't get
-//!   ordered ([`Needs::InTurn`]).
+//!   goals fan out. When subagents can't take goals, an unordered goal goes *in turn*: it waits for
+//!   every goal still to go before it, as every goal did before goals ran side by side. So does a
+//!   goal kiln couldn't get ordered ([`Needs::InTurn`]). A part that says what it waits for has no
+//!   place in the stack's order of its own: it takes its goal's.
+//! - **A plan run's steps** laid on the stack as goals of their own ([`Node::run`]) are ordered by
+//!   their plan: they're neither ordered against each other nor wait in turn for each other.
 //! - **Ready.** A goal is ready when it's still to go, isn't under way anywhere, is ordered, and
 //!   nothing it waits for is still to go. Each goes as soon as it's ready (greedily), the ready ones
-//!   by round over the whole stack (breadth first), then in the stack's order.
-//! - **Who takes it** ([`assign`]). While subagents are in play (two goals or more at work or ready
-//!   at once), each ready goal goes to a subagent of its own while there's room, and the agent
-//!   coordinates. With nothing to fan out, the agent takes the one ready goal itself, as it always
-//!   has. A goal that came back from its subagent unmet is the agent's own.
+//!   by round over the whole stack (breadth first), then in the stack's order. A goal met once its
+//!   parts are (one with a plan) is never ready itself.
+//! - **Who takes it** ([`assign`]). While subagents are in play (two goals or more at work, ready
+//!   or waiting to be ordered at once), each ready goal goes to a subagent of its own while there's
+//!   room, the rest wait for room, and the agent coordinates: it takes only what's its own
+//!   ([`Takes::Agent`]: a goal back from its subagent unmet, planning a goal, starting a plan's run).
+//!   With nothing to fan out, the agent takes the first ready goal itself, as it always has. While
+//!   goals wait for it to order them, it takes nothing new, so it's free to answer.
 //!
 //! Its work is bounded by the stack (500 goals at the most) and how far parts nest, with no
 //! recursion.
@@ -32,13 +38,26 @@ const DEPTH: usize = 16;
 pub(super) enum Needs {
     /// These goals of its stack, by id (none: nothing).
     Given(Vec<String>),
-    /// It says nothing yet. While subagents can take goals the agent orders it; otherwise it waits
-    /// for the goal still to go before it.
+    /// It says nothing yet. While subagents can take goals the agent orders it; otherwise it goes
+    /// in turn.
     #[default]
     Unknown,
-    /// After the goal still to go before it, whatever subagents can do: kiln asked for its order
-    /// and didn't get it in time.
+    /// In turn, whatever subagents can do (after every goal still to go before it): kiln asked for
+    /// its order and didn't get it in time.
     InTurn,
+}
+
+/// Who may take a goal up once it's ready.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Takes {
+    /// The agent, or a subagent of its own.
+    #[default]
+    Anyone,
+    /// The agent itself: a goal back from its subagent unmet, or the agent's own work for a goal
+    /// (planning it, starting the plan run it waits on).
+    Agent,
+    /// No one: a goal met once its parts are (one with a plan, its steps its parts).
+    Nobody,
 }
 
 /// Where a goal is under way, when it isn't for the agent to take.
@@ -64,8 +83,11 @@ pub(super) struct Node {
     /// The goal it's a part of.
     pub part_of: Option<String>,
     pub needs: Needs,
-    /// It came back from its subagent unmet: the agent takes it itself.
-    pub back: bool,
+    /// Who may take it up once it's ready.
+    pub takes: Takes,
+    /// The plan run it's a step of, when the run's steps are goals of the stack of their own (not a
+    /// goal's parts): its plan orders them.
+    pub run: Option<String>,
 }
 
 /// A stack as a graph ([`build`]).
@@ -153,28 +175,42 @@ fn reaches(of: &HashMap<&str, Vec<&str>>, from: &str, to: &str) -> bool {
 
 /// The graph of `nodes`, the stack's goals in its order. `infer`: subagents can take its goals, so
 /// a goal still to go that says nothing waits for the agent to order it, unless nothing else is
-/// still to go to order it against (but its own parts, or the goals it's a part of). Without
-/// `infer`, such a goal waits for the goal still to go before it in the stack's order (one handed to
-/// another agent passed over), so the stack runs in its order, as it always has.
+/// still to go to order it against (but its own parts, the goals it's a part of, or its plan run's
+/// other steps). Without `infer`, such a goal goes in turn: it waits for every goal still to go
+/// before it in the stack's order (one handed to another agent passed over, and a step its plan run's
+/// other steps), so the stack runs in its order, as it always has.
 pub(super) fn build(nodes: &[Node], infer: bool) -> Graph {
     let by_id: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let ups: HashMap<&str, Vec<&Node>> = nodes.iter().map(|n| (n.id.as_str(), ancestors(n, &by_id))).collect();
     let above = |n: &str, of: &str| ups.get(of).is_some_and(|u| u.iter().any(|a| a.id == n));
+    // Goals one can't be ordered against the other: one a part of the other, or steps of one run.
+    let kin = |a: &Node, b: &Node| above(&a.id, &b.id) || above(&b.id, &a.id) || (a.run.is_some() && a.run == b.run);
+    let in_turn = |n: &Node| n.needs == Needs::InTurn || (n.needs == Needs::Unknown && !infer);
     let mut unordered: Vec<String> = Vec::new();
     let mut own: HashMap<&str, Vec<(&str, bool)>> = HashMap::new();
     for (k, n) in nodes.iter().enumerate() {
-        let before = nodes.iter().take(k).rev().find(|m| m.open && m.away != Away::Other).map(|m| m.id.as_str());
-        let alone = !nodes.iter().any(|m| m.open && m.id != n.id && !above(&m.id, &n.id) && !above(&n.id, &m.id));
-        let waiting = n.open && !n.here && n.away == Away::No;
         let w: Vec<(&str, bool)> = match &n.needs {
             Needs::Given(v) => v.iter().map(String::as_str).filter(|d| *d != n.id && by_id.contains_key(d)).map(|d| (d, false)).collect(),
-            Needs::Unknown if infer => {
-                if waiting && !alone {
+            _ if in_turn(n) => {
+                // Every goal still to go before it. The nearest that goes in turn itself (and is no
+                // run's step) waits for those before it already, so it stands for them: each goal's
+                // waits stay few however long the stack.
+                let mut w: Vec<(&str, bool)> = Vec::new();
+                for m in nodes.iter().take(k).rev().filter(|m| m.open && m.away != Away::Other && !kin(n, m)) {
+                    w.push((m.id.as_str(), true));
+                    if in_turn(m) && m.run.is_none() {
+                        break;
+                    }
+                }
+                w
+            }
+            _ => {
+                let waiting = n.open && !n.here && n.away == Away::No;
+                if waiting && nodes.iter().any(|m| m.open && m.id != n.id && !kin(n, m)) {
                     unordered.push(n.id.clone());
                 }
                 Vec::new()
             }
-            Needs::Unknown | Needs::InTurn => before.map(|b| (b, true)).into_iter().collect(),
         };
         own.insert(n.id.as_str(), w);
     }
@@ -182,9 +218,11 @@ pub(super) fn build(nodes: &[Node], infer: bool) -> Graph {
     for n in nodes {
         let up = ups.get(n.id.as_str()).map_or(&[][..], Vec::as_slice);
         let mut e: Vec<(&str, bool)> = own.get(n.id.as_str()).cloned().unwrap_or_default();
-        // What the goals it's a part of say they need (their place in the stack's order is its own).
+        // What the goals it's a part of say they need; and where they stand in the stack's order,
+        // for a part that says what it waits for (it has no place in that order of its own).
+        let placed = !matches!(n.needs, Needs::Given(_));
         for a in up {
-            e.extend(own.get(a.id.as_str()).into_iter().flatten().filter(|(_, soft)| !soft).copied());
+            e.extend(own.get(a.id.as_str()).into_iter().flatten().filter(|(_, soft)| !soft || !placed).copied());
         }
         e.extend(nodes.iter().filter(|p| p.part_of.as_deref() == Some(n.id.as_str())).map(|p| (p.id.as_str(), false)));
         // Never itself, nor a goal it's a part of (that one waits for it).
@@ -241,7 +279,8 @@ pub(super) fn loops(nodes: &[Node]) -> Vec<String> {
     build(nodes, true).looped
 }
 
-/// The goals ready to go out now, in the order they go: by round, then in the stack's order.
+/// The goals ready to go out now, in the order they go: by round, then in the stack's order. A goal
+/// met once its parts are is never one of them.
 pub(super) fn ready<'a>(g: &Graph, nodes: &'a [Node]) -> Vec<&'a Node> {
     let by_id: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let unordered = |n: &Node| g.unordered.contains(&n.id);
@@ -250,6 +289,7 @@ pub(super) fn ready<'a>(g: &Graph, nodes: &'a [Node]) -> Vec<&'a Node> {
         .enumerate()
         .filter(|(_, n)| {
             n.open
+                && n.takes != Takes::Nobody
                 && !n.here
                 && n.away == Away::No
                 && !unordered(n)
@@ -288,28 +328,31 @@ pub(super) struct Out {
 }
 
 /// Who takes `g`'s ready goals, with `room` for subagents. While subagents are in play (the agent's
-/// own goal, the goals out on subagents and those ready come to two or more), each ready goal goes
-/// to a subagent while there's room; the rest wait for one to free up, and the agent coordinates.
-/// With nothing to fan out, or no room ever, the agent takes the first ready goal itself. A goal
-/// back from its subagent is the agent's either way.
+/// own goal under way, the goals out on subagents, those ready and those waiting to be ordered come
+/// to two or more), each ready goal goes to a subagent while there's room, the rest wait for one to
+/// free up, and the agent coordinates, taking only what's its own ([`Takes::Agent`]). With nothing
+/// to fan out, or no room ever, the agent takes the first ready goal itself. While goals wait for it
+/// to order them, it takes nothing new.
 pub(super) fn assign(g: &Graph, nodes: &[Node], room: Room) -> Out {
     let by_id: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let here = nodes.iter().any(|n| n.open && n.here);
     let subs_out = nodes.iter().filter(|n| n.open && n.away == Away::Sub && !ancestors(n, &by_id).iter().any(|a| a.away == Away::Sub)).count();
-    let (back, rest): (Vec<&Node>, Vec<&Node>) = ready(g, nodes).into_iter().partition(|n| n.back);
-    let mine = if here { None } else { back.first().copied() };
-    let mut out = Out { agent: mine.map(|n| n.id.clone()), subagents: Vec::new(), order: g.unordered.clone() };
+    let ready = ready(g, nodes);
+    let mut out = Out { order: g.unordered.clone(), ..Out::default() };
+    // Free for a goal of its own: none under way, and none waiting for it to say what goals need.
+    let free = !here && out.order.is_empty();
+    let first = |its: fn(&Node) -> bool| ready.iter().find(|n| its(n)).filter(|_| free).map(|n| n.id.clone());
     let fan = match room {
         Room::Never => None,
-        Room::Any => Some(rest.len()),
-        Room::Left(k) => Some(k.min(rest.len())),
+        Room::Any => Some(usize::MAX),
+        Room::Left(k) => Some(k),
     };
     match fan {
-        Some(n) if usize::from(here) + subs_out + rest.len() + usize::from(mine.is_some()) >= 2 => {
-            out.subagents = rest.iter().take(n).map(|r| r.id.clone()).collect();
+        Some(k) if usize::from(here) + subs_out + ready.len() + out.order.len() >= 2 => {
+            out.agent = first(|n| n.takes == Takes::Agent);
+            out.subagents = ready.iter().filter(|n| n.takes == Takes::Anyone).take(k).map(|n| n.id.clone()).collect();
         }
-        _ if out.agent.is_none() => out.agent = rest.first().map(|r| r.id.clone()),
-        _ => {}
+        _ => out.agent = first(|_| true),
     }
     out
 }
@@ -504,8 +547,85 @@ mod tests {
     /// A goal back from its subagent unmet is the agent's, while the rest fan out beside it.
     #[test]
     fn g2_a_goal_back_from_its_subagent_is_the_agents() {
-        let nodes = vec![Node { back: true, ..given("a", &[]) }, given("b", &[])];
+        let nodes = vec![Node { takes: Takes::Agent, ..given("a", &[]) }, given("b", &[])];
         assert_eq!(assign(&build(&nodes, true), &nodes, Room::Any), Out { agent: Some("a".into()), subagents: vec!["b".into()], ..Out::default() });
+    }
+
+    /// In turn is after every goal still to go before it, not only the nearest: goals that say what
+    /// they wait for (a plan's steps) can end out of the stack's order, and a goal in turn after
+    /// them waits for each. The nearest goal in turn stands for those before it.
+    #[test]
+    fn g1_in_turn_a_goal_waits_for_every_goal_still_to_go_before_it() {
+        let nodes = vec![node("a"), given("s1", &[]), given("s2", &["s1"]), given("s3", &[]), node("h"), node("k")];
+        let g = build(&nodes, false);
+        assert_eq!(waits(&g, "h"), ["s3", "s2", "s1", "a"]);
+        assert_eq!(waits(&g, "k"), ["h"]);
+        // s3 ended first: h still waits for s1 and s2.
+        let nodes = vec![node("a"), given("s1", &[]), given("s2", &["s1"]), met(given("s3", &[])), node("h")];
+        assert_eq!(waits(&build(&nodes, false), "h"), ["s2", "s1", "a"]);
+    }
+
+    /// A plan run's steps laid on the stack as goals of their own are ordered by their plan. In turn,
+    /// a step that waits for no other waits for the goals before the run, not for the run's other
+    /// steps, and a goal in turn after the run waits for every one of them. While subagents can take
+    /// goals, those steps are ordered against the goals around the run, not each other, and a run
+    /// alone on the stack has nothing to be ordered against.
+    #[test]
+    fn g1_a_plan_runs_steps_are_ordered_by_their_plan() {
+        let step = |n: Node| Node { run: Some("r".into()), ..n };
+        let nodes = vec![node("a"), step(node("s1")), step(given("s2", &["s1"])), step(node("s3")), node("h")];
+        let g = build(&nodes, false);
+        assert_eq!((waits(&g, "s1"), waits(&g, "s2"), waits(&g, "s3")), (vec!["a"], vec!["s1"], vec!["a"]));
+        assert_eq!(waits(&g, "h"), ["s3", "s2", "s1", "a"]);
+        let after_a = vec![met(node("a")), step(node("s1")), step(given("s2", &["s1"])), step(node("s3")), node("h")];
+        assert_eq!(ids(&ready(&build(&after_a, false), &after_a)), ["s1", "s3"]);
+        assert_eq!(build(&nodes, true).unordered, ["a", "s1", "s3", "h"]);
+        let alone = vec![step(node("s1")), step(given("s2", &["s1"])), step(node("s3"))];
+        let g = build(&alone, true);
+        assert!(g.unordered.is_empty(), "{:?}", g.unordered);
+        assert_eq!(assign(&g, &alone, Room::Any), subs(&["s1", "s3"]));
+    }
+
+    /// A goal's plan steps (its parts, saying what they wait for) take the goal's place in the
+    /// stack's order: they start once what comes before the goal has ended. The goal, met once they
+    /// are, is never taken up itself.
+    #[test]
+    fn g1_a_goals_plan_steps_take_its_place_in_the_stacks_order() {
+        let with_plan = |n: Node| Node { takes: Takes::Nobody, ..n };
+        let nodes = vec![node("a"), part(given("s1", &[]), "p"), part(given("s2", &["s1"]), "p"), with_plan(node("p")), node("h")];
+        let g = build(&nodes, false);
+        assert_eq!(waits(&g, "s1"), ["a"]);
+        assert_eq!(waits(&g, "s2"), ["s1", "a"]);
+        assert_eq!(waits(&g, "p"), ["a", "s1", "s2"]);
+        assert_eq!(waits(&g, "h"), ["p"]);
+        let done = vec![met(node("a")), part(met(given("s1", &[])), "p"), part(met(given("s2", &["s1"])), "p"), with_plan(node("p")), node("h")];
+        let g = build(&done, false);
+        assert!(ready(&g, &done).is_empty(), "a goal with a plan is met by its parts, not taken up");
+        assert_eq!(assign(&g, &done, Room::Any), Out::default());
+    }
+
+    /// While goals wait for the agent to say what they need, it takes nothing new, so it's free to
+    /// answer. Those waiting are in play: an ordered goal ready beside them goes to a subagent.
+    #[test]
+    fn g2_while_goals_wait_to_be_ordered_the_agent_takes_nothing_new() {
+        let nodes = vec![given("x", &[]), node("y")];
+        let g = build(&nodes, true);
+        assert_eq!(g.unordered, ["y"]);
+        assert_eq!(assign(&g, &nodes, Room::Any), Out { subagents: vec!["x".into()], order: vec!["y".into()], ..Out::default() });
+        let nodes = vec![given("x", &["y"]), node("y")];
+        assert_eq!(assign(&build(&nodes, true), &nodes, Room::Any), Out { order: vec!["y".into()], ..Out::default() });
+    }
+
+    /// While subagents are in play, the agent takes only its own work (planning a goal, a goal back
+    /// from its subagent). With no room ever, it takes the first ready goal, whatever it is.
+    #[test]
+    fn g2_the_agent_keeps_only_its_own_work_while_subagents_are_in_play() {
+        let own = |n: Node| Node { takes: Takes::Agent, ..n };
+        let nodes = vec![given("x", &[]), own(given("plan it", &[])), given("y", &[])];
+        let g = build(&nodes, true);
+        assert_eq!(assign(&g, &nodes, Room::Any), Out { agent: Some("plan it".into()), subagents: vec!["x".into(), "y".into()], ..Out::default() });
+        assert_eq!(assign(&g, &nodes, Room::Left(1)), Out { agent: Some("plan it".into()), subagents: vec!["x".into()], ..Out::default() });
+        assert_eq!(assign(&g, &nodes, Room::Never).agent.as_deref(), Some("x"));
     }
 
     /// A goal out on another agent (a program's worker) isn't a subagent of this one's, and the
