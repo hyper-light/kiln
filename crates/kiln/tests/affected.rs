@@ -156,3 +156,59 @@ fn w24_r17_a_matrix_over_affected_runs_only_the_changed_crates_legs() -> anyhow:
     assert_eq!(keys(&legs), ["test (a)", "test (b)"], "a, and b, which depends on it\n{third}");
     Ok(())
 }
+
+const CHECKS: &str = r#"on: push
+jobs:
+  a:
+    runs-on: local
+    if: contains(affected('cargo'), 'a')
+    work: { memo: { paths: [crates/a, docs/a.md] } }
+    steps:
+      - run: echo "checked a as $(date +%s%N)"
+  b:
+    runs-on: local
+    if: contains(affected('cargo'), 'b')
+    work: { memo: { paths: [crates/b] } }
+    steps:
+      - run: echo "checked b as $(date +%s%N)"
+"#;
+
+/// W24-R06 with R17: jobs that opt in to reuse, each run only when the change affects its crate.
+/// One the change can't affect finishes reused, naming the run it came from, never skipped, so its
+/// required check stays green; with no earlier result of its inputs (a file it lists changed,
+/// though no crate of it did), it's skipped, saying why.
+#[test]
+fn w24_r06_a_leg_the_change_cannot_affect_finishes_reused() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+    let repo = Repo::new(&s, dir.path(), "acme/checks")?;
+    repo.workspace(&[("checks.yaml", CHECKS)])?;
+    repo.write("docs/a.md", "a, first\n")?;
+    repo.commit("the workspace")?;
+    let (first, legs) = finished(&s, "acme/checks", ".kiln/checks.yaml", 1)?;
+    for key in ["a", "b"] {
+        let l = legs.get(key).cloned().unwrap_or_default();
+        assert_eq!(l.pointer("/leg/conclusion"), Some(&json!("success")), "{key} runs: {l}\n{first}\n{}", s.log());
+        assert!(l.pointer("/leg/reused_from").is_none_or(Value::is_null), "{key} had nothing to reuse: {l}");
+    }
+    // b changes: a can't be affected, and takes the first run's result.
+    repo.write("crates/b/src/lib.rs", "pub fn b() -> u8 { 2 }\n")?;
+    repo.commit("b changes")?;
+    let (second, legs) = finished(&s, "acme/checks", ".kiln/checks.yaml", 2)?;
+    let (a, b) = (legs.get("a").cloned().unwrap_or_default(), legs.get("b").cloned().unwrap_or_default());
+    assert_eq!(a.pointer("/leg/conclusion"), Some(&json!("success")), "reused, never skipped: {a}\n{}", s.log());
+    assert!(a.pointer("/leg/reused_from").is_some_and(|r| !r.is_null()), "{a}");
+    assert_eq!(a.pointer("/leg/reused_run"), first.pointer("/run/id"), "it names the run it came from: {a}\n{first}");
+    assert!(b.pointer("/leg/reused_from").is_none_or(Value::is_null) && b.pointer("/leg/conclusion") == Some(&json!("success")), "b ran: {b}");
+    assert_eq!(second.pointer("/run/conclusion"), Some(&json!("success")), "{second}");
+    // b again, and a file a lists: still no crate of a's, but nothing of its inputs to reuse.
+    repo.write("crates/b/src/lib.rs", "pub fn b() -> u8 { 3 }\n")?;
+    repo.write("docs/a.md", "a, second\n")?;
+    repo.commit("b and a's notes change")?;
+    let (third, legs) = finished(&s, "acme/checks", ".kiln/checks.yaml", 3)?;
+    let a = legs.get("a").cloned().unwrap_or_default();
+    assert_eq!(a.pointer("/leg/status"), Some(&json!("skipped")), "{a}\n{third}");
+    let said = a.pointer("/leg/error").and_then(Value::as_str).unwrap_or_default();
+    assert!(said.contains("the change doesn't affect it, and no earlier result of its inputs is there to reuse"), "{said}");
+    Ok(())
+}

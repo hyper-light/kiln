@@ -171,6 +171,7 @@ fn dead_spec() -> LegSpec {
         emulated: false,
         reads: Vec::new(),
         cache_cap: None,
+        unaffected: None,
         workflow: Arc::new(Workflow::default()),
         job_index: 0,
     }
@@ -740,4 +741,55 @@ fn w24_r17_affected_says_what_it_lacks() {
     let broken = Arc::new(graph::read(&|_| Some("[workspace\n".to_owned()), &["Cargo.toml".to_owned()]));
     let r = Run::with(&wf("cargo"), Dialect::Kiln, changed(&["x"]), Source { graph: Some(broken), ..Source::default() });
     assert!(failed(&r, "affected('cargo'): the cargo package graph couldn't be read: Cargo.toml: isn't valid TOML"), "{:?}", r.log);
+}
+
+// ------------------------------------------------------------------ unaffected legs (W24-R06)
+
+/// W24-R06: a job that opts in to reuse, whose `if:` is false only for what the change didn't
+/// touch, is queued to finish reused (`unaffected` saying why it would have been skipped); one whose
+/// `if:` is false for another reason, or that doesn't opt in, is skipped as before; one the change
+/// affects runs.
+#[test]
+fn w24_r06_legs_the_change_cannot_affect_are_queued_to_be_reused() {
+    let wf = "name: k\non: push\njobs:\n  core:\n    if: contains(affected('cargo'), 'core')\n    work: { memo: { paths: [crates/core] } }\n    steps: [{run: t}]\n  plain:\n    if: contains(affected('cargo'), 'core')\n    steps: [{run: t}]\n  prs:\n    if: github.event_name == 'pull_request' && contains(affected('cargo'), 'core')\n    work: { memo: true }\n    steps: [{run: t}]\n  docs:\n    if: changed('docs/**')\n    reuse: true\n    steps: [{run: d}]\n  cli:\n    if: contains(affected('cargo'), 'cli')\n    reuse: true\n    steps: [{run: c}]\n";
+    let r = Run::with(wf, Dialect::Kiln, changed(&["crates/cli/src/main.rs"]), Source { graph: Some(crates()), ..Source::default() });
+    let mut queued = r.queued.clone();
+    queued.sort();
+    assert_eq!(queued, ["cli", "core", "docs"], "{:?}", r.log);
+    assert_eq!(r.spec("core").unaffected.as_deref(), Some("skipped: `if: contains(affected('cargo'), 'core')` was false"));
+    assert_eq!(r.spec("docs").unaffected.as_deref(), Some("skipped: `if: changed('docs/**')` was false"));
+    assert_eq!(r.spec("cli").unaffected, None, "the change affects it: it runs");
+    assert!(r.logged("plain skipped") && r.logged("prs skipped"), "no reuse, or false whatever changed: {:?}", r.log);
+    // Not part of what the leg is: its reuse key is the same either way.
+    let json = serde_json::to_value(r.spec("core")).unwrap_or_default();
+    assert!(json.get("unaffected").is_none(), "{json}");
+}
+
+/// W24-R06 with `when:`: a matrix's legs the change can't affect are queued to be reused, the
+/// others run.
+#[test]
+fn w24_r06_when_over_affected() {
+    let wf = "name: k\non: push\njobs:\n  test:\n    strategy:\n      matrix:\n        crate: [core, cli, docs]\n      when: contains(affected('cargo'), matrix.crate)\n    work: { memo: true }\n    steps: [{run: t}]\n";
+    let r = Run::with(wf, Dialect::Kiln, changed(&["crates/cli/src/main.rs"]), Source { graph: Some(crates()), ..Source::default() });
+    assert_eq!(r.queued, ["test (core)", "test (cli)", "test (docs)"], "{:?}", r.log);
+    assert_eq!(r.spec("test (cli)").unaffected, None);
+    assert_eq!(r.spec("test (core)").unaffected.as_deref(), Some("skipped by when"));
+    assert_eq!(r.spec("test (docs)").unaffected.as_deref(), Some("skipped by when"));
+}
+
+/// W24-R06: what the dispatcher makes of an unaffected leg is what follows it: reused, its
+/// dependents run on its outputs; skipped (nothing to reuse), they're skipped as they'd have been.
+#[test]
+fn w24_r06_an_unaffected_legs_end_is_its_dependents_need() {
+    let wf = "name: k\non: push\njobs:\n  core:\n    if: contains(affected('cargo'), 'core')\n    reuse: true\n    steps: [{run: t}]\n  after:\n    needs: core\n    steps: [{run: a}]\n";
+    let input = || changed(&["crates/cli/src/main.rs"]);
+    let mut r = Run::with(wf, Dialect::Kiln, input(), Source { graph: Some(crates()), ..Source::default() });
+    assert_eq!(r.queued, ["core"]);
+    r.outputs("core", &[("v", "1")]);
+    assert_eq!(r.queued, ["core", "after"], "reused: {:?}", r.log);
+    assert_eq!(at(&r.spec("after").needs, "/core/outputs/v"), serde_json::json!("1"));
+    let mut r = Run::with(wf, Dialect::Kiln, input(), Source { graph: Some(crates()), ..Source::default() });
+    r.finish("core", Conclusion::Skipped);
+    assert!(r.logged("after skipped"), "{:?}", r.log);
+    assert_eq!(r.finished, Some(Conclusion::Success));
 }

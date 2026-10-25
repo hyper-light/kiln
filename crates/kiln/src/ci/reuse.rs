@@ -250,4 +250,52 @@ mod tests {
         assert_eq!(matching(listing, "**/*.rs"), "100644 blob b1\tlib/x/b.rs");
         assert_eq!(matching(listing, "nothing"), "");
     }
+
+    /// W24-R06: a leg that took an earlier result over, as one the change can't affect does, is a
+    /// passing required check: the land policy sees it green, and its row names its source.
+    #[test]
+    fn w24_r06_a_reused_leg_is_a_passing_required_check() -> anyhow::Result<()> {
+        use crate::ci::runs;
+        use crate::store::Status;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let repo = Repo { id: "r1".into(), name: "acme/app".into(), clone_url: String::new(), branches: Vec::new(), poll_seconds: 0, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "native".into(), default_branch: None, mirror: None };
+            let repo = hub.store.upsert_repo(repo).await?;
+            let (wf, _) = kiln_ci::wf::parse_workflow(".kiln/ci.yaml", "on: push\njobs:\n  a:\n    work: { memo: true }\n    steps: [{run: t}]\n", kiln_ci::expr::Dialect::Kiln);
+            let wf = std::sync::Arc::new(wf.ok_or_else(|| anyhow::anyhow!("no workflow"))?);
+            let input = kiln_ci::plan::RunInput { trusted: true, ..Default::default() };
+            let (_, acts) = kiln_ci::plan::RunPlan::start(wf, input, kiln_ci::plan::Settings::default(), &kiln_ci::plan::NoSource).map_err(|e| anyhow::anyhow!(e))?;
+            let spec = acts.into_iter().find_map(|a| if let kiln_ci::plan::PlanAction::Queue(s) = a { Some(*s) } else { None }).ok_or_else(|| anyhow::anyhow!("no leg"))?;
+            let new = |id: &str, sha: &str| runs::NewRun {
+                id: id.into(),
+                workflow: ".kiln/ci.yaml".into(),
+                name: "ci".into(),
+                event: "push".into(),
+                branch: "main".into(),
+                sha: sha.into(),
+                message: String::new(),
+                author: String::new(),
+                actor: "ada".into(),
+                trigger: Value::Null,
+                trusted: true,
+                priority: 60,
+                payload: Value::Null,
+                model: String::new(),
+                input: String::new(),
+            };
+            runs::create(&hub, &repo, new("run1", "s1")).await?;
+            runs::create(&hub, &repo, new("run2", "s2")).await?;
+            runs::insert_leg(&hub, "run1", "leg1", &spec, Status::Queued, None).await?;
+            runs::finish_leg(&hub, "leg1", Status::Succeeded, "success", None, None).await?;
+            take_over(&hub, "run2", "leg1", "leg2", "h1").await?;
+            let checks = crate::ci::review::checks_on(&hub, "acme/app", "s2").await?;
+            anyhow::ensure!(checks.get("ci/a") == Some(&Some("success".to_owned())), "{checks:?}");
+            let land = kiln_ci::land::Land { checks: vec!["ci/a".into()], approvals: 0, owners: false, resolve_threads: false, ..Default::default() };
+            let blockers = kiln_ci::land::blockers(&land, &[], &kiln_ci::land::Facts { checks, ..Default::default() });
+            anyhow::ensure!(blockers.is_empty(), "{blockers:?}");
+            let from: Option<String> = hub.store.call(|c| Ok(c.query_row("SELECT reused_from FROM jobs WHERE id = 'leg2'", [], |r| r.get(0))?)).await?;
+            anyhow::ensure!(from.as_deref() == Some("leg1"), "{from:?}");
+            Ok(())
+        })
+    }
 }

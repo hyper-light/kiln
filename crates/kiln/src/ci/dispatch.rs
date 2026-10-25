@@ -1681,6 +1681,11 @@ impl Dispatch {
                 Err(e) => tracing::warn!(leg = %spec.key, error = %format!("{e:#}"), "reuse couldn't be looked up; the leg runs"),
             }
         }
+        // W24-R06: a leg the change can't affect, with no result of its inputs to take: skipped, as
+        // its `if` said.
+        if let Some(why) = spec.unaffected.clone() {
+            return Box::pin(self.unaffected(run, spec, why)).await;
+        }
         // One of `previews:` named: the leg deploys to its change's preview, that environment from
         // here on (W15-R07); or to none, skipped or failed, saying why.
         let mut unbound: Option<(bool, String)> = None;
@@ -1768,6 +1773,25 @@ impl Dispatch {
         let files = Arc::clone(&r.files);
         let timing = Arc::clone(&r.timing);
         let tree = Arc::clone(&r.tree);
+        let acts = r.plan.on_leg_finished(&spec.key, report.clone(), &Source { files: &files, timing: &timing, tree: &tree });
+        runs::log(&self.hub, run, seq, "leg", Some(spec.key.clone()), Some(report_json(&report))).await?;
+        self.actions(run, acts).await
+    }
+
+    /// A leg queued only to be reused, with no result of its inputs to take (W24-R06): skipped for
+    /// what its `if` (or `when`) said, and saying so; its report to the plan.
+    async fn unaffected(&mut self, run: &str, spec: LegSpec, why: String) -> anyhow::Result<()> {
+        let id = crate::util::new_id();
+        runs::insert_leg(&self.hub, run, &id, &spec, Status::Skipped, Some(format!("{why}: the change doesn't affect it, and no earlier result of its inputs is there to reuse"))).await?;
+        self.hub.emit_job(&id).await;
+        let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
+        r.keys.insert(spec.key.clone(), id);
+        r.seq += 1;
+        let seq = r.seq;
+        let files = Arc::clone(&r.files);
+        let timing = Arc::clone(&r.timing);
+        let tree = Arc::clone(&r.tree);
+        let report = LegReport::of(PlanC::Skipped);
         let acts = r.plan.on_leg_finished(&spec.key, report.clone(), &Source { files: &files, timing: &timing, tree: &tree });
         runs::log(&self.hub, run, seq, "leg", Some(spec.key.clone()), Some(report_json(&report))).await?;
         self.actions(run, acts).await
@@ -2849,6 +2873,7 @@ fn placeholder_spec(wf: &Arc<Workflow>, job: &str) -> LegSpec {
         emulated: false,
         reads: Vec::new(),
         cache_cap: None,
+        unaffected: None,
         workflow: Arc::clone(wf),
         job_index: index,
     }
