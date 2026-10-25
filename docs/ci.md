@@ -2003,12 +2003,15 @@ W20.
   - And to its CPUs (2026-10-25): a leg runs on CPUs of its own, as many as it asked for (whole
     ones: half of one is one), a cpuset and not a quota, which stalls a test's many threads
     where a hosted runner's machine wouldn't. The runner keeps a pool of the CPUs it may run on
-    itself (its `Cpus_allowed_list`: its affinity within its cgroup's cpuset); each leg takes
-    those no other leg holds while there are any, then the least held, and gives them back when
-    it ends. A job container and its services get them as `--cpuset-cpus` (a hosted runner's
+    itself (its `Cpus_allowed_list`: its affinity within its cgroup's cpuset), in one ledger with
+    the shares exclusive legs hold (W05-R03); each leg takes, of those no share holds, the ones
+    no other leg holds while there are any, then the least held, and gives them back when it
+    ends. A share taken later keeps off leased CPUs while there are enough others; when it
+    can't, a leased leg keeps what of its lease the share doesn't hold. A job container and its services get them as `--cpuset-cpus` (a hosted runner's
     services share its machine); a pool's executor, started before its leg came (W13-R09), gets
     them and the leg's memory by `docker update` as the leg takes it; and a host step starts
-    within them through `taskset` (Linux; elsewhere a leg sees the machine's). An engine that
+    on them from its first instruction, the thread starting it lending it its CPUs, and moves
+    as shares come and go (Linux; elsewhere a leg sees the machine's). An engine that
     can't hold a container to CPUs (a rootless one without the cpuset controller delegated to
     it) drops them with a warning, as Docker and Podman do, and the leg sees the machine's. So
     `nproc` says the leg's, and what sizes its work by it (`make -j$(nproc)`, cargo's jobs, a test
