@@ -20,8 +20,10 @@ concurrency: { group: "release-${{ event }}-${{ branch }}", cancel-in-progress: 
 jobs:
   linux:
     name: Linux (x86-64, ARM64)
-    # A Linux machine with rustup, python3 and node: the server's own runner.
-    runs-on: [baremetal, local]
+    # Any open Linux machine with rustup, python3 and node (W25): v1 places it on the runner
+    # meeting `requires` with the most room; build.sh adds its own rust targets and pinned zig.
+    runs-on: [baremetal]
+    requires: ["os == linux", "tools has cargo", "tools has python3", "tools has node"]
     timeout-minutes: 90
     steps:
       - name: ui
@@ -32,7 +34,8 @@ jobs:
 
   windows:
     name: Windows (x86-64, cross-built)
-    runs-on: [baremetal, local]
+    runs-on: [baremetal]
+    requires: ["os == linux", "tools has cargo", "tools has python3", "tools has node"]
     timeout-minutes: 90
     steps:
       - name: ui
