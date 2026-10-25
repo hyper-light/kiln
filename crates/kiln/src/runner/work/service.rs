@@ -498,11 +498,16 @@ impl Service {
 
     async fn route(self: &Arc<Self>, req: Request) -> anyhow::Result<Response> {
         let raw = req.uri().path().to_owned();
+        let folder = raw.ends_with('/');
         let segs: Vec<String> = raw.split('/').filter(|s| !s.is_empty()).map(unescape).collect();
         let s: Vec<&str> = segs.iter().map(String::as_str).collect();
         match s.as_slice() {
             ["_kiln", "cas", "v1", rest @ ..] => self.kiln(req, rest).await,
-            _ => Ok(msg(StatusCode::NOT_FOUND, "not a path of this runner's cache")),
+            // The tools' own protocols (AC08).
+            _ => match super::tools::route(self, req, &s, folder).await {
+                Some(r) => r,
+                None => Ok(msg(StatusCode::NOT_FOUND, "not a path of this runner's cache")),
+            },
         }
     }
 
@@ -816,6 +821,16 @@ pub(crate) mod tests {
     use crate::runner::work::client::{Conn, Endpoint, Reply};
     use futures::future::BoxFuture;
 
+    /// `f` on a thread of its own, awaited: a test's blocking client mustn't take one of the
+    /// blocking pool's few places, which the service it talks to needs for its own work.
+    pub(crate) async fn on_thread<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> anyhow::Result<R> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.await.map_err(|_| anyhow::anyhow!("the test's client thread ended without an answer"))
+    }
+
     pub(crate) fn access(repo: &str, domain: &str, read: bool, write: bool) -> Access {
         Access { repo: repo.into(), domain: domain.into(), read, write, ttl: Duration::from_secs(3600) }
     }
@@ -897,7 +912,7 @@ pub(crate) mod tests {
             let b_tr = svc.mint(&access("acme/other", "trusted", true, true))?;
             let b_pe = svc.mint(&access("acme/other", "person:ada", true, true))?;
             anyhow::ensure!(svc.mint(&access("acme/app", "everyone", true, true)).is_err(), "only W24-R21's domains");
-            crate::rt::blocking(move || -> anyhow::Result<()> {
+            on_thread(move || -> anyhow::Result<()> {
                 let mut c = conn(at);
                 let status = |c: &mut Conn, m: &str, p: &str, t: &str, b: &[u8]| call(c, m, p, Some(t), b).map(|r| r.status);
                 // A trusted entry of acme/app: its untrusted builds read it; acme/other's never.
@@ -964,7 +979,7 @@ pub(crate) mod tests {
             let local = svc.mint(&access("acme/app", "trusted", true, true))?;
             let big = noise(12 << 20, 9);
             let (big2, tr2, un2, local2) = (big.clone(), tr.clone(), un.clone(), local.clone());
-            crate::rt::blocking(move || -> anyhow::Result<()> {
+            on_thread(move || -> anyhow::Result<()> {
                 let mut c = conn(at);
                 for (t, name, body) in [(&tr2, "a", b"one".to_vec()), (&tr2, "a", b"one".to_vec()), (&un2, "b", b"two".to_vec()), (&local2, "c", b"three".to_vec()), (&tr2, "big", big2.clone())] {
                     let r = call(&mut c, "PUT", &format!("/_kiln/cas/v1/entries/turbo/{name}"), Some(t), &body)?;
@@ -985,7 +1000,7 @@ pub(crate) mod tests {
             // What the server holds and this runner doesn't is fetched, checked and kept.
             up.held.lock().insert((Scope::new("acme/app", "trusted"), "turbo".into(), "remote".into()), b"from the fleet".to_vec());
             let un3 = un.clone();
-            crate::rt::blocking(move || -> anyhow::Result<()> {
+            on_thread(move || -> anyhow::Result<()> {
                 let mut c = conn(at);
                 let r = call(&mut c, "GET", "/_kiln/cas/v1/entries/turbo/remote", Some(&un3), b"")?;
                 anyhow::ensure!(r.status == 200 && r.body == b"from the fleet", "{r:?}");
@@ -996,7 +1011,7 @@ pub(crate) mod tests {
             // trusted entry here.
             anyhow::ensure!(svc.store().entry(&[Scope::new("acme/app", "untrusted")], "turbo", "remote").is_some(), "kept here");
             anyhow::ensure!(svc.store().entry(&[Scope::new("acme/app", "trusted")], "turbo", "remote").is_none(), "never as trusted");
-            let r = crate::rt::blocking(move || call(&mut conn(at), "GET", "/_kiln/cas/v1/entries/turbo/big", Some(&tr), b"")).await??;
+            let r = on_thread(move || call(&mut conn(at), "GET", "/_kiln/cas/v1/entries/turbo/big", Some(&tr), b"")).await??;
             anyhow::ensure!(r.status == 200 && r.body == big, "a large entry streams back whole ({} bytes)", r.body.len());
             Ok(())
         })
@@ -1012,7 +1027,7 @@ pub(crate) mod tests {
             let (svc, _) = serve(&root).await?;
             let sock = svc.listen_unix(&root.join("cas.sock")).await?;
             let t = svc.mint(&access("acme/app", "trusted", true, true))?;
-            crate::rt::blocking(move || -> anyhow::Result<()> {
+            on_thread(move || -> anyhow::Result<()> {
                 let mut c = Conn::new(Endpoint::Unix(sock));
                 anyhow::ensure!(call(&mut c, "PUT", "/_kiln/cas/v1/entries/go/a1", Some(&t), b"output")?.status == 201);
                 let r = call(&mut c, "GET", "/_kiln/cas/v1/entries/go/a1", Some(&t), b"")?;
@@ -1033,7 +1048,7 @@ pub(crate) mod tests {
         crate::rt::block_on(async move {
             let (svc, at) = serve(&root).await?;
             let t = svc.mint(&access("acme/app", "trusted", true, true))?;
-            let (p50, p99, n) = crate::rt::blocking(move || -> anyhow::Result<(Duration, Duration, usize)> {
+            let (p50, p99, n) = on_thread(move || -> anyhow::Result<(Duration, Duration, usize)> {
                 let mut c = conn(at);
                 // 64 objects from 1 KiB to just under 1 MiB.
                 let objects: Vec<Vec<u8>> = (0..64u64).map(|i| noise(1024 + usize::try_from(i * 16_350).unwrap_or(0), i + 1)).collect();

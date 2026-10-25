@@ -8,9 +8,14 @@
 //! - [`upstream`]: where the service's writes go up to and its misses are looked for: the server,
 //!   by scope (W24-R08).
 //! - [`client`]: a small blocking client of the service.
+//! - [`tools`]: the tools' own cache protocols on the service: sccache's WebDAV, Bazel's and
+//!   Gradle's and ccache's HTTP caches, Turborepo's API (W24-R08, AC08).
+//! - [`gocacheprog`]: `kiln gocacheprog`, Go's `GOCACHEPROG` helper (W24-R08, AC08).
 
 pub mod client;
+pub mod gocacheprog;
 pub mod service;
 pub mod store;
 pub mod token;
+pub mod tools;
 pub mod upstream;
