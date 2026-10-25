@@ -11,9 +11,11 @@
 //! - [`tools`]: the tools' own cache protocols on the service: sccache's WebDAV, Bazel's and
 //!   Gradle's and ccache's HTTP caches, Turborepo's API (W24-R08, AC08).
 //! - [`gocacheprog`]: `kiln gocacheprog`, Go's `GOCACHEPROG` helper (W24-R08, AC08).
+//! - [`peers`]: objects from the runners on this one's LAN, each checked by its digest (W24-R27).
 
 pub mod client;
 pub mod gocacheprog;
+pub mod peers;
 pub mod service;
 pub mod store;
 pub mod token;

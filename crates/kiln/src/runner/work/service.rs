@@ -12,6 +12,8 @@
 //! - **Up**: a token minted under a grant with an upstream ([`super::upstream`]) sends what it
 //!   writes up to the server, by scope, in the background, and a read this runner can't answer
 //!   is asked of the server before it's a miss.
+//! - **Peers**: an object this runner lacks is asked of the runners on its LAN that hold it for
+//!   the asker's repository first, each copy checked by its digest ([`super::peers`], W24-R27).
 //!
 //! kiln's own API, under `/_kiln/cas/v1/`:
 //!
@@ -34,6 +36,7 @@ use http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
+use super::peers::Peers;
 use super::store::{Entry, Kept, Scope, Store, WHOLE_MAX, is_digest};
 use super::token::{Claims, Keyring, known_domain};
 use super::upstream::{Up, Upstream};
@@ -142,6 +145,8 @@ pub struct Service {
     jobs: async_channel::Sender<Job>,
     pending: Arc<Pending>,
     at: Mutex<Endpoints>,
+    /// The runners on this one's LAN, once something says how to reach them (W24-R27).
+    peers: Mutex<Option<Arc<dyn Peers>>>,
 }
 
 impl std::fmt::Debug for Service {
@@ -178,7 +183,32 @@ impl Service {
         for _ in 0..UPLOADERS {
             crate::rt::spawn(uploader(Arc::clone(&store), rx.clone(), Arc::clone(&pending)));
         }
-        Arc::new(Service { store, keys, grants: Mutex::new(HashMap::new()), jobs, pending, at: Mutex::new(Endpoints::default()) })
+        Arc::new(Service { store, keys, grants: Mutex::new(HashMap::new()), jobs, pending, at: Mutex::new(Endpoints::default()), peers: Mutex::new(None) })
+    }
+
+    /// Objects this runner lacks are asked of `peers` before the server (W24-R27).
+    pub fn set_peers(&self, peers: Arc<dyn Peers>) {
+        *self.peers.lock() = Some(peers);
+    }
+
+    /// `digest`, for the token's repository, from a LAN peer whose copy is what its name says:
+    /// kept here then, in the token's own scope. Whether it came.
+    async fn fetch_from_peers(&self, c: &Claims, digest: &str) -> bool {
+        let Some(peers) = self.peers.lock().clone() else { return false };
+        match super::peers::fetch(&self.store, peers.as_ref(), &c.repo, digest).await {
+            Ok(f) if f.from.is_some() => match self.store.hold(&c.scope(), digest) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(target: "kiln.work", object = %digest, error = %format!("{e:#}"), "an object from a peer couldn't be kept");
+                    false
+                }
+            },
+            Ok(_) => false,
+            Err(e) => {
+                tracing::warn!(target: "kiln.work", object = %digest, error = %format!("{e:#}"), "an object couldn't be fetched from a peer");
+                false
+            }
+        }
     }
 
     pub fn store(&self) -> &Arc<Store> {
@@ -304,15 +334,16 @@ impl Service {
 
     // --------------------------------------------------------------------------- operations
 
-    /// The entry `name` of `ns` in the first of the token's scopes that has it: here, else from
-    /// the server through the token's grant (kept here then).
+    /// The entry `name` of `ns` in the first of the token's scopes that has it: here (its object
+    /// from a LAN peer if this runner no longer has it), else from the server through the token's
+    /// grant (kept here then).
     pub(crate) async fn find_entry(&self, c: &Claims, ns: &str, name: &str) -> anyhow::Result<Option<(Scope, Entry)>> {
         let scopes = c.reads();
         if scopes.is_empty() {
             return Ok(None);
         }
         if let Some((scope, e)) = self.store.entry(&scopes, ns, name).await?
-            && self.store.has(&e.digest)
+            && (self.store.has(&e.digest) || self.fetch_from_peers(c, &e.digest).await)
         {
             return Ok(Some((scope, e)));
         }
@@ -342,9 +373,9 @@ impl Service {
         Ok(None)
     }
 
-    /// The first of the token's scopes holding the object `digest`: here, else from the server
-    /// (an object is the entry of namespace `cas` named by its digest there), checked, and kept in
-    /// the token's own scope.
+    /// The first of the token's scopes holding the object `digest`: here, else from a LAN peer,
+    /// else from the server (an object is the entry of namespace `cas` named by its digest there),
+    /// checked, and kept in the token's own scope.
     pub(crate) async fn find_object(&self, c: &Claims, digest: &str) -> anyhow::Result<Option<Scope>> {
         let scopes = c.reads();
         if scopes.is_empty() || !is_digest(digest) {
@@ -352,6 +383,9 @@ impl Service {
         }
         if let Some(s) = self.store.holder(&scopes, digest) {
             return Ok(Some(s));
+        }
+        if self.fetch_from_peers(c, digest).await {
+            return Ok(Some(c.scope()));
         }
         let Some((_, upstream)) = self.upstream_of(c) else { return Ok(None) };
         let own = c.scope();
