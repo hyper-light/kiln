@@ -2835,6 +2835,7 @@ pub(crate) mod tests {
             facts: None,
             instances: Vec::new(),
             transport: None,
+            skew: crate::skew::Skew::default(),
         }
     }
 
