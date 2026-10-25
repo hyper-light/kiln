@@ -417,8 +417,10 @@ mod tests {
     use super::*;
 
     fn sh(dir: &Path, args: &[&str]) -> Result<String> {
+        // Free of this machine's git config: one that signs tags makes a lightweight `git tag` ask
+        // for a message.
         let out = Command::new("git").current_dir(dir).args(args).env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").output()?;
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").output()?;
         if !out.status.success() {
             bail!("{}", String::from_utf8_lossy(&out.stderr));
         }
