@@ -1332,7 +1332,7 @@ fn a_full_disk_is_refused_in_time_never_spun_on_and_nothing_it_took_is_lost() ->
         &cfg,
         format!(
             "[server]\nhttp_addr = \"127.0.0.1:{port}\"\nquic_addr = \"127.0.0.1:{}\"\npublic_url = \"http://127.0.0.1:{port}\"\ndata_dir = \"/data/server\"\n[gitops]\nauto_pipelines = false\n[local_agent]\nenabled = false\n[discovery]\nenabled = false\n[kubernetes]\nenabled = false\n[cd]\nenabled = false\n[observe]\nenabled = true\nhost_seconds = 3600\n",
-            common::free_port()?
+            common::free_udp_port()?
         ),
     )?;
     let name = format!("kiln-fulldisk-{port}");

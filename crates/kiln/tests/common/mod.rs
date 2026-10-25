@@ -47,6 +47,14 @@ pub fn free_port() -> anyhow::Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
+/// A UDP port free on 127.0.0.1, for a QUIC listener: asked of UDP, not TCP. Windows reserves
+/// ranges of each apart (Hyper-V's, Docker Desktop's: `netsh int ipv4 show excludedportrange
+/// protocol=udp`); a TCP port free there was refused to UDP (`bind`: 10013, an access forbidden),
+/// and the fleet's server had no QUIC listener: no runner joined.
+pub fn free_udp_port() -> anyhow::Result<u16> {
+    Ok(std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?.port())
+}
+
 /// How a test's containers and this machine reach each other. Under Linux's own engine a container
 /// shares this machine's network (`--network host`): it reaches this machine's services, and this
 /// machine its, at 127.0.0.1. Under Docker Desktop (macOS, Windows: its containers in a VM of its
@@ -178,7 +186,7 @@ impl Fleet {
     /// `extra(root)` too, and the server has `env`.
     pub fn with_tables(tables: &Tables<'_>, extra: impl Fn(&Path) -> String, env: &[(&str, &str)]) -> anyhow::Result<Self> {
         let root = tempfile::tempdir()?;
-        let (http, quic) = (free_port()?, free_port()?);
+        let (http, quic) = (free_port()?, free_udp_port()?);
         let data = root.path().join("server");
         let cfg = format!(
             r#"
@@ -833,7 +841,7 @@ pub struct Options<'a> {
 
 /// A server of its own under `dir`, up and answering.
 pub fn start(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
-    let (port, quic) = (free_port()?, free_port()?);
+    let (port, quic) = (free_port()?, free_udp_port()?);
     let data = dir.join("data");
     let work = dir.join("work");
     let config = format!(
