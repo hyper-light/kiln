@@ -7961,7 +7961,11 @@ for the one-file change; `image_pool`, `pools`, `post_steps`, `leftovers` and `h
 and each links the library a change to `crates/kiln/src/lib.rs` rebuilds, so selection by binary
 runs nearly all of it again, about 2,540 s against the 663 s allowed. Meeting it takes selection
 finer than a binary (each test by what it reads or covers, R10's finer keys), or `crates/kiln`
-split into crates its tests depend on apart. From a trunk commit whose trusted run of `ci.yaml` is complete (its
+split into crates its tests depend on apart. Both scenarios also need a suite that passes: a failure is
+never kept, so a failing binary runs every time. M0's docs-only and one-file runs each had eleven
+failing binaries, 1,920 s of their test time (`image_pool` 911 s, `post_steps` 311 s, `leftovers`
+and `pools` 301 s each, the shapes of timeouts under load), against two in the cold run; until they
+pass or are quarantined (`.kiln/quarantine.yaml`, W16-R05), no docs-only run can be under 60 s. From a trunk commit whose trusted run of `ci.yaml` is complete (its
 warm state and ledger entries are the baseline), three pushes of a docs-only change (`docs/ci.md`
 touched) and three of a one-file change in `crates/kiln` (`crates/kiln/src/lib.rs` touched, as
 M0's), each its own commit on that parent, pushed to a branch of kiln's own repository (trusted)
