@@ -5103,6 +5103,10 @@ collector's, the scanner's and the tracer's scenarios found no runner caught up:
 QUIC listener was refused its port (`bind`: 10013, an access forbidden), the fleet having asked TCP
 for a free port it then listened on over UDP, and Windows reserving ranges of each apart
 (Hyper-V's, Docker Desktop's); a QUIC port is now asked of UDP, and the three pass at b903c978.
+And again at d9480644, after counting was made faster (§12.23): kiln-obs's tests (354, its group's
+4), kiln's observe, CD and transport tests (291), and every live file above, the Event Log, kiln
+CD's kind cluster and Docker's among them; in three parts, the machine's own kiln runner having
+restarted twice under the run (its files then run again, what they left removed).
 Not run there: DogStatsD's Unix socket (Windows has no Unix datagram sockets),
 macOS's unified log, and the full disk's (it runs this machine's build in a Linux container).
 
