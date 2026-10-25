@@ -2141,7 +2141,9 @@ fn w24_r18_a_warm_jobs_leg_says_where_it_runs_warm() -> anyhow::Result<()> {
     std::fs::create_dir_all(&home)?;
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/placed", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "{st} {body}");
-    let work = dir.path().join("work");
+    // The checkout pushed from: not the runner's work directory (`work`), whose files would be
+    // pushed with it.
+    let work = dir.path().join("tree");
     std::fs::create_dir_all(work.join(".kiln"))?;
     must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
     std::fs::write(work.join("README.md"), "placed\n")?;
@@ -2153,10 +2155,11 @@ fn w24_r18_a_warm_jobs_leg_says_where_it_runs_warm() -> anyhow::Result<()> {
         let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
         Ok((body.contains("\"last_polled_at\":null")).then_some(body))
     })?;
-    // The second run's leg runs a while: long enough to be asked where it runs warm.
+    // Each leg takes a couple of seconds (a leg that takes none gains nothing from a warm
+    // workspace), and the second runs a while: long enough to be asked where it runs warm.
     std::fs::write(
         work.join(".kiln/placed.yaml"),
-        "on: push\njobs:\n  build:\n    runs-on: local\n    work: { warm: [target] }\n    prefer: [{ warm: true }]\n    steps:\n      - run: |\n          mkdir -p target && echo built > target/f\n          case \"$(cat README.md)\" in second) sleep 40;; esac\n",
+        "on: push\njobs:\n  build:\n    runs-on: local\n    work: { warm: [target] }\n    prefer: [{ warm: true }]\n    steps:\n      - run: |\n          mkdir -p target && echo built > target/f\n          sleep 2\n          case \"$(cat README.md)\" in second) sleep 40;; esac\n",
     )?;
     let runs = || -> anyhow::Result<Vec<Value>> {
         let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/placed&limit=10", &s.admin, None)?;
@@ -2166,7 +2169,8 @@ fn w24_r18_a_warm_jobs_leg_says_where_it_runs_warm() -> anyhow::Result<()> {
         std::fs::write(work.join("README.md"), format!("{what}\n"))?;
         must(git(&home, &work, &["add", "."]), "add")?;
         must(git(&home, &work, &["commit", "-qm", what]), "commit")?;
-        must(git(&home, &work, &["push", "-q", &url, "main"]), "push")
+        must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+        Ok(())
     };
     push("first")?;
     wait_for(300, "the first run", || Ok(runs()?.iter().any(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).then_some(())))?;
@@ -2180,15 +2184,27 @@ fn w24_r18_a_warm_jobs_leg_says_where_it_runs_warm() -> anyhow::Result<()> {
     let lane = kiln_ci::work::slots::placement(&kiln_ci::work::slots::lane_for("acme/placed", ".kiln/placed.yaml", "build", &json!({}), String::new())).hex();
     // The runner says it again once the leg leased the workspace: the first run's checkout, now
     // a commit behind trunk's newest, README.md changed between them.
+    // What the repository and the leg said, should this fail.
+    let said = || -> anyhow::Result<String> {
+        let mut all = must(git(&home, &work, &["log", "--format=%H %s", "--stat"]), "log")?;
+        for step in 0..3 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+            all.push_str(&t);
+        }
+        Ok(all)
+    };
+    let mut last = String::new();
     let warm = wait_for(35, "the leg's runner warm for it", || {
         let (_, body) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/routing"), &s.admin, None)?;
         let v: Value = serde_json::from_str(&body)?;
         let runners = v.get("runners").and_then(Value::as_array).cloned().unwrap_or_default();
+        last = body;
         Ok(runners.iter().filter_map(|r| r.get("warm")).find(|w| w.get("lane").and_then(Value::as_str) == Some(lane.as_str()) && w.get("behind").and_then(Value::as_u64) == Some(1)).cloned())
-    })?;
+    });
+    let warm = warm.map_err(|e| anyhow::anyhow!("{e}: {last}\n{}", said().unwrap_or_default()))?;
     let num = |k: &str| warm.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
     // No warm run here yet: the prior's half, shrunk for the one file changed (100 ÷ 101).
-    assert!(warm.get("files").and_then(Value::as_u64) == Some(1), "{warm}");
+    assert!(warm.get("files").and_then(Value::as_u64) == Some(1), "{warm}\n{}", said()?);
     assert!((num("warmth") - 0.5 * 100.0 / 101.0).abs() < 1e-9 && num("run_s") > 0.0 && num("fetch_s") == 0.0 && num("finish_s") >= num("run_s"), "{warm}");
     wait_for(120, "the second run", || Ok((runs()?.iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).count() >= 2).then_some(())))?;
     let list = runs()?;
