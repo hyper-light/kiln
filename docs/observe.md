@@ -2123,7 +2123,7 @@ testable.
 group first alerts, warns or stops having data, labelled `kiln` and with the group's key (its dedup
 key, PagerDuty's), by which it is found again: JQL, the project, the label, a status not done, the
 newest first (Cloud's `GET /rest/api/3/search/jql`, its `search` being gone; Data Center's
-`/rest/api/2/search`). Kiln keeps nothing of it, so a server that takes over finds what the last one
+`/rest/api/2/search`). kiln keeps nothing of it, so a server that takes over finds what the last one
 made. Each change after that is a comment on the issue; its recovery a comment, and the issue moved
 to a done status by the first of its transitions that goes to one (`statusCategory` `done`; none
 there, the comment is kept and that said), unless the integration says not to. An issue someone
@@ -2134,7 +2134,9 @@ signed in with the account's email and an API token. Data Center speaks REST API
 message and facts as they are in a `{noformat}` block (so no markup in them takes effect), then the
 link; signed in with a personal access token (Bearer) or a user's name and password. The summary is
 the title, one line of 255 characters at the most; the type `Task` unless said (every software
-project has it). A refusal is said in Jira's words (`400 {"errors":{"issuetype":…}}`).
+project has it). The project's create screen needs Labels, as it has unless someone took it off
+(else Jira refuses the issue, `Field 'labels' cannot be set`). A refusal is said in Jira's words
+(`400 {"errors":{"issuetype":…}}`).
 
 **ServiceNow** (`@servicenow-<name>`, ITSM's incidents through the Table API): an incident a group,
 made while it is wrong (`POST /api/now/table/incident`: its short description the title, 160
