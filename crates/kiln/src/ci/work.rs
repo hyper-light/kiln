@@ -514,8 +514,8 @@ fn marks(c: &Connection, scope: &str, key: &Key) -> anyhow::Result<Marks> {
 }
 
 /// Records a test binary's run (W24-R10) through the ledger's one path: a pass goes in by
-/// [`record`], under the binary's weak key and what it read (its test key,
-/// [`kiln_ci::work::tests::key`]), so [`lookup`] finds it only while its digest, arguments,
+/// [`record`], as the binary's unit ([`kiln_ci::work::tests::unit`]) with what it read (its test
+/// key, [`kiln_ci::work::tests::key`]), so [`lookup`] finds it only while its digest, arguments,
 /// environment, platform and every file it read are as they were; a failure, a crash or a timeout
 /// never does. Every run counts towards its test key's flaky marks (W16-R04), and a pass is kept as
 /// its binary's identity's newest, with what it read, for a run that doesn't rebuild it. Returns the
@@ -538,22 +538,22 @@ pub fn record_test(c: &Connection, scope: &str, b: &Binary, cx: &Context, read: 
         domain: cx.trust.clone(),
         ..Recorded::default()
     };
-    let strong = record(c, scope, &test_results::weak(b, cx), read, &result)?;
+    let strong = record(c, scope, &test_results::unit(b, cx), read, &result)?;
     put(c, Family::Test, &last_at(scope, b, cx), &serde_json::to_vec(&(&kept, read))?, now)?;
     Ok(Some(strong))
 }
 
 /// What the ledger has for a test binary (W24-R10), as [`kiln_ci::work::tests::select`] asks: a
-/// pass under its test key by two-phase lookup (only for a binary with its digest), with that key's
-/// flaky tests as they are now; and its identity's newest pass, with whether what that read holds.
-/// `now` gives a path set as it is now.
+/// pass found for its unit by [`lookup`] (only for a binary with its digest), with the flaky tests
+/// of the key it was found under as they are now; and its identity's newest pass, with whether what
+/// that read holds. `now` gives a path set as it is now.
 pub fn found_test(c: &Connection, scope: &str, b: &Binary, cx: &Context, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<Found> {
     let mut by_key = None;
     if b.digest.is_some()
-        && let Some((strong, found)) = lookup(c, scope, &test_results::weak(b, cx), now)?
-        && let Some(kept) = found.outputs.get("test").map(|t| serde_json::from_str::<Kept>(t)).transpose()?
+        && let Some(hit) = lookup(c, scope, &test_results::unit(b, cx), now)?
+        && let Some(kept) = hit.recorded.outputs.get("test").map(|t| serde_json::from_str::<Kept>(t)).transpose()?
     {
-        by_key = Some(Kept { flaky: marks(c, scope, &strong)?.flaky(), ..kept });
+        by_key = Some(Kept { flaky: marks(c, scope, &hit.key)?.flaky(), ..kept });
     }
     let last: Option<(Kept, PathSet)> = get(c, Family::Test, &last_at(scope, b, cx))?.map(|v| serde_json::from_slice(&v)).transpose()?;
     let last_holds = last.as_ref().is_some_and(|(_, read)| now(read) == *read);
