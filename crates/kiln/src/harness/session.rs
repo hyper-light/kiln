@@ -2459,6 +2459,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     adapter.seed(items.clone());
                 }
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
+                // One the machine's own PATH lacks may be on its user's: their login shell is asked
+                // first (once, then kept ten minutes).
+                if blocked.is_none() && spec.program.is_none() && !kind.available() {
+                    crate::reach::serve::login_env().await;
+                }
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
                     // In the session's group of processes where the machine has them, and marked as

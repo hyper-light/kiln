@@ -1018,6 +1018,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         h.restore_from(convo.as_ref());
         h
     });
+    // The harnesses its user's login shell finds are this machine's too
+    // (`crate::harness::kinds::search_path`): that shell is asked now, and every ten minutes.
+    if harness.is_some() {
+        crate::rt::spawn(crate::reach::serve::login_env());
+    }
     // A copy of the server's store this runner keeps, if the server picks it (a mirror), and
     // that copy sent back while the server restores its store from it.
     let mut mirror: Option<crate::convo::feed::Intake> = None;
@@ -1083,6 +1088,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The harnesses this machine offers, as last reported (rechecked every minute or so).
     let mut harness_kinds_sent: Option<String> = None;
     let mut harness_kinds_tick: u32 = 0;
+    // Whether its user's login shell had said its PATH when they were last looked at.
+    let mut users_path_known = false;
     let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
@@ -3050,11 +3057,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let shells = terms.iter().filter_map(|(id, (pty, _))| Some((pty.pid()?, id.clone()))).collect();
                         ai.scan(shells, uplink.0.clone());
                     }
-                    // A harness installed (or removed) since: say so.
+                    // A harness installed (or removed) since, or found once its user's login shell
+                    // said its PATH (asked again every ten minutes): say so.
                     harness_kinds_tick = harness_kinds_tick.wrapping_add(1);
+                    let users_path = crate::reach::serve::login_path().is_some();
                     if let Some(h) = &harness
-                        && harness_kinds_tick.is_multiple_of(12)
+                        && (harness_kinds_tick.is_multiple_of(12) || users_path != users_path_known)
                     {
+                        users_path_known = users_path;
+                        crate::rt::spawn(crate::reach::serve::login_env());
                         let now = serde_json::to_string(&crate::harness::kinds::offered()).ok();
                         if now != harness_kinds_sent
                             && let Ok(json) = serde_json::to_string(&h.inventory())

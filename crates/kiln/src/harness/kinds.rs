@@ -64,7 +64,12 @@ impl Kind {
 
     /// Installed on this machine.
     pub fn available(&self) -> bool {
-        crate::os::which(self.program).is_some()
+        self.find().is_some()
+    }
+
+    /// Its executable, on [`search_path`].
+    pub fn find(&self) -> Option<std::path::PathBuf> {
+        crate::os::which_in(self.program, &search_path()?)
     }
 
     /// kiln can run it as a structured session (else only as a terminal program).
@@ -89,7 +94,7 @@ impl Kind {
         }
         let program = match &spec.program {
             Some(p) => std::path::PathBuf::from(p),
-            None => crate::os::which(self.program).ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?,
+            None => self.find().ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?,
         };
         let mut p = Process::new(program);
         let cwd = super::session::resolve_cwd(spec.cwd.as_deref());
@@ -159,7 +164,7 @@ impl Kind {
         }
         let program = match &spec.program {
             Some(p) => std::path::PathBuf::from(p),
-            None => crate::os::which(self.program).ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?,
+            None => self.find().ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?,
         };
         let mut p = Process::new(program);
         let cwd = spec.cwd.clone().unwrap_or_else(|| crate::os::home_dir().to_string_lossy().into_owned());
@@ -205,9 +210,35 @@ pub fn acp_servers(spec: &Spec, session: &str) -> Vec<serde_json::Value> {
     Vec::new()
 }
 
+/// Where harnesses are looked for, and the PATH they run with: this process's, then the folders
+/// only its user's login shell has (`crate::reach::serve::login_env`, which a runner asks as it
+/// starts and every ten minutes). A runner's service keeps the PATH of the terminal it was
+/// installed from: a harness installed since in a folder that PATH lacks (Claude Code's and
+/// Codex's installers put theirs in `~/.local/bin`) is on its user's PATH alone.
+pub fn search_path() -> Option<std::ffi::OsString> {
+    let users = crate::reach::serve::login_path();
+    joined_path(std::env::var_os("PATH").as_deref(), users.as_deref().map(std::ffi::OsStr::new))
+}
+
+/// `first`'s folders, then the whole paths of `then` it hasn't (a relative one would be the
+/// runner's folder's), as one PATH (none without a folder).
+fn joined_path(first: Option<&std::ffi::OsStr>, then: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    let mut dirs: Vec<std::path::PathBuf> = first.map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
+    for dir in then.into_iter().flat_map(|p| std::env::split_paths(p).collect::<Vec<_>>()) {
+        if dir.is_absolute() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    std::env::join_paths(dirs).ok().filter(|p| !p.is_empty())
+}
+
 /// The session's environment over the machine's: what its shell had (minus the shell's own
 /// terminal plumbing), without what a Claude Code session sets for its children.
 fn set_env(p: &mut Process, spec: &Spec) {
+    // The PATH it was found on, so what it starts (its interpreter, its tools) is found too.
+    if let Some(path) = search_path() {
+        p.env("PATH", path);
+    }
     // `kiln run` in the agent's shell reaches other runners through this machine's runner.
     if let Some(sock) = crate::reach::local::socket() {
         p.env("KILN_REACH_SOCK", sock);
@@ -645,6 +676,37 @@ mod tests {
         let (modes, default) = kind.modes();
         assert_eq!(default, "accept-edits");
         assert_eq!(modes.iter().map(|m| (m.id.as_str(), m.dangerous)).collect::<Vec<_>>(), [("accept-edits", false), ("smart", false), ("ask", false), ("plan", false), ("bypass", true)]);
+        Ok(())
+    }
+
+    /// A runner's service keeps the PATH it was installed with: a harness installed since in a
+    /// folder only its user's PATH has (`~/.local/bin`) is found on the two together, the
+    /// runner's folders first and each once (the user's relative ones left out), and runs with
+    /// them.
+    #[test]
+    fn a_harness_on_its_users_path_alone_is_found_and_runs_with_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (own, users) = (dir.path().join("usr/bin"), dir.path().join("home/.local/bin"));
+        std::fs::create_dir_all(&own)?;
+        std::fs::create_dir_all(&users)?;
+        let claude = users.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\n")?;
+        crate::os::make_executable(&claude)?;
+        let runner = std::env::join_paths([&own])?;
+        assert_eq!(crate::os::which_in("claude", &runner), None);
+        let both = joined_path(Some(&runner), Some(&std::env::join_paths([users.as_path(), std::path::Path::new("bin"), &own])?));
+        assert_eq!(both, Some(std::env::join_paths([&own, &users])?));
+        assert_eq!(both.as_deref().and_then(|p| crate::os::which_in("claude", p)), Some(claude.clone()));
+        assert_eq!(joined_path(Some(&runner), None), Some(runner));
+        assert_eq!(joined_path(None, None), None);
+        // Started, it has the PATH it was looked for on: this process's folders first.
+        let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no Claude Code harness"))?;
+        let spec = Spec { kind: "claude".into(), program: Some(claude.to_string_lossy().into_owned()), cwd: Some(dir.path().to_string_lossy().into_owned()), ..Spec::default() };
+        let launch = kind.launch(&spec, "session")?;
+        let dirs = |p: Option<&std::ffi::OsStr>| p.map(|p| std::env::split_paths(p).collect::<Vec<_>>()).unwrap_or_default();
+        let ran = dirs(launch.get_envs().find(|(k, _)| *k == "PATH").and_then(|(_, v)| v));
+        let mine = dirs(std::env::var_os("PATH").as_deref());
+        assert!(!ran.is_empty() && ran.starts_with(&mine), "{ran:?} starts with {mine:?}");
         Ok(())
     }
 

@@ -29,6 +29,13 @@ pub struct Talk {
 /// A runner of the server at `port`, named `name`, the stand-in harness first on its PATH and
 /// `chaos` its faults (a `kiln agent --chaos` spec; a build with the `chaos` feature): its log.
 pub fn runner(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk) -> anyhow::Result<(Runner, PathBuf)> {
+    let path = format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+    runner_env(dir, port, name, chaos, talk, &[("PATH", &path)])
+}
+
+/// [`runner`], with `env` in its environment (its `PATH`, its `SHELL`): the stand-in harness is in
+/// `<dir>/bin`, on its PATH only if `env` puts it there.
+pub fn runner_env(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk, env: &[(&str, &str)]) -> anyhow::Result<(Runner, PathBuf)> {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin)?;
     let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-claude/claude");
@@ -39,7 +46,6 @@ pub fn runner(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk
     std::fs::create_dir_all(&home)?;
     let log_path = dir.join(format!("{name}.log"));
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
     cmd.args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name]);
     if let Some(c) = chaos {
@@ -51,7 +57,7 @@ pub fn runner(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk
         .arg("--state-dir")
         .arg(dir.join(format!("{name}-state")))
         .env("HOME", &home)
-        .env("PATH", &path)
+        .envs(env.iter().copied())
         .env("NO_COLOR", "1")
         .env("FAKE_CLAUDE_LINES", talk.lines.to_string())
         .env("FAKE_CLAUDE_EVERY_MS", talk.every_ms.to_string())

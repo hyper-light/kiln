@@ -67,6 +67,17 @@ again on the same conversation. A new model, effort or mode is a flag, so it sta
 between turns. Files you attach go to it as their paths on its machine; its models come from
 `agy models`.
 
+## Where a harness is found
+
+A machine offers a harness (`/api/harness/kinds`, the machines the new-agent dialog lists) when its
+program is on the runner's PATH or on the PATH a login shell of the machine's user has, asked as
+reach asks it for runs (`$SHELL -l -i`; as the runner starts, then kept ten minutes). A runner's
+service keeps the PATH of the terminal it was installed from, so a harness installed since in a
+folder that PATH lacks (Claude Code's and Codex's installers put theirs in `~/.local/bin`) is
+found all the same, within a minute, without the runner starting again. The harness runs with
+that PATH too: the runner's folders first, then those only the login shell has. An agent started
+from a kiln shell (`kiln spawn`) has that shell's PATH, as it has the rest of its environment.
+
 ## What an agent left running
 
 Every agent session's processes are held together by the system where it can (`crate::os::contain`):
