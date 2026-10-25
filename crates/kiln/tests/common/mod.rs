@@ -955,7 +955,18 @@ pub fn start_with(dir: &Path, o: &Options<'_>, https: bool) -> anyhow::Result<Se
 
 /// [`start`], with KilnCD and deploying by API running (no cluster of its own).
 pub fn start_cd(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
-    start_full(dir, o, false, true, &[])
+    let s = start_full(dir, o, false, true, &[])?;
+    // Deploying by API starts beside the server, not with it (its records copied first): until it
+    // has, its calls are answered 503.
+    let started = Instant::now();
+    loop {
+        let (code, body) = http(s.port, "GET", "/api/deploy/environments", &s.admin, None)?;
+        if code != 503 {
+            return Ok(s);
+        }
+        anyhow::ensure!(started.elapsed() < Duration::from_secs(60), "deploying by API never started: {body}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// `start_with`, the server's environment given `env` too.
