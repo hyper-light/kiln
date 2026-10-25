@@ -597,6 +597,7 @@ impl Sim {
                         let short = |v: Option<&Version>| match v {
                             Some(Version::File { hash, .. }) => hash.get(..8).unwrap_or_default().to_owned(),
                             Some(Version::Link { target }) => format!("->{target}"),
+                            Some(Version::Ref { commit }) => format!("ref {}", commit.get(..8).unwrap_or_default()),
                             None => "-".to_owned(),
                         };
                         let state = &feed.copy.state;
@@ -963,6 +964,8 @@ impl Sim {
                 let known = match &c.to {
                     Some(Version::File { hash, .. }) => self.written.contains(hash),
                     Some(Version::Link { target }) => self.written.contains(&format!("->{target}")),
+                    // The model's copies sync files only (Mode::Files): a ref nobody wrote.
+                    Some(Version::Ref { .. }) => false,
                     None => true,
                 };
                 if !known && self.invented.len() < 10 {
