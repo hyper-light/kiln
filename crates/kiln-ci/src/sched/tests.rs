@@ -297,6 +297,107 @@ fn a_leg_gone_with_its_repository_frees_its_runner() {
     assert!(c.is_empty(), "once: {c:?}");
 }
 
+/// A machine of `cpus` CPUs and `gib` GiB, its slots `slots`: a bench's runner.
+fn machine(name: &str, slots: u32, cpus: u32, gib: u64) -> RunnerIn {
+    let mut r = linux(name, slots);
+    r.view.facts.cpu.cores = cpus / 2;
+    r.view.facts.cpu.threads = cpus;
+    r.view.facts.mem.total = gib << 30;
+    r
+}
+
+/// An exclusive leg asking for `cpus` CPUs and `gib` GiB: a bench.
+fn bench(id: &str, cpus: f64, gib: u64) -> LegIn {
+    LegIn { exclusive: true, request: Resources { cpu: cpus, mem: gib << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) }
+}
+
+fn assigned(c: &[Command]) -> Vec<String> {
+    c.iter().filter_map(|x| if let Command::Assign { leg, .. } = x { Some(leg.clone()) } else { None }).collect()
+}
+
+/// An exclusive leg that asks for CPUs holds them and its memory, and ordinary legs pack in
+/// beside it, in what's left: on a 32-CPU, 64 GiB runner of 4 slots, a bench holding 16 CPUs
+/// leaves two slots' worth.
+#[test]
+fn an_exclusive_leg_holds_its_share_and_others_run_beside_it() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(bench("bench", 16.0, 16))), 1);
+    assert_eq!(assigned(&c), vec!["bench"], "it doesn't wait for an empty runner");
+    let mut on = Vec::new();
+    for (i, id) in ["o1", "o2", "o3"].iter().enumerate() {
+        on.extend(assigned(&s.handle(Input::LegQueued(Box::new(leg(id, "acme/x", 60))), 2 + i as i64)));
+    }
+    assert_eq!(on, vec!["o1", "o2"], "two ordinary legs beside it, in the half it doesn't hold");
+    assert!(matches!(s.reason("o3"), Some(WaitReason::Capacity { eligible: 1, busy: 1, draining: 0 })), "{:?}", s.reason("o3"));
+    // Another bench waits for its own share: of the 16 CPUs not held, the two legs there take 16.
+    s.handle(Input::LegQueued(Box::new(bench("bench2", 16.0, 16))), 6);
+    assert!(matches!(s.reason("bench2"), Some(WaitReason::Capacity { .. })), "{:?}", s.reason("bench2"));
+    // The bench ends: all four slots are there again, and the waiting legs take them.
+    let c = s.handle(Input::AttemptFinished { leg: "bench".into(), attempt: 1, outcome: Outcome::Success }, 7);
+    let next = assigned(&c);
+    assert!(next.contains(&"o3".to_owned()) || next.contains(&"bench2".to_owned()), "what waited goes on: {next:?}");
+}
+
+/// Asking for nothing, an exclusive leg still has its runner to itself, as before.
+#[test]
+fn an_exclusive_leg_asking_nothing_still_takes_the_whole_runner() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("busy", "acme/x", 60))), 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { exclusive: true, ..leg("ex", "acme/x", 60) })), 1);
+    assert_eq!(s.reason("ex"), Some(&WaitReason::Exclusive));
+    let c = s.handle(Input::AttemptFinished { leg: "busy".into(), attempt: 1, outcome: Outcome::Success }, 2);
+    assert_eq!(assigned(&c), vec!["ex"]);
+    let c = s.handle(Input::LegQueued(Box::new(leg("after", "acme/x", 60))), 3);
+    assert!(assigned(&c).is_empty(), "nothing shares the runner with it");
+}
+
+/// After a restart, a bench the runner still runs holds its share as before: nothing new lands
+/// in it.
+#[test]
+fn a_bench_adopted_after_a_restart_keeps_its_share() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::LegRunning { leg: Box::new(bench("bench", 16.0, 16)), runner: "a".into(), attempt: 1 }, 0);
+    s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 1);
+    let mut on = Vec::new();
+    for (i, id) in ["o1", "o2", "o3"].iter().enumerate() {
+        on.extend(assigned(&s.handle(Input::LegQueued(Box::new(leg(id, "acme/x", 60))), 2 + i as i64)));
+    }
+    assert_eq!(on, vec!["o1", "o2"], "the adopted bench still holds half the runner");
+    // And one asking for nothing, adopted, still holds all of it.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::LegRunning { leg: Box::new(LegIn { exclusive: true, ..leg("ex", "acme/x", 60) }), runner: "a".into(), attempt: 1 }, 0);
+    s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 1);
+    let c = s.handle(Input::LegQueued(Box::new(leg("o", "acme/x", 60))), 2);
+    assert!(assigned(&c).is_empty(), "nothing beside an adopted exclusive leg");
+}
+
+/// A share bigger than any runner it could run on waits, saying so.
+#[test]
+fn a_share_no_runner_can_hold_waits_saying_why() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 0);
+    s.handle(Input::LegQueued(Box::new(bench("huge", 64.0, 16))), 1);
+    assert!(matches!(s.reason("huge"), Some(WaitReason::Unroutable { failing }) if failing.iter().any(|f| f.contains("64 CPUs"))), "{:?}", s.reason("huge"));
+}
+
+/// In resource mode the share comes out of the runner before overcommit: ordinary legs
+/// overcommit only what no bench holds.
+#[test]
+fn in_resource_mode_ordinary_legs_overcommit_only_what_isnt_held() {
+    let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
+    let big = RunnerIn { capacity: Some(Resources { cpu: 32.0, mem: 64 << 30, disk: 500 << 30, gpu: 0 }), ..machine("a", 99, 32, 64) };
+    s.handle(Input::RunnerUp(Box::new(big)), 0);
+    assert_eq!(assigned(&s.handle(Input::LegQueued(Box::new(bench("bench", 16.0, 16))), 1)), vec!["bench"]);
+    let cpu = |id: &str| LegIn { request: Resources { cpu: 4.0, mem: 2 << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) };
+    let mut on = 0;
+    for i in 0..8 {
+        on += assigned(&s.handle(Input::LegQueued(Box::new(cpu(&format!("c{i}")))), 2 + i)).len();
+    }
+    assert_eq!(on, 6, "16 unheld CPUs × 1.5 overcommit = 24, six legs of 4");
+}
+
 #[test]
 fn resources_mode_and_cancellation() {
     let cfg = Config { resources: true, ..Config::default() };

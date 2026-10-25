@@ -316,7 +316,46 @@ struct Runner {
     used: Resources,
     connected: bool,
     draining: bool,
-    exclusive: bool,
+}
+
+/// What an exclusive leg holds of its runner (W05-R03): asking for CPUs, those and the memory it
+/// asks, for itself alone, other legs running in the rest; asking for none, or on a runner whose
+/// size isn't known, the whole runner.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Claim {
+    Share(Resources),
+    Whole,
+}
+
+fn claim(l: &LegIn, size: Option<Resources>) -> Option<Claim> {
+    if !l.exclusive {
+        return None;
+    }
+    Some(if l.request.cpu > 0.0 && size.is_some() { Claim::Share(l.request) } else { Claim::Whole })
+}
+
+/// A runner's own size: its CPUs (threads) and memory, as it offers them in resource mode or else
+/// as its facts say; `None` when they don't.
+fn size(r: &Runner) -> Option<Resources> {
+    if let Some(c) = r.input.capacity {
+        return (c.cpu > 0.0).then_some(c);
+    }
+    let f = &r.input.view.facts;
+    let cpus = if f.cpu.threads > 0 { f.cpu.threads } else { f.cpu.cores };
+    (cpus > 0 && f.mem.total > 0).then(|| Resources { cpu: f64::from(cpus), mem: f.mem.total, disk: f.disk.free, gpu: u32::try_from(f.gpus.len()).unwrap_or(u32::MAX) })
+}
+
+/// The slots a runner keeps for ordinary legs beside what's held of it: its slots in the share of
+/// its CPUs and memory no exclusive leg holds.
+fn slots_left(slots: u32, size: Option<Resources>, held: &Resources) -> usize {
+    let slots = slots.max(1) as usize;
+    let Some(s) = size else { return slots };
+    if held.cpu <= 0.0 && held.mem == 0 {
+        return slots;
+    }
+    let cpu = ((s.cpu - held.cpu) / s.cpu).clamp(0.0, 1.0);
+    let mem = if s.mem == 0 { 1.0 } else { (s.mem.saturating_sub(held.mem) as f64 / s.mem as f64).clamp(0.0, 1.0) };
+    (slots as f64 * cpu.min(mem) + 1e-9).floor() as usize
 }
 
 #[derive(Debug, Clone, Default)]
@@ -605,7 +644,7 @@ impl Scheduler {
             l.ends = ends;
         }
         // The runner may not have reconnected yet: keep what it runs until it does.
-        let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, exclusive: false });
+        let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false });
         r.running.push(id);
         add(&mut r.used, &request);
     }
@@ -716,6 +755,30 @@ impl Scheduler {
         }
     }
 
+    /// What a runner's legs hold of it now: the share its exclusive legs hold, whether one holds
+    /// it whole, and how many ordinary legs of its own run beside them (a pool's legs run in their
+    /// executors). Read from the legs it runs, so a leg adopted after a restart holds as it did.
+    fn holding(&self, r: &Runner) -> (Resources, bool, usize) {
+        let size = size(r);
+        let mut held = Resources::default();
+        let (mut whole, mut ordinary) = (false, 0);
+        for id in &r.running {
+            let Some(l) = self.legs.get(id) else {
+                ordinary += 1;
+                continue;
+            };
+            if l.req.pool.is_some() {
+                continue;
+            }
+            match claim(&l.input, size) {
+                Some(Claim::Share(q)) => add(&mut held, &q),
+                Some(Claim::Whole) => whole = true,
+                None => ordinary += 1,
+            }
+        }
+        (held, whole, ordinary)
+    }
+
     /// Whether a runner takes a leg now: it could ([`Self::room`]); and for a leg that waits for a
     /// busy warm runner, it's that one or one where the leg would take no longer (W24-R18).
     fn fits(&self, r: &Runner, l: &Leg) -> bool {
@@ -759,14 +822,13 @@ impl Scheduler {
         true
     }
 
-    /// Whether a runner has room for a leg now: no exclusive leg on it, nothing on it for an
-    /// exclusive one, one of a pool's idle executors there for a pool's leg, else a slot or the
-    /// resources.
+    /// Whether a runner has room for a leg now: none while an exclusive leg holds it whole; one of
+    /// a pool's idle executors there for a pool's leg; for an exclusive leg, the whole runner
+    /// empty when it asks for nothing, else a share of what no other share holds and the ordinary
+    /// legs there don't take; for an ordinary leg, a slot or the resources beside what's held.
     fn capacity(&self, r: &Runner, l: &Leg) -> bool {
-        if r.exclusive {
-            return false;
-        }
-        if l.input.exclusive && !r.running.is_empty() {
+        let (held, whole, ordinary) = self.holding(r);
+        if whole {
             return false;
         }
         // A pool's leg runs in one of its idle executors on that host: one made for it when it
@@ -776,21 +838,36 @@ impl Scheduler {
             return self.executors.values().any(|e| e.pool == *pool && e.runner == r.input.id && e.state == ExecState::Idle && e.leg.as_deref() == own);
         }
         let c = self.config();
+        let size = size(r);
+        match claim(&l.input, size) {
+            // The whole runner: it waits for it to be empty.
+            Some(Claim::Whole) => return r.running.is_empty(),
+            // A share: what it holds is its own, so of the runner's CPUs and memory that no other
+            // share holds and the ordinary legs there don't take, never more than the runner is.
+            Some(Claim::Share(q)) => {
+                let Some(s) = size else { return false };
+                let (cpu, mem) = match (c.resources, r.input.capacity) {
+                    (true, Some(_)) => ((r.used.cpu - held.cpu).max(0.0), r.used.mem.saturating_sub(held.mem)),
+                    _ => {
+                        let each = 1.0 / f64::from(r.input.slots.max(1));
+                        (ordinary as f64 * s.cpu * each, (ordinary as f64 * s.mem as f64 * each) as u64)
+                    }
+                };
+                return held.cpu + cpu + q.cpu <= s.cpu + 1e-9 && held.mem.saturating_add(mem).saturating_add(q.mem) <= s.mem;
+            }
+            None => {}
+        }
+        // An ordinary leg: in what no exclusive leg holds.
         match (c.resources, r.input.capacity) {
             (true, Some(cap)) => {
                 let q = &l.input.request;
-                r.used.cpu + q.cpu <= cap.cpu * c.overcommit_cpu
-                    && (r.used.mem + q.mem) as f64 <= cap.mem as f64 * c.overcommit_mem
+                (r.used.cpu - held.cpu).max(0.0) + q.cpu <= (cap.cpu - held.cpu).max(0.0) * c.overcommit_cpu
+                    && (r.used.mem.saturating_sub(held.mem) + q.mem) as f64 <= cap.mem.saturating_sub(held.mem) as f64 * c.overcommit_mem
                     && (r.used.disk + q.disk) as f64 <= cap.disk as f64 * c.overcommit_disk
                     && r.used.gpu + q.gpu <= cap.gpu
             }
-            _ => self.own_legs(r) < r.input.slots.max(1) as usize,
+            _ => ordinary < slots_left(r.input.slots, size, &held),
         }
-    }
-
-    /// The legs a runner runs in its own slots (a pool's run in their executors).
-    fn own_legs(&self, r: &Runner) -> usize {
-        r.running.iter().filter(|x| !self.legs.get(*x).is_some_and(|l| l.req.pool.is_some())).count()
     }
 
     /// What holds a heavy leg off a runner by the runner's load, when admission is on (W24-R19).
@@ -836,7 +913,7 @@ impl Scheduler {
         l.hold = None;
         l.ends = expected.map(|s| now.saturating_add(ms(s)));
         l.last_runner = Some(runner.to_owned());
-        let (attempt, request, exclusive, repo, fair) = (l.attempt, l.input.request, l.input.exclusive, l.input.repo.clone(), l.key.map_or(0, |k| k.1));
+        let (attempt, request, repo, fair) = (l.attempt, l.input.request, l.input.repo.clone(), l.key.map_or(0, |k| k.1));
         let req = l.req.clone();
         let (image, docker) = (req.image.clone(), req.docker.clone());
         self.vtime = self.vtime.max(fair as f64 / 1000.0);
@@ -845,7 +922,6 @@ impl Scheduler {
         if let Some(r) = self.runners.get_mut(runner) {
             r.running.push(id.to_owned());
             add(&mut r.used, &request);
-            r.exclusive = exclusive;
             executor = req.executors.iter().find(|e| super::routing::usable(&req, &r.input.view.facts, e)).cloned();
         }
         // Its pool's idle executor there, which it alone uses.
@@ -868,9 +944,6 @@ impl Scheduler {
         if let Some(r) = self.runners.get_mut(&runner) {
             r.running.retain(|x| x != id);
             sub(&mut r.used, &request);
-            if r.running.is_empty() {
-                r.exclusive = false;
-            }
         }
         Some(runner)
     }
@@ -1027,8 +1100,8 @@ impl Scheduler {
                 None => {}
             }
         }
-        let (running, used, exclusive) = self.runners.get(&id).map(|x| (x.running.clone(), x.used, x.exclusive)).unwrap_or_default();
-        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false, exclusive });
+        let (running, used) = self.runners.get(&id).map(|x| (x.running.clone(), x.used)).unwrap_or_default();
+        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false });
         self.refresh_eligibility(&id);
         self.release_holds(now, out);
         self.try_avoided(now, out);
@@ -1427,9 +1500,12 @@ impl Scheduler {
                 }
                 let c = self.config();
                 if let (true, Some(cap)) = (c.resources, r.input.capacity) {
+                    // Beside what exclusive legs hold there, never in it.
                     let q = &p.request;
-                    let fits = r.used.cpu + q.cpu <= cap.cpu * c.overcommit_cpu
-                        && (r.used.mem + q.mem) as f64 <= cap.mem as f64 * c.overcommit_mem
+                    let (held, whole, _) = self.holding(r);
+                    let fits = !whole
+                        && (r.used.cpu - held.cpu).max(0.0) + q.cpu <= (cap.cpu - held.cpu).max(0.0) * c.overcommit_cpu
+                        && (r.used.mem.saturating_sub(held.mem) + q.mem) as f64 <= cap.mem.saturating_sub(held.mem) as f64 * c.overcommit_mem
                         && (r.used.disk + q.disk) as f64 <= cap.disk as f64 * c.overcommit_disk
                         && r.used.gpu + q.gpu <= cap.gpu;
                     if !fits {
@@ -1676,7 +1752,12 @@ impl Scheduler {
             return WaitReason::Load { held };
         }
         if !eligible.is_empty() {
-            if l.input.exclusive && eligible.iter().all(|r| !r.running.is_empty() || r.draining) {
+            // A share no runner it could run on is big enough to hold.
+            let q = &l.input.request;
+            if l.input.exclusive && q.cpu > 0.0 && eligible.iter().all(|r| size(r).is_some_and(|s| q.cpu > s.cpu + 1e-9 || q.mem > s.mem)) {
+                return WaitReason::Unroutable { failing: vec![format!("{} CPUs and {} MiB held for it alone: no runner it could run on is that big", q.cpu, q.mem >> 20)] };
+            }
+            if l.input.exclusive && eligible.iter().all(|r| matches!(claim(&l.input, size(r)), Some(Claim::Whole)) && (!r.running.is_empty() || r.draining)) {
                 return WaitReason::Exclusive;
             }
             let draining = eligible.iter().filter(|r| r.draining).count();
@@ -1749,7 +1830,10 @@ impl Scheduler {
                     name: r.input.view.name.clone(),
                     connected: r.connected,
                     eligible: checks.iter().all(|c| c.pass),
-                    room: r.connected && !r.draining && r.running.len() < r.input.slots as usize,
+                    room: r.connected && !r.draining && {
+                        let (held, whole, ordinary) = self.holding(r);
+                        !whole && ordinary < slots_left(r.input.slots, size(r), &held)
+                    },
                     score: scores.get(i).copied(),
                     checks,
                     warm: None,
