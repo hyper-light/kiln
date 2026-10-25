@@ -359,6 +359,36 @@ fn request_of(job: Option<&kiln_ci::wf::ir::Job>, cfg: &crate::config::ci::Ci) -
     asked.and_then(|a| a.resources().ok()).or_else(|| cfg.scheduler.default_request.resources().ok()).unwrap_or_default()
 }
 
+/// What a leg's executor holds it to (W05-R03): in resource mode, the memory it was given, which a
+/// container executor makes its job container's limit (tools that size themselves by their
+/// cgroup, CodeQL's analysis among them, then fit the leg, not the machine), and its CPUs, which
+/// the runner gives it of its own ([`crate::runner::cpus`]); nothing in slot mode.
+fn executor_options(mode: &str, request: &kiln_ci::sched::state::Resources) -> serde_json::Value {
+    let mut o = serde_json::Map::new();
+    if mode == "resources" {
+        if request.mem > 0 {
+            o.insert("memory".into(), serde_json::json!(request.mem));
+        }
+        // Whole CPUs, as a cpuset gives them: half of one is one.
+        if request.cpu > 0.0 {
+            o.insert("cpus".into(), serde_json::json!(request.cpu.ceil() as u64));
+        }
+    }
+    if o.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(o) }
+}
+
+/// The executor's options with Docker inside its container (W13-R04): beside what resource mode
+/// gave the leg (its memory and CPUs), not in their place, which left a leg with Docker free of
+/// both (corpus pass 1025b).
+fn with_docker(options: serde_json::Value, docker: &str) -> serde_json::Value {
+    let mut o = match options {
+        serde_json::Value::Object(o) => o,
+        _ => serde_json::Map::new(),
+    };
+    o.insert("docker".into(), serde_json::json!(docker));
+    serde_json::Value::Object(o)
+}
+
 /// The hub's handle on the dispatcher.
 pub struct Handle {
     tx: async_channel::Sender<Msg>,
@@ -1058,7 +1088,7 @@ impl Dispatch {
 
     async fn runner_facts(&mut self, agent: &str) {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
-        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: a.slots, capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
+        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
         self.commands(cmds).await;
     }
@@ -1076,7 +1106,7 @@ impl Dispatch {
             self.hub.command_start(agent, &ServerMsg::Cancel { job: leg, reason: "the leg was given up while this runner was away".into() }).await.log_when_answered(crate::hub::LOG_WITHIN);
         }
         // The hub keeps at least 1 for runners that take jobs; 0 (an outpost) takes no legs.
-        let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots, capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
+        let r = RunnerIn { id: agent.to_owned(), view, slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());
         cmds.extend(self.lose(gone, "the runner lost it").await);
         self.commands(cmds).await;
@@ -2061,6 +2091,13 @@ impl Dispatch {
         if let Some(b) = a.environment.as_mut() {
             b.kind = super::environments::ensure(&self.hub, &r.repo, &b.name).await.ok().and_then(|d| d.kind);
         }
+        // A one-leg runner in a pod (`kiln agent --ephemeral`: a job's, a `k8s` pool's) has the
+        // CPUs its cluster gives it, its node's, which the node's other pods share: CPUs of the
+        // leg's own taken there would be the same first ones in each pod (W05-R03).
+        let pod = self.hub.pod_executors.lock().contains_key(runner) || self.hub.agents.lock().get(runner).is_some_and(|g| g.ephemeral);
+        if pod && let Some(o) = a.executor.options.as_object_mut() {
+            o.remove("cpus");
+        }
         // An action it uses that couldn't be resolved (W07-R03) fails it as it starts, as GitHub
         // fails a job at "Set up job"; the run's other jobs go on.
         if let Some(m) = l.spec.def().and_then(|j| unresolved(&j.steps, &r.actions)) {
@@ -2094,7 +2131,7 @@ impl Dispatch {
         // Docker inside the `docker` executor's container: the host's socket, for trusted runs
         // only (W13-R04).
         if let Some(d) = docker.filter(|_| r.trusted && a.executor.kind == "docker") {
-            a.executor.options = serde_json::json!({ "docker": d });
+            a.executor.options = with_docker(std::mem::take(&mut a.executor.options), &d);
         }
         a.executor.slot = slot;
         // Needed jobs' secret outputs, as masked environment only (W04-R22).
@@ -2296,7 +2333,7 @@ impl Dispatch {
             executor: wire::ExecutorSpec {
                 image: if matches!(executor.as_deref(), Some("docker" | "firecracker")) { image } else { None },
                 kind: executor.unwrap_or_else(|| "host".into()),
-                options: serde_json::Value::Null,
+                options: executor_options(&self.hub.cfg.ci.scheduler.mode, &request_of(job, &self.hub.cfg.ci)),
                 slot: None,
             },
             container: spec.container.clone(),
@@ -2323,6 +2360,8 @@ impl Dispatch {
             workflow_defaults: wf.defaults.clone(),
             job_defaults: job.map(|j| j.defaults.clone()).unwrap_or_default(),
             outputs: job.map(|j| j.outputs.iter().map(|o| (o.name.clone(), o.value.clone())).collect()).unwrap_or_default(),
+            // The workflow file that defines the job (W06-R03), for `job.workflow_*`.
+            job_workflow: Some(spec.defined_in.clone()).filter(|d| !d.workflow_file_path.is_empty()),
             environment_url: job.and_then(|j| j.environment.as_ref()).and_then(|e| e.url.clone()),
             environment: l.spec.environment.as_ref().filter(|e| !e.name.is_empty()).map(|e| wire::Bound { name: e.name.clone(), kind: None, preview: e.preview.clone() }),
             contexts: wire::Contexts {
@@ -2895,6 +2934,7 @@ fn rebuild_spec(wf: &Arc<Workflow>, v: &serde_json::Value) -> LegSpec {
     spec.continue_on_error = v.get("continue_on_error").and_then(serde_json::Value::as_bool).unwrap_or(false);
     spec.container = v.get("container").and_then(|c| c.as_str().map(str::to_owned));
     spec.cache_cap = v.get("cache_cap").and_then(|c| c.as_str().map(str::to_owned));
+    spec.defined_in = v.get("defined_in").and_then(|d| serde_json::from_value(d.clone()).ok()).unwrap_or_default();
     spec
 }
 
@@ -2929,6 +2969,7 @@ fn placeholder_spec(wf: &Arc<Workflow>, job: &str) -> LegSpec {
         reads: Vec::new(),
         cache_cap: None,
         unaffected: None,
+        defined_in: plan::DefinedIn::default(),
         workflow: Arc::clone(wf),
         job_index: index,
     }
@@ -3095,6 +3136,12 @@ fn graphql_of(api: &str) -> String {
     }
 }
 
+/// The slots a runner offers legs: none while its kiln is to be upgraded (`crate::skew`), as an
+/// outpost offers none.
+fn work_slots(a: &crate::hub::AgentLive) -> u32 {
+    if a.skew.takes_work() { a.slots } else { 0 }
+}
+
 #[cfg(test)]
 mod tests {
     /// W05-R17: a rerun's `github.triggering_actor` is whoever reran it, as GitHub names people; an
@@ -3105,5 +3152,26 @@ mod tests {
         assert_eq!(super::login_of("agent:abcdefgh for user:lead"), "lead");
         assert_eq!(super::login_of("agent:abcdefgh@mac for user:lead"), "lead");
         assert_eq!(super::login_of("octocat"), "octocat", "GitHub's Re-run, by its login");
+    }
+
+    /// W05-R03: in resource mode a leg's executor is told the memory it was given, to hold it to;
+    /// in slot mode, and without a memory request, nothing.
+    #[test]
+    fn w05_r03_a_legs_memory_is_its_executors_limit() {
+        let asked = kiln_ci::sched::state::Resources { cpu: 4.0, mem: 16 << 30, disk: 0, gpu: 0 };
+        assert_eq!(super::executor_options("resources", &asked), serde_json::json!({ "memory": 17179869184u64, "cpus": 4 }));
+        assert_eq!(super::executor_options("slots", &asked), serde_json::Value::Null);
+        assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { mem: 0, ..asked }), serde_json::json!({ "cpus": 4 }));
+        assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { cpu: 0.5, mem: 0, ..asked }), serde_json::json!({ "cpus": 1 }), "whole CPUs");
+        assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { cpu: 0.0, mem: 0, ..asked }), serde_json::Value::Null);
+    }
+
+    /// W05-R03, W13-R04: Docker inside a leg's container goes beside the memory and CPUs it was
+    /// given, not in their place.
+    #[test]
+    fn w05_r03_docker_inside_keeps_the_legs_resources() {
+        let given = serde_json::json!({ "memory": 17179869184u64, "cpus": 4 });
+        assert_eq!(super::with_docker(given, "socket"), serde_json::json!({ "memory": 17179869184u64, "cpus": 4, "docker": "socket" }));
+        assert_eq!(super::with_docker(serde_json::Value::Null, "socket"), serde_json::json!({ "docker": "socket" }), "slot mode: Docker alone");
     }
 }

@@ -20,6 +20,7 @@ pub mod kube;
 pub mod live;
 pub mod ops;
 pub mod plans;
+pub mod rollback;
 pub mod rollouts;
 pub mod runners;
 pub mod targets;

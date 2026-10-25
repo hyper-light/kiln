@@ -208,6 +208,21 @@ pub struct Workflow {
     pub chain_depth: Option<u32>,
     /// kiln: the implicit checkout (W06-R14); GHA workflows never have one.
     pub checkout: bool,
+    /// Where a called workflow came from when that isn't the run's own repository and commit: a
+    /// remote one's repository, its ref and the commit it was pinned to. Its jobs' `job.workflow_*`
+    /// say so (W06-R03). `None` for the run's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
+}
+
+/// A workflow file's repository, ref and commit, for `job.workflow_*` (W06-R03).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    /// `owner/repo`.
+    pub repository: String,
+    /// The ref as GitHub writes it: `refs/heads/main`, `refs/tags/v1`, or a commit's SHA.
+    pub git_ref: String,
+    pub sha: String,
 }
 
 impl Workflow {

@@ -38,7 +38,8 @@ finishes.
 ACP sessions prefer [config options](https://agentclientprotocol.com/protocol/v1/session-config-options)
 (`configOptions`) over the older `modes` and `models` fields. The first select
 in the `mode`, `model` and `thought_level` categories drives kiln's existing permission, model
-and effort selectors; additional options, including ones with no category or an unknown
+and effort selectors, and a select with the id `speed` (Devin's Standard and Fast, on the models
+that go faster) drives kiln's speed; additional options, including ones with no category or an unknown
 category, are ordinary session controls. Grouped choices keep their group names in the labels.
 Boolean options use the existing toggles, advertised with `session.configOptions.boolean`.
 Unrecognized option types are kept with the adapter's state but have no control. The agent's
@@ -66,6 +67,17 @@ stopped mid-turn either: a stop ends its process, which keeps the turn so far, a
 again on the same conversation. A new model, effort or mode is a flag, so it starts again with it
 between turns. Files you attach go to it as their paths on its machine; its models come from
 `agy models`.
+
+## Where a harness is found
+
+A machine offers a harness (`/api/harness/kinds`, the machines the new-agent dialog lists) when its
+program is on the runner's PATH or on the PATH a login shell of the machine's user has, asked as
+reach asks it for runs (`$SHELL -l -i`; as the runner starts, then kept ten minutes). A runner's
+service keeps the PATH of the terminal it was installed from, so a harness installed since in a
+folder that PATH lacks (Claude Code's and Codex's installers put theirs in `~/.local/bin`) is
+found all the same, within a minute, without the runner starting again. The harness runs with
+that PATH too: the runner's folders first, then those only the login shell has. An agent started
+from a kiln shell (`kiln spawn`) has that shell's PATH, as it has the rest of its environment.
 
 ## What an agent left running
 
@@ -156,12 +168,12 @@ counted.
 | GET | `/api/harness/sessions` | `Info[]` |
 | POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?}` → `Info[]` |
 | GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good |
-| POST | `/api/harness/sessions/:id/command` | a `Command` → 204 |
+| POST | `/api/harness/sessions/:id/command` | a `Command` → its runner's answer: 204 taken, 202 `{parked: true}` (its machine is away and it waits for it), 404 when its runner doesn't have the session, 409 for another refusal (how and why) or a machine that's away for one refused while away, 504 when its link dropped before it answered (docs/wire.md, "Commands"); for a message (a `send`, a skill run with its `id`) its inbox's answer: 200 `{sent, message, accepted}` (`accepted.repeat` when its id was taken before), or a typed refusal (409 for an epoch the agent left, a machine it moved from, or an id given to other words). A message's `id` is its idempotency key; an `Idempotency-Key` header makes it from that instead (docs/sends.md), and takes any other command once under it |
 | POST | `/api/harness/broadcast` | one thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits on you; see below |
-| POST | `/api/harness/command` | `{ids, command}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`) |
+| POST | `/api/harness/command` | `{ids, command, key?}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`); each agent's message id is made from `key` (or the `Idempotency-Key` header, else the command's own `id`) and the agent, so sending it again sends the same messages |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
 | GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it. Native Codex subagents return `reset: true`: replace previous output with this snapshot (last 64 KiB), regardless of `since`; `pending: true` means a live child has not produced output yet |
-| WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands may be sent on it too |
+| WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands go on it too, each under an id and answered `ack` or `nack` (docs/wire.md, "The UI's sockets") |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
 | POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear,restore}` | run, pause, skip the goal under way, empty its goal stack, or bring back the goals cleared last |
@@ -278,9 +290,13 @@ Devin does not offer conversation branching through ACP.
     message id per agent.
   - `approvals`: `"allow"` or `"deny"`: answers every tool call waiting on you on each agent
     (questions are left: they need answers).
+- `key` (or the `Idempotency-Key` header): sent again with the same key, each agent's message is
+  the same one (its id made from the key and the agent), and each agent gets it once. Kiln's
+  broadcast panel sends one again under the key it first had when the first try didn't come back.
 
 → `{id, sent, skipped, failed, results: [{id, name, machine, kind, result, reason?}]}`, `result`
-being `sent`, `skipped` or `failed`. Each broadcast is in the audit log.
+being `sent`, `skipped` or `failed` (an agent's inbox refusing it is `failed`, saying why). Each
+broadcast is in the audit log.
 
 ### Signing harnesses in and out
 
@@ -436,7 +452,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.list` | `GET /api/harness/agents` | `machine?` (a runner's name, `local` for the server), `harness?`, `state?` (a stand or a status), `parent?`, `plan_run?` → `{agents: [Agent]}` |
 | `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state}` (its state without the catalogs) |
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
-| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now"}` → `{sent, message}` |
+| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?}` (or the `Idempotency-Key` header) → `{sent, message, accepted?}`: `accepted` is the agent's inbox's answer, `repeat` on every one after the first ("Sending again", below) |
 | `agents.wait` | `GET /api/harness/agents/wait` | `agent?` or `agents?` (a list; over HTTP `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
@@ -479,6 +495,16 @@ agent's own machine, in its folder unless `cwd` says otherwise; a person's runs 
 when it runs agents, else on the best runner with the harness. A child on another machine starts
 in that machine's home unless `cwd` names a folder there.
 
+### Sending again
+
+A message's id is made once, by whoever sends it, and every retry carries it: the agent's inbox
+takes each id once (docs/sends.md). Give `agents.send` a `key` of yours (1 to 256 bytes; over HTTP
+the `Idempotency-Key` header does too) and a call with the same key is the same message: the agent
+gets it once, and every call is answered as the first was, `accepted.repeat` on the ones after.
+A key is its caller's: an agent's is the same on whichever machine it runs, so its retry after it
+moves is the same message. Without a key, each call is a message of its own. A key given to other
+words is refused (409). From a kiln shell: `kiln agents send <id> --key <key> <text>`.
+
 ### Messages between agents
 
 Agents that work for the same person can talk to each other, whoever started them: any of them may
@@ -500,7 +526,7 @@ goals and plan runs are theirs alone. Agents that work for different people aren
 | Bypass | only under a parent in bypass that was itself allowed it (`allow_bypass`); a child of a parent without it can't be switched to bypass either |
 | Its reach | a parent whose commands run only on its own machine (`reach` off) has children that run there too, with reach off |
 | Depth | at most `[agents] max_depth` (3) agents deep below the one a person started |
-| Children | at most `[agents] max_children` (24) running at once per agent, or fewer as its own settings say (Subagents → At once) |
+| Children | as many subagents at work at once as its own settings say (Subagents → At once), one pool whatever each does: the agents it started that work, wait on a person or are held to a goal still to go on a stack that runs, and its harness's own still going; one idle with its work done, or ended, holds no place. None set: no limit, unless kiln's config sets `[agents] max_children` for every agent |
 | Messages | an agent may send a queued message to any agent that works for the same person, whoever started it (`agents.send`, `queue`): its receiver is told who sent it, that it isn't from its person, and how to answer ("Messages between agents") |
 | Steering | an agent steers into a turn, sends now, interrupts and ends only itself and the agents it started (and theirs); the same holds for their goals (`goals.add`, `goals.set`, `goals.control`, and the console's goal routes when an agent calls them) and for running a plan on an agent that runs (`plans.run` with `session`); it stops and retries only the plan runs it ran, or that the agents it started ran (`plans.runs.stop`, `plans.runs.retry`) |
 | Plans | a plan run on a new agent (`plans.run` with `new`, any mode) starts it as `agents.start` would: the caller's child, under every rule above |
@@ -522,8 +548,9 @@ across restarts.
 Runners advertise this behavior as `permissions_live`; the picker can also reapply the current
 preset to a turn inherited from an older runner. Older runners still show "From the next turn."
 
-A native Codex subagent keeps the settings it started with (its spawner's) for its whole life:
-Codex has no way to change them, and refuses kiln's input to a subagent. kiln notes them when it
+A native Codex subagent keeps the settings it started with (its spawner's) until a turn kiln
+starts on its thread for a person's message ("Messages to its subagents", below), which takes the
+session's settings then; Codex has no other way to change them. kiln notes them when it
 sees the spawn. A change stops (interrupts) subagents still working with more than the new
 settings allow. Under an approval policy of `never` (Full access), nothing started with the
 session's settings asks, so a request for approval comes from work started with earlier ones: the
@@ -789,14 +816,21 @@ on Slates).
 Every command is JSON with a `type`. Those that answer one client carry `client` (any string the
 console picks) and are answered with a `reply` update to that client.
 
+Each command is answered: on the session's socket, sent under an id (`{"t": "cmd", "id", "c"}`),
+with `ack` or `nack`, taken once however often it's sent; over the API, as its status. What waits
+for an agent's machine while it's away and what's refused at once, how each answer comes, and what
+a reconnect or a restart does to commands on their way: docs/wire.md ("Commands", "The UI's
+sockets").
+
 | type | fields | answer |
 |---|---|---|
-| `send` | `id, text, mode: "queue"\|"steer"\|"now", attachments?, overrides?: {model?, effort?}` | `state.delivery[id]`: queued → sent → started → completed / cancelled |
+| `send` | `id, text, mode: "queue"\|"steer"\|"now", attachments?, overrides?: {model?, effort?}, task?` | `state.delivery[id]`: queued → sent → started → completed / cancelled; with `task`, to that subagent ("Messages to its subagents") |
 | `queue_edit` / `queue_remove` / `queue_move` / `queue_send_now` | `id` (+ `text` / `index`) | |
 | `queue_steer` | `id` | the queued message goes into the running turn as steering, without interrupting it (sent as the next turn when none runs); feature `"queue_steer"` (Claude Code, Codex, Devin when advertised) |
 | `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, choices?` (or the older `answers?`) | see "Questions" below |
 | `interrupt`, `restart`, `snapshot` | | |
 | `set_mode` / `set_model` / `set_effort` | `mode` / `model` / `effort` | `state.mode` / `state.model` / `state.effort` |
+| `set_speed` | `speed`: `""` (standard) or one of `meta.speeds` (the model's faster speeds, slowest first) | `state.speed`, from the next turn when one is under way; `state.speed_blocked` says why it can't go faster (its account), `state.speed_cooldown` that fast mode's own rate limit is cooling down; feature `"set_speed"` (Claude Code's fast mode, Codex's service tiers, Devin's `speed` option) |
 | `stop_task` | `task` | the task's `status` (stopped) |
 | `stop_tasks` | | every live task stopped |
 | `suggest` | `client, query` | `{suggestions: [{path}], cwd}` |
@@ -812,7 +846,7 @@ console picks) and are answered with a `reply` update to that client.
 | `resume` | | ends a pause now (`state.pause`): the turn it cut off goes on, then the queue |
 | `auto_resume` | `on` | whether a pause ends by itself at its limit's reset (`state.pause.auto`, and `state.manual_resume` for later pauses) |
 | `pause_at` | `percent` (null: off) | pause once a limit is this full, between turns or at the next step of one under way (`state.pause_at`) |
-| `max_subagents` | `count` (null: no limit of its own) | the most subagents it runs at once (`state.max_subagents`, Settings → Subagents): its harness's own and the agents it starts through kiln, each. Claude Code's Agent tool asks kiln first (a PreToolUse hook kiln registers at `initialize`, whatever its permissions), counting those running and those let start that haven't yet, and past the limit is told to wait for one to finish; Codex takes it as its own `agents.max_concurrent_threads_per_session` when it next starts; kiln refuses `agents.start` past it |
+| `max_subagents` | `count` (null: no limit of its own) | the most subagents it has at work at once (`state.max_subagents`, Settings → Subagents): its harness's own and the agents it starts through kiln, one pool whatever each does. Claude Code's Agent tool asks kiln first (a PreToolUse hook kiln registers at `initialize`, whatever its permissions), counting those running and those let start that haven't yet, and past the limit is told to wait for one to finish; Codex takes it as its own `agents.max_concurrent_threads_per_session` when it next starts; kiln refuses `agents.start` past it, counting the agents it started that are at work (working, waiting on a person, or held to a goal still to go on a stack that runs) and its harness's own still going, so one idle or ended holds no place; a plan's steps side by side go to subagents within it, on its goal stack (docs/goals.md, "A plan's steps side by side") or in a run with an agent per step, the rest waiting for room; and a plan run on it as one message or a step a turn tells it so |
 | `move_on_limit` | `on, to?, kind?, model?` | at a limit, go on on another machine with room (`state.move_on_limit`): `to` (`agent:<name>`) that machine alone, `kind` and `model` that harness and model there (`state.move_plan`) |
 | `limit_hold` | `window?, label?, until?, said?, account?` | the server's: another session on `account` reached a usage limit, so this one pauses until it resets too, if it's signed in to that account and its own usage, asked then, says the limit is its own as well |
 
@@ -1073,6 +1107,33 @@ sends to the background, monitors and workflows. Besides `id`, `description`, `s
 - `events`, `last_event`: a monitor's events so far and the latest (one line). `wakes`: who they
   wake, "agent" or the subagent task that started the monitor.
 - `stoppable`: `stop_task` can stop it.
+- `takes`, `via`, `queue` (subagents): how a person's message reaches it now (`queue`, `steer`,
+  `now`; none: it takes none), `"parent"` when its agent passes it on, and the messages waiting
+  for it to finish ("Messages to its subagents", below).
+
+### Messages to its subagents
+
+With a subagent's thread open (`?task=`), the agent page's composer writes to that subagent,
+as the agent's own composer writes to the agent: queued for when it finishes, steered into its
+turn, or sent now (its turn stopped, this one the next), as its `takes` allows; Stop (and Esc)
+stops it (`stop_task`). Its queue shows above the field, edited, moved, steered or sent now from
+there (`queue_edit`, `queue_move`, `queue_steer`, `queue_send_now`, `queue_remove`, by id). One
+that takes none (it ended, or its harness has no way in) leaves the composer writing to the
+agent, as before. The message is a `send` with `task` (its task's id); it shows in the
+subagent's thread, its delivery as any message's. One a subagent can't take, or one that waited
+for a subagent that ended, is said not sent in its thread, and why. While the session is paused,
+messages for its subagents wait in their queues too.
+
+| Harness | How it reaches the subagent | takes |
+|---|---|---|
+| Codex (multi-agent v1, its default) | on the subagent's own thread: `turn/start` (with the session's permissions then), `turn/steer` into its turn, `turn/interrupt` then `turn/start` for now; Codex says it back under kiln's id (`clientUserMessageId`) | queue, steer, now while it works; queue (a turn at once) between turns |
+| Codex (multi-agent v2; a subagent this process didn't spawn) | Codex refuses input there (`direct app-server input is not allowed for multi-agent v2 sub-agents`), so kiln asks the agent, in its turn, to pass it on with its own agent tools (`send_message`, `followup_task`; v1's `send_input`); delivered once the agent's call reaches it | queue, steer; agents it started itself only |
+| Claude Code | it takes nothing for a subagent from kiln (2.1.309 and 2.1.310 answer `send_task_message` "Unsupported control request subtype" in `-p`, and a prompt naming the subagent's call goes to the agent), so kiln asks the agent, in its turn, to pass it on with its SendMessage tool: at the subagent's next tool round while it works in the background, or resuming it once it has finished; under way when the agent's SendMessage to it starts, delivered when that succeeds | queue, steer while it works in the background; queue while in the foreground (its agent's turn waits on it) or once it finished; none once stopped (Claude Code doesn't resume one stopped) |
+| ACP agents, Antigravity CLI | kiln has no subagent threads for them | none |
+
+What kiln asks an agent to pass on carries the person's words as written (the files attached by
+their paths) and is kiln's own message in its timeline (`kiln-relay-<message id>`); a turn that
+took it and ended without passing it on leaves the message not sent, saying so.
 
 Codex's native subagents keep their own threads and execution settings. kiln tracks each one by
 its native thread ID and keeps its work under the original spawning call, including later
@@ -1223,11 +1284,13 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (interrupts and continues an active turn) | ✓ (the agent's modes) | ? |
 | `set_model` mid-session | ✓ | ✓ (from the next turn) | ? (sent as session/set_model) | ? |
 | effort from the start (`meta.efforts`), `set_effort` | ✓ | ✓ (from the next turn) | — | — |
+| speed where the model goes faster (`meta.speeds`), `set_speed` | unit (fast mode, a setting of the session's alone; what keeps it off and its cooldown from each turn) | unit (each model's service tiers, with every turn) | unit (an agent's `speed` option, as Devin offers it) | ? |
 | one message's own model and effort | unit | ✓ | — | — |
 | attachments: images inline, files by path | ✓ | ✓ | ? (images when offered) | ? |
 | diffs, approval previews, cumulative changeset | ✓ | ✓ | ✓ | ? |
 | calls waiting behind a prompt read as pending | ✓ | — (Codex reports each call's own state) | — | — |
 | subagents: tasks, nested messages, stop | ✓ | unit (read-only task and thread tracking; no direct stop) | — | — |
+| a person's message to a subagent: queue, steer, now | unit (by way of its agent's SendMessage; no now) | unit (v1 on its own thread; v2 by way of its agent) | — | — |
 | rewind, branch, compact, rename | ✓ | ✓ | — | — |
 | restore files on rewind | ✓ | — | — | — |
 | thinking display / budget, output style | ✓ | ✓ (reasoning summaries) | — | — |

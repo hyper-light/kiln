@@ -36,6 +36,7 @@ impl Owned {
             | ServerMsg::TermAttach { session } => Some(Self::Terminal(session.clone())),
             ServerMsg::HarnessOpen { session, .. }
             | ServerMsg::HarnessCmd { session, .. }
+            | ServerMsg::HarnessSend { session, .. }
             | ServerMsg::HarnessClose { session }
             | ServerMsg::HarnessPackage { session, .. }
             | ServerMsg::HarnessRelease { session }
@@ -307,9 +308,29 @@ impl Instances {
     /// Where a message for machine `name` goes: to the instance holding what it is about, else
     /// (new things, and anything not about one thing) to the newest. A message that creates a
     /// thing makes that instance its owner.
+    /// What the runner process of machine `name` that a message about `what` would go to can do
+    /// (its caps): the one that holds it, else the newest; 0 when none is connected.
+    pub fn caps_for(&self, name: &str, what: &Owned) -> u32 {
+        let peer = self.owner_on(name, what).or_else(|| self.newest(name));
+        peer.and_then(|p| self.get(p)).map_or(0, |i| i.caps)
+    }
+
+    /// [`Instances::caps_for`] in 64 bits: `Build`'s 32 and what it said past them
+    /// ([`crate::proto::AgentMsg::Caps`]).
+    pub fn wide_caps_for(&self, name: &str, what: &Owned) -> u64 {
+        let peer = self.owner_on(name, what).or_else(|| self.newest(name));
+        peer.and_then(|p| self.get(p)).map_or(0, |i| u64::from(i.caps) | i.wide)
+    }
+
+    /// The instance of machine `name` that holds `what`: none when none does (one of another
+    /// machine that held it, before it went on there, doesn't count).
+    fn owner_on(&self, name: &str, what: &Owned) -> Option<PeerId> {
+        self.owner(what).filter(|p| self.by_peer.get(p).is_some_and(|i| i.name == name))
+    }
+
     pub fn route(&mut self, name: &str, msg: &ServerMsg) -> Option<PeerId> {
         let what = Owned::of(msg);
-        let held = what.as_ref().filter(|_| !Owned::creates(msg)).and_then(|w| self.owner(w)).filter(|p| self.by_peer.contains_key(p));
+        let held = what.as_ref().filter(|_| !Owned::creates(msg)).and_then(|w| self.owner_on(name, w));
         let peer = held.or_else(|| self.newest(name))?;
         if let Some(w) = what
             && Owned::creates(msg)
@@ -367,6 +388,13 @@ impl Instances {
     /// `crate::bluegreen`).
     pub fn hands_over(&self, peer: PeerId) -> bool {
         self.by_peer.get(&peer).is_some_and(|i| i.wide & crate::proto::CAP_HANDOVER != 0 && !(i.id.is_some() && i.created_at < 0))
+    }
+
+    /// Whether machine `name` is being upgraded blue/green: a new build of its runner is connected
+    /// and hasn't taken over yet. Its newest process meanwhile is the one handing everything to it,
+    /// and leaving.
+    pub fn upgrading(&self, name: &str) -> bool {
+        self.by_peer.values().any(|i| i.name == name && i.id.is_some() && i.created_at < 0)
     }
 
     /// Every connected peer of every machine with more than one instance, with its machine.
@@ -486,8 +514,10 @@ mod tests {
         m.join(4, "box", hello("d"), 4);
         m.set_wide(4, CAP_HANDOVER);
         assert!(!m.hands_over(4));
+        assert!(m.upgrading("box") && !m.upgrading("other"), "its machine is being upgraded meanwhile");
         assert_eq!(m.reannounce(4, &ih("green", 200)), Some(vec![2]), "the one drained before stays so");
         assert!(m.hands_over(4), "once it took over, it's a process like the others");
+        assert!(!m.upgrading("box"));
     }
 
     #[test]
@@ -517,6 +547,21 @@ mod tests {
         assert!(!j.newest);
         assert_eq!(m.newest("box"), Some(2));
         assert_eq!(m.crowded(), vec![("box".to_owned(), 2), ("box".to_owned(), 3)]);
+    }
+
+    /// CP-T3.2: a session owned by an instance of another machine (its copy left behind there,
+    /// which answered a message) is sent to on the machine it runs on: its newest instance.
+    #[test]
+    fn an_owner_on_another_machine_does_not_take_a_sessions_messages() {
+        let mut m = Instances::default();
+        m.join(1, "old-box", hello("a"), 1);
+        m.join(2, "new-box", hello("b"), 2);
+        m.own(Owned::Agent("s1".into()), 1);
+        let send = ServerMsg::HarnessSend { session: "s1".into(), epoch: 1, json: "{}".into() };
+        assert_eq!(m.route("new-box", &send), Some(2));
+        assert_eq!(m.caps_for("new-box", &Owned::Agent("s1".into())), m.get(2).map_or(0, |i| i.caps));
+        // On its own machine, its owner keeps it.
+        assert_eq!(m.route("old-box", &send), Some(1));
     }
 
     #[test]

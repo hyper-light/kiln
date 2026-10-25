@@ -58,24 +58,27 @@ async fn output(program: &str, args: &[&str]) -> Option<String> {
     o.status.success().then(|| format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
 }
 
+/// The tools a runner's facts report when they're on `PATH`: each as its fact names it, the program
+/// and the arguments that print its version.
+pub const TOOLS: &[(&str, &str, &[&str])] = &[
+    ("git", "git", &["--version"]),
+    ("node", "node", &["--version"]),
+    ("python3", "python3", &["--version"]),
+    ("cargo", "cargo", &["--version"]),
+    ("go", "go", &["version"]),
+    ("java", "java", &["-version"]),
+    ("dotnet", "dotnet", &["--version"]),
+    ("docker", "docker", &["--version"]),
+    ("docker buildx", "docker", &["buildx", "version"]),
+    ("podman", "podman", &["--version"]),
+    ("shards", "shards", &["--version"]),
+    ("firecracker", "firecracker", &["--version"]),
+    ("kubectl", "kubectl", &["version", "--client"]),
+];
+
 /// Tools found on `PATH`, with the version each reports.
 async fn tools() -> BTreeMap<String, String> {
-    let list: &[(&str, &str, &[&str])] = &[
-        ("git", "git", &["--version"]),
-        ("node", "node", &["--version"]),
-        ("python3", "python3", &["--version"]),
-        ("cargo", "cargo", &["--version"]),
-        ("go", "go", &["version"]),
-        ("java", "java", &["-version"]),
-        ("dotnet", "dotnet", &["--version"]),
-        ("docker", "docker", &["--version"]),
-        ("docker buildx", "docker", &["buildx", "version"]),
-        ("podman", "podman", &["--version"]),
-        ("shards", "shards", &["--version"]),
-        ("firecracker", "firecracker", &["--version"]),
-        ("kubectl", "kubectl", &["version", "--client"]),
-    ];
-    let found = futures::future::join_all(list.iter().map(|(name, program, args)| async move { output(program, args).await.as_deref().and_then(version_in).map(|v| ((*name).to_owned(), v)) })).await;
+    let found = futures::future::join_all(TOOLS.iter().map(|(name, program, args)| async move { output(program, args).await.as_deref().and_then(version_in).map(|v| ((*name).to_owned(), v)) })).await;
     found.into_iter().flatten().collect()
 }
 
@@ -261,7 +264,7 @@ fn machine(work_dir: &Path) -> RunnerFacts {
         },
         arch,
         cpu: Cpu { model, cores, threads, flags: cpu_flags() },
-        mem: Mem { total: sys.total_memory(), free: sys.available_memory() },
+        mem: mem(sys.total_memory(), sys.available_memory(), crate::os::cgroup::memory_limit()),
         disk,
         virt: Virt { kvm, hvf: false, nested },
         binfmt: binfmt(),
@@ -269,6 +272,14 @@ fn machine(work_dir: &Path) -> RunnerFacts {
         work: Some(kiln_ci::facts::WorkFacts { io_full: io_pressure() }),
         ..RunnerFacts::default()
     }
+}
+
+/// The memory this runner may use (W13-R01): the machine's, no more than its cgroups' limit (a
+/// systemd scope's or slice's, a container's, a pod's), which the scheduler gives legs out of
+/// in resource mode (W05-R03).
+fn mem(total: u64, free: u64, limit: Option<u64>) -> Mem {
+    let total = limit.map_or(total, |l| l.min(total));
+    Mem { total, free: free.min(total) }
 }
 
 /// Every fact of this runner, its probes run now.
@@ -307,6 +318,16 @@ pub async fn gather(work_dir: &Path, declared: &Declared) -> RunnerFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W05-R03: a runner in a cgroup offers what the cgroup lets it use, not the machine's.
+    #[test]
+    fn w05_r03_a_runner_offers_its_cgroups_memory() {
+        let g = 1u64 << 30;
+        assert_eq!(mem(124 * g, 49 * g, Some(40 * g)), Mem { total: 40 * g, free: 40 * g }, "a 40G scope on a 124G machine");
+        assert_eq!(mem(124 * g, 30 * g, Some(40 * g)), Mem { total: 40 * g, free: 30 * g });
+        assert_eq!(mem(16 * g, 8 * g, Some(40 * g)), Mem { total: 16 * g, free: 8 * g }, "a limit over the machine's");
+        assert_eq!(mem(124 * g, 49 * g, None), Mem { total: 124 * g, free: 49 * g }, "no limit");
+    }
 
     #[test]
     fn w13_r01_versions() {

@@ -1,19 +1,34 @@
 //! Contents, addressed by their SHA-256: a step names a file's new contents by hash, and the copy
 //! that applies it reads them from here (fetched from a member that has them, when it doesn't).
 
-use std::fs::File;
-use std::io::{self, Read as _, Write as _};
+use std::collections::BTreeSet;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sha2::{Digest as _, Sha256};
+
+use super::fs::{Fs, Kind, Std};
 
 /// Read and hashed at a time.
 const CHUNK: usize = 64 * 1024;
 
-/// A content-addressed store: `<dir>/<first two hex digits>/<hash>`.
-#[derive(Debug, Clone)]
+/// A content-addressed store: `<dir>/<first two hex digits>/<hash>`, on a filesystem (the
+/// machine's own, or a simulated one: `super::fs`).
+#[derive(Clone)]
 pub struct Blobs {
     dir: PathBuf,
+    fs: Arc<dyn Fs>,
+    /// Its folders whose names changed (contents renamed in, a folder made for them) since a copy
+    /// last took them ([`Blobs::take_touched`]): synced with the copy's own before its state names
+    /// what's in them. Clones share it.
+    touched: Arc<parking_lot::Mutex<BTreeSet<PathBuf>>>,
+}
+
+impl std::fmt::Debug for Blobs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Blobs").field("dir", &self.dir).finish_non_exhaustive()
+    }
 }
 
 /// A SHA-256 as a store names it: 64 lowercase hex digits, so a name from elsewhere can never
@@ -24,7 +39,12 @@ pub fn valid_hash(hash: &str) -> bool {
 
 /// The SHA-256 of a file's contents.
 pub fn hash_file(path: &Path) -> io::Result<String> {
-    let mut f = File::open(path)?;
+    hash_file_on(&Std, path)
+}
+
+/// The SHA-256 of the contents of a file on `fs`.
+pub fn hash_file_on(fs: &dyn Fs, path: &Path) -> io::Result<String> {
+    let mut f = fs.open(path)?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; CHUNK];
     loop {
@@ -39,8 +59,54 @@ pub fn hash_file(path: &Path) -> io::Result<String> {
 
 impl Blobs {
     pub fn new(dir: &Path) -> io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
-        Ok(Self { dir: dir.to_owned() })
+        Self::on(super::fs::std_fs(), dir)
+    }
+
+    /// A store at `dir` on `fs`.
+    pub fn on(fs: Arc<dyn Fs>, dir: &Path) -> io::Result<Self> {
+        fs.create_dir_all(dir)?;
+        Ok(Self { dir: dir.to_owned(), fs, touched: Arc::default() })
+    }
+
+    /// The folders whose names it changed since this was last asked: what a copy syncs with its
+    /// own before its state names what's in them (`Copy::sync_dirs`).
+    pub fn take_touched(&self) -> BTreeSet<PathBuf> {
+        std::mem::take(&mut *self.touched.lock())
+    }
+
+    /// Makes `dest`'s folder, noting the store's own when it's new: its name changed.
+    fn make_folder(&self, dest: &Path) -> io::Result<()> {
+        if let Some(dir) = dest.parent() {
+            let made = self.fs.meta(dir).is_err();
+            self.fs.create_dir_all(dir)?;
+            if made {
+                self.touched.lock().insert(self.dir.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Notes the folders holding blob `hash` (its own, and the store's, which names that one), to
+    /// sync before a state names it: one a process put there before a crash may not be durable yet,
+    /// though it's there to see.
+    pub fn hold(&self, hash: &str) {
+        if let Some(dir) = self.path(hash).as_deref().and_then(Path::parent) {
+            let mut touched = self.touched.lock();
+            touched.insert(dir.to_owned());
+            touched.insert(self.dir.clone());
+        }
+    }
+
+    /// Notes that a blob was renamed into `dest`'s folder.
+    fn renamed_in(&self, dest: &Path) {
+        if let Some(dir) = dest.parent() {
+            self.touched.lock().insert(dir.to_owned());
+        }
+    }
+
+    /// The filesystem it's on: what a copy beside it writes its folder on.
+    pub fn fs(&self) -> &Arc<dyn Fs> {
+        &self.fs
     }
 
     /// Where a blob is (or would be); `None` for a name that isn't a hash.
@@ -49,14 +115,14 @@ impl Blobs {
     }
 
     pub fn has(&self, hash: &str) -> bool {
-        self.path(hash).is_some_and(|p| p.is_file())
+        self.path(hash).is_some_and(|p| super::fs::is_file(self.fs.as_ref(), &p))
     }
 
     /// Keeps a file's contents: its hash, as read (a file changed while it was copied is kept as
     /// it was read, under the hash of that).
     pub fn put_file(&self, src: &Path) -> io::Result<String> {
-        let mut f = File::open(src)?;
-        self.put_reader(&mut f)
+        let mut f = self.fs.open(src)?;
+        self.put_reader(f.as_mut())
     }
 
     pub fn put_bytes(&self, bytes: &[u8]) -> io::Result<String> {
@@ -64,8 +130,8 @@ impl Blobs {
     }
 
     fn put_reader(&self, r: &mut dyn io::Read) -> io::Result<String> {
-        let tmp = self.dir.join(format!(".in-{}", crate::util::new_id()));
-        let mut out = File::create(&tmp)?;
+        let tmp = self.dir.join(format!(".in-{}", self.fs.temp_id()));
+        let mut out = self.fs.create(&tmp)?;
         let mut h = Sha256::new();
         let mut buf = vec![0u8; CHUNK];
         let written = (|| -> io::Result<()> {
@@ -80,22 +146,22 @@ impl Blobs {
             }
             out.sync_all()
         })();
+        drop(out);
         if let Err(e) = written {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = self.fs.remove_file(&tmp);
             return Err(e);
         }
         let hash = hex::encode(h.finalize());
         let Some(dest) = self.path(&hash) else {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = self.fs.remove_file(&tmp);
             return Err(io::Error::other("a SHA-256 that isn't one"));
         };
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if dest.is_file() {
-            std::fs::remove_file(&tmp)?;
+        self.make_folder(&dest)?;
+        if super::fs::is_file(self.fs.as_ref(), &dest) {
+            self.fs.remove_file(&tmp)?;
         } else {
-            std::fs::rename(&tmp, &dest)?;
+            self.fs.rename(&tmp, &dest)?;
+            self.renamed_in(&dest);
         }
         Ok(hash)
     }
@@ -103,28 +169,27 @@ impl Blobs {
     /// A blob's contents.
     pub fn read(&self, hash: &str) -> io::Result<Vec<u8>> {
         let p = self.path(hash).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a SHA-256"))?;
-        std::fs::read(p)
+        super::fs::read(self.fs.as_ref(), &p)
     }
 
     /// A place for a download on its way in: inside the store, so it moves in with a rename.
     pub fn incoming(&self) -> PathBuf {
-        self.dir.join(format!(".incoming-{}", crate::util::new_id()))
+        self.dir.join(format!(".incoming-{}", self.fs.temp_id()))
     }
 
     /// Takes a file as blob `hash` if that is what it holds (moved in: true); else drops it.
     pub fn adopt(&self, file: &Path, hash: &str) -> io::Result<bool> {
         let Some(dest) = self.path(hash) else {
-            let _ = std::fs::remove_file(file);
+            let _ = self.fs.remove_file(file);
             return Ok(false);
         };
-        if hash_file(file)? != hash {
-            std::fs::remove_file(file)?;
+        if hash_file_on(self.fs.as_ref(), file)? != hash {
+            self.fs.remove_file(file)?;
             return Ok(false);
         }
-        if let Some(dir) = dest.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::rename(file, &dest)?;
+        self.make_folder(&dest)?;
+        self.fs.rename(file, &dest)?;
+        self.renamed_in(&dest);
         Ok(true)
     }
 
@@ -136,16 +201,16 @@ impl Blobs {
     /// Every blob held, and when it was last written.
     pub fn all(&self) -> io::Result<Vec<(String, std::time::SystemTime)>> {
         let mut out = Vec::new();
-        for shard in std::fs::read_dir(&self.dir)? {
-            let shard = shard?;
-            if !shard.file_type()?.is_dir() {
+        for (shard, kind) in self.fs.read_dir(&self.dir)? {
+            if kind != Kind::Dir {
                 continue;
             }
-            for entry in std::fs::read_dir(shard.path())? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().into_owned();
+            let shard = self.dir.join(shard);
+            for (name, _) in self.fs.read_dir(&shard)? {
                 if valid_hash(&name) {
-                    out.push((name, entry.metadata()?.modified()?));
+                    let ns = self.fs.meta(&shard.join(&name))?.mtime_ns;
+                    let since = std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(0));
+                    out.push((name, std::time::UNIX_EPOCH.checked_add(since).unwrap_or(std::time::UNIX_EPOCH)));
                 }
             }
         }
@@ -155,7 +220,7 @@ impl Blobs {
     /// Drops a blob nothing needs any more.
     pub fn remove(&self, hash: &str) -> io::Result<()> {
         match self.path(hash) {
-            Some(p) if p.is_file() => std::fs::remove_file(p),
+            Some(p) if super::fs::is_file(self.fs.as_ref(), &p) => self.fs.remove_file(&p),
             _ => Ok(()),
         }
     }

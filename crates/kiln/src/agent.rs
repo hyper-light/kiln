@@ -362,6 +362,12 @@ const RETIRE_QUIET: Duration = Duration::from_secs(8);
 /// environment set up, its images pulled) before it's refused.
 const LEG_SHELL_WAIT: Duration = Duration::from_secs(60);
 
+/// How long a new build that took its sessions over, and whose link to the runner it upgraded
+/// ended with no word of a promotion, holds their messages still (a runner that takes them back
+/// stops it well before).
+#[cfg(unix)]
+const TAKE_OVER_GRACE: Duration = Duration::from_secs(30);
+
 #[cfg(unix)]
 use crate::upgrade::with_instance;
 
@@ -421,18 +427,225 @@ async fn announce(sessions: Vec<proto::TermInfo>, harness: Option<&Arc<crate::ha
     }
 }
 
+/// Start this machine's replica of kiln's records with the server's newest word to join (`join`),
+/// trying again until it starts: the process before this one may hold the replica's files a
+/// while yet (an old build keeps them until its last job ends and it retires, minutes later). It
+/// stops once the server takes the replica away (`join` emptied by a Leave) or this runner is
+/// going (`going`). `wait`: how long before each try again ([`replica_wait`]).
+async fn start_replica<S, F, Fut>(join: &parking_lot::Mutex<Option<(u64, String)>>, going: impl Fn() -> bool, start: F, wait: fn(u32) -> Duration) -> anyhow::Result<(S, u64)>
+where
+    F: Fn(u64, String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<S>>,
+{
+    let mut tries = 0u32;
+    loop {
+        let Some((member, token)) = join.lock().clone() else {
+            anyhow::bail!("the server no longer asks this machine for a replica");
+        };
+        let e = match start(member, token).await {
+            Ok(s) => return Ok((s, member)),
+            Err(e) => e,
+        };
+        tries += 1;
+        if going() {
+            return Err(e);
+        }
+        if tries == REPLICA_PATIENCE {
+            tracing::warn!(error = %format!("{e:#}"), tries, "this machine's replica of kiln's records hasn't started yet; it's tried again every minute until it does");
+        } else {
+            tracing::debug!(error = %format!("{e:#}"), tries, "this machine's replica of kiln's records didn't start yet");
+        }
+        crate::rt::sleep(wait(tries)).await;
+    }
+}
+
+/// The tries a replica gets 15 s apart, before it's tried each minute instead (and said so).
+const REPLICA_PATIENCE: u32 = 5;
+
+/// How long a replica that didn't start waits before it's tried again, after `tries`.
+fn replica_wait(tries: u32) -> Duration {
+    Duration::from_secs(if tries < REPLICA_PATIENCE { 15 } else { 60 })
+}
+
+/// How often a runner checks that its replica follows the server, and how many checks running it
+/// may stay behind the server's last write before it's started again.
+const REPLICA_CHECK: Duration = Duration::from_secs(60);
+const REPLICA_BEHIND: u32 = 5;
+
+/// This machine's replica of kiln's records (docs/p2p.md, P2): where it's kept once started, and
+/// what starting it takes.
+#[derive(Clone)]
+struct ReplicaStart {
+    slot: Arc<parking_lot::Mutex<Option<Arc<crate::store::learner::Learner>>>>,
+    starting: Arc<std::sync::atomic::AtomicBool>,
+    /// The server's last word to join the group as a learner (`None` once it said Leave).
+    join: Arc<parking_lot::Mutex<Option<(u64, String)>>>,
+    up: async_channel::Sender<Up>,
+    dir: PathBuf,
+    me: String,
+    server: String,
+    http: Arc<Client>,
+}
+
+impl ReplicaStart {
+    /// Starts the replica with the server's newest word to join, unless one is starting already:
+    /// on a task of its own (fetching a first copy takes a while).
+    fn start(&self) {
+        use crate::store::learner::Learner;
+        if self.starting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let r = self.clone();
+        crate::rt::spawn(async move {
+            let going = r.up.clone();
+            let (dir, me, server, http) = (r.dir.clone(), r.me.clone(), r.server.clone(), r.http.clone());
+            let started = start_replica(
+                &r.join,
+                move || going.is_closed(),
+                move |member, token| {
+                    let (dir, me, server, http) = (dir.clone(), me.clone(), server.clone(), http.clone());
+                    async move {
+                        // A thread of its own: fetching a copy takes minutes on a large store, and the
+                        // blocking pool is the runtime's.
+                        let (tx, rx) = async_channel::bounded(1);
+                        std::thread::Builder::new()
+                            .name("kiln-learner".into())
+                            .spawn(move || {
+                                let _ = tx.send_blocking(Learner::start(&dir, &me, member, http, &server, &token));
+                            })
+                            .map_err(|e| anyhow::anyhow!("starting the learner's thread: {e}"))?;
+                        rx.recv().await.map_err(|_| anyhow::anyhow!("the learner's thread ended"))?
+                    }
+                },
+                replica_wait,
+            )
+            .await;
+            match started {
+                Ok(((learner, said), member)) => {
+                    tracing::info!(member, "this machine holds a replica of kiln's records");
+                    let learner = Arc::new(learner);
+                    crate::store::learner::set_global(Some(Arc::clone(&learner)));
+                    *r.slot.lock() = Some(learner);
+                    let up = r.up.clone();
+                    crate::rt::spawn(async move {
+                        while let Ok(m) = said.recv().await {
+                            if up.send(Up::Sync(m)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "this machine's replica of kiln's records didn't start"),
+            }
+            r.starting.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    /// Keeps the replica following the server: one whose group stopped, or that stays behind the
+    /// server's last write for [`REPLICA_BEHIND`] checks running, is stopped and started again with
+    /// the newest word to join. Nothing else would start it again, and its front door would leave
+    /// every read to the server for good (adacachy's, on 2026-10-25, applied nothing for hours after
+    /// the server restarted).
+    async fn watch(self) {
+        let mut behind = 0u32;
+        loop {
+            crate::rt::sleep(REPLICA_CHECK).await;
+            if self.up.is_closed() {
+                return;
+            }
+            let Some(learner) = self.slot.lock().clone() else {
+                behind = 0;
+                continue;
+            };
+            let why = if let Some(why) = learner.stopped() {
+                format!("its cluster group stopped: {why}")
+            } else if learner.current(Duration::from_secs(30)).await {
+                behind = 0;
+                continue;
+            } else {
+                behind += 1;
+                if behind < REPLICA_BEHIND {
+                    continue;
+                }
+                format!("it stayed behind the server's last write for {behind} checks running")
+            };
+            behind = 0;
+            let (seq, applied) = learner.standing();
+            drop(learner);
+            tracing::warn!(seq, applied, "this machine's replica of kiln's records stopped following the server and starts again: {why}");
+            // Taken away as at a Leave (its files let go, waiting for its thread), then started.
+            let old = self.slot.lock().take();
+            if let Some(old) = old {
+                crate::store::learner::set_global(None);
+                let _ = crate::rt::blocking(move || drop(old)).await;
+            }
+            self.start();
+        }
+    }
+}
+
+#[cfg(test)]
+mod replica_tests {
+    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+
+    /// A replica whose files another process holds is tried again until it starts, with the
+    /// server's newest word to join; it stops once the server takes the replica away, or the
+    /// runner goes. On adacachy on 2026-10-25 the old build held them for nine minutes, and five
+    /// tries gave up after four.
+    #[test]
+    fn a_replica_is_tried_again_until_it_starts() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let no_wait: fn(u32) -> std::time::Duration = |_| std::time::Duration::ZERO;
+            let join = parking_lot::Mutex::new(Some((7u64, "first".to_owned())));
+            let tries = AtomicU32::new(0);
+            let (got, member) = super::start_replica(
+                &join,
+                || false,
+                |_, token| {
+                    let n = tries.fetch_add(1, SeqCst) + 1;
+                    if n == 3 {
+                        *join.lock() = Some((8, "renewed".into()));
+                    }
+                    async move { if n < 9 { Err(anyhow::anyhow!("another process still has kiln.db open")) } else { Ok(token) } }
+                },
+                no_wait,
+            )
+            .await?;
+            anyhow::ensure!(got == "renewed" && member == 8 && tries.load(SeqCst) == 9, "{got} {member} after {} tries", tries.load(SeqCst));
+            // Taken away while it's tried: it stops.
+            let r = super::start_replica(&join, || false, |_, _| {
+                *join.lock() = None;
+                async { Err::<String, _>(anyhow::anyhow!("held")) }
+            }, no_wait)
+            .await;
+            anyhow::ensure!(r.as_ref().is_err_and(|e| e.to_string().contains("no longer asks")), "{:?}", r.err());
+            // The runner going: it stops.
+            *join.lock() = Some((7, "t".into()));
+            let n = AtomicU32::new(0);
+            let r = super::start_replica(&join, || n.load(SeqCst) >= 2, |_, _| {
+                n.fetch_add(1, SeqCst);
+                async { Err::<String, _>(anyhow::anyhow!("held")) }
+            }, no_wait)
+            .await;
+            anyhow::ensure!(r.is_err() && n.load(SeqCst) == 2, "{} tries", n.load(SeqCst));
+            anyhow::ensure!(super::replica_wait(1).as_secs() == 15 && super::replica_wait(super::REPLICA_PATIENCE).as_secs() == 60);
+            Ok(())
+        })
+    }
+}
+
 /// Serve the machine's local sockets (`kiln run`, `kiln spawn`) from this runner process: the new
 /// build once it has taken over, or the old one again after a rollback (the paths are the same).
 #[cfg(unix)]
 fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, state_dir: &std::path::Path) {
     crate::browser::set_home(state_dir);
     if let Some(r) = reach
-        && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(name, state_dir))
+        && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(name, state_dir), true)
     {
         tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine");
     }
     if let Some(h) = harness
-        && let Err(e) = crate::harness::socket::serve(h, crate::harness::socket::path(name, state_dir))
+        && let Err(e) = crate::harness::socket::serve(h, crate::harness::socket::path(name, state_dir), true)
     {
         tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
     }
@@ -455,12 +668,25 @@ async fn roll_back(
     use std::os::fd::IntoRawFd as _;
     let empty = tracing::field::Empty;
     let span = tracing::info_span!(target: "kiln::upgrade", parent: &mv.root, "upgrade.rollback", reason = %why, result = empty, error = empty);
-    if let Some(sup) = crate::bluegreen::Supervisor::from_env() {
-        let green = mv.green;
-        if let Ok(Err(e)) | Err(e) = crate::rt::blocking(move || sup.kill(green)).await {
-            // Gone already (it exited, or it was never started).
-            tracing::debug!(error = %format!("{e:#}"), pid = green.pid, "stopping the new build");
-        }
+    // Nothing is taken back until the new build is seen gone: one left running takes messages again
+    // a while after its link here ends (`Bg::TakeOverEnded`), and the two would hold the same
+    // sessions, each with an inbox of its own (CP-T3.2, the thirteenth adversarial check's). One
+    // that can't be stopped keeps what it took over.
+    if !stop_new_build(crate::bluegreen::Supervisor::from_env(), mv.green, Duration::from_secs(5)).await {
+        tracing::error!(pid = mv.green.pid, "the new build couldn't be stopped: what it took over stays with it, and nothing is taken back here");
+        let kept: Vec<String> = mv
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::Terminal { session, .. } => format!("terminal {session}: kept by the new build, which couldn't be stopped"),
+                Item::Session { record, .. } => format!("agent session {}: kept by the new build, which couldn't be stopped", record.id()),
+            })
+            .collect();
+        span.record("result", "failed");
+        span.record("error", "the new build couldn't be stopped");
+        mv.root.record("result", "rolled_back");
+        mv.root.record("error", why);
+        return kept;
     }
     let mut problems = Vec::new();
     for (i, item) in mv.items.into_iter().enumerate() {
@@ -500,6 +726,38 @@ async fn roll_back(
     mv.root.record("result", "rolled_back");
     mv.root.record("error", why);
     problems
+}
+
+/// Stops the new build `green`, a rollback's first step: its supervisor `sup` kills it (none, or it
+/// didn't: killed here), and it's seen gone within `patience` of each. Whether it's gone.
+#[cfg(unix)]
+async fn stop_new_build(sup: Option<crate::bluegreen::Supervisor>, green: crate::bluegreen::Green, patience: Duration) -> bool {
+    if let Some(sup) = sup
+        && let Ok(Err(e)) | Err(e) = crate::rt::blocking(move || sup.kill(green)).await
+    {
+        // Gone already (it exited, or it was never started), or its supervisor couldn't.
+        tracing::debug!(error = %format!("{e:#}"), pid = green.pid, "stopping the new build");
+    }
+    if gone_within(green.pid, patience).await {
+        return true;
+    }
+    if let Ok(pid) = i32::try_from(green.pid) {
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+    }
+    gone_within(green.pid, patience).await
+}
+
+/// Whether process `pid` is gone within `patience` (looked at every 20 ms).
+#[cfg(unix)]
+async fn gone_within(pid: u32, patience: Duration) -> bool {
+    let until = std::time::Instant::now() + patience;
+    while crate::bluegreen::alive(pid) {
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        crate::rt::sleep(Duration::from_millis(20)).await;
+    }
+    true
 }
 
 /// (The new build's runner, blue/green.) Take over from the runner being upgraded, at `path`: say
@@ -716,9 +974,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // What the server last heard of it on this connection.
     let mut front_door_sent: Option<String> = None;
     let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
-    // A test build's fault: frames lost below the channel, which it makes up for.
-    if let Some(rule) = crate::runner::chaos::get().and_then(|c| c.shed) {
-        net.command(net::Out::Shed(rule)).await;
+    // A test build's faults: frames lost, sent twice or sent late below the channel, which it
+    // makes up for.
+    if let Some(c) = crate::runner::chaos::get() {
+        net.command(net::Out::Seed(c.seed)).await;
+        for rule in c.faults.iter().copied() {
+            net.command(net::Out::Shed(rule)).await;
+        }
     }
     // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
     let mut paths = if o.ephemeral {
@@ -747,6 +1009,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // started once the server says which member it is (never in a job pod or an outpost).
     let cluster: Arc<parking_lot::Mutex<Option<Arc<crate::store::learner::Learner>>>> = Arc::default();
     let cluster_starting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The server's last word to join the group as a learner (`None` once it said Leave): what a
+    // replica being started goes on with.
+    let cluster_join: Arc<parking_lot::Mutex<Option<(u64, String)>>> = Arc::default();
     // Reach: links to other runners, and the runs this machine does for them (none in a job pod).
     // Agent sessions other runners hand this one (a session moving here) are taken over by its
     // session host, once there is one (below).
@@ -770,7 +1035,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             if take_over_pending.is_some() {
                 crate::reach::local::set_socket(path.to_string_lossy().into_owned());
             } else {
-                match crate::reach::local::serve(handle.clone(), name.clone(), path) {
+                match crate::reach::local::serve(handle.clone(), name.clone(), path, false) {
                     Ok(p) => crate::reach::local::set_socket(p.to_string_lossy().into_owned()),
                     Err(e) => tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine"),
                 }
@@ -783,6 +1048,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
     });
     let uplink = Uplink(up_tx);
+    let replica = ReplicaStart {
+        slot: cluster.clone(),
+        starting: cluster_starting.clone(),
+        join: cluster_join.clone(),
+        up: uplink.0.clone(),
+        dir: o.state_dir.clone(),
+        me: name.clone(),
+        server: o.server_url.clone(),
+        http: http.clone(),
+    };
+    if !o.ephemeral && !o.outpost {
+        crate::rt::spawn(replica.clone().watch());
+    }
     // Agent sessions handed to this machine's newer runner process go by way of the server.
     crate::harness::handing::install(uplink.0.clone());
     // Its facts, probed again every 10 minutes (docs/ci.md W13-R01); once on each connection.
@@ -886,6 +1164,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // each stream; and the one being applied, answered at the top of the next turn of the loop
     // (however its arm ended), taken unless its arm refused it.
     let mut wire_in = crate::wire::channel::Receiver::new();
+    // Which of the server's command streams are current: an item of one let go of is dropped.
+    let mut wire_current = crate::wire::commands::Current::new();
     let mut answer_after: Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)> = None;
     // What the server's copy of each session here has, said in digests on this connection: a
     // stream that starts sends only what the copy lacks (`crate::wire::sums`).
@@ -917,6 +1197,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // serves them once it holds the sessions.
     #[cfg(unix)]
     let mut sockets_served = take_over_pending.is_none();
+    // It took the sessions over (the runner it upgrades said that was everything).
+    #[cfg(unix)]
+    let mut took_over = false;
     // Conversations kept on disk as they happen (docs/conversations.md), and sent to the server's
     // store over this link (`crate::convo::feed`).
     let mut convo: Option<crate::convo::store::Store> = None;
@@ -926,9 +1209,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
         let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
         let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), Default::default());
+        // A new build taking over takes no messages till it's promoted (`Host::hold`).
+        if take_over_pending.is_some() {
+            h.hold(true);
+        }
         h.restore_from(convo.as_ref());
         h
     });
+    // The harnesses its user's login shell finds are this machine's too
+    // (`crate::harness::kinds::search_path`): that shell is asked now, and every ten minutes.
+    if harness.is_some() {
+        crate::rt::spawn(crate::reach::serve::login_env());
+    }
     // A copy of the server's store this runner keeps, if the server picks it (a mirror), and
     // that copy sent back while the server restores its store from it.
     let mut mirror: Option<crate::convo::feed::Intake> = None;
@@ -959,7 +1251,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         if take_over_pending.is_some() {
             return Some(path.to_string_lossy().into_owned());
         }
-        match crate::harness::socket::serve(h, path) {
+        match crate::harness::socket::serve(h, path, false) {
             Ok(p) => Some(p.to_string_lossy().into_owned()),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
@@ -976,9 +1268,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let answer = match &host {
                     Some(h) => {
                         let h = Arc::clone(h);
-                        crate::rt::blocking(move || h.adopt(&from, &data)).await.unwrap_or_else(|e| Err(format!("{e:#}")))
+                        // Stopped part-way (it panicked): it may have been taken over, so not "not taken".
+                        crate::rt::blocking(move || h.adopt(&from, &data)).await.unwrap_or_else(|_| Err(crate::reach::node::DROPPED.to_owned()))
                     }
-                    None => Err("this runner runs no agent sessions".into()),
+                    None => Err(format!("{}this runner runs no agent sessions", crate::reach::node::NOT_TAKEN)),
                 };
                 let _ = reply.send(answer);
             }
@@ -994,6 +1287,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The harnesses this machine offers, as last reported (rechecked every minute or so).
     let mut harness_kinds_sent: Option<String> = None;
     let mut harness_kinds_tick: u32 = 0;
+    // Whether its user's login shell had said its PATH when they were last looked at.
+    let mut users_path_known = false;
     let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
@@ -1374,6 +1669,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let _ = done.send(r);
                     }
                     Bg::TookOver { sessions, terminals, refused } => {
+                        took_over = true;
                         tracing::info!(sessions, terminals, refused, "took over from the runner being upgraded");
                         // The server learns they run here now.
                         announce(term_list(&terms), harness.as_ref(), &uplink).await;
@@ -1385,10 +1681,29 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if !std::mem::replace(&mut sockets_served, true) {
                             serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
                         }
+                        // Its link to the runner it upgraded ended after it took everything over, and
+                        // no word of its promotion: that one is gone (one that takes its sessions
+                        // back stops this one first). It takes messages again after a while.
+                        if took_over
+                            && let Some(h) = harness.as_ref().filter(|h| h.is_held())
+                        {
+                            let h = Arc::clone(h);
+                            crate::rt::spawn(async move {
+                                crate::rt::sleep(TAKE_OVER_GRACE).await;
+                                if h.is_held() {
+                                    tracing::warn!("no word of a promotion after taking over: this runner takes messages again");
+                                    h.hold(false);
+                                }
+                            });
+                        }
                     }
                     Bg::Promoted => {
                         // Joined ranked oldest (new work stayed with the old runner): the newest now.
                         tracing::info!("promoted: this runner is the machine's newest; new work comes here");
+                        // Its sessions are its own for good: it takes their messages.
+                        if let Some(h) = &harness {
+                            h.hold(false);
+                        }
                         instance_hello.created_at = real_created_at;
                         draining = false;
                         uplink.msg(AgentMsg::Instance(instance_hello.clone())).await;
@@ -1589,11 +1904,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md), and an
-                // outpost aside, it says what it holds warm (docs/ci.md W24-R18).
-                if !o.ephemeral {
+                // outpost aside, it says what it holds warm (docs/ci.md W24-R18). A test build's
+                // `old` says nothing, as a runner from before the channel.
+                if !o.ephemeral && !crate::runner::chaos::get().is_some_and(|c| c.old) {
                     let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | work }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -1653,7 +1969,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     tracing::warn!(%reason, "disconnected from server");
                     paths.disconnected();
                     // No word comes for agent sessions on their way to a newer process: they go on here.
-                    crate::harness::handing::link_lost();
+                    crate::harness::handing::runner_link_lost();
                 } else {
                     tracing::info!(%reason, via = %paths.via(), retry_in = ?dial_backoff, "dial failed");
                     // The path changed (to the tunnel, or back): dial that way now.
@@ -1701,11 +2017,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     match msg {
                         ServerMsg::Wire(crate::wire::channel::Frame::Item { stream, seq, low, body }) => {
                             use crate::wire::channel::{Arrival, Refusal};
-                            // A command stream's new generation: the ones before it are done with.
-                            if seq == 1
-                                && let Some(prefix) = crate::wire::commands::prefix_of(&stream)
-                            {
-                                wire_in.forget_where(|s| s != stream && crate::wire::commands::prefix_of(s) == Some(prefix));
+                            // A command stream's newer generation: the ones before it are done with,
+                            // and an item of one of those that comes late isn't taken again.
+                            match wire_current.of(&stream) {
+                                crate::wire::commands::Stand::Gone => continue 'events,
+                                crate::wire::commands::Stand::Newer(prefix) => wire_in.forget_where(|s| s != stream && crate::wire::commands::prefix_of(s) == Some(prefix)),
+                                crate::wire::commands::Stand::Current => {}
                             }
                             let answer = match wire_in.on_item(&stream, seq, low, body) {
                                 Arrival::Take(body) => match proto::decode::<ServerMsg>(&body) {
@@ -1742,6 +2059,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     continue;
                 }
                 match msg {
+                    // A test build's `old` skips both, as a runner from before the channel can't
+                    // read them.
+                    ServerMsg::Kept { .. } | ServerMsg::Caps { .. } if crate::runner::chaos::get().is_some_and(|c| c.old) => {}
                     // What the server can do past Build's 32 bits (docs/wire.md): said before its
                     // Welcome, so this runner sends its sessions over the channel, not whole. It
                     // says what it has of the server's streams (none yet).
@@ -2066,9 +2386,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     },
                     ServerMsg::HarnessOpen { session, json } => {
-                        let opened = match (&harness, serde_json::from_str::<crate::harness::session::Spec>(&json)) {
-                            (None, _) => Err(anyhow::anyhow!("agent sessions are not enabled on this runner")),
-                            (_, Err(e)) => Err(anyhow::anyhow!("bad session spec: {e}")),
+                        use crate::wire::channel::Refusal;
+                        // How it fared, as its answer says it (a command on the channel).
+                        let opened: Result<(), (Refusal, anyhow::Error)> = match (&harness, serde_json::from_str::<crate::harness::session::Spec>(&json)) {
+                            (None, _) => Err((Refusal::Unsupported, anyhow::anyhow!("agent sessions are not enabled on this runner"))),
+                            (_, Err(e)) => Err((Refusal::Malformed, anyhow::anyhow!("bad session spec: {e}"))),
                             (Some(h), Ok(mut spec)) => {
                                 // Started on a shell: in that shell's directory and environment.
                                 if let Some(pid) = spec.shell.as_ref().and_then(|t| terms.get(t)).and_then(|(pty, _)| pty.pid()) {
@@ -2098,11 +2420,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     });
                                     Ok(())
                                 } else {
-                                    h.open(Some(session.clone()), spec).map(|_| ())
+                                    h.open(Some(session.clone()), spec).map(|_| ()).map_err(|e| (Refusal::Refused, e))
                                 }
                             }
                         };
-                        if let Err(e) = opened {
+                        if let Err((code, e)) = opened {
+                            refuse(&mut answer_after, code, format!("{e:#}"));
                             for u in crate::harness::host::refusal(&session, &json, &format!("{e:#}")) {
                                 if let Ok(json) = serde_json::to_string(&u) {
                                     uplink.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
@@ -2111,27 +2434,62 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::HarnessCmd { session, json } => {
+                        use crate::wire::channel::Refusal;
                         let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
                         match serde_json::from_str::<crate::harness::model::Command>(&json) {
                             // The server's word on a hand-over to this machine's newer runner
                             // process: never "gone here", even once this process has let go.
-                            Ok(crate::harness::model::Command::HandedOver { error }) => {
+                            Ok(crate::harness::model::Command::HandedOver { error, unsure, by_newest, none_newer }) => {
+                                // With no newer process to take it, a word that it wasn't taken
+                                // settles as a refusal does (the machine's record says).
                                 if let Some(h) = &harness {
-                                    h.handed_over(&session, error);
+                                    h.handed_over(&session, error, unsure, by_newest || none_newer);
                                 }
                             }
                             Ok(c) if known => {
-                                if let Some(h) = &harness {
-                                    h.command(&session, c);
+                                if let Some(h) = &harness
+                                    && !h.command(&session, c)
+                                {
+                                    refuse(&mut answer_after, Refusal::Refused, format!("session {session} didn't take it: its lane is full, or it just ended"));
                                 }
                             }
                             Ok(_) => {
+                                refuse(&mut answer_after, Refusal::Unknown, format!("no session {session} here"));
                                 // Gone here (e.g. stopped while the server was away): say so.
                                 if let Ok(json) = serde_json::to_string(&crate::harness::core::Update::Closed) {
                                     uplink.0.send(Up::Term(AgentMsg::Harness { session, json })).await.ok();
                                 }
                             }
-                            Err(e) => tracing::debug!(error = %e, "unreadable agent session command"),
+                            Err(e) => {
+                                tracing::debug!(error = %e, "unreadable agent session command");
+                                refuse(&mut answer_after, Refusal::Malformed, format!("{e}"));
+                            }
+                        }
+                    }
+                    // A message for an epoch (CP-T3.2): through its session's inbox, which answers.
+                    ServerMsg::HarnessSend { session, epoch, json } => {
+                        let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
+                        match serde_json::from_str::<crate::harness::model::Command>(&json) {
+                            Ok(c) if known => {
+                                if let Some(h) = &harness {
+                                    h.command_at(&session, c, Some(epoch));
+                                }
+                            }
+                            Ok(c) => {
+                                // Gone here: the message is refused, and the session said gone.
+                                let mut said = Vec::new();
+                                if let Some(message) = crate::harness::registry::message_id(&c) {
+                                    let refused = crate::harness::inbox::Said { message, answer: Err(crate::harness::inbox::Refusal::NoSession { session: session.clone() }) };
+                                    said.push(crate::harness::core::Update::Inbox { said: Box::new(refused) });
+                                }
+                                said.push(crate::harness::core::Update::Closed);
+                                for u in said {
+                                    if let Ok(json) = serde_json::to_string(&u) {
+                                        uplink.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::debug!(error = %e, "unreadable agent session message"),
                         }
                     }
                     ServerMsg::AiView { req, pid } => match &ai {
@@ -2148,8 +2506,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::HarnessClose { session } => {
-                        if let Some(h) = &harness {
-                            h.close(&session);
+                        // One this runner doesn't have is gone here already: said so (`unknown`).
+                        if !harness.as_ref().is_some_and(|h| h.close(&session)) {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no session {session} here"));
                         }
                         // What it had going live: its app, its streams.
                         crate::browser::apps::stop(&session);
@@ -2158,13 +2517,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     ServerMsg::HarnessPackage { session, offset, data, done } => {
                         // A session going on here from the server's store (its machine is gone).
-                        let Some(h) = harness.clone() else { continue };
+                        let Some(h) = harness.clone() else {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unsupported, "agent sessions are not enabled on this runner");
+                            continue;
+                        };
+                        // Handing everything to a new build of it, or retiring: an older process's
+                        // hand-over isn't taken here (`Host::adopt_package`).
+                        #[cfg(unix)]
+                        let leaving = retiring || moving.as_ref().is_some_and(|m| m.handing);
+                        #[cfg(not(unix))]
+                        let leaving = false;
                         match h.receive_package(&session, offset, &data, done) {
                             Ok(Some(path)) => {
                                 let up = uplink.0.clone();
                                 crate::rt::spawn(async move {
                                     let h2 = h.clone();
-                                    let (handover, taken) = crate::rt::blocking(move || h2.adopt_package(&path)).await.unwrap_or_else(|e| (false, Err(format!("{e:#}"))));
+                                    let (handover, taken) = crate::rt::blocking(move || h2.adopt_package(&path, leaving)).await.unwrap_or_else(|e| (false, Err(format!("{e:#}"))));
                                     // Handed over by an older process of this machine: that one
                                     // goes on with it unless this one took it, so it's told either
                                     // way, and nothing else is said here.
@@ -2187,7 +2555,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 });
                             }
                             Ok(None) => {}
-                            Err(e) => tracing::warn!(%session, error = %format!("{e:#}"), "a session package couldn't be kept"),
+                            Err(e) => {
+                                tracing::warn!(%session, error = %format!("{e:#}"), "a session package couldn't be kept");
+                                refuse(&mut answer_after, crate::wire::channel::Refusal::Refused, format!("its package couldn't be kept: {e:#}"));
+                            }
                         }
                     }
                     ServerMsg::HarnessRelease { session } => {
@@ -2316,61 +2687,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::Cluster { json, raft } => {
-                        use crate::store::learner::{Learner, Msg};
+                        use crate::store::learner::Msg;
                         match crate::store::learner::decode(&json) {
                             Some(Msg::Join { member, token }) if !o.ephemeral && !o.outpost => {
-                                if cluster.lock().is_some() || cluster_starting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                // A replica being started goes on with the newest word to join.
+                                *cluster_join.lock() = Some((member, token));
+                                if cluster.lock().is_some() {
                                     continue;
                                 }
-                                // Fetching its first copy of kiln.db takes a while: not on this loop.
-                                let (slot, starting, up) = (cluster.clone(), cluster_starting.clone(), uplink.0.clone());
-                                let (dir, me, server, http) = (o.state_dir.clone(), name.clone(), o.server_url.clone(), http.clone());
-                                crate::rt::spawn(async move {
-                                    // A few tries: the process before this one may still hold the
-                                    // replica's files for a moment.
-                                    let mut tries = 0;
-                                    let started = loop {
-                                        let (dir, me, server, http, token) = (dir.clone(), me.clone(), server.clone(), http.clone(), token.clone());
-                                        // A thread of its own: fetching a copy takes minutes on a large
-                                        // store, and the blocking pool is the runtime's.
-                                        let (tx, rx) = async_channel::bounded(1);
-                                        let spawned = std::thread::Builder::new().name("kiln-learner".into()).spawn(move || {
-                                            let _ = tx.send_blocking(Learner::start(&dir, &me, member, http, &server, &token));
-                                        });
-                                        let r = match spawned {
-                                            Ok(_) => rx.recv().await.map_err(|_| anyhow::anyhow!("the learner's thread ended")),
-                                            Err(e) => Err(anyhow::anyhow!("starting the learner's thread: {e}")),
-                                        };
-                                        tries += 1;
-                                        match r {
-                                            Ok(Ok(started)) => break Ok(started),
-                                            Ok(Err(e)) | Err(e) if tries >= 5 => break Err(e),
-                                            Ok(Err(e)) | Err(e) => {
-                                                tracing::debug!(error = %format!("{e:#}"), tries, "this machine's replica of kiln's records didn't start yet");
-                                                crate::rt::sleep(std::time::Duration::from_secs(15)).await;
-                                            }
-                                        }
-                                    };
-                                    match started {
-                                        Ok((learner, said)) => {
-                                            tracing::info!(member, "this machine holds a replica of kiln's records");
-                                            let learner = Arc::new(learner);
-                                            crate::store::learner::set_global(Some(Arc::clone(&learner)));
-                                            *slot.lock() = Some(learner);
-                                            crate::rt::spawn(async move {
-                                                while let Ok(m) = said.recv().await {
-                                                    if up.send(Up::Sync(m)).await.is_err() {
-                                                        break;
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        Err(e) => tracing::warn!(error = %format!("{e:#}"), "this machine's replica of kiln's records didn't start"),
-                                    }
-                                    starting.store(false, std::sync::atomic::Ordering::SeqCst);
-                                });
+                                replica.start();
                             }
                             Some(Msg::Leave) => {
+                                // A replica being started stops trying.
+                                *cluster_join.lock() = None;
                                 // Another process of this machine holds it now: its files are let go
                                 // (stopping it waits for its thread: not on this loop).
                                 if let Some(old) = cluster.lock().take() {
@@ -2977,11 +3306,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let shells = terms.iter().filter_map(|(id, (pty, _))| Some((pty.pid()?, id.clone()))).collect();
                         ai.scan(shells, uplink.0.clone());
                     }
-                    // A harness installed (or removed) since: say so.
+                    // A harness installed (or removed) since, or found once its user's login shell
+                    // said its PATH (asked again every ten minutes): say so.
                     harness_kinds_tick = harness_kinds_tick.wrapping_add(1);
+                    let users_path = crate::reach::serve::login_path().is_some();
                     if let Some(h) = &harness
-                        && harness_kinds_tick.is_multiple_of(12)
+                        && (harness_kinds_tick.is_multiple_of(12) || users_path != users_path_known)
                     {
+                        users_path_known = users_path;
+                        crate::rt::spawn(crate::reach::serve::login_env());
                         let now = serde_json::to_string(&crate::harness::kinds::offered()).ok();
                         if now != harness_kinds_sent
                             && let Ok(json) = serde_json::to_string(&h.inventory())
@@ -3486,6 +3819,22 @@ fn open_mirror(dir: &std::path::Path, up: &async_channel::Sender<Up>) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CP-T3.2 (the thirteenth adversarial check's): a rollback takes nothing back until the new
+    /// build is seen gone. One its supervisor didn't stop (none found here) is killed, and seen gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_build_its_supervisor_didn_t_stop_is_stopped_before_anything_is_taken_back() -> anyhow::Result<()> {
+        let mut child = std::process::Command::new("sleep").arg("60").spawn()?;
+        let pid = child.id();
+        // Reaped as it goes (a zombie still counts as running where the system can't tell).
+        let reaper = std::thread::spawn(move || child.wait());
+        // No supervisor (one the tests' runner runs under is never asked).
+        let gone = crate::rt::block_on(async move { anyhow::Ok(stop_new_build(None, crate::bluegreen::Green { pid }, Duration::from_millis(300)).await) })?;
+        let reaped = reaper.join().map_err(|_| anyhow::anyhow!("the reaper panicked"))??;
+        anyhow::ensure!(gone && !crate::bluegreen::alive(pid), "the new build still runs (gone {gone}; it ended {reaped:?})");
+        Ok(())
+    }
     use crate::harness::core::Update;
     use crate::harness::model::{Body, Event};
 
@@ -3524,7 +3873,7 @@ mod tests {
                 }))
             };
             let body = |n: u64| match n % 5 {
-                0 => Body::User { text: format!("ask {n}"), images: 1, client_id: Some("c".into()), origin: None, attachments: vec!["/a.png".into()] },
+                0 => Body::User { text: format!("ask {n}"), images: 1, client_id: Some("c".into()), origin: None, attachments: vec!["/a.png".into()], reply_to: None },
                 1 => Body::Assistant { text: format!("line {n} \u{2713}"), streaming: false },
                 2 => Body::Thinking { text: format!("think {n}"), streaming: false, redacted: n.is_multiple_of(2) },
                 3 => tool(n, ToolStatus::Done),

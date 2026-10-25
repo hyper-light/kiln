@@ -470,6 +470,11 @@ struct State {
     /// In a `k8s` pod made for the leg (W13-R07): its services, the pod's sidecars, as
     /// `job.services` says them.
     pod_services: Option<serde_json::Value>,
+    /// The workflow file that defines the job (W06-R03's `job.workflow_*`).
+    job_workflow: Option<kiln_ci::plan::DefinedIn>,
+    /// The CPUs the leg was given (W05-R03, resource mode), held until it ends: its background
+    /// steps' copies of its state share them.
+    cpus: Option<std::sync::Arc<super::cpus::Lease>>,
     /// The problem matchers steps added (W06-R06).
     matchers: matchers::Job,
     /// A background step's own stop (`cancel:`, W06-R17).
@@ -672,6 +677,12 @@ impl State {
             job.push(("services".to_owned(), Value::from_json(&services)));
         } else if let Some(services) = &self.pod_services {
             job.push(("services".to_owned(), Value::from_json(services)));
+        }
+        // The workflow file that defines the job (W06-R03): a called workflow's for its jobs.
+        if let Some(d) = &self.job_workflow {
+            for (k, v) in [("workflow_ref", &d.workflow_ref), ("workflow_sha", &d.workflow_sha), ("workflow_repository", &d.workflow_repository), ("workflow_file_path", &d.workflow_file_path)] {
+                job.push((k.to_owned(), Value::str(v)));
+            }
         }
         values.push(("job", Value::object(job)));
         let steps = Value::object(self.steps.iter().filter_map(|d| {
@@ -1348,6 +1359,16 @@ impl Leg {
             containers: None,
             docker_sock: None,
             pod_services: None,
+            job_workflow: a.job_workflow.clone(),
+            // This machine's CPUs, for its steps and its containers: a microVM's are its vCPUs.
+            cpus: a
+                .executor
+                .options
+                .get("cpus")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|_| matches!(a.executor.kind.as_str(), "" | "host" | "docker"))
+                .and_then(|n| super::cpus::take(usize::try_from(n).unwrap_or(0)))
+                .map(std::sync::Arc::new),
             matchers: matchers::Job::default(),
             stop: None,
             masks_added: Vec::new(),
@@ -1917,7 +1938,13 @@ impl Leg {
             for (k, t) in &step.env {
                 env.insert(k.clone(), st.render(t, Site::StepEnv, &format!("env.{k}"))?);
             }
-            let wd = match step.working_directory.as_ref().or(self.a.job_defaults.working_directory.as_ref()).or(self.a.workflow_defaults.working_directory.as_ref()) {
+            // `defaults.run` (W04-R28) are the job's own `run:` steps', as on GitHub: an action runs
+            // in the workspace (JavaScript, Docker and kiln's own alike), and a composite action's
+            // steps take no defaults (actions/runner's ScriptHandler applies them outside an
+            // action only).
+            let (job, workflow, defaulted) = (&self.a.job_defaults, &self.a.workflow_defaults, step.run.is_some() && !nested);
+            let dir = if step.uses.is_some() { None } else { step.working_directory.as_ref().or_else(|| job.working_directory.as_ref().or(workflow.working_directory.as_ref()).filter(|_| defaulted)) };
+            let wd = match dir {
                 Some(t) => {
                     let w = st.render(t, Site::StepWorkingDirectory, "working-directory")?;
                     let p = PathBuf::from(&w);
@@ -1925,7 +1952,7 @@ impl Leg {
                 }
                 None => st.layout.workspace.clone(),
             };
-            let shell = match step.shell.as_ref().or(self.a.job_defaults.shell.as_ref()).or(self.a.workflow_defaults.shell.as_ref()) {
+            let shell = match step.shell.as_ref().or_else(|| job.shell.as_ref().or(workflow.shell.as_ref()).filter(|_| defaulted)) {
                 Some(t) => Some(st.render(t, Site::StepRun, "shell")?),
                 None => None,
             };
@@ -2222,7 +2249,22 @@ impl Leg {
             Some(o) => Some(st.render(o, site, "options")?),
             None => None,
         };
-        Ok(super::docker::Spec { image, credentials, env, ports, volumes, options, docker_socket: false, docker_proxy: None, seccomp_unconfined: false, user: None, workspace_size: None })
+        Ok(super::docker::Spec {
+            image,
+            credentials,
+            env,
+            ports,
+            volumes,
+            options,
+            docker_socket: false,
+            docker_proxy: None,
+            seccomp_unconfined: false,
+            user: None,
+            workspace_size: None,
+            memory: None,
+            seed_tools: false,
+            cpuset: st.cpus.as_ref().map(|l| l.list()),
+        })
     }
 
     /// "Initialize containers" (W13-R08): the leg's network, services and job container, before
@@ -2249,6 +2291,17 @@ impl Leg {
     fn hosted_image(&self) -> Option<&str> {
         let a = &self.a;
         if a.job_container.is_none() && a.executor.kind == "docker" { a.executor.image.as_deref() } else { None }
+    }
+
+    /// A host path as the leg's expressions see it: the container's in the `docker` executor's
+    /// container (the leg's machine), as `runner.temp` is; the host's elsewhere, a job's
+    /// `container:` included, as on GitHub.
+    fn seen_path(&self, l: &Layout, p: &Path) -> String {
+        let s = p.to_string_lossy();
+        match self.hosted_image() {
+            Some(_) => self.container_map(l).translate(&s),
+            None => s.into_owned(),
+        }
     }
 
     /// Whether the `docker` executor's container gets the host's Docker socket (W13-R04: the
@@ -2344,6 +2397,12 @@ impl Leg {
             let own = crate::githost::host_of(if a.runtime.registry_url.is_empty() { &a.runtime.facade_url } else { &a.runtime.registry_url });
             let mut c = w.containers;
             c.cli = c.cli.through(&own, a.runtime.mirrors.clone());
+            // Its pool started it without the leg's CPUs and memory (W05-R03): given them now. A
+            // leg that can't be held to them still runs, and says so.
+            let cpus = st.cpus.as_ref().map(|l| l.list());
+            if let Err(e) = c.hold(cpus.as_deref(), a.executor.options.get("memory").and_then(serde_json::Value::as_u64)).await {
+                self.note(idx, &format!("The pool's executor couldn't be held to the leg's CPUs and memory: {e:#}")).await;
+            }
             st.containers = Some(c);
             return Ok(());
         }
@@ -2391,6 +2450,7 @@ impl Leg {
                     docker_proxy,
                     seccomp_unconfined: socket,
                     env,
+                    seed_tools: true,
                     ..super::docker::Spec::default()
                 })
             }
@@ -2398,6 +2458,10 @@ impl Leg {
         };
         // A test build's full disk (W22-AC04): the job container's workspace, a volume that small.
         let job = job.map(|j| super::docker::Spec { workspace_size: super::chaos::for_leg(a.attempt).and_then(|c| c.disk_mib).map(|mib| u64::from(mib) << 20), ..j });
+        // The memory the leg was given in resource mode (W05-R03), its job container's limit.
+        let job = job.map(|j| super::docker::Spec { memory: a.executor.options.get("memory").and_then(serde_json::Value::as_u64), ..j });
+        // And the CPUs it was given, its job container's own (`--cpuset-cpus`).
+        let job = job.map(|j| super::docker::Spec { cpuset: st.cpus.as_ref().map(|l| l.list()), ..j });
         // W18-R08: a job in a container is contained, its one way out the relay to the runner's
         // proxy. A runner without a static kiln for the relay can't contain it: an untrusted leg
         // stops here; a trusted one runs as it would without its policy, and says so.
@@ -2560,7 +2624,19 @@ impl Leg {
             .map(|k| (*k, st.layout.commands.join(format!("{}_{id}", k.to_ascii_lowercase()))))
             .collect();
         {
-            let (file, body, paths, wd) = (file.clone(), body.clone(), files.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(), wd.to_path_buf());
+            // The step's directory, made where it is on the host. In a job container it may be named
+            // as the container has it (`${{ runner.temp }}` there, `/__w/_temp` or the runner image's
+            // `/home/runner/work/_temp`): made where its mount is on the host, and one the container
+            // alone has is the container's (Home Assistant's pylint step, corpus pass 1024b: kiln made
+            // `/home/runner` here, and was refused).
+            let host_wd = match st.containers.as_ref().and_then(|c| c.job.as_ref()).filter(|_| in_job) {
+                None => Some(wd.to_path_buf()),
+                Some(j) => {
+                    let w = wd.to_string_lossy();
+                    if j.map.translate(&w) != w { Some(wd.to_path_buf()) } else { j.map.to_host(&w) }
+                }
+            };
+            let (file, body, paths) = (file.clone(), body.clone(), files.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>());
             crate::rt::blocking(move || -> std::io::Result<()> {
                 if let Some(f) = &file {
                     std::fs::write(f, body)?;
@@ -2568,7 +2644,10 @@ impl Leg {
                 for p in paths {
                     std::fs::write(p, b"")?;
                 }
-                std::fs::create_dir_all(wd)
+                match host_wd {
+                    Some(d) => std::fs::create_dir_all(d),
+                    None => Ok(()),
+                }
             })
             .await??;
         }
@@ -2637,7 +2716,15 @@ impl Leg {
             }
             cli.exec_command(&j.id, j.user.as_deref(), &j.map.translate(&wd.to_string_lossy()), &inner, &j.map.translate(&prog), &args)
         } else {
-            let mut c = shell_program(&prog, &args, shell);
+            // On the host, within the CPUs the leg was given (W05-R03), as `taskset` starts it.
+            let mut c = match (&st.cpus, super::cpus::taskset()) {
+                (Some(l), Some(t)) => {
+                    let mut c = Command::new(t);
+                    c.arg("-c").arg(l.list()).arg(&prog).args(&args);
+                    c
+                }
+                _ => shell_program(&prog, &args, shell),
+            };
             c.current_dir(wd).envs(&env);
             c
         };
@@ -4372,7 +4459,13 @@ impl Leg {
             aenv.insert(input_var(k), v.clone());
         }
         aenv.insert("GITHUB_ACTION".into(), step.id.clone().unwrap_or_else(|| action_name(uses)));
-        aenv.insert("GITHUB_ACTION_PATH".into(), loc.dir.to_string_lossy().to_string());
+        // `GITHUB_ACTION_PATH` is a composite action's, for its steps, as GitHub's runner has it
+        // (`github.action_path`, set in its CompositeActionHandler only): an action among those
+        // steps keeps it (CodSpeed's github-script step reads its composite's files by it), and
+        // one on its own has none.
+        if action.runs.using == "composite" {
+            aenv.insert("GITHUB_ACTION_PATH".into(), loc.dir.to_string_lossy().to_string());
+        }
         aenv.insert("GITHUB_ACTION_REPOSITORY".into(), loc.repo.clone());
         aenv.insert("GITHUB_ACTION_REF".into(), loc.git_ref.clone());
         // One that signs only on GitHub (docs/ci.md W18-R02) runs as asked, and the leg is told
@@ -4449,7 +4542,9 @@ impl Leg {
         st.base.push(("inputs", str_map(inputs)));
         if let Value::Object(m) = &st.github {
             let mut members: Vec<(String, Value)> = m.0.iter().filter(|(k, _)| &**k != "action_path").map(|(k, v)| (k.to_string(), v.clone())).collect();
-            members.push(("action_path".to_owned(), Value::str(&loc.dir.to_string_lossy())));
+            // Where the leg's machine has it (next.js's cargo-binstall runs
+            // `bash "${{ github.action_path }}/install-from-binstall-release.sh"`).
+            members.push(("action_path".to_owned(), Value::str(&self.seen_path(&st.layout, &loc.dir))));
             st.github = Value::object(members);
         }
         st.failed = false;
@@ -4540,7 +4635,7 @@ impl Leg {
             for (k, v) in &inputs {
                 env.insert(input_var(k), v.clone());
             }
-            env.insert("GITHUB_ACTION_PATH".into(), loc.dir.to_string_lossy().to_string());
+            // No `GITHUB_ACTION_PATH`: a pre step is a JavaScript or Docker action's, which has none.
             env.insert("GITHUB_ACTION_REPOSITORY".into(), loc.repo.clone());
             env.insert("GITHUB_ACTION_REF".into(), loc.git_ref.clone());
             env.extend(runs_env(st, &action, &inputs));
@@ -4964,6 +5059,7 @@ mod tests {
         let (w, d) = kiln_ci::wf::parse_workflow(path, workflow, dialect);
         anyhow::ensure!(d.iter().all(|x| !x.is_error()), "{d:?}");
         let run_env = w.as_ref().is_some_and(|w| w.run_env);
+        let workflow_defaults = w.as_ref().map(|w| w.defaults.clone()).unwrap_or_default();
         let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
         let tmp = tempfile::tempdir()?;
         prepare(tmp.path())?;
@@ -4974,6 +5070,8 @@ mod tests {
             exports_env: job.kiln.exports_env.clone(),
             secret_outputs: job.outputs.iter().filter(|o| o.secret).map(|o| o.name.clone()).collect(),
             run_env,
+            workflow_defaults,
+            job_defaults: job.defaults.clone(),
             steps: job.steps.clone(),
             job_env: job.env.clone(),
             outputs: job.outputs.iter().map(|o| (o.name.clone(), o.value.clone())).collect(),
@@ -5125,6 +5223,29 @@ jobs:
         Ok(())
     }
 
+    /// W06-R03: `job.workflow_*` are the workflow file that defines the job, as the assignment
+    /// says it (a called workflow's for its jobs: astral-sh's security review checks itself out by
+    /// them, corpus pass 1024b); none without one.
+    #[cfg(unix)]
+    #[test]
+    fn w06_r03_the_job_context_names_its_workflow() -> anyhow::Result<()> {
+        let wf = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: echo \"from ${{ job.workflow_repository }} at ${{ job.workflow_sha }} in ${{ job.workflow_file_path }} as ${{ job.workflow_ref }}\"\n";
+        let defined = kiln_ci::plan::DefinedIn {
+            workflow_ref: "octo-org/automation/.github/workflows/review.yml@refs/tags/v1".into(),
+            workflow_sha: "f".repeat(40),
+            workflow_repository: "octo-org/automation".into(),
+            workflow_file_path: ".github/workflows/review.yml".into(),
+        };
+        let given = defined.clone();
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Gha, &|_| Ok(()), &move |a: &mut AssignmentV2| a.job_workflow = Some(given.clone()))?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        let said = format!("from octo-org/automation at {} in .github/workflows/review.yml as octo-org/automation/.github/workflows/review.yml@refs/tags/v1", defined.workflow_sha);
+        assert!(logs.get(&0).is_some_and(|l| l.contains(&said)), "{logs:?}");
+        let (_, logs, _) = run_leg(wf, &[])?;
+        assert!(logs.get(&0).is_some_and(|l| l.contains("from  at  in  as ")), "none without the assignment's: {logs:?}");
+        Ok(())
+    }
+
     /// W07-R07: a local composite action: inputs with defaults, outputs from its steps,
     /// `$GITHUB_ENV` reaching the job's later steps, its steps in the caller's log.
     #[cfg(unix)]
@@ -5159,6 +5280,154 @@ runs:
         assert!(logs.get(&1).is_some_and(|l| l.contains("hello push, kiln")), "{logs:?}");
         assert_eq!(finished(&events, 1).map(|f| f.2.get("said").cloned()), Some(Some("hello push, kiln".into())));
         assert!(logs.get(&2).is_some_and(|l| l.contains("it said 'hello push, kiln' and GREETED=yes")), "{logs:?}");
+        Ok(())
+    }
+
+    /// W04-R28: `defaults.run` are the job's own `run:` steps': an action runs in the workspace
+    /// and a composite action's steps take none, as on GitHub (react's setup-node, under
+    /// `working-directory: compiler`, looked for `compiler/yarn.lock` in `compiler/`: corpus pass
+    /// 1024b). The JavaScript action runs on this machine's Node, skipped without one.
+    #[cfg(unix)]
+    #[test]
+    fn w04_r28_defaults_are_the_jobs_run_steps_own() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let composite = r#"runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        [ "$(pwd -P)" = "$(cd "$GITHUB_WORKSPACE" && pwd -P)" ] && where=workspace || where=${PWD##*/}
+        echo "composite in the $where"
+"#;
+        let js = "runs:\n  using: node20\n  main: index.js\n";
+        let index = "const fs = require('fs');\nconst [here, ws] = [process.cwd(), process.env.GITHUB_WORKSPACE].map(p => fs.realpathSync(p));\nconsole.log('node in the ' + (here === ws ? 'workspace' : here));\n";
+        let node = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("node")).find(|n| n.is_file()));
+        let wf = format!(
+            "on: push\ndefaults:\n  run:\n    working-directory: sub\njobs:\n  t:\n    runs-on: x\n    steps:\n      - working-directory: .\n        run: |\n          mkdir -p sub .github/actions/c .github/actions/js\n          echo {} | base64 -d > .github/actions/c/action.yml\n          echo {} | base64 -d > .github/actions/js/action.yml\n          echo {} | base64 -d > .github/actions/js/index.js\n      - run: echo \"run in ${{PWD##*/}}\"\n      - uses: ./.github/actions/c\n{}",
+            b64(composite),
+            b64(js),
+            b64(index),
+            if node.is_some() { "      - uses: ./.github/actions/js\n" } else { "" }
+        );
+        let prepare = |work: &Path| -> anyhow::Result<()> {
+            if let Some(n) = &node {
+                let bin = work.join("_externals/node20/bin");
+                std::fs::create_dir_all(&bin)?;
+                std::os::unix::fs::symlink(n, bin.join("node"))?;
+            }
+            Ok(())
+        };
+        let (r, logs, _) = run_leg_prepared(&wf, &[], Dialect::Gha, &prepare)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        assert!(logs.get(&1).is_some_and(|l| l.contains("run in sub")), "a run step takes them: {logs:?}");
+        assert!(logs.get(&2).is_some_and(|l| l.contains("composite in the workspace")), "{logs:?}");
+        if node.is_some() {
+            assert!(logs.get(&3).is_some_and(|l| l.contains("node in the workspace")), "{logs:?}");
+        }
+        Ok(())
+    }
+
+    /// W13-R08: a step in a job container given the container's own path as its directory runs
+    /// there, kiln making it where its mount is on the host, not at `/__w` here. The `docker`
+    /// executor's `${{ runner.temp }}` is such a path (`/home/runner/work/_temp`): Home
+    /// Assistant's pylint step was refused with "Permission denied" (corpus pass 1024b).
+    #[cfg(unix)]
+    #[test]
+    fn w13_r08_a_job_containers_own_path_as_working_directory() -> anyhow::Result<()> {
+        if super::super::docker::find().is_none() {
+            return Ok(());
+        }
+        let wf = "on: push\njobs:\n  t:\n    runs-on: x\n    container: alpine:latest\n    steps:\n      - working-directory: /__w/_temp\n        run: echo \"in $(pwd)\"\n";
+        let (w, _) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", wf, Dialect::Gha);
+        let container = w.and_then(|w| w.jobs.into_iter().next()).and_then(|j| j.container);
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Gha, &|_| Ok(()), &move |a: &mut AssignmentV2| {
+            a.container = Some("alpine:latest".into());
+            a.job_container = container.clone();
+        })?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        assert!(logs.get(&0).is_some_and(|l| l.contains("in /__w/_temp")), "{logs:?}");
+        Ok(())
+    }
+
+    /// W05-R03: a leg in resource mode runs on CPUs of its own, as many as it asked for: on the
+    /// host its steps start within them (`taskset`), so `nproc` says the leg's (Linux).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn w05_r03_a_host_leg_runs_on_its_cpus() -> anyhow::Result<()> {
+        if super::super::cpus::taskset().is_none() {
+            return Ok(());
+        }
+        let wf = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: echo \"cpus $(nproc)\"\n";
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Gha, &|_| Ok(()), &|a: &mut AssignmentV2| a.executor.options = serde_json::json!({ "cpus": 1 }))?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        assert!(logs.get(&0).is_some_and(|l| l.contains("cpus 1")), "{logs:?}");
+        Ok(())
+    }
+
+    /// W07-R07: a composite action's `github.action_path` is where the leg's machine has it: the
+    /// container's path in the `docker` executor's container, the host's on the host and for a
+    /// job's `container:` (as GitHub's is). next.js's cargo-binstall ran its script by the host's
+    /// path in the container, where nothing was (corpus pass 1024b).
+    #[test]
+    fn w07_r07_an_actions_path_is_where_the_machine_has_it() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let leg = |executor: kiln_ci::wire::ExecutorSpec, job_container: Option<kiln_ci::wf::ir::Container>| -> anyhow::Result<Leg> {
+            let (tx, _rx) = async_channel::unbounded();
+            let a = AssignmentV2 { job_id: "leg-1".into(), repo: "acme/app".into(), executor, job_container, ..AssignmentV2::default() };
+            Ok(Leg {
+                a,
+                work_dir: tmp.path().to_path_buf(),
+                runner_name: "r".into(),
+                up: Uplink(tx),
+                cancel: Shutdown::new(),
+                http: std::sync::Arc::new(crate::http::client::Client::public()?),
+                warm: Default::default(),
+                cache_max: None,
+            })
+        };
+        let dir = tmp.path().join("_actions/cargo-bins/cargo-binstall/dc19f1e4");
+        let docker = kiln_ci::wire::ExecutorSpec { kind: "docker".into(), image: Some("kiln/runner-ubuntu-24.04".into()), ..Default::default() };
+        let machine = leg(docker.clone(), None)?;
+        assert_eq!(machine.seen_path(&machine.layout(), &dir), "/home/runner/work/_actions/cargo-bins/cargo-binstall/dc19f1e4", "the machine's");
+        let host = leg(kiln_ci::wire::ExecutorSpec { kind: "host".into(), ..Default::default() }, None)?;
+        assert_eq!(host.seen_path(&host.layout(), &dir), dir.to_string_lossy(), "the host's");
+        let (w, _) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", "on: push\njobs:\n  t:\n    runs-on: x\n    container: alpine\n    steps: [{run: a}]\n", Dialect::Gha);
+        let container = w.and_then(|w| w.jobs.into_iter().next()).and_then(|j| j.container);
+        let job = leg(docker, container)?;
+        assert_eq!(job.seen_path(&job.layout(), &dir), dir.to_string_lossy(), "a job's `container:` sees the host's, as on GitHub");
+        Ok(())
+    }
+
+    /// W07-R07: `GITHUB_ACTION_PATH` is a composite action's, for its steps, as on GitHub: its
+    /// `run:` steps and an action among them see the composite's directory (CodSpeed's
+    /// github-script step reads its composite's files by it: ruff's benchmarks, corpus pass
+    /// 1024b), and an action on its own has none. Runs on this machine's Node, skipped without.
+    #[cfg(unix)]
+    #[test]
+    fn w07_r07_a_composites_path_is_its_steps_own() -> anyhow::Result<()> {
+        let Some(node) = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("node")).find(|n| n.is_file())) else { return Ok(()) };
+        use base64::Engine as _;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let composite = "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"the run step sees ${GITHUB_ACTION_PATH##*/}\"\n    - uses: ./.github/actions/js\n";
+        let js = "runs:\n  using: node20\n  main: index.js\n";
+        let index = "const p = process.env.GITHUB_ACTION_PATH;\nconsole.log('the action sees ' + (p ? p.split('/').pop() : 'no action path'));\n";
+        let wf = format!(
+            "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: |\n          mkdir -p .github/actions/c .github/actions/js\n          echo {} | base64 -d > .github/actions/c/action.yml\n          echo {} | base64 -d > .github/actions/js/action.yml\n          echo {} | base64 -d > .github/actions/js/index.js\n      - uses: ./.github/actions/c\n      - uses: ./.github/actions/js\n",
+            b64(composite),
+            b64(js),
+            b64(index)
+        );
+        let prepare = |work: &Path| -> anyhow::Result<()> {
+            let bin = work.join("_externals/node20/bin");
+            std::fs::create_dir_all(&bin)?;
+            std::os::unix::fs::symlink(&node, bin.join("node"))?;
+            Ok(())
+        };
+        let (r, logs, _) = run_leg_prepared(&wf, &[], Dialect::Gha, &prepare)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        assert!(logs.get(&1).is_some_and(|l| l.contains("the run step sees c") && l.contains("the action sees c")), "the composite's, for its steps: {logs:?}");
+        assert!(logs.get(&2).is_some_and(|l| l.contains("the action sees no action path")), "none on its own: {logs:?}");
         Ok(())
     }
 

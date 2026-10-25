@@ -8,6 +8,7 @@ pub mod auth;
 pub mod builtins;
 pub mod cache;
 pub mod chaos;
+pub mod cpus;
 pub mod credential;
 pub mod docker;
 pub mod docker_sock;

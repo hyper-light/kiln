@@ -164,3 +164,13 @@ await test("cached resources do not process live events while nothing shows them
     assert.equal(applied, 0);
   } finally { events.stop(); }
 });
+
+await test("a message's id is a UUIDv7 made once: 32 hex digits, its time first, and never another's (CP-T3.2)", async () => {
+  const { clientId } = await import("../src/api/harness.ts");
+  const ids = Array.from({ length: 10_000 }, () => clientId());
+  for (const id of ids.slice(0, 100)) assert.match(id, /^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$/);
+  assert.equal(new Set(ids).size, ids.length);
+  const ms = Number.parseInt(ids[0]!.slice(0, 12), 16);
+  assert.ok(Math.abs(ms - Date.now()) < 60_000, `its time: ${ms}`);
+  assert.ok(ids.every((id, i) => i === 0 || id.slice(0, 12) >= ids[i - 1]!.slice(0, 12)), "made later, sorted later");
+});

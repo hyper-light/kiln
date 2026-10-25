@@ -178,6 +178,9 @@ pub struct Took {
     /// Rows of a copy ([`Engine::take_copy`]) of sessions this store has from elsewhere, or of
     /// what the copy dropped, left out.
     pub left: usize,
+    /// Events and record lines it had already as they came (sent again, from another store of
+    /// the same machine): nothing written, no number given.
+    pub same: usize,
     /// The batch didn't follow what it had (`rev` says what it has): nothing was taken.
     pub gap: bool,
     /// This store's own numbers the batch was written under, first and last (None: it wrote

@@ -387,6 +387,74 @@ pub fn sync() -> &'static SyncMetrics {
     })
 }
 
+/// A tenth of a millisecond to ten seconds: how long a session's inbox takes to take a message.
+pub const SEND_BUCKETS: &[f64] = &[0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.003, 0.004, 0.005, 0.0075, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 10.0];
+
+/// Sends (CP-T3.2; docs/sends.md): what sessions' inboxes said of the messages sent them, as the
+/// server heard it, and how long taking one took where it was taken.
+pub struct SendsMetrics {
+    /// Messages an inbox took, the first time.
+    pub accepted: Counter,
+    /// Messages an inbox had taken already: answered with the first time's answer, and never
+    /// delivered again.
+    pub repeated: Counter,
+    /// Messages an inbox refused, by reason (`Refusal::reason`).
+    pub refused: CounterVec,
+    /// Messages the server stopped waiting for an answer to (said to be on their way).
+    pub unanswered: Counter,
+    /// Messages a host without inboxes handed on (`KILN_INBOX` off, or its records couldn't be
+    /// opened): not checked for repeats. Answered at place (`seq`) 0.
+    pub unchecked: Counter,
+    /// How long a session's inbox took to take a message, on the host that took it.
+    pub take_seconds: Histogram,
+}
+
+impl SendsMetrics {
+    /// One answer, counted.
+    pub fn said(&self, said: &crate::harness::inbox::Said) {
+        match &said.answer {
+            Ok(a) if a.repeat => self.repeated.inc(),
+            // No inbox took it (a take's place is a revision, never 0).
+            Ok(a) if a.seq == 0 => self.unchecked.inc(),
+            Ok(_) => self.accepted.inc(),
+            Err(r) => self.refused.inc(&[r.reason()]),
+        }
+    }
+}
+
+pub fn sends() -> &'static SendsMetrics {
+    static M: OnceLock<SendsMetrics> = OnceLock::new();
+    M.get_or_init(|| SendsMetrics {
+        accepted: Counter::default(),
+        repeated: Counter::default(),
+        refused: CounterVec::new(&["reason"]),
+        unanswered: Counter::default(),
+        unchecked: Counter::default(),
+        take_seconds: Histogram::new(SEND_BUCKETS),
+    })
+}
+
+/// Sends' families, in the exposition.
+fn render_sends(o: &mut String) {
+    let m = sends();
+    let help = |o: &mut String, name: &str, kind: &str, h: &str| {
+        let _ = writeln!(o, "# HELP {name} {h}\n# TYPE {name} {kind}");
+    };
+    for (name, h, v) in [
+        ("kiln_sends_accepted_total", "Messages a session's inbox took, the first time.", m.accepted.get()),
+        ("kiln_sends_repeated_total", "Messages a session's inbox had taken already: answered, never delivered again.", m.repeated.get()),
+        ("kiln_sends_unanswered_total", "Messages the server stopped waiting for an inbox's answer to.", m.unanswered.get()),
+        ("kiln_sends_unchecked_total", "Messages a host without inboxes handed on, not checked for repeats.", m.unchecked.get()),
+    ] {
+        help(o, name, "counter", h);
+        let _ = writeln!(o, "{name} {v}");
+    }
+    help(o, "kiln_sends_refused_total", "counter", "Messages a session's inbox refused, by reason.");
+    m.refused.render(o, "kiln_sends_refused_total");
+    help(o, "kiln_sends_take_seconds", "histogram", "How long a session's inbox took to take a message, where it was taken.");
+    m.take_seconds.render(o, "kiln_sends_take_seconds", "");
+}
+
 /// A family as docs/agents.md ("Metrics") lists it: its name, type, label and that label's values
 /// (none: it has no label), and what it counts (its help, word for word the doc's).
 pub(crate) struct Family {
@@ -707,6 +775,17 @@ mod tests {
         assert!(out.contains("x_seconds_bucket{repo=\"b\\\"q\",le=\"150\"} 1"), "{out}");
     }
 
+    /// CP-T3.2: the sends families render before anything was sent, as the sync families do.
+    #[test]
+    fn sends_families_render_even_before_anything_happened() {
+        let text = render();
+        for name in ["kiln_sends_accepted_total", "kiln_sends_repeated_total", "kiln_sends_refused_total", "kiln_sends_unanswered_total", "kiln_sends_unchecked_total", "kiln_sends_take_seconds"] {
+            assert!(text.contains(&format!("# TYPE {name} ")), "{name}");
+        }
+        assert!(text.contains("kiln_sends_take_seconds_bucket{le=\"0.0001\"} "), "its finest bucket");
+        assert!(text.contains("kiln_sends_take_seconds_bucket{le=\"0.003\"} "), "close near the sync floor");
+    }
+
     #[test]
     fn sync_families_render_even_before_anything_happened() {
         let text = render();
@@ -951,6 +1030,7 @@ pub fn render() -> String {
     help(&mut o, "kiln_queue_wait_seconds", "histogram", "Time from queued to started.");
     m.queue_wait.render(&mut o, "kiln_queue_wait_seconds", "");
     render_sync(&mut o);
+    render_sends(&mut o);
     render_agents(agents(), &mut o);
     render_blobs(&mut o);
     render_bus(&mut o);

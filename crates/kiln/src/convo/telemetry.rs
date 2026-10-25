@@ -330,6 +330,10 @@ pub struct PeerView {
     pub fenced: u64,
     pub left: u64,
     pub bytes: u64,
+    /// Since kiln started: rows it had already as they came (sent again, from another store of
+    /// the same machine), so nothing was written for them.
+    #[serde(default)]
+    pub same: u64,
     /// Batches that didn't follow what it had, and batches it couldn't take.
     pub gaps: u64,
     pub errors: u64,

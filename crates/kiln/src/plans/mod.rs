@@ -484,21 +484,89 @@ pub fn markdown(p: &Plan) -> String {
     out
 }
 
-/// The message that hands an agent the whole plan, under its title (unless it opens with it).
-pub fn message(p: &Plan) -> String {
+/// The message that hands an agent the whole plan, under its title (unless it opens with it); for a
+/// plan whose steps say what they wait for, the order they go in, those side by side on subagents
+/// of the agent's own, at most `at_once` at a time (its Subagents setting).
+pub fn message(p: &Plan, at_once: Option<u32>) -> String {
     let all = markdown(p);
     let body = all.trim();
     let first = body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let order = order_words(p, at_once).map(|o| format!(" {o}")).unwrap_or_default();
     if first.starts_with('#') && title_of(first) == p.title {
-        format!("Carry out this plan, step by step, and say when it is done.\n\n{body}")
+        format!("Carry out this plan, step by step, and say when it is done.{order}\n\n{body}")
     } else {
-        format!("Carry out this plan, step by step, and say when it is done.\n\n# {}\n\n{body}", p.title)
+        format!("Carry out this plan, step by step, and say when it is done.{order}\n\n# {}\n\n{body}", p.title)
     }
 }
 
 /// The message that hands an agent one step of a plan.
 pub fn step_message(p: &Plan, i: usize, n: usize, step: &str) -> String {
     format!("Step {} of {} of the plan \"{}\": {}\n\nDo this step only, then say what you did.", i + 1, n, p.title, step)
+}
+
+/// The message that hands an agent steps of a plan that don't wait for each other (`at`: each one's
+/// index from 0, with its text, of `n`), to run side by side on subagents of its own, at most
+/// `at_once` at a time (its Subagents setting): one message, so the steps after them wait for it.
+pub fn side_by_side_message(p: &Plan, at: &[(usize, &str)], n: usize, at_once: Option<u32>) -> String {
+    let nums: Vec<usize> = at.iter().map(|(i, _)| *i).collect();
+    let steps = at.iter().map(|(i, s)| format!("Step {}: {s}", i + 1)).collect::<Vec<_>>().join("\n\n");
+    format!(
+        "Steps {} of {n} of the plan \"{}\" don't wait for each other: run them side by side, a subagent of yours for each ({SUBAGENT_TOOLS}){}. Brief each with its step, and keep each to its step's own files.\n\n{steps}\n\nDo these steps only: wait for every subagent, check what each did, then say what each did.",
+        numbers(&nums),
+        p.title,
+        at_most(at_once)
+    )
+}
+
+/// How an agent starts subagents of its own, whatever its harness.
+const SUBAGENT_TOOLS: &str = "your Agent or Task tool; without one, start agents with agents_start";
+
+/// Steps (indexes from 0) as their numbers are said: "2", "2 and 3", "2, 3 and 4".
+fn numbers(i: &[usize]) -> String {
+    let n: Vec<String> = i.iter().map(|i| (i + 1).to_string()).collect();
+    match n.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// How many subagents at once, as a message says it (none: as many as the agent likes).
+fn at_most(at_once: Option<u32>) -> String {
+    match at_once {
+        Some(1) => ", one at a time (your Subagents setting)".to_owned(),
+        Some(n) => format!(", at most {n} at once (your Subagents setting)"),
+        None => String::new(),
+    }
+}
+
+/// The order a plan's steps go in, for the agent that carries out the whole plan: its steps in
+/// rounds as they say they wait for each other ([`rounds`]), each round's steps side by side on
+/// subagents of its own (at most `at_once` at a time). None when its steps say nothing of waiting,
+/// or none of them run side by side.
+fn order_words(p: &Plan, at_once: Option<u32>) -> Option<String> {
+    let n = p.items.len().min(STEPS);
+    let rounds = picked_rounds(&p.items, n, &(0..n).collect::<Vec<_>>());
+    if rounds.iter().all(|r| r.len() < 2) {
+        return None;
+    }
+    let order = rounds.iter().map(|r| if r.len() > 1 { format!("{} side by side", numbers(r)) } else { numbers(r) }).collect::<Vec<_>>().join(", then ");
+    Some(format!(
+        "Its steps say what they wait for, so they go in this order: {order}. Run the steps side by side on subagents of yours, one a step ({SUBAGENT_TOOLS}){}, and check what each did before the steps that wait for them.",
+        at_most(at_once)
+    ))
+}
+
+/// The steps `picked` (indexes from 0, of `n`) in the rounds they run in, as the plan's steps say
+/// what they wait for (`needs`; a step outside `picked` taken as done): each round's steps wait only
+/// for steps of the rounds before, so they run side by side. A plan whose steps say nothing of
+/// waiting has each step a round of its own, in order.
+pub fn picked_rounds(items: &[Item], n: usize, picked: &[usize]) -> Vec<Vec<usize>> {
+    if !items.iter().take(n).any(|it| !it.needs.is_empty()) {
+        return picked.iter().map(|&i| vec![i]).collect();
+    }
+    let needs: Vec<Vec<usize>> = waits(items, n, false).into_iter().enumerate().map(|(i, d)| if picked.contains(&i) { d.into_iter().filter(|j| picked.contains(j)).collect() } else { Vec::new() }).collect();
+    rounds(&needs).into_iter().map(|r| r.into_iter().filter(|i| picked.contains(i)).collect::<Vec<_>>()).filter(|r| !r.is_empty()).collect()
 }
 
 fn clean_tags(tags: Vec<String>) -> R<Vec<String>> {
@@ -823,11 +891,43 @@ async fn start_for(hub: &Hub, by: &crate::harness::lineage::Starter, target: Str
 }
 
 /// Runs a plan on an agent: an existing one, or a new one started with it (as `by` starts agents).
-pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, pick: &Pick, by: &crate::harness::lineage::Starter) -> R<Ran> {
+///
+/// With `key` (an idempotency key, CP-T3.2) the run's id is made from it, the plan and who runs it,
+/// so running it again under the key is the same run: on an agent that runs, it's done again (its
+/// messages are the same ones, which the agent takes once) and answered as it was; one that starts
+/// an agent, or adds goals, is answered as it was once it's done, and refused while it's under way
+/// (or stopped part-way), saying so: it's never done twice.
+pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, pick: &Pick, by: &crate::harness::lineage::Starter, key: Option<&str>) -> R<Ran> {
     let p = get(hub, id).await?;
     ready_to_run(&p)?;
+    let run = key.map_or_else(crate::util::new_id, |k| crate::util::derive_id(&["plans.run", &p.id, k]));
+    // Done again only where doing it again is safe: an agent that runs, sent the same messages.
+    let again_safe = matches!(target, Target::Session(_)) && mode != Mode::Goals;
+    if key.is_some()
+        && let Some(done) = claim(hub, &p, &run, mode, pick, by, again_safe).await?
+    {
+        return Ok(done);
+    }
+    // A run that failed before it did anything (started no agent, sent nothing) lets go of its
+    // claim: run again under its key, it's tried again.
+    let mut acted = false;
+    let ran = run_claimed(hub, &p, target, mode, pick, by, run.clone(), &mut acted).await;
+    if ran.is_err() && key.is_some() && !acted {
+        let run_c = run.clone();
+        let released = hub.store.call(move |c| Ok(c.execute("DELETE FROM plan_runs WHERE id = ?1 AND session = ''", params![run_c])?)).await;
+        if let Err(e) = released {
+            tracing::warn!(%run, error = %format!("{e:#}"), "a plan run that failed couldn't let go of its key: run again under it, it's refused");
+        }
+    }
+    ran
+}
+
+/// Plan `p`'s run `run`, claimed under its key if it has one (`run`): `acted` once it started an
+/// agent or sent anything.
+#[allow(clippy::too_many_arguments)]
+async fn run_claimed(hub: &Hub, p: &Plan, target: Target, mode: Mode, pick: &Pick, by: &crate::harness::lineage::Starter, run: String, acted: &mut bool) -> R<Ran> {
     if mode == Mode::Goals {
-        return run_goals(hub, &p, target, pick, by).await;
+        return run_goals(hub, p, target, pick, by, run, acted).await;
     }
     if mode == Mode::Agents {
         return Err(Error::Bad("one agent per step starts agents of its own: run it with `new` (agents::start)".into()));
@@ -835,8 +935,14 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, pick: &Pick, b
     if pick.only.is_some() && mode == Mode::Message {
         return Err(Error::Bad("`only` picks steps: run them as steps, goals or agents".into()));
     }
+    // The most subagents the agent runs at once (its Subagents setting): its steps side by side go to
+    // subagents of its own, within it (docs/agentic.md P2). A new agent has no setting of its own.
+    let at_once = match &target {
+        Target::Session(s) => hub.harness.info(s).and_then(|i| i.max_subagents),
+        Target::New { .. } => None,
+    };
     let messages: Vec<String> = match mode {
-        Mode::Message | Mode::Goals | Mode::Agents => vec![message(&p)],
+        Mode::Message | Mode::Goals | Mode::Agents => vec![message(p, at_once)],
         Mode::Steps => {
             let steps: Vec<&String> = p.steps.iter().take(STEPS).collect();
             if steps.is_empty() {
@@ -847,31 +953,53 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, pick: &Pick, b
             if picked.is_empty() {
                 return Err(Error::Bad(format!("none of those steps is in this plan: it has {n}")));
             }
-            picked.iter().filter_map(|&i| Some(step_message(&p, i, n, steps.get(i)?))).collect()
+            // A message a round: steps that don't wait for each other in one, side by side.
+            picked_rounds(&p.items, n, &picked)
+                .iter()
+                .filter_map(|r| match r.as_slice() {
+                    [one] => Some(step_message(p, *one, n, steps.get(*one)?)),
+                    many => {
+                        let at: Vec<(usize, &str)> = many.iter().filter_map(|&i| Some((i, steps.get(i)?.as_str()))).collect();
+                        Some(side_by_side_message(p, &at, n, at_once))
+                    }
+                })
+                .collect()
         }
     };
+    // The run's id is made first, and each of its messages' ids from it and its place among them:
+    // whatever sends one again sends the same message, which its agent gets once (CP-T3.2).
     let (session, rest) = match target {
         Target::Session(session) => (session, messages.as_slice()),
         Target::New { target, kind, cwd } => {
             let (first, rest) = messages.split_first().ok_or_else(|| Error::Bad("nothing to send".into()))?;
-            (start_for(hub, by, target, kind, cwd, Some(first.clone()), p.title.clone()).await?, rest)
+            let started = start_for(hub, by, target, kind, cwd, Some(first.clone()), p.title.clone()).await?;
+            *acted = true;
+            (started, rest)
         }
     };
-    let mut sent = messages.len().saturating_sub(rest.len());
-    for text in rest {
-        let c = Command::Send { id: crate::util::new_id(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None };
+    let first = messages.len().saturating_sub(rest.len());
+    let mut sent = first;
+    for (n, text) in rest.iter().enumerate() {
+        let step = n.saturating_add(first).to_string();
+        let c = Command::Send { id: crate::util::derive_id(&["plan-run", &run, &step]), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
         match hub.harness.command(hub, &session, c).await {
-            Sent::Ok => sent += 1,
+            Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => {
+                sent += 1;
+                *acted = true;
+            }
+            Sent::Refused(r) => return Err(Error::Bad(r.to_string())),
+            s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => return Err(Error::Bad(s.failure().map_or_else(|| "its runner refused it".to_owned(), |(_, why)| why))),
             Sent::NoSession => return Err(Error::Bad("no such agent".into())),
             Sent::Unreachable => return Err(Error::Bad("that agent's machine is not connected".into())),
         }
     }
-    let (run, now, by_s, version, mode_s, plan_id, session_c) = (crate::util::new_id(), crate::util::now_unix(), by.actor.clone(), p.version, mode.as_str(), p.id.clone(), session.clone());
+    let (now, by_s, version, mode_s, plan_id, session_c) = (crate::util::now_unix(), by.actor.clone(), p.version, mode.as_str(), p.id.clone(), session.clone());
     let run_c = run.clone();
     hub.store
         .call(move |c| {
+            // A run claimed under its key (`claim`) is done now: it says where it ran.
             c.execute(
-                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (id) DO UPDATE SET session = excluded.session, at = excluded.at",
                 params![run_c, plan_id, version, session_c, mode_s, now, by_s],
             )?;
             Ok(())
@@ -992,7 +1120,7 @@ fn goals_error(e: crate::goals::Error) -> Error {
 
 /// A plan's steps as goals, after the agent's others (a new agent is started for them), and the
 /// stack running.
-async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate::harness::lineage::Starter) -> R<Ran> {
+async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate::harness::lineage::Starter, run: String, acted: &mut bool) -> R<Ran> {
     let all: Vec<String> = if p.items.is_empty() { p.steps.iter().take(STEPS).cloned().collect() } else { p.items.iter().take(STEPS).map(Item::goal).collect() };
     if all.is_empty() {
         return Err(Error::Bad("this plan has no steps (no list in it) to make goals of".into()));
@@ -1005,10 +1133,13 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate:
     let texts: Vec<(usize, String)> = picked.iter().filter_map(|&i| Some((i, all.get(i)?.clone()))).collect();
     let session = match target {
         Target::Session(s) => s,
-        Target::New { target, kind, cwd } => start_for(hub, by, target, kind, cwd, None, p.title.clone()).await?,
+        Target::New { target, kind, cwd } => {
+            let started = start_for(hub, by, target, kind, cwd, None, p.title.clone()).await?;
+            *acted = true;
+            started
+        }
     };
     let sent = texts.len();
-    let run = crate::util::new_id();
     // Each goal says the step it's made from: the agent splits one into its acceptance criteria and
     // tests (`crate::goals::split`).
     let goals = texts
@@ -1020,6 +1151,7 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate:
         })
         .collect();
     let stack = crate::goals::add_at(hub, &session, goals, true, &crate::goals::At::End).await.map_err(goals_error)?;
+    *acted = true;
     // Each step its goal stack: its acceptance criteria and tests, a goal each, before it (one
     // without either stays as it is).
     let mut split = 0;
@@ -1036,13 +1168,66 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate:
     hub.store
         .call(move |c| {
             c.execute(
-                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES (?1, ?2, ?3, ?4, 'goals', ?5, ?6)",
+                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES (?1, ?2, ?3, ?4, 'goals', ?5, ?6) ON CONFLICT (id) DO UPDATE SET session = excluded.session, at = excluded.at",
                 params![run_c, plan_id, version, session_c, now, by_s],
             )?;
             Ok(())
         })
         .await?;
     Ok(Ran { session, sent, run, split })
+}
+
+/// A run under an idempotency key, before it's done: the run it was, if it was done (its answer,
+/// again), else none, the run claimed now. One under way (or stopped part-way) is refused unless
+/// doing it again is safe (`again_safe`: its messages to an agent that runs, the same ones again).
+async fn claim(hub: &Hub, p: &Plan, run: &str, mode: Mode, pick: &Pick, by: &crate::harness::lineage::Starter, again_safe: bool) -> R<Option<Ran>> {
+    // What was asked under the key: asked again for other steps, or in another mode, it's another
+    // request, refused (never answered as the run it isn't).
+    let shape = serde_json::json!({"only": pick.only, "split": pick.split}).to_string();
+    let (run_c, plan_id, version, mode_s, by_s, now, shape_c) = (run.to_owned(), p.id.clone(), p.version, mode.as_str(), by.actor.clone(), crate::util::now_unix(), shape.clone());
+    // Claimed with no session yet: it says where it ran once it's done.
+    let found: Option<(String, String, String)> = hub
+        .store
+        .call(move |c| {
+            let claimed = c.execute(
+                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by, config) VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7) ON CONFLICT (id) DO NOTHING",
+                params![run_c, plan_id, version, mode_s, now, by_s, shape_c],
+            )?;
+            if claimed == 1 {
+                return Ok(None);
+            }
+            Ok(c.query_row("SELECT session, mode, COALESCE(config, '') FROM plan_runs WHERE id = ?1", params![run_c], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)
+        })
+        .await?;
+    if let Some((_, was_mode, was_shape)) = &found
+        && (was_mode != mode.as_str() || *was_shape != shape)
+    {
+        return Err(Error::Refused(http::StatusCode::CONFLICT, "this key was given to another request (other steps, or another mode): give this one a key of its own".into()));
+    }
+    let found = found.map(|(session, _, _)| session);
+    match found {
+        None => Ok(None),
+        Some(session) if !session.is_empty() => {
+            let sent = match mode {
+                Mode::Steps => pick.of(p.steps.len().min(STEPS)).len(),
+                Mode::Goals => pick.of(if p.items.is_empty() { p.steps.len().min(STEPS) } else { p.items.len().min(STEPS) }).len(),
+                Mode::Message | Mode::Agents => 1,
+            };
+            let split = if mode == Mode::Goals && pick.split { split_of(hub, &session, run).await } else { 0 };
+            Ok(Some(Ran { session, sent, run: run.to_owned(), split }))
+        }
+        Some(_) if again_safe => Ok(None),
+        Some(_) => Err(Error::Refused(http::StatusCode::CONFLICT, "a run under this key is under way, or stopped part-way: see plans.runs.list for where it is".into())),
+    }
+}
+
+/// How many of run `run`'s goals on agent `session`'s stack were split into their parts.
+async fn split_of(hub: &Hub, session: &str, run: &str) -> usize {
+    let Ok(stack) = crate::goals::get(hub, session).await else {
+        return 0;
+    };
+    let ours = |i: &crate::goals::Item| i.part_of.is_none() && i.step.as_ref().is_some_and(|s| s.run.as_deref() == Some(run));
+    stack.items.iter().filter(|i| ours(i) && stack.items.iter().any(|j| j.part_of.as_deref() == Some(i.id.as_str()))).count()
 }
 
 #[cfg(test)]
@@ -1100,9 +1285,9 @@ mod tests {
             phase: "ready".into(),
             research: None,
         };
-        assert!(message(&p).contains("# T\n\n- a\n- b"));
+        assert!(message(&p, None).contains("# T\n\n- a\n- b"));
         let headed = Plan { body: "# T\n\n- a\n- b".into(), ..p.clone() };
-        assert_eq!(message(&headed).matches("# T").count(), 1);
+        assert_eq!(message(&headed, None).matches("# T").count(), 1);
         assert!(step_message(&p, 1, 2, "b").starts_with("Step 2 of 2 of the plan \"T\": b"));
     }
 
@@ -1137,7 +1322,7 @@ mod tests {
         let md = markdown(&p);
         assert!(md.starts_with("Why: the scanner grew.\n\n## 1. Split the scanner\n\nMove number scanning"), "{md}");
         assert!(md.contains("**Acceptance criteria**\n\n- scan_number exists\n- scan time is at most 2 ms") && md.contains("**Tests**\n\n- hex literals — passes when 0x1F reads as 31") && md.contains("## 2. Ship it"), "{md}");
-        assert!(message(&p).contains("# Lexer\n\nWhy: the scanner grew."));
+        assert!(message(&p, None).contains("# Lexer\n\nWhy: the scanner grew."));
         assert!(it.text().starts_with("Split the scanner\n\nMove number scanning") && it.text().contains("Acceptance criteria:\n- scan_number exists\n- scan time is at most 2 ms\n\nTests:\n- hex literals"), "{}", it.text());
         assert_eq!(
             it.goal(),
@@ -1194,4 +1379,41 @@ mod tests {
         assert_eq!(read.needs, [1, 2]);
     }
 
+    /// docs/agentic.md P2: run on an agent as one message or a step a turn, a plan whose steps say
+    /// what they wait for goes in rounds: the steps of a round, side by side, go to subagents of the
+    /// agent's own, at most its Subagents setting at once (a step a turn: one message a round, so the
+    /// steps after them wait for it). A plan whose steps say nothing of waiting goes as before, a
+    /// step at a time; and steps picked (`only`) wait only for each other.
+    #[test]
+    fn p2_steps_side_by_side_go_to_the_agent_s_subagents_at_most_its_setting_at_once() {
+        let it = |t: &str, needs: &[usize]| Item { title: t.into(), needs: needs.to_vec(), ..Item::default() };
+        let items = vec![it("Schema", &[]), it("API", &[1]), it("UI", &[1]), it("Docs", &[]), it("Ship", &[2, 3])];
+        assert_eq!(picked_rounds(&items, 5, &[0, 1, 2, 3, 4]), [vec![0, 3], vec![1, 2], vec![4]]);
+        assert_eq!(picked_rounds(&items, 5, &[1, 2, 4]), [vec![1, 2], vec![4]], "step 1, not picked, is taken as done");
+        let chain = vec![it("a", &[]), it("b", &[]), it("c", &[])];
+        assert_eq!(picked_rounds(&chain, 3, &[0, 2]), [vec![0], vec![2]], "saying nothing of waiting: a step at a time, in order");
+        let p = Plan {
+            id: "p".into(),
+            title: "Search".into(),
+            body: String::new(),
+            steps: items.iter().map(Item::text).collect(),
+            items,
+            tags: vec![],
+            source: None,
+            share: None,
+            version: 1,
+            created_at: 0,
+            updated_at: 0,
+            runs: 0,
+            phase: "ready".into(),
+            research: None,
+        };
+        let whole = message(&p, Some(2));
+        assert!(whole.contains("they go in this order: 1 and 4 side by side, then 2 and 3 side by side, then 5.") && whole.contains("at most 2 at once (your Subagents setting)"), "{whole}");
+        assert!(!message(&Plan { items: chain, ..p.clone() }, Some(2)).contains("side by side"), "nothing to say of a plan whose steps say nothing of waiting");
+        let two = side_by_side_message(&p, &[(1, "API"), (2, "UI")], 5, Some(1));
+        assert!(two.starts_with("Steps 2 and 3 of 5 of the plan \"Search\" don't wait for each other: run them side by side, a subagent of yours for each"), "{two}");
+        assert!(two.contains("one at a time (your Subagents setting)") && two.contains("Step 2: API\n\nStep 3: UI") && two.ends_with("then say what each did."), "{two}");
+        assert!(!side_by_side_message(&p, &[(1, "API"), (2, "UI")], 5, None).contains("Subagents setting"), "no setting of its own: no limit said");
+    }
 }

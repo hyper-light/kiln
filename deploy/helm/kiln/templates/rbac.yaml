@@ -59,6 +59,11 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list]
+  # It says how a deploy ended as an Event on the Deployment, so `kubectl get events` shows a
+  # hold or a rollback even while no kiln is up to tell (docs/resilience.md, G7).
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

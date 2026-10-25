@@ -254,16 +254,20 @@ export const plansApi = {
   versions: (id: string, signal?: AbortSignal) => request<PlanVersion[]>("GET", `/api/plans/${enc(id)}/versions`, undefined, { signal }),
   runs: (id: string, signal?: AbortSignal) => request<PlanRun[]>("GET", `/api/plans/${enc(id)}/runs`, undefined, { signal }),
   restore: (id: string, version: number) => request<Plan>("POST", `/api/plans/${enc(id)}/restore`, { version }),
-  run: (id: string, target: PlanRunTarget, mode: Exclude<PlanMode, "agents">, pick: PlanPick = {}) => request<PlanRan>("POST", `/api/plans/${enc(id)}/run`, { ...target, mode, ...pick }),
-  /** One agent per step, on the machine and harness given, one after another. */
-  runAgents: (id: string, to: { target: string; kind: string; cwd?: string }, pick: Pick<PlanPick, "only"> = {}) =>
-    request<PlanStarted>("POST", `/api/plans/${enc(id)}/run`, { new: to, mode: "agents", ...pick }),
+  /** `key`: the run asked again under it (its answer lost) is the same run, never a second (CP-T3.2). */
+  run: (id: string, target: PlanRunTarget, mode: Exclude<PlanMode, "agents">, pick: PlanPick = {}, key?: string) =>
+    request<PlanRan>("POST", `/api/plans/${enc(id)}/run`, { ...target, mode, ...pick, key }),
+  /** One agent per step, on the machine and harness given, one after another (`key`, as `run`'s). */
+  runAgents: (id: string, to: { target: string; kind: string; cwd?: string }, pick: Pick<PlanPick, "only"> = {}, key?: string) =>
+    request<PlanStarted>("POST", `/api/plans/${enc(id)}/run`, { new: to, mode: "agents", ...pick, key }),
   /** Runs of one agent per step (`active`: those under way). */
   agentRuns: (active: boolean, signal?: AbortSignal) => request<{ runs: PlanRunBrief[] }>("GET", `/api/plans/runs${active ? "?active=1" : ""}`, undefined, { signal }),
   runView: (run: string, signal?: AbortSignal) => request<PlanRunView>("GET", `/api/plans/runs/${enc(run)}`, undefined, { signal }),
   stopRun: (run: string) => request<PlanRunView>("POST", `/api/plans/runs/${enc(run)}/stop`),
   /** Retry a step with a new agent; take it over (kiln stops holding its agent to it); or say it's met. */
-  step: (run: string, n: number, act: "retry" | "take" | "met") => request<PlanRunView>("POST", `/api/plans/runs/${enc(run)}/steps/${n}/${act}`),
+  /** `tries`: for a retry, the try it replaces (asked again once it was tried again, nothing more starts: CP-T3.2). */
+  step: (run: string, n: number, act: "retry" | "take" | "met", tries?: number) =>
+    request<PlanRunView>("POST", `/api/plans/runs/${enc(run)}/steps/${n}/${act}`, act === "retry" && tries !== undefined ? { try: tries } : undefined),
   share: (id: string, on: boolean) => request<Plan>("POST", `/api/plans/${enc(id)}/share`, { on }),
   shared: (token: string, signal?: AbortSignal) => request<SharedPlan>("GET", `/api/shared/plans/${enc(token)}`, undefined, { signal }),
 };

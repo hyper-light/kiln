@@ -61,12 +61,27 @@ struct News {
     said: Vec<(String, String)>,
     /// The lines that reach the parent should the message go now (as `Kept::held`).
     held: Vec<(String, String)>,
+    /// The words its message was given, sent with and then each edit, the newest last
+    /// (`queued::stable` of each, [`GIVEN_MAX`] of them) and the lines each said: once its runner
+    /// says what its harness was handed (`Info::said`), those lines reached the parent, whatever
+    /// kiln had it say since (an edit too late, or one its own read of a child made: `saw`).
+    given: Vec<(String, Vec<(String, String)>)>,
 }
+
+/// The most of a news message's words kept to tell which its harness was handed.
+const GIVEN_MAX: usize = 16;
 
 impl News {
     fn text(&self) -> String {
         text_of(self.before.as_deref(), &self.lines, self.more)
     }
+}
+
+/// News message words `text`, saying `lines`, given to it (`given`: [`News::given`]).
+fn gave(given: &mut Vec<(String, Vec<(String, String)>)>, text: &str, lines: &[(String, String)]) {
+    given.push((super::queued::stable(text), lines.to_vec()));
+    let over = given.len().saturating_sub(GIVEN_MAX);
+    given.drain(..over);
 }
 
 /// What kiln knows of children and of their parents' news: the server's is [`TOLD`].
@@ -120,7 +135,8 @@ pub async fn tick(hub: &crate::hub::Hub, all: &[Info], now: i64, driven: &[Strin
         {
             super::wait::sent(&p.id, p.last_turn.as_ref().map(|t| t.at));
         }
-        if !matches!(hub.harness.command(hub, &parent, c.clone()).await, super::registry::Sent::Ok) {
+        // It went: queued, or taken by its session's inbox (CP-T3.2).
+        if !hub.harness.command(hub, &parent, c.clone()).await.went() {
             tracing::info!(agent = %parent, "news of the agents it started didn't reach it");
             TOLD.lock().unsent(&parent, &c);
         }
@@ -131,7 +147,10 @@ impl Told {
     /// News message `id` was found waiting for `parent` at `now`, saying `text`, queued before this
     /// server started: kept as its news, said first.
     fn found(&mut self, parent: &str, id: String, text: String, now: i64) {
-        self.news.entry(parent.to_owned()).or_insert_with(|| News { msg: Some(Kept::found(id, text.clone(), now)), before: Some(text), ..News::default() });
+        self.news.entry(parent.to_owned()).or_insert_with(|| {
+            let given = vec![(super::queued::stable(&text), Vec::new())];
+            News { msg: Some(Kept::found(id, text.clone(), now)), before: Some(text), given, ..News::default() }
+        });
     }
 
     /// [`saw`]: what goes to the parent for it, the line taken out (an edit, or the message removed).
@@ -150,7 +169,8 @@ impl Told {
             Some(m) => {
                 m.text = text;
                 n.said.clone_from(&n.lines);
-                Some(Command::QueueEdit { id: m.id.clone(), text: m.text.clone() })
+                gave(&mut n.given, &m.text, &n.lines);
+                Some(Command::QueueEdit { id: m.id.clone(), text: m.text.clone(), attachments: None })
             }
             None => None,
         };
@@ -206,17 +226,32 @@ impl Told {
         for parent in parents {
             let Some(info) = all.iter().find(|i| i.id == parent) else { continue };
             let n = self.news.entry(parent.clone()).or_default();
+            let mut unheard = false;
             if let Some(m) = n.msg.as_mut() {
                 let at = m.look(Some(info), now);
-                if !m.lost() {
+                // What it says reaches the parent, unless an edit of it didn't go (its words not
+                // known since: what it held before stands).
+                if !m.lost() && !m.text.is_empty() {
                     n.held.clone_from(&n.said);
                 }
-                if at == Now::Gone {
+                // What its harness was handed, as its runner says: the lines of those words
+                // (CP-T3.2, the seventeenth adversarial check's).
+                if let Some((_, lines)) = info.said.iter().find(|g| g.id == m.id).and_then(|h| n.given.iter().rev().find(|(d, _)| *d == h.digest)) {
+                    n.held.clone_from(lines);
+                }
+                // Gone from its queue, its handing not heard of yet (a runner from before this
+                // release says it in its events, which may come just after its state): it waits
+                // `queued::HEARD_MS` for that, nothing going meanwhile, so lines an edit gave it
+                // aren't told again (CP-T3.2, the sixteenth adversarial check's; the goal driver's
+                // word waits so too).
+                unheard = at == Now::Gone && m.look_heard(Some(info), now) == Now::Waiting;
+                if at == Now::Gone && !unheard {
                     n.lines.retain(|l| !n.held.contains(l));
                     n.msg = None;
                     n.before = None;
                     n.said.clear();
                     n.held.clear();
+                    n.given.clear();
                     n.more = 0;
                 }
             }
@@ -233,21 +268,23 @@ impl Told {
                 self.news.remove(&parent);
                 continue;
             }
-            if info.status == Status::Disconnected {
+            if info.status == Status::Disconnected || unheard {
                 continue;
             }
             let text = n.text();
             match n.msg.as_mut() {
                 Some(m) if m.text == text => {}
                 Some(m) => {
-                    out.push((parent, Command::QueueEdit { id: m.id.clone(), text: text.clone() }));
+                    out.push((parent, Command::QueueEdit { id: m.id.clone(), text: text.clone(), attachments: None }));
+                    gave(&mut n.given, &text, &n.lines);
                     m.text = text;
                     n.said.clone_from(&n.lines);
                 }
                 None if quiet.contains(&parent) => {}
                 None => {
                     let id = super::queued::made(NEWS);
-                    out.push((parent, Command::Send { id: id.clone(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None }));
+                    out.push((parent, Command::Send { id: id.clone(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }));
+                    n.given = vec![(super::queued::stable(&text), n.lines.clone())];
                     n.msg = Some(Kept::sent(id, text, info, now));
                     n.said.clone_from(&n.lines);
                     n.held.clone_from(&n.lines);
@@ -265,6 +302,7 @@ impl Told {
             (Command::Send { id, .. }, Some(m)) if m.id == *id => {
                 n.msg = None;
                 n.held.clear();
+                n.given.clear();
             }
             (Command::QueueEdit { id, .. }, Some(m)) if m.id == *id => m.text.clear(),
             _ => {}
@@ -454,7 +492,7 @@ mod tests {
     fn apply(p: &mut Info, c: &Command) {
         match c {
             Command::Send { id, text, .. } => p.queue.push(Queued::of(id, text)),
-            Command::QueueEdit { id, text } => {
+            Command::QueueEdit { id, text, .. } => {
                 if let Some(q) = p.queue.iter_mut().find(|q| q.id == *id) {
                     *q = Queued::of(id, text);
                 }
@@ -463,6 +501,17 @@ mod tests {
             _ => {}
         }
         p.queued = p.queue.len();
+    }
+
+    /// The parent's harness is handed what waits in its queue (`handed`: each message's id and the
+    /// words it had then), as this release's runner says it beside its queue (`State::given`, kept
+    /// by the server as `Info::said`).
+    fn take(p: &mut Info, handed: &[(&str, &str)]) {
+        for (id, text) in handed {
+            p.said.push(crate::harness::model::Given { id: (*id).to_owned(), digest: crate::harness::queued::stable(text) });
+        }
+        p.queue.clear();
+        p.queued = 0;
     }
 
     /// Children `which` (by index, with their last words) go to work, then end a turn and stand
@@ -529,8 +578,7 @@ mod tests {
         }
         anyhow::ensure!(latest.matches("which you started").count() == 3, "each child once: {latest}");
         // Its turn ends and it takes the news; what settles next is news again, on its own.
-        p.queue.clear();
-        p.queued = 0;
+        take(&mut p, &[(&id, &latest)]);
         now += 10_000;
         let next = settle(&mut t, &p, &mut kids, &[(2, "The bench is green.")], now);
         let Some(Command::Send { id: again, text, .. }) = next.first() else { anyhow::bail!("no news after the parent took the last: {next:?}") };
@@ -550,16 +598,131 @@ mod tests {
         now += 10_000;
         let first = settle(&mut t, &p, &mut kids, &[(0, "First news.")], now);
         first.iter().for_each(|c| apply(&mut p, c));
-        anyhow::ensure!(matches!(first.as_slice(), [Command::Send { .. }]), "{first:?}");
+        let [Command::Send { id, text, .. }] = first.as_slice() else { anyhow::bail!("{first:?}") };
         now += 10_000;
         let edit = settle(&mut t, &p, &mut kids, &[(1, "Second news.")], now);
         anyhow::ensure!(matches!(edit.as_slice(), [Command::QueueEdit { .. }]), "{edit:?}");
         // Before the edit came, the turn ended and the message went as it was.
-        p.queue.clear();
-        p.queued = 0;
+        take(&mut p, &[(id, text)]);
         let resent = t.plan(&all(&p, &kids), now + 10_000, &[], &[]);
         let Some((to, Command::Send { text, .. })) = resent.first() else { anyhow::bail!("the edit's words were lost: {resent:?}") };
         anyhow::ensure!(resent.len() == 1 && to == "q2" && text.contains("Second news.") && !text.contains("First news."), "only what didn't reach it: {resent:?}");
+        Ok(())
+    }
+
+    /// CP-T3.2 (the sixteenth adversarial check's): a runner from before this release says what its
+    /// harness was handed only in its events, and coming back it says its state first. News edited
+    /// and taken between two looks, its handing not heard of yet, waits for it (`queued::HEARD_MS`)
+    /// rather than tell again the lines the edit gave it; heard of, they aren't news any more. Not
+    /// heard of in that time, it's taken for lost, and what it may not have said goes again.
+    #[test]
+    fn news_edited_and_taken_between_two_looks_waits_to_hear_it_was_handed() -> anyhow::Result<()> {
+        let mut t = Told::default();
+        let mut p = coordinator("q9");
+        let mut kids = helpers("q9", &["t1", "t2"]);
+        let mut now = 9_000_000;
+        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
+        now += 10_000;
+        let first = settle(&mut t, &p, &mut kids, &[(0, "First news.")], now);
+        first.iter().for_each(|c| apply(&mut p, c));
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty(), "seen waiting");
+        now += 10_000;
+        let edit = settle(&mut t, &p, &mut kids, &[(1, "Second news.")], now);
+        let [Command::QueueEdit { id, text, .. }] = edit.as_slice() else { anyhow::bail!("{edit:?}") };
+        let (id, text) = (id.clone(), text.clone());
+        // The edit applies and the parent takes the news before the next look; its runner comes
+        // back saying its queue (empty) before its events.
+        edit.iter().for_each(|c| apply(&mut p, c));
+        p.queue.clear();
+        p.queued = 0;
+        for wait in [10_000, 12_000] {
+            let sent = t.plan(&all(&p, &kids), now + wait, &[], &[]);
+            anyhow::ensure!(sent.is_empty(), "nothing goes while its handing isn't heard of: {sent:?}");
+        }
+        // Its events say it was handed the news as edited: nothing to tell again.
+        p.said.push(crate::harness::model::Given { id: id.clone(), digest: crate::harness::queued::stable(&text) });
+        let sent = t.plan(&all(&p, &kids), now + 13_000, &[], &[]);
+        anyhow::ensure!(sent.is_empty(), "the edit's lines reached it: {sent:?}");
+        // What settles next is news again, on its own; edited and taken the same way, and its
+        // handing never heard of, what the edit said goes again once the wait is over.
+        now += 20_000;
+        let next = settle(&mut t, &p, &mut kids, &[(0, "Third news.")], now);
+        anyhow::ensure!(matches!(next.as_slice(), [Command::Send { text, .. }] if text.contains("Third news.") && !text.contains("Second news.")), "{next:?}");
+        next.iter().for_each(|c| apply(&mut p, c));
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty(), "seen waiting");
+        now += 10_000;
+        let edit = settle(&mut t, &p, &mut kids, &[(1, "Fourth news.")], now);
+        anyhow::ensure!(matches!(edit.as_slice(), [Command::QueueEdit { .. }]), "{edit:?}");
+        edit.iter().for_each(|c| apply(&mut p, c));
+        p.queue.clear();
+        p.queued = 0;
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 10_000, &[], &[]).is_empty(), "waiting to hear of it");
+        let lost = t.plan(&all(&p, &kids), now + 10_000 + crate::harness::queued::HEARD_MS, &[], &[]);
+        anyhow::ensure!(matches!(lost.as_slice(), [(_, Command::Send { text, .. })] if text.contains("Fourth news.") && !text.contains("Third news.")), "{lost:?}");
+        Ok(())
+    }
+
+    /// CP-T3.2, AC-T3.2.1 (the seventeenth adversarial check's): news edited and taken between two looks,
+    /// this release's runner saying what its harness was handed beside its queue, and the parent,
+    /// reading it, asks for one child's result (agents_result, as the news tells it to) before the
+    /// server's next look. That child's line comes out of the news kiln keeps, so the words it
+    /// keeps no longer match the words handed. The parent was handed every line: none is told again.
+    #[test]
+    fn news_taken_then_a_child_read_before_the_next_look_is_told_once() -> anyhow::Result<()> {
+        let mut t = Told::default();
+        let mut p = coordinator("q10");
+        let mut kids = helpers("q10", &["s1", "s2"]);
+        let mut now = 10_000_000;
+        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
+        now += 10_000;
+        let first = settle(&mut t, &p, &mut kids, &[(0, "First news.")], now);
+        first.iter().for_each(|c| apply(&mut p, c));
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty(), "seen waiting");
+        now += 10_000;
+        let edit = settle(&mut t, &p, &mut kids, &[(1, "Second news.")], now);
+        let [Command::QueueEdit { id, text, .. }] = edit.as_slice() else { anyhow::bail!("{edit:?}") };
+        let (id, text) = (id.clone(), text.clone());
+        anyhow::ensure!(text.contains("First news.") && text.contains("Second news."), "{text}");
+        // The edit applies and the parent takes the news, both lines, before the next look; its
+        // runner says so beside its queue.
+        edit.iter().for_each(|c| apply(&mut p, c));
+        take(&mut p, &[(&id, &text)]);
+        // Reading it, the parent asks for the first child's result before the server looks again.
+        let s1 = kids.first().cloned().ok_or_else(|| anyhow::anyhow!("no child"))?;
+        anyhow::ensure!(t.saw(&s1).is_some(), "its line was in the news");
+        let sent = t.plan(&all(&p, &kids), now + 10_000, &[], &[]);
+        anyhow::ensure!(sent.is_empty(), "news the parent was handed is told again: {sent:?}");
+        Ok(())
+    }
+
+    /// The same, its runner from before this release (its events say what was handed, after its
+    /// state): the parent reads the first child's result while the server waits to hear of the
+    /// handing (`queued::HEARD_MS`); then heard of, it was handed every line: none is told again.
+    #[test]
+    fn news_taken_then_a_child_read_while_its_handing_is_awaited_is_told_once() -> anyhow::Result<()> {
+        let mut t = Told::default();
+        let mut p = coordinator("q11");
+        let mut kids = helpers("q11", &["r1", "r2"]);
+        let mut now = 11_000_000;
+        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
+        now += 10_000;
+        let first = settle(&mut t, &p, &mut kids, &[(0, "First news.")], now);
+        first.iter().for_each(|c| apply(&mut p, c));
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty(), "seen waiting");
+        now += 10_000;
+        let edit = settle(&mut t, &p, &mut kids, &[(1, "Second news.")], now);
+        let [Command::QueueEdit { id, text, .. }] = edit.as_slice() else { anyhow::bail!("{edit:?}") };
+        let (id, text) = (id.clone(), text.clone());
+        edit.iter().for_each(|c| apply(&mut p, c));
+        p.queue.clear();
+        p.queued = 0;
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 10_000, &[], &[]).is_empty(), "waiting to hear of its handing");
+        let r1 = kids.first().cloned().ok_or_else(|| anyhow::anyhow!("no child"))?;
+        anyhow::ensure!(t.saw(&r1).is_some(), "its line was in the news");
+        // Its events: it was handed the news as edited, both lines.
+        p.said.push(crate::harness::model::Given { id: id.clone(), digest: crate::harness::queued::stable(&text) });
+        let sent = t.plan(&all(&p, &kids), now + 12_000, &[], &[]);
+        anyhow::ensure!(sent.is_empty(), "news the parent was handed is told again: {sent:?}");
         Ok(())
     }
 
@@ -578,7 +741,9 @@ mod tests {
         let Some(send) = first.first() else { anyhow::bail!("no news") };
         t.unsent("q6", send);
         let again = t.plan(&all(&p, &kids), now + 10_000, &[], &[]);
-        anyhow::ensure!(matches!(again.as_slice(), [(_, Command::Send { text, .. })] if text.contains("First news.")), "{again:?}");
+        let [(_, Command::Send { id: sent, text: said, .. })] = again.as_slice() else { anyhow::bail!("{again:?}") };
+        anyhow::ensure!(said.contains("First news."), "{again:?}");
+        let (sent, said) = (sent.clone(), said.clone());
         again.iter().for_each(|(_, c)| apply(&mut p, c));
         now += 20_000;
         let edit = settle(&mut t, &p, &mut kids, &[(1, "Second news.")], now);
@@ -588,8 +753,7 @@ mod tests {
         anyhow::ensure!(again.len() == 1 && again.first().map(|(_, c)| c) == Some(c), "the same edit again: {again:?}");
         // It didn't go either, and the parent took the message as it was.
         t.unsent("q6", c);
-        p.queue.clear();
-        p.queued = 0;
+        take(&mut p, &[(&sent, &said)]);
         let next = t.plan(&all(&p, &kids), now + 20_000, &[], &[]);
         anyhow::ensure!(matches!(next.as_slice(), [(_, Command::Send { text, .. })] if text.contains("Second news.") && !text.contains("First news.")), "{next:?}");
         Ok(())
@@ -608,14 +772,14 @@ mod tests {
         now += 10_000;
         let first = settle(&mut t, &p, &mut kids, &[(0, "v1 is done.")], now);
         first.iter().for_each(|c| apply(&mut p, c));
+        let [Command::Send { id, text, .. }] = first.as_slice() else { anyhow::bail!("{first:?}") };
         anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty(), "seen waiting");
         p.status = Status::Disconnected;
         now += 10_000;
         anyhow::ensure!(settle(&mut t, &p, &mut kids, &[(1, "v2 is done.")], now).is_empty(), "nothing goes while it's away");
         anyhow::ensure!(t.plan(&all(&p, &kids), now + 10_000, &[], &[]).is_empty());
         p.status = Status::Running;
-        p.queue.clear();
-        p.queued = 0;
+        take(&mut p, &[(id, text)]);
         let back = t.plan(&all(&p, &kids), now + 20_000, &[], &[]);
         anyhow::ensure!(matches!(back.as_slice(), [(_, Command::Send { text, .. })] if text.contains("v2 is done.") && !text.contains("v1 is done.")), "{back:?}");
         Ok(())
@@ -635,13 +799,12 @@ mod tests {
         anyhow::ensure!(t.plan(&all(&p, &kids), now, &[], &[]).is_empty(), "nothing new to say");
         now += 10_000;
         let sent = settle(&mut t, &p, &mut kids, &[(0, "u1 is done.")], now);
-        let [Command::QueueEdit { id, text }] = sent.as_slice() else { anyhow::bail!("{sent:?}") };
+        let [Command::QueueEdit { id, text, .. }] = sent.as_slice() else { anyhow::bail!("{sent:?}") };
         anyhow::ensure!(id == old && text.starts_with(before) && text.contains("u1 is done."), "{text}");
         sent.iter().for_each(|c| apply(&mut p, c));
         // Once the parent takes it, what came before goes with it.
         anyhow::ensure!(t.plan(&all(&p, &kids), now + 10_000, &[], &[]).is_empty());
-        p.queue.clear();
-        p.queued = 0;
+        take(&mut p, &[(id, text)]);
         now += 20_000;
         let next = settle(&mut t, &p, &mut kids, &[(0, "u1 again.")], now);
         anyhow::ensure!(matches!(next.as_slice(), [Command::Send { id, text, .. }] if id.starts_with(NEWS) && !text.contains("before the restart")), "{next:?}");
@@ -668,7 +831,7 @@ mod tests {
         };
         // It waited for x1: x1's line comes out, the rest stay, in the same message.
         let Some((to, c)) = t.saw(&x1) else { anyhow::bail!("x1's line stayed in the news") };
-        let Command::QueueEdit { id: edited, text } = &c else { anyhow::bail!("{c:?}") };
+        let Command::QueueEdit { id: edited, text, .. } = &c else { anyhow::bail!("{c:?}") };
         anyhow::ensure!(to == "q3" && *edited == id && !text.contains("x1 is done.") && text.contains("x2 is done.") && text.contains("x3 is done."), "{text}");
         apply(&mut p, &c);
         // It read x2's result: one line left, said on its own.

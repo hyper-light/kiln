@@ -69,8 +69,11 @@ Methods: `spawn_boxed`.
 Every record kiln keeps, by family and key, each at the revision of the commit that last wrote it.
 
 - **Implementations:** Amphora's typed records (CP-T1.5, which takes this suite past 200 cases);
-  kiln's own (`kiln::records::StoreRecords`, durable in kiln's store, until CP-T1.5 takes its
-  place, copying each family through the seam);
+  until then two of kiln's own: a host's over kiln's embedded Turso (`kiln::records::turso`, a
+  file per host, each commit synced before it's answered, commits that come together written
+  together; CP-T3.2), the one `records::open` swaps for Amphora's; and the server's
+  (`kiln::records::StoreRecords`, durable in kiln's store, until CP-T1.5 takes its place, copying
+  each family through the seam);
   `kiln_seams::records::SimRecords`: linearizable, snapshot reads from each key's last 32
   versions and the last 100,000 deleted keys' histories (older: refused `Compacted`), a change
   feed of the last 100,000 changes (a read of changes or a wait from before it: refused
@@ -78,11 +81,11 @@ Every record kiln keeps, by family and key, each at the revision of the commit t
   lost a version, a snapshot from before the oldest kept is refused for every key (coarse,
   never wrong). Its `compact` forgets the history before a revision at once, as a compaction
   does; a suite's fixture makes its store do that for RECORDS-14.
-- **Used by:** deploying by API's records (docs/deploy-api.md §14.1); goal stacks, goal items,
-  plans, plan runs and keep-going, once CP-T1.5 moves them off rusqlite; the session journal
-  (CP-T3.1).
-- **Passed by:** the simulator, every clause; kiln's own, every clause; Amphora's, when CP-T1.5
-  lands it.
+- **Used by:** sessions' inboxes (CP-T3.2, `harness/inbox`); deploying by API's records
+  (docs/deploy-api.md §14.1); goal stacks, goal items, plans, plan runs and keep-going, once
+  CP-T1.5 moves them off rusqlite; the session journal (CP-T3.1).
+- **Passed by:** the simulator, every clause; kiln's Turso store, every clause
+  (`records/turso.rs`'s test); kiln's store's, every clause; Amphora's, when CP-T1.5 lands it.
 - **Bounds:** family names 1 to 64 of `a-z 0-9 _ - .`; keys 1 to 1024 bytes; values to 1 MiB;
   1000 conditions and 1000 writes a transaction; 1000 rows a page or a change read.
 
@@ -458,12 +461,9 @@ command catalog), and commands to them. Generic over kiln's types: an agent is k
   catalog, a machine away).
 - **Used by:** the goal driver and keep-going (`goals/mod.rs`, `goals/keep.rs`); the inbox and the
   dispatcher of sends (CP-T3.2, CP-T3.3).
-- **Passed by:** the simulator, every clause. kiln's registry passes HARNESS-1, HARNESS-2 and
-  HARNESS-4 (`harness/port.rs`'s test). Its "delivered" means the command is on its way to the
-  session's runner; HARNESS-3 and HARNESS-5 (each command reaches its agent once, in order, and
-  only it) are CP-T3.2's and CP-T3.3's: sends deduplicated, then acknowledged end to end. Until
-  then what reached an agent can't be seen there (its fixture's `heard` is `None`): the test runs
-  every clause, each on a hub of its own, and checks that those two fail for that alone.
+- **Passed by:** the simulator, every clause; kiln's registry, every clause (`harness/port.rs`'s
+  test, each clause on a hub of its own). A message reaches an agent when its inbox takes it
+  (CP-T3.2: once, whatever retried it); what reached one is what its inbox took, in order.
 
 Methods: `agents`, `agent`, `catalog`, `send`.
 

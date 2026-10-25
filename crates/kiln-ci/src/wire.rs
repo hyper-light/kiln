@@ -48,6 +48,9 @@ pub struct AssignmentV2 {
     pub job_defaults: Defaults,
     /// The job's `outputs`, evaluated after its steps.
     pub outputs: Vec<(String, Tpl)>,
+    /// The workflow file that defines the job, for `job.workflow_*` (W06-R03).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_workflow: Option<crate::plan::DefinedIn>,
     /// `environment.url`, evaluated after its steps too (W15-R04).
     #[serde(default)]
     pub environment_url: Option<Tpl>,

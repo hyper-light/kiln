@@ -232,13 +232,15 @@ pub struct Conversations {
 pub struct Agents {
     /// How many agents deep a chain may go below the one a person started (that one is 0).
     pub max_depth: u32,
-    /// How many children still running one agent may have at once.
-    pub max_children: u32,
+    /// The most subagents at work one agent may have at once, whatever its own Subagents setting
+    /// says. None (the default): as many as that setting says, and with none, no limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_children: Option<u32>,
 }
 
 impl Default for Agents {
     fn default() -> Self {
-        Self { max_depth: 3, max_children: 24 }
+        Self { max_depth: 3, max_children: None }
     }
 }
 
@@ -592,6 +594,14 @@ pub struct Updates {
     pub wait_for_jobs_minutes: u64,
     /// Minutes a machine has to build kiln itself, install included.
     pub build_minutes: u64,
+    /// Version skew (`crate::skew`): a runner on the server's commit or one of this many release
+    /// branch commits before it (its first parents) does everything. System → Updates can change
+    /// it, and the one below.
+    pub skew_full: u32,
+    /// Version skew: a runner on one of this many commits before the server's, past `skew_full`,
+    /// connects to be upgraded and takes no new work until it is; further behind, it's refused.
+    /// Never less than `skew_full`.
+    pub skew_upgrade: u32,
 }
 
 impl Default for Updates {
@@ -606,6 +616,9 @@ impl Default for Updates {
             upgrade_minutes: 15,
             wait_for_jobs_minutes: 6 * 60,
             build_minutes: 60,
+            // About three days of main, and about a month: a runner a day behind does everything.
+            skew_full: 100,
+            skew_upgrade: 1000,
         }
     }
 }

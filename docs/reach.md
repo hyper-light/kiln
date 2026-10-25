@@ -162,7 +162,9 @@ unchanged tree 0.5 s.
 
 `<runtime dir>/kiln/reach-<runner>-<hash>.sock` (`0600` in a `0700` folder), beside `kiln spawn`'s.
 Terminals and agents kiln starts get it as `KILN_REACH_SOCK`; elsewhere `kiln run` finds the only
-one on the machine. One connection is one request (`local::Req`) answered by a stream of
+one on the machine. A socket another live kiln process answers on is never taken, but by a new
+build taking the machine over; one left dead is bound again within seconds (`harness::socket::Kept`,
+docs/releases.md). One connection is one request (`local::Req`) answered by a stream of
 `local::Ev`. `Req::Ask` carries an agent's question for the kiln server (kiln's operations, §7)
 over the runner's own connection (`AgentMsg::ReachAsk`), answered with `Ev::Answer`.
 

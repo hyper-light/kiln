@@ -66,7 +66,7 @@ fn an_adopted_session_imports_a_learned_default_only_when_it_has_none() {
 }
 
 fn send(a: &mut Acp, core: &mut Core, id: &str) {
-    a.command(core, Command::Send { id: id.into(), text: format!("work {id}"), mode: SendMode::Queue, attachments: Vec::new(), overrides: None });
+    a.command(core, Command::Send { id: id.into(), text: format!("work {id}"), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None});
 }
 
 fn options(mode: &str, model: &str, effort: &str) -> Vec<Value> {
@@ -178,7 +178,7 @@ fn grouped_models_and_uncategorized_options_use_existing_selectors_and_controls(
     ];
     let (mut a, mut core) = opened(config.clone())?;
     assert_eq!(core.meta.models.iter().map(|m| (m.id.as_str(), m.label.as_str())).collect::<Vec<_>>(), [("small", "Recommended · Small"), ("large", "Recommended · Large")]);
-    assert_eq!(core.meta.controls.iter().map(|c| (c.id.as_str(), c.label.as_str(), c.kind)).collect::<Vec<_>>(), [("acp:style", "Style", ControlKind::Select), ("acp:format", "Format", ControlKind::Select)]);
+    assert_eq!(core.meta.controls.iter().map(|c| (c.id.as_str(), c.label.as_str(), c.kind)).collect::<Vec<_>>(), [("acp:style", "Style", ControlKind::Select), ("acp:format", "Format", ControlKind::Select), ("rewind_files", "Restore files to here", ControlKind::Action), ("rewind", "Rewind conversation to here", ControlKind::Action), ("branch", "Branch from here", ControlKind::Action), ("fork", "Fork the conversation", ControlKind::Action)]);
     for (id, value) in [("acp:style", "long"), ("acp:format", "markdown")] {
         a.command(&mut core, Command::Control { id: id.into(), value: Some(json!(value)) });
         let setting = request(&mut core, "session/set_config_option")?;
@@ -373,7 +373,8 @@ fn unknown_types_and_malformed_values_are_kept_without_becoming_controls() -> an
     ];
     config.extend(options("ask", "default", "low"));
     let (mut a, mut core) = opened(config.clone())?;
-    assert!(core.meta.controls.is_empty());
+    // None of the malformed values became a control (what's declared is kiln's go-back set).
+    assert!(!core.meta.controls.iter().any(|c| c.id.starts_with("acp:")));
     assert_eq!(core.state.model, "default");
     for id in ["future", "bad-toggle", "bad-model"] {
         a.command(&mut core, Command::Control { id: format!("acp:{id}"), value: Some(json!("a")) });
@@ -753,5 +754,54 @@ fn a_missing_nonempty_session_is_not_replaced_during_account_refresh() -> anyhow
     assert!(!a.ready);
     assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Queued));
     assert!(core.events().any(|e| matches!(&e.body, Body::Notice { level: Level::Error, text } if text.contains("session_not_found"))));
+    Ok(())
+}
+
+/// Devin's `speed` option, on the models that go faster, is kiln's speed (the head's bolt) rather
+/// than a control of its own: standard is "", Fast is its own value, set with its own setter; a
+/// model without it has none; a session going on sets the speed it had once ready, before its
+/// first prompt.
+#[test]
+fn a_speed_option_is_the_sessions_speed() -> anyhow::Result<()> {
+    let speed = |current: &str| json!({"id": "speed", "name": "Speed", "category": "model_config", "type": "select", "currentValue": current, "options": [{"value": "standard", "name": "Standard"}, {"value": "fast", "name": "Fast"}]});
+    let with = |current: &str| {
+        let mut o = options("accept-edits", "default", "low");
+        o.push(speed(current));
+        o
+    };
+    let (mut a, mut core) = opened(with("standard"))?;
+    assert_eq!(core.meta.speeds.iter().map(|s| (s.id.as_str(), s.label.as_str())).collect::<Vec<_>>(), [("fast", "Fast")]);
+    assert_eq!(core.state.speed, "");
+    assert!(core.meta.features.iter().any(|f| f == "set_speed"));
+    assert!(core.meta.controls.iter().all(|c| c.id != "acp:speed"));
+    a.command(&mut core, Command::SetSpeed { speed: "fast".into() });
+    let setting = request(&mut core, "session/set_config_option")?;
+    assert_eq!(setting.get("params"), Some(&json!({"sessionId": "s1", "configId": "speed", "value": "fast"})));
+    reply(&mut a, &mut core, &setting, json!({"configOptions": with("fast")}));
+    assert_eq!(core.state.speed, "fast");
+    a.command(&mut core, Command::SetSpeed { speed: String::new() });
+    let setting = request(&mut core, "session/set_config_option")?;
+    assert_eq!(setting.pointer("/params/value"), Some(&json!("standard")));
+    reply(&mut a, &mut core, &setting, json!({"configOptions": with("standard")}));
+    assert_eq!(core.state.speed, "");
+    // A model without it: no speeds, and nothing to set.
+    update(&mut a, &mut core, options("accept-edits", "careful", "high"));
+    assert!(core.meta.speeds.is_empty() && !core.meta.features.iter().any(|f| f == "set_speed"));
+    a.command(&mut core, Command::SetSpeed { speed: "fast".into() });
+    assert!(written(&mut core).is_empty());
+
+    // Going on (a restart, a move): the speed it had, once ready, before its first prompt.
+    let mut a = Acp::from_spec(&Spec { kind: "devin".into(), speed: Some("fast".into()), ..Spec::default() });
+    let mut core = Core::new();
+    core.state.cwd = "/work".into();
+    let session = initialize(&mut a, &mut core, false)?;
+    send(&mut a, &mut core, "m1");
+    reply(&mut a, &mut core, &session, json!({"sessionId": "s1", "configOptions": with("standard")}));
+    let setting = request(&mut core, "session/set_config_option")?;
+    assert_eq!(setting.get("params"), Some(&json!({"sessionId": "s1", "configId": "speed", "value": "fast"})));
+    assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Queued));
+    reply(&mut a, &mut core, &setting, json!({"configOptions": with("fast")}));
+    request(&mut core, "session/prompt")?;
+    assert_eq!(core.state.speed, "fast");
     Ok(())
 }

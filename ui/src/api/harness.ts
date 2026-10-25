@@ -65,8 +65,8 @@ export interface ToolCall {
 }
 
 export type Body =
-  | { kind: "user"; text: string; images?: number; attachments?: string[]; client_id?: string; origin?: string }
-  | { kind: "assistant"; text: string; streaming?: boolean }
+  | { kind: "user"; text: string; images?: number; attachments?: string[]; client_id?: string; origin?: string; reply_to?: string }
+  | { kind: "assistant"; text: string; streaming?: boolean; reply_to?: string }
   | { kind: "thinking"; text: string; streaming?: boolean; redacted?: boolean }
   | ({ kind: "tool" } & ToolCall)
   | { kind: "notice"; level: Level; text: string };
@@ -132,6 +132,9 @@ export interface QueueItem {
   id: string;
   text: string;
   at: number;
+  attachments?: Attachment[];
+  overrides?: { model?: string; effort?: string };
+  reply_to?: string;
 }
 
 export interface Task {
@@ -167,6 +170,12 @@ export interface Task {
   wakes?: string;
   /** Whether a stop can work. */
   stoppable?: boolean;
+  /** Subagents: how a person's message reaches it now (a `send` with its `task`); none: it takes none, and the composer writes to the agent. */
+  takes?: SendMode[];
+  /** "parent": a message to it goes by way of the agent that started it (its harness takes none from kiln itself). */
+  via?: string;
+  /** Messages waiting for it to finish what it's doing. */
+  queue?: QueueItem[];
 }
 
 /** A harness's own subagent, tracked within its parent's session without another executor. */
@@ -331,6 +340,12 @@ export interface State {
   exit?: ExitInfo;
   dropped: number;
   effort?: string;
+  /** The speed it runs at: absent or "" standard, else one of `Meta.speeds`. */
+  speed?: string;
+  /** Why its faster speeds can't serve it now (its account doesn't allow them), as its harness said. */
+  speed_blocked?: string;
+  /** Fast, but at standard speed for now: fast mode's own rate limit is cooling down (Claude Code). */
+  speed_cooldown?: boolean;
   /** Live values of Meta.controls, by id. */
   control_values?: Record<string, unknown>;
   limits?: Limit[];
@@ -473,6 +488,8 @@ export interface GoalItem {
   planned_as?: string;
   /** The plan run it waits for. */
   waits_on?: string;
+  /** The subagent a plan's step was handed to, side by side with the plan's other steps (docs/goals.md, "A plan's steps side by side"): under way there while it's still to go here; once met, who met it. */
+  subagent?: string;
 }
 
 /** An agent's goals, one after another: each goes once the one before is met. */
@@ -517,6 +534,8 @@ export interface BroadcastBody {
   mode?: SendMode;
   command?: Command;
   approvals?: "allow" | "deny";
+  /** An idempotency key: sent again with it, each agent's message is the same one, delivered once. */
+  key?: string;
 }
 
 export interface BroadcastOutcome {
@@ -599,11 +618,13 @@ export interface Meta {
   hooks?: HookInfo[];
   /** Reasoning effort levels, when the harness has them. */
   efforts?: ControlOption[];
+  /** The speeds faster than standard the model in use runs at, slowest first (absent: none). */
+  speeds?: ControlOption[];
   modes: ModeOption[];
   models: ModelOption[];
   commands: SlashCommand[];
   agents: string[];
-  /** "steer", "send_now", "queue_cancel", "interrupt", "set_mode", "set_model", "stop_task", "file_suggestions", "resume", "switch_harness" */
+  /** "steer", "send_now", "queue_cancel", "interrupt", "set_mode", "set_model", "set_speed", "stop_task", "file_suggestions", "resume", "switch_harness" */
   features: string[];
 }
 
@@ -787,7 +808,7 @@ export interface Spec {
 export type WorkspacesAvailable = Record<string, { available: boolean; why_not?: string }>;
 
 export type Command =
-  | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string } }
+  | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string }; reply_to?: string; task?: string }
   | { type: "control"; id: string; value?: unknown }
   | { type: "mcp_enable"; name: string; enabled: boolean }
   | { type: "mcp_reconnect"; name: string }
@@ -795,9 +816,11 @@ export type Command =
   | { type: "mcp_add"; scope: string; name: string; transport: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> }
   | { type: "mcp_remove"; scope: string; name: string }
   | { type: "skill_view"; name: string; client: string }
-  | { type: "skill_run"; name: string; args?: string }
+  /** `id`: the message's id, made once (a skill run is delivered like a message: once). */
+  | { type: "skill_run"; name: string; args?: string; id?: string }
   | { type: "set_effort"; effort: string }
-  | { type: "queue_edit"; id: string; text: string }
+  | { type: "set_speed"; speed: string }
+  | { type: "queue_edit"; id: string; text: string; attachments?: Attachment[] }
   | { type: "queue_remove"; id: string }
   | { type: "queue_move"; id: string; index: number }
   | { type: "queue_send_now"; id: string }
@@ -845,6 +868,10 @@ export type Update =
   /** Files finished messages mention, kept by the server (ahead of the events in a snapshot). */
   | { t: "files"; files: KeptFile[] }
   | { t: "error"; error: string }
+  /** A command sent under `id` was taken: applied, parked for its runner, accepted by its inbox (`accepted`), or sent to a runner that can't say more (docs/wire.md, "The UI's sockets"). */
+  | { t: "ack"; id: string; outcome: "taken" | "parked" | "accepted" | "unchecked" | "pending"; accepted?: unknown }
+  /** A command sent under `id` wasn't: its kind (`code`) and why; `again` when it may go again under its id (it didn't get through this time); `id` null for what couldn't be read. */
+  | { t: "nack"; id: string | null; code: string; why: string; again?: boolean; refused?: unknown }
   | { t: "closed" }
   | { t: "state"; state: State }
   /** What changed in the state since the last one (asked for with `?patch=state`): the fields set, and those gone. */
@@ -859,11 +886,11 @@ export type Update =
 
 /* ------------------------------------------------------------------ REST */
 
-async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>): Promise<T> {
   const res = await fetch(path, {
     method,
     credentials: "same-origin",
-    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    headers: body === undefined ? headers : { "content-type": "application/json", ...headers },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   });
@@ -965,8 +992,10 @@ export const harnessApi = {
   /** Its live pages. */
   streams: (id: string) => call<StreamView[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/streams`),
   /** Open a live page: an address, or (`start`) the project's app; in a profile. */
-  openStream: (id: string, body: { url?: string; start?: boolean; profile?: string; engine?: string; device?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string }) =>
-    call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
+  openStream: (
+    id: string,
+    body: { url?: string; start?: boolean; profile?: string; engine?: string; device?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string },
+  ) => call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
   closeStream: (id: string, stream: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}/streams/${stream}`),
   /** Open the app on a port of its machine on this person's own device: a link to follow there. */
   openOnDevice: (id: string, body: { port: number; path?: string }) => call<Opened>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/opened`, body),
@@ -991,9 +1020,13 @@ export const harnessApi = {
   /** Its goals still to go, as they should be (existing ones by id; the one under way among them puts it back or rewords it). */
   setGoals: (id: string, goals: { id?: string; text: string }[]) => call<GoalStack>("PUT", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals }),
   /** Goals after its others; `start` runs the stack. */
-  addGoals: (id: string, goals: string[], start = false) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals, start }),
+  /** `key` (CP-T3.2): asked again under it, its goals are added once. */
+  addGoals: (id: string, goals: string[], start = false, key?: string) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals, start, key }),
   /** Start (or resume), pause, skip the goal under way, clear, or bring back the goals cleared last. */
-  goalAction: (id: string, action: "start" | "pause" | "skip" | "clear" | "restore") => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`),
+  /** `goal`: for a skip, the goal under way it's for (asked again once it's skipped, nothing more is: CP-T3.2). */
+  /** `key` (CP-T3.2): asked again under it (its answer lost), it does nothing more, whatever changed since. */
+  goalAction: (id: string, action: "start" | "pause" | "skip" | "clear" | "restore", goal: string | undefined, key: string) =>
+    call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`, goal ? { id: goal, key } : { key }),
   /** One of its goals turned into a plan: planning it (research, its steps, ready) goes first, then its steps (`goals_plan`). */
   /** Whether its stack plans its big goals first (a person's setting, not the agent's). */
   goalSettings: (id: string, settings: { plan_big: boolean }) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/settings`, settings),
@@ -1030,8 +1063,13 @@ export const harnessApi = {
   /** Every agent of `machine`, which is gone, goes on elsewhere from the server's copy of its conversation: each on the machine that suits it, or all on `to`. */
   recover: (machine: string, to?: string) =>
     call<{ moved: { id: string; name: string; to?: string; error?: string }[] }>("POST", `/api/harness/machines/${encodeURIComponent(machine)}/recover`, to ? { to } : {}),
-  /** A command without opening the session's socket (inbox answers). */
-  command: (id: string, c: Command) => call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c),
+  /**
+   * A command without opening the session's socket (inbox answers). It goes under an id, as on the
+   * socket: a message's own (its id is its key), else `key`, one made now unless given, taken once
+   * however often it's sent under it (docs/wire.md, "The UI's sockets").
+   */
+  command: (id: string, c: Command, key: string = clientId()) =>
+    call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, c.type === "send" || c.type === "skill_run" ? undefined : { "idempotency-key": key }),
   /** Events whose words hold every word of `q`, across conversations (one agent's with `agent`; those before `until`, unix ms), newest first, from the server's conversation store. */
   said: (p: { q: string; agent?: string; until?: number; limit?: number }) => {
     const qs = new URLSearchParams({ q: p.q });
@@ -1061,13 +1099,56 @@ export const harnessApi = {
   broadcastPreview: (to: BroadcastTo) => call<BroadcastPreview>("POST", "/api/harness/broadcast/preview", { to }),
 };
 
-let seq = 0;
-/** A client-made id for a message or request (delivery state is reported under it). */
-export const clientId = () => `c${Date.now().toString(36)}${(++seq).toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+/**
+ * A client-made id for a message or request (delivery state is reported under it): a UUIDv7, 48
+ * bits of the time and 74 random, as 32 hex digits. A message's id is made once and every retry
+ * carries it, and the agent's inbox takes each id once (CP-T3.2), so it mustn't meet another's.
+ */
+export const clientId = (): string => {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  const ms = Date.now();
+  b[0] = Math.floor(ms / 2 ** 40) & 0xff;
+  b[1] = Math.floor(ms / 2 ** 32) & 0xff;
+  b[2] = (ms >>> 24) & 0xff;
+  b[3] = (ms >>> 16) & 0xff;
+  b[4] = (ms >>> 8) & 0xff;
+  b[5] = ms & 0xff;
+  b[6] = ((b[6] ?? 0) & 0x0f) | 0x70;
+  b[8] = ((b[8] ?? 0) & 0x3f) | 0x80;
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+};
 
 /* ------------------------------------------------------------------ live session */
 
 export type Conn = "connecting" | "open" | "reconnecting" | "gone";
+
+/** A command this page sent under an id it made (docs/wire.md, "The UI's sockets"): waiting for its answer (sent again on the next socket until it comes), or refused, saying how and why. */
+export interface Asked {
+  id: string;
+  command: Command;
+  /** When it was first sent (ms). */
+  at: number;
+  state: "pending" | "refused";
+  code?: string;
+  why?: string;
+  /** How many times it was answered for now (parked, or to send again), and sent again for it. */
+  tries?: number;
+}
+
+/** How long a command waits for an answer, sent again on each socket meanwhile: past it, it's said to have had none. One answered for now (parked, or to send again) has had one, and goes on. */
+export const ASKED_FOR_MS = 10 * 60_000;
+/** How long a refused command stays shown. */
+export const REFUSED_FOR_MS = 15_000;
+/** How long a command answered for now (parked, or a nack the server says to send `again`) waits before it goes again under its id: doubling from the first, to the last at most. */
+export const AGAIN_AFTER_MS = [10_000, 20_000, 40_000, 60_000];
+
+/** The id a command goes under: a message's own (its inbox takes it once under it), else one made now. */
+export function commandId(c: Command): string {
+  if (c.type === "send" && c.id) return c.id;
+  if (c.type === "skill_run" && c.id) return c.id;
+  return clientId();
+}
 
 export interface Snapshot {
   conn: Conn;
@@ -1087,6 +1168,8 @@ export interface Snapshot {
   stopAsked: { turn: number | undefined; at: number } | null;
   /** When the turn under way began, kept once it ends: between turns the clock holds the last one's length. */
   ranFrom: number | null;
+  /** The commands this page sent that haven't been answered, and those refused a moment ago. */
+  asked: Asked[];
 }
 
 /**
@@ -1113,7 +1196,7 @@ export function lastTurnFrom(s: Snapshot): number | null {
 /** A promise React reads as settled without waiting (its `status`, as React marks the ones it tracks). */
 const READY: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
 
-const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, files: [], error: null, ready: false, stopAsked: null, ranFrom: null };
+const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, files: [], error: null, ready: false, stopAsked: null, ranFrom: null, asked: [] };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /**
  * The snapshot sent as the socket opens ends with the server's "synced"; one sent later (a machine
@@ -1264,6 +1347,8 @@ export class SessionStore {
   /** When nothing showed it any more. */
   idleSince = 0;
   private replies = new Map<string, (v: unknown) => void>();
+  /** The commands sent and not answered yet, and those refused a moment ago, by id. */
+  private asked = new Map<string, Asked>();
   private waiting: { promise: Promise<void>; resolve: () => void } | null = null;
   /** Packed messages being unpacked, and the chain they (and what came after them) are taken in. */
   private unpacking = 0;
@@ -1306,12 +1391,61 @@ export class SessionStore {
   /** Connect now rather than at the next try (the tab is shown again, the network is back). */
   wake = () => this.kick(false);
 
-  /** Send a command; false when the session isn't connected. */
+  /**
+   * Send a command; false when the session isn't connected. It goes under an id ({@link commandId}),
+   * taken once however often it's sent: kept until its answer comes, it's sent again on each socket
+   * after this one, and shown as waiting meanwhile, or refused once it is (`Snapshot.asked`).
+   */
   send = (c: Command): boolean => {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
-    this.ws.send(JSON.stringify(c));
+    const id = commandId(c);
+    this.asked.set(id, { id, command: c, at: Date.now(), state: "pending" });
+    this.ws.send(JSON.stringify({ t: "cmd", id, c }));
+    this.patch({ asked: [...this.asked.values()] });
     return true;
   };
+
+  /** The socket's open: what was sent and not answered goes again under its id; what waited too long for any answer is said to have had none. */
+  private sendAgain(ws: WebSocket) {
+    const now = Date.now();
+    let changed = false;
+    for (const a of this.asked.values()) {
+      if (a.state !== "pending") continue;
+      if (!a.tries && now - a.at > ASKED_FOR_MS) {
+        this.refuse(a.id, "unanswered", "no answer came");
+        changed = true;
+        continue;
+      }
+      ws.send(JSON.stringify({ t: "cmd", id: a.id, c: a.command }));
+    }
+    if (changed) this.patch({ asked: [...this.asked.values()] });
+  }
+
+  /** Command `id` was answered for now: it waits, and goes again under its id in a while, on this socket if it's still open (or on the next as any waiting one does). */
+  private later(id: string, why?: string) {
+    const a = this.asked.get(id);
+    if (!a || a.state !== "pending") return;
+    const tries = (a.tries ?? 0) + 1;
+    this.asked.set(id, { ...a, tries, why });
+    this.patch({ asked: [...this.asked.values()] });
+    const ws = this.ws;
+    window.setTimeout(() => {
+      const now = this.asked.get(id);
+      if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && now.tries === tries) ws.send(JSON.stringify({ t: "cmd", id, c: now.command }));
+    }, AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1]);
+  }
+
+  /** Command `id` was refused: shown so a moment, then let go of. */
+  private refuse(id: string, code: string, why: string) {
+    const a = this.asked.get(id);
+    if (!a) return;
+    this.asked.set(id, { ...a, state: "refused", code, why });
+    window.setTimeout(() => {
+      if (this.asked.get(id)?.state !== "refused") return;
+      this.asked.delete(id);
+      this.patch({ asked: [...this.asked.values()] });
+    }, REFUSED_FOR_MS);
+  }
 
   /**
    * Stop the turn under way; `force` when asking didn't take (the harness starts again, the
@@ -1409,6 +1543,9 @@ export class SessionStore {
     this.ws = ws;
     this.wsAt = Date.now();
     this.unpacking = 0;
+    ws.onopen = () => {
+      if (this.ws === ws) this.sendAgain(ws);
+    };
     ws.onmessage = (ev) => {
       if (this.ws !== ws) return;
       if (typeof ev.data === "string") {
@@ -1515,6 +1652,21 @@ export class SessionStore {
       }
       case "error":
         this.patch({ error: u.error });
+        return;
+      case "ack":
+        // Parked for its machine, which is away: it waits, asked again in a while.
+        if (u.outcome === "parked") return this.later(u.id, "its machine is away, and it goes once that's back");
+        // A message its inbox hasn't answered yet: asked again, its inbox answers a repeat if it took it.
+        if (u.outcome === "pending") return this.later(u.id, "its inbox hasn't said it took it yet");
+        if (this.asked.delete(u.id)) this.patch({ asked: [...this.asked.values()] });
+        return;
+      case "nack":
+        // Not this time (its machine away, its inbox full ...): it waits, and goes again.
+        if (u.id != null && u.again) return this.later(u.id, u.why);
+        if (u.id != null && this.asked.has(u.id)) {
+          this.refuse(u.id, u.code, u.why);
+          this.patch({ asked: [...this.asked.values()], error: u.why });
+        } else this.patch({ error: u.why });
         return;
       case "open":
       case "resumed":

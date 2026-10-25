@@ -87,6 +87,10 @@ pub struct Job {
     /// The commit it brings the machine to, when kiln knows it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// A build's: the machine that builds it, when another than the runner's own
+    /// (`crate::fleet`); the runner downloads that build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
     /// The machine reported running `to_build`.
     pub reached: bool,
     pub log: Vec<String>,
@@ -166,6 +170,10 @@ pub struct Updates {
     in_step_wake: crate::rt::Notify,
     /// How long upgrades are waited on, once read (`waits`).
     waits: Mutex<Option<Waits>>,
+    /// The version-skew tolerances, once read (`crate::skew::tolerance`).
+    pub(crate) skew: Mutex<Option<crate::skew::Tolerance>>,
+    /// Where each commit runners said stands under them (`crate::skew::weigh`).
+    pub(crate) skew_seen: Mutex<crate::skew::Seen>,
     /// Every runner on the newest kiln.
     pub fleet: crate::fleet::Fleet,
     /// The binaries kept for other platforms, by target, as kiln's store of bytes holds them
@@ -229,12 +237,12 @@ pub(crate) fn hash_file(p: &Path) -> anyhow::Result<(String, u64)> {
     Ok((hex::encode(h.finalize()), size))
 }
 
-/// The release build for an OS and architecture (Linux gets the static one).
+/// The release build for an OS and architecture (Linux gets the static one). An Intel Mac has
+/// none: kiln runs on Apple silicon only.
 fn release_target(os: &str, arch: &str) -> Option<&'static str> {
     Some(match (os, arch) {
         ("linux", "x86_64") => "x86_64-unknown-linux-musl",
         ("linux", "aarch64") => "aarch64-unknown-linux-musl",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
         ("macos", "aarch64") => "aarch64-apple-darwin",
         ("windows", "x86_64") => "x86_64-pc-windows-msvc",
         ("windows", "aarch64") => "aarch64-pc-windows-msvc",
@@ -1199,6 +1207,7 @@ pub(crate) fn new_job(kind: &'static str, target: &str, method: &'static str, fr
         from_build,
         to_build,
         commit: None,
+        on: None,
         reached: false,
         log: Vec::new(),
         error: None,
@@ -1261,8 +1270,9 @@ pub struct RunnerInfo {
     pub instances: Vec<crate::instances::InstanceView>,
 }
 
-/// How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built on
-/// the machine itself, from the server's source.
+/// How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built from
+/// the server's source, on the machine itself or, for a Mac that can't, on another machine whose
+/// build it then downloads (`crate::fleet`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Way {
@@ -1278,6 +1288,9 @@ pub struct WayOpen {
     /// What it does ("downloads build 493003c712b0"), or why it can't ("no binary of 31c0bbaf734c
     /// for aarch64-apple-darwin yet").
     pub why: String,
+    /// A build's: the machine it's made on, when another than the runner's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
 }
 
 /// What a runner does with a newer kiln (`crate::fleet`), as chosen for it in System → Updates.
@@ -1532,10 +1545,10 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
 }
 
 /// Start upgrading `machine`'s runner to the newest kiln (`crate::fleet`): the `way` asked for, or
-/// a binary of it when kiln has one for its platform, else a build of it on the machine itself.
-/// A person asking now isn't held back by the wait between automatic tries. With no newest known
-/// (a server built without knowing its commit), to the build kiln has for its platform. Nothing it
-/// runs is stopped.
+/// a binary of it when kiln has one for its platform, else a build of it (on the machine itself,
+/// or one another machine makes for its platform, which it downloads). A person asking now isn't
+/// held back by the wait between automatic tries. With no newest known (a server built without
+/// knowing its commit), to the build kiln has for its platform. Nothing it runs is stopped.
 pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str, way: Option<Way>) -> anyhow::Result<Job> {
     if let Some(j) = hub.updates.running_for("runner", machine) {
         return Ok(j);
@@ -1558,7 +1571,8 @@ pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str, way: Option<Way>) -> 
         };
         return match plan {
             crate::fleet::Plan::Download(b) => upgrade_with(hub, &r, &b, "admin").await,
-            crate::fleet::Plan::Build(c) => crate::fleet::self_build(hub, &r, &t.commit, c, "admin").await,
+            crate::fleet::Plan::Build(b) => crate::fleet::build(hub, &r, &t.commit, &b, "admin").await,
+            crate::fleet::Plan::Join { job, on } => crate::fleet::join(hub, &r, &t.commit, &job, &on, "admin").await,
             crate::fleet::Plan::Wait(why) => anyhow::bail!("{machine} can't be upgraded yet: it {why}"),
         };
     }
@@ -1612,6 +1626,43 @@ pub async fn upgrade_with(hub: &Arc<Hub>, r: &RunnerInfo, b: &Binary, by: &str) 
         crate::rt::spawn(async move { terminal(&h, &id, &machine, &b, &inst8).await });
     }
     Ok(job)
+}
+
+/// Job `id` goes on to upgrade `machine` to `b`, a build another machine made for its platform
+/// (`crate::fleet`): downloaded and installed as [`upgrade_with`] has it done. Nothing it runs is
+/// stopped.
+pub(crate) async fn upgrade_into(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
+    let u = &hub.updates;
+    let Some(r) = runners(hub).await.into_iter().find(|r| r.name == machine) else {
+        u.finish(hub, id, Err(format!("there is no runner called {machine}")));
+        return;
+    };
+    let cant = if !r.connected {
+        Some(format!("{machine} is not connected"))
+    } else if r.method != "native" && !r.terminal {
+        Some(format!("{machine} runs a kiln too old to upgrade itself and has terminals turned off: run `kiln install --agent --upgrade` with a new kiln binary on it"))
+    } else {
+        None
+    };
+    if let Some(e) = cant {
+        u.finish(hub, id, Err(e));
+        return;
+    }
+    if r.build.as_deref() == Some(b.build.as_str()) {
+        u.finish(hub, id, Ok(format!("{machine} runs build {} already", b.build)));
+        return;
+    }
+    u.update(hub, id, |j| {
+        j.from_build.clone_from(&r.build);
+        j.to_build = Some(b.build.clone());
+    });
+    hub.store.audit("kiln".into(), "upgrade.runner".into(), format!("{machine} to build {} ({}, {}), built by {}", b.build, b.target, r.method, b.by.as_deref().unwrap_or("another machine"))).await;
+    u.say(hub, id, format!("upgrading {machine} to build {} ({}); nothing it runs is stopped", b.build, b.target));
+    if r.method == "native" {
+        native(hub, id, machine, b).await;
+    } else {
+        terminal(hub, id, machine, b, &instance8(&r)).await;
+    }
 }
 
 /// The runner does it itself: it fetches the binary from this server, checks it and runs

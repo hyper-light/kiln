@@ -792,6 +792,26 @@ textarea.hx-input {
   margin-bottom: 4px;
   font-size: 11px;
 }
+/* Where a message stands, each state in its own colour (the stands' tints, stands.css): sent the
+   quietest, dropped the one that's seen. */
+.hx-delivery {
+  font-weight: 500;
+}
+.hx-delivery[data-delivery="sent"] {
+  color: var(--color-muted);
+}
+.hx-delivery[data-delivery="queued"] {
+  color: #b8c2d3;
+}
+.hx-delivery[data-delivery="started"] {
+  color: #cdc6ea;
+}
+.hx-delivery[data-delivery="completed"] {
+  color: #bfdccf;
+}
+.hx-delivery[data-delivery="cancelled"] {
+  color: #e2b9bd;
+}
 .hx-prompt-text {
   font-size: 14px;
   line-height: 1.6;
@@ -1319,7 +1339,9 @@ textarea.hx-input {
 }
 .hx-todos li[data-status="completed"] .hx-check {
   border-color: #a5c8b3;
-  background: #a5c8b3 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M3.5 7.2l2.3 2.3 4.7-5' fill='none' stroke='%2308090a' stroke-width='1.8'/%3E%3C/svg%3E") center/12px no-repeat;
+  background: #a5c8b3
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M3.5 7.2l2.3 2.3 4.7-5' fill='none' stroke='%2308090a' stroke-width='1.8'/%3E%3C/svg%3E")
+    center/12px no-repeat;
 }
 .hx-todos li[data-status="in_progress"] {
   color: #ddd6f5;
@@ -2838,6 +2860,43 @@ textarea.hx-input {
 
 /* Paused for a usage limit: the same disclosure line as the work around it. Actions can be
    folded away; their own scroll area leaves room for the conversation and composer on a phone. */
+/* What was asked here and waits for its answer, or was refused (asked.tsx). */
+.hx-asked {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  margin: 0;
+  padding: 6px 4px;
+  list-style: none;
+  border-block: 1px solid #25272c;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-secondary);
+}
+.hx-asked-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.hx-asked-row > svg {
+  flex: none;
+  color: var(--color-subtle);
+}
+.hx-asked-row[data-state="refused"] > svg {
+  color: var(--color-fail);
+}
+.hx-asked-what {
+  flex: none;
+  color: var(--color-foreground);
+}
+.hx-asked-how {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-subtle);
+}
 .hx-paused {
   min-width: 0;
   border-block: 1px solid #25272c;
@@ -3030,43 +3089,402 @@ textarea.hx-input {
     opacity: 1;
   }
 }
-
-/* Copying what was said: a quiet icon on your messages and the agent's answer; on what it said
-   along the way, shown where a pointer rests or a finger taps. */
-.hx-msg-copy {
+/* A block's own head row (the language on the left, its Copy on the right in reserved space):
+   the button never sits over the block's words. */
+.hx-block-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px 3px 12px;
+  border: 1px solid #1d1f24;
+  border-bottom: 0;
+  border-radius: 10px 10px 0 0;
+  background: #0b0c0f;
+}
+.hx-block-tag {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--color-subtle);
+}
+.hx-block-head .hx-copy {
+  position: static;
   flex: none;
+  margin-left: auto;
+}
+.hx-pre-wrap > .hx-block-head + .hx-pre {
+  border-top: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+.hx-generic .hx-block-head {
+  border-color: #2b2e39;
+  border-radius: 6px 6px 0 0;
+  background: #101217;
+}
+/* An output's copy stays corner-floating (its card has its own chrome): its lane is reserved. */
+.hx-pre-wrap > .hx-out {
+  padding-right: 66px;
+}
+
+/* Each message's ⋯ menu: on what the agent said it floats top-right (it is the first child, so
+   the quote's and the text's lines wrap around it, never beneath it) — said-menu drops by the
+   note's top padding so it sits level with the first line; on your messages it ends the meta row
+   at the bubble's right edge. */
+.hx-said-menu {
+  float: right;
+  margin: 12px 0 2px 10px;
+}
+.hx-outcome-menu {
+  float: right;
+  margin: 0 0 2px 10px;
+}
+/* A reply's quote sits above the text: the menu goes to its top-right instead of mid-quote. */
+.hx-said:has(> .hx-quote) > .hx-said-menu,
+.hx-outcome-body:has(> .hx-quote) > .hx-outcome-menu {
+  margin-top: 0;
+}
+.hx-prompt-menu {
+  margin-left: auto;
+}
+.hx-msg-menu {
   width: 24px;
   height: 24px;
   color: var(--color-subtle);
 }
-.hx-msg-copy:hover {
+.hx-msg-menu:hover,
+.hx-msg-menu[data-state="open"] {
   color: var(--color-bright);
 }
-.hx-prompt-copy,
-.hx-outcome-copy {
+.hx-menu-group {
+  padding: 4px 10px;
+}
+.hx-menu-sep {
+  height: 1px;
+  margin: 2px 8px;
+  background: var(--color-line);
+}
+.hx-menu-dead {
+  cursor: default;
+  color: var(--color-subtle);
+}
+.hx-menu-hint {
   margin-left: auto;
+  padding-left: 14px;
+  font-size: 10px;
+  color: var(--color-subtle);
 }
-.hx-prompt-copy + .hx-turn-menu {
-  margin-left: 0;
+.hx-menu-why {
+  display: block;
+  margin-left: auto;
+  padding-left: 14px;
+  font-size: 10px;
+  font-style: normal;
+  color: var(--color-subtle);
 }
+.hx-menu-dead .hx-menu-why {
+  font-size: 9px;
+}
+
+/* Holding a message copies it as Markdown: a faint ring says it's armed, a toast when it's done. */
+.hx-said,
+.hx-prompt {
+  position: relative;
+}
+.hx-said[data-held],
+.hx-prompt[data-held] {
+  outline: 1px solid color-mix(in oklab, var(--color-accent) 55%, transparent);
+  outline-offset: 3px;
+}
+
+/* A reply's quote of what it answers: the speaker's name on a bar, its words, clamped when long. */
+.hx-quote {
+  position: relative;
+  display: block;
+  margin: 0 0 6px;
+  padding: 4px 10px 4px 12px;
+  border-left: 2px solid var(--color-accent);
+  background: color-mix(in oklab, var(--color-accent) 7%, transparent);
+  text-align: left;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-muted);
+}
+.hx-quote[role="button"] {
+  cursor: pointer;
+}
+.hx-quote-who {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+}
+.hx-quote-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+/* Its words render as markdown; the strip itself is the one tap target. */
+.hx-quote-text .hx-prose {
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+  pointer-events: none;
+}
+.hx-quote-text .hx-prose > * {
+  margin-top: 0;
+}
+.hx-quote-text .hx-prose > * + * {
+  margin-top: 0.25em;
+}
+/* A long quote fades out where it clamps. */
+.hx-quote-clamp {
+  mask-image: linear-gradient(180deg, #000 55%, transparent 96%);
+  -webkit-mask-image: linear-gradient(180deg, #000 55%, transparent 96%);
+}
+.hx-quote-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 3px;
+  font-size: 10px;
+  color: var(--color-accent);
+}
+
+/* The full message behind a clamped quote, and an attached image at full size: one card inside
+   the conversation's own surface (solid popover, dark scrim). */
+.hx-cover {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgb(0 0 0 / 0.72);
+}
+.hx-cover-card {
+  max-width: min(560px, 92vw);
+  max-height: 82vh;
+  overflow: auto;
+  border: 1px solid var(--color-line);
+  border-radius: 9px;
+  background: var(--color-popover);
+  box-shadow: 0 18px 60px rgb(0 0 0 / 0.5);
+  padding: 14px 16px;
+}
+.hx-cover-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: -4px -4px 10px;
+}
+.hx-cover-head .hx-cover-who {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 0;
+}
+.hx-cover-x {
+  flex: none;
+}
+/* The whole quoted message: conversation prose on the popover card, then its attachments. */
+.hx-quote-full {
+  min-width: min(430px, 78vw);
+}
+.hx-quote-full .hx-prose {
+  font-size: 13.5px;
+}
+.hx-quote-files {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--color-line);
+}
+.hx-quote-img {
+  display: block;
+  max-width: 100%;
+  max-height: 50vh;
+  border-radius: 6px;
+  border: 1px solid var(--color-line);
+}
+.hx-quote-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border: 1px solid var(--color-line);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--color-muted);
+}
+.hx-cover-who {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+}
+.hx-cover-text {
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.hx-viewer {
+  display: flex;
+  flex-direction: column;
+  width: min(860px, 94vw);
+  max-width: 94vw;
+  max-height: 88vh;
+  padding: 0;
+  overflow: hidden;
+}
+.hx-viewer-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-line);
+  font-size: 12px;
+}
+.hx-viewer-name {
+  flex: 1;
+  min-width: 0;
+}
+.hx-viewer-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px;
+  overflow: auto;
+}
+.hx-viewer-body img {
+  max-width: 100%;
+  max-height: 62vh;
+  object-fit: contain;
+}
+.hx-viewer-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--color-line);
+}
+.hx-attach-view {
+  cursor: zoom-in;
+}
+.hx-attach-add {
+  border-style: dashed !important;
+  color: var(--color-subtle);
+}
+.hx-attach-add:hover {
+  color: var(--color-bright);
+}
+.qd-attach {
+  margin: 2px 0 0;
+}
+
+/* Swiping a still-waiting message right lets it go (unsend): it slides over a strip that shows
+   it will be taken back. */
+.hx-prompt-wrap {
+  position: relative;
+  align-self: flex-start;
+  max-width: min(100%, 720px);
+}
+.hx-unsend-strip {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  padding-left: 14px;
+  gap: 7px;
+  border-radius: 14px 14px 14px 4px;
+  background: color-mix(in oklab, var(--color-danger, #e5484d) 16%, var(--color-background));
+  color: var(--color-danger, #e5484d);
+  font-size: 11px;
+}
+.hx-prompt-wrap > .hx-prompt {
+  position: relative;
+  max-width: 100%;
+  touch-action: pan-y;
+  transition: transform 0.18s ease-out;
+}
+.hx-prompt-wrap[data-dragging] > .hx-prompt {
+  transition: none;
+}
+.hx-unsent {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px dashed var(--color-line);
+  border-radius: 9px;
+  font-size: 11px;
+  color: var(--color-subtle);
+}
+.hx-unsent button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--color-accent);
+}
+.hx-prompt-edit {
+  width: min(100%, 560px);
+  min-height: 64px;
+  resize: vertical;
+}
+.hx-prompt-acts {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+/* What a message answers, where it's typed (the composer's reply strip). */
+.cp-reply {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 6px;
+  padding: 5px 10px;
+  border-left: 2px solid var(--color-accent);
+  background: color-mix(in oklab, var(--color-accent) 7%, transparent);
+  font-size: 12px;
+}
+.cp-reply > svg {
+  flex: none;
+  color: var(--color-accent);
+}
+.cp-reply-who {
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+}
+.cp-reply-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-muted);
+}
+
 .hx-outcome-foot {
   align-items: center;
-}
-.hx-said {
-  position: relative;
-  outline: none;
-}
-.hx-said-copy {
-  position: absolute;
-  top: 6px;
-  right: 0;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-.hx-said:hover > .hx-said-copy,
-.hx-said:focus > .hx-said-copy,
-.hx-said-copy:focus-visible {
-  opacity: 1;
 }
 /* A touch screen takes a tap on it as a hover (as WebKit does for what looks tappable). */
 @media (pointer: coarse) {
@@ -3135,9 +3553,7 @@ textarea.hx-input {
   padding: 0;
   border: 1px solid #2a3039;
   border-radius: 9px;
-  background:
-    radial-gradient(ellipse at 0 0, #c6b08e0c, transparent 65%),
-    #0a0c0f;
+  background: radial-gradient(ellipse at 0 0, #c6b08e0c, transparent 65%), #0a0c0f;
 }
 .hx-inbox .hx-section-head {
   margin: 0;
@@ -3375,9 +3791,7 @@ textarea.hx-input {
 .hx-approval {
   border-color: #3a352c;
   border-radius: 9px;
-  background:
-    radial-gradient(ellipse at 0 0, #c6b08e10, transparent 65%),
-    #0a0c0f;
+  background: radial-gradient(ellipse at 0 0, #c6b08e10, transparent 65%), #0a0c0f;
   box-shadow: none;
 }
 .hx-approval-danger {

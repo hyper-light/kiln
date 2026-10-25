@@ -172,6 +172,7 @@ fn dead_spec() -> LegSpec {
         reads: Vec::new(),
         cache_cap: None,
         unaffected: None,
+        defined_in: DefinedIn::default(),
         workflow: Arc::new(Workflow::default()),
         job_index: 0,
     }
@@ -447,6 +448,31 @@ fn w04_ac04_inputs_and_secrets_are_checked() {
     let r = run("    with: { n: 1 }\n", "    secrets: { token: '${{ secrets.T }}' }\n");
     assert!(matches!(r.spec("call / inner").secrets, SecretsSpec::Mapped { ref map, .. } if map == &vec![("token".to_owned(), "${{ secrets.T }}".to_owned())]));
     assert_eq!(run("    with: { n: 1 }\n", "").spec("call / inner").secrets, SecretsSpec::None);
+}
+
+/// W06-R03: a leg knows the workflow file that defines its job, as `job.workflow_*` say it: the
+/// run's own; a `./` one's (the run's repository and commit, at its ref); a remote one's (its
+/// repository, its ref as GitHub writes it, and the commit it was pinned to).
+#[test]
+fn w06_r03_a_legs_job_knows_its_workflow() {
+    let caller = "on: push\njobs:\n  top:\n    runs-on: x\n    steps: [{run: a}]\n  local:\n    uses: ./.github/workflows/called.yml\n    with: { n: 1 }\n  remote:\n    uses: octo-org/automation/.github/workflows/deploy.yml@v1\n";
+    let at = |src: &str, path: &str, origin: Option<crate::wf::ir::Origin>| Arc::new(Workflow { path: path.into(), origin, ..(*workflow(src, Dialect::Gha)).clone() });
+    let mut src = Source::default();
+    src.workflows.insert("./.github/workflows/called.yml".into(), at(CALLED, ".github/workflows/called.yml", None));
+    let far = "on: workflow_call\njobs:\n  far:\n    runs-on: x\n    steps: [{run: b}]\n";
+    let pinned = crate::wf::ir::Origin { repository: "octo-org/automation".into(), git_ref: "refs/tags/v1".into(), sha: "f".repeat(40) };
+    src.workflows.insert("octo-org/automation/.github/workflows/deploy.yml@v1".into(), at(far, ".github/workflows/deploy.yml", Some(pinned)));
+    let github = serde_json::json!({ "repository": "acme/app", "ref": "refs/heads/main", "sha": "a".repeat(40) });
+    let r = Run::with(caller, Dialect::Gha, RunInput { trusted: true, github, ..RunInput::default() }, src);
+    let defined = |repo: &str, path: &str, git_ref: &str, sha: String| DefinedIn {
+        workflow_ref: format!("{repo}/{path}@{git_ref}"),
+        workflow_sha: sha,
+        workflow_repository: repo.into(),
+        workflow_file_path: path.into(),
+    };
+    assert_eq!(r.spec("top").defined_in, defined("acme/app", ".github/workflows/t.yml", "refs/heads/main", "a".repeat(40)), "the run's own");
+    assert_eq!(r.spec("local / inner").defined_in, defined("acme/app", ".github/workflows/called.yml", "refs/heads/main", "a".repeat(40)), "a `./` one, at the run's commit");
+    assert_eq!(r.spec("remote / far").defined_in, defined("octo-org/automation", ".github/workflows/deploy.yml", "refs/tags/v1", "f".repeat(40)), "a remote one, pinned");
 }
 
 #[test]

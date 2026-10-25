@@ -173,6 +173,10 @@ pub struct Acp {
     /// Only a new conversation with no prompt or history may be replaced after signing in.
     #[serde(default)]
     empty: bool,
+    /// The speed the session had (`Spec::speed`: a restart, a move), set once it's ready where
+    /// the model in use has a `speed` option.
+    #[serde(default)]
+    speed_start: Option<String>,
 }
 
 fn ready() -> bool {
@@ -183,6 +187,10 @@ fn ready() -> bool {
 /// kiln answers every request to go ahead itself.
 pub const KILN_ASK: &str = "kiln-ask";
 pub const KILN_BYPASS: &str = "kiln-bypass";
+
+/// The config option an agent offers its speeds as (Devin's Standard and Fast, on the models that
+/// go faster): kiln's speed (`Meta::speeds`), not a control of its own.
+const SPEED: &str = "speed";
 
 fn kiln_ask() -> ModeOption {
     ModeOption { id: KILN_ASK.into(), label: "Ask".into(), description: "Ask before anything the agent asks to do".into(), dangerous: false }
@@ -230,6 +238,7 @@ impl Acp {
             account: false,
             refresh: false,
             empty,
+            speed_start: None,
         }
     }
 
@@ -241,6 +250,7 @@ impl Acp {
                 a.settings.push((category.into(), v.clone()));
             }
         }
+        a.speed_start.clone_from(&spec.speed);
         a
     }
 
@@ -362,10 +372,16 @@ impl Acp {
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         match cmd {
-            Command::Send { id, text, mode, attachments, overrides } => self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides }, mode),
-            Command::QueueEdit { id, text } => {
+            Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => {
+                // Its go-back is kiln's (`harness::goback`): a checkpoint anchors the prompt's
+                // moment so "restore files to here" reaches back to it.
+                core.effects.push(Effect::Checkpoint { at: Core::now() });
+                self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to }, mode);
+            }
+            Command::QueueEdit { id, text, attachments } => {
                 if let Some(q) = core.state.queue.iter_mut().find(|q| q.id == id) {
                     q.text = text;
+                    if let Some(a) = attachments { q.attachments = a; }
                     core.touch_state();
                 }
             }
@@ -402,6 +418,7 @@ impl Acp {
             Command::SetMode { mode } => self.change(core, "mode".into(), json!(mode)),
             Command::SetModel { model, .. } => self.change(core, "model".into(), json!(model)),
             Command::SetEffort { effort } => self.change(core, "thought_level".into(), json!(effort)),
+            Command::SetSpeed { speed } => self.set_speed(core, &speed),
             Command::Suggest { client, .. } => core.reply(client, json!({"suggestions": []})),
             // kiln exports the conversation from its timeline.
             Command::Control { id, value } if id == "export" => {
@@ -414,6 +431,8 @@ impl Acp {
                     self.next(core);
                 }
             }
+            // Its go-back is kiln's where its own ends (`harness::goback`).
+            Command::Control { id, value } if super::goback::control(core, &id, value.as_ref()) => {}
             Command::Control { id, value } => {
                 if id.starts_with("acp:")
                     && let Some(value) = value
@@ -435,7 +454,7 @@ impl Acp {
                     Some(a) => format!("/{name} {a}"),
                     None => format!("/{name}"),
                 };
-                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None }, mode);
+                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, mode);
             }
             Command::SkillView { client, .. } | Command::McpAuth { client, .. } => core.reply(client, json!({"error": UNSUPPORTED})),
             Command::McpAdd { client, .. } | Command::McpRemove { client, .. } => match client.filter(|c| !c.is_empty()) {
@@ -578,10 +597,27 @@ impl Acp {
         core.meta.efforts.clear();
         core.meta.controls.retain(|c| !c.id.starts_with("acp:"));
         core.state.control_values.retain(|id, _| !id.starts_with("acp:"));
-        core.meta.features.retain(|f| f != "set_model" && f != "set_effort");
+        core.meta.features.retain(|f| f != "set_model" && f != "set_effort" && f != "set_speed");
+        // Its speeds are kiln's own selector (the head's bolt), not a control.
+        let speed = self.speed_option();
+        match &speed {
+            Some((standard, faster)) => {
+                let current = self.config.iter().find(|c| c.get("id").and_then(Value::as_str) == Some(SPEED)).and_then(|c| c.get("currentValue")).and_then(Value::as_str).unwrap_or_default();
+                core.state.speed = if current == standard { String::new() } else { current.to_owned() };
+                core.meta.speeds.clone_from(faster);
+                core.meta.features.push("set_speed".into());
+            }
+            None => {
+                core.state.speed.clear();
+                core.meta.speeds.clear();
+            }
+        }
         let mut primary = std::collections::HashSet::new();
         for c in options {
             let Some(id) = c.get("id").and_then(Value::as_str) else { continue };
+            if id == SPEED && speed.is_some() {
+                continue;
+            }
             let category = c.get("category").and_then(Value::as_str).unwrap_or("");
             let current = c.get("currentValue").cloned().unwrap_or(Value::Null);
             let kind = match c.get("type").and_then(Value::as_str) {
@@ -649,6 +685,8 @@ impl Acp {
         if self.bypass {
             core.state.mode = KILN_BYPASS.into();
         }
+        // Its go-back (rewind, restore files, branch, fork) is kiln's own (`harness::goback`).
+        super::goback::declare(core);
         core.touch_meta();
         core.touch_state();
     }
@@ -724,7 +762,28 @@ impl Acp {
         self.startup_mode = None;
         self.ready = true;
         core.set_status(Status::Idle);
+        // The speed it had, where the model in use has one: a speed it can't take holds no prompt.
+        if let Some(speed) = self.speed_start.take() {
+            self.set_speed(core, &speed);
+        }
         self.next(core);
+    }
+
+    /// The agent's `speed` option (Devin's, on the models that go faster), as kiln says it: its
+    /// standard value ("standard", else its first), and the faster ones in its order.
+    fn speed_option(&self) -> Option<(String, Vec<ControlOption>)> {
+        let c = self.config.iter().find(|c| c.get("id").and_then(Value::as_str) == Some(SPEED) && c.get("type").and_then(Value::as_str) == Some("select") && c.get("currentValue").is_some_and(Value::is_string))?;
+        let choices = config_choices(c);
+        let standard = choices.iter().find(|o| o.id == "standard").or_else(|| choices.first())?.id.clone();
+        let faster: Vec<ControlOption> = choices.into_iter().filter(|o| o.id != standard).collect();
+        (!faster.is_empty()).then_some((standard, faster))
+    }
+
+    /// The speed it runs at ("" standard), set as its `speed` option, where the model in use has one.
+    fn set_speed(&mut self, core: &mut Core, speed: &str) {
+        let Some((standard, _)) = self.speed_option() else { return };
+        let value = if speed.is_empty() { standard } else { speed.to_owned() };
+        self.change(core, format!("acp:{SPEED}"), json!(value));
     }
 
     fn setting_done(&mut self, core: &mut Core, id: &Value, category: Option<&str>) {
@@ -825,8 +884,8 @@ impl Acp {
     fn show(&mut self, core: &mut Core, m: &QueueItem, d: Delivery) {
         core.state.delivery.insert(m.id.clone(), d);
         let (images, names) = super::model::attachment_summary(&m.attachments);
-        core.note_sent(&m.id);
-        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names });
+        core.note_sent(&m.id, &m.text);
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
         core.touch_state();
     }
 
@@ -860,7 +919,7 @@ impl Acp {
     pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
         if p.cut.is_some() && !self.busy(core) && core.state.status != Status::Exited {
             let id = crate::util::new_id();
-            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None }, SendMode::Queue);
+            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Queue);
             super::pause::from_kiln(core, &id);
             return;
         }
@@ -894,7 +953,7 @@ impl Acp {
         if decision == Decision::Deny
             && let Some(f) = message.filter(|m| !m.trim().is_empty())
         {
-            let m = QueueItem { id: crate::util::new_id(), text: f, at: Core::now(), attachments: Vec::new(), overrides: None };
+            let m = QueueItem { id: crate::util::new_id(), text: f, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None };
             self.show(core, &m, Delivery::Queued);
             self.waiting.insert(0, m);
         }
@@ -1309,7 +1368,7 @@ impl Acp {
                         let body = match kind {
                             "agent_message_chunk" => Body::Assistant { text: text.clone(), streaming: true },
                             "agent_thought_chunk" => Body::Thinking { text: text.clone(), streaming: true, redacted: false },
-                            _ => Body::User { text: text.clone(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new() },
+                            _ => Body::User { text: text.clone(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new(), reply_to: None },
                         };
                         core.upsert(&id, None, body);
                         match kind {
@@ -1673,7 +1732,7 @@ mod tests {
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}})]);
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}})]);
         let _ = written(&mut core);
-        a.command(&mut core, Command::Send { id: "m1".into(), text: "go on".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        a.command(&mut core, Command::Send { id: "m1".into(), text: "go on".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         let prompt = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).cloned().unwrap_or_default();
         assert_eq!(prompt.pointer("/params/prompt/0/text").and_then(Value::as_str), Some("<kiln_handoff>earlier</kiln_handoff>"));
@@ -1682,7 +1741,7 @@ mod tests {
         assert!(core.events().any(|e| matches!(&e.body, Body::User { text, .. } if text == "go on")));
         let pid = prompt.get("id").cloned().unwrap_or_default();
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": pid, "result": {"stopReason": "end_turn"}})]);
-        a.command(&mut core, Command::Send { id: "m2".into(), text: "and then".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        a.command(&mut core, Command::Send { id: "m2".into(), text: "and then".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         let prompt = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).cloned().unwrap_or_default();
         assert_eq!(prompt.pointer("/params/prompt/0/text").and_then(Value::as_str), Some("and then"), "only the first message carries it");
@@ -1702,7 +1761,7 @@ mod tests {
             feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}})]);
             feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": format!("s{n}")}})]);
             let _ = written(&mut core);
-            a.command(&mut core, Command::Send { id: format!("m{n}"), text: format!("question {n}"), mode: SendMode::Queue, attachments: vec![], overrides: None });
+            a.command(&mut core, Command::Send { id: format!("m{n}"), text: format!("question {n}"), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
             let w = written(&mut core);
             let pid = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).and_then(|p| p.get("id").cloned()).unwrap_or_default();
             feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": format!("s{n}"), "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": answer}}}})]);
@@ -1724,7 +1783,7 @@ mod tests {
         a.start(&mut core);
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/params/protocolVersion")).and_then(Value::as_u64), Some(1));
-        a.command(&mut core, Command::Send { id: "m1".into(), text: "refactor".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        a.command(&mut core, Command::Send { id: "m1".into(), text: "refactor".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}})]);
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("session/new"));
@@ -1755,7 +1814,7 @@ mod tests {
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/result/outcome/optionId")).and_then(Value::as_str), Some("ever"));
         // A second message waits (no steering in ACP).
-        a.command(&mut core, Command::Send { id: "m2".into(), text: "then tests".into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
+        a.command(&mut core, Command::Send { id: "m2".into(), text: "then tests".into(), mode: SendMode::Steer, attachments: vec![], overrides: None, reply_to: None, task: None});
         assert_eq!(core.state.queue.len(), 1);
         feed(
             &mut a,
@@ -1806,7 +1865,7 @@ mod tests {
         let mut a = Acp::new(None);
         a.start(&mut core);
         feed(&mut a, &mut core, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"sessionId": "s1"}})]);
-        a.command(&mut core, Command::Send { id: "m1".into(), text: "hello".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        a.command(&mut core, Command::Send { id: "m1".into(), text: "hello".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         for _ in 0..2 {
             a.update(&mut core, &json!({"sessionUpdate": "usage_update", "used": 120, "size": 2000, "cost": {"amount": 2.5, "currency": "USD"}, "_meta": {"cognition.ai/inputTokens": 100}}));
         }
@@ -1853,11 +1912,11 @@ mod tests {
         );
         assert_eq!(core.state.harness_session.as_deref(), Some("old"));
         assert!(core.events().any(|e| matches!(&e.body, Body::User { text, .. } if text == "earlier")));
-        a.command(&mut core, Command::Send { id: "m1".into(), text: "long task".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        a.command(&mut core, Command::Send { id: "m1".into(), text: "long task".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         core.take_writes();
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 9, "method": "session/request_permission", "params": {"sessionId": "old", "toolCall": {"toolCallId": "t9", "kind": "execute", "title": "Run", "rawInput": {"command": "rm -rf x"}}, "options": [{"optionId": "y", "name": "Allow", "kind": "allow_once"}]}})]);
         assert_eq!(core.state.approvals.first().and_then(|a| a.command.clone()).as_deref(), Some("rm -rf x"));
-        a.command(&mut core, Command::Send { id: "m2".into(), text: "stop, do this".into(), mode: SendMode::Now, attachments: vec![], overrides: None });
+        a.command(&mut core, Command::Send { id: "m2".into(), text: "stop, do this".into(), mode: SendMode::Now, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         assert!(w.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("session/cancel")));
         assert!(w.iter().any(|v| v.pointer("/result/outcome/outcome").and_then(Value::as_str) == Some("cancelled")));
@@ -1884,7 +1943,7 @@ mod tests {
     }
 
     fn message(a: &mut Acp, core: &mut Core, id: &str, mode: SendMode) {
-        a.command(core, Command::Send { id: id.into(), text: id.into(), mode, attachments: vec![], overrides: None });
+        a.command(core, Command::Send { id: id.into(), text: id.into(), mode, attachments: vec![], overrides: None, reply_to: None, task: None});
     }
 
     #[test]

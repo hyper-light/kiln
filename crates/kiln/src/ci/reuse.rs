@@ -86,8 +86,15 @@ pub async fn inputs(hub: &Hub, repo: &Repo, sha: &str, leg: &LegSpec, reuse: &Sp
     let job = leg.def().ok_or("the job isn't in the workflow")?;
     let wf = &leg.workflow;
     let json = |v: serde_json::Result<Value>| v.map_err(|e| format!("its definition: {e}"));
+    // Where its job is defined (W06-R03's `job.workflow_*`) names the run's own commit for the
+    // run's own workflow, as `github.sha` does: in the hash, every push's inputs were new and
+    // nothing was reused. The job's definition itself is in it, below.
+    let mut planned = json(serde_json::to_value(leg))?;
+    if let Some(o) = planned.as_object_mut() {
+        o.remove("defined_in");
+    }
     let definition = json!({
-        "leg": json(serde_json::to_value(leg))?,
+        "leg": planned,
         "job": json(serde_json::to_value(job))?,
         "workflow": { "env": json(serde_json::to_value(&wf.env))?, "defaults": json(serde_json::to_value(&wf.defaults))? },
     });

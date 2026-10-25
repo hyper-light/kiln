@@ -411,7 +411,7 @@ fn a_hand_over_arrives_whole_and_says_how_it_went() -> anyhow::Result<()> {
             }
         });
         let data: Vec<u8> = (0..5_000_000usize).map(|i| (i % 253) as u8).collect();
-        lab.mac.adopt("linux", &data).await.map_err(|e| anyhow::anyhow!(e))?;
+        lab.mac.adopt("linux", &data, false).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         // A refusal comes back as it was said.
         let taker = lab.adoptions.clone();
         crate::rt::spawn(async move {
@@ -419,11 +419,59 @@ fn a_hand_over_arrives_whole_and_says_how_it_went() -> anyhow::Result<()> {
                 let _ = a.reply.send(Err("no room for it here".into()));
             }
         });
-        let refused = lab.mac.adopt("linux", b"small").await;
-        assert_eq!(refused, Err("no room for it here".to_owned()));
+        let refused = lab.mac.adopt("linux", b"small", false).await;
+        assert_eq!(refused, Err(node::NotAdopted::Refused("no room for it here".to_owned())));
         // A runner that takes nothing over says so.
-        let nobody = lab.linux.adopt("mac", b"x").await;
-        assert!(nobody.is_err_and(|e| e.contains("doesn't take over")));
+        let nobody = lab.linux.adopt("mac", b"x", false).await;
+        assert!(nobody.is_err_and(|e| e.to_string().contains("doesn't take over")));
+        Ok(())
+    })
+}
+
+/// CP-T3.2 (the sixth adversarial check's): a hand-over whose answer is lost after all of it went
+/// may have been taken over, and says so (`Unknown`, never a plain refusal: the runner it left
+/// would go on with the session too). Asked again, a runner from before NOT_TAKEN that says it runs
+/// the session already took it over the time before; said without a try before, that's a refusal.
+/// Refused saying it wasn't taken, it isn't there; refused otherwise after a try whose answer was
+/// lost, it may be (the seventh check's).
+#[cfg(unix)]
+#[test]
+fn a_hand_over_whose_answer_is_lost_may_have_been_taken_over() -> anyhow::Result<()> {
+    use crate::harness::host::RUNS_HERE;
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        // linux takes it over, and its connection drops before its answer goes back.
+        let (taker, ctl) = (lab.adoptions.clone(), lab.ctl.clone());
+        crate::rt::spawn(async move {
+            if let Ok(a) = taker.recv().await {
+                let _ = ctl.send(Ctl::Drop("linux")).await;
+                crate::rt::sleep(Duration::from_millis(300)).await;
+                let _ = a.reply.send(Ok(()));
+            }
+        });
+        let lost = lab.mac.adopt("linux", b"a session", false).await;
+        assert!(matches!(lost, Err(node::NotAdopted::Unknown(_))), "{lost:?}");
+        lab.ctl.send(Ctl::Back("linux")).await?;
+        let answers = |answer: Result<(), String>| {
+            let taker = lab.adoptions.clone();
+            crate::rt::spawn(async move {
+                if let Ok(a) = taker.recv().await {
+                    let _ = a.reply.send(answer);
+                }
+            });
+        };
+        answers(Err(RUNS_HERE.into()));
+        assert_eq!(lab.mac.adopt("linux", b"a session", true).await, Ok(()), "asked again: taken over the time before");
+        answers(Err(RUNS_HERE.into()));
+        assert_eq!(lab.mac.adopt("linux", b"a session", false).await, Err(node::NotAdopted::Refused(RUNS_HERE.into())));
+        // Asked again and refused, saying it wasn't taken: it isn't there.
+        answers(Err(format!("{}no room for it here", node::NOT_TAKEN)));
+        assert_eq!(lab.mac.adopt("linux", b"a session", true).await, Err(node::NotAdopted::Refused("no room for it here".into())));
+        // Asked again and refused by a runner from before NOT_TAKEN: it can't say whether the time
+        // before took it over (the session may have ended there since).
+        answers(Err("no room for it here".into()));
+        let unsure = lab.mac.adopt("linux", b"a session", true).await;
+        assert!(matches!(unsure, Err(node::NotAdopted::Unknown(_))), "{unsure:?}");
         Ok(())
     })
 }

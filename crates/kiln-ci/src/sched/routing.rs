@@ -181,6 +181,16 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             v.push(d);
             i += 1;
         }
+        // A lone `=`, `&` or `|` (`os = linux`) is no symbol and no word: without this it was an
+        // empty word, again and again, never moving on.
+        if v.is_empty() {
+            let meant = match c {
+                '=' => "==",
+                '&' => "&&",
+                _ => "||",
+            };
+            return Err(format!("`{s}`: `{c}` alone isn't an operator (`{meant}`?)"));
+        }
         out.push(Tok::Word(v));
     }
     Ok(out)
@@ -958,9 +968,10 @@ mod tests {
         assert!(holds("!(os == windows) && executors has docker", &f, &[]));
         // Unknown facts are false, never errors.
         assert!(!holds("gpu.memory > 0", &f, &[]) && !holds("custom.rack == a1", &f, &[]) && holds("!custom.rack", &f, &[]));
-        for bad in ["", "os ==", "(os == linux", "arch in x86_64", "os == linux ]"] {
+        for bad in ["", "os ==", "(os == linux", "arch in x86_64", "os == linux ]", "os = linux", "label a & label b", "label a | label b"] {
             assert!(Constraint::parse(bad).is_err(), "{bad}");
         }
+        assert_eq!(Constraint::parse("os = linux"), Err("`os = linux`: `=` alone isn't an operator (`==`?)".into()));
         assert_eq!(number("50Gi"), Some(50.0 * 1024.0 * 1024.0 * 1024.0));
         assert_eq!(number("8m"), Some(480.0));
     }

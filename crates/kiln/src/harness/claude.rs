@@ -142,6 +142,10 @@ const LEVEL_GRACE_MS: i64 = 5_000;
 /// the model in use has, and for a model it does not list.
 pub(super) const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
+/// Fast mode, as `State::speed` says it: Claude Code's one speed past standard (its `fastMode`
+/// setting), on the models initialize says take it.
+const FAST: &str = "fast";
+
 /// A permission request we are holding for a person: the input exactly as the CLI sent it (the
 /// approval's copy is shortened for display; the answer must carry the original).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +200,14 @@ pub struct Claude {
     entries: Vec<(String, Option<String>)>,
     /// Effort levels per model, as initialize lists them.
     efforts: HashMap<String, Vec<String>>,
+    /// Whether each model runs in fast mode, as initialize lists them (`supportsFastMode`).
+    #[serde(default)]
+    fast: HashMap<String, bool>,
+    /// Fast mode as kiln last set it (`FAST` or "" standard: `Command::SetSpeed`, or the spec it
+    /// started from), which is what it runs at from its next turn. None: kiln never set it, so
+    /// it's as Claude Code says.
+    #[serde(default)]
+    speed: Option<String>,
     output_styles: Vec<String>,
     /// Its configuration directory (user skills and commands live under it).
     config_dir: String,
@@ -245,6 +257,17 @@ pub struct Claude {
     /// Where a background command's output goes, by the tool call that started it, until its
     /// task is known: (task id, file).
     bg_files: HashMap<String, (String, String)>,
+    /// Messages a person wrote to a subagent, which the agent is to pass on with its SendMessage
+    /// (Claude Code takes none for a subagent from kiln): by subagent, their ids, oldest first.
+    #[serde(default)]
+    relays: HashMap<String, std::collections::VecDeque<String>>,
+    /// The SendMessage calls passing one on: call id → (subagent, message id).
+    #[serde(default)]
+    relay_calls: HashMap<String, (String, String)>,
+    /// Subagents that finished and are being resumed with what waited for them: the next waits
+    /// until they've taken that one.
+    #[serde(default)]
+    waking: BTreeSet<String>,
 }
 
 impl Claude {
@@ -265,6 +288,8 @@ impl Claude {
             bypass_next: false,
             entries: Vec::new(),
             efforts: HashMap::new(),
+            fast: HashMap::new(),
+            speed: None,
             output_styles: Vec::new(),
             config_dir: String::new(),
             commands: Vec::new(),
@@ -288,6 +313,9 @@ impl Claude {
             reload: None,
             reload_waits: false,
             bg_files: HashMap::new(),
+            relays: HashMap::new(),
+            relay_calls: HashMap::new(),
+            waking: BTreeSet::new(),
         }
     }
 
@@ -295,6 +323,14 @@ impl Claude {
     #[must_use]
     pub fn with_config_dir(mut self, dir: String) -> Self {
         self.config_dir = dir;
+        self
+    }
+
+    /// Starts at this speed (`Spec::speed`), set once it has started: a session going on (a
+    /// restart, a move) keeps fast mode as it was.
+    #[must_use]
+    pub fn with_speed(mut self, speed: Option<String>) -> Self {
+        self.speed = speed.filter(|s| s.is_empty() || s == FAST);
         self
     }
 
@@ -380,10 +416,61 @@ impl Claude {
         c.push(ctl("background", "Subagents", "Move to background", "Let running commands and subagents continue in the background", ControlKind::Action));
         // MCP servers and skills have their own state and commands (State::mcp, State::skills).
         core.meta.controls = c;
+        // Claude's own go-back runs on its wire protocol; "fork" is handled here but was never
+        // declared — the go-back declarations fill it (and anything else) in.
+        super::goback::declare(core);
         // Effort levels of the model in use (by its id, an alias in it, or the default model's),
         // else the ones the CLI knows.
         core.meta.efforts = self.effort_levels(&core.state.model).iter().map(|e| opt(e, &capitalize(e), "")).collect();
+        // Fast mode, where the model in use takes it.
+        core.meta.speeds = if self.fast_on(&core.state.model) {
+            vec![opt(FAST, "Fast", "Up to 2.5x faster, at a higher price per token. Turned on part-way, the conversation so far is billed once at that price")]
+        } else {
+            Vec::new()
+        };
         core.touch_meta();
+    }
+
+    /// Whether `model` runs in fast mode, as initialize listed it: by its id or alias, else the
+    /// alias it contains ("opus[1m]"); with none yet, the default model.
+    fn fast_on(&self, model: &str) -> bool {
+        if model.is_empty() {
+            return self.fast.get("default").copied().unwrap_or(false);
+        }
+        let mut keys: Vec<&String> = self.fast.keys().filter(|k| !k.is_empty() && model.contains(k.as_str())).collect();
+        keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        self.fast.get(model).or_else(|| keys.first().and_then(|k| self.fast.get(*k))).copied().unwrap_or(false)
+    }
+
+    /// Fast mode as Claude Code says it is (`fast_mode_state` and `fast_mode_disabled_reason`,
+    /// in initialize's answer, each turn's init and its result): on, off, or cooling down after
+    /// its own rate limit; and what keeps it off, if anything a person could change.
+    fn fast_reported(&mut self, core: &mut Core, v: &Value) {
+        let Some(state) = str_of(v, "fast_mode_state") else { return };
+        let blocked = if state == "off" { str_of(v, "fast_mode_disabled_reason").and_then(fast_blocked) } else { None };
+        let cooldown = state == "cooldown";
+        let mut changed = core.state.speed_blocked != blocked || core.state.speed_cooldown != cooldown;
+        core.state.speed_blocked = blocked;
+        core.state.speed_cooldown = cooldown;
+        // What kiln set is what runs from the next turn on (one set mid-turn shows after it).
+        if self.speed.is_none() {
+            let speed = if matches!(state, "on" | "cooldown") { FAST } else { "" };
+            changed |= core.state.speed != speed;
+            speed.clone_into(&mut core.state.speed);
+        }
+        if changed {
+            core.touch_state();
+        }
+    }
+
+    /// Fast mode on (`FAST`) or off (""), as kiln sets it: a flag setting, so it holds for this
+    /// session alone.
+    fn set_fast(&mut self, core: &mut Core, speed: String) {
+        self.request(core, Pending::ApplySettings, json!({"subtype": "apply_flag_settings", "settings": {"fastMode": speed == FAST}}));
+        self.speed = Some(speed.clone());
+        core.state.speed = speed;
+        core.state.speed_cooldown = false;
+        core.touch_state();
     }
 
     /// The effort levels of `model` as initialize listed them: by its id or alias, an alias it
@@ -541,7 +628,7 @@ impl Claude {
     /// A slash command (or any text) sent as a message.
     fn slash(&mut self, core: &mut Core, text: &str) {
         let id = crate::util::new_id();
-        self.send(core, id, text.trim().to_owned(), SendMode::Queue, Vec::new(), None);
+        self.send(core, QueueItem { id, text: text.trim().to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Queue);
     }
 
     fn request(&mut self, core: &mut Core, kind: Pending, body: Value) {
@@ -588,7 +675,7 @@ impl Claude {
         if core.meta.commands.is_empty() {
             core.meta.commands = sort_catalog(claude_catalog());
         }
-        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"]
+        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
@@ -603,6 +690,12 @@ impl Claude {
         self.inflight.clear();
         self.pending.clear();
         self.asks.clear();
+        // Messages it was passing on to its subagents didn't get there.
+        let unsent: Vec<String> = self.relays.drain().flat_map(|(_, q)| q).chain(self.relay_calls.drain().map(|(_, (_, m))| m)).collect();
+        for m in unsent {
+            super::subagent::delivered(core, &m, Delivery::Cancelled);
+        }
+        self.waking.clear();
         core.state.approvals.clear();
         for id in self.tools.keys().cloned().collect::<Vec<_>>() {
             finish_tool(core, &id, ToolStatus::Cancelled, None);
@@ -624,10 +717,11 @@ impl Claude {
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         match cmd {
-            Command::Send { id, text, mode, attachments, overrides } => self.send(core, id, text, mode, attachments, overrides),
-            Command::QueueEdit { id, text } => {
+            Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to }, mode),
+            Command::QueueEdit { id, text, attachments } => {
                 if let Some(q) = core.state.queue.iter_mut().find(|q| q.id == id) {
                     q.text = text;
+                    if let Some(a) = attachments { q.attachments = a; }
                     core.touch_state();
                 }
             }
@@ -647,7 +741,7 @@ impl Claude {
                 if let Some(pos) = core.state.queue.iter().position(|q| q.id == id) {
                     let item = core.state.queue.remove(pos);
                     core.touch_state();
-                    self.send(core, item.id, item.text, SendMode::Now, item.attachments, item.overrides);
+                    self.send(core, item, SendMode::Now);
                 }
             }
             // Written now, without priority: the CLI folds it into the running turn (or starts
@@ -656,7 +750,7 @@ impl Claude {
                 if let Some(pos) = core.state.queue.iter().position(|q| q.id == id) {
                     let item = core.state.queue.remove(pos);
                     core.touch_state();
-                    self.send(core, item.id, item.text, SendMode::Steer, item.attachments, item.overrides);
+                    self.send(core, item, SendMode::Steer);
                 }
             }
             Command::Approve { id, decision, message, always, answers, choices } => self.answer(core, &id, decision, message, always, choices_of(answers, choices)),
@@ -700,6 +794,10 @@ impl Claude {
                 core.state.effort = effort;
                 core.touch_state();
             }
+            // Fast mode, as a setting of this session's (`-p` sessions opt in this way; a person's
+            // own default stays as it is): from the next turn, if one is under way.
+            Command::SetSpeed { speed } if speed.is_empty() || speed == FAST => self.set_fast(core, speed),
+            Command::SetSpeed { speed } => self.notice(core, Level::Warn, format!("{speed}: not a speed Claude Code has"), None),
             Command::Control { id, value } => self.control(core, &id, value),
             Command::Suggest { client, query } => {
                 self.request(core, Pending::Suggest(client), json!({"subtype": "file_suggestions", "query": query}));
@@ -765,7 +863,7 @@ impl Claude {
                     Some(a) => format!("/{name} {a}"),
                     None => format!("/{name}"),
                 };
-                self.send(core, id.unwrap_or_else(crate::util::new_id), text, mode, Vec::new(), None);
+                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, mode);
             }
             Command::SkillsReload => self.request(core, Pending::ReloadSkills, json!({"subtype": "reload_skills"})),
         }
@@ -965,7 +1063,7 @@ impl Claude {
     pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
         if p.cut.is_some() && !self.busy(core) && core.state.status != Status::Exited {
             let id = crate::util::new_id();
-            self.send(core, id.clone(), super::pause::CONTINUE.to_owned(), SendMode::Queue, Vec::new(), None);
+            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Queue);
             super::pause::from_kiln(core, &id);
             return;
         }
@@ -1391,14 +1489,15 @@ impl Claude {
         core.effects.push(Effect::Read { client, paths });
     }
 
-    fn send(&mut self, core: &mut Core, id: String, text: String, mode: SendMode, attachments: Vec<super::model::Attachment>, overrides: Option<super::model::Overrides>) {
+    fn send(&mut self, core: &mut Core, item: QueueItem, mode: SendMode) {
+        let QueueItem { id, text, attachments, overrides, reply_to, .. } = item;
         let text = text.trim_end().to_owned();
         if text.is_empty() && attachments.is_empty() {
             return;
         }
         let busy = self.busy(core);
         if busy && mode == SendMode::Queue {
-            core.state.queue.push(QueueItem { id, text, at: Core::now(), attachments, overrides });
+            core.state.queue.push(QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to });
             core.touch_state();
             return;
         }
@@ -1448,8 +1547,8 @@ impl Claude {
         core.state.delivery.insert(id.clone(), Delivery::Sent);
         prune_delivery(core);
         let (images, names) = super::model::attachment_summary(&attachments);
-        core.note_sent(&id);
-        core.upsert(&id, None, Body::User { text, images, client_id: Some(id.clone()), origin: Some(super::core::origin_of(&id).into()), attachments: names });
+        core.note_sent(&id, &text);
+        core.upsert(&id, None, Body::User { text, images, client_id: Some(id.clone()), origin: Some(super::core::origin_of(&id).into()), attachments: names, reply_to });
         core.touch_state();
         self.settle(core);
     }
@@ -1463,8 +1562,102 @@ impl Claude {
         let item = core.state.queue.remove(0);
         core.touch_state();
         let id = item.id.clone();
-        self.send(core, item.id, item.text, SendMode::Queue, item.attachments, item.overrides);
+        self.send(core, item, SendMode::Queue);
         super::pause::sent_from_queue(core, &id);
+    }
+
+    // ------------------------------------------------------------------ messages to subagents
+
+    /// How a person's message reaches subagent `t` now. Claude Code takes none for a subagent
+    /// from kiln (`send_task_message` is refused in `-p`, and a prompt naming its call goes to the
+    /// agent), so the agent passes it on with its SendMessage tool: to one at work in the
+    /// background at its next tool round (a steer), or waiting for it to finish; to one that
+    /// finished (or failed) by resuming it. One at work in the foreground holds its agent's turn, so
+    /// what's for it waits until it finishes; one stopped isn't resumed, and takes none.
+    pub fn takes(&self, core: &Core, t: &Task) -> (Vec<SendMode>, Option<&'static str>) {
+        let none = (Vec::new(), None);
+        if t.tool_id.is_none() || matches!(t.kind.as_str(), "remote_agent" | "main-session") || matches!(core.state.status, Status::Exited | Status::Starting) {
+            return none;
+        }
+        let via = Some(super::subagent::PARENT);
+        match t.status.as_str() {
+            "running" | "pending" if t.background && !self.waking.contains(&t.id) => (vec![SendMode::Queue, SendMode::Steer], via),
+            "running" | "pending" | "paused" | "completed" | "failed" => (vec![SendMode::Queue], via),
+            _ => none,
+        }
+    }
+
+    /// A person's message to subagent `t`, `mode` one it takes now: one to wait for it to finish
+    /// waits in its queue; else the agent is asked to pass it on now.
+    pub fn send_task(&mut self, core: &mut Core, t: &Task, m: QueueItem, mode: SendMode) {
+        if mode == SendMode::Queue && (t.live() || self.waking.contains(&t.id) || !super::pause::open(core)) {
+            super::subagent::hold(core, &t.id, m);
+            return;
+        }
+        self.relay(core, t, m);
+    }
+
+    /// The agent passes `m` on to its subagent `t` with SendMessage: asked in its turn (Claude Code
+    /// takes it in at its next step), or in a turn of its own when none runs. The message shows in
+    /// the subagent's thread, sent; it's under way once the agent's SendMessage to it is seen, and
+    /// delivered once that succeeds.
+    fn relay(&mut self, core: &mut Core, t: &Task, m: QueueItem) {
+        let how = format!("Send it with your SendMessage tool (to: \"{}\").", t.id);
+        let words = super::subagent::relay_words(t, &m, &how);
+        super::subagent::show(core, &t.id, &m, Delivery::Sent);
+        self.relays.entry(t.id.clone()).or_default().push_back(m.id.clone());
+        if !t.live() {
+            self.waking.insert(t.id.clone());
+        }
+        let id = super::subagent::relay_id(&m);
+        self.send(core, QueueItem { id: id.clone(), text: words, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Steer);
+        super::pause::from_kiln(core, &id);
+    }
+
+    /// What waits for its subagents goes, to each that finished, one message each: it's resumed
+    /// with it (and the next waits until it finishes again).
+    pub fn drain_subagents(&mut self, core: &mut Core) {
+        if !super::pause::open(core) || matches!(core.state.status, Status::Exited | Status::Starting) {
+            return;
+        }
+        for task in super::subagent::waiting(core) {
+            let Some(t) = core.state.tasks.iter().find(|t| t.id == task).cloned() else { continue };
+            if t.live() || self.waking.contains(&t.id) || self.takes(core, &t).0.is_empty() {
+                continue;
+            }
+            if let Some(m) = super::subagent::next(core, &task) {
+                self.relay(core, &t, m);
+            }
+        }
+    }
+
+    /// The agent's SendMessage call `tid` to `to`: passing on the oldest message waiting for that
+    /// subagent, which is under way now.
+    fn relaying(&mut self, core: &mut Core, tid: &str, input: &Value) {
+        let Some(to) = str_of(input, "to").map(str::trim) else { return };
+        let Some(task) = self.relays.keys().find(|t| to == t.as_str() || to.contains(t.as_str())).cloned() else { return };
+        let Some(msg) = self.relays.get_mut(&task).and_then(std::collections::VecDeque::pop_front) else { return };
+        if self.relays.get(&task).is_some_and(std::collections::VecDeque::is_empty) {
+            self.relays.remove(&task);
+        }
+        super::subagent::delivered(core, &msg, Delivery::Started);
+        self.relay_calls.insert(tid.to_owned(), (task, msg));
+    }
+
+    /// A SendMessage call passing a message on ended: delivered, or not, and why (its result).
+    fn relayed(&mut self, core: &mut Core, tid: &str, ok: bool, said: &str) {
+        let Some((task, msg)) = self.relay_calls.remove(tid) else { return };
+        // Claude Code answers success: false (not an error) for one it didn't send.
+        let refused = !ok || serde_json::from_str::<Value>(said).ok().and_then(|v| v.get("success").and_then(Value::as_bool)) == Some(false);
+        if refused {
+            self.waking.remove(&task);
+            super::subagent::delivered(core, &msg, Delivery::Cancelled);
+            let parent = core.state.tasks.iter().find(|t| t.id == task).and_then(|t| t.tool_id.clone());
+            let why = clip_middle(said.trim(), 600).0;
+            core.upsert(&format!("subagent-unsent-{msg}"), parent, Body::Notice { level: Level::Warn, text: if why.is_empty() { "Not sent to the subagent.".to_owned() } else { format!("Not sent to the subagent: {why}") } });
+        } else {
+            super::subagent::delivered(core, &msg, Delivery::Completed);
+        }
     }
 
     fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, choices: Option<Vec<ChoiceAnswer>>) {
@@ -1636,8 +1829,10 @@ impl Claude {
                 if let Some(models) = body.get("models").and_then(Value::as_array) {
                     for m in models {
                         let levels: Vec<String> = m.get("supportedEffortLevels").and_then(Value::as_array).map(|l| l.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                        let fast = m.get("supportsFastMode").and_then(Value::as_bool).unwrap_or(false);
                         for key in [str_of(m, "value"), str_of(m, "resolvedModel")].into_iter().flatten() {
                             self.efforts.insert(key.to_owned(), levels.clone());
+                            self.fast.insert(key.to_owned(), fast);
                         }
                     }
                     core.meta.models = models
@@ -1666,6 +1861,11 @@ impl Claude {
                 self.output_styles = body.get("available_output_styles").and_then(Value::as_array).map(|s| s.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
                 if let Some(s) = str_of(&body, "output_style") {
                     core.set_control("output_style", json!(s));
+                }
+                self.fast_reported(core, &body);
+                // Fast mode as the session had it (a restart, a move), before its first prompt.
+                if let Some(speed) = self.speed.clone() {
+                    self.set_fast(core, speed);
                 }
                 core.touch_meta();
                 self.refresh_controls(core);
@@ -2046,8 +2246,9 @@ impl Claude {
                 self.rebuild_skills(core);
                 // Commands bound to the CLI's terminal are known now.
                 self.refresh_catalog(core);
+                self.fast_reported(core, v);
                 core.touch_state();
-                // The model in use is known now: its effort levels.
+                // The model in use is known now: its effort levels and speeds.
                 self.refresh_controls(core);
             }
             "commands_changed" => {
@@ -2162,8 +2363,11 @@ impl Claude {
                 {
                     t.task = Some(task.id.clone());
                 }
+                // One resumed with a message kiln had it passed on: it has taken it.
+                self.waking.remove(&task.id);
+                let queue = core.state.tasks.iter_mut().find(|t| t.id == task.id).map(|t| std::mem::take(&mut t.queue)).unwrap_or_default();
                 core.state.tasks.retain(|t| t.id != task.id);
-                core.state.tasks.push(task);
+                core.state.tasks.push(Task { queue, ..task });
                 prune_tasks(core);
                 core.touch_state();
             }
@@ -2233,7 +2437,10 @@ impl Claude {
                         t.status = s.to_owned();
                         if s != "running" && s != "pending" && s != "paused" {
                             t.ended = Some(patch.get("end_time").and_then(Value::as_i64).unwrap_or_else(Core::now));
+                        } else {
+                            t.ended = None;
                         }
+                        self.waking.remove(id);
                     }
                     if let Some(b) = patch.get("is_backgrounded").and_then(Value::as_bool) {
                         t.background = b;
@@ -2266,6 +2473,9 @@ impl Claude {
                     }
                     core.touch_state();
                 }
+                // A subagent that finished takes what waited for it now.
+                self.waking.remove(id);
+                self.drain_subagents(core);
             }
             _ => {}
         }
@@ -2422,6 +2632,10 @@ impl Claude {
                     if parent.is_none() {
                         core.state.doing = Some(doing(&call));
                         core.touch_state();
+                        // Passing on a person's message to one of its subagents.
+                        if name == "SendMessage" {
+                            self.relaying(core, &tid, &input);
+                        }
                     }
                     self.tools.insert(tid.clone(), (name, input));
                     core.upsert(&tid, parent.clone(), Body::Tool(Box::new(call)));
@@ -2524,6 +2738,11 @@ impl Claude {
         if v.get("isReplay").and_then(Value::as_bool) == Some(true) && joins_in_flight(core, &id, t, ours) {
             return;
         }
+        // The CLI's replay of what we sent: keep the reply it answered, already on the event.
+        let reply_to = match core.get(&id).map(|e| &e.body) {
+            Some(Body::User { reply_to, .. }) => reply_to.clone(),
+            _ => None,
+        };
         core.upsert(
             &id,
             parent,
@@ -2533,6 +2752,7 @@ impl Claude {
                 attachments: keep_names,
                 client_id: ours.then(|| id.clone()),
                 origin: Some(from.into()),
+                reply_to,
             },
         );
     }
@@ -2606,6 +2826,7 @@ impl Claude {
             track_changes(core, structured);
             follow_worktree(core, &name, structured);
         }
+        self.relayed(core, tid, status == ToolStatus::Done, &text);
         let (output, truncated) = clip_middle(&text, OUTPUT_MAX);
         if let Some(ev) = core.get_mut(tid)
             && let Body::Tool(t) = &mut ev.body
@@ -2736,6 +2957,7 @@ impl Claude {
         }
         u.turns += 1;
         core.state.activity = None;
+        self.fast_reported(core, v);
         // Calls left without a result were cut off with the turn (a background task's call
         // returns at once, so it is not among them).
         let open: Vec<String> = self.tools.keys().cloned().collect();
@@ -2841,6 +3063,22 @@ impl Claude {
         if core.state.delivery.contains_key(id) {
             core.state.delivery.insert(id.to_owned(), state);
             core.touch_state();
+        }
+        // kiln's word to pass a message on to a subagent was done with (or dropped, the turn
+        // stopped first) and the agent never passed it on: that message didn't go.
+        if matches!(state, Delivery::Completed | Delivery::Cancelled)
+            && let Some(msg) = id.strip_prefix(super::subagent::RELAY_ID)
+            && let Some(task) = self.relays.iter().find(|(_, q)| q.iter().any(|m| m == msg)).map(|(t, _)| t.clone())
+        {
+            if let Some(q) = self.relays.get_mut(&task) {
+                q.retain(|m| m != msg);
+            }
+            self.relays.retain(|_, q| !q.is_empty());
+            self.waking.remove(&task);
+            super::subagent::delivered(core, msg, Delivery::Cancelled);
+            let parent = core.state.tasks.iter().find(|t| t.id == task).and_then(|t| t.tool_id.clone());
+            let why = if state == Delivery::Cancelled { "the agent's turn was stopped before it passed it on." } else { "the agent didn't pass it on." };
+            core.upsert(&format!("subagent-unsent-{msg}"), parent, Body::Notice { level: Level::Warn, text: format!("Not sent to the subagent: {why}") });
         }
         self.settle(core);
         if matches!(state, Delivery::Completed | Delivery::Cancelled) {
@@ -3494,6 +3732,24 @@ fn capitalize(s: &str) -> String {
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
+/// What keeps fast mode off, in Claude Code's own words, from its `fast_mode_disabled_reason`.
+/// None for what isn't in the way: kiln not having turned it on (`-p` sessions opt in), or a
+/// check still under way.
+fn fast_blocked(reason: &str) -> Option<String> {
+    let said = match reason {
+        "sdk_opt_in_required" | "pending" => return None,
+        "extra_usage_disabled" => "Fast mode requires usage credits, which are off for this account",
+        "free" => "Fast mode requires a paid subscription",
+        "preference" => "Fast mode has been disabled by your organization",
+        "model_not_allowed" => "Fast mode's model is not in your organization's allowed models",
+        "network_error" => "Fast mode is unavailable: Claude Code couldn't reach api.anthropic.com to check it",
+        "not_first_party" => "Fast mode is only available when using the Anthropic API directly",
+        "disabled_by_env" => "Fast mode is turned off in Claude Code's environment (CLAUDE_CODE_DISABLE_FAST_MODE)",
+        _ => "Fast mode is currently unavailable",
+    };
+    Some(said.to_owned())
+}
+
 fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -3892,7 +4148,7 @@ mod tests {
         let mut core = Core::new();
         c.line(&mut core, &json!({"type": "system", "subtype": "init", "cwd": "/w", "session_id": "s1", "model": "m", "permissionMode": "default"}).to_string());
         for (id, text) in [("m1", "refactor the parser"), ("m2", "then the tests"), ("m3", "then the docs")] {
-            c.command(&mut core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+            c.command(&mut core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         }
         assert_eq!(core.state.queue.len(), 2);
         let _ = core.take_writes();
@@ -4034,7 +4290,7 @@ mod tests {
         let mut core = Core::new();
         c.start(&mut core);
         c.line(&mut core, r#"{"type":"system","subtype":"init","cwd":"/work","session_id":"old-1","model":"claude-opus-5-5","permissionMode":"default"}"#);
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "fix the flaky test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "fix the flaky test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         feed(&mut c, &mut core, &[
             r#"{"type":"user","message":{"role":"user","content":"fix the flaky test"},"session_id":"old-1","parent_tool_use_id":null,"uuid":"m1","isReplay":true}"#,
             r#"{"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"Fixed."}]},"parent_tool_use_id":null,"session_id":"old-1","uuid":"a1"}"#,
@@ -4082,7 +4338,7 @@ mod tests {
         assert!(again.get("next").is_some_and(|e| e.seq > cleared));
 
         // The next message goes to the new session.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "now the docs".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "now the docs".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         assert!(core.take_writes().last().is_some_and(|w| w.contains("\"session_id\":\"new-2\"")));
         Ok(())
     }
@@ -4136,7 +4392,7 @@ mod tests {
         let init: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
         assert_eq!(init.pointer("/request/subtype").and_then(Value::as_str), Some("initialize"));
 
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "please RUN_BASH".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "please RUN_BASH".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let sent: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
         assert_eq!(sent.get("uuid").and_then(Value::as_str), Some("m1"));
         assert!(sent.get("priority").is_none());
@@ -4164,7 +4420,7 @@ mod tests {
         let w = core.take_writes();
         assert!(["get_settings", "mcp_status", "get_hooks_listing"].iter().all(|k| w.iter().any(|l| l.contains(k))), "{w:?}");
         // A message typed meanwhile waits in kiln's queue.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "next please".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "next please".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         assert_eq!(core.state.queue.len(), 1);
         assert!(core.take_writes().is_empty());
 
@@ -4196,15 +4452,15 @@ mod tests {
         let mut core = Core::new();
         c.start(&mut core);
         core.take_writes();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "SLOW story".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "SLOW story".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         c.line(&mut core, r#"{"type":"command_lifecycle","command_uuid":"m1","state":"started"}"#);
         core.take_writes();
         // Steer goes straight to the CLI (it folds it into the running turn), without priority.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "also the moon".into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "also the moon".into(), mode: SendMode::Steer, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = core.take_writes();
         assert!(w.first().is_some_and(|l| l.contains("also the moon") && !l.contains("priority")));
         // Send now carries priority "now".
-        c.command(&mut core, Command::Send { id: "m3".into(), text: "urgent".into(), mode: SendMode::Now, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m3".into(), text: "urgent".into(), mode: SendMode::Now, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = core.take_writes();
         assert!(w.first().is_some_and(|l| l.contains("\"priority\":\"now\"")));
         // A denial with feedback lets the model continue; without feedback it stops the turn.
@@ -4235,14 +4491,14 @@ mod tests {
         let mut core = Core::new();
         c.start(&mut core);
         core.take_writes();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "stop, then this".into(), mode: SendMode::Now, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "stop, then this".into(), mode: SendMode::Now, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = core.take_writes();
         assert!(w.first().is_some_and(|l| l.contains("\"priority\":\"now\"") && l.contains("stop, then this")), "{w:?}");
         c.command(&mut core, Command::Interrupt);
         assert!(core.take_writes().first().is_some_and(|l| l.contains("\"subtype\":\"interrupt\"")));
         // A queued message while idle still just goes, without priority.
         c.line(&mut core, r#"{"type":"command_lifecycle","command_uuid":"m1","state":"completed"}"#);
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "later".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "later".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         assert!(core.take_writes().first().is_some_and(|l| l.contains("later") && !l.contains("priority")));
     }
 
@@ -4299,6 +4555,59 @@ mod tests {
         assert!(core.take_writes().iter().any(|w| w.contains("\"stop_task\"") && w.contains("a575")));
     }
 
+    /// kiln can't write to a Claude Code subagent itself (2.1.309 and 2.1.310 answer
+    /// `send_task_message` "Unsupported control request subtype" in `-p`, and a prompt naming its
+    /// call goes to the agent): the agent passes the person's message on with SendMessage, asked in
+    /// its turn, and the message shows in the subagent's thread as it goes.
+    #[test]
+    fn a_message_to_a_claude_subagent_goes_by_way_of_its_agents_send_message() -> anyhow::Result<()> {
+        let mut a = crate::harness::kinds::Adapter::Claude(Box::new(Claude::new(false)));
+        let mut core = Core::new();
+        core.state.status = Status::Idle;
+        let send = |id: &str, text: &str, mode| Command::Send { id: id.into(), text: text.into(), mode, attachments: vec![], overrides: None, reply_to: None, task: Some("a575".into()) };
+        for l in [
+            r#"{"type":"assistant","message":{"id":"msg_4","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_5","name":"Agent","input":{"description":"Mock subtask","prompt":"SUBTASK","subagent_type":"general-purpose","run_in_background":true}}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"a575","tool_use_id":"toolu_5","description":"Mock subtask","subagent_type":"general-purpose","is_backgrounded":true,"task_type":"local_agent"}"#,
+        ] {
+            a.line(&mut core, l);
+        }
+        let t = core.state.tasks.first().cloned().unwrap_or_default();
+        assert_eq!((t.takes.clone(), t.via.as_deref()), (vec![SendMode::Queue, SendMode::Steer], Some("parent")));
+        core.take_writes();
+        a.command(&mut core, send("m1", "use the v2 parser", SendMode::Steer));
+        let w = core.take_writes();
+        let relay = w.iter().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v.get("type") == Some(&json!("user"))).ok_or_else(|| anyhow::anyhow!("nothing written: {w:?}"))?;
+        let words = relay.pointer("/message/content").and_then(Value::as_str).unwrap_or("");
+        anyhow::ensure!(words.contains("SendMessage tool (to: \"a575\")") && words.contains("<message>\nuse the v2 parser\n</message>"), "{words}");
+        anyhow::ensure!(relay.get("priority").is_none(), "into its turn, without stopping it: {relay}");
+        // The person's words in the subagent's thread; kiln's ask in the agent's, as kiln's.
+        assert_eq!(core.get("m1").and_then(|e| e.parent.clone()).as_deref(), Some("toolu_5"));
+        assert!(matches!(core.get("kiln-relay-m1").map(|e| &e.body), Some(Body::User { origin: Some(o), .. }) if o == "kiln"));
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
+        a.line(&mut core, r#"{"type":"assistant","message":{"id":"msg_7","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_8","name":"SendMessage","input":{"to":"a575","message":"use the v2 parser","summary":"parser"}}]},"parent_tool_use_id":null}"#);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Started));
+        a.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_8","type":"tool_result","content":"{\"success\":true,\"message\":\"Message queued for delivery to Mock subtask at its next tool round.\"}"}]},"parent_tool_use_id":null}"#);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
+        // One to wait for it to finish waits in its queue, and resumes it once it has.
+        a.command(&mut core, send("m2", "then the tests", SendMode::Queue));
+        assert!(core.take_writes().is_empty());
+        assert_eq!(core.state.tasks.first().map(|t| t.queue.len()), Some(1));
+        a.line(&mut core, r#"{"type":"system","subtype":"task_notification","task_id":"a575","tool_use_id":"toolu_5","status":"completed","summary":"done"}"#);
+        assert!(core.take_writes().iter().any(|l| l.contains("then the tests")));
+        assert_eq!(core.state.tasks.first().map(|t| (t.queue.len(), t.takes.clone())), Some((0, vec![SendMode::Queue])));
+        // A SendMessage Claude Code didn't carry out: the message didn't go, and says why.
+        a.line(&mut core, r#"{"type":"assistant","message":{"id":"msg_9","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_9","name":"SendMessage","input":{"to":"a575","message":"then the tests","summary":"tests"}}]},"parent_tool_use_id":null}"#);
+        a.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_9","type":"tool_result","content":"{\"success\":false,\"message\":\"Agent was not resumed\"}"}]},"parent_tool_use_id":null}"#);
+        assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Cancelled));
+        assert!(core.get("subagent-unsent-m2").is_some_and(|e| e.parent.as_deref() == Some("toolu_5")));
+        // Stopped, it isn't resumed: what's for it isn't sent, and says so.
+        a.line(&mut core, r#"{"type":"system","subtype":"task_notification","task_id":"a575","tool_use_id":"toolu_5","status":"stopped"}"#);
+        a.command(&mut core, send("m3", "and more", SendMode::Queue));
+        assert!(core.take_writes().is_empty());
+        assert_eq!(core.state.delivery.get("m3"), Some(&Delivery::Cancelled));
+        Ok(())
+    }
+
     /// An agent that started a subagent in the background and ended its turn is done with it:
     /// the subagent's own output, coming in after, is the subagent's, and doesn't make its parent
     /// work again (nor hold a message sent to it meanwhile). The parent works again when it does:
@@ -4329,7 +4638,7 @@ mod tests {
         assert_eq!(core.get("toolu_7").and_then(|e| e.parent.clone()), Some("toolu_5".to_owned()), "the subagent's call shows, under it");
         // A message to the parent goes to it now, rather than waiting for the subagent.
         let _ = core.take_writes();
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "and another thing".into(), mode: Default::default(), attachments: Vec::new(), overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "and another thing".into(), mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None});
         assert!(core.take_writes().iter().any(|w| w.contains("and another thing")), "sent at once");
     }
 
@@ -4412,7 +4721,7 @@ mod tests {
     fn a_queued_message_is_steered_into_the_running_turn() -> anyhow::Result<()> {
         let (mut c, mut core, _) = started();
         assert!(core.meta.features.iter().any(|f| f == "queue_steer"));
-        let send = |c: &mut Claude, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let send = |c: &mut Claude, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         send(&mut c, &mut core, "m1", "build it");
         send(&mut c, &mut core, "m2", "tests too, please");
         core.take_writes();
@@ -4435,7 +4744,7 @@ mod tests {
         // Two written during a turn: Claude Code queues both, then starts them together, as one
         // prompt, their words joined, under the second's id (as Claude Code 2.1 does).
         let (mut c, mut core, _) = started();
-        let steer = |c: &mut Claude, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
+        let steer = |c: &mut Claude, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Steer, attachments: vec![], overrides: None, reply_to: None, task: None});
         steer(&mut c, &mut core, "m1", "So I have an issue with your research.");
         steer(&mut c, &mut core, "m2", "This means that your plan isn't grounded.");
         for (id, state) in [("m1", "queued"), ("m2", "queued"), ("m1", "started"), ("m2", "started")] {
@@ -4545,7 +4854,7 @@ mod tests {
     #[test]
     fn a_turn_ended_by_a_stop_sequence_is_cut_short() {
         let (mut c, mut core, _) = started();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "carry on".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "carry on".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None});
         c.line(
             &mut core,
             &json!({"type": "assistant", "message": {"id": "msg_9", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "No response requested."}]}, "parent_tool_use_id": null, "session_id": "s1", "uuid": "a9"}).to_string(),
@@ -4554,7 +4863,7 @@ mod tests {
         let t = core.state.last_turn.clone().unwrap_or_default();
         assert_eq!((t.how.as_str(), t.why.as_deref()), ("cut", Some("stop_sequence")));
         // One that ends as turns do is done; one you stopped is yours.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "and?".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "and?".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None});
         c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "result": "Done.", "stop_reason": "end_turn", "session_id": "s1"}).to_string());
         assert_eq!(core.state.last_turn.as_ref().map(|t| t.how.as_str()), Some("done"));
         c.line(&mut core, &json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "terminal_reason": "aborted_streaming", "session_id": "s1"}).to_string());
@@ -5236,6 +5545,82 @@ mod tests {
         let reqs = requests(&mut core2);
         reply_to(&mut c2, &mut core2, &reqs, "initialize", json!({"commands": []}));
         assert_eq!(ids(&core2).len(), 5);
+    }
+
+    /// Fast mode (the head's bolt) on the models initialize says take it: set as a flag setting of
+    /// the session's, what keeps it off said in Claude Code's own words, its cooldown shown, and set
+    /// again before the first prompt of a session that goes on (a restart, a move).
+    #[test]
+    fn fast_mode_on_the_models_that_take_it() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        assert!(core.meta.features.iter().any(|f| f == "set_speed"));
+        let reqs = requests(&mut core);
+        reply_to(
+            &mut c,
+            &mut core,
+            &reqs,
+            "initialize",
+            json!({"commands": [], "fast_mode_state": "off", "fast_mode_disabled_reason": "sdk_opt_in_required", "models": [
+                {"value": "default", "resolvedModel": "claude-opus-5-5", "displayName": "Default", "supportsFastMode": true},
+                {"value": "sonnet", "resolvedModel": "claude-sonnet-5-5", "displayName": "Sonnet"},
+                {"value": "claude-opus-4-7", "displayName": "Opus 4.7"}
+            ]}),
+        );
+        let speeds = |core: &Core| core.meta.speeds.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        let applied = |reqs: &[(String, String, Value)]| reqs.iter().filter(|r| r.1 == "apply_flag_settings").filter_map(|r| r.2.pointer("/settings/fastMode").and_then(Value::as_bool)).collect::<Vec<_>>();
+        // No model yet: the default model's. A session not opted in yet has nothing in its way.
+        assert_eq!(speeds(&core), ["fast"]);
+        assert_eq!((core.state.speed.as_str(), core.state.speed_blocked.as_deref()), ("", None));
+        assert!(applied(&requests(&mut core)).is_empty());
+        // An alias with a context suffix finds its model; a model without fast mode has no speeds.
+        c.line(&mut core, &json!({"type": "system", "subtype": "init", "cwd": "/w", "session_id": "s", "model": "claude-opus-5-5[1m]", "permissionMode": "default"}).to_string());
+        assert_eq!(speeds(&core), ["fast"]);
+        for (model, fast) in [("claude-opus-4-7", false), ("sonnet", false), ("default", true)] {
+            c.command(&mut core, Command::SetModel { model: model.into(), kind: None });
+            let reqs = requests(&mut core);
+            reply_to(&mut c, &mut core, &reqs, "set_model", json!({}));
+            assert_eq!(!core.meta.speeds.is_empty(), fast, "{model}");
+        }
+        // On: a flag setting of this session's, shown at once.
+        c.command(&mut core, Command::SetSpeed { speed: "fast".into() });
+        assert_eq!(core.state.speed, "fast");
+        assert_eq!(applied(&requests(&mut core)), [true]);
+        // The account can't: said in its words, and what kiln set stays set.
+        let result = |state: &str, reason: Option<&str>| json!({"type": "result", "subtype": "success", "session_id": "s", "fast_mode_state": state, "fast_mode_disabled_reason": reason}).to_string();
+        c.line(&mut core, &result("off", Some("extra_usage_disabled")));
+        assert_eq!(core.state.speed_blocked.as_deref(), Some("Fast mode requires usage credits, which are off for this account"));
+        assert_eq!(core.state.speed, "fast");
+        // On, then cooling down after its own rate limit, then on again.
+        c.line(&mut core, &result("cooldown", None));
+        assert_eq!((core.state.speed_blocked.as_deref(), core.state.speed_cooldown), (None, true));
+        c.line(&mut core, &result("on", None));
+        assert!(!core.state.speed_cooldown);
+        // Off again; a speed Claude Code doesn't have changes nothing.
+        c.command(&mut core, Command::SetSpeed { speed: String::new() });
+        let reqs = requests(&mut core);
+        assert_eq!((core.state.speed.as_str(), applied(&reqs)), ("", vec![false]));
+        c.command(&mut core, Command::SetSpeed { speed: "ultrafast".into() });
+        let reqs = requests(&mut core);
+        assert_eq!((core.state.speed.as_str(), applied(&reqs)), ("", vec![]));
+
+        // Going on with fast mode on: set again before its first prompt.
+        let mut c2 = Claude::new(false).with_speed(Some("fast".into()));
+        let mut core2 = Core::new();
+        c2.start(&mut core2);
+        let reqs = requests(&mut core2);
+        reply_to(&mut c2, &mut core2, &reqs, "initialize", json!({"commands": [], "models": [], "fast_mode_state": "off", "fast_mode_disabled_reason": "sdk_opt_in_required"}));
+        let reqs = requests(&mut core2);
+        assert_eq!((core2.state.speed.as_str(), applied(&reqs)), ("fast", vec![true]));
+        // Never set from kiln: as Claude Code says.
+        let mut c3 = Claude::new(false);
+        let mut core3 = Core::new();
+        c3.start(&mut core3);
+        let reqs = requests(&mut core3);
+        reply_to(&mut c3, &mut core3, &reqs, "initialize", json!({"commands": [], "models": [], "fast_mode_state": "on"}));
+        let reqs = requests(&mut core3);
+        assert_eq!((core3.state.speed.as_str(), applied(&reqs)), ("fast", vec![]));
     }
 
     #[test]

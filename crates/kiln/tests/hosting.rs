@@ -299,7 +299,7 @@ fn w14_ac01_stacks() -> anyhow::Result<()> {
 
 /// `kiln` with `args` in `dir`, as a developer whose token is `token` would run it.
 fn kiln(home: &Path, dir: &Path, s: &Server, token: &str, args: &[&str]) -> anyhow::Result<(bool, String)> {
-    let o = Command::new(env!("CARGO_BIN_EXE_kiln"))
+    let o = common::kiln()
         .args(args)
         .current_dir(dir)
         .env("HOME", home)
@@ -1081,9 +1081,11 @@ fn w14_generated_files_and_blobs() -> anyhow::Result<()> {
 }
 
 /// The facade's runs and code scanning (docs/ci.md W14-R11): a job reads its own run, the
-/// repository's runs and its workflow as GitHub serves them, and code scanning takes SARIF (gzipped
-/// and in base64), reads it into alerts, says it's complete, and marks an alert fixed when a
-/// later analysis no longer finds it.
+/// repository's runs and its workflow as GitHub serves them, and people's permissions on the
+/// repository as actions check them (the owner admin, a developer write, a viewer read, someone
+/// without a grant none, no such person 404); code scanning takes SARIF (gzipped and in base64),
+/// reads it into alerts, says it's complete, and marks an alert fixed when a later analysis no
+/// longer finds it.
 #[test]
 fn w14_r11_runs_and_code_scanning() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1094,6 +1096,8 @@ fn w14_r11_runs_and_code_scanning() -> anyhow::Result<()> {
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "native repository: {st} {body}");
     let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    person(&s, "reader", &["viewer@repo:acme/app"])?;
+    person(&s, "stranger", &[])?;
     must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
     let work = dir.path().join("work");
     // The first trunk: the poller's first look takes it as it is.
@@ -1133,6 +1137,14 @@ jobs:
           # custom properties (none).
           test "$(api "$R/code-scanning/codeql-action/features")" = "{}"
           test "$(api "$R/properties/values")" = "[]"
+          # What openai/codex-action asks before it acts for the run's actor: their access here,
+          # as GitHub's legacy base permission.
+          perm() { api "$R/collaborators/$1/permission" | sed -n 's/.*"permission":"\([a-z]*\)".*/\1/p'; }
+          test "$(perm admin)" = admin
+          test "$(perm dev)" = write
+          test "$(perm reader)" = read
+          test "$(perm stranger)" = none
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$R/collaborators/nobody/permission")" = 404
           sarif() { printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Lint","rules":[{"id":"no-eval","defaultConfiguration":{"level":"error"}}]}},"results":[%s]}]}' "$1" | gzip -c | base64 -w0; }
           found='{"ruleId":"no-eval","message":{"text":"eval is evil"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/a.js"},"region":{"startLine":3}}}]}'
           up() { api -X POST "$R/code-scanning/sarifs" -d "{\"commit_sha\":\"$GITHUB_SHA\",\"ref\":\"$GITHUB_REF\",\"sarif\":\"$(sarif "$1")\",\"tool_name\":\"Lint\"}" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'; }
@@ -3094,7 +3106,7 @@ fn w17_r01_kiln_debug_terminal() -> anyhow::Result<()> {
         anyhow::ensure!(Instant::now() < deadline, "the leg never ran: {body}\n{}", s.log());
         std::thread::sleep(Duration::from_millis(500));
     };
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kiln"))
+    let mut child = common::kiln()
         .args(["debug", "terminal", &leg])
         .env("HOME", &home)
         .env("KILN_URL", format!("http://127.0.0.1:{}", s.port))
@@ -3253,8 +3265,10 @@ fn w03_ac07_a_diffs_versions_are_pull_request_events() -> anyhow::Result<()> {
     std::fs::create_dir_all(work.join(".github/workflows"))?;
     std::fs::write(
         work.join(".github/workflows/pr.yml"),
-        "on: pull_request\njobs:\n  show:\n    runs-on: local\n    steps:\n      - run: |\n          echo \"saw ${{ github.event.action }} of ${{ github.event.number }}: ${{ github.event.pull_request.head.sha }} onto ${{ github.event.pull_request.base.ref }}\"\n",
+        "on: pull_request\njobs:\n  show:\n    runs-on: local\n    steps:\n      - run: |\n          echo \"saw ${{ github.event.action }} of ${{ github.event.number }}: ${{ github.event.pull_request.head.sha }} onto ${{ github.event.pull_request.base.ref }} (${{ github.event.pull_request.commits }} commit, +${{ github.event.pull_request.additions }} -${{ github.event.pull_request.deletions }} in ${{ github.event.pull_request.changed_files }})\"\n",
     )?;
+    // Its paths filter reads what each version changes (W03-R05): neither touches `docs/`.
+    std::fs::write(work.join(".github/workflows/docs.yml"), "on:\n  pull_request:\n    paths: ['docs/**']\njobs:\n  docs:\n    runs-on: local\n    steps:\n      - run: echo docs\n")?;
     std::fs::write(work.join("README.md"), "prs\n")?;
     must(git(&home, &work, &["add", "."]), "add")?;
     must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
@@ -3271,7 +3285,9 @@ fn w03_ac07_a_diffs_versions_are_pull_request_events() -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(300);
     let saw = loop {
         let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/prs&event=pull_request&limit=10", &s.admin, None)?;
-        let done: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).collect();
+        let runs = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        anyhow::ensure!(!runs.iter().any(|r| text(r, "workflow").ends_with("docs.yml")), "docs.yml ran for versions that don't touch docs/: {body}");
+        let done: Vec<Value> = runs.into_iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).collect();
         if done.len() >= 2 {
             let mut logs = Vec::new();
             for r in &done {
@@ -3290,8 +3306,9 @@ fn w03_ac07_a_diffs_versions_are_pull_request_events() -> anyhow::Result<()> {
         anyhow::ensure!(Instant::now() < deadline, "two pull_request runs didn't finish: {body}\n{}", s.log());
         std::thread::sleep(Duration::from_millis(500));
     };
-    assert!(saw.iter().any(|l| l.contains(&format!("saw opened of 1: {v1} onto main"))), "v1 opened it: {saw:?}");
-    assert!(saw.iter().any(|l| l.contains(&format!("saw synchronize of 1: {v2} onto main"))), "v2 synchronized it: {saw:?}");
+    // GitHub's counts, which a workflow sizes its fetch by (cpython's `--depth=$(( commits + 1 ))`).
+    assert!(saw.iter().any(|l| l.contains(&format!("saw opened of 1: {v1} onto main (1 commit, +1 -0 in 1)"))), "v1 opened it: {saw:?}");
+    assert!(saw.iter().any(|l| l.contains(&format!("saw synchronize of 1: {v2} onto main (1 commit, +1 -0 in 1)"))), "v2 synchronized it: {saw:?}");
     Ok(())
 }
 

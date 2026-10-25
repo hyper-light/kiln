@@ -244,6 +244,9 @@ pub struct LegSpec {
     /// what a leg is, so not of its reuse key.
     #[serde(skip)]
     pub unaffected: Option<String>,
+    /// The workflow file that defines its job (W06-R03's `job.workflow_*`, the OIDC token's
+    /// `job_workflow_ref`).
+    pub defined_in: DefinedIn,
     /// The workflow whose job this is (steps, env, defaults, outputs), for the runner.
     #[serde(skip)]
     pub workflow: Arc<Workflow>,
@@ -378,6 +381,22 @@ struct Scope {
     cache_cap: Option<crate::store::cache::Mode>,
     secrets: SecretsSpec,
     nodes: Vec<usize>,
+    /// The workflow file that defines its jobs (W06-R03).
+    defined: DefinedIn,
+}
+
+/// The workflow file that defines a leg's job, as `job.workflow_*` say it (W06-R03): the run's
+/// own workflow, or a called one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DefinedIn {
+    /// `owner/repo/<path>@<ref>`.
+    pub workflow_ref: String,
+    pub workflow_sha: String,
+    /// `owner/repo`.
+    pub workflow_repository: String,
+    /// The file's path in its repository: `.github/workflows/build.yml`.
+    pub workflow_file_path: String,
 }
 
 /// A run's plan in progress.
@@ -677,8 +696,24 @@ impl RunPlan {
                 node.leg_needs = leg_needs;
             }
         }
-        self.scopes.push(Scope { wf, dialect, inputs, prefix, id_prefix, caller, depth, perms_cap, cache_cap, secrets, nodes });
+        let defined = self.defined_in(&wf);
+        self.scopes.push(Scope { wf, dialect, inputs, prefix, id_prefix, caller, depth, perms_cap, cache_cap, secrets, nodes, defined });
         s
+    }
+
+    /// The workflow file that defines `wf`'s jobs (W06-R03): a remote one's origin, else the run's
+    /// own repository at the run's ref and commit, as `github.workflow_ref` says it for the run's
+    /// own workflow and GitHub says it for a `./` or `$/` one (the same commit).
+    fn defined_in(&self, wf: &Workflow) -> DefinedIn {
+        let github = |k: &str| match &self.github {
+            Value::Object(m) => m.get(k).map(Value::coerce_string).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let (repository, git_ref, sha) = match &wf.origin {
+            Some(o) => (o.repository.clone(), o.git_ref.clone(), o.sha.clone()),
+            None => (github("repository"), github("ref"), github("sha")),
+        };
+        DefinedIn { workflow_ref: format!("{repository}/{}@{git_ref}", wf.path), workflow_sha: sha, workflow_repository: repository, workflow_file_path: wf.path.clone() }
     }
 
     /// Whether the plan has finished, and how.
@@ -1412,6 +1447,7 @@ impl RunPlan {
             reads: reads(job),
             cache_cap: None,
             unaffected: None,
+            defined_in: scope.map(|s| s.defined.clone()).unwrap_or_default(),
             workflow: wf.clone(),
             job_index,
         };
