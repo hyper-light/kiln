@@ -21,6 +21,7 @@ pub mod environments;
 pub mod events;
 pub mod experiments;
 pub mod facade;
+pub mod graphs;
 pub mod hooks;
 pub mod hosting;
 pub mod imap;

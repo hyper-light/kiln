@@ -704,8 +704,10 @@ keys), so both sides agree on every value.
     `run_url`), `run` (`id`, `number`, `attempt`, `env`: W04-R17), `diff` and `stack` (W14), and
     `runner.facts` (W13);
   - functions `changed(glob, …)` (whether the trigger changed matching files; W03-R12),
-    `matches(s, regex)` (RE2 syntax, linear time), `coalesce(a, b, …)` (the first non-empty
-    value), `split(s, sep)`, `replace(s, from, to)`, `lower(s)`, `upper(s)`,
+    `affected(ecosystem)` (the packages of `cargo`, `npm`, `uv` or `go` the trigger's changed
+    files can affect, and those depending on them, by name and sorted, from the commit's package
+    graph; W24-R16, R17), `matches(s, regex)` (RE2 syntax, linear time), `coalesce(a, b, …)` (the
+    first non-empty value), `split(s, sep)`, `replace(s, from, to)`, `lower(s)`, `upper(s)`,
     `trim(s)`, `fromYAML(s)`, `toYAML(v)`.
 
   (`case` is GitHub's own, available in both dialects; see W01-R06.)
@@ -8065,8 +8067,8 @@ improvement on top. Every row cites the requirement that delivers it.
 
 All operators and `contains`, `startsWith`, `endsWith`, `format`, `join`, `toJSON`, `fromJSON`,
 `hashFiles` (**S\***: sorted order, W01-R09), `success`, `always`, `cancelled`, `failure`: **S**
-(W01). kiln adds `changed`, `matches`, `coalesce`, `case`, `split`, `replace`, `lower`, `upper`,
-`trim`, `fromYAML`, `toYAML`: **K**.
+(W01). kiln adds `changed`, `affected` (W24-R17), `matches`, `coalesce`, `case`, `split`, `replace`,
+`lower`, `upper`, `trim`, `fromYAML`, `toYAML`: **K**.
 
 ### A.4 Workflow commands and files
 
