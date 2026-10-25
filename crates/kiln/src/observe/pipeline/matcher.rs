@@ -265,6 +265,16 @@ impl Admit {
     }
 }
 
+/// Where nothing may begin (one past the last instruction).
+const NOWHERE: Admit = Admit { bytes: [0; 4], end: false, any: false };
+
+/// Whether `hay` holds `lit` at `at`, a byte at a time: a rule's literals are a few bytes (a space,
+/// a quote and a space, a bracket), fewer than a call to `memcmp` costs (§12.17's profile).
+#[inline]
+fn holds_lit(hay: &[u8], at: usize, lit: &[u8]) -> bool {
+    hay.get(at..).is_some_and(|h| h.len() >= lit.len() && h.iter().zip(lit).all(|(a, b)| a == b))
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Inst {
     /// These bytes: `lits[at..at + len]`.
@@ -756,9 +766,10 @@ impl Program {
         })
     }
 
+    /// Where instruction `pc` may begin (read in place: a split asks two of them a step).
     #[inline]
-    fn admit(&self, pc: usize) -> Admit {
-        self.admit.get(pc).copied().unwrap_or_default()
+    fn admit(&self, pc: usize) -> &Admit {
+        self.admit.get(pc).unwrap_or(&NOWHERE)
     }
 
     /// Whether `value` matches from its start (to its end, as the program's `$` says), its groups
@@ -834,7 +845,7 @@ impl Program {
             next = match inst {
                 Inst::Lit { at: l, len: n } => {
                     let lit = self.lits.get(l as usize..(l + n) as usize).unwrap_or_default();
-                    hay.get(at..).is_some_and(|h| h.starts_with(lit)).then_some((pc + 1, at + lit.len()))
+                    holds_lit(hay, at, lit).then_some((pc + 1, at + lit.len()))
                 }
                 Inst::One(set) => self.sets.get(set as usize).and_then(|s| s.at(hay, at)).map(|n| (pc + 1, at + n)),
                 Inst::Run { set, min, max, greedy, keep } => {
@@ -1304,5 +1315,13 @@ mod tests {
         }
         // A loop that may match nothing is `regex`'s.
         assert!(both(r"(?:a*)*b").is_none());
+    }
+
+    /// A literal is held where its bytes are, whole: not past the value's end, not cut short.
+    #[test]
+    fn a_literal_is_held_where_its_bytes_are() {
+        let hay = b"GET /x HTTP/1.1";
+        assert!(holds_lit(hay, 0, b"GET ") && holds_lit(hay, 7, b"HTTP/") && holds_lit(hay, 15, b"") && holds_lit(hay, 14, b"1"));
+        assert!(!holds_lit(hay, 7, b"HTTP/1.1x") && !holds_lit(hay, 14, b"1.") && !holds_lit(hay, 16, b"") && !holds_lit(hay, 1, b"GET"));
     }
 }

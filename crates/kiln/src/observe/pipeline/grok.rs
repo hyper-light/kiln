@@ -865,6 +865,54 @@ const fn ua_starts() -> [u32; 256] {
 
 static UA_STARTS: [u32; 256] = ua_starts();
 
+/// A word's place among [`UA_WORDS`], found as the program is compiled (past them for a word that
+/// is none of them: a test holds that each named below is one).
+#[allow(clippy::indexing_slicing)]
+const fn ua_word(w: &str) -> usize {
+    let w = w.as_bytes();
+    let mut k = 0;
+    while k < UA_WORDS.len() {
+        let x = UA_WORDS[k].as_bytes();
+        if x.len() == w.len() {
+            let mut i = 0;
+            while i < x.len() && x[i] == w[i] {
+                i += 1;
+            }
+            if i == x.len() {
+                return k;
+            }
+        }
+        k += 1;
+    }
+    UA_WORDS.len()
+}
+
+const EDG: usize = ua_word("Edg/");
+const OPR: usize = ua_word("OPR/");
+const FIREFOX: usize = ua_word("Firefox/");
+const CHROME: usize = ua_word("Chrome/");
+const VERSION: usize = ua_word("Version/");
+const CURL: usize = ua_word("curl/");
+const CHROMIUM: usize = ua_word("Chromium/");
+const SAFARI: usize = ua_word("Safari/");
+const WINDOWS: usize = ua_word("Windows");
+const IPHONE: usize = ua_word("iPhone");
+const IPAD: usize = ua_word("iPad");
+const IOS: usize = ua_word("iOS");
+const MAC_OS_X: usize = ua_word("Mac OS X");
+const MACINTOSH: usize = ua_word("Macintosh");
+const ANDROID: usize = ua_word("Android");
+const LINUX: usize = ua_word("Linux");
+const MOBILE: usize = ua_word("Mobile");
+const TABLET: usize = ua_word("Tablet");
+
+/// Whether `b` begins with `w`, a byte at a time: a word of a few bytes, most told apart at its
+/// second (fewer than a call to `memcmp` costs, §12.17's profile).
+#[inline]
+fn begins_with(b: &[u8], w: &[u8]) -> bool {
+    b.len() >= w.len() && b.iter().zip(w).all(|(x, y)| x == y)
+}
+
 /// A user agent's browser, operating system and device, as far as its words tell (the families
 /// Datadog's parser names, not its full database). Its words found in one pass: at each byte, the
 /// words that may begin with it (a word found is not looked for again).
@@ -888,7 +936,7 @@ pub(crate) fn user_agent(ua: &str, prefix: Option<&str>, out: &mut Attrs) {
             m &= m - 1;
             let rest = b.get(i..).unwrap_or_default();
             let hit = match UA_WORDS.get(k) {
-                Some(w) => rest.starts_with(w.as_bytes()),
+                Some(w) => begins_with(rest, w.as_bytes()),
                 None => BOT_WORDS.get(k - UA_WORDS.len()).is_some_and(|w| rest.get(..w.len()).is_some_and(|r| r.eq_ignore_ascii_case(w.as_bytes()))),
             };
             if hit {
@@ -899,32 +947,31 @@ pub(crate) fn user_agent(ua: &str, prefix: Option<&str>, out: &mut Attrs) {
             }
         }
     }
-    let has = |w: &str| UA_WORDS.iter().position(|x| *x == w).is_some_and(|k| found & (1 << k) != 0);
+    let has = |k: usize| k < UA_WORDS.len() && found & (1 << k) != 0;
     // A version's major part: of its digits and dots, those before the first dot (none where
     // neither follows its key).
-    let version = |key: &str| -> Option<&str> {
-        let k = UA_WORDS.iter().position(|x| *x == key)?;
-        if found & (1 << k) == 0 {
+    let version = |k: usize| -> Option<&str> {
+        if !has(k) {
             return None;
         }
-        let rest = ua.get(first.get(k)? + key.len()..)?;
+        let rest = ua.get(first.get(k)? + UA_WORDS.get(k)?.len()..)?;
         let run = rest.bytes().take_while(|c| c.is_ascii_digit() || *c == b'.').count();
         let major = rest.bytes().take_while(u8::is_ascii_digit).count();
         if run == 0 { None } else { rest.get(..major) }
     };
     let bot = found >> UA_WORDS.len() != 0;
-    let browser = if has("Edg/") {
-        Some(("Edge", version("Edg/")))
-    } else if has("OPR/") {
-        Some(("Opera", version("OPR/")))
-    } else if has("Firefox/") {
-        Some(("Firefox", version("Firefox/")))
-    } else if has("Chrome/") && !has("Chromium/") {
-        Some(("Chrome", version("Chrome/")))
-    } else if has("Safari/") && has("Version/") {
-        Some(("Safari", version("Version/")))
+    let browser = if has(EDG) {
+        Some(("Edge", version(EDG)))
+    } else if has(OPR) {
+        Some(("Opera", version(OPR)))
+    } else if has(FIREFOX) {
+        Some(("Firefox", version(FIREFOX)))
+    } else if has(CHROME) && !has(CHROMIUM) {
+        Some(("Chrome", version(CHROME)))
+    } else if has(SAFARI) && has(VERSION) {
+        Some(("Safari", version(VERSION)))
     } else if ua.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("curl/")) {
-        Some(("curl", version("curl/")))
+        Some(("curl", version(CURL)))
     } else {
         None
     };
@@ -934,15 +981,15 @@ pub(crate) fn user_agent(ua: &str, prefix: Option<&str>, out: &mut Attrs) {
             put(out, "browser.major", v);
         }
     }
-    let os = if has("Windows") {
+    let os = if has(WINDOWS) {
         Some("Windows")
-    } else if has("iPhone") || has("iPad") || has("iOS") {
+    } else if has(IPHONE) || has(IPAD) || has(IOS) {
         Some("iOS")
-    } else if has("Mac OS X") || has("Macintosh") {
+    } else if has(MAC_OS_X) || has(MACINTOSH) {
         Some("Mac OS X")
-    } else if has("Android") {
+    } else if has(ANDROID) {
         Some("Android")
-    } else if has("Linux") {
+    } else if has(LINUX) {
         Some("Linux")
     } else {
         None
@@ -952,9 +999,9 @@ pub(crate) fn user_agent(ua: &str, prefix: Option<&str>, out: &mut Attrs) {
     }
     let device = if bot {
         "Bot"
-    } else if has("Mobile") || has("iPhone") || has("Android") {
+    } else if has(MOBILE) || has(IPHONE) || has(ANDROID) {
         "Mobile"
-    } else if has("iPad") || has("Tablet") {
+    } else if has(IPAD) || has(TABLET) {
         "Tablet"
     } else {
         "Desktop"
@@ -1893,6 +1940,36 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
             let before = user_agent_before(ua);
             assert_eq!(ours.iter().collect::<Vec<_>>(), before.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>(), "{ua:?}");
         }
+    }
+
+    /// Each word the user agent's reading asks about by its place is the word at that place.
+    #[test]
+    fn a_user_agent_s_words_are_at_their_places() {
+        let named = [
+            (EDG, "Edg/"),
+            (OPR, "OPR/"),
+            (FIREFOX, "Firefox/"),
+            (CHROME, "Chrome/"),
+            (VERSION, "Version/"),
+            (CURL, "curl/"),
+            (CHROMIUM, "Chromium/"),
+            (SAFARI, "Safari/"),
+            (WINDOWS, "Windows"),
+            (IPHONE, "iPhone"),
+            (IPAD, "iPad"),
+            (IOS, "iOS"),
+            (MAC_OS_X, "Mac OS X"),
+            (MACINTOSH, "Macintosh"),
+            (ANDROID, "Android"),
+            (LINUX, "Linux"),
+            (MOBILE, "Mobile"),
+            (TABLET, "Tablet"),
+        ];
+        for (k, w) in named {
+            assert_eq!(UA_WORDS.get(k), Some(&w), "{w}");
+        }
+        assert_eq!(ua_word("Netscape"), UA_WORDS.len());
+        assert!(begins_with(b"Firefox/131", b"Firefox/") && !begins_with(b"Fire", b"Firefox/") && begins_with(b"x", b"") && !begins_with(b"Firefax/", b"Firefox/"));
     }
 
     #[test]

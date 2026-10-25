@@ -103,8 +103,35 @@ pub struct RecordBuf {
     /// Its service, host and source.
     names: [Span; 3],
     message: Span,
-    /// Each attribute's key and value.
-    attrs: Vec<(Span, Span)>,
+    attrs: Vec<Attr>,
+    /// A bit of each of its keys' tags ([`bit_of`]): a key whose bit is not set is not among them.
+    held: [u64; 2],
+}
+
+/// An attribute: its key's place, its value's, and its key's tag ([`tag_of`]).
+#[derive(Debug, Clone, Copy)]
+struct Attr {
+    key: Span,
+    value: Span,
+    tag: u32,
+}
+
+/// A key's tag: its length and its last three bytes (attributes' names share their beginnings,
+/// `http.…`, far more than their ends). A key is looked for by its tag; its text is compared only
+/// where the tags are the same.
+#[inline]
+fn tag_of(key: &[u8]) -> u32 {
+    let n = key.len();
+    let back = |i: usize| n.checked_sub(i).and_then(|j| key.get(j)).map_or(0, |&b| u32::from(b));
+    (n as u32 & 0xFF) | back(1) << 8 | back(2) << 16 | back(3) << 24
+}
+
+/// A tag's bit among a record's 128 ([`RecordBuf::held`]): its word and its bit, by its hash's
+/// top seven bits (Fibonacci's multiplier).
+#[inline]
+fn bit_of(tag: u32) -> (usize, u64) {
+    let h = tag.wrapping_mul(0x9E37_79B9);
+    ((h >> 31) as usize, 1 << ((h >> 25) & 63))
 }
 
 const SERVICE: usize = 0;
@@ -117,12 +144,12 @@ enum Field {
     Name(usize),
 }
 
-fn field_of(key: &str) -> Option<Field> {
+fn field_of(key: &[u8]) -> Option<Field> {
     match key {
-        "message" => Some(Field::Message),
-        "service" => Some(Field::Name(SERVICE)),
-        "host" => Some(Field::Name(HOST)),
-        "source" => Some(Field::Name(SOURCE)),
+        b"message" => Some(Field::Message),
+        b"service" => Some(Field::Name(SERVICE)),
+        b"host" => Some(Field::Name(HOST)),
+        b"source" => Some(Field::Name(SOURCE)),
         _ => None,
     }
 }
@@ -138,6 +165,7 @@ impl RecordBuf {
         self.names = [(0, 0); 3];
         self.message = (0, 0);
         self.attrs.clear();
+        self.held = [0; 2];
     }
 
     /// `s` written at the end of the buffer: its place (none past 4 GiB, nothing written).
@@ -150,6 +178,11 @@ impl RecordBuf {
 
     fn at(&self, (a, e): Span) -> &str {
         self.text.get(a as usize..e as usize).unwrap_or("")
+    }
+
+    /// The bytes of a place (a key's, compared with another's: no character's bounds asked).
+    fn bytes_at(&self, (a, e): Span) -> &[u8] {
+        self.text.as_bytes().get(a as usize..e as usize).unwrap_or_default()
     }
 
     fn name(&self, i: usize) -> &str {
@@ -204,21 +237,56 @@ impl RecordBuf {
     }
 
     pub fn attr_at(&self, i: usize) -> Option<(&str, &str)> {
-        let &(k, v) = self.attrs.get(i)?;
-        Some((self.at(k), self.at(v)))
+        let a = self.attrs.get(i)?;
+        Some((self.at(a.key), self.at(a.value)))
     }
 
     pub fn attrs(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
-        self.attrs.iter().map(|&(k, v)| (self.at(k), self.at(v)))
+        self.attrs.iter().map(|a| (self.at(a.key), self.at(a.value)))
     }
 
     /// The first attribute of the name's value.
     pub fn attr(&self, key: &str) -> Option<&str> {
-        self.attrs.iter().find(|&&(k, _)| self.at(k) == key).map(|&(_, v)| self.at(v))
+        let i = self.position(key.as_bytes())?;
+        self.attrs.get(i).map(|a| self.at(a.value))
     }
 
-    fn position(&self, key: &str) -> Option<usize> {
-        self.attrs.iter().position(|&(k, _)| self.at(k) == key)
+    /// Where the first attribute of the name is.
+    #[inline]
+    fn position(&self, key: &[u8]) -> Option<usize> {
+        self.position_of(key, tag_of(key))
+    }
+
+    /// Where the first attribute of the name (its tag `tag`) is: none at once where its tag's bit
+    /// is not set, else the first of its tag whose key is the same.
+    #[inline]
+    fn position_of(&self, key: &[u8], tag: u32) -> Option<usize> {
+        let (w, bit) = bit_of(tag);
+        if self.held.get(w).is_none_or(|h| h & bit == 0) {
+            return None;
+        }
+        self.attrs.iter().position(|a| a.tag == tag && self.bytes_at(a.key) == key)
+    }
+
+    /// An attribute of a key and value in its buffer added, after the rest.
+    fn push_span(&mut self, key: Span, value: Span, tag: u32) {
+        self.attrs.push(Attr { key, value, tag });
+        let (w, bit) = bit_of(tag);
+        if let Some(h) = self.held.get_mut(w) {
+            *h |= bit;
+        }
+    }
+
+    /// Its keys' bits again, of those left (once some were taken out).
+    fn remark(&mut self) {
+        let mut held = [0u64; 2];
+        for a in &self.attrs {
+            let (w, bit) = bit_of(a.tag);
+            if let Some(h) = held.get_mut(w) {
+                *h |= bit;
+            }
+        }
+        self.held = held;
     }
 
     pub fn reserve_attrs(&mut self, n: usize) {
@@ -229,14 +297,14 @@ impl RecordBuf {
     pub fn push_attr(&mut self, key: &str, value: &str) {
         let at = self.text.len();
         match (self.put(key), self.put(value)) {
-            (Some(k), Some(v)) => self.attrs.push((k, v)),
+            (Some(k), Some(v)) => self.push_span(k, v, tag_of(key.as_bytes())),
             _ => self.text.truncate(at),
         }
     }
 
     /// The first attribute of the name given `value`, or one added.
     pub fn set_attr(&mut self, key: &str, value: &str) {
-        match self.position(key) {
+        match self.position(key.as_bytes()) {
             Some(i) => self.set_value_at(i, value),
             None => self.push_attr(key, value),
         }
@@ -248,14 +316,15 @@ impl RecordBuf {
             && let Some(v) = self.put(value)
             && let Some(slot) = self.attrs.get_mut(i)
         {
-            slot.1 = v;
+            slot.value = v;
         }
     }
 
     /// The first attribute of the name taken out, the rest in their order.
     pub fn remove_attr(&mut self, key: &str) {
-        if let Some(i) = self.position(key) {
+        if let Some(i) = self.position(key.as_bytes()) {
             self.attrs.remove(i);
+            self.remark();
         }
     }
 
@@ -263,7 +332,11 @@ impl RecordBuf {
     pub fn retain_attrs(&mut self, mut keep: impl FnMut(&str, &str) -> bool) {
         let text = &self.text;
         let at = |(a, e): Span| text.get(a as usize..e as usize).unwrap_or("");
-        self.attrs.retain(|&(k, v)| keep(at(k), at(v)));
+        let before = self.attrs.len();
+        self.attrs.retain(|a| keep(at(a.key), at(a.value)));
+        if self.attrs.len() != before {
+            self.remark();
+        }
     }
 
     /// Each of `a` set as [`RecordBuf::set_attr`] sets it, in its order, but a key that names one of
@@ -278,7 +351,7 @@ impl RecordBuf {
         self.attrs.reserve(a.pairs.len());
         for &(ka, kb, ve) in &a.pairs {
             let (k, v) = ((base + ka, base + kb), (base + kb, base + ve));
-            match field_of(self.at(k)) {
+            match field_of(self.bytes_at(k)) {
                 Some(Field::Message) => self.message = v,
                 Some(Field::Name(i)) => {
                     if let Some(slot) = self.names.get_mut(i) {
@@ -293,14 +366,15 @@ impl RecordBuf {
     /// An attribute whose key and value are in the buffer already: the first of its name given
     /// the value, or it added.
     fn put_attr_span(&mut self, k: Span, v: Span) {
-        let key = self.at(k);
-        match self.attrs.iter().position(|&(x, _)| self.at(x) == key) {
+        let key = self.bytes_at(k);
+        let tag = tag_of(key);
+        match self.position_of(key, tag) {
             Some(i) => {
                 if let Some(slot) = self.attrs.get_mut(i) {
-                    slot.1 = v;
+                    slot.value = v;
                 }
             }
-            None => self.attrs.push((k, v)),
+            None => self.push_span(k, v, tag),
         }
     }
 
@@ -415,7 +489,8 @@ mod tests {
         for round in 0..2_000 {
             let mut r = Record { ts: round, severity: (round % 24) as u8, service: "web".into(), host: "h1".into(), source: "nginx".into(), message: format!("line {round}"), ..Record::default() };
             b.set_from(&r);
-            let keys = ["a", "b", "c", "http.status_code", "é", ""];
+            // Two of the same tag (the same length and last three bytes): told apart by their text.
+            let keys = ["a", "b", "c", "http.status_code", "é", "", "status_code", "statuz_code"];
             for step in 0..20 {
                 let k = keys[rng.below(keys.len() as u64) as usize];
                 let v = format!("v{round}.{step}");
@@ -475,6 +550,47 @@ mod tests {
             super::super::record::put_row(&mut theirs, &r, 5);
             assert_eq!(ours, theirs, "round {round}'s row");
         }
+    }
+
+    /// A key is found by its tag and its bit: among 600 attributes (every bit set many times over),
+    /// 300 of them of one tag (the same length and last bytes), each is found as the one of its
+    /// name, set in place, taken out alone; a key none has is none, before and after.
+    #[test]
+    fn a_key_is_found_among_many_and_among_those_of_its_tag() {
+        let mut b = RecordBuf::default();
+        let mut model: Vec<(String, String)> = Vec::new();
+        let keys: Vec<String> = (0..300).map(|i| format!("k{i:03}.code")).chain((0..300).map(|i| format!("attr.{i}"))).collect();
+        assert!(keys.iter().take(300).all(|k| tag_of(k.as_bytes()) == tag_of(b"k000.code")), "300 keys of one tag");
+        let check = |b: &RecordBuf, model: &[(String, String)]| {
+            assert_eq!(b.attrs().map(|(k, v)| (k.to_owned(), v.to_owned())).collect::<Vec<_>>(), model);
+            for k in &keys {
+                assert_eq!(b.attr(k), model.iter().find(|(x, _)| x == k).map(|(_, v)| v.as_str()), "{k}");
+            }
+            for absent in ["k300.code", "attr.300", "", "zzz", "k000.cod", "k000.codex"] {
+                assert_eq!(b.attr(absent), None, "{absent}");
+            }
+        };
+        for (i, k) in keys.iter().enumerate() {
+            b.set_attr(k, &format!("v{i}"));
+            model.push((k.clone(), format!("v{i}")));
+        }
+        check(&b, &model);
+        for (i, k) in keys.iter().enumerate().step_by(7) {
+            b.set_attr(k, &format!("again {i}"));
+            model[i].1 = format!("again {i}");
+        }
+        check(&b, &model);
+        for k in keys.iter().skip(3).step_by(5) {
+            b.remove_attr(k);
+            model.retain(|(x, _)| x != k);
+        }
+        check(&b, &model);
+        b.retain_attrs(|k, _| !k.ends_with('3'));
+        model.retain(|(k, _)| !k.ends_with('3'));
+        check(&b, &model);
+        b.clear();
+        model.clear();
+        check(&b, &model);
     }
 
     /// A long line's room is let go past its bound; a short one's is kept for the next.
