@@ -158,8 +158,8 @@ fn stands(c: &rusqlite::Connection, leg: &str, now: i64) -> rusqlite::Result<boo
 }
 
 /// The newest succeeded leg for `hash` within `max_age` whose artifacts are all still there, with
-/// its report: from the work ledger first (W24-R06), then from W08-R10's own table, which holds
-/// the results kept before the ledger.
+/// its report: from the work ledger alone, on its one path (W24-R06, R30). The newest run that
+/// reproduced the entry is the one taken, so a rerun past `max_age` makes it fresh again.
 pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u64) -> anyhow::Result<Option<(String, String)>> {
     let (hash, since) = (hash.to_owned(), crate::util::now_unix().saturating_sub(i64::try_from(max_age).unwrap_or(i64::MAX)));
     let (scope, unit) = (crate::ci::work::scope(repo, domain(trusted)), work_unit(&hash, trusted));
@@ -175,17 +175,11 @@ pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u
                 if let Some(by) = &hit.class {
                     tracing::info!(leg = %hit.recorded.provenance.leg, class = ?by.class, why = ?by.why, "a leg's result is reused by its class (W24-R30)");
                 }
-                return Ok(Some((hit.recorded.provenance.leg.clone(), hit.recorded.outputs.get("report").cloned().unwrap_or_default())));
+                // Its report is among its notes; an entry kept before them has it among its outputs.
+                let report = hit.recorded.notes.get("report").or_else(|| hit.recorded.outputs.get("report")).cloned().unwrap_or_default();
+                return Ok(Some((hit.recorded.provenance.leg.clone(), report)));
             }
-            Ok(c.query_row(
-                "SELECT r.leg_id, r.report FROM ci_reuse r JOIN jobs j ON j.id = r.leg_id
-                 WHERE r.input_hash = ?1 AND r.created_at >= ?2 AND j.status = 'succeeded'
-                   AND NOT EXISTS (SELECT 1 FROM ci_artifacts a WHERE a.leg_id = r.leg_id AND (a.finalized = 0 OR (a.expires_at IS NOT NULL AND a.expires_at <= ?3)))
-                 ORDER BY r.created_at DESC LIMIT 1",
-                params![hash, since, crate::util::now_unix()],
-                |x| Ok((x.get(0)?, x.get(1)?)),
-            )
-            .optional()?)
+            Ok(None)
         })
         .await;
     // Every lookup counted, by layer and outcome (W24-R28).
@@ -199,16 +193,16 @@ pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u
 }
 
 /// A leg that succeeded under `hash`: kept for those that come after, in the work ledger as its
-/// work unit's (W24-R06) and in W08-R10's own table.
+/// work unit's (W24-R06). Its report is a note, not an output: every succeeded run of the unit
+/// reproduces the entry, and the newest is the one a lookup takes (W24-R30).
 pub async fn remember(hub: &Hub, repo: &str, trusted: bool, leg: &str, run: &str, hash: &str, report: &str) -> anyhow::Result<()> {
     let (repo, leg, run, hash, report) = (repo.to_owned(), leg.to_owned(), run.to_owned(), hash.to_owned(), report.to_owned());
     hub.store
         .call(move |c| {
             let now = crate::util::now_unix();
-            c.execute("INSERT OR REPLACE INTO ci_reuse (input_hash, leg_id, run_id, report, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![hash, leg, run, report, now])?;
             let result = crate::ci::work::Recorded {
                 outcome: "success".into(),
-                outputs: BTreeMap::from([("report".to_owned(), report)]),
+                notes: BTreeMap::from([("report".to_owned(), report)]),
                 provenance: crate::ci::work::Provenance { repo: repo.clone(), run, leg, finished_at: now, ..Default::default() },
                 domain: domain(trusted).to_owned(),
                 ..Default::default()

@@ -156,6 +156,11 @@ pub struct Recorded {
     /// The entries it reused, `<scope><strong>` each (W24-R22): its provenance lists them, each
     /// with its producer and verifiers a lookup away.
     pub reused: Vec<String>,
+    /// What a run says of itself that isn't what it produced (W24-R30): per-run data, as W08-R10's
+    /// report. Never compared when the unit is recorded again, so a run that differs only here
+    /// reproduces the entry; a lookup gives the newest such run's.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub notes: BTreeMap<String, String>,
 }
 
 impl Recorded {
@@ -443,6 +448,11 @@ pub fn write(c: &Connection, seal: Option<&Seal>, scope: &str, unit: &Unit, read
                         judge_again(&tx, scope, weak, &strong)?;
                     }
                 }
+                // The newest run that gave the same result is the entry's current one (its leg,
+                // its time, its notes), kept beside it apart from the runners that verified it,
+                // so it never counts as one of them (W24-R30).
+                let fresh = Recorded { verified_by: Vec::new(), ..result.clone() };
+                put(&tx, Family::Verify, &format!("{}fresh", verify_prefix(scope, &strong)), &serde_json::to_vec(&verification("fresh", Some(Comparison::Same), Some(fresh)))?, now)?;
                 Written::Reproduced { strong, by_another }
             }
             comparison => {
@@ -612,6 +622,15 @@ fn judge(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, read
         return Ok(Err(why));
     }
     entry.verified_by = named.into_iter().skip(1).collect();
+    // The newest run that gave the same result stands for the entry now: its leg, its time, its
+    // notes. What it produced is the entry's (W24-R30).
+    if let Some(v) = get(c, Family::Verify, &format!("{}fresh", verify_prefix(scope, &strong)))?
+        && let Ok(Verification { result: Some(newer), .. }) = serde_json::from_slice::<Verification>(&v)
+        && trust::compare(&entry.outcome(), &newer.outcome()) == Comparison::Same
+    {
+        entry.provenance = newer.provenance;
+        entry.notes = newer.notes;
+    }
     let nondeterministic = nondeterministic(c, scope, weak)?.map(|m| m.outputs);
     bump_hits(c, scope, &strong)?;
     Ok(Ok(Hit { key: strong, domain: domain.clone(), recorded: entry, class: None, nondeterministic }))
@@ -2445,6 +2464,33 @@ mod tests {
                 }
                 anyhow::ensure!(went.iter().all(|e| !e.rule.is_empty() && (e.reason != Reason::MaxAge || e.scope.is_some())), "each eviction says why: {went:?}");
             }
+            Ok(())
+        })
+    }
+
+    /// W24-R30: the newest run that gave the same result stands for the entry. A lookup gives its
+    /// leg, time and notes; notes are never compared; and it never counts as a runner that
+    /// verified the entry.
+    #[test]
+    fn w24_r30_the_newest_reproduction_is_current() -> anyhow::Result<()> {
+        in_store(|c| {
+            let sc = scope("acme/app", "trusted");
+            let (u, read) = (unit(40), reads(40, 0));
+            let at = |run: &str, finished: i64, note: &str| Recorded {
+                notes: BTreeMap::from([("report".to_owned(), note.to_owned())]),
+                provenance: Provenance { run: run.into(), leg: format!("{run}-leg"), finished_at: finished, ..Provenance::default() },
+                ..made("trusted", "", &[("bin", "sha256:aa")])
+            };
+            let strong = match write(c, None, &sc, &u, &read, &at("r1", 100, "first"))? {
+                Written::New(k) => k,
+                other => anyhow::bail!("{other:?}"),
+            };
+            anyhow::ensure!(write(c, None, &sc, &u, &read, &at("r2", 200, "second"))? == Written::Reproduced { strong, by_another: false }, "only the notes differ: the same result");
+            let same = |p: &PathSet| p.clone();
+            let hit = lookup(c, &sc, &u, &same)?.ok_or_else(|| anyhow::anyhow!("no hit"))?;
+            let r = &hit.recorded;
+            anyhow::ensure!(r.provenance.leg == "r2-leg" && r.provenance.finished_at == 200 && r.notes.get("report").map(String::as_str) == Some("second"), "{r:?}");
+            anyhow::ensure!(r.verified_by.is_empty() && quarantined(c, &sc, &strong)?.is_none(), "{r:?}");
             Ok(())
         })
     }
