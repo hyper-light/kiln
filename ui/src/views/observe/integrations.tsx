@@ -1,6 +1,7 @@
 /**
  * Integrations: where monitors' messages go (Slack, Discord, Microsoft Teams, PagerDuty, Opsgenie,
- * email through an SMTP relay, or any webhook, signed), each named, each mentioned in a message as
+ * email through an SMTP relay, Jira's issues, ServiceNow's incidents, or any webhook, signed), each
+ * named, each mentioned in a message as
  * `@<kind>-<name>`; the clouds whose
  * metrics kiln reads (`./clouds`), and the Prometheus endpoints it scrapes (`./scrapes`). Secrets
  * are kept by the server and never shown again; a
@@ -8,7 +9,7 @@
  */
 import * as React from "react";
 import { Plus, Send, Trash2 } from "lucide-react";
-import { observeApi, type Integration, type IntegrationIn, type IntegrationKind, type SmtpSecurity } from "@/api/observe";
+import { observeApi, type Integration, type IntegrationIn, type IntegrationKind, type JiraEdition, type SmtpSecurity } from "@/api/observe";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { TableHold } from "@/components/ui/hold";
@@ -31,8 +32,21 @@ const KINDS: { value: IntegrationKind; label: string; url: string }[] = [
   { value: "pagerduty", label: "PagerDuty", url: "Events API v2 (events.pagerduty.com unless set)" },
   { value: "opsgenie", label: "Opsgenie", url: "The Alert API (api.opsgenie.com unless set; EU: https://api.eu.opsgenie.com)" },
   { value: "email", label: "Email", url: "" },
+  { value: "jira", label: "Jira", url: "The site: https://<site>.atlassian.net, or a Data Center's address" },
+  { value: "servicenow", label: "ServiceNow", url: "The instance: https://<instance>.service-now.com" },
   { value: "webhook", label: "Webhook", url: "Any URL: kiln POSTs each notice as JSON" },
 ];
+const EDITIONS: { value: JiraEdition; label: string }[] = [
+  { value: "cloud", label: "Jira Cloud" },
+  { value: "data_center", label: "Jira Data Center" },
+];
+type SignIn = "password" | "token";
+const SIGN_IN: { value: SignIn; label: string }[] = [
+  { value: "password", label: "A user and password" },
+  { value: "token", label: "An OAuth token" },
+];
+/** Jira's rule for a project's key: a capital letter, then capitals, digits or _. */
+const projectKey = (k: string) => /^[A-Z][A-Z0-9_]*$/.test(k);
 const SECURITY: { value: SmtpSecurity; label: string }[] = [
   { value: "starttls", label: "STARTTLS (587)" },
   { value: "tls", label: "TLS (465)" },
@@ -49,6 +63,7 @@ const address = (a: string) => /^[^\s@<>,;"]+@[^\s@<>,;"]+$/.test(a);
 function sendsTo(i: Integration): string {
   if (i.kind === "email") return `${(i.to ?? []).join(", ")} via ${i.host ?? ""}`;
   if (i.kind === "opsgenie") return i.url ?? "api.opsgenie.com";
+  if (i.kind === "jira") return `${i.project ?? ""} on ${i.url ?? ""}`;
   return i.url ?? "—";
 }
 const WORDS = Object.fromEntries(KINDS.map((k) => [k.value, k.label])) as Record<IntegrationKind, string>;
@@ -105,7 +120,7 @@ function List({ onAdd }: { onAdd: () => void }) {
         <button type="button" className="text-link" onClick={onAdd}>
           Add one
         </button>{" "}
-        to send monitors&apos; messages to Slack, Discord, Teams, PagerDuty, Opsgenie, email or a webhook.
+        to send monitors&apos; messages to Slack, Discord, Teams, PagerDuty, Opsgenie, email, Jira, ServiceNow or a webhook.
       </p>
     );
   return (
@@ -187,6 +202,16 @@ function AddDialog({ onClose }: { onClose: () => void }) {
   const [user, setUser] = React.useState("");
   const [password, setPassword] = React.useState("");
   const [ca, setCa] = React.useState("");
+  // Jira's edition, project and issue type; ServiceNow's sign-in, group, caller and close code;
+  // whether a recovery closes the issue or resolves the incident.
+  const [edition, setEdition] = React.useState<JiraEdition>("cloud");
+  const [project, setProject] = React.useState("");
+  const [issueType, setIssueType] = React.useState("");
+  const [signIn, setSignIn] = React.useState<SignIn>("password");
+  const [group, setGroup] = React.useState("");
+  const [caller, setCaller] = React.useState("");
+  const [closeCode, setCloseCode] = React.useState("");
+  const [close, setClose] = React.useState(true);
   const [busy, setBusy] = React.useState(false);
   const hint = KINDS.find((k) => k.value === kind)?.url;
   // A mention ends at a trailing '.' (the end of a sentence): a name may not.
@@ -202,7 +227,9 @@ function AddDialog({ onClose }: { onClose: () => void }) {
       address(from.trim()) &&
       /^[^\s/]+$/.test(host.trim()) &&
       (port === "" || (/^\d+$/.test(port) && Number(port) > 0 && Number(port) < 65536)));
-  const ok = validName && validUrl && validEmail && (!optionalUrl || key.trim() !== "");
+  const validJira = kind !== "jira" || (projectKey(project) && key.trim() !== "" && (edition !== "cloud" || address(user.trim())));
+  const validServicenow = kind !== "servicenow" || (signIn === "token" ? key.trim() !== "" : user.trim() !== "" && password !== "");
+  const ok = validName && validUrl && validEmail && validJira && validServicenow && (!optionalUrl || key.trim() !== "");
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent title="Add an integration" description="Its secrets stay on the server: they are sent once, here, and never shown again.">
@@ -229,7 +256,28 @@ function AddDialog({ onClose }: { onClose: () => void }) {
                       }
                     : kind === "webhook"
                       ? { kind, url, ...(secret ? { secret } : {}) }
-                      : { kind, url };
+                      : kind === "jira"
+                        ? {
+                            kind,
+                            url: url.trim(),
+                            edition,
+                            project,
+                            ...(issueType.trim() ? { issue_type: issueType.trim() } : {}),
+                            ...(user.trim() ? { user: user.trim() } : {}),
+                            token: key.trim(),
+                            close,
+                          }
+                        : kind === "servicenow"
+                          ? {
+                              kind,
+                              url: url.trim(),
+                              ...(signIn === "token" ? { token: key.trim() } : { user: user.trim(), password }),
+                              ...(group.trim() ? { assignment_group: group.trim() } : {}),
+                              ...(caller.trim() ? { caller: caller.trim() } : {}),
+                              close,
+                              ...(closeCode.trim() ? { close_code: closeCode.trim() } : {}),
+                            }
+                          : { kind, url };
             setBusy(true);
             try {
               await observeApi.putIntegration(name, body);
@@ -295,7 +343,7 @@ function AddDialog({ onClose }: { onClose: () => void }) {
             </>
           ) : (
             <TextField
-              label={kind === "pagerduty" ? "Events URL (optional)" : kind === "opsgenie" ? "API URL (optional)" : "URL"}
+              label={kind === "pagerduty" ? "Events URL (optional)" : kind === "opsgenie" ? "API URL (optional)" : kind === "jira" ? "Site" : kind === "servicenow" ? "Instance" : "URL"}
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               placeholder="https://"
@@ -311,6 +359,65 @@ function AddDialog({ onClose }: { onClose: () => void }) {
               hint="Each request is signed with it as GitHub signs: X-Kiln-Signature: sha256=<HMAC of the body>."
               autoComplete="off"
             />
+          )}
+          {kind === "jira" && (
+            <>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <SelectField label="Edition" value={edition} onChange={(v) => setEdition(v as JiraEdition)} options={EDITIONS} />
+                <TextField
+                  label="Project"
+                  value={project}
+                  onChange={(e) => setProject(e.target.value.toUpperCase())}
+                  placeholder="OPS"
+                  hint={project && !projectKey(project) ? "A project key: a letter, then letters, digits or _" : undefined}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <TextField label="Issue type (optional)" value={issueType} onChange={(e) => setIssueType(e.target.value)} placeholder="Task" autoComplete="off" />
+                <TextField label={edition === "cloud" ? "Account email" : "Username (optional)"} value={user} onChange={(e) => setUser(e.target.value)} autoComplete="off" spellCheck={false} />
+              </div>
+              <TextField
+                label={edition === "cloud" ? "API token" : user.trim() ? "Password" : "Personal access token"}
+                type="password"
+                value={key}
+                onChange={(e) => setKey(e.target.value)}
+                hint={edition === "cloud" ? "An API token of the account's, made at id.atlassian.com under Security." : undefined}
+                autoComplete="new-password"
+              />
+            </>
+          )}
+          {kind === "servicenow" && (
+            <>
+              <SelectField label="Signs in with" value={signIn} onChange={(v) => setSignIn(v as SignIn)} options={SIGN_IN} />
+              {signIn === "password" ? (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <TextField label="User" value={user} onChange={(e) => setUser(e.target.value)} autoComplete="off" spellCheck={false} />
+                  <TextField label="Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
+                </div>
+              ) : (
+                <TextField label="OAuth token" type="password" value={key} onChange={(e) => setKey(e.target.value)} autoComplete="new-password" />
+              )}
+              <div className="grid gap-3 sm:grid-cols-2">
+                <TextField label="Assignment group (optional)" value={group} onChange={(e) => setGroup(e.target.value)} placeholder="sys_id" autoComplete="off" spellCheck={false} />
+                <TextField label="Caller (optional)" value={caller} onChange={(e) => setCaller(e.target.value)} placeholder="sys_id" autoComplete="off" spellCheck={false} />
+              </div>
+              <TextField
+                label="Close code (optional)"
+                value={closeCode}
+                onChange={(e) => setCloseCode(e.target.value)}
+                placeholder="Resolved by caller"
+                hint="One of the instance's close codes, set as an incident is resolved."
+                autoComplete="off"
+              />
+            </>
+          )}
+          {(kind === "jira" || kind === "servicenow") && (
+            <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
+              <input type="checkbox" className="check" checked={close} onChange={(e) => setClose(e.target.checked)} />{" "}
+              {kind === "jira" ? "Move the issue to done when the monitor recovers" : "Resolve the incident when the monitor recovers"}
+            </label>
           )}
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>

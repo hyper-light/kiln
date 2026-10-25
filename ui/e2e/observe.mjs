@@ -1139,6 +1139,94 @@ const scenarios = {
     }
   },
 
+  /** Jira and ServiceNow integrations added from the form, each tested: Jira Cloud's REST API is
+   * asked for the group's open issue and made one (the account's email and token, the summary the
+   * test's title, the description a document); ServiceNow's Table API is asked for the group's open
+   * incident and made one (the user's credentials, the title its short description); their secrets
+   * never shown; then both removed. */
+  async "Jira and ServiceNow integrations are added from the form and tested"() {
+    const http = await import("node:http");
+    const heard = [];
+    // Jira Cloud and ServiceNow, as far as a test goes: nothing open yet, and one made.
+    const service = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        heard.push({ method: req.method, path: req.url, auth: req.headers.authorization, body });
+        const path = req.url.split("?")[0];
+        const [status, out] =
+          req.method === "GET" && path === "/rest/api/3/search/jql"
+            ? [200, { issues: [] }]
+            : req.method === "POST" && path === "/rest/api/3/issue"
+              ? [201, { id: "10001", key: "OPS-1" }]
+              : req.method === "GET" && path === "/api/now/table/incident"
+                ? [200, { result: [] }]
+                : req.method === "POST" && path === "/api/now/table/incident"
+                  ? [201, { result: { sys_id: "a1", number: "INC0010001" } }]
+                  : [404, {}];
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(out));
+      });
+    });
+    await new Promise((r) => service.listen(0, "127.0.0.1", r));
+    const at = `http://127.0.0.1:${service.address().port}`;
+    const jira = `e2e-jira-${run}`;
+    const snow = `e2e-snow-${run}`;
+    const basic = (u, p) => `Basic ${Buffer.from(`${u}:${p}`).toString("base64")}`;
+    const rowOf = (n) => page.locator("table.data-table tbody tr").filter({ has: page.getByText(n, { exact: true }) });
+    try {
+      await page.goto(`${BASE}/observe/integrations`);
+      await page.getByRole("button", { name: "Add integration", exact: true }).click();
+      const add = page.getByRole("dialog");
+      await add.getByLabel("Kind", { exact: true }).selectOption("jira");
+      await fillIn(add.getByLabel("Name", { exact: true }), jira);
+      await fillIn(add.getByLabel("Site", { exact: true }), at);
+      await fillIn(add.getByLabel("Project", { exact: true }), "OPS");
+      await fillIn(add.getByLabel("Account email", { exact: true }), "ops@example.com");
+      await fillIn(add.getByLabel("API token", { exact: true }), `J1RA-${run}`);
+      await add.getByRole("button", { name: "Add", exact: true }).click();
+      const row = rowOf(jira);
+      await row.waitFor();
+      await until("where it sends", async () => (await row.textContent())?.includes(`OPS on ${at}`));
+      await row.getByRole("button", { name: "Test", exact: true }).click();
+      const made = await until("Jira was made an issue", async () => heard.find((h) => h.method === "POST" && h.path === "/rest/api/3/issue"), 30_000);
+      const issue = JSON.parse(made.body);
+      expect(made.auth === basic("ops@example.com", `J1RA-${run}`), `the account's credentials: ${made.auth}`);
+      expect(issue.fields.summary === "[Triggered] A test from kiln on host:kiln" && issue.fields.project.key === "OPS" && issue.fields.issuetype.name === "Task", made.body);
+      expect(issue.fields.description.type === "doc" && issue.fields.labels.includes("kiln"), made.body);
+      const asked = heard.find((h) => h.method === "GET" && h.path.startsWith("/rest/api/3/search/jql?"));
+      expect(asked && (new URL(asked.path, at).searchParams.get("jql") ?? "").includes(`labels = "${issue.fields.labels.find((l) => l !== "kiln")}"`), "the group's issue looked for first");
+
+      await page.getByRole("button", { name: "Add integration", exact: true }).click();
+      const add2 = page.getByRole("dialog");
+      await add2.getByLabel("Kind", { exact: true }).selectOption("servicenow");
+      await fillIn(add2.getByLabel("Name", { exact: true }), snow);
+      await fillIn(add2.getByLabel("Instance", { exact: true }), at);
+      await fillIn(add2.getByLabel("User", { exact: true }), "kiln");
+      await fillIn(add2.getByLabel("Password", { exact: true }), `SN0W-${run}`);
+      await add2.getByRole("button", { name: "Add", exact: true }).click();
+      const srow = rowOf(snow);
+      await srow.waitFor();
+      await srow.getByRole("button", { name: "Test", exact: true }).click();
+      const raised = await until("ServiceNow was made an incident", async () => heard.find((h) => h.method === "POST" && h.path === "/api/now/table/incident"), 30_000);
+      const incident = JSON.parse(raised.body);
+      expect(raised.auth === basic("kiln", `SN0W-${run}`), `the user's credentials: ${raised.auth}`);
+      expect(incident.short_description === "[Triggered] A test from kiln on host:kiln" && incident.correlation_display === "kiln" && incident.impact === "2" && incident.urgency === "2", raised.body);
+      const listed = JSON.stringify((await api("GET", "/api/observe/v1/integrations")).body.integrations);
+      expect(!listed.includes(`J1RA-${run}`) && !listed.includes(`SN0W-${run}`), "the secrets are never shown");
+      for (const n of [jira, snow]) {
+        await rowOf(n)
+          .getByRole("button", { name: `Remove ${n}`, exact: true })
+          .click();
+        await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+        await until(`${n} gone`, async () => !(await api("GET", "/api/observe/v1/integrations")).body.integrations.some((i) => i.name === n));
+      }
+    } finally {
+      service.close();
+      for (const n of [jira, snow]) await api("DELETE", `/api/observe/v1/integrations/${n}`);
+    }
+  },
+
   /** An Azure integration's event hubs: its stream's failing shown in its row (nothing answers at
    * its endpoint), its hubs and kept connection string in the form, a hub added, the connection
    * string given up for the integration's credentials, and removed. */

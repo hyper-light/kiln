@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 mod common;
-use common::{Fleet, Got, Mock, at, caught_up, file_url, now_ms, raw};
+use common::{Fleet, Got, Mock, Service, at, caught_up, file_url, now_ms, param, raw};
 
 #[test]
 #[ignore = "starts a kiln server and two runners as processes"]
@@ -420,6 +420,274 @@ fn a_monitor_alerts_every_integration_it_names_recovers_and_keeps_quiet_muted() 
     anyhow::ensure!(alerts.len() == 2 && alerts.iter().any(|e| at(e, &["attributes", "muted"]) == "true"), "two alerts, the second muted: {events}");
     let delivered = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "source:kiln.event @event.type:monitor.notification @result:delivered", "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 100 })))?;
     anyhow::ensure!(at(&delivered, &["records"]).as_array().is_some_and(|a| a.len() >= 8), "every delivery recorded: {delivered}");
+    Ok(())
+}
+
+/// What the Jira stand-in keeps of an issue: its key, its labels, whether it is done, how many
+/// comments it has.
+#[derive(Debug, Clone)]
+struct JiraIssue {
+    key: String,
+    labels: Vec<String>,
+    done: bool,
+    comments: usize,
+}
+
+/// Whether `v` is a document Jira Cloud takes: a `doc` of version 1 of nodes it knows, no text
+/// node empty, no list without items.
+fn adf_ok(v: &Value) -> bool {
+    fn node(v: &Value) -> bool {
+        let content = || v.get("content").and_then(Value::as_array);
+        match v.get("type").and_then(Value::as_str) {
+            Some("text") => v.get("text").and_then(Value::as_str).is_some_and(|t| !t.is_empty()),
+            Some("hardBreak") => true,
+            Some("paragraph") => content().is_some_and(|c| c.iter().all(node)),
+            Some("bulletList" | "listItem") => content().is_some_and(|c| !c.is_empty() && c.iter().all(node)),
+            _ => false,
+        }
+    }
+    v.get("type").and_then(Value::as_str) == Some("doc") && v.get("version").and_then(Value::as_u64) == Some(1) && v.get("content").and_then(Value::as_array).is_some_and(|c| c.iter().all(node))
+}
+
+/// Jira Cloud's REST API 3 as it answers: the account's credentials checked; issues made (the
+/// project and type it has, a summary of one line of 255, a description in Atlassian's document
+/// format, labels without spaces), found by JQL's project and label among those not done, the
+/// newest first, commented on, and moved by their transitions (one of them to done).
+fn jira_cloud(auth: String, issues: std::sync::Arc<std::sync::Mutex<Vec<JiraIssue>>>) -> std::sync::Arc<common::Answer> {
+    std::sync::Arc::new(move |method: &str, got: &Got| -> (u16, String) {
+        if got.header("authorization") != Some(auth.as_str()) {
+            return (401, json!({ "errorMessages": ["You are not authenticated."] }).to_string());
+        }
+        let route = got.path.split('?').next().unwrap_or("");
+        let body = got.json();
+        let mut all = issues.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (method, route) {
+            ("GET", "/rest/api/3/search/jql") => {
+                let jql = param(&got.path, "jql");
+                let label = jql.split("labels = \"").nth(1).and_then(|r| r.split('"').next()).unwrap_or("").to_owned();
+                if !jql.starts_with("project = \"OPS\" AND ") || !jql.contains("statusCategory != Done") {
+                    return (400, json!({ "errorMessages": [format!("Error in the JQL Query: {jql}")] }).to_string());
+                }
+                let found: Vec<Value> = all.iter().rev().filter(|i| !i.done && i.labels.contains(&label)).take(1).map(|i| json!({ "id": "1", "key": i.key })).collect();
+                (200, json!({ "issues": found, "isLast": true }).to_string())
+            }
+            ("POST", "/rest/api/3/issue") => {
+                let f = at(&body, &["fields"]);
+                let summary = at(f, &["summary"]).as_str().unwrap_or("");
+                let labels: Vec<String> = at(f, &["labels"]).as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+                if at(f, &["project", "key"]) != "OPS" || at(f, &["issuetype", "name"]) != "Task" {
+                    return (400, json!({ "errorMessages": [], "errors": { "issuetype": "Specify a valid issue type" } }).to_string());
+                }
+                if summary.is_empty() || summary.chars().count() > 255 || summary.contains('\n') || !adf_ok(at(f, &["description"])) || labels.iter().any(|l| l.contains(' ')) {
+                    return (400, json!({ "errorMessages": [], "errors": { "description": "Operation value must be an Atlassian Document" } }).to_string());
+                }
+                let key = format!("OPS-{}", all.len() + 1);
+                all.push(JiraIssue { key: key.clone(), labels, done: false, comments: 0 });
+                (201, json!({ "id": format!("1000{}", all.len()), "key": key }).to_string())
+            }
+            _ => {
+                let Some((key, what)) = route.strip_prefix("/rest/api/3/issue/").and_then(|r| r.split_once('/')) else { return (404, String::new()) };
+                let Some(issue) = all.iter_mut().find(|i| i.key == key) else { return (404, json!({ "errorMessages": ["Issue does not exist"] }).to_string()) };
+                match (method, what) {
+                    ("POST", "comment") if adf_ok(at(&body, &["body"])) => {
+                        issue.comments += 1;
+                        (201, json!({ "id": "1" }).to_string())
+                    }
+                    ("GET", "transitions") => (
+                        200,
+                        json!({ "transitions": [{ "id": "21", "to": { "statusCategory": { "key": "indeterminate" } } }, { "id": "31", "to": { "statusCategory": { "key": "done" } } }] }).to_string(),
+                    ),
+                    ("POST", "transitions") => {
+                        issue.done = at(&body, &["transition", "id"]) == "31";
+                        (204, String::new())
+                    }
+                    _ => (400, json!({ "errorMessages": ["not as Jira takes it"] }).to_string()),
+                }
+            }
+        }
+    })
+}
+
+/// What the ServiceNow stand-in keeps of an incident.
+#[derive(Debug, Clone)]
+struct SnowIncident {
+    sys_id: String,
+    number: String,
+    correlation: String,
+    state: String,
+    impact: String,
+    urgency: String,
+    notes: usize,
+    close_code: String,
+}
+
+/// ServiceNow's Table API as it answers: a user's credentials checked; incidents made (a short
+/// description of 160, a correlation id of 100, an impact and urgency of 1 to 3), found by an
+/// encoded query (a correlation id, states not among those given, the newest first), changed by
+/// PATCH, a work note added; resolving one without a close code and notes refused, as its data
+/// policy does.
+fn servicenow(auth: String, incidents: std::sync::Arc<std::sync::Mutex<Vec<SnowIncident>>>) -> std::sync::Arc<common::Answer> {
+    std::sync::Arc::new(move |method: &str, got: &Got| -> (u16, String) {
+        if got.header("authorization") != Some(auth.as_str()) {
+            return (401, json!({ "error": { "message": "User Not Authenticated" }, "status": "failure" }).to_string());
+        }
+        let route = got.path.split('?').next().unwrap_or("");
+        let body = got.json();
+        let text = |k: &str| at(&body, &[k]).as_str().unwrap_or("").to_owned();
+        let mut all = incidents.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (method, route) {
+            ("GET", "/api/now/table/incident") => {
+                let q = param(&got.path, "sysparm_query");
+                let parts: Vec<&str> = q.split('^').collect();
+                let correlation = parts.iter().find_map(|p| p.strip_prefix("correlation_id=")).unwrap_or("");
+                let not_in: Vec<&str> = parts.iter().find_map(|p| p.strip_prefix("stateNOT IN")).map(|s| s.split(',').collect()).unwrap_or_default();
+                if parts.last() != Some(&"ORDERBYDESCsys_created_on") || not_in.is_empty() {
+                    return (400, json!({ "error": { "message": format!("Invalid query: {q}") } }).to_string());
+                }
+                let found: Vec<Value> =
+                    all.iter().rev().filter(|i| i.correlation == correlation && !not_in.contains(&i.state.as_str())).take(1).map(|i| json!({ "sys_id": i.sys_id, "number": i.number })).collect();
+                (200, json!({ "result": found }).to_string())
+            }
+            ("POST", "/api/now/table/incident") => {
+                let level = |k: &str| ["1", "2", "3"].contains(&text(k).as_str());
+                let short = text("short_description");
+                if short.is_empty() || short.chars().count() > 160 || text("correlation_id").is_empty() || text("correlation_id").len() > 100 || !level("impact") || !level("urgency") {
+                    return (400, json!({ "error": { "message": "Invalid field values" } }).to_string());
+                }
+                let (sys_id, number) = (format!("{:032x}", all.len() + 1), format!("INC00100{:02}", all.len() + 1));
+                all.push(SnowIncident {
+                    sys_id: sys_id.clone(),
+                    number: number.clone(),
+                    correlation: text("correlation_id"),
+                    state: "1".into(),
+                    impact: text("impact"),
+                    urgency: text("urgency"),
+                    notes: 0,
+                    close_code: String::new(),
+                });
+                (201, json!({ "result": { "sys_id": sys_id, "number": number } }).to_string())
+            }
+            ("PATCH", r) => {
+                let Some(i) = r.strip_prefix("/api/now/table/incident/").and_then(|id| all.iter_mut().find(|i| i.sys_id == id)) else {
+                    return (404, json!({ "error": { "message": "No Record found" } }).to_string());
+                };
+                if text("state") == "6" && (text("close_code").is_empty() || text("close_notes").is_empty()) {
+                    return (403, json!({ "error": { "message": "Data Policy Exception: Resolution code, Resolution notes are mandatory" }, "status": "failure" }).to_string());
+                }
+                if !text("work_notes").is_empty() {
+                    i.notes += 1;
+                }
+                for (k, field) in [("state", &mut i.state), ("impact", &mut i.impact), ("urgency", &mut i.urgency), ("close_code", &mut i.close_code)] {
+                    if body.get(k).is_some() {
+                        *field = text(k);
+                    }
+                }
+                (200, json!({ "result": { "sys_id": i.sys_id, "number": i.number } }).to_string())
+            }
+            _ => (404, String::new()),
+        }
+    })
+}
+
+/// Jira's issues and ServiceNow's incidents through a monitor, against services that answer as
+/// Jira Cloud and ServiceNow's Table API do: as the monitor's group alerts, an issue in the
+/// project (labelled with the group's key) and an incident (correlated by it); as it warns, a
+/// comment on the issue and a work note on the incident (its impact and urgency the warning's);
+/// as it recovers, the issue moved to done and the incident resolved with its close code; as it
+/// alerts again, a new issue and a new incident. Each delivery an event saying what it did.
+#[test]
+#[ignore = "starts a kiln server as a process, and services for it to notify"]
+fn a_monitor_s_group_is_one_jira_issue_and_one_servicenow_incident_until_it_recovers() -> anyhow::Result<()> {
+    use base64::Engine as _;
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let issues: std::sync::Arc<std::sync::Mutex<Vec<JiraIssue>>> = std::sync::Arc::default();
+    let incidents: std::sync::Arc<std::sync::Mutex<Vec<SnowIncident>>> = std::sync::Arc::default();
+    let basic = |u: &str, p: &str| format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}")));
+    let jira = Service::start(jira_cloud(basic("ops@example.com", "J1RA-T0K3N"), issues.clone()))?;
+    let snow = Service::start(servicenow(basic("kiln", "SN0W-PW"), incidents.clone()))?;
+    for (name, body) in [
+        ("ops", json!({ "kind": "jira", "url": jira.url(), "project": "OPS", "user": "ops@example.com", "token": "J1RA-T0K3N" })),
+        ("itsm", json!({ "kind": "servicenow", "url": snow.url(), "user": "kiln", "password": "SN0W-PW" })),
+    ] {
+        let (code, b) = f.request("PUT", &format!("/api/observe/v1/integrations/{name}"), Some(&body))?;
+        anyhow::ensure!(code == 204, "integration {name}: {code} {}", String::from_utf8_lossy(&b));
+    }
+    let listed = f.call("GET", "/api/observe/v1/integrations", None)?;
+    anyhow::ensure!(!listed.to_string().contains("J1RA-T0K3N") && !listed.to_string().contains("SN0W-PW"), "secrets are never shown: {listed}");
+    let (code, b) = f.request("PUT", "/api/observe/v1/integrations/bad", Some(&json!({ "kind": "jira", "url": jira.url(), "project": "ops", "user": "ops@example.com", "token": "t" })))?;
+    anyhow::ensure!(code == 400, "a project's key is capitals: {code} {}", String::from_utf8_lossy(&b));
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e queue deep",
+            "query": "last(last_1m):max:e2e.queue{*} by {host} > 100",
+            "message": "queue on {{host.name}} is {{value}} @jira-ops @servicenow-itsm",
+            "options": { "every": 10, "thresholds": { "critical": 100, "warning": 80 } },
+        })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let depth = |v: f64| f.write("e2e.queue", &["q1"], crate_now() - 50_000, 6, |_, _| v);
+    let wait = |what: &str, done: &dyn Fn() -> bool| -> anyhow::Result<()> {
+        let start = Instant::now();
+        while !done() {
+            anyhow::ensure!(
+                start.elapsed() < Duration::from_secs(90),
+                "{what}: Jira {:?}, ServiceNow {:?}\n{}",
+                issues.lock().map(|i| i.clone()).unwrap_or_default(),
+                incidents.lock().map(|i| i.clone()).unwrap_or_default(),
+                f.logs()
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        Ok(())
+    };
+    let issue = |n: usize| issues.lock().ok().and_then(|i| i.get(n).cloned());
+    let incident = |n: usize| incidents.lock().ok().and_then(|i| i.get(n).cloned());
+    // Alerting: an issue and an incident, its impact and urgency an alert's (P3: 2 and 2).
+    depth(150.0)?;
+    wait("an issue and an incident", &|| issue(0).is_some() && incident(0).is_some())?;
+    let label = issue(0).and_then(|i| i.labels.into_iter().find(|l| l != "kiln")).unwrap_or_default();
+    anyhow::ensure!(label.starts_with(&format!("kiln-{id}-")), "the issue labelled with the group's key: {label}");
+    anyhow::ensure!(incident(0).is_some_and(|i| i.correlation == label && i.impact == "2" && i.urgency == "2"), "the incident correlated by the same key: {:?}", incident(0));
+    // Warning: a comment and a work note on them, no new ones; the incident's urgency lower (P4).
+    depth(90.0)?;
+    wait("a comment and a work note", &|| issue(0).is_some_and(|i| i.comments == 1) && incident(0).is_some_and(|i| i.notes == 1))?;
+    anyhow::ensure!(issue(1).is_none() && incident(1).is_none() && incident(0).is_some_and(|i| i.impact == "2" && i.urgency == "3"), "{:?} {:?}", issue(1), incident(0));
+    // Recovered: the issue moved to done (a comment first), the incident resolved.
+    depth(50.0)?;
+    wait("the issue done and the incident resolved", &|| issue(0).is_some_and(|i| i.done) && incident(0).is_some_and(|i| i.state == "6"))?;
+    anyhow::ensure!(issue(0).is_some_and(|i| i.comments == 2) && incident(0).is_some_and(|i| i.close_code == "Resolved by caller"), "{:?} {:?}", issue(0), incident(0));
+    // Alerting again: a new issue and a new incident, the first ones left as they are.
+    depth(150.0)?;
+    wait("a new issue and a new incident", &|| issue(1).is_some() && incident(1).is_some())?;
+    anyhow::ensure!(
+        issue(1).is_some_and(|i| !i.done && i.labels.contains(&label)) && issue(0).is_some_and(|i| i.done) && incident(1).is_some_and(|i| i.state == "1"),
+        "{:?} {:?}",
+        issue(1),
+        incident(1)
+    );
+    // Each delivery is an event that says what it did, and none failed (a request the services
+    // refused would have).
+    anyhow::ensure!(jira.requests().iter().all(|(_, g)| g.header("content-type") == Some("application/json") || g.body.is_empty()), "JSON, every body");
+    let said = |what: &str| -> anyhow::Result<Vec<String>> {
+        let found = f.call(
+            "POST",
+            "/api/observe/v1/logs/search",
+            Some(&json!({ "query": format!("source:kiln.event @event.type:monitor.notification @integration:{what}"), "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 50 })),
+        )?;
+        Ok(at(&found, &["records"]).as_array().into_iter().flatten().filter_map(|r| at(r, &["message"]).as_str().map(str::to_owned)).collect())
+    };
+    f.until(Duration::from_secs(30), "every delivery an event", |_| said("ops").is_ok_and(|s| s.len() >= 4) && said("itsm").is_ok_and(|s| s.len() >= 4))?;
+    let (ops, itsm) = (said("ops")?.join("\n"), said("itsm")?.join("\n"));
+    anyhow::ensure!(!ops.contains(": failed,") && !itsm.contains(": failed,"), "a delivery failed:\n{ops}\n{itsm}");
+    for want in ["delivered, 201 made OPS-1", "delivered, commented on OPS-1", "delivered, commented on OPS-1 and closed it", "delivered, 201 made OPS-2"] {
+        anyhow::ensure!(ops.contains(want), "{want:?} in:\n{ops}");
+    }
+    for want in ["delivered, 201 made INC0010001", "delivered, noted on INC0010001", "delivered, resolved INC0010001", "delivered, 201 made INC0010002"] {
+        anyhow::ensure!(itsm.contains(want), "{want:?} in:\n{itsm}");
+    }
     Ok(())
 }
 

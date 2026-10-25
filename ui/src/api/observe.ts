@@ -248,7 +248,10 @@ export interface MonitorCheck {
 /** What a monitor is made of, as it is sent. */
 export type MonitorIn = Pick<Monitor, "name" | "query" | "message" | "tags" | "priority" | "options"> & { type?: string };
 
-export type IntegrationKind = "slack" | "discord" | "teams" | "pagerduty" | "webhook" | "opsgenie" | "email";
+export type IntegrationKind = "slack" | "discord" | "teams" | "pagerduty" | "webhook" | "opsgenie" | "email" | "jira" | "servicenow";
+
+/** Which Jira a site is: Cloud (REST API 3) or Data Center (REST API 2). */
+export type JiraEdition = "cloud" | "data_center";
 
 /** How an SMTP relay is reached: STARTTLS (587), TLS from the first byte (465), or neither (25). */
 export type SmtpSecurity = "starttls" | "tls" | "none";
@@ -266,6 +269,16 @@ export interface Integration {
   port?: number;
   security?: SmtpSecurity;
   username?: string;
+  /** Jira's edition, project, issue type and user; ServiceNow's user, group and caller. */
+  edition?: JiraEdition;
+  project?: string;
+  issue_type?: string;
+  user?: string;
+  assignment_group?: string;
+  caller?: string;
+  /** Whether a recovery closes the issue or resolves the incident, and ServiceNow's close code. */
+  close?: boolean;
+  close_code?: string;
 }
 
 /** An integration as it is sent: whole. */
@@ -274,7 +287,19 @@ export type IntegrationIn =
   | { kind: "pagerduty"; routing_key: string; url?: string }
   | { kind: "webhook"; url: string; secret?: string }
   | { kind: "opsgenie"; api_key: string; url?: string }
-  | { kind: "email"; to: string[]; from: string; host: string; port?: number; security?: SmtpSecurity; username?: string; password?: string; ca?: string };
+  | { kind: "email"; to: string[]; from: string; host: string; port?: number; security?: SmtpSecurity; username?: string; password?: string; ca?: string }
+  | { kind: "jira"; url: string; edition?: JiraEdition; project: string; issue_type?: string; user?: string; token: string; close?: boolean }
+  | {
+      kind: "servicenow";
+      url: string;
+      user?: string;
+      password?: string;
+      token?: string;
+      assignment_group?: string;
+      caller?: string;
+      close?: boolean;
+      close_code?: string;
+    };
 
 /** What a metric is and costs: its series (its cardinality) by kind, each tag's values, its samples. */
 export interface MetricSummary {

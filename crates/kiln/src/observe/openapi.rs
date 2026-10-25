@@ -640,6 +640,33 @@ fn schemas() -> Map<String, Value> {
                 ],
                 &["kind", "to", "from", "host"],
             ),
+            object(
+                &[
+                    ("kind", one_of(&["jira"])),
+                    ("url", describe(string(), "the site: https://<site>.atlassian.net, or a Data Center's base URL")),
+                    ("edition", describe(one_of(&["cloud", "data_center"]), "cloud (REST API 3) unless said; data_center: REST API 2")),
+                    ("project", describe(string(), "the project's key, as OPS")),
+                    ("issue_type", describe(string(), "the issues' type, Task unless said")),
+                    ("user", describe(string(), "Cloud: the account's email, its token an API token; Data Center: a user's name, its token the password (none: the token a personal access token)")),
+                    ("token", string()),
+                    ("close", describe(boolean(), "whether an issue moves to a done status as its group recovers; true unless said")),
+                ],
+                &["kind", "url", "project", "token"],
+            ),
+            object(
+                &[
+                    ("kind", one_of(&["servicenow"])),
+                    ("url", describe(string(), "the instance: https://<instance>.service-now.com")),
+                    ("user", describe(string(), "with password: Basic; or token alone")),
+                    ("password", string()),
+                    ("token", describe(string(), "an OAuth access token (Bearer)")),
+                    ("assignment_group", describe(string(), "the sys_id of the group incidents are assigned to")),
+                    ("caller", describe(string(), "the sys_id of the user incidents are raised for")),
+                    ("close", describe(boolean(), "whether an incident is resolved as its group recovers; true unless said")),
+                    ("close_code", describe(string(), "its close code then, one of the instance's; Resolved by caller unless said")),
+                ],
+                &["kind", "url"],
+            ),
         ] }),
     );
     put(
@@ -648,7 +675,7 @@ fn schemas() -> Map<String, Value> {
             object(
                 &[
                     ("name", string()),
-                    ("kind", one_of(&["slack", "discord", "teams", "pagerduty", "webhook", "opsgenie", "email"])),
+                    ("kind", one_of(&["slack", "discord", "teams", "pagerduty", "webhook", "opsgenie", "email", "jira", "servicenow"])),
                     ("url", string()),
                     ("routing_key", string()),
                     ("api_key", string()),
@@ -661,10 +688,19 @@ fn schemas() -> Map<String, Value> {
                     ("username", string()),
                     ("password", string()),
                     ("ca", string()),
+                    ("edition", one_of(&["cloud", "data_center"])),
+                    ("project", string()),
+                    ("issue_type", string()),
+                    ("user", string()),
+                    ("token", string()),
+                    ("assignment_group", string()),
+                    ("caller", string()),
+                    ("close", boolean()),
+                    ("close_code", string()),
                 ],
                 &["name", "kind"],
             ),
-            "as shown: a webhook URL's host alone, keys and passwords \"…\", whether a webhook signs",
+            "as shown: a webhook URL's host alone, keys, tokens and passwords \"…\", whether a webhook signs",
         ),
     );
     put(

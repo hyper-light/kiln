@@ -598,6 +598,98 @@ impl Mock {
     }
 }
 
+/// What a [`Service`] answers a request: its method and what came (its path and query, headers,
+/// body) to a status and a JSON body.
+pub type Answer = dyn Fn(&str, &Got) -> (u16, String) + Send + Sync;
+
+/// A service on a port of its own that answers as the one it stands in for does (`answer`, which
+/// keeps what state it needs), keeping each request in order with its method.
+pub struct Service {
+    pub port: u16,
+    pub got: std::sync::Arc<std::sync::Mutex<Vec<(String, Got)>>>,
+}
+
+impl Service {
+    pub fn start(answer: std::sync::Arc<Answer>) -> anyhow::Result<Self> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let got: std::sync::Arc<std::sync::Mutex<Vec<(String, Got)>>> = std::sync::Arc::default();
+        let g = got.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let (g, answer) = (g.clone(), answer.clone());
+                std::thread::spawn(move || {
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                    let (mut buf, mut chunk) = (Vec::new(), [0u8; 8192]);
+                    let head_end = loop {
+                        let Ok(n) = s.read(&mut chunk) else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(buf.get(..head_end).unwrap_or(&[])).into_owned();
+                    let mut lines = head.lines();
+                    let mut first = lines.next().unwrap_or("").split_whitespace();
+                    let (method, path) = (first.next().unwrap_or("").to_owned(), first.next().unwrap_or("").to_owned());
+                    let headers: Vec<(String, String)> = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned())).collect();
+                    let len: usize = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+                    let mut body = buf.get(head_end + 4..).unwrap_or(&[]).to_vec();
+                    while body.len() < len {
+                        let Ok(n) = s.read(&mut chunk) else { break };
+                        if n == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
+                    }
+                    let came = Got { path, headers, body };
+                    let (status, out) = answer(&method, &came);
+                    g.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((method, came));
+                    let _ = write!(s, "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}", out.len());
+                });
+            }
+        });
+        Ok(Self { port, got })
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// The requests that came, each with its method.
+    pub fn requests(&self) -> Vec<(String, Got)> {
+        self.got.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+}
+
+/// `%XX` as its byte: a query's value as it was before it was encoded.
+pub fn decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let (mut out, mut i) = (Vec::with_capacity(b.len()), 0);
+    while let Some(&c) = b.get(i) {
+        match b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            Some(v) if c == b'%' => {
+                out.push(v);
+                i += 3;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The value of `name` in a path's query, decoded.
+pub fn param(path: &str, name: &str) -> String {
+    path.split_once('?').and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('=')))).map(decode).unwrap_or_default()
+}
+
 /// Whether every runner named is a learner, up, and has applied all the leader has.
 pub fn caught_up(s: &Value, names: &[&str]) -> bool {
     let applied = at(s, &["applied"]).as_u64().unwrap_or(0);
