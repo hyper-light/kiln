@@ -149,7 +149,8 @@ fn stands(c: &rusqlite::Connection, leg: &str, now: i64) -> rusqlite::Result<boo
 pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u64) -> anyhow::Result<Option<(String, String)>> {
     let (hash, since) = (hash.to_owned(), crate::util::now_unix().saturating_sub(i64::try_from(max_age).unwrap_or(i64::MAX)));
     let (scope, unit) = (crate::ci::work::scope(repo, domain(trusted)), work_unit(&hash, trusted));
-    hub.store
+    let found = hub
+        .store
         .call(move |c| {
             let now = crate::util::now_unix();
             let same = |p: &kiln_ci::work::key::PathSet| p.clone();
@@ -172,7 +173,15 @@ pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u
             )
             .optional()?)
         })
-        .await
+        .await;
+    // Every lookup counted, by layer and outcome (W24-R28).
+    let outcome = match &found {
+        Ok(Some(_)) => "hit",
+        Ok(None) => "miss",
+        Err(_) => "error",
+    };
+    crate::metrics::global().work_lookups.inc(&["leg", outcome]);
+    found
 }
 
 /// A leg that succeeded under `hash`: kept for those that come after, in the work ledger as its
@@ -223,7 +232,12 @@ pub async fn take_over(hub: &Hub, run: &str, source: &str, id: &str, hash: &str)
                  SELECT ?1, ?2, name, object, size, digest, mime_type, created_at, expires_at, finalized FROM ci_artifacts WHERE leg_id = ?3",
                 params![run, id, source],
             )?;
+            // The time it saved: what its source ran (W24-R28).
+            let ran: Option<i64> = tx.query_row("SELECT finished_at - started_at FROM jobs WHERE id = ?1", [&id], |r| r.get(0)).optional()?.flatten();
             tx.commit()?;
+            if let Some(s) = ran.and_then(|s| u64::try_from(s).ok()) {
+                crate::metrics::global().work_saved_seconds.add(s);
+            }
             Ok(())
         })
         .await
