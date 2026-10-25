@@ -631,10 +631,17 @@ async fn on_goals(hub: &Hub, ids: Vec<String>) -> Vec<String> {
     })
 }
 
-async fn at_once(hub: &Hub, parent: &Info) -> AtOnce {
+/// How many of the agents `parent` started hold a place in its pool now (at work, as [`room`]
+/// counts them), its harness's own aside: what its harness's own limit is to add to the subagents it
+/// counts itself, so the two count one pool.
+pub async fn started_at_work(hub: &Hub, parent: &Info) -> usize {
     let children: Vec<Info> = hub.harness.list().into_iter().filter(|i| i.parent.as_deref() == Some(parent.id.as_str()) && i.status != Status::Exited).collect();
     let held = on_goals(hub, children.iter().map(|c| c.id.clone()).collect()).await;
-    let started = children.iter().filter(|c| in_pool(c, &held)).count();
+    children.iter().filter(|c| in_pool(c, &held)).count()
+}
+
+async fn at_once(hub: &Hub, parent: &Info) -> AtOnce {
+    let started = started_at_work(hub, parent).await;
     let (max, own) = most(parent.max_subagents, hub.cfg.agents.max_children);
     AtOnce { at_work: started.saturating_add(own_at_work(parent)), max, own }
 }
