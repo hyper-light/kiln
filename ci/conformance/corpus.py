@@ -81,6 +81,9 @@ KNOWN = [
     # ruff's ecosystem check builds its base first, checked out (`HEAD is now at … F-03: an empty
     # trunk`) steps before the build that finds no Cargo.toml.
     (r"Build baseline version: error: could not find `Cargo\.toml`", "it builds the pull request's base to compare, and the base is the corpus's empty trunk"),
+    # openai/codex-action (ruff's security review) starts its Responses API proxy only with an
+    # OpenAI API key (`if: inputs['openai-api-key'] != ''`), the upstream's secrets.OPENAI_API_KEY.
+    (r"Failed to read server info from \S*codex", "openai/codex-action starts its Responses API proxy only with an OpenAI API key, the upstream's secrets.OPENAI_API_KEY, which the corpus's copy hasn't: it then finds no proxy's server info"),
     # ruff's publish dry run resolves its crates against crates.io as it is today: ruff_cache 0.0.19
     # came out on 2026-10-22, after the corpus's commit (2026-10-16), which GitHub ran; pass 1025a's
     # met ruff_python_parser's the same way.
