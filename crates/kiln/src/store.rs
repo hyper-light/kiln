@@ -445,6 +445,8 @@ impl Store {
             std::fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
         }
         let mut conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        // Refused before anything is written: a newer kiln migrated it past what this one reads.
+        migrations::check(&conn)?;
         conn.execute_batch(SCHEMA).context("apply schema")?;
         migrations::apply(&mut conn).context("apply migrations")?;
         Ok(conn)
