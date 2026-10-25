@@ -4,18 +4,19 @@
  * rest on, each finding graded), run on an agent (one that runs, or a new one; as one message, step
  * by step, as goals, or an agent per step), shared by a link, exported, its versions and runs. A
  * plan made from a goal is planned first: its agent researches it and writes its steps, and it runs
- * once it's ready. Everything in the page's flow. A plan that isn't there (deleted, or a wrong link)
- * says so.
+ * once it's ready. Everything in the page's flow. A plan is kept with its agent session (written in
+ * its Plan tab, or by the agent): the way back is to that session's plans. A plan that isn't there
+ * (deleted, or a wrong link) says so.
  */
 import * as React from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ApiError } from "@/api/client";
 import { harnessApi, type KindInfo } from "@/api/harness";
-import { planHref, plansApi, runHref, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan, type PlanStarted } from "@/api/plans";
+import { plansApi, runHref, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan, type PlanStarted } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { Confirm, CopyButton, Crumbs, EmptyState, SelectField, TextField } from "@/components/ui/misc";
+import { Confirm, CopyButton, EmptyState, SelectField, TextField } from "@/components/ui/misc";
 import { useAuth } from "@/lib/auth";
 import { harnessSessionsRes, useRes, warm, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
@@ -24,6 +25,7 @@ import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Prose } from "@/views/harness/parts";
 import { Shimmer } from "@/views/harness/signals";
 import { ResearchPanel } from "@/views/research/research";
+import { SessionCrumbs } from "./crumbs";
 import { effectiveNeeds, PlanGraph } from "./graph";
 import { PlanItemsEditor } from "./items";
 import { itemsMarkdown, planMarkdown, planSteps, withoutTitle } from "./steps";
@@ -45,11 +47,11 @@ const unlessGone = (e: unknown): "gone" => {
   throw e;
 };
 
-/** A plan; none for a new one; "gone" for one that isn't there (deleted, or a wrong link). */
-const planRes = (id: string): Res<Plan | null | "gone"> => ({ key: `plans/${id}`, fetch: (s) => (id === "new" ? Promise.resolve(null) : plansApi.get(id, s).catch(unlessGone)) });
+/** A plan; "gone" for one that isn't there (deleted, or a wrong link). */
+const planRes = (id: string): Res<Plan | "gone"> => ({ key: `plans/${id}`, fetch: (s) => plansApi.get(id, s).catch(unlessGone) });
 
 export default function PlanPage() {
-  const { id = "new" } = useParams();
+  const { id = "" } = useParams();
   return (
     <div className="container-console page plan-page">
       <Loadable label="the plan" fallback={<PlanHold />}>
@@ -69,12 +71,12 @@ function NoPlan() {
   return (
     <>
       <title>No plan · kiln</title>
-      <PlanCrumbs />
+      <SessionCrumbs />
       <EmptyState
         title="No plan here"
         action={
           <Button asChild size="sm" variant="secondary">
-            <Link to="/agents/plans">All plans</Link>
+            <Link to="/agents">Agents</Link>
           </Button>
         }
       >
@@ -84,24 +86,12 @@ function NoPlan() {
   );
 }
 
-function PlanCrumbs() {
-  return (
-    <Crumbs
-      index={6}
-      items={[
-        { label: "Agents", to: "/agents" },
-        { label: "Plans", to: "/agents/plans" },
-      ]}
-    />
-  );
-}
-
 /** The plan while it loads: the way back, its title's and text's space. */
 function PlanHold() {
   return (
     <>
       <title>Plan · kiln</title>
-      <PlanCrumbs />
+      <SessionCrumbs />
       <Hold height={420} label="Loading the plan" />
     </>
   );
@@ -119,8 +109,6 @@ interface Base {
 const baseOf = (p: Plan): Base => ({ key: keyOf(p), title: p.title, body: p.body, items: JSON.stringify(p.items ?? []), tags: p.tags.join(", ") });
 
 function PlanEditor({ id }: { id: string }) {
-  const isNew = id === "new";
-  const navigate = useNavigate();
   const res = useRes(planRes(id));
   const plan = res.data === "gone" ? null : res.data;
   if (plan) warm(harnessSessionsRes, kindsRes);
@@ -131,8 +119,8 @@ function PlanEditor({ id }: { id: string }) {
   const [items, setItems] = React.useState<PlanItem[]>(plan?.items ?? []);
   const [tags, setTags] = React.useState(base?.tags ?? "");
   const [preview, setPreview] = React.useState(true);
-  // A plan is read first; its words and steps are changed on asking (a new one is written at once).
-  const [editing, setEditing] = React.useState(isNew);
+  // A plan is read first; its words and steps are changed on asking.
+  const [editing, setEditing] = React.useState(false);
   // Steps picked to run just those (`?pick=2,3`: picked elsewhere, an agent's Plan tab, to run here).
   const [search] = useSearchParams();
   const [picked, setPicked] = React.useState<number[]>(() =>
@@ -153,9 +141,7 @@ function PlanEditor({ id }: { id: string }) {
     setItems(p.items ?? []);
     setTags(b.tags);
   };
-  const dirty = isNew
-    ? body.trim() !== "" || title.trim() !== "" || items.length > 0
-    : base !== null && (title !== base.title || body !== base.body || JSON.stringify(items) !== base.items || tagList(tags).join(",") !== tagList(base.tags).join(","));
+  const dirty = base !== null && (title !== base.title || body !== base.body || JSON.stringify(items) !== base.items || tagList(tags).join(",") !== tagList(base.tags).join(","));
   // A newer version saved elsewhere comes in, unless there are unsaved changes here.
   if (plan && keyOf(plan) !== base?.key && !dirty) take(plan);
 
@@ -167,18 +153,12 @@ function PlanEditor({ id }: { id: string }) {
     setBusy(true);
     setError(null);
     try {
-      if (isNew) {
-        const p = await plansApi.create({ title, body, items, tags: tagList(tags) });
-        invalidate("plans");
-        navigate(planHref(p.id), { replace: true });
-      } else {
-        const p = await plansApi.update(id, { title, body, items, tags: tagList(tags) });
-        res.setData(() => p);
-        take(p);
-        invalidate("plans");
-        setEditing(false);
-        setPicked([]);
-      }
+      const p = await plansApi.update(id, { title, body, items, tags: tagList(tags) });
+      res.setData(() => p);
+      take(p);
+      invalidate("plans");
+      setEditing(false);
+      setPicked([]);
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -191,8 +171,8 @@ function PlanEditor({ id }: { id: string }) {
 
   return (
     <>
-      <title>{`${plan ? plan.title : "New plan"} · kiln`}</title>
-      <PlanCrumbs />
+      <title>{`${plan?.title ?? "Plan"} · kiln`}</title>
+      <SessionCrumbs session={plan?.source?.session} />
       {plan && (
         <p className="plan-dim plan-meta">
           {plan.phase === "planning" && (
@@ -284,20 +264,18 @@ function PlanEditor({ id }: { id: string }) {
           <TextField label="Tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="release, parser" hint="Separated by commas." />
           <div className="plan-actions">
             <Button size="sm" disabled={!dirty || busy || (!body.trim() && items.length === 0)} onClick={() => void save()}>
-              {busy ? "Saving…" : isNew ? "Save plan" : "Save changes"}
+              {busy ? "Saving…" : "Save changes"}
             </Button>
-            {!isNew && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  discard();
-                  setEditing(false);
-                }}
-              >
-                {dirty ? "Discard changes" : "Done"}
-              </Button>
-            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                discard();
+                setEditing(false);
+              }}
+            >
+              {dirty ? "Discard changes" : "Done"}
+            </Button>
             {error && <span className="plan-error">{error}</span>}
           </div>
         </>
@@ -661,7 +639,8 @@ function DeletePlan({ plan }: { plan: Plan }) {
                   try {
                     await plansApi.remove(plan.id);
                     invalidate("plans");
-                    navigate("/agents/plans", { replace: true });
+                    // Back to the plans of the session it was kept with.
+                    navigate(plan.source?.session ? `/agents/${encodeURIComponent(plan.source.session)}?tab=plan` : "/agents", { replace: true });
                   } catch (e) {
                     setError(errorMessage(e));
                   }
