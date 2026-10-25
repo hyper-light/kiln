@@ -3151,12 +3151,28 @@ const scenarios = {
   },
 };
 
+/** The page blank before a scenario, each starting from a page of its own: a navigation of the
+ * scenario before's left in flight (its cleanup's, which goes on however it fares) otherwise lands
+ * in this one and interrupts its first (WebKit on a phone, once in some 64 runs: the notebooks'
+ * page by the incidents' list). Interrupted itself by one, tried again. */
+const blank = async () => {
+  for (let i = 0; ; i++) {
+    try {
+      await page.goto("about:blank");
+      return;
+    } catch (e) {
+      if (i >= 2 || !/interrupted by another navigation/.test(String(e?.message ?? e))) throw e;
+    }
+  }
+};
+
 let failed = 0;
 for (const [name, f] of Object.entries(scenarios).filter(([n]) => !process.env.ONLY || n.includes(process.env.ONLY))) {
   const t0 = Date.now();
   problems.length = 0;
   navs.length = 0;
   try {
+    await blank();
     const note = await f();
     if (problems.length) throw new Error(problems.join("\n"));
     console.log(`ok   ${which}${phone ? " (phone)" : ""}  ${name}  ${Date.now() - t0} ms${note ? `  (${note})` : ""}`);
