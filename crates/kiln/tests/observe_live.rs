@@ -584,7 +584,16 @@ fn otlp_over_grpc_is_taken_on_the_server_and_a_runner() -> anyhow::Result<()> {
     anyhow::ensure!(ok(r.clone()), "the server's export: {r:?}");
     let r = grpc_call(server, m, Some(&f.admin), Some("gzip"), grpc_frame(true, &gz(&metrics("grpc.rust.gzip", 7.0)?)?))?;
     anyhow::ensure!(ok(r.clone()), "a gzip export: {r:?}");
-    let r = grpc_call(runner, m, None, None, grpc_frame(false, &metrics("grpc.rust.runner", 3.0)?))?;
+    // A runner just caught up may say it is behind on its writes (UNAVAILABLE, 14): an exporter tries
+    // again, as OTLP's specification says to, and so does this.
+    let start = Instant::now();
+    let r = loop {
+        let r = grpc_call(runner, m, None, None, grpc_frame(false, &metrics("grpc.rust.runner", 3.0)?))?;
+        if r.1 != 14 || start.elapsed() > Duration::from_secs(10) {
+            break r;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
     anyhow::ensure!(ok(r.clone()), "the runner's export: {r:?}");
     let r = grpc_call(server, l, Some(&f.admin), None, grpc_frame(false, &logs))?;
     anyhow::ensure!(ok(r.clone()), "a logs export: {r:?}");

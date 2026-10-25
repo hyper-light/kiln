@@ -159,11 +159,18 @@ remote_write:
         }
     }
     eprintln!("  samples    {} of a gauge over 20 s, each in kiln to the bit, by 1.0, 2.0 and the runner", samples.len());
-    // A counter counts: the /metrics handler's requests rose by about one a scrape (a scrape every 2 s).
+    // A counter counts: the /metrics handler's requests rise by one a scrape, and kiln counts over 20 s
+    // what Prometheus holds of them: its samples' rise in the window and the one into its first
+    // (kiln's bucket counts the rise from the sample before it), a sample at either edge apart. (Not
+    // a scrape every 2 s: Docker Desktop's VM, on Windows, scraped 7 times in 20 s.)
     let window = (now_ms() - 25_000, now_ms() - 5_000);
+    let scraped = prom.query("prometheus_http_requests_total{job=\"prometheus\",handler=\"/metrics\"}[20s]", window.1 as f64 / 1000.0)?;
+    let held: Vec<f64> = scraped.first().and_then(|r| at(r, &["values"]).as_array().cloned()).unwrap_or_default().iter().filter_map(|p| p.get(1)?.as_str()?.parse().ok()).collect();
+    anyhow::ensure!(held.len() >= 5, "Prometheus's samples of the /metrics handler's requests over 20 s: {scraped:?}");
+    let rose = held.last().zip(held.first()).map_or(0.0, |(l, f)| l - f) + 1.0;
     for way in ["v1", "v2", "runner"] {
         let n: f64 = by(&f, &format!("sum:prometheus_http_requests_total{{handler:/metrics,rw:{way}}}.as_count()"), "rw", window.0, window.1, 20_000)?.values().flatten().flatten().sum();
-        anyhow::ensure!((8.0..=12.0).contains(&n), "{way}: the /metrics handler counted {n} requests in 20 s");
+        anyhow::ensure!((n - rose).abs() <= 1.0, "{way}: the /metrics handler counted {n} requests in 20 s, Prometheus's samples {rose} ({held:?})");
     }
     // A histogram answers percentiles from its buckets, as Prometheus's histogram_quantile does.
     let p99 = by(&f, "p99:prometheus_http_request_duration_seconds{handler:/metrics,rw:v1}", "rw", window.0, window.1, 20_000)?;
