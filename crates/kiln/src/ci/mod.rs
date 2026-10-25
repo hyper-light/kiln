@@ -38,6 +38,8 @@ pub mod notify;
 pub mod oidc;
 pub mod ops;
 pub mod otel;
+#[cfg(test)]
+mod own_workflows;
 pub mod preview;
 pub mod previews;
 pub mod providers;

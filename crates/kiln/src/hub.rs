@@ -2881,6 +2881,22 @@ pub(crate) mod tests {
         assert!(carries(&[], "macos", "aarch64", "mac", "arm64") && carries(&[], "macos", "aarch64", "mac", "darwin"));
     }
 
+    /// W05-R21 in v1: `[baremetal, linux]` fits a Linux runner labelled only `baremetal` (its
+    /// platform says Linux), `[Linux]` fits one labelled `linux`, and `[baremetal, linux]` doesn't
+    /// fit a Mac labelled `baremetal`.
+    #[test]
+    fn w05_r21_labels_match_in_any_case() {
+        let fits = |labels: &[&str], os: &str, arch: &str, want: &[&str]| {
+            let own: Vec<String> = labels.iter().map(|l| (*l).to_owned()).collect();
+            want.iter().all(|w| carries(&own, os, arch, "runner", w))
+        };
+        assert!(fits(&["baremetal"], "linux", "x86_64", &["baremetal", "linux"]), "the platform's Linux");
+        assert!(fits(&["baremetal"], "linux", "x86_64", &["baremetal", "Linux"]) && fits(&["baremetal"], "linux", "x86_64", &["BAREMETAL", "LINUX"]));
+        assert!(fits(&["linux"], "linux", "x86_64", &["Linux"]), "`Linux` against `linux`");
+        assert!(fits(&["Linux"], "linux", "x86_64", &["linux"]), "`linux` against `Linux`");
+        assert!(!fits(&["baremetal"], "macos", "aarch64", &["baremetal", "linux"]), "a Mac isn't Linux");
+    }
+
     /// A connected runner on `os`/`arch` that hosts agents (its terminals on), for a test's hub.
     pub(crate) fn live_runner(name: &str, os: &str, arch: &str) -> AgentLive {
         AgentLive {

@@ -944,6 +944,31 @@ mod tests {
         assert!(!missing_labels(&["mac-1".into(), "x".into()], &l, &r.name).is_empty());
     }
 
+    /// W05-R21: labels match in any case, as GitHub's do. `[baremetal, linux]` fits a Linux runner
+    /// labelled only `baremetal`, by GitHub's implicit `Linux` (production's adacachy); `[Linux]`
+    /// fits a runner labelled `linux`; and `[baremetal, linux]` doesn't fit a Mac.
+    #[test]
+    fn w05_r21_labels_match_in_any_case() -> Result<(), String> {
+        let runner = |labels: &[&str], os: &str, arch: &str| RunnerView {
+            name: format!("{os}-runner"),
+            labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+            facts: RunnerFacts { os: os.into(), arch: arch.into(), ..RunnerFacts::default() },
+            ..RunnerView::default()
+        };
+        let implicit = runner(&["baremetal"], "linux", "x86_64");
+        let labelled = runner(&["linux"], "linux", "x86_64");
+        let mac = runner(&["baremetal"], "macos", "aarch64");
+        let asks = |labels: &[&str]| resolve(&LegRoute { labels: labels.iter().map(|l| (*l).to_owned()).collect(), ..LegRoute::default() }, &[native_rule()]);
+        let (metal_linux, cap_linux) = (asks(&["baremetal", "linux"])?, asks(&["Linux"])?);
+        assert!(implicit.all_labels().contains(&"Linux".to_owned()) && !implicit.labels.iter().any(|l| l == "linux"), "its only Linux label is GitHub's implicit one");
+        assert!(eligible(&metal_linux, &implicit), "{:?}", checks(&metal_linux, &implicit));
+        assert!(eligible(&cap_linux, &labelled), "{:?}", checks(&cap_linux, &labelled));
+        assert!(eligible(&cap_linux, &implicit) && eligible(&asks(&["BAREMETAL", "LINUX"])?, &implicit));
+        assert!(!eligible(&metal_linux, &mac), "a Mac isn't Linux");
+        assert_eq!(missing_labels(&metal_linux.labels, &mac.all_labels(), &mac.name), vec!["linux"]);
+        Ok(())
+    }
+
     #[test]
     fn rules_resolve_and_explain() -> Result<(), String> {
         let leg = LegRoute { job: "build".into(), labels: vec!["ubuntu-latest".into()], repo: "acme/app".into(), caps: 1 << 10, ..LegRoute::default() };
