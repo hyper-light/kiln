@@ -93,11 +93,15 @@ the agent took it is taken out of the queue (what's next goes in a message of it
 its harness's own goal is cleared first, as an edit of the clear). So an agent that spends hours in
 one turn, its stack changing meanwhile, finds the stack's latest word when the turn ends, once,
 rather than every goal and clear sent since, in the order they went. kiln sees the queue as the
-agent's machine last reported it: an edit that reaches the machine just after the turn ended, the
-message gone as it was, does nothing there, so what the edit said goes again, in a message of its
-own (and again at the next look, should it not reach the agent either). The stack's messages say
-so in their ids (`goal-…`): a server that started since (an upgrade) takes the one waiting for the
-stack's last word.
+agent's machine last reported it, and what the agent was handed as its machine says it (beside its
+queue; a machine from before this release: its timeline): an edit
+that reaches the machine just after the turn ended, the message gone as it was, does nothing there,
+so what the edit said goes again, in a message of its own (and again at the next look, should it
+not reach the agent either); one applied and taken between two looks isn't said again. A goal that
+goes as an edit of the message waiting goes under that message's id (docs/sends.md): sent again
+after a server restart, the agent's inbox answers it as the message it took. The stack's messages
+say so in their ids (`goal-…`): a server that started since (an upgrade) takes the one waiting for
+the stack's last word.
 
 A goal set in the agent itself (`/goal …` in its composer) joins its stack as the goal under way,
 so it's kept the same way, across restarts too; a goal the stack had under way goes back to the

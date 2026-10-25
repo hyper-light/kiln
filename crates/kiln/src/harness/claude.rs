@@ -1547,7 +1547,7 @@ impl Claude {
         core.state.delivery.insert(id.clone(), Delivery::Sent);
         prune_delivery(core);
         let (images, names) = super::model::attachment_summary(&attachments);
-        core.note_sent(&id);
+        core.note_sent(&id, &text);
         core.upsert(&id, None, Body::User { text, images, client_id: Some(id.clone()), origin: Some(super::core::origin_of(&id).into()), attachments: names, reply_to });
         core.touch_state();
         self.settle(core);

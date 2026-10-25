@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use super::core::{MAX_EVENTS, Update};
 use super::files;
+use super::inbox::{self, Answer, Said};
 use super::kept::{Job, Keeper, Kept};
 use super::host::{Host, Inventory, Limits};
 use super::kinds::KindInfo;
@@ -22,6 +23,16 @@ use crate::proto::{LANE_TERM, ServerMsg};
 /// How long a session this server opened on a machine waits for the machine to announce it before
 /// a report from the machine that leaves it out ends it.
 const OPEN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A message's id (what its session's inbox takes once): none for a command that isn't a message,
+/// or a message without one.
+pub fn message_id(c: &Command) -> Option<String> {
+    match c {
+        Command::Send { id, .. } if !id.is_empty() => Some(id.clone()),
+        Command::SkillRun { id: Some(id), .. } if !id.is_empty() => Some(id.clone()),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
@@ -330,14 +341,62 @@ impl Parts {
     }
 }
 
+/// The epoch to send a message once more for, when its session's inbox refused it as sent for an
+/// epoch the session has since left (the server sends it once more, for the one named). The sends
+/// simulation runs this too (`inbox::sim`).
+pub(crate) fn again_for(r: &inbox::Refusal) -> Option<u64> {
+    match r {
+        inbox::Refusal::StaleEpoch { current, sent, .. } if current > sent => Some(*current),
+        _ => None,
+    }
+}
+
 /// How a command fared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sent {
+    /// On its way to the session's machine: a command, or a message whose inbox's answer didn't
+    /// come in time (or that went to a runner from before inboxes).
     Ok,
+    /// The session's inbox took the message, or had: `repeat`, the first time's answer (CP-T3.2).
+    Accepted(Answer),
+    /// The session's inbox refused the message, saying why.
+    Refused(inbox::Refusal),
     NoSession,
     /// The session's machine is not connected right now.
     Unreachable,
 }
+
+/// A command sent ([`Registry::dispatch`]): how it fared already, or the answer still to come.
+pub enum Pending {
+    Now(Sent),
+    /// A message on its way, its inbox's answer waited for ([`Registry::settle`]).
+    Answer { message: String, rx: futures::channel::oneshot::Receiver<Said> },
+}
+
+/// What a sender is told of message `message` the session's machine took: its inbox's answer and,
+/// from a machine without inboxes (`seq` 0: none took it), that nothing there checks it for repeats
+/// (docs/sends.md, "Off").
+pub fn accepted(message: impl serde::Serialize, a: &Answer) -> Value {
+    let mut said = json!({"sent": true, "message": message, "accepted": a});
+    if a.seq == 0
+        && let Some(o) = said.as_object_mut()
+    {
+        o.insert("unchecked".into(), json!("the agent's machine checks no messages for repeats (its inbox is off): sent again, this is another message"));
+    }
+    said
+}
+
+impl Sent {
+    /// It got to the session's machine (and its inbox didn't refuse it).
+    pub fn went(&self) -> bool {
+        matches!(self, Self::Ok | Self::Accepted(_))
+    }
+}
+
+/// How long a message waits for its session's inbox to answer: past it, it's said to be on its way.
+pub const ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Messages waiting for their inbox's answer at once, at most: past it, one isn't waited for.
+pub const WAITING_MAX: usize = 10_000;
 
 /// What a viewer gets on attach: the catch-up frames, and where on the session's topic the live
 /// ones after them start (none while the bus can't hold its feed: snapshots alone, then).
@@ -404,6 +463,10 @@ struct Upload {
     mime: String,
     data: bytes::Bytes,
     at: std::time::Instant,
+    /// When a message first carried it: kept after, so a message sent again (its answer lost, or
+    /// sent once more for the epoch its session is at) carries it too, and reads as the same
+    /// message (CP-T3.2).
+    sent: Option<std::time::Instant>,
 }
 
 /// Uploads kept at most this long, and this much in all.
@@ -493,6 +556,8 @@ pub struct Registry {
     /// them (`super::opened`).
     pub ports: super::opened::Tunnels,
     pub opened: super::opened::Openings,
+    /// Messages waiting for their session's inbox to answer (CP-T3.2), by session and message id.
+    waiting: Mutex<HashMap<(String, String), Vec<futures::channel::oneshot::Sender<Said>>>>,
     /// Tests: what every session started here runs instead of its harness (a program that isn't
     /// there, so no harness ever starts, whatever this machine has installed).
     #[cfg(test)]
@@ -604,6 +669,7 @@ impl Registry {
             webrtc: super::webrtc::Webrtc::default(),
             ports: super::opened::Tunnels::default(),
             opened: super::opened::Openings::default(),
+            waiting: Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_program: Mutex::new(None),
         }
@@ -1064,6 +1130,14 @@ impl Registry {
     /// An update of session `id` from `from`. `shipped`: its machine keeps it in a store it sends
     /// the server's (`crate::convo::feed`), which keeps it from that, not from here.
     pub fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
+        // What became of a message: for whoever waits for it, wherever it was taken or refused.
+        let u = match u {
+            Update::Inbox { said } => {
+                self.answered(id, *said);
+                return;
+            }
+            other => other,
+        };
         let mut changed: Option<Info> = None;
         let mut gone = false;
         // The copy's events went another way than its viewers have them: they start over from it.
@@ -1122,6 +1196,13 @@ impl Registry {
                 let mut info = (**info).clone();
                 // What its goals wait on a person for is the server's to say (`goals::held_stacks`): kept.
                 info.held = g.get(id).and_then(|m| m.info.held.clone());
+                // What kiln's own words were handed is kept too, and what waits in its queue until
+                // the state after this says again (neither goes in an Open): a runner that comes
+                // back doesn't make a word handed look lost (CP-T3.2, the fourteenth adversarial check's).
+                if let Some(old) = g.get(id) {
+                    info.said.clone_from(&old.info.said);
+                    info.queue.clone_from(&old.info.queue);
+                }
                 let m = g.entry(id.to_owned()).or_insert_with(|| Mirror::new(info.clone(), from.clone(), Arc::clone(&self.bus)));
                 // Its machine announced it: what it reports from now on counts.
                 m.opened_at = None;
@@ -1164,7 +1245,8 @@ impl Registry {
                         m.started_over();
                     }
                 }
-                Update::Reply { .. } => {}
+                // An inbox's answer went to whoever waits for it, before any of this.
+                Update::Reply { .. } | Update::Inbox { .. } => {}
                 Update::Closed => gone = true,
                 Update::Reset { .. } => {
                     m.clear_events();
@@ -1213,6 +1295,13 @@ impl Registry {
                     for e in events {
                         if let Some(job) = mentions(id, &m.info.cwd, &m.location, e) {
                             jobs.push(job);
+                        }
+                        // kiln's own words handed to its harness, with what they said then: what a
+                        // goal stack's word or a parent's news held when its agent took it.
+                        if let super::model::Body::User { text, client_id: Some(c), .. } = &e.body
+                            && super::queued::own(c)
+                        {
+                            super::queued::note_given(&mut m.info.said, c, super::queued::stable(text));
                         }
                         if let Some(plan) = proposed_in(e) {
                             proposed = Some(plan);
@@ -1592,6 +1681,7 @@ impl Registry {
                         approvals: Vec::new(),
                         queued: 0,
                         queue: Vec::new(),
+                        said: Vec::new(),
                         tasks_running: 0,
                         subagents: Vec::new(),
                         cost_usd: 0.0,
@@ -1639,22 +1729,44 @@ impl Registry {
         Ok(out)
     }
 
-    /// Keep an uploaded file until a message refers to it (by the returned id).
+    /// Keep an uploaded file for the messages that refer to it (by the returned id): until it
+    /// expires, also after a message carried it (one sent again carries it too). Short of room, the
+    /// files messages carried already go first, the oldest first.
     pub fn upload(&self, name: String, mime: String, data: bytes::Bytes) -> anyhow::Result<String> {
         let mut g = self.uploads.lock();
         g.retain(|_, u| u.at.elapsed() < UPLOAD_TTL);
-        let used: usize = g.values().map(|u| u.data.len()).sum();
-        if used + data.len() > UPLOADS_MAX {
+        let mut used: usize = g.values().map(|u| u.data.len()).sum();
+        if used.saturating_add(data.len()) > UPLOADS_MAX {
+            let mut sent: Vec<(std::time::Instant, String)> = g.iter().filter_map(|(id, u)| u.sent.map(|t| (t, id.clone()))).collect();
+            sent.sort();
+            for (_, id) in sent {
+                if used.saturating_add(data.len()) <= UPLOADS_MAX {
+                    break;
+                }
+                if let Some(u) = g.remove(&id) {
+                    used = used.saturating_sub(u.data.len());
+                }
+            }
+        }
+        if used.saturating_add(data.len()) > UPLOADS_MAX {
             anyhow::bail!("too many uploads waiting; send them first");
         }
         let id = crate::util::new_id();
-        g.insert(id.clone(), Upload { name, mime, data, at: std::time::Instant::now() });
+        g.insert(id.clone(), Upload { name, mime, data, at: std::time::Instant::now(), sent: None });
         Ok(id)
     }
 
+    /// Upload `id`'s name, type and bytes, for a message that carries it: kept (marked sent), so a
+    /// message sent again carries it as well.
+    fn upload_of(&self, id: &str) -> Option<(String, String, bytes::Bytes)> {
+        let mut g = self.uploads.lock();
+        let u = g.get_mut(id)?;
+        u.sent.get_or_insert_with(std::time::Instant::now);
+        Some((u.name.clone(), u.mime.clone(), u.data.clone()))
+    }
+
     /// Attachments that refer to uploads, with the uploads' bytes in them instead: what one
-    /// message to many agents carries to each (an upload is taken by the first message that sends
-    /// it). One whose upload is gone (or expired) is left out.
+    /// message to many agents carries to each. One whose upload is gone (expired) is left out.
     pub fn inline_uploads(&self, attachments: Vec<super::model::Attachment>) -> Vec<super::model::Attachment> {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -1663,14 +1775,14 @@ impl Registry {
             .filter_map(|mut a| {
                 a.path = None;
                 let Some(fid) = a.file_id.take() else { return (!a.data_base64.is_empty()).then_some(a) };
-                let u = self.uploads.lock().remove(&fid)?;
+                let (name, mime, data) = self.upload_of(&fid)?;
                 if a.name.is_empty() {
-                    a.name = u.name;
+                    a.name = name;
                 }
                 if a.mime.is_empty() {
-                    a.mime = u.mime;
+                    a.mime = mime;
                 }
-                a.data_base64 = b64.encode(&u.data);
+                a.data_base64 = b64.encode(&data);
                 Some(a)
             })
             .collect()
@@ -1689,15 +1801,15 @@ impl Registry {
         for mut a in attachments {
             a.path = None;
             // The bytes: inline, or an upload.
-            let data: Option<bytes::Bytes> = match a.file_id.take().and_then(|f| self.uploads.lock().remove(&f)) {
-                Some(u) => {
+            let data: Option<bytes::Bytes> = match a.file_id.take().and_then(|f| self.upload_of(&f)) {
+                Some((name, mime, data)) => {
                     if a.name.is_empty() {
-                        a.name = u.name;
+                        a.name = name;
                     }
                     if a.mime.is_empty() {
-                        a.mime = u.mime;
+                        a.mime = mime;
                     }
-                    Some(u.data)
+                    Some(data)
                 }
                 None => b64.decode(a.data_base64.as_bytes()).ok().map(bytes::Bytes::from),
             };
@@ -1751,15 +1863,126 @@ impl Registry {
         }
     }
 
-    /// A command for a session, from any device.
+    /// The epoch the server last heard session `id` is at.
+    pub fn epoch_of(&self, id: &str) -> u64 {
+        let seen = self.mirrors.lock().get(id).map_or(0, |m| m.info.epoch);
+        self.epochs.lock().get(id).copied().unwrap_or(0).max(seen)
+    }
+
+    /// Waits for the answer to message `message` sent to session `id`: none when too many wait
+    /// already (it isn't waited for).
+    fn wait_for(&self, id: &str, message: &str) -> Option<futures::channel::oneshot::Receiver<Said>> {
+        let mut w = self.waiting.lock();
+        if w.len() >= WAITING_MAX {
+            // Those whose senders went away (and no answer came for) go first.
+            w.retain(|_, v| {
+                v.retain(|tx| !tx.is_canceled());
+                !v.is_empty()
+            });
+            if w.len() >= WAITING_MAX {
+                return None;
+            }
+        }
+        let (tx, rx) = futures::channel::oneshot::channel();
+        w.entry((id.to_owned(), message.to_owned())).or_default().push(tx);
+        Some(rx)
+    }
+
+    /// No longer waiting for message `message` sent to session `id`: the waits whose ends were
+    /// dropped go (an answer for those still waiting still reaches them).
+    fn unwait(&self, id: &str, message: &str) {
+        let mut w = self.waiting.lock();
+        let key = (id.to_owned(), message.to_owned());
+        if let Some(v) = w.get_mut(&key) {
+            v.retain(|tx| !tx.is_canceled());
+            if v.is_empty() {
+                w.remove(&key);
+            }
+        }
+    }
+
+    /// Session `id`'s inbox said what became of a message: whoever waits for it longest is told (each
+    /// send of it is answered once, in the order they went: two sent under one id at once, one
+    /// taken and one refused, are each told their own).
+    fn answered(&self, id: &str, said: Said) {
+        crate::metrics::sends().said(&said);
+        let key = (id.to_owned(), said.message.clone());
+        let first = {
+            let mut w = self.waiting.lock();
+            let Some(v) = w.get_mut(&key) else { return };
+            v.retain(|tx| !tx.is_canceled());
+            let first = (!v.is_empty()).then(|| v.remove(0));
+            if v.is_empty() {
+                w.remove(&key);
+            }
+            first
+        };
+        if let Some(tx) = first {
+            let _ = tx.send(said);
+        }
+    }
+
+    /// The answer to message `message` sent to session `id`, once it comes (by [`ANSWER_WAIT`]
+    /// on `hub`'s clock): on its way when it doesn't.
+    async fn answer(&self, hub: &Hub, id: &str, message: &str, rx: futures::channel::oneshot::Receiver<Said>) -> Sent {
+        let late = hub.clock.sleep(ANSWER_WAIT);
+        let sent = match futures::future::select(rx, late).await {
+            futures::future::Either::Left((Ok(said), _)) => match said.answer {
+                Ok(a) => Sent::Accepted(a),
+                Err(r) => Sent::Refused(r),
+            },
+            _ => {
+                crate::metrics::sends().unanswered.inc();
+                Sent::Ok
+            }
+        };
+        self.unwait(id, message);
+        sent
+    }
+
+    /// A command for a session, from any device. A message (`Command::Send`, a skill run with an
+    /// id) goes for the epoch the server last heard the session is at, and its inbox's answer is
+    /// waited for (CP-T3.2): one sent for an epoch the session has since left is sent again, once,
+    /// for the epoch its inbox named.
     pub async fn command(&self, hub: &Hub, id: &str, c: Command) -> Sent {
-        let Some(loc) = self.location(id) else { return Sent::NoSession };
+        match self.dispatch(hub, id, c.clone()).await {
+            Pending::Now(sent) => sent,
+            Pending::Answer { message, rx } => self.settle(hub, id, c, &message, rx).await,
+        }
+    }
+
+    /// The answer to command `c`, message `message`, sent to session `id` ([`Registry::dispatch`]):
+    /// sent for an epoch the session has since left, it's sent again, once, for the one its inbox
+    /// named.
+    pub async fn settle(&self, hub: &Hub, id: &str, c: Command, message: &str, rx: futures::channel::oneshot::Receiver<Said>) -> Sent {
+        let sent = self.answer(hub, id, message, rx).await;
+        if let Sent::Refused(r) = &sent
+            && let Some(current) = again_for(r)
+        {
+            self.raise_epoch(id, current);
+            return self.command_once(hub, id, c).await;
+        }
+        sent
+    }
+
+    async fn command_once(&self, hub: &Hub, id: &str, c: Command) -> Sent {
+        match self.dispatch(hub, id, c).await {
+            Pending::Now(sent) => sent,
+            Pending::Answer { message, rx } => self.answer(hub, id, &message, rx).await,
+        }
+    }
+
+    /// Sends command `c` to session `id` now, after whatever was sent before: how it fared, or (a
+    /// message) its inbox's answer to wait for ([`Registry::settle`]), so a sender that goes on
+    /// meanwhile (a viewer's socket) waits for nothing.
+    pub async fn dispatch(&self, hub: &Hub, id: &str, c: Command) -> Pending {
+        let Some(loc) = self.location(id) else { return Pending::Now(Sent::NoSession) };
         // Kiln's own (`goals::keep`), kept here: its harness has nothing to do with it.
         if let Command::Control { id: control, value } = &c
             && control == "keep_going"
         {
             self.set_keep_going(hub, id, value.as_ref().and_then(Value::as_bool).unwrap_or(true));
-            return Sent::Ok;
+            return Pending::Now(Sent::Ok);
         }
         // A name is kept here: the session takes it at once, whatever its machine can do (and
         // its harness names its conversation too, where it does).
@@ -1771,24 +1994,61 @@ impl Registry {
         }
         let c = match self.route_attachments(hub, id, &loc, c).await {
             Ok(c) => c,
-            Err(e) => return e,
+            Err(e) => return Pending::Now(e),
         };
-        match Some(loc) {
-            None => Sent::NoSession,
-            Some(Location::Local) => {
-                if self.local.command(id, c) {
-                    Sent::Ok
-                } else {
-                    Sent::NoSession
+        let message = message_id(&c);
+        // A message without an id goes on unchecked (counted).
+        let unchecked = message.is_none() && super::session::is_message(&c);
+        let epoch = self.epoch_of(id);
+        match loc {
+            Location::Local => {
+                let wait = message.as_deref().and_then(|m| self.wait_for(id, m));
+                if !self.local.command_at(id, c, Some(epoch)) {
+                    // Not waited for after all: its end of the wait goes first, then the wait.
+                    drop(wait);
+                    if let Some(m) = &message {
+                        self.unwait(id, m);
+                    }
+                    // Its session is here: its lane holds its most (a message is refused so).
+                    if message.is_some() && self.local.get(id).is_some() {
+                        return Pending::Now(Sent::Refused(inbox::Refusal::Full { session: id.to_owned(), limit: super::host::LANE }));
+                    }
+                    return Pending::Now(Sent::NoSession);
+                }
+                if unchecked {
+                    crate::metrics::sends().unchecked.inc();
+                }
+                match (wait, message) {
+                    (Some(rx), Some(message)) => Pending::Answer { message, rx },
+                    _ => Pending::Now(Sent::Ok),
                 }
             }
-            Some(Location::Machine(machine)) => {
-                let Ok(json) = serde_json::to_string(&c) else { return Sent::NoSession };
+            Location::Machine(machine) => {
+                let Ok(json) = serde_json::to_string(&c) else { return Pending::Now(Sent::NoSession) };
+                // A runner with inboxes takes a message for an epoch, and answers it.
+                let caps = hub.instances.lock().wide_caps_for(&machine, &crate::instances::Owned::Agent(id.to_owned()));
+                let had_id = message.is_some();
+                if let Some(m) = message.filter(|_| caps & crate::proto::CAP_INBOX != 0) {
+                    let wait = self.wait_for(id, &m);
+                    if !hub.send_to_agent(&machine, LANE_TERM, &ServerMsg::HarnessSend { session: id.to_owned(), epoch, json }).await {
+                        drop(wait);
+                        self.unwait(id, &m);
+                        return Pending::Now(Sent::Unreachable);
+                    }
+                    return match wait {
+                        Some(rx) => Pending::Answer { message: m, rx },
+                        None => Pending::Now(Sent::Ok),
+                    };
+                }
                 // A name is given even while the machine is away: it's kept here.
                 if hub.send_to_agent(&machine, LANE_TERM, &ServerMsg::HarnessCmd { session: id.to_owned(), json }).await || renamed {
-                    Sent::Ok
+                    // A message to a runner from before inboxes, or one without an id: unchecked.
+                    if unchecked || had_id {
+                        crate::metrics::sends().unchecked.inc();
+                    }
+                    Pending::Now(Sent::Ok)
                 } else {
-                    Sent::Unreachable
+                    Pending::Now(Sent::Unreachable)
                 }
             }
         }
@@ -1943,6 +2203,65 @@ fn proposed_in(e: &super::model::Event) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CP-T3.2: a message a machine without inboxes took (`seq` 0) is answered as taken, and as
+    /// unchecked: sent again, it's another message. One an inbox took says nothing of the kind.
+    #[test]
+    fn a_message_no_inbox_checked_is_answered_unchecked() {
+        let answer = |seq: u64| Answer { session: "s1".into(), message: "m1".into(), epoch: 0, at: 1, seq, repeat: false };
+        let unchecked = super::accepted("m1", &answer(0));
+        assert!(unchecked.get("unchecked").and_then(Value::as_str).is_some_and(|w| w.contains("another message")), "{unchecked}");
+        assert_eq!(unchecked.get("sent"), Some(&json!(true)));
+        assert!(super::accepted("m1", &answer(7)).get("unchecked").is_none());
+    }
+
+    /// CP-T3.2: a wait for a message's answer that's given up goes (none is left behind to fill the
+    /// most there may be); one still waiting stays, and is told the answer when it comes.
+    #[test]
+    fn waits_given_up_go_and_those_still_waiting_are_told() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let conversations = crate::config::Conversations { off: true, ..Default::default() };
+            let r = Registry::with(dir.path().to_path_buf(), &conversations, Arc::new(kiln_seams::clock::SimClock::new()), sim_bus());
+            let gone = r.wait_for("s1", "m1");
+            let kept = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
+            drop(gone);
+            r.unwait("s1", "m1");
+            assert_eq!(r.waiting.lock().get(&("s1".to_owned(), "m1".to_owned())).map(Vec::len), Some(1), "the one still waiting stays");
+            let said = Said { message: "m1".into(), answer: Err(inbox::Refusal::NoSession { session: "s1".into() }) };
+            r.answered("s1", said.clone());
+            assert!(r.waiting.lock().is_empty());
+            assert_eq!(kept.await.ok(), Some(said));
+            // Given up before any answer: nothing is left.
+            let w = r.wait_for("s2", "m2");
+            drop(w);
+            r.unwait("s2", "m2");
+            assert!(r.waiting.lock().is_empty());
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: each send of a message is answered once, in the order they went: two sent under one
+    /// id at once, the first taken and the other refused (another message under its id), are each
+    /// told their own.
+    #[test]
+    fn each_send_under_an_id_is_told_its_own_answer() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let conversations = crate::config::Conversations { off: true, ..Default::default() };
+            let r = Registry::with(dir.path().to_path_buf(), &conversations, Arc::new(kiln_seams::clock::SimClock::new()), sim_bus());
+            let first = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
+            let second = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
+            let taken = Said { message: "m1".into(), answer: Ok(inbox::Answer { session: "s1".into(), message: "m1".into(), epoch: 0, at: 1, seq: 7, repeat: false }) };
+            let reused = Said { message: "m1".into(), answer: Err(inbox::Refusal::Reused { session: "s1".into(), message: "m1".into() }) };
+            r.answered("s1", taken.clone());
+            r.answered("s1", reused.clone());
+            assert_eq!(first.await.ok(), Some(taken));
+            assert_eq!(second.await.ok(), Some(reused));
+            assert!(r.waiting.lock().is_empty());
+            Ok(())
+        })
+    }
 
     /// One update taken by a copy, as `Registry::ingest_from` takes it: its revision first.
     fn took<R>(m: &mut Mirror, f: impl FnOnce(&mut Mirror) -> R) {
@@ -2120,6 +2439,49 @@ mod tests {
         let Ok(read) = futures::executor::block_on(hub.bus.read(topic, *at, 1000)) else { return Vec::new() };
         *at = read.next;
         read.messages.iter().filter_map(|m| super::super::live::decode(&m.payload)).map(|f| f.text.to_string()).collect()
+    }
+
+    /// CP-T3.2 (the thirteenth and fourteenth adversarial checks'): what kiln's own words (a goal
+    /// stack's, a parent's news) said when their harness was handed them is kept on the session's
+    /// info (`queued::Kept::look` reads it): from its runner's state (`State::given`), and from its
+    /// user events (a runner from before says no `given`), once; another's message isn't. A runner
+    /// that comes back (an Open) or started again (its state saying less) takes none of it away.
+    #[test]
+    fn kiln_s_own_words_handed_to_a_harness_are_noted_with_what_they_said() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event, Given, State};
+        use crate::harness::queued::stable;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let open = || Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None };
+            hub.harness.ingest(&hub, &there, "s", open());
+            let user = |id: &str, seq: u64, text: &str| Event {
+                id: id.into(),
+                seq,
+                at: 1,
+                parent: None,
+                by: None,
+                body: Body::User { text: text.into(), images: 0, client_id: Some(id.into()), origin: None, attachments: Vec::new(), reply_to: None },
+            };
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![user("goal-1", 1, "/goal tests pass"), user("m-person", 2, "hello"), user("news-1", 3, "one child settled")] });
+            // Upserted again (its delivery's state), with other words: what it was handed stays.
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![user("goal-1", 1, "/goal tests pass, edited later")] });
+            // Its runner's state says another handed.
+            let given = |g: &[(&str, &str)]| Update::State { state: Box::new(State { given: g.iter().map(|(m, t)| Given { id: (*m).into(), digest: stable(t) }).collect(), ..State::default() }) };
+            hub.harness.ingest(&hub, &there, "s", given(&[("goal-2", "/goal docs build")]));
+            let want = vec![
+                Given { id: "goal-1".into(), digest: stable("/goal tests pass") },
+                Given { id: "news-1".into(), digest: stable("one child settled") },
+                Given { id: "goal-2".into(), digest: stable("/goal docs build") },
+            ];
+            let said = || hub.harness.info("s").map(|i| i.said).unwrap_or_default();
+            assert_eq!(said(), want);
+            // Its runner comes back, then says less (started again): all of it stays.
+            hub.harness.ingest(&hub, &there, "s", open());
+            hub.harness.ingest(&hub, &there, "s", given(&[]));
+            assert_eq!(said(), want, "kept across the Open and a state that says less");
+            Ok(())
+        })
     }
 
     /// A runner that started again goes on from what the copy has (`crate::wire::sums`): the copy

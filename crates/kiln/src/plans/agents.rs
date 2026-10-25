@@ -245,7 +245,8 @@ fn side_by_side(hub: &Hub, cfg: &Config, needs: &[Vec<usize>], given: &[Option<S
 }
 
 /// Runs plan `p` as one agent per step, as `cfg` says. The steps that wait for none start at once.
-pub async fn start(hub: &Arc<Hub>, p: &Plan, cfg: Config) -> R<Started> {
+/// Under `key` (CP-T3.2), asked for again, it's the run it started then, as it stands.
+pub async fn start(hub: &Arc<Hub>, p: &Plan, cfg: Config, key: Option<&str>) -> R<Started> {
     super::ready_to_run(p)?;
     let n = p.steps.len().min(STEPS);
     if n == 0 {
@@ -279,16 +280,26 @@ pub async fn start(hub: &Arc<Hub>, p: &Plan, cfg: Config) -> R<Started> {
         .map(|&i| (i, title_of(p, i), goal_of(p, i, n), serde_json::to_string(needs.get(i).map_or(&[][..], Vec::as_slice)).unwrap_or_else(|_| "[]".into()), given.get(i).cloned().flatten()))
         .collect();
     let taken = steps.len();
-    let (run, now, version, plan_id, by) = (crate::util::new_id(), crate::util::now_unix(), p.version, p.id.clone(), cfg.actor.clone());
+    // The same id as `plans::run` makes under the key: one key, one request, whatever its mode.
+    let run = key.map_or_else(crate::util::new_id, |k| crate::util::derive_id(&["plans.run", &p.id, k]));
+    let (now, version, plan_id, by) = (crate::util::now_unix(), p.version, p.id.clone(), cfg.actor.clone());
     let config = serde_json::to_string(&cfg).map_err(anyhow::Error::from)?;
     let (run_c, note_c) = (run.clone(), note.clone());
-    hub.store
+    // The run it started before under its key: its steps and note as they were, what it was asked
+    // (its config), and whether it was one agent per step too.
+    let had: Option<(usize, Option<String>, Option<String>, bool)> = hub
+        .store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
-            tx.execute(
-                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by, state, config, note) VALUES (?1, ?2, ?3, '', 'agents', ?4, ?5, 'running', ?6, ?7)",
+            let made = tx.execute(
+                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by, state, config, note) VALUES (?1, ?2, ?3, '', 'agents', ?4, ?5, 'running', ?6, ?7) ON CONFLICT (id) DO NOTHING",
                 params![run_c, plan_id, version, now, by, config, note_c],
             )?;
+            if made == 0 {
+                let steps: i64 = tx.query_row("SELECT COUNT(*) FROM plan_run_steps WHERE run_id = ?1", params![run_c], |r| r.get(0))?;
+                let (note, was, mode): (Option<String>, Option<String>, String) = tx.query_row("SELECT note, config, mode FROM plan_runs WHERE id = ?1", params![run_c], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                return Ok(Some((usize::try_from(steps).unwrap_or(0), note, was, mode == "agents")));
+            }
             for (i, title, goal, needs, given) in &steps {
                 tx.execute(
                     "INSERT INTO plan_run_steps (run_id, idx, title, goal, needs, given_to) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -296,9 +307,18 @@ pub async fn start(hub: &Arc<Hub>, p: &Plan, cfg: Config) -> R<Started> {
                 )?;
             }
             tx.commit()?;
-            Ok(())
+            Ok(None)
         })
         .await?;
+    if let Some((steps, note, was, agents)) = had {
+        // Asked again under its key for other steps, or after a run of it in another mode, it's
+        // another request: refused, never answered as the run it isn't.
+        let was_cfg = was.as_deref().and_then(|c| serde_json::from_str::<Config>(c).ok());
+        if !agents || was_cfg.as_ref().is_none_or(|c| c.only != cfg.only) {
+            return Err(Error::Refused(http::StatusCode::CONFLICT, "this key was given to another request (other steps, or another mode): give this one a key of its own".into()));
+        }
+        return Ok(Started { run, steps, note });
+    }
     // The first steps' agents, now rather than at the next look.
     if let Err(e) = advance(hub, &run).await {
         tracing::warn!(%run, error = %format!("{e:#}"), "plan run");
@@ -779,13 +799,19 @@ fn step_row(rows: &[Row], n: usize) -> R<&Row> {
 }
 
 /// Tries step `n` again (a new agent for it; given to an agent that's there, its goal again on that
-/// agent's stack): the one before, if it still runs, ends, and the run goes on from there.
-pub async fn retry(hub: &Arc<Hub>, run: &str, n: usize, by: &str) -> R<Run> {
+/// agent's stack): the one before, if it still runs, ends, and the run goes on from there. `seen`:
+/// the try the asker means to replace (the step's `tries` as it saw them): asked again once the step
+/// was tried again since, nothing more is started (CP-T3.2), and the run is answered as it is.
+pub async fn retry(hub: &Arc<Hub>, run: &str, n: usize, seen: Option<i64>, by: &str) -> R<Run> {
     {
         let lock = looking(run);
         let _one = lock.lock().await;
         let (_, rows) = load_run(hub, run).await?;
         let row = step_row(&rows, n)?;
+        if seen.is_some_and(|t| t != row.tries) {
+            drop(_one);
+            return view(hub, run).await;
+        }
         if row.status == "met" {
             return Err(Error::Bad(format!("step {n} is met already")));
         }
@@ -893,7 +919,7 @@ mod tests {
                     actor: "admin".into(),
                     ..Config::default()
                 };
-                let started = start(&hub, &p, cfg).await?;
+                let started = start(&hub, &p, cfg, None).await?;
                 anyhow::ensure!(started.steps == 3 && started.note.is_none(), "each step waits for the one before: nothing side by side to say");
                 let run = started.run;
                 let meet = |agent: String| {
@@ -925,9 +951,12 @@ mod tests {
                 let v = view(&hub, &run).await?;
                 anyhow::ensure!(v.state == "stopped" && v.steps.get(2).is_some_and(|s| s.stand == "unmet") && v.reason.as_deref().is_some_and(|r| r.contains("step 3 wasn't met")), "{:?} {:?}", v.state, v.reason);
                 // Retried: a new agent, and the run goes on to done.
-                let v = retry(&hub, &run, 3, "admin").await?;
+                let v = retry(&hub, &run, 3, Some(1), "admin").await?;
                 let a3b = v.steps.get(2).and_then(|s| s.agent_id.clone()).unwrap_or_default();
                 anyhow::ensure!(v.state == "running" && a3b != a3 && v.steps.get(2).is_some_and(|s| s.tries == 2), "a new agent for the step");
+                // Asked again for the try it replaced (its answer lost, CP-T3.2): nothing more starts.
+                let again = retry(&hub, &run, 3, Some(1), "admin").await?;
+                anyhow::ensure!(again.steps.get(2).is_some_and(|s| s.tries == 2 && s.agent_id.as_deref() == Some(a3b.as_str())), "the retry asked again started another: {:?}", again.steps.get(2).map(|s| (s.tries, s.agent_id.clone())));
                 meet(a3b).await?;
                 advance(&hub, &run).await?;
                 let v = view(&hub, &run).await?;
@@ -1001,7 +1030,7 @@ mod tests {
                 let items = vec![it("Schema", &[]), it("API", &[1]), it("UI", &[1]), it("Docs", &[]), it("Ship", &[2, 3])];
                 let p = super::super::create(&hub, super::super::New { title: "Graph".into(), items, ..Default::default() }, "admin").await?;
                 let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some("/nonexistent/kiln-plan-dag".into()), ..Place::default() };
-                let started = start(&hub, &p, Config { place, opener: Some("owner".into()), actor: "admin".into(), ..Config::default() }).await?;
+                let started = start(&hub, &p, Config { place, opener: Some("owner".into()), actor: "admin".into(), ..Config::default() }, None).await?;
                 let note = started.note.clone().unwrap_or_default();
                 anyhow::ensure!(note.contains("steps 1 and 4; steps 2 and 3") && note.contains("one folder"), "{note}");
                 let run = started.run;
@@ -1028,7 +1057,7 @@ mod tests {
                 let v = view(&hub, &run).await?;
                 anyhow::ensure!(v.state == "stopped" && v.reason.as_deref().is_some_and(|r| r.starts_with("step 2 wasn't met")), "{} {:?}", v.state, v.reason);
                 // Retried: a new agent for step 2 only; met, step 5 starts; met, done.
-                let v = retry(&hub, &run, 2, "admin").await?;
+                let v = retry(&hub, &run, 2, None, "admin").await?;
                 anyhow::ensure!(v.state == "running" && stands(&v) == strs(&["met", "working", "met", "met", "waiting"]) && v.steps.get(1).is_some_and(|s| s.tries == 2), "{:?}", stands(&v));
                 meet(&hub, &run, 2).await?;
                 advance(&hub, &run).await?;
@@ -1076,7 +1105,7 @@ mod tests {
                 let p = super::super::create(&hub, super::super::New { title: "Some".into(), items, ..Default::default() }, "admin").await?;
                 let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some("/nonexistent/kiln-plan-some".into()), ..Place::default() };
                 let cfg = Config { place, only: Some(vec![1, 2]), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
-                let started = start(&hub, &p, cfg).await?;
+                let started = start(&hub, &p, cfg, None).await?;
                 anyhow::ensure!(started.steps == 2, "{started:?}");
                 anyhow::ensure!(started.note.as_deref().is_some_and(|n| n.contains("Not in this run, taken as done: step 2 waits for step 1.")), "{:?}", started.note);
                 let v = view(&hub, &started.run).await?;
@@ -1098,7 +1127,7 @@ mod tests {
                 let p = super::super::create(&hub, super::super::New { title: "Fan out".into(), items, ..Default::default() }, "admin").await?;
                 let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some("/nonexistent/kiln-plan-fan".into()), ..Place::default() };
                 let cfg = Config { place, parallel: true, max_parallel: Some(2), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
-                let run = start(&hub, &p, cfg).await?.run;
+                let run = start(&hub, &p, cfg, None).await?.run;
                 anyhow::ensure!(stands(&view(&hub, &run).await?) == strs(&["working", "working", "waiting"]));
                 meet(&hub, &run, 2).await?;
                 advance(&hub, &run).await?;
@@ -1128,7 +1157,7 @@ mod tests {
                 let p = super::super::create(&hub, super::super::New { title: "Fan out".into(), items, ..Default::default() }, "admin").await?;
                 let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some(cwd), ..Place::default() };
                 let cfg = Config { place, parallel: true, main: Some(main.clone()), parent: Some(main), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
-                let v = view(&hub, &start(&hub, &p, cfg).await?.run).await?;
+                let v = view(&hub, &start(&hub, &p, cfg, None).await?.run).await?;
                 anyhow::ensure!(stands(&v) == strs(&["working", "waiting", "waiting"]), "{:?} {:?}", stands(&v), v.steps.iter().map(|s| &s.reason).collect::<Vec<_>>());
                 Ok(())
             })
@@ -1162,7 +1191,7 @@ mod tests {
                 let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some(cwd.clone()), ..Place::default() };
                 let steps = vec![Place { agent: Some("main".into()), ..Place::default() }];
                 let cfg = Config { place, steps, main: Some(main.clone()), parent: Some(main.clone()), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
-                let run = start(&hub, &p, cfg).await?.run;
+                let run = start(&hub, &p, cfg, None).await?.run;
                 let v = view(&hub, &run).await?;
                 anyhow::ensure!(stands(&v) == strs(&["working", "waiting"]) && v.steps.first().is_some_and(|s| s.given && s.agent_id.as_deref() == Some(main.as_str())), "{:?}", stands(&v));
                 anyhow::ensure!(hub.harness.list().iter().all(|i| i.parent.as_deref() != Some(main.as_str())), "no agent started for a step given to the main agent");

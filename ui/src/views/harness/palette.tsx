@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { Copy, Download, X } from "lucide-react";
-import type { Command, SessionStore, SlashCommand } from "@/api/harness";
+import { clientId, type Command, type SessionStore, type SlashCommand } from "@/api/harness";
 import { copyText } from "@/views/terminal/clipboard";
 import { Prose } from "./parts";
 
@@ -90,7 +90,7 @@ export function runCommand(c: SlashCommand, args: string, store: SessionStore): 
   const r = c.route;
   if (!r || r.kind === "prompt") {
     if (r?.skill) {
-      store.send({ type: "skill_run", name: c.name, args: args || undefined });
+      store.send({ type: "skill_run", name: c.name, args: args || undefined, id: clientId() });
       return { kind: "sent" };
     }
     return { kind: "send", text: r?.text ? r.text.replaceAll("{args}", args) : `/${c.name}${args ? ` ${args}` : ""}` };

@@ -316,7 +316,7 @@ Bits from 36 are free. Take the next one, and add its row here in the same chang
 | `PortClose` | carried (port window) | A port's end. | As its class says. |
 | `Executor` | answer | Answers `Executor`. | As its class says. |
 | `Undeployed` | answer | Answers `Undeploy`. | As its class says. |
-| `Caps` | handshake | What the runner can do, in 64 bits (`Build`'s 32 ran out): `CAP_WIRE` says it keeps the channel. | New: sent from plan step 3. |
+| `Caps` | handshake | What the runner can do, in 64 bits (`Build`'s 32 ran out): `CAP_WIRE` says it keeps the channel, `CAP_INBOX` that its sessions have inboxes (CP-T3.2). | New: sent from plan step 3. |
 | `Wire` | carried (the channel) | A frame of the channel: numbered items carrying other messages, their ACKs and NACKs, wants, and what each side has after a reconnect. | New: `crate::wire::channel`. |
 | `Cluster` | carried (the cluster group) | The runner's learner of the cluster group (docs/p2p.md, P2): hyper-raft's messages, which it acknowledges and resends, and asks for where the server's records are before a read. | As its class says: a read whose ask goes unanswered in 2 s goes to the server. |
 | `NetDrops` | telemetry | What the runner's QUIC layer let go before it reached the wire, by lane and reason, counted from its start: each supersedes the last ("Loss below the channel"). | Sent with its samples once it changed, to a server announcing `CAP_NET_DROPS`. |
@@ -384,6 +384,7 @@ Bits from 36 are free. Take the next one, and add its row here in the same chang
 | `Wire` | carried (the channel) | A frame of the channel, as the runner's. | New: `crate::wire::channel`. |
 | `Cluster` | carried (the cluster group) | To the runner's learner: join or leave the group (said again on every connect), hyper-raft's messages, and where the server's records are. | As its class says. |
 | `Kept` | state | What the server's copy of each of the runner's sessions has, said in digests, so a stream the runner starts sends only what the copy lacks ("Restarts", above). | Sent before `Welcome` to a runner that keeps the channel, 32 sessions a frame. |
+| `HarnessSend` | command, parked | A message (or a skill run) for an agent session, for the epoch the server last heard it's at: its id made once, its inbox takes it once, refuses it typed (a stale epoch named), and answers either way (CP-T3.2, docs/sends.md). To runners that say `CAP_INBOX` in their `Caps`. | T3: answered (`Update::Inbox`); while its runner is away it's refused at once, until CP-T3.3 parks it. |
 
 ## Commands to a session: `Command`
 
@@ -392,7 +393,7 @@ travels in `HarnessCmd`.
 
 | Command | Class | Why | Today |
 |---|---|---|---|
-| `Send` | command, parked | A message. T3's: its inbox takes each id once and parks it for a runner that's away. | T3 (`cp/t3-sends`): ids and inbox answers built, not on main. |
+| `Send` | command, parked | A message. T3's: its inbox takes each id once and parks it for a runner that's away. | Its id made once and its inbox's answer (CP-T3.2, docs/sends.md); refused at once while its runner is away, until CP-T3.3 parks it. |
 | `QueueEdit` | command, parked | Goes with the messages it edits (T3). | Fire-and-forget. |
 | `QueueRemove` | command, parked | Goes with the messages it edits (T3). | Fire-and-forget. |
 | `QueueMove` | command, parked | Goes with the messages it edits (T3). | Fire-and-forget. |
@@ -420,7 +421,7 @@ travels in `HarnessCmd`.
 | `McpAdd` | command, refused while away | Runs the harness's own CLI now. | Fire-and-forget. |
 | `McpRemove` | command, refused while away | As `McpAdd`. | Fire-and-forget. |
 | `SkillView` | ask | Answered to its client. | As its class says. |
-| `SkillRun` | command, parked | Delivered like a message (T3). | T3 (`cp/t3-sends`). |
+| `SkillRun` | command, parked | Delivered like a message (T3). | Through its session's inbox, as a message (CP-T3.2). |
 | `SkillsReload` | command, refused while away | Reads the skills again now. | Fire-and-forget. |
 | `StopTasks` | command, refused while away | Stops what runs now. | Fire-and-forget. |
 | `Resume` | command, refused while away | Ends a pause now. | Fire-and-forget. |
@@ -444,6 +445,7 @@ From wherever a session runs to the server, inside `Harness`, and on to its view
 | `Changes` | state | Its whole changeset: each replaces the last. | As `Harness`. |
 | `Stream` | stream | Text appended to a streaming event. | As `Harness`. |
 | `Reply` | answer | Answers one client's ask. | As its class says. |
+| `Inbox` | answer | What a session's inbox made of a message (`HarnessSend`): taken, a repeat with the first time's answer, or refused and why (CP-T3.2). | T3: rides the session's stream. Sent again after a server restart, it finds no waiter, or a retry's own waiter (CP-T3.3 gives each send a nonce). |
 | `Reset` | stream | The timeline starts over (a snapshot follows). | As `Harness`. |
 
 ## The UI's sockets

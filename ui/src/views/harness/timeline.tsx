@@ -6,7 +6,7 @@
  */
 import * as React from "react";
 import { ArrowDown, ArrowUpRight, ChevronRight, CircleAlert, Copy, CornerDownRight, Download, FileDown, GitBranch, GitFork, Info, Pencil, Reply, SquarePlus, TriangleAlert, Undo2 } from "lucide-react";
-import { clientId, useSession, type Approval, type Command, type Delivery, type HEvent, type Meta, type QueueItem, type SessionStore, type Task } from "@/api/harness";
+import { useSession, type Approval, type Command, type Delivery, type HEvent, type Meta, type QueueItem, type SessionStore, type Task } from "@/api/harness";
 import { useNavigate } from "@/lib/router";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -52,6 +52,7 @@ import { latestThought, thinkingStarted, thoughtIsLive, thoughtShown, type Thoug
 import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
 import { useHeld, useRecent } from "./dom";
+import { unsending } from "./unsend";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
@@ -739,13 +740,14 @@ const Prompt = React.memo(function Prompt({
   const navigate = useNavigate();
   const why = delivery ? DELIVERY[delivery] : "sent";
   const unsend = () => {
-    if (!onCommand || (!queueItem?.id && !e.client_id)) return;
-    onCommand({ type: "queue_remove", id: queueItem?.id ?? e.client_id ?? "" });
+    const { unsend: remove } = unsending(queueItem?.id ?? e.client_id);
+    if (!onCommand || !remove) return;
+    onCommand(remove);
     setUnsent(true);
   };
+  // What it unsent still goes (unsend.ts): Undo shows it again, sending nothing.
   const undo = () => {
-    if (!onCommand) return;
-    onCommand({ type: "send", id: clientId(), text: e.text, mode: "queue", attachments: queueItem?.attachments, reply_to: queueItem?.reply_to ?? e.reply_to });
+    unsending(queueItem?.id ?? e.client_id).undo.forEach((c) => onCommand?.(c));
     setUnsent(false);
   };
   const swipe = useUnsendSwipe(queued && !editing && !unsent, unsend);

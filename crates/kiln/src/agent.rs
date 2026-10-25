@@ -362,6 +362,12 @@ const RETIRE_QUIET: Duration = Duration::from_secs(8);
 /// environment set up, its images pulled) before it's refused.
 const LEG_SHELL_WAIT: Duration = Duration::from_secs(60);
 
+/// How long a new build that took its sessions over, and whose link to the runner it upgraded
+/// ended with no word of a promotion, holds their messages still (a runner that takes them back
+/// stops it well before).
+#[cfg(unix)]
+const TAKE_OVER_GRACE: Duration = Duration::from_secs(30);
+
 #[cfg(unix)]
 use crate::upgrade::with_instance;
 
@@ -662,12 +668,25 @@ async fn roll_back(
     use std::os::fd::IntoRawFd as _;
     let empty = tracing::field::Empty;
     let span = tracing::info_span!(target: "kiln::upgrade", parent: &mv.root, "upgrade.rollback", reason = %why, result = empty, error = empty);
-    if let Some(sup) = crate::bluegreen::Supervisor::from_env() {
-        let green = mv.green;
-        if let Ok(Err(e)) | Err(e) = crate::rt::blocking(move || sup.kill(green)).await {
-            // Gone already (it exited, or it was never started).
-            tracing::debug!(error = %format!("{e:#}"), pid = green.pid, "stopping the new build");
-        }
+    // Nothing is taken back until the new build is seen gone: one left running takes messages again
+    // a while after its link here ends (`Bg::TakeOverEnded`), and the two would hold the same
+    // sessions, each with an inbox of its own (CP-T3.2, the thirteenth adversarial check's). One
+    // that can't be stopped keeps what it took over.
+    if !stop_new_build(crate::bluegreen::Supervisor::from_env(), mv.green, Duration::from_secs(5)).await {
+        tracing::error!(pid = mv.green.pid, "the new build couldn't be stopped: what it took over stays with it, and nothing is taken back here");
+        let kept: Vec<String> = mv
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::Terminal { session, .. } => format!("terminal {session}: kept by the new build, which couldn't be stopped"),
+                Item::Session { record, .. } => format!("agent session {}: kept by the new build, which couldn't be stopped", record.id()),
+            })
+            .collect();
+        span.record("result", "failed");
+        span.record("error", "the new build couldn't be stopped");
+        mv.root.record("result", "rolled_back");
+        mv.root.record("error", why);
+        return kept;
     }
     let mut problems = Vec::new();
     for (i, item) in mv.items.into_iter().enumerate() {
@@ -707,6 +726,38 @@ async fn roll_back(
     mv.root.record("result", "rolled_back");
     mv.root.record("error", why);
     problems
+}
+
+/// Stops the new build `green`, a rollback's first step: its supervisor `sup` kills it (none, or it
+/// didn't: killed here), and it's seen gone within `patience` of each. Whether it's gone.
+#[cfg(unix)]
+async fn stop_new_build(sup: Option<crate::bluegreen::Supervisor>, green: crate::bluegreen::Green, patience: Duration) -> bool {
+    if let Some(sup) = sup
+        && let Ok(Err(e)) | Err(e) = crate::rt::blocking(move || sup.kill(green)).await
+    {
+        // Gone already (it exited, or it was never started), or its supervisor couldn't.
+        tracing::debug!(error = %format!("{e:#}"), pid = green.pid, "stopping the new build");
+    }
+    if gone_within(green.pid, patience).await {
+        return true;
+    }
+    if let Ok(pid) = i32::try_from(green.pid) {
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+    }
+    gone_within(green.pid, patience).await
+}
+
+/// Whether process `pid` is gone within `patience` (looked at every 20 ms).
+#[cfg(unix)]
+async fn gone_within(pid: u32, patience: Duration) -> bool {
+    let until = std::time::Instant::now() + patience;
+    while crate::bluegreen::alive(pid) {
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        crate::rt::sleep(Duration::from_millis(20)).await;
+    }
+    true
 }
 
 /// (The new build's runner, blue/green.) Take over from the runner being upgraded, at `path`: say
@@ -1136,6 +1187,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // serves them once it holds the sessions.
     #[cfg(unix)]
     let mut sockets_served = take_over_pending.is_none();
+    // It took the sessions over (the runner it upgrades said that was everything).
+    #[cfg(unix)]
+    let mut took_over = false;
     // Conversations kept on disk as they happen (docs/conversations.md), and sent to the server's
     // store over this link (`crate::convo::feed`).
     let mut convo: Option<crate::convo::store::Store> = None;
@@ -1145,6 +1199,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
         let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
         let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), Default::default());
+        // A new build taking over takes no messages till it's promoted (`Host::hold`).
+        if take_over_pending.is_some() {
+            h.hold(true);
+        }
         h.restore_from(convo.as_ref());
         h
     });
@@ -1200,9 +1258,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let answer = match &host {
                     Some(h) => {
                         let h = Arc::clone(h);
-                        crate::rt::blocking(move || h.adopt(&from, &data)).await.unwrap_or_else(|e| Err(format!("{e:#}")))
+                        // Stopped part-way (it panicked): it may have been taken over, so not "not taken".
+                        crate::rt::blocking(move || h.adopt(&from, &data)).await.unwrap_or_else(|_| Err(crate::reach::node::DROPPED.to_owned()))
                     }
-                    None => Err("this runner runs no agent sessions".into()),
+                    None => Err(format!("{}this runner runs no agent sessions", crate::reach::node::NOT_TAKEN)),
                 };
                 let _ = reply.send(answer);
             }
@@ -1600,6 +1659,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let _ = done.send(r);
                     }
                     Bg::TookOver { sessions, terminals, refused } => {
+                        took_over = true;
                         tracing::info!(sessions, terminals, refused, "took over from the runner being upgraded");
                         // The server learns they run here now.
                         announce(term_list(&terms), harness.as_ref(), &uplink).await;
@@ -1611,10 +1671,29 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if !std::mem::replace(&mut sockets_served, true) {
                             serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
                         }
+                        // Its link to the runner it upgraded ended after it took everything over, and
+                        // no word of its promotion: that one is gone (one that takes its sessions
+                        // back stops this one first). It takes messages again after a while.
+                        if took_over
+                            && let Some(h) = harness.as_ref().filter(|h| h.is_held())
+                        {
+                            let h = Arc::clone(h);
+                            crate::rt::spawn(async move {
+                                crate::rt::sleep(TAKE_OVER_GRACE).await;
+                                if h.is_held() {
+                                    tracing::warn!("no word of a promotion after taking over: this runner takes messages again");
+                                    h.hold(false);
+                                }
+                            });
+                        }
                     }
                     Bg::Promoted => {
                         // Joined ranked oldest (new work stayed with the old runner): the newest now.
                         tracing::info!("promoted: this runner is the machine's newest; new work comes here");
+                        // Its sessions are its own for good: it takes their messages.
+                        if let Some(h) = &harness {
+                            h.hold(false);
+                        }
                         instance_hello.created_at = real_created_at;
                         draining = false;
                         uplink.msg(AgentMsg::Instance(instance_hello.clone())).await;
@@ -1817,7 +1896,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md).
                 if !o.ephemeral {
                     let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -1877,7 +1956,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     tracing::warn!(%reason, "disconnected from server");
                     paths.disconnected();
                     // No word comes for agent sessions on their way to a newer process: they go on here.
-                    crate::harness::handing::link_lost();
+                    crate::harness::handing::runner_link_lost();
                 } else {
                     tracing::info!(%reason, via = %paths.via(), retry_in = ?dial_backoff, "dial failed");
                     // The path changed (to the tunnel, or back): dial that way now.
@@ -2336,9 +2415,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         match serde_json::from_str::<crate::harness::model::Command>(&json) {
                             // The server's word on a hand-over to this machine's newer runner
                             // process: never "gone here", even once this process has let go.
-                            Ok(crate::harness::model::Command::HandedOver { error }) => {
+                            Ok(crate::harness::model::Command::HandedOver { error, unsure, by_newest, none_newer }) => {
+                                // With no newer process to take it, a word that it wasn't taken
+                                // settles as a refusal does (the machine's record says).
                                 if let Some(h) = &harness {
-                                    h.handed_over(&session, error);
+                                    h.handed_over(&session, error, unsure, by_newest || none_newer);
                                 }
                             }
                             Ok(c) if known => {
@@ -2353,6 +2434,32 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 }
                             }
                             Err(e) => tracing::debug!(error = %e, "unreadable agent session command"),
+                        }
+                    }
+                    // A message for an epoch (CP-T3.2): through its session's inbox, which answers.
+                    ServerMsg::HarnessSend { session, epoch, json } => {
+                        let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
+                        match serde_json::from_str::<crate::harness::model::Command>(&json) {
+                            Ok(c) if known => {
+                                if let Some(h) = &harness {
+                                    h.command_at(&session, c, Some(epoch));
+                                }
+                            }
+                            Ok(c) => {
+                                // Gone here: the message is refused, and the session said gone.
+                                let mut said = Vec::new();
+                                if let Some(message) = crate::harness::registry::message_id(&c) {
+                                    let refused = crate::harness::inbox::Said { message, answer: Err(crate::harness::inbox::Refusal::NoSession { session: session.clone() }) };
+                                    said.push(crate::harness::core::Update::Inbox { said: Box::new(refused) });
+                                }
+                                said.push(crate::harness::core::Update::Closed);
+                                for u in said {
+                                    if let Ok(json) = serde_json::to_string(&u) {
+                                        uplink.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::debug!(error = %e, "unreadable agent session message"),
                         }
                     }
                     ServerMsg::AiView { req, pid } => match &ai {
@@ -3663,6 +3770,22 @@ fn open_mirror(dir: &std::path::Path, up: &async_channel::Sender<Up>) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CP-T3.2 (the thirteenth adversarial check's): a rollback takes nothing back until the new
+    /// build is seen gone. One its supervisor didn't stop (none found here) is killed, and seen gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_build_its_supervisor_didn_t_stop_is_stopped_before_anything_is_taken_back() -> anyhow::Result<()> {
+        let mut child = std::process::Command::new("sleep").arg("60").spawn()?;
+        let pid = child.id();
+        // Reaped as it goes (a zombie still counts as running where the system can't tell).
+        let reaper = std::thread::spawn(move || child.wait());
+        // No supervisor (one the tests' runner runs under is never asked).
+        let gone = crate::rt::block_on(async move { anyhow::Ok(stop_new_build(None, crate::bluegreen::Green { pid }, Duration::from_millis(300)).await) })?;
+        let reaped = reaper.join().map_err(|_| anyhow::anyhow!("the reaper panicked"))??;
+        anyhow::ensure!(gone && !crate::bluegreen::alive(pid), "the new build still runs (gone {gone}; it ended {reaped:?})");
+        Ok(())
+    }
     use crate::harness::core::Update;
     use crate::harness::model::{Body, Event};
 

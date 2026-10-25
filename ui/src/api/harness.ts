@@ -534,6 +534,8 @@ export interface BroadcastBody {
   mode?: SendMode;
   command?: Command;
   approvals?: "allow" | "deny";
+  /** An idempotency key: sent again with it, each agent's message is the same one, delivered once. */
+  key?: string;
 }
 
 export interface BroadcastOutcome {
@@ -814,7 +816,8 @@ export type Command =
   | { type: "mcp_add"; scope: string; name: string; transport: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> }
   | { type: "mcp_remove"; scope: string; name: string }
   | { type: "skill_view"; name: string; client: string }
-  | { type: "skill_run"; name: string; args?: string }
+  /** `id`: the message's id, made once (a skill run is delivered like a message: once). */
+  | { type: "skill_run"; name: string; args?: string; id?: string }
   | { type: "set_effort"; effort: string }
   | { type: "set_speed"; speed: string }
   | { type: "queue_edit"; id: string; text: string; attachments?: Attachment[] }
@@ -1013,9 +1016,13 @@ export const harnessApi = {
   /** Its goals still to go, as they should be (existing ones by id; the one under way among them puts it back or rewords it). */
   setGoals: (id: string, goals: { id?: string; text: string }[]) => call<GoalStack>("PUT", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals }),
   /** Goals after its others; `start` runs the stack. */
-  addGoals: (id: string, goals: string[], start = false) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals, start }),
+  /** `key` (CP-T3.2): asked again under it, its goals are added once. */
+  addGoals: (id: string, goals: string[], start = false, key?: string) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals, start, key }),
   /** Start (or resume), pause, skip the goal under way, clear, or bring back the goals cleared last. */
-  goalAction: (id: string, action: "start" | "pause" | "skip" | "clear" | "restore") => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`),
+  /** `goal`: for a skip, the goal under way it's for (asked again once it's skipped, nothing more is: CP-T3.2). */
+  /** `key` (CP-T3.2): asked again under it (its answer lost), it does nothing more, whatever changed since. */
+  goalAction: (id: string, action: "start" | "pause" | "skip" | "clear" | "restore", goal: string | undefined, key: string) =>
+    call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`, goal ? { id: goal, key } : { key }),
   /** One of its goals turned into a plan: planning it (research, its steps, ready) goes first, then its steps (`goals_plan`). */
   /** Whether its stack plans its big goals first (a person's setting, not the agent's). */
   goalSettings: (id: string, settings: { plan_big: boolean }) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/settings`, settings),
@@ -1083,9 +1090,25 @@ export const harnessApi = {
   broadcastPreview: (to: BroadcastTo) => call<BroadcastPreview>("POST", "/api/harness/broadcast/preview", { to }),
 };
 
-let seq = 0;
-/** A client-made id for a message or request (delivery state is reported under it). */
-export const clientId = () => `c${Date.now().toString(36)}${(++seq).toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+/**
+ * A client-made id for a message or request (delivery state is reported under it): a UUIDv7, 48
+ * bits of the time and 74 random, as 32 hex digits. A message's id is made once and every retry
+ * carries it, and the agent's inbox takes each id once (CP-T3.2), so it mustn't meet another's.
+ */
+export const clientId = (): string => {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  const ms = Date.now();
+  b[0] = Math.floor(ms / 2 ** 40) & 0xff;
+  b[1] = Math.floor(ms / 2 ** 32) & 0xff;
+  b[2] = (ms >>> 24) & 0xff;
+  b[3] = (ms >>> 16) & 0xff;
+  b[4] = (ms >>> 8) & 0xff;
+  b[5] = ms & 0xff;
+  b[6] = ((b[6] ?? 0) & 0x0f) | 0x70;
+  b[8] = ((b[8] ?? 0) & 0x3f) | 0x80;
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+};
 
 /* ------------------------------------------------------------------ live session */
 

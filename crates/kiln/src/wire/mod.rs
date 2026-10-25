@@ -251,6 +251,7 @@ classes! {
         ServerMsg::Wire(..) => CHANNEL,
         ServerMsg::Cluster { .. } => CLUSTER,
         ServerMsg::Kept { .. } => Class::State,
+        ServerMsg::HarnessSend { .. } => PARKED,
     }
 }
 
@@ -311,6 +312,7 @@ classes! {
         Update::Changes { .. } => Class::State,
         Update::Stream { .. } => Class::Stream,
         Update::Reply { .. } => Class::Answer,
+        Update::Inbox { .. } => Class::Answer,
         Update::Reset { .. } => Class::Stream,
     }
 }

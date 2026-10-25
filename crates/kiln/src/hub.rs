@@ -1787,6 +1787,12 @@ impl Hub {
                     let msg = if lets_go { ServerMsg::HarnessRelease { session } } else { ServerMsg::HarnessClose { session } };
                     self.send_peer(peer, &msg).await;
                 }
+                // An inbox's answer counts wherever it came from (it's for the message sent there),
+                // and says nothing of where the session runs: whoever waits for it is told, and
+                // the session's messages still go where it runs.
+                Ok(u @ crate::harness::core::Update::Inbox { .. }) => {
+                    self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.clone()), &session, u, false);
+                }
                 // The rest of what a copy left behind says (its machine was told to let go of it):
                 // none of it counts, and it doesn't take the session's messages from where it runs.
                 Ok(u) if !matches!(u, crate::harness::core::Update::Open { .. }) && !self.harness.runs_on(&session, &agent) => {}
@@ -2875,6 +2881,28 @@ pub(crate) mod tests {
         let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
         Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
+    }
+
+    /// CP-T3.2: an inbox's answer from a runner that no longer holds the session (a copy left
+    /// behind there) counts for whoever waits for it, and leaves the session where it runs: its
+    /// machine and owner as they were, so its messages still go there.
+    #[test]
+    fn an_inbox_answer_from_another_machine_leaves_the_session_where_it_runs() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            hub.peers.lock().insert(1, "box-a".into());
+            hub.peers.lock().insert(2, "box-b".into());
+            let say = |u: &crate::harness::core::Update| serde_json::to_string(u).map(|json| AgentMsg::Harness { session: "s1".into(), json });
+            let spec = serde_json::json!({"kind": "claude", "cwd": "/w"}).to_string();
+            let open = crate::harness::host::refusal("s1", &spec, "").into_iter().find(|u| matches!(u, crate::harness::core::Update::Open { .. })).ok_or_else(|| anyhow::anyhow!("no announcement"))?;
+            hub.on_agent_msg(1, say(&open)?).await?;
+            anyhow::ensure!(hub.harness.runs_on("s1", "box-a"), "it runs on box-a");
+            let refused = crate::harness::inbox::Said { message: "m1".into(), answer: Err(crate::harness::inbox::Refusal::Moved { session: "s1".into(), epoch: 0 }) };
+            hub.on_agent_msg(2, say(&crate::harness::core::Update::Inbox { said: Box::new(refused) })?).await?;
+            assert!(hub.harness.runs_on("s1", "box-a"), "it still runs on box-a");
+            assert_eq!(hub.instances.lock().owner(&crate::instances::Owned::Agent("s1".into())), Some(1), "box-a's runner still holds it");
+            Ok(())
+        })
     }
 
     #[test]

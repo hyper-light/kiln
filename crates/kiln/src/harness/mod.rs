@@ -38,6 +38,7 @@ pub mod handing;
 pub mod handoff;
 pub mod homes;
 pub mod host;
+pub mod inbox;
 pub mod kept;
 pub mod kinds;
 pub mod lineage;

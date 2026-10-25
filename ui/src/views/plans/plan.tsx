@@ -11,7 +11,7 @@
 import * as React from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ApiError } from "@/api/client";
-import { harnessApi, type KindInfo } from "@/api/harness";
+import { clientId, harnessApi, type KindInfo } from "@/api/harness";
 import { plansApi, runHref, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan, type PlanStarted } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
@@ -22,6 +22,7 @@ import { harnessSessionsRes, useRes, warm, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { Tries } from "@/lib/tries";
 import { Prose } from "@/views/harness/parts";
 import { Shimmer } from "@/views/harness/signals";
 import { ResearchPanel } from "@/views/research/research";
@@ -376,6 +377,9 @@ function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; 
   // One agent per step starts agents of its own.
   const fresh = where === "new" || mode === "agents";
 
+  /** The run asked and its key, until it's started (CP-T3.2). */
+  const [tries] = React.useState(() => new Tries(clientId));
+
   const run = async () => {
     setBusy(true);
     setError(null);
@@ -384,8 +388,12 @@ function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; 
     try {
       const to = { target, kind, cwd: cwd.trim() || undefined };
       const only = some ? picked : undefined;
-      if (mode === "agents") setStarted(await plansApi.runAgents(plan.id, to, { only }));
-      else setRan(await plansApi.run(plan.id, where === "new" ? { new: to } : { session: where }, mode, { only, split: mode === "goals" && checks && split }));
+      const splits = mode === "goals" && checks && split;
+      // Asked again (its answer lost, or it failed), the same run under its key, never a second.
+      const key = tries.keyFor(JSON.stringify({ plan: plan.id, version: plan.version, mode, where, to, only, splits }));
+      if (mode === "agents") setStarted(await plansApi.runAgents(plan.id, to, { only }, key));
+      else setRan(await plansApi.run(plan.id, where === "new" ? { new: to } : { session: where }, mode, { only, split: splits }, key));
+      tries.done();
       onPicked([]);
       onRan();
     } catch (e) {

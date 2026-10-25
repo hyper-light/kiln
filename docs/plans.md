@@ -106,7 +106,16 @@ plans** (write one, pick one, **Run here** any of the three ways) and its **Goal
 page opened with `?pick=2,3` has those steps picked, its **Run it** in view, on the agent the plan
 came from while it runs.
 
-A run sends the saved version and is listed under the plan with the agent it went to.
+A run sends the saved version and is listed under the plan with the agent it went to. Each of its
+messages has an id made once, from the run's: whatever sends one again sends the same message, which
+the agent takes once (docs/sends.md). `plans.run` takes an idempotency `key` (or, over HTTP, the
+`Idempotency-Key` header) in every mode: run again with it, it's the same run, answered as it was.
+On an agent that runs it's done again, its messages the same ones; one that starts an agent or adds
+goals is done once, and while it's under way (or if it stopped part-way) a run under its key is
+refused, 409, saying so. One agent per step under a key is the run it started then, as it stands:
+its steps' agents start once. A key is one request, its caller's: an agent's is the same on whichever
+machine it runs, so asked for again after it moves, it's the same run; asked again under it for other
+steps (`only`, `split`) or in another mode, it's refused (409), saying so.
 
 ### One agent per step
 

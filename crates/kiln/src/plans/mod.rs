@@ -891,11 +891,43 @@ async fn start_for(hub: &Hub, by: &crate::harness::lineage::Starter, target: Str
 }
 
 /// Runs a plan on an agent: an existing one, or a new one started with it (as `by` starts agents).
-pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, pick: &Pick, by: &crate::harness::lineage::Starter) -> R<Ran> {
+///
+/// With `key` (an idempotency key, CP-T3.2) the run's id is made from it, the plan and who runs it,
+/// so running it again under the key is the same run: on an agent that runs, it's done again (its
+/// messages are the same ones, which the agent takes once) and answered as it was; one that starts
+/// an agent, or adds goals, is answered as it was once it's done, and refused while it's under way
+/// (or stopped part-way), saying so: it's never done twice.
+pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, pick: &Pick, by: &crate::harness::lineage::Starter, key: Option<&str>) -> R<Ran> {
     let p = get(hub, id).await?;
     ready_to_run(&p)?;
+    let run = key.map_or_else(crate::util::new_id, |k| crate::util::derive_id(&["plans.run", &p.id, k]));
+    // Done again only where doing it again is safe: an agent that runs, sent the same messages.
+    let again_safe = matches!(target, Target::Session(_)) && mode != Mode::Goals;
+    if key.is_some()
+        && let Some(done) = claim(hub, &p, &run, mode, pick, by, again_safe).await?
+    {
+        return Ok(done);
+    }
+    // A run that failed before it did anything (started no agent, sent nothing) lets go of its
+    // claim: run again under its key, it's tried again.
+    let mut acted = false;
+    let ran = run_claimed(hub, &p, target, mode, pick, by, run.clone(), &mut acted).await;
+    if ran.is_err() && key.is_some() && !acted {
+        let run_c = run.clone();
+        let released = hub.store.call(move |c| Ok(c.execute("DELETE FROM plan_runs WHERE id = ?1 AND session = ''", params![run_c])?)).await;
+        if let Err(e) = released {
+            tracing::warn!(%run, error = %format!("{e:#}"), "a plan run that failed couldn't let go of its key: run again under it, it's refused");
+        }
+    }
+    ran
+}
+
+/// Plan `p`'s run `run`, claimed under its key if it has one (`run`): `acted` once it started an
+/// agent or sent anything.
+#[allow(clippy::too_many_arguments)]
+async fn run_claimed(hub: &Hub, p: &Plan, target: Target, mode: Mode, pick: &Pick, by: &crate::harness::lineage::Starter, run: String, acted: &mut bool) -> R<Ran> {
     if mode == Mode::Goals {
-        return run_goals(hub, &p, target, pick, by).await;
+        return run_goals(hub, p, target, pick, by, run, acted).await;
     }
     if mode == Mode::Agents {
         return Err(Error::Bad("one agent per step starts agents of its own: run it with `new` (agents::start)".into()));
@@ -910,7 +942,7 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, pick: &Pick, b
         Target::New { .. } => None,
     };
     let messages: Vec<String> = match mode {
-        Mode::Message | Mode::Goals | Mode::Agents => vec![message(&p, at_once)],
+        Mode::Message | Mode::Goals | Mode::Agents => vec![message(p, at_once)],
         Mode::Steps => {
             let steps: Vec<&String> = p.steps.iter().take(STEPS).collect();
             if steps.is_empty() {
@@ -925,37 +957,48 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, pick: &Pick, b
             picked_rounds(&p.items, n, &picked)
                 .iter()
                 .filter_map(|r| match r.as_slice() {
-                    [one] => Some(step_message(&p, *one, n, steps.get(*one)?)),
+                    [one] => Some(step_message(p, *one, n, steps.get(*one)?)),
                     many => {
                         let at: Vec<(usize, &str)> = many.iter().filter_map(|&i| Some((i, steps.get(i)?.as_str()))).collect();
-                        Some(side_by_side_message(&p, &at, n, at_once))
+                        Some(side_by_side_message(p, &at, n, at_once))
                     }
                 })
                 .collect()
         }
     };
+    // The run's id is made first, and each of its messages' ids from it and its place among them:
+    // whatever sends one again sends the same message, which its agent gets once (CP-T3.2).
     let (session, rest) = match target {
         Target::Session(session) => (session, messages.as_slice()),
         Target::New { target, kind, cwd } => {
             let (first, rest) = messages.split_first().ok_or_else(|| Error::Bad("nothing to send".into()))?;
-            (start_for(hub, by, target, kind, cwd, Some(first.clone()), p.title.clone()).await?, rest)
+            let started = start_for(hub, by, target, kind, cwd, Some(first.clone()), p.title.clone()).await?;
+            *acted = true;
+            (started, rest)
         }
     };
-    let mut sent = messages.len().saturating_sub(rest.len());
-    for text in rest {
-        let c = Command::Send { id: crate::util::new_id(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+    let first = messages.len().saturating_sub(rest.len());
+    let mut sent = first;
+    for (n, text) in rest.iter().enumerate() {
+        let step = n.saturating_add(first).to_string();
+        let c = Command::Send { id: crate::util::derive_id(&["plan-run", &run, &step]), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
         match hub.harness.command(hub, &session, c).await {
-            Sent::Ok => sent += 1,
+            Sent::Ok | Sent::Accepted(_) => {
+                sent += 1;
+                *acted = true;
+            }
+            Sent::Refused(r) => return Err(Error::Bad(r.to_string())),
             Sent::NoSession => return Err(Error::Bad("no such agent".into())),
             Sent::Unreachable => return Err(Error::Bad("that agent's machine is not connected".into())),
         }
     }
-    let (run, now, by_s, version, mode_s, plan_id, session_c) = (crate::util::new_id(), crate::util::now_unix(), by.actor.clone(), p.version, mode.as_str(), p.id.clone(), session.clone());
+    let (now, by_s, version, mode_s, plan_id, session_c) = (crate::util::now_unix(), by.actor.clone(), p.version, mode.as_str(), p.id.clone(), session.clone());
     let run_c = run.clone();
     hub.store
         .call(move |c| {
+            // A run claimed under its key (`claim`) is done now: it says where it ran.
             c.execute(
-                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (id) DO UPDATE SET session = excluded.session, at = excluded.at",
                 params![run_c, plan_id, version, session_c, mode_s, now, by_s],
             )?;
             Ok(())
@@ -1076,7 +1119,7 @@ fn goals_error(e: crate::goals::Error) -> Error {
 
 /// A plan's steps as goals, after the agent's others (a new agent is started for them), and the
 /// stack running.
-async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate::harness::lineage::Starter) -> R<Ran> {
+async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate::harness::lineage::Starter, run: String, acted: &mut bool) -> R<Ran> {
     let all: Vec<String> = if p.items.is_empty() { p.steps.iter().take(STEPS).cloned().collect() } else { p.items.iter().take(STEPS).map(Item::goal).collect() };
     if all.is_empty() {
         return Err(Error::Bad("this plan has no steps (no list in it) to make goals of".into()));
@@ -1089,10 +1132,13 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate:
     let texts: Vec<(usize, String)> = picked.iter().filter_map(|&i| Some((i, all.get(i)?.clone()))).collect();
     let session = match target {
         Target::Session(s) => s,
-        Target::New { target, kind, cwd } => start_for(hub, by, target, kind, cwd, None, p.title.clone()).await?,
+        Target::New { target, kind, cwd } => {
+            let started = start_for(hub, by, target, kind, cwd, None, p.title.clone()).await?;
+            *acted = true;
+            started
+        }
     };
     let sent = texts.len();
-    let run = crate::util::new_id();
     // Each goal says the step it's made from: the agent splits one into its acceptance criteria and
     // tests (`crate::goals::split`).
     let goals = texts
@@ -1104,6 +1150,7 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate:
         })
         .collect();
     let stack = crate::goals::add_at(hub, &session, goals, true, &crate::goals::At::End).await.map_err(goals_error)?;
+    *acted = true;
     // Each step its goal stack: its acceptance criteria and tests, a goal each, before it (one
     // without either stays as it is).
     let mut split = 0;
@@ -1120,13 +1167,66 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate:
     hub.store
         .call(move |c| {
             c.execute(
-                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES (?1, ?2, ?3, ?4, 'goals', ?5, ?6)",
+                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES (?1, ?2, ?3, ?4, 'goals', ?5, ?6) ON CONFLICT (id) DO UPDATE SET session = excluded.session, at = excluded.at",
                 params![run_c, plan_id, version, session_c, now, by_s],
             )?;
             Ok(())
         })
         .await?;
     Ok(Ran { session, sent, run, split })
+}
+
+/// A run under an idempotency key, before it's done: the run it was, if it was done (its answer,
+/// again), else none, the run claimed now. One under way (or stopped part-way) is refused unless
+/// doing it again is safe (`again_safe`: its messages to an agent that runs, the same ones again).
+async fn claim(hub: &Hub, p: &Plan, run: &str, mode: Mode, pick: &Pick, by: &crate::harness::lineage::Starter, again_safe: bool) -> R<Option<Ran>> {
+    // What was asked under the key: asked again for other steps, or in another mode, it's another
+    // request, refused (never answered as the run it isn't).
+    let shape = serde_json::json!({"only": pick.only, "split": pick.split}).to_string();
+    let (run_c, plan_id, version, mode_s, by_s, now, shape_c) = (run.to_owned(), p.id.clone(), p.version, mode.as_str(), by.actor.clone(), crate::util::now_unix(), shape.clone());
+    // Claimed with no session yet: it says where it ran once it's done.
+    let found: Option<(String, String, String)> = hub
+        .store
+        .call(move |c| {
+            let claimed = c.execute(
+                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by, config) VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7) ON CONFLICT (id) DO NOTHING",
+                params![run_c, plan_id, version, mode_s, now, by_s, shape_c],
+            )?;
+            if claimed == 1 {
+                return Ok(None);
+            }
+            Ok(c.query_row("SELECT session, mode, COALESCE(config, '') FROM plan_runs WHERE id = ?1", params![run_c], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)
+        })
+        .await?;
+    if let Some((_, was_mode, was_shape)) = &found
+        && (was_mode != mode.as_str() || *was_shape != shape)
+    {
+        return Err(Error::Refused(http::StatusCode::CONFLICT, "this key was given to another request (other steps, or another mode): give this one a key of its own".into()));
+    }
+    let found = found.map(|(session, _, _)| session);
+    match found {
+        None => Ok(None),
+        Some(session) if !session.is_empty() => {
+            let sent = match mode {
+                Mode::Steps => pick.of(p.steps.len().min(STEPS)).len(),
+                Mode::Goals => pick.of(if p.items.is_empty() { p.steps.len().min(STEPS) } else { p.items.len().min(STEPS) }).len(),
+                Mode::Message | Mode::Agents => 1,
+            };
+            let split = if mode == Mode::Goals && pick.split { split_of(hub, &session, run).await } else { 0 };
+            Ok(Some(Ran { session, sent, run: run.to_owned(), split }))
+        }
+        Some(_) if again_safe => Ok(None),
+        Some(_) => Err(Error::Refused(http::StatusCode::CONFLICT, "a run under this key is under way, or stopped part-way: see plans.runs.list for where it is".into())),
+    }
+}
+
+/// How many of run `run`'s goals on agent `session`'s stack were split into their parts.
+async fn split_of(hub: &Hub, session: &str, run: &str) -> usize {
+    let Ok(stack) = crate::goals::get(hub, session).await else {
+        return 0;
+    };
+    let ours = |i: &crate::goals::Item| i.part_of.is_none() && i.step.as_ref().is_some_and(|s| s.run.as_deref() == Some(run));
+    stack.items.iter().filter(|i| ours(i) && stack.items.iter().any(|j| j.part_of.as_deref() == Some(i.id.as_str()))).count()
 }
 
 #[cfg(test)]

@@ -168,9 +168,9 @@ counted.
 | GET | `/api/harness/sessions` | `Info[]` |
 | POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?}` → `Info[]` |
 | GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good |
-| POST | `/api/harness/sessions/:id/command` | a `Command` → 204 |
+| POST | `/api/harness/sessions/:id/command` | a `Command` → 204, or for a message (a `send`, a skill run with its `id`) its inbox's answer: 200 `{sent, message, accepted}` (`accepted.repeat` when its id was taken before), or a typed refusal (409 for an epoch the agent left, a machine it moved from, or an id given to other words). A message's `id` is its idempotency key; an `Idempotency-Key` header makes it from that instead (docs/sends.md) |
 | POST | `/api/harness/broadcast` | one thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits on you; see below |
-| POST | `/api/harness/command` | `{ids, command}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`) |
+| POST | `/api/harness/command` | `{ids, command, key?}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`); each agent's message id is made from `key` (or the `Idempotency-Key` header, else the command's own `id`) and the agent, so sending it again sends the same messages |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
 | GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it. Native Codex subagents return `reset: true`: replace previous output with this snapshot (last 64 KiB), regardless of `since`; `pending: true` means a live child has not produced output yet |
 | WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands may be sent on it too |
@@ -290,9 +290,13 @@ Devin does not offer conversation branching through ACP.
     message id per agent.
   - `approvals`: `"allow"` or `"deny"`: answers every tool call waiting on you on each agent
     (questions are left: they need answers).
+- `key` (or the `Idempotency-Key` header): sent again with the same key, each agent's message is
+  the same one (its id made from the key and the agent), and each agent gets it once. Kiln's
+  broadcast panel sends one again under the key it first had when the first try didn't come back.
 
 → `{id, sent, skipped, failed, results: [{id, name, machine, kind, result, reason?}]}`, `result`
-being `sent`, `skipped` or `failed`. Each broadcast is in the audit log.
+being `sent`, `skipped` or `failed` (an agent's inbox refusing it is `failed`, saying why). Each
+broadcast is in the audit log.
 
 ### Signing harnesses in and out
 
@@ -448,7 +452,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.list` | `GET /api/harness/agents` | `machine?` (a runner's name, `local` for the server), `harness?`, `state?` (a stand or a status), `parent?`, `plan_run?` → `{agents: [Agent]}` |
 | `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state}` (its state without the catalogs) |
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
-| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now"}` → `{sent, message}` |
+| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?}` (or the `Idempotency-Key` header) → `{sent, message, accepted?}`: `accepted` is the agent's inbox's answer, `repeat` on every one after the first ("Sending again", below) |
 | `agents.wait` | `GET /api/harness/agents/wait` | `agent?` or `agents?` (a list; over HTTP `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
@@ -490,6 +494,16 @@ memory) gets it; outposts and job pods never do. Without `on`, an agent's child 
 agent's own machine, in its folder unless `cwd` says otherwise; a person's runs on the server
 when it runs agents, else on the best runner with the harness. A child on another machine starts
 in that machine's home unless `cwd` names a folder there.
+
+### Sending again
+
+A message's id is made once, by whoever sends it, and every retry carries it: the agent's inbox
+takes each id once (docs/sends.md). Give `agents.send` a `key` of yours (1 to 256 bytes; over HTTP
+the `Idempotency-Key` header does too) and a call with the same key is the same message: the agent
+gets it once, and every call is answered as the first was, `accepted.repeat` on the ones after.
+A key is its caller's: an agent's is the same on whichever machine it runs, so its retry after it
+moves is the same message. Without a key, each call is a message of its own. A key given to other
+words is refused (409). From a kiln shell: `kiln agents send <id> --key <key> <text>`.
 
 ### Messages between agents
 
