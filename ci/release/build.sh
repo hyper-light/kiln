@@ -23,9 +23,12 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 root=$PWD
 
-all=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc)
+all=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-pc-windows-msvc)
 targets=("$@")
 [ ${#targets[@]} -gt 0 ] || targets=("${all[@]}")
+for t in "${targets[@]}"; do
+  case $t in x86_64-apple-darwin) echo "kiln doesn't ship for Intel Macs: only aarch64-apple-darwin" >&2; exit 1 ;; esac
+done
 
 native_mac=false
 if [ "$(uname -s)" = Darwin ]; then
@@ -84,7 +87,7 @@ zigbuild="$zig_home/bin/cargo-zigbuild"
 # They also pass each framework once: rustc repeats `-framework X` for every crate that links X,
 # zig's linker writes a load command per occurrence, and dyld refuses a binary that loads the same
 # library twice ("duplicate linked dylib").
-for arch in aarch64 x86_64; do
+for arch in aarch64; do
   cat > "$zig_home/macos11/cc-$arch" <<WRAPPER
 #!/bin/sh
 seen=" "

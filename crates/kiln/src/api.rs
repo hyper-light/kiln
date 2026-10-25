@@ -2980,11 +2980,11 @@ pub const COMMIT: &str = env!("KILN_COMMIT");
 /// `kiln-<version>-<target>` (`.exe` on Windows) of release `v<version>`.
 pub const RELEASES: &str = "https://github.com/hyper-light/kiln/releases/download";
 
-/// The targets the release workflow builds.
-pub const RELEASE_TARGETS: [&str; 6] = [
+/// The targets the release workflow builds. Macs are Apple silicon only: kiln doesn't run on Intel
+/// Macs.
+pub const RELEASE_TARGETS: [&str; 5] = [
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
-    "x86_64-apple-darwin",
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
     "aarch64-pc-windows-msvc",

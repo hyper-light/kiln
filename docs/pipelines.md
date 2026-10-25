@@ -121,6 +121,7 @@ They are `${{ inputs.target }}` in expressions. Scheduled runs may pass `inputs`
 | --- | --- |
 | `name` | display name; expressions allowed (`"test ${{ matrix.profile }}"`) |
 | `runs-on` | labels a runner must have, or a runner's name. Default `[k8s]` |
+| `requires` | constraints a runner's facts must meet, one or a list (`tools has node`, `disk.free >= 50Gi`, `os == macos`: docs/ci.md W05-R22); see [Runners](#runners) |
 | `isolation` ✦ | `none` (on the host), `container`, `microvm`; see [Runners](#runners) |
 | `image` | OCI image for `container` / `microvm` / Kubernetes jobs; overrides `toolchain` |
 | `toolchain` | `rust` · `go` · `python` · `node` · `bun` · `erlang`: an image plus its caches |
@@ -249,7 +250,9 @@ keys), `changed(glob, …)` (whether the trigger changed any matching file).
 A job goes to a runner that carries every label of its `runs-on`, in any case: one of the runner's
 own, its name, or what its platform is (`linux`, `macos`, `windows`; `x86_64`, `amd64`, `x64`;
 `aarch64`, `arm64`; `self-hosted`), so `[linux]` fits every Linux runner, not only those labelled
-so. Of those with a slot free, the one with the most room: its idle cores (by its busy share or its
+so; and whose facts, as it last reported them, meet each of its `requires` (one that hasn't
+reported any meets none, so the job waits for a runner known to have what it needs). Of those
+with a slot free, the one with the most room: its idle cores (by its busy share or its
 load average, whichever leaves fewer), then its free memory, the share of its slots in use counting
 against it. A runner that's overloaded (under 2 GiB or a twentieth of its memory free, or a load
 past twice its cores) takes no job: the job goes to another, or waits for room.

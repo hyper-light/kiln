@@ -662,7 +662,7 @@ const RELEASE_JOBS: JobTpl[] = [
     needs: [],
     labels: ["baremetal", "macos"],
     toolchain: "rust",
-    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh aarch64-apple-darwin x86_64-apple-darwin", dur: [24, 32], kind: "compile" }],
+    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh aarch64-apple-darwin", dur: [24, 32], kind: "compile" }],
   },
 ];
 let releaseRun: Run | null = null;

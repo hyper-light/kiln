@@ -88,6 +88,23 @@ fn carries(labels: &[String], os: &str, arch: &str, name: &str, want: &str) -> b
     want == name || labels.iter().any(|l| l.eq_ignore_ascii_case(want)) || platform_labels(os, arch).iter().any(|l| l.eq_ignore_ascii_case(want))
 }
 
+/// Whether runner `a` meets every constraint of `job`'s `requires` (docs/ci.md W05-R22), against
+/// the facts it last reported. One that hasn't reported any meets none: a job that needs a tool
+/// waits for a runner known to have it, rather than going where it would fail (the release's
+/// macOS job on a Mac with no developer tools, 2026-10-24).
+fn meets(job: &Job, a: &AgentLive) -> bool {
+    job.spec.as_ref().is_none_or(|spec| facts_meet(&spec.requires, a.facts.as_deref(), &a.labels))
+}
+
+/// [`meets`]: each of `requires` holds for `facts` (none reported: none holds).
+fn facts_meet(requires: &[String], facts: Option<&kiln_ci::facts::RunnerFacts>, labels: &[String]) -> bool {
+    if requires.is_empty() {
+        return true;
+    }
+    let Some(f) = facts else { return false };
+    requires.iter().all(|r| kiln_ci::sched::routing::Constraint::parse(r).is_ok_and(|c| c.eval(f, labels)))
+}
+
 /// The labels a runner's platform gives it.
 fn platform_labels<'a>(os: &'a str, arch: &'a str) -> Vec<&'a str> {
     let mut v = vec!["self-hosted", os, arch];
@@ -2492,6 +2509,7 @@ impl Hub {
                 None => true,
             })
             .filter(|a| job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l)))
+            .filter(|a| meets(job, a))
             .filter(|a| if exclusive { a.running.is_empty() } else { a.busy < a.slots })
             // Not one that's overloaded (nearly out of memory, or loaded past twice its cores): the
             // job goes to another, or waits for one (a pod made for it is its own).
@@ -2655,6 +2673,26 @@ impl Hub {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A job's `requires` route it by the runner's facts (docs/ci.md W05-R22): the release's
+    /// macOS job goes to a Mac with cargo and node, never to one with no developer tools (which
+    /// failed it at `npm`, 2026-10-24), nor to one that hasn't said what it has.
+    #[test]
+    fn a_job_goes_only_where_its_requires_hold() {
+        let mac = |tools: &[&str]| kiln_ci::facts::RunnerFacts {
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            tools: tools.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(),
+            ..Default::default()
+        };
+        let release: Vec<String> = ["os == macos", "arch == aarch64", "tools has cargo", "tools has node"].iter().map(|r| (*r).to_owned()).collect();
+        let labels = vec!["baremetal".to_owned(), "macos".to_owned()];
+        assert!(facts_meet(&release, Some(&mac(&["cargo", "node", "git"])), &labels), "the Mac with its tools");
+        assert!(!facts_meet(&release, Some(&mac(&["git"])), &labels), "a Mac with no developer tools");
+        assert!(!facts_meet(&release, None, &labels), "a runner that hasn't said what it has");
+        assert!(facts_meet(&[], None, &labels), "a job with no requires goes where its labels say");
+        assert!(!facts_meet(&["tools has".to_owned()], Some(&mac(&["node"])), &labels), "a requirement that doesn't parse holds nowhere");
+    }
 
     /// A job's labels fit a runner by its own labels, its name, or its platform (`linux`, `amd64`,
     /// `arm64`, `self-hosted`), in any case: `[linux]` isn't only for runners labelled so.

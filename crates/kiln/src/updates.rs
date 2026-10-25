@@ -229,12 +229,12 @@ pub(crate) fn hash_file(p: &Path) -> anyhow::Result<(String, u64)> {
     Ok((hex::encode(h.finalize()), size))
 }
 
-/// The release build for an OS and architecture (Linux gets the static one).
+/// The release build for an OS and architecture (Linux gets the static one). An Intel Mac has
+/// none: kiln runs on Apple silicon only.
 fn release_target(os: &str, arch: &str) -> Option<&'static str> {
     Some(match (os, arch) {
         ("linux", "x86_64") => "x86_64-unknown-linux-musl",
         ("linux", "aarch64") => "aarch64-unknown-linux-musl",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
         ("macos", "aarch64") => "aarch64-apple-darwin",
         ("windows", "x86_64") => "x86_64-pc-windows-msvc",
         ("windows", "aarch64") => "aarch64-pc-windows-msvc",
