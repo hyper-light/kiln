@@ -180,8 +180,15 @@ enum Proc {
     TraceId(Vec<String>),
     Attr { sources: Vec<String>, target: String, format: Format, preserve: bool, overwrite: bool },
     Url { sources: Vec<String>, target: String, trim_slashes: bool },
-    /// Its keys made once (`target.browser.family`, …).
-    UserAgent { sources: Vec<String>, target: String, encoded: bool, keys: grok::UaKeys },
+    /// Its keys made once (`target.browser.family`, …); its target read as it is by the tests'
+    /// code before alone.
+    UserAgent {
+        sources: Vec<String>,
+        #[cfg(test)]
+        target: String,
+        encoded: bool,
+        keys: grok::UaKeys,
+    },
     Category { target: String, categories: Vec<(Search, String)> },
     Arithmetic { expr: expr::Expr, target: String, replace_missing: bool },
     Builder { template: Vec<Piece>, target: String, replace_missing: bool },
@@ -281,9 +288,13 @@ fn compile(name: &str, filter: &FilterDef, processors: &[ProcessorDef], depth: u
                 overwrite: *override_on_conflict,
             },
             KindDef::UrlParser { sources, target, normalize_ending_slashes } => Proc::Url { sources: nonempty(sources, "sources")?, target: target.clone(), trim_slashes: *normalize_ending_slashes },
-            KindDef::UserAgentParser { sources, target, is_encoded } => {
-                Proc::UserAgent { sources: nonempty(sources, "sources")?, target: target.clone(), encoded: *is_encoded, keys: grok::UaKeys::new(Some(target)) }
-            }
+            KindDef::UserAgentParser { sources, target, is_encoded } => Proc::UserAgent {
+                sources: nonempty(sources, "sources")?,
+                #[cfg(test)]
+                target: target.clone(),
+                encoded: *is_encoded,
+                keys: grok::UaKeys::new(Some(target)),
+            },
             KindDef::CategoryProcessor { target, categories } => {
                 let mut cats = Vec::new();
                 for c in categories {
