@@ -320,12 +320,12 @@ function Cell({ c }: { c: TimelineCell }) {
   }
 }
 
-/** Its todos: done (or not), removed, and one added (`@name` its assignees). */
+/** Its todos: done (or not), removed, and one added (`@name` its assignees, read as a monitor's mentions are: a sentence's full stop not part of one). */
 function Todos({ id, incident }: { id: string; incident: string }) {
   const todos = useRes(todosRes(id)).data;
   const [text, setText] = React.useState("");
   const add = async () => {
-    const assignees = [...text.matchAll(/(?:^|\s)@([\w.\-]+)/g)].flatMap((x) => (x[1] ? [x[1]] : []));
+    const assignees = [...text.matchAll(/(?:^|[\s(])@([\w-]+(?:\.[\w-]+)*)/g)].flatMap((x) => (x[1] ? [x[1]] : []));
     if (await act("add the todo", () => observeApi.addIncidentTodo(incident, text.trim(), assignees))) setText("");
   };
   return (

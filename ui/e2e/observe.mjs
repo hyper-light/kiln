@@ -2471,12 +2471,14 @@ const scenarios = {
       await fillIn(page.getByLabel("A note", { exact: true }), "Rolled back checkout-api.");
       await page.getByRole("button", { name: "Add note", exact: true }).click();
       await page.getByText("Rolled back checkout-api.", { exact: true }).waitFor();
-      // A todo, its assignee by its mention, done.
-      await fillIn(page.getByLabel("A todo", { exact: true }), "Write the postmortem @ada");
+      // A todo, its assignee by its mention (the sentence's full stop not part of the name), done.
+      await fillIn(page.getByLabel("A todo", { exact: true }), "Write the postmortem, @ada.");
       await page.getByRole("button", { name: "Add", exact: true }).click();
-      await page.getByLabel("Done: Write the postmortem @ada", { exact: true }).check();
+      await page.getByLabel("Done: Write the postmortem, @ada.", { exact: true }).check();
       await until("the todo done", async () =>
-        (await api("GET", `/api/observe/v1/incidents/${id}/relationships/todos`)).body.data.some((t) => t.attributes.completed && t.attributes.assignees.includes("ada")),
+        (await api("GET", `/api/observe/v1/incidents/${id}/relationships/todos`)).body.data.some(
+          (t) => t.attributes.completed && t.attributes.assignees.length === 1 && t.attributes.assignees[0] === "ada",
+        ),
       );
       // Its postmortem.
       await fillIn(page.getByLabel("Its URL", { exact: true }), "https://docs.example.com/pm/e2e");
