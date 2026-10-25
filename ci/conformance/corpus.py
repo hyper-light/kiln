@@ -84,6 +84,11 @@ KNOWN = [
     # ruff's publish dry run resolves its crates against crates.io as it is today: ruff_cache 0.0.19
     # came out on 2026-10-22, after the corpus's commit (2026-10-16), which GitHub ran.
     (r"multiple different versions of crate `ruff_cache` in the dependency graph", "its publish dry run resolves against crates.io as it is now, which has ruff_cache 0.0.19 (out 2026-10-22, after the commit of 2026-10-16 that GitHub ran): the registry moved on"),
+    # Home Assistant's: its recorder's database versions against endoflife.date as it is now; its
+    # translations to Lokalise and its wheels' SSH key with the repository's secrets.
+    (r"is out of date with the latest MariaDB or MySQL release data from endoflife\.date", "it compares the repository's list of database versions with endoflife.date's today, which has releases since the commit"),
+    (r"API request error 400 Invalid `X-Api-Token` header", "it uploads translations to Lokalise with the repository's secret (its API token), which the corpus's copy hasn't"),
+    (r'Load key "\.ssh/[\w.-]+": error in libcrypto', "it loads an SSH key from the repository's secret, which the corpus's copy hasn't (its cleanup's `docker rm -f` then finds no container to remove)"),
     # rails' Markdown API check reads the files the pull request adds: the corpus's adds them all.
     (r"Check Markdown APIs in new files", "it checks the files a pull request adds, and the corpus's adds every file to an empty trunk"),
     # TypeScript's tag-vscode-typescript: the pushed commit's parent, the empty trunk too.
@@ -161,9 +166,11 @@ KNOWN = [
     (r"seems to be in use by another Erlang node", "two of its legs at once share the lab's host network, so their Erlang nodes share one port mapper and one name; a hosted runner's own machine has one each"),
     # laravel's services publish fixed ports (3306 for every MySQL and MariaDB, 5432, 6379), which
     # on that network are the host's: two legs at once, and the second's database can't bind, or
-    # one's tests meet the other's tables and queued jobs (pass 1024b: mysql:9.7 and redis:7.0 of
-    # one leg held the host's 3306 and 6379).
-    (r"\[kiln\] Error: (mysql|mariadb|postgres|pgsql|redis|beanstalkd?)\w* is unhealthy|Table 'migrations' already exists|Undefined property: Illuminate\\Tests\\Integration\\Queue\\JobChaining|JobChainingTest::testChainBatchFailureAllowed", "two of its legs at once share the lab's host network, and their services' fixed ports (MySQL's 3306, Redis's 6379) are the host's: one leg's database couldn't bind, or its tests met the other's tables and queued jobs; a hosted runner's machine has its ports to itself"),
+    # one's tests meet the other's tables, queued jobs and keys (pass 1024b: mysql:9.7 and
+    # redis:7.0 of one leg held the host's 3306 and 6379). Its database tests then wait on each
+    # other's locks past their 10 minutes (0.8 to 1.6 minutes on GitHub at the commit), and its
+    # Redis Cluster job finds the other's cluster on the same ports.
+    (r"\[kiln\] Error: (mysql|mariadb|postgres|pgsql|redis|beanstalkd?)\w* is unhealthy|Table 'migrations' already exists|Table 'laravel\.\w+' doesn't exist|Unknown table 'laravel\.|Undefined property: Illuminate\\Tests\\Integration\\Queue\\JobChaining|JobChainingTest::testChainBatchFailureAllowed|`redis[^`]*`: Execute (Queue|Redis) tests: Failed asserting|`(mysql|mariadb|pgsql|mssql)_\d+`: Execute tests: .*exceeded the maximum execution time|Node 127\.0\.0\.1:\d+ is not empty|`redis-cluster[^`]*`: Create Redis Cluster: error: Final attempt failed", "two of its legs at once share the lab's host network, and their services' fixed ports (MySQL's 3306, Redis's 6379) are the host's: one leg's database couldn't bind, or its tests met the other's tables and queued jobs; a hosted runner's machine has its ports to itself"),
     # prometheus's test servers take ports the host says are free, checked in their own process
     # only (`testutil.RandomUnprivilegedPort`): two legs at once on that network, and a reload went
     # to the other leg's server, whose lifecycle API is off (403; pass 1023d, push).
@@ -395,7 +402,7 @@ def wait_reason(w):
 
 
 # A line that says what went wrong (not a shell's `set -x` trace of what ran after).
-ERRORISH = re.compile(r"(?i)\b(error|fatal|not found|failed|panicked|no such|cannot|denied|refused|exception)\b")
+ERRORISH = re.compile(r"(?i)\b(error|fatal|not found|failed|panicked|no such|cannot|denied|refused|\w*exception)\b")
 
 
 # A test runner's own words for a failed test, before the generic last line (make's, an exit code):
@@ -619,6 +626,9 @@ LEFT = [
     (r"cannot stat /proc/sys/kernel/apparmor_restrict_unprivileged_userns", "it sets a kernel setting of Ubuntu's AppArmor (`sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`), then makes namespaces of its own (`unshare --net`): a `docker` executor's container is no machine for either (its `/proc/sys` is read-only, this host's kernel has no AppArmor), and the host executor would change the host's own; a Firecracker microVM leg with Ubuntu's kernel runs it (W13-R05, left: the lab has no Firecracker)"),
     # cpython's test-hypothesis mounts its sources read-only (`sudo mount --bind -o ro`).
     (r"dmesg\(1\) may have more information after failed mount system call", "it mounts (`sudo mount --bind`: cpython's read-only source tree), which a `docker` executor's container can't (no `CAP_SYS_ADMIN`), where a hosted runner's machine can; a Firecracker microVM leg runs it (W13-R05, left: the lab has no Firecracker)"),
+    # laravel's SQL Server legs: PHP's sqlsrv talks through Microsoft's ODBC driver, which GitHub's
+    # images have (mssql-tools18 and msodbcsql18, their EULA accepted in the image's build).
+    (r"This extension requires the Microsoft ODBC Driver for SQL Server", "it reaches SQL Server through Microsoft's ODBC driver, which GitHub's image has and kiln's hasn't: installing it accepts Microsoft's licence (its EULA), the user's call, as Android's SDK's is (W13-R04, left)"),
     # cpython's Android build: Android's SDK at `ANDROID_HOME`, as bevy's below.
     (r"The ANDROID_HOME environment variable is required", "it builds for Android with Android's SDK at `ANDROID_HOME`: GitHub's image has one, kiln's only its opt-in `-android` image, whose SDK licence the user accepts (the plan's step 7, left)"),
     # bevy's Android build: cargo-ndk needs Android's NDK, in GitHub's image and only in kiln's
