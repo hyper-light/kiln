@@ -2117,6 +2117,84 @@ fn w24_r11_a_warm_jobs_next_run_sees_the_last_ones_build() -> anyhow::Result<()>
     Ok(())
 }
 
+/// W24-R18 through the server: a warm job that prefers warm runners (`prefer: [{ warm: true }]`).
+/// Once its first run is done, the runner tells the server what it holds warm
+/// (`AgentMsg::WorkState`), and the second run's leg, explained (`ci.legs.routing`), says which
+/// workspace it starts from there, how warm, and the finish that makes of the first run's cold
+/// time.
+#[test]
+fn w24_r18_a_warm_jobs_leg_says_where_it_runs_warm() -> anyhow::Result<()> {
+    /// What `f` gives once it gives something, within `secs` seconds.
+    fn wait_for<T>(secs: u64, what: &str, mut f: impl FnMut() -> anyhow::Result<Option<T>>) -> anyhow::Result<T> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(t) = f()? {
+                return Ok(t);
+            }
+            anyhow::ensure!(Instant::now() < deadline, "{what}: not within {secs} s");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/placed", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "placed\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "init"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/placed.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    // The second run's leg runs a while: long enough to be asked where it runs warm.
+    std::fs::write(
+        work.join(".kiln/placed.yaml"),
+        "on: push\njobs:\n  build:\n    runs-on: local\n    work: { warm: [target] }\n    prefer: [{ warm: true }]\n    steps:\n      - run: |\n          mkdir -p target && echo built > target/f\n          case \"$(cat README.md)\" in second) sleep 40;; esac\n",
+    )?;
+    let runs = || -> anyhow::Result<Vec<Value>> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/placed&limit=10", &s.admin, None)?;
+        Ok(serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default())
+    };
+    let push = |what: &str| -> anyhow::Result<()> {
+        std::fs::write(work.join("README.md"), format!("{what}\n"))?;
+        must(git(&home, &work, &["add", "."]), "add")?;
+        must(git(&home, &work, &["commit", "-qm", what]), "commit")?;
+        must(git(&home, &work, &["push", "-q", &url, "main"]), "push")
+    };
+    push("first")?;
+    wait_for(300, "the first run", || Ok(runs()?.iter().any(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).then_some(())))?;
+    push("second")?;
+    let leg = wait_for(120, "the second run's leg", || {
+        let list = runs()?;
+        let Some(run) = list.iter().find(|r| r.get("finished_at").is_none_or(Value::is_null)) else { return Ok(None) };
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(run, "id")), &s.admin, None)?;
+        Ok(serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).map(str::to_owned))
+    })?;
+    let lane = kiln_ci::work::slots::placement(&kiln_ci::work::slots::lane_for("acme/placed", ".kiln/placed.yaml", "build", &json!({}), String::new())).hex();
+    // The runner says it again once the leg leased the workspace: the first run's checkout, now
+    // a commit behind trunk's newest, README.md changed between them.
+    let warm = wait_for(35, "the leg's runner warm for it", || {
+        let (_, body) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/routing"), &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body)?;
+        Ok(v.pointer("/runners/0/warm").filter(|w| w.get("lane").and_then(Value::as_str) == Some(lane.as_str()) && w.get("behind").and_then(Value::as_u64) == Some(1)).cloned())
+    })?;
+    let num = |k: &str| warm.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
+    // No warm run here yet: the prior's half, shrunk for the one file changed (100 ÷ 101).
+    assert!(warm.get("files").and_then(Value::as_u64) == Some(1), "{warm}");
+    assert!((num("warmth") - 0.5 * 100.0 / 101.0).abs() < 1e-9 && num("run_s") > 0.0 && num("fetch_s") == 0.0 && num("finish_s") >= num("run_s"), "{warm}");
+    wait_for(120, "the second run", || Ok((runs()?.iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).count() >= 2).then_some(())))?;
+    let list = runs()?;
+    assert!(list.iter().all(|r| text(r, "conclusion") == "success"), "{list:?}\n{}", s.log());
+    Ok(())
+}
+
 /// W08-R09's `kiln/cache@v1` with its local tier: a first run misses and saves every chunk; a
 /// second restores the first's entry by a restore key with nothing downloaded (the runner kept
 /// the chunks), changes a little of it, and saves only the chunks that changed.

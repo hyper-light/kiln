@@ -726,7 +726,15 @@ impl Fe<'_> {
                 "exclusive" => kiln.exclusive = self.bool(v, &at).unwrap_or(false),
                 "resources" => kiln.resources = Some(self.yval(v)),
                 "requires" => kiln.requires = self.tpl_list(v, &at),
-                "prefer" => kiln.prefer = v.as_seq().map(|s| s.iter().map(|x| self.yval(x)).collect()).unwrap_or_default(),
+                // W05-R23, W24-R18: an item routing can't read counts for nothing, and says why.
+                "prefer" => {
+                    kiln.prefer = v.as_seq().map(|s| s.iter().map(|x| self.yval(x)).collect()).unwrap_or_default();
+                    for (i, (item, node)) in kiln.prefer.iter().zip(v.as_seq().unwrap_or_default()).enumerate() {
+                        if let Err(why) = crate::sched::routing::preference(item) {
+                            self.diags.push(Diag::warning("KCI1011", format!("`{at}[{i}]` counts for nothing: {why}"), node.range).at(&at));
+                        }
+                    }
+                }
                 "priority" => kiln.priority = Some(self.yval(v)),
                 "retry" => kiln.retry = Some(self.yval(v)),
                 "retries" => {

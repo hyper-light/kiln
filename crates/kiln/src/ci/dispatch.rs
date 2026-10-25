@@ -104,6 +104,12 @@ pub enum Msg {
     PoolsChanged,
     /// The pools and their executors now.
     Pools { reply: async_channel::Sender<serde_json::Value> },
+    /// What a runner holds warm (W24-R18): its lanes' workspaces and how long their legs took
+    /// there, as it last said.
+    WorkState { agent: String, state: Box<kiln_ci::work::slots::WorkState> },
+    /// A runner's warm workspaces as placement takes them, their distances measured (W24-R18);
+    /// `seq` names the report they're made of, so an older one never stands for a newer.
+    Warm { agent: String, seq: u64, held: Box<kiln_ci::sched::warm::Held> },
 }
 
 /// Where and how a leg runs, as the scheduler placed it.
@@ -267,8 +273,10 @@ fn keep_minutes(debug: Option<&kiln_ci::wf::ir::YVal>) -> Option<u32> {
     Some(u32::try_from(minutes.min(u64::from(crate::runner::kept::MAX_KEEP_MINUTES))).unwrap_or(crate::runner::kept::MAX_KEEP_MINUTES))
 }
 
-/// What the scheduler gets of a leg: its route, priority, concurrency group and retries.
-fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::ci::Ci) -> LegIn {
+/// What the scheduler gets of a leg: its route, priority, concurrency group and retries; and for
+/// placement (W24-R18), its lane, how long it runs cold (`warm`: what runners last said they hold
+/// warm), its job's container and workflow file, and its job's `prefer:`.
+fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::ci::Ci, warm: &HashMap<String, (u64, kiln_ci::work::slots::WorkState)>) -> LegIn {
     let job = spec.def();
     // Untrusted code runs only where `ci.untrusted` lets it (W18-R07).
     let mut route = route_of(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, cfg.local, (!r.trusted).then(|| cfg.untrusted.route()));
@@ -284,6 +292,16 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
     }
     let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
     let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
+    // A job that keeps a warm workspace has a lane (W24-R11), as placement matches lanes: its
+    // runners' toolchains apart. A cold rerun's legs (W24-R23) start from nothing kept, so warm
+    // runners are nothing to them.
+    let keeps = job.is_some_and(|j| kiln_ci::work::slots::warm(j.kiln.work.as_ref()).is_some());
+    let lane = (keeps && !r.cold).then(|| kiln_ci::work::slots::placement(&kiln_ci::work::slots::lane_for(&r.repo.name, &r.path, &spec.job, &spec.matrix, String::new())).hex());
+    let cold = lane.as_deref().and_then(|l| kiln_ci::work::slots::cold_ms(warm.values().map(|(_, s)| s), l)).map(|ms| ms as f64 / 1000.0);
+    let mut prefer = job.map(|j| kiln_ci::sched::routing::preferences(&j.kiln.prefer)).unwrap_or_default();
+    if r.cold {
+        prefer.retain(|p| !p.warm && p.affinity.is_none());
+    }
     LegIn {
         id: id.to_owned(),
         run: run.to_owned(),
@@ -299,7 +317,11 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         request: request_of(job, cfg),
         // Its I/O, for admission by load (W24-R19).
         load: kiln_ci::sched::admit::load_of(job.and_then(|j| j.kiln.resources.as_ref())),
-        ..LegIn::default()
+        lane,
+        cold,
+        container: spec.container.clone(),
+        workflow_file: r.path.clone(),
+        prefer,
     }
 }
 
@@ -716,6 +738,10 @@ struct Dispatch {
     /// When the runners of legs the rebuild after a restart found running have had their grace to
     /// say hello (ms): a leg whose runner hasn't by then was lost with it ([`Dispatch::absent`]).
     absent_after: Option<i64>,
+    /// What each runner last said it holds warm (W24-R18), numbered: legs' cold durations are read
+    /// from it, and placement takes the measured report of the newest.
+    warm: HashMap<String, (u64, kiln_ci::work::slots::WorkState)>,
+    warm_seq: u64,
 }
 
 fn now_ms() -> i64 {
@@ -782,6 +808,8 @@ pub fn spawn(hub: Arc<Hub>) {
             in_commands: false,
             pods: std::collections::HashSet::new(),
             absent_after: None,
+            warm: HashMap::new(),
+            warm_seq: 0,
         };
         // A test build's fault: the rebuild late, so the runners say hello first (W22-AC04).
         if let Some(late) = crate::runner::chaos::get().and_then(|c| c.rebuild_after) {
@@ -834,6 +862,24 @@ impl Dispatch {
             }
             Msg::RunnerFacts { agent } => {
                 self.runner_facts(&agent).await;
+                Ok(())
+            }
+            Msg::WorkState { agent, state } => {
+                self.warm_seq += 1;
+                let (seq, hub, report) = (self.warm_seq, Arc::clone(&self.hub), (*state).clone());
+                self.warm.insert(agent.clone(), (seq, *state));
+                // How far each workspace is behind is git's to say, in the mirrors: off the loop.
+                crate::rt::spawn(async move {
+                    let held = super::warm::held(&hub, &report).await;
+                    hub.ci.send(Msg::Warm { agent, seq, held: Box::new(held) });
+                });
+                Ok(())
+            }
+            Msg::Warm { agent, seq, held } => {
+                if self.warm.get(&agent).is_some_and(|(newest, _)| *newest == seq) {
+                    let cmds = self.sched.handle(Input::Warm { runner: agent, held: *held }, now_ms());
+                    self.commands(cmds).await;
+                }
                 Ok(())
             }
             Msg::RunnerLost { agent } => {
@@ -1719,7 +1765,7 @@ impl Dispatch {
         let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
-        let leg = leg_in(r, run, &id, &spec, &self.hub.cfg.ci);
+        let leg = leg_in(r, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
         let dockerless = dockerless_pod(&self.sched, r, &spec, &leg.route);
         self.legs.insert(
             id.clone(),
@@ -2768,7 +2814,7 @@ impl Dispatch {
                     gone: false,
                 },
             );
-            let li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci);
+            let li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
             match (s, agent) {
                 // Running on `a` as the store has it; `a` says whether it still is. A runner that
                 // said hello while this rebuilt said what it runs (what it left out it lost:

@@ -25,12 +25,16 @@
 //!   extents aren't read yet.
 //! - **A holder that died** (its runner stopped mid-leg) left its slot leased with no lock held:
 //!   the next lease of the lane resets it to its repository, or drops it.
+//! - **For placement** (W24-R18) each lane keeps how long its trusted legs that succeeded took
+//!   here, warm or cold (`<lane>/runs.json`, [`ran`]), and the runner tells the server what it
+//!   holds warm ([`state`]) whenever that changed ([`changes`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kiln_ci::wire::AssignmentV2;
@@ -39,6 +43,20 @@ use serde::{Deserialize, Serialize};
 
 /// The most slots a lane keeps.
 const SLOTS: u32 = 4;
+
+/// How many times what this process's legs left of the warm workspaces changed: a lease, a
+/// release, a measurement or an eviction, a run's history. The runner tells the server again once
+/// it moved ([`state`], W24-R18).
+static CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// [`CHANGES`] now.
+pub fn changes() -> u64 {
+    CHANGES.load(Ordering::Relaxed)
+}
+
+fn changed() {
+    CHANGES.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Where warm workspaces are: `<work>/warm`.
 pub fn root(work: &Path) -> PathBuf {
@@ -79,6 +97,41 @@ struct LaneFile {
 
 fn read_lane(lane: &Path) -> Option<LaneFile> {
     serde_json::from_slice(&std::fs::read(lane.join("lane.json")).ok()?).ok()
+}
+
+/// How long a lane's legs took here (`runs.json`, W24-R18); nothing yet, or unreadable, none.
+fn read_runs(lane: &Path) -> slots::Runs {
+    std::fs::read(lane.join("runs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// A trusted leg of the lane at `lane` succeeded here in `ms`, having started from one of its
+/// workspaces (`warm`) or from none (blocking): its history keeps it, for placement's expected
+/// finish (W24-R18). Nothing for a lane a lease never made.
+pub fn ran(lane: &Path, warm: bool, ms: u64) {
+    if read_lane(lane).is_none() {
+        return;
+    }
+    let Ok(_locked) = lock_file(&lane.join(".lock")) else { return };
+    let mut runs = read_runs(lane);
+    runs.add(warm, ms);
+    let at = lane.join("runs.json");
+    let tmp = at.with_extension(format!("json.{}", crate::util::new_id()));
+    let wrote = serde_json::to_vec(&runs).map_err(std::io::Error::other).and_then(|b| std::fs::write(&tmp, b)).and_then(|()| std::fs::rename(&tmp, &at));
+    match wrote {
+        Ok(()) => changed(),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::debug!(lane = %lane.display(), error = %e, "a warm lane's history couldn't be written");
+        }
+    }
+}
+
+/// What this runner holds warm (blocking), as it tells the server (`AgentMsg::WorkState`,
+/// W24-R18): each lane's record, its slots and its history. A lane without a record (one a lease
+/// never finished making) is left out.
+pub fn state(work: &Path) -> slots::WorkState {
+    let lanes = lanes(work).into_iter().filter_map(|dir| read_lane(&dir).map(|f| slots::LaneState { key: f.key, lane: f.lane, slots: read_slots(&dir), runs: read_runs(&dir) })).collect();
+    slots::WorkState { lanes }
 }
 
 /// A lane's slots, each numbered by its directory. A record whose directory is gone isn't one; a
@@ -382,10 +435,9 @@ pub fn lane_of(a: &AssignmentV2) -> LaneOf {
     let s = |k: &str| g.get(k).and_then(serde_json::Value::as_str).unwrap_or_default();
     // `owner/repo/<path>@<ref>`: the file, not the ref, so a branch's legs share trunk's lane.
     let workflow = s("workflow_ref").strip_prefix(s("repository")).map(|x| x.trim_start_matches('/')).and_then(|x| x.rsplit_once('@')).map_or("", |(p, _)| p);
-    let matrix = a.contexts.matrix.as_object().map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_owned))).collect()).unwrap_or_default();
-    let executor = if a.executor.kind.is_empty() { "host" } else { a.executor.kind.as_str() };
-    let toolchain = [executor, a.executor.image.as_deref().unwrap_or_default(), a.container.as_deref().unwrap_or_default()].join("|");
-    LaneOf { repo: a.repo.clone(), job: format!("{workflow}#{}", a.leg.job_id), matrix, toolchain, profile: String::new() }
+    // As the server keys the lane for placement too (W24-R18), but for the toolchain.
+    let toolchain = slots::toolchain(&a.executor.kind, a.executor.image.as_deref(), a.container.as_deref());
+    slots::lane_for(&a.repo, workflow, &a.leg.job_id, &a.contexts.matrix, toolchain)
 }
 
 /// What a leg asks of its lane.
@@ -414,7 +466,10 @@ pub struct Lease {
     pub dir: PathBuf,
     /// What the leg's log says of it.
     pub said: String,
-    lane: PathBuf,
+    /// It holds a checkout the leg starts from: warm, not a new, empty slot (W24-R18's history).
+    pub warm: bool,
+    /// Its lane's directory.
+    pub lane: PathBuf,
     /// The slot's number; `None` for a throwaway clone.
     n: Option<u32>,
     name: String,
@@ -541,8 +596,10 @@ pub fn lease_with(work: &Path, ask: &Ask, clones: Clones, budget: &Budget) -> an
             let _ = write_slot(&lane, &Slot { state: State::Quarantined, holder: None, ..s });
             return Ok(Leased::Cold(format!("No warm workspace: slot {n} of the job's lane couldn't be cleared ({e}), so it goes. The leg runs cold.")));
         }
+        let warm = matches!(c.take, Take::Slot(_)) && s.base.is_some();
         write_slot(&lane, &Slot { state: State::Leased, holder: Some(ask.leg.clone()), ..s }).context("the slot's record")?;
-        return Ok(Leased::Warm(Lease { dir, said, lane, n: Some(n), name: ask.name.clone(), quarantine: false, _lock: lock }));
+        changed();
+        return Ok(Leased::Warm(Lease { dir, said, warm, lane, n: Some(n), name: ask.name.clone(), quarantine: false, _lock: lock }));
     }
     Ok(Leased::Cold("No warm workspace: the lane's workspaces are all held. The leg runs cold.".to_owned()))
 }
@@ -568,6 +625,7 @@ fn throwaway(work: &Path, lane: &Path, ask: &Ask, found: &[Slot], distance: &BTr
         Ok(took) => Leased::Warm(Lease {
             said: format!("Warm workspace: a throwaway copy-on-write clone of slot {n} of the job's lane, {}, made in {:.1}s. The leg is untrusted: nothing it writes is kept.", at(&s, distance.get(&n).copied(), now), took.as_secs_f64()),
             dir,
+            warm: s.base.is_some(),
             lane: lane.to_path_buf(),
             n: None,
             name: ask.name.clone(),
@@ -677,6 +735,7 @@ pub fn release(work: &Path, l: Lease) -> Option<(PathBuf, u32)> {
     if let Err(e) = write_slot(&lane, &Slot { state, base, used: crate::util::now_unix(), holder: None, ..s }) {
         tracing::warn!(lane = %lane.display(), error = %e, "a warm workspace's record couldn't be written");
     }
+    changed();
     // Its lock goes before the lane's: a lease never finds it free and held.
     drop(l);
     drop(guard);
@@ -755,6 +814,7 @@ pub fn settle(work: &Path, measured: Option<(PathBuf, u32)>, budget: &Budget) ->
     }
     let went = sweep(work, budget);
     empty_trash(work);
+    changed();
     went
 }
 

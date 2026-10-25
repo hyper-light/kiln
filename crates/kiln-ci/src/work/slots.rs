@@ -19,6 +19,9 @@
 //! - [`evict`] drops the least recently used slots first, never a leased one, until each lane is
 //!   within its budget, the runner within its own and the volume above its floor (W24-R15).
 //! - A slot whose holder died is dirty: [`recover`] resets it to its repository, or drops it.
+//! - What a runner holds warm it tells the server ([`WorkState`]), with how long each lane's legs
+//!   took there ([`Runs`]); placement matches lanes but for their toolchain ([`placement`],
+//!   [`held`], W24-R18).
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -27,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::key::{Key, VERSION};
+use crate::sched::warm::{Held, Workspace};
 use crate::wf::ir::YVal;
 use crate::wire::Warm;
 
@@ -83,9 +87,20 @@ fn put(h: &mut Sha256, s: &str) {
 /// A lane's key: SHA-256 over [`VERSION`], `lane` and each component, tagged and length-prefixed
 /// as [`super::key`]'s fingerprints are.
 pub fn lane(l: &LaneOf) -> Key {
+    key_of("lane", l, &l.toolchain)
+}
+
+/// A lane as placement matches it (W24-R18): [`lane`] but for its toolchain, which the runner a
+/// leg goes to decides (the executor it runs the leg on, and that executor's image). Placement
+/// compares toolchains apart, runner by runner.
+pub fn placement(l: &LaneOf) -> Key {
+    key_of("placement", l, "")
+}
+
+fn key_of(tag: &str, l: &LaneOf, toolchain: &str) -> Key {
     let mut h = Sha256::new();
     put(&mut h, VERSION);
-    put(&mut h, "lane");
+    put(&mut h, tag);
     h.update([1]);
     put(&mut h, &l.repo);
     h.update([2]);
@@ -97,10 +112,26 @@ pub fn lane(l: &LaneOf) -> Key {
         put(&mut h, v);
     }
     h.update([4]);
-    put(&mut h, &l.toolchain);
+    put(&mut h, toolchain);
     h.update([5]);
     put(&mut h, &l.profile);
     Key(h.finalize().into())
+}
+
+/// A leg's lane from what both its runner and the server know of it (W24-R11): its repository,
+/// its workflow's file and its job's id (`.kiln/ci.yaml#rust`), its matrix values as text, and
+/// `toolchain` ([`toolchain`]; empty for placement, which compares toolchains apart).
+pub fn lane_for(repo: &str, workflow: &str, job: &str, matrix: &serde_json::Value, toolchain: String) -> LaneOf {
+    let matrix = matrix.as_object().map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_owned))).collect()).unwrap_or_default();
+    LaneOf { repo: repo.to_owned(), job: format!("{workflow}#{job}"), matrix, toolchain, profile: String::new() }
+}
+
+/// A lane's toolchain as a runner keys it (W24-R11): the executor that runs the leg (`host` when
+/// none is named), the image it runs in where the executor runs one (a container's or a
+/// microVM's), and the job's container, `|` between.
+pub fn toolchain(executor: &str, image: Option<&str>, container: Option<&str>) -> String {
+    let executor = if executor.is_empty() { "host" } else { executor };
+    [executor, image.unwrap_or_default(), container.unwrap_or_default()].join("|")
 }
 
 /// Where a slot stands.
@@ -147,6 +178,102 @@ pub struct Slot {
 pub fn lane_bytes(slots: &[Slot]) -> u64 {
     let own = slots.iter().fold(0u64, |a, s| a.saturating_add(s.bytes));
     own.saturating_add(slots.iter().map(|s| s.shared).max().unwrap_or(0))
+}
+
+/// The most runs of each kind a lane's history keeps ([`Runs`]).
+pub const RUNS: usize = 9;
+
+/// How long a lane's legs took on a runner, for placement's expected finish (W24-R18): its trusted
+/// legs that succeeded, in milliseconds, the newest last, at most [`RUNS`] of each kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Runs {
+    /// Those that started from one of its workspaces.
+    pub warm_ms: Vec<u64>,
+    /// Those that started from none: its first leg there, one that found every workspace held
+    /// and no room for another, a cold rerun.
+    pub cold_ms: Vec<u64>,
+}
+
+impl Runs {
+    /// One more run, warm or cold, of `ms`: past [`RUNS`] of its kind the oldest goes.
+    pub fn add(&mut self, warm: bool, ms: u64) {
+        let list = if warm { &mut self.warm_ms } else { &mut self.cold_ms };
+        list.push(ms);
+        let over = list.len().saturating_sub(RUNS);
+        list.drain(..over);
+    }
+}
+
+/// The median of `xs`, the lower of the middle two for an even count; `None` for none.
+pub fn median(xs: &[u64]) -> Option<u64> {
+    let mut v = xs.to_vec();
+    v.sort_unstable();
+    v.get(v.len().saturating_sub(1) / 2).copied()
+}
+
+/// What a runner holds warm (W24-R11), as it tells the server (`AgentMsg::WorkState`'s JSON) for
+/// placement (W24-R18): each of its lanes, with its workspaces and how long its legs took there.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkState {
+    pub lanes: Vec<LaneState>,
+}
+
+/// One lane on a runner.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaneState {
+    /// Its key ([`lane`]), and what it's made of.
+    pub key: String,
+    pub lane: LaneOf,
+    pub slots: Vec<Slot>,
+    pub runs: Runs,
+}
+
+impl LaneState {
+    /// The workspace the lane's next leg there would most likely start from: of those holding a
+    /// checkout, free or leased (a leased one is free again once its runner has room for the
+    /// leg), the one let go last.
+    pub fn freshest(&self) -> Option<&Slot> {
+        self.slots.iter().filter(|s| s.base.is_some() && matches!(s.state, State::Free | State::Leased)).max_by_key(|s| (s.used, Reverse(s.n)))
+    }
+}
+
+/// What a runner holds warm, for placement (W24-R18): a workspace for each lane that has one
+/// holding a checkout ([`LaneState::freshest`]), keyed as placement matches lanes ([`placement`])
+/// with its toolchain beside it, the median of the lane's warm runs there as its history, and how
+/// far its checkout is from the lane's next commit as `distance` says for its repository and
+/// checkout (commits behind, files changed; none counted where it can't say).
+pub fn held(state: &WorkState, distance: &dyn Fn(&str, &str) -> Option<(u32, u32)>) -> Held {
+    let workspaces = state
+        .lanes
+        .iter()
+        .filter_map(|l| {
+            let base = l.freshest()?.base.as_deref()?;
+            let (workflow, job) = l.lane.job.rsplit_once('#').unwrap_or_default();
+            let (behind, files) = distance(&l.lane.repo, base).unwrap_or_default();
+            Some(Workspace {
+                lane: placement(&l.lane).hex(),
+                toolchain: l.lane.toolchain.clone(),
+                repo: l.lane.repo.clone(),
+                workflow: workflow.to_owned(),
+                job: job.to_owned(),
+                behind,
+                files,
+                warm_s: median(&l.runs.warm_ms).map(|ms| ms as f64 / 1000.0),
+                missing: 0,
+            })
+        })
+        .collect();
+    Held { workspaces, bandwidth: None }
+}
+
+/// How long a leg of the lane placement keys `key` ([`placement`]) runs cold: the median of every
+/// runner's cold runs of the lane, in milliseconds (W24-R18's cold duration, from history).
+pub fn cold_ms<'a>(states: impl IntoIterator<Item = &'a WorkState>, key: &str) -> Option<u64> {
+    let runs: Vec<u64> = states.into_iter().flat_map(|s| s.lanes.iter()).filter(|l| placement(&l.lane).hex() == key).flat_map(|l| l.runs.cold_ms.iter().copied()).collect();
+    median(&runs)
 }
 
 /// Whether the runner's volume clones a folder copy-on-write.
@@ -647,5 +774,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// W24-R18: placement keys a lane but for its toolchain; the lane's own key keeps it; a leg's
+    /// lane from its parts is the one its runner keys.
+    #[test]
+    fn w24_r18_placement_keys_lanes_but_for_their_toolchain() {
+        let l = lane_of();
+        let docker = LaneOf { toolchain: "docker|kiln/runner-ubuntu-24.04|".into(), ..l.clone() };
+        assert_ne!(lane(&l), lane(&docker));
+        assert_eq!(placement(&l), placement(&docker));
+        assert_ne!(placement(&l), lane(&LaneOf { toolchain: String::new(), ..l.clone() }), "a key of its own");
+        assert_ne!(placement(&l), placement(&LaneOf { matrix: BTreeMap::from([("os".into(), "macos".into())]), ..l.clone() }));
+        assert_eq!(lane_for("acme/app", ".kiln/ci.yaml", "rust", &serde_json::json!({ "os": "linux" }), "host".into()), l);
+        let m = lane_for("a/b", "w.yml", "j", &serde_json::json!({ "n": 14, "x": true }), String::new()).matrix;
+        assert_eq!(m, BTreeMap::from([("n".into(), "14".into()), ("x".into(), "true".into())]));
+        assert_eq!(toolchain("", None, None), "host||");
+        assert_eq!(toolchain("docker", Some("kiln/runner-ubuntu-24.04"), Some("rust:1.91")), "docker|kiln/runner-ubuntu-24.04|rust:1.91");
+    }
+
+    /// W24-R18: what a runner holds warm, as placement takes it: a workspace for each lane with a
+    /// checkout (its freshest, free or leased), its history's median, its distance as given (none
+    /// counted where it isn't known); and a lane's cold duration from every runner's cold runs.
+    #[test]
+    fn w24_r18_a_runners_warm_state_for_placement() -> Result<(), String> {
+        let slot = |n: u32, state: State, base: Option<&str>, used: i64| Slot { n, state, base: base.map(str::to_owned), used, ..Slot::default() };
+        let rust = LaneState {
+            key: lane(&lane_of()).hex(),
+            lane: lane_of(),
+            slots: vec![slot(0, State::Free, Some("aaa"), 10), slot(1, State::Leased, Some("bbb"), 20), slot(2, State::Dirty, Some("ccc"), 30)],
+            runs: Runs { warm_ms: vec![30_000, 10_000, 20_000], cold_ms: vec![120_000] },
+        };
+        let docs = LaneState { key: "docs".into(), lane: LaneOf { job: ".kiln/ci.yaml#docs".into(), ..lane_of() }, slots: vec![slot(0, State::Free, None, 5)], runs: Runs::default() };
+        let state = WorkState { lanes: vec![rust.clone(), docs] };
+        let h = held(&state, &|repo, base| (repo == "acme/app" && base == "bbb").then_some((2, 7)));
+        let [w] = h.workspaces.as_slice() else { return Err(format!("one workspace, the docs lane having no checkout: {h:?}")) };
+        assert_eq!((w.lane.clone(), w.toolchain.as_str(), w.repo.as_str(), w.workflow.as_str(), w.job.as_str()), (placement(&lane_of()).hex(), "host", "acme/app", ".kiln/ci.yaml", "rust"));
+        assert_eq!((w.behind, w.files, w.warm_s, w.missing), (2, 7, Some(20.0), 0));
+        let unknown = held(&state, &|_, _| None);
+        assert!(unknown.workspaces.iter().all(|w| (w.behind, w.files) == (0, 0)), "{unknown:?}");
+        let other = WorkState { lanes: vec![LaneState { lane: LaneOf { toolchain: "docker|i|".into(), ..lane_of() }, runs: Runs { cold_ms: vec![100_000, 140_000], ..Runs::default() }, ..rust }] };
+        assert_eq!(cold_ms([&state, &other], &placement(&lane_of()).hex()), Some(120_000), "every runner's, whatever the toolchain");
+        assert_eq!(cold_ms([&state], "another"), None);
+        let json = serde_json::to_string(&state).map_err(|e| e.to_string())?;
+        assert_eq!(serde_json::from_str::<WorkState>(&json).map_err(|e| e.to_string())?, state, "as the runner says it");
+        Ok(())
+    }
+
+    /// A lane's history keeps the newest [`RUNS`] of each kind; the median is the lower middle.
+    #[test]
+    fn w24_r18_runs_keep_the_newest() {
+        let mut r = Runs::default();
+        for ms in 1..=12u64 {
+            r.add(true, ms);
+        }
+        r.add(false, 99);
+        assert_eq!(r.warm_ms, (4..=12).collect::<Vec<u64>>());
+        assert_eq!(r.cold_ms, vec![99]);
+        assert_eq!((median(&[3, 1, 2]), median(&[4, 1, 3, 2]), median(&[])), (Some(2), Some(2), None));
     }
 }

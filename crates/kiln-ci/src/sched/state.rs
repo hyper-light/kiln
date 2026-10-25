@@ -102,10 +102,19 @@ pub struct LegIn {
     pub own_executor: bool,
     /// What admission by load knows of it (W24-R19): heavy on I/O, and its I/O weight.
     pub load: super::admit::Load,
-    /// Its lane (W24-R11): the workspaces its `warm` term looks for (W24-R18).
+    /// Its lane (W24-R11) as placement matches lanes (`work::slots::placement`): the workspaces
+    /// its `warm` term looks for (W24-R18), on each runner those made with the toolchain it would
+    /// run with there.
     pub lane: Option<String>,
-    /// How long it runs cold, in seconds (history, W24-R28); its `cost` when that's unknown.
+    /// How long it runs cold, in seconds (runners' history of its lane, W24-R18); its `cost` when
+    /// that's unknown.
     pub cold: Option<f64>,
+    /// Its job's container image (`container:`): with the executor and image a runner gives it,
+    /// the toolchain its lane's workspaces there must have been made with (W24-R11).
+    pub container: Option<String>,
+    /// Its workflow's file (`.kiln/ci.yaml`), as runners' lanes name its jobs: what `affinity: {
+    /// job }` and a `warm` term without a lane go by (W24-R18).
+    pub workflow_file: String,
 }
 
 /// A runner that can take legs.
@@ -1147,7 +1156,7 @@ impl Scheduler {
     fn terms(l: &Leg) -> Vec<(f64, Wants<'_>)> {
         let mine = match &l.input.lane {
             Some(lane) => Wants::Lane(lane),
-            None => Wants::Job { repo: &l.input.repo, workflow: &l.input.route.workflow, job: &l.input.route.job },
+            None => Wants::Job { repo: &l.input.repo, workflow: &l.input.workflow_file, job: &l.input.route.job },
         };
         let mut out = Vec::new();
         for p in &l.req.prefer {
@@ -1156,7 +1165,7 @@ impl Scheduler {
                 out.push((w, mine));
             }
             if let Some(a) = &p.affinity {
-                out.push((w, Wants::Job { repo: &l.input.repo, workflow: &l.input.route.workflow, job: &a.job }));
+                out.push((w, Wants::Job { repo: &l.input.repo, workflow: &l.input.workflow_file, job: &a.job }));
             }
         }
         out
@@ -1186,9 +1195,20 @@ impl Scheduler {
         most.clamp(0.0, 1.0)
     }
 
-    /// A leg's estimate on a runner, from the workspaces `wants` names there.
+    /// A leg's estimate on a runner, from the workspaces `wants` names there: of its lane's, those
+    /// made with the toolchain it would run with there.
     fn estimate(&self, l: &Leg, runner: &str, wants: &[Wants]) -> warm::Estimate {
-        warm::estimate(self.warm.get(runner), wants, self.cold_s(l), &self.cfg.warm)
+        let toolchain = self.runners.get(runner).map(|r| Self::toolchain(l, r));
+        warm::estimate(self.warm.get(runner), wants, self.cold_s(l), &self.cfg.warm, toolchain.as_deref())
+    }
+
+    /// The toolchain a leg would run with on a runner (W24-R11): the first executor its rules
+    /// allow that the runner has (the host where they name none), as an assignment there would
+    /// carry it, that executor's image where it runs one, and the job's container.
+    fn toolchain(l: &Leg, r: &Runner) -> String {
+        let executor = l.req.executors.iter().find(|e| routing::usable(&l.req, &r.input.view.facts, e)).map_or("host", String::as_str);
+        let image = matches!(executor, "docker" | "firecracker").then_some(l.req.image.as_deref()).flatten();
+        crate::work::slots::toolchain(executor, image, l.input.container.as_deref())
     }
 
     /// How long a leg is expected to take on a runner, in seconds, for when that runner will have

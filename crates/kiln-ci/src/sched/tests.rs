@@ -726,7 +726,7 @@ fn warm_leg(id: &str, cold: f64, patience: Option<f64>) -> LegIn {
 /// A runner holding the lane's workspace: its warm runs take `warm_s`, it's `files` behind, and
 /// lacks `missing` bytes of it.
 fn holding(warm_s: f64, files: u32, missing: u64) -> Held {
-    Held { workspaces: vec![Workspace { lane: LANE.into(), repo: "acme/x".into(), workflow: "ci".into(), job: "rust".into(), behind: files / 4, files, warm_s: Some(warm_s), missing }], bandwidth: None }
+    Held { workspaces: vec![Workspace { lane: LANE.into(), toolchain: String::new(), repo: "acme/x".into(), workflow: "ci".into(), job: "rust".into(), behind: files / 4, files, warm_s: Some(warm_s), missing }], bandwidth: None }
 }
 
 fn warm_input(runner: &str, held: Held) -> Input {
@@ -819,13 +819,54 @@ fn w24_r18_affinity_goes_after_that_jobs_workspaces() {
     let test = |id: &str, repo: &str, workflow: &str| {
         let mut l = LegIn { cost: Some(100.0), prefer: vec![Preference { affinity: Some(Affinity { job: "build".into() }), ..Preference::default() }], ..leg(id, repo, 60) };
         l.route.job = "test".into();
-        l.route.workflow = workflow.into();
+        l.workflow_file = workflow.into();
         l
     };
     assert_eq!(assigned_to(&s.handle(Input::LegQueued(Box::new(test("t1", "acme/x", "ci"))), 1), "t1").as_deref(), Some("b"));
     assert_eq!(assigned_to(&s.handle(Input::LegQueued(Box::new(test("t2", "other/y", "ci"))), 2), "t2").as_deref(), Some("c"));
     // Another workflow's `build` is another job: no runner is warm for it, so the least loaded.
     assert_eq!(assigned_to(&s.handle(Input::LegQueued(Box::new(test("t3", "acme/x", "release"))), 3), "t3").as_deref(), Some("a"));
+}
+
+/// W24-R11 through R18: a runner's workspace of the leg's lane counts only where the leg would run
+/// with the toolchain it was made with. Both runners hold one made in the `docker` executor's
+/// container; the rules run the leg there where a runner has Docker, else on the host. It goes to
+/// the one with Docker, though the other comes first by name, and the explanation says why.
+#[test]
+fn w24_r18_a_lanes_workspace_counts_where_the_leg_runs_with_its_toolchain() -> Result<(), String> {
+    use super::routing::{Rule, RuleMatch};
+    let rule = Rule { matches: RuleMatch { labels: vec!["k8s".into()], ..RuleMatch::default() }, executor: vec!["docker".into(), "host".into()], image: Some("kiln/runner-ubuntu-24.04".into()), ..Rule::default() };
+    let mut s = Scheduler::new(Config { rules: vec![rule.clone()], ..Config::default() });
+    let mut docker = linux("w", 1);
+    for e in ["docker", "host"] {
+        docker.view.facts.executors.insert(e.into(), crate::facts::Executor::default());
+    }
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(docker)), 0);
+    let made = |toolchain: &str| Held { workspaces: vec![Workspace { lane: LANE.into(), toolchain: toolchain.into(), warm_s: Some(20.0), ..Workspace::default() }], bandwidth: None };
+    for r in ["a", "w"] {
+        s.handle(warm_input(r, made("docker|kiln/runner-ubuntu-24.04|")), 0);
+    }
+    let c = s.handle(Input::LegQueued(Box::new(warm_leg("x", 120.0, Some(0.0)))), 1);
+    assert_eq!(assigned_to(&c, "x").as_deref(), Some("w"), "{c:?}");
+    let why = s.explain("x");
+    let of = |r: &str| why.iter().find(|e| e.runner == r).and_then(|e| e.warm.clone()).ok_or(format!("no {r}"));
+    let (a, w) = (of("a")?, of("w")?);
+    assert!(a.estimate.lane.is_none() && near(a.estimate.run_s, 120.0), "on the host, cold: {a:?}");
+    assert!(w.estimate.lane.as_deref() == Some(LANE) && near(w.estimate.run_s, 20.0), "{w:?}");
+    // A workspace made on the host is warm on `a` and not on `w`, where the leg would run in a
+    // container.
+    let mut s = Scheduler::new(Config { rules: vec![rule], ..Config::default() });
+    let mut docker = linux("w", 1);
+    docker.view.facts.executors.insert("docker".into(), crate::facts::Executor::default());
+    s.handle(Input::RunnerUp(Box::new(docker)), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("z", 1))), 0);
+    for r in ["w", "z"] {
+        s.handle(warm_input(r, made("host||")), 0);
+    }
+    let c = s.handle(Input::LegQueued(Box::new(warm_leg("y", 120.0, Some(0.0)))), 1);
+    assert_eq!(assigned_to(&c, "y").as_deref(), Some("z"), "{c:?}");
+    Ok(())
 }
 
 /// W24-R18's patience, on the simulator. Warm on `w` (20 s there, 120 s cold): a second leg waits
@@ -979,7 +1020,7 @@ proptest! {
         let c = s.handle(Input::LegQueued(Box::new(warm_leg("x", cold, Some(share)))), t0);
         // The rule, from each runner's estimate.
         let m = warm::Model::default();
-        let busy_s: Vec<f64> = fleet.iter().map(|b| warm::estimate(held(b).as_ref(), &[Wants::Lane(LANE)], cold, &m).busy_s()).collect();
+        let busy_s: Vec<f64> = fleet.iter().map(|b| warm::estimate(held(b).as_ref(), &[Wants::Lane(LANE)], cold, &m, None).busy_s()).collect();
         let at = |i: usize| busy_s.get(i).copied().unwrap_or(f64::INFINITY);
         let free: Vec<usize> = (0..fleet.len()).filter(|i| fleet.get(*i).is_some_and(|b| b.busy.is_none())).collect();
         let Some(first) = free.iter().copied().min_by(|i, j| at(*i).total_cmp(&at(*j)).then(i.cmp(j))) else {

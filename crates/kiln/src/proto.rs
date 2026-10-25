@@ -233,6 +233,11 @@ pub enum AgentMsg {
     /// or why it couldn't (`error`): the older one lets go of it, or goes on with it. Only to a
     /// server announcing [`CAP_HANDOVER`]. Appended last: postcard encodes variants by index.
     HarnessAdopted { session: String, error: Option<String> },
+    /// CI: what this runner holds warm (JSON `kiln_ci::work::slots::WorkState`, docs/ci.md W24-R11,
+    /// R18): each lane's workspaces and how long its legs took here, for placement. Sent once it
+    /// changed, and every 10 minutes, each superseding the last; only to a server announcing
+    /// [`CAP_WORK`]. Appended last: postcard encodes variants by index.
+    WorkState { json: String },
 }
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
@@ -357,6 +362,11 @@ pub const CAP_NET_DROPS: u64 = 1 << 33;
 /// the server passes the session on and says how it went (`Command::HandedOver`, in a
 /// [`ServerMsg::HarnessCmd`]). Bit 34 is T3's `CAP_INBOX` (docs/wire.md).
 pub const CAP_HANDOVER: u64 = 1 << 35;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: warm workspaces, for placement
+/// (docs/ci.md W24-R18). A runner that says it tells the server what it holds warm
+/// ([`AgentMsg::WorkState`]); a server that says it takes that.
+pub const CAP_WORK: u64 = 1 << 36;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -741,6 +751,19 @@ mod tests {
         }
         // Bit 34 is T3's CAP_INBOX.
         assert!(CAP_HANDOVER.is_power_of_two() && CAP_HANDOVER == 1 << 35 && CAP_HANDOVER & (CAP_WIRE | CAP_NET_DROPS) == 0);
+        Ok(())
+    }
+
+    /// W24-R18: a runner's warm state comes after every older variant, and its bit is a new one.
+    #[test]
+    fn work_state_is_appended_after_the_hand_overs() -> anyhow::Result<()> {
+        let adopted = encode(&AgentMsg::HarnessAdopted { session: "s".into(), error: None })?;
+        let m = AgentMsg::WorkState { json: r#"{"lanes":[]}"#.into() };
+        let b = encode(&m)?;
+        assert_eq!(b.first().copied(), adopted.first().map(|i| i + 1), "AgentMsg::WorkState comes right after HarnessAdopted");
+        assert_eq!(decode::<AgentMsg>(&b)?, m);
+        // Bit 34 is T3's CAP_INBOX.
+        assert!(CAP_WORK.is_power_of_two() && CAP_WORK == 1 << 36 && CAP_WORK & (CAP_WIRE | CAP_NET_DROPS | 1 << 34 | CAP_HANDOVER) == 0);
         Ok(())
     }
 

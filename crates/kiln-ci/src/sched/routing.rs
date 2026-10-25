@@ -521,6 +521,30 @@ pub struct Affinity {
     pub job: String,
 }
 
+/// A job's `prefer:` (W05-R23, W24-R18) as routing takes it: each item that reads as a
+/// [`Preference`]. The editor warns of the others ([`preference`]), which count for nothing.
+pub fn preferences(items: &[crate::wf::ir::YVal]) -> Vec<Preference> {
+    items.iter().filter_map(|i| preference(i).ok()).collect()
+}
+
+/// One item of a job's `prefer:`, or why routing can't read it: it isn't a mapping, a value has
+/// the wrong type, it names no term routing reads (`fact`, `label`, `warm`, `affinity`), or its
+/// `patience` isn't a share from 0 to 1.
+pub fn preference(item: &crate::wf::ir::YVal) -> Result<Preference, String> {
+    let v = serde_json::to_value(item).map_err(|e| e.to_string())?;
+    if !v.is_object() {
+        return Err("a preference is a mapping, as `{ warm: true }` or `{ fact: disk.free, higher: true }`".into());
+    }
+    let p: Preference = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    if p.fact.is_none() && p.label.is_none() && !p.warm && p.affinity.is_none() {
+        return Err("it names none of the terms routing reads: `fact`, `label`, `warm`, `affinity`".into());
+    }
+    if p.patience.is_some_and(|x| !(0.0..=1.0).contains(&x)) {
+        return Err("`patience` is a share of what a warm runner saves, from 0 to 1".into());
+    }
+    Ok(p)
+}
+
 /// What selects the legs a routing rule applies to.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1048,5 +1072,30 @@ mod tests {
         assert!(scores(&[], &[&a, &b]).is_empty());
         let s = scores(&[Preference { fact: Some("disk.free".into()), higher: true, weight: Some(2.0), label: None, ..Preference::default() }, Preference { label: Some("fast".into()), ..Preference::default() }], &[&a, &b]);
         assert_eq!(s, vec![0.0, 3.0]);
+    }
+
+    /// W05-R23, W24-R18: a job's `prefer:` as routing reads it, each term; an item routing can't
+    /// read counts for nothing, and the editor says why (a warning, not an error).
+    #[test]
+    fn w24_r18_a_jobs_preferences() -> Result<(), String> {
+        let src = "on: push\njobs:\n  test:\n    runs-on: local\n    prefer:\n      - { warm: true, patience: 0.25, weight: 2 }\n      - { affinity: { job: build } }\n      - { fact: disk.free, higher: true }\n      - { label: fast }\n      - { warmth: true }\n      - { warm: true, patience: 2 }\n      - fast\n      - { weight: heavy, label: fast }\n    steps:\n      - run: make test\n";
+        let (w, d) = crate::wf::parse_workflow(".kiln/ci.yaml", src, Dialect::Kiln);
+        let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or("no job")?;
+        let read = preferences(&job.kiln.prefer);
+        let want = vec![
+            Preference { warm: true, patience: Some(0.25), weight: Some(2.0), ..Preference::default() },
+            Preference { affinity: Some(Affinity { job: "build".into() }), ..Preference::default() },
+            Preference { fact: Some("disk.free".into()), higher: true, ..Preference::default() },
+            Preference { label: Some("fast".into()), ..Preference::default() },
+        ];
+        assert_eq!(read, want);
+        assert!(d.iter().all(|x| !x.is_error()), "{d:?}");
+        let warned: Vec<&str> = d.iter().filter(|x| x.code == "KCI1011").map(|x| x.message.as_str()).collect();
+        let expect = [("prefer[4]", "names none of the terms"), ("prefer[5]", "from 0 to 1"), ("prefer[6]", "is a mapping"), ("prefer[7]", "invalid type")];
+        assert_eq!(warned.len(), expect.len(), "{warned:?}");
+        for ((at, why), said) in expect.iter().zip(&warned) {
+            assert!(said.contains(at) && said.contains(why) && said.contains("counts for nothing"), "{said}");
+        }
+        Ok(())
     }
 }

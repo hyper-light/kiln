@@ -504,6 +504,9 @@ struct Warmed {
     said: String,
     /// Its kept folders, in its workspace.
     kept: Vec<String>,
+    /// Its lane's directory, and whether it started from one of the lane's workspaces: where its
+    /// time goes into the lane's history once it succeeds, for placement (W24-R18).
+    history: Option<(PathBuf, bool)>,
 }
 
 /// A full commit SHA, as a checkout in place takes it (a ref is fetched to `FETCH_HEAD` first).
@@ -851,6 +854,7 @@ impl Leg {
         let started = Instant::now();
         // A warm leg works in a slot of its lane, held until its workspace is let go (W24-R11).
         let warmed = self.lease_warm().await;
+        let history = warmed.as_ref().and_then(|w| w.history.clone());
         let layout = match warmed.as_ref().and_then(|w| w.dir.clone()) {
             Some(dir) => Layout::within(&self.work_dir, dir, &self.a.repo, self.hosted_image()),
             None => self.layout(),
@@ -867,12 +871,20 @@ impl Leg {
             Ok(Err(e)) => (Status::Failed, Some(format!("{e:#}"))),
             Err(_) => (Status::Failed, Some("the runtime failed unexpectedly".into())),
         };
+        // How long a trusted leg of a warm job took here, warm or cold: its lane's history, for
+        // placement (W24-R18). An untrusted leg's time says nothing anyone may plan by.
+        if status == Status::Succeeded
+            && self.a.trusted
+            && let Some((lane, warm)) = history
+        {
+            let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let _ = crate::rt::blocking(move || super::warm::ran(&lane, warm, ms)).await;
+        }
         // The workspace goes with the leg, unless a failed leg is kept to look into (W17-R02).
         let keep = if matches!(status, Status::Failed | Status::TimedOut) { self.a.debug.keep_on_failure_minutes } else { None };
         if let Some(until) = super::kept::ended(&job, ws, keep).await {
             self.event(&JobEventV2::Kept { until }).await;
         }
-        let _ = started;
         JobResult { job, status, exit_code: None, error, peak_rss: None, cpu_seconds: None }
     }
 
@@ -888,33 +900,35 @@ impl Leg {
         }
         let (kept, refused) = super::warm::kept_paths(&w.paths);
         let mut said: String = refused.iter().map(|p| format!("`{p}` isn't kept: a kept folder is a path inside the workspace.\n")).collect();
+        let lane = super::warm::lane_of(a);
+        let lane_dir = super::warm::lane_dir(&self.work_dir, &a.repo, &kiln_ci::work::slots::lane(&lane).hex());
         // A cold run (`kiln rerun --cold`, W24-R23) leases no warm slot: it starts from nothing
         // kept, and its lane's workspaces stay as they were for the legs after it.
         if a.cold {
             said.push_str("No warm workspace: a cold run (`kiln rerun --cold`) starts from nothing kept. The leg runs cold.");
-            return Some(Warmed { dir: None, said, kept });
+            return Some(Warmed { dir: None, said, kept, history: Some((lane_dir, false)) });
         }
         let sha = if a.sha.is_empty() { a.contexts.github.get("sha").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned() } else { a.sha.clone() };
         let name = a.repo.rsplit('/').next().unwrap_or("repo").to_owned();
-        let ask = super::warm::Ask { repo: a.repo.clone(), lane: super::warm::lane_of(a), leg: a.job_id.clone(), sha, trusted: a.trusted, kept: kept.clone(), budget: w.budget, name };
+        let ask = super::warm::Ask { repo: a.repo.clone(), lane, leg: a.job_id.clone(), sha, trusted: a.trusted, kept: kept.clone(), budget: w.budget, name };
         let work = self.work_dir.clone();
-        let dir = match crate::rt::blocking(move || super::warm::lease(&work, &ask)).await {
+        let (dir, history) = match crate::rt::blocking(move || super::warm::lease(&work, &ask)).await {
             Ok(Ok(super::warm::Leased::Warm(l))) => {
                 said.push_str(&l.said);
-                let dir = l.dir.clone();
+                let (dir, history) = (l.dir.clone(), (l.lane.clone(), l.warm));
                 super::warm::hold(&self.work_dir, l);
-                Some(dir)
+                (Some(dir), Some(history))
             }
             Ok(Ok(super::warm::Leased::Cold(why))) => {
                 said.push_str(&why);
-                None
+                (None, Some((lane_dir, false)))
             }
             Ok(Err(e)) | Err(e) => {
                 said.push_str(&format!("No warm workspace: {e:#}. The leg runs cold."));
-                None
+                (None, None)
             }
         };
-        Some(Warmed { dir, said, kept })
+        Some(Warmed { dir, said, kept, history })
     }
 
     /// The leg's layout: its own directory, or its pool's executor's (W13-R09).

@@ -16,7 +16,8 @@
 //! warmth is what warm runs saved there (`1 − warm ÷ cold`), or [`Model::prior`] before any did,
 //! shrunk as the workspace falls behind: × `h ÷ (h + files changed)`, `h` being
 //! [`Model::half_files`]. A runner where no workspace saves more than its fetch costs runs the leg
-//! cold.
+//! cold. A workspace of the leg's lane counts only where the leg would run with the toolchain it
+//! was made with (the executor and image the runner gives it, and its job's container).
 //!
 //! **Patience** ([`patience`]). A leg that could start now may wait instead for a busy runner
 //! where it would finish sooner: when that runner saves it at least a second, finishes it sooner
@@ -29,12 +30,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Workspace {
-    /// Its lane: W24-R11's hash of the repository, the job, the matrix values that matter, the
-    /// toolchain and the profile.
+    /// Its lane as placement matches lanes (`work::slots::placement`): W24-R11's hash of the
+    /// repository, the job, the matrix values that matter and the profile, its toolchain apart.
     pub lane: String,
-    /// The repository, workflow and job whose lane it is, as legs' routes name them
-    /// (`LegRoute::repo`, `workflow`, `job`): what `affinity: { job }` goes by, and `warm` for a
-    /// leg without a lane.
+    /// The toolchain it was made with (`work::slots::toolchain`: the executor, its image, the
+    /// job's container): a leg's lane is this workspace's only where the leg would run with the
+    /// same one here. Empty when it isn't known, matching any.
+    pub toolchain: String,
+    /// The repository, workflow (its file) and job whose lane it is (`LegIn::repo`,
+    /// `workflow_file`, `route.job`): what `affinity: { job }` goes by, and `warm` for a leg
+    /// without a lane.
     pub repo: String,
     pub workflow: String,
     pub job: String,
@@ -148,14 +153,16 @@ pub fn warmth(w: &Workspace, cold_s: f64, m: &Model) -> f64 {
 
 /// The estimate on a runner holding `held` (`None`: nothing): of the workspaces `wants` names
 /// there, the one that would finish a leg of `cold_s` seconds first, and cold when none would
-/// finish it sooner than a cold run.
-pub fn estimate(held: Option<&Held>, wants: &[Wants], cold_s: f64, m: &Model) -> Estimate {
+/// finish it sooner than a cold run. `toolchain` is the one the leg would run with there: a
+/// workspace of its lane made with another isn't its lane's (W24-R11); `None` matches any.
+pub fn estimate(held: Option<&Held>, wants: &[Wants], cold_s: f64, m: &Model, toolchain: Option<&str>) -> Estimate {
     let cold = Estimate::cold(cold_s);
     let Some(h) = held.filter(|_| !wants.is_empty()) else { return cold };
     let bandwidth = h.bandwidth.filter(|b| b.is_finite() && *b > 0.0).unwrap_or(m.bandwidth);
+    let made_alike = |w: &Workspace| w.toolchain.is_empty() || toolchain.is_none_or(|t| t == w.toolchain);
     h.workspaces
         .iter()
-        .filter(|w| wants.iter().any(|x| x.matches(w)))
+        .filter(|w| wants.iter().any(|x| x.matches(w) && (!matches!(x, Wants::Lane(_)) || made_alike(w))))
         .map(|w| {
             let warmth = warmth(w, cold_s, m);
             let fetch_s = if bandwidth > 0.0 { w.missing as f64 / bandwidth } else { f64::INFINITY };
@@ -206,7 +213,7 @@ mod tests {
     const MIB: f64 = 1024.0 * 1024.0;
 
     fn ws(lane: &str, warm_s: Option<f64>, files: u32, missing: u64) -> Workspace {
-        Workspace { lane: lane.into(), repo: "acme/app".into(), workflow: "ci".into(), job: "rust".into(), behind: files / 2, files, warm_s, missing }
+        Workspace { lane: lane.into(), toolchain: String::new(), repo: "acme/app".into(), workflow: ".kiln/ci.yaml".into(), job: "rust".into(), behind: files / 2, files, warm_s, missing }
     }
 
     fn close(a: f64, b: f64) -> bool {
@@ -223,7 +230,7 @@ mod tests {
         let behind = ws("l1", Some(30.0), 100, 1 << 30);
         assert!(close(warmth(&behind, 120.0, &m), 0.375));
         let held = Held { workspaces: vec![behind], bandwidth: Some(100.0 * MIB) };
-        let e = estimate(Some(&held), &[Wants::Lane("l1")], 120.0, &m);
+        let e = estimate(Some(&held), &[Wants::Lane("l1")], 120.0, &m, None);
         assert!(close(e.run_s, 75.0) && close(e.fetch_s, 10.24), "{e:?}");
         assert_eq!((e.lane.as_deref(), e.behind, e.files), (Some("l1"), 50, 100));
         // No warm run yet: the prior's half, shrunk by distance alike.
@@ -239,15 +246,31 @@ mod tests {
     fn w24_r18_the_best_workspace_named_counts() {
         let m = Model::default();
         let held = Held { workspaces: vec![ws("l1", Some(60.0), 0, 0), ws("l1", Some(20.0), 0, 0), ws("l2", Some(1.0), 0, 0)], bandwidth: None };
-        let e = estimate(Some(&held), &[Wants::Lane("l1")], 120.0, &m);
+        let e = estimate(Some(&held), &[Wants::Lane("l1")], 120.0, &m, None);
         assert!(close(e.busy_s(), 20.0), "{e:?}");
-        let job = estimate(Some(&held), &[Wants::Job { repo: "acme/app", workflow: "ci", job: "rust" }], 120.0, &m);
+        let job = estimate(Some(&held), &[Wants::Job { repo: "acme/app", workflow: ".kiln/ci.yaml", job: "rust" }], 120.0, &m, None);
         assert!(close(job.busy_s(), 1.0), "any lane of the job: {job:?}");
-        assert_eq!(estimate(Some(&held), &[Wants::Job { repo: "other/app", workflow: "ci", job: "rust" }], 120.0, &m), Estimate::cold(120.0));
-        assert_eq!(estimate(Some(&held), &[], 120.0, &m), Estimate::cold(120.0), "no term, no warmth");
-        assert_eq!(estimate(None, &[Wants::Lane("l1")], 120.0, &m), Estimate::cold(120.0));
+        assert_eq!(estimate(Some(&held), &[Wants::Job { repo: "other/app", workflow: ".kiln/ci.yaml", job: "rust" }], 120.0, &m, None), Estimate::cold(120.0));
+        assert_eq!(estimate(Some(&held), &[], 120.0, &m, None), Estimate::cold(120.0), "no term, no warmth");
+        assert_eq!(estimate(None, &[Wants::Lane("l1")], 120.0, &m, None), Estimate::cold(120.0));
         let far = Held { workspaces: vec![ws("l1", Some(20.0), 0, 500 << 30)], bandwidth: Some(MIB) };
-        assert_eq!(estimate(Some(&far), &[Wants::Lane("l1")], 120.0, &m), Estimate::cold(120.0), "fetching costs more than it saves");
+        assert_eq!(estimate(Some(&far), &[Wants::Lane("l1")], 120.0, &m, None), Estimate::cold(120.0), "fetching costs more than it saves");
+    }
+
+    /// W24-R11's lanes are per toolchain: a workspace of the leg's lane made with another counts
+    /// for nothing there, one whose toolchain isn't known counts, and `affinity`'s job terms look
+    /// past toolchains.
+    #[test]
+    fn w24_r18_a_lanes_workspace_counts_only_made_with_the_legs_toolchain() {
+        let m = Model::default();
+        let made = |toolchain: &str| Held { workspaces: vec![Workspace { toolchain: toolchain.into(), ..ws("l1", Some(20.0), 0, 0) }], bandwidth: None };
+        let docker = made("docker|kiln/runner-ubuntu-24.04|");
+        assert!(close(estimate(Some(&docker), &[Wants::Lane("l1")], 120.0, &m, Some("docker|kiln/runner-ubuntu-24.04|")).busy_s(), 20.0));
+        assert_eq!(estimate(Some(&docker), &[Wants::Lane("l1")], 120.0, &m, Some("host||")), Estimate::cold(120.0), "made in a container, the leg would run on the host");
+        assert!(close(estimate(Some(&made("")), &[Wants::Lane("l1")], 120.0, &m, Some("host||")).busy_s(), 20.0), "not known: it counts");
+        assert!(close(estimate(Some(&docker), &[Wants::Lane("l1")], 120.0, &m, None).busy_s(), 20.0), "no toolchain asked");
+        let job = Wants::Job { repo: "acme/app", workflow: ".kiln/ci.yaml", job: "rust" };
+        assert!(close(estimate(Some(&docker), &[job], 120.0, &m, Some("host||")).busy_s(), 20.0), "a job's workspaces, whatever made them");
     }
 
     #[test]

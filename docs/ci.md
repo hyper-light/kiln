@@ -7861,6 +7861,22 @@ microVMs keep their own workspaces (R13, R14); `actions/checkout` cleans a works
 unless given `clean: false`. AC11: kiln's `target` (29.2 GiB, 42,407 files) cloned in 1.39 s on
 fedora's btrfs through the runner (0.94 s with `cp` alone) and removed in 0.4 s.
 
+**Warm-aware placement (M1, step 6).** Built, awaiting review (R18; `kiln_ci::sched::warm`,
+`work::slots`, `ci/warm.rs`). A job opts in with `prefer: [{ warm: true }]`, or `affinity: { job:
+build }`, each with its `weight` and `patience` (the share, from 0 to 1, of what a busy warm runner
+saves that its legs may wait for it; half by default). An item routing can't read counts for
+nothing, and the editor warns (`KCI1011`). Runners say what they hold warm (`AgentMsg::WorkState`,
+under `CAP_WORK`) once it changed and every 10 minutes: each lane's slots, and how long its
+trusted legs that succeeded took there, warm and cold (`<lane>/runs.json`, the last nine of
+each). The server measures each lane's freshest checkout against its repository's newest commit
+in its mirror (commits behind, files changed) and gives the scheduler the result. A leg's lane is
+matched but for its toolchain, which each runner decides (the executor the rules give the leg
+there, that executor's image, and the job's container): a workspace made in a container counts
+only where the leg would run in one. A leg's cold duration is the median of every runner's cold
+runs of its lane, else its cost. A cold rerun's legs have no lane and no warm terms.
+`ci.legs.routing` gives each runner's estimate: the workspace, its warmth, and the expected wait,
+run, fetch and finish.
+
 **Legs the change can't affect (M3, R06).** A job that opts in to reuse (`reuse:`, `work: { memo
 }`) whose `if:` or matrix `when:` is false only for what the change didn't touch (it would hold had
 the change touched every file: `changed()` true, `affected()` every package) isn't skipped: its legs
@@ -8451,7 +8467,7 @@ in `.github/workflows`. Each key's semantics are in the requirement cited.
 | on | `diff`, `land`, `review`, `comment`, `pipeline`, `agent`, `deploy`, `webhook`; v1 `manual`, `tag`, string `schedule` | W03-R09, W02-R06 |
 | on | `schedule[].{timezone,branch,inputs,jitter,skip-if-unchanged,catch-up}` (O) | W03-R10 |
 | job | `toolchain`, `image`, `exclusive`, `resources: { cpu, memory, disk, gpu }` (O for `resources`) | W02-R06, W05-R03 |
-| job | `requires: [constraints]`, `prefer: [preferences]`, `priority` (O) | W05-R22, W05-R23, W05-R09 |
+| job | `requires: [constraints]`, `prefer: [preferences]` (`{ fact, higher }`, `{ label }`, `{ warm }`, `{ affinity: { job } }`, each with `weight`; `patience` with `warm` or `affinity`), `priority` (O) | W05-R22, W05-R23, W24-R18, W05-R09 |
 | job, step | `retry: { max, on, backoff, runner }` (O) | W05-R14 |
 | workflow, job | `concurrency.limit` (O) | W05-R07 |
 | job | `strategy.matrix.{where,platforms,emulate}`, `strategy.{when,shard,chunk}`, `strategy.max-parallel: {total, per}`, `strategy.fail-fast: {scope, cancel}` (O) | W04-R11 to R16 |

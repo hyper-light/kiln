@@ -64,6 +64,7 @@ pub mod services;
 pub mod token;
 pub mod trackers;
 pub mod uploads;
+pub mod warm;
 pub mod webhooks;
 pub mod work;
 pub mod workflows;
