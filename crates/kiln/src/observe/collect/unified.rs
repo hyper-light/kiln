@@ -5,12 +5,17 @@
 //! before it, so nothing falls between), of the events the log keeps on disk (the default level
 //! and above: info and debug ones are held in memory), and the stream's events the catch-up held
 //! dropped. An
-//! event is known by its boot and its mach time (the machine's monotonic clock, which no two of a
-//! boot's events share on one thread): one later than the last written is taken, of another boot
-//! by its time. Where there is no unified log (Linux, Windows), its status says so.
+//! event is known by its boot, its mach time (the machine's monotonic clock) and its thread (no two
+//! of a thread's events share a mach time), and taken once: never by order alone, as `log stream`
+//! gives different processes' events out of their mach order (two `logger`s a millisecond apart
+//! came the other way round, 2026-10-25, and the one behind was dropped as read). Its place is the
+//! last event written and those written in the [`WINDOW_NS`] before it: after a restart an event
+//! before the window was written, one of it was written if it is among them, and any other is
+//! taken. Where there is no unified log (Linux, Windows), its status says so.
 //!
 //! `KILN_LOG_TOOL` names another `log` (a test's).
 
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
@@ -30,13 +35,33 @@ const AGAIN_MIN: Duration = Duration::from_secs(1);
 const AGAIN_MAX: Duration = Duration::from_secs(60);
 /// How often the place is written down.
 const SAVE_EVERY: Duration = Duration::from_secs(1);
+/// How far before the last event written the place keeps those written: far past how long `log
+/// stream` holds an event behind a later one of another process (a millisecond, 2026-10-25).
+const WINDOW_NS: i64 = 1_000_000_000;
+/// The most events the place keeps of its window (the newest): all of a second's at 2,048 a second.
+const RECENT_MAX: usize = 2_048;
+/// The events a run took last that it won't take again: the catch-up and the stream both read the
+/// moments between the stream's start and the catch-up's end, and those are the catch-up's last.
+const READ_KEYS: usize = 16_384;
 
-/// The last event written: its boot, its mach time and its time (ns since the epoch).
+/// An event's place: its boot, its mach time, its time (ns since the epoch) and its thread.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Mark {
     pub boot: String,
     pub mach: u64,
     pub ts_ns: i64,
+    /// 0 in a place written before threads were (an older kiln's).
+    #[serde(default)]
+    pub thread: u64,
+}
+
+/// An event's identity: its boot's, its mach time and its thread.
+type Key = (u64, u64, u64);
+
+fn key(m: &Mark) -> Key {
+    // FNV-1a: a boot is one of a few, and its events are told apart by their mach times.
+    let boot = m.boot.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    (boot, m.mach, m.thread)
 }
 
 impl Mark {
@@ -46,10 +71,60 @@ impl Mark {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Saved {
     #[serde(default)]
     last: Option<Mark>,
+    /// The events written in the window before `last`, of its boot: each its mach time and thread.
+    #[serde(default)]
+    recent: Vec<(u64, u64)>,
+}
+
+/// Which events a run takes: each once. One the place says was written (before its window, or one
+/// of its window's) is not taken again, nor one this run read already; any other is, whatever its
+/// order.
+struct Seen {
+    /// The place's window's first event: one before it was written.
+    floor: Option<Mark>,
+    /// A place an older kiln wrote (no window): its last event and those before it were written.
+    inclusive: bool,
+    written: HashSet<Key>,
+    read: HashSet<Key>,
+    order: VecDeque<Key>,
+}
+
+impl Seen {
+    fn new(saved: &Saved) -> Self {
+        let Some(last) = &saved.last else {
+            return Self { floor: None, inclusive: false, written: HashSet::new(), read: HashSet::new(), order: VecDeque::new() };
+        };
+        let of = |(mach, thread): (u64, u64)| Mark { boot: last.boot.clone(), mach, ts_ns: last.ts_ns, thread };
+        let written: HashSet<Key> = saved.recent.iter().map(|&r| key(&of(r))).chain(std::iter::once(key(last))).collect();
+        let first = saved.recent.iter().map(|&(mach, _)| mach).min().filter(|&m| m < last.mach);
+        let floor = first.map_or_else(|| last.clone(), |mach| Mark { mach, ..last.clone() });
+        Self { floor: Some(floor), inclusive: saved.recent.is_empty(), written, read: HashSet::new(), order: VecDeque::new() }
+    }
+
+    /// Whether `e` is taken (and so known from now on as read).
+    fn takes(&mut self, e: &Mark) -> bool {
+        let k = key(e);
+        if self.read.contains(&k) || self.written.contains(&k) {
+            return false;
+        }
+        if let Some(f) = &self.floor
+            && (e.before(f) || (self.inclusive && !f.before(e)))
+        {
+            return false;
+        }
+        if self.order.len() >= READ_KEYS
+            && let Some(old) = self.order.pop_front()
+        {
+            self.read.remove(&old);
+        }
+        self.read.insert(k);
+        self.order.push_back(k);
+        true
+    }
 }
 
 fn log_tool() -> String {
@@ -138,7 +213,8 @@ pub(crate) fn event(c: &Compiled, line: &str, now_ns: i64) -> Option<(Option<Rec
     }
     let field = |k: &str| o.get(k).and_then(Value::as_str).filter(|s| !s.is_empty());
     let ts_ns = field("timestamp").and_then(time)?;
-    let mark = Mark { boot: field("bootUUID").unwrap_or_default().to_owned(), mach: o.get("machTimestamp").and_then(Value::as_u64)?, ts_ns };
+    let thread = o.get("threadID").and_then(Value::as_u64).unwrap_or(0);
+    let mark = Mark { boot: field("bootUUID").unwrap_or_default().to_owned(), mach: o.get("machTimestamp").and_then(Value::as_u64)?, ts_ns, thread };
     let mut message = field("eventMessage").unwrap_or_default().to_owned();
     if !c.keep(&mut message) {
         return Some((None, mark));
@@ -184,9 +260,10 @@ struct Run<'a> {
     state: &'a Mutex<State>,
     batch: Batch<Mark>,
     flight: InFlight<Mark>,
-    /// The last event taken (written or on its way), and the last written.
-    taken: Option<Mark>,
+    seen: Seen,
+    /// The last event written, and those written in the window before it (oldest first).
     written: Option<Mark>,
+    recent: VecDeque<Mark>,
     records: u64,
     excluded: u64,
     errors: u64,
@@ -196,40 +273,89 @@ struct Run<'a> {
     dirty: bool,
 }
 
+/// Marks of events written: the last of them (by its place) and the window before it.
+fn note_written(written: &mut Option<Mark>, recent: &mut VecDeque<Mark>, marks: Vec<Mark>) {
+    for m in marks {
+        if written.as_ref().is_none_or(|w| w.before(&m)) {
+            *written = Some(m.clone());
+        }
+        recent.push_back(m);
+    }
+    let Some(last) = written.as_ref() else { return };
+    while recent.front().is_some_and(|f| f.ts_ns < last.ts_ns - WINDOW_NS) || recent.len() > RECENT_MAX {
+        recent.pop_front();
+    }
+}
+
+impl<'a> Run<'a> {
+    fn new(c: &'a Compiled, state: &'a Mutex<State>, place: &Saved) -> Self {
+        let recent = match &place.last {
+            Some(last) => place.recent.iter().map(|&(mach, thread)| Mark { boot: last.boot.clone(), mach, ts_ns: last.ts_ns, thread }).collect(),
+            None => VecDeque::new(),
+        };
+        Run {
+            c,
+            state,
+            batch: Batch::default(),
+            flight: InFlight::default(),
+            seen: Seen::new(place),
+            written: place.last.clone(),
+            recent,
+            records: 0,
+            excluded: 0,
+            errors: 0,
+            bytes: 0,
+            last_ms: None,
+            error: None,
+            dirty: false,
+        }
+    }
+}
+
 impl Run<'_> {
-    /// One line read: an event later than any taken goes into the batch.
+    /// One line read: an event not taken before goes into the batch.
     fn line(&mut self, line: &str, now_ns: i64) {
         self.bytes += line.len() as u64;
         let Some((r, mark)) = event(self.c, line, now_ns) else { return };
-        if self.taken.as_ref().is_some_and(|t| !t.before(&mark)) {
+        if !self.seen.takes(&mark) {
             return;
         }
         match r {
             Some(r) => self.batch.push(r),
             None => self.excluded += 1,
         }
-        self.batch.marks.clear();
-        self.batch.marks.push(mark.clone());
-        self.taken = Some(mark);
+        self.batch.marks.push(mark);
     }
 
     fn written_marks(&mut self) {
-        let (mut records, mut last) = (0, None);
-        self.flight.written(|marks, n| {
-            if let Some(m) = marks.into_iter().last() {
-                last = Some(m);
-            }
+        let mut records = 0;
+        let (flight, written, recent, dirty) = (&mut self.flight, &mut self.written, &mut self.recent, &mut self.dirty);
+        flight.written(|marks, n| {
+            note_written(written, recent, marks);
+            *dirty = true;
             records += n;
         });
-        if let Some(m) = last {
-            self.written = Some(m);
-            self.dirty = true;
-        }
         if records > 0 {
             self.records += records;
             self.last_ms = Some(crate::observe::clock_ms());
             self.error = None;
         }
+    }
+
+    /// Where it is, as written down: the last event written and its window's, of its boot.
+    fn saved(&self) -> Saved {
+        let recent = match &self.written {
+            Some(last) => self.recent.iter().filter(|m| m.boot == last.boot).map(|m| (m.mach, m.thread)).collect(),
+            None => Vec::new(),
+        };
+        Saved { last: self.written.clone(), recent }
+    }
+
+    /// Where a catch-up reads from: the second before a window before its window's first event (a
+    /// place read back knows its window's events by their mach times, their own times not kept).
+    fn from_s(&self) -> Option<i64> {
+        let first = self.recent.iter().chain(self.written.iter()).map(|m| m.ts_ns).min()?;
+        Some((first - WINDOW_NS).div_euclid(1_000_000_000) - 1)
     }
 
     fn report(&self) {
@@ -245,7 +371,7 @@ impl Run<'_> {
 
     /// Reads `reading` until it ends (`Ok`) or the source is told to stop (`Err`), offering as it
     /// goes and taking in what is written; its place saved each second.
-    fn pump(&mut self, reading: &mut Reading, stop: &Stop, offer: Offer<'_>, save: &dyn Fn(&Option<Mark>) -> Result<(), String>, saved: &mut Instant) -> Result<(), ()> {
+    fn pump(&mut self, reading: &mut Reading, stop: &Stop, offer: Offer<'_>, save: &dyn Fn(&Saved) -> Result<(), String>, saved: &mut Instant) -> Result<(), ()> {
         let mut quiet = None;
         loop {
             if stop.stopped() {
@@ -285,7 +411,7 @@ impl Run<'_> {
             }
             self.written_marks();
             if self.dirty && saved.elapsed() >= SAVE_EVERY {
-                if let Err(e) = save(&self.written) {
+                if let Err(e) = save(&self.saved()) {
                     self.error = Some(e);
                 }
                 self.dirty = false;
@@ -300,11 +426,11 @@ impl Run<'_> {
 /// wait, when it ends), after `log show` of what came since the last event written; each event's
 /// mark kept once its write is applied.
 pub(crate) fn run(c: &Compiled, saved_to: &Path, stop: &Stop, state: &Mutex<State>, offer: Offer<'_>) {
-    let mark: Option<Mark> = std::fs::read(saved_to).ok().and_then(|b| serde_json::from_slice::<Saved>(&b).ok()).and_then(|s| s.last);
-    let save = |m: &Option<Mark>| -> Result<(), String> {
-        serde_json::to_vec(&Saved { last: m.clone() }).map_err(std::io::Error::other).and_then(|b| crate::sync::group::save_atomic(saved_to, &b)).map_err(|e| format!("its place could not be written down: {e}"))
+    let place: Saved = std::fs::read(saved_to).ok().and_then(|b| serde_json::from_slice::<Saved>(&b).ok()).unwrap_or_default();
+    let save = |s: &Saved| -> Result<(), String> {
+        serde_json::to_vec(s).map_err(std::io::Error::other).and_then(|b| crate::sync::group::save_atomic(saved_to, &b)).map_err(|e| format!("its place could not be written down: {e}"))
     };
-    let mut run = Run { c, state, batch: Batch::default(), flight: InFlight::default(), taken: mark.clone(), written: mark, records: 0, excluded: 0, errors: 0, bytes: 0, last_ms: None, error: None, dirty: false };
+    let mut run = Run::new(c, state, &place);
     let mut saved = Instant::now();
     let mut again = AGAIN_MIN;
     let mut first = true;
@@ -324,7 +450,7 @@ pub(crate) fn run(c: &Compiled, saved_to: &Path, stop: &Stop, state: &Mutex<Stat
         let started = Instant::now();
         // What came since the last event written (or, the source asking, everything kept): read
         // whole first; the stream's events it held are dropped as the stream is read.
-        let from = run.written.as_ref().map(|m| m.ts_ns.div_euclid(1_000_000_000) - 1);
+        let from = run.from_s();
         if from.is_some() || (first && c.start == Start::Beginning) {
             tracing::debug!(source = %c.name, from = ?from, "the unified log read since its last event");
             match spawn(&show_args(c, from, now_s() + 1)) {
@@ -356,13 +482,12 @@ pub(crate) fn run(c: &Compiled, saved_to: &Path, stop: &Stop, state: &Mutex<Stat
         stop.sleep(again);
         again = (again * 2).min(AGAIN_MAX);
     }
-    run.flight.drain(|marks, n| {
-        if let Some(m) = marks.into_iter().last() {
-            run.written = Some(m);
-        }
-        run.records += n;
+    let (flight, written, recent, records) = (&mut run.flight, &mut run.written, &mut run.recent, &mut run.records);
+    flight.drain(|marks, n| {
+        note_written(written, recent, marks);
+        *records += n;
     });
-    if let Err(e) = save(&run.written) {
+    if let Err(e) = save(&run.saved()) {
         run.error = Some(e);
     }
     run.report();
@@ -425,7 +550,7 @@ mod tests {
         let r = r.unwrap();
         // 04:01:27.177196 at -07:00 is 11:01:27.177196 UTC.
         assert_eq!(r.ts, 1_792_407_687_177_196_000);
-        assert_eq!(mark, Mark { boot: "E571B146-3D40-47EB-A907-AF472B516F9D".into(), mach: 25_584_498_816_458, ts_ns: r.ts });
+        assert_eq!(mark, Mark { boot: "E571B146-3D40-47EB-A907-AF472B516F9D".into(), mach: 25_584_498_816_458, ts_ns: r.ts, thread: 287_582_287 });
         assert_eq!((r.severity, r.service.as_str(), r.source.as_str(), r.host.as_str(), r.message.as_str()), (17, "Example", "unified_log", "mbp", "connection refused"));
         let attr = |k: &str| r.attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
         assert_eq!((attr("macos.subsystem"), attr("macos.category"), attr("process.pid"), attr("team")), (Some("com.example.app"), Some("net"), Some("67508"), Some("mac")));
@@ -436,11 +561,83 @@ mod tests {
 
     #[test]
     fn a_mark_orders_events_by_boot_and_mach_time() {
-        let m = Mark { boot: "a".into(), mach: 10, ts_ns: 1_000 };
-        assert!(m.before(&Mark { boot: "a".into(), mach: 11, ts_ns: 900 }), "of a boot, mach time decides");
-        assert!(!m.before(&Mark { boot: "a".into(), mach: 10, ts_ns: 2_000 }));
-        assert!(m.before(&Mark { boot: "b".into(), mach: 1, ts_ns: 1_001 }), "another boot's, later");
-        assert!(!m.before(&Mark { boot: "z".into(), mach: 99, ts_ns: 999 }), "another boot's, earlier: the one before");
+        let m = Mark { boot: "a".into(), mach: 10, ts_ns: 1_000, thread: 1 };
+        assert!(m.before(&Mark { boot: "a".into(), mach: 11, ts_ns: 900, thread: 1 }), "of a boot, mach time decides");
+        assert!(!m.before(&Mark { boot: "a".into(), mach: 10, ts_ns: 2_000, thread: 1 }));
+        assert!(m.before(&Mark { boot: "b".into(), mach: 1, ts_ns: 1_001, thread: 1 }), "another boot's, later");
+        assert!(!m.before(&Mark { boot: "z".into(), mach: 99, ts_ns: 999, thread: 1 }), "another boot's, earlier: the one before");
+    }
+
+    /// `LINE` as event `n` of mach time `mach` on thread `thread`.
+    fn line(mach: u64, thread: u64, n: u64) -> String {
+        LINE.replace("25584498816458", &mach.to_string()).replace("287582287", &thread.to_string()).replace("connection refused", &format!("n={n}"))
+    }
+
+    fn taken(run: &mut Run<'_>) -> Vec<String> {
+        run.batch.take_records().into_iter().map(|r| r.message).collect()
+    }
+
+    /// `log stream` gives different processes' events out of their mach order: each is taken, once,
+    /// whatever came before it (2026-10-25: the one behind a millisecond's swap was dropped as read).
+    #[test]
+    fn events_out_of_their_mach_order_are_each_taken_once() {
+        let c = source().compile("mac", "mbp").unwrap();
+        let state = Mutex::new(State::default());
+        let mut run = Run::new(&c, &state, &Saved::default());
+        for (mach, thread, n) in [(100, 1, 0), (300, 2, 2), (200, 3, 1), (300, 2, 2), (400, 1, 3), (200, 3, 1)] {
+            run.line(&line(mach, thread, n), i64::MAX / 2);
+        }
+        assert_eq!(taken(&mut run), ["n=0", "n=2", "n=1", "n=3"]);
+        assert_eq!(run.batch.marks.iter().map(|m| m.mach).collect::<Vec<_>>(), [100, 300, 200, 400], "each event's mark");
+    }
+
+    /// After a restart, what the place says was written is not taken again (an event before its
+    /// window, or one of its window's), and the rest is: one in flight when it stopped (in its
+    /// window, not written), the new ones, and the stream's after the catch-up's, once each.
+    #[test]
+    fn a_restart_takes_what_its_place_says_was_not_written() {
+        let c = source().compile("mac", "mbp").unwrap();
+        let state = Mutex::new(State::default());
+        let boot = "E571B146-3D40-47EB-A907-AF472B516F9D";
+        let place = Saved { last: Some(Mark { boot: boot.into(), mach: 500, ts_ns: 5_000_000_000, thread: 1 }), recent: vec![(300, 2), (400, 1), (500, 1)] };
+        let mut run = Run::new(&c, &state, &place);
+        assert_eq!(run.from_s(), Some(3), "a window before the window, and a second more");
+        // The catch-up (`log show`), then the stream (its first events the catch-up's last).
+        for (mach, thread, n) in [(100, 1, 1), (300, 2, 3), (350, 3, 35), (400, 1, 4), (500, 1, 5), (600, 1, 6)] {
+            run.line(&line(mach, thread, n), i64::MAX / 2);
+        }
+        for (mach, thread, n) in [(600, 1, 6), (700, 1, 7), (650, 4, 65)] {
+            run.line(&line(mach, thread, n), i64::MAX / 2);
+        }
+        assert_eq!(taken(&mut run), ["n=35", "n=6", "n=7", "n=65"]);
+        // A place an older kiln wrote (no window, no threads): its last event and those before it.
+        let old: Saved = serde_json::from_str(&format!(r#"{{"last":{{"boot":"{boot}","mach":500,"ts_ns":5000000000}}}}"#)).unwrap();
+        let mut run = Run::new(&c, &state, &old);
+        for (mach, thread, n) in [(450, 2, 45), (500, 9, 5), (501, 9, 51)] {
+            run.line(&line(mach, thread, n), i64::MAX / 2);
+        }
+        assert_eq!(taken(&mut run), ["n=51"]);
+    }
+
+    /// The place: the last event written by its place (not the last to be written), and those written
+    /// in the window before it, the oldest let go; written down and read back as the same place.
+    #[test]
+    fn the_place_is_the_last_event_written_and_its_window() {
+        let c = source().compile("mac", "mbp").unwrap();
+        let state = Mutex::new(State::default());
+        let mark = |mach: u64, thread: u64, ts_ns: i64| Mark { boot: "b".into(), mach, ts_ns, thread };
+        let mut run = Run::new(&c, &state, &Saved::default());
+        note_written(&mut run.written, &mut run.recent, vec![mark(100, 1, 1_000_000_000), mark(300, 2, 2_500_000_000), mark(200, 3, 2_400_000_000)]);
+        assert_eq!(run.written, Some(mark(300, 2, 2_500_000_000)), "the latest by mach time, not the last written");
+        assert_eq!(run.recent.iter().map(|m| m.mach).collect::<Vec<_>>(), [300, 200], "100 is more than a second before");
+        let saved = run.saved();
+        assert_eq!(saved.recent, [(300, 2), (200, 3)]);
+        let back: Saved = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(back, saved);
+        // A window of more than RECENT_MAX events keeps the newest.
+        note_written(&mut run.written, &mut run.recent, (0..RECENT_MAX as u64 + 10).map(|i| mark(1_000 + i, 1, 2_600_000_000)).collect());
+        assert_eq!(run.recent.len(), RECENT_MAX);
+        assert_eq!(run.recent.front().map(|m| m.mach), Some(1_010));
     }
 
     #[test]

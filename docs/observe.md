@@ -922,10 +922,15 @@ back (its connection is not read) until there is.
 
 **macOS's unified log** is read through `log stream --style ndjson --type log`, at the source's
 level and its predicate, events as they come (each within some 20–40 ms of being logged, measured
-on a laptop through a pipe). An event is known by its boot and its mach time (the machine's
-monotonic clock); its place is the last one written. As the source starts again, the stream starts
-first, then `log show` reads from that place to just past the stream's start, and the stream's
-events the catch-up held are dropped: nothing falls between, nothing is read twice. The catch-up
+on a laptop through a pipe). An event is known by its boot, its mach time (the machine's monotonic
+clock) and its thread, and taken once, never by order alone: the stream gives different processes'
+events out of their mach order (two `logger`s a millisecond apart came the other way round, and
+until 2026-10-25 the one behind was dropped as read, a line in some hundreds lost in the live
+scenario). Its place is the last event written and those written in the second before it (2,048 at
+the most). As the source starts again, the stream starts first, then `log show` reads from before
+that window to just past the stream's start: an event before the window was written, one of the
+window's was if it is among those, and any other is taken (one in flight when kiln stopped); the
+stream's events the catch-up read are dropped. Nothing falls between, nothing is read twice. The catch-up
 reads what the log keeps on disk, the default level and above: info and debug events are held in
 memory, and `log show --info` reads a laptop's minute in 18 s against 1.5 s without, so what came at
 those levels while kiln was not reading is not read. An event's severity is its type's (`Fault`
