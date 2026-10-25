@@ -20,7 +20,6 @@
 
 mod common;
 
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::{Fleet, at, docker, free_port, now_ms};
@@ -159,7 +158,7 @@ fn run_app(mode: &str, app: &str, apm: u16, otlp: u16, env: &[(&str, &str)]) -> 
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("app.py"), APP)?;
     #[cfg(unix)]
-    Command::new("chmod").args(["-R", "a+rX"]).arg(dir.path()).output()?;
+    std::process::Command::new("chmod").args(["-R", "a+rX"]).arg(dir.path()).output()?;
     // The app in a container (its model a server of its own, at its own 127.0.0.1), the runner's
     // receivers where the container reaches this machine.
     let net = common::DockerNet::get();

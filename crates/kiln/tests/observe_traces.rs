@@ -12,7 +12,6 @@
 
 mod common;
 
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::{Fleet, at, docker, free_port, now_ms};

@@ -21,7 +21,6 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::process::Command;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -193,7 +192,7 @@ fn fail(mode: &str, places: &str, first: u64, version: &str, env: &[(&str, Strin
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("shop.py"), SHOP)?;
     #[cfg(unix)]
-    Command::new("chmod").args(["-R", "a+rX"]).arg(dir.path()).output()?;
+    std::process::Command::new("chmod").args(["-R", "a+rX"]).arg(dir.path()).output()?;
     // The shop and its driver in one container (each other at its own 127.0.0.1); the server and the
     // runner where the container reaches this machine.
     let mut args: Vec<String> = vec!["run".into(), "--rm".into()];
