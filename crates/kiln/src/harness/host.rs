@@ -1018,7 +1018,8 @@ impl Host {
 
     /// What session `id` reaches its host through: its attached files, branches, letting go, and its
     /// inbox's ids, fence and hand-overs' record. Its host gone, the session can neither read its
-    /// inbox's ids nor fence it (CP-T3.2): a hand-over or move of it stays, never going without them.
+    /// inbox's ids nor fence it (CP-T3.2): a hand-over or move of it stays, never going without them;
+    /// nor read how a try at handing it over was decided, so it never goes on as if it was refused.
     fn files_for(&self, id: &str) -> session::Files {
         let me = self.me.clone();
         let me2 = self.me.clone();
@@ -1065,7 +1066,7 @@ impl Host {
                 Box::pin(async move {
                     match h {
                         Some(h) => crate::rt::blocking(move || h.settle(&attempt, &id, take_back)).await.map_err(|e| format!("{e:#}")).and_then(|r| r),
-                        None => Ok(None),
+                        None => Err(HOST_GONE.into()),
                     }
                 })
             }),
@@ -2746,6 +2747,10 @@ mod tests {
             assert!(read.as_ref().is_err_and(|e| e.contains("stays here")), "{read:?}");
             let fenced = (files.fence)("s1".into(), true).await;
             assert!(fenced.as_ref().is_err_and(|e| e.contains("stays here")), "{fenced:?}");
+            // Nor is a try at handing it over said undecided: a refusal then would let it go on
+            // here though the machine's record may say it was taken (the twenty-second check's).
+            let decided = (files.settle)("try-1".into(), "s1".into(), true).await;
+            assert!(decided.as_ref().is_err_and(|e| e.contains("stays here")), "{decided:?}");
             Ok(())
         })
     }
