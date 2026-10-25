@@ -5770,6 +5770,10 @@ its warning and its reaching each an event, once. Those not kept still counted: 
 400, by the metric from logs, each once; Datadog's estimated usage, `audit`'s 150 (those past its
 quota too), `payments`' 30, `main`'s 440 kept and excluded, 180 of them excluded at the least.
 `audit` removed: its records no longer found, its name refused again, the order `payments`, `main`.
+Then a metric from logs of what comes after, records two a second for 150 s, across three of the
+leader's retention rounds (each states the removed part's cutoff now while it holds rows): every
+one counted, once. 2026-10-25: passes (249 s; adacachy); with the windows judged by every part as
+before (a copy built so), never all counted (283 s), as Error Tracking's issues were lost (§8.3).
 The server stopped and started: the indexes as they were (`main`'s two exclusion filters), and a
 moment on (the leader states each part's cutoff as it begins to lead) the records of `web`, the
 runner's and `payments`' all as they were, `audit`'s still not found. 2026-10-22: passes (141 s;
