@@ -445,6 +445,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/legs/*/logs", "logs.read", At::Job(3)),
     r("GET", "/api/ci/legs/*/logs/*", "logs.read", At::Job(3)),
     r("GET", "/api/ci/logs/search", "logs.read", At::RepoQuery),
+    // A finished job (a leg, a pipeline's job) again, here or elsewhere (W05-R28).
+    r("POST", "/api/ci/legs/*/retry", "runs.rerun", At::Job(3)),
     // A terminal into a leg, and keeping or releasing a failed one (W17); on the `host` executor
     // the terminal also needs `runners.terminal` on its runner, which the handler checks.
     r("GET", "/api/ci/legs/*/terminal", "runs.debug", At::Job(3)),

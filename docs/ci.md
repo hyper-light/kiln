@@ -178,7 +178,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
 | W03 | Triggers and events | W02 | done | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; the whole native table: `pull_request`'s activity types and `pull_request_target`, comments and reviews, the merge queue's `enqueued`/`dequeued`; kiln's `land`, `agent`, `webhook` (inbound hooks), `pipeline` and `deploy`; `chain-depth`; nothing started by a job's token; the App's events; AC01–AC09 |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit, and AC04 and AC06 end to end), reusable workflows local and remote, plan preview, outputs' provenance and readers (R23); fixtures F-10 to F-15 and AC07; `files:` shards in runs, `$KILN_SHARD_ITEMS`, runs' removed combinations; AC08 on the live cluster left |
-| W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC10 (AC08 at 127k assignments/s; AC09 a server killed under a queue, its running legs re-adopted), reruns as attempts; pools' executors scaled with W13 (R27); reservations (R12); the `scaling` and `reservation` reasons; resource mode from runners' facts (R03); AC11 on the live cluster left |
+| W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC10 (AC08 at 127k assignments/s; AC09 a server killed under a queue, its running legs re-adopted), reruns as attempts; pools' executors scaled with W13 (R27); reservations (R12); the `scaling` and `reservation` reasons; resource mode from runners' facts (R03); a finished job retried elsewhere or on a runner named (R28, AC12); AC11 on the live cluster left |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); AC04 (each shell, on Linux, macOS and Windows), AC05 (pre, main and post order, `post-if`, cancellation, timeouts) and AC06 (paths in containers); a `k8s` pool's pods (W13-R07); Firecracker microVMs (W13-R05); shards' left with W13 |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1`, `kiln/auth@v1`, `kiln/upload@v1`, `kiln/download@v1`, `kiln/cache@v1` and `kiln/deploy@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` actions of the owner's own repositories; tarballs in the store; the run page's pins and a rerun with fresh actions; musl Node for Alpine job containers |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06, a rebased diff's); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; the store's chunks in an S3-compatible bucket (R02); BuildKit's `type=gha` and `type=registry` caches (R11, AC03); speed (AC08): a 1 GiB restore at 1,181 MiB/s over HTTP on a 10 GbE link of the bench's own, release build, bench machine |
@@ -1730,6 +1730,25 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   them), re-run one job (and its dependents), optionally with debug logging. A rerun is a new run
   attempt (`github.run_attempt`); automatic leg retries are attempts of the leg
   (`KILN_ATTEMPT`) and leave `github.run_attempt` unchanged.
+- **W05-R28 Retry here or elsewhere.** A finished job runs again from its own panel, the API
+  (`POST /api/ci/legs/:id/retry`) and MCP (`ci.legs.retry`): on any runner that can run it, on any
+  but the one its last attempt ran on (`elsewhere`), or on a runner named (`runner`) that can run
+  it (`GET /api/ci/legs/:id/runners`, `ci.legs.runners`: every runner of its own, able or why
+  not). A placement narrows what the job's requirements allow, never widens it, and holds through
+  the attempt's own retries.
+  - A leg of the engine's is one leg rerun, GitHub-exact (each matrix combination is a job of its
+    own there): a new attempt of its finished run, that leg and the jobs that need its job running
+    for real (none takes an earlier result over), the rest kept as R17 keeps them; a called
+    workflow's leg reruns the job that calls it, whole. A leg placed on a runner waits for it and
+    says why (`pinned`: busy, draining, offline or unable); one placed elsewhere, when only the
+    runner it avoids could take it, waits with `other-runner`, saying its retry asked. A refusal by
+    the runner asked for has the leg asked again 15 s later, as v1 offers a declined job again.
+  - A `.kiln/` pipeline's job (v1) runs again in its run, a running run or a finished one, its next
+    attempt placed so: every job that needs it, directly or not, waits for it again, and a job one
+    of those runs under is refused. Its logs are kept, a line in each where the next attempt begins.
+  - Another provider's job (W23) is rerun by its provider, which picks its runners.
+  - Not to be placed: a job that ran in a Kubernetes pod made for it (each attempt has a new one),
+    and runners that take no job asked of them (a pod made for another job, an outpost).
 
 **Requirements: cancellation**
 
@@ -1847,6 +1866,11 @@ W20.
 - **W05-AC11 Live concurrency.** On the live cluster, a run fanning out 500 legs uses every free
   slot of the eligible runners and pod quota; dispatch never waits on the scheduler (the leg-wait
   histogram shows capacity waits only). *E2E.*
+- **W05-AC12 Retry elsewhere.** Two runners with the same label; a pipeline's job and a leg that
+  fail wherever they run. Retried elsewhere, each runs on the other runner; retried on a runner
+  named (through the API, and the operation MCP calls), on that one; each lists both runners and
+  the one it ran on; a runner unknown, or both asks at once, is refused. *Unit test (the
+  scheduler's placement, a leg's rerun, a pipeline job's retry), then E2E on a local server.*
 
 **Scenarios**
 
@@ -2045,6 +2069,18 @@ W20.
     (`other-runner`), as a leg a runner refused does.
   - Unit-tested (`w05_r16_a_lost_runners_retry`); a server's own runner, the only one, takes its
     lost legs' retries across a restart (`tests/chaos.rs`, `tests/restart.rs`).
+- *Done* (2026-10-25), R28, a finished job retried here or elsewhere:
+  - The scheduler's placement (`LegIn.placement`): a runner only, or any but one, in `fits`, the
+    `pinned` and asked `other-runner` reasons, and the routing explanation's per-runner check
+    (`w05_r28_a_placed_retry`).
+  - A leg's rerun (`kiln_ci::plan::rerun::Mode::Leg`, `w05_r28_one_leg_runs_again`); the placement
+    is kept with the run's saved input, so legs queued after a restart have it too, and on the
+    leg's row (`jobs.placement`) for the API and the run page.
+  - A pipeline's job retried in place (`Store::retry_job`, `w05_r28_a_job_retried_in_place`) and
+    placed by v1's `pick_agent`; a job asked onto a runner by name gets no pod made for it.
+  - `GET /api/ci/legs/:id/runners` and `POST /api/ci/legs/:id/retry` (`crates/kiln/src/ci/retry.rs`),
+    `ci.legs.runners` and `ci.legs.retry` for MCP, and the job panel's Retry with where to run it.
+  - End to end (`tests/retry_elsewhere.rs`, AC12).
 
 ### W06 Step runtime on the runner
 
@@ -8717,6 +8753,8 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/legs/:id/logs/search?q=` · `/failure` | `ci.legs.search`, `ci.legs.failure_excerpt` | logs.read | W19, W20 |
 | GET | `/api/ci/logs/search?q=&repo=&workflow=&branch=&conclusion=&days=` (built) | `ci.logs.search` | logs.read | W19 |
 | GET | `/api/ci/legs/:id/routing` | `ci.legs.routing` (explain) | runs.read | W05 |
+| GET | `/api/ci/legs/:id/runners` | `ci.legs.runners` (where a finished leg, or a pipeline's job, could run again: each runner able or why not, `ran_on`, `elsewhere`, `retry`) | runs.read | W05 |
+| POST | `/api/ci/legs/:id/retry` | `ci.legs.retry` (`{ runner?, elsewhere? }`: a leg's rerun alone, a pipeline's job in place, another provider's by it) | runs.rerun | W05 |
 | GET | `/api/ci/legs/:id/terminal` (WebSocket) | a terminal (agents run commands with `ci.legs.exec`) | runs.debug | W17 |
 | GET · PUT · DELETE | `/api/ci/oidc/subject?scope=` | `ci.oidc.subject`, `ci.oidc.set_subject` (`{ use_default, include_claim_keys }`), `ci.oidc.reset_subject` | runs.read · settings.manage | W10 |
 | POST | `/api/ci/legs/:id/exec` | `ci.legs.exec` (command → output; for agents) | runs.debug | W17, W20 |

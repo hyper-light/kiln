@@ -102,6 +102,7 @@ export type { OfflineRunner } from "./OfflineRunner";
 export type { OpPhase } from "./OpPhase";
 export type { Overrides } from "./Overrides";
 export type { Pause } from "./Pause";
+export type { Placement } from "./Placement";
 export type { PlannedJob } from "./PlannedJob";
 export type { Plugin } from "./Plugin";
 export type { Question } from "./Question";

@@ -31,4 +31,4 @@ pub mod warm;
 #[cfg(test)]
 mod tests;
 
-pub use state::{Command, Config, FairBy, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason};
+pub use state::{Command, Config, FairBy, Input, LegIn, Outcome, PinnedState, Placement, Resources, RunnerIn, Scheduler, Supersede, WaitReason};
