@@ -7506,8 +7506,14 @@ credentials, W14's review pages, W19's insights and notifications, and W21.
   host makes a choice possible (KilnCI, and GitHub Actions, GitLab CI/CD or Bitbucket Pipelines),
   each a checkbox, saved together (at least one). Checked in Chromium and WebKit, desktop and
   phone, on a repository on a GitLab (`ci/ui/people_check.mjs`).
-- *Left.* The review pages showing other hosts' pull requests (the agentic work's, against R06's
-  API); AC02 and AC03, which need test repositories on GitHub, GitLab and Bitbucket and their
+- *Done.* The review pages show the hosts' pull requests (R06's API): a repository's open ones at
+  `/review/hosts/:repo` (linked from its panel on the Repositories page), and one at
+  `/review/hosts/:repo/:number` with its checks, conversation, threads on lines and files in
+  kiln's diff view, comments on lines and replies going out at once (a host keeps no drafts), a
+  review (approve, request changes, comment) and a merge by each method the host allows; the inbox
+  lists the ones asking the person's review. Checked in Chromium, desktop and phone, against the
+  mock's GitLab merge requests (`ui/e2e/host-pulls.spec.ts`).
+- *Left.* AC02 and AC03, which need test repositories on GitHub, GitLab and Bitbucket and their
   credentials (user-assisted).
 
 ### W24 Incremental CI: fingerprints, reuse, warm state and shared caches

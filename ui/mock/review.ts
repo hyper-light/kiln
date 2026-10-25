@@ -640,7 +640,94 @@ function inbox() {
       .filter((d) => d.author === ME || d.author_for === ME)
       .filter((d) => !["landed", "abandoned"].includes(d.state))
       .map((d) => ({ repo: d.repo, diff: d.name, title: d.title, state: d.state })),
+    elsewhere: hostPulls.filter((x) => x.state === "open").map((x) => ({ repo: HOST_REPO, host: x.host, number: x.number, title: x.title, author: x.author, url: x.url, updated_at: x.updated_at })),
   };
+}
+
+/** Two merge requests on a GitLab the mock's repository `lundhe/w23` is on (W23-R06), each with a
+ * thread on a line, a comment on the change and a pipeline's run of its head; what's sent changes
+ * them. Two, so a desktop and a phone can each merge one. */
+const HOST_REPO = "lundhe/w23";
+type HostThreadMock = { id: string; path: string | null; line: number | null; side: string | null; resolved: boolean | null; comments: { id: string; author: string; body: string; at: number }[] };
+const hostPullOf = (number: number) => ({
+  host: "gitlab",
+  number,
+  title: number === 3 ? "ci: a failing job to rerun" : "ci: a manual job to dispatch",
+  body: "Adds a job that fails until `FIX=1`, for rerun and cancel from kiln.",
+  author: "adalundhe",
+  state: "open",
+  draft: false,
+  head: `w23-${number}`,
+  sha: sha(`w23-${number}`),
+  base: "main",
+  base_sha: sha("w23-main"),
+  url: `https://gitlab.com/lundhe/w23/-/merge_requests/${number}`,
+  updated_at: T0 + 7200,
+  mergeable: true,
+  reviewers: ["ada"],
+  files: [
+    {
+      path: ".gitlab-ci.yml",
+      old_path: null,
+      status: "modified",
+      additions: 4,
+      deletions: 1,
+      patch: ["@@ -1,4 +1,7 @@", " stages: [test]", " ", " test:", "-  script: echo ok", "+  script:", "+    - echo running", '+    - test "$FIX" = 1', "+  when: always"].join("\n"),
+    },
+    { path: "README.md", old_path: null, status: "added", additions: 2, deletions: 0, patch: ["@@ -0,0 +1,2 @@", "+# w23", "+A test repository for kiln's providers."].join("\n") },
+  ],
+  conversation: [{ id: `n${number}1`, author: "adalundhe", body: `Pipeline #${number * 4} should fail on this one.`, at: T0 + 3600 }],
+  threads: [
+    { id: `d${number}`, path: ".gitlab-ci.yml", line: 6, side: "right", resolved: false, comments: [{ id: `n${number}2`, author: "adalundhe", body: "This is the line that fails.", at: T0 + 3700 }] },
+  ] as HostThreadMock[],
+  reviews: [] as { author: string; state: string; body: string; at: number | null }[],
+  merge_methods: ["merge", "squash"],
+  checks: {
+    state: "failure",
+    checks: [
+      {
+        run: `r-gl-${number * 4}`,
+        provider: "gitlab-ci",
+        name: `pipeline #${number * 4}`,
+        status: "failed",
+        conclusion: "failure",
+        url: `https://gitlab.com/lundhe/w23/-/pipelines/${number * 4}`,
+        number: number * 4,
+      },
+    ],
+  },
+});
+const hostPulls = [hostPullOf(3), hostPullOf(4)];
+
+async function handleHostPulls(req: http.IncomingMessage, res: http.ServerResponse, rest: string[], ctx: Ctx): Promise<boolean> {
+  const m = req.method ?? "GET";
+  const [n, what] = rest;
+  const summary = (hp: (typeof hostPulls)[number]) => Object.fromEntries(Object.entries(hp).filter(([k]) => !["files", "conversation", "threads", "reviews", "merge_methods", "checks"].includes(k)));
+  if (!n && m === "GET") return (ctx.json(res, 200, { repo: HOST_REPO, pulls: hostPulls.filter((x) => x.state === "open").map(summary) }), true);
+  const hp = hostPulls.find((x) => x.number === Number(n));
+  if (!hp) return (ctx.err(res, 502, `merge request !${n} (404): 404 Not found`), true);
+  if (!what && m === "GET") return (ctx.json(res, 200, hp), true);
+  if (what === "comments" && m === "POST") {
+    const body = await ctx.body<{ body: string; path?: string; line?: number; side?: string; reply_to?: string }>(req);
+    const c = { id: `n${now()}${Math.random().toString(36).slice(2, 6)}`, author: "ada", body: body.body, at: now() };
+    const into = body.reply_to ? hp.threads.find((t) => t.id === body.reply_to || t.comments.some((x) => x.id === body.reply_to)) : undefined;
+    if (into) into.comments.push(c);
+    else if (body.line != null) hp.threads.push({ id: `d${c.id}`, path: body.path ?? "", line: body.line, side: body.side ?? "right", resolved: false, comments: [c] });
+    else hp.conversation.push(c);
+    return (ctx.json(res, 201, { id: c.id, as: "person" }), true);
+  }
+  if (what === "reviews" && m === "POST") {
+    const body = await ctx.body<{ verdict: string; body: string }>(req);
+    hp.reviews.push({ author: "ada", state: body.verdict === "approve" ? "approved" : body.verdict === "request_changes" ? "changes_requested" : "commented", body: body.body, at: now() });
+    return (ctx.json(res, 200, { review: body.verdict, as: "person" }), true);
+  }
+  if (what === "merge" && m === "POST") {
+    const body = await ctx.body<{ method: string }>(req);
+    if (!hp.merge_methods.includes(body.method)) return (ctx.err(res, 422, `GitLab merges by ${hp.merge_methods.map((x) => `\`${x}\``).join(", ")}, not \`${body.method}\``), true);
+    hp.state = "merged";
+    return (ctx.json(res, 200, { merged: true, commit: sha(`merged-${body.method}`), method: body.method, as: "person" }), true);
+  }
+  return (ctx.err(res, 404, "no such route"), true);
 }
 
 /** A small PNG (32×32, a check of kiln's grey and green), for the image diff. */
@@ -651,6 +738,7 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
   const m = req.method ?? "GET";
   const segs = p.split("/").filter(Boolean).slice(1);
   const [a, b, c, d2, e] = segs;
+  if (a === "ci" && b === "repos" && segs[3] === "pulls" && decodeURIComponent(c ?? "") === HOST_REPO) return handleHostPulls(req, res, segs.slice(4), ctx);
   if (a === "review" && b === "inbox" && m === "GET") return (ctx.json(res, 200, inbox()), true);
   if (a === "stacks" && b && m === "GET") {
     const list = diffs.filter((d) => d.stack === b).map((d) => Object.fromEntries(Object.entries(d).filter(([k]) => k !== "versions")));

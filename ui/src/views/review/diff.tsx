@@ -54,7 +54,10 @@ export interface FileProps {
   /** A new thread on lines of this file (draft unless `publish`). */
   onComment: (pick: Pick, body: string, publish: boolean) => Promise<void>;
   onReply: (thread: Thread, body: string, publish: boolean) => Promise<void>;
-  onResolve: (thread: Thread, resolved: boolean) => Promise<void>;
+  /** None: threads can't be resolved from here. */
+  onResolve?: (thread: Thread, resolved: boolean) => Promise<void>;
+  /** Comments go out at once, and files aren't ticked off (a host's pull request: W23-R06). */
+  now?: boolean;
 }
 
 /** Where a thread sits in the version shown: its side and the line it ends on (null: outdated here). */
@@ -187,18 +190,20 @@ export function FileDiff(p: FileProps) {
               <b>+{added}</b> <i>−{deleted}</i>
             </span>
           )}
-          <label className="rv-viewed">
-            <input
-              type="checkbox"
-              className="check"
-              checked={viewed}
-              onChange={(e) => {
-                p.onViewed(file.path, e.target.checked);
-                setOpen(!e.target.checked);
-              }}
-            />
-            Viewed
-          </label>
+          {!p.now && (
+            <label className="rv-viewed">
+              <input
+                type="checkbox"
+                className="check"
+                checked={viewed}
+                onChange={(e) => {
+                  p.onViewed(file.path, e.target.checked);
+                  setOpen(!e.target.checked);
+                }}
+              />
+              Viewed
+            </label>
+          )}
         </span>
       </header>
       {open && (
@@ -209,7 +214,7 @@ export function FileDiff(p: FileProps) {
                 {outdated.length} thread{outdated.length === 1 ? "" : "s"} on code this version no longer has
               </p>
               {outdated.map((t) => (
-                <ThreadView key={t.id} t={t} onReply={p.onReply} onResolve={p.onResolve} />
+                <ThreadView key={t.id} t={t} onReply={p.onReply} onResolve={p.onResolve} now={p.now} />
               ))}
             </div>
           )}
@@ -419,9 +424,9 @@ function Under({ side, line, c }: { side: Side; line: number | null; c: RowCtx }
   return (
     <div className="rv-under">
       {threads.map((t) => (
-        <ThreadView key={t.id} t={t} onReply={c.p.onReply} onResolve={c.p.onResolve} />
+        <ThreadView key={t.id} t={t} onReply={c.p.onReply} onResolve={c.p.onResolve} now={c.p.now} />
       ))}
-      {composing && c.pick && <NewComment pick={c.pick} onDone={c.close} onSend={c.p.onComment} />}
+      {composing && c.pick && <NewComment pick={c.pick} onDone={c.close} onSend={c.p.onComment} now={c.p.now} />}
     </div>
   );
 }
@@ -531,7 +536,19 @@ function SplitRow({ d, a, tok, c }: { d: Line | undefined; a: Line | undefined; 
 
 /* ------------------------------------------------------------------ threads */
 
-function Composer({ placeholder, onSend, onCancel, autoFocus }: { placeholder: string; onSend: (body: string, publish: boolean) => Promise<void>; onCancel?: () => void; autoFocus?: boolean }) {
+function Composer({
+  placeholder,
+  onSend,
+  onCancel,
+  autoFocus,
+  now,
+}: {
+  placeholder: string;
+  onSend: (body: string, publish: boolean) => Promise<void>;
+  onCancel?: () => void;
+  autoFocus?: boolean;
+  now?: boolean;
+}) {
   const [text, setText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -559,7 +576,7 @@ function Composer({ placeholder, onSend, onCancel, autoFocus }: { placeholder: s
         autoFocus={autoFocus}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void send(false);
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void send(!!now);
           if (e.key === "Escape") onCancel?.();
         }}
       />
@@ -569,12 +586,20 @@ function Composer({ placeholder, onSend, onCancel, autoFocus }: { placeholder: s
         </p>
       )}
       <div className="rv-compose-acts">
-        <Button size="xs" disabled={busy || !text.trim()} onClick={() => void send(false)}>
-          Add to your review
-        </Button>
-        <Button size="xs" variant="secondary" disabled={busy || !text.trim()} onClick={() => void send(true)}>
-          Comment now
-        </Button>
+        {now ? (
+          <Button size="xs" disabled={busy || !text.trim()} onClick={() => void send(true)}>
+            Comment
+          </Button>
+        ) : (
+          <>
+            <Button size="xs" disabled={busy || !text.trim()} onClick={() => void send(false)}>
+              Add to your review
+            </Button>
+            <Button size="xs" variant="secondary" disabled={busy || !text.trim()} onClick={() => void send(true)}>
+              Comment now
+            </Button>
+          </>
+        )}
         {onCancel && (
           <Button size="xs" variant="ghost" disabled={busy} onClick={onCancel}>
             Cancel
@@ -585,7 +610,7 @@ function Composer({ placeholder, onSend, onCancel, autoFocus }: { placeholder: s
   );
 }
 
-function NewComment({ pick, onSend, onDone }: { pick: Pick; onSend: FileProps["onComment"]; onDone: () => void }) {
+function NewComment({ pick, onSend, onDone, now }: { pick: Pick; onSend: FileProps["onComment"]; onDone: () => void; now?: boolean }) {
   const lines = pick.start === pick.end ? `line ${pick.start}` : `lines ${pick.start}–${pick.end}`;
   return (
     <div className="rv-thread rv-new">
@@ -593,12 +618,12 @@ function NewComment({ pick, onSend, onDone }: { pick: Pick; onSend: FileProps["o
         <MessageSquarePlus size={13} aria-hidden="true" /> On {pick.side === "old" ? "the old " : ""}
         {lines}
       </p>
-      <Composer placeholder="Say what should change, or ask" autoFocus onCancel={onDone} onSend={(body, publish) => onSend(pick, body, publish)} />
+      <Composer placeholder="Say what should change, or ask" autoFocus now={now} onCancel={onDone} onSend={(body, publish) => onSend(pick, body, publish)} />
     </div>
   );
 }
 
-export function ThreadView({ t, onReply, onResolve }: { t: Thread; onReply: FileProps["onReply"]; onResolve: FileProps["onResolve"] }) {
+export function ThreadView({ t, onReply, onResolve, now }: { t: Thread; onReply: FileProps["onReply"]; onResolve?: FileProps["onResolve"]; now?: boolean }) {
   const [replying, setReplying] = React.useState(false);
   const resolved = t.state === "resolved";
   const [open, setOpen] = React.useState(!resolved);
@@ -631,11 +656,13 @@ export function ThreadView({ t, onReply, onResolve }: { t: Thread; onReply: File
                 Reply
               </Button>
             )}
-            <Button size="xs" variant="ghost" onClick={() => void onResolve(t, !resolved).then(() => setOpen(resolved))}>
-              {resolved ? "Reopen" : "Resolve"}
-            </Button>
+            {onResolve && (
+              <Button size="xs" variant="ghost" onClick={() => void onResolve(t, !resolved).then(() => setOpen(resolved))}>
+                {resolved ? "Reopen" : "Resolve"}
+              </Button>
+            )}
           </div>
-          {replying && <Composer placeholder="Reply" autoFocus onCancel={() => setReplying(false)} onSend={(body, publish) => onReply(t, body, publish)} />}
+          {replying && <Composer placeholder="Reply" autoFocus now={now} onCancel={() => setReplying(false)} onSend={(body, publish) => onReply(t, body, publish)} />}
         </>
       )}
     </div>
