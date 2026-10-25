@@ -5,12 +5,15 @@
 import * as React from "react";
 import { ci, type CiProviders } from "@/api/ci";
 import { Button } from "@/components/ui/button";
+import { Link } from "@/lib/router";
 import { useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 
 const providersRes = (repo: string): Res<CiProviders> => ({ key: `ci/providers/${repo}`, fetch: (s) => ci.providers(repo, s) });
 
 const NAMES: Record<string, string> = { kiln: "KilnCI", "github-actions": "GitHub Actions", "gitlab-ci": "GitLab CI/CD", "bitbucket-pipelines": "Bitbucket Pipelines" };
+
+const HOST: Record<string, string> = { "github-actions": "GitHub", "gitlab-ci": "GitLab", "bitbucket-pipelines": "Bitbucket" };
 
 export function Providers({ repo }: { repo: string }) {
   const res = useRes(providersRes(repo));
@@ -57,6 +60,9 @@ export function Providers({ repo }: { repo: string }) {
         </div>
       )}
       {error && <p className="text-[12.5px] text-[#d1aaad]">{error}</p>}
+      <Link to={`/review/hosts/${encodeURIComponent(repo)}`} className="w-fit text-[13px] text-[#b5b8c0] underline-offset-2 hover:text-white hover:underline">
+        Its pull requests on {HOST[p.available.find((a) => a in HOST) ?? ""] ?? "its host"}
+      </Link>
     </section>
   );
 }
