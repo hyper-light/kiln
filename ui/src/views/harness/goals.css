@@ -533,43 +533,87 @@
   color: var(--color-bright);
 }
 
-/* A goal being planned now (planner.tsx), under its planning step: the subagent's last calls, a
-   line each cut to fit, the older fainter, on a hairline as output is; then who's at it, for how
-   long, and the subagent to open. Nothing here moves: the step is the one at work (its glyph's
-   turning light, its words in the shimmer). */
+/* A goal being planned now (planner.tsx), under its planning step: how far it has got in the
+   console's status dots joined by a line (done filled in the prism's green and the line after it,
+   the one at work the running dot, next a ring, later hollow and faint, where it stopped in amber),
+   the latest call cut to fit on a hairline as output is, then who's at it, for how long, and the
+   subagent to open. Besides the step's own glyph, only the running dot's ring moves. */
 .gp-live {
   grid-column: 2 / -1;
   display: grid;
-  gap: 5px;
+  gap: 6px;
   min-width: 0;
   margin-top: 6px;
 }
 .gp-row[data-lane="branch"] .gp-live {
   grid-column: 3 / -1;
 }
-.gp-tail {
-  display: grid;
-  gap: 1px;
-  min-width: 0;
+.gp-dots {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 0;
+  margin: 0;
+  padding: 0;
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  list-style: none;
+  text-transform: uppercase;
+}
+.gp-dots li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.gp-dots li + li::before {
+  width: 18px;
+  height: 1px;
+  margin: 0 7px 0 8px;
+  background: #343a45;
+  content: "";
+}
+.gp-dots li[data-at="done"] {
+  color: #a8c9bc;
+}
+.gp-dots li[data-at="done"] + li::before {
+  background: #5d7a74;
+}
+.gp-dots li[data-at="now"] {
+  color: #c9c1ec;
+}
+.gp-dots li[data-at="next"] {
+  color: #a6b2c6;
+}
+.gp-dots li[data-at="stopped"] {
+  color: #d8bb95;
+}
+.gp-dots li[data-at="stopped"] .dot {
+  background: #d8bb95;
+}
+.gp-dots li[data-at="later"] .dot {
+  border-color: #4a4f58;
+}
+:root[data-motion="paused"] .gp-dots .dot::after {
+  animation-play-state: paused;
+}
+@media (prefers-reduced-motion: reduce) {
+  .gp-dots .dot::after {
+    animation: none;
+  }
+}
+.gp-last {
+  overflow: hidden;
   margin: 0;
   padding: 1px 0 1px 9px;
   border-left: 1px solid #2a3039;
+  color: #c9cbd1;
   font-family: var(--font-mono);
   font-size: 10.5px;
   line-height: 1.55;
-  list-style: none;
-}
-.gp-tail li {
-  overflow: hidden;
-  color: #c9cbd1;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.gp-tail li[data-age="1"] {
-  color: #8d9099;
-}
-.gp-tail li[data-age="2"] {
-  color: #5f636c;
 }
 .gp-live-meta {
   color: #7d818b;
