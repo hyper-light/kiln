@@ -45,7 +45,7 @@ use hyper_durable::{Fatal, GroupStore, LogStore as _, OpenError, Output, Point, 
 use hyper_log::{Config as LogConfig, Facts, Log};
 use hyper_raft::proto::{ConfChangeV2, ConfState, Message, MessageType};
 use hyper_raft::wire::Record as _;
-use hyper_raft::{Config, Elections, Limits, Stated};
+use hyper_raft::{Config, Elections, Limits, Stated, Timing};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,14 @@ const KEEP_LEARNERS: u64 = if cfg!(test) { 16 } else { 65_536 };
 /// How often the server's member beats while it has learners: a learner hears what's committed
 /// when no write moves.
 const BEAT: Duration = Duration::from_secs(1);
+/// What the group's elections and the leader's own beat are timed by, until hyper-liveness measures
+/// the paths between kiln's nodes (P3e, `Replica::measure`). Without one, the leader's beat never
+/// runs: nothing counts how long a member hasn't answered, so a probe or an append lost on the way
+/// with nobody saying so is never sent again, and that member waits until the leader restarts
+/// (adacachy's learner, 2026-10-25, for hours). A follower draws no delay to campaign without one
+/// either. A campaign is drawn over half a second, a vote round is half a second (a leader with
+/// work in flight beats that often), and an election is expected to take two.
+const TIMING: Timing = Timing { span: Duration::from_millis(500), round: Duration::from_millis(500), election: Duration::from_secs(2) };
 /// A change of learners that hasn't applied in this long is proposed again.
 const CHANGE_PATIENCE: Duration = Duration::from_secs(30);
 /// The group's messages waiting for the links to the runners, at most (past them, they're
@@ -371,7 +379,7 @@ impl Group {
             .name("kiln-cluster".into())
             .spawn(move || {
                 let waker = Waker::from(Arc::new(Unpark(thread::current())));
-                let replica = match Replica::open(&settings, store, machine, Unbounded) {
+                let mut replica = match Replica::open(&settings, store, machine, Unbounded) {
                     Ok(r) => r,
                     Err(OpenError::StartPastMachine { .. }) if learner => {
                         ready_tx.send(Err(Opening::LogPastCopy)).ok();
@@ -382,6 +390,10 @@ impl Group {
                         return;
                     }
                 };
+                if let Err(e) = replica.set_timing(TIMING) {
+                    ready_tx.send(Err(Opening::Failed(anyhow::anyhow!("timing the cluster group's beat: {e:?}")))).ok();
+                    return;
+                }
                 let mut d = Driver {
                     replica,
                     _log: log,
@@ -1802,6 +1814,59 @@ mod tests {
         followed?;
         assert_eq!(read("gap49")?.as_deref(), Some("y"), "with the writes made while it was away");
         Ok(())
+    }
+
+    /// The restarted server's first probe of a learner is lost on the way and nobody says so (it
+    /// went into a connection that was going): the leader sends it again a beat later, and the
+    /// learner follows (production, 2026-10-25: without a timing the leader never did, and
+    /// adacachy's learner waited for hours, until the next restart).
+    #[test]
+    fn a_learner_follows_a_restarted_server_whose_first_probe_was_lost() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (db, logs) = (dir.path().join("kiln.db"), dir.path().join("cluster"));
+        let server = Store::open_grouped(&db, &logs)?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        {
+            let g = server.group().context("grouped")?;
+            g.learners([member].into());
+            until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        }
+        let current = Arc::new(Mutex::new(Some(server.clone())));
+        let fetch: Fetch = {
+            let current = current.clone();
+            Arc::new(move |dest: &Path| {
+                let (s, d) = (current.lock().clone().context("the server is stopped")?, dest.to_path_buf());
+                crate::rt::block_on(async move { s.copy_for_learner(d).await })
+            })
+        };
+        let replica = dir.path().join("runner").join("kiln.db");
+        let read = |k: &str| -> anyhow::Result<Option<String>> {
+            let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
+        };
+        let learner = Arc::new(Group::learner(&replica, &dir.path().join("runner").join("cluster"), member, fetch)?);
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up, done.clone());
+        set(&server, "w", "x")?;
+        until("a write on the learner", || Ok(read("w")?.as_deref() == Some("x")))?;
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        *current.lock() = None;
+        drop(server);
+        // The restarted server's messages are dropped, unsaid, until its first probe has gone.
+        let server = Store::open_grouped(&db, &logs)?;
+        *current.lock() = Some(server.clone());
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone());
+        set(&server, "lost", "y")?;
+        thread::sleep(Duration::from_millis(500));
+        up.store(true, Ordering::SeqCst);
+        set(&server, "after", "2")?;
+        let followed = until("a write after the lost probe on the learner", || Ok(read("after")?.as_deref() == Some("2")));
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        followed
     }
 
     /// A learner whose group stops (here a gap it can't fetch a copy for) says so and why, and
