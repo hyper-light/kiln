@@ -758,8 +758,8 @@ export interface UpdateJob {
   /** The machine, or "server". */
   target: string;
   /** native: the runner's own upgrade command · terminal: through a terminal on an older runner ·
-   * build: the machine builds the newest kiln itself · restart: Kubernetes rollout restart ·
-   * replace: the server's binary replaced. */
+   * build: the newest kiln built from the server's source (on the machine itself, or on `on`) ·
+   * restart: Kubernetes rollout restart · replace: the server's binary replaced. */
   method: "native" | "terminal" | "build" | "restart" | "replace";
   state: "running" | "done" | "failed";
   started_at: number;
@@ -768,6 +768,8 @@ export interface UpdateJob {
   to_build: string | null;
   /** The commit it brings the machine to, when kiln knows it. */
   commit?: string;
+  /** A build's: the machine that builds it, when another than the runner's own; the runner downloads that build. */
+  on?: string;
   /** The machine reported running to_build. */
   reached: boolean;
   log: string[];
@@ -886,8 +888,9 @@ export interface RunnerUpdate {
   ways?: UpgradeWayOpen[];
 }
 
-/** How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built on
- * the machine itself, from the server's source. */
+/** How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built from
+ * the server's source, on the machine itself or, for a Mac that can't, on another machine whose
+ * build it then downloads. */
 export type UpgradeWay = "download" | "build";
 
 /** What a diagnosis found about a runner (`GET /api/agents/:name/diagnose`, docs/releases.md). */
@@ -928,6 +931,8 @@ export interface UpgradeWayOpen {
   ok: boolean;
   /** What it does ("downloads build 493003c712b0"), or why it can't. */
   why: string;
+  /** A build's: the machine it's made on, when another than the runner's own. */
+  on?: string;
 }
 
 /** How long kiln waits on a runner's upgrade before it calls it failed, in minutes. */

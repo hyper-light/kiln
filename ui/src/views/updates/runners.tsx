@@ -134,7 +134,11 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
       started(job);
       if (job.state === "failed") throw new Error(job.error ?? "The upgrade couldn't start.");
       toggleOutput(r.name, true);
-      toast({ title: way === "build" ? `Building kiln on ${r.name}` : `Upgrading ${r.name}`, description: "Its terminals, agents and jobs keep running.", tone: "running" });
+      toast({
+        title: way === "build" ? (job.on ? `Building kiln for ${r.name} on ${job.on}` : `Building kiln on ${r.name}`) : `Upgrading ${r.name}`,
+        description: "Its terminals, agents and jobs keep running.",
+        tone: "running",
+      });
     } catch (e) {
       toast.error(`Couldn't upgrade ${r.name}`, errorMessage(e));
       throw e;
@@ -206,11 +210,13 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
     const again = job?.state === "failed";
     const build = way === "build";
     const failedWay = offer.failed ? wayOf(offer.failed) : null;
+    const chosen = offer.open.find((w) => w.way === way);
+    const where = build && chosen?.on ? `for ${r.name} on ${chosen.on}` : `on ${r.name}`;
     setConfirm({
       scope: `runner:${r.name}`,
-      title: again ? (build ? `Try building kiln on ${r.name} again?` : `Try upgrading ${r.name} again?`) : build ? `Build the newest kiln on ${r.name}?` : `Upgrade ${r.name}?`,
+      title: again ? (build ? `Try building kiln ${where} again?` : `Try upgrading ${r.name} again?`) : build ? `Build the newest kiln ${where}?` : `Upgrade ${r.name}?`,
       lead: "What will happen:",
-      plan: <RunnerPlan r={r} newest={newest} build={build} />,
+      plan: <RunnerPlan r={r} newest={newest} build={build} on={build ? chosen?.on : undefined} why={chosen?.why} />,
       confirmLabel: again ? "Try again" : build ? "Build and upgrade" : "Upgrade",
       run: () => startRunner(r, way),
       instead: offer.open.filter((w) => w.way !== way).map((w) => ({ label: wayLabel(w.way, false, failedWay === w.way), ask: () => askRunner(e, w.way) })),
@@ -805,14 +811,25 @@ function RunnerRows({
   );
 }
 
-function RunnerPlan({ r, newest: target, build }: { r: RunnerUpdate; newest: FleetTarget | null; build: boolean }) {
+function RunnerPlan({ r, newest: target, build, on, why }: { r: RunnerUpdate; newest: FleetTarget | null; build: boolean; on?: string; why?: string }) {
   const newest = r.instances.find((i) => i.newest);
   const inPlace = r.method === "native" && newest !== undefined && newest.id !== "main" && !newest.legacy;
   const of = target ? ` (${shortSha(target.commit)})` : "";
   const to = r.target_build ? `build ${r.target_build}${of}` : `the ${r.target ?? ""} build (this version's GitHub release, if one is published)`;
   return (
     <ul className="up-plan">
-      {build ? (
+      {build && on ? (
+        <>
+          <li>
+            {why ?? `${on} builds ${target ? shortSha(target.commit) : "the newest kiln"} for ${r.target ?? "its platform"}`}. The build runs in a terminal kiln opens on {on} (it won&rsquo;t appear
+            among your terminals): it fetches the source from this server, builds it in <code>~/.cache/kiln/self-build</code> and hands the binary back to this server. Neither machine needs a checkout
+            of kiln.
+          </li>
+          <li>
+            Then {r.name} downloads it from this server, checks its SHA-256 and runs <code>kiln install --agent --upgrade</code>. The other machines of its platform download the same build.
+          </li>
+        </>
+      ) : build ? (
         <>
           <li>
             {r.how === "build" ? (
@@ -827,16 +844,7 @@ function RunnerPlan({ r, newest: target, build }: { r: RunnerUpdate; newest: Fle
             : kiln opens a terminal on it (it won&rsquo;t appear among your terminals) that fetches the source from this server, builds it in <code>~/.cache/kiln/self-build</code> and runs{" "}
             <code>kiln install --agent --upgrade</code>.
           </li>
-          <li>
-            {r.checkout ? (
-              <>
-                Its kiln checkout at <code>{r.checkout}</code> is left as it is.
-              </>
-            ) : (
-              "Its kiln checkout is left as it is."
-            )}{" "}
-            It brings its stable Rust toolchain up to date first (kiln needs a recent one), and the build takes its CPU for a few minutes.
-          </li>
+          <li>It needs no checkout of kiln. It brings its stable Rust toolchain up to date first (kiln needs a recent one), and the build takes its CPU for a few minutes.</li>
           {r.os === "macos" && <li>The binary comes back to this server, so other Macs download it instead of building.</li>}
         </>
       ) : r.method === "native" ? (

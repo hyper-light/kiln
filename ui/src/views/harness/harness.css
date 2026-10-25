@@ -792,6 +792,26 @@ textarea.hx-input {
   margin-bottom: 4px;
   font-size: 11px;
 }
+/* Where a message stands, each state in its own colour (the stands' tints, stands.css): sent the
+   quietest, dropped the one that's seen. */
+.hx-delivery {
+  font-weight: 500;
+}
+.hx-delivery[data-delivery="sent"] {
+  color: var(--color-muted);
+}
+.hx-delivery[data-delivery="queued"] {
+  color: #b8c2d3;
+}
+.hx-delivery[data-delivery="started"] {
+  color: #cdc6ea;
+}
+.hx-delivery[data-delivery="completed"] {
+  color: #bfdccf;
+}
+.hx-delivery[data-delivery="cancelled"] {
+  color: #e2b9bd;
+}
 .hx-prompt-text {
   font-size: 14px;
   line-height: 1.6;

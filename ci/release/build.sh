@@ -84,6 +84,9 @@ zigbuild="$zig_home/bin/cargo-zigbuild"
 
 # macOS: cargo-zigbuild doesn't let us pick the minimum OS (zig then defaults to its newest), so
 # these wrappers pass zig an explicit `<arch>-macos.11.0` target for both compiling C and linking.
+# They drop the exported symbols list rustc gives a dependency's cdylib (crc-fast's:
+# `-Wl,-exported_symbols_list -Wl,<file>`): zig's linker reads the argument after the file as the
+# list ("unable to read exported symbols list"), and kiln links the rlib, never that dylib.
 # They also pass each framework once: rustc repeats `-framework X` for every crate that links X,
 # zig's linker writes a load command per occurrence, and dyld refuses a binary that loads the same
 # library twice ("duplicate linked dylib").
@@ -94,6 +97,10 @@ seen=" "
 n=\$#
 while [ "\$n" -gt 0 ]; do
   a=\$1; shift; n=\$((n - 1))
+  if [ "\$a" = -Wl,-exported_symbols_list ] && [ "\$n" -gt 0 ]; then
+    shift; n=\$((n - 1))
+    continue
+  fi
   if [ "\$a" = -framework ] && [ "\$n" -gt 0 ]; then
     f=\$1; shift; n=\$((n - 1))
     case "\$seen" in *" \$f "*) continue ;; esac
