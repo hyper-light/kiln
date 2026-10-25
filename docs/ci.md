@@ -7656,7 +7656,9 @@ jobs:
 - **W24-AC12 Eviction.** Under quota pressure, eviction keeps the entries with the most time saved
   per byte. *Simulation.*
 
-**Progress.** Specified (2026-10-24); nothing built yet. The milestones, each a goal with a kiln
+**Progress.** Specified (2026-10-24). M0 built (2026-10-25), awaiting review: R24's sync keeps the
+remote's build output (`reach/sync.rs`), R11's v1 `cache:` folders are kept per repository and job
+(`kiln/keep@v1`), the baseline and the `.kiln/` plan below. The milestones, each a goal with a kiln
 plan:
 
 | Milestone | What it delivers | Requirements |
