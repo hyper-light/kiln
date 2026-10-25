@@ -49,6 +49,8 @@ pub struct Config {
     pub pools: Vec<Pool>,
     /// Runners and pools kept for matching legs in windows (W05-R12).
     pub reservations: Vec<Reservation>,
+    /// Admission by load (`[ci.scheduler.admission]`, W24-R19): off when `None`.
+    pub admission: Option<super::admit::Admission>,
 }
 
 impl Default for Config {
@@ -65,6 +67,7 @@ impl Default for Config {
             quotas: HashMap::new(),
             pools: Vec::new(),
             reservations: Vec::new(),
+            admission: None,
         }
     }
 }
@@ -89,6 +92,8 @@ pub struct LegIn {
     /// It has a `container:` or `services:`: on a hosted pool (`k8s`), it runs in an executor
     /// made for it (a pod of that container, those services beside it, W13-R07).
     pub own_executor: bool,
+    /// What admission by load knows of it (W24-R19): heavy on I/O, and its I/O weight.
+    pub load: super::admit::Load,
 }
 
 /// A runner that can take legs.
@@ -179,6 +184,9 @@ pub enum WaitReason {
     /// Only `avoided` could take it, and it waits for another: as its retry policy asks
     /// (`runner: different`), or as that one refused it (W05-R16).
     OtherRunner { avoided: String, refused: bool },
+    /// It's heavy on I/O, and the runners that could take it are past admission's limits
+    /// (W24-R19): each, with its I/O pressure, the leg's limit there, its free disk and the floor.
+    Load { held: Vec<super::admit::Held> },
 }
 
 /// What to do.
@@ -651,6 +659,10 @@ impl Scheduler {
         if !r.connected || r.draining || r.exclusive {
             return false;
         }
+        // A heavy leg isn't started on a runner past admission's limits (W24-R19).
+        if self.held_by_load(r, l).is_some() {
+            return false;
+        }
         if self.reserved_against(r, l).is_some() {
             return false;
         }
@@ -693,6 +705,11 @@ impl Scheduler {
     /// The legs a runner runs in its own slots (a pool's run in their executors).
     fn own_legs(&self, r: &Runner) -> usize {
         r.running.iter().filter(|x| !self.legs.get(*x).is_some_and(|l| l.req.pool.is_some())).count()
+    }
+
+    /// What holds a heavy leg off a runner by the runner's load, when admission is on (W24-R19).
+    fn held_by_load(&self, r: &Runner, l: &Leg) -> Option<super::admit::Held> {
+        super::admit::held(self.cfg.admission.as_ref(), &l.input.load, l.input.cost, &r.input.view.name, &r.input.view.facts)
     }
 
     /// Gives a runner the best queued legs that fit it, until none does.
@@ -1328,6 +1345,11 @@ impl Scheduler {
         {
             let avoided = self.runners.get(a).map_or_else(|| a.clone(), |r| r.input.view.name.clone());
             return WaitReason::OtherRunner { avoided, refused: *off == Off::Refused };
+        }
+        // Heavy, and held off by their load the runners that could take it (W24-R19).
+        let held: Vec<super::admit::Held> = eligible.iter().filter(|r| r.connected && !r.draining).filter_map(|r| self.held_by_load(r, l)).collect();
+        if !held.is_empty() {
+            return WaitReason::Load { held };
         }
         if !eligible.is_empty() {
             if l.input.exclusive && eligible.iter().all(|r| !r.running.is_empty() || r.draining) {

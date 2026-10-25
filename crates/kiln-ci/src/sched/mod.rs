@@ -7,7 +7,9 @@
 //! - [`routing`]: requirements, rules, eligibility, preferences, explanations.
 //! - [`pools`]: pools of executors kiln starts and stops (W13-R09).
 //! - [`reserve`]: runners and pools kept for some legs in windows (W05-R12).
+//! - [`admit`]: heavy legs held off machines under I/O pressure or short of disk (W24-R19).
 
+pub mod admit;
 pub mod groups;
 pub mod pools;
 pub mod reserve;

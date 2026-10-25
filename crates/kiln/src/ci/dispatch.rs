@@ -297,6 +297,8 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         // On a `k8s` pool, a pod of its own, its containers in it (W13-R07).
         own_executor: job.is_some_and(|j| j.container.is_some() || !j.services.is_empty()),
         request: request_of(job, cfg),
+        // Its I/O, for admission by load (W24-R19).
+        load: kiln_ci::sched::admit::load_of(job.and_then(|j| j.kiln.resources.as_ref())),
         ..LegIn::default()
     }
 }
@@ -314,6 +316,8 @@ fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config 
         overcommit_cpu: s.overcommit.cpu,
         overcommit_mem: s.overcommit.memory,
         overcommit_disk: s.overcommit.disk,
+        // Admission by load (W24-R19): off until set, and while it doesn't read.
+        admission: s.admission.as_ref().and_then(|a| a.admission().inspect_err(|e| tracing::warn!(error = %e, "admission by load is off")).ok()),
         ..Config::default()
     }
 }

@@ -7828,6 +7828,20 @@ diffs affecting it. Each decision says why. Tested on decisions, and over random
 trusted entries with exactly a package's inputs are ever reused. Left: W14-R08's candidates and
 bisection steps (`ci/land.rs`) keyed and looked up this way.
 
+**Admission by load (M3, R19).** Built, off until set (`kiln_ci::sched::admit`). Runners report
+their I/O pressure in their facts (`work.io_full`: PSI's `full avg10` from `/proc/pressure/io`)
+beside their work volume's free disk (`disk.free`). A leg is heavy when its job says `resources: {
+io: heavy }`, or, with `heavy_after`, when its job's legs lately took that long. A heavy leg isn't
+started on a runner past `io_full` or under `disk_free`; it waits with `WaitReason::Load { held }`,
+which names each runner it's held off with its pressure, the leg's limit there, its free disk and
+the floor (`ci.legs.routing`; `kiln ci run` says it in words). The limit honours the leg's I/O
+weight on the `Sandbox` seam's scale (`resources: { io-weight }`, 1 to 10,000, 100 an even share):
+`io_full` × 100 ÷ weight, at most 100 %. Light legs go anywhere. `[ci.scheduler.admission]`:
+`io_full` (percent, default 40), `disk_free` (default `20Gi`), `heavy_after` (seconds; unset, only
+declared legs are heavy). Simulated in `w24_r19_admission_by_load_in_the_scheduler`. Left: facts are
+as fresh as the last probe (on connect, every 10 minutes, on request), so a refresh of the load
+alone between probes; and the UI's sentence for the wait.
+
 ## 4. API, events, CLI and MCP reference
 
 All routes come from the one route table (W10-R05, W20-R01) and follow access.md's conventions:

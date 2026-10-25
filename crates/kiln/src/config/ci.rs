@@ -391,6 +391,8 @@ pub struct Scheduler {
     pub mode: String,
     pub overcommit: Overcommit,
     pub default_request: kiln_ci::sched::pools::ResourceSpec,
+    /// `[ci.scheduler.admission]` (docs/ci.md W24-R19): off when unset.
+    pub admission: Option<Admission>,
 }
 
 impl Scheduler {
@@ -403,7 +405,46 @@ impl Scheduler {
 impl Default for Scheduler {
     fn default() -> Self {
         let d = kiln_ci::sched::state::Config::default();
-        Scheduler { aging_per_minute: d.aging_per_minute, default_cost_seconds: d.default_cost, mode: "slots".into(), overcommit: Overcommit::default(), default_request: Default::default() }
+        Scheduler { aging_per_minute: d.aging_per_minute, default_cost_seconds: d.default_cost, mode: "slots".into(), overcommit: Overcommit::default(), default_request: Default::default(), admission: None }
+    }
+}
+
+/// `[ci.scheduler.admission]` (docs/ci.md W24-R19): legs heavy on I/O (their job's `resources: {
+/// io: heavy }`, or their job's legs lately took `heavy_after` seconds or more) aren't started on a
+/// runner whose I/O pressure is past `io_full` (scaled by the leg's `io-weight`) or whose work
+/// volume has less than `disk_free` free. Runners that don't report them aren't held.
+///
+/// ```toml
+/// [ci.scheduler.admission]
+/// io_full = 40          # percent: PSI's `full avg10`, for a leg of an even I/O weight
+/// disk_free = "20Gi"
+/// heavy_after = 600     # unset: only legs whose job says so are heavy
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Admission {
+    pub io_full: f64,
+    pub disk_free: String,
+    pub heavy_after: Option<f64>,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Admission { io_full: 40.0, disk_free: "20Gi".into(), heavy_after: None }
+    }
+}
+
+impl Admission {
+    /// As the scheduler takes it; why not when a value doesn't read.
+    pub fn admission(&self) -> Result<kiln_ci::sched::admit::Admission, String> {
+        if !self.io_full.is_finite() || !(0.0..=100.0).contains(&self.io_full) {
+            return Err(format!("`[ci.scheduler.admission] io_full` is a percentage from 0 to 100, not {}", self.io_full));
+        }
+        let disk_free = kiln_ci::sched::routing::number(self.disk_free.trim()).filter(|n| n.is_finite() && *n >= 0.0).ok_or_else(|| format!("`[ci.scheduler.admission] disk_free` isn't a size (`20Gi`, `500G`): `{}`", self.disk_free))?;
+        if let Some(h) = self.heavy_after.filter(|h| !h.is_finite() || *h < 0.0) {
+            return Err(format!("`[ci.scheduler.admission] heavy_after` is seconds, not {h}"));
+        }
+        Ok(kiln_ci::sched::admit::Admission { io_full: self.io_full, disk_free: disk_free as u64, heavy_after: self.heavy_after })
     }
 }
 
@@ -637,4 +678,29 @@ pub struct Oidc {
     pub listen: Vec<String>,
     pub listen_cert: Option<std::path::PathBuf>,
     pub listen_key: Option<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W24-R19: `[ci.scheduler.admission]` as the scheduler takes it, its values checked, and the
+    /// I/O weights admission scales by held to the `Sandbox` seam's.
+    #[test]
+    fn w24_r19_admission_config() -> anyhow::Result<()> {
+        let s: Scheduler = toml::from_str("[admission]\nio_full = 35\ndisk_free = \"50Gi\"\nheavy_after = 900\n")?;
+        let a = s.admission.as_ref().map(Admission::admission).transpose().map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(a == Some(kiln_ci::sched::admit::Admission { io_full: 35.0, disk_free: 50 << 30, heavy_after: Some(900.0) }), "{a:?}");
+        anyhow::ensure!(Scheduler::default().admission.is_none(), "off until set");
+        let defaults: Scheduler = toml::from_str("[admission]\n")?;
+        anyhow::ensure!(defaults.admission.map(|a| a.admission()) == Some(Ok(kiln_ci::sched::admit::Admission { io_full: 40.0, disk_free: 20 << 30, heavy_after: None })));
+        for (bad, says) in [(Admission { io_full: 140.0, ..Admission::default() }, "io_full"), (Admission { disk_free: "lots".into(), ..Admission::default() }, "disk_free"), (Admission { heavy_after: Some(-1.0), ..Admission::default() }, "heavy_after")] {
+            anyhow::ensure!(bad.admission().is_err_and(|e| e.contains(says)), "{bad:?}");
+        }
+        anyhow::ensure!(toml::from_str::<Scheduler>("[admission]\nio = 3\n").is_err(), "an unknown key is an error");
+        use kiln_ci::sched::admit;
+        use kiln_seams::sandbox;
+        anyhow::ensure!((admit::WEIGHT_MIN, admit::WEIGHT_MAX, admit::WEIGHT_EVEN) == (sandbox::WEIGHT_MIN, sandbox::WEIGHT_MAX, sandbox::Limits::default().io_weight));
+        Ok(())
+    }
 }
