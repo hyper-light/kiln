@@ -76,6 +76,8 @@ pub struct Live {
     lists: Mutex<HashMap<ListKey, (Instant, Listed)>>,
     trees: Mutex<HashMap<String, (Instant, Arc<AppTree>)>>,
     commits: Mutex<HashMap<String, Option<Value>>>,
+    /// Each repository's tags and the commits they name, and when they were read.
+    pub(super) tags: Mutex<HashMap<String, (Instant, Arc<Vec<(String, String)>>)>>,
 }
 
 /// An app's tree as last read.
