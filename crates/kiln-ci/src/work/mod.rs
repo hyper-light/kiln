@@ -5,7 +5,9 @@
 //! - [`graph`]: package graphs from manifests, and the packages a change affects (W24-R16, R17).
 //! - [`ops`]: container operations as a DAG of W24 units, and the Dockerfile frontend that lowers
 //!   a Dockerfile to them (W24-R29).
+//! - [`slots`]: warm workspaces, decided: lanes, leases, clones, budgets (W24-R11, R15).
 
 pub mod graph;
 pub mod key;
 pub mod ops;
+pub mod slots;
