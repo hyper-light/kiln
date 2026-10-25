@@ -77,6 +77,11 @@ Messages to agents ride the same channel, and their answers are T3's inbox answe
   `1 << 31`, which is P2's `CAP_CLUSTER` on main. It's `1 << 34` in `AgentMsg::Caps`'s 64 bits,
   and this plan's next bits start at 35.
 
+The UI's command ids and their answers ("The UI's sockets", plan step 7) were agreed with T3 by
+message on 2026-10-24, for CP-T3.4's composer outbox to build on. A message goes under its own id,
+and the composer keeps it until a final answer: dropped on a final ack, dropped and the person told
+on a final nack, sent again with backoff while it's parked or not through this time.
+
 ## Commands
 
 The server's commands to a runner process ride that process's command streams on the channel
@@ -103,7 +108,11 @@ once.
 The runner process takes each command once however often it comes, applies it as if it had come
 alone, and answers it: an ACK, or a NACK with its kind (`unknown`, `refused`, `stale_epoch`,
 `unsupported`, `malformed`) and why. Within a live link, a command whose answer is late goes
-again (`Want` and patience, as for any item: "Loss below the channel").
+again (`Want` and patience, as for any item: "Loss below the channel"). A stream's newer
+generation, or the streams of a server that started again, let go of those before it, and an
+item of one let go of that comes late (sent twice or held up below the channel) is dropped, not
+taken: its server dropped that stream as it started the next, so nothing waits for its answer,
+and taken anew it would be applied again (`wire::commands::Current`).
 
 Its caller gets one of these answers:
 
@@ -132,6 +141,39 @@ says what the process has (nothing, for one that started again). A parked comman
 runner a day at the most. A forgotten runner's waiting commands end `unreachable`. Commands live
 in the server's memory: one that restarts lets go of them, which their callers see as `unanswered`.
 
+An agent session's commands ride these streams too: `HarnessOpen`, `HarnessCmd`, `HarnessClose`,
+`HarnessPackage` and `HarnessRelease`. A `HarnessCmd` rides the stream its `Command`'s class says
+(`crate::wire::command_class`):
+- **Parked** (waits for a runner that's away): a message (`Send`, `SkillRun`), a change to the
+  queue (`QueueEdit`, `QueueRemove`, `QueueMove`) and an approval (`Approve`).
+- **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `McpAuth`
+  and `SkillView`.
+- **Live**, refused at once while its runner is away: every other command (an interrupt, a model,
+  effort or mode to change to, a move, a restart, the MCP servers' and skills' commands ...).
+
+The parked and live ones' callers get the runner's answer:
+
+| Answer (the registry's `Sent`) | The API | A viewer's socket |
+|---|---|---|
+| `Taken` | 204 | nothing more |
+| `Parked` | 202, `{"parked": true}` | nothing more |
+| `Rejected`: `unknown` (its runner doesn't have the session) | 404 | an `error` frame |
+| `Rejected`, another kind | 409, with how and why | an `error` frame |
+| `Unanswered` | 504 | an `error` frame |
+| `Unreachable` (a live command while its runner is away) | 409, as before the channel | an `error` frame |
+| `NoSession` (the server doesn't know the session, or it's closed) | 404 | an `error` frame |
+| `Ok`: sent to a runner from before the channel, which can't say | 204 | nothing more |
+
+Messages to agents go as T3's `HarnessSend` to runners with an inbox, answered by it. The files
+a message carries (`HarnessFile`) go beside it on the terminal lane, in its order, until CP-T3.3
+moves messages onto the channel.
+
+A runner from before the channel says nothing past `Build`'s 32 bits, and skips the server's
+`Caps` and `Kept`, which it can't read. The server sends it commands as before, answered `sent`,
+and every connect sends its sessions whole: it goes on working while the fleet upgrades after its
+server. A test build's `old` fault (`crate::runner::chaos`) makes a runner do the same, and
+`tests/old_runner.rs` runs an agent session on one: its turn, a command, a message and a close.
+
 ## Loss below the channel
 
 kiln's QUIC layer (`crate::net`) holds frames a lane can't take yet in a queue of 8,192 frames per
@@ -146,6 +188,11 @@ peer and lane. It counts every frame it lets go before the wire, by lane and rea
 | `closed` | Its connection closed, or its peer wasn't connected, with the frame queued. |
 | `ended` | The net loop started over (a rebuild), or stopped, with the frame queued. |
 | `chaos` | A test build's fault (`shed=`, `crate::runner::chaos`). |
+
+A test build can also send frames twice (`twice=`) or late, after the next on their lane
+(`late=`), from a seed of its own (`seed=`), beside those it drops. The channel takes each item
+once and in order whatever comes twice or out of order, as `net::tests` show over kiln's real QUIC
+layer.
 
 The channel makes up for what of these it carried, without waiting for a reconnect:
 - A receiver that sees an item past a gap drops it and asks for the stream again from the gap
@@ -270,6 +317,48 @@ takes a new bit, never one that means something already, even in the other direc
 
 Bits from 36 are free. Take the next one, and add its row here in the same change.
 
+## The lab
+
+`tests/wire_lab.rs` puts it all together. It runs a server and three runners, with kiln's real net
+layer between them and a hundred agent sessions streaming. Ten thousand commands come from the API
+and from viewers' sockets: models to change to, and messages and skill runs under their ids. The
+faults:
+- each runner's link cut every few seconds;
+- each side's channel frames dropped, sent twice and sent late: about one in 101 dropped by default
+  (`WIRE_LAB_FRAMES`), one in 64 sent twice and one in 45 late;
+- each runner killed (kill -9) and started again, then the server;
+- viewers' sockets dropped and opened again, as a page reloads.
+
+The sessions all open before any streams, then stream a first turn of 2,000 lines each while the
+commands come. A checker then holds every command to one answer and to one application at the
+most: exactly one when it was answered taken, accepted or parked, none when it was refused. It
+holds every update to the server's copy once and in order, and each viewer to its copy. At full
+scale a run needs 200 faults and 100,000 updates. The lab runs on a seed (`WIRE_LAB_SEED`), which
+picks the frames the faults hit and the moments the rest fall. kiln's CI runs it nightly on eight
+seeds (`.kiln/wire-lab.yaml`). Run it with `cargo test -p kiln --features chaos --test wire_lab
+--release`, which prints its counts and seed as it passes. Without `chaos` it has no faults to drive,
+and cargo says so rather than running nothing.
+
+At one frame in 11 dropped, the channel's repairs take most of its time. Updates come about three
+times slower, and most commands wait past their 30 s for an answer. An item lost with nothing
+after it waits out its patience (15 s for a runner's updates) before it goes again.
+
+Four edges are left, and the lab steers clear of each:
+- **A message lost to a runner's crash.** A runner killed within half a second of its inbox
+  taking a message loses it: the record of what the inbox took is written half a second after it
+  changes. CP-T3.1's journal closes that.
+- **A message a runner's crash hands its harness again.** A runner killed just after one of its
+  sessions handed its harness a message that waited in its queue hands it again once it starts
+  again: its record of the queue is written half a second after it changes. That's CP-T3.5's
+  (docs/sends.md). The lab kills a runner once none of its sessions has handed its harness a
+  message for a moment (1.5 s).
+- **A command a runner's crash takes with it.** A runner killed after its session took a command,
+  before its harness applied it (a model to change to, written to Claude Code and not yet read),
+  loses it, though it was answered taken. A harness applies one within milliseconds, but nothing
+  journals it yet. The lab sends a runner nothing for a moment before its kill.
+- **A command sent again to a restarted server goes on again.** The server's command ids live in
+  its memory, so an unanswered command sent to the server that starts again is new to it.
+
 ## Runner to server: `AgentMsg`
 
 | Message | Class | Why | Today |
@@ -341,11 +430,11 @@ Bits from 36 are free. Take the next one, and add its row here in the same chang
 | `TermClose` | command, parked | A terminal to close. | On the channel ("Commands"): answered once applied. |
 | `TermAttach` | ask | Answered by `TermReplay`. | As its class says. |
 | `AiTranscript` | ask | Answered by `AiTranscript`. | As its class says. |
-| `HarnessOpen` | command, refused while away | An agent to start. One started later than asked would surprise. | Fire-and-forget: reported opened once queued. |
-| `HarnessCmd` | command, as its `Command` says | Carries one `Command`. | Fire-and-forget: `Sent::Ok` once queued in the server's own process (`harness/registry.rs`). |
-| `HarnessClose` | command, parked | A session closed while its machine was away must still close once it's back. | Fire-and-forget. |
+| `HarnessOpen` | command, refused while away | An agent to start. One started later than asked would surprise. | On its runner's live command stream: opened once its runner says it started it; a refusal (`unsupported`, `malformed`, `refused`) is its caller's error. |
+| `HarnessCmd` | command, as its `Command` says | Carries one `Command`. | On its runner's command stream, live or parked as its command says. Its caller gets its runner's answer: `Sent::Taken`, `Rejected` (`unknown` for a session the runner doesn't have), `Unanswered` or `Parked` (`harness/registry.rs`). A message goes as `HarnessSend` instead, to a runner with an inbox. |
+| `HarnessClose` | command, parked | A session closed while its machine was away must still close once it's back. | On its runner's parked command stream. A runner that doesn't have the session answers `unknown`, and the server lets its copy go. |
 | `AiView` | ask | Answered by `AiView`. | As its class says. |
-| `HarnessFile` | command, parked | A piece of a file a message carries, kept with the message. | Fire-and-forget. |
+| `HarnessFile` | command, parked | A piece of a file a message carries, kept with the message. | Still sent beside its message on the terminal lane, in order with `HarnessSend`. It moves onto the channel with messages (T3, CP-T3.3). |
 | `Retire` | command, parked | An older runner process may stop. | On the channel ("Commands"): answered once applied. |
 | `Upgrade` | command, refused while away | Upgrade the runner. The updater tries again on its own schedule. | On the channel ("Commands"): answered once taken, then by `UpgradeDone`. |
 | `HarnessTaskOutput` | ask | Answered by `HarnessTaskOutput`. | As its class says. |
@@ -364,8 +453,8 @@ Bits from 36 are free. Take the next one, and add its row here in the same chang
 | `JobRerunStep` | command, refused while away | Run a kept leg's step again. | On the channel ("Commands"): answered once applied; refused at once while away. |
 | `JobExec` | command, refused while away | Run a command in a leg's shell. | On the channel ("Commands"): answered once applied; refused at once while away. |
 | `Convo` | carried (conversation feed) | The feed's answers. | As its class says. |
-| `HarnessPackage` | command, refused while away | A moving session's package. A move goes only to a machine that's up. | Fire-and-forget. |
-| `HarnessRelease` | command, parked | A machine that comes back must let go of a session that went on elsewhere. | Fire-and-forget. |
+| `HarnessPackage` | command, refused while away | A moving session's package. A move goes only to a machine that's up. | On its runner's live command stream, in pieces of 768 KiB, each answered before the next goes. A move whose machine goes away midway says so. |
+| `HarnessRelease` | command, parked | A machine that comes back must let go of a session that went on elsewhere. | On its runner's parked command stream. |
 | `UpdateAvailable` | state | The newest kiln for this machine. | On the channel ("Commands"), parked: answered once taken. Sent once per commit. |
 | `Diagnose` | ask | Answered by `Answer`. | As its class says. |
 | `Repair` | ask | Answered by `Answer`. | As its class says. |
@@ -396,7 +485,7 @@ travels in `HarnessCmd`.
 
 | Command | Class | Why | Today |
 |---|---|---|---|
-| `Send` | command, parked | A message. T3's: its inbox takes each id once and parks it for a runner that's away. | Its id made once and its inbox's answer (CP-T3.2, docs/sends.md); refused at once while its runner is away, until CP-T3.3 parks it. |
+| `Send` | command, parked | A message. T3's: its inbox takes each id once and parks it for a runner that's away. | Its id made once and its inbox's answer (CP-T3.2, docs/sends.md); refused at once while its runner is away, until CP-T3.3 parks it. One without an id rides `HarnessCmd` instead, parked, unchecked. |
 | `QueueEdit` | command, parked | Goes with the messages it edits (T3). | Fire-and-forget. |
 | `QueueRemove` | command, parked | Goes with the messages it edits (T3). | Fire-and-forget. |
 | `QueueMove` | command, parked | Goes with the messages it edits (T3). | Fire-and-forget. |
@@ -453,10 +542,57 @@ From wherever a session runs to the server, inside `Harness`, and on to its view
 
 ## The UI's sockets
 
-The session socket's commands up are `Command`s, each classed in its own table.
+The session socket's commands up are `Command`s, each classed in its own table. A client sends each
+under an id it makes, `{"t": "cmd", "id", "c"}`, and the server answers each time it comes:
+- `{"t": "ack", "id", "outcome"}`, where the outcome is one of:
+  - `taken`: its runner applied it, or the server did, for what it does itself;
+  - `accepted`: its inbox took a message, with the inbox's answer as it is (`epoch`, `seq`, `at`,
+    and `repeat` when it had taken it before);
+  - `unchecked`: it went unchecked, to a runner from before the channel or without inboxes, which
+    can't say more. Nothing there takes it once, so it's never sent again: a message would be a
+    second prompt;
+  - `pending`: a message to a runner with inboxes whose inbox hasn't answered in 10 s;
+  - `parked`: its runner is away, and it goes once the runner is back.
+- `{"t": "nack", "id", "code", "why", "again"}` for one that didn't get through. `code` is the
+  refusal's kind: `unknown`, `malformed`, `refused`, `stale_epoch`, `unsupported`, `unanswered`,
+  `unreachable` or `no_session`, or an inbox refusal's by its tag (`stale_epoch`, `behind`,
+  `moved`, `reused`, `invalid`, `full`, `no_session`, `unavailable`), with the inbox's own under
+  `refused`. `invalid` is an inbox refusing a message; `malformed`, a frame the server can't read
+  (`id` null when it couldn't read that much).
+
+Each answer is final, for now, or not this time, agreed with T3 for CP-T3.4's composer outbox
+(`crate::harness::asked`):
+- **Final:** the acks but `parked` and `pending`, and the nacks `unknown`, `refused`, `malformed`,
+  `reused`, `invalid` and `no_session`. It's kept under the id, and a client stops.
+- **For now:** `parked`. Sent again, the command is answered `parked`, until its runner's answer
+  comes and takes its place.
+- **Not this time:** `pending`, and the nacks with `again: true`: a message's `unreachable`,
+  `moved`, `behind`, `full`, `unavailable` or `stale_epoch` (after the server's own one send for
+  the epoch named), and `unanswered` from a runner with inboxes. It isn't kept, and a client sends
+  the command again under its id after a while: its inbox answers a repeat if it took it, and takes
+  it if it was lost. A command other than a message that's refused while its runner is away, or
+  whose link dropped before it answered, is final: done later, or done twice, it would surprise.
+
+A message goes under its own id. The server keeps an id while its command waits for its answer,
+or is parked, until its answer comes; and each session's newest 1,024 answered ids for 10 minutes
+from their answers.
+Ids are their caller's own: two callers' ids never meet. A command sent again under an id it has
+isn't sent on again; it's answered as the first was, or when that answer comes. Its answer is kept
+whether or not the socket that sent it is still there, and the client sends what it hasn't heard
+back about again on its next socket. So the command is applied once, and each send gets one
+answer. The UI's store keeps what's parked or not through this time, sending it again after 10, 20,
+40, then every 60 s. Above the composer, the page shows what waits past a moment, and why, and
+what was refused, and why.
+
+A command over the API under an `Idempotency-Key` is taken once the same way; the UI makes a key
+for each. A message there is its inbox's to take once (CP-T3.2). A server that restarts lets go of
+its ids, so a command sent again to it goes on again. A message's inbox still takes it once.
 
 | Socket | Way | Message | Class | Why | Today |
 |---|---|---|---|---|---|
+| `/api/harness/sessions/:id/ws` | up | `cmd` | command, as its `Command` says | A command under the id its client made. | Taken once per id, answered `ack` or `nack`, and sent again by the client on its next socket until then (plan step 7). |
+| `/api/harness/sessions/:id/ws` | down | `ack` | ack | A command under its id was taken. | Sent once to each socket that sent it, once its runner (or the server) answered. |
+| `/api/harness/sessions/:id/ws` | down | `nack` | ack | A command under its id was refused, saying how and why. | As `ack`. |
 | `/api/harness/sessions/:id/ws` | down | `open` | stream | Starts what a viewer is sent: the whole session, its revision and the server's incarnation (`rev`, `born`). | Sent on an attach without `after=`, or when the copy can't resume it. |
 | `/api/harness/sessions/:id/ws` | down | `resumed` | stream | Starts a resume (`?after=<born>.<rev>`): the newest meta, state, changes and files, then only the events changed since. | Sent when the copy can resume the viewer. |
 | `/api/harness/sessions/:id/ws` | down | `meta` | state | The newest wins. | Sent whole on every attach. |
@@ -467,7 +603,7 @@ The session socket's commands up are `Command`s, each classed in its own table.
 | `/api/harness/sessions/:id/ws` | down | `events` | stream | Timeline events. | Every attach, and a viewer that falls behind, gets them all again. |
 | `/api/harness/sessions/:id/ws` | down | `synced` | stream | Follows a snapshot. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `closed` | stream | The session is gone. | As its class says. |
-| `/api/harness/sessions/:id/ws` | down | `error` | answer | A command's refusal. | Says some refusals. Others go unanswered. |
+| `/api/harness/sessions/:id/ws` | down | `error` | answer | A command's refusal. | Says a bare command's refusals, to clients from before ids. |
 | `/api/events` | down | `event` | stream | Kiln's events for the UI. | Not resumed after a reconnect. |
 | `/api/terminal/ws` | up | `input` | command, refused while away | Keystrokes, never replayed later. | Not answered. |
 | `/api/terminal/ws` | up | `resize` | state | The newest wins. | Not answered. |

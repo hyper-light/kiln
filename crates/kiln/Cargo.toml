@@ -8,6 +8,12 @@ license.workspace = true
 # Fault injection for tests (docs/ci.md W22-AC04): `kiln agent --chaos`, `KILN_CHAOS`.
 chaos = []
 
+# The wire lab drives faults only a build with `chaos` has: asked for without it, cargo says so
+# rather than running nothing (docs/wire.md, "The lab").
+[[test]]
+name = "wire_lab"
+required-features = ["chaos"]
+
 [dependencies]
 kiln-cd = { path = "../kiln-cd" }
 kiln-ci = { path = "../kiln-ci" }

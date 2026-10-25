@@ -229,8 +229,9 @@ pub async fn run(hub: &Arc<Hub>, b: &Broadcast, by: &str, among: &[Info]) -> any
             };
             for c in commands {
                 match hub.harness.command(hub, &info.id, c).await {
-                    Sent::Ok | Sent::Accepted(_) => {}
+                    Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => {}
                     Sent::Refused(r) => return outcome("failed", Some(r.to_string())),
+                    s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => return outcome("failed", s.failure().map(|(_, why)| why)),
                     Sent::NoSession => return outcome("failed", Some("it has gone".to_owned())),
                     Sent::Unreachable => return outcome("failed", Some(format!("{} is not connected", machine(&info.target)))),
                 }

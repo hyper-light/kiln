@@ -35,7 +35,9 @@ impl kiln_seams::HarnessPort for Hub {
     fn send<'a>(&'a self, id: &'a str, command: Command) -> BoxFuture<'a, Sent> {
         Box::pin(async move {
             match self.harness.command(self, id, command).await {
-                registry::Sent::Ok | registry::Sent::Accepted(_) => Sent::Delivered,
+                registry::Sent::Ok | registry::Sent::Accepted(_) | registry::Sent::Taken | registry::Sent::Parked => Sent::Delivered,
+                registry::Sent::Rejected { code: crate::wire::channel::Refusal::Unknown, .. } => Sent::NoSession,
+                registry::Sent::Rejected { .. } | registry::Sent::Unanswered(_) => Sent::Unreachable,
                 // Its id was given to another message before: one sent under it got there (a retry
                 // whose words changed since its first try).
                 registry::Sent::Refused(Refusal::Reused { .. }) => Sent::Delivered,

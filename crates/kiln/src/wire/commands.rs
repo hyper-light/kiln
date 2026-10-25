@@ -13,13 +13,15 @@
 //!
 //! Each stream's name carries the server's incarnation and a generation (`p:<born>.<gen>`,
 //! `l:<born>.<gen>`). A runner process that started again has neither stream. Its parked commands
-//! not yet answered go again on a new generation, and its live ones end unanswered.
+//! not yet answered go again on a new generation, and its live ones end unanswered. On the
+//! runner, a stream's newer generation, or a server that started again, lets go of those before
+//! it, and an item of one let go of that comes late is dropped ([`Current`]).
 //!
 //! Sans-io: the hub pushes commands, hands in the runner's frames and its link's comings and
 //! goings, and sends what [`Commands::poll`] gives. Each command's answer comes back on the
 //! receiver [`Commands::push`] gave for it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use futures::channel::oneshot;
@@ -385,13 +387,81 @@ fn restart(p: &mut Peer, kind: Kind, born: u64, went: bool) {
     }
 }
 
-/// On the runner: a command stream's kind, from its name, so a new generation (seq 1) lets go of
-/// the ones before it.
+/// On the runner: a command stream's kind, from its name, so a newer generation lets go of the
+/// ones before it ([`Current`]).
 pub fn prefix_of(stream: &str) -> Option<&'static str> {
     match stream.split_once(':').map(|(p, _)| p) {
         Some("p") => Some("p"),
         Some("l") => Some("l"),
         _ => None,
+    }
+}
+
+/// A command stream's kind, its server's incarnation and its generation, from its name.
+fn named(stream: &str) -> Option<(&'static str, u64, u64)> {
+    let prefix = prefix_of(stream)?;
+    let (born, generation) = stream.split_once(':')?.1.split_once('.')?;
+    Some((prefix, born.parse().ok()?, generation.parse().ok()?))
+}
+
+/// How many incarnations of its server a runner remembers having let go of.
+const GONE_KEPT: usize = 16;
+
+/// On the runner: which of its server's command streams are current. A newer generation of one
+/// (its link dropped, or this process started again) lets go of those before it, as the streams
+/// of a server that started again let go of the old server's. An item of a stream let go of that
+/// comes late (held up below the channel, or sent twice) is dropped, not taken: its server dropped
+/// that stream as it started the next, so nothing waits for its answer, and taken anew it would be
+/// applied a second time.
+#[derive(Default)]
+pub struct Current {
+    /// By kind: the incarnation and generation of the newest stream.
+    newest: HashMap<&'static str, (u64, u64)>,
+    /// Incarnations let go of, the newest last.
+    gone: VecDeque<u64>,
+}
+
+/// What a stream an item came on is to its runner ([`Current::of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stand {
+    /// The newest of its kind, or not a command stream: the item goes as it comes.
+    Current,
+    /// Newer than the newest of its kind (`Receiver::forget_where` lets go of the others).
+    Newer(&'static str),
+    /// One let go of: the item is dropped.
+    Gone,
+}
+
+impl Current {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What `stream`, the one an item came on, is: the newest of its kind from now when it's newer.
+    pub fn of(&mut self, stream: &str) -> Stand {
+        let Some((prefix, born, generation)) = named(stream) else { return Stand::Current };
+        if self.gone.contains(&born) {
+            return Stand::Gone;
+        }
+        match self.newest.get(prefix).copied() {
+            Some((b, g)) if b == born && generation == g => return Stand::Current,
+            Some((b, g)) if b == born && generation < g => return Stand::Gone,
+            _ => {}
+        }
+        // A newer generation, or another incarnation (one that started since: a server's that
+        // ended sends nothing more), whose kinds let go of the old one's too.
+        let old: Vec<u64> = self.newest.values().map(|(b, _)| *b).filter(|b| *b != born).collect();
+        for b in old {
+            if !self.gone.contains(&b) {
+                self.gone.push_back(b);
+            }
+        }
+        while self.gone.len() > GONE_KEPT {
+            self.gone.pop_front();
+        }
+        self.newest.retain(|_, (b, _)| *b == born);
+        self.newest.insert(prefix, (born, generation));
+        Stand::Newer(prefix)
     }
 }
 
@@ -408,23 +478,26 @@ mod tests {
     /// answers back; what it took, in order.
     struct Runner {
         rx: Receiver,
+        current: Current,
         took: Vec<Vec<u8>>,
     }
 
     impl Runner {
         fn new() -> Self {
-            Self { rx: Receiver::new(), took: Vec::new() }
+            Self { rx: Receiver::new(), current: Current::new(), took: Vec::new() }
         }
 
         fn deliver(&mut self, frames: Vec<(PeerId, Frame)>, refuse: impl Fn(&[u8]) -> bool) -> Vec<Frame> {
             let mut back = Vec::new();
             for (_, f) in frames {
                 if let Frame::Item { stream, seq, low, body } = f {
-                    if seq == 1
-                        && let Some(prefix) = prefix_of(&stream)
-                    {
-                        let keep = stream.clone();
-                        self.rx.forget_where(|s| s != keep && prefix_of(s) == Some(prefix));
+                    match self.current.of(&stream) {
+                        Stand::Gone => continue,
+                        Stand::Newer(prefix) => {
+                            let keep = stream.clone();
+                            self.rx.forget_where(|s| s != keep && prefix_of(s) == Some(prefix));
+                        }
+                        Stand::Current => {}
                     }
                     match self.rx.on_item(&stream, seq, low, body) {
                         Arrival::Take(body) => {
@@ -591,6 +664,54 @@ mod tests {
             c.on_frame(1, a);
         }
         assert_eq!(answer(&mut more), Some(Answer::Taken));
+    }
+
+    /// A live command's frame sent twice (or held up) below the channel, its copy coming once the
+    /// link dropped and the stream went on to its next generation: dropped, not applied again.
+    #[test]
+    fn a_command_of_a_generation_let_go_of_that_comes_late_is_not_taken_again() {
+        let base = Instant::now();
+        let mut c = Commands::new(7);
+        let mut r = Runner::new();
+        c.on_frame(1, r.rx.have());
+        let mut model = c.push(1, Kind::Live, b"model".to_vec(), base);
+        let frames = c.poll(base);
+        let copy = frames.clone();
+        // Taken; its answer lost with the link, which drops.
+        let _lost = r.deliver(frames, |_| false);
+        c.down(1);
+        assert!(matches!(answer(&mut model), Some(Answer::Unanswered { .. })));
+        // Back, and the next live command goes on the stream's next generation.
+        c.on_frame(1, r.rx.have());
+        let mut keys = c.push(1, Kind::Live, b"keys".to_vec(), t(base, 50));
+        for a in r.deliver(c.poll(t(base, 50)), |_| false) {
+            c.on_frame(1, a);
+        }
+        assert_eq!(answer(&mut keys), Some(Answer::Taken));
+        // The first command's copy comes now: its stream was let go of.
+        assert!(r.deliver(copy, |_| false).is_empty(), "nothing to answer for a stream let go of");
+        assert_eq!(r.took, vec![b"model".to_vec(), b"keys".to_vec()], "each taken once");
+    }
+
+    #[test]
+    fn a_runner_lets_go_of_a_server_that_started_again_and_of_older_generations() {
+        let mut cur = Current::new();
+        assert_eq!(cur.of("l:7.1"), Stand::Newer("l"));
+        assert_eq!(cur.of("l:7.1"), Stand::Current);
+        assert_eq!(cur.of("p:7.1"), Stand::Newer("p"));
+        assert_eq!(cur.of("l:7.3"), Stand::Newer("l"), "a newer generation");
+        assert_eq!(cur.of("l:7.2"), Stand::Gone, "an older one");
+        assert_eq!(cur.of("l:7.1"), Stand::Gone);
+        assert_eq!(cur.of("p:7.1"), Stand::Current, "the other kind goes on");
+        // The server started again (another incarnation): the old one's streams are let go of,
+        // both kinds, whatever their generation.
+        assert_eq!(cur.of("l:9.1"), Stand::Newer("l"));
+        assert_eq!(cur.of("p:7.1"), Stand::Gone);
+        assert_eq!(cur.of("l:7.4"), Stand::Gone);
+        assert_eq!(cur.of("p:9.1"), Stand::Newer("p"));
+        assert_eq!(cur.of("l:9.1"), Stand::Current);
+        // Not a command stream: as it comes.
+        assert_eq!(cur.of("s:abc#1"), Stand::Current);
     }
 
     #[test]

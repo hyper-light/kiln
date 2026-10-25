@@ -974,9 +974,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // What the server last heard of it on this connection.
     let mut front_door_sent: Option<String> = None;
     let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
-    // A test build's fault: frames lost below the channel, which it makes up for.
-    if let Some(rule) = crate::runner::chaos::get().and_then(|c| c.shed) {
-        net.command(net::Out::Shed(rule)).await;
+    // A test build's faults: frames lost, sent twice or sent late below the channel, which it
+    // makes up for.
+    if let Some(c) = crate::runner::chaos::get() {
+        net.command(net::Out::Seed(c.seed)).await;
+        for rule in c.faults.iter().copied() {
+            net.command(net::Out::Shed(rule)).await;
+        }
     }
     // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
     let mut paths = if o.ephemeral {
@@ -1156,6 +1160,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // each stream; and the one being applied, answered at the top of the next turn of the loop
     // (however its arm ended), taken unless its arm refused it.
     let mut wire_in = crate::wire::channel::Receiver::new();
+    // Which of the server's command streams are current: an item of one let go of is dropped.
+    let mut wire_current = crate::wire::commands::Current::new();
     let mut answer_after: Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)> = None;
     // What the server's copy of each session here has, said in digests on this connection: a
     // stream that starts sends only what the copy lacks (`crate::wire::sums`).
@@ -1893,8 +1899,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
-                // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md).
-                if !o.ephemeral {
+                // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md). A test
+                // build's `old` says nothing, as a runner from before the channel.
+                if !o.ephemeral && !crate::runner::chaos::get().is_some_and(|c| c.old) {
                     let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
                     if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
@@ -2002,11 +2009,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     match msg {
                         ServerMsg::Wire(crate::wire::channel::Frame::Item { stream, seq, low, body }) => {
                             use crate::wire::channel::{Arrival, Refusal};
-                            // A command stream's new generation: the ones before it are done with.
-                            if seq == 1
-                                && let Some(prefix) = crate::wire::commands::prefix_of(&stream)
-                            {
-                                wire_in.forget_where(|s| s != stream && crate::wire::commands::prefix_of(s) == Some(prefix));
+                            // A command stream's newer generation: the ones before it are done with,
+                            // and an item of one of those that comes late isn't taken again.
+                            match wire_current.of(&stream) {
+                                crate::wire::commands::Stand::Gone => continue 'events,
+                                crate::wire::commands::Stand::Newer(prefix) => wire_in.forget_where(|s| s != stream && crate::wire::commands::prefix_of(s) == Some(prefix)),
+                                crate::wire::commands::Stand::Current => {}
                             }
                             let answer = match wire_in.on_item(&stream, seq, low, body) {
                                 Arrival::Take(body) => match proto::decode::<ServerMsg>(&body) {
@@ -2043,6 +2051,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     continue;
                 }
                 match msg {
+                    // A test build's `old` skips both, as a runner from before the channel can't
+                    // read them.
+                    ServerMsg::Kept { .. } | ServerMsg::Caps { .. } if crate::runner::chaos::get().is_some_and(|c| c.old) => {}
                     // What the server can do past Build's 32 bits (docs/wire.md): said before its
                     // Welcome, so this runner sends its sessions over the channel, not whole. It
                     // says what it has of the server's streams (none yet).
@@ -2366,9 +2377,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     },
                     ServerMsg::HarnessOpen { session, json } => {
-                        let opened = match (&harness, serde_json::from_str::<crate::harness::session::Spec>(&json)) {
-                            (None, _) => Err(anyhow::anyhow!("agent sessions are not enabled on this runner")),
-                            (_, Err(e)) => Err(anyhow::anyhow!("bad session spec: {e}")),
+                        use crate::wire::channel::Refusal;
+                        // How it fared, as its answer says it (a command on the channel).
+                        let opened: Result<(), (Refusal, anyhow::Error)> = match (&harness, serde_json::from_str::<crate::harness::session::Spec>(&json)) {
+                            (None, _) => Err((Refusal::Unsupported, anyhow::anyhow!("agent sessions are not enabled on this runner"))),
+                            (_, Err(e)) => Err((Refusal::Malformed, anyhow::anyhow!("bad session spec: {e}"))),
                             (Some(h), Ok(mut spec)) => {
                                 // Started on a shell: in that shell's directory and environment.
                                 if let Some(pid) = spec.shell.as_ref().and_then(|t| terms.get(t)).and_then(|(pty, _)| pty.pid()) {
@@ -2398,11 +2411,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     });
                                     Ok(())
                                 } else {
-                                    h.open(Some(session.clone()), spec).map(|_| ())
+                                    h.open(Some(session.clone()), spec).map(|_| ()).map_err(|e| (Refusal::Refused, e))
                                 }
                             }
                         };
-                        if let Err(e) = opened {
+                        if let Err((code, e)) = opened {
+                            refuse(&mut answer_after, code, format!("{e:#}"));
                             for u in crate::harness::host::refusal(&session, &json, &format!("{e:#}")) {
                                 if let Ok(json) = serde_json::to_string(&u) {
                                     uplink.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
@@ -2411,6 +2425,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::HarnessCmd { session, json } => {
+                        use crate::wire::channel::Refusal;
                         let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
                         match serde_json::from_str::<crate::harness::model::Command>(&json) {
                             // The server's word on a hand-over to this machine's newer runner
@@ -2423,17 +2438,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 }
                             }
                             Ok(c) if known => {
-                                if let Some(h) = &harness {
-                                    h.command(&session, c);
+                                if let Some(h) = &harness
+                                    && !h.command(&session, c)
+                                {
+                                    refuse(&mut answer_after, Refusal::Refused, format!("session {session} didn't take it: its lane is full, or it just ended"));
                                 }
                             }
                             Ok(_) => {
+                                refuse(&mut answer_after, Refusal::Unknown, format!("no session {session} here"));
                                 // Gone here (e.g. stopped while the server was away): say so.
                                 if let Ok(json) = serde_json::to_string(&crate::harness::core::Update::Closed) {
                                     uplink.0.send(Up::Term(AgentMsg::Harness { session, json })).await.ok();
                                 }
                             }
-                            Err(e) => tracing::debug!(error = %e, "unreadable agent session command"),
+                            Err(e) => {
+                                tracing::debug!(error = %e, "unreadable agent session command");
+                                refuse(&mut answer_after, Refusal::Malformed, format!("{e}"));
+                            }
                         }
                     }
                     // A message for an epoch (CP-T3.2): through its session's inbox, which answers.
@@ -2476,8 +2497,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::HarnessClose { session } => {
-                        if let Some(h) = &harness {
-                            h.close(&session);
+                        // One this runner doesn't have is gone here already: said so (`unknown`).
+                        if !harness.as_ref().is_some_and(|h| h.close(&session)) {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no session {session} here"));
                         }
                         // What it had going live: its app, its streams.
                         crate::browser::apps::stop(&session);
@@ -2486,7 +2508,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     ServerMsg::HarnessPackage { session, offset, data, done } => {
                         // A session going on here from the server's store (its machine is gone).
-                        let Some(h) = harness.clone() else { continue };
+                        let Some(h) = harness.clone() else {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unsupported, "agent sessions are not enabled on this runner");
+                            continue;
+                        };
                         // Handing everything to a new build of it, or retiring: an older process's
                         // hand-over isn't taken here (`Host::adopt_package`).
                         #[cfg(unix)]
@@ -2521,7 +2546,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 });
                             }
                             Ok(None) => {}
-                            Err(e) => tracing::warn!(%session, error = %format!("{e:#}"), "a session package couldn't be kept"),
+                            Err(e) => {
+                                tracing::warn!(%session, error = %format!("{e:#}"), "a session package couldn't be kept");
+                                refuse(&mut answer_after, crate::wire::channel::Refusal::Refused, format!("its package couldn't be kept: {e:#}"));
+                            }
                         }
                     }
                     ServerMsg::HarnessRelease { session } => {

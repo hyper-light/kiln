@@ -354,13 +354,25 @@ pub(crate) fn again_for(r: &inbox::Refusal) -> Option<u64> {
 /// How a command fared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sent {
-    /// On its way to the session's machine: a command, or a message whose inbox's answer didn't
-    /// come in time (or that went to a runner from before inboxes).
+    /// On its way to the session's machine, which can't say more: a message whose inbox's answer
+    /// didn't come in time, or a command or message to a runner from before the channel (or from
+    /// before inboxes). Also what kiln does here itself (a name kept).
     Ok,
     /// The session's inbox took the message, or had: `repeat`, the first time's answer (CP-T3.2).
     Accepted(Answer),
     /// The session's inbox refused the message, saying why.
     Refused(inbox::Refusal),
+    /// The session took the command: its runner applied it, or the server did (docs/wire.md,
+    /// "Commands").
+    Taken,
+    /// The session's runner refused the command, saying how and why: one it doesn't run there any
+    /// more is `unknown`.
+    Rejected { code: crate::wire::channel::Refusal, why: String },
+    /// The runner may or may not have applied it: its link dropped before it answered a command
+    /// that doesn't wait, or no answer came in time.
+    Unanswered(String),
+    /// A command that waits for its runner, which is away: it goes once the runner is back.
+    Parked,
     NoSession,
     /// The session's machine is not connected right now.
     Unreachable,
@@ -371,6 +383,8 @@ pub enum Pending {
     Now(Sent),
     /// A message on its way, its inbox's answer waited for ([`Registry::settle`]).
     Answer { message: String, rx: futures::channel::oneshot::Receiver<Said> },
+    /// A command on its runner's command stream, its answer to come ([`Sent::of`]).
+    Command(crate::hub::Pending),
 }
 
 /// What a sender is told of message `message` the session's machine took: its inbox's answer and,
@@ -387,9 +401,40 @@ pub fn accepted(message: impl serde::Serialize, a: &Answer) -> Value {
 }
 
 impl Sent {
-    /// It got to the session's machine (and its inbox didn't refuse it).
+    /// It got to the session's machine (and its inbox didn't refuse it), or waits for it.
     pub fn went(&self) -> bool {
-        matches!(self, Self::Ok | Self::Accepted(_))
+        matches!(self, Self::Ok | Self::Accepted(_) | Self::Taken | Self::Parked)
+    }
+
+    /// What a runner's answer to a command says of it (`crate::wire::commands`).
+    pub fn of(a: crate::wire::commands::Answer) -> Self {
+        use crate::wire::commands::Answer;
+        match a {
+            Answer::Taken => Self::Taken,
+            Answer::Refused { code, why } => Self::Rejected { code, why },
+            Answer::Unreachable { .. } => Self::Unreachable,
+            Answer::Unanswered { why } => Self::Unanswered(why),
+            Answer::Sent => Self::Ok,
+            Answer::Parked => Self::Parked,
+        }
+    }
+
+    /// For a command's caller over HTTP: the status and words of one that didn't go (a message's
+    /// answers are its inbox's, `accepted` and `inbox::Refusal`). None: it was taken, sent, or
+    /// waits for its runner.
+    pub fn failure(&self) -> Option<(http::StatusCode, String)> {
+        use crate::wire::channel::Refusal as Code;
+        use http::StatusCode;
+        match self {
+            Self::Ok | Self::Accepted(_) | Self::Taken | Self::Parked => None,
+            Self::Refused(r) => Some((StatusCode::CONFLICT, r.to_string())),
+            Self::Rejected { code: Code::Unknown, why } => Some((StatusCode::NOT_FOUND, format!("its runner doesn't have it: {why}"))),
+            Self::Rejected { code: Code::StaleEpoch, why } => Some((StatusCode::CONFLICT, format!("its runner let go of it: {why}"))),
+            Self::Rejected { why, .. } => Some((StatusCode::CONFLICT, format!("its runner refused it: {why}"))),
+            Self::Unanswered(why) => Some((StatusCode::GATEWAY_TIMEOUT, format!("its runner didn't say whether it did it: {why}"))),
+            Self::NoSession => Some((StatusCode::NOT_FOUND, "no such agent session".to_owned())),
+            Self::Unreachable => Some((StatusCode::CONFLICT, "the session's machine is not connected".to_owned())),
+        }
     }
 }
 
@@ -528,6 +573,8 @@ pub struct Registry {
     /// Sessions kiln doesn't keep going when they stop part-way (`goals::keep`; the "keep_going"
     /// control), kept in `keep-off.json` so it holds across restarts.
     keep_off: Mutex<std::collections::HashSet<String>>,
+    /// The UI's commands by the ids their clients made, each taken once (`super::asked`).
+    pub asked: super::asked::Asked,
     /// Which of its machine's runner processes holds each session on a machine (its instance:
     /// `main`, a uuid, `legacy`), kept in `holders.json` so it holds across restarts: a process
     /// that says what it holds speaks for its own sessions, never for another's that is away
@@ -656,6 +703,7 @@ impl Registry {
             local_shells: Mutex::new(HashMap::new()),
             names: Mutex::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             keep_off: Mutex::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
+            asked: super::asked::Asked::default(),
             holders: Mutex::new(std::fs::read(dir.join("holders.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             epochs: Mutex::new(std::fs::read(dir.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             proposed: Mutex::new(HashMap::new()),
@@ -1362,6 +1410,7 @@ impl Registry {
             self.visuals.forget(id);
             self.forget_holders(&[id.to_owned()]);
             self.opened.forget(id);
+            self.asked.forget(id);
             super::archive::closed(hub, id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         } else if let Some(info) = changed {
@@ -1380,14 +1429,7 @@ impl Registry {
                     self.local.command(&id, c.clone());
                 }
                 Location::Machine(machine) => {
-                    let msg = ServerMsg::HarnessCmd { session: id, json: json.clone() };
-                    let net = hub.net.clone();
-                    let peer = hub.agents.lock().get(&machine).and_then(|a| a.peer);
-                    if let (Some(peer), Ok(b)) = (peer, crate::proto::encode(&msg)) {
-                        crate::rt::spawn(async move {
-                            net.send(peer, LANE_TERM, crate::net::Kind::Term, b).await;
-                        });
-                    }
+                    hub.command_soon(&machine, &ServerMsg::HarnessCmd { session: id, json: json.clone() }).log_when_answered(crate::hub::LOG_WITHIN);
                 }
             }
         }
@@ -1395,14 +1437,7 @@ impl Registry {
 
     fn request_snapshot(&self, hub: &Hub, machine: &str, id: &str) {
         let msg = ServerMsg::HarnessCmd { session: id.to_owned(), json: json!({"type": "snapshot"}).to_string() };
-        let machine = machine.to_owned();
-        let net = hub.net.clone();
-        let peer = hub.agents.lock().get(&machine).and_then(|a| a.peer);
-        if let (Some(peer), Ok(b)) = (peer, crate::proto::encode(&msg)) {
-            crate::rt::spawn(async move {
-                net.send(peer, LANE_TERM, crate::net::Kind::Term, b).await;
-            });
-        }
+        hub.command_soon(machine, &msg).log_when_answered(crate::hub::LOG_WITHIN);
     }
 
     /// A machine (re)connected and said what it runs: forget sessions it no longer has. Its
@@ -1658,8 +1693,13 @@ impl Registry {
                 Location::Machine(machine) => {
                     let id = crate::util::new_id();
                     let json = serde_json::to_string(&spec)?;
-                    if !hub.send_to_agent(machine, LANE_TERM, &ServerMsg::HarnessOpen { session: id.clone(), json }).await {
-                        anyhow::bail!("machine {machine} is not connected");
+                    // Its runner answers once it started it (docs/wire.md, "Commands").
+                    use crate::wire::commands::Answer;
+                    match hub.command(machine, &ServerMsg::HarnessOpen { session: id.clone(), json }, crate::hub::COMMAND_WITHIN).await {
+                        Answer::Taken | Answer::Sent | Answer::Parked => {}
+                        Answer::Refused { why, .. } => anyhow::bail!("{machine} refused to start it: {why}"),
+                        Answer::Unreachable { .. } => anyhow::bail!("machine {machine} is not connected"),
+                        Answer::Unanswered { why } => anyhow::bail!("{machine} may or may not have started it: {why}"),
                     }
                     let now = crate::util::now_ms();
                     let kind = super::kinds::Kind::get(&spec.kind);
@@ -1945,9 +1985,49 @@ impl Registry {
     /// waited for (CP-T3.2): one sent for an epoch the session has since left is sent again, once,
     /// for the epoch its inbox named.
     pub async fn command(&self, hub: &Hub, id: &str, c: Command) -> Sent {
-        match self.dispatch(hub, id, c.clone()).await {
+        let pending = self.dispatch(hub, id, c.clone()).await;
+        self.resolve(hub, id, c, pending).await
+    }
+
+    /// What command `c` to session `id` is, for what its answers mean (`super::asked`): a message,
+    /// and whether it goes under its id to an inbox that takes it once.
+    pub fn kind_of(&self, hub: &Hub, id: &str, c: &Command) -> super::asked::Kind {
+        let message = super::session::is_message(c);
+        let inbox = match self.location(id) {
+            Some(Location::Local) => self.local.inbox().is_some(),
+            Some(Location::Machine(machine)) => hub.instances.lock().wide_caps_for(&machine, &crate::instances::Owned::Agent(id.to_owned())) & crate::proto::CAP_INBOX != 0,
+            None => false,
+        };
+        super::asked::Kind { message, deduped: message && inbox && message_id(c).is_some() }
+    }
+
+    /// Sends on command `c` to session `id`, new under the id `cmd` its client made, from `scope`
+    /// (the UI's sockets', and an API call's under its key: [`super::asked::Asked::take`] took
+    /// it). Its answers are kept as their stand says, whether or not who sent it is still there to
+    /// hear them: one parked at once, then its runner's once it's back.
+    pub async fn send_asked(&self, hub: &Arc<Hub>, id: &str, scope: &str, cmd: &str, c: Command) {
+        use std::time::Instant;
+        let pending = self.dispatch(hub, id, c.clone()).await;
+        let (h, session, scope, cmd) = (Arc::clone(hub), id.to_owned(), scope.to_owned(), cmd.to_owned());
+        crate::rt::spawn(async move {
+            let sent = match pending {
+                Pending::Command(p) if p.is_away() => {
+                    h.harness.asked.answered(&session, &scope, &cmd, &Sent::Parked, Instant::now());
+                    Sent::of(p.answer(crate::wire::commands::PARK_FOR).await)
+                }
+                other => h.harness.resolve(&h, &session, c, other).await,
+            };
+            h.harness.asked.answered(&session, &scope, &cmd, &sent, Instant::now());
+        });
+    }
+
+    /// What became of command `c` to session `id`, sent as [`Registry::dispatch`] said (`p`): its
+    /// answer, waited for.
+    pub async fn resolve(&self, hub: &Hub, id: &str, c: Command, p: Pending) -> Sent {
+        match p {
             Pending::Now(sent) => sent,
             Pending::Answer { message, rx } => self.settle(hub, id, c, &message, rx).await,
+            Pending::Command(p) => Sent::of(p.answer_or_parked(crate::hub::COMMAND_WITHIN).await),
         }
     }
 
@@ -1969,6 +2049,7 @@ impl Registry {
         match self.dispatch(hub, id, c).await {
             Pending::Now(sent) => sent,
             Pending::Answer { message, rx } => self.answer(hub, id, &message, rx).await,
+            Pending::Command(p) => Sent::of(p.answer_or_parked(crate::hub::COMMAND_WITHIN).await),
         }
     }
 
@@ -1997,8 +2078,9 @@ impl Registry {
             Err(e) => return Pending::Now(e),
         };
         let message = message_id(&c);
+        let is_message = super::session::is_message(&c);
         // A message without an id goes on unchecked (counted).
-        let unchecked = message.is_none() && super::session::is_message(&c);
+        let unchecked = message.is_none() && is_message;
         let epoch = self.epoch_of(id);
         match loc {
             Location::Local => {
@@ -2020,6 +2102,8 @@ impl Registry {
                 }
                 match (wait, message) {
                     (Some(rx), Some(message)) => Pending::Answer { message, rx },
+                    // A command its session here took.
+                    _ if !is_message => Pending::Now(Sent::Taken),
                     _ => Pending::Now(Sent::Ok),
                 }
             }
@@ -2040,16 +2124,18 @@ impl Registry {
                         None => Pending::Now(Sent::Ok),
                     };
                 }
-                // A name is given even while the machine is away: it's kept here.
-                if hub.send_to_agent(&machine, LANE_TERM, &ServerMsg::HarnessCmd { session: id.to_owned(), json }).await || renamed {
-                    // A message to a runner from before inboxes, or one without an id: unchecked.
-                    if unchecked || had_id {
-                        crate::metrics::sends().unchecked.inc();
-                    }
-                    Pending::Now(Sent::Ok)
-                } else {
-                    Pending::Now(Sent::Unreachable)
+                // On the runner's command stream, which answers it (docs/wire.md, "Commands").
+                let p = hub.command_start(&machine, &ServerMsg::HarnessCmd { session: id.to_owned(), json }).await;
+                let unreachable = matches!(p.at_once(), Some(crate::wire::commands::Answer::Unreachable { .. }));
+                if unreachable && !renamed {
+                    return Pending::Now(Sent::Unreachable);
                 }
+                // A message to a runner from before inboxes, or one without an id: unchecked.
+                if unchecked || had_id {
+                    crate::metrics::sends().unchecked.inc();
+                }
+                // A name is given even while the machine is away: it's kept here.
+                if unreachable { Pending::Now(Sent::Ok) } else { Pending::Command(p) }
             }
         }
     }
@@ -2103,14 +2189,19 @@ impl Registry {
             hub.emit(&json!({"type": "harness", "info": info}));
         }
         tracing::info!(session = %id, from = %from_name, %to, bytes = bytes.len(), "agent session goes on on another machine, from the server's store");
-        // In pieces, on the conversation lane.
-        const PIECE: usize = 3 << 20;
+        // In pieces that fit a command's frame, each answered before the next goes (docs/wire.md,
+        // "Commands"): a move whose machine went away mid-way says so.
+        const PIECE: usize = 768 << 10;
         let pieces: Vec<&[u8]> = bytes.chunks(PIECE).collect();
         let mut offset = 0u64;
         for (n, piece) in pieces.iter().enumerate() {
+            use crate::wire::commands::Answer;
             let msg = ServerMsg::HarnessPackage { session: id.to_owned(), offset, data: piece.to_vec(), done: n + 1 == pieces.len() };
-            if !hub.send_to_agent(to, crate::proto::LANE_CONVO, &msg).await {
-                return Err(format!("{to} went away while the session was on its way"));
+            match hub.command(to, &msg, crate::hub::COMMAND_WITHIN).await {
+                Answer::Taken | Answer::Sent => {}
+                Answer::Refused { why, .. } => return Err(format!("{to} couldn't take the session: {why}")),
+                Answer::Unreachable { .. } | Answer::Parked => return Err(format!("{to} went away while the session was on its way")),
+                Answer::Unanswered { why } => return Err(format!("{to} didn't answer while the session was on its way: {why}")),
             }
             offset += piece.len() as u64;
         }
@@ -2122,7 +2213,11 @@ impl Registry {
         let ok = match &loc {
             None => false,
             Some(Location::Local) => self.local.close(id),
-            Some(Location::Machine(machine)) => hub.send_to_agent(machine, LANE_TERM, &ServerMsg::HarnessClose { session: id.to_owned() }).await,
+            // Closed there, or once its machine is back; one its machine doesn't run is gone there.
+            Some(Location::Machine(machine)) => {
+                use crate::wire::commands::Answer;
+                matches!(hub.command(machine, &ServerMsg::HarnessClose { session: id.to_owned() }, crate::hub::COMMAND_WITHIN).await, Answer::Taken | Answer::Sent | Answer::Parked)
+            }
         };
         // A machine that is gone cannot confirm: forget it here; it is dropped there on reconnect.
         // Ended in the store too, or it would be listed as away again after a restart.
@@ -2135,6 +2230,7 @@ impl Registry {
             self.visuals.forget(id);
             self.streams.forget(hub, id).await;
             self.opened.forget(id);
+            self.asked.forget(id);
             if let Some(store) = &self.convo {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }

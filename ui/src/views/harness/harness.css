@@ -2860,6 +2860,43 @@ textarea.hx-input {
 
 /* Paused for a usage limit: the same disclosure line as the work around it. Actions can be
    folded away; their own scroll area leaves room for the conversation and composer on a phone. */
+/* What was asked here and waits for its answer, or was refused (asked.tsx). */
+.hx-asked {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  margin: 0;
+  padding: 6px 4px;
+  list-style: none;
+  border-block: 1px solid #25272c;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-secondary);
+}
+.hx-asked-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.hx-asked-row > svg {
+  flex: none;
+  color: var(--color-subtle);
+}
+.hx-asked-row[data-state="refused"] > svg {
+  color: var(--color-fail);
+}
+.hx-asked-what {
+  flex: none;
+  color: var(--color-foreground);
+}
+.hx-asked-how {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-subtle);
+}
 .hx-paused {
   min-width: 0;
   border-block: 1px solid #25272c;

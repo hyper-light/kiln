@@ -178,6 +178,11 @@ pub struct Pending {
 }
 
 impl Pending {
+    /// A parked command whose runner is away: it goes once the runner is back.
+    pub fn is_away(&self) -> bool {
+        self.away
+    }
+
     /// Its answer, when it has one already: none of its runner's processes could take it, or
     /// none can answer.
     pub fn at_once(&self) -> Option<&crate::wire::commands::Answer> {
@@ -227,6 +232,25 @@ impl Pending {
         crate::rt::spawn(async move {
             let _ = self.answer(within).await;
         });
+    }
+}
+
+/// Which of a runner process's command streams `msg` rides (docs/wire.md, "Commands"): live for
+/// a command refused while its runner is away, parked for one that waits for it. A `HarnessCmd`
+/// rides as the command it carries says. None: not a command.
+fn stream_of(msg: &ServerMsg) -> Option<crate::wire::commands::Kind> {
+    use crate::wire::commands::Kind as Stream;
+    use crate::wire::{Away, Class};
+    let class = match (crate::wire::server_class(msg), msg) {
+        (Class::Command(Away::AsItsCommand), ServerMsg::HarnessCmd { json, .. }) => {
+            serde_json::from_str::<crate::harness::model::Command>(json).map_or(Class::Command(Away::Park), |c| crate::wire::command_class(&c))
+        }
+        (c, _) => c,
+    };
+    match class {
+        Class::Command(Away::Refuse) => Some(Stream::Live),
+        Class::Command(Away::Park | Away::AsItsCommand) | Class::State => Some(Stream::Parked),
+        _ => None,
     }
 }
 
@@ -323,6 +347,9 @@ pub struct Hub {
     pub cmds: Mutex<crate::wire::commands::Commands>,
     /// The process each machine that's away last had: its parked commands wait for it there.
     away_peers: Mutex<HashMap<String, PeerId>>,
+    /// Commands queued where nothing could wait to send them ([`Hub::command_soon`]): the commands
+    /// loop sends them now rather than on its next tick.
+    commands_due: Notify,
     /// The AI coding sessions each connected machine last reported.
     pub ai_sessions: Mutex<HashMap<String, Vec<crate::aisessions::AiSession>>>,
     /// Transcript requests waiting for their machine's answer, by request number.
@@ -467,6 +494,7 @@ impl Hub {
             // never mistakes another's commands for these.
             cmds: Mutex::new(crate::wire::commands::Commands::new(rand::random::<u64>() >> 11)),
             away_peers: Mutex::new(HashMap::new()),
+            commands_due: Notify::new(),
             ai_sessions: Mutex::new(HashMap::new()),
             ai_requests: Mutex::new(HashMap::new()),
             ai_seq: AtomicU64::new(1),
@@ -995,33 +1023,66 @@ impl Hub {
     /// Sends `msg` to machine `agent` as a command, to the processes [`Hub::peers_for`] picks: its
     /// answer to come (a caller that mustn't wait for it, the scheduler say, takes it later).
     pub async fn command_start(&self, agent: &str, msg: &ServerMsg) -> Pending {
-        use crate::wire::{Away, Class};
+        let peers = self.command_targets(agent, msg);
+        self.command_peers(agent, peers, msg).await
+    }
+
+    /// [`Hub::command_start`] where nothing can wait (a sync path, under a lock): the command is
+    /// queued now, and the commands loop sends it at once. A runner from before the channel gets
+    /// it if its lane has room.
+    pub fn command_soon(&self, agent: &str, msg: &ServerMsg) -> Pending {
+        let peers = self.command_targets(agent, msg);
+        let pending = self.queue_command(agent, peers, msg, |p, body| self.net.try_send(p, LANE_CONTROL, Kind::Control, body));
+        self.commands_due.notify();
+        pending
+    }
+
+    /// The runner processes a command to machine `agent` goes to ([`Hub::peers_for`]): for a
+    /// parked one to a machine that's away, the process it last had, which comes back under the
+    /// same certificate.
+    fn command_targets(&self, agent: &str, msg: &ServerMsg) -> Vec<PeerId> {
         let mut peers = self.peers_for(agent, msg);
-        // A parked command to a machine that's away waits for the process it last had, which
-        // comes back under the same certificate.
-        if peers.is_empty() && matches!(crate::wire::server_class(msg), Class::Command(Away::Park) | Class::State) {
+        if peers.is_empty() && stream_of(msg) == Some(crate::wire::commands::Kind::Parked) {
             let last = self.away_peers.lock().get(agent).copied();
             peers.extend(last.filter(|p| self.cmds.lock().keeps(*p)));
         }
-        self.command_peers(agent, peers, msg).await
+        peers
     }
 
     /// Sends `msg` as a command to runner processes `peers` of machine `agent`. One that keeps the
     /// channel gets it on its command stream (parked or live, as the message's class says) and
     /// answers it once it applied it; one from before the channel gets it as it always did.
     pub async fn command_peers(&self, agent: &str, peers: Vec<PeerId>, msg: &ServerMsg) -> Pending {
+        // A runner from before the channel gets it as it always did, sent after the rest.
+        let mut legacy: Vec<(PeerId, Vec<u8>)> = Vec::new();
+        let mut pending = self.queue_command(agent, peers, msg, |p, body| {
+            legacy.push((p, body));
+            true
+        });
+        if !legacy.is_empty() {
+            let mut sent = false;
+            for (p, body) in legacy {
+                sent |= self.net.send(p, LANE_CONTROL, Kind::Control, body).await;
+            }
+            if !sent {
+                use crate::wire::commands::Answer;
+                pending.at_once = if pending.waits.is_empty() { Answer::Unreachable { why: format!("{agent} is not connected") } } else { Answer::Taken };
+            }
+        }
+        self.flush_commands().await;
+        pending
+    }
+
+    /// Queues command `msg` to runner processes `peers` of machine `agent`: on its command stream
+    /// for one that keeps the channel, else handed to `legacy` (which says whether it went).
+    fn queue_command(&self, agent: &str, peers: Vec<PeerId>, msg: &ServerMsg, mut legacy: impl FnMut(PeerId, Vec<u8>) -> bool) -> Pending {
         use crate::wire::commands::{Answer, Kind as Stream};
-        use crate::wire::{Away, Class};
         let what = crate::wire::server_name(msg);
         let at_once = |a: Answer| Pending { agent: agent.to_owned(), what, waits: Vec::new(), at_once: a, away: false };
         if peers.is_empty() {
             return at_once(Answer::Unreachable { why: format!("{agent} is not connected") });
         }
-        let stream = match crate::wire::server_class(msg) {
-            Class::Command(Away::Refuse) => Some(Stream::Live),
-            Class::Command(Away::Park | Away::AsItsCommand) | Class::State => Some(Stream::Parked),
-            _ => None,
-        };
+        let stream = stream_of(msg);
         let body = match proto::encode(msg) {
             Ok(b) => b,
             Err(e) => return at_once(Answer::Unreachable { why: format!("it couldn't be encoded: {e}") }),
@@ -1046,11 +1107,10 @@ impl Hub {
                 }
                 None => {
                     away = false;
-                    sent |= self.net.send(p, LANE_CONTROL, Kind::Control, body.clone()).await;
+                    sent |= legacy(p, body.clone());
                 }
             }
         }
-        self.flush_commands().await;
         let first = if sent {
             Answer::Sent
         } else if !waits.is_empty() {
@@ -1097,6 +1157,7 @@ impl Hub {
         loop {
             futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
+                () = self.commands_due.notified().fuse() => {}
                 () = tick.tick().fuse() => {}
             }
             // Runners that never said they keep the channel: from before it, what waited for them
@@ -1793,7 +1854,7 @@ impl Hub {
                     // doesn't count either way).
                     let lets_go = self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
                     let msg = if lets_go { ServerMsg::HarnessRelease { session } } else { ServerMsg::HarnessClose { session } };
-                    self.send_peer(peer, &msg).await;
+                    self.command_peers(&agent, vec![peer], &msg).await.log_when_answered(LOG_WITHIN);
                 }
                 // An inbox's answer counts wherever it came from (it's for the message sent there),
                 // and says nothing of where the session runs: whoever waits for it is told, and

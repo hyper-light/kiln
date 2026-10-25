@@ -7,7 +7,7 @@
 
 mod common;
 
-use std::process::{Child, Command};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -67,7 +67,7 @@ fn a_message_sent_twice_under_one_key_through_a_runner_reaches_its_agent_once() 
         std::fs::create_dir_all(d)?;
     }
     let log = std::fs::File::create(dir.path().join("runner.log"))?;
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    let mut cmd = common::kiln();
     cmd.args(["agent", "--server", &format!("http://127.0.0.1:{}", server.port), "--token", &join, "--name", "t3-runner", "--labels", "t3"])
         .arg("--state-dir")
         .arg(&state)

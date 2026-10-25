@@ -299,7 +299,7 @@ fn w14_ac01_stacks() -> anyhow::Result<()> {
 
 /// `kiln` with `args` in `dir`, as a developer whose token is `token` would run it.
 fn kiln(home: &Path, dir: &Path, s: &Server, token: &str, args: &[&str]) -> anyhow::Result<(bool, String)> {
-    let o = Command::new(env!("CARGO_BIN_EXE_kiln"))
+    let o = common::kiln()
         .args(args)
         .current_dir(dir)
         .env("HOME", home)
@@ -2866,7 +2866,7 @@ fn w17_r01_kiln_debug_terminal() -> anyhow::Result<()> {
         anyhow::ensure!(Instant::now() < deadline, "the leg never ran: {body}\n{}", s.log());
         std::thread::sleep(Duration::from_millis(500));
     };
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kiln"))
+    let mut child = common::kiln()
         .args(["debug", "terminal", &leg])
         .env("HOME", &home)
         .env("KILN_URL", format!("http://127.0.0.1:{}", s.port))

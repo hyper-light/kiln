@@ -868,6 +868,10 @@ export type Update =
   /** Files finished messages mention, kept by the server (ahead of the events in a snapshot). */
   | { t: "files"; files: KeptFile[] }
   | { t: "error"; error: string }
+  /** A command sent under `id` was taken: applied, parked for its runner, accepted by its inbox (`accepted`), or sent to a runner that can't say more (docs/wire.md, "The UI's sockets"). */
+  | { t: "ack"; id: string; outcome: "taken" | "parked" | "accepted" | "unchecked" | "pending"; accepted?: unknown }
+  /** A command sent under `id` wasn't: its kind (`code`) and why; `again` when it may go again under its id (it didn't get through this time); `id` null for what couldn't be read. */
+  | { t: "nack"; id: string | null; code: string; why: string; again?: boolean; refused?: unknown }
   | { t: "closed" }
   | { t: "state"; state: State }
   /** What changed in the state since the last one (asked for with `?patch=state`): the fields set, and those gone. */
@@ -882,11 +886,11 @@ export type Update =
 
 /* ------------------------------------------------------------------ REST */
 
-async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>): Promise<T> {
   const res = await fetch(path, {
     method,
     credentials: "same-origin",
-    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    headers: body === undefined ? headers : { "content-type": "application/json", ...headers },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   });
@@ -1059,8 +1063,13 @@ export const harnessApi = {
   /** Every agent of `machine`, which is gone, goes on elsewhere from the server's copy of its conversation: each on the machine that suits it, or all on `to`. */
   recover: (machine: string, to?: string) =>
     call<{ moved: { id: string; name: string; to?: string; error?: string }[] }>("POST", `/api/harness/machines/${encodeURIComponent(machine)}/recover`, to ? { to } : {}),
-  /** A command without opening the session's socket (inbox answers). */
-  command: (id: string, c: Command) => call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c),
+  /**
+   * A command without opening the session's socket (inbox answers). It goes under an id, as on the
+   * socket: a message's own (its id is its key), else `key`, one made now unless given, taken once
+   * however often it's sent under it (docs/wire.md, "The UI's sockets").
+   */
+  command: (id: string, c: Command, key: string = clientId()) =>
+    call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, c.type === "send" || c.type === "skill_run" ? undefined : { "idempotency-key": key }),
   /** Events whose words hold every word of `q`, across conversations (one agent's with `agent`; those before `until`, unix ms), newest first, from the server's conversation store. */
   said: (p: { q: string; agent?: string; until?: number; limit?: number }) => {
     const qs = new URLSearchParams({ q: p.q });
@@ -1114,6 +1123,33 @@ export const clientId = (): string => {
 
 export type Conn = "connecting" | "open" | "reconnecting" | "gone";
 
+/** A command this page sent under an id it made (docs/wire.md, "The UI's sockets"): waiting for its answer (sent again on the next socket until it comes), or refused, saying how and why. */
+export interface Asked {
+  id: string;
+  command: Command;
+  /** When it was first sent (ms). */
+  at: number;
+  state: "pending" | "refused";
+  code?: string;
+  why?: string;
+  /** How many times it was answered for now (parked, or to send again), and sent again for it. */
+  tries?: number;
+}
+
+/** How long a command waits for an answer, sent again on each socket meanwhile: past it, it's said to have had none. One answered for now (parked, or to send again) has had one, and goes on. */
+export const ASKED_FOR_MS = 10 * 60_000;
+/** How long a refused command stays shown. */
+export const REFUSED_FOR_MS = 15_000;
+/** How long a command answered for now (parked, or a nack the server says to send `again`) waits before it goes again under its id: doubling from the first, to the last at most. */
+export const AGAIN_AFTER_MS = [10_000, 20_000, 40_000, 60_000];
+
+/** The id a command goes under: a message's own (its inbox takes it once under it), else one made now. */
+export function commandId(c: Command): string {
+  if (c.type === "send" && c.id) return c.id;
+  if (c.type === "skill_run" && c.id) return c.id;
+  return clientId();
+}
+
 export interface Snapshot {
   conn: Conn;
   info: AgentInfo | null;
@@ -1132,6 +1168,8 @@ export interface Snapshot {
   stopAsked: { turn: number | undefined; at: number } | null;
   /** When the turn under way began, kept once it ends: between turns the clock holds the last one's length. */
   ranFrom: number | null;
+  /** The commands this page sent that haven't been answered, and those refused a moment ago. */
+  asked: Asked[];
 }
 
 /**
@@ -1158,7 +1196,7 @@ export function lastTurnFrom(s: Snapshot): number | null {
 /** A promise React reads as settled without waiting (its `status`, as React marks the ones it tracks). */
 const READY: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
 
-const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, files: [], error: null, ready: false, stopAsked: null, ranFrom: null };
+const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, files: [], error: null, ready: false, stopAsked: null, ranFrom: null, asked: [] };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /**
  * The snapshot sent as the socket opens ends with the server's "synced"; one sent later (a machine
@@ -1309,6 +1347,8 @@ export class SessionStore {
   /** When nothing showed it any more. */
   idleSince = 0;
   private replies = new Map<string, (v: unknown) => void>();
+  /** The commands sent and not answered yet, and those refused a moment ago, by id. */
+  private asked = new Map<string, Asked>();
   private waiting: { promise: Promise<void>; resolve: () => void } | null = null;
   /** Packed messages being unpacked, and the chain they (and what came after them) are taken in. */
   private unpacking = 0;
@@ -1351,12 +1391,61 @@ export class SessionStore {
   /** Connect now rather than at the next try (the tab is shown again, the network is back). */
   wake = () => this.kick(false);
 
-  /** Send a command; false when the session isn't connected. */
+  /**
+   * Send a command; false when the session isn't connected. It goes under an id ({@link commandId}),
+   * taken once however often it's sent: kept until its answer comes, it's sent again on each socket
+   * after this one, and shown as waiting meanwhile, or refused once it is (`Snapshot.asked`).
+   */
   send = (c: Command): boolean => {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
-    this.ws.send(JSON.stringify(c));
+    const id = commandId(c);
+    this.asked.set(id, { id, command: c, at: Date.now(), state: "pending" });
+    this.ws.send(JSON.stringify({ t: "cmd", id, c }));
+    this.patch({ asked: [...this.asked.values()] });
     return true;
   };
+
+  /** The socket's open: what was sent and not answered goes again under its id; what waited too long for any answer is said to have had none. */
+  private sendAgain(ws: WebSocket) {
+    const now = Date.now();
+    let changed = false;
+    for (const a of this.asked.values()) {
+      if (a.state !== "pending") continue;
+      if (!a.tries && now - a.at > ASKED_FOR_MS) {
+        this.refuse(a.id, "unanswered", "no answer came");
+        changed = true;
+        continue;
+      }
+      ws.send(JSON.stringify({ t: "cmd", id: a.id, c: a.command }));
+    }
+    if (changed) this.patch({ asked: [...this.asked.values()] });
+  }
+
+  /** Command `id` was answered for now: it waits, and goes again under its id in a while, on this socket if it's still open (or on the next as any waiting one does). */
+  private later(id: string, why?: string) {
+    const a = this.asked.get(id);
+    if (!a || a.state !== "pending") return;
+    const tries = (a.tries ?? 0) + 1;
+    this.asked.set(id, { ...a, tries, why });
+    this.patch({ asked: [...this.asked.values()] });
+    const ws = this.ws;
+    window.setTimeout(() => {
+      const now = this.asked.get(id);
+      if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && now.tries === tries) ws.send(JSON.stringify({ t: "cmd", id, c: now.command }));
+    }, AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1]);
+  }
+
+  /** Command `id` was refused: shown so a moment, then let go of. */
+  private refuse(id: string, code: string, why: string) {
+    const a = this.asked.get(id);
+    if (!a) return;
+    this.asked.set(id, { ...a, state: "refused", code, why });
+    window.setTimeout(() => {
+      if (this.asked.get(id)?.state !== "refused") return;
+      this.asked.delete(id);
+      this.patch({ asked: [...this.asked.values()] });
+    }, REFUSED_FOR_MS);
+  }
 
   /**
    * Stop the turn under way; `force` when asking didn't take (the harness starts again, the
@@ -1454,6 +1543,9 @@ export class SessionStore {
     this.ws = ws;
     this.wsAt = Date.now();
     this.unpacking = 0;
+    ws.onopen = () => {
+      if (this.ws === ws) this.sendAgain(ws);
+    };
     ws.onmessage = (ev) => {
       if (this.ws !== ws) return;
       if (typeof ev.data === "string") {
@@ -1560,6 +1652,21 @@ export class SessionStore {
       }
       case "error":
         this.patch({ error: u.error });
+        return;
+      case "ack":
+        // Parked for its machine, which is away: it waits, asked again in a while.
+        if (u.outcome === "parked") return this.later(u.id, "its machine is away, and it goes once that's back");
+        // A message its inbox hasn't answered yet: asked again, its inbox answers a repeat if it took it.
+        if (u.outcome === "pending") return this.later(u.id, "its inbox hasn't said it took it yet");
+        if (this.asked.delete(u.id)) this.patch({ asked: [...this.asked.values()] });
+        return;
+      case "nack":
+        // Not this time (its machine away, its inbox full ...): it waits, and goes again.
+        if (u.id != null && u.again) return this.later(u.id, u.why);
+        if (u.id != null && this.asked.has(u.id)) {
+          this.refuse(u.id, u.code, u.why);
+          this.patch({ asked: [...this.asked.values()], error: u.why });
+        } else this.patch({ error: u.why });
         return;
       case "open":
       case "resumed":

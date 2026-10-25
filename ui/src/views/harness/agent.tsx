@@ -28,6 +28,7 @@ import { EarlierMatches } from "./said";
 import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
 import { DesktopLayout, INSPECTOR_COLLAPSED } from "./desktop";
+import { AskedLine } from "./asked";
 import { PausedLine } from "./pause";
 import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
@@ -510,6 +511,7 @@ function Dock({
         </div>
       ) : null}
       <PausedLine store={store} send={send} onLogin={() => onView("login")} />
+      <AskedLine store={store} />
       <Composer store={store} agent={id} attachments={attachments} toMain={toMain} task={task} onView={onView} onTerminal={onTerminal} replyTo={reply} onClearReply={onClearReply} />
     </div>
   );

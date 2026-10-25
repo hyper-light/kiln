@@ -389,7 +389,7 @@ impl Runner {
             std::fs::create_dir_all(d)?;
         }
         let log = std::fs::File::create(dir.join("runner.log"))?;
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_kiln"));
+        let mut cmd = common::kiln();
         cmd.args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", token.trim(), "--name", name, "--labels", "lab"])
             .arg("--state-dir")
             .arg(&state)
@@ -399,9 +399,6 @@ impl Runner {
             .env("NO_COLOR", "1")
             .stdout(log.try_clone()?)
             .stderr(log);
-        for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG", "KILN_SERVER", "KILN_JOIN_TOKEN", "KILN_AGENT_NAME"] {
-            cmd.env_remove(var);
-        }
         Ok(Self(cmd.spawn()?))
     }
 }

@@ -983,11 +983,12 @@ async fn run_claimed(hub: &Hub, p: &Plan, target: Target, mode: Mode, pick: &Pic
         let step = n.saturating_add(first).to_string();
         let c = Command::Send { id: crate::util::derive_id(&["plan-run", &run, &step]), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
         match hub.harness.command(hub, &session, c).await {
-            Sent::Ok | Sent::Accepted(_) => {
+            Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => {
                 sent += 1;
                 *acted = true;
             }
             Sent::Refused(r) => return Err(Error::Bad(r.to_string())),
+            s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => return Err(Error::Bad(s.failure().map_or_else(|| "its runner refused it".to_owned(), |(_, why)| why))),
             Sent::NoSession => return Err(Error::Bad("no such agent".into())),
             Sent::Unreachable => return Err(Error::Bad("that agent's machine is not connected".into())),
         }

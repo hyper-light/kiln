@@ -168,12 +168,12 @@ counted.
 | GET | `/api/harness/sessions` | `Info[]` |
 | POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?}` → `Info[]` |
 | GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good |
-| POST | `/api/harness/sessions/:id/command` | a `Command` → 204, or for a message (a `send`, a skill run with its `id`) its inbox's answer: 200 `{sent, message, accepted}` (`accepted.repeat` when its id was taken before), or a typed refusal (409 for an epoch the agent left, a machine it moved from, or an id given to other words). A message's `id` is its idempotency key; an `Idempotency-Key` header makes it from that instead (docs/sends.md) |
+| POST | `/api/harness/sessions/:id/command` | a `Command` → its runner's answer: 204 taken, 202 `{parked: true}` (its machine is away and it waits for it), 404 when its runner doesn't have the session, 409 for another refusal (how and why) or a machine that's away for one refused while away, 504 when its link dropped before it answered (docs/wire.md, "Commands"); for a message (a `send`, a skill run with its `id`) its inbox's answer: 200 `{sent, message, accepted}` (`accepted.repeat` when its id was taken before), or a typed refusal (409 for an epoch the agent left, a machine it moved from, or an id given to other words). A message's `id` is its idempotency key; an `Idempotency-Key` header makes it from that instead (docs/sends.md), and takes any other command once under it |
 | POST | `/api/harness/broadcast` | one thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits on you; see below |
 | POST | `/api/harness/command` | `{ids, command, key?}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`); each agent's message id is made from `key` (or the `Idempotency-Key` header, else the command's own `id`) and the agent, so sending it again sends the same messages |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
 | GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it. Native Codex subagents return `reset: true`: replace previous output with this snapshot (last 64 KiB), regardless of `since`; `pending: true` means a live child has not produced output yet |
-| WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands may be sent on it too |
+| WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands go on it too, each under an id and answered `ack` or `nack` (docs/wire.md, "The UI's sockets") |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
 | POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear,restore}` | run, pause, skip the goal under way, empty its goal stack, or bring back the goals cleared last |
@@ -815,6 +815,12 @@ on Slates).
 
 Every command is JSON with a `type`. Those that answer one client carry `client` (any string the
 console picks) and are answered with a `reply` update to that client.
+
+Each command is answered: on the session's socket, sent under an id (`{"t": "cmd", "id", "c"}`),
+with `ack` or `nack`, taken once however often it's sent; over the API, as its status. What waits
+for an agent's machine while it's away and what's refused at once, how each answer comes, and what
+a reconnect or a restart does to commands on their way: docs/wire.md ("Commands", "The UI's
+sockets").
 
 | type | fields | answer |
 |---|---|---|

@@ -140,10 +140,13 @@ async fn send(cx: Cx, v: Value) -> Out {
         None => made,
     };
     wait::sent(&id, info.last_turn.as_ref().map(|t| t.at));
-    match cx.hub.harness.command(&cx.hub, &id, Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None}).await {
-        Sent::Ok => Ok(json!({"sent": true, "message": message})),
+    match cx.hub.harness.command(&cx.hub, &id, Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None }).await {
+        Sent::Ok | Sent::Taken => Ok(json!({"sent": true, "message": message})),
+        // Its machine is away: it goes once that's back, once.
+        Sent::Parked => Ok(json!({"sent": true, "parked": true, "message": message})),
         Sent::Accepted(a) => Ok(super::registry::accepted(&message, &a)),
         Sent::Refused(r) => Err(refused(&r)),
+        s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => Err(s.failure().unwrap_or((StatusCode::CONFLICT, "its runner refused it".to_owned()))),
         Sent::NoSession => Err((StatusCode::NOT_FOUND, format!("no agent {id}"))),
         Sent::Unreachable => Err((StatusCode::BAD_GATEWAY, format!("{}'s machine isn't connected right now: try again once it's back", info.name))),
     }
@@ -234,7 +237,7 @@ async fn hand_over(hub: &crate::hub::Hub, me: &wait::Waiter) -> Vec<Value> {
     }
     for q in hub.harness.queue(&me.id).into_iter().filter(|q| mail.contains(&q.id)) {
         let Some(from) = super::queued::sender_of(&q.id).map(str::to_owned) else { continue };
-        if !wait::claim(&q.id) || !matches!(hub.harness.command(hub, &me.id, Command::QueueRemove { id: q.id.clone() }).await, Sent::Ok) {
+        if !wait::claim(&q.id) || !hub.harness.command(hub, &me.id, Command::QueueRemove { id: q.id.clone() }).await.went() {
             continue;
         }
         let name = hub.harness.info(&from).map(|i| i.name);
@@ -421,8 +424,9 @@ async fn interrupt(cx: Cx, v: Value) -> Out {
     let id = info.id.clone();
     may_steer(&cx, &id).await?;
     match cx.hub.harness.command(&cx.hub, &id, Command::Interrupt).await {
-        Sent::Ok | Sent::Accepted(_) => Ok(json!({"interrupted": true})),
+        Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => Ok(json!({"interrupted": true})),
         Sent::Refused(r) => Err(refused(&r)),
+        s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => Err(s.failure().unwrap_or((StatusCode::CONFLICT, "its runner refused it".to_owned()))),
         Sent::NoSession => Err((StatusCode::NOT_FOUND, format!("no agent {id}"))),
         Sent::Unreachable => Err((StatusCode::BAD_GATEWAY, format!("{}'s machine isn't connected right now", info.name))),
     }

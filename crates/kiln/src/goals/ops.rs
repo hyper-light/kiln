@@ -244,11 +244,14 @@ async fn dispatch(hub: &crate::hub::Hub, agent: &str, p: &super::Planned) -> Res
     let id = format!("{}plan-{}", crate::harness::pause::KILN_ID, crate::util::derive_id(&["goals.plan.dispatch", &p.plan, &asked.map(|a| a.to_string()).unwrap_or_default()]));
     let send = crate::harness::model::Command::Send { id, text: dispatch_words(p), mode: crate::harness::model::SendMode::Steer, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
     match hub.harness.command(hub, agent, send).await {
-        crate::harness::registry::Sent::Ok | crate::harness::registry::Sent::Accepted(_) => {
+        crate::harness::registry::Sent::Ok | crate::harness::registry::Sent::Accepted(_) | crate::harness::registry::Sent::Taken | crate::harness::registry::Sent::Parked => {
             let _ = hub.store.kv_set(key, now.to_string()).await;
             Ok(())
         }
         crate::harness::registry::Sent::Refused(why) => Err(format!("its agent's inbox refused it ({why}), so it's planned when the stack gets to it")),
+        s @ (crate::harness::registry::Sent::Rejected { .. } | crate::harness::registry::Sent::Unanswered(_)) => {
+            Err(format!("{}, so it's planned when the stack gets to it", s.failure().map_or_else(|| "its agent's runner refused it".to_owned(), |(_, why)| why)))
+        }
         crate::harness::registry::Sent::NoSession => Err("the agent isn't running, so it's planned when the stack gets to it".into()),
         crate::harness::registry::Sent::Unreachable => Err("the agent's machine can't be reached, so it's planned when the stack gets to it".into()),
     }
