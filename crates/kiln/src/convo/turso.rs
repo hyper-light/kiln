@@ -1360,6 +1360,10 @@ impl Engine for Turso {
         }
     }
 
+    fn release(&mut self) -> anyhow::Result<()> {
+        self.flush()
+    }
+
     fn look(&mut self, count: bool) -> anyhow::Result<Look> {
         let pages = |p: &str| -> anyhow::Result<u64> { Ok(self.one_int(&format!("PRAGMA {p}"), &[])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0)) };
         let page = pages("page_size")?;

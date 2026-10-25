@@ -54,3 +54,35 @@ pub fn open_file(dir: &std::path::Path, file: &str, upkeep: store::Upkeep) -> Op
         }
     }
 }
+
+/// Move a store's file at `from`, once let go of ([`store::Store::close`]), to `to`, with its log
+/// beside it: for the process that goes on with it there (a new build taking over from the runner
+/// being upgraded keeps that runner's store, `crate::bluegreen`). Never over a file at `to`.
+pub fn move_file(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {
+    let side = |p: &std::path::Path, s: &str| {
+        let mut name = p.as_os_str().to_owned();
+        name.push(s);
+        std::path::PathBuf::from(name)
+    };
+    for s in ["", "-wal", "-shm"] {
+        anyhow::ensure!(!side(to, s).exists(), "{} is there already", side(to, s).display());
+    }
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::rename(from, to).map_err(|e| anyhow::Error::from(e).context(format!("move {} to {}", from.display(), to.display())))?;
+    for s in ["-wal", "-shm"] {
+        match std::fs::rename(side(from, s), side(to, s)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("move {}", side(from, s).display()))),
+        }
+    }
+    // The renames themselves on disk (not on Windows, which opens no folder).
+    if let Some(dir) = to.parent()
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
