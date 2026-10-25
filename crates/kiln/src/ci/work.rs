@@ -2216,7 +2216,7 @@ mod tests {
         in_store(move |c| {
             let sc = scope("acme/app", "trusted");
             let u = unit_with("first");
-            anyhow::ensure!(matches!(write(c, None, &sc, &key::weak(&u), &read, &made("trusted", "r1", &[("libprobe.rmeta", "sha256:meta")]))?, Written::New(_)));
+            anyhow::ensure!(matches!(write(c, None, &sc, &u, &read, &made("trusted", "r1", &[("libprobe.rmeta", "sha256:meta")]))?, Written::New(_)));
             let found = |u: &Unit, ws: &PathBuf| -> anyhow::Result<bool> { Ok(lookup_as(c, None, "acme/app", &Domain::Trusted, u, &now_in(ws.clone()))?.hit.is_some()) };
             anyhow::ensure!(found(&u, &one2)?, "what it read is as it was");
             anyhow::ensure!(found(&u, &two2)?, "from another workspace, its paths placed alike (W24-R05)");
