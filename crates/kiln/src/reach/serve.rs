@@ -580,13 +580,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_login_shells_environment_bigger_than_its_pipe_is_read() -> anyhow::Result<()> {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir()?;
-        let shell = dir.path().join("shell");
-        std::fs::write(&shell, "#!/bin/sh\nBIG=$(head -c 100000 /dev/zero | tr '\\000' x)\nexport BIG\nexec /bin/sh -c \"$4\"\n")?;
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))?;
+        // `/bin/sh` itself, handed the variable and a home of its own: a script the test wrote can
+        // be busy for a moment (ETXTBSY) while another test's process starts.
+        let home = tempfile::tempdir()?;
+        let env = vec![("BIG".to_owned(), "x".repeat(100_000)), ("HOME".to_owned(), home.path().to_string_lossy().into_owned())];
         let started = Instant::now();
-        let env = ask_login_shell(&shell.to_string_lossy(), Vec::new()).ok_or_else(|| anyhow::anyhow!("no answer"))?;
+        let env = ask_login_shell("/bin/sh", env).ok_or_else(|| anyhow::anyhow!("no answer"))?;
         assert!(env.iter().any(|(k, v)| k == "BIG" && v.len() == 100_000), "its 100 kB variable: {:?}", env.iter().map(|(k, v)| (k, v.len())).collect::<Vec<_>>());
         assert!(started.elapsed() < ENV_TIMEOUT, "answered, not given up on");
         Ok(())
