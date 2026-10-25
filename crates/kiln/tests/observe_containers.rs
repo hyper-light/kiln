@@ -224,7 +224,7 @@ processors:
         action: upsert
 exporters:
   otlphttp:
-    endpoint: http://127.0.0.1:{otlp}
+    endpoint: http://{host}:{otlp}
 service:
   telemetry:
     metrics:
@@ -234,25 +234,19 @@ service:
       receivers: [docker_stats]
       processors: [resource]
       exporters: [otlphttp]
-"
+",
+        host = common::DockerNet::get().host()
     );
     std::fs::write(dir.path().join("config.yaml"), config)?;
     let socket_group = docker(&["run", "--rm", "-v", "/var/run/docker.sock:/s:ro", "alpine:latest", "stat", "-c", "%g", "/s"])?;
-    docker(&[
-        "run",
-        "-d",
-        "--name",
-        &collector,
-        "--network",
-        "host",
-        "--group-add",
-        &socket_group,
-        "-v",
-        "/var/run/docker.sock:/var/run/docker.sock:ro",
-        "-v",
-        &format!("{}:/etc/otelcol-contrib/config.yaml:ro", dir.path().join("config.yaml").display()),
-        COLLECTOR,
-    ])?;
+    // The engine's socket mounted (Docker Desktop's its VM's); the runner where the container
+    // reaches this machine.
+    let network = common::DockerNet::get().args(&[], &[]);
+    let config_mount = format!("{}:/etc/otelcol-contrib/config.yaml:ro", dir.path().join("config.yaml").display());
+    let mut args = vec!["run", "-d", "--name", &collector];
+    args.extend(network.iter().map(String::as_str));
+    args.extend(["--group-add", &socket_group, "-v", "/var/run/docker.sock:/var/run/docker.sock:ro", "-v", &config_mount, COLLECTOR]);
+    docker(&args)?;
 
     // Listed from the Collector's series alone, in kiln's units.
     let mut seen = Value::Null;

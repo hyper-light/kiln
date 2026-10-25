@@ -1,9 +1,11 @@
 //! The Docker Engine API (`docs/observe.md` §10.10), as Docker and Podman serve it on a node: each
 //! running container's name, image, labels and start (`GET /containers/json`), and, where the node's
 //! cgroups are not seen (Docker Desktop's VM, on macOS and Windows), its stats
-//! (`GET /containers/{id}/stats?stream=false&one-shot=true`). HTTP/1.0 over the engine's Unix socket
-//! (or Windows' named pipe), with std alone: to a 1.0 request the engine answers whole, not chunked,
-//! and closes.
+//! (`GET /containers/{id}/stats?stream=false&one-shot=true`), its limits (`GET /containers/{id}/json`:
+//! the stats carry none of its CPU, and the VM's memory where it has none of its own) and the OOM
+//! kills the engine tells of (`GET /events`, a window of them: the stats carry none). HTTP/1.0 over
+//! the engine's Unix socket (or Windows' named pipe), with std alone: to a 1.0 request the engine
+//! answers whole, not chunked, and closes.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
@@ -183,6 +185,53 @@ pub fn stats(e: &Endpoint, id: &str) -> std::io::Result<Stats> {
     parse_stats(&get(e, &format!("/containers/{id}/stats?stream=false&one-shot=true"))?).ok_or_else(|| std::io::Error::other("the engine's stats do not read"))
 }
 
+/// A container's limits as its settings say them (its `HostConfig`): its CPU in cores (`NanoCpus`,
+/// else `CpuQuota` over `CpuPeriod`, 100 ms where that is not said), its memory in bytes
+/// (`Memory`); none where it has none (0).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Limits {
+    pub cpu: Option<f64>,
+    pub memory: Option<u64>,
+}
+
+#[allow(clippy::cast_precision_loss)]
+pub fn parse_limits(body: &[u8]) -> Option<Limits> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let h = v.get("HostConfig")?;
+    let n = |k: &str| h.get(k).and_then(Value::as_i64).filter(|&x| x > 0);
+    let cpu = n("NanoCpus").map(|x| x as f64 / 1e9).or_else(|| n("CpuQuota").map(|q| q as f64 / n("CpuPeriod").unwrap_or(100_000) as f64));
+    Some(Limits { cpu, memory: n("Memory").and_then(|m| u64::try_from(m).ok()) })
+}
+
+/// A container's limits.
+pub fn limits(e: &Endpoint, id: &str) -> std::io::Result<Limits> {
+    parse_limits(&get(e, &format!("/containers/{id}/json"))?).ok_or_else(|| std::io::Error::other("the engine's container does not read"))
+}
+
+/// The OOM kills an answer of the engine's events tells of (an event a line): each one's time (ns
+/// since the epoch) and container.
+pub fn parse_ooms(body: &[u8]) -> Vec<(i64, String)> {
+    body.split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_slice::<Value>(l).ok())
+        .filter(|v| v.get("Action").or_else(|| v.get("status")).and_then(Value::as_str) == Some("oom"))
+        .filter_map(|v| {
+            let id = v.pointer("/Actor/ID").or_else(|| v.get("id")).and_then(Value::as_str)?.to_owned();
+            let at = v.get("timeNano").and_then(Value::as_i64).or_else(|| v.get("time").and_then(Value::as_i64).map(|s| s.saturating_mul(1_000_000_000)))?;
+            Some((at, id))
+        })
+        .collect()
+}
+
+/// The OOM kills the engine tells of from `since` to `until` (ns since the epoch; an `until` past,
+/// so the engine answers at once and closes).
+pub fn ooms(e: &Endpoint, since: i64, until: i64) -> std::io::Result<Vec<(i64, String)>> {
+    let t = |ns: i64| format!("{}.{:09}", ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000));
+    // `{"event":["oom"],"type":["container"]}`, its URL's way.
+    let filters = "%7B%22event%22%3A%5B%22oom%22%5D%2C%22type%22%3A%5B%22container%22%5D%7D";
+    Ok(parse_ooms(&get(e, &format!("/events?since={}&until={}&filters={filters}", t(since), t(until)))?))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -208,5 +257,34 @@ mod tests {
         assert_eq!(body_of(b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n[]").unwrap(), b"[]");
         assert!(body_of(b"HTTP/1.0 404 Not Found\r\n\r\n{}").unwrap_err().to_string().contains("404"));
         assert!(body_of(b"garbage").is_err());
+    }
+
+    /// A container's limits read from its settings as an engine of 2026 gives them: `--cpus`'
+    /// nanocores, a quota of its period (100 ms where none is said), none where it has none; its
+    /// memory, none where it has none (where its stats would say the VM's).
+    #[test]
+    fn a_container_s_limits_read_from_its_settings() {
+        let of = |h: &str| parse_limits(format!(r#"{{"Id":"aa11","State":{{"Running":true}},"HostConfig":{h}}}"#).as_bytes()).unwrap();
+        assert_eq!(of(r#"{"NanoCpus":500000000,"CpuQuota":0,"CpuPeriod":0,"Memory":67108864}"#), Limits { cpu: Some(0.5), memory: Some(67_108_864) });
+        assert_eq!(of(r#"{"NanoCpus":0,"CpuQuota":150000,"CpuPeriod":50000,"Memory":0}"#), Limits { cpu: Some(3.0), memory: None });
+        assert_eq!(of(r#"{"NanoCpus":0,"CpuQuota":25000,"CpuPeriod":0}"#), Limits { cpu: Some(0.25), memory: None });
+        assert_eq!(of(r#"{"NanoCpus":0,"CpuQuota":-1,"CpuPeriod":100000,"Memory":0}"#), Limits::default());
+        assert!(parse_limits(br#"{"Id":"aa11"}"#).is_none() && parse_limits(b"not json").is_none());
+    }
+
+    /// The OOM kills of an answer of the engine's events (an event a line, as Docker writes them):
+    /// each its time and container; other events, and lines that do not read, left out.
+    #[test]
+    fn an_answer_s_oom_kills_read() {
+        let body = concat!(
+            r#"{"status":"oom","id":"aa11","from":"alpine:latest","Type":"container","Action":"oom","Actor":{"ID":"aa11","Attributes":{"image":"alpine:latest","name":"oomy"}},"scope":"local","time":1792890000,"timeNano":1792890000123456789}"#,
+            "\n",
+            r#"{"status":"die","id":"bb22","Type":"container","Action":"die","Actor":{"ID":"bb22"},"time":1792890001,"timeNano":1792890001000000000}"#,
+            "\n",
+            r#"{"Type":"container","Action":"oom","Actor":{"ID":"aa11"},"time":1792890002}"#,
+            "\n\nnot json\n",
+        );
+        assert_eq!(parse_ooms(body.as_bytes()), vec![(1_792_890_000_123_456_789, "aa11".to_owned()), (1_792_890_002_000_000_000, "aa11".to_owned())]);
+        assert!(parse_ooms(b"").is_empty());
     }
 }

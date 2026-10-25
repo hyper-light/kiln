@@ -44,6 +44,12 @@ pub const RENAMED: Duration = Duration::from_secs(300);
 /// cgroup is there before the engine lists it, as it starts (its samples until then are written
 /// without its name: a series apart from its own).
 const UNNAMED_ASKED: Duration = Duration::from_secs(30);
+/// The engine's events asked for again at each look, before where the last ask ended: an event the
+/// engine stamps a little late (its VM's clock, a moment behind this machine's) is not missed, and
+/// none is counted twice (those counted are kept that long).
+const OOM_LAG_NS: i64 = 10_000_000_000;
+/// OOM kills kept counted, to be told apart from the next window's (a storm's at the most).
+const OOM_COUNTED: usize = 100_000;
 
 /// The check's metrics, in Datadog's names and kinds, in the order a container's keys are kept.
 const METRICS: [(&str, Kind); 18] = [
@@ -127,6 +133,14 @@ pub struct Check {
     pods: kube::Names,
     looks: u64,
     reader: cgroup::Reader,
+    /// Where there are no cgroups to read (Docker Desktop's VM): each container's limits as its
+    /// settings say them, and when they were asked (again every [`RENAMED`]); its OOM kills the
+    /// engine told of since the first look; where the events were last asked to, and those counted
+    /// in the last [`OOM_LAG_NS`].
+    limits: HashMap<String, (engine::Limits, Instant)>,
+    ooms: HashMap<String, u64>,
+    oom_until: Option<i64>,
+    oom_counted: std::collections::HashSet<(i64, String)>,
 }
 
 impl Check {
@@ -155,6 +169,10 @@ impl Check {
             pods: kube::Names::default(),
             looks: 0,
             reader: cgroup::Reader::default(),
+            limits: HashMap::new(),
+            ooms: HashMap::new(),
+            oom_until: None,
+            oom_counted: std::collections::HashSet::new(),
         }
     }
 
@@ -205,9 +223,54 @@ impl Check {
                 out
             }
             None => {
-                let Some(e) = &self.engine else { return Vec::new() };
-                self.named.keys().take(CONTAINERS).filter_map(|id| engine::stats(e, id).ok().map(|stats| Seen { id: id.clone(), runtime: "docker", qos: None, stats })).collect()
+                let Some(e) = self.engine.clone() else { return Vec::new() };
+                self.count_ooms(&e);
+                let now = Instant::now();
+                let named = &self.named;
+                self.limits.retain(|id, _| named.contains_key(id));
+                self.ooms.retain(|id, _| named.contains_key(id));
+                let mut out = Vec::new();
+                for id in self.named.keys().take(CONTAINERS) {
+                    let Ok(mut stats) = engine::stats(&e, id) else { continue };
+                    // Its limits: the stats carry none of its CPU, and the VM's memory where it has
+                    // none of its own.
+                    if self.limits.get(id).is_none_or(|(_, at)| now.duration_since(*at) >= RENAMED)
+                        && let Ok(l) = engine::limits(&e, id)
+                    {
+                        self.limits.insert(id.clone(), (l, now));
+                    }
+                    if let Some((l, _)) = self.limits.get(id) {
+                        (stats.cpu_limit, stats.memory_limit) = (l.cpu, l.memory);
+                    }
+                    stats.counters.oom_kills = self.ooms.get(id).copied().unwrap_or(0);
+                    out.push(Seen { id: id.clone(), runtime: "docker", qos: None, stats });
+                }
+                out
             }
+        }
+    }
+
+    /// The OOM kills the engine told of since the last look, each container's counted (the stats
+    /// carry none): from where the last ask ended, less [`OOM_LAG_NS`], to a second ago, those
+    /// counted already left out. None before the first look (as the cgroups' count from it).
+    fn count_ooms(&mut self, e: &engine::Endpoint) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+        let until = now.saturating_sub(1_000_000_000);
+        let Some(last) = self.oom_until else {
+            self.oom_until = Some(until);
+            return;
+        };
+        match engine::ooms(e, last.saturating_sub(OOM_LAG_NS), until) {
+            Ok(events) => {
+                for (at, id) in events {
+                    if self.oom_counted.len() < OOM_COUNTED && self.oom_counted.insert((at, id.clone())) {
+                        *self.ooms.entry(id).or_insert(0) += 1;
+                    }
+                }
+                self.oom_counted.retain(|(at, _)| *at >= until.saturating_sub(OOM_LAG_NS));
+                self.oom_until = Some(until);
+            }
+            Err(err) => tracing::debug!(error = %err, "the container engine's events were not read"),
         }
     }
 
@@ -442,6 +505,73 @@ mod tests {
         // Gone: nothing said of it, its counters let go.
         std::fs::remove_dir_all(root.join(&scope)).unwrap();
         assert!(look(&mut check, 3_000).is_empty() && check.kept.is_empty());
+    }
+
+    /// A stand-in for the engine on a Unix socket: each request's path answered by `answer`
+    /// (HTTP/1.0, whole, then closed).
+    #[cfg(unix)]
+    fn engine_at(dir: &std::path::Path, answer: impl Fn(&str) -> String + Send + 'static) -> engine::Endpoint {
+        let path = dir.join("engine.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { break };
+                let mut buf = [0u8; 4096];
+                let n = std::io::Read::read(&mut s, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = answer(req.split_whitespace().nth(1).unwrap_or(""));
+                let _ = std::io::Write::write_all(&mut s, format!("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{body}").as_bytes());
+            }
+        });
+        engine::Endpoint::Unix(path)
+    }
+
+    /// Where there are no cgroups to read (Docker Desktop's VM): a container's figures are the
+    /// engine's stats, its limits its settings' (the stats carry none of its CPU, and the VM's memory
+    /// where it has none of its own: none then), its OOM kills the engine's events, counted from the
+    /// first look, each once though the next window asks for it again.
+    #[cfg(unix)]
+    #[test]
+    fn without_cgroups_a_container_s_limits_and_oom_kills_are_the_engine_s() {
+        let dir = tempfile::tempdir().unwrap();
+        let (limited, free) = ("a".repeat(64), "b".repeat(64));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let e = engine_at(dir.path(), {
+            let (limited, free, events) = (limited.clone(), free.clone(), events.clone());
+            move |path| {
+                if path == "/containers/json" {
+                    return format!(r#"[{{"Id":"{limited}","Names":["/busy"],"Image":"alpine:latest","Created":1}},{{"Id":"{free}","Names":["/free"],"Image":"alpine:latest","Created":1}}]"#);
+                }
+                if path.starts_with("/events") {
+                    return events.lock().unwrap().clone();
+                }
+                let id = path.trim_start_matches("/containers/").split('/').next().unwrap_or("").to_owned();
+                if path.ends_with("/json") {
+                    let host = if id == limited { r#"{"NanoCpus":500000000,"Memory":67108864}"# } else { r#"{"NanoCpus":0,"Memory":0}"# };
+                    return format!(r#"{{"Id":"{id}","HostConfig":{host}}}"#);
+                }
+                r#"{"cpu_stats":{"cpu_usage":{"total_usage":1000}},"memory_stats":{"usage":4096,"stats":{"inactive_file":0},"limit":33554432000},"pids_stats":{"current":1}}"#.to_owned()
+            }
+        });
+        let mut check = Check::at("desk".into(), dir.path().join("no-cgroups"), dir.path().join("links"), None, Some(e));
+        let value = |pts: &[(SeriesKey, Vec<(i64, f64)>)], id: &str, m: &str| {
+            pts.iter().find(|(k, _)| kiln_obs::batch::parse_key(&k.key).is_ok_and(|p| p.metric == m && p.tags.iter().any(|(t, v)| *t == "container_id" && *v == id))).map(|(_, v)| v[0].1)
+        };
+        let first = look(&mut check, 1_000);
+        assert_eq!((value(&first, &limited, "container.cpu.limit"), value(&first, &limited, "container.memory.limit")), (Some(5e8), Some(67_108_864.0)), "its limits, its settings'");
+        assert_eq!((value(&first, &free, "container.cpu.limit"), value(&first, &free, "container.memory.limit")), (None, None), "none: not the VM's");
+        assert_eq!(value(&first, &free, "container.memory.usage"), Some(4096.0));
+        // Two OOM kills of the limited one, told of in the window the next look asks for and again
+        // in the one after (its lag).
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
+        *events.lock().unwrap() =
+            [now - 3_000_000_000, now - 2_000_000_000].iter().map(|t| format!(r#"{{"Type":"container","Action":"oom","Actor":{{"ID":"{limited}"}},"timeNano":{t}}}"#) + "\n").collect();
+        std::thread::sleep(Duration::from_millis(20));
+        let second = look(&mut check, 2_000);
+        assert_eq!((value(&second, &limited, "container.memory.oom_events"), value(&second, &free, "container.memory.oom_events")), (Some(2.0), Some(0.0)));
+        std::thread::sleep(Duration::from_millis(20));
+        let third = look(&mut check, 3_000);
+        assert_eq!(value(&third, &limited, "container.memory.oom_events"), Some(0.0), "each counted once");
     }
 
     /// A pod's sandbox is not a container (its `pause` process; its image, where the engine names
