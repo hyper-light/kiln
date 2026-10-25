@@ -201,7 +201,6 @@ struct Asked {
 const NO_SLOT: u32 = u32::MAX;
 
 /// The attribute keys the metrics counted ask a record for, each a slot of a [`Memo`].
-#[derive(Default)]
 struct Keys<'m> {
     keys: Vec<&'m str>,
 }
@@ -291,9 +290,10 @@ pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<C
     let mut out = Counted { tallies: vec![Tally::default(); metrics.len()], ..Counted::default() };
     // Each metric counted: its search's place among the distinct ones, its grouping's, and the
     // slots of the attributes it groups by and measures.
-    let (mut searches, mut bys): (Vec<&Search>, Vec<&[(Facet, String)]>) = (Vec::new(), Vec::new());
-    let mut keys = Keys::default();
-    let mut live: Vec<Asked> = Vec::new();
+    let n = metrics.len();
+    let (mut searches, mut bys): (Vec<&Search>, Vec<&[(Facet, String)]>) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    let mut keys = Keys { keys: Vec::with_capacity(64) };
+    let mut live: Vec<Asked> = Vec::with_capacity(n);
     for (i, m) in metrics.iter().enumerate().filter(|(_, m)| m.since <= window) {
         let search = searches.iter().position(|q| **q == m.search).unwrap_or(searches.len());
         if search == searches.len() {
@@ -319,19 +319,19 @@ pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<C
     if live.is_empty() {
         return Ok(out);
     }
-    // Each distinct search's leaves' slots, by node.
-    let mut leaves: Vec<Vec<u32>> = searches
-        .iter()
-        .map(|q| {
-            let mut slots = vec![NO_SLOT; q.nodes.len()];
-            for (node, k) in q.attr_leaves() {
-                if let Some(x) = slots.get_mut(node) {
-                    *x = keys.slot(k);
-                }
+    // Each distinct search's leaves' slots, by node: search `s`'s from `leaf_at[s]` on.
+    let mut leaf_at: Vec<usize> = Vec::with_capacity(searches.len());
+    let mut leaves: Vec<u32> = vec![NO_SLOT; searches.iter().map(|q| q.nodes.len()).sum()];
+    let mut at = 0;
+    for q in &searches {
+        leaf_at.push(at);
+        for (node, k) in q.attr_leaves() {
+            if let Some(x) = leaves.get_mut(at + node) {
+                *x = keys.slot(k);
             }
-            slots
-        })
-        .collect();
+        }
+        at += q.nodes.len();
+    }
     // A key asked once a record (a grouping's values are read once, a duration once) is read
     // where it is asked: kept, it would cost a lookup in the memo and its value read again.
     let mut asks = vec![0u32; keys.keys.len()];
@@ -340,12 +340,14 @@ pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<C
             *n += 1;
         }
     };
-    leaves.iter().flatten().for_each(|&s| ask(s));
-    let mut grouped_once: Vec<usize> = Vec::new();
+    leaves.iter().for_each(|&s| ask(s));
+    let mut grouped_once = vec![false; bys.len()];
     let mut duration_once = false;
     for a in &live {
-        if !grouped_once.contains(&a.grouping) {
-            grouped_once.push(a.grouping);
+        if let Some(once) = grouped_once.get_mut(a.grouping)
+            && !*once
+        {
+            *once = true;
             a.by.iter().for_each(|&s| ask(s));
         }
         match metrics.get(a.i).map(|m| &m.compute) {
@@ -362,7 +364,7 @@ pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<C
             *slot = NO_SLOT;
         }
     };
-    leaves.iter_mut().flatten().for_each(once);
+    leaves.iter_mut().for_each(once);
     for a in &mut live {
         a.by.iter_mut().for_each(once);
         once(&mut a.value);
@@ -389,8 +391,8 @@ pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<C
                 Some(1) => false,
                 Some(2) => true,
                 _ => {
-                    let slots = leaves.get(a.search);
-                    let yes = m.search.row_by(r, &mut scratch, |node, k| memo.get(r, slots.and_then(|s| s.get(node)).copied().unwrap_or(NO_SLOT), k));
+                    let at = leaf_at.get(a.search).copied().unwrap_or(usize::MAX);
+                    let yes = m.search.row_by(r, &mut scratch, |node, k| memo.get(r, leaves.get(at.saturating_add(node)).copied().unwrap_or(NO_SLOT), k));
                     if let Some(v) = said.get_mut(a.search) {
                         *v = 1 + u8::from(yes);
                     }
