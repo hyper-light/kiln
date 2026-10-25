@@ -56,8 +56,19 @@ impl<'a> RecordRef<'a> {
         })
     }
 
+    /// The attribute `key`'s value (its first, given twice): the keys compared as bytes, the values
+    /// passed unread, the one found alone read as text (a row's text is checked as its batch is
+    /// applied, `crate::store`'s `within_logs`). A search asks a span for some fifty attributes it
+    /// mostly lacks: each ask read every key and value before as text (§12.17).
     pub fn attr(&self, key: &str) -> Option<&'a str> {
-        self.attrs().find(|(k, _)| *k == key).map(|(_, v)| v)
+        let mut at = self.attrs_raw;
+        for _ in 0..self.attr_count {
+            if get_bytes(&mut at)? == key.as_bytes() {
+                return get_str(&mut at);
+            }
+            skip_str(&mut at)?;
+        }
+        None
     }
 
     pub fn to_owned(&self) -> Record {
@@ -165,10 +176,15 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
 }
 
 fn get_str<'a>(at: &mut &'a [u8]) -> Option<&'a str> {
+    std::str::from_utf8(get_bytes(at)?).ok()
+}
+
+/// A string's bytes, not read as text.
+fn get_bytes<'a>(at: &mut &'a [u8]) -> Option<&'a [u8]> {
     let n = usize::try_from(varint::get(at)?).ok()?;
     let (b, rest) = at.split_at_checked(n)?;
     *at = rest;
-    std::str::from_utf8(b).ok()
+    Some(b)
 }
 
 /// Past a string, its text unread.
@@ -395,8 +411,8 @@ impl<'a> Rows<'a> {
             return None;
         }
         // The attributes' bounds found, their text checked as `RecordRef::attrs` reads them: a seal
-        // reads each once, a search those it asks of (a batch's are all checked as it is applied,
-        // `crate::store`'s `within_logs`).
+        // reads each once, a search the values it finds (a batch's are all checked as it is
+        // applied, `crate::store`'s `within_logs`).
         let attrs_start = *at;
         for _ in 0..attr_count * 2 {
             skip_str(at)?;
