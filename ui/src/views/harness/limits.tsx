@@ -6,6 +6,7 @@ import * as React from "react";
 import { ChevronDown } from "lucide-react";
 import type { AgentInfo, Limit, StatusItem } from "@/api/harness";
 import { cn } from "@/lib/utils";
+import { costText, money } from "./derive";
 import { useClock } from "./dom";
 import { HarnessMark } from "./parts";
 
@@ -132,22 +133,21 @@ export function UsagePanel({
   id,
   limits,
   plan,
-  onMore,
+  cost,
   stopAt,
   onStopAt,
-  moveOn,
-  onMoveOn,
+  elsewhere,
 }: {
   id: string;
   limits: Limit[];
   plan?: string;
-  onMore?: () => void;
+  /** What the session has cost so far, as its harness estimates it (none: it doesn't say). */
+  cost?: number;
   /** The agent pauses once a limit is this full (null: only when one is reached). */
   stopAt?: number | null;
   onStopAt?: (percent: number | null) => void;
-  /** At a limit it goes on on another machine with room (opt in). */
-  moveOn?: boolean;
-  onMoveOn?: (on: boolean) => void;
+  /** What it does at a limit: waits for the reset, or goes on elsewhere (`AtLimit`). */
+  elsewhere?: React.ReactNode;
 }) {
   const now = useClock(30_000);
   return (
@@ -161,7 +161,7 @@ export function UsagePanel({
         {onStopAt && (
           <label className="hx-usage-stop">
             <span>Pause at</span>
-            <span className="select">
+            <span className="select hx-pick">
               <select value={stopAt ? String(stopAt) : ""} onChange={(e) => onStopAt(e.target.value ? Number(e.target.value) : null)}>
                 <option value="">the limit</option>
                 {STOP_POINTS.map((p) => (
@@ -174,20 +174,20 @@ export function UsagePanel({
             </span>
           </label>
         )}
-        {onMoveOn && (
-          <label className="hx-usage-move" title="At a limit, it goes on on another of your machines whose harness is signed in to an account with room: its conversation and repository go along">
-            <input type="checkbox" className="check" checked={Boolean(moveOn)} onChange={(e) => onMoveOn(e.target.checked)} />
-            Go on elsewhere at a limit
-          </label>
+        {elsewhere && (
+          <span className="hx-usage-move">
+            <span>At a limit</span>
+            {elsewhere}
+          </span>
         )}
-        <span className="hx-usage-end">
-          {plan && <span className="hx-tag">{plan}</span>}
-          {onMore && (
-            <button type="button" className="hx-usage-more" onClick={onMore}>
-              Cost and status
-            </button>
-          )}
-        </span>
+        {cost != null && cost > 0 && (
+          <p className="hx-usage-cost">
+            <span>Cost</span>
+            <span className="hx-usage-cost-v" title={costText(cost, plan).title}>
+              {money(cost)}
+            </span>
+          </p>
+        )}
       </div>
     </section>
   );
@@ -199,20 +199,20 @@ export function topLimit(limits: Limit[] | undefined): Limit | null {
 }
 
 /** The most-used limit; it opens the rest (`controls`: the panel it opens, `open`: whether it is). */
-export function LimitBadge({ limits, onClick, open, controls }: { limits: Limit[] | undefined; onClick?: () => void; open?: boolean; controls?: string }) {
+export function LimitBadge({ limits, onClick, open, controls, className }: { limits: Limit[] | undefined; onClick?: () => void; open?: boolean; controls?: string; className?: string }) {
   const top = topLimit(limits);
   if (!top || top.used_percent === null) return null;
   return (
     <button
       type="button"
-      className="hx-limit-badge"
+      className={cn("hx-limit-badge", className)}
       data-tone={tone(top.used_percent)}
       onClick={onClick}
       aria-expanded={open}
       aria-controls={open ? controls : undefined}
       title={(limits ?? []).map((l) => `${l.label}: ${l.used_percent ?? "?"}%`).join(" · ")}
     >
-      {top.label} {Math.round(top.used_percent)}%
+      <span>{top.label} {Math.round(top.used_percent)}%</span>
     </button>
   );
 }

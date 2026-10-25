@@ -208,9 +208,10 @@ async fn pass(hub: &Hub) -> anyhow::Result<usize> {
             }
         }
         let leg2 = leg.clone();
+        // The index is this node's own, built from its own logs: past the cluster group.
         hub.store
-            .call(move |c| {
-                let tx = c.transaction()?;
+            .call_local(move |c| {
+                let tx = crate::store::tx(c)?;
                 let (mut first, mut last, mut bytes) = (None::<i64>, None::<i64>, 0usize);
                 for (s, raw) in &texts {
                     bytes += raw.len();
@@ -236,8 +237,8 @@ async fn pass(hub: &Hub) -> anyhow::Result<usize> {
 pub async fn forget(hub: &Hub, legs: Vec<String>) {
     let _ = hub
         .store
-        .call(move |c| {
-            let tx = c.transaction()?;
+        .call_local(move |c| {
+            let tx = crate::store::tx(c)?;
             for leg in &legs {
                 let rows: Option<(Option<i64>, Option<i64>)> = tx.query_row("SELECT first_row, last_row FROM ci_log_indexed WHERE leg = ?1", [leg], |x| Ok((x.get(0)?, x.get(1)?))).optional()?;
                 if let Some((Some(a), Some(b))) = rows {
@@ -323,32 +324,66 @@ pub async fn leg(hub: &Hub, id: &str, what: &str, q: &HashMap<String, String>) -
         }
         _ => {
             let lines: usize = q.get("lines").and_then(|l| l.parse().ok()).unwrap_or(40).clamp(5, 400);
-            // The step that failed (else the last that ran), around its first error line, else its end.
-            let failed = steps.iter().find(|s| matches!(s.2.as_str(), "failure" | "failed" | "timed_out")).or_else(|| steps.iter().rev().find(|s| s.2 != "skipped" && s.2 != "pending"));
-            let Some((idx, name, status, exit_code)) = failed.cloned() else { return Ok(srv::json(StatusCode::OK, &json!({ "leg": id, "step": null, "lines": [] }))) };
-            let body = plain(&hub.logs.read(id, idx).await);
-            let body = body.trim_end();
-            let all: Vec<&str> = if body.is_empty() { Vec::new() } else { body.split('\n').collect() };
-            let (from, to) = excerpt(&all, lines);
-            let shown: Vec<Value> = all.get(from..to).unwrap_or_default().iter().enumerate().map(|(i, l)| json!({ "line": from + i + 1, "text": crate::util::truncate(l, 2000) })).collect();
-            Ok(srv::json(StatusCode::OK, &json!({ "leg": id, "step": idx, "step_name": name, "status": status, "exit_code": exit_code, "total_lines": all.len(), "lines": shown })))
+            Ok(srv::json(StatusCode::OK, &failure_of(hub, id, &steps, lines).await))
         }
     }
+}
+
+/// What to read first when leg `id` failed (`lines` of it): `{ leg, step, step_name, status,
+/// exit_code, total_lines, lines: [{ line, text }] }`. For whoever follows a failure (an agent
+/// whose change it is, `crate::workspace::follow`).
+pub async fn failure(hub: &Hub, id: &str, lines: usize) -> Result<Value, Fail> {
+    let steps = steps_of(hub, id).await?;
+    Ok(failure_of(hub, id, &steps, lines.clamp(5, 400)).await)
+}
+
+async fn failure_of(hub: &Hub, id: &str, steps: &[(u32, String, String, Option<i64>)], lines: usize) -> Value {
+    // The step that failed (else the last that ran), around its first error line, else its end.
+    let failed = steps.iter().find(|s| matches!(s.2.as_str(), "failure" | "failed" | "timed_out")).or_else(|| steps.iter().rev().find(|s| s.2 != "skipped" && s.2 != "pending"));
+    let Some((idx, name, status, exit_code)) = failed.cloned() else { return json!({ "leg": id, "step": null, "lines": [] }) };
+    let body = plain(&hub.logs.read(id, idx).await);
+    let body = body.trim_end();
+    let all: Vec<&str> = if body.is_empty() { Vec::new() } else { body.split('\n').collect() };
+    let (from, to) = excerpt(&all, lines);
+    let shown: Vec<Value> = all.get(from..to).unwrap_or_default().iter().enumerate().map(|(i, l)| json!({ "line": from + i + 1, "text": crate::util::truncate(l, 2000) })).collect();
+    json!({ "leg": id, "step": idx, "step_name": name, "status": status, "exit_code": exit_code, "total_lines": all.len(), "lines": shown })
 }
 
 /// Words that mark a line as an error's.
 const ERROR_MARKS: &[&str] = &["##[error]", "error:", "error[", "fatal:", "panicked at", "exception", "traceback (most recent call last)", "failed", "fail:", "--- fail", "assertionerror", "npm err!"];
 
+/// How a line that surely is an error's starts (a compiler's, a test's, a tool's), its indent
+/// aside; and what it has wherever.
+const ERROR_STARTS: &[&str] = &["##[error]", "error:", "error[", "fatal:", "fail:", "--- fail", "fail\t", "npm err!", "traceback (most recent call last)"];
+const ERROR_ANYWHERE: &[&str] = &["##[error]", "panicked at", "assertionerror"];
+
+/// A line (lower case, its indent aside) that says it isn't an error's though it has one of their
+/// words: a log record at a lower level (`level=info msg="fetch failed …"`, a JSON record's
+/// `"level":"debug"`, `[INFO]`, `warning:`), or a test runner's progress (Go's `=== RUN`,
+/// `--- PASS`, `ok`).
+fn lesser(l: &str) -> bool {
+    const BELOW: &[&str] = &["info", "debug", "trace", "warning", "warn", "notice"];
+    let level = ["level=", "\"level\":", "lvl="]
+        .iter()
+        .any(|k| l.match_indices(k).any(|(at, _)| l.get(at + k.len()..).is_some_and(|rest| BELOW.iter().any(|b| rest.trim_start_matches([' ', '"']).starts_with(b)))));
+    let tag = l.strip_prefix('[').unwrap_or(l);
+    let tagged = BELOW.iter().any(|b| tag.strip_prefix(b).is_some_and(|after| after.starts_with([':', ' ', ']'])));
+    let progress = ["=== run", "=== pause", "=== cont", "=== name", "--- pass", "--- skip", "ok ", "ok\t"].iter().any(|p| l.starts_with(p));
+    level || tagged || progress
+}
+
 /// The excerpt of `lines` (`n` of them) to show for a failure: from a few lines before the first
-/// line that reads like an error, else the last `n`.
+/// line that surely reads like an error, else the first that may, else the last `n`. A line that
+/// says it's a lesser one's (`lesser`) is neither.
 pub fn excerpt(lines: &[&str], n: usize) -> (usize, usize) {
-    let first = lines.iter().position(|l| {
-        let l = l.to_lowercase();
-        ERROR_MARKS.iter().any(|m| l.contains(m))
-    });
+    let lower: Vec<String> = lines.iter().map(|l| l.trim_start().to_lowercase()).collect();
+    let sure = lower.iter().position(|l| !lesser(l) && (ERROR_STARTS.iter().any(|m| l.starts_with(m)) || ERROR_ANYWHERE.iter().any(|m| l.contains(m))));
+    let first = sure.or_else(|| lower.iter().position(|l| !lesser(l) && ERROR_MARKS.iter().any(|m| l.contains(m))));
     match first {
+        // A few lines before it (fewer in a short excerpt, so it's in it), and no fewer than `n`
+        // when it's near the end.
         Some(i) => {
-            let from = i.saturating_sub(5);
+            let from = i.saturating_sub(5.min(n.saturating_sub(1) / 2)).min(lines.len().saturating_sub(n));
             (from, (from + n).min(lines.len()))
         }
         None => (lines.len().saturating_sub(n), lines.len()),
@@ -375,8 +410,26 @@ mod tests {
     fn w19_r04_lines() -> anyhow::Result<()> {
         assert_eq!(plain(b"\x1b[31mred\x1b[0m\r\nprogress 10%\rprogress 100%\nlast"), "red\nprogress 100%\nlast");
         let lines = ["ok", "compiling", "error[E0308]: mismatched types", "  --> src/a.rs:3", "done"];
-        assert_eq!(excerpt(&lines, 3), (0, 3));
+        assert_eq!(excerpt(&lines, 3), (1, 4));
         assert_eq!(excerpt(&["a", "b", "c", "d"], 2), (2, 4), "no error line: the end");
+        // A log record at a lower level, or a test's progress, isn't an error's, and a line that
+        // starts as one comes before one that only has its words (buildx's integration tests).
+        let go = [
+            "time=\"2026-10-23T20:22:41Z\" level=info msg=\"fetch failed after status: 404 Not Found\"",
+            "=== RUN   TestIntegration/TestBuildFailedNoParallel",
+            "--- PASS: TestIntegration/TestBuildFailedNoParallel (2.22s)",
+            "{\"level\":\"debug\",\"msg\":\"retry failed\"}",
+            "[INFO] a step failed, retrying",
+            "    dap_build.go:937:",
+            "        \tError Trace:\t/src/tests/dap_build.go:937",
+            "        \tError:      \ttimeout reached",
+            "--- FAIL: TestIntegration (70.54s)",
+            "FAIL",
+        ];
+        assert_eq!(excerpt(&go, 3), (6, 9), "{:?}", go.get(6..9));
+        assert_eq!(excerpt(&["x"; 60].iter().copied().chain(["error: no such file"]).collect::<Vec<_>>(), 40), (21, 61), "near the end: the last 40");
+        assert_eq!(excerpt(&["ok", "Build failed: 2 errors", "done"], 2), (1, 3), "only a mark: the first");
+        assert_eq!(excerpt(&["warning: the build failed for an optional part", "information: failed", "x"], 1), (1, 2), "a warning is lesser; information isn't");
         let c = db()?;
         c.execute("INSERT INTO runs VALUES ('r1', 7, 'repo', 'ci.yml', '', 'main', 'failure', 'failed', 100)", [])?;
         c.execute("INSERT INTO jobs VALUES ('l1', 'r1', 'test', 100)", [])?;

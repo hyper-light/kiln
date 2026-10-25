@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::model::{ChoiceAnswer, Command, Decision, SendMode, Status};
+use super::model::{Attachment, ChoiceAnswer, Command, Decision, SendMode, Status};
 use super::registry::Sent;
 use super::session::Info;
 use crate::hub::Hub;
@@ -35,13 +35,17 @@ pub struct To {
     pub status: Vec<String>,
 }
 
-/// What to send. One of `text`, `command`, `approvals`.
+/// What to send. One of `text` (with or without `attachments`, or they alone), `command`,
+/// `approvals`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Broadcast {
     pub to: To,
     /// A prompt, or "/name args": read in each agent's catalog.
     #[serde(default)]
     pub text: Option<String>,
+    /// Files with the prompt (uploaded first: `POST /api/harness/files`), each agent its own copy.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
     /// For a prompt: "queue" (after the current turn, the default), "steer" (into it), "now"
     /// (stopping it).
     #[serde(default)]
@@ -74,6 +78,9 @@ pub struct Report {
     pub skipped: usize,
     pub failed: usize,
     pub results: Vec<Outcome>,
+    /// Agents asked for by id that the caller doesn't act on (or kiln doesn't run): not sent to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreached: Vec<String>,
 }
 
 /// The machine an agent runs on, as people name it.
@@ -106,8 +113,9 @@ pub fn pick(infos: &[Info], to: &To) -> Vec<Info> {
 
 /// What to send one agent, read for that agent: `Err` says why it is skipped.
 fn plan(b: &Broadcast, info: &Info, meta: Option<&Value>, approvals: &[(String, bool)], client: &str) -> Result<Vec<Command>, String> {
-    if let Some(text) = b.text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-        let send = |text: String| Command::Send { id: client.to_owned(), text, mode: b.mode.unwrap_or_default(), attachments: Vec::new(), overrides: None };
+    let text = b.text.as_deref().map_or("", str::trim);
+    if !text.is_empty() || !b.attachments.is_empty() {
+        let send = |text: String| Command::Send { id: client.to_owned(), text, mode: b.mode.unwrap_or_default(), attachments: b.attachments.clone(), overrides: None, reply_to: None, task: None };
         let Some(rest) = text.strip_prefix('/') else { return Ok(vec![send(text.to_owned())]) };
         let (name, args) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(n, a)| (n, a.trim()));
         let found = meta.and_then(|m| m.get("commands")).and_then(Value::as_array).and_then(|cs| {
@@ -167,11 +175,19 @@ fn fill(v: Value, args: &str, client: &str) -> Value {
 }
 
 /// Send it: every picked agent at once.
-pub async fn run(hub: &Arc<Hub>, b: &Broadcast) -> anyhow::Result<Report> {
-    let given = [b.text.as_deref().is_some_and(|t| !t.trim().is_empty()), b.command.is_some(), b.approvals.is_some()].into_iter().filter(|x| *x).count();
-    anyhow::ensure!(given == 1, "send one of text, command or approvals");
+/// Send `b` to the agents it asks for among `among`, the agents its caller acts on
+/// (`lineage::reached`).
+pub async fn run(hub: &Arc<Hub>, b: &Broadcast, among: &[Info]) -> anyhow::Result<Report> {
+    let prompt = b.text.as_deref().is_some_and(|t| !t.trim().is_empty()) || !b.attachments.is_empty();
+    let given = [prompt, b.command.is_some(), b.approvals.is_some()].into_iter().filter(|x| *x).count();
+    anyhow::ensure!(given == 1, "send one of text (or attachments), command or approvals");
+    // Each agent gets the files themselves: an upload goes with the first message that sends it.
+    let mut b = b.clone();
+    b.attachments = hub.harness.inline_uploads(std::mem::take(&mut b.attachments));
+    let b = &b;
     let id = format!("bc-{}", crate::util::new_id());
-    let picked = pick(&hub.harness.list(), &b.to);
+    let picked = pick(among, &b.to);
+    let unreached: Vec<String> = b.to.ids.iter().filter(|id| !among.iter().any(|i| &i.id == *id)).cloned().collect();
     let sends = picked.iter().enumerate().map(|(n, info)| {
         let client = format!("{id}-{n}");
         async move {
@@ -201,7 +217,7 @@ pub async fn run(hub: &Arc<Hub>, b: &Broadcast) -> anyhow::Result<Report> {
     });
     let results = futures::future::join_all(sends).await;
     let count = |r: &str| results.iter().filter(|o| o.result == r).count();
-    Ok(Report { id, sent: count("sent"), skipped: count("skipped"), failed: count("failed"), results })
+    Ok(Report { id, sent: count("sent"), skipped: count("skipped"), failed: count("failed"), results, unreached })
 }
 
 #[cfg(test)]
@@ -244,7 +260,7 @@ mod tests {
             {"name": "model", "route": {"kind": "view", "view": "model"}},
             {"name": "doctor", "route": {"kind": "unsupported", "reason": "a setting of Claude Code's terminal interface"}}
         ]});
-        let say = |text: &str| Broadcast { to: To::default(), text: Some(text.into()), mode: None, command: None, approvals: None };
+        let say = |text: &str| Broadcast { to: To::default(), text: Some(text.into()), attachments: Vec::new(), mode: None, command: None, approvals: None };
         let sent = |text: &str| plan(&say(text), &info, Some(&meta), &[], "bc-1-0");
         assert!(matches!(sent("/compact keep the plan").as_deref(), Ok([Command::Send { text, id, .. }]) if text == "/compact keep the plan" && id == "bc-1-0"));
         assert!(matches!(sent("/name nightly").as_deref(), Ok([Command::Control { .. }])), "an alias, a control");
@@ -255,16 +271,32 @@ mod tests {
     }
 
     #[test]
+    fn files_go_with_the_prompt_to_each_agent_or_alone() {
+        let info = agent("a1", "agent:adacachy", "claude", "idle");
+        assert!(info.is_some(), "the fixture reads");
+        let Some(info) = info else { return };
+        let file = Attachment { name: "shot.png".into(), mime: "image/png".into(), data_base64: "iVBORw0KGgo=".into(), file_id: None, path: None };
+        let with = |text: Option<&str>| Broadcast { to: To::default(), text: text.map(str::to_owned), attachments: vec![file.clone()], mode: Some(SendMode::Steer), command: None, approvals: None };
+        for (text, said) in [(Some("Look at this"), "Look at this"), (None, "")] {
+            let sent = plan(&with(text), &info, None, &[], "bc-1-0");
+            assert!(
+                matches!(sent.as_deref(), Ok([Command::Send { text, attachments, mode: SendMode::Steer, .. }]) if text == said && attachments.len() == 1 && attachments.first().is_some_and(|a| a.name == "shot.png")),
+                "{sent:?}"
+            );
+        }
+    }
+
+    #[test]
     fn waiting_tool_calls_are_answered_but_questions_left() {
         let info = agent("a1", "agent:adacachy", "claude", "waiting");
         assert!(info.is_some(), "the fixture reads");
         let Some(info) = info else { return };
-        let b = Broadcast { to: To::default(), text: None, mode: None, command: None, approvals: Some("allow".into()) };
+        let b = Broadcast { to: To::default(), text: None, attachments: Vec::new(), mode: None, command: None, approvals: Some("allow".into()) };
         let waiting = [("p1".to_owned(), false), ("q1".to_owned(), true)];
         assert!(matches!(plan(&b, &info, None, &waiting, "c").as_deref(), Ok([Command::Approve { id, decision: Decision::Allow, .. }]) if id == "p1"));
         assert_eq!(plan(&b, &info, None, &waiting[1..], "c").err().as_deref(), Some("only questions waiting: answer those in its console"));
         assert_eq!(plan(&b, &info, None, &[], "c").err().as_deref(), Some("nothing waiting on you"));
-        let cmd = Broadcast { to: To::default(), text: None, mode: None, command: Some(json!({"type": "interrupt"})), approvals: None };
+        let cmd = Broadcast { to: To::default(), text: None, attachments: Vec::new(), mode: None, command: Some(json!({"type": "interrupt"})), approvals: None };
         assert!(matches!(plan(&cmd, &info, None, &[], "c").as_deref(), Ok([Command::Interrupt])));
     }
 }

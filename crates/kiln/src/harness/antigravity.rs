@@ -160,6 +160,8 @@ impl Agy {
         core.meta.features = ["send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "resume", "attachments"].iter().map(|s| (*s).to_owned()).collect();
         core.meta.modes = modes();
         core.meta.efforts = EFFORTS.iter().map(|e| ControlOption { id: (*e).to_owned(), label: capitalize(e), description: String::new(), dangerous: false }).collect();
+        // Its go-back (rewind, restore files, branch, fork) is kiln's own (`harness::goback`).
+        super::goback::declare(core);
         if core.meta.commands.is_empty() {
             core.meta.commands = sort_catalog(extras());
         }
@@ -182,7 +184,7 @@ impl Agy {
             // Older versions have no multi-turn mode: say what it needs.
             if e.contains("input-format") { format!("{e}\nkiln needs agy 1.4 or newer (`agy update`).") } else { e }
         });
-        core.state.exit = Some(ExitInfo { code, error });
+        core.state.exit = Some(ExitInfo::now(code, error));
         core.state.doing = None;
         core.state.turn_started = None;
         core.set_status(Status::Exited);
@@ -193,10 +195,16 @@ impl Agy {
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         match cmd {
-            Command::Send { id, text, mode, attachments, overrides } => self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides }, mode),
-            Command::QueueEdit { id, text } => {
+            Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => {
+                // Its go-back is kiln's (`harness::goback`): a checkpoint anchors the prompt's
+                // moment so "restore files to here" reaches back to it.
+                core.effects.push(Effect::Checkpoint { at: Core::now() });
+                self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to }, mode);
+            }
+            Command::QueueEdit { id, text, attachments } => {
                 if let Some(q) = core.state.queue.iter_mut().find(|q| q.id == id) {
                     q.text = text;
+                    if let Some(a) = attachments { q.attachments = a; }
                     core.touch_state();
                 }
             }
@@ -264,10 +272,13 @@ impl Agy {
                 let client = value.as_ref().and_then(|v| v.get("client")).and_then(Value::as_str).unwrap_or("").to_owned();
                 core.reply(client, json!({"title": "Conversation", "text": core.export(), "format": "markdown", "filename": "conversation.md"}));
             }
-            Command::Control { .. } => {}
-            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
+            // Its go-back is kiln's (`harness::goback`), Antigravity's own ending at export.
+            Command::Control { id, value } => {
+                super::goback::control(core, &id, value.as_ref());
+            }
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } => {}
             // A pause's commands are the session's (`harness::pause`).
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
             // Its own commands and skills run as "/name args" messages.
             Command::SkillRun { name, args, id, mode } => {
                 let name = name.trim().trim_start_matches('/').to_owned();
@@ -278,7 +289,7 @@ impl Agy {
                     Some(a) => format!("/{name} {a}"),
                     None => format!("/{name}"),
                 };
-                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None }, mode);
+                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, mode);
             }
             Command::SkillView { client, .. } | Command::McpAuth { client, .. } => core.reply(client, json!({"error": UNSUPPORTED})),
             Command::McpAdd { client, .. } | Command::McpRemove { client, .. } => match client.filter(|c| !c.is_empty()) {
@@ -419,7 +430,7 @@ impl Agy {
         core.state.delivery.insert(m.id.clone(), Delivery::Started);
         let (images, names) = super::model::attachment_summary(&m.attachments);
         core.note_sent(&m.id);
-        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names });
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
         core.state.turn_started = Some(Core::now());
         core.state.doing = Some("Thinking".to_owned());
         core.settle_status(true);
@@ -445,7 +456,7 @@ impl Agy {
     pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
         if p.cut.is_some() && !self.busy() && core.state.status != Status::Exited {
             let id = crate::util::new_id();
-            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None }, SendMode::Queue);
+            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Queue);
             super::pause::from_kiln(core, &id);
             return;
         }
@@ -756,6 +767,7 @@ fn tool_call(id: &str, name: &str, params: &Value, cwd: &str) -> ToolCall {
         server: None,
         tool_short: None,
         skill: None,
+        runner: None,
     }
 }
 
@@ -799,7 +811,7 @@ mod tests {
     }
 
     fn send(a: &mut Agy, core: &mut Core, id: &str, text: &str, mode: SendMode) {
-        a.command(core, Command::Send { id: id.into(), text: text.into(), mode, attachments: vec![], overrides: None });
+        a.command(core, Command::Send { id: id.into(), text: text.into(), mode, attachments: vec![], overrides: None, reply_to: None, task: None});
     }
 
     #[test]

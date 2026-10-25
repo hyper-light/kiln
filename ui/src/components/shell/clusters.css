@@ -1,0 +1,83 @@
+/* Peered clusters in the shell (clusters.tsx): the header's picker, and the clusters' frames, which
+   fill the page and show nothing of their own: no border, no background. */
+
+/* It gives way first when the header is narrow (a phone): its name is cut short, and the controls
+   on the right keep their place. */
+.cluster-pick {
+  position: relative;
+  display: inline-flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  min-height: 32px;
+  max-width: min(220px, 36vw);
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px 0 12px;
+  border: 1px solid rgb(255 255 255 / 10%);
+  border-radius: 999px;
+  color: #c9cbd1;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    color 0.15s;
+}
+.cluster-pick:hover,
+.cluster-pick:focus-within {
+  border-color: rgb(255 255 255 / 22%);
+  color: #fff;
+}
+/* Another cluster is shown: the picker says so. */
+.cluster-pick[data-away] {
+  border-color: rgb(186 176 227 / 45%);
+  color: #e3dcfb;
+}
+.cluster-pick-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Too narrow for any of the name (a small phone, or one zoomed): the chevron alone, in a circle. */
+@media (max-width: 359px) {
+  .cluster-pick {
+    width: 34px;
+    justify-content: center;
+    margin-left: -8px;
+    padding: 0;
+  }
+  .cluster-pick-name {
+    display: none;
+  }
+}
+/* The native list, clear over the pill: every platform's own menu, keyboard and screen reader. */
+.cluster-pick select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  opacity: 0;
+  cursor: pointer;
+  font-size: 16px;
+}
+
+/* The window's visible part, as an agent's page takes it (a phone's keyboard takes the rest:
+   app-shell's fitTheWindow), less this page's header while that shows. */
+.cluster-frame-wrap {
+  display: flex;
+  height: calc(var(--window-h, 100dvh) - var(--header-h) - 1px);
+  min-height: 0;
+  flex: none;
+  flex-direction: column;
+}
+.cluster-frame-wrap[data-whole] {
+  height: var(--window-h, 100dvh);
+}
+.cluster-frame {
+  display: block;
+  width: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
+  border: 0;
+  background: transparent;
+  color-scheme: dark;
+}

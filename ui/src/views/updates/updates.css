@@ -1,0 +1,1692 @@
+/* System → Updates and Builds: the Rollout figure (the approved design study, system-updates),
+   the table of machines under it, how long kiln waits, and the platforms' builds. */
+
+:where(.up-figure, .up-panel) [data-tone="ok"] {
+  --up-tone: #a8c9bc;
+}
+:where(.up-figure, .up-panel) [data-tone="warn"] {
+  --up-tone: #d0b591;
+}
+:where(.up-figure, .up-panel) [data-tone="bad"] {
+  --up-tone: #d6a2aa;
+}
+:where(.up-figure, .up-panel) [data-tone="run"] {
+  --up-tone: #b8b0d8;
+}
+:where(.up-figure, .up-panel) [data-tone="off"] {
+  --up-tone: #6f7887;
+}
+
+/* ---------------------------- the figure ---------------------------- */
+
+.up-figure {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid #29303b;
+  border-radius: 8px;
+  background: radial-gradient(ellipse at 50% 38%, #28324713, transparent 60%), #0a0c0f;
+}
+/* The prism hairline along its top. */
+.up-figure::before {
+  position: absolute;
+  top: 0;
+  right: 22%;
+  left: 22%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #b5d8cf60, #b5c6e680, #bda8d460, transparent);
+  content: "";
+}
+.up-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 25px 28px 0;
+}
+.up-eyebrow {
+  margin: 0 0 10px;
+  color: #8c97a7;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+.up-fig-title {
+  margin: 0;
+  color: #e6e8ec;
+  font-size: 24px;
+  font-weight: 450;
+  letter-spacing: -0.7px;
+  line-height: 1.2;
+}
+.up-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  color: var(--up-tone, #a8c9bc);
+  font-size: 12px;
+  white-space: nowrap;
+  transition: color 0.3s;
+}
+.up-status::before {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+.up-stage {
+  position: relative;
+  margin-top: 4px;
+}
+.up-scene {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+/* As wide as the page, as Replication is: the two figures' lettering reads the same size. */
+.up-portrait {
+  display: none;
+}
+.up-scene text {
+  transition: fill 0.3s;
+}
+/* Names as Replication sets them; a line under each in mono, plain unless it needs attention. */
+.up-scene .up-ink {
+  fill: #a2aab7;
+  font-family: var(--font-sans);
+  font-size: 14px;
+}
+.up-scene .up-tail {
+  fill: #7f8b9b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.up-scene .up-sub {
+  fill: #8e9bab;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.up-scene .up-sub[data-tone="warn"] {
+  fill: #d0b591;
+}
+.up-scene .up-sub[data-tone="bad"] {
+  fill: #d6a2aa;
+}
+.up-scene .up-sub[data-tone="run"] {
+  fill: #b8b0d8;
+}
+.up-scene .up-sub[data-tone="off"] {
+  fill: #6f7887;
+}
+.up-scene .up-heading {
+  fill: #8d9aae;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+.up-scene .up-node-name {
+  fill: #d6dde6;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  letter-spacing: -0.2px;
+}
+
+/* A cable: still unless something moves on it. Behind reads amber, failed rose and broken, away
+   faint, waiting dotted. */
+.up-cable {
+  transition: opacity 0.3s;
+}
+.up-cable-shadow {
+  fill: none;
+  stroke: #141b25;
+  stroke-width: 5;
+  stroke-opacity: 0.55;
+  vector-effect: non-scaling-stroke;
+}
+.up-cable-line {
+  fill: none;
+  stroke: #526278;
+  stroke-width: 0.8;
+  stroke-opacity: 0.55;
+  vector-effect: non-scaling-stroke;
+  transition:
+    stroke 0.3s,
+    stroke-opacity 0.3s;
+}
+.up-cable[data-tone="warn"] .up-cable-line {
+  stroke: #c9aa84;
+  stroke-opacity: 0.5;
+}
+.up-cable[data-tone="bad"] .up-cable-line {
+  stroke: #c98f99;
+  stroke-dasharray: 3 4;
+}
+.up-cable[data-tone="wait"] .up-cable-line {
+  stroke-dasharray: 2 5;
+}
+.up-cable[data-tone="off"] {
+  opacity: 0.25;
+}
+.up-cable[data-dim] {
+  opacity: 0.3;
+}
+.up-chevron {
+  fill: none;
+  stroke: #8196ad;
+  stroke-width: 0.7;
+  opacity: 0.58;
+  vector-effect: non-scaling-stroke;
+}
+
+/* Light on a cable while an upgrade or a build moves on it: comets flowing its length one after
+   another, a bright head in a soft glow, the way things go. A connected runner's cable carries a
+   faint pulse every 6 to 8 s, the link live; an offline one's nothing. Under the motion setting and
+   for reduced motion a comet holds halfway along, a mark, and the pulses rest. */
+.up-light {
+  transition: opacity 0.3s;
+}
+.up-light[data-dim] {
+  opacity: 0.3;
+}
+.up-light path {
+  fill: none;
+  stroke: #b8c9e8;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+  animation: up-flow 3.6s linear var(--up-delay, 0s) infinite;
+}
+.up-light[data-kind="build"] path {
+  stroke: #b6d5c8;
+}
+.up-light-halo {
+  stroke-width: 5;
+  stroke-opacity: 0.2;
+  stroke-dasharray: 16 34;
+}
+.up-light .up-light-core {
+  stroke-width: 1.6;
+  stroke-dasharray: 6 44;
+  animation-name: up-flow-head;
+}
+@keyframes up-flow {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: -50;
+  }
+}
+@keyframes up-flow-head {
+  from {
+    stroke-dashoffset: -10;
+  }
+  to {
+    stroke-dashoffset: -60;
+  }
+}
+.up-pulse {
+  fill: none;
+  stroke: #a9bad3;
+  stroke-width: 1.2;
+  stroke-linecap: round;
+  stroke-dasharray: 7 200;
+  vector-effect: non-scaling-stroke;
+  opacity: 0;
+  animation: up-pulse var(--up-period, 7s) linear var(--up-delay, 0s) infinite;
+}
+.up-pulse[data-dim] {
+  visibility: hidden;
+}
+@keyframes up-pulse {
+  0% {
+    stroke-dashoffset: 7;
+    opacity: 0;
+  }
+  4% {
+    opacity: 0.6;
+  }
+  36% {
+    opacity: 0.6;
+  }
+  40% {
+    stroke-dashoffset: -100;
+    opacity: 0;
+  }
+  100% {
+    stroke-dashoffset: -100;
+    opacity: 0;
+  }
+}
+
+/* The boxes: glass faces in the prism, etched lines, kiln's mark on the server's top. */
+.up-shadow {
+  fill: #010305;
+  opacity: 0.6;
+}
+.up-facet {
+  stroke-width: 0.7;
+  stroke-opacity: 0.6;
+  vector-effect: non-scaling-stroke;
+}
+.up-etch {
+  fill: none;
+  stroke: #b5c3d5;
+  stroke-width: 0.6;
+  stroke-opacity: 0.2;
+  vector-effect: non-scaling-stroke;
+}
+.up-ridge {
+  fill: none;
+  stroke-width: 0.95;
+  stroke-opacity: 0.8;
+  vector-effect: non-scaling-stroke;
+}
+.up-mark {
+  fill: none;
+  stroke-width: 1;
+  stroke-opacity: 0.5;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.up-mark-tail {
+  fill: none;
+  stroke: #bcb1d8;
+  stroke-width: 1.1;
+  stroke-opacity: 0.7;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.up-led {
+  transition: fill 0.3s;
+}
+.up-unit {
+  transition: opacity 0.4s;
+}
+/* A chip's die: its outline, and while the release pipeline builds its platform, drawn as it goes. */
+.up-die {
+  fill: none;
+  stroke-width: 0.8;
+  stroke-opacity: 0.55;
+  vector-effect: non-scaling-stroke;
+}
+.up-die[data-building] {
+  stroke: #cfc6ef;
+  stroke-opacity: 0.95;
+  stroke-dasharray: 7 14;
+  animation: up-die 2.4s linear infinite;
+}
+@keyframes up-die {
+  to {
+    stroke-dashoffset: -42;
+  }
+}
+
+/* A machine or a build: picked, or pickable. */
+.up-node {
+  cursor: pointer;
+  outline: none;
+}
+.up-hit {
+  fill: transparent;
+  stroke: transparent;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+@media (hover: hover) {
+  .up-node:hover .up-hit {
+    fill: #b2bbd808;
+    stroke: #788ba65c;
+  }
+}
+.up-node[data-picked] .up-hit {
+  fill: #afbbd406;
+  stroke: #809ab54d;
+}
+.up-node:focus-visible .up-hit {
+  fill: #b2bbd808;
+  stroke: #b8b0d8;
+}
+
+/* Under the picture: what is picked (or the fleet as a whole), and three figures. */
+.up-readout {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  margin: 0 28px;
+  padding: 13px 0;
+  border-top: 1px solid #222a35;
+}
+.up-readout-mark {
+  flex: none;
+  width: 21px;
+  height: 21px;
+  color: #a8c9bc;
+}
+.up-readout-text {
+  flex: 1;
+  min-width: 0;
+}
+.up-readout-title {
+  display: block;
+  color: #bcc6d3;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.up-readout-note {
+  display: block;
+  margin-top: 3px;
+  color: #8693a4;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.up-reset {
+  min-height: 44px;
+  padding: 12px 0 12px 12px;
+  color: #beb4d8;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.up-reset:hover {
+  color: #e1d6fa;
+}
+.up-legend {
+  display: flex;
+  gap: 16px;
+  margin-left: auto;
+  color: #8c98a9;
+  font-family: var(--font-mono);
+  font-size: 9px;
+}
+.up-legend span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+.up-legend i {
+  display: block;
+  width: 12px;
+  height: 2px;
+  border-radius: 2px;
+  background: #b8c9e8;
+  box-shadow: 0 0 5px #b8c9e840;
+}
+.up-legend span:nth-child(2) i {
+  background: #b6d5c8;
+  box-shadow: 0 0 5px #b6d5c840;
+}
+.up-legend span:last-child i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #a8c9bc;
+  box-shadow: none;
+}
+.up-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+  padding: 20px 28px 22px;
+  border-top: 1px solid #252d38;
+  background: #0e121737;
+}
+.up-metrics > div {
+  padding-left: 28px;
+  border-left: 1px solid #252d38;
+}
+.up-metrics > div:first-child {
+  padding: 0;
+  border: 0;
+}
+.up-metrics dt {
+  margin-bottom: 10px;
+  color: #8c99ab;
+  font-size: 11px;
+}
+.up-metrics dd {
+  margin: 0;
+  color: #dce3eb;
+  font-family: var(--font-mono);
+  font-size: 23px;
+  letter-spacing: -0.8px;
+  line-height: 1;
+  transition: color 0.3s;
+}
+.up-metrics dd[data-tone] {
+  color: var(--up-tone);
+}
+.up-metrics dd small {
+  margin-left: 8px;
+  color: #8c99ab;
+  font-size: 11px;
+  letter-spacing: 0;
+}
+.up-slash {
+  margin: 0 6px;
+  color: #667487;
+  font-size: 15px;
+}
+.up-stage-hold {
+  margin: 4px auto 0;
+  aspect-ratio: 960 / 318;
+}
+
+/* ---------------------------- panels ---------------------------- */
+
+.up-panel {
+  margin-top: 16px;
+  overflow: hidden;
+  border: 1px solid #232a34;
+  border-radius: 8px;
+  background: #0a0c0f;
+}
+.up-panel-flush {
+  margin-top: 0;
+}
+.up-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-height: 68px;
+  padding: 18px 24px 16px;
+}
+.up-panel-words {
+  min-width: 0;
+}
+.up-panel-words h3 {
+  margin: 0;
+  color: #e6e8ec;
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: -0.2px;
+}
+.up-panel-words p {
+  margin: 4px 0 0;
+  color: #7f8998;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.up-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
+}
+.up-instep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 8px;
+  color: var(--up-tone);
+  font-size: 12px;
+}
+.up-instep::before {
+  flex: none;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+.up-instep a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: rgb(255 255 255 / 22%);
+  text-underline-offset: 3px;
+}
+.up-instep a:hover {
+  text-decoration-color: currentColor;
+}
+/* A plan for the whole fleet, under the panel's head. */
+.up-wide {
+  padding: 0 24px 16px;
+}
+.up-bulk,
+.up-upload {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 24px;
+  border-top: 1px solid #1b2028;
+  background: #0d1015;
+  color: #b9c0cb;
+  font-size: 12px;
+}
+.up-bulk-count {
+  margin-right: 6px;
+}
+.up-bulk .up-error {
+  flex-basis: 100%;
+}
+.up-spacer {
+  flex: 1;
+}
+.up-upload-select {
+  min-width: 260px;
+}
+.up-none {
+  margin: 0;
+  padding: 18px 24px;
+  border-top: 1px solid #1b2028;
+  color: #7f8998;
+  font-size: 12px;
+}
+
+/* A native select at the table's size. */
+.up-select {
+  min-width: 118px;
+}
+.up-select select {
+  height: 32px;
+  min-height: 32px;
+  padding: 0 30px 0 10px;
+  border-color: #2a313b;
+  border-radius: 6px;
+  background: #0c0f13;
+  color: #c9d0da;
+  font-size: 12px;
+}
+.up-select select:hover {
+  border-color: #3d4552;
+}
+.up-select select:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+.up-select > svg {
+  right: 9px;
+  color: #7f8998;
+}
+
+/* ---------------------------- the table of machines ---------------------------- */
+
+.up-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.up-table th {
+  padding: 12px 12px 10px;
+  border-top: 1px solid #1b2028;
+  border-bottom: 1px solid #1b2028;
+  color: #7c8696;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 400;
+  letter-spacing: 0.12em;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.up-table td {
+  padding: 13px 12px;
+  vertical-align: middle;
+}
+.up-table th:first-child,
+.up-row > td:first-child {
+  padding-left: 24px;
+}
+.up-table th:last-child,
+.up-row > td:last-child {
+  padding-right: 20px;
+}
+/* A machine's checkbox stands by the first line of its name: its name and its line under it are
+   44px, centred in the row as every cell is, however tall the row grows. */
+.up-row > td.up-c-check .check {
+  display: block;
+  position: relative;
+  top: -11px;
+}
+/* A machine: its row, then what it needs said under it; one rule under both. */
+.up-machine {
+  border-bottom: 1px solid #151a21;
+  transition: background 0.2s;
+}
+.up-machine:last-child {
+  border-bottom: 0;
+}
+@media (hover: hover) {
+  .up-machine:hover {
+    background: #0d1116;
+  }
+}
+.up-machine[data-picked] {
+  background: #100f16;
+}
+.up-machine[data-hl] {
+  background: #0f1218;
+}
+.up-c-check {
+  width: 52px;
+}
+.up-c-build {
+  width: 164px;
+}
+.up-c-state {
+  width: 206px;
+}
+.up-c-policy {
+  width: 150px;
+}
+.up-c-act {
+  width: 340px;
+}
+.up-more > td {
+  padding: 0 20px 0 76px;
+}
+.up-more-in {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: 16px;
+}
+.up-more:has(.up-more-in:empty) {
+  display: none;
+}
+.up-more-in > .upgrade-log {
+  margin-top: 0;
+}
+.up-name {
+  display: block;
+  overflow: hidden;
+  color: #e0e5ec;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.up-tag {
+  margin-left: 8px;
+  padding: 2px 5px;
+  border: 1px solid #2a313b;
+  border-radius: 4px;
+  color: #8c97a7;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  vertical-align: 2px;
+}
+.up-sub {
+  display: block;
+  margin-top: 4px;
+  overflow: hidden;
+  color: #7f8998;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.up-policy-words {
+  margin: 0;
+  white-space: normal;
+}
+.up-build {
+  display: block;
+  overflow: hidden;
+  color: #c6cdd7;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.up-from {
+  color: #7f8998;
+}
+.up-build .up-goes {
+  margin: 0 7px;
+  color: #566170;
+}
+.up-build[data-tone] .up-to {
+  color: var(--up-tone);
+}
+.up-state {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--up-tone);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.up-state::before {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+.up-state-sub {
+  display: block;
+  margin: 4px 0 0 15px;
+  overflow: hidden;
+  color: #7f8998;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* While a machine is upgraded or a platform built: a line with light moving along it. */
+.up-track {
+  position: relative;
+  display: block;
+  width: min(140px, 80%);
+  height: 1px;
+  margin: 7px 0 0 15px;
+  overflow: hidden;
+  border-radius: 1px;
+  background: #262c36;
+}
+.up-track i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 38%;
+  background: linear-gradient(90deg, transparent, #c9c1ee, transparent);
+  transform: translateX(-100%);
+  animation: up-track 1.6s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
+}
+@keyframes up-track {
+  to {
+    transform: translateX(265%);
+  }
+}
+.up-track-wide {
+  width: 100%;
+  margin: 0;
+}
+/* What can be done about a machine, from its column's left edge as every column starts: a row led
+   by a bordered button starts at its border, one led by a plain one at its mark. */
+.up-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.up-acts:not([data-lead]) {
+  margin-left: -13px;
+}
+.up-saving {
+  display: block;
+  margin-top: 4px;
+  color: #c9bde3;
+  font-size: 10.5px;
+}
+.up-table-hold tbody td {
+  height: 63px;
+  border-bottom: 1px solid #151a21;
+}
+
+/* What a row says under it: notes, errors, a plan, a diagnosis, its output. */
+.up-note {
+  margin: 0;
+  color: #8f99a8;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.up-note[data-tone="error"],
+.up-error {
+  margin: 0;
+  color: #d1aaad;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.up-dim {
+  color: #7f8794;
+}
+.up-mono {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.up-procs {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: #c8cad0;
+  font-size: 12px;
+}
+.up-procs li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+}
+.up-confirm {
+  max-width: 680px;
+}
+.up-confirm p {
+  margin: 0;
+}
+.up-confirm-title {
+  color: var(--color-foreground);
+  font-weight: 500;
+}
+.up-confirm-lead {
+  color: #8f99a8;
+  font-size: 12px;
+}
+.up-plan {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+  list-style: disc;
+  color: #b9c2cf;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.up-plan li::marker {
+  color: #6f7682;
+}
+.up-plan code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgb(255 255 255 / 5%);
+  color: #d6dbe2;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+.up-plan-after {
+  margin: 12px 0 0;
+  color: #aab3c1;
+  font-size: 12px;
+  line-height: 1.6;
+}
+/* A runner's diagnosis: what's wrong first, each with its repair. */
+.up-diag {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid #262c35;
+  border-radius: 8px;
+  background: #07080a;
+}
+.up-diag-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.up-diag-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 6px 10px;
+  min-width: 0;
+}
+.up-diag-item > .min-w-0 {
+  flex-basis: 16rem;
+}
+.up-diag-title {
+  margin: 0;
+  color: #c9d0da;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.up-diag-log {
+  max-height: 14rem;
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  overflow-y: auto;
+  border-radius: 7px;
+  background: rgb(255 255 255 / 3%);
+  color: #8f99a8;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.up-diag-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+/* How long kiln waits: a line, changed in place. */
+.up-waits {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+  padding: 14px 24px;
+  border-top: 1px solid #1b2028;
+  color: #8c96a5;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.up-waits b {
+  color: #c6cdd7;
+  font-family: var(--font-mono);
+  font-weight: 400;
+}
+.up-waits-words {
+  flex: 1;
+  min-width: 240px;
+}
+.up-waits-fields {
+  display: flex;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+}
+.up-waits label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #9aa4b2;
+}
+.up-waits input {
+  width: 64px;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid #2a313b;
+  border-radius: 6px;
+  background: #0c0f13;
+  color: #e0e5ec;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.up-waits input:focus-visible {
+  border-color: #a5a0bf;
+  outline: 2px solid rgb(165 160 191 / 35%);
+  outline-offset: 1px;
+}
+.up-waits-note {
+  flex-basis: 100%;
+  margin: 0;
+  color: #7f8998;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.up-waits .up-error {
+  flex-basis: 100%;
+}
+
+/* ---------------------------- the platforms ---------------------------- */
+
+/* Tiles in a grid, a hairline between them: each draws its right and bottom one, and the panel cuts
+   those along its edges. */
+.up-platforms {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0 -1px -1px 0;
+  border-top: 1px solid #1b2028;
+}
+.up-platforms[data-cols="1"] {
+  grid-template-columns: minmax(0, 1fr);
+}
+.up-platforms[data-cols="2"] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.up-platforms[data-cols="3"] {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.up-platforms[data-cols="5"] {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+.up-platform {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  padding: 20px 22px 18px;
+  border-right: 1px solid #1b2028;
+  border-bottom: 1px solid #1b2028;
+  transition: background 0.3s;
+}
+.up-platform[data-tone="run"] {
+  background: #0e0d14;
+}
+.up-platform[data-hl] {
+  background: #0f1218;
+  box-shadow: inset 0 0 0 1px #809ab54d;
+}
+/* A platform is picked with the whole of its tile, by pointer or keyboard: its log opens under the
+   tiles. What can be done in it stays its own button, above. */
+.up-p-pick {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: transparent;
+  cursor: pointer;
+}
+.up-p-pick:focus-visible {
+  outline: 2px solid #b8b0d8;
+  outline-offset: -2px;
+}
+@media (hover: hover) {
+  .up-platform:not([data-hl]):has(> .up-p-pick:hover) {
+    background: #0d1116;
+  }
+}
+.up-p-acts,
+.up-p-shadow {
+  position: relative;
+  z-index: 2;
+  pointer-events: none;
+}
+.up-p-acts :is(a, button),
+.up-p-shadow button,
+.up-platform > .up-confirm {
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
+}
+/* An older build kept beside the one runners get, said quietly, with its Remove. */
+.up-p-shadow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 6px;
+  margin: -4px 0 0;
+  color: #7a8493;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.up-p-shadow [data-slot="button"] {
+  margin-left: -6px;
+}
+/* While its job builds it, light runs along under its facts, as on its cable in the picture; queued,
+   the line waits still. */
+.up-track-wide i {
+  background: linear-gradient(90deg, transparent, #b6d5c8, transparent);
+  animation-duration: 2.8s;
+  animation-timing-function: linear;
+}
+.up-track[data-state="queued"] i {
+  display: none;
+}
+.up-chip-die[data-building] {
+  stroke: #cfc6ef;
+  stroke-dasharray: 7 14;
+  animation: up-die 2.4s linear infinite;
+}
+.up-p-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.up-p-head svg {
+  flex: none;
+  width: 38px;
+  height: 30px;
+}
+.up-p-os {
+  color: #e0e5ec;
+  font-size: 14px;
+}
+.up-p-arch {
+  display: block;
+  margin-top: 3px;
+  color: #7f8998;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.up-p-facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 14px;
+  margin: 0;
+  font-size: 12px;
+}
+.up-p-facts dt {
+  color: #7f8998;
+}
+.up-p-facts dd {
+  margin: 0;
+  overflow: hidden;
+  color: #c6cdd7;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.up-p-facts dd[data-tone] {
+  color: var(--up-tone);
+}
+.up-p-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: auto -12px 0;
+}
+.up-platform > .up-confirm {
+  font-size: 12px;
+}
+.up-platforms-hold {
+  min-height: 196px;
+  border-top: 1px solid #1b2028;
+}
+
+/* A platform's build log, under the tiles: its run and job, their steps, the step's log. */
+.up-blog {
+  border-top: 1px solid #1b2028;
+  background: #0b0d11;
+}
+.up-blog-none {
+  margin: 0;
+  padding: 16px 24px;
+  color: #8f99a8;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.up-blog-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  padding: 16px 24px 12px;
+  font-size: 12px;
+}
+.up-blog-title {
+  min-width: 0;
+  color: #c9d0da;
+}
+.up-blog-title a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: rgb(255 255 255 / 22%);
+  text-underline-offset: 3px;
+}
+.up-blog-title a:hover {
+  text-decoration-color: currentColor;
+}
+.up-blog-meta {
+  margin-left: auto;
+  color: #7f8998;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.up-blog-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0 24px 14px;
+  list-style: none;
+}
+.up-blog-steps button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 11px;
+  border: 1px solid #252c36;
+  border-radius: 6px;
+  background: #0d1015;
+  color: #b9c0cb;
+  font-size: 12px;
+  transition:
+    border-color 0.2s,
+    background 0.2s;
+}
+@media (hover: hover) {
+  .up-blog-steps button:hover {
+    border-color: #3a4350;
+  }
+}
+.up-blog-steps button[aria-pressed="true"] {
+  border-color: #6d6590;
+  background: #13121b;
+  color: #e6e8ec;
+}
+.up-blog-steps button:focus-visible {
+  outline: 2px solid #b8b0d8;
+  outline-offset: 1px;
+}
+.up-blog-n {
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.up-blog-t {
+  color: #93a1b4;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.up-blog > .upgrade-log {
+  margin: 14px 24px 18px;
+}
+.up-blog-hold {
+  border-top: 1px solid #1d2128;
+}
+.up-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 12px 0 0;
+  color: #7e8a9a;
+  font-size: 11px;
+}
+.up-foot span:last-child {
+  color: #6d7a8b;
+  font-family: var(--font-mono);
+  font-size: 9px;
+}
+
+/* ---------------------------- narrower ---------------------------- */
+
+@media (max-width: 1100px) {
+  .up-c-act {
+    width: 200px;
+  }
+  .up-c-state {
+    width: 180px;
+  }
+  .up-platforms[data-cols="4"],
+  .up-platforms[data-cols="5"] {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* Too narrow for six columns: each machine's row is a grid of its own, the update policy a fixed
+   column with the actions wrapping beside it. */
+@media (max-width: 960px) {
+  .up-table thead {
+    display: none;
+  }
+  .up-table,
+  .up-machine {
+    display: block;
+  }
+  .up-row {
+    display: grid;
+    grid-template-areas:
+      "check name name state"
+      ". build build build"
+      ". policy act act";
+    grid-template-columns: 28px 160px minmax(0, 1fr) auto;
+    gap: 10px 12px;
+    align-items: center;
+    padding: 16px;
+  }
+  .up-row > td,
+  .up-row > td:first-child,
+  .up-row > td:last-child {
+    display: block;
+    width: auto;
+    min-width: 0;
+    padding: 0;
+    text-align: left;
+  }
+  .up-c-check {
+    grid-area: check;
+  }
+  .up-row > td.up-c-check {
+    align-self: start;
+    padding-top: 3px;
+  }
+  .up-row > td.up-c-check .check {
+    top: 0;
+  }
+  .up-c-name {
+    align-self: start;
+  }
+  .up-c-name {
+    grid-area: name;
+  }
+  .up-c-build {
+    grid-area: build;
+  }
+  .up-row > td.up-c-state {
+    grid-area: state;
+    justify-self: end;
+    text-align: right;
+  }
+  .up-c-policy {
+    grid-area: policy;
+  }
+  .up-c-act {
+    grid-area: act;
+  }
+  .up-state {
+    justify-content: flex-end;
+  }
+  /* The state's line wraps rather than run into the machine's beside it. */
+  .up-state-sub {
+    margin-left: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .up-track {
+    margin-left: auto;
+  }
+  .up-acts {
+    justify-content: flex-start;
+  }
+  .up-more {
+    display: block;
+  }
+  .up-more > td {
+    display: block;
+    padding: 0 16px 0 56px;
+  }
+  .up-platforms[data-cols]:not([data-cols="1"]) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .up-head {
+    flex-direction: column;
+    gap: 12px;
+    padding: 21px 18px 0;
+  }
+  .up-eyebrow {
+    margin-bottom: 9px;
+    font-size: 8px;
+  }
+  .up-fig-title {
+    font-size: 21px;
+  }
+  .up-status {
+    margin-top: 0;
+    font-size: 11px;
+  }
+  .up-landscape {
+    display: none;
+  }
+  .up-portrait {
+    display: block;
+    max-width: 430px;
+    margin: 18px auto 0;
+  }
+  .up-stage-hold {
+    max-width: 430px;
+    aspect-ratio: 360 / 404;
+  }
+  .up-readout {
+    gap: 10px;
+    min-height: 64px;
+    margin: 0 18px;
+    padding: 14px 0;
+  }
+  .up-readout-note {
+    font-size: 10px;
+  }
+  .up-readout-mark {
+    width: 18px;
+    height: 18px;
+  }
+  .up-legend {
+    display: none;
+  }
+  .up-metrics {
+    padding: 18px 18px 20px;
+  }
+  .up-metrics > div {
+    padding-left: 14px;
+  }
+  .up-metrics dt {
+    font-size: 10px;
+    white-space: nowrap;
+  }
+  .up-metrics dd {
+    font-size: 20px;
+  }
+  .up-metrics dd small {
+    display: block;
+    margin: 6px 0 0;
+  }
+  .up-slash {
+    margin: 0 4px;
+    font-size: 14px;
+  }
+  .up-panel-head {
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 16px 16px 14px;
+  }
+  .up-panel-actions {
+    justify-content: flex-start;
+    width: 100%;
+    margin-left: 0;
+  }
+  .up-instep {
+    width: 100%;
+    margin: 0;
+  }
+  .up-panel [data-slot="button"] {
+    min-height: 40px;
+    padding-inline: 14px;
+  }
+  .up-select {
+    width: 100%;
+    min-width: 0;
+  }
+  .up-select select {
+    height: 40px;
+    min-height: 40px;
+  }
+  .up-wide {
+    padding: 0 16px 14px;
+  }
+  /* A machine on a phone: its checkbox in a column of its own, then its name, its build, its state
+     (the dot after its word), its updates and what can be done, each on a line of its own. */
+  .up-row {
+    grid-template-areas:
+      "check name"
+      ". build"
+      ". state"
+      ". policy"
+      ". act";
+    grid-template-columns: 28px minmax(0, 1fr);
+    align-items: start;
+  }
+  .up-row > td.up-c-state {
+    justify-self: stretch;
+    text-align: left;
+  }
+  .up-state {
+    flex-direction: row-reverse;
+    justify-content: flex-end;
+  }
+  .up-track {
+    margin-left: 0;
+  }
+  .up-c-policy .up-select {
+    width: min(100%, 240px);
+  }
+  /* Its head lines up with its rows: Check for updates' mark in the checkboxes' column, as big as
+     a checkbox, its words where the names start; Upgrade all under them, on a line of its own. */
+  .up-fleet-actions {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+  .up-fleet-actions .up-check-updates {
+    gap: 24px;
+    margin-left: -1px;
+    padding: 0;
+  }
+  .up-fleet-actions .up-check-updates svg {
+    width: 16px;
+    height: 16px;
+  }
+  .up-fleet-actions .up-upgrade-all {
+    margin-left: 40px;
+  }
+  .up-acts:not([data-lead]) {
+    margin-left: -15px;
+  }
+  .up-bulk,
+  .up-upload {
+    padding: 10px 16px;
+  }
+  .up-bulk .up-select {
+    width: auto;
+    flex: 1 1 140px;
+  }
+  .up-upload-select {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+  .up-waits {
+    padding: 14px 16px;
+  }
+  .up-waits-words {
+    min-width: 0;
+  }
+  .up-waits-fields {
+    gap: 12px;
+  }
+  .up-waits label {
+    flex: 1 1 40%;
+  }
+  .up-waits input {
+    width: 100%;
+    height: 40px;
+  }
+  .up-platforms[data-cols],
+  .up-platforms[data-cols]:not([data-cols="1"]) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .up-platform {
+    gap: 10px;
+    padding: 16px;
+  }
+  .up-p-facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+  }
+  .up-p-facts dt {
+    display: none;
+  }
+  .up-p-acts {
+    margin: 0 -14px;
+  }
+  .up-blog-none,
+  .up-blog-head {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+  .up-blog-meta {
+    flex-basis: 100%;
+    margin-left: 0;
+  }
+  .up-blog-steps {
+    padding: 0 16px 12px;
+  }
+  .up-blog > .upgrade-log {
+    margin: 12px 16px 16px;
+  }
+  .up-foot {
+    display: block;
+    line-height: 1.6;
+  }
+  .up-foot span:last-child {
+    display: none;
+  }
+}
+
+@media (max-width: 360px) {
+  .up-head {
+    padding: 19px 15px 0;
+  }
+  .up-readout {
+    margin: 0 15px;
+  }
+  .up-metrics {
+    padding-right: 15px;
+    padding-left: 15px;
+  }
+  .up-metrics > div {
+    padding-left: 10px;
+  }
+  .up-metrics dt {
+    font-size: 9px;
+  }
+  .up-row {
+    grid-template-columns: 24px minmax(0, 1fr);
+    gap: 10px;
+    padding: 14px 12px;
+  }
+  .up-more > td {
+    padding-left: 46px;
+  }
+  .up-fleet-actions {
+    margin-left: -4px;
+  }
+  .up-fleet-actions .up-check-updates {
+    gap: 18px;
+  }
+  .up-fleet-actions .up-upgrade-all {
+    margin-left: 34px;
+  }
+}
+
+/* Still under the motion setting and for reduced motion: what moves while a machine is upgraded
+   or a platform built holds as a mark, a comet halfway along its cable; the pulses rest. */
+:root[data-motion="paused"] .up-light path,
+:root[data-motion="paused"] .up-pulse {
+  animation: none;
+}
+:root[data-motion="paused"] .up-light-halo {
+  stroke-dasharray: 16 84;
+  stroke-dashoffset: -42;
+}
+:root[data-motion="paused"] .up-light .up-light-core {
+  stroke-dasharray: 6 94;
+  stroke-dashoffset: -52;
+}
+:root[data-motion="paused"] .up-die[data-building],
+:root[data-motion="paused"] .up-chip-die[data-building],
+:root[data-motion="paused"] .up-track i {
+  animation: none;
+}
+:root[data-motion="paused"] .up-track i {
+  transform: translateX(80%);
+}
+@media (prefers-reduced-motion: reduce) {
+  .up-light path,
+  .up-pulse {
+    animation: none;
+  }
+  .up-light-halo {
+    stroke-dasharray: 16 84;
+    stroke-dashoffset: -42;
+  }
+  .up-light .up-light-core {
+    stroke-dasharray: 6 94;
+    stroke-dashoffset: -52;
+  }
+  .up-die[data-building],
+  .up-chip-die[data-building],
+  .up-track i {
+    animation: none;
+  }
+  .up-track i {
+    transform: translateX(80%);
+  }
+  .up-scene text,
+  .up-cable,
+  .up-cable-line,
+  .up-light,
+  .up-led,
+  .up-unit,
+  .up-status,
+  .up-machine,
+  .up-platform,
+  .up-metrics dd {
+    transition: none;
+  }
+}

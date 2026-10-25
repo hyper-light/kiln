@@ -1,0 +1,187 @@
+/* Agents attached to what they look after (views/attach): a run's incident cards (card.tsx), and
+   where what they watch is shown (here.tsx). */
+.attach-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  min-width: 0;
+}
+.attach-name {
+  color: var(--color-bright);
+  font-size: 15px;
+  font-weight: 500;
+}
+.attach-state {
+  margin-left: auto;
+  color: var(--color-secondary);
+  font-size: 12.5px;
+}
+.attach-meta {
+  min-width: 0;
+  color: var(--color-meta);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.attach-meta a:hover {
+  color: var(--color-link);
+}
+.attach-latest,
+.attach-report {
+  min-width: 0;
+  color: var(--color-secondary);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.attach-report {
+  white-space: pre-wrap;
+}
+.attach-incident-title {
+  color: var(--color-foreground);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.attach-error {
+  color: var(--color-fail);
+  font-size: 12.5px;
+}
+/* A run's incident card (views/attach/card.tsx). */
+.attach-cards {
+  display: grid;
+  gap: 8px;
+  max-width: 72ch;
+  margin-top: 16px;
+}
+.attach-card {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--color-line);
+  border-left: 2px solid var(--color-line-strong);
+  border-radius: 6px;
+}
+.attach-card[data-state="waiting"] {
+  border-left-color: var(--color-warn);
+}
+/* Attached agents where what they watch is shown (views/attach/here.tsx): "Watched by" on its own
+   row, each one's chip under it (as tall as a small button), an opened one's own line, a row to
+   attach one more. */
+.watch {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.watch-label {
+  margin: 0;
+}
+.watch-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 32px;
+}
+.watch-none {
+  color: #8f939e;
+  font-size: 12.5px;
+}
+.watch-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid rgb(255 255 255 / 10%);
+  border-radius: 999px;
+  background: rgb(255 255 255 / 2%);
+  color: var(--color-bright);
+  font-size: 12.5px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    border-color 0.15s var(--ease),
+    background 0.15s var(--ease);
+}
+.watch-chip:hover,
+.watch-chip[aria-expanded="true"] {
+  border-color: rgb(255 255 255 / 24%);
+  background: rgb(255 255 255 / 5%);
+}
+.watch-chip[data-stand="paused"] .watch-name {
+  color: var(--color-secondary);
+}
+.watch-of {
+  color: #a1a4ad;
+  font-size: 12px;
+}
+.watch-stand {
+  color: #8f939e;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+.watch-chip[data-stand="waiting for you"] .watch-stand {
+  color: #e0b45a;
+}
+.watch-detail {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding-top: 10px;
+  border-top: 1px solid var(--color-line);
+}
+.watch-what {
+  min-width: 0;
+  flex: 1 1 260px;
+  margin: 0;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.watch-what a {
+  color: var(--color-foreground);
+}
+.watch-what a:hover {
+  color: var(--color-bright);
+}
+.watch-acts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+.watch-kept {
+  color: #8f939e;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.watch-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.8fr) auto;
+  align-items: end;
+  gap: 12px 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-line);
+}
+.watch-wakes {
+  min-width: 0;
+}
+.watch-form-acts {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+}
+@media (max-width: 640px) {
+  .watch-form {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .watch-wakes,
+  .watch-form-acts {
+    grid-column: 1 / -1;
+  }
+}

@@ -23,6 +23,7 @@ pub mod dns;
 pub mod mobileconfig;
 pub mod netinfo;
 pub mod proxy;
+pub mod replica;
 pub mod runner;
 pub mod tailnet;
 pub mod zone;
@@ -382,6 +383,9 @@ pub struct Push {
     /// Renew the self-signed certificate now (`POST /api/runners/:name/front-door/cert/renew`):
     /// a new key, and a CSR for it at once. The certificate in use serves until the new one is in.
     pub renew: bool,
+    /// The clusters this one is peered with, which the front door forwards to itself
+    /// (`crate::peers`); `None` from a server that has none to say.
+    pub peers: Option<crate::peers::forward::Table>,
 }
 
 impl std::fmt::Debug for Push {
@@ -502,6 +506,67 @@ pub struct Status {
     pub tailscale: Option<tailnet::TailnetStatus>,
 }
 
+/// A port for a test to listen on (TCP and UDP): below Linux's ephemeral range, where no
+/// connection's own end and no other test's `bind(0)` lands, never one this process handed out
+/// before, and claimed for the process's life by a lock file, so test suites running side by side
+/// (several at once on a busy machine) never take the same one. The OS lets go of the lock when the
+/// process ends. Taking a port from `bind(0)` and binding it again races every test alongside.
+#[cfg(test)]
+pub(crate) fn test_port() -> std::io::Result<u16> {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    const LOW: u16 = 20_000;
+    const HIGH: u16 = 32_000;
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    static CLAIMS: parking_lot::Mutex<Vec<std::fs::File>> = parking_lot::Mutex::new(Vec::new());
+    let dir = std::env::temp_dir().join("kiln-test-ports");
+    std::fs::create_dir_all(&dir)?;
+    let start = LOW + u16::try_from(std::process::id() % 10_000).unwrap_or(0);
+    let _ = NEXT.compare_exchange(0, start, Ordering::SeqCst, Ordering::SeqCst);
+    for _ in 0..usize::from(HIGH - LOW) {
+        let mut port = NEXT.fetch_add(1, Ordering::SeqCst);
+        if !(LOW..HIGH).contains(&port) {
+            NEXT.store(LOW + 1, Ordering::SeqCst);
+            port = LOW;
+        }
+        // Claimed by another test process (it holds the lock for its life): the next.
+        let claim = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(format!("{port}.lock")))?;
+        if claim.try_lock().is_err() {
+            continue;
+        }
+        let free = match listed(port) {
+            Some(used) => !used,
+            None => std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() && std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok(),
+        };
+        if free {
+            CLAIMS.lock().push(claim);
+            return Ok(port);
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "no free port for a test"))
+}
+
+/// Whether a socket here has `port` (TCP or UDP, any address, any state), as Linux lists them.
+/// Looked up rather than bound to find out: a socket bound to try stays open a moment longer in
+/// any process another test starts just then (until it runs its program), and the test's own bind
+/// fails meanwhile. `None` without the lists (not Linux): bound to find out.
+#[cfg(test)]
+fn listed(port: u16) -> Option<bool> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let end = format!(":{port:04X}");
+    let mut used = false;
+    for table in ["tcp", "udp", "tcp6", "udp6"] {
+        match std::fs::read_to_string(format!("/proc/net/{table}")) {
+            Ok(text) => used |= text.lines().skip(1).any(|l| l.split_whitespace().nth(1).is_some_and(|local| local.ends_with(&end))),
+            // No IPv6 here.
+            Err(_) if table.ends_with('6') => {}
+            Err(_) => return None,
+        }
+    }
+    Some(used)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,7 +639,7 @@ mod tests {
     #[test]
     fn settings_and_status_round_trip_as_json() -> anyhow::Result<()> {
         let s = on().validated().map_err(anyhow::Error::msg)?;
-        let push = Push { settings: s.clone(), standby: false, issued: Some("PEM".into()), custom: Some(CustomCert { cert_pem: "C".into(), key_pem: "SECRET KEY".into() }), renew: true };
+        let push = Push { settings: s.clone(), standby: false, issued: Some("PEM".into()), custom: Some(CustomCert { cert_pem: "C".into(), key_pem: "SECRET KEY".into() }), renew: true, peers: None };
         let json = serde_json::to_string(&push)?;
         let back: Push = serde_json::from_str(&json)?;
         assert_eq!(back.settings, s);

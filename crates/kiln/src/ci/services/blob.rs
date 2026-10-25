@@ -29,6 +29,9 @@ const MAX_BLOCK: u64 = 256 << 20;
 pub enum Target {
     Cache(i64),
     Artifact(i64),
+    /// An object of the content store by its SHA-256, read only: what a release deploys, for a
+    /// runner's job to fetch (docs/cd-targets.md §2.2, `host`).
+    Object([u8; 32]),
 }
 
 impl Target {
@@ -36,12 +39,16 @@ impl Target {
         match self {
             Target::Cache(n) => format!("cache-{n}"),
             Target::Artifact(n) => format!("artifact-{n}"),
+            Target::Object(d) => format!("object-{}", hex::encode(d)),
         }
     }
 
     pub fn parse(s: &str) -> Option<Target> {
         if let Some(n) = s.strip_prefix("cache-") {
             return n.parse().ok().map(Target::Cache);
+        }
+        if let Some(h) = s.strip_prefix("object-") {
+            return hex::decode(h).ok().and_then(|b| b.try_into().ok()).map(Target::Object);
         }
         s.strip_prefix("artifact-").and_then(|n| n.parse().ok()).map(Target::Artifact)
     }
@@ -101,6 +108,12 @@ fn azure_headers(mut r: Response) -> Response {
 
 /// The byte range a read asks for (`Range` or `x-ms-range`), as `[start, end)` within `size`.
 /// `None` for the whole object. A range past the end is refused with `Err`.
+/// The byte range a request asks for of `size` bytes, `[start, end)`: `None` for all of it, `Err` when
+/// it can't be met.
+pub(crate) fn byte_range(req: &Request, size: u64) -> Result<Option<(u64, u64)>, ()> {
+    range(req, size)
+}
+
 fn range(req: &Request, size: u64) -> Result<Option<(u64, u64)>, ()> {
     let v = req.headers().get("x-ms-range").or_else(|| req.headers().get(header::RANGE)).and_then(|v| v.to_str().ok());
     parse_range(v, size)
@@ -144,6 +157,7 @@ async fn readable(hub: &Hub, t: Target) -> anyhow::Result<Option<Readable>> {
                         Ok(Readable { object: r.get(0)?, mime: r.get(1)?, name: Some(r.get(2)?) })
                     })
                     .optional()?,
+                Target::Object(d) => Some(Readable { object: hex::encode(d), mime: "application/octet-stream".into(), name: None }),
             })
         })
         .await
@@ -222,7 +236,7 @@ fn stage_dir(hub: &Hub, t: Target) -> PathBuf {
 fn limit(hub: &Hub, t: Target) -> u64 {
     let gb = match t {
         Target::Cache(_) => hub.cfg.ci.cache.max_entry_gb,
-        Target::Artifact(_) => hub.cfg.ci.artifacts.max_size_gb,
+        Target::Artifact(_) | Target::Object(_) => hub.cfg.ci.artifacts.max_size_gb,
     };
     gb.saturating_mul(1 << 30)
 }
@@ -235,6 +249,8 @@ async fn writable(hub: &Hub, t: Target) -> anyhow::Result<bool> {
             Ok(match t {
                 Target::Cache(id) => c.query_row("SELECT object IS NULL FROM ci_caches WHERE id = ?1", [id], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false),
                 Target::Artifact(id) => c.query_row("SELECT finalized = 0 FROM ci_artifacts WHERE id = ?1", [id], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false),
+                // The content store's objects are never written through a URL.
+                Target::Object(_) => false,
             })
         })
         .await
@@ -305,6 +321,7 @@ async fn commit(hub: &Hub, target: Target, assembled: &std::path::Path, mime: Op
             let n = match target {
                 Target::Cache(id) => c.execute("UPDATE ci_caches SET object = ?2, size = ?3, last_used_at = ?4 WHERE id = ?1 AND object IS NULL", params![id, digest, size, crate::util::now_unix()])?,
                 Target::Artifact(id) => c.execute("UPDATE ci_artifacts SET object = ?2, size = ?3, mime_type = COALESCE(?4, mime_type) WHERE id = ?1 AND finalized = 0", params![id, digest, size, mime])?,
+                Target::Object(_) => 0,
             };
             Ok(n > 0)
         })

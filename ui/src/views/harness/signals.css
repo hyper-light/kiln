@@ -2,6 +2,7 @@
 
 .sg-optic,
 .sg-label,
+.sg-shimmer,
 .sg-think,
 .sg-trace,
 .sg-caret {
@@ -11,14 +12,6 @@
   --sg-ease: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-@keyframes sg-prism-current {
-  from {
-    background-position: 0% 50%;
-  }
-  to {
-    background-position: 100% 50%;
-  }
-}
 
 /* ------------------------------------------------------------ optic */
 
@@ -47,25 +40,18 @@
   transform: rotate(-35deg) scaleX(0.55) rotate(calc(var(--i) * 5deg));
   opacity: calc(0.6 + var(--i) * 0.13);
 }
-.sg-optic[data-state="idle"] > span {
-  animation:
-    sg-optic-breathe 14s ease-in-out infinite,
-    sg-optic-chroma 18s linear infinite;
-  animation-delay: calc(var(--i) * -0.55s), calc(var(--i) * -0.9s);
-}
-/* Thinking: the idle motion, quickened. */
+/* Idle, the rings hold still in the settled prism. They move only while it works: the shape, which
+   the GPU moves (a colour change in a border is painted again every frame, the whole page with
+   it, so the colours hold still). */
+/* Thinking: the rings breathe. */
 .sg-optic[data-state="thinking"] > span {
-  animation:
-    sg-optic-breathe 3.5s ease-in-out infinite,
-    sg-optic-chroma 4.5s linear infinite;
-  animation-delay: calc(var(--i) * -0.14s), calc(var(--i) * -0.22s);
+  animation: sg-optic-breathe 3.5s ease-in-out infinite;
+  animation-delay: calc(var(--i) * -0.14s);
 }
-/* Tool: colour runs fast through the rings while the shape barely moves. */
+/* Tool: the shape barely sways. */
 .sg-optic[data-state="tool"] > span {
-  animation:
-    sg-optic-sway 2.4s ease-in-out infinite,
-    sg-optic-chroma 1.6s linear infinite;
-  animation-delay: calc(var(--i) * -0.1s), calc(var(--i) * -0.4s);
+  animation: sg-optic-sway 2.4s ease-in-out infinite;
+  animation-delay: calc(var(--i) * -0.1s);
 }
 /* Waiting on you: held still in amber, the outer ring lit. */
 .sg-optic[data-state="waiting"] {
@@ -103,18 +89,6 @@
     transform: rotate(-32deg) scaleX(0.6) rotate(calc(var(--i) * 5deg + 2deg));
   }
 }
-@keyframes sg-optic-chroma {
-  0%,
-  100% {
-    border-color: #b8d9d2 #b8a6d5 #a6c4ed #d6a2aa;
-  }
-  33.333% {
-    border-color: #d8cbb0 #a6c4ed #b8d9d2 #b8a6d5;
-  }
-  66.667% {
-    border-color: #b8a6d5 #b8d9d2 #d6a2aa #a6c4ed;
-  }
-}
 
 /* ------------------------------------------------------------ prism label */
 
@@ -130,10 +104,9 @@
 .sg-label[data-live="true"] {
   color: transparent;
   background: var(--sg-prism);
-  background-size: 250% 100%;
   -webkit-background-clip: text;
   background-clip: text;
-  animation: sg-prism-current 6s ease-in-out infinite alternate;
+  animation: prism-breathe 2.4s ease-in-out infinite alternate;
 }
 .sg-num {
   font-variant-numeric: tabular-nums;
@@ -141,17 +114,115 @@
 
 /* ------------------------------------------------------------ thinking */
 
-.sg-think-head {
+.sg-thinking-line {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  margin-left: -5px;
-  padding: 2px 5px;
+  min-height: 24px;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.sg-thinking-line .sg-label {
+  font-size: 11px;
+  line-height: 1.8;
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+/* While it thinks, the prism sweeps through its words: the holographic shimmer (other live labels
+   only breathe). The GPU moves it: the words are drawn white on black, a strip of the prism two
+   and a half times their width is multiplied over them and slides across, and the whole is
+   screened onto the page, where black adds nothing and the words take the prism's colours, as
+   they would clipped to a sliding background. Only the strip's transform changes, so nothing is
+   painted again for it (a sliding background was, every frame, and every animation on the page
+   restyled with it). */
+.sg-label[data-live="true"][data-sweep] {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  color: #fff;
+  background: #000;
+  -webkit-background-clip: border-box;
+  background-clip: border-box;
+  mix-blend-mode: screen;
+  animation: none;
+}
+.sg-sweep {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 250%;
+  background: var(--sg-prism);
+  mix-blend-mode: multiply;
+  pointer-events: none;
+  animation: sg-prism-sweep 6s ease-in-out infinite alternate;
+}
+@keyframes sg-prism-sweep {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-60%);
+  }
+}
+/* A subagent running: the prism sweeps through what says so (the activity line's "1 subagent",
+   Mission Control's "Working"), painted into its own letters (background-clip: text). No layer of
+   its own and no blending, so nothing beside it (shells, the queue, the Latest button) takes it. */
+/* Its own flow where it's given one (Shimmer's `flow`, signals.tsx `flowOf`): its colours, a sweep
+   back and forth or a drift one way, its pace, phase and depth of colour; else the one sweep. */
+.sg-shimmer {
+  background-image: var(--sg-image, linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 18%, #b8a6d5 34%, #d6a2aa 50%, #b8a6d5 66%, #a6c4ed 82%, #b8d9d2 100%));
+  background-size: var(--sg-size, 300%) 100%;
+  background-repeat: repeat-x;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  filter: saturate(var(--sg-depth, 1));
+  animation: var(--sg-motion, sg-shimmer-sweep) var(--sg-dur, 6s) var(--sg-ease, ease-in-out) var(--sg-delay, 0s) infinite var(--sg-dir, alternate);
+}
+/* A drift: the band moves one way without end, one width of it a period (its size 200%: the image is
+   twice the box, so 0% to 200% is exactly one image along, and the repeat joins it seamlessly). */
+@keyframes sg-shimmer-drift {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 200% 50%;
+  }
+}
+@keyframes sg-shimmer-sweep {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 100% 50%;
+  }
+}
+/* The same sweep painted every frame (the conversation loader's words). */
+@keyframes sg-prism-current {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 100% 50%;
+  }
+}
+.sg-think-head {
+  position: relative;
+  margin: 0;
+  padding: 0;
   border: 0;
   border-radius: 6px;
   background: none;
   color: var(--color-muted, #97999f);
   cursor: pointer;
+}
+.sg-think-head::before {
+  position: absolute;
+  inset: -8px -5px;
+  content: "";
 }
 .sg-think-head:hover {
   background: rgb(255 255 255 / 4%);
@@ -202,13 +273,20 @@
 
 /* ------------------------------------------------------------ trace (a tool call's state) */
 
-/* hyperlight's mark, drawn small. A fixed 14px square, so settling never shifts the row. */
-.sg-trace {
+/* hyperlight's mark, drawn small. The outline and running light share the wrapper's size. */
+.sg-beam {
+  position: relative;
+  display: inline-grid;
   flex: none;
   width: 14px;
   height: 14px;
-  overflow: visible;
   vertical-align: middle;
+}
+.sg-trace {
+  grid-area: 1 / 1;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
   fill: none;
   stroke-linecap: round;
   --sg-tone: #97999f;
@@ -225,24 +303,38 @@
     opacity 0.25s var(--sg-ease),
     stroke 0.25s ease;
 }
-/* The light: a quarter of the loop, travelling it end to end and out through the refraction. */
-.sg-trace-light {
-  stroke-dasharray: 26 74;
-  stroke-dashoffset: 100;
-  opacity: 0;
-}
 .sg-trace-tail {
   stroke: var(--sg-tone);
   opacity: 0;
   transition: opacity 0.25s ease;
 }
-.sg-trace[data-status="running"] .sg-trace-light {
-  opacity: 1;
-  animation: sg-trace-run 1.8s linear infinite;
-}
+/* The running light: a sector of the prism turning behind the mark's own shape (the loop and the
+   refraction), clockwise as the loop is drawn. Only a transform moves, so the GPU turns it and
+   nothing is painted again (a stroke's moving dash would be restyled and repainted every frame). */
 .sg-trace[data-status="running"] .sg-trace-tail {
   stroke: #bcb1d8;
-  animation: sg-trace-refract 1.8s linear infinite;
+  opacity: 0.35;
+}
+.sg-trace-glow {
+  position: relative;
+  grid-area: 1 / 1;
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+  -webkit-mask: var(--sg-mark) center / 100% 100% no-repeat;
+  mask: var(--sg-mark) center / 100% 100% no-repeat;
+  --sg-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' fill='none' stroke='%23000' stroke-width='3.2' stroke-linecap='round'%3E%3Cpath d='M6.4 22.5C2.4 17.1 7.1 6.2 14 4.5C21.4 2.7 27.4 10.1 25.1 16.5C22.8 22.9 13.1 28.8 8.8 26.6'/%3E%3Cpath d='M8.8 26.6C6.9 25.6 5.6 23.6 5.2 21.3'/%3E%3C/svg%3E");
+}
+.sg-trace-glow > span {
+  position: absolute;
+  inset: -30%;
+  background: conic-gradient(transparent 0turn 0.66turn, #b8d9d2 0.72turn, #a6c4ed 0.8turn, #b8a6d5 0.87turn, #d6a2aa 0.93turn, #d8cbb0 0.985turn, transparent 1turn);
+  animation: sg-trace-turn 1.8s linear infinite;
+}
+@keyframes sg-trace-turn {
+  to {
+    transform: rotate(1turn);
+  }
 }
 /* Settled: the loop draws itself closed in the outcome's tone. */
 .sg-trace:not([data-status="running"]) .sg-trace-loop {
@@ -275,10 +367,13 @@
 .sg-trace[data-status="pending"] {
   --sg-tone: #aab8d2;
 }
-/* …and a pending call is only sketched, breathing. */
+/* …and a pending call is only sketched, breathing (the whole mark: the GPU fades it). */
 .sg-trace[data-status="pending"] .sg-trace-loop {
   opacity: 0.6;
   stroke-dasharray: 2 6;
+  animation: none;
+}
+.sg-beam[data-status="pending"] {
   animation: sg-soft-pulse 2.4s ease-in-out infinite alternate;
 }
 .sg-trace[data-status="pending"] .sg-trace-tail,
@@ -290,7 +385,7 @@
   stroke-dasharray: none;
   animation: none;
 }
-@keyframes sg-trace-run {
+@keyframes sg-trace-close {
   from {
     stroke-dashoffset: 100;
   }
@@ -298,8 +393,45 @@
     stroke-dashoffset: 0;
   }
 }
-/* The refraction lights as the light reaches the loop's end. */
-@keyframes sg-trace-refract {
+
+/* ------------------------------------------------------------ loading (a conversation on its way) */
+
+/* hyperlight's mark, large and thin: a quarter of the loop in the prism travels it end to end and
+   out through the refraction, which lights as the light reaches it. */
+.sg-load {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  overflow: visible;
+  fill: none;
+  stroke-linecap: round;
+}
+.sg-load path {
+  stroke-width: 1.1;
+}
+.sg-load-loop {
+  stroke: #97999f;
+  opacity: 0.22;
+}
+.sg-load-light {
+  stroke-dasharray: 26 74;
+  stroke-dashoffset: 100;
+  animation: sg-load-run 1.8s linear infinite;
+}
+.sg-load-tail {
+  stroke: #bcb1d8;
+  opacity: 0.15;
+  animation: sg-load-refract 1.8s linear infinite;
+}
+@keyframes sg-load-run {
+  from {
+    stroke-dashoffset: 100;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes sg-load-refract {
   0%,
   62% {
     opacity: 0.15;
@@ -309,14 +441,6 @@
   }
   100% {
     opacity: 0.15;
-  }
-}
-@keyframes sg-trace-close {
-  from {
-    stroke-dashoffset: 100;
-  }
-  to {
-    stroke-dashoffset: 0;
   }
 }
 @keyframes sg-soft-pulse {
@@ -353,8 +477,13 @@
 
 :root[data-motion="paused"] .sg-optic > span,
 :root[data-motion="paused"] .sg-label,
+:root[data-motion="paused"] .sg-sweep,
+:root[data-motion="paused"] .sg-shimmer,
 :root[data-motion="paused"] .sg-think::before,
 :root[data-motion="paused"] .sg-trace path,
+:root[data-motion="paused"] .sg-beam,
+:root[data-motion="paused"] .sg-trace-glow > span,
+:root[data-motion="paused"] .sg-load path,
 :root[data-motion="paused"] .sg-caret {
   animation-play-state: paused;
 }
@@ -363,26 +492,45 @@
 @media (prefers-reduced-motion: reduce) {
   .sg-optic > span,
   .sg-label,
+  .sg-sweep,
+  .sg-shimmer,
   .sg-think::before,
   .sg-trace path,
+  .sg-beam,
+  .sg-trace-glow > span,
+  .sg-load path,
   .sg-caret,
   .sg-chev {
     animation: none !important;
     transition: none !important;
   }
   /* Running shows the whole loop in the prism, still. */
-  .sg-trace[data-status="running"] .sg-trace-light {
+  .sg-trace-glow > span {
+    background: linear-gradient(45deg, #b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa, #d8cbb0);
+  }
+  .sg-load-light {
     stroke-dasharray: none;
   }
 }
 
 /* Clipped-gradient text would vanish under forced colours; fall back to the system text colour. */
 @media (forced-colors: active) {
-  .sg-label[data-live="true"] {
+  .sg-label[data-live="true"],
+  .sg-label[data-live="true"][data-sweep],
+  .sg-shimmer {
     color: CanvasText;
+    -webkit-text-fill-color: CanvasText;
     background: none;
+    mix-blend-mode: normal;
   }
-  .sg-trace path {
+  .sg-sweep {
+    display: none;
+  }
+  .sg-trace path,
+  .sg-load path {
     stroke: CanvasText;
+  }
+  .sg-trace-glow {
+    display: none;
   }
 }

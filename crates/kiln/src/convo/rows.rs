@@ -69,6 +69,29 @@ pub struct RecordRow {
     /// The byte just past it in the file: where reading goes on.
     pub end: u64,
     pub line: String,
+    /// The line as the store it is from keeps it, compressed behind its codec byte, sent to a
+    /// taker that says it takes lines so (`kept` in [`From`](super::feed::Msg::From)): it is
+    /// kept the same way there, never decompressed and compressed again on the way. `line` is
+    /// then empty.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "kept_bytes")]
+    pub kept: Option<Vec<u8>>,
+}
+
+/// A kept line's bytes in a feed's JSON: base64.
+mod kept_bytes {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(b) => s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(b)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        Option::<String>::deserialize(d)?.map(|t| base64::engine::general_purpose::STANDARD.decode(t).map_err(serde::de::Error::custom)).transpose()
+    }
 }
 
 /// An event, with what it is found by pulled out of its body.
@@ -113,7 +136,7 @@ impl Row {
         match self {
             Row::Session { info, meta, state, changes, .. } => 64 + [info, meta, state, changes].iter().map(|p| p.as_ref().map_or(0, String::len)).sum::<usize>(),
             Row::Event(e) => 128 + e.text.len() + e.body.len(),
-            Row::Record(r) => 64 + r.source.len() + r.line.len(),
+            Row::Record(r) => 64 + r.source.len() + r.line.len() + r.kept.as_ref().map_or(0, |k| k.len() / 3 * 4),
             Row::Reset { .. } | Row::Closed { .. } | Row::RecordReset { .. } | Row::Machine { .. } => 64,
         }
     }
@@ -124,7 +147,15 @@ impl Row {
 pub fn of(session: &str, update: &Update, now: i64) -> Vec<Row> {
     let s = || session.to_owned();
     match update {
-        Update::Open { info } => vec![Row::Session { session: s(), info: json(info.as_ref()), meta: None, state: None, changes: None, epoch: None, open: true, at: now }],
+        Update::Open { info, since } => {
+            let open = Row::Session { session: s(), info: json(info.as_ref()), meta: None, state: None, changes: None, epoch: None, open: true, at: now };
+            // Going on from what the copy has (a runner that started again): its events after
+            // that go, and those its machine has come again.
+            match since {
+                Some(n) => vec![open, Row::Reset { session: s(), from: Some(n.saturating_add(1)), at: now }],
+                None => vec![open],
+            }
+        }
         Update::State { state } => vec![Row::Session { session: s(), info: None, meta: None, state: json(state.as_ref()), changes: None, epoch: Some(state.epoch), open: false, at: now }],
         Update::Meta { meta } => vec![Row::Session { session: s(), info: None, meta: json(meta.as_ref()), state: None, changes: None, epoch: None, open: false, at: now }],
         Update::Changes { files } => vec![Row::Session { session: s(), info: None, meta: None, state: None, changes: json(files), epoch: None, open: false, at: now }],
@@ -326,6 +357,7 @@ mod tests {
             server: None,
             tool_short: None,
             skill: None,
+            runner: None,
         };
         let rows = of("a1", &Update::Events { events: vec![ev("t1", 3, Body::Tool(Box::new(tool))), ev("n1", 4, Body::Notice { level: Level::Warn, text: "Paused".into() })] }, 9);
         let Some(Row::Event(t)) = rows.first() else { anyhow::bail!("no tool row") };
@@ -370,6 +402,14 @@ mod tests {
         // isn't merged into it.
         assert_eq!(out.len(), 3);
         assert!(matches!(out.get(1), Some(Row::Reset { .. })));
+    }
+
+    #[test]
+    fn an_open_that_goes_on_from_the_copy_drops_only_what_comes_after() {
+        let info = Box::new(crate::harness::session::Info::default());
+        let rows = of("a1", &Update::Open { info: info.clone(), since: Some(9) }, 1);
+        assert!(matches!(rows.as_slice(), [Row::Session { open: true, .. }, Row::Reset { from: Some(10), .. }]), "{rows:?}");
+        assert!(matches!(of("a1", &Update::Open { info, since: None }, 1).as_slice(), [Row::Session { .. }]));
     }
 
     #[test]

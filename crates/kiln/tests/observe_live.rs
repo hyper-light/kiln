@@ -814,7 +814,7 @@ fn grpc_call(addr: std::net::SocketAddr, path: &str, token: Option<&str>, encodi
     kiln::rt::block_on(async move {
         use http_body_util::BodyExt as _;
         let tcp = hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (mut send, conn) = hyper::client::conn::http2::handshake(kiln::http::io::RtExec, kiln::http::io::RtIo::new(tcp)).await?;
+        let (mut send, conn) = kiln_http::client::http2::handshake(kiln::http::io::RtIo::new(tcp)).await?;
         let _conn = kiln::rt::spawn(conn);
         let mut req = http::Request::builder().method("POST").uri(format!("http://127.0.0.1{path}")).header("content-type", "application/grpc").header("te", "trailers");
         if let Some(t) = token {

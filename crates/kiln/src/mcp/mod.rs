@@ -27,10 +27,63 @@ use crate::hub::Hub;
 /// `--mcp-config` file holding a token of their own) and kiln's skills (as a Claude Code plugin
 /// directory).
 pub struct Kit {
-    /// The MCP config file (0600: it holds the token).
+    /// The MCP config file every agent here could share (0600: it holds the token).
     pub claude_mcp_config: std::path::PathBuf,
     /// The plugin directory with kiln's skills.
     pub plugin_dir: std::path::PathBuf,
+    /// Where this machine reaches the server's MCP endpoint.
+    url: String,
+    /// What its tokens are made with.
+    key: String,
+    /// Where each agent's own config is kept.
+    dir: std::path::PathBuf,
+}
+
+impl Kit {
+    /// Agent session `session`'s own MCP config (0600): a token that is that agent, so kiln knows
+    /// which agent calls (`Caller::agent`) and whom it acts for. The shared one if it can't be
+    /// written.
+    pub fn config_for(&self, session: &str) -> std::path::PathBuf {
+        match self.write_for(session) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(%session, error = %format!("{e:#}"), "an agent's own MCP config couldn't be written: it shares the machine's");
+                self.claude_mcp_config.clone()
+            }
+        }
+    }
+
+    fn write_for(&self, session: &str) -> anyhow::Result<std::path::PathBuf> {
+        let safe: String = session.chars().filter(char::is_ascii_alphanumeric).take(64).collect();
+        anyhow::ensure!(!safe.is_empty(), "no session");
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.dir.join(format!("{safe}.json"));
+        let body = json!({"mcpServers": {"kiln": {"type": "http", "url": format!("{}/api/mcp", self.url.trim_end_matches('/')),
+            "headers": {"Authorization": format!("Bearer {}", session_token(&self.key, &safe))}}}});
+        write_private(&path, &serde_json::to_vec_pretty(&body)?)?;
+        Ok(path)
+    }
+}
+
+/// `bytes` as `path`, readable by this user alone, whole or not at all.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// The label of an agent session's own MCP token.
+const SESSION_LABEL: &str = "session-";
+
+/// Agent session `session`'s own MCP token: calls with it are that agent's.
+pub fn session_token(admin_token: &str, session: &str) -> String {
+    token(admin_token, &format!("{SESSION_LABEL}{session}"))
 }
 
 static KIT: std::sync::OnceLock<Kit> = std::sync::OnceLock::new();
@@ -49,15 +102,8 @@ pub fn init_kit(hub: &Hub, local_url: &str) -> anyhow::Result<()> {
     let config = dir.join("kiln-mcp.json");
     let body = json!({"mcpServers": {"kiln": {"type": "http", "url": format!("{}/api/mcp", local_url.trim_end_matches('/')),
         "headers": {"Authorization": format!("Bearer {}", token(&hub.admin_token, "local-agents"))}}}});
-    let tmp = config.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&body)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, &config)?;
-    let _ = KIT.set(Kit { claude_mcp_config: config, plugin_dir: plugin });
+    write_private(&config, &serde_json::to_vec_pretty(&body)?)?;
+    let _ = KIT.set(Kit { claude_mcp_config: config, plugin_dir: plugin, url: local_url.to_owned(), key: hub.admin_token.clone(), dir: dir.join("mcp") });
     Ok(())
 }
 
@@ -67,12 +113,118 @@ pub fn opener_key(id: &str) -> String {
     format!("agents/opener/{id}")
 }
 
+/// Where the person who opened agent session `id` is kept, whatever token they used.
+pub fn opened_by_key(id: &str) -> String {
+    format!("agents/opened-by/{id}")
+}
+
+/// Whose agent session `session` is (`owner` or `user:<id>`): the person who opened it, whatever
+/// token they used (docs/agents.md, "Whose agents"), else whom it acts for ([`acts_for`]). One
+/// opened with a token narrower than its person acts for no one, but is still theirs.
+pub async fn whose(hub: &Hub, session: &str) -> Option<String> {
+    match hub.store.kv_get(opened_by_key(session)).await.ok().flatten() {
+        Some(p) => Some(p),
+        None => acts_for(hub, session).await,
+    }
+}
+
+/// Whom agent session `session` acts for (`owner` or `user:<id>`): whoever started it, or for one
+/// started with `kiln spawn` in a kiln shell, whoever opened that shell; the owner on a kiln nobody
+/// else signs in to. `None`: kiln doesn't know.
+pub async fn acts_for(hub: &Hub, session: &str) -> Option<String> {
+    let shell = hub.harness.info(session).and_then(|i| i.shell);
+    let opener = match hub.store.kv_get(opener_key(session)).await.ok().flatten() {
+        Some(o) => Some(o),
+        None => match shell {
+            Some(t) => hub.store.kv_get(terminal_opener_key(&t)).await.ok().flatten(),
+            None => None,
+        },
+    };
+    match opener {
+        Some(o) => Some(o),
+        None if !crate::authz::gate::has_users(hub).await => Some("owner".to_owned()),
+        None => None,
+    }
+}
+
+/// The caller agent session `session` is (one kiln runs, on `runner` or the server): it acts for
+/// whoever started it (the owner on a kiln nobody else signs in to), audited as
+/// `agent:<short>[@<runner>] for <them>`, and what it starts are its children.
+pub async fn session_caller(hub: &Hub, session: &str, runner: Option<&str>) -> Result<Caller, String> {
+    let Some(opener) = acts_for(hub, session).await else {
+        return Err("kiln doesn't know who started this agent, so it can't act for them: start the agent from Agents".to_owned());
+    };
+    let short: String = session.chars().take(8).collect();
+    let name = runner.map_or_else(|| format!("agent:{short}"), |r| format!("agent:{short}@{r}"));
+    let Some(mut caller) = crate::authz::gate::agent_for(hub, &name, &opener).await else {
+        return Err("whoever started this agent can't sign in here any more".to_owned());
+    };
+    caller.agent = Some(session.to_owned());
+    // An agent kiln started for an attachment does no more than its capabilities give it.
+    if let Some(limit) = crate::ci::attach::limit_for(hub, session).await {
+        caller = caller.limited_to(limit);
+    }
+    Ok(caller)
+}
+
+/// Where kiln keeps who opened kiln terminal `id` (`owner` or `user:<id>`).
+pub fn terminal_opener_key(id: &str) -> String {
+    format!("terminals/opener/{id}")
+}
+
+/// The person in kiln terminal `terminal` (one on `runner`, or on the server): whoever opened it
+/// (the owner on a kiln nobody else signs in to), audited as `shell:<short>[@<runner>] for <them>`.
+pub async fn terminal_caller(hub: &Hub, terminal: &str, runner: Option<&str>) -> Result<Caller, String> {
+    let short: String = terminal.chars().take(8).collect();
+    let t = hub.terminals.get(terminal).ok_or_else(|| format!("kiln has no terminal {short} open: run this in a terminal kiln opened"))?;
+    let here = runner.map_or_else(|| "local".to_owned(), |r| format!("agent:{r}"));
+    if t.target != here {
+        return Err(format!("terminal {short} isn't on this machine"));
+    }
+    let opener = match hub.store.kv_get(terminal_opener_key(terminal)).await.ok().flatten() {
+        Some(o) => o,
+        None if !crate::authz::gate::has_users(hub).await => "owner".to_owned(),
+        None => return Err("kiln doesn't know who opened this terminal, so it can't act for them: open a new one".to_owned()),
+    };
+    let name = runner.map_or_else(|| format!("shell:{short}"), |r| format!("shell:{short}@{r}"));
+    crate::authz::gate::agent_for(hub, &name, &opener).await.ok_or_else(|| "whoever opened this terminal can't sign in here any more".to_owned())
+}
+
+/// The caller an MCP token of an agent session is (`session_token`), when `actor` is one: that
+/// agent, if kiln still runs it. `None`: another kind of MCP token.
+pub async fn token_caller(hub: &Hub, actor: &str) -> Option<Result<Caller, String>> {
+    let session = actor.strip_prefix("agent:")?.strip_prefix(SESSION_LABEL)?;
+    if hub.harness.info(session).is_none() {
+        return Some(Err(format!("kiln doesn't run agent {} any more: its MCP token ended with it", session.chars().take(8).collect::<String>())));
+    }
+    Some(session_caller(hub, session, None).await)
+}
+
 /// The most an answer to a runner may be (it goes over the runner's control lane).
 const RUNNER_ANSWER_MAX: usize = 4 << 20;
 
+/// The plans operations an agent has as tools: keeping plans, running them and following their
+/// runs (a plan's versions, and deleting one, are code mode's).
+const PLAN_TOOLS: &[&str] = &["plans.list", "plans.get", "plans.create", "plans.update", "plans.ready", "plans.run", "plans.runs.list", "plans.runs.get", "plans.runs.stop", "plans.runs.retry"];
+
+/// kiln's operations an agent has as tools of its own (`agents_start`, `goals_plan`, `plans_run`,
+/// …): `agents.*`, `goals.*` but a stack's settings, most of `plans.*`, and `research.*`. The server says which
+/// ([`runner_ask`]'s registry answer), so its agents' MCP servers offer what it has, however old
+/// their runner: a deploy reaches the agents at work.
+pub fn agent_ops() -> Vec<crate::ops::Op> {
+    crate::harness::ops::list_ops()
+        .into_iter()
+        // Whether a stack plans its big goals first is the person's to say, not its agent's.
+        .chain(crate::goals::ops::list_ops().into_iter().filter(|o| o.name != "goals.settings"))
+        .chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name)))
+        .chain(crate::research::ops::list_ops())
+        .collect()
+}
+
 /// What a runner asks for one of its agent sessions' MCP server (`kiln reach mcp`, whose code
 /// mode runs on the runner, `crate::reach::mcp`): `{"op": "registry", "session"}` for the
-/// operations, or `{"op": "call", "session", "name", "input"}` to run one. The session must be one
+/// operations, `{"op": "call", "session", "name", "input"}` to run one, or `{"op": "page",
+/// "session", "do", ...}` for a page it shows (`crate::harness::visuals::ask`). The session must be one
 /// kiln knows on that runner, which mustn't be a job's; it acts for whoever started it (the owner
 /// on a kiln nobody else signs in to), audited as `agent:<session>@<runner> for <them>`. The
 /// answer: `{"registry", "skills"}`, `{"ok": <answer>}`, or `{"error", "status"?}`.
@@ -81,22 +233,24 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
         return json!({"error": "kiln's operations are for its agents' runners, not a job's"});
     }
     let session = ask.get("session").and_then(Value::as_str).unwrap_or("");
-    if session.is_empty() || !hub.harness.located_on(session, runner) {
+    let terminal = ask.get("terminal").and_then(Value::as_str).unwrap_or("");
+    // The person in one of its kiln shells (`kiln spawn --on`, `kiln agents wait`), for a call.
+    let caller = if session.is_empty() && !terminal.is_empty() && ask.get("op").and_then(Value::as_str) == Some("call") {
+        terminal_caller(hub, terminal, Some(runner)).await
+    } else if session.is_empty() || !hub.harness.located_on(session, runner) {
         return json!({"error": format!("kiln knows no agent session {session:?} on {runner}: its operations are for the agents it runs")});
-    }
-    let opener = match hub.store.kv_get(opener_key(session)).await.ok().flatten() {
-        Some(o) => o,
-        None if !crate::authz::gate::has_users(hub).await => "owner".to_owned(),
-        None => return json!({"error": "kiln doesn't know who started this agent, so it can't act for them: start the agent from Agents"}),
+    } else {
+        session_caller(hub, session, Some(runner)).await
     };
-    let short: String = session.chars().take(8).collect();
-    let Some(caller) = crate::authz::gate::agent_for(hub, &format!("agent:{short}@{runner}"), &opener).await else {
-        return json!({"error": "whoever started this agent can't sign in here any more"});
+    let caller = match caller {
+        Ok(c) => c,
+        Err(e) => return json!({"error": e}),
     };
     let answer = match ask.get("op").and_then(Value::as_str) {
         Some("registry") => {
             let skills: Vec<Value> = skills::list().into_iter().map(|s| json!({"name": s.get("name"), "description": s.get("description")})).collect();
-            json!({"registry": code::registry(hub), "skills": skills})
+            let tools: Vec<&str> = agent_ops().iter().map(|o| o.name).collect();
+            json!({"registry": code::registry(hub), "skills": skills, "agent_tools": tools})
         }
         Some("call") => {
             let name = ask.get("name").and_then(Value::as_str).unwrap_or("");
@@ -104,6 +258,33 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
             match crate::ops::call(crate::ops::Cx { hub: Arc::clone(hub), caller }, name, input).await {
                 Ok(v) => json!({"ok": v}),
                 Err((status, msg)) => json!({"error": msg, "status": status.as_u16()}),
+            }
+        }
+        // A page it shows in its conversation (`crate::harness::visuals`), or one it streams
+        // live there (`crate::harness::streams`): its own session's, audited as the agent acting
+        // for whoever started it.
+        Some(op @ ("page" | "stream")) => {
+            let r = if op == "page" { crate::harness::visuals::ask(hub, session, ask).await } else { crate::harness::streams::ask(hub, session, ask).await };
+            let what = format!("{}.{}", if op == "page" { "pages" } else { "streams" }, ask.get("do").and_then(Value::as_str).unwrap_or("?"));
+            if what != "pages.measured" {
+                let (principal, on_behalf_of) = crate::audit::who(&caller);
+                let entry = crate::audit::Entry {
+                    principal,
+                    on_behalf_of,
+                    action: what,
+                    target: Some(format!("agent session {session}")),
+                    result: if r.is_ok() { "ok".to_owned() } else { "error".to_owned() },
+                    detail: match &r {
+                        Ok(v) => v.get("url").or_else(|| v.get("path")).and_then(Value::as_str).unwrap_or("").to_owned(),
+                        Err(e) => format!("{e:#}"),
+                    },
+                    ..crate::audit::Entry::default()
+                };
+                crate::audit::write(&hub.store, entry).await;
+            }
+            match r {
+                Ok(v) => json!({"ok": v}),
+                Err(e) => json!({"error": format!("{e:#}")}),
             }
         }
         _ => json!({"error": "an unknown question"}),
@@ -121,7 +302,7 @@ fn write_plugin(dir: &std::path::Path) -> anyhow::Result<()> {
     std::fs::write(
         dir.join(".claude-plugin").join("plugin.json"),
         serde_json::to_vec_pretty(&json!({"name": "kiln", "version": env!("CARGO_PKG_VERSION"),
-            "description": "kiln's skills: deploying, diagnosing deployments, defining apps, moving from Argo CD."}))?,
+            "description": "kiln's skills: running agents, deploying, diagnosing deployments and CI, defining apps, moving from Argo CD."}))?,
     )?;
     skills::install(&dir.join("skills"))?;
     Ok(())
@@ -132,7 +313,10 @@ fn write_plugin(dir: &std::path::Path) -> anyhow::Result<()> {
 pub fn plugin_dir() -> Option<&'static std::path::Path> {
     static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = crate::config::default_data_dir().join("agents").join("kiln-plugin");
+        // Tests write a folder of their own: the machine's is what its real runner hands every
+        // agent it starts, and a test build's skills (a branch's) mustn't reach them.
+        let agents = if cfg!(test) { std::env::temp_dir().join(format!("kiln-test-agents-{}", std::process::id())) } else { crate::config::default_data_dir().join("agents") };
+        let dir = agents.join("kiln-plugin");
         match write_plugin(&dir) {
             Ok(()) => Some(dir),
             Err(e) => {
@@ -149,12 +333,54 @@ const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-0
 /// The skills extension's identifier (SEP-2640).
 const SKILLS_EXTENSION: &str = "io.modelcontextprotocol/skills";
 
-const INSTRUCTIONS: &str = "kiln builds, tests and deploys code. CI is under `kiln.ci`: runs, their legs and logs, \
+const INSTRUCTIONS: &str = "kiln builds, tests and deploys code, and runs coding agents. CI is under `kiln.ci`: runs, their legs and logs, \
 workflows (validate and plan before proposing), reruns, approvals, and failed legs kept to look into (`ci.legs.exec` runs \
 a command in one, `ci.legs.rerun_step` reruns a step there). Deployments (GitOps CD) are under `kiln.cd`: apps, their \
-sync and health, resources and why they differ, diffs, history, syncs, clusters. Prefer code_run: one program can list, \
-filter and act on a whole fleet and return only what matters. code_search shows the operations and their inputs. \
-The skills (kiln-ci-diagnose, kiln-deploy, kiln-diagnose, kiln-apps, kiln-argocd-migration) say how to use them.";
+sync and health, resources and why they differ, diffs, history, syncs, clusters. Agents are under `kiln.agents`: start \
+agents for parts of the work on any machine (`agents_start`), carry on while they work (kiln tells you when each is done; \
+`agents_wait` when you can't go on without one) and read what they concluded \
+(`agents_result`), and put an agent's work up for review (`agents_change`); what they ask a person stays a person's to answer. \
+Goal stacks, plans and research are under `kiln.goals`, `kiln.plans` and `kiln.research`. Prefer code_run: one program can list, filter and act on a \
+whole fleet and return only what matters. code_search shows the operations and their inputs. The skills (kiln-agents, \
+kiln-plans, kiln-deploy, kiln-diagnose, kiln-apps, kiln-argocd-migration, and CI's kiln-ci-author, kiln-ci-diagnose, \
+kiln-ci-runners, kiln-ci-review, kiln-ci-migrate, kiln-ci-secrets and kiln-ci-performance) say how to use them.";
+
+/// What kiln's MCP servers (this one and the runners', `crate::reach::mcp`) tell an agent about
+/// its own goal stack and plans.
+pub const GOALS_AND_PLANS: &str = "kiln keeps a goal stack for you: `goals_add` lines goals up (leave out `agent`: they're \
+yours), one condition or objective each, in order, and kiln gives you each in turn and holds you to it until it's met, then \
+the next, so you carry on without a person. To pursue a document or a list as a goal stack, add one goal per item (every \
+item asked for), each saying what done is, then end your turn: the first comes to you as soon as you're free. When you've \
+met the goal under way, say so with `goals_done` and what shows it (`evidence`): the next comes at once (skipping a goal \
+leaves it unmet). `goals_split` splits a goal into parts you pursue first (a plan step's goal into its acceptance criteria \
+and tests); `goals_update` changes one goal by its id (its words, its place, or takes it out); `goals_control` pauses the \
+stack (say `why`; `resume_in_s` resumes it by itself), resumes, skips or clears it; `goals_get` says where it stands. A plan \
+is kept in kiln for the person to read, change and run again: `plans_create` keeps one (its top-level list items are its \
+steps; a step's `needs` are the steps it waits for), and `plans_run` runs it on you (leave out `session` and `new`: as one \
+message, a step a turn, or each step a goal on your goal stack, `split` making each a goal stack of its acceptance criteria \
+and tests) or with an agent of its own for each step (mode `agents`: in your harness, on your machine and in your folder \
+unless you say otherwise; steps that don't wait for each other run side by side; a step given to `main` goes on your own goal \
+stack; `plans_runs_get` follows the run); `only` runs just some of its steps, by number. `goals_plan` turns a goal into a plan \
+(do that first with a goal that takes several steps of work, rather than starting on it): research \
+it first, inside (files on your machine and others, kiln's records: `conversations_search`) and outside (the web, docs, \
+papers), recording each claim with its sources and the exact words quoted (`research_add`: kiln checks each quote where it's \
+cited and grades each finding A to F), write its steps with the findings each rests on, then `plans_ready`: its steps become \
+the goal's parts, and once they're all met so is the goal. Whenever you present research to a person, give every claim's \
+sources and its grade and score as `research_get`'s markdown has them. The kiln-plans skill says how.";
+
+/// Who an agent kiln runs is, as kiln's MCP servers tell it.
+pub fn you_are(agent: &str) -> String {
+    format!("You are kiln agent {agent}: that's your id wherever an operation asks for an agent's, and kiln's operations act for whoever started you.")
+}
+
+/// What this server tells `caller` it is for: an agent kiln runs also hears about its goal stack
+/// and plans, and who it is.
+fn instructions(caller: &Caller) -> String {
+    match caller.agent.as_deref() {
+        Some(me) => format!("{INSTRUCTIONS} {GOALS_AND_PLANS} {}", you_are(me)),
+        None => INSTRUCTIONS.to_owned(),
+    }
+}
 
 /// An MCP token for `label` (an agent session, an attachment): `kiln_mcp_<label>_<hmac>`.
 pub fn token(admin_token: &str, label: &str) -> String {
@@ -182,7 +408,7 @@ pub fn caller(hub: &Hub, headers: &HeaderMap, authed: bool) -> Option<String> {
 }
 
 /// `POST /api/mcp`: one JSON-RPC message or a batch, each operation as `caller` may (W20-R06).
-pub async fn http(hub: &Arc<Hub>, caller: Caller, body: hyper::body::Incoming) -> Result<Response, (StatusCode, String)> {
+pub async fn http(hub: &Arc<Hub>, caller: Caller, body: kiln_http::Incoming) -> Result<Response, (StatusCode, String)> {
     let bytes = srv::body_bytes(body, 16 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let msg: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -213,6 +439,18 @@ fn rpc_ok(id: Value, result: Value) -> Value {
 
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+/// The most of a run's logs `kiln://runs/<id>/logs` gives at once.
+const RUN_LOGS: usize = 4 << 20;
+
+/// kiln's resources, as templates (docs/ci.md §4.4).
+fn templates() -> Value {
+    json!([
+        {"uriTemplate": "kiln://runs/{run}/logs", "name": "run-logs", "title": "A run's logs", "description": "Every leg's steps' logs, in order.", "mimeType": "text/plain"},
+        {"uriTemplate": "kiln://legs/{leg}/logs/{step}", "name": "step-log", "title": "A step's log", "description": "One step of a leg (its index in ci.legs.get).", "mimeType": "text/plain"},
+        {"uriTemplate": "kiln://workflows/{owner}/{repo}/{path}", "name": "workflow", "title": "A workflow's file", "description": "As the repository's default branch has it.", "mimeType": "application/yaml"},
+    ])
 }
 
 /// The MCP name of an operation: dots become underscores (tool names are `[a-zA-Z0-9_-]`).
@@ -253,7 +491,7 @@ impl Server {
                             "extensions": {SKILLS_EXTENSION: {}},
                         },
                         "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
-                        "instructions": INSTRUCTIONS,
+                        "instructions": instructions(&self.caller),
                     }),
                 )
             }
@@ -267,6 +505,12 @@ impl Server {
             "resources/list" => rpc_ok(id, json!({"resources": skills::resources()})),
             "resources/read" => {
                 let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
+                if uri.starts_with("kiln://") {
+                    return Some(match self.read_kiln(uri).await {
+                        Ok(text) => rpc_ok(id, json!({"contents": [{"uri": uri, "mimeType": if uri.starts_with("kiln://workflows/") { "application/yaml" } else { "text/plain" }, "text": text}]})),
+                        Err(e) => rpc_error(id, -32002, &e),
+                    });
+                }
                 match skills::read(uri) {
                     Some(c) => rpc_ok(id, json!({"contents": [c]})),
                     None => rpc_error(id, -32002, &format!("no resource {uri}")),
@@ -280,10 +524,53 @@ impl Server {
                     None => rpc_error(id, -32002, &format!("no skill {key}")),
                 }
             }
-            "resources/templates/list" => rpc_ok(id, json!({"resourceTemplates": []})),
+            "resources/templates/list" => rpc_ok(id, json!({"resourceTemplates": templates()})),
             "prompts/list" => rpc_ok(id, json!({"prompts": []})),
             other => rpc_error(id, -32601, &format!("method not found: {other}")),
         })
+    }
+
+    /// One of kiln's resources (docs/ci.md §4.4), read through the operations, so the caller
+    /// reads exactly what it may: a run's logs (every leg's steps', in order), a leg's step's
+    /// log, a workflow's file.
+    async fn read_kiln(&self, uri: &str) -> Result<String, String> {
+        let call = |name: &'static str, input: Value| crate::ops::call(self.cx(), name, input);
+        let said = |(_, m): crate::ops::Fail| m;
+        let text = |v: Value| v.get("text").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let parts: Vec<&str> = uri.trim_start_matches("kiln://").split('/').collect();
+        match parts.as_slice() {
+            ["legs", leg, "logs", step] => {
+                let step: i64 = step.parse().map_err(|_| format!("{uri}: a step is its index"))?;
+                Ok(text(call("ci.legs.logs", json!({"leg": leg, "step": step})).await.map_err(said)?))
+            }
+            ["runs", run, "logs"] => {
+                let detail = call("ci.runs.get", json!({"run": run})).await.map_err(said)?;
+                let mut out = String::new();
+                for l in detail.get("legs").and_then(Value::as_array).cloned().unwrap_or_default() {
+                    let Some(leg) = l.get("id").and_then(Value::as_str) else { continue };
+                    let name = l.get("name").and_then(Value::as_str).or_else(|| l.get("key").and_then(Value::as_str)).unwrap_or(leg);
+                    let steps = call("ci.legs.get", json!({"leg": leg})).await.map_err(said)?;
+                    for st in steps.get("steps").and_then(Value::as_array).cloned().unwrap_or_default() {
+                        let idx = st.get("idx").and_then(Value::as_i64).unwrap_or_default();
+                        let log = text(call("ci.legs.logs", json!({"leg": leg, "step": idx})).await.map_err(said)?);
+                        out.push_str(&format!("== {name} · {} ==\n{log}", st.get("name").and_then(Value::as_str).unwrap_or_default()));
+                        if !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        if out.len() > RUN_LOGS {
+                            out.push_str("… (the rest: read each leg's steps with ci.legs.logs)\n");
+                            return Ok(out);
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            ["workflows", owner, name, path @ ..] if !path.is_empty() => {
+                let v = call("ci.workflows.get", json!({"repo": format!("{owner}/{name}"), "path": path.join("/")})).await.map_err(said)?;
+                Ok(v.get("source").and_then(Value::as_str).unwrap_or_default().to_owned())
+            }
+            _ => Err(format!("no resource {uri}: kiln's are kiln://runs/<id>/logs, kiln://legs/<id>/logs/<step> and kiln://workflows/<owner>/<repo>/<path>")),
+        }
     }
 
     async fn call_tool(&self, name: &str, args: Value) -> Value {
@@ -383,7 +670,8 @@ pub async fn stdio(url: String, token: String) -> anyhow::Result<()> {
             .bearer(&token)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
-            .timeout(std::time::Duration::from_secs(120))
+            // `agents_wait` may wait up to 10 minutes.
+            .timeout(std::time::Duration::from_secs(660))
             .body(line.clone())
             .send()
             .await;
@@ -410,6 +698,92 @@ pub async fn stdio(url: String, token: String) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// The operations docs/ci.md §4.1 names, each once: a row's `.x` is the last full name's
+    /// area's `x` (`ci.caches.list`, `.delete`).
+    fn spec_operations(doc: &str) -> Vec<String> {
+        let start = doc.find("### 4.1 Routes").unwrap_or(0);
+        let end = doc.get(start..).and_then(|d| d.find("### 4.2")).map_or(doc.len(), |e| start + e);
+        let mut out: Vec<String> = Vec::new();
+        for line in doc.get(start..end).unwrap_or_default().lines().filter(|l| l.starts_with("| ") && !l.starts_with("| Method") && !l.starts_with("| ---")) {
+            let cells: Vec<String> = line.replace("\\|", "\u{1}").split('|').map(|c| c.trim().to_owned()).collect();
+            let Some(names) = cells.get(3) else { continue };
+            let mut last = String::new();
+            for tick in names.split('`').skip(1).step_by(2) {
+                let name = match tick.strip_prefix('.') {
+                    Some(rest) if !last.is_empty() => format!("{}.{rest}", last.rsplit_once('.').map_or(last.as_str(), |(area, _)| area)),
+                    _ => tick.to_owned(),
+                };
+                let dotted = name.contains('.') && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._*".contains(c));
+                if dotted && !name.starts_with('.') {
+                    if !out.contains(&name) {
+                        out.push(name.clone());
+                    }
+                    last = name;
+                }
+            }
+        }
+        out
+    }
+
+    /// What code mode's `kiln` is made of: its names, and nothing to call.
+    struct Listed(Vec<String>);
+
+    impl code::Host for Listed {
+        fn names(&self) -> Vec<String> {
+            self.0.clone()
+        }
+
+        fn registry(&self) -> Value {
+            Value::Array(Vec::new())
+        }
+
+        fn call(&self, _: &str, _: Value) -> Result<Value, Value> {
+            Err(json!({"error": "not here"}))
+        }
+    }
+
+    /// What §4.1 names that isn't built yet: W24's work operations, specified before they're built.
+    const LEFT: &[&str] = &["ci.work.gc", "ci.work.status", "ci.work.verify", "ci.work.warm", "ci.work.why"];
+
+    /// W20-AC01: every operation docs/ci.md §4.1 names is in the one registry (what isn't built
+    /// yet, [`LEFT`], aside), and every operation of the registry is an MCP tool and a function of
+    /// code mode's `kiln` by the same name. Each is its HTTP route too, and `kiln op` runs any of
+    /// them: `ops::tests` and `ci::ops::tests` check those.
+    #[test]
+    fn w20_ac01_every_operation_on_every_surface() -> Result<(), String> {
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/ci.md")).map_err(|e| e.to_string())?;
+        let named = spec_operations(&doc);
+        assert!(named.len() > 120, "§4.1 read: {named:?}");
+        let ops = crate::ops::listed(true);
+        let names: Vec<&str> = ops.iter().map(|o| o.name).collect();
+        let mut missing: Vec<&str> = named
+            .iter()
+            .map(String::as_str)
+            .filter(|n| match n.strip_suffix(".*") {
+                Some(area) => !names.iter().any(|o| o.starts_with(&format!("{area}."))),
+                None => !names.contains(n),
+            })
+            .collect();
+        missing.sort_unstable();
+        assert_eq!(missing, LEFT, "what §4.1 names and the registry lacks");
+        // Each its tool, and no two the same.
+        let tools: Vec<String> = tools_of(crate::ops::listed(true)).iter().filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned)).collect();
+        for n in &names {
+            assert!(tools.contains(&tool_name(n)), "{n} has no tool");
+        }
+        let mut unique = tools.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), tools.len(), "two tools share a name");
+        assert_eq!(tools.len(), names.len() + 2, "code_search and code_run, then one each");
+        // Each a function of code mode's `kiln`, by its name.
+        let all: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+        let program = "return input.filter(n => typeof n.split('.').reduce((o, k) => o && o[k], kiln) !== 'function')";
+        let out = code::run_on(std::sync::Arc::new(Listed(all.clone())), code::Mode::Run { input: json!(all) }, program, code::Limits::default()).map_err(|e| e.message)?;
+        assert_eq!(out.get("result").cloned().unwrap_or(out.clone()), json!([]), "not functions of `kiln`");
+        Ok(())
+    }
+
     #[test]
     fn mcp_tokens_verify_only_with_the_key_they_were_minted_with() {
         let t = token("admin-secret", "session-42");
@@ -429,5 +803,17 @@ mod tests {
             assert!(!name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'), "{name}");
             assert!(t.get("inputSchema").and_then(|s| s.get("type")).is_some(), "{name}");
         }
+    }
+
+    /// An agent kiln runs is told who it is and how its goal stack and plans work; anyone else
+    /// hears what kiln is.
+    #[test]
+    fn an_agent_hears_who_it_is_and_of_its_goals_and_plans() {
+        let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:01a14ab9", None, None);
+        agent.agent = Some("01a14ab9693976deb6ff6825f7da1c42".into());
+        let told = instructions(&agent);
+        assert!(told.starts_with(INSTRUCTIONS) && told.contains("You are kiln agent 01a14ab9693976deb6ff6825f7da1c42") && told.contains("goals_add") && told.contains("plans_run"), "{told}");
+        assert_eq!(instructions(&Caller::owner()), INSTRUCTIONS);
+        assert!(skills::list().iter().any(|s| s.get("name").and_then(Value::as_str) == Some("kiln-plans")), "the skill the instructions name is there");
     }
 }

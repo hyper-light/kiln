@@ -35,16 +35,24 @@ on a repository covers its pipelines and environments.
 | Code | `diffs.read`, `diffs.submit`, `diffs.review`, `diffs.land`, `queue.manage` |
 | Pipelines | `pipelines.edit` (always as a reviewed diff), `environments.deploy` |
 | Machines | `machines.read`, `machines.manage`, `machines.terminal`, `binaries.publish` |
-| Agents | `agents.run`, `agents.attach`, `agents.stop`, `experiments.run` |
+| Agents | `agents.run`, `agents.manage`, `agents.attach`, `agents.stop`, `experiments.run` |
 | Secrets | `secrets.use:<name>`, `secrets.manage` |
 | Observe | `observe.read` (queries, searches, live tails, dashboards, monitors, integrations listed without their secrets), `observe.write` (dashboards, monitors, series, logs and events posted), `observe.manage` (integrations and clouds, which hold secrets; the store's compaction and checks) |
 | Server | `settings.manage`, `tokens.manage`, `users.manage`, `audit.read` |
 
 **Roles** are named sets of capabilities: `viewer` (reads, observe's too), `developer` (trigger,
 rerun, submit, review; observe's dashboards and monitors), `maintainer` (plus land, attach agents,
-manage the queue; observe's integrations and clouds), `admin` (everything but ownership) and
-`owner`. Custom roles are allowed. A user holds roles per scope. Grants add up across scopes, and
-an explicit deny wins.
+manage everyone's agents, manage the queue; observe's integrations and clouds), `admin` (everything
+but ownership) and `owner`. Custom roles are allowed. A user holds roles per scope. Grants add up
+across scopes, and an explicit deny wins.
+
+**Whose agents.** A person reaches the agent sessions they opened, and those sessions' children.
+The owner and anyone with `agents.manage` reach every session. Anyone else gets 404 for a session
+that isn't theirs: it isn't in their list, and no route, socket or operation finds it. Opening an
+agent on a machine needs `runners.terminal` there (the server's own scope for the server), as a
+terminal does. So does listing, reading, taking over or branching the sessions found running on
+it, and reading the sessions it keeps. Commands and closes are audited as the person who made them.
+docs/agents.md, "Whose agents", has the whole rule, agents' own reach included.
 
 ## Tokens
 
@@ -112,7 +120,11 @@ kiln machines · kiln tokens create|list|revoke · kiln api GET /api/runs
   - ACP agents through session parameters.
   Each acts for whoever started it (with their rights), so every call is audited under the agent,
   on behalf of its user (`agent:<session>@<runner> for <user>`). Agents the server itself starts get
-  `/api/mcp` with a token of their own.
+  `/api/mcp` with a token of their own (`kiln_mcp_session-<id>_…`, which works only while kiln runs
+  that agent), and act for whoever started them the same way (`agent:<session> for <user>`).
+- **Agents' own operations** (`agents.*`, `plans.*`, `goals.*`) are tools too, with deployments on
+  or off, each checked as its route (`agents.run`): an agent starts, waits on and reads other
+  agents, and what it starts can do no more than it can (docs/agents.md, "Agents that run agents").
 
 ## Audit
 

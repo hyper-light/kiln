@@ -48,6 +48,9 @@ pub enum Body {
         /// Names of the files attached to it (images are counted in `images` too).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<String>,
+        /// The event it answers (a messenger-style reply), shown as its quote.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
     },
     Assistant {
         text: String,
@@ -164,6 +167,10 @@ pub struct ToolCall {
     /// For a skill run: the skill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<String>,
+    /// A command run on another machine (kiln reach): the runner it ran on once one is picked, what
+    /// it must be (`linux/amd64`) until then, or empty while kiln picks the best.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
 }
 
 impl ToolCall {
@@ -212,8 +219,13 @@ pub struct Hunk {
 /// touched it to how it is now.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileChange {
-    /// Relative to the session's directory when inside it.
+    /// Relative to its working tree's top ([`FileChange::tree`]) when it's in one, else to the
+    /// session's directory when inside it.
     pub path: String,
+    /// The top of the git working tree it's in, when that's one of the session's repository's: its
+    /// folder's own, or a worktree of it the agent works in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub created: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -370,6 +382,9 @@ pub struct QueueItem {
     pub attachments: Vec<Attachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overrides: Option<Overrides>,
+    /// The event it answers (a messenger-style reply): its quote rides with the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 /// What the timeline shows of a message's attachments: (images, file names).
@@ -465,6 +480,18 @@ pub struct Task {
     /// kiln can stop it (`stop_task`).
     #[serde(default)]
     pub stoppable: bool,
+    /// How a person's message reaches this subagent now (`Command::Send` with its `task`): queued
+    /// for when it finishes, steered into its turn, or sent now, its turn stopped. Empty: it takes
+    /// none (it ended, or its harness lets nothing in), and what's written goes to the agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub takes: Vec<SendMode>,
+    /// "parent": a message to it goes by way of the agent that started it, which passes it on
+    /// with its own tool (its harness takes nothing else from kiln).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    /// Messages waiting for it to finish what it's doing, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue: Vec<QueueItem>,
 }
 
 fn is_zero_u64(n: &u64) -> bool {
@@ -475,6 +502,15 @@ impl Task {
     /// Still running (or paused): not finished in any way.
     pub fn live(&self) -> bool {
         matches!(self.status.as_str(), "running" | "pending" | "paused")
+    }
+
+    /// One of the agent's own subagents, not something it left running. Older machines only report
+    /// the harness's own task kind: the same as the task inspector's classOf fallback.
+    pub fn subagent(&self) -> bool {
+        match self.class.as_deref() {
+            Some(class) => class == "agent",
+            None => !self.kind.starts_with("monitor") && !matches!(self.kind.as_str(), "local_bash" | "local_workflow") && !self.kind.contains("mcp"),
+        }
     }
 
     /// Something it leaves running on its own: a shell, a monitor, a workflow, a background call
@@ -929,6 +965,10 @@ impl Objective {
 /// Everything about a session that is not the timeline. Small; sent whole on change.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct State {
+    /// Moved here: where its folder stood in its repo's sync log on the machine it left. It goes
+    /// on once the folder here has taken the log that far, after a restart too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arriving: Option<crate::sync::runner::Mark>,
     pub status: Status,
     /// The harness's own session id (what `--resume` takes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -944,6 +984,11 @@ pub struct State {
     pub reach: Option<String>,
     #[serde(default)]
     pub cwd: String,
+    /// The working tree its work is in: the top of the one its latest change is in (its folder's,
+    /// or a worktree of its repository), once it has changed a file in one. What's asked of git
+    /// about its work is asked there (`Info::work_dir`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     #[serde(default)]
     pub model: String,
     #[serde(default)]
@@ -1049,6 +1094,11 @@ pub struct State {
     /// limit cuts a turn off. None: only when a limit is reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_at: Option<u8>,
+    /// The most subagents it runs at once (Agent settings): its harness's own, and the agents it
+    /// starts through kiln, each. None: as many as its harness and kiln's `[agents] max_children`
+    /// let it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subagents: Option<u32>,
     /// A pause ends only when a person resumes it, not by itself at the reset.
     #[serde(default, skip_serializing_if = "is_false")]
     pub manual_resume: bool,
@@ -1057,6 +1107,10 @@ pub struct State {
     /// conversation at a time (the server sees to it, `harness::elsewhere`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub move_on_limit: bool,
+    /// Where it goes on then, if a person said (`MovePlan`). Always sent, so a viewer knows its
+    /// runner takes one.
+    #[serde(default)]
+    pub move_plan: MovePlan,
     /// Windows a person resumed it in past its stop point (their `Limit::id`, and when they start
     /// over): the stop point leaves them be until then (`pause::waive_stop_point`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1068,6 +1122,34 @@ pub struct State {
     /// something.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub kept: u32,
+}
+
+/// Where an agent goes on at a usage limit, when it does (`State::move_on_limit`), as a person
+/// chose: a machine, and a harness and model there. What isn't said is left to kiln: whichever
+/// machine has room, in its own harness or one its conversation can be carried into
+/// (`harness::elsewhere`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MovePlan {
+    /// The machine, `agent:<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// The harness it goes on in there (none: its own, or one it can be carried into).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The model, in that harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl MovePlan {
+    pub fn is_empty(&self) -> bool {
+        self.to.is_none() && self.kind.is_none() && self.model.is_none()
+    }
+
+    /// The machine it names, without `agent:`.
+    pub fn machine(&self) -> Option<&str> {
+        self.to.as_deref().map(|t| t.strip_prefix("agent:").unwrap_or(t))
+    }
 }
 
 /// How a turn ended (`Core::end_turn`): enough for kiln to tell a turn that's done from one that
@@ -1167,6 +1249,17 @@ pub struct Switching {
     /// The harness ("codex").
     pub kind: String,
     pub model: String,
+    /// What it goes on with there, as the switch carries them over: the permission mode (the same
+    /// latitude, never more) and the nearest effort; with that harness's own choices of each, so
+    /// its page shows the session as it will run while the switch waits, not as the old harness ran it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<ModeOption>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<ControlOption>,
 }
 
 impl State {
@@ -1184,6 +1277,21 @@ pub struct ExitInfo {
     pub code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Unix ms it ended: what a stop is known by (its card, a person's mark of it), so a refresh
+    /// or a restart is never another stop.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub at: i64,
+}
+
+impl ExitInfo {
+    /// It ended now, with `code` and `error`.
+    pub fn now(code: Option<i32>, error: Option<String>) -> Self {
+        Self { code, error, at: crate::util::now_ms() }
+    }
+}
+
+fn is_zero_i64(n: &i64) -> bool {
+    *n == 0
 }
 
 /// What rarely changes: what the harness supports and offers.
@@ -1241,10 +1349,20 @@ pub enum Command {
         attachments: Vec<Attachment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         overrides: Option<Overrides>,
+        /// The event it answers (a messenger-style reply): its quote rides with the prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+        /// To one of its subagents (its task's id, as `Task::takes` allows), not to the agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
     },
     QueueEdit {
         id: String,
         text: String,
+        /// Its new attachment set, when the edit changed it (a queued message gains or drops
+        /// files until it is sent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachments: Option<Vec<Attachment>>,
     },
     QueueRemove {
         id: String,
@@ -1309,10 +1427,29 @@ pub enum Command {
         /// Not waiting for the turn under way: it is interrupted, and picked up over there.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         now: bool,
+        /// It goes on there in another harness (`Kind::id`), its conversation carried over, with
+        /// this model (None: that harness's default).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// `to` is this machine itself: the session goes to its newer runner process, which takes
+        /// this one's place (a take-over, `harness::handover`). Same disk, same home: nothing of
+        /// its folder or its harness's record travels, and it goes by way of the server.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        local: bool,
     },
     /// How a move is getting on before it starts (its repository being copied over): shown.
     Moving {
         text: String,
+    },
+    /// The server's word on a hand-over to the machine's newer runner process (a local
+    /// [`Command::MoveTo`]): taken over there (no `error`: this process lets go of the session),
+    /// or not (it goes on here). Never a person's; only to runners announcing
+    /// `proto::CAP_HANDOVER`.
+    HandedOver {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// Set a control's value, or run an action (its argument, if any, in `value`).
     Control {
@@ -1411,12 +1548,24 @@ pub enum Command {
         #[serde(default)]
         percent: Option<u8>,
     },
-    /// Whether at a usage limit it goes on on another machine with room (`State::move_on_limit`).
+    /// The most subagents it runs at once (`State::max_subagents`). None: no limit of its own.
+    MaxSubagents {
+        #[serde(default)]
+        count: Option<u32>,
+    },
+    /// Whether at a usage limit it goes on on another machine with room (`State::move_on_limit`),
+    /// and where (`State::move_plan`): a machine (`agent:<name>`), a harness and a model there.
     MoveOnLimit {
         on: bool,
+        #[serde(default)]
+        to: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
-    /// Another session on the same account reached a usage limit: wait for its reset too (the
-    /// server sends it).
+    /// Another session on the same account reached a usage limit: wait for its reset too, if its
+    /// own usage says the limit is its own as well (the server sends it; `pause::account_hold`).
     LimitHold {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window: Option<String>,
@@ -1426,6 +1575,10 @@ pub enum Command {
         until: Option<i64>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         said: String,
+        /// The account that reached it (`account_id`): a session signed in as another by now, as
+        /// it knows itself, takes no hold for it. None from a server that didn't say.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
     },
 }
 
@@ -1452,6 +1605,18 @@ fn who_hash(who: &str) -> Option<String> {
     use sha2::Digest as _;
     let w = who.trim().to_lowercase();
     (!w.is_empty()).then(|| hex::encode(sha2::Sha256::digest(w.as_bytes()).get(..5).unwrap_or_default()))
+}
+
+/// Whether two account ids (`account_id`) name the same account: the short hash that ends an id
+/// says who it is, and different places name the same plan differently ("max", "claude_max"); ids
+/// without a who compare whole. Another harness's id is another account.
+pub fn same_account(a: &str, b: &str) -> bool {
+    let (ha, hb) = (a.split(':').next(), b.split(':').next());
+    let who = |id: &str| id.split(':').nth(2).map(str::to_owned);
+    match (who(a), who(b)) {
+        (Some(x), Some(y)) => ha == hb && x == y,
+        _ => a == b,
+    }
 }
 
 /// Whether account id `account` (`account_id`) is `harness` signed in as `who`: Some(true) or
@@ -1615,6 +1780,7 @@ mod tests {
             server: None,
             tool_short: None,
             skill: None,
+            runner: None,
         };
         t.annotate();
         assert_eq!((t.server.as_deref(), t.tool_short.as_deref(), t.tool), (Some("github"), Some("search_issues"), ToolKind::Mcp));
@@ -1638,7 +1804,7 @@ mod tests {
         let back: Event = serde_json::from_value(v)?;
         assert_eq!(back, e);
         let c: Command = serde_json::from_str(r#"{"type":"send","id":"m1","text":"go","mode":"steer"}"#)?;
-        assert_eq!(c, Command::Send { id: "m1".into(), text: "go".into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
+        assert_eq!(c, Command::Send { id: "m1".into(), text: "go".into(), mode: SendMode::Steer, attachments: vec![], overrides: None, reply_to: None, task: None});
         let c: Command = serde_json::from_str(r#"{"type":"control","id":"compact","value":"keep the API notes"}"#)?;
         assert_eq!(c, Command::Control { id: "compact".into(), value: Some(serde_json::json!("keep the API notes")) });
         let c: Command = serde_json::from_str(r#"{"type":"send","id":"m2","text":"see","attachments":[{"name":"a.png","mime":"image/png","data_base64":"iVBO"}],"overrides":{"effort":"high"}}"#)?;

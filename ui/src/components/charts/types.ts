@@ -37,6 +37,8 @@ export interface ChartProps {
   y2Format?: (v: number) => string;
   yRange?: [number, number];
   timeFormat?: "time" | "hour" | "day";
+  /** The legend's reading of the x under the cursor (unix seconds); the time of day unless said. */
+  xValue?: (ts: number) => string;
   legend?: boolean;
   className?: string;
   ariaLabel?: string;

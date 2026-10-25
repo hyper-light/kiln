@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as AppIndexRouteImport } from './routes/_app.index'
 import { Route as AppSplatRouteImport } from './routes/_app.$'
+import { Route as AppClustersRouteImport } from './routes/_app.clusters'
 import { Route as AppInsightsRouteImport } from './routes/_app.insights'
 import { Route as AppLogsRouteImport } from './routes/_app.logs'
 import { Route as AppReposRouteImport } from './routes/_app.repos'
@@ -41,12 +42,21 @@ import { Route as AppObserveMetricsRouteImport } from './routes/_app.observe.met
 import { Route as AppObserveMetricsSummaryRouteImport } from './routes/_app.observe.metrics-summary'
 import { Route as AppObserveProfilesRouteImport } from './routes/_app.observe.profiles'
 import { Route as AppObserveSyntheticsRouteImport } from './routes/_app.observe.synthetics'
+import { Route as AppReviewIndexRouteImport } from './routes/_app.review.index'
+import { Route as AppReviewKeyRouteImport } from './routes/_app.review.$key'
+import { Route as AppReviewQueueRouteImport } from './routes/_app.review.queue'
 import { Route as AppRunnersIndexRouteImport } from './routes/_app.runners.index'
 import { Route as AppRunnersAddRouteImport } from './routes/_app.runners.add'
 import { Route as AppRunsIndexRouteImport } from './routes/_app.runs.index'
 import { Route as SharedPlansTokenRouteImport } from './routes/shared.plans.$token'
 import { Route as AppAgentsPlansIndexRouteImport } from './routes/_app.agents.plans.index'
 import { Route as AppAgentsPlansIdRouteImport } from './routes/_app.agents.plans.$id'
+import { Route as AppAgentsResearchIdRouteImport } from './routes/_app.agents.research.$id'
+import { Route as AppDeploymentsEnvironmentsIndexRouteImport } from './routes/_app.deployments.environments.index'
+import { Route as AppDeploymentsEnvironmentsNameRouteImport } from './routes/_app.deployments.environments.$name'
+import { Route as AppDeploymentsReleasesIndexRouteImport } from './routes/_app.deployments.releases.index'
+import { Route as AppDeploymentsReleasesIdRouteImport } from './routes/_app.deployments.releases.$id'
+import { Route as AppDeploymentsReleasesNewRouteImport } from './routes/_app.deployments.releases.new'
 import { Route as AppObserveApmIndexRouteImport } from './routes/_app.observe.apm.index'
 import { Route as AppObserveApmMapRouteImport } from './routes/_app.observe.apm.map'
 import { Route as AppObserveCatalogIndexRouteImport } from './routes/_app.observe.catalog.index'
@@ -74,12 +84,21 @@ import { Route as AppObserveSlosIndexRouteImport } from './routes/_app.observe.s
 import { Route as AppObserveSlosIdRouteImport } from './routes/_app.observe.slos.$id'
 import { Route as AppObserveTracesIndexRouteImport } from './routes/_app.observe.traces.index'
 import { Route as AppObserveTracesIdRouteImport } from './routes/_app.observe.traces.$id'
+import { Route as AppReviewStacksIdRouteImport } from './routes/_app.review.stacks.$id'
 import { Route as AppRunsIdIndexRouteImport } from './routes/_app.runs.$id.index'
 import { Route as AppRunsIdCompareRouteImport } from './routes/_app.runs.$id.compare'
+import { Route as AppAgentsPlansRunsRunRouteImport } from './routes/_app.agents.plans.runs.$run'
 import { Route as AppDeploymentsAppsProjectNameRouteImport } from './routes/_app.deployments.apps.$project.$name'
+import { Route as AppDeploymentsReleasesAppsAppRouteImport } from './routes/_app.deployments.releases.apps.$app'
+import { Route as AppDeploymentsReleasesEnvironmentsEnvRouteImport } from './routes/_app.deployments.releases.environments.$env'
+import { Route as AppDeploymentsReleasesFleetsIdRouteImport } from './routes/_app.deployments.releases.fleets.$id'
+import { Route as AppDeploymentsReleasesFleetsNewRouteImport } from './routes/_app.deployments.releases.fleets.new'
+import { Route as AppDeploymentsReleasesTemplatesIndexRouteImport } from './routes/_app.deployments.releases.templates.index'
+import { Route as AppDeploymentsReleasesTemplatesNameRouteImport } from './routes/_app.deployments.releases.templates.$name'
 import { Route as AppObserveApmServicesNameRouteImport } from './routes/_app.observe.apm.services.$name'
 import { Route as AppObserveLlmTracesIdRouteImport } from './routes/_app.observe.llm.traces.$id'
 import { Route as AppRunsIdJobsJobIdRouteImport } from './routes/_app.runs.$id.jobs.$jobId'
+import { Route as AppDeploymentsReleasesAppsAppEnvironmentsEnvRouteImport } from './routes/_app.deployments.releases.apps.$app_.environments.$env'
 
 const AppRoute = AppRouteImport.update({
   id: '/_app',
@@ -93,6 +112,11 @@ const AppIndexRoute = AppIndexRouteImport.update({
 const AppSplatRoute = AppSplatRouteImport.update({
   id: '/$',
   path: '/$',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppClustersRoute = AppClustersRouteImport.update({
+  id: '/clusters',
+  path: '/clusters',
   getParentRoute: () => AppRoute,
 } as any)
 const AppInsightsRoute = AppInsightsRouteImport.update({
@@ -241,6 +265,21 @@ const AppObserveSyntheticsRoute = AppObserveSyntheticsRouteImport.update({
   path: '/observe/synthetics',
   getParentRoute: () => AppRoute,
 } as any)
+const AppReviewIndexRoute = AppReviewIndexRouteImport.update({
+  id: '/review/',
+  path: '/review/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppReviewKeyRoute = AppReviewKeyRouteImport.update({
+  id: '/review/$key',
+  path: '/review/$key',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppReviewQueueRoute = AppReviewQueueRouteImport.update({
+  id: '/review/queue',
+  path: '/review/queue',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppRunnersIndexRoute = AppRunnersIndexRouteImport.update({
   id: '/runners/',
   path: '/runners/',
@@ -271,6 +310,41 @@ const AppAgentsPlansIdRoute = AppAgentsPlansIdRouteImport.update({
   path: '/agents/plans/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppAgentsResearchIdRoute = AppAgentsResearchIdRouteImport.update({
+  id: '/agents/research/$id',
+  path: '/agents/research/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppDeploymentsEnvironmentsIndexRoute =
+  AppDeploymentsEnvironmentsIndexRouteImport.update({
+    id: '/deployments/environments/',
+    path: '/deployments/environments/',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsEnvironmentsNameRoute =
+  AppDeploymentsEnvironmentsNameRouteImport.update({
+    id: '/deployments/environments/$name',
+    path: '/deployments/environments/$name',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesIndexRoute =
+  AppDeploymentsReleasesIndexRouteImport.update({
+    id: '/deployments/releases/',
+    path: '/deployments/releases/',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesIdRoute =
+  AppDeploymentsReleasesIdRouteImport.update({
+    id: '/deployments/releases/$id',
+    path: '/deployments/releases/$id',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesNewRoute =
+  AppDeploymentsReleasesNewRouteImport.update({
+    id: '/deployments/releases/new',
+    path: '/deployments/releases/new',
+    getParentRoute: () => AppRoute,
+  } as any)
 const AppObserveApmIndexRoute = AppObserveApmIndexRouteImport.update({
   id: '/observe/apm/',
   path: '/observe/apm/',
@@ -411,6 +485,11 @@ const AppObserveTracesIdRoute = AppObserveTracesIdRouteImport.update({
   path: '/observe/traces/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppReviewStacksIdRoute = AppReviewStacksIdRouteImport.update({
+  id: '/review/stacks/$id',
+  path: '/review/stacks/$id',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppRunsIdIndexRoute = AppRunsIdIndexRouteImport.update({
   id: '/runs/$id/',
   path: '/runs/$id/',
@@ -421,10 +500,51 @@ const AppRunsIdCompareRoute = AppRunsIdCompareRouteImport.update({
   path: '/runs/$id/compare',
   getParentRoute: () => AppRoute,
 } as any)
+const AppAgentsPlansRunsRunRoute = AppAgentsPlansRunsRunRouteImport.update({
+  id: '/agents/plans/runs/$run',
+  path: '/agents/plans/runs/$run',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppDeploymentsAppsProjectNameRoute =
   AppDeploymentsAppsProjectNameRouteImport.update({
     id: '/deployments/apps/$project/$name',
     path: '/deployments/apps/$project/$name',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesAppsAppRoute =
+  AppDeploymentsReleasesAppsAppRouteImport.update({
+    id: '/deployments/releases/apps/$app',
+    path: '/deployments/releases/apps/$app',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesEnvironmentsEnvRoute =
+  AppDeploymentsReleasesEnvironmentsEnvRouteImport.update({
+    id: '/deployments/releases/environments/$env',
+    path: '/deployments/releases/environments/$env',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesFleetsIdRoute =
+  AppDeploymentsReleasesFleetsIdRouteImport.update({
+    id: '/deployments/releases/fleets/$id',
+    path: '/deployments/releases/fleets/$id',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesFleetsNewRoute =
+  AppDeploymentsReleasesFleetsNewRouteImport.update({
+    id: '/deployments/releases/fleets/new',
+    path: '/deployments/releases/fleets/new',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesTemplatesIndexRoute =
+  AppDeploymentsReleasesTemplatesIndexRouteImport.update({
+    id: '/deployments/releases/templates/',
+    path: '/deployments/releases/templates/',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesTemplatesNameRoute =
+  AppDeploymentsReleasesTemplatesNameRouteImport.update({
+    id: '/deployments/releases/templates/$name',
+    path: '/deployments/releases/templates/$name',
     getParentRoute: () => AppRoute,
   } as any)
 const AppObserveApmServicesNameRoute =
@@ -443,10 +563,17 @@ const AppRunsIdJobsJobIdRoute = AppRunsIdJobsJobIdRouteImport.update({
   path: '/runs/$id/jobs/$jobId',
   getParentRoute: () => AppRoute,
 } as any)
+const AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute =
+  AppDeploymentsReleasesAppsAppEnvironmentsEnvRouteImport.update({
+    id: '/deployments/releases/apps/$app_/environments/$env',
+    path: '/deployments/releases/apps/$app/environments/$env',
+    getParentRoute: () => AppRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/$': typeof AppSplatRoute
+  '/clusters': typeof AppClustersRoute
   '/insights': typeof AppInsightsRoute
   '/logs': typeof AppLogsRoute
   '/repos': typeof AppReposRoute
@@ -473,14 +600,21 @@ export interface FileRoutesByFullPath {
   '/observe/metrics-summary': typeof AppObserveMetricsSummaryRoute
   '/observe/profiles': typeof AppObserveProfilesRoute
   '/observe/synthetics': typeof AppObserveSyntheticsRoute
+  '/review/$key': typeof AppReviewKeyRoute
+  '/review/queue': typeof AppReviewQueueRoute
   '/runners/add': typeof AppRunnersAddRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
   '/agents/': typeof AppAgentsIndexRoute
   '/deployments/': typeof AppDeploymentsIndexRoute
   '/observe/': typeof AppObserveIndexRoute
+  '/review/': typeof AppReviewIndexRoute
   '/runners/': typeof AppRunnersIndexRoute
   '/runs/': typeof AppRunsIndexRoute
   '/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/agents/research/$id': typeof AppAgentsResearchIdRoute
+  '/deployments/environments/$name': typeof AppDeploymentsEnvironmentsNameRoute
+  '/deployments/releases/$id': typeof AppDeploymentsReleasesIdRoute
+  '/deployments/releases/new': typeof AppDeploymentsReleasesNewRoute
   '/observe/apm/map': typeof AppObserveApmMapRoute
   '/observe/catalog/$name': typeof AppObserveCatalogNameRoute
   '/observe/containers/$id': typeof AppObserveContainersIdRoute
@@ -494,8 +628,11 @@ export interface FileRoutesByFullPath {
   '/observe/scanner/$id': typeof AppObserveScannerIdRoute
   '/observe/slos/$id': typeof AppObserveSlosIdRoute
   '/observe/traces/$id': typeof AppObserveTracesIdRoute
+  '/review/stacks/$id': typeof AppReviewStacksIdRoute
   '/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/agents/plans/': typeof AppAgentsPlansIndexRoute
+  '/deployments/environments/': typeof AppDeploymentsEnvironmentsIndexRoute
+  '/deployments/releases/': typeof AppDeploymentsReleasesIndexRoute
   '/observe/apm/': typeof AppObserveApmIndexRoute
   '/observe/catalog/': typeof AppObserveCatalogIndexRoute
   '/observe/containers/': typeof AppObserveContainersIndexRoute
@@ -511,13 +648,22 @@ export interface FileRoutesByFullPath {
   '/observe/slos/': typeof AppObserveSlosIndexRoute
   '/observe/traces/': typeof AppObserveTracesIndexRoute
   '/runs/$id/': typeof AppRunsIdIndexRoute
+  '/agents/plans/runs/$run': typeof AppAgentsPlansRunsRunRoute
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
+  '/deployments/releases/apps/$app': typeof AppDeploymentsReleasesAppsAppRoute
+  '/deployments/releases/environments/$env': typeof AppDeploymentsReleasesEnvironmentsEnvRoute
+  '/deployments/releases/fleets/$id': typeof AppDeploymentsReleasesFleetsIdRoute
+  '/deployments/releases/fleets/new': typeof AppDeploymentsReleasesFleetsNewRoute
+  '/deployments/releases/templates/$name': typeof AppDeploymentsReleasesTemplatesNameRoute
   '/observe/apm/services/$name': typeof AppObserveApmServicesNameRoute
   '/observe/llm/traces/$id': typeof AppObserveLlmTracesIdRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/deployments/releases/templates/': typeof AppDeploymentsReleasesTemplatesIndexRoute
+  '/deployments/releases/apps/$app/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
 }
 export interface FileRoutesByTo {
   '/$': typeof AppSplatRoute
+  '/clusters': typeof AppClustersRoute
   '/insights': typeof AppInsightsRoute
   '/logs': typeof AppLogsRoute
   '/repos': typeof AppReposRoute
@@ -545,14 +691,21 @@ export interface FileRoutesByTo {
   '/observe/metrics-summary': typeof AppObserveMetricsSummaryRoute
   '/observe/profiles': typeof AppObserveProfilesRoute
   '/observe/synthetics': typeof AppObserveSyntheticsRoute
+  '/review/$key': typeof AppReviewKeyRoute
+  '/review/queue': typeof AppReviewQueueRoute
   '/runners/add': typeof AppRunnersAddRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
   '/agents': typeof AppAgentsIndexRoute
   '/deployments': typeof AppDeploymentsIndexRoute
   '/observe': typeof AppObserveIndexRoute
+  '/review': typeof AppReviewIndexRoute
   '/runners': typeof AppRunnersIndexRoute
   '/runs': typeof AppRunsIndexRoute
   '/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/agents/research/$id': typeof AppAgentsResearchIdRoute
+  '/deployments/environments/$name': typeof AppDeploymentsEnvironmentsNameRoute
+  '/deployments/releases/$id': typeof AppDeploymentsReleasesIdRoute
+  '/deployments/releases/new': typeof AppDeploymentsReleasesNewRoute
   '/observe/apm/map': typeof AppObserveApmMapRoute
   '/observe/catalog/$name': typeof AppObserveCatalogNameRoute
   '/observe/containers/$id': typeof AppObserveContainersIdRoute
@@ -566,8 +719,11 @@ export interface FileRoutesByTo {
   '/observe/scanner/$id': typeof AppObserveScannerIdRoute
   '/observe/slos/$id': typeof AppObserveSlosIdRoute
   '/observe/traces/$id': typeof AppObserveTracesIdRoute
+  '/review/stacks/$id': typeof AppReviewStacksIdRoute
   '/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/agents/plans': typeof AppAgentsPlansIndexRoute
+  '/deployments/environments': typeof AppDeploymentsEnvironmentsIndexRoute
+  '/deployments/releases': typeof AppDeploymentsReleasesIndexRoute
   '/observe/apm': typeof AppObserveApmIndexRoute
   '/observe/catalog': typeof AppObserveCatalogIndexRoute
   '/observe/containers': typeof AppObserveContainersIndexRoute
@@ -583,15 +739,24 @@ export interface FileRoutesByTo {
   '/observe/slos': typeof AppObserveSlosIndexRoute
   '/observe/traces': typeof AppObserveTracesIndexRoute
   '/runs/$id': typeof AppRunsIdIndexRoute
+  '/agents/plans/runs/$run': typeof AppAgentsPlansRunsRunRoute
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
+  '/deployments/releases/apps/$app': typeof AppDeploymentsReleasesAppsAppRoute
+  '/deployments/releases/environments/$env': typeof AppDeploymentsReleasesEnvironmentsEnvRoute
+  '/deployments/releases/fleets/$id': typeof AppDeploymentsReleasesFleetsIdRoute
+  '/deployments/releases/fleets/new': typeof AppDeploymentsReleasesFleetsNewRoute
+  '/deployments/releases/templates/$name': typeof AppDeploymentsReleasesTemplatesNameRoute
   '/observe/apm/services/$name': typeof AppObserveApmServicesNameRoute
   '/observe/llm/traces/$id': typeof AppObserveLlmTracesIdRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/deployments/releases/templates': typeof AppDeploymentsReleasesTemplatesIndexRoute
+  '/deployments/releases/apps/$app/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_app': typeof AppRouteWithChildren
   '/_app/$': typeof AppSplatRoute
+  '/_app/clusters': typeof AppClustersRoute
   '/_app/insights': typeof AppInsightsRoute
   '/_app/logs': typeof AppLogsRoute
   '/_app/repos': typeof AppReposRoute
@@ -619,14 +784,21 @@ export interface FileRoutesById {
   '/_app/observe/metrics-summary': typeof AppObserveMetricsSummaryRoute
   '/_app/observe/profiles': typeof AppObserveProfilesRoute
   '/_app/observe/synthetics': typeof AppObserveSyntheticsRoute
+  '/_app/review/$key': typeof AppReviewKeyRoute
+  '/_app/review/queue': typeof AppReviewQueueRoute
   '/_app/runners/add': typeof AppRunnersAddRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
   '/_app/agents/': typeof AppAgentsIndexRoute
   '/_app/deployments/': typeof AppDeploymentsIndexRoute
   '/_app/observe/': typeof AppObserveIndexRoute
+  '/_app/review/': typeof AppReviewIndexRoute
   '/_app/runners/': typeof AppRunnersIndexRoute
   '/_app/runs/': typeof AppRunsIndexRoute
   '/_app/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/_app/agents/research/$id': typeof AppAgentsResearchIdRoute
+  '/_app/deployments/environments/$name': typeof AppDeploymentsEnvironmentsNameRoute
+  '/_app/deployments/releases/$id': typeof AppDeploymentsReleasesIdRoute
+  '/_app/deployments/releases/new': typeof AppDeploymentsReleasesNewRoute
   '/_app/observe/apm/map': typeof AppObserveApmMapRoute
   '/_app/observe/catalog/$name': typeof AppObserveCatalogNameRoute
   '/_app/observe/containers/$id': typeof AppObserveContainersIdRoute
@@ -640,8 +812,11 @@ export interface FileRoutesById {
   '/_app/observe/scanner/$id': typeof AppObserveScannerIdRoute
   '/_app/observe/slos/$id': typeof AppObserveSlosIdRoute
   '/_app/observe/traces/$id': typeof AppObserveTracesIdRoute
+  '/_app/review/stacks/$id': typeof AppReviewStacksIdRoute
   '/_app/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/_app/agents/plans/': typeof AppAgentsPlansIndexRoute
+  '/_app/deployments/environments/': typeof AppDeploymentsEnvironmentsIndexRoute
+  '/_app/deployments/releases/': typeof AppDeploymentsReleasesIndexRoute
   '/_app/observe/apm/': typeof AppObserveApmIndexRoute
   '/_app/observe/catalog/': typeof AppObserveCatalogIndexRoute
   '/_app/observe/containers/': typeof AppObserveContainersIndexRoute
@@ -657,16 +832,25 @@ export interface FileRoutesById {
   '/_app/observe/slos/': typeof AppObserveSlosIndexRoute
   '/_app/observe/traces/': typeof AppObserveTracesIndexRoute
   '/_app/runs/$id/': typeof AppRunsIdIndexRoute
+  '/_app/agents/plans/runs/$run': typeof AppAgentsPlansRunsRunRoute
   '/_app/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
+  '/_app/deployments/releases/apps/$app': typeof AppDeploymentsReleasesAppsAppRoute
+  '/_app/deployments/releases/environments/$env': typeof AppDeploymentsReleasesEnvironmentsEnvRoute
+  '/_app/deployments/releases/fleets/$id': typeof AppDeploymentsReleasesFleetsIdRoute
+  '/_app/deployments/releases/fleets/new': typeof AppDeploymentsReleasesFleetsNewRoute
+  '/_app/deployments/releases/templates/$name': typeof AppDeploymentsReleasesTemplatesNameRoute
   '/_app/observe/apm/services/$name': typeof AppObserveApmServicesNameRoute
   '/_app/observe/llm/traces/$id': typeof AppObserveLlmTracesIdRoute
   '/_app/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/_app/deployments/releases/templates/': typeof AppDeploymentsReleasesTemplatesIndexRoute
+  '/_app/deployments/releases/apps/$app_/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
     | '/$'
+    | '/clusters'
     | '/insights'
     | '/logs'
     | '/repos'
@@ -693,14 +877,21 @@ export interface FileRouteTypes {
     | '/observe/metrics-summary'
     | '/observe/profiles'
     | '/observe/synthetics'
+    | '/review/$key'
+    | '/review/queue'
     | '/runners/add'
     | '/shared/plans/$token'
     | '/agents/'
     | '/deployments/'
     | '/observe/'
+    | '/review/'
     | '/runners/'
     | '/runs/'
     | '/agents/plans/$id'
+    | '/agents/research/$id'
+    | '/deployments/environments/$name'
+    | '/deployments/releases/$id'
+    | '/deployments/releases/new'
     | '/observe/apm/map'
     | '/observe/catalog/$name'
     | '/observe/containers/$id'
@@ -714,8 +905,11 @@ export interface FileRouteTypes {
     | '/observe/scanner/$id'
     | '/observe/slos/$id'
     | '/observe/traces/$id'
+    | '/review/stacks/$id'
     | '/runs/$id/compare'
     | '/agents/plans/'
+    | '/deployments/environments/'
+    | '/deployments/releases/'
     | '/observe/apm/'
     | '/observe/catalog/'
     | '/observe/containers/'
@@ -731,13 +925,22 @@ export interface FileRouteTypes {
     | '/observe/slos/'
     | '/observe/traces/'
     | '/runs/$id/'
+    | '/agents/plans/runs/$run'
     | '/deployments/apps/$project/$name'
+    | '/deployments/releases/apps/$app'
+    | '/deployments/releases/environments/$env'
+    | '/deployments/releases/fleets/$id'
+    | '/deployments/releases/fleets/new'
+    | '/deployments/releases/templates/$name'
     | '/observe/apm/services/$name'
     | '/observe/llm/traces/$id'
     | '/runs/$id/jobs/$jobId'
+    | '/deployments/releases/templates/'
+    | '/deployments/releases/apps/$app/environments/$env'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/$'
+    | '/clusters'
     | '/insights'
     | '/logs'
     | '/repos'
@@ -765,14 +968,21 @@ export interface FileRouteTypes {
     | '/observe/metrics-summary'
     | '/observe/profiles'
     | '/observe/synthetics'
+    | '/review/$key'
+    | '/review/queue'
     | '/runners/add'
     | '/shared/plans/$token'
     | '/agents'
     | '/deployments'
     | '/observe'
+    | '/review'
     | '/runners'
     | '/runs'
     | '/agents/plans/$id'
+    | '/agents/research/$id'
+    | '/deployments/environments/$name'
+    | '/deployments/releases/$id'
+    | '/deployments/releases/new'
     | '/observe/apm/map'
     | '/observe/catalog/$name'
     | '/observe/containers/$id'
@@ -786,8 +996,11 @@ export interface FileRouteTypes {
     | '/observe/scanner/$id'
     | '/observe/slos/$id'
     | '/observe/traces/$id'
+    | '/review/stacks/$id'
     | '/runs/$id/compare'
     | '/agents/plans'
+    | '/deployments/environments'
+    | '/deployments/releases'
     | '/observe/apm'
     | '/observe/catalog'
     | '/observe/containers'
@@ -803,14 +1016,23 @@ export interface FileRouteTypes {
     | '/observe/slos'
     | '/observe/traces'
     | '/runs/$id'
+    | '/agents/plans/runs/$run'
     | '/deployments/apps/$project/$name'
+    | '/deployments/releases/apps/$app'
+    | '/deployments/releases/environments/$env'
+    | '/deployments/releases/fleets/$id'
+    | '/deployments/releases/fleets/new'
+    | '/deployments/releases/templates/$name'
     | '/observe/apm/services/$name'
     | '/observe/llm/traces/$id'
     | '/runs/$id/jobs/$jobId'
+    | '/deployments/releases/templates'
+    | '/deployments/releases/apps/$app/environments/$env'
   id:
     | '__root__'
     | '/_app'
     | '/_app/$'
+    | '/_app/clusters'
     | '/_app/insights'
     | '/_app/logs'
     | '/_app/repos'
@@ -838,14 +1060,21 @@ export interface FileRouteTypes {
     | '/_app/observe/metrics-summary'
     | '/_app/observe/profiles'
     | '/_app/observe/synthetics'
+    | '/_app/review/$key'
+    | '/_app/review/queue'
     | '/_app/runners/add'
     | '/shared/plans/$token'
     | '/_app/agents/'
     | '/_app/deployments/'
     | '/_app/observe/'
+    | '/_app/review/'
     | '/_app/runners/'
     | '/_app/runs/'
     | '/_app/agents/plans/$id'
+    | '/_app/agents/research/$id'
+    | '/_app/deployments/environments/$name'
+    | '/_app/deployments/releases/$id'
+    | '/_app/deployments/releases/new'
     | '/_app/observe/apm/map'
     | '/_app/observe/catalog/$name'
     | '/_app/observe/containers/$id'
@@ -859,8 +1088,11 @@ export interface FileRouteTypes {
     | '/_app/observe/scanner/$id'
     | '/_app/observe/slos/$id'
     | '/_app/observe/traces/$id'
+    | '/_app/review/stacks/$id'
     | '/_app/runs/$id/compare'
     | '/_app/agents/plans/'
+    | '/_app/deployments/environments/'
+    | '/_app/deployments/releases/'
     | '/_app/observe/apm/'
     | '/_app/observe/catalog/'
     | '/_app/observe/containers/'
@@ -876,10 +1108,18 @@ export interface FileRouteTypes {
     | '/_app/observe/slos/'
     | '/_app/observe/traces/'
     | '/_app/runs/$id/'
+    | '/_app/agents/plans/runs/$run'
     | '/_app/deployments/apps/$project/$name'
+    | '/_app/deployments/releases/apps/$app'
+    | '/_app/deployments/releases/environments/$env'
+    | '/_app/deployments/releases/fleets/$id'
+    | '/_app/deployments/releases/fleets/new'
+    | '/_app/deployments/releases/templates/$name'
     | '/_app/observe/apm/services/$name'
     | '/_app/observe/llm/traces/$id'
     | '/_app/runs/$id/jobs/$jobId'
+    | '/_app/deployments/releases/templates/'
+    | '/_app/deployments/releases/apps/$app_/environments/$env'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -908,6 +1148,13 @@ declare module '@tanstack/react-router' {
       path: '/$'
       fullPath: '/$'
       preLoaderRoute: typeof AppSplatRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/clusters': {
+      id: '/_app/clusters'
+      path: '/clusters'
+      fullPath: '/clusters'
+      preLoaderRoute: typeof AppClustersRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/insights': {
@@ -1113,6 +1360,27 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppObserveSyntheticsRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/review/': {
+      id: '/_app/review/'
+      path: '/review'
+      fullPath: '/review/'
+      preLoaderRoute: typeof AppReviewIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/review/$key': {
+      id: '/_app/review/$key'
+      path: '/review/$key'
+      fullPath: '/review/$key'
+      preLoaderRoute: typeof AppReviewKeyRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/review/queue': {
+      id: '/_app/review/queue'
+      path: '/review/queue'
+      fullPath: '/review/queue'
+      preLoaderRoute: typeof AppReviewQueueRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/runners/': {
       id: '/_app/runners/'
       path: '/runners'
@@ -1153,6 +1421,48 @@ declare module '@tanstack/react-router' {
       path: '/agents/plans/$id'
       fullPath: '/agents/plans/$id'
       preLoaderRoute: typeof AppAgentsPlansIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/agents/research/$id': {
+      id: '/_app/agents/research/$id'
+      path: '/agents/research/$id'
+      fullPath: '/agents/research/$id'
+      preLoaderRoute: typeof AppAgentsResearchIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/environments/': {
+      id: '/_app/deployments/environments/'
+      path: '/deployments/environments'
+      fullPath: '/deployments/environments/'
+      preLoaderRoute: typeof AppDeploymentsEnvironmentsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/environments/$name': {
+      id: '/_app/deployments/environments/$name'
+      path: '/deployments/environments/$name'
+      fullPath: '/deployments/environments/$name'
+      preLoaderRoute: typeof AppDeploymentsEnvironmentsNameRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/': {
+      id: '/_app/deployments/releases/'
+      path: '/deployments/releases'
+      fullPath: '/deployments/releases/'
+      preLoaderRoute: typeof AppDeploymentsReleasesIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/$id': {
+      id: '/_app/deployments/releases/$id'
+      path: '/deployments/releases/$id'
+      fullPath: '/deployments/releases/$id'
+      preLoaderRoute: typeof AppDeploymentsReleasesIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/new': {
+      id: '/_app/deployments/releases/new'
+      path: '/deployments/releases/new'
+      fullPath: '/deployments/releases/new'
+      preLoaderRoute: typeof AppDeploymentsReleasesNewRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/observe/apm/': {
@@ -1344,6 +1654,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppObserveTracesIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/review/stacks/$id': {
+      id: '/_app/review/stacks/$id'
+      path: '/review/stacks/$id'
+      fullPath: '/review/stacks/$id'
+      preLoaderRoute: typeof AppReviewStacksIdRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/runs/$id/': {
       id: '/_app/runs/$id/'
       path: '/runs/$id'
@@ -1358,11 +1675,60 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppRunsIdCompareRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/agents/plans/runs/$run': {
+      id: '/_app/agents/plans/runs/$run'
+      path: '/agents/plans/runs/$run'
+      fullPath: '/agents/plans/runs/$run'
+      preLoaderRoute: typeof AppAgentsPlansRunsRunRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/deployments/apps/$project/$name': {
       id: '/_app/deployments/apps/$project/$name'
       path: '/deployments/apps/$project/$name'
       fullPath: '/deployments/apps/$project/$name'
       preLoaderRoute: typeof AppDeploymentsAppsProjectNameRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/apps/$app': {
+      id: '/_app/deployments/releases/apps/$app'
+      path: '/deployments/releases/apps/$app'
+      fullPath: '/deployments/releases/apps/$app'
+      preLoaderRoute: typeof AppDeploymentsReleasesAppsAppRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/environments/$env': {
+      id: '/_app/deployments/releases/environments/$env'
+      path: '/deployments/releases/environments/$env'
+      fullPath: '/deployments/releases/environments/$env'
+      preLoaderRoute: typeof AppDeploymentsReleasesEnvironmentsEnvRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/fleets/$id': {
+      id: '/_app/deployments/releases/fleets/$id'
+      path: '/deployments/releases/fleets/$id'
+      fullPath: '/deployments/releases/fleets/$id'
+      preLoaderRoute: typeof AppDeploymentsReleasesFleetsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/fleets/new': {
+      id: '/_app/deployments/releases/fleets/new'
+      path: '/deployments/releases/fleets/new'
+      fullPath: '/deployments/releases/fleets/new'
+      preLoaderRoute: typeof AppDeploymentsReleasesFleetsNewRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/templates/': {
+      id: '/_app/deployments/releases/templates/'
+      path: '/deployments/releases/templates'
+      fullPath: '/deployments/releases/templates/'
+      preLoaderRoute: typeof AppDeploymentsReleasesTemplatesIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/templates/$name': {
+      id: '/_app/deployments/releases/templates/$name'
+      path: '/deployments/releases/templates/$name'
+      fullPath: '/deployments/releases/templates/$name'
+      preLoaderRoute: typeof AppDeploymentsReleasesTemplatesNameRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/observe/apm/services/$name': {
@@ -1386,11 +1752,19 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppRunsIdJobsJobIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/deployments/releases/apps/$app_/environments/$env': {
+      id: '/_app/deployments/releases/apps/$app_/environments/$env'
+      path: '/deployments/releases/apps/$app/environments/$env'
+      fullPath: '/deployments/releases/apps/$app/environments/$env'
+      preLoaderRoute: typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRouteImport
+      parentRoute: typeof AppRoute
+    }
   }
 }
 
 interface AppRouteChildren {
   AppSplatRoute: typeof AppSplatRoute
+  AppClustersRoute: typeof AppClustersRoute
   AppInsightsRoute: typeof AppInsightsRoute
   AppLogsRoute: typeof AppLogsRoute
   AppReposRoute: typeof AppReposRoute
@@ -1418,13 +1792,20 @@ interface AppRouteChildren {
   AppObserveMetricsSummaryRoute: typeof AppObserveMetricsSummaryRoute
   AppObserveProfilesRoute: typeof AppObserveProfilesRoute
   AppObserveSyntheticsRoute: typeof AppObserveSyntheticsRoute
+  AppReviewKeyRoute: typeof AppReviewKeyRoute
+  AppReviewQueueRoute: typeof AppReviewQueueRoute
   AppRunnersAddRoute: typeof AppRunnersAddRoute
   AppAgentsIndexRoute: typeof AppAgentsIndexRoute
   AppDeploymentsIndexRoute: typeof AppDeploymentsIndexRoute
   AppObserveIndexRoute: typeof AppObserveIndexRoute
+  AppReviewIndexRoute: typeof AppReviewIndexRoute
   AppRunnersIndexRoute: typeof AppRunnersIndexRoute
   AppRunsIndexRoute: typeof AppRunsIndexRoute
   AppAgentsPlansIdRoute: typeof AppAgentsPlansIdRoute
+  AppAgentsResearchIdRoute: typeof AppAgentsResearchIdRoute
+  AppDeploymentsEnvironmentsNameRoute: typeof AppDeploymentsEnvironmentsNameRoute
+  AppDeploymentsReleasesIdRoute: typeof AppDeploymentsReleasesIdRoute
+  AppDeploymentsReleasesNewRoute: typeof AppDeploymentsReleasesNewRoute
   AppObserveApmMapRoute: typeof AppObserveApmMapRoute
   AppObserveCatalogNameRoute: typeof AppObserveCatalogNameRoute
   AppObserveContainersIdRoute: typeof AppObserveContainersIdRoute
@@ -1438,8 +1819,11 @@ interface AppRouteChildren {
   AppObserveScannerIdRoute: typeof AppObserveScannerIdRoute
   AppObserveSlosIdRoute: typeof AppObserveSlosIdRoute
   AppObserveTracesIdRoute: typeof AppObserveTracesIdRoute
+  AppReviewStacksIdRoute: typeof AppReviewStacksIdRoute
   AppRunsIdCompareRoute: typeof AppRunsIdCompareRoute
   AppAgentsPlansIndexRoute: typeof AppAgentsPlansIndexRoute
+  AppDeploymentsEnvironmentsIndexRoute: typeof AppDeploymentsEnvironmentsIndexRoute
+  AppDeploymentsReleasesIndexRoute: typeof AppDeploymentsReleasesIndexRoute
   AppObserveApmIndexRoute: typeof AppObserveApmIndexRoute
   AppObserveCatalogIndexRoute: typeof AppObserveCatalogIndexRoute
   AppObserveContainersIndexRoute: typeof AppObserveContainersIndexRoute
@@ -1455,14 +1839,23 @@ interface AppRouteChildren {
   AppObserveSlosIndexRoute: typeof AppObserveSlosIndexRoute
   AppObserveTracesIndexRoute: typeof AppObserveTracesIndexRoute
   AppRunsIdIndexRoute: typeof AppRunsIdIndexRoute
+  AppAgentsPlansRunsRunRoute: typeof AppAgentsPlansRunsRunRoute
   AppDeploymentsAppsProjectNameRoute: typeof AppDeploymentsAppsProjectNameRoute
+  AppDeploymentsReleasesAppsAppRoute: typeof AppDeploymentsReleasesAppsAppRoute
+  AppDeploymentsReleasesEnvironmentsEnvRoute: typeof AppDeploymentsReleasesEnvironmentsEnvRoute
+  AppDeploymentsReleasesFleetsIdRoute: typeof AppDeploymentsReleasesFleetsIdRoute
+  AppDeploymentsReleasesFleetsNewRoute: typeof AppDeploymentsReleasesFleetsNewRoute
+  AppDeploymentsReleasesTemplatesNameRoute: typeof AppDeploymentsReleasesTemplatesNameRoute
   AppObserveApmServicesNameRoute: typeof AppObserveApmServicesNameRoute
   AppObserveLlmTracesIdRoute: typeof AppObserveLlmTracesIdRoute
   AppRunsIdJobsJobIdRoute: typeof AppRunsIdJobsJobIdRoute
+  AppDeploymentsReleasesTemplatesIndexRoute: typeof AppDeploymentsReleasesTemplatesIndexRoute
+  AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute: typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
   AppSplatRoute: AppSplatRoute,
+  AppClustersRoute: AppClustersRoute,
   AppInsightsRoute: AppInsightsRoute,
   AppLogsRoute: AppLogsRoute,
   AppReposRoute: AppReposRoute,
@@ -1490,13 +1883,20 @@ const AppRouteChildren: AppRouteChildren = {
   AppObserveMetricsSummaryRoute: AppObserveMetricsSummaryRoute,
   AppObserveProfilesRoute: AppObserveProfilesRoute,
   AppObserveSyntheticsRoute: AppObserveSyntheticsRoute,
+  AppReviewKeyRoute: AppReviewKeyRoute,
+  AppReviewQueueRoute: AppReviewQueueRoute,
   AppRunnersAddRoute: AppRunnersAddRoute,
   AppAgentsIndexRoute: AppAgentsIndexRoute,
   AppDeploymentsIndexRoute: AppDeploymentsIndexRoute,
   AppObserveIndexRoute: AppObserveIndexRoute,
+  AppReviewIndexRoute: AppReviewIndexRoute,
   AppRunnersIndexRoute: AppRunnersIndexRoute,
   AppRunsIndexRoute: AppRunsIndexRoute,
   AppAgentsPlansIdRoute: AppAgentsPlansIdRoute,
+  AppAgentsResearchIdRoute: AppAgentsResearchIdRoute,
+  AppDeploymentsEnvironmentsNameRoute: AppDeploymentsEnvironmentsNameRoute,
+  AppDeploymentsReleasesIdRoute: AppDeploymentsReleasesIdRoute,
+  AppDeploymentsReleasesNewRoute: AppDeploymentsReleasesNewRoute,
   AppObserveApmMapRoute: AppObserveApmMapRoute,
   AppObserveCatalogNameRoute: AppObserveCatalogNameRoute,
   AppObserveContainersIdRoute: AppObserveContainersIdRoute,
@@ -1510,8 +1910,11 @@ const AppRouteChildren: AppRouteChildren = {
   AppObserveScannerIdRoute: AppObserveScannerIdRoute,
   AppObserveSlosIdRoute: AppObserveSlosIdRoute,
   AppObserveTracesIdRoute: AppObserveTracesIdRoute,
+  AppReviewStacksIdRoute: AppReviewStacksIdRoute,
   AppRunsIdCompareRoute: AppRunsIdCompareRoute,
   AppAgentsPlansIndexRoute: AppAgentsPlansIndexRoute,
+  AppDeploymentsEnvironmentsIndexRoute: AppDeploymentsEnvironmentsIndexRoute,
+  AppDeploymentsReleasesIndexRoute: AppDeploymentsReleasesIndexRoute,
   AppObserveApmIndexRoute: AppObserveApmIndexRoute,
   AppObserveCatalogIndexRoute: AppObserveCatalogIndexRoute,
   AppObserveContainersIndexRoute: AppObserveContainersIndexRoute,
@@ -1527,10 +1930,22 @@ const AppRouteChildren: AppRouteChildren = {
   AppObserveSlosIndexRoute: AppObserveSlosIndexRoute,
   AppObserveTracesIndexRoute: AppObserveTracesIndexRoute,
   AppRunsIdIndexRoute: AppRunsIdIndexRoute,
+  AppAgentsPlansRunsRunRoute: AppAgentsPlansRunsRunRoute,
   AppDeploymentsAppsProjectNameRoute: AppDeploymentsAppsProjectNameRoute,
+  AppDeploymentsReleasesAppsAppRoute: AppDeploymentsReleasesAppsAppRoute,
+  AppDeploymentsReleasesEnvironmentsEnvRoute:
+    AppDeploymentsReleasesEnvironmentsEnvRoute,
+  AppDeploymentsReleasesFleetsIdRoute: AppDeploymentsReleasesFleetsIdRoute,
+  AppDeploymentsReleasesFleetsNewRoute: AppDeploymentsReleasesFleetsNewRoute,
+  AppDeploymentsReleasesTemplatesNameRoute:
+    AppDeploymentsReleasesTemplatesNameRoute,
   AppObserveApmServicesNameRoute: AppObserveApmServicesNameRoute,
   AppObserveLlmTracesIdRoute: AppObserveLlmTracesIdRoute,
   AppRunsIdJobsJobIdRoute: AppRunsIdJobsJobIdRoute,
+  AppDeploymentsReleasesTemplatesIndexRoute:
+    AppDeploymentsReleasesTemplatesIndexRoute,
+  AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute:
+    AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute,
 }
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)

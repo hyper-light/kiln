@@ -1122,6 +1122,7 @@ impl Page {
     /// Try to decrement the pin count by 1, but do nothing if it was already 0.
     /// Returns true if the pin count was decremented.
     #[inline]
+    #[allow(deprecated)] // kiln: `fetch_update`, kept for older Rust
     pub fn try_unpin(&self) -> bool {
         self.get()
             .pin_count

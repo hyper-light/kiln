@@ -37,14 +37,13 @@ export function useAgents() {
       const news = batch.pending;
       batch.pending = new Map();
       res.setData((l) => {
-        const next = l.slice();
-        for (const [id, info] of news) {
-          const i = next.findIndex((a) => a.id === id);
-          if (info === null) {
-            if (i !== -1) next.splice(i, 1);
-          } else if (i === -1) next.push(info);
-          else next[i] = info;
+        const next: AgentInfo[] = [];
+        for (const a of l) {
+          const info = news.has(a.id) ? news.get(a.id) : a;
+          news.delete(a.id);
+          if (info) next.push(info);
         }
+        for (const info of news.values()) if (info) next.push(info);
         return next;
       });
     }, BATCH_MS);

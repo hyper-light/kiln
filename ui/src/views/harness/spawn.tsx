@@ -6,9 +6,9 @@
 import * as React from "react";
 import "./harness.css";
 import { Dialog as D, DropdownMenu, Popover } from "radix-ui";
-import { Check, ChevronDown, Folder, Gauge, Rocket, Server, ShieldCheck, ShieldOff, SlidersHorizontal, SquareTerminal, X } from "lucide-react";
+import { Check, ChevronDown, Folder, Gauge, Layers, Rocket, Server, ShieldCheck, ShieldOff, SlidersHorizontal, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
-import { harnessApi, type AgentInfo, type KindInfo, type PastSession, type Spec } from "@/api/harness";
+import { harnessApi, type AgentInfo, type KindInfo, type PastSession, type Spec, type WorkspacesAvailable } from "@/api/harness";
 import type { Agent, ReachRunner, TerminalSessionInfo } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
@@ -20,6 +20,7 @@ import { HarnessMark } from "./parts";
 import { tildify } from "./derive";
 import { useListener } from "./dom";
 import { InlinePath } from "./inline-path";
+import { effortsFor, resumeEffort } from "./spawn-efforts";
 
 interface ModeChoice {
   id: string;
@@ -43,22 +44,6 @@ const MODES: Record<string, ModeChoice[]> = {
   ],
 };
 const modesFor = (k: KindInfo | undefined): ModeChoice[] => k?.modes?.map((m) => ({ id: m.id, label: m.label, hint: m.description, dangerous: m.dangerous })) ?? MODES[k?.id ?? ""] ?? [];
-
-/** Each harness's effort levels, lowest first, for runners that don't report them yet. */
-const EFFORTS: Record<string, string[]> = { claude: ["low", "medium", "high", "xhigh", "max"], codex: ["low", "medium", "high", "xhigh", "max", "ultra"] };
-const capital = (v: string) => v.charAt(0).toUpperCase() + v.slice(1);
-/** An effort level as people read it: "xhigh" is "Extra high". */
-const effortLabel = (id: string) => (id === "xhigh" ? "Extra high" : capital(id));
-/** The levels a new agent can start at: the chosen model's, when its harness says which it takes;
- * else the harness's own (its default model's). */
-const effortsFor = (k: KindInfo | undefined, model = ""): { id: string; label: string; hint?: string }[] => {
-  const chosen = model.trim() ? k?.models?.find((m) => m.id === model.trim()) : undefined;
-  if (chosen?.efforts?.length) {
-    const named = new Map((k?.efforts ?? []).map((e) => [e.id, e]));
-    return chosen.efforts.map((id) => ({ id, label: named.get(id)?.label || effortLabel(id), hint: named.get(id)?.description || undefined }));
-  }
-  return k?.efforts?.map((e) => ({ id: e.id, label: e.label || effortLabel(e.id), hint: e.description || undefined })) ?? (EFFORTS[k?.id ?? ""] ?? []).map((id) => ({ id, label: effortLabel(id) }));
-};
 
 const COUNTS = [1, 2, 3, 4, 6, 8, 12];
 
@@ -216,7 +201,7 @@ function PastList({ target, kind, kindName, onPick, busy }: { target: string; ki
     ),
   ).data;
   return error ? (
-    <p className="ps-none">{/(502|404|not found)/i.test(error) ? "This machine's runner can't list its past sessions yet — upgrade it in Settings → Updates." : error}</p>
+    <p className="ps-none">{/(502|404|not found)/i.test(error) ? "This machine's runner can't list its past sessions yet — upgrade it in System → Updates." : error}</p>
   ) : list.length === 0 ? (
     <p className="ps-none">No past {kindName} sessions on this machine.</p>
   ) : (
@@ -236,8 +221,8 @@ function PastList({ target, kind, kindName, onPick, busy }: { target: string; ki
   );
 }
 
-/** Start inside this shell (its machine and folder), or like another agent (Duplicate). */
-type Defaults = { target?: string; shell?: string; cwd?: string; kind?: string };
+/** Start inside this shell (its machine and folder), like another agent (Duplicate), or with a first message written for it (Diagnose, in System → Updates). */
+type Defaults = { target?: string; shell?: string; cwd?: string; kind?: string; prompt?: string };
 
 /** What starting agents needs to know: each machine's harnesses, the machines, their shells, and the runners its commands can go to. */
 interface Machines {
@@ -245,6 +230,8 @@ interface Machines {
   machines: Agent[];
   shells: TerminalSessionInfo[];
   reach: ReachRunner[];
+  /** Where an agent can have a workspace of its own. */
+  workspaces: WorkspacesAvailable;
 }
 
 /** Asked all at once. A part that can't be had is empty: no harnesses (the dialog says what to do), no machine names, no shells. */
@@ -260,7 +247,8 @@ const askMachines = (signal: AbortSignal): Promise<Machines> =>
       (r) => r.runners.filter((x) => x.connected && x.reach),
       (): ReachRunner[] => [],
     ),
-  ]).then(([byTarget, machines, shells, reach]) => ({ byTarget, machines, shells, reach }));
+    harnessApi.workspaces().catch((): WorkspacesAvailable => ({})),
+  ]).then(([byTarget, machines, shells, reach, workspaces]) => ({ byTarget, machines, shells, reach, workspaces }));
 
 /** What stays from one opening to the next: the message, how many, its options, a start under way. */
 interface Kept {
@@ -295,6 +283,7 @@ function MoreFields({
   onName,
   model,
   onModel,
+  models = [],
   reach,
   onReach,
   reachOptions,
@@ -307,6 +296,7 @@ function MoreFields({
   onName: (v: string) => void;
   model: string;
   onModel: (v: string) => void;
+  models?: KindInfo["models"];
   reach: string;
   onReach: (v: string) => void;
   reachOptions: { value: string; label: string }[];
@@ -322,7 +312,14 @@ function MoreFields({
       </label>
       <label className="sp-field">
         <span>Model</span>
-        <input className="hx-input" value={model} onChange={(e) => onModel(e.target.value)} placeholder="the harness's default" spellCheck={false} autoCapitalize="off" />
+        <select className="hx-select" value={model} onChange={(e) => onModel(e.target.value)} disabled={models.length === 0}>
+          <option value="">The harness's default</option>
+          {models.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.label || m.id}
+            </option>
+          ))}
+        </select>
       </label>
       <label className="sp-field">
         <span>Commands</span>
@@ -355,12 +352,12 @@ function MoreFields({
 
 /** Until the machines have said what they have: the note where the chips go, and Start, not startable yet. */
 function Looking({ kept }: { kept: Kept }) {
-  const { count, more, name, setName, model, setModel, reach, setReach, busy } = kept;
+  const { count, more, name, setName, setModel, reach, setReach, busy } = kept;
   return (
     <>
       <div className="sp-note">Looking at your machines…</div>
       {more && (
-        <MoreFields count={count} name={name} onName={setName} model={model} onModel={setModel} reach={reach} onReach={setReach} reachOptions={[]} shell="" onShell={() => undefined} shells={[]} />
+        <MoreFields count={count} name={name} onName={setName} model="" onModel={setModel} reach={reach} onReach={setReach} reachOptions={[]} shell="" onShell={() => undefined} shells={[]} />
       )}
       <footer className="sp-foot">
         <span className="sp-foot-note" />
@@ -384,12 +381,12 @@ export function SpawnDialog({
   /** It has opened (and taken focus). */
   onOpened?: () => void;
   onStarted: (agents: AgentInfo[]) => void;
-  /** Start inside this shell (its machine and folder), or like another agent (Duplicate). */
+  /** Start inside this shell (its machine and folder), like another agent (Duplicate), or with a first message written for it. */
   defaults?: Defaults;
 }) {
   const [kind, setKind] = useLocalStorage("kiln.agents.kind", "claude");
   const [count, setCount] = React.useState(1);
-  const [prompt, setPrompt] = React.useState("");
+  const [prompt, setPrompt] = React.useState(defaults?.prompt ?? "");
   const [more, setMore] = React.useState(false);
   const [name, setName] = React.useState("");
   const [model, setModel] = React.useState("");
@@ -410,6 +407,8 @@ export function SpawnDialog({
             promptRef.current?.focus();
             // Opened like another agent: its harness, as if it had been chosen.
             if (defaults?.kind) setKind(defaults.kind);
+            // Opened with a message written for it: that one, to read and change before it starts.
+            if (defaults?.prompt) setPrompt(defaults.prompt);
             onOpened?.();
           }}
         >
@@ -472,10 +471,12 @@ function Setup({
   onStarted: (agents: AgentInfo[]) => void;
   onOpenChange: (o: boolean) => void;
 }) {
-  const { count, setCount, prompt, setPrompt, more, setMore, name, setName, model, setModel, reach, setReach, busy, setBusy } = kept;
+  const { count, setCount, prompt, setPrompt, more, setMore, name, setName, model: chosenModel, setModel, reach, setReach, busy, setBusy } = kept;
   // Each machine's harnesses, the machines and their shells: shown at once when known from before,
   // read again as it opens.
-  const { byTarget, machines, shells, reach: reachRunners } = useSuspenseResource("harness/spawn", askMachines).data;
+  const { byTarget, machines, shells, reach: reachRunners, workspaces } = useSuspenseResource("harness/spawn", askMachines).data;
+  /** `volume`: a Slates volume of its own over the folder, where the machine can make one. */
+  const [workspace, setWorkspace] = useLocalStorage<"folder" | "volume">("kiln.agents.workspace", "folder");
   const [lastTarget, setLastTarget] = useLocalStorage("kiln.agents.target", "");
   const [modeByKind, setModeByKind] = useLocalStorage<Record<string, string>>("kiln.agents.modes", {});
   const [effortByKind, setEffortByKind] = useLocalStorage<Record<string, string>>("kiln.agents.efforts", {});
@@ -489,6 +490,7 @@ function Setup({
   // Opened like another agent: its harness; else the one chosen last.
   const [preferred, setPreferred] = React.useState(defaults?.kind || remembered);
   const setKind = (k: string) => {
+    if (k !== kind) setModel("");
     setPreferred(k);
     remember(k);
   };
@@ -526,7 +528,9 @@ function Setup({
     setCwd(folder);
   }
 
-  const kindInfo = all.find((k) => k.id === kind);
+  const kindInfo = byTarget[target]?.find((k) => k.id === kind) ?? all.find((k) => k.id === kind);
+  // A remembered model is usable only if this machine's selected harness offers it.
+  const model = kindInfo?.models?.some((m) => m.id === chosenModel) ? chosenModel : "";
   const modes = modesFor(kindInfo);
   const safe = (id: string | undefined) => modes.some((m) => m.id === id && !m.dangerous);
   const mode = modes.some((m) => m.id === unchecked) ? unchecked : safe(modeByKind[kind]) ? (modeByKind[kind] ?? "") : (kindInfo?.default_mode ?? modes.find((m) => !m.dangerous)?.id ?? "");
@@ -541,6 +545,8 @@ function Setup({
     setUnchecked("");
     setModeByKind({ ...modeByKind, [kind]: id });
   };
+  const canVolume = workspaces[target]?.available === true;
+  const ownVolume = workspace === "volume" && canVolume && !shell;
   const efforts = effortsFor(kindInfo, model);
   const effort = efforts.some((e) => e.id === effortByKind[kind]) ? (effortByKind[kind] ?? "") : "";
   const effortInfo = efforts.find((e) => e.id === effort);
@@ -554,7 +560,7 @@ function Setup({
     try {
       const started = await harnessApi.start(
         target,
-        { kind: p.kind, cwd: p.cwd || undefined, resume: p.id, mode: mode || undefined, effort: effort || undefined, name: (p.title || "").slice(0, 80) || undefined },
+        { kind: p.kind, cwd: p.cwd || undefined, resume: p.id, mode: mode || undefined, effort: resumeEffort(kindInfo, p.model, effort), name: (p.title || "").slice(0, 80) || undefined },
         1,
       );
       setDirs({ ...dirs, [target]: [p.cwd, ...recent.filter((d) => d !== p.cwd)].slice(0, 8) });
@@ -581,6 +587,7 @@ function Setup({
       prompt: prompt.trim() || undefined,
       shell: shell || undefined,
       reach: reach || undefined,
+      workspace: ownVolume ? { kind: "volume" } : undefined,
     };
     try {
       const started = await harnessApi.start(target, spec, count);
@@ -638,12 +645,33 @@ function Setup({
             label={machineName(target)}
             value={target}
             onPick={(t) => {
+              if (!byTarget[t]?.find((k) => k.id === kind)?.models?.some((m) => m.id === model)) setModel("");
               setPicked(t);
               setShell("");
             }}
             options={where.map((t) => ({ value: t, label: machineName(t) }))}
           />
           {shell && <FolderChip value={cwd} onChange={setCwd} recent={recent} shellLabel={shellInfo ? shellInfo.title || "this shell" : "this shell"} />}
+          {!shell && (
+            <Chip
+              title="Workspace"
+              icon={<Layers size={13} />}
+              label={ownVolume ? "Its own volume" : "This folder"}
+              value={ownVolume ? "volume" : "folder"}
+              onPick={(w) => setWorkspace(w)}
+              options={[
+                { value: "folder", label: "This folder", hint: "It works in the folder itself" },
+                {
+                  value: "volume",
+                  label: "Its own volume",
+                  hint: canVolume
+                    ? "A Slates volume over the folder: what it changes stays its own until it's up for review or you write it to disk"
+                    : (workspaces[target]?.why_not ?? "Not on this machine"),
+                  disabled: !canVolume,
+                },
+              ]}
+            />
+          )}
           <Chip title="How many" label={`×${count}`} value={count} onPick={(n) => setCount(n)} options={COUNTS.map((n) => ({ value: n, label: n === 1 ? "1 agent" : `${n} agents` }))} />
           {modes.length > 0 && (
             <Chip
@@ -679,6 +707,7 @@ function Setup({
           onName={setName}
           model={model}
           onModel={setModel}
+          models={kindInfo?.models}
           reach={reach}
           onReach={setReach}
           reachOptions={reachChoices(reachRunners, target)}

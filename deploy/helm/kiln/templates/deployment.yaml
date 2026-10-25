@@ -59,6 +59,11 @@ spec:
             - name: quic
               containerPort: {{ .Values.ports.quic }}
               protocol: UDP
+            {{- if .Values.ports.webrtc }}
+            - name: webrtc
+              containerPort: {{ .Values.ports.webrtc }}
+              protocol: UDP
+            {{- end }}
           env:
             - name: KILN_CONFIG
               value: /etc/kiln/kiln.toml

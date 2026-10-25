@@ -16,10 +16,14 @@ jobs:
     # Compiling kiln's own crate takes 7 GiB and more, and `cargo test` compiles it twice at once
     # (the library, and the library as its tests): 8Gi ran out, rustc killed. Cargo runs a rustc
     # per CPU the machine has, not per CPU asked for, unless told; line tables are the debug info
-    # a test's backtrace needs, at far less memory.
-    resources: { cpu: "4", memory: 16Gi }
+    # a test's backtrace needs, at far less memory. Its CPUs are what it asks for to be placed, not
+    # a cap (the pod has no CPU limit): the jobs namespace's quota (18 CPUs, 36Gi, every
+    # repository's jobs together) refuses a pod that asks more than is left, and it waits until
+    # others' jobs end; it uses whatever's free once it runs.
+    resources: { cpu: "2", memory: 16Gi }
     env:
       CARGO_BUILD_JOBS: "4"
+      RUST_TEST_THREADS: "4"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     timeout-minutes: 45
     steps:
@@ -27,19 +31,65 @@ jobs:
         run: rustup component add clippy && cargo --version
       - name: clippy (no-panic lint wall)
         run: cargo clippy --locked --all-targets -- -D warnings
+      # Built apart, the libraries as their tests first, then the rest: kiln's crate compiled twice
+      # at once (the library, and the library as its tests) still ran out of 16Gi now and then.
+      - name: build the libraries' tests
+        run: cargo test --locked --lib --no-run
+      # Every test binary, whatever fails before it: each failing test shows in one run.
       - name: test
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast
 
   ui:
-    name: ui typecheck + build
+    name: ui typecheck + lint + build
     runs-on: [k8s]
     toolchain: node
     resources: { cpu: "2", memory: 4Gi }
     steps:
       - run: npm ci --prefix ui --no-audit --no-fund
       - run: npm run --prefix ui typecheck
+      - run: npm run --prefix ui lint
       # The UI only: packing Bun for the binary (vendor/bun) is the release builds' part.
       - run: KILN_UI_SERVER=off npm run --prefix ui build
+
+  ui-checks:
+    name: ui checks (Chromium and WebKit, desktop and phone)
+    needs: [rust, ui]
+    # Every page's check (docs/ci.md W21-AC01) against servers of this build, the browsers in
+    # Playwright's image: on a Linux machine that runs Docker and builds kiln. The engine routes by
+    # `requires`; v1 by the labels alone, and the Windows and macOS runners are bare metal too
+    # (c76ef82's checks went to jupiter, whose PowerShell couldn't read them): `linux` keeps it on
+    # Linux.
+    runs-on: [baremetal, linux]
+    requires: ["os == linux", "executors has docker", "tools has cargo", "tools has node", "tools has python3", "tools has git"]
+    if: "branch == 'main'"
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "4"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: what it needs
+        run: for t in docker python3 git node npm cargo; do command -v "$t" > /dev/null || { echo "this machine has no $t"; exit 1; }; done && docker info --format '{{.ServerVersion}}'
+      - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build
+      - run: cargo build --locked -p kiln --bin kiln
+      - run: ci/ui/run-all.sh target/debug/kiln
+    artifacts: [ci/ui/shots/*/*]
+
+  vendor:
+    name: vendored projects (upstream plus kiln's recorded changes)
+    runs-on: [k8s]
+    toolchain: python
+    resources: { cpu: "1", memory: 2Gi }
+    timeout-minutes: 15
+    steps:
+      - name: git
+        run: command -v git >/dev/null || { apt-get update && apt-get install -y --no-install-recommends git ca-certificates; }
+      - name: the vendor tool's tests
+        run: python3 scripts/test_vendor.py
+      # Each git project fetched at its commit (one shallow fetch apiece). Bun's release is checked
+      # against its sources by every re-vendor, and its hashes by every release build's pack, not
+      # here: its image comes from Docker Hub, whose pulls are rate-limited (docs/vendoring.md).
+      - name: every vendored git project is its upstream plus its recorded changes
+        run: python3 scripts/vendor.py check --kind git
 
   release-binary:
     name: release build (bare metal)

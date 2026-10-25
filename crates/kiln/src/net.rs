@@ -9,10 +9,15 @@
 //!   app ──Out──▶ [ net thread: Driver<Endpoint> ⇄ UDP ] ──NetEvent──▶ app
 //! ```
 //!
-//! Lanes have no "writable" event, so frames refused with `LaneFull` wait in a bounded per-lane
-//! outbox and are retried as the connection drains. A failure or panic inside the loop ends that
+//! Frames refused with `LaneFull` wait in a bounded per-lane outbox and are sent again once the
+//! lane says it has room (`Event::LaneRoom`), or as the connection drains. A failure or panic inside the loop ends that
 //! incarnation; the thread rebuilds the endpoint on a fresh runtime and an agent re-dials. The
 //! owner can force the same rebuild with [`Out::Rebuild`] (the agent's dial watchdog does).
+//!
+//! Every frame the loop lets go before the wire is counted, by lane and reason
+//! (`crate::metrics::NetMetrics`, docs/wire.md "Loss below the channel"). A control frame is never
+//! shed: a control lane whose queue is full means its peer is stuck, and the connection is closed
+//! instead, so the channel's resume repairs what it carried. Other lanes shed their oldest frame.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -24,8 +29,8 @@ use hyper_rt::runtime::LocalRuntime;
 use hyper_rt_transport::{Driver, Io};
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, Tls};
 use hyper_transport::{
-    AdmissionLimits, Authenticated, Classes, Config, Directory, Endpoint, Event, Fixed, Limits,
-    PeerId, RECEIVE_CHUNK, Refusal,
+    AdmissionLimits, AskQueue, Authenticated, Classes, Config, Directory, Endpoint, Event, Fixed, Limits,
+    PeerId, RECEIVE_CHUNK, Refusal, StreamCredit,
 };
 
 use crate::pki::Leaf;
@@ -167,10 +172,24 @@ pub enum Out {
     Connect { addr: SocketAddr },
     /// Drop the endpoint and build a new one (fresh socket and runtime); an agent re-dials.
     Rebuild,
+    /// A test build's fault (`crate::runner::chaos`, `shed=`): frames dropped as [`Shed`] says,
+    /// from now on.
+    Shed(Shed),
     /// What the endpoint measures now, answered on the loop's next turn ([`NetHandle::sample`]).
     Sample {
         reply: std::sync::mpsc::SyncSender<QuicSample>,
     },
+}
+
+/// About one frame in `every` of `lane` (of those whose first byte, a message's variant, is
+/// `variant`, when it says) dropped before the wire, counted as `chaos`: a frame lost below the
+/// channel. Which ones is a seeded draw, not every `every`th: a fixed period could fall on the
+/// same item of each resend, as no real loss does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shed {
+    pub lane: u32,
+    pub variant: Option<u8>,
+    pub every: u64,
 }
 
 /// What a node's QUIC endpoint measures now ([`NetHandle::sample`]): its own counts, and each
@@ -292,8 +311,18 @@ pub fn limits(server: bool) -> Limits {
             per_identity: 2,
         },
         streams_per_connection: 64,
+        // kiln opens no exchanges (lanes only): every connection holds its streams from its
+        // handshake, and the exchange table alone bounds what would wait for one.
+        stream_credit: StreamCredit::Fixed,
+        ask_queue: AskQueue::Table,
+        // A handshake from an address not yet proven is answered with a Retry once half the
+        // pending places are taken (RFC 9000 §8.1.2), as before: kiln's places are a count, not
+        // derived from its memory.
+        retry_bytes: None,
         exchanges: if server { 4096 } else { 256 },
-        lanes_per_peer: 8,
+        // Eight lanes kiln has always had, and `proto::LANE_STREAM` and `proto::LANE_PORTS` past
+        // them (a peer opens one only when the other side announced it takes it).
+        lanes_per_peer: 16,
         lane_window: 1024,
         max_head: 64 << 10,
         window_ceiling: window,
@@ -445,26 +474,80 @@ macro_rules! clock {
 #[derive(Default)]
 struct Outbox {
     queues: HashMap<(PeerId, u32), VecDeque<(Kind, Vec<u8>)>>,
-    dropped: u64,
+    /// A test build's fault, and its draw's state.
+    shed: Option<(Shed, u64)>,
+}
+
+/// What became of a frame handed to the outbox.
+#[derive(Debug, PartialEq, Eq)]
+enum Push {
+    Queued,
+    /// Its lane is a control lane whose queue is full: its peer is stuck. Not queued: the caller
+    /// closes the connection.
+    Stuck,
 }
 
 impl Outbox {
-    fn push(&mut self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>) {
+    fn push(&mut self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>) -> Push {
+        if let Some((rule, draw)) = self.shed.as_mut()
+            && rule.lane == lane
+            && rule.variant.is_none_or(|v| data.first() == Some(&v))
+        {
+            // xorshift64*: the same frames each run, at no fixed period.
+            *draw ^= *draw << 13;
+            *draw ^= *draw >> 7;
+            *draw ^= *draw << 17;
+            if draw.wrapping_mul(0x2545_f491_4f6c_dd1d).checked_rem(rule.every.max(1)) == Some(0) {
+                crate::metrics::net().dropped(peer, lane, "chaos", 1);
+                return Push::Queued;
+            }
+        }
         let q = self.queues.entry((peer, lane)).or_default();
         if q.len() >= OUTBOX_FRAMES {
-            // Bulk lanes shed their oldest frame; a full control lane means the peer is stuck.
+            if kind == Kind::Control {
+                return Push::Stuck;
+            }
             q.pop_front();
-            self.dropped += 1;
+            crate::metrics::net().dropped(peer, lane, "shed", 1);
         }
         q.push_back((kind, data));
+        Push::Queued
     }
 
     fn is_empty(&self) -> bool {
         self.queues.values().all(VecDeque::is_empty)
     }
 
-    fn forget(&mut self, peer: PeerId) {
-        self.queues.retain(|(p, _), _| *p != peer);
+    /// What fills `peer`'s `lane`: each message variant there (a frame's first byte) and how many
+    /// of its frames, the most first, at most four.
+    fn filled_with(&self, peer: PeerId, lane: u32) -> String {
+        let mut n: HashMap<u8, usize> = HashMap::new();
+        for (_, data) in self.queues.get(&(peer, lane)).into_iter().flatten() {
+            *n.entry(data.first().copied().unwrap_or(0)).or_default() += 1;
+        }
+        let mut most: Vec<(u8, usize)> = n.into_iter().collect();
+        most.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        most.iter().take(4).map(|(v, c)| format!("{v}×{c}")).collect::<Vec<_>>().join(", ")
+    }
+
+    /// Lets go of what's queued for `peer`, counted as dropped for `reason`.
+    fn forget(&mut self, peer: PeerId, reason: &'static str) {
+        self.queues.retain(|(p, lane), q| {
+            if *p != peer {
+                return true;
+            }
+            crate::metrics::net().dropped(*p, *lane, reason, u64::try_from(q.len()).unwrap_or(u64::MAX));
+            false
+        });
+    }
+}
+
+/// What's still queued when the loop ends (a rebuild, or the end) goes with it, counted.
+impl Drop for Outbox {
+    fn drop(&mut self) {
+        for ((peer, lane), q) in &self.queues {
+            crate::metrics::net().dropped(*peer, *lane, "ended", u64::try_from(q.len()).unwrap_or(u64::MAX));
+        }
     }
 }
 
@@ -491,12 +574,13 @@ where
                 Err(r) => {
                     tracing::warn!(peer, lane, refusal = %r, "frame refused; dropping");
                     q.pop_front();
+                    crate::metrics::net().dropped(*peer, *lane, "refused", 1);
                 }
             }
         }
     }
     for p in dead {
-        outbox.forget(p);
+        outbox.forget(p, "closed");
     }
     outbox.queues.retain(|_, q| !q.is_empty());
     sent_any
@@ -582,9 +666,26 @@ async fn run_loop(
                 }
                 for cmd in cmds {
                     match cmd {
-                        Out::Frame { peer, lane, kind, data } => outbox.push(peer, lane, kind, data),
+                        Out::Frame { peer, lane, kind, data } => {
+                            if outbox.push(peer, lane, kind, data) == Push::Stuck {
+                                // Its control lane's queue is full: rather than lose control
+                                // frames, the connection closes, and the channel's resume repairs
+                                // what it carried.
+                                tracing::warn!(peer, lane, frames = OUTBOX_FRAMES, filled_with = %outbox.filled_with(peer, lane), "a control lane's queue is full, its peer stuck: its connection closes");
+                                crate::metrics::net().dropped(peer, lane, "stuck", 1);
+                                outbox.forget(peer, "stuck");
+                                with_driver!(&mut driver, d => {
+                                    let now = clock!(d);
+                                    d.endpoint().disconnect(now, peer);
+                                });
+                            }
+                        }
+                        Out::Shed(rule) => {
+                            tracing::warn!(?rule, "chaos: frames are shed below the channel");
+                            outbox.shed = Some((rule, 0x9e37_79b9_7f4a_7c15));
+                        }
                         Out::Disconnect { peer } => {
-                            outbox.forget(peer);
+                            outbox.forget(peer, "closed");
                             with_driver!(&mut driver, d => {
                                 let now = clock!(d);
                                 d.endpoint().disconnect(now, peer);
@@ -732,14 +833,14 @@ fn on_event<B, D>(
             ep.release(frame);
         }
         Event::Closed { peer, refusal, .. } => {
-            outbox.forget(peer);
+            outbox.forget(peer, "closed");
             out.push(NetEvent::Closed {
                 peer,
                 reason: refusal.map_or_else(|| "closed".to_owned(), |r| r.to_string()),
             });
         }
         Event::Unreachable { peer, refusal } => {
-            outbox.forget(peer);
+            outbox.forget(peer, "closed");
             out.push(NetEvent::Unreachable {
                 peer,
                 reason: refusal.map_or_else(|| "unreachable".to_owned(), |r| r.to_string()),
@@ -748,7 +849,9 @@ fn on_event<B, D>(
         // kiln uses lanes only; refuse any exchange a peer tries to open.
         Event::Request { exchange, .. } => ep.refuse_exchange(exchange, Refusal::Kind),
         Event::Reply { exchange, .. } | Event::Refused { exchange, .. } => ep.end(exchange),
-        Event::BodyReady { .. } | Event::Writable { .. } => {}
+        // A lane that found a frame too full has room again: the loop flushes the outbox after
+        // every event it handles.
+        Event::BodyReady { .. } | Event::Writable { .. } | Event::LaneRoom { .. } => {}
     }
 }
 
@@ -761,6 +864,177 @@ mod tests {
             .await
             .map_err(|_| anyhow::anyhow!("timed out"))?
             .map_err(|_| anyhow::anyhow!("event stream closed"))
+    }
+
+    /// What the outbox lets go is counted by lane and reason, and a control frame is never shed:
+    /// a control lane whose queue is full is its peer stuck, for the caller to close.
+    #[test]
+    fn the_outbox_counts_what_it_lets_go_and_never_sheds_a_control_frame() {
+        let m = crate::metrics::net();
+        // A peer and lanes of their own ("other" to the metric), so no other test counts with them.
+        let (peer, bulk, control): (PeerId, u32, u32) = (0xdead_0008, 13, 12);
+        let count = |reason: &str| m.frames_dropped.get(&["other", reason]);
+        let before: Vec<u64> = ["shed", "closed", "chaos", "ended"].iter().map(|r| count(r)).collect();
+        let grew = |i: usize, reason: &str| count(reason) - before.get(i).copied().unwrap_or(0);
+        let mut o = Outbox::default();
+        for _ in 0..=OUTBOX_FRAMES {
+            assert_eq!(o.push(peer, bulk, Kind::Log, vec![1]), Push::Queued);
+        }
+        assert_eq!(grew(0, "shed"), 1, "a full lane that may lose frames sheds its oldest, counted");
+        for i in 0..OUTBOX_FRAMES {
+            assert_eq!(o.push(peer, control, Kind::Control, vec![if i == 0 { 5 } else { 2 }]), Push::Queued);
+        }
+        assert_eq!(o.push(peer, control, Kind::Control, vec![3]), Push::Stuck, "a full control lane sheds nothing");
+        assert_eq!(o.filled_with(peer, control), format!("2×{}, 5×1", OUTBOX_FRAMES - 1), "what filled it, said by message variant");
+        assert_eq!(grew(0, "shed"), 1);
+        o.forget(peer, "closed");
+        assert_eq!(grew(1, "closed"), 2 * OUTBOX_FRAMES as u64, "what a closed connection had queued, counted");
+        // A test build's fault: every one of the bulk lane's frames whose first byte is 9.
+        o.shed = Some((Shed { lane: bulk, variant: Some(9), every: 1 }, 0x9e37_79b9_7f4a_7c15));
+        for b in [9, 8, 9, 9, 9, 9] {
+            assert_eq!(o.push(peer, bulk, Kind::Log, vec![b]), Push::Queued);
+        }
+        assert_eq!(grew(2, "chaos"), 5);
+        // One in three: some, not all, of 300.
+        o.shed = Some((Shed { lane: bulk, variant: None, every: 3 }, 0x9e37_79b9_7f4a_7c15));
+        for _ in 0..300 {
+            o.push(peer, bulk, Kind::Log, vec![7]);
+        }
+        let some = grew(2, "chaos") - 5;
+        assert!((50..150).contains(&some), "about one in three dropped: {some} of 300");
+        drop(o);
+        assert_eq!(grew(3, "ended"), 1 + 300 - some, "what the loop still held when it ended, counted");
+        let toward: u64 = m.toward(peer).iter().map(|d| d.frames).sum();
+        assert_eq!(toward, 1 + 2 * OUTBOX_FRAMES as u64 + 5 + 300 + 1, "and counted by peer, for its runner's page");
+    }
+
+    /// Plan step 8 of "Nothing kiln sends between its processes is fire-and-forget": frames lost
+    /// below the channel inside a live connection, kiln's real QUIC layer between a runner and a
+    /// server. The runner drops about one in 5 of its channel frames and the server one in 4 of its,
+    /// while a stream of updates goes up and a stream of commands down. The channel makes up for
+    /// each (a receiver's `Want`, a sender's patience): every item is taken once and answered, and
+    /// each side counted what it dropped.
+    #[test]
+    fn what_is_lost_below_the_channel_is_sent_again_and_taken_once() -> anyhow::Result<()> {
+        use crate::proto::{AgentMsg, LANE_CONTROL, LANE_TERM, ServerMsg};
+        use crate::wire::channel::{Arrival, Event as Said, Frame, Outcome, Receiver, Sender};
+        const N: u64 = 60;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(dir.path())?;
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let addr = probe.local_addr()?;
+            drop(probe);
+            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE })?;
+            let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("shed-1")?, server: false, dial_deadline: DIAL_DEADLINE })?;
+            let chaos = |lane: u32| crate::metrics::net().frames_dropped.get(&[crate::proto::lane_name(lane), "chaos"]);
+            let (term0, control0) = (chaos(LANE_TERM), chaos(LANE_CONTROL));
+            agent.command(Out::Shed(Shed { lane: LANE_TERM, variant: Some(46), every: 5 })).await;
+            srv.command(Out::Shed(Shed { lane: LANE_CONTROL, variant: Some(54), every: 4 })).await;
+            agent.command(Out::Connect { addr }).await;
+            let patience = Duration::from_millis(300);
+            // Updates up (the runner's sender, the server's receiver); commands down.
+            let (mut up, mut up_in) = (Sender::new(1 << 20, patience), Receiver::new());
+            let (mut down, mut down_in) = (Sender::new(1 << 20, patience), Receiver::new());
+            for n in 0..N {
+                up.push("s:x", n.to_be_bytes().to_vec()).map_err(|_| anyhow::anyhow!("full"))?;
+                down.push("cmd", n.to_be_bytes().to_vec()).map_err(|_| anyhow::anyhow!("full"))?;
+            }
+            let index = |body: &[u8]| body.try_into().ok().map(u64::from_be_bytes).and_then(|n| usize::try_from(n).ok());
+            let (mut took_up, mut took_down) = (vec![0u32; N as usize], vec![0u32; N as usize]);
+            let (mut answered_up, mut answered_down) = (0u64, 0u64);
+            let mut peer = None;
+            let mut reconnects = 0;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while answered_up < N || answered_down < N {
+                anyhow::ensure!(Instant::now() < deadline, "answered {answered_up} of {N} updates and {answered_down} of {N} commands, over {reconnects} reconnects");
+                if let Some(p) = peer {
+                    for f in down.poll(Instant::now()) {
+                        srv.send(p, LANE_CONTROL, Kind::Control, crate::proto::encode(&ServerMsg::Wire(f))?).await;
+                    }
+                }
+                for f in up.poll(Instant::now()) {
+                    agent.send(SERVER_PEER, LANE_TERM, Kind::Term, crate::proto::encode(&AgentMsg::Wire(f))?).await;
+                }
+                // Every event that came: the first waited for (or a tick), then all the others.
+                let mut evs: Vec<(bool, NetEvent)> = Vec::new();
+                evs.extend(futures::select_biased! {
+                    ev = srv_ev.recv().fuse() => ev.ok().map(|e| (true, e)),
+                    ev = agent_ev.recv().fuse() => ev.ok().map(|e| (false, e)),
+                    () = crate::rt::sleep(Duration::from_millis(50)).fuse() => None,
+                });
+                evs.extend(std::iter::from_fn(|| srv_ev.try_recv().ok()).map(|e| (true, e)));
+                evs.extend(std::iter::from_fn(|| agent_ev.try_recv().ok()).map(|e| (false, e)));
+                // Each side's frames to the other, and what it takes of the other's.
+                let mut answers: Vec<(bool, Frame)> = Vec::new();
+                for ev in evs {
+                    match ev {
+                        (true, NetEvent::Connected { peer: p, .. }) => {
+                            peer = Some(p);
+                            answers.push((true, up_in.have()));
+                        }
+                        (false, NetEvent::Connected { .. }) => answers.push((false, down_in.have())),
+                        // A connection closed (a stuck lane, say): each side's sends go again once
+                        // the other says what it has, on the next one.
+                        (true, NetEvent::Closed { .. } | NetEvent::Unreachable { .. }) => down.down(),
+                        (false, NetEvent::Closed { .. } | NetEvent::Unreachable { .. }) => {
+                            up.down();
+                            reconnects += 1;
+                            agent.command(Out::Connect { addr }).await;
+                        }
+                        (server, NetEvent::Frame { data, .. }) => {
+                            let frame = if server {
+                                match crate::proto::decode::<AgentMsg>(&data)? {
+                                    AgentMsg::Wire(f) => f,
+                                    other => anyhow::bail!("the runner sent {other:?}"),
+                                }
+                            } else {
+                                match crate::proto::decode::<ServerMsg>(&data)? {
+                                    ServerMsg::Wire(f) => f,
+                                    other => anyhow::bail!("the server sent {other:?}"),
+                                }
+                            };
+                            let (rx, took, tx, answered) = if server { (&mut up_in, &mut took_up, &mut down, &mut answered_down) } else { (&mut down_in, &mut took_down, &mut up, &mut answered_up) };
+                            match frame {
+                                Frame::Item { stream, seq, low, body } => match rx.on_item(&stream, seq, low, body) {
+                                    Arrival::Take(body) => {
+                                        if let Some(t) = index(&body).and_then(|i| took.get_mut(i)) {
+                                            *t += 1;
+                                        }
+                                        answers.push((server, rx.took(&stream, seq)));
+                                    }
+                                    Arrival::Answered(Some(a)) | Arrival::Gap(a) => answers.push((server, a)),
+                                    Arrival::Answered(None) => {}
+                                },
+                                other => {
+                                    for said in tx.on_frame(other) {
+                                        if let Said::Answered { outcome, .. } = said {
+                                            anyhow::ensure!(outcome == Outcome::Taken, "refused: {outcome:?}");
+                                            *answered += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for (server, f) in answers {
+                    match (server, peer) {
+                        (true, Some(p)) => {
+                            srv.send(p, LANE_CONTROL, Kind::Control, crate::proto::encode(&ServerMsg::Wire(f))?).await;
+                        }
+                        (false, _) => {
+                            agent.send(SERVER_PEER, LANE_TERM, Kind::Term, crate::proto::encode(&AgentMsg::Wire(f))?).await;
+                        }
+                        (true, None) => {}
+                    }
+                }
+            }
+            anyhow::ensure!(took_up.iter().all(|n| *n == 1), "updates taken: {took_up:?}");
+            anyhow::ensure!(took_down.iter().all(|n| *n == 1), "commands taken: {took_down:?}");
+            anyhow::ensure!(chaos(LANE_TERM) > term0 && chaos(LANE_CONTROL) > control0, "each side counted what it dropped");
+            Ok(())
+        })
     }
 
     #[test]

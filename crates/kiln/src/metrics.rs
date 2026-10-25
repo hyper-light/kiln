@@ -2,7 +2,7 @@
 //! bucket histograms, and labelled families keyed by a small string set. Host statistics are read
 //! straight from `/proc` on demand (only when scraped or sampled), so idle cost is ~zero.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -40,17 +40,26 @@ impl Gauge {
     }
 }
 
-/// Seconds-scale histogram suited to build and step durations.
+/// A histogram of seconds, its buckets fixed (build and step durations, sync's latencies).
 pub struct Histogram {
     bounds: &'static [f64],
     buckets: Vec<AtomicU64>,
     count: AtomicU64,
-    sum_ms: AtomicU64,
+    /// Microseconds, so that a millisecond's latencies add up.
+    sum_us: AtomicU64,
 }
 
 pub const DURATION_BUCKETS: &[f64] =
     &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0, 3600.0, 7200.0];
 pub const QUEUE_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0];
+/// A millisecond to ten minutes, about 2.5 times apart: sync's commits, transfers and how long a
+/// change takes to reach another machine, and a move's waits.
+/// 50 µs to 5 s: an in-process delivery (the live feed's publish to a viewer's read) sits well
+/// under a millisecond, so the buckets start there (Kiln Metrics, 2026-10-23).
+pub const DELIVERY_BUCKETS: &[f64] =
+    &[0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
+pub const LATENCY_BUCKETS: &[f64] =
+    &[0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0, 150.0, 300.0, 600.0];
 
 impl Histogram {
     pub fn new(bounds: &'static [f64]) -> Self {
@@ -58,7 +67,7 @@ impl Histogram {
             bounds,
             buckets: bounds.iter().map(|_| AtomicU64::new(0)).collect(),
             count: AtomicU64::new(0),
-            sum_ms: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
         }
     }
 
@@ -70,7 +79,7 @@ impl Histogram {
         }
         self.count.fetch_add(1, Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        self.sum_ms.fetch_add((secs.max(0.0) * 1000.0) as u64, Ordering::Relaxed);
+        self.sum_us.fetch_add((secs.max(0.0) * 1_000_000.0) as u64, Ordering::Relaxed);
     }
 
     fn render(&self, out: &mut String, name: &str, labels: &str) {
@@ -85,7 +94,7 @@ impl Histogram {
         let n = self.count.load(Ordering::Relaxed);
         let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"+Inf\"}} {n}");
         #[allow(clippy::cast_precision_loss)]
-        let sum = self.sum_ms.load(Ordering::Relaxed) as f64 / 1000.0;
+        let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         let wrap = if labels.is_empty() { String::new() } else { format!("{{{labels}}}") };
         let _ = writeln!(out, "{name}_sum{wrap} {sum}");
         let _ = writeln!(out, "{name}_count{wrap} {n}");
@@ -112,6 +121,17 @@ impl CounterVec {
         *self.series.write().entry(key).or_insert(0) += n;
     }
 
+    /// One series' count (0 before it's counted).
+    pub fn get(&self, values: &[&str]) -> u64 {
+        let key: Vec<String> = values.iter().map(|s| (*s).to_owned()).collect();
+        self.series.read().get(&key).copied().unwrap_or(0)
+    }
+
+    /// Every series counted so far: its label values and its count.
+    pub fn series(&self) -> Vec<(Vec<String>, u64)> {
+        self.series.read().iter().map(|(k, n)| (k.clone(), *n)).collect()
+    }
+
     fn render(&self, out: &mut String, name: &str) {
         for (vals, n) in self.series.read().iter() {
             let _ = writeln!(out, "{name}{{{}}} {n}", labels(self.keys, vals));
@@ -136,9 +156,46 @@ impl GaugeVec {
         *self.series.write() = series.into_iter().collect();
     }
 
+    /// The series of one publisher, as just measured: those whose first label is one of `owned`
+    /// (what it published before, and now) replaced, another publisher's kept (several sync
+    /// servers in one process, as tests have them).
+    pub fn replace_owned(&self, owned: &BTreeSet<String>, series: impl IntoIterator<Item = (Vec<String>, i64)>) {
+        let mut g = self.series.write();
+        g.retain(|k, _| k.first().is_none_or(|first| !owned.contains(first)));
+        g.extend(series);
+    }
+
     fn render(&self, out: &mut String, name: &str) {
         for (vals, v) in self.series.read().iter() {
             let _ = writeln!(out, "{name}{{{}}} {v}", labels(self.keys, vals));
+        }
+    }
+}
+
+/// A label-keyed histogram family, e.g. how long commits take by repo.
+pub struct HistogramVec {
+    keys: &'static [&'static str],
+    bounds: &'static [f64],
+    series: RwLock<BTreeMap<Vec<String>, Histogram>>,
+}
+
+impl HistogramVec {
+    pub fn new(keys: &'static [&'static str], bounds: &'static [f64]) -> Self {
+        Self { keys, bounds, series: RwLock::new(BTreeMap::new()) }
+    }
+
+    pub fn observe(&self, values: &[&str], secs: f64) {
+        let key: Vec<String> = values.iter().map(|s| (*s).to_owned()).collect();
+        if let Some(h) = self.series.read().get(&key) {
+            h.observe(secs);
+            return;
+        }
+        self.series.write().entry(key).or_insert_with(|| Histogram::new(self.bounds)).observe(secs);
+    }
+
+    fn render(&self, out: &mut String, name: &str) {
+        for (vals, h) in self.series.read().iter() {
+            h.render(out, name, &labels(self.keys, vals));
         }
     }
 }
@@ -184,6 +241,9 @@ pub struct Metrics {
     pub runner_update_policy: GaugeVec,
     /// The kiln each runner runs (1).
     pub runner_version_info: GaugeVec,
+    /// What each runner's QUIC layer dropped, by lane and reason, as it last said
+    /// (`AgentMsg::NetDrops`).
+    pub runner_net_dropped: GaugeVec,
     /// The CI engine's (docs/ci.md W19-R02): cache lookups by result and saves (W08-R13),
     /// attempts by conclusion and failure class, queue seconds by wait reason, and how far
     /// behind the rollups are.
@@ -220,11 +280,506 @@ pub fn global() -> &'static Metrics {
         runner_behind: GaugeVec::new(&["runner"]),
         runner_update_policy: GaugeVec::new(&["runner", "policy"]),
         runner_version_info: GaugeVec::new(&["runner", "version"]),
+        runner_net_dropped: GaugeVec::new(&["runner", "lane", "reason"]),
         ci_cache: CounterVec::new(&["result"]),
         ci_attempts: CounterVec::new(&["conclusion", "class"]),
         ci_wait_seconds: CounterVec::new(&["reason"]),
         ci_rollup_lag: Gauge::default(),
     })
+}
+
+/// Repo sync's (docs/sync.md, "Watching it"): the server's, as the leader of each synced repo's
+/// log; each runner's, as the copies it holds; and agent sessions' moves between machines. `repo`
+/// is a synced repo's name; `machine`, a copy's machine (Observe adds `host`, the process's own).
+pub struct SyncMetrics {
+    /// Steps each repo's log committed and its tree took; the changes they made by `kind`
+    /// (`added`, `changed`, `deleted`); and those that met another machine's change (the log kept
+    /// its own; the step's version went beside it).
+    pub steps_committed: CounterVec,
+    pub changes: CounterVec,
+    pub conflicts: CounterVec,
+    /// What the server let go: `what` a step or a raft `message`, and why.
+    pub dropped: CounterVec,
+    /// Something done again: by the server (`step_again`, a step sent again; `contents_asked`,
+    /// contents asked for again) or a runner (`fetch`, `upload`, `resend`).
+    pub retries: CounterVec,
+    /// What went wrong, by `kind`: a repo's `group` (server or runner), a copy's `folder` taking
+    /// the log, or `look`ing at it (runner).
+    pub errors: CounterVec,
+    /// From a step's arrival at the server to its commit.
+    pub commit_seconds: HistogramVec,
+    /// Each copy, as the server last heard of it: log entries its folder hasn't taken, its own
+    /// steps not in the log yet, contents it waits for, its state (every state, 1 for the one it's
+    /// in), and how long since it said how it is.
+    pub copy_lag_steps: GaugeVec,
+    pub copy_unsent_steps: GaugeVec,
+    pub copy_waiting_blobs: GaugeVec,
+    pub copy_state: GaugeVec,
+    pub copy_heard_age: GaugeVec,
+    /// Conflict copies each repo holds, not resolved yet.
+    pub conflict_files: GaugeVec,
+    /// Contents machines sent (`up`) and fetched (`down`) at the server, by result, and their bytes.
+    pub blob_requests: CounterVec,
+    pub blob_bytes: CounterVec,
+    /// A runner's: steps its copies proposed and took into their folders; what taking them did to
+    /// each file (`applied`, `conflict`, `kept`: changed here and on its way, `refused`).
+    pub proposed: CounterVec,
+    pub applied: CounterVec,
+    pub folder_writes: CounterVec,
+    /// Contents moved with the server: `up` or `down`, `ok`, `present` (there already), `gone`
+    /// (replaced since) or `failed` (tried again); their bytes, and how long each took.
+    pub transfers: CounterVec,
+    pub transfer_bytes: CounterVec,
+    pub transfer_seconds: HistogramVec,
+    /// From a change's look on the machine that made it to its file here (the two clocks apart
+    /// add to it).
+    pub apply_lag: HistogramVec,
+    /// How long a look at a folder for what changed takes.
+    pub look_seconds: HistogramVec,
+    /// Files each copy's last look left out (too big, or unreadable).
+    pub skipped_files: GaugeVec,
+    /// Agent sessions moving off this machine, by result; how long a session leaving waited for
+    /// its folder's last changes to be in the log, and one arriving for them to be in its folder;
+    /// and what its repository carried besides synced files (`git`, `ignored`, `worktree`).
+    pub moves: CounterVec,
+    pub move_barrier: Histogram,
+    pub move_files_wait: Histogram,
+    pub move_carried_bytes: CounterVec,
+}
+
+pub fn sync() -> &'static SyncMetrics {
+    static M: OnceLock<SyncMetrics> = OnceLock::new();
+    M.get_or_init(|| SyncMetrics {
+        steps_committed: CounterVec::new(&["repo"]),
+        changes: CounterVec::new(&["repo", "kind"]),
+        conflicts: CounterVec::new(&["repo"]),
+        dropped: CounterVec::new(&["repo", "what", "reason"]),
+        retries: CounterVec::new(&["repo", "what"]),
+        errors: CounterVec::new(&["repo", "kind"]),
+        commit_seconds: HistogramVec::new(&["repo"], LATENCY_BUCKETS),
+        copy_lag_steps: GaugeVec::new(&["repo", "machine"]),
+        copy_unsent_steps: GaugeVec::new(&["repo", "machine"]),
+        copy_waiting_blobs: GaugeVec::new(&["repo", "machine"]),
+        copy_state: GaugeVec::new(&["repo", "machine", "state"]),
+        copy_heard_age: GaugeVec::new(&["repo", "machine"]),
+        conflict_files: GaugeVec::new(&["repo"]),
+        blob_requests: CounterVec::new(&["machine", "direction", "result"]),
+        blob_bytes: CounterVec::new(&["machine", "direction"]),
+        proposed: CounterVec::new(&["repo"]),
+        applied: CounterVec::new(&["repo"]),
+        folder_writes: CounterVec::new(&["repo", "outcome"]),
+        transfers: CounterVec::new(&["repo", "direction", "result"]),
+        transfer_bytes: CounterVec::new(&["repo", "direction"]),
+        transfer_seconds: HistogramVec::new(&["direction"], LATENCY_BUCKETS),
+        apply_lag: HistogramVec::new(&["repo"], LATENCY_BUCKETS),
+        look_seconds: HistogramVec::new(&["repo"], LATENCY_BUCKETS),
+        skipped_files: GaugeVec::new(&["repo"]),
+        moves: CounterVec::new(&["result"]),
+        move_barrier: Histogram::new(LATENCY_BUCKETS),
+        move_files_wait: Histogram::new(LATENCY_BUCKETS),
+        move_carried_bytes: CounterVec::new(&["what"]),
+    })
+}
+
+/// A family as docs/agents.md ("Metrics") lists it: its name, type, label and that label's values
+/// (none: it has no label), and what it counts (its help, word for word the doc's).
+pub(crate) struct Family {
+    pub name: &'static str,
+    pub kind: &'static str,
+    pub label: Option<(&'static str, &'static [&'static str])>,
+    pub help: &'static str,
+}
+
+/// Agents' families (agreed with Observe's owner, 2026-10-20; CP-M2): the goal driver's sends and
+/// the goals it saw end, and the harness host's looks and record writes. In this order, they're
+/// the fields of [`AgentMetrics`].
+pub(crate) const AGENTS: [Family; 4] = [
+    Family {
+        name: "kiln_goals_sent_total",
+        kind: "counter",
+        label: Some(("kind", &["start", "reminder"])),
+        help: "Goals the goal driver sent an agent: a goal's first send, or afresh once resumed or reworded (start), or again after the agent stopped short of it (reminder).",
+    },
+    Family {
+        name: "kiln_goals_ended_total",
+        kind: "counter",
+        label: Some(("status", &["met", "skipped"])),
+        help: "Goals that ended: met (as its harness, the agent or you said, or with its plan's steps or run), or skipped (cleared in the agent, skipped through goal control, or taken out while under way).",
+    },
+    Family { name: "kiln_harness_polls_total", kind: "counter", label: None, help: "Looks the harness host's watch took at what its harnesses run (every 10 s)." },
+    Family { name: "kiln_harness_records_written_total", kind: "counter", label: None, help: "Writes of the harness host's record of its sessions." },
+];
+
+/// The agents' families' counts ([`AGENTS`]): every series there from the start, at 0, so a rate
+/// reads from the first scrape. Production counts into [`agents`]; a test into one of its own.
+pub struct AgentMetrics {
+    pub goals_sent: CounterVec,
+    pub goals_ended: CounterVec,
+    pub harness_polls: Counter,
+    pub harness_records_written: Counter,
+}
+
+impl Default for AgentMetrics {
+    fn default() -> Self {
+        let m = Self { goals_sent: CounterVec::new(&["kind"]), goals_ended: CounterVec::new(&["status"]), harness_polls: Counter::default(), harness_records_written: Counter::default() };
+        let [sent, ended, ..] = &AGENTS;
+        for (family, v) in [(sent, &m.goals_sent), (ended, &m.goals_ended)] {
+            for value in family.label.map_or(&[][..], |(_, values)| values) {
+                v.add(&[*value], 0);
+            }
+        }
+        m
+    }
+}
+
+impl AgentMetrics {
+    /// A goal sent to its agent: its first send, or again (`reminder`).
+    pub fn goal_sent(&self, reminder: bool) {
+        self.goals_sent.inc(&[if reminder { "reminder" } else { "start" }]);
+    }
+
+    /// A goal ended: met, or skipped.
+    pub fn goal_ended(&self, met: bool) {
+        self.goals_ended.inc(&[if met { "met" } else { "skipped" }]);
+    }
+}
+
+pub fn agents() -> &'static AgentMetrics {
+    static M: OnceLock<AgentMetrics> = OnceLock::new();
+    M.get_or_init(AgentMetrics::default)
+}
+
+/// The agents' families of `m`, in the exposition.
+fn render_agents(m: &AgentMetrics, o: &mut String) {
+    let [sent, ended, polls, written] = &AGENTS;
+    let head = |o: &mut String, f: &Family| {
+        let _ = writeln!(o, "# HELP {} {}\n# TYPE {} {}", f.name, f.help, f.name, f.kind);
+    };
+    head(o, sent);
+    m.goals_sent.render(o, sent.name);
+    head(o, ended);
+    m.goals_ended.render(o, ended.name);
+    head(o, polls);
+    let _ = writeln!(o, "{} {}", polls.name, m.harness_polls.get());
+    head(o, written);
+    let _ = writeln!(o, "{} {}", written.name, m.harness_records_written.get());
+}
+
+/// What kiln's QUIC layer let go before it reached the wire (`crate::net`, docs/wire.md, "Loss
+/// below the channel"), by `lane` (`crate::proto::lane_name`) and `reason`: `shed` (a lane that
+/// may lose frames had its queue full: its oldest went), `stuck` (a control lane had its queue
+/// full: its connection was closed, and what it held went with it), `refused` (the transport
+/// wouldn't take it), `closed` (its connection closed, or its peer wasn't connected, with it
+/// queued), `ended` (the net loop started over, or stopped, with it queued) and `chaos` (a test
+/// build's fault). The channel sends again what of these it carried. `toward`: the same by peer, for
+/// the server's runner pages.
+pub struct NetMetrics {
+    pub frames_dropped: CounterVec,
+    toward: RwLock<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>>,
+}
+
+impl NetMetrics {
+    /// `n` frames of `lane` to `peer` dropped, for `reason`.
+    pub fn dropped(&self, peer: u64, lane: u32, reason: &'static str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let lane = crate::proto::lane_name(lane);
+        self.frames_dropped.add(&[lane, reason], n);
+        *self.toward.write().entry(peer).or_default().entry((lane, reason)).or_insert(0) += n;
+    }
+
+    /// What this process dropped, by lane and reason.
+    pub fn counts(&self) -> Vec<crate::proto::NetDrop> {
+        self.frames_dropped
+            .series()
+            .into_iter()
+            .filter_map(|(k, frames)| match k.as_slice() {
+                [lane, reason] => Some(crate::proto::NetDrop { lane: lane.clone(), reason: reason.clone(), frames }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What this process dropped of what it had for `peer`, by lane and reason.
+    pub fn toward(&self, peer: u64) -> Vec<crate::proto::NetDrop> {
+        self.toward
+            .read()
+            .get(&peer)
+            .map(|m| m.iter().map(|((lane, reason), n)| crate::proto::NetDrop { lane: (*lane).to_owned(), reason: (*reason).to_owned(), frames: *n }).collect())
+            .unwrap_or_default()
+    }
+}
+
+pub fn net() -> &'static NetMetrics {
+    static M: OnceLock<NetMetrics> = OnceLock::new();
+    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: RwLock::new(BTreeMap::new()) })
+}
+
+/// The `kiln_net_*` families, in the exposition: this process's drops, and (the server's) what each
+/// runner last said its own were.
+fn render_net(o: &mut String) {
+    let _ = writeln!(
+        o,
+        "# HELP kiln_net_frames_dropped_total Frames kiln's QUIC layer let go before they reached the wire, by lane and reason (shed, stuck, refused, closed, ended, chaos).\n# TYPE kiln_net_frames_dropped_total counter"
+    );
+    net().frames_dropped.render(o, "kiln_net_frames_dropped_total");
+    let _ = writeln!(o, "# HELP kiln_runner_net_frames_dropped Frames each runner's QUIC layer let go, by lane and reason, as it last said.\n# TYPE kiln_runner_net_frames_dropped gauge");
+    global().runner_net_dropped.render(o, "kiln_runner_net_frames_dropped");
+}
+
+/// kiln's bytes behind kiln-seams' `Blobs` (docs/blobs.md), by `store` (`local`, `s3`): requests by
+/// `op` and `outcome` (`ok`, `refused`: a typed refusal, `unavailable`: the store couldn't answer);
+/// how long each took; the bytes `written` and `read`; objects let go by what keeps them (`kind`:
+/// `cas`, `sync`, `recordings`, `transcripts`); and closed conversations whose record couldn't be
+/// archived before the conversation store let it go (`crate::harness::archive`).
+pub struct BlobsMetrics {
+    pub requests: CounterVec,
+    pub seconds: HistogramVec,
+    pub bytes: CounterVec,
+    pub collected: CounterVec,
+    pub archives_given_up: Counter,
+}
+
+pub fn blobs() -> &'static BlobsMetrics {
+    static M: OnceLock<BlobsMetrics> = OnceLock::new();
+    M.get_or_init(|| BlobsMetrics {
+        requests: CounterVec::new(&["store", "op", "outcome"]),
+        seconds: HistogramVec::new(&["store", "op"], LATENCY_BUCKETS),
+        bytes: CounterVec::new(&["store", "direction"]),
+        collected: CounterVec::new(&["kind"]),
+        archives_given_up: Counter::default(),
+    })
+}
+
+/// The bus kiln's events ride (docs/bus.md): what its live feeds published and were refused, and
+/// what its viewers were told they missed.
+pub struct BusMetrics {
+    /// Frames the live feeds published.
+    pub published: Counter,
+    /// What the bus refused a live feed, by operation (create, publish, delete).
+    pub refused: CounterVec,
+    /// Viewers told they fell behind what a feed keeps, and sent back to a snapshot.
+    pub lag_notices: Counter,
+    /// How long a frame took from its publish to a viewer's read.
+    pub delivery_seconds: Histogram,
+}
+
+pub fn bus() -> &'static BusMetrics {
+    static M: OnceLock<BusMetrics> = OnceLock::new();
+    M.get_or_init(|| BusMetrics { published: Counter::default(), refused: CounterVec::new(&["op"]), lag_notices: Counter::default(), delivery_seconds: Histogram::new(DELIVERY_BUCKETS) })
+}
+
+/// The bus's figures as the server's node states them when scraped: set by whoever holds the bus.
+pub struct BusGauges {
+    pub topics: Gauge,
+    pub viewers: Gauge,
+    pub memory_bytes: Gauge,
+    pub memory_limit_bytes: Gauge,
+}
+
+pub fn bus_gauges() -> &'static BusGauges {
+    static M: OnceLock<BusGauges> = OnceLock::new();
+    M.get_or_init(|| BusGauges { topics: Gauge::default(), viewers: Gauge::default(), memory_bytes: Gauge::default(), memory_limit_bytes: Gauge::default() })
+}
+
+/// The `kiln_bus_*` families, in the exposition.
+fn render_bus(o: &mut String) {
+    let m = bus();
+    let g = bus_gauges();
+    let help = |o: &mut String, name: &str, kind: &str, h: &str| {
+        let _ = writeln!(o, "# HELP {name} {h}\n# TYPE {name} {kind}");
+    };
+    help(o, "kiln_bus_published_total", "counter", "Frames sessions' live feeds published on the bus.");
+    let _ = writeln!(o, "kiln_bus_published_total {}", m.published.get());
+    help(o, "kiln_bus_refused_total", "counter", "Operations the bus refused a live feed, by operation (create, publish, delete): each sends the feed's viewers back to a snapshot.");
+    m.refused.render(o, "kiln_bus_refused_total");
+    help(o, "kiln_bus_lag_notices_total", "counter", "Viewers told they fell behind what a live feed keeps, and sent back to a snapshot.");
+    let _ = writeln!(o, "kiln_bus_lag_notices_total {}", m.lag_notices.get());
+    help(o, "kiln_bus_delivery_seconds", "histogram", "How long a live feed's frame took from its publish to a viewer's read.");
+    m.delivery_seconds.render(o, "kiln_bus_delivery_seconds", "");
+    help(o, "kiln_bus_topics", "gauge", "Topics the bus holds.");
+    let _ = writeln!(o, "kiln_bus_topics {}", g.topics.get());
+    help(o, "kiln_bus_viewers", "gauge", "Viewers reading sessions' live feeds.");
+    let _ = writeln!(o, "kiln_bus_viewers {}", g.viewers.get());
+    help(o, "kiln_bus_memory_bytes", "gauge", "Bytes the bus's messages take, framing included, until their readers let them go.");
+    let _ = writeln!(o, "kiln_bus_memory_bytes {}", g.memory_bytes.get());
+    help(o, "kiln_bus_memory_limit_bytes", "gauge", "Bytes the bus's messages may take ([bus] memory).");
+    let _ = writeln!(o, "kiln_bus_memory_limit_bytes {}", g.memory_limit_bytes.get());
+}
+
+/// The `kiln_blobs_*` families, in the exposition.
+fn render_blobs(o: &mut String) {
+    let m = blobs();
+    let help = |o: &mut String, name: &str, kind: &str, h: &str| {
+        let _ = writeln!(o, "# HELP {name} {h}\n# TYPE {name} {kind}");
+    };
+    help(o, "kiln_blobs_requests_total", "counter", "Requests to the store kiln keeps its bytes in, by store, operation and outcome (ok, refused, unavailable).");
+    m.requests.render(o, "kiln_blobs_requests_total");
+    help(o, "kiln_blobs_bytes_total", "counter", "Bytes written to and read from the store kiln keeps its bytes in.");
+    m.bytes.render(o, "kiln_blobs_bytes_total");
+    help(o, "kiln_blobs_collected_total", "counter", "Objects kiln let go that nothing refers to, by what kept them.");
+    m.collected.render(o, "kiln_blobs_collected_total");
+    help(o, "kiln_blobs_archives_given_up_total", "counter", "Closed conversations whose record couldn't be archived in the days held past the conversation store's keeping: given up, and let go by the store.");
+    let _ = writeln!(o, "kiln_blobs_archives_given_up_total {}", m.archives_given_up.get());
+    help(o, "kiln_blobs_request_seconds", "histogram", "How long requests to the store kiln keeps its bytes in took, by store and operation.");
+    m.seconds.render(o, "kiln_blobs_request_seconds");
+}
+
+/// Repo sync's families, in the exposition.
+fn render_sync(o: &mut String) {
+    let m = sync();
+    let help = |o: &mut String, name: &str, kind: &str, h: &str| {
+        let _ = writeln!(o, "# HELP {name} {h}\n# TYPE {name} {kind}");
+    };
+    for (name, h, v) in [
+        ("kiln_sync_steps_committed_total", "Steps a synced repo's log committed.", &m.steps_committed),
+        ("kiln_sync_changes_total", "Changes committed steps made, by kind (added, changed, deleted).", &m.changes),
+        ("kiln_sync_conflicts_total", "Committed changes that met another machine's: kept beside.", &m.conflicts),
+        ("kiln_sync_dropped_total", "Steps and raft messages the server let go, by reason.", &m.dropped),
+        ("kiln_sync_retries_total", "Steps, contents and transfers tried again.", &m.retries),
+        ("kiln_sync_errors_total", "Sync errors, by kind (group, folder, look).", &m.errors),
+        ("kiln_sync_blob_requests_total", "Contents sent (up) and fetched (down) at the server, by machine and result.", &m.blob_requests),
+        ("kiln_sync_blob_bytes_total", "Bytes of contents sent (up) and fetched (down) at the server, by machine.", &m.blob_bytes),
+        ("kiln_sync_proposed_total", "Steps this machine's copies proposed.", &m.proposed),
+        ("kiln_sync_applied_total", "Committed steps this machine's copies took into their folders.", &m.applied),
+        ("kiln_sync_folder_writes_total", "What taking committed steps did to each file here, by outcome.", &m.folder_writes),
+        ("kiln_sync_transfers_total", "Contents moved with the server, by direction and result.", &m.transfers),
+        ("kiln_sync_transfer_bytes_total", "Bytes of contents moved with the server, by direction.", &m.transfer_bytes),
+        ("kiln_moves_total", "Agent sessions moving off this machine, by result.", &m.moves),
+        ("kiln_move_carried_bytes_total", "What moving sessions carried besides synced files (git, ignored, worktree; home: what their harness keeps for them).", &m.move_carried_bytes),
+    ] {
+        help(o, name, "counter", h);
+        v.render(o, name);
+    }
+    for (name, h, v) in [
+        ("kiln_sync_copy_lag_steps", "Log entries a copy's folder hasn't taken yet.", &m.copy_lag_steps),
+        ("kiln_sync_copy_unsent_steps", "A copy's own steps not in the log yet.", &m.copy_unsent_steps),
+        ("kiln_sync_copy_waiting_blobs", "Contents a copy waits for.", &m.copy_waiting_blobs),
+        ("kiln_sync_copy_state", "Each copy's state: 1 for the one it is in, 0 for the others.", &m.copy_state),
+        ("kiln_sync_copy_heard_age_seconds", "Seconds since a copy last said how it is.", &m.copy_heard_age),
+        ("kiln_sync_conflict_files", "Conflict copies a synced repo holds, not resolved yet.", &m.conflict_files),
+        ("kiln_sync_skipped_files", "Files a copy's last look left out.", &m.skipped_files),
+    ] {
+        help(o, name, "gauge", h);
+        v.render(o, name);
+    }
+    for (name, h, v) in [
+        ("kiln_sync_commit_seconds", "From a step's arrival at the server to its commit.", &m.commit_seconds),
+        ("kiln_sync_transfer_seconds", "How long moving contents with the server took, by direction.", &m.transfer_seconds),
+        ("kiln_sync_apply_lag_seconds", "From a change's look on the machine that made it to its file here.", &m.apply_lag),
+        ("kiln_sync_look_seconds", "How long a look at a copy's folder took.", &m.look_seconds),
+    ] {
+        help(o, name, "histogram", h);
+        v.render(o, name);
+    }
+    help(o, "kiln_move_barrier_seconds", "histogram", "How long a session leaving waited for its folder's last changes to be in the log.");
+    m.move_barrier.render(o, "kiln_move_barrier_seconds", "");
+    help(o, "kiln_move_files_wait_seconds", "histogram", "How long a session arriving waited for its folder's last changes.");
+    m.move_files_wait.render(o, "kiln_move_files_wait_seconds", "");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_labelled_histogram_renders_each_series_whole() {
+        let h = HistogramVec::new(&["repo"], LATENCY_BUCKETS);
+        h.observe(&["a"], 0.0004);
+        h.observe(&["a"], 0.003);
+        h.observe(&["b\"q"], 90.0);
+        let mut out = String::new();
+        h.render(&mut out, "x_seconds");
+        assert!(out.contains("x_seconds_bucket{repo=\"a\",le=\"0.001\"} 1"), "{out}");
+        assert!(out.contains("x_seconds_bucket{repo=\"a\",le=\"0.005\"} 2"), "{out}");
+        assert!(out.contains("x_seconds_bucket{repo=\"a\",le=\"+Inf\"} 2"), "{out}");
+        // Microseconds add up where milliseconds would round to nothing.
+        assert!(out.contains("x_seconds_sum{repo=\"a\"} 0.0034"), "{out}");
+        assert!(out.contains("x_seconds_count{repo=\"a\"} 2"), "{out}");
+        assert!(out.contains("x_seconds_bucket{repo=\"b\\\"q\",le=\"60\"} 0"), "escaped, and over the top bucket but one: {out}");
+        assert!(out.contains("x_seconds_bucket{repo=\"b\\\"q\",le=\"150\"} 1"), "{out}");
+    }
+
+    #[test]
+    fn sync_families_render_even_before_anything_happened() {
+        let text = render();
+        for name in ["kiln_sync_steps_committed_total", "kiln_sync_copy_state", "kiln_sync_transfer_seconds", "kiln_move_barrier_seconds", "kiln_moves_total"] {
+            assert!(text.contains(&format!("# TYPE {name} ")), "{name}");
+        }
+        assert!(text.contains("kiln_move_barrier_seconds_bucket{le=\"600\"} "), "an unlabelled histogram's buckets");
+    }
+
+    /// CP-M2's counters (docs/agents.md, "Metrics"): every series is there before anything is
+    /// counted, at 0, under the help and type the table gives, and in the server's exposition.
+    #[test]
+    fn the_agents_families_render_every_series_from_the_start() {
+        let mut out = String::new();
+        render_agents(&AgentMetrics::default(), &mut out);
+        for f in &AGENTS {
+            assert!(out.contains(&format!("# HELP {} {}\n# TYPE {} {}\n", f.name, f.help, f.name, f.kind)), "{}: {out}", f.name);
+            match f.label {
+                Some((key, values)) => {
+                    for v in values {
+                        assert!(out.contains(&format!("{}{{{key}=\"{v}\"}} 0\n", f.name)), "{} {v}: {out}", f.name);
+                    }
+                }
+                None => assert!(out.contains(&format!("\n{} 0\n", f.name)), "{}: {out}", f.name),
+            }
+        }
+        let text = render();
+        for f in &AGENTS {
+            assert!(text.contains(&format!("# TYPE {} {}\n", f.name, f.kind)), "{}", f.name);
+        }
+    }
+
+    /// A row of the metrics reference: metric, type, its label and that label's values, and what
+    /// it counts.
+    type Said = (String, String, Option<(String, Vec<String>)>, String);
+
+    fn said_of(f: &Family) -> Said {
+        let label = f.label.map(|(k, vs)| (k.to_owned(), vs.iter().map(|v| (*v).to_owned()).collect()));
+        (f.name.to_owned(), f.kind.to_owned(), label, f.help.to_owned())
+    }
+
+    /// The rows of a doc's "## Metrics" table, in order: `| `name` | type | `label`: `a`, `b` | counts |`.
+    fn metrics_said(doc: &str) -> Option<Vec<Said>> {
+        let section = doc.split("\n## ").find(|s| s.starts_with("Metrics\n"))?;
+        let rows = section.lines().filter(|l| l.starts_with("| `")).map(|l| {
+            let cells: Vec<&str> = l.trim_matches('|').split('|').map(str::trim).collect();
+            let [name, kind, labels, counts] = cells.as_slice() else { return (l.to_owned(), String::new(), None, String::new()) };
+            let ticked: Vec<String> = labels.split('`').skip(1).step_by(2).map(str::to_owned).collect();
+            let label = ticked.split_first().map(|(k, vs)| (k.clone(), vs.to_vec()));
+            (name.trim_matches('`').to_owned(), (*kind).to_owned(), label, (*counts).to_owned())
+        });
+        Some(rows.collect())
+    }
+
+    /// The metrics reference (docs/agents.md, "Metrics") is the code's (CP-M2, doc-truth): each
+    /// row's metric, type, label and values, and what it counts, in [`AGENTS`]'s order, word for
+    /// word.
+    #[test]
+    fn docs_agents_md_lists_the_agents_metrics_as_the_code_has_them() -> Result<(), String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/agents.md");
+        let doc = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let said = metrics_said(&doc).ok_or("docs/agents.md has no \"## Metrics\" section")?;
+        let code: Vec<Said> = AGENTS.iter().map(said_of).collect();
+        if said == code { Ok(()) } else { Err(format!("docs/agents.md says\n{said:#?}\nthe code has\n{code:#?}")) }
+    }
+
+    /// The check itself: a label value, or a row, the code doesn't have shows; other sections'
+    /// tables don't count.
+    #[test]
+    fn a_row_the_code_doesn_t_have_is_caught() {
+        let doc = "# x\n\n## Metrics\n\n| Metric | Type | Labels | Counts |\n| --- | --- | --- | --- |\n| `a_total` | counter | `kind`: `x`, `y` | Xs. |\n| `b_total` | counter | | Bs. |\n\n## Next\n\n| `c_total` | counter | | not this section's |\n";
+        let said = metrics_said(doc).unwrap_or_default();
+        let a = Family { name: "a_total", kind: "counter", label: Some(("kind", &["x", "y"])), help: "Xs." };
+        let b = Family { name: "b_total", kind: "counter", label: None, help: "Bs." };
+        assert_eq!(said, vec![said_of(&a), said_of(&b)]);
+        let fewer = Family { label: Some(("kind", &["x"])), ..a };
+        assert_ne!(said, vec![said_of(&fewer), said_of(&b)], "a label value the code doesn't have");
+        assert_ne!(said, vec![said_of(&b)], "a row the code doesn't have");
+    }
 }
 
 /// Live per-agent host samples, reported by agents and rendered with an `agent` label.
@@ -247,6 +802,75 @@ pub static AGENT_SAMPLES: OnceLock<RwLock<BTreeMap<String, HostSample>>> = OnceL
 
 pub fn agent_samples() -> &'static RwLock<BTreeMap<String, HostSample>> {
     AGENT_SAMPLES.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+/// The conversation stores' metrics (`crate::convo::board`): name, type and help of each, in the
+/// order [`set_convo`] measures them.
+const CONVO: [(&str, &str, &str); 13] = [
+    ("kiln_convo_store_up", "gauge", "Conversation stores linked to the server (1) or not (0)."),
+    ("kiln_convo_store_bytes", "gauge", "Each conversation store's file size."),
+    ("kiln_convo_store_free_bytes", "gauge", "The part of each store's file free for what comes next."),
+    ("kiln_convo_store_wal_bytes", "gauge", "Each store's log (WAL) size."),
+    ("kiln_convo_store_rev", "gauge", "Each store's last write number: how many writes it has had."),
+    ("kiln_convo_store_sessions", "gauge", "Sessions each store holds."),
+    ("kiln_convo_store_behind_rows", "gauge", "Rows a store's feed hasn't delivered yet (a runner's to the server, the server's to a mirror)."),
+    ("kiln_convo_store_commits_total", "counter", "Commits of each store's writer, since its kiln started."),
+    ("kiln_convo_store_busy_milliseconds_total", "counter", "Time each store's writer was busy, since its kiln started."),
+    ("kiln_convo_store_dropped_total", "counter", "Updates each store dropped while its writer couldn't keep up."),
+    ("kiln_convo_store_read_timeouts_total", "counter", "Reads of each store that got no answer in time."),
+    ("kiln_convo_feed_batches_total", "counter", "Feed batches: taken by the server, from a runner's store; sent to a mirror."),
+    ("kiln_convo_feed_bytes_total", "counter", "Feed bytes on the wire, as for kiln_convo_feed_batches_total."),
+];
+
+/// Each store's labels (`store`, `role`, `machine`) and its [`CONVO`] values (None: not known).
+type ConvoRow = ([String; 3], [Option<i64>; 13]);
+static CONVO_ROWS: OnceLock<RwLock<Vec<ConvoRow>>> = OnceLock::new();
+
+fn convo_rows() -> &'static RwLock<Vec<ConvoRow>> {
+    CONVO_ROWS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// The conversation stores as the board just sampled them.
+pub fn set_convo(status: &crate::convo::board::Status) {
+    let n = |v: u64| Some(i64::try_from(v).unwrap_or(i64::MAX));
+    let rows = status
+        .stores
+        .iter()
+        .filter(|s| s.id.is_some())
+        .map(|s| {
+            let r = s.report.as_ref();
+            let behind = s.feed.as_ref().and_then(|f| f.behind).or(s.mirror.as_ref().and_then(|m| m.behind));
+            let (batches, bytes) = match (&s.feed, &s.mirror) {
+                (Some(f), _) => (f.intake.as_ref().map(|i| i.batches), f.intake.as_ref().map(|i| i.bytes)),
+                (None, Some(m)) => (Some(m.ship.batches), Some(m.ship.bytes)),
+                // The server's: what it took from every feed.
+                (None, None) => {
+                    let feeds = status.stores.iter().filter_map(|x| x.feed.as_ref()?.intake.as_ref());
+                    let (b, w) = feeds.fold((0, 0), |(b, w), i| (b + i.batches, w + i.bytes));
+                    (Some(b), Some(w))
+                }
+            };
+            (
+                [s.key.clone(), s.role.to_owned(), s.machine.clone()],
+                [
+                    Some(i64::from(s.connected)),
+                    r.and_then(|r| n(r.file.bytes)),
+                    r.and_then(|r| n(r.file.free)),
+                    r.and_then(|r| n(r.file.wal)),
+                    r.and_then(|r| n(r.file.top)),
+                    r.and_then(|r| r.file.sessions).and_then(n),
+                    behind.and_then(n),
+                    r.and_then(|r| n(r.commits)),
+                    r.and_then(|r| n(r.busy_ms)),
+                    r.and_then(|r| n(r.dropped)),
+                    r.and_then(|r| n(r.timeouts)),
+                    batches.and_then(n),
+                    bytes.and_then(n),
+                ],
+            )
+        })
+        .collect();
+    *convo_rows().write() = rows;
 }
 
 pub fn render() -> String {
@@ -303,6 +927,11 @@ pub fn render() -> String {
     m.job_duration.render(&mut o, "kiln_job_duration_seconds", "");
     help(&mut o, "kiln_queue_wait_seconds", "histogram", "Time from queued to started.");
     m.queue_wait.render(&mut o, "kiln_queue_wait_seconds", "");
+    render_sync(&mut o);
+    render_agents(agents(), &mut o);
+    render_blobs(&mut o);
+    render_bus(&mut o);
+    render_net(&mut o);
 
     let samples = agent_samples().read();
     if !samples.is_empty() {
@@ -338,6 +967,18 @@ pub fn render() -> String {
             }
         }
     }
+    let convo = convo_rows().read();
+    if !convo.is_empty() {
+        for (i, (name, kind, h)) in CONVO.iter().enumerate() {
+            help(&mut o, name, kind, h);
+            for (l, values) in convo.iter() {
+                if let Some(v) = values.get(i).copied().flatten() {
+                    let _ = writeln!(o, "{name}{{{}}} {v}", labels(&["store", "role", "machine"], l));
+                }
+            }
+        }
+    }
+    drop(convo);
     let p = crate::host::process_self();
     scalar!("process_resident_memory_bytes", "gauge", "Server RSS.", p.rss_bytes);
     scalar!("process_cpu_seconds_total", "counter", "Server CPU time.", p.cpu_seconds);

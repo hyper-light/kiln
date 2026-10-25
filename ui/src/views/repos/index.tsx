@@ -5,16 +5,18 @@
  * machines hold, each once, with the machines it is on. One filter field (kind, machine, OS,
  * architecture, labels, state, each with counts) and a sort, as the agents list has. A repository
  * opens under its row: where it is, the tasks that put it there, and putting it on more machines
- * (cloned, or kept in sync), moving it or giving it up, all in place.
+ * (cloned, or kept in sync), moving it or giving it up, all in place. Above the list, a section that
+ * opens shows sync at work: each copy's state and every change as it goes between machines.
  */
 import * as React from "react";
 import { Link, useSearchParams } from "@/lib/router";
 import { AlertTriangle, ArrowUpRight, FolderSync, HardDriveDownload, Play, Plus, RefreshCw, ScanSearch, GitBranch, Trash2 } from "lucide-react";
+import { WatchedBy } from "@/views/attach/here";
 import { api } from "@/api/client";
 import type { PlaceMachine, PlacesView, PlaceTask, SyncView } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { FacetBox } from "@/components/ui/facet-box";
-import { TableHold } from "@/components/ui/hold";
+import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { EmptyState, PageIntro, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
@@ -29,6 +31,9 @@ import { AddRepoForm, DeleteRepo, type Notice, RunForm } from "./forms";
 import { DEFAULT_VIEW, type Entry, type ListView, SORTS, type SortId, browseUrl, dimsOf, entriesOf, facetsOf, isActive, isFiltered, machinesOf, matches, sortEntries, tildeOf } from "./model";
 import { PlaceList, TaskList, taskLine } from "./places";
 import { PutForm, type PutMode } from "./put";
+import { SyncActivity } from "./sync-activity";
+import { ScopeSecrets } from "../settings-ci";
+import { Providers } from "./providers";
 import "./repos.css";
 
 /** Folders kept the same on several machines; read often, they move by the second. */
@@ -59,6 +64,12 @@ function useRepoParams() {
   return { adding: params.get("add") === "1", syncing: params.get("sync") === "1", show: params.get("show"), repo: params.get("repo"), set };
 }
 
+/** The Sync section, opened on one repo's activity, brought into view. */
+function showActivity(set: (patch: Record<string, string | null>) => void, repo: string) {
+  set({ activity: repo });
+  document.getElementById("sync-activity")?.scrollIntoView({ block: "start", behavior: "smooth" });
+}
+
 export default function Repos() {
   const { adding, syncing, set } = useRepoParams();
   const look = async () => {
@@ -85,6 +96,9 @@ export default function Repos() {
             </Button>
             <Button size="sm" variant="secondary" onClick={() => set({ sync: "1" })} disabled={syncing}>
               <FolderSync /> Sync a folder
+            </Button>
+            <Button asChild size="sm" variant="secondary">
+              <Link to="/review">Review</Link>
             </Button>
             <Tip content="Every machine looks at its repositories again now">
               <Button size="sm" variant="ghost" onClick={() => void look()}>
@@ -229,6 +243,8 @@ function ReposBody() {
         </section>
       )}
 
+      <SyncActivity sync={sync.data} />
+
       {entries.length === 0 ? (
         <EmptyState
           icon={<GitBranch size={24} />}
@@ -285,6 +301,7 @@ function ReposBody() {
                         places.reload();
                       }}
                       onChange={changed}
+                      onActivity={(id) => showActivity(set, id)}
                     />
                   )}
                 </Row>
@@ -507,6 +524,7 @@ function Details({
   onNotice,
   onDeleted,
   onChange,
+  onActivity,
 }: {
   entry: Entry;
   machines: Map<string, PlaceMachine>;
@@ -518,6 +536,8 @@ function Details({
   onNotice: (n: Notice) => void;
   onDeleted: () => void;
   onChange: () => void;
+  /** Open the Sync section on a synced repo's activity. */
+  onActivity: (repo: string) => void;
 }) {
   const r = e.built;
   return (
@@ -528,18 +548,20 @@ function Details({
           <p className="repo-details-origin">{e.origin ?? (e.key.startsWith("here:") ? "no remote: it is on one machine alone" : e.key)}</p>
         </div>
         <div className="repo-actions">
-          <Button size="xs" variant={panel === "clone" ? "secondary" : "ghost"} onClick={() => onPanel(panel === "clone" ? "details" : "clone")}>
-            Clone to machines
+          <Button size="xs" variant="secondary" aria-pressed={panel === "clone"} title="Clone it to machines" onClick={() => onPanel(panel === "clone" ? "details" : "clone")}>
+            Clone
           </Button>
-          <Button size="xs" variant={panel === "sync" ? "secondary" : "ghost"} onClick={() => onPanel(panel === "sync" ? "details" : "sync")}>
-            Sync to machines
+          <Button size="xs" variant="secondary" aria-pressed={panel === "sync"} title="Keep it in sync on machines" onClick={() => onPanel(panel === "sync" ? "details" : "sync")}>
+            Sync
           </Button>
           {r && (
-            <Button size="xs" variant="ghost" asChild>
-              <Link to={`/runs?repo=${encodeURIComponent(r.id)}`}>Its runs</Link>
+            <Button size="xs" variant="secondary" asChild>
+              <Link to={`/runs?repo=${encodeURIComponent(r.id)}`} title="Its runs">
+                Runs
+              </Link>
             </Button>
           )}
-          <Button size="xs" variant="ghost" onClick={onClose}>
+          <Button size="xs" variant="secondary" onClick={onClose}>
             Close
           </Button>
         </div>
@@ -548,13 +570,33 @@ function Details({
       {panel === "run" && r && <RunForm repo={r} onCancel={() => onPanel("details")} onNotice={onNotice} />}
       {panel === "delete" && r && <DeleteRepo repo={r} onCancel={() => onPanel("details")} onDeleted={onDeleted} />}
       <TaskList tasks={e.tasks} machines={machines} onChange={onChange} />
+      {r && <WatchedBy on={`repo:${r.name}`} watches={(on) => on === `repo:${r.name}` || on.startsWith(`workflow:${r.name}:`) || on.startsWith(`environment:${r.name}:`)} />}
       <section className="repo-section" aria-label="On machines">
         <h4 className="field-label">On machines</h4>
         <PlaceList entry={e} machines={machines} synced={e.synced} onStarted={onStarted} />
       </section>
+      {r && (
+        // What runs its CI (W23-R07), when its host makes a choice possible.
+        <Loadable label="what runs its CI" fallback={<></>}>
+          <Providers repo={r.name} />
+        </Loadable>
+      )}
+      {r && (
+        // Its CI secrets and variables (W09-R11).
+        <section className="repo-section" aria-label="Its secrets and variables">
+          <Loadable label="its secrets and variables" fallback={<Hold height={120} />}>
+            <ScopeSecrets scope={`repo:${r.name}`} of="Its" />
+          </Loadable>
+        </section>
+      )}
       {e.synced && (
         <section className="repo-section">
           <RepoBlock repo={e.synced} machines={machineNames} onChange={onChange} title="Kept in sync" copies={false} />
+          <div>
+            <Button size="xs" variant="ghost" onClick={() => e.synced && onActivity(e.synced.id)}>
+              Its sync activity: each change and the copies that have it
+            </Button>
+          </div>
         </section>
       )}
     </div>

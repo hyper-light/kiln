@@ -94,6 +94,8 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET | `/api/agents` | `Agent[]` |
 | DELETE | `/api/agents/:name` | forget agent |
 | POST | `/api/agents/:name/drain` | `{ draining: bool }` |
+| GET | `/api/agents/:name/diagnose` | what's wrong with that runner, worst first, each with its repair ([releases.md](releases.md#diagnosing-and-repairing-a-runner)) |
+| POST | `/api/agents/:name/repair` | `{ action, way? }`: a repair a diagnosis offers |
 | GET | `/api/agents/join` | `{ token, server, quic, command, manual, join, join_manual }` – bare-metal join commands: with the join token (`command`, `manual`), or asking for approval (`join`: `install.sh --join`, `join_manual`: `kiln join --server …`) |
 | GET | `/api/front-doors` | `FrontDoorView[]`: every runner with front-door settings (see [front-door.md](front-door.md)) |
 | GET | `/api/runners/:name/front-door` | `FrontDoorView`; 404 for an unknown runner |
@@ -110,7 +112,15 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | POST | `/api/join-requests/:id/deny` | → `{ id, status: "denied", name }`; the machine learns it on its next poll |
 | GET | `/api/metrics/history?agent=` | `{ [agent]: HostSample[] }` last hour, 5 s resolution (`agent` optional; server is `"server"`) |
 | GET | `/api/system` | `{ version, uptime_s, generation, children: Child[], crash_log: string[], config: object }` |
+| GET | `/api/conversations/status` | every conversation store as the server sees it: `{ at, on, mirrors_wanted, restore, stores: ConvoStore[], notes }` (docs/conversations.md, "Telemetry") |
+| GET | `/api/conversations/series?key=&window=` | one store's series, a column each (`t` in unix s; rates per second): an hour at 5 s, up to a day at a minute |
 | GET | `/api/audit?limit=` | `{ts, actor, action, detail}[]` |
+| GET | `/api/push` | `{ enabled, available, why, public_key, kinds, muted, reached }`: whether this server pushes notifications to devices, and the key to subscribe with ([notifications.md](notifications.md#api)) |
+| GET, POST | `/api/push/subscriptions` | your devices; a browser's subscription with its name and what it hears (at most 20 devices each) |
+| DELETE | `/api/push/subscriptions/:id` | forgets one of your devices |
+| POST | `/api/push/test` | `{ id? }`: a test to your devices → `{ sent, results }` |
+| PUT, DELETE | `/api/push/mutes/:agent` | mutes or unmutes an agent's notifications for you |
+| GET | `/sw.js`, `/manifest.webmanifest` | **open** · the service worker that shows pushes (no fetch handler: it never intercepts the app), and the web app manifest |
 | GET | `/api/voice` | `{ transcribe, language }`: whether kiln transcribes recordings ([voice.md](voice.md)) |
 | POST | `/api/voice/transcribe?lang=` | body: the recording (`Content-Type: audio/*`, up to 25 MiB) → `{ text }`; 501 not set up, 415 not a recording, 413 too big, 502 the service failed |
 | POST | `/api/hooks/github` | GitHub webhook (HMAC `X-Hub-Signature-256`) → immediate poll |

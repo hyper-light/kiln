@@ -1,0 +1,28 @@
+# F-22 (docs/ci.md W22-AC03, A.8): summary and annotation display limits. What's compared is the
+# annotations each job ends with (their level and message, by step), read from the provider's API.
+name: probe limits
+on: [push, workflow_dispatch]
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: exactly 1 MiB
+        run: head -c 1048576 /dev/zero | tr '\0' 'a' >> "$GITHUB_STEP_SUMMARY"
+      - name: one byte more
+        run: head -c 1048577 /dev/zero | tr '\0' 'b' >> "$GITHUB_STEP_SUMMARY"
+      - name: small, after
+        run: echo "PROBE summary.after=written" && echo "after" >> "$GITHUB_STEP_SUMMARY"
+  annotations:
+    runs-on: ubuntu-latest
+    steps:
+      - name: twelve of each
+        run: |
+          for i in $(seq 1 12); do
+            echo "::error title=e$i::error $i"
+            echo "::warning title=w$i::warning $i"
+            echo "::notice title=n$i::notice $i"
+          done
+      - name: sixty errors
+        run: |
+          for i in $(seq 1 60); do echo "::error title=more$i::more $i"; done
+      - run: echo "PROBE annotations.emitted=yes"

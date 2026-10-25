@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use bytes::Bytes;
+use futures::FutureExt as _;
 use hyper_rt::{RtError, Runtime, RuntimeConfig, SlotHolder, TaskId};
 
 // ------------------------------------------------------------------------------------- sizing
@@ -184,22 +185,24 @@ fn submit_spread(slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
     false
 }
 
-fn spawn_boxed(fut: Boxed) {
+/// Whether the runtime took the task (refused on every shard: dropped, and said so).
+fn spawn_boxed(fut: Boxed) -> bool {
     let slot = handoff(fut);
     if submit(&slot) {
-        return;
+        return true;
     }
     if !on_shard() {
         // Off the runtime (startup, tests): wait out a burst that filled the control queues.
         for _ in 0..2000 {
             std::thread::sleep(Duration::from_millis(2));
             if submit(&slot) {
-                return;
+                return true;
             }
         }
     }
     crate::metrics::global().panics_caught.inc();
     tracing::error!("hyper-rt refused a task on every shard (arenas or control queues full); task dropped");
+    false
 }
 
 /// Wait for a spawned task's output. Dropping the handle detaches the task (it keeps running).
@@ -232,12 +235,26 @@ where
 {
     let (tx, rx) = futures::channel::oneshot::channel();
     let (fut, abort) = futures::future::abortable(fut);
-    spawn_boxed(Box::pin(async move {
+    let _ = spawn_boxed(Box::pin(async move {
         if let Ok(v) = fut.await {
             let _ = tx.send(v);
         }
     }));
     JoinHandle { rx, abort }
+}
+
+/// The runtime as kiln-seams' [`kiln_seams::Spawn`]: a task it can't take is refused, typed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RtSpawn;
+
+impl kiln_seams::Spawn for RtSpawn {
+    fn spawn_boxed(&self, task: futures::future::BoxFuture<'static, ()>) -> Result<(), kiln_seams::spawn::Refused> {
+        if spawn_boxed(task) {
+            return Ok(());
+        }
+        let p = PROFILE.get().copied().unwrap_or_else(Profile::tool);
+        Err(kiln_seams::spawn::Refused::Full { limit: usize::from(p.shards).saturating_mul(p.tasks_per_shard) })
+    }
 }
 
 /// Run `fut` on the next shard round-robin wherever the caller is: spreads accepted connections
@@ -265,12 +282,18 @@ where
     anyhow::ensure!(!on_shard(), "block_on called from inside the runtime");
     rt()?;
     let (tx, mut rx) = hyper_rt::sync::oneshot::<anyhow::Result<T>>().map_err(|e| anyhow::anyhow!("oneshot: {e}"))?;
-    spawn_boxed(Box::pin(async move {
-        let _ = tx.send(fut.await);
+    let _ = spawn_boxed(Box::pin(async move {
+        // A panic says what it was (a failed assertion, in a test), rather than leaving it lost on
+        // the thread that ran it.
+        let out = match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+            Ok(r) => r,
+            Err(p) => Err(anyhow::anyhow!("the task panicked: {}", crate::sup::panic_message(p.as_ref()))),
+        };
+        let _ = tx.send(out);
     }));
     match rx.blocking_recv() {
         Ok(r) => r,
-        Err(_) => anyhow::bail!("the task ended without a result (it panicked or could not start)"),
+        Err(_) => anyhow::bail!("the task ended without a result (it could not start)"),
     }
 }
 
@@ -462,7 +485,29 @@ impl Future for Sleep {
 }
 
 pub fn sleep(d: Duration) -> Sleep {
-    Sleep::until(Instant::now() + d)
+    Sleep::until(kiln_seams::clock::later(Instant::now(), d))
+}
+
+/// Real time, on the runtime's timers, as kiln-seams' [`kiln_seams::Clock`]: what production code
+/// that takes a clock is given (tests give it a `kiln_seams::clock::SimClock`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RtClock;
+
+impl kiln_seams::Clock for RtClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn unix_ms(&self) -> i64 {
+        crate::util::now_ms()
+    }
+    fn sleep_until(&self, deadline: Instant) -> kiln_seams::clock::Sleep {
+        Box::pin(sleep_until(deadline))
+    }
+}
+
+/// The process's real clock.
+pub fn clock() -> Arc<dyn kiln_seams::Clock> {
+    Arc::new(RtClock)
 }
 
 pub fn sleep_until(deadline: Instant) -> Sleep {
@@ -1047,6 +1092,56 @@ mod tests {
             assert_eq!(v, 25);
             let a = resolve("localhost:80").await?;
             assert_eq!(a.port(), 80);
+            Ok(())
+        })
+    }
+
+    /// kiln's runtime passes kiln-seams' Clock suite on real time (CP-M2, AC-M2.2): the clock the
+    /// goal driver and the harness host take their time by in production (AC-M2.1).
+    struct RtClockFixture;
+
+    impl kiln_seams::clock::ClockFixture for RtClockFixture {
+        fn clock(&self) -> Arc<dyn kiln_seams::Clock> {
+            clock()
+        }
+        fn pass(&self, d: Duration) -> futures::future::BoxFuture<'_, ()> {
+            Box::pin(sleep(d))
+        }
+        fn quantum(&self) -> Duration {
+            Duration::from_millis(50)
+        }
+    }
+
+    /// CP-M2, AC-M2.1 and AC-M2.2: production's clock passes the Clock suite.
+    #[test]
+    fn the_runtime_passes_the_clock_suite() -> anyhow::Result<()> {
+        block_on(async {
+            let cases = kiln_seams::clock::cases::<RtClockFixture>();
+            // Each case fails, named, if it hasn't ended in 30 s.
+            let n = kiln_seams::conformance::run_within("Clock (kiln's runtime)", &cases, || async { RtClockFixture }, || sleep(Duration::from_secs(30))).await.into_result().map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(n == cases.len());
+            Ok(())
+        })
+    }
+
+    struct RtSpawnFixture;
+
+    impl kiln_seams::spawn::SpawnFixture for RtSpawnFixture {
+        fn spawner(&self) -> Arc<dyn kiln_seams::Spawn> {
+            Arc::new(RtSpawn)
+        }
+        fn finish<'a, T: Send + 'a>(&'a self, fut: futures::future::BoxFuture<'a, T>) -> futures::future::BoxFuture<'a, Option<T>> {
+            Box::pin(async move { timeout(Duration::from_secs(10), fut).await.ok() })
+        }
+    }
+
+    /// CP-M2, AC-M2.2: kiln's runtime passes the Spawn suite.
+    #[test]
+    fn the_runtime_passes_the_spawn_suite() -> anyhow::Result<()> {
+        block_on(async {
+            let cases = kiln_seams::spawn::cases::<RtSpawnFixture>();
+            let n = kiln_seams::conformance::run_within("Spawn (kiln's runtime)", &cases, || async { RtSpawnFixture }, || sleep(Duration::from_secs(30))).await.into_result().map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(n == cases.len());
             Ok(())
         })
     }

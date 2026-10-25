@@ -1,0 +1,106 @@
+/* Pages agents show (page.tsx): the page itself at the column's width, under a mono eyebrow with
+   its name and two quiet actions. Its box takes its height before a byte of the page comes (the
+   heights the agent's machine measured), so nothing below it moves as it loads. */
+
+.pg {
+  display: block;
+  margin: 6px 0 12px;
+}
+
+.pg-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+}
+.pg-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pg-beam {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+.pg-said {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pg-actions {
+  display: inline-flex;
+  flex: none;
+  gap: 4px;
+  margin-left: auto;
+}
+.pg-action {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 6px;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-decoration: none;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition: color 0.15s;
+}
+/* 40px to tap, without taking more room in the row. */
+.pg-action::before {
+  position: absolute;
+  inset: -8px -2px;
+  content: "";
+}
+/* The last one's reach stays in the row: past its edge, the row would scroll sideways. */
+.pg-action:last-child::before {
+  right: 0;
+}
+.pg-action:focus-visible {
+  outline: 2px solid #bab0e3;
+  outline-offset: 2px;
+}
+@media (hover: hover) {
+  .pg-action:hover {
+    color: var(--color-bright);
+  }
+}
+
+/* The page's box: a hairline, and the prism's rule along its top. The page's own background is
+   transparent, so it sits on the conversation's. */
+.pg-box {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid #1d1f23;
+  border-radius: 8px;
+}
+.pg-box::before {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 1px;
+  background: linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
+  opacity: 0.45;
+  content: "";
+  pointer-events: none;
+}
+.pg-frame {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  /* The same as the console's, so the page's transparent canvas stays transparent. */
+  color-scheme: dark;
+}
+.pg-away {
+  background: #0c0d10;
+}

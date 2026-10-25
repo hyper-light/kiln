@@ -16,11 +16,11 @@ import "./diff.css";
 
 /* ------------------------------------------------------------------ model */
 
-type Kind = "ctx" | "del" | "add";
+export type Kind = "ctx" | "del" | "add";
 /** [start, end) of a run of changed characters in a line. */
-type Span = [number, number];
+export type Span = [number, number];
 
-interface Line {
+export interface Line {
   kind: Kind;
   /** Its number in the old file (unchanged and deleted lines) and in the new one (unchanged and added). */
   o: number | null;
@@ -33,15 +33,15 @@ interface Line {
 }
 
 /** One row of a change block side by side: a deletion's index, an addition's, or nothing. */
-type Pair = [number | null, number | null];
+export type Pair = [number | null, number | null];
 
 /**
  * A hunk is runs of unchanged lines around blocks of changes. A block's pairs line each deletion up
  * with the addition it became (or with nothing), the way the two sides show it side by side.
  */
-type Seg = { t: "ctx"; lines: Line[] } | { t: "chg"; dels: Line[]; adds: Line[]; pairs: Pair[] };
+export type Seg = { t: "ctx"; lines: Line[] } | { t: "chg"; dels: Line[]; adds: Line[]; pairs: Pair[] };
 
-interface HunkModel {
+export interface HunkModel {
   segs: Seg[];
   /** Where it sits in the file, for the hairline above it. */
   where: string;
@@ -249,7 +249,8 @@ function line(kind: Kind, o: number | null, n: number | null, text: string): Lin
   return { kind, o, n, text, hang: hangOf(text) };
 }
 
-function hunkOf(h: Hunk): HunkModel {
+/** A hunk as rows: its unchanged runs and its change blocks, each deletion paired with what it became (the review page reads it too). */
+export function hunkOf(h: Hunk): HunkModel {
   const segs: Seg[] = [];
   let o = h.old_start;
   let n = h.new_start;
@@ -476,21 +477,14 @@ export function FileDiffView({
   }
   const [unfolded, setUnfolded] = React.useState<ReadonlySet<string>>(() => new Set());
   const body = React.useRef<HTMLDivElement>(null);
+  const hunks = diff.hunks;
   const model = React.useMemo(() => {
-    const hunks = diff.hunks.map(hunkOf);
     let last = 1;
-    for (const h of diff.hunks) last = Math.max(last, h.old_start + h.old_lines - 1, h.new_start + h.new_lines - 1);
-    let dels = false;
-    let adds = false;
-    for (const h of hunks)
-      for (const s of h.segs)
-        if (s.t === "chg") {
-          dels ||= s.dels.length > 0;
-          adds ||= s.adds.length > 0;
-        }
-    const only = dels && !adds ? "del" : adds && !dels ? "add" : undefined;
-    return { hunks, digits: Math.max(2, String(last).length), only, stats: diffStats([diff]) };
-  }, [diff]);
+    for (const h of hunks) last = Math.max(last, h.old_start + h.old_lines - 1, h.new_start + h.new_lines - 1);
+    const stats = diffStats([{ hunks }]);
+    const only = stats.del > 0 && stats.add === 0 ? "del" : stats.add > 0 && stats.del === 0 ? "add" : undefined;
+    return { hunks: open ? hunks.map(hunkOf) : [], digits: Math.max(2, String(last).length), only, stats };
+  }, [hunks, open]);
   // Side by side only helps when lines changed on both sides (not in a new file or a pure deletion,
   // whose other column of numbers goes, too).
   const split = layout !== "unified" && !model.only ? (layout === "split" ? "on" : "auto") : undefined;

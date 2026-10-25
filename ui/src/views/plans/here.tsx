@@ -1,8 +1,9 @@
 /**
- * Your plans, in an agent's Plan tab: write one right here, step by step (each with its
+ * Your plans, in an agent's Plan tab: the plans kept with this agent session (written here, made by
+ * the agent, from its goals, or proposed by it). Write one right here, step by step (each with its
  * description, examples, acceptance criteria and testing), keep it, change it, and run it on this
  * agent as one message, step by step, or as goals (each step a /goal once the one before is met).
- * Kept plans are the same ones Agents › Plans lists; everything stays in the page's flow.
+ * Everything stays in the page's flow.
  */
 import * as React from "react";
 import { Link } from "@/lib/router";
@@ -14,7 +15,7 @@ import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { plansRes } from "./data";
+import { sessionPlansRes } from "./data";
 import { PlanItemsEditor } from "./items";
 import "./plans.css";
 
@@ -26,7 +27,10 @@ interface Draft {
   items: PlanItem[];
 }
 
-const MODES: { value: PlanMode; label: string }[] = [
+/** How a plan runs on this agent (one agent per step starts agents of its own: from the plan's page). */
+type HereMode = Exclude<PlanMode, "agents">;
+
+const MODES: { value: HereMode; label: string }[] = [
   { value: "message", label: "One message: the whole plan" },
   { value: "steps", label: "Step by step: a step a turn" },
   { value: "goals", label: "Goals: each step a /goal, the next once it's met" },
@@ -41,10 +45,10 @@ export function PlansHere({ session }: { session: string }) {
 }
 
 function Here({ session }: { session: string }) {
-  const res = useRes(plansRes);
+  const res = useRes(sessionPlansRes(session));
   const [draft, setDraft] = React.useState<Draft | null>(null);
   const [picked, setPicked] = React.useState("");
-  const [mode, setMode] = React.useState<PlanMode>("message");
+  const [mode, setMode] = React.useState<HereMode>("message");
   const [busy, setBusy] = React.useState(false);
   const [note, setNote] = React.useState<string | null>(null);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
@@ -156,7 +160,7 @@ function Here({ session }: { session: string }) {
         v{plan.version} · changed {relativeTime(plan.updated_at)}
         {plan.runs ? ` · run ${plan.runs}×` : ""} · <Link to={planHref(plan.id)}>open in Plans</Link>
       </p>
-      {n > 0 && <SelectField label="Run as" value={mode} onChange={(v) => setMode(v as PlanMode)} options={MODES} />}
+      {n > 0 && <SelectField label="Run as" value={mode} onChange={(v) => setMode(v as HereMode)} options={MODES} />}
       <div className="plan-actions">
         <Button size="sm" variant="secondary" disabled={busy} onClick={() => void run()}>
           {busy ? "Sending…" : "Run here"}

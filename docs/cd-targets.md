@@ -247,7 +247,7 @@ Appendix C does). Every provider gets the same treatment, whether or not it's na
 
 | Provider | Kinds | A sync | Rollouts | Health | Reads |
 | --- | --- | --- | --- | --- | --- |
-| `aws-ecs` | TaskDefinition (immutable revisions), Service | registers a task definition revision, updates the service | ECS's rolling with the circuit breaker and rollback; its blue/green, linear and canary where the account has them; or kiln's steps over weighted ALB target groups | the primary deployment's rollout state; running against desired; target health; CloudWatch alarms | task definition JSON |
+| `aws-ecs` | TaskDefinition (immutable revisions), Service, Parameter (SSM: an app's secrets) | registers a task definition revision, updates the service | ECS's rolling with the circuit breaker and rollback; its blue/green, linear and canary where the account has them; or kiln's steps over weighted ALB target groups | the primary deployment's rollout state; running against desired; target health; CloudWatch alarms | task definition JSON |
 | `aws-lambda` | Function, Version, Alias, FunctionUrl, EventSourceMapping, Permission | updates code (S3 zip or image) and configuration, publishes a version, moves the alias | alias weights: canary, linear | `State`, `LastUpdateStatus`; errors and throttles during steps | SAM `template.yaml` functions |
 | `aws-beanstalk` | Application, ApplicationVersion, Environment | puts the bundle in S3, makes a version, updates the environment | Beanstalk's own policies: all at once, rolling, rolling with an extra batch, immutable, traffic splitting | status and enhanced health (Green, Yellow, Red) | `Dockerrun.aws.json`, `.ebextensions` |
 | `aws-ec2` | LaunchTemplate (versions), AutoScalingGroup | a launch template version with the new image or user data, then an instance refresh | instance refresh: checkpoints, minimum healthy %, skip matching, rollback, alarms | refresh status, instance and target health | — |
@@ -423,8 +423,9 @@ rollouts, and past Argo Rollouts, which is Kubernetes only. §5.2 compares the t
 Rollouts' code; §5.3 says what each platform's API allows.
 
 **Built so far.** The state machine is the same for every platform. The server drives it on
-**Lambda aliases** for now: canary, linear and blue/green, with `http`, `metric` (Prometheus) and
-`approve` checks. A rollout that names a check of another kind is refused before any traffic
+**Lambda aliases** for now: canary, linear, blue/green and all-at-once, with `http`, `metric`
+(Prometheus) and `approve` checks. On Kubernetes, **kiln's own deploy** is health-gated: its guard
+watches an all-at-once rollout's after checks (§10). A rollout that names a check of another kind is refused before any traffic
 moves. Not built yet: the other platforms of §5.3 (Workers, Vercel and ECS come next), `script` and
 `workflow` checks, metric backends other than Prometheus, `http` checks from runners (`from:`),
 secrets in checks, and notifications.
@@ -435,7 +436,7 @@ secrets in checks, and notifications.
 
 | Strategy | What happens |
 | --- | --- |
-| `all-at-once` | the default |
+| `all-at-once` | the default. With `after:` checks, they watch it for `window` (10 minutes) once it has all the traffic, and a failure goes back to blue: for what can't run two versions side by side, as kiln's own server can't (one writer on its data) |
 | `rolling` | batches with a maximum unavailable, for instance-based targets |
 | `blue-green` | green starts beside blue with an address of its own; checks run against it, then traffic switches, then checks run against production; blue stays warm to switch back to |
 | `canary` | steps: weights, pauses, checks, approvals |
@@ -697,10 +698,12 @@ Gateway API's types.
   Appendix C).
 - **Clusters in clouds.** EKS takes a token from STS; GKE and AKS take access tokens from their
   account. Any cluster with structured authentication can trust kiln's issuer directly.
-- **Runtime secrets.** An app's secrets are references into the platform's store: Secrets Manager,
-  Secret Manager, Key Vault, Workers secrets, Vercel environment variables. kiln manages them as
-  objects whose values come from W09 secrets. They are masked in diffs and plans, and compared by
-  hash.
+- **Runtime secrets.** An app's secrets (deploy-api.md §3.5) go to each platform its own way:
+  Lambda's environment variables, SSM SecureString parameters an ECS task reads, Workers' secret
+  bindings, Vercel's sensitive variables. The objects kiln applies hold references
+  (`kiln-secret:…`) the provider resolves from kiln's secrets service as it applies them, so no
+  value is in a desired object, a record, a plan or a view; each compares as kiln's while the
+  platform's own revision of it is the one kiln left.
 - **Least privilege.** Each provider documents the permissions it needs: read alone for shadow
   mode, write for syncs. Setup generates the policy for each.
 - **Agents (D6).** By default only people sync, roll back and approve; an agent can plan, and can
@@ -874,11 +877,36 @@ a rollout: that changes nothing that runs.
    4. You approve, from the UI or your phone.
    5. kiln syncs, and restarts into the new version.
 5. **Self-deploy safety.** A sync that changes kiln's own Deployment can't watch its own restart.
-   - Before applying, kiln creates a **guard** Job (a hook, running the *previous* kiln image).
-   - The guard waits for the new server to become ready within a deadline. If it doesn't, the
-     guard puts the previous image back and records why.
-   - When the new server starts, it finds the sync it inherited and finishes it, as restart
-     safety already allows.
+   kiln can't run beside itself either (one writer on its data), so it takes over all at once and
+   then has to prove itself before its deploy stands.
+   - Before applying, kiln creates a **guard** Job (a hook, running the *previous* kiln image) and
+     tells it what to watch: the app's `rollout: all-at-once: { after, window }`, or five minutes
+     with no checks of its own when the app says none. A rollout kiln's deploy can't do (canary,
+     blue/green, an approval with nobody there while kiln restarts) stops the sync before it
+     applies.
+   - The guard waits for the new server's pods to be available within a deadline (10 minutes),
+     and gives up sooner when their containers keep restarting.
+   - Then it watches them for the window. The pods must stay available, and none of their
+     containers may restart. kiln's server in them must not be started again by its supervisor,
+     after a crash or the kernel's OOM killer, which a pod's status doesn't show: the guard reads
+     kiln's report of itself, `/healthz/server`, on each pod. The after checks must pass, each
+     measured by its own timing and limits as in any rollout. One that can't tell fails, since
+     nobody is there to decide.
+   - Anything failing puts the previous image back. The annotation `kiln.dev/guard` says how the
+     watch goes (`watching`, until when), then how it ended (`ready` or `rolled-back`), why, and
+     each check's record.
+   - The server that runs afterwards finishes the record once the guard has said: the deployment
+     succeeded and stayed healthy for its window, or failed with the guard's reason. Until then
+     the deploy isn't over.
+   - `/healthz/server` answers with the commit the server runs, how long it has been up, how many
+     times its supervisor started it again, its container's memory (from its cgroup: the working
+     set, the limit, the share, the peak, the OOM killer's kills), and its runners: connected now,
+     connected just before it started, and the share back. Numbers and the commit only, so it is
+     open, as `/healthz` is.
+   - kiln's own `.kiln/deploy.yaml` watches ten minutes. It checks that `/readyz` answers, that the
+     server isn't started again and the OOM killer doesn't strike, that its memory stays under 80%
+     of its limit, that it runs the commit deployed, and that three minutes in, at least half of
+     the runners connected before are back.
    - `deploy-image.sh` stays as break-glass, documented.
 6. **Runners** keep following the server's build (releases.md). A later `kiln-runners` provider
    could make that a CD rollout (batches, health per runner), outside this work.
@@ -939,15 +967,21 @@ Agreed with the Kiln CI work on 2026-10-18:
 | --- | --- |
 | This design | agreed 2026-10-18 |
 | Registries (§7.1): `oci` integrations, any OCI registry, private or public, tag → digest, indexes' platforms, pull secrets | built; checked against a fake token-auth registry and Docker Hub |
-| Artifacts (§1.3): images resolved per revision, in render keys and sources (`${{ artifacts.* }}`, in plain manifests too), recorded with each deployment, a rollback's exactly as recorded; plans ask no registry | built; checked on the test cluster |
+| Artifacts (§1.3): images resolved per revision, in render keys and sources (`${{ artifacts.* }}`, in plain manifests too), recorded with each deployment, a rollback's exactly as recorded and never waiting on the head's (git's head may be what broke, or its image still building); plans ask no registry | built; checked on the test cluster |
 | Published images (§7.1, §10): local Docker (loaded into the cluster's nodes by the image pipeline) or a registry, set in the UI (Settings → Deployments) | built; checked on the test cluster |
 | `.kiln/deploy.yaml` from kiln's repositories at trunk, apps registered and removed with the file | built; checked on the test cluster |
 | Agents deploy only where people let them (D6) | built; checked |
 | kiln deploying itself, with the guard (§10) | built and live (2026-10-18); production's three apps registered from `.kiln/deploy.yaml`, differing from Argo CD's objects only by kiln's tracking marks; the move off Argo CD waits for your go-ahead |
+| Health-gated self-deploys (§10): the guard's window, its own watch of pods and kiln's server, the app's after checks (all-at-once), `/healthz/server`, kiln's checks in its deploy file | built; the guard checked end to end on the test cluster against a stand-in server (kept when healthy; put back when its server restarts, its memory nears its limit, its container restarts, or it can't start; let go when someone else deploys). Production's first deploy with it is still guarded by the previous version's guard |
 | Accounts (§6, W11): AWS (SigV4, AssumeRoleWithWebIdentity), Google Cloud (STS, then impersonation), Azure (client assertion) from kiln's identity; Cloudflare and Vercel tokens; Verify; the issuer's documents served while any account federates | built; checked against AWS's signing examples and fakes of each service; no real account yet (D8) |
 | The provider framework (§1, §2): targets as clusters, kinds and scopes, polling (60 s at rest, 3 s while a sync changes a kind), request budgets, what kiln applied kept and read back (drift as §2.4 says), tracking in tags, credentials per app's workload | built; checked against fakes |
 | Workflow artifacts (§7): a file a run uploaded, by its hash; zips opened; Lambda zips through kiln's bucket in the account | built; checked against fakes |
 | `aws-ecs`, `aws-lambda`, `cloudflare-workers` (Durable Object migrations, deletes confirmed in git), `vercel` (prebuilt output) | built; each driven through its whole life (create, change, drift, delete) against a fake of its API; not yet against a real account (D8) |
 | The builder (§8.2): New app on Deployments (platform, account, discovery and adoption, settings, artifacts, sync, the YAML checked and rendered, kept in kiln); Settings → Deployments → Accounts | built; typechecked and linted, not yet walked through in a browser |
 | Rollouts (§5): canary, linear and blue/green compiled from the deploy file; checks with Argo Rollouts' limits, errors, streaks, dry runs and a timeout on every measurement; traffic held to the step and to green being ready; the progress deadline; promote, promote fully, pause, resume, abort, retry; newer revisions superseding; first deploys and rollbacks going straight; an id on every request | the state machine built, and checked by 21 tests against a simulated platform (§5.2 compares it with Argo Rollouts' code). The server's side (keeping rollouts, the checks' executors, each platform's traffic, the panel) not built yet |
-| Import in bulk and shadow mode for providers (§8.3), the rest of §3's providers (M2 to M4) | not built yet |
+| `cloudformation` (a stack changed through change sets CloudFormation works out first, its rollback on failure; a template kept as its text, through kiln's bucket past 51,200 bytes), `aws-beanstalk` (an application, versions named for their bundles, an environment updated by Beanstalk's own deployment policy), `aws-ec2` (launch template versions, the group moved by an instance refresh, with AutoRollback), `aws-static` (each release's files under a prefix of their own, unchanged ones copied over in S3, CloudFront's origin path switched and invalidated) | built (2026-10-22); each driven through releases (the first, the same again, the next, one that fails, a rollback to the release before, delete) against a fake of its API; not yet against a real account (D8) |
+| `gcp-run` (each release's template a revision named for its content, all the traffic to it once it started; a rollback moves the traffic back to the revision Cloud Run kept, the template left as it is; Knative's `service.yaml` read into v2's shape; health from the routes, so a failed revision with no traffic leaves the service healthy), `gcp-functions` (the zip CI built uploaded to the URL Cloud Functions signs, built and rolled out by Cloud Functions; a rollback deploys the earlier source again), `gcp-appengine` (a version per release named for its content, from the zip in the app's staging bucket, the service's split moved to it; `app.yaml` read into the Admin API's Version; the default service and a version with traffic never deleted), `gcp-compute` (an instance template per release's properties, kept for rollbacks, the managed instance group's version moved to it at its fingerprint and rolled out by its update policy; health from the group and listErrors) | built (2026-10-23); each driven through releases (the first, the same again, the next, one that fails, a rollback to the release before, delete; drift in Cloud Run's traffic and a function's source) against a fake of its API; not yet against a real account (D8). Cloud Run's traffic moves all at once: kiln's stepped rollouts (§5) and tagged previews on it are not built yet |
+| `azure-containerapps` (Multiple revision mode, each release's revision named for its template, the ingress traffic to it, or without ingress the one kiln keeps active; a rollback moves the traffic back, activating its revision again if it was let go), `azure-appservice` and `azure-functions` (kiln's app settings and site config merged in, then an image or a zip deployed through the app's SCM site; with a slot, deployed there and swapped in, so going back to the release before is one swap; apps made with their plans, outside kiln), `azure-vmss` (the model moved to each release's image under a rolling upgrade policy; health from the instances on the model and the upgrade), `azure-static` (each release's zip in kiln's storage account, made the first time and signed with a SAS Resource Manager makes, deployed from a URL signed to read it) | built (2026-10-23); each driven through releases (the first, the same again, the next, one that fails, a rollback to the release before, delete; drift in a function app's deployment) against a fake of Azure; not yet against a real account (D8) |
+| `cloudflare-pages` (each release's files uploaded as wrangler's direct upload sends them, named by their BLAKE3 hashes, only those Pages lacks, then deployed to production), `fly` (the app's machines rolled onto each release one at a time under a lease, as flyctl's rolling strategy does, a machine that doesn't start stopping the rollout; `fly.toml` read into the Machines API's config), `netlify` (a deploy naming each file by its SHA-1, only the files Netlify lacks uploaded), `render` (a deploy of each release's image or commit), `heroku` (each release's source tarball built into a release; config vars kiln sets), `digitalocean` (each release's app spec from `.do/app.yaml`, a service's image set); for each, a rollback to a release kiln deployed before is the platform's own: Pages' rollback, Netlify's restore, Render's rollback to a deploy, Heroku's rollback to a release, App Platform's rollback to a deployment, Fly's machines rolled back | built (2026-10-23); each driven through releases (the first, the same again, the next, one that fails, a rollback to the release before, delete) against a fake of its API; not yet against a real account (D8). A Render service is deployed to, not made: making one needs a plan and region kiln doesn't choose |
+| `nomad` (each release registered as a job version, HCL parsed by Nomad itself, kiln waiting for that version's own deployment; a rollback reverts to the version kiln registered), and the providers that act through kiln's runners (§2.2): `terraform` and OpenTofu (init, the workspace and apply in a job on a runner with the tool, at the release's commit), `pulumi` (the stack selected, its config set and brought up the same way), `job` (one of the repository's workflows, or one job of it and the jobs it needs, run at the release's commit with its inputs), `host` (a systemd user unit, a launch agent or a Windows service on each runner the target's selector picks, a batch at a time, each host fetching the release's files from a link kiln signs into a directory of their own; a rollback switches back to its directory), `compose` (the project's file brought up with `docker compose up --wait` on each host, taken down when it goes), `microvm` (each host's job bound to an environment of its own, kind `microvm`, where the deploy action boots the image blue/green on the runner; taken down when it goes). Each release is a run kiln writes and follows; the same release again runs nothing | built (2026-10-23); `nomad` against a fake of its API, the runners' providers against fake runners (each job kiln writes, its runners and batches, a run that fails, a rollback to the release before); not yet against a real Nomad or real tools on runners. Terraform and Pulumi plans as objects (their resource changes in kiln's diff) are not built yet: a release applies, and its run's log says what changed. In production the runners' providers need the new CI engine (`[ci] enabled`) |
+| Import in bulk and shadow mode for providers (§8.3), `railway` | not built yet |

@@ -36,6 +36,10 @@ namespaces:
 ports:
   http: 7070   # TCP: UI, REST/WebSocket API, /metrics, /healthz, /readyz, agent enrollment
   quic: 7071   # UDP: QUIC agent transport
+  # UDP: WebRTC to live pages' viewers (docs/previews.md, "WebRTC"). 0 = off: viewers take streams
+  # over their WebSocket. On, viewers must reach it: set webrtcAdvertise to the address they dial
+  # (e.g. a forward to externalService.nodePorts.webrtc).
+  webrtc: 0
 
 # Addresses. Job pods ALWAYS use the in-cluster Service (kubernetes.server_url/server_quic are
 # derived from it). public_url / quic_advertise are what humans and the "join agent" command
@@ -44,6 +48,9 @@ ports:
 # Empty → the in-cluster Service address.
 publicURL: ""
 quicAdvertise: ""
+# `host:port`s viewers reach WebRTC at (ports.webrtc), e.g. ["192.168.1.50:7072"]. Empty → the
+# pod's own addresses, which only viewers inside the cluster reach.
+webrtcAdvertise: []
 # Extra DNS names / IPs for the server certificate (QUIC mTLS). The Service names
 # (<fullname>, <fullname>.<ns>, <fullname>.<ns>.svc[.cluster.local]) are always included.
 # Add the external host/IP that bare-metal agents dial.
@@ -211,6 +218,7 @@ externalService:
   nodePorts:
     http: 30070   # TCP
     quic: 30071   # UDP
+    webrtc: 30072 # UDP, with ports.webrtc
   loadBalancerIP: ""
   loadBalancerSourceRanges: []
   # Local keeps client source IPs and avoids an extra hop for QUIC; requires a server pod on

@@ -1,0 +1,106 @@
+# F-22 (docs/ci.md W22-AC03, A.8): 51 calls of reusable workflows, 1 of them different (make_reusable.py).
+name: probe reusable same-51
+on: [push, workflow_dispatch]
+jobs:
+  c01:
+    uses: ./.github/workflows/u01.yml
+  c02:
+    uses: ./.github/workflows/u01.yml
+  c03:
+    uses: ./.github/workflows/u01.yml
+  c04:
+    uses: ./.github/workflows/u01.yml
+  c05:
+    uses: ./.github/workflows/u01.yml
+  c06:
+    uses: ./.github/workflows/u01.yml
+  c07:
+    uses: ./.github/workflows/u01.yml
+  c08:
+    uses: ./.github/workflows/u01.yml
+  c09:
+    uses: ./.github/workflows/u01.yml
+  c10:
+    uses: ./.github/workflows/u01.yml
+  c11:
+    uses: ./.github/workflows/u01.yml
+  c12:
+    uses: ./.github/workflows/u01.yml
+  c13:
+    uses: ./.github/workflows/u01.yml
+  c14:
+    uses: ./.github/workflows/u01.yml
+  c15:
+    uses: ./.github/workflows/u01.yml
+  c16:
+    uses: ./.github/workflows/u01.yml
+  c17:
+    uses: ./.github/workflows/u01.yml
+  c18:
+    uses: ./.github/workflows/u01.yml
+  c19:
+    uses: ./.github/workflows/u01.yml
+  c20:
+    uses: ./.github/workflows/u01.yml
+  c21:
+    uses: ./.github/workflows/u01.yml
+  c22:
+    uses: ./.github/workflows/u01.yml
+  c23:
+    uses: ./.github/workflows/u01.yml
+  c24:
+    uses: ./.github/workflows/u01.yml
+  c25:
+    uses: ./.github/workflows/u01.yml
+  c26:
+    uses: ./.github/workflows/u01.yml
+  c27:
+    uses: ./.github/workflows/u01.yml
+  c28:
+    uses: ./.github/workflows/u01.yml
+  c29:
+    uses: ./.github/workflows/u01.yml
+  c30:
+    uses: ./.github/workflows/u01.yml
+  c31:
+    uses: ./.github/workflows/u01.yml
+  c32:
+    uses: ./.github/workflows/u01.yml
+  c33:
+    uses: ./.github/workflows/u01.yml
+  c34:
+    uses: ./.github/workflows/u01.yml
+  c35:
+    uses: ./.github/workflows/u01.yml
+  c36:
+    uses: ./.github/workflows/u01.yml
+  c37:
+    uses: ./.github/workflows/u01.yml
+  c38:
+    uses: ./.github/workflows/u01.yml
+  c39:
+    uses: ./.github/workflows/u01.yml
+  c40:
+    uses: ./.github/workflows/u01.yml
+  c41:
+    uses: ./.github/workflows/u01.yml
+  c42:
+    uses: ./.github/workflows/u01.yml
+  c43:
+    uses: ./.github/workflows/u01.yml
+  c44:
+    uses: ./.github/workflows/u01.yml
+  c45:
+    uses: ./.github/workflows/u01.yml
+  c46:
+    uses: ./.github/workflows/u01.yml
+  c47:
+    uses: ./.github/workflows/u01.yml
+  c48:
+    uses: ./.github/workflows/u01.yml
+  c49:
+    uses: ./.github/workflows/u01.yml
+  c50:
+    uses: ./.github/workflows/u01.yml
+  c51:
+    uses: ./.github/workflows/u01.yml

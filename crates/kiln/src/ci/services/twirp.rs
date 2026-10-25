@@ -140,7 +140,7 @@ async fn create(hub: &Hub, c: &Claims, body: &Value, origin: &str) -> anyhow::Re
     let made = hub
         .store
         .call(move |db| {
-            let tx = db.transaction()?;
+            let tx = crate::store::tx(db)?;
             let existing: Option<(i64, bool)> = tx.query_row("SELECT id, finalized = 1 FROM ci_artifacts WHERE run_id = ?1 AND name = ?2", params![run, n], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
             match existing {
                 Some((_, true)) => return Ok(Err("an artifact with this name already exists on the workflow run")),

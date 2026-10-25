@@ -29,10 +29,18 @@ export interface Me {
   authenticated: boolean;
   version: string;
   hostname: string;
+  /** Who is signed in: the owner, a person, or a token's or agent's principal. */
+  kind?: "owner" | "user" | "pat" | "agent" | "job" | "peer" | null;
+  /** Each capability held: on the whole server, or only somewhere (a repository, …). */
+  can?: Record<string, "server" | "some">;
   /** Where the server says it is reachable from other devices. */
   public_url?: string;
   /** Its runners' front doors (`https://kiln.home`, …). */
   origins?: string[];
+  /** Where pages agents show are served, when not here (docs/previews.md). */
+  pages_url?: string | null;
+  /** The groups the person is in: kiln's (`shop`), and their identity providers' (`github:acme/platform`), as an app's owner teams name them. */
+  groups?: string[];
 }
 
 export interface Repo {
@@ -46,6 +54,8 @@ export interface Repo {
   created_at: number;
   last_polled_at: number | null;
   last_error: string | null;
+  /** `native`: kiln hosts it (W14); `upstream`: kiln follows another host's. */
+  mode?: string;
 }
 
 export interface Run {
@@ -65,6 +75,9 @@ export interface Run {
   finished_at: number | null;
   error: string | null;
   concurrency_group: string | null;
+  /** The runners and executors its legs ran on (the runs list's facets). */
+  runners?: string[];
+  executors?: string[];
 }
 
 export interface Step {
@@ -132,6 +145,8 @@ export interface Job {
   cpu_seconds: number | null;
   steps: Step[];
   spec?: PlannedJob;
+  /** A CI matrix leg's values, by axis. */
+  matrix?: Record<string, unknown>;
 }
 
 export interface HostSample {
@@ -147,6 +162,17 @@ export interface HostSample {
   net_rx: number;
   net_tx: number;
   procs: number;
+}
+
+/** A machine's battery, when it has one (its runner says, about once a minute). */
+export interface Battery {
+  /** How full, 0–100. */
+  percent: number;
+  /** It runs on its charger (false: on battery). */
+  ac: boolean;
+  charging: boolean;
+  /** Minutes left on battery, when the machine says. */
+  minutes?: number | null;
 }
 
 export interface Agent {
@@ -166,12 +192,24 @@ export interface Agent {
   busy: number;
   draining: boolean;
   sample: HostSample | null;
+  /** Its battery, when it has one. */
+  battery?: Battery | null;
+  /** What its QUIC layer let go before the wire, by lane and reason, as it last said; and what the server's let go of what it had for it (docs/wire.md, "Loss below the channel"). */
+  dropped?: NetDrop[];
+  dropped_toward?: NetDrop[];
   /** While a new runner replaces an old one without a restart: both processes, newest first. */
   instances?: RunnerInstance[];
   /** An outpost (`kiln outpost`): kiln run where it isn't installed. It takes no jobs and the server doesn't upgrade it. */
   outpost?: boolean;
   /** What its probes found and its administrator declared (docs/ci.md W13-R01, R02): what routing decides over. */
   facts?: RunnerFacts;
+}
+
+/** Frames a QUIC layer let go of one lane, for one reason: shed, stuck, refused, closed, ended or chaos. */
+export interface NetDrop {
+  lane: string;
+  reason: string;
+  frames: number;
 }
 
 /** A runner's facts (kiln_ci::facts::RunnerFacts). */
@@ -244,15 +282,19 @@ export interface OverviewStats {
 export interface Overview {
   stats: OverviewStats;
   queue: { queued: number; running: number };
-  agents: { connected: number; total: number; slots: number; busy: number };
+  /** `null` for a person of some repositories (W10): runners are the server's. */
+  agents: { connected: number; total: number; slots: number; busy: number } | null;
   system: {
     version: string;
     uptime_s: number;
-    hostname: string;
+    /** `null` for a person of some repositories. */
+    hostname: string | null;
     generation: number;
     children: Child[];
     sample: HostSample | null;
   };
+  /** The repositories it covers, for a person of some of them (W10); absent, it is the whole server's. */
+  narrowed?: string[];
 }
 
 export interface RunDetail {
@@ -343,6 +385,167 @@ export interface SystemInfo {
   config: Record<string, unknown>;
 }
 
+/** What a conversation store's writer last saw of its file (docs/conversations.md, "Telemetry"). Times are unix ms. */
+export interface ConvoFile {
+  at: number;
+  bytes: number;
+  /** The part of the file free for what comes next. */
+  free: number;
+  wal: number;
+  /** Its last write number: how many writes it has had. */
+  top: number;
+  /** When it last saw `top` change (0: not since its kiln started). */
+  wrote_at: number;
+  sessions?: number;
+  upkeep: ConvoUpkeep;
+  compacted?: { at: number; before: number; after: number; ms: number };
+  pruned?: { at: number; lines: number };
+}
+
+/** What a store does to its file while it has nothing else to do. */
+export type ConvoUpkeep =
+  | { state: "idle" }
+  | { state: "squeezing" }
+  | { state: "pruning"; lines: number }
+  | { state: "compacting"; phase: "copy" | "catch_up" | "count" | "swap"; table?: string; copied: number; of: number; began: number };
+
+/** A store's counters since its kiln started, and its file. */
+export interface ConvoStoreReport {
+  id: string;
+  commits: number;
+  rows: number;
+  jobs: number;
+  busy_ms: number;
+  dropped: number;
+  timeouts: number;
+  /** Reads by how long they waited: under 1 ms, 2, 4, … ms. */
+  waits: number[];
+  file: ConvoFile;
+}
+
+/** Where a feed's sending side stands. */
+export interface ConvoShip {
+  up: boolean;
+  acked: number | null;
+  sent: number;
+  flight: number;
+  batches: number;
+  rows: number;
+  bytes: number;
+  last_sent: number | null;
+  last_ack: number | null;
+  hellos: number;
+  stalls: number;
+}
+
+/** Where the server's side of a runner's feed stands. */
+export interface ConvoPeer {
+  machine: string;
+  store: string;
+  rev: number;
+  hello_at: number;
+  batches: number;
+  rows: number;
+  fenced: number;
+  left: number;
+  bytes: number;
+  gaps: number;
+  errors: number;
+  last_batch: number;
+  take_ms: number;
+  copy?: boolean;
+}
+
+export type ConvoState = "live" | "in_sync" | "catching_up" | "behind" | "offline" | "feeding" | "no_store";
+
+/** One conversation store as the server's board shows it: its own, a runner's, or a mirror's copy. */
+export interface ConvoStore {
+  /** `server`, `<machine>/<store>`, `mirror:<machine>`, or `<machine>/` (a machine that keeps none). */
+  key: string;
+  role: "server" | "runner" | "mirror";
+  machine: string;
+  id: string | null;
+  version: string | null;
+  connected: boolean;
+  state: ConvoState;
+  heard: number | null;
+  report: ConvoStoreReport | null;
+  feed?: { rev: number; top: number | null; behind: number | null; at: number; intake: ConvoPeer | null; ship: ConvoShip | null };
+  mirror?: { chosen_at: number; last_seen: number; ship: ConvoShip; behind: number | null };
+  /** Per second over the last minute; `busy` 0–1. */
+  rates: { writes: number | null; batches: number | null; wire: number | null; busy: number | null };
+  /** Writes per second over the last ten minutes. */
+  spark: (number | null)[];
+}
+
+export interface ConvoNote {
+  at: number;
+  key: string;
+  level: "info" | "warn" | "error";
+  text: string;
+}
+
+export type ConvoRestore =
+  | { state: "idle" }
+  | { state: "asked"; from: string; at: number }
+  | { state: "copying"; from: string; store: string; at: number }
+  | { state: "done"; from: string; sessions: number; at: number }
+  | { state: "failed"; from: string; error: string; at: number };
+
+/** `GET /api/conversations/status`. */
+export interface ConvoStatus {
+  at: number;
+  on: boolean;
+  mirrors_wanted: number;
+  restore: ConvoRestore;
+  stores: ConvoStore[];
+  /** Newest first. */
+  notes: ConvoNote[];
+}
+
+/** `GET /api/conversations/series`: one store's series, a column each; `t` in unix seconds. */
+/** A line of the replication log (`GET /api/conversations/log`): what moved between the stores
+ * since the board's sample before (`batch`: a runner's store into the server's; `restore`: a mirror's
+ * copy sent back; `ship`: the server's store to a mirror's copy), or what happened to one (`note`). */
+export interface ConvoLogLine {
+  at: number;
+  /** Its store's key on the board (`fedora/abc`, `server`, `mirror:adacachy`). */
+  key: string;
+  kind: "batch" | "restore" | "ship" | "note";
+  level: "info" | "warn" | "error";
+  text: string;
+  moved?: { batches: number; rows: number; bytes: number; rev: number | null };
+}
+
+/** The replication log, newest first; `total` lines kept, `matched` of them have what was searched. */
+export interface ConvoLog {
+  at: number;
+  total: number;
+  matched: number;
+  lines: ConvoLogLine[];
+}
+
+export interface ConvoSeries {
+  key: string;
+  step: number;
+  t: number[];
+  bytes: (number | null)[];
+  free: (number | null)[];
+  wal: (number | null)[];
+  sessions: (number | null)[];
+  writes: (number | null)[];
+  commits: (number | null)[];
+  busy: (number | null)[];
+  p50: (number | null)[];
+  p99: (number | null)[];
+  timeouts: (number | null)[];
+  dropped: (number | null)[];
+  behind: (number | null)[];
+  batches: (number | null)[];
+  wire: (number | null)[];
+  up: number[];
+}
+
 /** A row of the audit log (docs/ci.md W19-R05). `actor` is v1's: the principal, and for whom. */
 export interface AuditEntry {
   id: number;
@@ -370,6 +573,7 @@ export interface NewRepo {
 /* ---------------------------- WebSocket frames ---------------------------- */
 
 export type ServerEvent =
+  | { type: "resync" }
   | { type: "run"; run: Run }
   | { type: "job"; job: Job }
   | { type: "agent"; agent: Agent }
@@ -386,7 +590,7 @@ export type ServerEvent =
   | { type: "harness"; info: AgentInfo }
   /** An agent session kiln ran is gone. */
   | { type: "harness_closed"; id: string }
-  /** Settings → Updates changed: refetch GET /api/updates. */
+  /** System → Updates changed: refetch GET /api/updates. */
   | { type: "updates" }
   /** An upgrade moved on (new output, or it finished). */
   | { type: "update_job"; job: UpdateJob }
@@ -401,7 +605,13 @@ export type ServerEvent =
   /** A rollout of an app's object on a target moved on: refetch GET /api/cd/apps/:app/rollout. */
   | { type: "cd_rollout"; app: string; id: string }
   /** What machines hold, or a task moving a repository between them, changed: refetch GET /api/places. */
-  | { type: "places" };
+  | { type: "places" }
+  /** Your notifications changed (a device, a mute, a delivery): refetch GET /api/push and its devices. */
+  | { type: "push" }
+  /** Someone marked notices (`principal`: whose; `tags`: agents whose shown notifications go): notices.ts. */
+  | { type: "notices"; principal: string; keys: string[]; how: "away" | "done" | "seen"; at: number; tags?: string[] }
+  /** An agent's change request opened or moved on (`agents.change`, review, CI): refetch GET /api/harness/changes. */
+  | { type: "agent_change"; agent: string };
 
 /* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
 
@@ -540,7 +750,7 @@ export interface FrontDoorView {
   ca: { subject: string; sha256: string; not_after: number } | null;
 }
 
-/* ---------------------------- updates (Settings → Updates) ---------------------------- */
+/* ---------------------------- updates (System → Updates) ---------------------------- */
 
 export interface UpdateJob {
   id: string;
@@ -548,8 +758,8 @@ export interface UpdateJob {
   /** The machine, or "server". */
   target: string;
   /** native: the runner's own upgrade command · terminal: through a terminal on an older runner ·
-   * build: the machine builds the newest kiln itself · restart: Kubernetes rollout restart ·
-   * replace: the server's binary replaced. */
+   * build: the newest kiln built from the server's source (on the machine itself, or on `on`) ·
+   * restart: Kubernetes rollout restart · replace: the server's binary replaced. */
   method: "native" | "terminal" | "build" | "restart" | "replace";
   state: "running" | "done" | "failed";
   started_at: number;
@@ -558,10 +768,14 @@ export interface UpdateJob {
   to_build: string | null;
   /** The commit it brings the machine to, when kiln knows it. */
   commit?: string;
+  /** A build's: the machine that builds it, when another than the runner's own; the runner downloads that build. */
+  on?: string;
   /** The machine reported running to_build. */
   reached: boolean;
   log: string[];
   error: string | null;
+  /** kiln stopped waiting for it: which of the upgrade waits ran out. */
+  timed_out?: "upgrade" | "jobs" | "build";
 }
 
 /** A kiln binary the server can hand out. */
@@ -669,6 +883,66 @@ export interface RunnerUpdate {
   waits_on?: ReleaseWait | null;
   /** Its kiln checkout, as it reports it. */
   checkout?: string | null;
+  /** The ways it can be upgraded to the newest kiln now, each with what it does or why it can't
+   * (empty when it runs the newest, or kiln knows no newest). Older servers omit it. */
+  ways?: UpgradeWayOpen[];
+}
+
+/** How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built from
+ * the server's source, on the machine itself or, for a Mac that can't, on another machine whose
+ * build it then downloads. */
+export type UpgradeWay = "download" | "build";
+
+/** What a diagnosis found about a runner (`GET /api/agents/:name/diagnose`, docs/releases.md). */
+export interface RunnerFinding {
+  /** What was checked (`disk.work`, `upgrade.last`, …). */
+  id: string;
+  level: "ok" | "info" | "warn" | "fail";
+  title: string;
+  /** What was seen in more words, or a log's last lines. */
+  detail?: string;
+  /** The repair that fixes it, when kiln can make it (`POST /api/agents/:name/repair`). */
+  fix?: { action: string; label: string; way?: UpgradeWay };
+}
+
+/** A runner diagnosed: what the server knows, and what the machine found about itself. */
+export interface RunnerDiagnosis {
+  runner: string;
+  /** Unix ms. */
+  at: number;
+  worst: RunnerFinding["level"];
+  /** Worst first. */
+  findings: RunnerFinding[];
+  /** The machine looked at itself too (else `why` says why not). */
+  machine_checked: boolean;
+  why: string | null;
+}
+
+/** A repair's outcome: what it did, or the upgrade it started. */
+export interface RunnerRepair {
+  ok: boolean;
+  action: string;
+  message?: string | null;
+  job?: UpdateJob;
+}
+
+export interface UpgradeWayOpen {
+  way: UpgradeWay;
+  ok: boolean;
+  /** What it does ("downloads build 493003c712b0"), or why it can't. */
+  why: string;
+  /** A build's: the machine it's made on, when another than the runner's own. */
+  on?: string;
+}
+
+/** How long kiln waits on a runner's upgrade before it calls it failed, in minutes. */
+export interface UpgradeWaits {
+  /** To switch to the new build and report in, once the runner has no jobs running. */
+  upgrade_minutes: number;
+  /** While the runner finishes the jobs it is running (it switches only once they are done). */
+  wait_for_jobs_minutes: number;
+  /** For a machine to build kiln itself, install included. */
+  build_minutes: number;
 }
 
 /** A release run building what a runner waits for: its job's step under way, since when, and where. */
@@ -698,6 +972,8 @@ export interface UpdatesOverview {
   newest?: FleetTarget | null;
   /** Every runner follows the newest kiln on its own (`[updates] follow`). */
   follow?: boolean;
+  /** How long upgrades are waited on now, what kiln.toml says, and whether they were changed here. Older servers omit it. */
+  waits?: { now: UpgradeWaits; config: UpgradeWaits; changed: boolean };
 }
 
 export type LogControlFrame = { type: "step"; idx: number; status: Status } | { type: "end" };
@@ -1345,6 +1621,28 @@ export interface SyncCopyStatus {
   looked?: boolean;
   /** It waits to take the group's files (a folder kiln just cloned). */
   adopting?: boolean;
+  /** The contents it moved with the server since its runner started (older runners: none). */
+  traffic?: SyncTraffic;
+  /** How long the last change from another machine took to reach its folder, in ms. */
+  lag_ms?: number | null;
+}
+
+/** What a copy moved with the server since its runner started. */
+export interface SyncTraffic {
+  sent: number;
+  sent_bytes: number;
+  fetched: number;
+  fetched_bytes: number;
+  /** Transfers that failed, and those tried again after. */
+  failed: number;
+  retried: number;
+  /** Contents the server no longer had: versions later steps replaced. */
+  gone: number;
+  /** Steps sent again, the log not having brought them back yet. */
+  resent: number;
+  last_failure: string | null;
+  /** Unix seconds. */
+  failed_at: number;
 }
 
 export type SyncCopyState = "in step" | "catching up" | "fetching" | "sending" | "starting" | "offline" | "error";
@@ -1356,6 +1654,10 @@ export interface SyncCopy {
   added: number;
   state: SyncCopyState;
   status: SyncCopyStatus | null;
+  /** When the server last heard how it is (unix ms). */
+  heard?: number | null;
+  /** Log entries its folder hasn't taken yet. */
+  lag?: number;
 }
 
 export interface SyncConflict {
@@ -1365,11 +1667,16 @@ export interface SyncConflict {
   beside: string;
 }
 
+/** What a synced repo keeps the same on its copies: its files (uncommitted work too), its branches and commits, or both. */
+export type SyncMode = "files" | "files_and_git" | "git";
+
 export interface SyncRepo {
   id: string;
   name: string;
   created: number;
   exclude: string[];
+  /** Older servers: none, files. */
+  mode?: SyncMode;
   files: number;
   index: number;
   conflicts: SyncConflict[];
@@ -1377,6 +1684,76 @@ export interface SyncRepo {
   error: string | null;
   /** Synced only while a move is under way (that task's batch). */
   transient?: string | null;
+  /** What its sync did since the server started (older servers: none). */
+  stats?: SyncStats;
+}
+
+/** What a repo's sync did since the server started (`since`, unix ms). */
+export interface SyncStats {
+  since: number;
+  steps: number;
+  files: number;
+  bytes: number;
+  conflicts: number;
+  dropped: number;
+  retries: number;
+  errors: number;
+  /** When the newest step was committed (unix ms). */
+  last_step: number | null;
+}
+
+export type SyncEventKind = "step" | "copy" | "state" | "error" | "dropped" | "retry" | "resolved" | "move";
+export type SyncTone = "info" | "ok" | "warn" | "fail";
+
+/** One of a committed step's changes. */
+export interface SyncFileEvent {
+  path: string;
+  kind: "added" | "changed" | "deleted";
+  /** What the log did with it. */
+  outcome: "taken" | "same" | "conflict" | "refused";
+  size?: number;
+  /** A conflict: the name its version went under beside the path. */
+  beside?: string;
+  link?: boolean;
+}
+
+/** A step the log committed. */
+export interface SyncStepEvent {
+  /** Its log index: a copy whose `applied` is this far has it. */
+  index: number;
+  /** When its machine looked and saw the changes (unix ms, that machine's clock). */
+  seen: number;
+  /** From its arrival at the server to its commit (ms). */
+  commit_ms: number | null;
+  /** The first 40 of its changes. */
+  files: SyncFileEvent[];
+  added: number;
+  changed: number;
+  deleted: number;
+  conflicts: number;
+  refused: number;
+  bytes: number;
+}
+
+/** Something that happened in a synced repo (GET /api/sync/activity). */
+export interface SyncEvent {
+  seq: number;
+  repo: string;
+  /** Unix ms, the server's clock. */
+  at: number;
+  kind: SyncEventKind;
+  /** The machine it's about: a step's maker ("kiln" for the server's own). */
+  machine: string;
+  text?: string;
+  tone: SyncTone;
+  step?: SyncStepEvent;
+}
+
+export interface SyncActivity {
+  /** Newest first. */
+  events: SyncEvent[];
+  /** The number the next event gets: ask `since` it for what's new. */
+  next: number;
 }
 
 export interface SyncView {
@@ -1406,6 +1783,8 @@ export interface GitState {
   active: number;
   /** kiln cloned it there. */
   kiln: boolean;
+  /** Its branch against the same branch on the other machines that hold it (their work, taken in as `kiln/<machine>/<branch>`). */
+  peers?: { machine: string; ahead: number; behind: number; wip: boolean }[];
 }
 
 /** `copy`: kept in step by sync; `clone`: kiln cloned it there; `found`: it was there. */
@@ -1492,6 +1871,8 @@ export interface PlaceAsk {
   branch?: string;
   to?: { machine: string; path: string }[];
   delete?: boolean;
+  /** A new sync's: what its copies keep the same. */
+  mode?: SyncMode;
 }
 
 /** What to plan (`/api/cd/plans`): one commit, a stack (`head`, from where it leaves trunk or

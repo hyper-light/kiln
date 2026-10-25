@@ -97,7 +97,7 @@ function drawPast(u: uPlot, bands: Band[]) {
   ctx.restore();
 }
 
-export default function UPlotChart({ data, series, height = 200, yFormat = (v) => String(v), y2Format, yRange, timeFormat = "time", legend = true, className, ariaLabel, bands = [] }: ChartProps) {
+export default function UPlotChart({ data, series, height = 200, yFormat = (v) => String(v), y2Format, yRange, timeFormat = "time", xValue, legend = true, className, ariaLabel, bands = [] }: ChartProps) {
   const plotRef = React.useRef<uPlot | null>(null);
   const dataRef = React.useRef(data);
   dataRef.current = data;
@@ -174,7 +174,7 @@ export default function UPlotChart({ data, series, height = 200, yFormat = (v) =
             : []),
         ],
         series: [
-          { value: (_u, v) => (v == null ? "—" : new Date(v * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false })) },
+          { value: (_u, v) => (v == null ? "—" : xValue ? xValue(v) : new Date(v * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false })) },
           ...series.map<uPlot.Series>((s) => ({
             label: s.label,
             scale: s.scale ?? "y",

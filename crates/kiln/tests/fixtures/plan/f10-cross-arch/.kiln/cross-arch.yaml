@@ -1,0 +1,44 @@
+# F-10 (docs/ci.md Appendix F; W04-AC07, AC08): a Rust binary built for three platforms, each leg
+# on a runner of its own platform (`runs-on: native`); each platform's test waits only for its own
+# build (`matrix: same`); one job collects the three binaries.
+name: cross-arch
+on: push
+jobs:
+  build:
+    runs-on: native
+    strategy:
+      matrix:
+        platforms: [linux/amd64, linux/arm64, darwin/arm64]
+    steps:
+      - run: |
+          mkdir -p out
+          rustc -O -o out/hello hello.rs
+      - uses: kiln/upload@v1
+        with:
+          name: hello-${{ matrix.os }}-${{ matrix.arch }}
+          path: out/hello
+  test:
+    runs-on: native
+    needs: [{ job: build, matrix: same }]
+    strategy:
+      matrix:
+        platforms: [linux/amd64, linux/arm64, darwin/arm64]
+    steps:
+      - uses: kiln/download@v1
+        with:
+          name: hello-${{ matrix.os }}-${{ matrix.arch }}
+          path: bin
+      - run: |
+          chmod +x bin/hello
+          bin/hello | grep "^hello from "
+  collect:
+    runs-on: native
+    needs: [test]
+    steps:
+      - uses: kiln/download@v1
+        with:
+          pattern: hello-*
+          path: all
+      - run: |
+          ls all
+          test "$(ls all | wc -l)" -eq 3

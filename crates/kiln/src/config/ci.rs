@@ -30,6 +30,33 @@ pub struct Ci {
     /// executor = ["host"]
     /// ```
     pub routing: Vec<kiln_ci::sched::routing::Rule>,
+    /// Pools of executors kiln starts and stops (docs/ci.md W13-R09):
+    ///
+    /// ```toml
+    /// [[ci.pools]]
+    /// name = "docker-linux"
+    /// executor = "docker"
+    /// hosts = "executors contains docker"
+    /// image = "kiln/runner-ubuntu-24.04"
+    /// labels = ["ubuntu-latest", "linux", "x64"]
+    /// min_idle = 2
+    /// max = 32
+    /// per_host_max = 16
+    /// idle_timeout = "10m"
+    /// ```
+    pub pools: Vec<kiln_ci::sched::pools::PoolSpec>,
+    /// Runners kept for matching legs in windows (docs/ci.md W05-R12); a pool's own go in its
+    /// `reserve`:
+    ///
+    /// ```toml
+    /// [[ci.reservations]]
+    /// name = "nightly-bench"
+    /// runners = "custom.rack == bench"
+    /// for = "workflow == 'bench'"
+    /// cron = "0 2 * * *"
+    /// duration = "2h"
+    /// ```
+    pub reservations: Vec<kiln_ci::sched::reserve::ReservationSpec>,
     pub cache: Cache,
     pub artifacts: Artifacts,
     pub oidc: Oidc,
@@ -55,6 +82,72 @@ pub struct Ci {
     /// it: a host (`hooks.corp`, `hooks.corp:8443`, `*.corp`), an address, or a network
     /// (`10.0.0.0/8`).
     pub allow_private_targets: Vec<String>,
+    /// `[ci.github]`: the GitHub App kiln acts through on GitHub (docs/ci.md W14-R10, W23): its
+    /// id and private key, or none (the App the manifest flow made, kept in the store).
+    ///
+    /// ```toml
+    /// [ci.github]
+    /// app_id = 123456
+    /// private_key_file = "/etc/kiln/github-app.pem"
+    /// webhook_secret_file = "/etc/kiln/github-webhook-secret"
+    /// # GitHub Enterprise Server: api_url = "https://ghe.example.com/api/v3", web_url = "https://ghe.example.com"
+    /// ```
+    pub github: GithubApp,
+    /// `[[ci.gitlab]]`: GitLab instances kiln acts on (docs/ci.md W23-R04; docs/deploy-api.md §7),
+    /// GitLab.com or self-managed, each with a token (a group's or project's access token, or a
+    /// person's) with the `api` scope.
+    ///
+    /// ```toml
+    /// [[ci.gitlab]]
+    /// url = "https://gitlab.com"
+    /// token_file = "/etc/kiln/gitlab-token"
+    /// webhook_secret_file = "/etc/kiln/gitlab-webhook-secret"   # the webhooks' secret token
+    /// groups = ["acme"]                                          # what the token covers; none: everything
+    /// ```
+    pub gitlab: Vec<GitlabHost>,
+    /// `[ci.bitbucket]`: Bitbucket Cloud (docs/ci.md W23-R05), with an access token (a workspace's,
+    /// project's or repository's), or a user and an app password or API token (an API token's user
+    /// is the account's email).
+    ///
+    /// ```toml
+    /// [ci.bitbucket]
+    /// token_file = "/etc/kiln/bitbucket-token"
+    /// # or: username = "kiln-bot", password_file = "/etc/kiln/bitbucket-app-password"
+    /// webhook_secret_file = "/etc/kiln/bitbucket-webhook-secret"
+    /// workspaces = ["acme"]
+    /// # ssh_url = "ssh://git@bitbucket.org"   # where git reads over SSH (Argo CD, with a deploy key)
+    /// ```
+    pub bitbucket: Option<BitbucketHost>,
+    /// `[ci.registry]`: kiln's own OCI registry at `/v2/` (docs/ci.md W12-R01).
+    ///
+    /// ```toml
+    /// [ci.registry]
+    /// listen = "0.0.0.0:5000"            # its own address too (the main origin serves it as well)
+    /// anonymous_pull = ["acme/public"]   # namespaces anyone may pull
+    /// max_blob = 21474836480             # bytes a blob may have (20 GiB)
+    /// ```
+    pub registry: Registry,
+    /// `[ci.advisories]`: the advisory database the dependency graph's compare looks up the
+    /// packages a change adds in (docs/ci.md W14-R11, for `actions/dependency-review-action`). None
+    /// by default: the changes are listed without vulnerabilities, and the answer says so.
+    ///
+    /// ```toml
+    /// [ci.advisories]
+    /// osv = "https://api.osv.dev"   # OSV's API (it carries GitHub's advisories), sent those packages' purls
+    /// ```
+    pub advisories: Advisories,
+    /// `[ci.attest]`: how kiln signs attestations (docs/ci.md W18-R02).
+    ///
+    /// ```toml
+    /// [ci.attest]
+    /// signing = "keyless"                       # kiln (its own key, the default), key, kms or keyless
+    /// fulcio_url = "https://fulcio.example.com" # keyless: a Fulcio that trusts kiln's OIDC issuer
+    /// rekor_url = "https://rekor.example.com"
+    /// # key: key_file = "/etc/kiln/cosign.key", key_password_file = "/etc/kiln/cosign.password"
+    /// # kms: kms = "awskms:///arn:aws:kms:eu-west-1:123456789012:key/…", integration = "aws-signing"
+    /// trusted_root = "/etc/kiln/trusted_root.json" # keyless bundles verify against it (default: Sigstore's public one)
+    /// ```
+    pub attest: Attest,
     /// `[ci.land_signing]`: the land queue signs the commits it writes (docs/ci.md W14-R07).
     ///
     /// ```toml
@@ -66,6 +159,205 @@ pub struct Ci {
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]
     pub local: bool,
+}
+
+/// `[ci.advisories]`'s settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Advisories {
+    /// OSV's API (`https://api.osv.dev`, or a mirror of it).
+    pub osv: Option<String>,
+}
+
+/// The GitHub App's settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GithubApp {
+    pub app_id: Option<u64>,
+    pub private_key_file: Option<std::path::PathBuf>,
+    pub webhook_secret_file: Option<std::path::PathBuf>,
+    /// GitHub's REST API.
+    pub api_url: String,
+    /// GitHub's web origin: repositories there are GitHub's.
+    pub web_url: String,
+}
+
+impl Default for GithubApp {
+    fn default() -> Self {
+        GithubApp { app_id: None, private_key_file: None, webhook_secret_file: None, api_url: "https://api.github.com".into(), web_url: "https://github.com".into() }
+    }
+}
+
+/// A GitLab kiln acts on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitlabHost {
+    /// Its web origin: repositories there are this GitLab's.
+    pub url: String,
+    /// Its REST API (`{url}/api/v4` unless set).
+    pub api_url: Option<String>,
+    pub token_file: std::path::PathBuf,
+    pub webhook_secret_file: Option<std::path::PathBuf>,
+    /// The groups the token covers (`acme`, `acme/platform`); none: every project there.
+    pub groups: Vec<String>,
+}
+
+impl Default for GitlabHost {
+    fn default() -> Self {
+        GitlabHost { url: "https://gitlab.com".into(), api_url: None, token_file: std::path::PathBuf::new(), webhook_secret_file: None, groups: Vec::new() }
+    }
+}
+
+/// Bitbucket Cloud, as kiln acts on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BitbucketHost {
+    pub web_url: String,
+    pub api_url: String,
+    /// An access token.
+    pub token_file: Option<std::path::PathBuf>,
+    /// Or a user and their app password (or API token).
+    pub username: Option<String>,
+    pub password_file: Option<std::path::PathBuf>,
+    pub webhook_secret_file: Option<std::path::PathBuf>,
+    /// The workspaces it covers; none: every one.
+    pub workspaces: Vec<String>,
+    /// Where git reads its repositories over SSH (`ssh://git@<web_url's host>` unless set): Argo
+    /// CD reads a release repository there with a deploy key kiln makes.
+    pub ssh_url: Option<String>,
+}
+
+impl Default for BitbucketHost {
+    fn default() -> Self {
+        BitbucketHost {
+            web_url: "https://bitbucket.org".into(),
+            api_url: "https://api.bitbucket.org/2.0".into(),
+            token_file: None,
+            username: None,
+            password_file: None,
+            webhook_secret_file: None,
+            workspaces: Vec::new(),
+            ssh_url: None,
+        }
+    }
+}
+
+/// kiln's OCI registry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Registry {
+    /// An address of its own (`0.0.0.0:5000`), beside the main origin's `/v2/`.
+    pub listen: Option<String>,
+    /// Namespaces (`acme`, `acme/public`; `*`: all) anyone may pull from, without signing in.
+    pub anonymous_pull: Vec<String>,
+    /// The biggest blob, in bytes (20 GiB by default).
+    pub max_blob: Option<u64>,
+    /// The names images use for kiln's registry besides the public URL's host
+    /// (`registry.example.com`): an attestation about such an image is attached to it (W18).
+    pub hosts: Vec<String>,
+    /// `[[ci.registry.mirrors]]`: pull-through caches of other registries (docs/ci.md W12-R02).
+    ///
+    /// ```toml
+    /// [[ci.registry.mirrors]]
+    /// upstream = "docker.io"            # ghcr.io, quay.io, gcr.io, us-docker.pkg.dev, public.ecr.aws, mcr.microsoft.com, registry.k8s.io, …
+    /// listen = "0.0.0.0:5001"           # Docker's registry-mirrors (Docker Hub) pull here, at the root
+    /// anonymous = true                  # pulls without signing in (a public upstream's)
+    /// username = "kiln"                 # the upstream's credentials (Docker Hub's pull limits)
+    /// password_file = "/etc/kiln/dockerhub-token"
+    /// ```
+    pub mirrors: Vec<Mirror>,
+    /// `[[ci.registry.proxies]]`: caching proxies for package registries at
+    /// `/_kiln/proxy/<name>/…` (docs/ci.md W12-R04, R05, R06).
+    ///
+    /// ```toml
+    /// [[ci.registry.proxies]]
+    /// ecosystem = "npm"                 # pypi, crates, go, maven, nuget, rubygems, http
+    /// # upstream = "https://registry.npmjs.org"   (each ecosystem's public one by default; a private one's, R05)
+    /// # token_file = "…", or username + password_file: the upstream's credentials
+    /// ttl = 300                         # seconds an index is trusted before asking again
+    /// ```
+    pub proxies: Vec<Proxy>,
+}
+
+/// A package registry kiln proxies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Proxy {
+    /// `npm`, `pypi`, `crates`, `go`, `maven`, `nuget`, `rubygems`, `http`.
+    pub ecosystem: String,
+    /// The path it's under (`/_kiln/proxy/<name>/`); the ecosystem's name by default.
+    pub name: Option<String>,
+    /// The upstream (its index's, for PyPI and crates.io), when not the ecosystem's public one.
+    pub upstream: Option<String>,
+    /// Where the upstream keeps its packages, when elsewhere (PyPI's files, crates.io's crates).
+    pub files: Option<String>,
+    /// `http`: the hosts it may reach; Go: checksum databases besides `sum.golang.org`.
+    pub hosts: Vec<String>,
+    /// Anyone may read through it, without signing in.
+    pub anonymous: bool,
+    pub token_file: Option<std::path::PathBuf>,
+    pub username: Option<String>,
+    pub password_file: Option<std::path::PathBuf>,
+    /// Seconds an index is trusted (300).
+    pub ttl: Option<u64>,
+    /// Every job's tools use it by themselves: npm's, pip's and uv's, Go's, Maven's, RubyGems'
+    /// and Bundler's, conda's settings point at it, with the job's token.
+    pub jobs: bool,
+}
+
+/// A registry kiln pulls through.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Mirror {
+    /// The upstream, as image references name it (`docker.io`, `ghcr.io`).
+    pub upstream: String,
+    /// Its API, when not the upstream's own (`https://<upstream>`; Docker Hub's is known).
+    pub url: Option<String>,
+    /// Names through kiln start with this (default: the upstream): `/v2/docker.io/library/alpine/…`.
+    pub prefix: Option<String>,
+    /// An address serving it at the root, for Docker's `registry-mirrors`.
+    pub listen: Option<String>,
+    /// Anyone may pull through it, without signing in.
+    pub anonymous: bool,
+    pub username: Option<String>,
+    pub password_file: Option<std::path::PathBuf>,
+    /// Seconds a tag is trusted before asking the upstream again (300).
+    pub tag_ttl: Option<u64>,
+}
+
+impl Mirror {
+    /// The names' prefix through kiln.
+    pub fn prefix(&self) -> String {
+        self.prefix.clone().unwrap_or_else(|| self.upstream.clone()).trim_matches('/').to_owned()
+    }
+}
+
+impl Registry {
+    pub fn max_blob_bytes(&self) -> u64 {
+        self.max_blob.unwrap_or(20 << 30)
+    }
+}
+
+/// How attestations are signed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Attest {
+    /// `kiln` (its own key), `key`, `kms` or `keyless`.
+    pub signing: Option<String>,
+    /// `key`: cosign's key file (or a PKCS#8 or SEC1 PEM), and its password's file.
+    pub key_file: Option<std::path::PathBuf>,
+    pub key_password_file: Option<std::path::PathBuf>,
+    /// `kms`: the key (`awskms:///<arn>`), and the `aws` integration kiln reaches it with.
+    pub kms: Option<String>,
+    pub integration: Option<String>,
+    /// `keyless`: Fulcio and Rekor, and the audience of kiln's identity token for Fulcio.
+    pub fulcio_url: Option<String>,
+    pub rekor_url: Option<String>,
+    pub audience: Option<String>,
+    /// The Sigstore trusted root (`trusted_root.json`: its Fulcios, Rekors and CT logs) keyless
+    /// bundles are verified against: the instance's kiln signs with, when that's its own.
+    /// Without one, Sigstore's public instance's, through its TUF repository.
+    pub trusted_root: Option<std::path::PathBuf>,
 }
 
 /// How landed commits are signed.
@@ -93,12 +385,42 @@ pub struct Scheduler {
     pub aging_per_minute: f64,
     /// Seconds a leg is expected to take when its job has no history (W19's medians).
     pub default_cost_seconds: f64,
+    /// `slots` (each runner takes its `slots` legs at once) or `resources` (W05-R03): a runner
+    /// offers what its facts say it has (CPUs, memory, the work volume's free disk, GPUs), times
+    /// `overcommit`, and a leg takes what its job's `resources:` asks, else `default_request`.
+    pub mode: String,
+    pub overcommit: Overcommit,
+    pub default_request: kiln_ci::sched::pools::ResourceSpec,
+}
+
+impl Scheduler {
+    /// Resource mode (W05-R03).
+    pub fn resources(&self) -> bool {
+        self.mode.trim().eq_ignore_ascii_case("resources")
+    }
 }
 
 impl Default for Scheduler {
     fn default() -> Self {
         let d = kiln_ci::sched::state::Config::default();
-        Scheduler { aging_per_minute: d.aging_per_minute, default_cost_seconds: d.default_cost }
+        Scheduler { aging_per_minute: d.aging_per_minute, default_cost_seconds: d.default_cost, mode: "slots".into(), overcommit: Overcommit::default(), default_request: Default::default() }
+    }
+}
+
+/// How far past what a runner has its legs may ask, in resource mode: CPUs 1.5 times, memory and
+/// disk once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Overcommit {
+    pub cpu: f64,
+    pub memory: f64,
+    pub disk: f64,
+}
+
+impl Default for Overcommit {
+    fn default() -> Self {
+        let d = kiln_ci::sched::state::Config::default();
+        Overcommit { cpu: d.overcommit_cpu, memory: d.overcommit_mem, disk: d.overcommit_disk }
     }
 }
 
@@ -198,12 +520,34 @@ pub struct Actions {
     /// Actions to mirror by `kiln actions sync` (`owner/repo@ref`), for servers that will run
     /// without reaching GitHub.
     pub prefetch: Vec<String>,
+    /// `[[ci.actions.sources]]`: where some owners' actions come from instead of GitHub, the
+    /// first that names the owner (W07-R02).
+    pub sources: Vec<ActionSource>,
 }
 
 impl Actions {
     pub fn policy(&self) -> kiln_ci::policy::Policy {
         kiln_ci::policy::Policy { allow: self.allow.clone(), deny: self.deny.clone(), require_sha_pins: self.require_sha_pins }
     }
+
+    /// The source for `owner`'s actions, when one names it.
+    pub fn source_of(&self, owner: &str) -> Option<&ActionSource> {
+        let owner = owner.to_ascii_lowercase();
+        self.sources.iter().find(|s| s.owners.iter().any(|g| crate::pipeline::glob_match(&g.to_ascii_lowercase(), &owner)))
+    }
+}
+
+/// Another home for some owners' actions (W07-R02): a git host (`url`, with `{owner}` and
+/// `{repo}` filled in), or the repositories kiln hosts itself (`native`, W14-R01).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ActionSource {
+    /// Owner globs (`acme`, `acme-*`).
+    pub owners: Vec<String>,
+    /// The clone URL: `https://git.example.com/{owner}/{repo}.git`.
+    pub url: Option<String>,
+    /// `owner/repo` is one of kiln's native repositories.
+    pub native: bool,
 }
 
 /// `[ci.cache]`: GitHub's cache service (docs/ci.md W08-R06).
@@ -242,6 +586,20 @@ impl Default for Artifacts {
     }
 }
 
+/// How kiln signs in to an S3-compatible store: an `aws` integration (kiln's own identity,
+/// exchanged for the role's short-lived credentials, so no key is stored), or a key pair whose
+/// secret is read from a file or an environment variable; with neither, the server's environment
+/// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`). The content-addressed
+/// store's own bucket is `[blobs.s3]`'s (docs/blobs.md).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct S3Credentials {
+    pub integration: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key_file: Option<std::path::PathBuf>,
+    pub secret_access_key_env: Option<String>,
+}
+
 /// `[ci.oidc]`: kiln as an OpenID Connect issuer for jobs (docs/ci.md W10-R06 to W10-R10).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -259,4 +617,24 @@ pub struct Oidc {
     /// Keep the discovery document and keys written here, for a static host that serves the
     /// directory at `issuer` (W10-R12): providers that fetch from the internet read them there.
     pub publish_dir: Option<std::path::PathBuf>,
+    /// Where the hourly upkeep and each rotation publish the two documents (W10-R12): a directory
+    /// for a static host, `s3://<bucket>[/<prefix>]` or `gs://<bucket>[/<prefix>]`. `issuer` is
+    /// then where that is served (`https://<bucket>.s3.<region>.amazonaws.com/<prefix>`, say).
+    pub publish_to: Option<String>,
+    /// For `s3://`: the store's endpoint, AWS S3's in `publish_region` by default (MinIO's, R2's).
+    pub publish_endpoint: Option<String>,
+    /// For `s3://`: the region requests are signed for (`us-east-1` by default).
+    pub publish_region: Option<String>,
+    /// How kiln signs in to publish: an integration (`aws` for
+    /// `s3://`, `gcp` for `gs://`), a key pair, or the server's environment. An `aws` integration
+    /// can't publish the first keys, since AWS checks kiln's token against them: start with a
+    /// key pair. Google Cloud takes the keys pasted into its pool, so a `gcp` one can.
+    pub publish_credentials: S3Credentials,
+    /// Addresses of the issuer's own (W10-R12), each serving its two documents and nothing else,
+    /// rate-limited, so they can face the internet without the rest of kiln: `["0.0.0.0:8444"]`.
+    /// Over TLS with `listen_cert` and `listen_key` (a certificate for the issuer's public name),
+    /// else the server's own when `server.https`, else plain HTTP (a TLS proxy or tunnel in front).
+    pub listen: Vec<String>,
+    pub listen_cert: Option<std::path::PathBuf>,
+    pub listen_key: Option<std::path::PathBuf>,
 }

@@ -1,0 +1,104 @@
+/* Requests share the bottom toast position with kiln's other notifications, on every screen, above
+   any passing ones. */
+.rq-viewport {
+  z-index: 121;
+  bottom: calc(max(16px, env(safe-area-inset-bottom, 0px)) + var(--toast-stack-height, 0px));
+}
+.toast.rq {
+  padding: 12px 8px 12px 14px;
+  touch-action: pan-y;
+}
+.toast.rq::before {
+  background: #c6b08e;
+}
+.rq-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: #d8bb95;
+}
+/* Stopped by itself: the rose of what failed. At a usage limit: only said, so quiet grey. */
+.toast.rq[data-kind="stopped"]::before {
+  background: #c9a2a6;
+}
+.toast.rq[data-kind="stopped"] .rq-dot {
+  background: #d1aaad;
+}
+.toast.rq[data-kind="limit"]::before {
+  background: #6d717a;
+}
+.toast.rq[data-kind="limit"] .rq-dot {
+  background: #8d9099;
+}
+.rq-body {
+  flex: 1;
+  min-width: 0;
+}
+.rq-head {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: #eceef2;
+}
+.rq-name {
+  font-weight: 450;
+  color: inherit;
+}
+.rq-name:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.rq-lead {
+  color: #b9bcc4;
+}
+.rq-where {
+  margin-left: auto;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: #7d808a;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rq-line {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 4px 0 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: #ece0ca;
+  word-break: break-word;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.rq-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 9px;
+}
+.rq-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 4px;
+  font-size: 12.5px;
+  color: #b9bcc4;
+}
+.rq-open:hover {
+  color: #eceef2;
+}
+.rq-close {
+  margin: -6px 0 0;
+}
+.toast.rq-rest {
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #b9bcc4;
+}

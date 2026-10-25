@@ -5,6 +5,7 @@
  */
 import * as React from "react";
 import { wsUrl } from "@/api/client";
+import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import type { TerminalSessionInfo } from "./types";
 
@@ -59,11 +60,13 @@ export interface ToolCall {
   tool_short?: string;
   /** Skill calls: which skill. */
   skill?: string;
+  /** A command run on another machine (kiln reach): the runner once picked, what it must be (`linux/amd64`) until then, "" while kiln picks the best. */
+  runner?: string;
 }
 
 export type Body =
-  | { kind: "user"; text: string; images?: number; attachments?: string[]; client_id?: string; origin?: string }
-  | { kind: "assistant"; text: string; streaming?: boolean }
+  | { kind: "user"; text: string; images?: number; attachments?: string[]; client_id?: string; origin?: string; reply_to?: string }
+  | { kind: "assistant"; text: string; streaming?: boolean; reply_to?: string }
   | { kind: "thinking"; text: string; streaming?: boolean; redacted?: boolean }
   | ({ kind: "tool" } & ToolCall)
   | { kind: "notice"; level: Level; text: string };
@@ -129,6 +132,9 @@ export interface QueueItem {
   id: string;
   text: string;
   at: number;
+  attachments?: Attachment[];
+  overrides?: { model?: string; effort?: string };
+  reply_to?: string;
 }
 
 export interface Task {
@@ -164,11 +170,23 @@ export interface Task {
   wakes?: string;
   /** Whether a stop can work. */
   stoppable?: boolean;
+  /** Subagents: how a person's message reaches it now (a `send` with its `task`); none: it takes none, and the composer writes to the agent. */
+  takes?: SendMode[];
+  /** "parent": a message to it goes by way of the agent that started it (its harness takes none from kiln itself). */
+  via?: string;
+  /** Messages waiting for it to finish what it's doing. */
+  queue?: QueueItem[];
 }
+
+/** A harness's own subagent, tracked within its parent's session without another executor. */
+export type SubagentBrief = Pick<Task, "id" | "tool_id" | "description" | "status" | "parent_task" | "started" | "ended">;
 
 /** A slice of a task's output (`since` → `offset`); `gone` once the harness deleted it. */
 export interface TaskOutput {
   data?: string;
+  /** A transcript snapshot replaces previously read output instead of appending to it. */
+  reset?: boolean;
+  pending?: boolean;
   offset?: number;
   live?: boolean;
   truncated?: boolean;
@@ -246,11 +264,46 @@ export interface StatusItem {
 export interface ExitInfo {
   code: number | null;
   error?: string;
+  /** Unix ms it ended: what a stop is known by (its card's key). */
+  at?: number;
 }
 
 /** One file's change since the agent first touched it (the server keeps it cumulative). */
-export interface FileChange {
+/** A file as its machine had it (`crate::harness::files::Meta`). */
+export interface FileMeta {
+  size: number;
+  /** Unix ms. */
+  mtime: number;
+  mime: string;
+  /** In pixels as it shows, for a picture or a recording whose start says. */
+  width?: number;
+  height?: number;
+}
+
+/**
+ * A file a finished message mentioned, as the server kept it (`crate::harness::kept::Kept`): the
+ * file as it was when the message (`seq`) was done. `sha`: a copy is kept (served for good);
+ * without one it's read from its machine when someone looks. `error`: why it couldn't be read.
+ */
+export interface KeptFile {
   path: string;
+  seq: number;
+  meta?: FileMeta;
+  sha?: string;
+  error?: string;
+}
+
+/** A conversation's kept files with these added (each path and message once). */
+function withFiles(was: KeptFile[], added: KeptFile[]): KeptFile[] {
+  const fresh = added.filter((a) => !was.some((w) => w.path === a.path && w.seq === a.seq));
+  return fresh.length ? [...was, ...fresh] : was;
+}
+
+export interface FileChange {
+  /** Relative to its working tree's top (`tree`) when it's in one, else to the agent's folder. */
+  path: string;
+  /** The top of the git working tree it's in: its folder's repository's own, or a worktree of it. */
+  tree?: string;
   created?: boolean;
   deleted?: boolean;
   added: number;
@@ -304,12 +357,15 @@ export interface State {
   reach?: string | null;
   /** Which of those lists the harness has reported yet (servers that predate it omit this). */
   inventory?: { mcp?: Known; skills?: Known; plugins?: Known; limits?: Known };
-  /** A switch to another harness's model, waiting for the turn under way to end. */
-  switching?: { kind: string; model: string };
+  /** A switch to another harness's model, waiting for the turn under way to end: with the permission
+   * mode and effort it carries over and that harness's choices of each, how it will run there. */
+  switching?: { kind: string; model: string; mode?: string; effort?: string; modes?: ModeOption[]; efforts?: ControlOption[] };
   /** Nothing more goes to the harness until this ends: its account reached a usage limit. Queued messages, goals and plan steps wait. */
   pause?: Pause;
   /** It pauses once a limit is this full (percent): between turns, or at the next step of one under way; absent: only when one is reached. */
   pause_at?: number;
+  /** The most subagents it runs at once: its harness's own, and the agents it starts through kiln (absent: no limit of its own). */
+  max_subagents?: number;
   /** How its last turn ended (what kiln's keep-going reads). */
   last_turn?: TurnEnd;
   /** Turns in a row kiln started to keep it going, since a person last said something. */
@@ -318,6 +374,19 @@ export interface State {
   manual_resume?: boolean;
   /** At a limit it goes on on another machine whose harness is signed in to an account with room. */
   move_on_limit?: boolean;
+  /** Where it goes on then, as a person chose (sent by runners that take one, empty or not). */
+  move_plan?: MovePlan;
+}
+
+/**
+ * Where an agent goes on at a usage limit (`State.move_plan`): a machine (`agent:<name>`), and a
+ * harness and model there. What isn't said kiln picks: whichever has room, its own harness or one
+ * its conversation can be carried into.
+ */
+export interface MovePlan {
+  to?: string;
+  kind?: string;
+  model?: string;
 }
 
 /** Why a session waits for a usage limit, and until when (`State.pause`). */
@@ -363,6 +432,7 @@ export interface ModelOption {
   id: string;
   label: string;
   description?: string;
+  default?: boolean;
   /** The effort levels it takes, lowest first (when the harness says). */
   efforts?: string[];
 }
@@ -400,6 +470,18 @@ export interface GoalItem {
   reminders?: number;
   /** When it was last sent (unix ms). */
   reminded_at?: number;
+  /** The goal it's a part of (split into parts: that one comes back after them). */
+  part_of?: string;
+  /** The plan step it was made from (`n` from 1). */
+  step?: { plan: string; version: number; n: number; run?: string };
+  /** The agent it's under way on, handed to it (a program's coordinator's goal, its track's worker's: docs/programs.md). */
+  on?: string;
+  /** Who made it a part: the agent (`own`: its goal comes back for its own check), or kiln (`checks`, `plan`, `planning`, `run`: its goal is met once they all are). */
+  part_kind?: "own" | "checks" | "plan" | "planning" | "run";
+  /** The plan it became. */
+  planned_as?: string;
+  /** The plan run it waits for. */
+  waits_on?: string;
 }
 
 /** An agent's goals, one after another: each goes once the one before is met. */
@@ -409,6 +491,12 @@ export interface GoalStack {
   reason?: string;
   items: GoalItem[];
   updated_at: number;
+  /** How many goals the last clear kept, to bring back (`restore`). */
+  cleared?: number;
+  /** Paused for a while: when it resumes by itself (unix ms). */
+  resume_at?: number;
+  /** Its big goals planned first (docs/goals.md, "Big goals, planned first"): on unless turned off. */
+  plan_big?: boolean;
 }
 
 /** A terminal beside an agent, in its folder on its machine: its shell, or its harness's own screen. */
@@ -433,6 +521,8 @@ export interface BroadcastTo {
 export interface BroadcastBody {
   to: BroadcastTo;
   text?: string;
+  /** Files with the prompt (uploaded first), each agent its own copy. */
+  attachments?: Attachment[];
   mode?: SendMode;
   command?: Command;
   approvals?: "allow" | "deny";
@@ -455,7 +545,8 @@ export interface BroadcastReport {
   results: BroadcastOutcome[];
 }
 
-type Counted<T> = T & { count: number };
+/** An entry of the agents' merged catalogs: how many of them have it, and which. */
+type Counted<T> = T & { count: number; agents?: string[] };
 
 export interface BroadcastPreview {
   agents: { id: string; name: string; machine: string; kind: string; status: Status }[];
@@ -549,6 +640,16 @@ export interface TurnEnd {
   kept?: number;
 }
 
+/** Goals an agent paused for you, until you resume them (`AgentInfo.held`). */
+export interface Held {
+  /** Why, as its goal stack says it ("Paused by the agent: …"). */
+  why: string;
+  /** The plan it waits for you to look at first, when that's why. */
+  plan?: string;
+  /** Unix ms it paused. */
+  since: number;
+}
+
 export interface AgentInfo {
   id: string;
   kind: string;
@@ -558,6 +659,8 @@ export interface AgentInfo {
   name: string;
   shell?: string;
   cwd: string;
+  /** The working tree its work is in (its latest change's): git's questions about its work go there. */
+  tree?: string;
   created_at: number;
   status: Status;
   title: string;
@@ -567,6 +670,8 @@ export interface AgentInfo {
   approvals: ApprovalBrief[];
   queued: number;
   tasks_running: number;
+  /** Native Claude/Codex subagents, including their completed work (older servers omit these). */
+  subagents?: SubagentBrief[];
   /** Shells, monitors and other tasks still running while the agent is idle or ended. */
   left_behind?: number;
   /** Where its commands may run besides its machine: absent anywhere it needs, "off" only its own machine, else a runner or platform it prefers. */
@@ -575,10 +680,16 @@ export interface AgentInfo {
   pause?: Pause;
   /** Kiln doesn't keep it going when it stops part-way (the "keep_going" control). */
   keep_off?: boolean;
+  /** Its goals wait on you: it paused them for you, until you resume them (set on the server). */
+  held?: Held;
   /** At a limit it goes on on another machine with room (as `State.move_on_limit`). */
   move_on_limit?: boolean;
+  /** Where it goes on then (as `State.move_plan`). */
+  move_plan?: MovePlan;
   /** Where it pauses as its limits fill (as `State.pause_at`). */
   pause_at?: number;
+  /** The most subagents it runs at once (as `State.max_subagents`). */
+  max_subagents?: number;
   cost_usd: number;
   activity?: string;
   last_activity: number;
@@ -597,6 +708,40 @@ export interface AgentInfo {
   limits?: Limit[];
   account?: string;
   plan?: string;
+  /** The agent that started it (docs/agents.md, "Agents that run agents"). */
+  parent?: string;
+  /** The plan run it does a step of. */
+  plan_run?: string;
+  /** Started without its harness's skip-every-check mode (an agent it starts can't have it either). */
+  no_bypass?: boolean;
+  /** Its workspace of its own: a Slates volume over `over` (its repository's top), once made. */
+  workspace?: { kind: string; over?: string; sub?: string; made?: { volume: string; name: string; mount: string } };
+}
+
+/** What writing an agent's workspace back to its folder would do (`agents.land` without a landing). */
+export interface LandingPlan {
+  plan: {
+    grant_required: boolean;
+    landing?: number;
+    manifest?: string;
+    summary?: { by_action: { action: string; count: number }[]; bytes: number; filtered_out: number };
+    conflicts?: string[];
+    outcome?: unknown;
+  };
+  /** Left out, from the top: git's own directory. */
+  excludes: string[];
+  /** Whether this machine's Slates can take a person's go-ahead from kiln (not on Linux yet), and why not. */
+  can_write: boolean;
+  why_not?: string;
+}
+
+/** An agent's children that still run (and theirs), as `agents.children` gives them. */
+export interface AgentChild {
+  id: string;
+  name: string;
+  kind: string;
+  status: Status;
+  parent?: string;
 }
 
 export interface KindInfo {
@@ -643,10 +788,15 @@ export interface Spec {
   effort?: string;
   /** Commands on other runners (kiln reach): unset, it may use any; "off", only its own machine; else where it prefers them (a runner, or `linux/x86_64`). */
   reach?: string;
+  /** Where it works: its folder itself (none), or a Slates volume of its own laid over the folder (`volume`). */
+  workspace?: { kind: "volume" };
 }
 
+/** Where agents can have workspaces of their own, by target (`local`, `agent:<name>`). */
+export type WorkspacesAvailable = Record<string, { available: boolean; why_not?: string }>;
+
 export type Command =
-  | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string } }
+  | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string }; reply_to?: string; task?: string }
   | { type: "control"; id: string; value?: unknown }
   | { type: "mcp_enable"; name: string; enabled: boolean }
   | { type: "mcp_reconnect"; name: string }
@@ -656,7 +806,7 @@ export type Command =
   | { type: "skill_view"; name: string; client: string }
   | { type: "skill_run"; name: string; args?: string }
   | { type: "set_effort"; effort: string }
-  | { type: "queue_edit"; id: string; text: string }
+  | { type: "queue_edit"; id: string; text: string; attachments?: Attachment[] }
   | { type: "queue_remove"; id: string }
   | { type: "queue_move"; id: string; index: number }
   | { type: "queue_send_now"; id: string }
@@ -690,15 +840,24 @@ export type Command =
   | { type: "auto_resume"; on: boolean }
   /** Pause once a limit is this full (null: only when one is reached). */
   | { type: "pause_at"; percent: number | null }
-  /** Whether at a limit it goes on on another machine with room. */
-  | { type: "move_on_limit"; on: boolean };
+  /** The most subagents it runs at once (null: no limit of its own). */
+  | { type: "max_subagents"; count: number | null }
+  /** Whether at a limit it goes on on another machine with room, and where (`MovePlan`). */
+  | ({ type: "move_on_limit"; on: boolean } & MovePlan);
 
 export type Update =
-  | { t: "open"; info: AgentInfo }
+  /** The session whole follows; `rev` is the server's copy's revision, `born` its process's incarnation (docs/wire.md, "Revisions"). */
+  | { t: "open"; info: AgentInfo; rev?: number; born?: number }
+  /** Only what changed since the revision asked for follows (`?after=`), then "synced". */
+  | { t: "resumed"; info: AgentInfo; rev?: number; born?: number }
   | { t: "changes"; files: FileChange[] }
+  /** Files finished messages mention, kept by the server (ahead of the events in a snapshot). */
+  | { t: "files"; files: KeptFile[] }
   | { t: "error"; error: string }
   | { t: "closed" }
   | { t: "state"; state: State }
+  /** What changed in the state since the last one (asked for with `?patch=state`): the fields set, and those gone. */
+  | { t: "state_patch"; set: Partial<State>; gone?: string[] }
   | { t: "meta"; meta: Meta }
   | { t: "events"; events: HEvent[] }
   | { t: "stream"; id: string; text: string }
@@ -709,12 +868,13 @@ export type Update =
 
 /* ------------------------------------------------------------------ REST */
 
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const res = await fetch(path, {
     method,
     credentials: "same-origin",
     headers: body === undefined ? undefined : { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
   });
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
@@ -730,19 +890,127 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   return (await res.json()) as T;
 }
 
+/** A port an agent's machine listens on (`crate::browser::apps::Listening`). */
+export interface Listening {
+  port: number;
+  address: string;
+  pid?: number;
+  command: string;
+  /** One of the session's own processes. */
+  agents: boolean;
+}
+
+/** A device a live page can be laid out as (`crate::browser::devices`). */
+export interface Device {
+  name: string;
+  width: number;
+  height: number;
+  scale: number;
+  mobile: boolean;
+  agent?: string;
+}
+
+/** What a person may open live from a session (`GET .../preview`): its machine's ports, its
+ *  project's app, the engines it has, the devices kiln knows. */
+export interface PreviewLook {
+  ports: Listening[];
+  app: { configured: boolean; start?: string; port?: number; path?: string; running?: string | null; error?: string };
+  engines?: { chromium?: boolean; firefox?: boolean; webkit?: boolean; ios?: boolean };
+  devices?: Device[];
+  /** The machine's system (`macos`, `linux`, `windows`). */
+  platform?: string;
+  /** Whether the one asking may open pages in a profile of their own, and why not. */
+  personal?: { ok: boolean; why?: string | null };
+}
+
+/** A live page of a session, as the server relays it (`crate::harness::streams::Live::view`). */
+export interface StreamView {
+  id: string;
+  session: string;
+  machine: string;
+  spec: { url?: string; title?: string; profile?: string; engine?: string; device?: string };
+  by: string;
+  at: number;
+  viewers: number;
+  said: { opened?: unknown; navigated?: { url?: string }; loaded?: { title?: string } };
+}
+
+/** An agent's app opened on this person's own devices (`crate::harness::opened`): `url` (when
+ *  just opened) its link, good once for ten minutes. */
+export interface Opened {
+  id: string;
+  session: string;
+  port: number;
+  path: string;
+  by: string;
+  at: number;
+  until: number;
+  url?: string;
+}
+
+/** A recording of one of a session's streams (`crate::harness::streams::Recording`): its video,
+ *  its log of what was done, and that as a Playwright test, on its machine. */
+export interface Recording {
+  id: string;
+  stream: string;
+  at: number;
+  seconds: number;
+  bytes: number;
+  pictures: number;
+  video: string;
+  inputs: string;
+  test: string;
+}
+
+/** Where a recording's file is read (`video`, `inputs`, `test`). */
+export const recordingUrl = (session: string, id: string, what: "video" | "inputs" | "test") => apiPath(`/api/harness/sessions/${encodeURIComponent(session)}/recordings/${id}/${what}`);
+
 export const harnessApi = {
   kinds: (target: string) => call<KindInfo[]>("GET", `/api/harness/kinds?target=${encodeURIComponent(target)}`),
+  /** What a person may open live from it: the ports its machine serves (its agent's first), its project's app. */
+  preview: (id: string) => call<PreviewLook>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/preview`),
+  /** Stop the project's app kiln started. */
+  stopApp: (id: string) => call<{ stopped: boolean }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/preview/stop`),
+  /** Its live pages. */
+  streams: (id: string) => call<StreamView[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/streams`),
+  /** Open a live page: an address, or (`start`) the project's app; in a profile. */
+  openStream: (
+    id: string,
+    body: { url?: string; start?: boolean; profile?: string; engine?: string; device?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string },
+  ) => call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
+  closeStream: (id: string, stream: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}/streams/${stream}`),
+  /** Open the app on a port of its machine on this person's own device: a link to follow there. */
+  openOnDevice: (id: string, body: { port: number; path?: string }) => call<Opened>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/opened`, body),
+  /** This person's apps of it open on their devices. */
+  opened: (id: string) => call<Opened[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/opened`),
+  endOpened: (id: string, opened: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}/opened/${opened}`),
+  /** Recordings of its streams. */
+  recordings: (id: string) => call<Recording[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/recordings`),
   /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
   kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
+  /** Where agents can have workspaces of their own (Slates volumes), by target. */
+  workspaces: () => call<WorkspacesAvailable>("GET", "/api/harness/workspaces"),
+  /** An agent's workspace of its own, and the files under it changed on disk since it changed them. */
+  workspace: (id: string) => call<{ workspace: AgentInfo["workspace"] | null; drift: string[] }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/workspace`),
+  /** What writing its workspace to its folder would do. */
+  planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),
+  /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */
+  land: (id: string, manifest: string) => call<{ landed?: unknown } & Partial<LandingPlan> & { changed?: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, { manifest }),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
   /** An agent's goal stack. */
   goals: (id: string) => call<GoalStack>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/goals`),
-  /** Its goals not yet started, as they should be (existing ones by id). */
+  /** Its goals still to go, as they should be (existing ones by id; the one under way among them puts it back or rewords it). */
   setGoals: (id: string, goals: { id?: string; text: string }[]) => call<GoalStack>("PUT", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals }),
   /** Goals after its others; `start` runs the stack. */
   addGoals: (id: string, goals: string[], start = false) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals, start }),
-  /** Start (or resume), pause, skip the goal under way, or clear. */
-  goalAction: (id: string, action: "start" | "pause" | "skip" | "clear") => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`),
+  /** Start (or resume), pause, skip the goal under way, clear, or bring back the goals cleared last. */
+  goalAction: (id: string, action: "start" | "pause" | "skip" | "clear" | "restore") => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`),
+  /** One of its goals turned into a plan: planning it (research, its steps, ready) goes first, then its steps (`goals_plan`). */
+  /** Whether its stack plans its big goals first (a person's setting, not the agent's). */
+  goalSettings: (id: string, settings: { plan_big: boolean }) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/settings`, settings),
+  /** `dispatched`: a subagent of its agent plans it now (else `why` not: its planning waits its turn). */
+  planGoal: (id: string, goal: string) =>
+    call<{ plan: string; research: string; goal: string; part: string; dispatched?: boolean; why?: string | null }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/plan`, { id: goal }),
   /** The terminals beside an agent (its shell, its harness's own screen), live ones first. */
   terminals: (id: string) => call<BesideTerminal[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/terminals`),
   /** Open one beside it: its shell (the one already open, with `command` run in it), or its harness's own screen on `command`. */
@@ -752,8 +1020,8 @@ export const harnessApi = {
   history: (target: string, kind?: string, limit = 40) =>
     call<PastSession[]>("GET", `/api/harness/history?target=${encodeURIComponent(target)}${kind ? `&kind=${encodeURIComponent(kind)}` : ""}&limit=${limit}`),
   /** A task's output: its tail, or what came after byte `since`. */
-  taskOutput: (id: string, task: string, since?: number) =>
-    call<TaskOutput>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/tasks/${encodeURIComponent(task)}/output${since !== undefined ? `?since=${since}` : ""}`),
+  taskOutput: (id: string, task: string, since?: number, signal?: AbortSignal) =>
+    call<TaskOutput>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/tasks/${encodeURIComponent(task)}/output${since !== undefined ? `?since=${since}` : ""}`, undefined, signal),
   /** End the terminal a found session runs in and continue its conversation as an agent here. */
   /** `stop`: it runs outside kiln, so it is stopped on its machine first. */
   takeover: (machine: string, pid: number, opts?: { stop?: boolean }) =>
@@ -762,9 +1030,14 @@ export const harnessApi = {
   fork: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/fork`),
   start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
+  /** End an agent for good; with `children`, the agents it started (and theirs) end first. */
+  end: (id: string, children: boolean) => call<{ ended: string[] }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/stop`, { children }),
+  /** The agents an agent started that still run (and theirs). */
+  children: (id: string) => call<{ children: AgentChild[] }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/children`),
   /** Move an agent to another runner (`agent:<name>`): it goes on there once its turn is over. */
   /** Move an agent to runner `to`: once its turn is over, or `now` (the turn stops here and goes on there). */
-  move: (id: string, to: string, now = false) => call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to, now }),
+  move: (id: string, to: string, now = false, kind?: string, model?: string) =>
+    call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to, now, ...(kind ? { kind } : {}), ...(model ? { model } : {}) }),
   /** Every agent of `machine`, which is gone, goes on elsewhere from the server's copy of its conversation: each on the machine that suits it, or all on `to`. */
   recover: (machine: string, to?: string) =>
     call<{ moved: { id: string; name: string; to?: string; error?: string }[] }>("POST", `/api/harness/machines/${encodeURIComponent(machine)}/recover`, to ? { to } : {}),
@@ -816,17 +1089,42 @@ export interface Snapshot {
   events: HEvent[];
   /** The changeset, file by file (null until the server sends one). */
   changes: FileChange[] | null;
+  /** Files its finished messages mention, as the server kept them. */
+  files: KeptFile[];
   error: string | null;
   /** The first snapshot is in: until then there's nothing to show but a loader. */
   ready: boolean;
   /** A stop asked of the turn under way: which turn, and when (ms). Done with once none runs. */
   stopAsked: { turn: number | undefined; at: number } | null;
+  /** When the turn under way began, kept once it ends: between turns the clock holds the last one's length. */
+  ranFrom: number | null;
+}
+
+/**
+ * When the last turn began, for the clock between turns: as this page saw it start, else (opened
+ * since, or the start went by unseen) when it was last asked something before it ended. Null while
+ * a turn runs, and before one has ended.
+ */
+export function lastTurnFrom(s: Snapshot): number | null {
+  const end = s.state?.last_turn?.at;
+  if (end == null || s.state?.turn_started != null) return null;
+  let asked = 0;
+  for (let i = s.events.length - 1; i >= 0; i--) {
+    const e = s.events[i];
+    if (e?.kind === "user" && e.at <= end) {
+      asked = e.at;
+      break;
+    }
+  }
+  const seen = s.ranFrom != null && s.ranFrom <= end ? s.ranFrom : 0;
+  // What it saw start, unless a later ask began a turn it didn't see.
+  return seen && seen + 2000 >= asked ? seen : asked || null;
 }
 
 /** A promise React reads as settled without waiting (its `status`, as React marks the ones it tracks). */
 const READY: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
 
-const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, ready: false, stopAsked: null };
+const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, files: [], error: null, ready: false, stopAsked: null, ranFrom: null };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /**
  * The snapshot sent as the socket opens ends with the server's "synced"; one sent later (a machine
@@ -847,6 +1145,15 @@ const ENDED_RETRY_MS = 10_000;
 const LINGER_MS = 30_000;
 /** Conversations kept in memory once left (the latest ones). */
 const KEEP = 8;
+/** Match the server mirror's rolling event window (harness/core.rs and registry.rs). */
+const MAX_EVENTS = 4000;
+/**
+ * The browser unpacks gzip itself (every current one does): a session's snapshot comes packed, a
+ * long conversation's history in a tenth of the bytes.
+ */
+const GUNZIP = typeof DecompressionStream !== "undefined";
+/** A packed message's text. */
+const gunzip = (data: ArrayBuffer): Promise<string> => new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
 
 /**
  * What came, with every part equal to what was there kept as it was (the whole of it when it's all
@@ -886,12 +1193,23 @@ const withState = (info: AgentInfo | null, s: State): AgentInfo | null => {
     : { ...info, name: name ?? info.name, status: s.status, title: s.title, model: s.model, mode: s.mode };
 };
 
+/** The state with a patch applied: what it sets, without what's gone, every other field the same object. */
+const patched = (was: State | null, u: { set: Partial<State>; gone?: string[] }): State => {
+  const now: Record<string, unknown> = { ...was, ...u.set };
+  for (const k of u.gone ?? []) delete now[k];
+  return now as unknown as State;
+};
+
+/** The socket's query: a snapshot packed when it can be unpacked here, and a state as what changed in it. */
+const TAKES = GUNZIP ? "?z=gzip&patch=state" : "?patch=state";
+
 /** A snapshot on its way: gathered here and swapped in at once, so what's shown never empties. */
 interface Incoming {
   info: AgentInfo | null;
   meta: Meta | null;
   state: State | null;
   changes: FileChange[] | null;
+  files: KeptFile[] | null;
   byId: Map<string, HEvent>;
   /** Some of its events came. */
   events: boolean;
@@ -921,6 +1239,8 @@ export class SessionStore {
   /** Since the last notification: events replaced, new ones, a new snapshot. */
   private touched = new Set<string>();
   private grew = false;
+  /** Ids of the events new since the last notification, as they came. */
+  private fresh: string[] = [];
   private reorder = false;
   private incoming: Incoming | null = null;
   private listeners = new Set<() => void>();
@@ -928,6 +1248,12 @@ export class SessionStore {
   private wsAt = 0;
   /** Frames on this connection so far. */
   private frames = 0;
+  /** How far what's shown goes in the server's copy (docs/wire.md, "Revisions"): its process's
+   * incarnation and the copy's revision. A reconnect asks for only what came after. */
+  private born = 0;
+  private rev = 0;
+  /** What an "open" or "resumed" said, taken once what follows it is in. */
+  private pending: { born: number; rev: number } | null = null;
   /** Something shows it (or will in a moment): the socket stays up. */
   private wanted = false;
   private unhook: (() => void)[] = [];
@@ -950,6 +1276,9 @@ export class SessionStore {
   idleSince = 0;
   private replies = new Map<string, (v: unknown) => void>();
   private waiting: { promise: Promise<void>; resolve: () => void } | null = null;
+  /** Packed messages being unpacked, and the chain they (and what came after them) are taken in. */
+  private unpacking = 0;
+  private inbox: Promise<void> = Promise.resolve();
 
   constructor(readonly id: string) {}
 
@@ -1080,23 +1409,36 @@ export class SessionStore {
     this.incoming = null;
     let ws: WebSocket;
     try {
-      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws`));
+      // What's shown already: only what came after it, when the server's copy can say.
+      const after = this.born && this.rev ? `&after=${this.born}.${this.rev}` : "";
+      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws${TAKES}${after}`));
     } catch {
       this.retry();
       return;
     }
+    ws.binaryType = "arraybuffer";
     this.ws = ws;
     this.wsAt = Date.now();
+    this.unpacking = 0;
     ws.onmessage = (ev) => {
-      if (this.ws !== ws || typeof ev.data !== "string") return;
-      let u: Update;
-      try {
-        u = JSON.parse(ev.data) as Update;
-      } catch {
+      if (this.ws !== ws) return;
+      if (typeof ev.data === "string") {
+        this.receive(ws, ev.data);
         return;
       }
-      this.frames += 1;
-      this.apply(u);
+      // A packed snapshot (`?z=gzip`): unpacked, then its lines taken in order; what comes after
+      // it waits its turn.
+      const data = ev.data as ArrayBuffer;
+      this.unpacking += 1;
+      this.inbox = this.inbox
+        .then(() => gunzip(data))
+        .then((text) => {
+          if (this.ws === ws) for (const line of text.split("\n")) if (line) this.take1(line);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (this.ws === ws) this.unpacking -= 1;
+        });
     };
     ws.onclose = () => {
       if (this.ws !== ws) return;
@@ -1105,12 +1447,50 @@ export class SessionStore {
     };
   }
 
+  /** A message as it came: at once, unless a packed one before it is still being unpacked. */
+  private receive(ws: WebSocket, data: string) {
+    if (this.unpacking === 0) {
+      this.take1(data);
+      return;
+    }
+    this.inbox = this.inbox.then(() => {
+      if (this.ws === ws) this.take1(data);
+    });
+  }
+
+  /** One update, as JSON. */
+  private take1(data: string) {
+    let u: Update;
+    try {
+      u = JSON.parse(data) as Update;
+    } catch {
+      return;
+    }
+    this.frames += 1;
+    this.apply(u);
+    this.mark(u);
+  }
+
+  /** Where a frame says the server's copy is: an "open" or "resumed" once what follows it is in, a
+   * live frame at once. */
+  private mark(u: Update) {
+    const rev = (u as { rev?: unknown }).rev;
+    if (u.t === "open" || u.t === "resumed") {
+      const born = (u as { born?: unknown }).born;
+      this.pending = typeof born === "number" && typeof rev === "number" ? { born, rev } : null;
+      return;
+    }
+    if (!this.incoming && typeof rev === "number" && rev > this.rev) this.rev = rev;
+  }
+
   /** The socket closed: try again (rarely once it has ended, in case it was only away). */
   private lost() {
     if (!this.wanted) return;
     window.clearTimeout(this.quiet);
     window.clearTimeout(this.hold);
+    // A snapshot or resume cut off isn't what's shown: a reconnect asks from what was before it.
     this.incoming = null;
+    this.pending = null;
     if (this.ended) {
       this.retry(ENDED_RETRY_MS);
       return;
@@ -1148,12 +1528,14 @@ export class SessionStore {
         this.patch({ error: u.error });
         return;
       case "open":
+      case "resumed":
         this.opened = true;
         this.ended = false;
         this.misses = 0;
         this.attempt = 0;
-        // Sent as the socket opens: the server's own snapshot, which it ends with "synced".
-        this.begin(u.info, this.frames === 1);
+        // Sent as the socket opens: the server's own snapshot, which it ends with "synced"; or
+        // only what came after what's shown (resumed), taken in with it.
+        this.begin(u.info, this.frames === 1, u.t === "resumed");
         if (this.snap.ready && this.snap.conn !== "open") this.patch({ conn: "open" });
         return;
       case "synced":
@@ -1183,9 +1565,11 @@ export class SessionStore {
     this.schedule();
   }
 
-  private begin(info: AgentInfo | null, told: boolean) {
+  private begin(info: AgentInfo | null, told: boolean, resumed = false) {
     window.clearTimeout(this.hold);
-    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: null, byId: new Map(), events: false, told };
+    // A resume adds to what's shown; a snapshot replaces it.
+    const byId = resumed ? new Map(this.byId) : new Map<string, HEvent>();
+    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: resumed ? this.snap.changes : null, files: null, byId, events: false, told };
     this.hold = window.setTimeout(() => this.commit(), HOLD_MS);
     this.wait();
   }
@@ -1199,11 +1583,15 @@ export class SessionStore {
         inc.meta = u.meta;
         break;
       case "state":
-        inc.state = u.state;
-        inc.info = withState(inc.info, u.state);
+      case "state_patch":
+        inc.state = u.t === "state" ? u.state : patched(inc.state, u);
+        inc.info = withState(inc.info, inc.state);
         break;
       case "changes":
         inc.changes = u.files;
+        break;
+      case "files":
+        inc.files = withFiles(inc.files ?? [], u.files);
         break;
       case "events":
         inc.events = true;
@@ -1235,6 +1623,12 @@ export class SessionStore {
     }
     this.byId = byId;
     this.reorder = true;
+    // What's shown goes as far as the open or resume said.
+    if (this.pending) {
+      this.born = this.pending.born;
+      this.rev = this.pending.rev;
+      this.pending = null;
+    }
     const s = this.snap;
     this.snap = {
       ...s,
@@ -1242,7 +1636,9 @@ export class SessionStore {
       info: share(s.info, inc.info),
       meta: share(s.meta, inc.meta),
       state: share(s.state, inc.state),
+      ranFrom: inc.state?.turn_started ?? s.ranFrom,
       changes: share(s.changes, inc.changes),
+      files: inc.files ? share(s.files, inc.files) : s.files,
       error: null,
       ready: true,
     };
@@ -1276,11 +1672,16 @@ export class SessionStore {
       case "changes":
         this.snap = { ...this.snap, changes: share(this.snap.changes, u.files) };
         break;
-      case "state": {
-        const state = share<State | null>(this.snap.state, u.state) ?? u.state;
+      case "files":
+        this.snap = { ...this.snap, files: withFiles(this.snap.files, u.files) };
+        break;
+      case "state":
+      case "state_patch": {
+        const now = u.t === "state" ? u.state : patched(this.snap.state, u);
+        const state = share<State | null>(this.snap.state, now) ?? now;
         // A stop asked of a turn holds while one runs; once none does, it's done with.
         const stopAsked = state.status === "running" || state.status === "waiting" ? this.snap.stopAsked : null;
-        this.snap = { ...this.snap, state, info: withState(this.snap.info, state), stopAsked };
+        this.snap = { ...this.snap, state, info: withState(this.snap.info, state), stopAsked, ranFrom: state.turn_started ?? this.snap.ranFrom };
         break;
       }
       case "meta":
@@ -1291,6 +1692,7 @@ export class SessionStore {
           const was = this.byId.get(e.id);
           if (!was) {
             this.grew = true;
+            this.fresh.push(e.id);
             this.byId.set(e.id, e);
             continue;
           }
@@ -1321,13 +1723,39 @@ export class SessionStore {
     w?.resolve();
   }
 
-  /** The events in timeline order: the same array while they are, and the same objects. */
+  /**
+   * The events in timeline order: the same array while they are, and the same objects. What's new
+   * almost always comes after the last one, and joins at the end as it is (sorting thousands of
+   * events for each new one stalled long conversations); only one that doesn't sorts them all.
+   */
   private ordered(): HEvent[] {
     const was = this.snap.events;
+    if (this.grew && !this.reorder) {
+      const add = this.fresh.map((id) => this.byId.get(id)).filter((e): e is HEvent => e !== undefined);
+      add.sort((a, b) => a.seq - b.seq);
+      const last = was.length ? (was[was.length - 1]?.seq ?? -Infinity) : -Infinity;
+      if ((add[0]?.seq ?? Infinity) > last) {
+        const next = was.slice();
+        for (const id of this.touched) {
+          const i = this.pos.get(id);
+          const e = this.byId.get(id);
+          if (i !== undefined && e) next[i] = e;
+        }
+        for (const e of add) {
+          this.pos.set(e.id, next.length);
+          next.push(e);
+        }
+        this.grew = false;
+        this.fresh = [];
+        this.touched.clear();
+        return next;
+      }
+    }
     if (this.reorder || this.grew) {
       const next = [...this.byId.values()].sort((a, b) => a.seq - b.seq);
       this.reorder = false;
       this.grew = false;
+      this.fresh = [];
       this.touched.clear();
       const out = next.length === was.length && next.every((e, i) => e === was[i]) ? was : next;
       this.pos = new Map(out.map((e, i) => [e.id, i]));
@@ -1361,7 +1789,12 @@ export class SessionStore {
   private flush() {
     if (!this.dirty) return;
     this.dirty = false;
-    const events = this.ordered();
+    let events = this.ordered();
+    if (events.length > MAX_EVENTS + MAX_EVENTS / 4) {
+      for (const e of events.slice(0, -MAX_EVENTS)) this.byId.delete(e.id);
+      events = events.slice(-MAX_EVENTS);
+      this.pos = new Map(events.map((e, i) => [e.id, i]));
+    }
     if (events !== this.snap.events) this.snap = { ...this.snap, events };
     this.listeners.forEach((l) => l());
   }

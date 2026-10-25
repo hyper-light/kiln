@@ -3,4 +3,7 @@ production:
   branches: [main]
   # The cluster kiln runs in.
   clusters: [in-cluster]
-  # People deploy here; agents plan and ask (add `agents: { deploy: true }` to let them).
+  # Agents may deploy; deployment approvals remain a person's decision.
+  agents:
+    deploy: true
+    approve: false

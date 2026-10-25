@@ -1,60 +1,9 @@
 /* Plans (views/plans): plain sections in the page's flow; standard fields, selects, checkboxes. */
 
-.plans-tools {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 8px 12px;
-  margin-bottom: 18px;
-}
-.plans-filter {
-  min-width: 0;
-  flex: 1 1 320px;
-}
-.plans-sort {
-  flex: 0 0 180px;
-}
-.plans-list {
-  display: grid;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  border-top: 1px solid var(--color-line);
-}
-.plans-row {
-  display: grid;
-  gap: 4px;
-  padding: 12px 0;
-  border-bottom: 1px solid var(--color-line);
-}
-.plans-row-title {
-  color: var(--color-bright);
-  font-size: 15px;
-  font-weight: 500;
-  overflow-wrap: anywhere;
-}
-.plans-row-title:hover {
-  color: var(--color-link);
-}
-.plans-row-meta,
 .plan-dim {
   color: var(--color-meta);
   font-size: 12.5px;
 }
-.plans-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.plans-tag {
-  padding: 1px 8px;
-  border: 1px solid var(--color-line-strong);
-  border-radius: 999px;
-  color: var(--color-secondary);
-  font-family: var(--font-mono);
-  font-size: 11px;
-}
-
 .plan-page {
   display: grid;
   gap: 14px;
@@ -301,7 +250,6 @@ a.plan-row-main:hover {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .plans-page *,
   .plan-page * {
     transition: none !important;
   }
@@ -473,13 +421,42 @@ a.plan-row-main:hover {
   color: #c9cbd1;
 }
 
+/* The steps a step runs after: a tick each. */
+.pi-needs {
+  display: grid;
+  gap: 2px;
+}
+.pi-need {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 30px;
+  color: #c9ccd3;
+  font-size: 13px;
+}
+.pi-need[data-blocked] {
+  color: #7d818b;
+}
+.pi-need-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pi-need-why {
+  flex: none;
+  color: #7d818b;
+  font-size: 11px;
+}
+
 @media (pointer: coarse) {
   .pi-icon {
     width: 40px;
     height: 40px;
   }
   .pi-add,
-  .pi-text {
+  .pi-text,
+  .pi-need {
     min-height: 40px;
   }
   .pi-body {
@@ -584,4 +561,419 @@ a.plan-row-main:hover {
 }
 .ts-pass {
   margin: 2px 0 -2px;
+}
+
+/* ---------------------------------------------------------------- a run of one agent per step */
+.run-title {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 26px;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+.run-note {
+  margin: 0;
+}
+.run-reason {
+  margin: 0;
+  color: var(--color-warn);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.run-steps {
+  display: grid;
+  margin: 6px 0 0;
+  padding: 0;
+  border-top: 1px solid var(--color-line);
+  list-style: none;
+}
+.run-step {
+  display: grid;
+  gap: 8px;
+  padding: 16px 0 18px;
+  border-bottom: 1px solid var(--color-line);
+}
+.run-step-head {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 12px;
+}
+.run-n {
+  flex: none;
+  min-width: 18px;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.run-step-title {
+  min-width: 0;
+  flex: 1;
+  color: var(--color-bright);
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+.run-word {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+  color: var(--color-meta);
+  font-size: 12.5px;
+}
+.run-step[data-stand="needs_you"] .run-word,
+.run-step[data-stand="yours"] .run-word {
+  color: var(--color-warn);
+}
+.run-step[data-stand="met"] .run-word {
+  color: var(--color-ok);
+}
+.run-step[data-stand="unmet"] .run-word,
+.run-step[data-stand="stopped"] .run-word {
+  color: var(--color-fail);
+}
+.run-agent,
+.run-what,
+.run-goal {
+  margin: 0;
+  padding-left: 30px;
+}
+.run-agent {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+.run-agent-name {
+  color: var(--color-foreground);
+  font-size: 13.5px;
+}
+.run-agent-name:hover {
+  color: var(--color-link);
+}
+.run-what {
+  width: 100%;
+  min-width: 0;
+  color: var(--color-secondary);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.run-agent .run-what {
+  padding-left: 0;
+}
+/* A met step's diff in review, linked as its agent is. */
+.run-review a {
+  color: var(--color-foreground);
+}
+.run-review a:hover {
+  color: var(--color-link);
+}
+.run-goal {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-step .plan-actions {
+  padding-left: 30px;
+}
+.plan-meta-line {
+  margin: 0;
+}
+
+/* A plan's steps as their graph (graph.tsx): rounds across, a line from each step a step waits for;
+   narrow (a phone, a side pane), down, a step a row the graph's width, a round's steps close
+   together. Where each stands is drawn as the console draws work (status.tsx). Only a step at work
+   moves (its mark's light, its title's shimmer: transforms the GPU moves); waiting steps are
+   sketched and still; the lines never move. */
+.ptree {
+  position: relative;
+  container-type: inline-size;
+  margin: 12px 0 4px;
+}
+.ptree-lines {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+.ptree-lines path {
+  fill: none;
+  stroke: #343a45;
+  stroke-width: 1.2;
+  stroke-dasharray: 3 4;
+}
+.ptree-lines path[data-s="met"] {
+  stroke: #5d7a74;
+  stroke-dasharray: none;
+}
+.ptree-lines path[data-s="live"] {
+  stroke-dasharray: none;
+}
+/* Down, a step a row at every width: the rounds one under another, and a round's steps too. */
+.ptree-rounds {
+  position: relative;
+  display: grid;
+  grid-auto-flow: row;
+  gap: 18px;
+}
+.ptree-round {
+  display: grid;
+  gap: 6px;
+}
+.ptree-node {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #262a31;
+  border-radius: 9px;
+  background: #0d0f12;
+  color: var(--color-bright);
+  text-decoration: none;
+}
+a.ptree-node:hover,
+button.ptree-node:hover {
+  border-color: #353b46;
+}
+/* A step to pick (a plan's page): tapped, it's picked, ringed in the prism's blue and ticked. */
+button.ptree-node {
+  width: 100%;
+  padding-right: 26px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ptree-node[aria-pressed="true"] {
+  border-color: #a6c4ed;
+  background: #10151d;
+}
+.ptree-node[aria-pressed="true"]::after {
+  position: absolute;
+  top: 7px;
+  right: 10px;
+  color: #a6c4ed;
+  font-size: 12px;
+  content: "✓";
+}
+.ptree-node[data-stand="working"] {
+  border-color: #3a3f5a;
+}
+.ptree-node[data-stand="needs_you"],
+.ptree-node[data-stand="yours"] {
+  border-color: #5a4c37;
+}
+.ptree-node .sg-beam,
+.ptree-node .sg-optic {
+  margin-top: 2px;
+}
+.ptree .sg-beam[data-status="pending"] {
+  animation: none;
+}
+.ptree-text {
+  display: grid;
+  min-width: 0;
+}
+.ptree-title {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  font-size: 12.5px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.ptree-node[data-stand="waiting"] .ptree-title,
+.ptree-node[data-stand="stopped"] .ptree-title {
+  color: #9a9ca3;
+}
+.ptree-code {
+  color: inherit;
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+.ptree-n {
+  margin-right: 5px;
+  color: #7d818b;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.ptree-word {
+  margin-top: 2px;
+  color: #8d9099;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.ptree-node[data-stand="met"] .ptree-word {
+  color: #a8c9bc;
+}
+.ptree-node[data-stand="needs_you"] .ptree-word,
+.ptree-node[data-stand="yours"] .ptree-word,
+.ptree-node[data-stand="unmet"] .ptree-word {
+  color: #d8bb95;
+}
+/* A step whose line to a step it waits for would run behind another: what it waits for, said. */
+.ptree-after {
+  color: #8d9099;
+  font-size: 11px;
+}
+.ptree-who {
+  overflow: hidden;
+  color: #7d818b;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ptree-bar {
+  display: flex;
+  gap: 2px;
+  height: 4px;
+  margin: 10px 0 2px;
+}
+.ptree-bar i {
+  flex: 1;
+  border-radius: 2px;
+  background: #2a3039;
+}
+.ptree-bar i[data-s="met"] {
+  background: #a8c9bc;
+}
+.ptree-bar i[data-s="working"] {
+  background: linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
+}
+.ptree-bar i[data-s="needs_you"],
+.ptree-bar i[data-s="yours"] {
+  background: #d8bb95;
+}
+.ptree-bar i[data-s="unmet"] {
+  background: repeating-linear-gradient(90deg, #d8bb95 0 6px, transparent 6px 8px);
+}
+.ptree-bar i[data-s="stopped"] {
+  background: #4a4f58;
+}
+/* A plan, read (steps-view.tsx): its overview, then its steps as their graph, to pick; what each
+   picked step is under it, in the graph's own look, and Run for just those. */
+.plan-overview {
+  color: var(--color-secondary);
+  font-size: 14px;
+}
+.sv-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+}
+.sv-hint {
+  font-size: 12px;
+}
+.sv-picked {
+  color: var(--color-bright);
+  font-size: 12px;
+}
+.sv-picked-steps {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+.sv-details {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sv-detail {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid #262a31;
+  border-radius: 9px;
+  background: #0d0f12;
+  font-size: 13px;
+}
+.sv-body {
+  min-width: 0;
+}
+.sv-run {
+  justify-self: start;
+}
+.sv-title {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.sv-n {
+  display: inline-block;
+  min-width: 1.7em;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.sv-link {
+  margin: -6px 0;
+  padding: 6px 0;
+  border: 0;
+  background: none;
+  color: var(--color-secondary);
+  font: inherit;
+  font-size: 12px;
+  text-decoration: underline;
+  text-decoration-color: #4a4f58;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.sv-link:hover {
+  color: var(--color-bright);
+}
+/* An agent's own plan, in its Plan tab (its-plan.tsx): its to-do list as the tree of a plan's steps;
+   the plan it proposed in its words, kept by kiln. */
+.ip {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.ip-head {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.ip-head a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: #4a4f58;
+  text-underline-offset: 3px;
+}
+.ip-words {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-secondary);
+  font: inherit;
+  font-size: 12px;
+  text-decoration: underline;
+  text-decoration-color: #4a4f58;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.ip-words:hover {
+  color: var(--color-bright);
+}
+.ip-meta {
+  color: var(--color-meta);
+  font-size: 12px;
+}
+.ip-todos .ptree-bar {
+  margin-top: 2px;
 }

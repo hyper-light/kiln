@@ -10626,6 +10626,7 @@ impl RowidAllocator {
     }
 
     /// Initialize from btree max. Called once per table, under lock.
+    #[allow(deprecated)] // kiln: `fetch_update`, kept for older Rust
     pub fn initialize(&self, rowid: Option<i64>) {
         tracing::trace!("initialize({rowid:?})");
         let _ = self

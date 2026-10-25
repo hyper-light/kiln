@@ -142,7 +142,7 @@ async fn sample(hub: &Hub, secs: f64) -> anyhow::Result<()> {
     let rows: Vec<(String, f64, f64)> = hub.agents.lock().values().filter(|a| a.connected && a.slots > 0 && !a.outpost).map(|a| (a.name.clone(), f64::from(a.slots), f64::from(a.busy.min(a.slots)))).collect();
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             for (runner, slots, busy) in rows {
                 tx.execute(
                     "INSERT INTO ci_runner_time (bucket, runner, connected, slot_seconds, busy_seconds) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -214,7 +214,7 @@ async fn roll(hub: &Hub) -> anyhow::Result<()> {
 async fn write(hub: &Hub, grain: &'static str, bucket: i64, rows: HashMap<Key, Rollup>) -> anyhow::Result<()> {
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute("DELETE FROM ci_rollups WHERE grain = ?1 AND bucket = ?2", params![grain, bucket])?;
             {
                 let mut st = tx.prepare("INSERT INTO ci_rollups (grain, bucket, repo_id, workflow, job, step, executor, runner, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?;
@@ -716,7 +716,7 @@ async fn critical(hub: &Hub, repo: &str, workflow: &str) -> anyhow::Result<Value
         })
         .await?;
     let Some((id, number)) = run else { return Ok(Value::Null) };
-    let g = super::runs_api::graph_json(hub, &id, None).await.map_err(|(_, e)| anyhow::anyhow!(e))?;
+    let g = super::runs_api::graph_json(&hub.store, &id, None).await.map_err(|(_, e)| anyhow::anyhow!(e))?;
     let path: Vec<String> = g.get("critical_path").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
     let span = |j: &str| -> i64 {
         g.get("nodes").and_then(Value::as_array).and_then(|n| n.iter().find(|x| x.get("job").and_then(Value::as_str) == Some(j))).map_or(0, |n| {

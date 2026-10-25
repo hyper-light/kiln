@@ -18,6 +18,9 @@ pub struct Declared {
     pub facts: BTreeMap<String, String>,
     /// Commands whose output is read as a version (`cuda = "nvcc --version"`).
     pub probes: BTreeMap<String, String>,
+    /// The most `kiln/cache@v1`'s local tier keeps in `<work>/_cache` (`cache_max = "20G"`; 10G
+    /// when unset, docs/ci.md W08-R09).
+    pub cache_max: Option<String>,
 }
 
 impl Declared {
@@ -76,12 +79,21 @@ async fn tools() -> BTreeMap<String, String> {
     found.into_iter().flatten().collect()
 }
 
-/// The executors this runner can run legs on right now, each probed: the host always; Docker (or
-/// Podman) when its engine answers, with its version and whether it runs rootless. Firecracker and
-/// shards are reported as tools until this runner can run legs on them.
+/// The executors this runner can run legs on right now, each probed: the host always; Firecracker
+/// when its microVMs can run here (KVM, Firecracker, its guest kernel and e2fsprogs: W13-R05), with
+/// its version and kernel; Docker (or Podman) when its engine answers, with its version and whether
+/// it runs rootless. shards is reported as a tool until this runner can run legs on it.
 async fn executors() -> BTreeMap<String, Executor> {
     let mut out = BTreeMap::new();
     out.insert("host".to_owned(), Executor::default());
+    #[cfg(target_os = "linux")]
+    if let Ok(Some(m)) = crate::rt::blocking(super::firecracker::Machine::find).await {
+        let kernel = m.kernel.to_string_lossy().into_owned();
+        // How its VMMs are confined (W13-R05): a jail of namespaces each, or none here.
+        let jail = if m.jail { "namespaces" } else { "none" }.to_owned();
+        let version = crate::rt::blocking(move || m.version()).await.ok().flatten();
+        out.insert("firecracker".to_owned(), Executor { version, details: [("kernel".to_owned(), kernel), ("jail".to_owned(), jail)].into() });
+    }
     let Ok(Some(bin)) = crate::rt::blocking(super::docker::find).await else { return out };
     let engine = if bin.ends_with("podman") { "podman" } else { "docker" };
     let mut version = None;
@@ -199,17 +211,9 @@ fn kvm() -> (bool, bool) {
 
 /// The work directory's own file system (a `tmpfs` too, which `sysinfo`'s disks leave out): its
 /// size and what this user may still write.
-#[cfg(unix)]
-#[allow(clippy::useless_conversion, reason = "the block counts are u32 on some systems, u64 on others")]
-fn volume(dir: &Path) -> Option<Disk> {
-    let s = nix::sys::statvfs::statvfs(dir).ok()?;
-    let frag = u64::from(s.fragment_size());
-    Some(Disk { total: u64::from(s.blocks()).saturating_mul(frag), free: u64::from(s.blocks_available()).saturating_mul(frag) })
-}
-
-#[cfg(not(unix))]
-fn volume(_dir: &Path) -> Option<Disk> {
-    None
+pub(crate) fn volume(dir: &Path) -> Option<Disk> {
+    let (total, free) = crate::os::disk_space(dir)?;
+    Some(Disk { total, free })
 }
 
 /// The machine: its OS, CPU, memory, the work directory's volume, virtualization and emulation.
@@ -252,6 +256,12 @@ fn machine(work_dir: &Path) -> RunnerFacts {
 pub async fn gather(work_dir: &Path, declared: &Declared) -> RunnerFacts {
     let dir = work_dir.to_path_buf();
     let mut f = crate::rt::blocking(move || machine(&dir)).await.unwrap_or_default();
+    // A test build posing as a runner of another platform (`--chaos platform=`, docs/ci.md
+    // W04-AC07): that platform's OS and architecture, and so the labels they give.
+    if let Some(p) = super::chaos::get().and_then(|c| c.platform.as_deref()).and_then(|p| kiln_ci::plan::matrix::Platform::parse(p).ok()) {
+        f.arch_variant = p.variant.clone().or_else(|| (p.fact_arch == "aarch64").then(|| "v8".to_owned()));
+        (f.os, f.arch) = (p.fact_os.to_owned(), p.fact_arch.to_owned());
+    }
     // Hypervisor.framework on a Mac: the kernel says whether it's supported.
     if cfg!(target_os = "macos") {
         f.virt.hvf = output("sysctl", &["-n", "kern.hv_support"]).await.is_some_and(|v| v.trim() == "1");
@@ -270,6 +280,7 @@ pub async fn gather(work_dir: &Path, declared: &Declared) -> RunnerFacts {
         }
     }
     f.kiln = Some(crate::updates::kiln_facts());
+    f.workspaces = Some(crate::workspace::slates::facts().await);
     f.probed_at = crate::util::now_unix();
     f
 }

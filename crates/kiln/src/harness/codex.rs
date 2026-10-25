@@ -9,6 +9,7 @@
 //! Unknown methods and fields are ignored.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -49,17 +50,52 @@ fn policy(mode: &str) -> (&'static str, &'static str, Value) {
     }
 }
 
+/// Whether permissions `a` (approval policy, sandbox) allow something `b` doesn't: they ask
+/// less or reach further. Unknown ones might, unless `b` is the most there is.
+fn exceeds(a: Option<&(String, String)>, b: &(String, String)) -> bool {
+    let asks = |p: &str| match p {
+        "untrusted" => 0,
+        "never" => 2,
+        _ => 1,
+    };
+    let reach = |s: &str| match s {
+        "read-only" => 0,
+        "danger-full-access" => 2,
+        _ => 1,
+    };
+    match a {
+        Some((approval, sandbox)) => asks(approval) > asks(&b.0) || reach(sandbox) > reach(&b.1),
+        None => asks(&b.0) < 2 || reach(&b.1) < 2,
+    }
+}
+
+/// "a", "a and b", "a, b and c".
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Pending {
     Initialize,
     Thread,
     /// thread/turns/list: a resumed thread's history, page by page.
     History,
+    /// Read-only views of a native subagent; never resume or attach an executor to it.
+    Child { thread: String, revision: u64 },
+    ChildHistory { thread: String, revision: u64 },
     Turn(String),
     /// turn/steer for a message; the message itself (to send it as the next turn should the
     /// running one end first), unless kiln wrote it (feedback).
     Steer(String, Option<QueueItem>),
     Interrupt,
+    PermissionInterrupt(String),
+    /// turn/interrupt of a native subagent's turn (its thread), as it works under other
+    /// permissions than the session's.
+    ChildInterrupt(String),
     Models,
     Suggest(String),
     Skills,
@@ -85,6 +121,13 @@ enum Pending {
     Goal(String),
     /// thread/inject_items: a conversation carried over from another harness, into the new thread.
     Inject,
+    /// thread/backgroundTerminals/list, asked at `at` while kiln showed these terminal tasks
+    /// running.
+    Terminals { at: i64, live: Vec<String> },
+    /// turn/start on a subagent's own thread, for a person's message.
+    ChildTurn { thread: String, m: QueueItem },
+    /// turn/steer into a subagent's turn, for a person's message.
+    ChildSteer { thread: String, m: QueueItem },
 }
 
 /// A run of the CLI (or a fetch) kiln is waiting on.
@@ -111,6 +154,62 @@ const LETTING_GO: &str = "Waiting for Codex to let go of the conversation (it st
 
 /// Turns of a resumed thread's history loaded (the latest).
 const HISTORY_TURNS: u32 = 100;
+const CHILD_REFRESH_MS: i64 = 5_000;
+/// How long a request is held back while the work that made it is stopped.
+const WITHHELD_MS: i64 = 30_000;
+/// A terminal's task id: `terminal-<item id>`.
+const TERMINAL: &str = "terminal-";
+/// How often kiln asks Codex which terminals it still runs while it shows some running.
+const TERMINALS_EVERY_MS: i64 = 30_000;
+/// A terminal that started this shortly before kiln asked may not be among Codex's yet.
+const TERMINAL_GRACE_MS: i64 = 2_000;
+
+/// A child's snapshots supplement notifications (which Codex does not always forward).
+#[derive(Default, Serialize, Deserialize)]
+struct Child {
+    read_at: i64,
+    revision: u64,
+    refresh: bool,
+    #[serde(default)]
+    runtime: Option<String>,
+    #[serde(default)]
+    turn: Option<String>,
+    #[serde(default)]
+    seen: HashMap<String, u64>,
+    #[serde(default)]
+    failures: u32,
+    /// The approval policy and sandbox it started with, which Codex keeps for its life (None:
+    /// it started before kiln saw it).
+    #[serde(default)]
+    permissions: Option<(String, String)>,
+    /// Its turn kiln is stopping, as it works under other permissions than the session's.
+    #[serde(default)]
+    stopping: Option<String>,
+    /// Its turn Codex wouldn't stop (what it asks is the person's).
+    #[serde(default)]
+    unstoppable: Option<String>,
+    /// It takes a person's messages on its own thread (`turn/start`, `turn/steer`): a multi-agent
+    /// v1 agent this process spawned. Codex refuses them for a v2 agent (it reports its spawn as
+    /// `subAgentActivity`) and for one it didn't spawn (unloaded): those go by way of the agent.
+    #[serde(default)]
+    direct: bool,
+    /// Its path among the agents (v2's `agentPath`), which the agent's tools address it by.
+    #[serde(default)]
+    path: Option<String>,
+    /// Closed (`close_agent`): it takes nothing until it's resumed.
+    #[serde(default)]
+    closed: bool,
+    /// A message sent now: it starts its next turn once the one under way is stopped.
+    #[serde(default)]
+    now: Option<QueueItem>,
+    /// A message kiln asked the agent to pass on to it while it was idle: what waits next goes
+    /// once its turn for that one has started and ended.
+    #[serde(default)]
+    relaying: bool,
+    /// Its turn that ended last (one kiln started may say it began after it ended).
+    #[serde(default)]
+    done_turn: Option<String>,
+}
 
 /// Whether a turn's error is the account's usage limit: `codexErrorInfo` says so
 /// (`usageLimitExceeded`, as a word or an object's key), or the message does.
@@ -182,6 +281,11 @@ pub struct Codex {
     thread: Option<String>,
     /// The turn under way.
     turn: Option<String>,
+    /// Runtime status pushed by Codex, including work started outside kiln.
+    #[serde(default)]
+    thread_status: Option<Status>,
+    #[serde(default)]
+    children: HashMap<String, Child>,
     /// The message that started (or was steered into) the turn under way.
     turn_messages: Vec<String>,
     /// Messages to send once the thread exists or the turn under way has been interrupted.
@@ -191,6 +295,9 @@ pub struct Codex {
     resume: Option<String>,
     model: Option<String>,
     allow_bypass: bool,
+    /// This run's tag, in the ids of the notices it makes ([`super::core::run_tag`]).
+    #[serde(default = "super::core::run_tag")]
+    run: String,
     notice_seq: u64,
     mode: String,
     /// Reasoning summaries in turns (auto, concise, detailed, none).
@@ -198,6 +305,27 @@ pub struct Codex {
     /// Approval policy and sandbox chosen directly (over the mode's).
     approval: Option<String>,
     sandbox: Option<String>,
+    /// A person's permission change is interrupting the current turn. Codex cannot change a
+    /// running turn's policy; its continuation starts with the newly chosen policy.
+    #[serde(default)]
+    permissions_changing: bool,
+    /// Policies sent for the current turn; old handed-over adapters may not know them.
+    #[serde(default)]
+    turn_permissions: Option<(String, String)>,
+    /// Notifications can finish a turn before its turn/start RPC reply arrives.
+    #[serde(default)]
+    completed_turn: Option<String>,
+    /// Subagents kiln stopped for working under other permissions than the session's, until
+    /// their parent is told.
+    #[serde(default)]
+    stopped: Vec<String>,
+    /// Requests for approval no work started with the session's permissions makes, kept from
+    /// the person while that work is moved onto them (shown after all if it can't be).
+    #[serde(default)]
+    withheld: HashMap<String, Approval>,
+    /// The turn kiln last interrupted to apply the session's permissions to (once each).
+    #[serde(default)]
+    applied: Option<String>,
     /// Effort levels per model, from model/list.
     efforts: HashMap<String, Vec<(String, String)>>,
     /// The turn each prompt started (rewinds and branches name a prompt).
@@ -233,6 +361,16 @@ pub struct Codex {
     mcp_again: bool,
     /// Terminals kiln is stopping: their end reads as stopped, not failed.
     stopping: std::collections::HashSet<String>,
+    /// When kiln last asked Codex which terminals it still runs, and whether it can't say (an
+    /// older Codex without `thread/backgroundTerminals/list`).
+    #[serde(default)]
+    terminals_at: i64,
+    #[serde(default)]
+    terminals_unknown: bool,
+    /// Terminals kiln ended as Codex no longer ran them, before Codex said how they ended: its
+    /// word, when it comes, replaces kiln's.
+    #[serde(default)]
+    unheard: std::collections::HashSet<String>,
     /// Queued messages to steer into the turn about to start, once it has (it has no id yet).
     steer_on_start: Vec<String>,
     /// The thread's rollout file.
@@ -249,6 +387,14 @@ pub struct Codex {
     seed: Option<Vec<Value>>,
     seeded: bool,
     injecting: bool,
+    /// The goal the thread it went on from pursued (a move), set on the new thread once its
+    /// conversation is in (`thread/goal/set`'s params, but the thread).
+    #[serde(default)]
+    goal: Option<Value>,
+    /// Messages a person wrote to a subagent Codex takes none for from kiln, which the agent is
+    /// to pass on with its own agent tools: by subagent (its thread), their ids, oldest first.
+    #[serde(default)]
+    relays: HashMap<String, std::collections::VecDeque<String>>,
 }
 
 impl Codex {
@@ -269,17 +415,26 @@ impl Codex {
             asks: HashMap::new(),
             thread: None,
             turn: None,
+            thread_status: None,
+            children: HashMap::new(),
             turn_messages: Vec::new(),
             waiting: Vec::new(),
             effort: None,
             resume,
             model: model.filter(|m| !m.is_empty()),
             allow_bypass,
+            run: super::core::run_tag(),
             notice_seq: 0,
             mode,
             summary: None,
             approval: None,
             sandbox: None,
+            permissions_changing: false,
+            turn_permissions: None,
+            completed_turn: None,
+            stopped: Vec::new(),
+            withheld: HashMap::new(),
+            applied: None,
             efforts: HashMap::new(),
             turns: HashMap::new(),
             skills: HashMap::new(),
@@ -300,6 +455,9 @@ impl Codex {
             mcp_status_seen: false,
             mcp_again: false,
             stopping: std::collections::HashSet::new(),
+            terminals_at: 0,
+            terminals_unknown: false,
+            unheard: std::collections::HashSet::new(),
             steer_on_start: Vec::new(),
             rollout: None,
             opening: None,
@@ -309,13 +467,34 @@ impl Codex {
             seed: None,
             seeded: false,
             injecting: false,
+            goal: None,
+            relays: HashMap::new(),
         }
     }
 
-    /// Start the new thread with this conversation (one carried over from another harness).
+    /// Start the new thread with this conversation (one carried over from another harness), and
+    /// the goal it pursued, if one came with it (`moving::GOAL`).
     pub fn seed(&mut self, items: Vec<Value>) {
+        let (goals, items): (Vec<Value>, Vec<Value>) = items.into_iter().partition(|i| i.get("type").and_then(Value::as_str) == Some(super::moving::GOAL));
+        self.goal = goals.into_iter().last().map(|mut g| {
+            if let Some(o) = g.as_object_mut() {
+                o.remove("type");
+                o.retain(|_, v| !v.is_null());
+            }
+            g
+        });
         self.seeded = items.is_empty();
         self.seed = (!items.is_empty()).then_some(items);
+    }
+
+    /// The goal that came with the conversation, set on the thread it goes on in.
+    fn set_carried_goal(&mut self, core: &mut Core) {
+        let (Some(mut params), Some(thread)) = (self.goal.take(), self.thread.clone()) else { return };
+        if let Some(o) = params.as_object_mut() {
+            o.insert("threadId".into(), json!(thread));
+            o.insert("origin".into(), json!("user"));
+        }
+        self.request(core, Pending::Plain("Setting the goal it pursued again".into()), "thread/goal/set", params);
     }
 
     /// The conversation it was given is in its thread (or it was given none).
@@ -335,6 +514,466 @@ impl Codex {
             _ => p,
         };
         (approval, sandbox, turn)
+    }
+
+    /// Keep the preset label honest when the two permission controls are chosen separately.
+    fn permission_controls(&mut self, core: &mut Core) {
+        // Older live adapters are adopted without start(); publish the capability there too.
+        if !core.meta.features.iter().any(|f| f == "permissions_live") {
+            core.meta.features.push("permissions_live".into());
+            core.touch_meta();
+        }
+        let (approval, sandbox, _) = self.policies(core);
+        // Older adapters could keep just one override. Preserve its other, implicit value
+        // before changing the label to Custom (which has no preset of its own).
+        if self.approval.is_some() || self.sandbox.is_some() {
+            self.approval = Some(approval.clone());
+            self.sandbox = Some(sandbox.clone());
+        }
+        let mode = modes(true).into_iter().find(|m| {
+            let (a, s, _) = policy(&m.id);
+            a == approval && s == sandbox
+        }).map_or_else(|| "custom".to_owned(), |m| m.id);
+        if core.state.mode != mode {
+            core.state.mode = mode;
+            core.touch_state();
+        }
+        if core.state.mode == "custom" && !core.meta.modes.iter().any(|m| m.id == "custom") {
+            core.meta.modes.push(ModeOption { id: "custom".into(), label: "Custom".into(), description: "The approval and sandbox settings selected separately".into(), dangerous: false });
+            core.touch_meta();
+        } else if core.state.mode != "custom" && core.meta.modes.iter().any(|m| m.id == "custom") {
+            // Custom describes the controls in force; it isn't a saved preset to switch back to.
+            core.meta.modes.retain(|m| m.id != "custom");
+            core.touch_meta();
+        }
+        core.set_control("approval_policy", json!(approval));
+        core.set_control("sandbox", json!(sandbox));
+        self.compose_status(core);
+    }
+
+    fn permissions_changed(&mut self, core: &mut Core) {
+        self.permission_controls(core);
+        let (approval, sandbox, _) = self.policies(core);
+        let now = (approval, sandbox);
+        // Subagents keep the permissions they started with: those allowed more stop now.
+        let over: Vec<(String, Option<String>)> = self.children.iter()
+            .filter(|(id, c)| c.turn.is_some() && exceeds(c.permissions.as_ref(), &now) && core.state.tasks.iter().any(|t| t.id == **id && t.live()))
+            .map(|(id, c)| (id.clone(), c.turn.clone()))
+            .collect();
+        for (child, turn) in over {
+            let _ = self.stop_child(core, &child, turn);
+        }
+        let running = self.turn.is_some() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)));
+        if running && (self.permissions_changing || self.turn_permissions.as_ref() != Some(&now)) {
+            if !self.permissions_changing {
+                self.notice(core, Level::Info, "Applying the new permissions: interrupting this turn, then continuing its work.");
+                self.permissions_changing = true;
+            }
+            self.interrupt_for_permissions(core);
+        }
+        self.reconcile(core);
+        // The change stopped work: the parent goes on with it now (one being interrupted, as
+        // it continues).
+        self.tell_parent(core, true);
+    }
+
+    /// A request for approval nothing started with the session's permissions makes: under
+    /// "never" nothing asks, so it comes from work started with earlier ones (a turn begun
+    /// before they changed, or a subagent, which keeps the permissions it started with).
+    fn outdated(&self, core: &Core, kind: AskKind, thread: Option<&str>) -> bool {
+        if !matches!(kind, AskKind::Command | AskKind::LegacyExec | AskKind::FileChange | AskKind::LegacyPatch | AskKind::Permissions) {
+            return false;
+        }
+        let (approval, sandbox, _) = self.policies(core);
+        if approval != "never" {
+            return false;
+        }
+        let now = (approval, sandbox);
+        match thread.filter(|t| self.thread.as_deref() != Some(*t)) {
+            Some(child) => self.children.get(child).and_then(|c| c.permissions.as_ref()) != Some(&now),
+            None => self.turn.is_some() && self.turn_permissions.as_ref() != Some(&now),
+        }
+    }
+
+    /// Move the work that asked (`thread`'s turn `turn`) onto the session's permissions rather
+    /// than ask the person, and never by answering for them: the session's own turn is
+    /// interrupted and goes on with them; a subagent is stopped and its parent told to start a
+    /// new one. False: it can't be (kiln tried for that turn, and Codex refused).
+    fn apply_permissions(&mut self, core: &mut Core, thread: Option<&str>, turn: Option<String>) -> bool {
+        match thread.filter(|t| self.thread.as_deref() != Some(*t)) {
+            Some(child) => self.stop_child(core, child, turn),
+            None => {
+                if self.permissions_changing {
+                    return true;
+                }
+                if self.turn.is_none() || self.applied == self.turn {
+                    return false;
+                }
+                self.applied.clone_from(&self.turn);
+                self.notice(core, Level::Info, "Applying your permissions: this turn started with earlier ones, so it's interrupted, then its work continues.");
+                self.permissions_changing = true;
+                self.interrupt_for_permissions(core);
+                true
+            }
+        }
+    }
+
+    /// Requests for approval shown, or held back, that only work started with earlier
+    /// permissions makes: that work is moved onto the session's.
+    fn reconcile(&mut self, core: &mut Core) {
+        let outdated: Vec<(Option<String>, Option<String>)> = core.state.approvals.iter().chain(self.withheld.values())
+            .filter(|a| self.asks.get(&a.id).is_some_and(|k| self.outdated(core, k.kind, a.input.get("threadId").and_then(Value::as_str))))
+            .map(|a| (a.input.get("threadId").and_then(Value::as_str).map(str::to_owned), a.input.get("turnId").and_then(Value::as_str).map(str::to_owned)))
+            .collect();
+        for (thread, turn) in outdated {
+            let _ = self.apply_permissions(core, thread.as_deref(), turn);
+        }
+    }
+
+    /// Stop a subagent's turn: it keeps the permissions it started with, and works under other
+    /// ones than the session's. What it asked goes with the turn. False: it can't be (kiln
+    /// tried for that turn, and Codex refused).
+    /// A person stops subagent `thread` (its row's Stop): the turn it works on is interrupted. Its
+    /// parent isn't told to start it again (that's for the permission change above). False: it
+    /// has no turn under way.
+    fn stop_child_asked(&mut self, core: &mut Core, thread: &str) -> bool {
+        let Some(turn) = self.children.get(thread).and_then(|c| c.turn.clone()) else { return false };
+        let name = core.state.tasks.iter().find(|t| t.id == thread).map(|t| t.description.trim().to_owned()).filter(|d| !d.is_empty()).unwrap_or_else(|| thread.to_owned());
+        self.notice(core, Level::Info, format!("Stopping subagent {name}, as asked."));
+        self.request(core, Pending::ChildInterrupt(thread.to_owned()), "turn/interrupt", json!({"threadId": thread, "turnId": turn}));
+        true
+    }
+
+    fn stop_child(&mut self, core: &mut Core, thread: &str, turn: Option<String>) -> bool {
+        let Some(turn) = turn.or_else(|| self.children.get(thread).and_then(|c| c.turn.clone())) else { return false };
+        let child = self.children.entry(thread.to_owned()).or_default();
+        if child.unstoppable.as_deref() == Some(turn.as_str()) {
+            return false;
+        }
+        if child.stopping.as_deref() == Some(turn.as_str()) {
+            return true;
+        }
+        child.stopping = Some(turn.clone());
+        if !self.stopped.iter().any(|s| s == thread) {
+            self.stopped.push(thread.to_owned());
+        }
+        let name = core.state.tasks.iter().find(|t| t.id == thread).map(|t| t.description.trim().to_owned()).filter(|d| !d.is_empty()).unwrap_or_else(|| thread.to_owned());
+        self.notice(core, Level::Info, format!("Stopping subagent {name}: it keeps the permissions it was started with, which differ from this session's now. Its parent is told to start a new one for its unfinished work."));
+        self.request(core, Pending::ChildInterrupt(thread.to_owned()), "turn/interrupt", json!({"threadId": thread, "turnId": turn}));
+        true
+    }
+
+    /// What the parent hears about the subagents kiln stopped (and forgets them).
+    fn stopped_note(&mut self, core: &Core) -> Option<String> {
+        if self.stopped.is_empty() {
+            return None;
+        }
+        let names: Vec<String> = std::mem::take(&mut self.stopped).iter()
+            .map(|id| core.state.tasks.iter().find(|t| t.id == *id).map(|t| t.description.trim()).filter(|d| !d.is_empty()).map_or_else(|| id.clone(), |d| format!("{d} ({id})")))
+            .collect();
+        let (they, them) = if names.len() == 1 { ("it", "it") } else { ("they", "them") };
+        Some(format!(
+            "kiln stopped your subagent{} {}: subagents keep the permissions they were started with, and {they} started with other ones than yours now. \
+             Start new subagents for any of {} work that isn't done (new ones get your current permissions) rather than sending {them} more.",
+            if names.len() == 1 { "" } else { "s" },
+            and_list(&names),
+            if names.len() == 1 { "its" } else { "their" },
+        ))
+    }
+
+    /// The parent hears which subagents kiln stopped: in its turn (steered in). Between turns,
+    /// `now` (a person's permission change stopped them) starts one to go on with their work;
+    /// else it hears with the next message it's sent. A turn interrupted for new permissions
+    /// hears as it goes on.
+    fn tell_parent(&mut self, core: &mut Core, now: bool) {
+        if self.permissions_changing || self.stopped.is_empty() {
+            return;
+        }
+        if self.turn.is_some() {
+            let Some(text) = self.stopped_note(core) else { return };
+            let id = format!("{}{}", super::pause::KILN_ID, crate::util::new_id());
+            self.send(core, QueueItem { id: id.clone(), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Steer);
+            super::pause::from_kiln(core, &id);
+        } else if now && !self.busy(core) {
+            let Some(note) = self.stopped_note(core) else { return };
+            super::pause::continue_later(core, &format!("Your permissions were updated. {note}"));
+            self.next(core);
+        }
+    }
+
+    /// Requests held back from the person are theirs after all (the work that asked could not
+    /// be stopped): those of `thread` (None: the session's own).
+    fn show_withheld(&mut self, core: &mut Core, thread: Option<&str>) {
+        let own = self.thread.clone();
+        let ids: Vec<String> = self.withheld.iter()
+            .filter(|(_, a)| {
+                let from = a.input.get("threadId").and_then(Value::as_str);
+                match thread {
+                    Some(t) => from == Some(t),
+                    None => from.is_none() || from == own.as_deref(),
+                }
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.release(core, ids);
+    }
+
+    fn release(&mut self, core: &mut Core, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
+            if let Some(a) = self.withheld.remove(&id) {
+                if let Some(tool) = a.tool_id.as_deref() {
+                    set_status(core, tool, ToolStatus::Pending);
+                }
+                core.add_approval(a);
+            }
+        }
+        self.settle(core);
+    }
+
+    // ------------------------------------------------------------------ messages to subagents
+
+    /// How a person's message reaches subagent `t` now. One this process spawned with
+    /// multi-agent v1 takes them on its own thread: as a turn of its own when idle, steered into
+    /// the one under way, or sent now (that turn interrupted). Codex refuses them for a v2 agent and
+    /// for one it didn't spawn here (`direct app-server input is not allowed …`), so the agent
+    /// passes those on with its own agent tools: steered into a turn, or a turn once it's idle
+    /// (agents it started itself only; a deeper one can't be reached that way).
+    pub fn takes(&self, core: &Core, t: &Task) -> (Vec<SendMode>, Option<&'static str>) {
+        let none = (Vec::new(), None);
+        let Some(child) = self.children.get(&t.id) else { return none };
+        if child.closed || t.tool_id.is_none() || self.thread.is_none() || matches!(core.state.status, Status::Exited | Status::Starting) {
+            return none;
+        }
+        let working = child.turn.is_some() || t.live();
+        match (child.direct, working) {
+            (true, true) if child.turn.is_some() => (vec![SendMode::Queue, SendMode::Steer, SendMode::Now], None),
+            (true, _) => (vec![SendMode::Queue], None),
+            (false, _) if t.parent_task.is_some() => none,
+            (false, true) => (vec![SendMode::Queue, SendMode::Steer], Some(super::subagent::PARENT)),
+            (false, false) => (vec![SendMode::Queue], Some(super::subagent::PARENT)),
+        }
+    }
+
+    /// A person's message to subagent `t`, `mode` one it takes now (`takes`).
+    pub fn send_task(&mut self, core: &mut Core, t: &Task, m: QueueItem, mode: SendMode) {
+        let Some(child) = self.children.get(&t.id) else {
+            super::subagent::refuse(core, &t.id, &m, "Codex no longer has that subagent.");
+            return;
+        };
+        if !child.direct {
+            self.relay(core, t, m, mode);
+            return;
+        }
+        let turn = child.turn.clone();
+        let starting = self.pending.values().any(|p| matches!(p, Pending::ChildTurn { thread, .. } if *thread == t.id)) || turn.is_some();
+        match (mode, turn) {
+            (SendMode::Steer, Some(turn)) => {
+                let items = self.items(&m);
+                self.request(core, Pending::ChildSteer { thread: t.id.clone(), m: m.clone() }, "turn/steer", json!({"threadId": t.id, "expectedTurnId": turn, "input": items, "clientUserMessageId": m.id}));
+                super::subagent::show(core, &t.id, &m, Delivery::Sent);
+            }
+            // Its turn stops; this one starts the next, before what waits for it (sent: it can't be
+            // taken back from there).
+            (SendMode::Now, Some(turn)) => {
+                super::subagent::show(core, &t.id, &m, Delivery::Sent);
+                if let Some(c) = self.children.get_mut(&t.id) {
+                    c.now = Some(m);
+                }
+                self.request(core, Pending::ChildInterrupt(t.id.clone()), "turn/interrupt", json!({"threadId": t.id, "turnId": turn}));
+            }
+            // At work (or about to be): it waits for that to end.
+            _ if starting || !super::pause::open(core) => {
+                super::subagent::hold(core, &t.id, m);
+            }
+            _ => self.start_child_turn(core, &t.id, m),
+        }
+    }
+
+    /// A turn of subagent `thread`'s own for the person's message `m`, under the session's
+    /// permissions now (which it keeps from then on).
+    fn start_child_turn(&mut self, core: &mut Core, thread: &str, m: QueueItem) {
+        let (approval, sandbox_mode, sandbox) = self.policies(core);
+        let items = self.items(&m);
+        self.request(
+            core,
+            Pending::ChildTurn { thread: thread.to_owned(), m: m.clone() },
+            "turn/start",
+            json!({"threadId": thread, "input": items, "clientUserMessageId": m.id, "approvalPolicy": approval, "sandboxPolicy": sandbox}),
+        );
+        let child = self.children.entry(thread.to_owned()).or_default();
+        child.permissions = Some((approval, sandbox_mode));
+        child.relaying = false;
+        super::subagent::show(core, thread, &m, Delivery::Sent);
+    }
+
+    /// Codex takes nothing for subagent `t` from kiln: the agent passes `m` on with its own agent
+    /// tools, asked in its turn (or in one of its own when none runs). One for a subagent at work
+    /// that's to wait for it to finish waits for that first.
+    fn relay(&mut self, core: &mut Core, t: &Task, m: QueueItem, mode: SendMode) {
+        let working = self.children.get(&t.id).is_some_and(|c| c.turn.is_some() || c.relaying) || t.live();
+        if mode == SendMode::Queue && (working || !super::pause::open(core)) {
+            super::subagent::hold(core, &t.id, m);
+            return;
+        }
+        let path = self.children.get(&t.id).and_then(|c| c.path.clone());
+        let how = match &path {
+            Some(p) => format!("Send it to that agent ({p}) with your agent tools: send_message while it works, followup_task once it has finished."),
+            None => "Send it to that agent with your agent tools (send_input; resume_agent first if it was closed).".to_owned(),
+        };
+        let words = super::subagent::relay_words(t, &m, &how);
+        super::subagent::show(core, &t.id, &m, Delivery::Sent);
+        self.relays.entry(t.id.clone()).or_default().push_back(m.id.clone());
+        if let Some(c) = self.children.get_mut(&t.id)
+            && !working
+        {
+            c.relaying = true;
+        }
+        let id = super::subagent::relay_id(&m);
+        self.send(core, QueueItem { id: id.clone(), text: words, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Steer);
+        super::pause::from_kiln(core, &id);
+    }
+
+    /// The agent's collab call `item` reached subagents (`send_input`, `send_message`,
+    /// `followup_task`; v2's "interacted"): the oldest message it was to pass on to each went.
+    fn relayed(&mut self, core: &mut Core, item: &Value, done: bool) {
+        let ty = item.get("type").and_then(Value::as_str);
+        let targets: Vec<String> = match (ty, item.get("tool").and_then(Value::as_str)) {
+            (Some("collabAgentToolCall"), Some("sendInput" | "sendMessage" | "followupTask")) => item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect(),
+            (Some("subAgentActivity"), _) if item.get("kind").and_then(Value::as_str) == Some("interacted") => item.get("agentThreadId").and_then(Value::as_str).map(str::to_owned).into_iter().collect(),
+            _ => return,
+        };
+        if !done {
+            return;
+        }
+        let failed = ty == Some("collabAgentToolCall") && item.get("status").and_then(Value::as_str) == Some("failed");
+        for target in targets {
+            let Some(msg) = self.relays.get_mut(&target).and_then(std::collections::VecDeque::pop_front) else { continue };
+            self.relays.retain(|_, q| !q.is_empty());
+            super::subagent::delivered(core, &msg, if failed { Delivery::Cancelled } else { Delivery::Completed });
+            if failed {
+                if let Some(c) = self.children.get_mut(&target) {
+                    c.relaying = false;
+                }
+                let parent = core.state.tasks.iter().find(|t| t.id == target).and_then(|t| t.tool_id.clone());
+                core.upsert(&format!("subagent-unsent-{msg}"), parent, Body::Notice { level: Level::Warn, text: "Not sent to the subagent: the agent's call to pass it on failed.".to_owned() });
+            }
+        }
+    }
+
+    /// The agent's turn that was to pass messages on ended: those it didn't pass on didn't go.
+    fn unrelayed(&mut self, core: &mut Core, turn_messages: &[String]) {
+        for id in turn_messages {
+            let Some(msg) = id.strip_prefix(super::subagent::RELAY_ID) else { continue };
+            let Some(task) = self.relays.iter().find(|(_, q)| q.iter().any(|m| m == msg)).map(|(t, _)| t.clone()) else { continue };
+            if let Some(q) = self.relays.get_mut(&task) {
+                q.retain(|m| m != msg);
+            }
+            self.relays.retain(|_, q| !q.is_empty());
+            if let Some(c) = self.children.get_mut(&task) {
+                c.relaying = false;
+            }
+            super::subagent::delivered(core, msg, Delivery::Cancelled);
+            let parent = core.state.tasks.iter().find(|t| t.id == task).and_then(|t| t.tool_id.clone());
+            core.upsert(&format!("subagent-unsent-{msg}"), parent, Body::Notice { level: Level::Warn, text: "Not sent to the subagent: the agent didn't pass it on.".to_owned() });
+        }
+    }
+
+    /// Subagent `thread` is between turns: a message sent now goes first, then what waits for it.
+    fn drain_child(&mut self, core: &mut Core, thread: &str) {
+        let Some(child) = self.children.get(thread) else { return };
+        if child.turn.is_some() || child.relaying || child.closed || !super::pause::open(core) || matches!(core.state.status, Status::Exited | Status::Starting) {
+            return;
+        }
+        if self.pending.values().any(|p| matches!(p, Pending::ChildTurn { thread: t, .. } if t == thread)) {
+            return;
+        }
+        let direct = child.direct;
+        let now = self.children.get_mut(thread).and_then(|c| c.now.take());
+        let Some(m) = now.or_else(|| super::subagent::next(core, thread)) else { return };
+        let Some(t) = core.state.tasks.iter().find(|t| t.id == thread).cloned() else { return };
+        if direct {
+            self.start_child_turn(core, thread, m);
+        } else if self.takes(core, &t).0.is_empty() {
+            super::subagent::refuse(core, thread, &m, "it can't be reached now.");
+        } else {
+            self.relay(core, &t, m, SendMode::Steer);
+        }
+    }
+
+    /// What waits for its subagents goes, to each between turns.
+    pub fn drain_subagents(&mut self, core: &mut Core) {
+        let waiting: Vec<String> = super::subagent::waiting(core).into_iter().chain(self.children.iter().filter(|(_, c)| c.now.is_some()).map(|(t, _)| t.clone())).collect();
+        for thread in waiting {
+            if core.state.tasks.iter().any(|t| t.id == thread && !t.live()) || self.children.get(&thread).is_some_and(|c| c.turn.is_none() && c.direct) {
+                self.drain_child(core, &thread);
+            }
+        }
+    }
+
+    /// Subagents a spawn the session saw start: Codex gives each its spawner's permissions. A
+    /// multi-agent v1 spawn (`collabAgentToolCall`) takes a person's messages on its own thread; a
+    /// v2 one (`subAgentActivity`) doesn't (Codex refuses them). Closing one and resuming it are
+    /// noted too.
+    fn note_spawns(&mut self, item: &Value, spawner: Option<&str>) {
+        let receivers = || item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<String>>();
+        let done = item.get("status").and_then(Value::as_str) == Some("completed");
+        let v1 = item.get("type").and_then(Value::as_str) == Some("collabAgentToolCall");
+        match item.get("tool").and_then(Value::as_str) {
+            Some("closeAgent") if v1 && done => {
+                for t in receivers() {
+                    self.children.entry(t).or_default().closed = true;
+                }
+                return;
+            }
+            Some("resumeAgent") if v1 => {
+                for t in receivers() {
+                    self.children.entry(t).or_default().closed = false;
+                }
+                return;
+            }
+            _ => {}
+        }
+        let targets: Vec<String> = match item.get("type").and_then(Value::as_str) {
+            Some("collabAgentToolCall") if item.get("tool").and_then(Value::as_str) == Some("spawnAgent") => receivers(),
+            Some("subAgentActivity") if item.get("kind").and_then(Value::as_str) == Some("started") => {
+                item.get("agentThreadId").and_then(Value::as_str).map(str::to_owned).into_iter().collect()
+            }
+            _ => return,
+        };
+        for target in &targets {
+            if self.thread.as_deref() != Some(target.as_str()) && spawner != Some(target.as_str()) {
+                let child = self.children.entry(target.clone()).or_default();
+                child.direct = v1;
+                if let Some(p) = item.get("agentPath").and_then(Value::as_str) {
+                    child.path = Some(p.to_owned());
+                }
+            }
+        }
+        let permissions = match spawner {
+            None => self.turn_permissions.clone(),
+            Some(t) => self.children.get(t).and_then(|c| c.permissions.clone()),
+        };
+        for target in targets {
+            if self.thread.as_deref() == Some(target.as_str()) || spawner == Some(target.as_str()) {
+                continue;
+            }
+            let child = self.children.entry(target).or_default();
+            if child.permissions.is_none() {
+                child.permissions.clone_from(&permissions);
+            }
+        }
+    }
+
+    fn interrupt_for_permissions(&mut self, core: &mut Core) {
+        if self.permissions_changing
+            && let (Some(thread), Some(turn)) = (self.thread.clone(), self.turn.clone())
+            && !self.pending.values().any(|p| matches!(p, Pending::PermissionInterrupt(t) if *t == turn))
+        {
+            self.request(core, Pending::PermissionInterrupt(turn.clone()), "turn/interrupt", json!({"threadId": thread, "turnId": turn}));
+        }
     }
 
     fn refresh_controls(&mut self, core: &mut Core) {
@@ -391,6 +1030,8 @@ impl Codex {
         c.push(t);
         // MCP servers and skills have their own state and commands (State::mcp, State::skills).
         core.meta.controls = c;
+        // What its own go-back doesn't reach (restoring files) kiln's does (`harness::goback`).
+        super::goback::declare(core);
         let model = core.state.model.clone();
         core.meta.efforts = match self.efforts.get(&model).or_else(|| self.efforts.get("")) {
             Some(l) => l.iter().map(|(e, d)| opt(e, &super::model::effort_label(e), d, false)).collect(),
@@ -431,17 +1072,29 @@ impl Codex {
             }
             "approval_policy" | "sandbox" => {
                 let v = text();
+                let valid = if id == "sandbox" { matches!(v.as_str(), "read-only" | "workspace-write" | "danger-full-access") }
+                    else { matches!(v.as_str(), "untrusted" | "on-request" | "never") };
+                if !valid {
+                    self.notice(core, Level::Warn, format!("{v}: not a {id} setting this session offers"));
+                    return;
+                }
                 let dangerous = matches!(v.as_str(), "never" | "danger-full-access");
                 if dangerous && !self.allow_bypass {
                     self.notice(core, Level::Warn, "That needs the session to be started with bypass allowed.");
                     return;
                 }
+                let before = self.policies(core);
+                // Both values stay explicit when a combination has no named preset.
+                self.approval = Some(before.0.clone());
+                self.sandbox = Some(before.1.clone());
                 if id == "sandbox" {
                     self.sandbox = Some(v.clone());
                 } else {
                     self.approval = Some(v.clone());
                 }
-                core.set_control(id, json!(v));
+                if self.policies(core) != before {
+                    self.permissions_changed(core);
+                }
             }
             "compact" => self.request(core, Pending::Plain("compact".into()), "thread/compact/start", json!({"threadId": thread})),
             "review" => {
@@ -496,12 +1149,23 @@ impl Codex {
             // Older consoles' MCP controls (now commands of their own).
             "mcp_refresh" => self.command(core, Command::McpRefresh),
             "mcp_reload" => self.mcp_reload(core),
+            // Signed in on its machine (kiln's sign-in, `codex login`): it reads its account at
+            // once (another one: the old one's limits go and the new one's are read), and starts
+            // again when idle so its app-server certainly runs on the new login.
+            "account" => {
+                self.request(core, Pending::Account, "account/read", json!({}));
+                self.reload = Some("Signed in".to_owned());
+                self.reload_when_idle(core);
+            }
             // Settings changed outside it (its own screen, beside it): start again to load them.
             "reload_config" => {
                 self.reload = Some(value.as_ref().and_then(|v| v.get("what")).and_then(Value::as_str).unwrap_or("Changed settings").to_owned());
                 self.reload_when_idle(core);
             }
-            _ => {}
+            // Its own rewind/branch/fork; a file restore is kiln's (`harness::goback`).
+            _ => {
+                super::goback::control(core, id, value.as_ref());
+            }
         }
         self.compose_status(core);
     }
@@ -514,11 +1178,14 @@ impl Codex {
 
     fn notice(&mut self, core: &mut Core, level: Level, text: impl Into<String>) {
         self.notice_seq += 1;
-        core.upsert(&format!("notice-{}", self.notice_seq), None, Body::Notice { level, text: text.into() });
+        core.upsert(&format!("notice-{}-{}", self.run, self.notice_seq), None, Body::Notice { level, text: text.into() });
     }
 
     fn busy(&self, core: &Core) -> bool {
-        self.injecting || self.turn.is_some() || !core.state.approvals.is_empty() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
+        let own_approval = core.state.approvals.iter().any(|a| {
+            a.input.get("threadId").and_then(Value::as_str).is_none_or(|id| self.thread.as_deref().is_none_or(|own| own == id))
+        });
+        self.injecting || self.turn.is_some() || matches!(self.thread_status, Some(Status::Running | Status::Waiting)) || own_approval || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
     }
 
     /// Start again with the changed settings (resuming the thread), unless a turn is under way or
@@ -537,8 +1204,12 @@ impl Codex {
     }
 
     fn settle(&self, core: &mut Core) {
-        let running = self.turn.is_some() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)));
-        core.settle_status(running);
+        let running = self.turn.is_some() || self.pending.values().any(|p| matches!(p, Pending::Turn(_))) || matches!(self.thread_status, Some(Status::Running | Status::Waiting));
+        if let Some(status @ (Status::Waiting | Status::Starting | Status::Exited)) = self.thread_status {
+            core.set_status(status);
+        } else {
+            core.settle_status(running);
+        }
     }
 
     pub fn start(&mut self, core: &mut Core) {
@@ -550,13 +1221,30 @@ impl Codex {
         if core.meta.efforts.is_empty() {
             core.meta.efforts = default_efforts().iter().map(|e| ControlOption { id: e.clone(), label: super::model::effort_label(e), description: String::new(), dangerous: false }).collect();
         }
-        if !modes(self.allow_bypass).iter().any(|m| m.id == core.state.mode) {
+        // Explicit controls survive a process restart. Older versions could persist a custom
+        // combination under a preset label; do not silently drop its restrictions.
+        if core.state.control_values.contains_key("approval_policy") || core.state.control_values.contains_key("sandbox") {
+            let (a, s, _) = policy(&core.state.mode);
+            let a = core.state.control_values.get("approval_policy").and_then(Value::as_str).unwrap_or(a);
+            let s = core.state.control_values.get("sandbox").and_then(Value::as_str).unwrap_or(s);
+            if matches!(a, "untrusted" | "on-request" | "never")
+                && matches!(s, "read-only" | "workspace-write" | "danger-full-access")
+                && (self.allow_bypass || (a != "never" && s != "danger-full-access"))
+            {
+                self.approval = Some(a.to_owned());
+                self.sandbox = Some(s.to_owned());
+            }
+        }
+        if !modes(self.allow_bypass).iter().any(|m| m.id == core.state.mode)
+            && !(core.state.mode == "custom" && self.approval.is_some() && self.sandbox.is_some())
+        {
             core.state.mode = self.mode.clone();
             core.touch_state();
         }
         // Full access is always a choice; choosing it allows it.
         core.meta.modes = modes(true);
-        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness"]
+        self.permission_controls(core);
+        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "permissions_live", "set_model", "set_effort", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
@@ -576,10 +1264,28 @@ impl Codex {
             t.ended.get_or_insert_with(Core::now);
         }
         self.turn = None;
+        self.thread_status = None;
         self.pending.clear();
         self.asks.clear();
+        self.permissions_changing = false;
+        self.turn_permissions = None;
+        self.withheld.clear();
+        self.stopped.clear();
+        self.unheard.clear();
+        // Its subagents' threads aren't loaded in the next process (Codex refuses input to those),
+        // and what was on its way to them didn't get there.
+        let mut unsent: Vec<String> = self.relays.drain().flat_map(|(_, q)| q).collect();
+        for c in self.children.values_mut() {
+            c.direct = false;
+            c.relaying = false;
+            c.turn = None;
+            unsent.extend(c.now.take().map(|m| m.id));
+        }
+        for m in unsent {
+            super::subagent::delivered(core, &m, Delivery::Cancelled);
+        }
         core.state.approvals.clear();
-        core.state.exit = Some(ExitInfo { code, error });
+        core.state.exit = Some(ExitInfo::now(code, error));
         core.state.activity = None;
         core.state.doing = None;
         core.state.turn_started = None;
@@ -591,10 +1297,16 @@ impl Codex {
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         match cmd {
-            Command::Send { id, text, mode, attachments, overrides } => self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides }, mode),
-            Command::QueueEdit { id, text } => {
+            Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => {
+                // A checkpoint anchors the prompt's moment: kiln's go-back file restore
+                // (`harness::goback`) reaches back to it (Codex's own rewind has no files side).
+                core.effects.push(Effect::Checkpoint { at: Core::now() });
+                self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to }, mode);
+            }
+            Command::QueueEdit { id, text, attachments } => {
                 if let Some(q) = core.state.queue.iter_mut().find(|q| q.id == id) {
                     q.text = text;
+                    if let Some(a) = attachments { q.attachments = a; }
                     core.touch_state();
                 }
             }
@@ -631,11 +1343,18 @@ impl Codex {
                 self.send(core, item, SendMode::Steer);
             }
             Command::Approve { id, decision, message, always, answers, choices } => self.answer(core, &id, decision, message, always, choices_of(answers, choices)),
-            Command::Interrupt => self.interrupt(core),
+            Command::Interrupt => {
+                // A person's stop wins over the automatic continuation of a setting change.
+                self.permissions_changing = false;
+                self.interrupt(core);
+            }
             Command::SetMode { mode } => {
-                // Takes effect from the next turn (Codex sets policy per turn): the mode's approval
-                // policy and sandbox, over any chosen one by one before.
                 if modes(true).iter().any(|m| m.id == mode) {
+                    if mode == "full-access" {
+                        // Persist even for an adopted adapter whose earlier version only
+                        // changed the in-memory flag.
+                        core.effects.push(Effect::AllowBypass);
+                    }
                     if mode == "full-access" && !self.allow_bypass {
                         // Chosen, so allowed: its approval and sandbox settings come with it.
                         self.allow_bypass = true;
@@ -648,6 +1367,7 @@ impl Codex {
                     core.set_control("sandbox", json!(s));
                     core.state.mode = mode;
                     core.touch_state();
+                    self.permissions_changed(core);
                 } else {
                     self.notice(core, Level::Warn, format!("{mode}: not a mode this session offers"));
                 }
@@ -669,9 +1389,15 @@ impl Codex {
             }
             Command::Control { id, value } => self.control(core, &id, value),
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } => {}
             // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
             // the process itself (the newest one under Codex running that command).
+            // A subagent: its turn under way is interrupted, as a person asked.
+            Command::StopTask { task } if self.children.contains_key(&task) => {
+                if !self.stop_child_asked(core, &task) {
+                    self.notice(core, Level::Info, "That subagent has no turn under way to stop.".to_owned());
+                }
+            }
             Command::StopTask { task } => self.stop_terminal(core, &task),
             Command::StopTasks => {
                 let live: Vec<String> = core.state.tasks.iter().filter(|t| t.live() && t.process.is_some()).map(|t| t.id.clone()).collect();
@@ -680,7 +1406,7 @@ impl Codex {
                 }
             }
             // A pause's commands are the session's (`harness::pause`).
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
             Command::McpEnable { name, enabled } => {
                 if !valid_server_name(&name) {
                     self.notice(core, Level::Warn, format!("{name}: not a server kiln can change"));
@@ -770,7 +1496,7 @@ impl Codex {
                     Some(a) => format!("/{name} {a}"),
                     None => format!("/{name}"),
                 };
-                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None }, mode);
+                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, mode);
             }
             Command::SkillsReload => {
                 let cwd = core.state.cwd.clone();
@@ -851,6 +1577,8 @@ impl Codex {
     /// Every few seconds: a thread open to send again; servers still starting; the plan's rate
     /// limits now and then.
     pub fn tick(&mut self, core: &mut Core) {
+        // A hot upgrade adopts the adapter without start(); reconcile legacy override labels.
+        self.permission_controls(core);
         self.reload_when_idle(core);
         if std::mem::take(&mut self.reopen)
             && let Some((method, params)) = self.opening.clone()
@@ -861,13 +1589,37 @@ impl Codex {
         if matches!(core.state.status, Status::Starting | Status::Exited) {
             return;
         }
+        // Requests an older kiln showed that work under the session's permissions doesn't make.
+        self.reconcile(core);
+        self.tell_parent(core, false);
         let now = Core::now();
+        // Held back while the work that asked was stopped: Codex withdraws what a stopped turn
+        // asked at once, so one still waiting wasn't stopped, and it's the person's.
+        let overdue: Vec<String> = self.withheld.iter().filter(|(_, a)| now - a.at > WITHHELD_MS).map(|(id, _)| id.clone()).collect();
+        self.release(core, overdue);
+        let children: Vec<String> = core.state.tasks.iter()
+            .filter(|t| t.class.as_deref() == Some("agent"))
+            // Hot adoption skips start/replay. Older adapters kept task rows without a
+            // child reader, so reconcile each missing reader once, even for ended tasks
+            // whose persisted output has never been loaded.
+            .filter(|t| self.children.get(&t.id).is_none_or(|c| (c.refresh || t.live()) && now - c.read_at >= CHILD_REFRESH_MS))
+            .map(|t| t.id.clone()).collect();
+        for child in children {
+            self.read_child(core, &child);
+        }
+        // Terminals still shown running are checked against Codex's own (a missed end, an older
+        // image's rows).
+        if now - self.terminals_at >= TERMINALS_EVERY_MS {
+            self.ask_terminals(core);
+        }
         if core.state.mcp.iter().any(|m| m.status == McpStatus::Pending) && now - self.mcp_at > 4_000 {
             self.ask_mcp(core);
         }
-        if self.account_kind.as_deref() == Some("chatgpt") && now - self.usage_at > USAGE_EVERY_MS && !self.pending.values().any(|p| matches!(p, Pending::RateLimits)) {
+        // Every few minutes its account, read again (one signed in outside kiln, `codex login` in a
+        // terminal, shows), and with a ChatGPT account its rate limits.
+        if now - self.usage_at > USAGE_EVERY_MS && !self.pending.values().any(|p| matches!(p, Pending::RateLimits | Pending::Account)) {
             self.usage_at = now;
-            self.request(core, Pending::RateLimits, "account/rateLimits/read", json!({}));
+            self.request(core, Pending::Account, "account/read", json!({}));
         }
     }
 
@@ -1044,6 +1796,9 @@ impl Codex {
         if m.text.is_empty() && m.attachments.is_empty() {
             return;
         }
+        if mode == SendMode::Now {
+            self.permissions_changing = false;
+        }
         if core.state.goal.is_empty() {
             core.state.goal = clip_middle(&m.text, 600).0;
         }
@@ -1094,8 +1849,16 @@ impl Codex {
     }
 
     fn start_turn(&mut self, core: &mut Core, thread: &str, m: QueueItem) {
-        let (approval, _, sandbox) = self.policies(core);
-        let items = self.items(&m);
+        self.thread_status = None;
+        let (approval, sandbox_mode, sandbox) = self.policies(core);
+        self.turn_permissions = Some((approval.clone(), sandbox_mode));
+        let mut items = self.items(&m);
+        // Subagents kiln stopped that it hasn't heard of yet.
+        if let Some(note) = self.stopped_note(core)
+            && let Some(list) = items.as_array_mut()
+        {
+            list.push(json!({"type": "text", "text": format!("<kiln_note>\n{note}\n</kiln_note>")}));
+        }
         let mut params = json!({
             "threadId": thread,
             "input": items,
@@ -1129,13 +1892,13 @@ impl Codex {
         core.state.delivery.insert(m.id.clone(), d);
         let (images, names) = super::model::attachment_summary(&m.attachments);
         core.note_sent(&m.id);
-        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names });
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
         core.touch_state();
     }
 
     /// Shown for a message kiln sends on its own (feedback after a refusal).
     fn note(&mut self, core: &mut Core, id: &str, text: &str, d: Delivery) {
-        let m = QueueItem { id: id.to_owned(), text: text.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None };
+        let m = QueueItem { id: id.to_owned(), text: text.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None };
         self.show_sent(core, &m, d);
     }
 
@@ -1148,7 +1911,9 @@ impl Codex {
                     let key = item.get("clientId").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or("").to_owned();
                     self.turns.insert(key, tid.clone());
                 }
-                self.item(core, item, true);
+                if !collab_replayed(core, &self.children, item, None) {
+                    self.item(core, item, true);
+                }
             }
         }
     }
@@ -1157,7 +1922,7 @@ impl Codex {
     fn ready(&mut self, core: &mut Core) {
         self.refresh_controls(core);
         core.touch_state();
-        core.set_status(Status::Idle);
+        core.set_status(self.thread_status.unwrap_or(Status::Idle));
         // The thread's own MCP connections (their runtime state).
         self.ask_mcp(core);
         self.compose_status(core);
@@ -1227,7 +1992,7 @@ impl Codex {
     pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
         if p.cut.is_some() && !self.busy(core) && core.state.status != Status::Exited {
             let id = crate::util::new_id();
-            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None }, SendMode::Queue);
+            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Queue);
             super::pause::from_kiln(core, &id);
             return;
         }
@@ -1308,7 +2073,7 @@ impl Codex {
                 // Cancelled: the feedback starts the next turn.
                 _ => {
                     self.note(core, &mid, &f, Delivery::Queued);
-                    self.waiting.insert(0, QueueItem { id: mid, text: f, at: Core::now(), attachments: Vec::new(), overrides: None });
+                    self.waiting.insert(0, QueueItem { id: mid, text: f, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
                 }
             }
         }
@@ -1353,11 +2118,36 @@ impl Codex {
                     self.waiting.insert(0, m);
                     self.next(core);
                 }
-                Pending::Turn(id) | Pending::Steer(id, _) => {
+                Pending::Turn(id) => {
+                    self.permissions_changing = false;
+                    self.turn_permissions = None;
                     core.state.delivery.insert(id, Delivery::Cancelled);
                     self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
                     core.touch_state();
                 }
+                Pending::Steer(id, _) => {
+                    core.state.delivery.insert(id, Delivery::Cancelled);
+                    self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
+                    core.touch_state();
+                }
+                // Codex takes nothing on that subagent's thread from kiln (a multi-agent v2 agent,
+                // or one this process didn't spawn): the agent passes it on instead.
+                Pending::ChildTurn { thread, m } | Pending::ChildSteer { thread, m } if msg.contains("direct app-server input is not allowed") => {
+                    if let Some(c) = self.children.get_mut(&thread) {
+                        c.direct = false;
+                    }
+                    match core.state.tasks.iter().find(|t| t.id == thread).cloned() {
+                        Some(t) if !self.takes(core, &t).0.is_empty() => self.relay(core, &t, m, SendMode::Steer),
+                        _ => super::subagent::refuse(core, &thread, &m, "Codex takes no message for it from kiln."),
+                    }
+                }
+                // The turn it was to be steered into ended first: it starts the next one.
+                Pending::ChildSteer { thread, m } if self.children.get(&thread).is_some_and(|c| c.turn.is_none()) => {
+                    super::subagent::show(core, &thread, &m, Delivery::Queued);
+                    super::subagent::hold_first(core, &thread, m);
+                    self.drain_child(core, &thread);
+                }
+                Pending::ChildTurn { thread, m } | Pending::ChildSteer { thread, m } => super::subagent::refuse(core, &thread, &m, &format!("Codex refused it: {msg}")),
                 // Not yet: tried again at the next tick.
                 Pending::Thread if wait.is_some() => {
                     self.reopen = true;
@@ -1372,6 +2162,14 @@ impl Codex {
                     self.notice(core, Level::Warn, format!("Codex could not list the conversation's history: {msg}"));
                     self.ready(core);
                 }
+                Pending::Child { thread, .. } | Pending::ChildHistory { thread, .. } => {
+                    // Rollouts can lag a new child. Retry without turning a read failure into
+                    // either a parent error or a claim that the child itself failed.
+                    if let Some(child) = self.children.get_mut(&thread) {
+                        child.failures = child.failures.saturating_add(1);
+                        child.refresh = child.failures < 3;
+                    }
+                }
                 Pending::RateLimits => {
                     // A pause's check that can't be answered: go on, and let Codex say.
                     if core.state.pause.as_ref().is_some_and(|p| p.checking.is_some())
@@ -1380,7 +2178,35 @@ impl Codex {
                         self.go_on(core, p);
                     }
                 }
-                Pending::Models | Pending::Interrupt | Pending::Hooks | Pending::Account => {}
+                Pending::PermissionInterrupt(turn) if self.permissions_changing && self.turn.as_deref() == Some(&turn) => {
+                    self.permissions_changing = false;
+                    self.notice(core, Level::Warn, format!("Codex could not interrupt to apply the permissions: {msg}. They apply when the next turn starts."));
+                    self.show_withheld(core, None);
+                    self.tell_parent(core, false);
+                }
+                // Not stopped (its turn may have just ended): what it asked is the person's after
+                // all. It isn't tried again for that turn.
+                Pending::ChildInterrupt(thread) => {
+                    // Not a permission change's stop (that one is `stopping`): a person asked.
+                    let asked = self.children.get(&thread).is_some_and(|c| c.stopping.is_none());
+                    if let Some(child) = self.children.get_mut(&thread) {
+                        child.unstoppable = child.stopping.take();
+                    }
+                    self.stopped.retain(|s| *s != thread);
+                    self.show_withheld(core, Some(&thread));
+                    if asked {
+                        self.notice(core, Level::Warn, format!("Codex couldn't stop that subagent: {msg}"));
+                    }
+                }
+                Pending::Models | Pending::Interrupt | Pending::PermissionInterrupt(_) | Pending::Hooks | Pending::Account => {}
+                // An older Codex can't list its terminals (the method is experimental): kiln
+                // goes on hearing of their ends alone. Anything else is asked again later.
+                Pending::Terminals { .. } => {
+                    let code = err.get("code").and_then(Value::as_i64);
+                    if code == Some(-32601) || ["experimental", "unknown variant", "method not found"].iter().any(|w| msg.to_lowercase().contains(w)) {
+                        self.terminals_unknown = true;
+                    }
+                }
                 Pending::Skills => {
                     core.state.inventory.skills = Known::Ready;
                     core.touch_state();
@@ -1411,6 +2237,8 @@ impl Codex {
                 Pending::Inject => {
                     self.injecting = false;
                     self.notice(core, Level::Error, format!("Codex did not take the conversation carried over: {msg}"));
+                    // Without the conversation, its goal would be pursued from nothing.
+                    self.goal = None;
                     self.ready(core);
                 }
                 Pending::Plain(what) => self.notice(core, Level::Warn, format!("{what}: {msg}")),
@@ -1470,8 +2298,14 @@ impl Codex {
                     self.thread = Some(id.to_owned());
                     core.state.harness_session = Some(id.to_owned());
                 }
+                if let Some(status) = thread.get("status") {
+                    self.thread_status(core, status);
+                }
                 if let Some(m) = result.get("model").and_then(Value::as_str) {
                     core.state.model = m.to_owned();
+                }
+                if let Some(e) = result.get("reasoningEffort").and_then(Value::as_str) {
+                    self.effort_reported(core, e);
                 }
                 if let Some(c) = result.get("cwd").and_then(Value::as_str) {
                     core.state.cwd = c.to_owned();
@@ -1498,6 +2332,8 @@ impl Codex {
                     self.settle(core);
                     return;
                 }
+                // A goal that came without a conversation to go in first.
+                self.set_carried_goal(core);
                 // A resumed thread's history: inline from a Codex that still sends it so, else
                 // its latest turns, listed (the session is ready once they are in).
                 let turns = thread.get("turns").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -1521,20 +2357,75 @@ impl Codex {
                 self.replay(core, &turns);
                 self.ready(core);
             }
+            Pending::Child { thread, revision } => {
+                if self.children.get(&thread).is_some_and(|c| c.revision == revision) {
+                    if let Some(metadata) = result.get("thread") {
+                        self.child_metadata(core, &thread, metadata);
+                        let runtime = metadata.get("status").and_then(child_runtime_status);
+                        if let Some(child) = self.children.get_mut(&thread) {
+                            child.runtime = runtime.map(str::to_owned);
+                        }
+                        if let Some(status) = runtime {
+                            child_status(core, &thread, status);
+                        }
+                    }
+                    self.request(core, Pending::ChildHistory { thread: thread.clone(), revision }, "thread/turns/list",
+                        json!({"threadId": thread, "itemsView": "full", "sortDirection": "desc", "limit": HISTORY_TURNS}));
+                } else if let Some(child) = self.children.get_mut(&thread) {
+                    child.refresh = true;
+                }
+            }
+            Pending::ChildHistory { thread, revision } => {
+                if self.children.get(&thread).is_some_and(|c| c.revision == revision) {
+                    let mut turns = result.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+                    turns.reverse();
+                    let ids: std::collections::HashSet<&str> = turns.iter()
+                        .flat_map(|turn| turn.get("items").and_then(Value::as_array).into_iter().flatten())
+                        .filter_map(|item| item.get("id").and_then(Value::as_str)).collect();
+                    if let Some(child) = self.children.get_mut(&thread) {
+                        child.seen.retain(|id, _| ids.contains(id.as_str()));
+                    }
+                    self.child_history(core, &thread, &turns);
+                    if let Some(child) = self.children.get_mut(&thread) {
+                        child.failures = 0;
+                    }
+                } else if let Some(child) = self.children.get_mut(&thread) {
+                    child.refresh = true;
+                }
+            }
             Pending::Turn(id) => {
                 if let Some(t) = result.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
+                    if self.completed_turn.as_deref() == Some(t) {
+                        self.next(core);
+                        return;
+                    }
                     self.turn = Some(t.to_owned());
                 }
                 core.state.delivery.insert(id, Delivery::Started);
                 core.touch_state();
+                self.interrupt_for_permissions(core);
                 self.steer_waiting(core);
             }
             Pending::Steer(id, _) => {
                 core.state.delivery.insert(id, Delivery::Started);
                 core.touch_state();
             }
+            // Its turn has its id (unless it ended already): nothing else starts on its thread
+            // before Codex says it began.
+            Pending::ChildTurn { thread, m } => {
+                let child = self.children.entry(thread).or_default();
+                if let Some(t) = result.pointer("/turn/id").and_then(Value::as_str)
+                    && child.turn.is_none()
+                    && child.done_turn.as_deref() != Some(t)
+                {
+                    child.turn = Some(t.to_owned());
+                }
+                super::subagent::delivered(core, &m.id, Delivery::Started);
+            }
+            Pending::ChildSteer { m, .. } => super::subagent::delivered(core, &m.id, Delivery::Started),
             Pending::Models => {
-                for m in result.get("data").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let data = result.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+                for m in &data {
                     let levels: Vec<(String, String)> = m
                         .get("supportedReasoningEfforts")
                         .and_then(Value::as_array)
@@ -1553,11 +2444,18 @@ impl Codex {
                     if m.get("isDefault").and_then(Value::as_bool) == Some(true) {
                         self.efforts.insert(String::new(), levels.clone());
                     }
-                    if m.get("isDefault").and_then(Value::as_bool) == Some(true)
-                        && core.state.effort.is_empty()
-                        && let Some(d) = m.get("defaultReasoningEffort").and_then(Value::as_str)
-                    {
-                        core.state.effort = self.effort.clone().unwrap_or_else(|| d.to_owned());
+                }
+                // An effort to show when none was chosen and Codex hasn't said what the thread runs
+                // at ([`Self::effort_reported`]; it says none when the model's default is all
+                // there is): its own model's default (the default model's when its own isn't
+                // listed). Only the default model's was taken before, so a session on any other
+                // model said nothing of how hard it thinks.
+                if core.state.effort.is_empty() {
+                    let model = core.state.model.clone();
+                    let default_of = |pick: &dyn Fn(&Value) -> bool| data.iter().find(|m| pick(m)).and_then(|m| m.get("defaultReasoningEffort")).and_then(Value::as_str).map(str::to_owned);
+                    let own = default_of(&|m| [m.get("model"), m.get("id")].into_iter().flatten().filter_map(Value::as_str).any(|k| !model.is_empty() && k == model));
+                    if let Some(e) = self.effort.clone().or(own).or_else(|| default_of(&|m| m.get("isDefault").and_then(Value::as_bool) == Some(true))) {
+                        core.state.effort = e;
                     }
                 }
                 if let Some(e) = &self.effort {
@@ -1660,6 +2558,8 @@ impl Codex {
                 // old account's limits go, and a pause for one ends.
                 if was.is_some() && core.state.account != was {
                     core.state.limits.clear();
+                    // What was read of the old account's limits is never shown as the new one's.
+                    self.rate_limits.clear();
                     if core.state.pause.is_some()
                         && let Some(p) = super::pause::release(core, "Signed in to another account: going on.")
                     {
@@ -1781,6 +2681,8 @@ impl Codex {
             Pending::Inject => {
                 self.injecting = false;
                 self.seeded = true;
+                // The conversation is in: the goal it pursued goes on too.
+                self.set_carried_goal(core);
                 self.ready(core);
             }
             Pending::Revert(ev) => {
@@ -1798,7 +2700,8 @@ impl Codex {
                     .unwrap_or_default();
                 core.reply(client, json!({"suggestions": files, "cwd": cwd}));
             }
-            Pending::Interrupt => {}
+            Pending::Interrupt | Pending::PermissionInterrupt(_) | Pending::ChildInterrupt(_) => {}
+            Pending::Terminals { at, live } => self.terminals_listed(core, at, &live, &result),
         }
         self.settle(core);
     }
@@ -1941,9 +2844,21 @@ impl Codex {
             default_to_no: false,
             questions,
             plan: None,
-            agent: None,
+            agent: p.get("threadId").and_then(Value::as_str)
+                .filter(|id| self.thread.as_deref().is_some_and(|own| own != *id))
+                .map(|id| core.state.tasks.iter().find(|t| t.id == id)
+                    .map_or_else(|| id.to_owned(), |t| t.description.clone())),
             at: Core::now(),
         };
+        let from = p.get("threadId").and_then(Value::as_str).map(str::to_owned);
+        self.asks.insert(id.clone(), Ask { rpc, kind, questions: question_ids, can_decline });
+        if self.outdated(core, kind, from.as_deref()) && self.apply_permissions(core, from.as_deref(), p.get("turnId").and_then(Value::as_str).map(str::to_owned)) {
+            // Not the person's to answer (nor answered for them): the work that asked goes on
+            // under the session's permissions instead, and this goes with its turn.
+            self.withheld.insert(id, approval);
+            self.tell_parent(core, false);
+            return;
+        }
         if let Some(tid) = item_id.as_deref() {
             set_status(core, tid, ToolStatus::Pending);
         }
@@ -1951,27 +2866,275 @@ impl Codex {
             ToolKind::Question => "Asking you a question".to_owned(),
             _ => "Waiting for your approval".to_owned(),
         });
-        self.asks.insert(id, Ask { rpc, kind, questions: question_ids, can_decline });
         core.add_approval(approval);
         self.settle(core);
     }
 
-    fn notification(&mut self, core: &mut Core, method: &str, p: Value) {
+    /// The effort Codex says the thread runs at (when it opens, and as its settings change): what
+    /// the page shows unless one was chosen here, which goes with every turn and so is what runs.
+    /// With none chosen it comes from the person's own Codex configuration
+    /// (`model_reasoning_effort`), which a model's default from model/list only guesses at; and
+    /// what the page shows is what a resumed session goes on with (`Session::resume_spec`), so a
+    /// guess kept there set every later turn to it.
+    fn effort_reported(&mut self, core: &mut Core, effort: &str) {
+        if self.effort.is_none() && !effort.is_empty() && core.state.effort != effort {
+            core.state.effort = effort.to_owned();
+            core.touch_state();
+        }
+    }
+
+    fn thread_status(&mut self, core: &mut Core, status: &Value) {
+        let next = match status.get("type").and_then(Value::as_str) {
+            Some("active") if status.get("activeFlags").and_then(Value::as_array).is_some_and(|f| f.iter().any(|v| matches!(v.as_str(), Some("waitingOnApproval" | "waitingOnUserInput")))) => Status::Waiting,
+            Some("active") => Status::Running,
+            Some("idle") => Status::Idle,
+            Some("notLoaded") => Status::Starting,
+            Some("systemError") => Status::Exited,
+            _ => return,
+        };
+        self.thread_status = Some(next);
+        if !matches!(next, Status::Running | Status::Waiting) {
+            self.turn = None;
+            core.state.doing = None;
+            core.set_status(next);
+        }
+        core.state.exit = (next == Status::Exited).then(|| ExitInfo::now(None, Some("Codex reported a thread error".into())));
+        core.touch_state();
+        self.settle(core);
+    }
+
+    fn read_child(&mut self, core: &mut Core, thread: &str) {
+        let child = self.children.entry(thread.to_owned()).or_default();
+        if self.pending.values().any(|p| matches!(p, Pending::Child { thread: t, .. } | Pending::ChildHistory { thread: t, .. } if t == thread)) {
+            child.refresh = true;
+            return;
+        }
+        child.read_at = Core::now();
+        child.refresh = false;
+        let revision = child.revision;
+        self.request(core, Pending::Child { thread: thread.to_owned(), revision }, "thread/read", json!({"threadId": thread, "includeTurns": false}));
+    }
+
+    fn child_changed(&mut self, core: &mut Core, thread: &str) {
+        let child = self.children.entry(thread.to_owned()).or_default();
+        child.revision += 1;
+        child.failures = 0;
+        self.read_child(core, thread);
+    }
+
+    fn child_metadata(&mut self, core: &mut Core, thread: &str, metadata: &Value) {
+        let Some(task) = core.state.tasks.iter_mut().find(|t| t.id == thread) else { return };
+        if let Some(name) = metadata.get("name").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+            task.description = clip_middle(name, 300).0;
+        }
+        if let Some(role) = metadata.get("agentRole").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            task.kind = role.to_owned();
+        }
+        if let Some(cwd) = metadata.get("cwd").and_then(Value::as_str) {
+            task.cwd = Some(cwd.to_owned());
+        }
+        if let Some(created) = metadata.get("createdAt").and_then(Value::as_i64) {
+            task.started = created.saturating_mul(1_000);
+        }
+        if task.prompt.is_none()
+            && let Some(prompt) = metadata.get("preview").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+        {
+            task.prompt = Some(clip_middle(prompt, OUTPUT_MAX).0);
+        }
+        if let Some(depth) = metadata.pointer("/source/subAgent/thread_spawn/depth").and_then(Value::as_u64) {
+            task.depth = u32::try_from(depth).unwrap_or(u32::MAX);
+        }
+        core.touch_state();
+    }
+
+    fn child_history(&mut self, core: &mut Core, thread: &str, turns: &[Value]) {
+        for turn in turns {
+            let active = turn.get("status").and_then(Value::as_str) == Some("inProgress");
+            let items = turn.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+            for (index, item) in items.iter().enumerate() {
+                let done = !active || match item.get("status").and_then(Value::as_str) {
+                    Some(status) => status != "inProgress",
+                    None => index + 1 < items.len() || item.get("phase").and_then(Value::as_str) == Some("final_answer"),
+                };
+                let Some(id) = item.get("id").and_then(Value::as_str) else { continue };
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                item.to_string().hash(&mut hash);
+                done.hash(&mut hash);
+                let hash = hash.finish();
+                let seen = &mut self.children.entry(thread.to_owned()).or_default().seen;
+                if seen.insert(id.to_owned(), hash) == Some(hash) || collab_replayed(core, &self.children, item, Some(thread)) {
+                    continue;
+                }
+                self.item_in(core, item, done, Some(thread));
+            }
+        }
+        let Some(turn) = turns.last() else { return };
+        if turn.get("status").and_then(Value::as_str) == Some("inProgress")
+            && let Some(child) = self.children.get_mut(thread)
+        {
+            child.turn = turn.get("id").and_then(Value::as_str).map(str::to_owned);
+        }
+        let Some(status) = self.children.get(thread).and_then(|c| c.runtime.as_deref()).or_else(|| child_turn_status(turn)).map(str::to_owned) else { return };
+        child_status(core, thread, &status);
+        if let Some(task) = core.state.tasks.iter_mut().find(|t| t.id == thread) {
+            if !task.live() {
+                task.ended = turn.get("completedAt").and_then(Value::as_i64).map(|s| s.saturating_mul(1_000)).or(task.ended);
+            }
+            task.duration_ms = turns.iter().filter_map(|t| t.get("durationMs").and_then(Value::as_u64)).sum();
+            if status == "failed"
+                && let Some(message) = turn.pointer("/error/message").and_then(Value::as_str)
+            {
+                task.summary = Some(clip_middle(message, OUTPUT_MAX).0);
+            }
+        }
+        core.touch_state();
+    }
+
+    /// A native child's work stays under its spawning call. None of these events may settle
+    /// the parent's turn, replace its answer, account its tokens, or change its files.
+    fn child_notification(&mut self, core: &mut Core, thread: &str, method: &str, p: &Value) {
+        let Some(parent) = core.state.tasks.iter().find(|t| t.id == thread).and_then(|t| t.tool_id.clone()) else { return };
+        let child = self.children.entry(thread.to_owned()).or_default();
+        child.revision += 1;
+        if let Some(id) = p.get("itemId").and_then(Value::as_str).or_else(|| p.pointer("/item/id").and_then(Value::as_str)) {
+            child.seen.remove(id);
+        }
         match method {
+            "item/started" | "item/completed" => {
+                if let Some(item) = p.get("item") {
+                    self.item_in(core, item, method == "item/completed", Some(thread));
+                    self.note_spawns(item, Some(thread));
+                }
+            }
+            "item/agentMessage/delta" | "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" | "item/plan/delta" => {
+                let (Some(id), Some(delta)) = (p.get("itemId").and_then(Value::as_str), p.get("delta").and_then(Value::as_str)) else { return };
+                let id = child_event_id(thread, id);
+                if core.get(&id).is_none() {
+                    let body = if matches!(method, "item/agentMessage/delta" | "item/plan/delta") {
+                        Body::Assistant { text: String::new(), streaming: true }
+                    } else {
+                        Body::Thinking { text: String::new(), streaming: true, redacted: false }
+                    };
+                    core.upsert(&id, Some(parent), body);
+                }
+                core.append(&id, delta);
+            }
+            "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
+                let (Some(id), Some(delta)) = (p.get("itemId").and_then(Value::as_str), p.get("delta").and_then(Value::as_str)) else { return };
+                if let Some(e) = core.get_mut(&child_event_id(thread, id))
+                    && let Body::Tool(t) = &mut e.body
+                {
+                    let output = t.output.get_or_insert_with(String::new);
+                    if output.len() < OUTPUT_MAX * 2 {
+                        output.push_str(delta);
+                    } else {
+                        t.truncated = true;
+                    }
+                }
+            }
             "turn/started" => {
+                let child = self.children.entry(thread.to_owned()).or_default();
+                child.runtime = Some("running".into());
+                child.turn = p.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned);
+                // What the agent passed on to it has its turn now.
+                child.relaying = false;
+                child_status(core, thread, "running");
+            }
+            "turn/completed" => {
+                let child = self.children.entry(thread.to_owned()).or_default();
+                if let (Some(current), Some(completed)) = (child.turn.as_deref(), p.pointer("/turn/id").and_then(Value::as_str))
+                    && current != completed
+                {
+                    return;
+                }
+                child.runtime = None;
+                child.turn = None;
+                child.done_turn = p.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned);
+                // What it asked goes with its turn (Codex withdraws it).
+                let ended = p.pointer("/turn/id").and_then(Value::as_str);
+                let gone: Vec<String> = core.state.approvals.iter().chain(self.withheld.values())
+                    .filter(|a| a.input.get("threadId").and_then(Value::as_str) == Some(thread))
+                    .filter(|a| a.input.get("turnId").and_then(Value::as_str).is_none_or(|id| ended.is_none_or(|e| e == id)))
+                    .map(|a| a.id.clone())
+                    .collect();
+                if !gone.is_empty() {
+                    for id in gone {
+                        self.asks.remove(&id);
+                        self.withheld.remove(&id);
+                        core.take_approval(&id);
+                    }
+                    self.settle(core);
+                }
+                if let Some(turn) = p.get("turn") {
+                    self.child_history(core, thread, std::slice::from_ref(turn));
+                }
+                self.read_child(core, thread);
+                // Between turns: a message sent now, then what waits for it, goes.
+                self.drain_child(core, thread);
+            }
+            "thread/status/changed" => {
+                let runtime = p.get("status").and_then(child_runtime_status);
+                self.children.entry(thread.to_owned()).or_default().runtime = runtime.map(str::to_owned);
+                if let Some(status) = runtime {
+                    child_status(core, thread, status);
+                }
+            }
+            "thread/tokenUsage/updated" => {
+                if let Some(task) = core.state.tasks.iter_mut().find(|t| t.id == thread)
+                    && let Some(total) = p.pointer("/tokenUsage/total")
+                {
+                    task.tokens = total.get("inputTokens").and_then(Value::as_u64).unwrap_or(0)
+                        + total.get("outputTokens").and_then(Value::as_u64).unwrap_or(0);
+                    core.touch_state();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn notification(&mut self, core: &mut Core, method: &str, p: Value) {
+        // One app-server can report child threads too. Their turns must not end the parent's.
+        if method != "serverRequest/resolved"
+            && let (Some(own), Some(thread)) = (self.thread.as_deref(), p.get("threadId").and_then(Value::as_str))
+            && own != thread
+        {
+            let thread = thread.to_owned();
+            self.child_notification(core, &thread, method, &p);
+            return;
+        }
+        match method {
+            "thread/status/changed" => self.thread_status(core, p.get("status").unwrap_or(&Value::Null)),
+            "turn/started" => {
+                if p.pointer("/turn/id").and_then(Value::as_str).is_some_and(|id| self.completed_turn.as_deref() == Some(id)) {
+                    return;
+                }
+                self.thread_status = Some(Status::Running);
                 if let Some(t) = p.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
                     self.turn = Some(t.to_owned());
                 }
                 self.steer_waiting(core);
+                self.interrupt_for_permissions(core);
+                self.tell_parent(core, false);
                 if core.state.turn_started.is_none() {
                     core.state.turn_started = Some(Core::now());
                 }
                 core.state.doing = Some("Thinking".to_owned());
                 core.touch_state();
+                self.settle(core);
             }
             "turn/completed" => {
                 let turn = p.get("turn").cloned().unwrap_or(Value::Null);
+                if turn.get("id").and_then(Value::as_str).is_some_and(|id| self.completed_turn.as_deref() == Some(id)) {
+                    return;
+                }
+                if let (Some(current), Some(completed)) = (self.turn.as_deref(), turn.get("id").and_then(Value::as_str))
+                    && current != completed
+                {
+                    return;
+                }
                 let status = turn.get("status").and_then(Value::as_str).unwrap_or("completed");
+                self.completed_turn = turn.get("id").and_then(Value::as_str).map(str::to_owned);
+                let permissions_changed = std::mem::take(&mut self.permissions_changing);
                 match status {
                     "interrupted" => self.notice(core, Level::Info, "Interrupted"),
                     "failed" => {
@@ -1986,28 +3149,50 @@ impl Codex {
                     _ => {}
                 }
                 let done = if status == "completed" { Delivery::Completed } else { Delivery::Cancelled };
-                for id in std::mem::take(&mut self.turn_messages) {
-                    if core.state.delivery.contains_key(&id) {
-                        core.state.delivery.insert(id, done);
+                let took = std::mem::take(&mut self.turn_messages);
+                for id in &took {
+                    if core.state.delivery.contains_key(id) {
+                        core.state.delivery.insert(id.clone(), done);
                     }
                 }
+                // Messages for its subagents it was to pass on in this turn and didn't.
+                self.unrelayed(core, &took);
                 // Calls the turn left open were cut off with it; terminals still running were left
                 // behind (they go on after the turn).
                 let terminals: Vec<String> = core.state.tasks.iter().filter(|t| t.live() && t.process.is_some()).filter_map(|t| t.tool_id.clone()).collect();
                 for t in core.state.tasks.iter_mut().filter(|t| t.live() && t.process.is_some()) {
                     t.background = true;
                 }
+                // Codex keeps them past the turn (its own TUI lists them until they exit) and says
+                // when each ends; whether it still runs those kiln shows running, it says too.
+                self.ask_terminals(core);
                 let open: Vec<String> = core
                     .events()
                     .filter_map(|e| match &e.body {
-                        Body::Tool(t) if matches!(t.status, ToolStatus::Running | ToolStatus::Pending) && !terminals.contains(&e.id) => Some(e.id.clone()),
+                        Body::Tool(t) if e.parent.is_none() && matches!(t.status, ToolStatus::Running | ToolStatus::Pending) && !terminals.contains(&e.id) => Some(e.id.clone()),
                         _ => None,
                     })
                     .collect();
                 for id in open {
                     set_status(core, &id, ToolStatus::Cancelled);
                 }
+                // Interrupting a turn cancels its pending requests. Never answer them as an
+                // approval; native children's requests still belong to their own turns.
+                let ended = turn.get("id").and_then(Value::as_str);
+                let resolved: Vec<String> = core.state.approvals.iter().chain(self.withheld.values())
+                    .filter(|a| a.input.get("threadId").and_then(Value::as_str).is_none_or(|id| self.thread.as_deref() == Some(id)))
+                    .filter(|a| a.input.get("turnId").and_then(Value::as_str).is_none_or(|id| ended == Some(id)))
+                    .map(|a| a.id.clone()).collect();
+                for id in resolved {
+                    self.asks.remove(&id);
+                    self.withheld.remove(&id);
+                    core.take_approval(&id);
+                }
                 self.turn = None;
+                self.turn_permissions = None;
+                if !matches!(self.thread_status, Some(Status::Starting | Status::Exited)) {
+                    self.thread_status = Some(Status::Idle);
+                }
                 // How it ended, for kiln's keep-going.
                 let how = match status {
                     "completed" => "done",
@@ -2019,6 +3204,24 @@ impl Codex {
                 core.state.doing = None;
                 core.state.usage.turns += 1;
                 core.touch_state();
+                // Work the change stopped goes on: the turn's, and its subagents' (who keep the
+                // permissions they started with, so new ones take over). Otherwise subagents
+                // kiln stopped are heard of with the next message it's sent.
+                if permissions_changed && (status == "interrupted" || !self.stopped.is_empty()) {
+                    let mut text = "Your permissions were updated.".to_owned();
+                    if status == "interrupted" {
+                        text.push_str(" Continue the work interrupted by that change, checking the state of any commands already started before retrying them.");
+                    }
+                    let (approval, sandbox, _) = self.policies(core);
+                    let now = (approval, sandbox);
+                    if let Some(note) = self.stopped_note(core) {
+                        text.push(' ');
+                        text.push_str(&note);
+                    } else if core.state.tasks.iter().any(|t| t.class.as_deref() == Some("agent") && self.children.get(&t.id).and_then(|c| c.permissions.as_ref()) != Some(&now)) {
+                        text.push_str(" Subagents keep the permissions they were started with: start new ones rather than sending more work to those started before this change.");
+                    }
+                    super::pause::continue_later(core, &text);
+                }
                 self.settle(core);
                 self.next(core);
             }
@@ -2031,12 +3234,14 @@ impl Codex {
                         self.turns.insert(key, turn.to_owned());
                     }
                     self.item(core, item, method == "item/completed");
+                    self.note_spawns(item, None);
+                    self.relayed(core, item, method == "item/completed");
                 }
             }
             "item/agentMessage/delta" | "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" | "item/plan/delta" => {
                 let (Some(id), Some(d)) = (p.get("itemId").and_then(Value::as_str), p.get("delta").and_then(Value::as_str)) else { return };
                 if core.get(id).is_none() {
-                    let body = if method == "item/agentMessage/delta" {
+                    let body = if matches!(method, "item/agentMessage/delta" | "item/plan/delta") {
                         Body::Assistant { text: String::new(), streaming: true }
                     } else {
                         Body::Thinking { text: String::new(), streaming: true, redacted: false }
@@ -2049,11 +3254,26 @@ impl Codex {
                     core.touch_state();
                 }
             }
+            "item/reasoning/summaryPartAdded" => {
+                let Some(id) = p.get("itemId").and_then(Value::as_str) else { return };
+                if core.get(id).is_none() {
+                    core.upsert(id, None, Body::Thinking { text: String::new(), streaming: true, redacted: false });
+                }
+                if p.get("summaryIndex").and_then(Value::as_u64).is_some_and(|i| i > 0) {
+                    core.append(id, "\n\n");
+                }
+            }
             "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
                 let (Some(id), Some(d)) = (p.get("itemId").and_then(Value::as_str), p.get("delta").and_then(Value::as_str)) else { return };
+                if d.is_empty() {
+                    return;
+                }
                 // A terminal's whole output is kept (the call shows only its start).
                 if let Some(task) = core.state.tasks.iter().find(|t| t.tool_id.as_deref() == Some(id) && t.process.is_some()).map(|t| t.id.clone()) {
                     core.task_output.entry(task).or_default().append(d.as_bytes());
+                }
+                if core.get(id).is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.truncated && t.output.as_ref().is_some_and(|out| out.len() >= OUTPUT_MAX * 2))) {
+                    return;
                 }
                 if let Some(e) = core.get_mut(id)
                     && let Body::Tool(t) = &mut e.body
@@ -2129,6 +3349,11 @@ impl Codex {
                     core.touch_state();
                 }
             }
+            "thread/settings/updated" => {
+                if let Some(e) = p.pointer("/threadSettings/effort").and_then(Value::as_str) {
+                    self.effort_reported(core, e);
+                }
+            }
             "serverRequest/resolved" => {
                 let id = match p.get("requestId") {
                     Some(Value::String(s)) => s.clone(),
@@ -2136,8 +3361,10 @@ impl Codex {
                     None => return,
                 };
                 self.asks.remove(&id);
+                self.withheld.remove(&id);
                 if core.take_approval(&id).is_some() {
                     self.settle(core);
+                    self.next(core);
                 }
             }
             "error" => {
@@ -2202,7 +3429,7 @@ impl Codex {
     /// until its item completes.
     #[allow(clippy::too_many_arguments)]
     fn terminal(&mut self, core: &mut Core, item_id: &str, process: &str, command: &str, item: &Value, done: bool, exit: Option<i32>) {
-        let task_id = format!("terminal-{item_id}");
+        let task_id = format!("{TERMINAL}{item_id}");
         let status = match (done, item.get("status").and_then(Value::as_str)) {
             (false, _) => "running",
             (true, _) if self.stopping.remove(&task_id) => "stopped",
@@ -2210,9 +3437,11 @@ impl Codex {
             (true, _) if exit.unwrap_or(0) != 0 => "failed",
             (true, _) => "completed",
         };
+        // Ended by kiln once Codex no longer ran it: how it really ended replaces that.
+        let heard = done && self.unheard.remove(&task_id);
         match core.state.tasks.iter_mut().find(|t| t.id == task_id) {
             Some(t) => {
-                if t.live() {
+                if t.live() || heard {
                     t.status = status.to_owned();
                 }
                 t.exit_code = exit.or(t.exit_code);
@@ -2240,6 +3469,55 @@ impl Codex {
         core.touch_state();
     }
 
+    /// Ask Codex which terminals it still runs (`thread/backgroundTerminals/list`, experimental):
+    /// one kiln shows running that it no longer has ended without kiln hearing how.
+    fn ask_terminals(&mut self, core: &mut Core) {
+        if self.terminals_unknown || self.pending.values().any(|p| matches!(p, Pending::Terminals { .. })) {
+            return;
+        }
+        let Some(thread) = self.thread.clone() else { return };
+        let live: Vec<String> = core.state.tasks.iter().filter(|t| t.live() && t.process.is_some() && t.id.starts_with(TERMINAL)).map(|t| t.id.clone()).collect();
+        if live.is_empty() {
+            return;
+        }
+        let at = Core::now();
+        self.terminals_at = at;
+        // Without a limit, Codex lists them all at once.
+        self.request(core, Pending::Terminals { at, live }, "thread/backgroundTerminals/list", json!({"threadId": thread}));
+    }
+
+    /// The terminals Codex runs now: those kiln showed running when it asked, started before that
+    /// and not among them, have ended. How, Codex says when its end comes (`unheard`).
+    fn terminals_listed(&mut self, core: &mut Core, at: i64, live: &[String], result: &Value) {
+        // Only the whole list says what's gone.
+        let Some(data) = result.get("data").and_then(Value::as_array).filter(|_| result.get("nextCursor").is_none_or(Value::is_null)) else { return };
+        let running: std::collections::HashSet<&str> = data.iter().flat_map(|t| [t.get("itemId"), t.get("processId")]).flatten().filter_map(Value::as_str).collect();
+        let gone: Vec<(String, Option<String>)> = core
+            .state
+            .tasks
+            .iter()
+            .filter(|t| t.live() && live.contains(&t.id) && t.started <= at - TERMINAL_GRACE_MS)
+            .filter(|t| !t.tool_id.as_deref().is_some_and(|id| running.contains(id)) && !t.process.as_deref().is_some_and(|p| running.contains(p)))
+            .map(|t| (t.id.clone(), t.tool_id.clone()))
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        let now = Core::now();
+        for (task, tool) in gone {
+            if let Some(t) = core.state.tasks.iter_mut().find(|t| t.id == task) {
+                t.status = "completed".into();
+                t.ended = Some(now);
+            }
+            if let Some(tool) = tool {
+                set_status(core, &tool, ToolStatus::Done);
+            }
+            self.unheard.insert(task);
+        }
+        self.unheard.retain(|id| core.state.tasks.iter().any(|t| t.id == *id));
+        core.touch_state();
+    }
+
     /// The installed plugins, with the skills each brings.
     fn plugins(&self) -> Vec<Plugin> {
         self.plugins_raw
@@ -2261,9 +3539,20 @@ impl Codex {
 
     /// One thread item, started or completed (`done`), into the timeline.
     fn item(&mut self, core: &mut Core, item: &Value, done: bool) {
-        let Some(id) = item.get("id").and_then(Value::as_str).map(str::to_owned) else { return };
+        self.item_in(core, item, done, None);
+    }
+
+    fn item_in(&mut self, core: &mut Core, item: &Value, done: bool, thread: Option<&str>) {
+        let Some(raw_id) = item.get("id").and_then(Value::as_str) else { return };
+        // Older Codex versions can include inherited items in a fork's history.
+        if thread.is_some() && core.get(raw_id).is_some_and(|e| e.parent.is_none()) {
+            return;
+        }
+        let id = thread.map_or_else(|| raw_id.to_owned(), |thread| child_event_id(thread, raw_id));
+        let parent = thread.and_then(|thread| core.state.tasks.iter().find(|t| t.id == thread)).and_then(|t| t.tool_id.clone());
         let ty = item.get("type").and_then(Value::as_str).unwrap_or("");
-        let cwd = core.state.cwd.clone();
+        let (started, ended) = item_times(core, &id, item, done);
+        let cwd = thread.and_then(|thread| core.state.tasks.iter().find(|t| t.id == thread)).and_then(|t| t.cwd.clone()).unwrap_or_else(|| core.state.cwd.clone());
         match ty {
             "userMessage" => {
                 let text = item
@@ -2272,15 +3561,16 @@ impl Codex {
                     .map(|c| c.iter().filter_map(|x| x.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"))
                     .unwrap_or_default();
                 let text = text.split("\n\nAttached files:\n").next().unwrap_or(&text).to_owned();
-                let client = item.get("clientId").and_then(Value::as_str).map(str::to_owned);
-                let key = client.clone().unwrap_or(id);
+                // A subagent's own: one kiln sent it for a person (its id, as Codex says it back).
+                let client = item.get("clientId").and_then(Value::as_str).map(str::to_owned).filter(|c| thread.is_none() || core.state.delivery.contains_key(c));
+                let key = client.clone().unwrap_or_else(|| id.clone());
                 if let Some(c) = &client
                     && core.state.delivery.contains_key(c)
                 {
                     core.state.delivery.insert(c.clone(), if done { Delivery::Completed } else { Delivery::Started });
                     core.touch_state();
                 }
-                if core.state.goal.is_empty() && !text.trim().is_empty() {
+                if thread.is_none() && core.state.goal.is_empty() && !text.trim().is_empty() {
                     core.state.goal = clip_middle(text.trim(), 600).0;
                 }
                 // What it carried: as kiln showed it when sending, else from its input items.
@@ -2292,22 +3582,23 @@ impl Codex {
                     .filter_map(|x| x.get("name").or_else(|| x.get("path")).and_then(Value::as_str))
                     .map(|p| p.rsplit('/').next().unwrap_or(p).to_owned())
                     .collect();
-                let (images, attachments) = match core.get(&key).map(|e| &e.body) {
-                    Some(Body::User { images, attachments, .. }) if !attachments.is_empty() => ((*images).max(counted), attachments.clone()),
-                    _ => (counted, named),
+                let (images, attachments, reply_to) = match core.get(&key).map(|e| &e.body) {
+                    Some(Body::User { images, attachments, reply_to, .. }) if !attachments.is_empty() => ((*images).max(counted), attachments.clone(), reply_to.clone()),
+                    Some(Body::User { reply_to, .. }) => (counted, named, reply_to.clone()),
+                    _ => (counted, named, None),
                 };
-                core.upsert(&key, None, Body::User { text, images, client_id: client, origin: Some("human".into()), attachments });
+                core.upsert(&key, parent.clone(), Body::User { text, images, client_id: client, origin: Some("human".into()), attachments, reply_to });
             }
             "agentMessage" => {
                 let text = item.get("text").and_then(Value::as_str).unwrap_or("").to_owned();
-                if done && !text.trim().is_empty() {
+                if thread.is_none() && done && !text.trim().is_empty() {
                     core.state.summary = clip_middle(text.trim(), 600).0;
                     core.touch_state();
                 }
                 if done || !text.is_empty() {
-                    core.upsert(&id, None, Body::Assistant { text, streaming: !done });
+                    core.upsert(&id, parent.clone(), Body::Assistant { text, streaming: !done });
                 } else if core.get(&id).is_none() {
-                    core.upsert(&id, None, Body::Assistant { text: String::new(), streaming: true });
+                    core.upsert(&id, parent.clone(), Body::Assistant { text: String::new(), streaming: true });
                 }
             }
             "reasoning" => {
@@ -2317,12 +3608,13 @@ impl Codex {
                 let text = if parts("summary").is_empty() { parts("content") } else { parts("summary") };
                 if done || core.get(&id).is_none() {
                     let redacted = done && text.is_empty();
-                    core.upsert(&id, None, Body::Thinking { text, streaming: !done, redacted });
+                    core.upsert(&id, parent.clone(), Body::Thinking { text, streaming: !done, redacted });
                 }
             }
             "plan" => {
-                if let Some(text) = item.get("text").and_then(Value::as_str).filter(|_| done) {
-                    core.upsert(&id, None, Body::Assistant { text: text.to_owned(), streaming: false });
+                if done || core.get(&id).is_none() {
+                    let text = item.get("text").and_then(Value::as_str).unwrap_or("").to_owned();
+                    core.upsert(&id, parent.clone(), Body::Assistant { text, streaming: !done });
                 }
             }
             "commandExecution" => {
@@ -2367,21 +3659,22 @@ impl Codex {
                     todos: Vec::new(),
                     task: None,
                     exit_code: exit,
-                    started: started_of(core, &id),
-                    ended: done.then(Core::now),
+                    started,
+                    ended,
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 };
-                if !done {
+                if thread.is_none() && !done {
                     core.state.doing = Some(super::claude::doing(&call));
                     core.touch_state();
                 }
                 // A terminal (unified exec): it can go on after its call and the turn.
-                if let Some(process) = item.get("processId").and_then(Value::as_str) {
+                if thread.is_none() && let Some(process) = item.get("processId").and_then(Value::as_str) {
                     self.terminal(core, &id, process, &command, item, done, exit);
                 }
-                core.upsert(&id, None, Body::Tool(Box::new(call)));
+                core.upsert(&id, parent.clone(), Body::Tool(Box::new(call)));
             }
             "fileChange" => {
                 let changes = item.get("changes").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -2392,7 +3685,7 @@ impl Codex {
                     "declined" => ToolStatus::Denied,
                     _ => ToolStatus::Running,
                 };
-                if done && status == ToolStatus::Done {
+                if thread.is_none() && done && status == ToolStatus::Done {
                     for c in &changes {
                         let Some(path) = c.get("path").and_then(Value::as_str) else { continue };
                         let abs = if std::path::Path::new(path).is_absolute() { path.to_owned() } else { format!("{}/{path}", cwd.trim_end_matches('/')) };
@@ -2421,17 +3714,18 @@ impl Codex {
                     todos: Vec::new(),
                     task: None,
                     exit_code: None,
-                    started: started_of(core, &id),
-                    ended: done.then(Core::now),
+                    started,
+                    ended,
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 };
-                if !done {
+                if thread.is_none() && !done {
                     core.state.doing = Some(super::claude::doing(&call));
                     core.touch_state();
                 }
-                core.upsert(&id, None, Body::Tool(Box::new(call)));
+                core.upsert(&id, parent.clone(), Body::Tool(Box::new(call)));
             }
             "mcpToolCall" | "dynamicToolCall" => {
                 let server = item.get("server").or_else(|| item.get("namespace")).and_then(Value::as_str).unwrap_or("");
@@ -2468,13 +3762,14 @@ impl Codex {
                     todos: Vec::new(),
                     task: None,
                     exit_code: shown.as_ref().and_then(|s| s.exit_code),
-                    started: started_of(core, &id),
-                    ended: done.then(Core::now),
+                    started,
+                    ended,
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: shown.as_ref().and_then(|s| s.runner.clone()).or_else(|| crate::reach::remote(server, tool_name, item.get("arguments").unwrap_or(&Value::Null))),
                 };
-                core.upsert(&id, None, Body::Tool(Box::new(call)));
+                core.upsert(&id, parent.clone(), Body::Tool(Box::new(call)));
             }
             "webSearch" => {
                 let q = item.get("query").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -2492,71 +3787,159 @@ impl Codex {
                     todos: Vec::new(),
                     task: None,
                     exit_code: None,
-                    started: started_of(core, &id),
-                    ended: done.then(Core::now),
+                    started,
+                    ended,
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 };
-                core.upsert(&id, None, Body::Tool(Box::new(call)));
+                core.upsert(&id, parent.clone(), Body::Tool(Box::new(call)));
             }
             "collabAgentToolCall" | "subAgentActivity" => {
                 let desc = item.get("prompt").or_else(|| item.get("agentPath")).and_then(Value::as_str).unwrap_or("subagent").to_owned();
-                let status = match item.get("status").and_then(Value::as_str) {
-                    Some("completed") => "completed",
-                    Some("failed") => "failed",
-                    _ if done => "completed",
-                    _ => "running",
-                };
-                let task_id = item.get("agentThreadId").and_then(Value::as_str).unwrap_or(&id).to_owned();
-                match core.state.tasks.iter_mut().find(|t| t.id == task_id) {
-                    Some(t) => {
-                        t.status = status.to_owned();
-                        if done {
-                            t.ended.get_or_insert_with(Core::now);
+                let mut task = None;
+                let status = if ty == "collabAgentToolCall" {
+                    let status = match item.get("status").and_then(Value::as_str) {
+                        Some("completed") => ToolStatus::Done,
+                        Some("failed") => ToolStatus::Error,
+                        Some("interrupted") => ToolStatus::Cancelled,
+                        _ => ToolStatus::Running,
+                    };
+                    let spawned = item.get("tool").and_then(Value::as_str) == Some("spawnAgent");
+                    let states = item.get("agentsStates").and_then(Value::as_object);
+                    let mut targets: Vec<&str> = item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+                    for target in states.into_iter().flat_map(|s| s.keys().map(String::as_str)) {
+                        if !targets.contains(&target) {
+                            targets.push(target);
                         }
                     }
-                    None => core.state.tasks.push(Task {
-                        id: task_id.clone(),
-                        tool_id: Some(id.clone()),
-                        description: clip_middle(&desc, 300).0,
-                        kind: item.get("kind").and_then(Value::as_str).unwrap_or("subagent").to_owned(),
-                        status: status.to_owned(),
-                        depth: 1,
-                        started: Core::now(),
-                        ended: done.then(Core::now),
-                        ..Task::default()
-                    }),
-                }
-                core.touch_state();
+                    for target in targets {
+                        // Child communications can address their parent or siblings; they do
+                        // not establish a new parent/child relationship.
+                        if self.thread.as_deref() == Some(target) || thread == Some(target)
+                            || (thread.is_some() && !spawned && !core.state.tasks.iter().any(|t| t.id == target && t.parent_task.as_deref() == thread))
+                        {
+                            continue;
+                        }
+                        let child = match states.and_then(|s| s.get(target)).and_then(|s| s.get("status")).and_then(Value::as_str) {
+                            Some("pendingInit") => Some("pending"),
+                            Some("running") => Some("running"),
+                            Some("completed") => Some("completed"),
+                            Some("errored") => Some("failed"),
+                            Some("interrupted" | "shutdown" | "notFound") => Some("stopped"),
+                            _ if spawned && status == ToolStatus::Done && !core.state.tasks.iter().any(|t| t.id == target) => Some("pending"),
+                            _ => None,
+                        };
+                        if let Some(child) = child {
+                            subagent(core, target, &id, &desc, child, spawned, thread);
+                            if let Some(t) = core.state.tasks.iter_mut().find(|t| t.id == target) {
+                                if spawned || item.get("tool").and_then(Value::as_str) == Some("followupTask") {
+                                    t.prompt = item.get("prompt").and_then(Value::as_str).map(|p| clip_middle(p, OUTPUT_MAX).0).or(t.prompt.take());
+                                }
+                                if let Some(message) = states.and_then(|s| s.get(target)).and_then(|s| s.get("message")).and_then(Value::as_str) {
+                                    t.summary = Some(clip_middle(message, OUTPUT_MAX).0);
+                                }
+                            }
+                            self.child_changed(core, target);
+                        }
+                        task.get_or_insert_with(|| target.to_owned());
+                    }
+                    status
+                } else {
+                    let Some(target) = item.get("agentThreadId").and_then(Value::as_str) else { return };
+                    let kind = item.get("kind").and_then(Value::as_str);
+                    let known = core.state.tasks.iter().any(|t| t.id == target);
+                    let child = match kind {
+                        Some("started") => Some("running"),
+                        Some("interrupted") => Some("stopped"),
+                        Some("completed") => Some("completed"),
+                        // As in Codex's own TUI, an interaction (`send_message`, `followup_task`)
+                        // doesn't change whether an agent runs: a message queued for an idle one
+                        // starts nothing (its last "completed" stands), and a follow-up's turn is
+                        // heard from the agent itself (its turn, or the read that follows). One
+                        // not known yet is read to find out.
+                        Some("interacted") if known => None,
+                        Some("interacted") => Some("completed"),
+                        _ => return,
+                    };
+                    let spawned = kind == Some("started");
+                    if self.thread.as_deref() != Some(target) && thread != Some(target)
+                        && (thread.is_none() || spawned || core.state.tasks.iter().any(|t| t.id == target && t.parent_task.as_deref() == thread))
+                    {
+                        if let Some(child) = child {
+                            subagent(core, target, &id, &desc, child, spawned, thread);
+                        }
+                        self.child_changed(core, target);
+                        // A follow-up's turn can start just after that read: once more, later.
+                        if kind == Some("interacted")
+                            && let Some(c) = self.children.get_mut(target)
+                        {
+                            c.refresh = true;
+                        }
+                        task = Some(target.to_owned());
+                    }
+                    if done { ToolStatus::Done } else { ToolStatus::Running }
+                };
                 let call = ToolCall {
                     tool_id: id.clone(),
                     name: ty.to_owned(),
                     tool: ToolKind::Agent,
                     title: clip_middle(&desc, 200).0,
                     detail: item.get("model").and_then(Value::as_str).map(str::to_owned),
-                    input: json!({}),
-                    status: if status == "running" { ToolStatus::Running } else if status == "failed" { ToolStatus::Error } else { ToolStatus::Done },
+                    input: json!({"kind": item.get("kind"), "tool": item.get("tool"), "model": item.get("model"), "reasoningEffort": item.get("reasoningEffort")}),
+                    status,
                     output: None,
                     truncated: false,
                     diffs: Vec::new(),
                     todos: Vec::new(),
-                    task: Some(task_id),
+                    task,
                     exit_code: None,
-                    started: started_of(core, &id),
-                    ended: done.then(Core::now),
+                    started,
+                    ended,
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 };
-                core.upsert(&id, None, Body::Tool(Box::new(call)));
+                core.upsert(&id, parent.clone(), Body::Tool(Box::new(call)));
             }
-            "contextCompaction" if done => self.notice(core, Level::Info, "Conversation compacted"),
-            "enteredReviewMode" if done => self.notice(core, Level::Info, "Reviewing"),
-            "exitedReviewMode" if done => self.notice(core, Level::Info, "Review finished"),
+            "contextCompaction" if thread.is_none() && done => self.notice(core, Level::Info, "Conversation compacted"),
+            "enteredReviewMode" if thread.is_none() && done => self.notice(core, Level::Info, "Reviewing"),
+            "exitedReviewMode" if thread.is_none() && done => self.notice(core, Level::Info, "Review finished"),
             _ => {}
         }
-        self.settle(core);
+        if let Some(thread) = thread {
+            let activity = core.get(&id).and_then(|e| match &e.body {
+                Body::Tool(t) => Some(super::claude::doing(t)),
+                _ => None,
+            });
+            let count = core.events().filter(|e| e.parent == parent && matches!(&e.body, Body::Tool(_))).count();
+            if let Some(task) = core.state.tasks.iter_mut().find(|t| t.id == thread) {
+                if let Some(activity) = activity {
+                    task.last_tool = Some(activity);
+                }
+                task.tool_uses = count as u64;
+                match ty {
+                    "userMessage" if task.prompt.is_none() => {
+                        let text = item.get("content").and_then(Value::as_array).into_iter().flatten()
+                            .filter_map(|v| v.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n");
+                        if !text.trim().is_empty() {
+                            task.prompt = Some(clip_middle(&text, OUTPUT_MAX).0);
+                        }
+                    }
+                    "agentMessage" if done => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                            task.summary = Some(clip_middle(text, OUTPUT_MAX).0);
+                        }
+                    }
+                    _ => {}
+                }
+                core.touch_state();
+            }
+        } else {
+            self.settle(core);
+        }
     }
 }
 
@@ -2752,11 +4135,301 @@ fn codex_server(name: &str, row: Option<&Value>, cfg: Option<&Value>, startup: O
     }
 }
 
-fn started_of(core: &Core, id: &str) -> i64 {
-    match core.get(id).map(|e| &e.body) {
-        Some(Body::Tool(t)) => t.started,
-        _ => Core::now(),
+fn item_times(core: &Core, id: &str, item: &Value, done: bool) -> (i64, Option<i64>) {
+    let previous = core.get(id).and_then(|e| match &e.body { Body::Tool(t) => Some(t), _ => None });
+    let ended = done.then(|| previous.and_then(|t| t.ended).unwrap_or_else(Core::now));
+    let duration = item.get("durationMs").and_then(Value::as_i64).unwrap_or(0).max(0);
+    let started = previous.map_or_else(|| ended.unwrap_or_else(Core::now).saturating_sub(duration), |t| t.started);
+    (started, ended)
+}
+
+fn child_event_id(thread: &str, item: &str) -> String {
+    format!("child:{thread}:{item}")
+}
+
+fn collab_replayed(core: &Core, children: &HashMap<String, Child>, item: &Value, thread: Option<&str>) -> bool {
+    let mut targets: Vec<&str> = if let Some(target) = item.get("agentThreadId").and_then(Value::as_str) {
+        vec![target]
+    } else {
+        item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect()
+    };
+    targets.extend(item.get("agentsStates").and_then(Value::as_object).into_iter().flat_map(|states| states.keys().map(String::as_str)));
+    matches!(item.get("type").and_then(Value::as_str), Some("subAgentActivity" | "collabAgentToolCall"))
+        && targets.iter().all(|target| children.contains_key(*target) && core.state.tasks.iter().any(|t| t.id == *target))
+        && item.get("id").and_then(Value::as_str).is_some_and(|id| {
+            let id = thread.map_or_else(|| id.to_owned(), |thread| child_event_id(thread, id));
+            core.get(&id).is_some_and(|e| matches!(&e.body, Body::Tool(t) if !matches!(t.status, ToolStatus::Running | ToolStatus::Pending)))
+        })
+}
+
+/// Largest rollout read for a native child kiln never read (its end).
+const ROLLOUT_MAX: u64 = 64 << 20;
+
+/// Native children kiln never read: their rows, with none of their work in the timeline (an older
+/// image kept rows without reading them). In a session that runs another harness now, no Codex can
+/// be asked, so their work comes from Codex's own record of their threads ([`read_rollouts`]).
+pub(super) fn unread_children(core: &Core) -> Vec<String> {
+    let thread_id = |id: &str| id.len() == 36 && id.char_indices().all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() });
+    core.state
+        .tasks
+        .iter()
+        .filter(|t| t.class.as_deref() == Some("agent") && t.tool_id.is_some() && thread_id(&t.id))
+        .filter(|t| {
+            let prefix = child_event_id(&t.id, "");
+            !core.events().any(|e| e.id.starts_with(&prefix))
+        })
+        .map(|t| t.id.clone())
+        .collect()
+}
+
+/// The records of these native children's threads, from their rollouts under Codex's home `home`
+/// (blocking: reads them), each oldest first; one without a rollout is left out.
+pub(super) fn read_rollouts(home: &std::path::Path, threads: Vec<String>) -> Vec<(String, Vec<Value>)> {
+    let mut out = Vec::new();
+    for thread in threads {
+        let mut segments = Vec::new();
+        for file in super::handoff::codex_files(home, &thread) {
+            let Some(lines) = super::transcript::tail_lines(&file, ROLLOUT_MAX) else { continue };
+            let records: Vec<Value> = lines.iter().filter_map(|l| serde_json::from_str(l).ok()).collect();
+            let meta = records.iter().find(|r| r.get("type").and_then(Value::as_str) == Some("session_meta"));
+            // Its own (a branch of it is another thread's file).
+            if meta.and_then(|m| m.pointer("/payload/id")).and_then(Value::as_str).is_some_and(|id| id != thread) {
+                continue;
+            }
+            let first = meta.and_then(|m| m.get("ordinal")).and_then(Value::as_u64);
+            let base = meta.and_then(|m| m.pointer("/payload/history_base/end_ordinal_exclusive")).and_then(Value::as_u64);
+            segments.push((first, base, records));
+        }
+        let records = super::handoff::codex_history(segments);
+        if !records.is_empty() {
+            out.push((thread, records));
+        }
     }
+    out
+}
+
+/// A native child's own turns from its rollout records, as `thread/turns/list` gives them (oldest
+/// first). The history of its parent a fork starts with is left out (its own turns start with the
+/// first one another agent started), and a turn without an end was cut off: no Codex runs it.
+pub(super) fn rollout_turns(records: &[Value]) -> Vec<Value> {
+    fn event(r: &Value) -> Option<&str> {
+        if r.get("type").and_then(Value::as_str) == Some("event_msg") { r.pointer("/payload/type").and_then(Value::as_str) } else { None }
+    }
+    let own = records.iter().position(|r| event(r) == Some("task_started") && r.pointer("/payload/turn_attribution/initiating_agent_path").is_some_and(|p| !p.is_null())).unwrap_or(0);
+    let mut turns: Vec<Value> = Vec::new();
+    for r in records.iter().skip(own) {
+        let p = r.get("payload").unwrap_or(&Value::Null);
+        let id = p.get("turn_id").and_then(Value::as_str);
+        if event(r) == Some("task_started") {
+            turns.push(json!({"id": id, "status": "inProgress", "startedAt": p.get("started_at"), "items": []}));
+            continue;
+        }
+        let Some(turn) = turns.iter_mut().rev().find(|t| id.is_none() || t.get("id").and_then(Value::as_str) == id).and_then(Value::as_object_mut) else { continue };
+        let ended = |turn: &mut serde_json::Map<String, Value>, status: &str| {
+            if turn.get("status").and_then(Value::as_str) != Some("failed") {
+                turn.insert("status".into(), json!(status));
+            }
+            turn.insert("completedAt".into(), p.get("completed_at").cloned().unwrap_or(Value::Null));
+            turn.insert("durationMs".into(), p.get("duration_ms").cloned().unwrap_or(Value::Null));
+        };
+        match event(r) {
+            Some("task_complete") => {
+                if let Some(message) = p.pointer("/error/message").and_then(Value::as_str) {
+                    turn.insert("status".into(), json!("failed"));
+                    turn.insert("error".into(), json!({"message": message}));
+                }
+                ended(turn, "completed");
+            }
+            Some("turn_aborted") => ended(turn, "interrupted"),
+            Some("item_completed") => {
+                if let (Some(item), Some(items)) = (p.get("item").and_then(rollout_item), turn.get_mut("items").and_then(Value::as_array_mut)) {
+                    items.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    for turn in turns.iter_mut().filter_map(Value::as_object_mut) {
+        if turn.get("status").and_then(Value::as_str) == Some("inProgress") {
+            turn.insert("status".into(), json!("interrupted"));
+        }
+    }
+    turns
+}
+
+/// One item of a rollout (Codex's own form) as the app server shows it; None: one kiln doesn't
+/// show for a child.
+fn rollout_item(item: &Value) -> Option<Value> {
+    let s = |k: &str| item.get(k).cloned().unwrap_or(Value::Null);
+    let id = item.get("id").and_then(Value::as_str)?;
+    Some(match item.get("type").and_then(Value::as_str)? {
+        "UserMessage" => json!({"type": "userMessage", "id": id, "content": s("content")}),
+        "AgentMessage" => {
+            let text: String = item.get("content").and_then(Value::as_array).into_iter().flatten().filter_map(|c| c.get("text").and_then(Value::as_str)).collect();
+            json!({"type": "agentMessage", "id": id, "text": text, "phase": s("phase")})
+        }
+        "Reasoning" => json!({"type": "reasoning", "id": id, "summary": s("summary_text"), "content": s("raw_content")}),
+        "CommandExecution" => {
+            let command = match item.get("command") {
+                Some(Value::Array(words)) => words.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+                Some(Value::String(c)) => c.clone(),
+                _ => String::new(),
+            };
+            let actions: Vec<Value> = item
+                .get("parsed_cmd")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|a| {
+                    let kind = match a.get("type").and_then(Value::as_str) {
+                        Some("list_files") => "listFiles",
+                        Some(other) => other,
+                        None => "unknown",
+                    };
+                    json!({"type": kind, "command": a.get("cmd"), "path": a.get("path"), "name": a.get("name")})
+                })
+                .collect();
+            let duration = item.get("duration").map(|d| d.get("secs").and_then(Value::as_u64).unwrap_or(0) * 1000 + d.get("nanos").and_then(Value::as_u64).unwrap_or(0) / 1_000_000);
+            let status = match item.get("status").and_then(Value::as_str) {
+                Some("in_progress") | None => "inProgress",
+                Some(other) => other,
+            };
+            let cwd = item.get("cwd").and_then(Value::as_str).map(|c| c.strip_prefix("file://").unwrap_or(c).to_owned());
+            json!({
+                "type": "commandExecution", "id": id, "command": command, "cwd": cwd, "status": status, "exitCode": s("exit_code"), "durationMs": duration,
+                "aggregatedOutput": s("aggregated_output"), "commandActions": actions
+            })
+        }
+        "FileChange" => {
+            let changes: Vec<Value> = item
+                .get("changes")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .map(|(path, c)| {
+                    let diff = c.get("unified_diff").or_else(|| c.get("content")).cloned().unwrap_or(Value::Null);
+                    json!({"path": path, "kind": {"type": c.get("type")}, "diff": diff})
+                })
+                .collect();
+            json!({"type": "fileChange", "id": id, "status": s("status"), "changes": changes})
+        }
+        "McpToolCall" => {
+            json!({"type": "mcpToolCall", "id": id, "server": s("server"), "tool": s("tool"), "arguments": s("arguments"), "status": s("status"), "result": s("result"), "error": s("error")})
+        }
+        "SubAgentActivity" => json!({"type": "subAgentActivity", "id": id, "kind": s("kind"), "agentThreadId": s("agent_thread_id"), "agentPath": s("agent_path"), "model": s("model")}),
+        _ => return None,
+    })
+}
+
+/// A native child's turns read from its rollout, under its spawning call as a read of its thread
+/// puts them; nothing is asked of any harness, and nothing it shows runs (no Codex runs it).
+pub(super) fn child_from_rollout(core: &mut Core, thread: &str, turns: &[Value]) {
+    // Its row went meanwhile: what it did would have no call to go under (not the main thread's).
+    if !core.state.tasks.iter().any(|t| t.id == thread && t.tool_id.is_some()) {
+        return;
+    }
+    let writes = core.writes.len();
+    let live: Vec<String> = core.state.tasks.iter().filter(|t| t.live()).map(|t| t.id.clone()).collect();
+    // Codex's work, said by Codex (not the harness running now).
+    let running = std::mem::replace(&mut core.harness, super::kinds::Kind::get("codex").map(|k| k.name.to_owned()));
+    Codex::new(None, None, None, false).child_history(core, thread, turns);
+    core.harness = running;
+    // What it would ask of a Codex about the children it started: there's none.
+    core.writes.truncate(writes);
+    let now = Core::now();
+    for t in core.state.tasks.iter_mut().filter(|t| t.live() && !live.contains(&t.id)) {
+        t.status = "stopped".into();
+        t.ended.get_or_insert(now);
+    }
+    core.touch_state();
+}
+
+fn child_turn_status(turn: &Value) -> Option<&'static str> {
+    match turn.get("status").and_then(Value::as_str)? {
+        "inProgress" => Some("running"),
+        "completed" => Some("completed"),
+        "failed" => Some("failed"),
+        "interrupted" => Some("stopped"),
+        _ => None,
+    }
+}
+
+/// Unloaded and idle threads need their latest turn to distinguish completion from a failure
+/// or interruption. In particular, `notLoaded` does not mean an agent is still initializing.
+fn child_runtime_status(status: &Value) -> Option<&'static str> {
+    match status.get("type").and_then(Value::as_str)? {
+        "active" if status.get("activeFlags").and_then(Value::as_array).is_some_and(|flags| flags.iter().any(|f| matches!(f.as_str(), Some("waitingOnApproval" | "waitingOnUserInput")))) => Some("paused"),
+        "active" => Some("running"),
+        "systemError" => Some("failed"),
+        _ => None,
+    }
+}
+
+fn child_status(core: &mut Core, id: &str, status: &str) {
+    let mut ended_parent = None;
+    if let Some(t) = core.state.tasks.iter_mut().find(|t| t.id == id) {
+        t.status = status.to_owned();
+        if t.live() {
+            t.ended = None;
+        } else {
+            t.ended.get_or_insert_with(Core::now);
+            ended_parent = t.tool_id.clone();
+        }
+        core.touch_state();
+    }
+    if let Some(parent) = ended_parent {
+        let ids: Vec<String> = core.events().filter(|e| e.parent.as_deref() == Some(&parent)).map(|e| e.id.clone()).collect();
+        for id in ids {
+            if let Some(event) = core.get_mut(&id) {
+                match &mut event.body {
+                    Body::Assistant { streaming, .. } | Body::Thinking { streaming, .. } => *streaming = false,
+                    Body::Tool(tool) if matches!(tool.status, ToolStatus::Running | ToolStatus::Pending) => {
+                        tool.status = ToolStatus::Cancelled;
+                        tool.ended.get_or_insert_with(Core::now);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// A collab call can finish while its child keeps working; only the child's state ends its task.
+#[allow(clippy::too_many_arguments)]
+fn subagent(core: &mut Core, id: &str, tool: &str, desc: &str, status: &str, spawned: bool, parent_task: Option<&str>) {
+    let depth = parent_task.and_then(|parent| core.state.tasks.iter().find(|t| t.id == parent)).map_or(1, |t| t.depth + 1);
+    match core.state.tasks.iter_mut().find(|t| t.id == id) {
+        Some(t) => {
+            t.status = status.to_owned();
+            if spawned {
+                t.tool_id.get_or_insert_with(|| tool.to_owned());
+                if t.prompt.is_none() {
+                    t.description = clip_middle(desc, 300).0;
+                }
+            }
+            if t.live() {
+                t.ended = None;
+            } else {
+                t.ended.get_or_insert_with(Core::now);
+            }
+        }
+        None => core.state.tasks.push(Task {
+            id: id.to_owned(),
+            tool_id: Some(if spawned { tool.to_owned() } else { format!("codex-agent:{id}") }),
+            description: clip_middle(desc, 300).0,
+            kind: "subagent".into(),
+            class: Some("agent".into()),
+            status: status.to_owned(),
+            depth,
+            parent_task: parent_task.map(str::to_owned),
+            started: Core::now(),
+            ended: (!matches!(status, "running" | "pending" | "paused")).then(Core::now),
+            // Its turn under way can be interrupted (`stop_child_asked`).
+            stoppable: true,
+            ..Task::default()
+        }),
+    }
+    core.touch_state();
 }
 
 fn set_status(core: &mut Core, id: &str, status: ToolStatus) {
@@ -2765,7 +4438,7 @@ fn set_status(core: &mut Core, id: &str, status: ToolStatus) {
         && matches!(t.status, ToolStatus::Running | ToolStatus::Pending)
     {
         t.status = status;
-        if matches!(status, ToolStatus::Cancelled | ToolStatus::Denied) {
+        if !matches!(status, ToolStatus::Running | ToolStatus::Pending) {
             t.ended = Some(Core::now());
         }
     }
@@ -2855,7 +4528,7 @@ mod tests {
         feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
         feed(&mut c, &mut core, &[json!({"id": 2, "result": {"thread": {"id": "th1", "cliVersion": "0.162.1", "turns": []}, "model": "gpt-5", "cwd": "/work"}})]);
         let _ = written(&mut core);
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "port the parser".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "port the parser".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core).into_iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).unwrap_or_default();
         feed(
             &mut c,
@@ -2865,7 +4538,7 @@ mod tests {
                 json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "inProgress", "items": []}}}),
             ],
         );
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "then the tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "then the tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         assert_eq!(core.state.queue.len(), 1);
         let said = "You've hit your usage limit. Upgrade to Pro or try again in 2 hours 13 minutes.";
         let before = Core::now();
@@ -2903,7 +4576,7 @@ mod tests {
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("initialize"));
         // A message before the thread exists waits for it.
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "list files".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "list files".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         assert!(core.take_writes().is_empty());
         feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
         let w = written(&mut core);
@@ -2933,7 +4606,7 @@ mod tests {
         assert_eq!((a.command.as_deref(), a.reason.as_deref()), (Some("rm -rf build"), Some("outside the sandbox")));
         assert_eq!(a.always.len(), 2);
         // A steer while the turn runs goes in as turn/steer.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "only build/".into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "only build/".into(), mode: SendMode::Steer, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("turn/steer"));
         assert_eq!(w.first().and_then(|v| v.pointer("/params/expectedTurnId")).and_then(Value::as_str), Some("t1"));
@@ -3000,7 +4673,7 @@ mod tests {
         ]}]}, "model": "gpt-5"}})]);
         assert!(core.get("u0").is_some() && core.get("a0").is_some());
         core.take_writes();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "edit it".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "edit it".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/params/sandboxPolicy/type")).and_then(Value::as_str), Some("readOnly"));
         let rid = w.first().and_then(|v| v.get("id")).cloned().unwrap_or_default();
@@ -3017,14 +4690,14 @@ mod tests {
         assert_eq!(a.title, "a.rs");
         assert_eq!(a.diffs.first().and_then(|d| d.hunks.first()).map(|h| h.lines.clone()), Some(vec!["-old".to_owned(), "+new".to_owned()]));
         // Queue while busy; deny with feedback declines and steers the feedback in.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "then test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "then test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         assert_eq!(core.state.queue.len(), 1);
         c.command(&mut core, Command::Approve { id: "44".into(), decision: Decision::Deny, message: Some("keep old".into()), always: None, answers: None, choices: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/result/decision")).and_then(Value::as_str), Some("decline"));
         assert!(w.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("turn/steer") && v.pointer("/params/input/0/text").and_then(Value::as_str) == Some("keep old")));
         // Send now: interrupt, and the message starts the next turn.
-        c.command(&mut core, Command::Send { id: "m3".into(), text: "stop and do X".into(), mode: SendMode::Now, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m3".into(), text: "stop and do X".into(), mode: SendMode::Now, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("turn/interrupt"));
         feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "interrupted", "items": []}}})]);
@@ -3291,7 +4964,7 @@ mod tests {
     fn a_queued_message_is_steered_into_the_running_turn() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
         assert!(core.meta.features.iter().any(|f| f == "queue_steer"));
-        let send = |c: &mut Codex, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let send = |c: &mut Codex, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         // A turn is starting (no id yet); a message waits behind it.
         send(&mut c, &mut core, "m1", "build it");
         let w = written(&mut core);
@@ -3454,6 +5127,44 @@ mod tests {
         Ok(())
     }
 
+    /// A move's goal goes on in the new thread, once the conversation is in; without a
+    /// conversation, as soon as the thread is open; not when Codex didn't take the conversation.
+    #[test]
+    fn a_goal_carried_over_is_set_on_the_new_thread_once_the_conversation_is_in() {
+        let goal = json!({"type": super::super::moving::GOAL, "objective": "port the parser", "status": "active", "tokenBudget": 200_000});
+        let said = json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "port the parser"}]});
+        let open = |items: Vec<Value>| {
+            let mut core = Core::new();
+            core.state.cwd = "/work".into();
+            let mut c = Codex::new(None, None, None, false);
+            c.seed(items);
+            c.start(&mut core);
+            feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
+            feed(&mut c, &mut core, &[json!({"id": 2, "result": {"thread": {"id": "th2", "turns": []}, "model": "gpt-5", "cwd": "/work"}})]);
+            let w = written(&mut core);
+            (c, core, w)
+        };
+        let set = |w: &[Value]| w.iter().find(|v| v.get("method") == Some(&json!("thread/goal/set"))).and_then(|v| v.get("params")).cloned();
+        let (mut c, mut core, w) = open(vec![said.clone(), goal.clone()]);
+        let inject = w.iter().find(|v| v.get("method") == Some(&json!("thread/inject_items"))).cloned().unwrap_or_default();
+        // The conversation alone goes in; the goal waits for it.
+        assert_eq!(inject.pointer("/params/items"), Some(&json!([said.clone()])));
+        assert_eq!(set(&w), None);
+        respond(&mut c, &mut core, &w, "thread/inject_items", json!({}));
+        assert!(c.seeded());
+        assert_eq!(set(&written(&mut core)), Some(json!({"threadId": "th2", "objective": "port the parser", "status": "active", "tokenBudget": 200_000, "origin": "user"})));
+        // A goal alone: set once the thread is open.
+        let (c, _, w) = open(vec![goal.clone()]);
+        assert!(c.seeded());
+        assert!(w.iter().all(|v| v.get("method") != Some(&json!("thread/inject_items"))));
+        assert_eq!(set(&w).and_then(|p| p.get("threadId").cloned()), Some(json!("th2")));
+        // Codex didn't take the conversation: no goal to pursue from nothing.
+        let (mut c, mut core, w) = open(vec![said, goal]);
+        let id = w.iter().find(|v| v.get("method") == Some(&json!("thread/inject_items"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "no"}})]);
+        assert_eq!(set(&written(&mut core)), None);
+    }
+
     #[test]
     fn the_threads_goal_is_followed_to_complete() {
         let mut c = Codex::new(None, None, None, false);
@@ -3509,16 +5220,17 @@ mod tests {
     }
 
     #[test]
-    fn a_mode_change_applies_from_the_next_turn() -> anyhow::Result<()> {
+    fn an_idle_mode_change_sets_the_next_turns_policies_and_persists_bypass() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
         assert!(core.meta.modes.iter().any(|m| m.id == "read-only"));
+        assert!(core.meta.features.iter().any(|f| f == "permissions_live"));
         // An approval policy chosen on its own, then a mode: the mode's policies win.
         c.command(&mut core, Command::Control { id: "approval_policy".into(), value: Some(json!("untrusted")) });
         c.command(&mut core, Command::SetMode { mode: "read-only".into() });
         assert_eq!(core.state.mode, "read-only");
         assert_eq!(core.state.control_values.get("approval_policy"), Some(&json!("on-request")));
-        let _ = written(&mut core);
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "hi".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "hi".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!(start.pointer("/params/approvalPolicy").and_then(Value::as_str), Some("on-request"));
@@ -3527,10 +5239,599 @@ mod tests {
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
         assert_eq!(core.state.mode, "full-access");
         assert_eq!(core.state.control_values.get("sandbox"), Some(&json!("danger-full-access")));
+        assert!(core.effects.contains(&Effect::AllowBypass));
         // Not a mode at all: refused.
         c.command(&mut core, Command::SetMode { mode: "nope".into() });
         assert_eq!(core.state.mode, "full-access");
         Ok(())
+    }
+
+    #[test]
+    fn a_running_permission_change_cancels_only_its_requests_and_continues_before_the_queue() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "finish the change".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "then run tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        core.state.tasks.push(Task { id: "child".into(), description: "Review".into(), class: Some("agent".into()), ..Task::default() });
+        for (id, thread) in [("own-ask", "th1"), ("child-ask", "child")] {
+            feed(&mut c, &mut core, &[json!({"id": id, "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": thread, "turnId": "t1", "itemId": id, "command": "gh pr list", "cwd": "/work"}})]);
+        }
+        assert_eq!(core.state.approvals.iter().find(|a| a.id == "child-ask").and_then(|a| a.agent.as_deref()), Some("Review"));
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        let w = written(&mut core);
+        // The turn, and the subagent (it keeps the permissions it started with, which asked):
+        // both stopped, neither request answered.
+        let stopped: Vec<(&str, &str)> = w.iter().filter(|v| v.get("method") == Some(&json!("turn/interrupt")))
+            .filter_map(|v| Some((v.pointer("/params/threadId")?.as_str()?, v.pointer("/params/turnId")?.as_str()?)))
+            .collect();
+        assert_eq!(stopped, [("th1", "t1"), ("child", "t1")]);
+        assert!(!w.iter().any(|v| v.get("result").is_some() || v.get("method") == Some(&json!("turn/start"))));
+        // A duplicate choice does not interrupt twice or add another continuation.
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        assert!(written(&mut core).is_empty());
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        let w = written(&mut core);
+        let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("no continuation"))?;
+        assert_eq!(next.pointer("/params/approvalPolicy"), Some(&json!("never")));
+        assert_eq!(next.pointer("/params/sandboxPolicy"), Some(&json!({"type": "dangerFullAccess"})));
+        let said = next.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or_default();
+        assert!(said.contains("Continue the work") && said.contains("kiln stopped your subagent Review (child)") && said.contains("Start new subagents"), "{said}");
+        assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["m2"]);
+        assert_eq!(core.state.approvals.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["child-ask"]);
+        assert!(c.asks.contains_key("child-ask") && !c.asks.contains_key("own-ask"));
+        assert!(core.events().any(|e| matches!(&e.body, Body::User { origin: Some(o), text, .. } if o == "kiln" && text.contains("permissions"))));
+        // An ordinary request in full access is still a request, never an automatic approval.
+        feed(&mut c, &mut core, &[json!({"id": "new-ask", "method": "item/commandExecution/requestApproval", "params": {"threadId": "th1", "turnId": "t2", "command": "gh pr list"}})]);
+        assert!(core.state.approvals.iter().any(|a| a.id == "new-ask"));
+        assert!(!written(&mut core).iter().any(|v| v.get("result").is_some()));
+        Ok(())
+    }
+
+    #[test]
+    fn changing_permissions_while_the_turn_starts_waits_for_its_id() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        let start = written(&mut core);
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method") == Some(&json!("turn/interrupt")) && v.pointer("/params/turnId") == Some(&json!("t1"))));
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}})]);
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+    }
+
+    #[test]
+    fn a_late_start_reply_cannot_resurrect_the_turn_interrupted_for_permissions() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        let start = written(&mut core);
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}})]);
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        written(&mut core);
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start")) && v.pointer("/params/approvalPolicy") == Some(&json!("never"))));
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        assert_eq!(c.turn_permissions, Some(("never".into(), "danger-full-access".into())));
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Cancelled));
+        assert!(c.turn.is_none());
+    }
+
+    #[test]
+    fn a_permission_change_does_not_continue_finished_or_explicitly_stopped_work() {
+        for (status, stop) in [("completed", false), ("interrupted", true)] {
+            let (mut c, mut core, _) = opened();
+            c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+            let start = written(&mut core);
+            respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+            c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+            let interrupt = written(&mut core);
+            if stop {
+                c.command(&mut core, Command::Interrupt);
+                written(&mut core);
+            }
+            feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": status}}})]);
+            // The turn may finish naturally before its interrupt is acknowledged.
+            respond(&mut c, &mut core, &interrupt, "turn/interrupt", json!({}));
+            assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+            assert!(!c.permissions_changing && core.state.queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_old_permission_interrupt_cannot_block_or_cancel_the_next_turns_change() {
+        for failed in [false, true] {
+            let (mut c, mut core, _) = opened();
+            c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+            let start = written(&mut core);
+            respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+            c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+            let interrupt = written(&mut core);
+            feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+            let next = written(&mut core);
+            respond(&mut c, &mut core, &next, "turn/start", json!({"turn": {"id": "t2", "status": "inProgress"}}));
+            c.command(&mut core, Command::SetMode { mode: "read-only".into() });
+            let w = written(&mut core);
+            assert!(w.iter().any(|v| v.get("method") == Some(&json!("turn/interrupt")) && v.pointer("/params/turnId") == Some(&json!("t2"))));
+            if failed {
+                let id = interrupt.iter().find(|v| v.get("method") == Some(&json!("turn/interrupt"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+                feed(&mut c, &mut core, &[json!({"id": id, "error": {"message": "turn already ended"}})]);
+            } else {
+                respond(&mut c, &mut core, &interrupt, "turn/interrupt", json!({}));
+            }
+            assert!(c.permissions_changing);
+            feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t2", "status": "interrupted"}}})]);
+            assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start")) && v.pointer("/params/sandboxPolicy/type") == Some(&json!("readOnly"))));
+        }
+    }
+
+    #[test]
+    fn an_explicit_replacement_does_not_requeue_the_work_interrupted_for_permissions() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "old work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        written(&mut core);
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "do this instead".into(), mode: SendMode::Now, attachments: vec![], overrides: None, reply_to: None, task: None});
+        written(&mut core);
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method") == Some(&json!("turn/start")) && v.pointer("/params/clientUserMessageId") == Some(&json!("m2"))));
+        assert!(core.state.queue.is_empty() && c.waiting.is_empty());
+    }
+
+    #[test]
+    fn separate_permission_controls_are_validated_labeled_and_restored() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        c.command(&mut core, Command::Control { id: "approval_policy".into(), value: Some(json!("on-request")) });
+        assert_eq!(core.state.mode, "custom");
+        assert_eq!(c.policies(&core).0, "on-request");
+        assert_eq!(c.policies(&core).1, "danger-full-access");
+        let mut restarted = Codex::new(None, None, Some(core.state.mode.clone()), true);
+        restarted.start(&mut core);
+        assert_eq!(restarted.policies(&core), c.policies(&core));
+        assert_eq!(core.state.mode, "custom");
+        assert!(core.meta.modes.iter().any(|m| m.id == "custom"));
+        c.command(&mut core, Command::Control { id: "sandbox".into(), value: Some(json!("no-such-policy")) });
+        assert_eq!(c.policies(&core).1, "danger-full-access");
+        c.command(&mut core, Command::Control { id: "sandbox".into(), value: Some(json!("workspace-write")) });
+        assert_eq!(core.state.mode, "auto");
+        assert!(!core.meta.modes.iter().any(|m| m.id == "custom"));
+        // Explicit session boundaries still exclude bypass controls.
+        let mut limited = Codex::new(None, None, None, false);
+        limited.thread = Some("limited".into());
+        limited.command(&mut core, Command::Control { id: "approval_policy".into(), value: Some(json!("never")) });
+        assert_eq!(limited.policies(&core).0, "on-request");
+    }
+
+    #[test]
+    fn an_adopted_adapter_repairs_legacy_labels_and_reapplies_an_unknown_turns_mode() {
+        let (mut c, mut core, _) = opened();
+        core.state.mode = "full-access".into();
+        c.allow_bypass = true;
+        c.approval = Some("on-request".into());
+        c.sandbox = None;
+        c.turn = Some("legacy".into());
+        c.turn_permissions = None;
+        core.meta.features.retain(|f| f != "permissions_live");
+        c.tick(&mut core);
+        assert!(core.meta.features.iter().any(|f| f == "permissions_live"));
+        assert_eq!(core.state.mode, "custom");
+        assert_eq!(c.policies(&core).1, "danger-full-access");
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        assert!(core.effects.contains(&Effect::AllowBypass));
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+        // An old header already saying full access can be explicitly selected again too.
+        c.permissions_changing = false;
+        c.pending.retain(|_, p| !matches!(p, Pending::PermissionInterrupt(_)));
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+    }
+
+    /// Thread `from`'s turn `turn` starts subagent `kid`, which starts its turn `<kid>-turn`.
+    fn spawn(c: &mut Codex, core: &mut Core, from: &str, turn: &str, kid: &str) {
+        feed(c, core, &[
+            json!({"method": "item/completed", "params": {"threadId": from, "turnId": turn, "item": {
+                "type": "collabAgentToolCall", "id": format!("spawn-{kid}"), "tool": "spawnAgent", "senderThreadId": from,
+                "receiverThreadIds": [kid], "status": "completed", "agentsStates": {kid: {"status": "running"}}, "prompt": "Audit the changes"}}}),
+            json!({"method": "turn/started", "params": {"threadId": kid, "turn": {"id": format!("{kid}-turn")}}}),
+        ]);
+    }
+
+    fn interrupts(w: &[Value]) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = w.iter().filter(|v| v.get("method") == Some(&json!("turn/interrupt")))
+            .filter_map(|v| Some((v.pointer("/params/threadId")?.as_str()?.to_owned(), v.pointer("/params/turnId")?.as_str()?.to_owned())))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn pair(a: &str, b: &str) -> (String, String) {
+        (a.to_owned(), b.to_owned())
+    }
+
+    fn to_kid(id: &str, text: &str, mode: SendMode) -> Command {
+        Command::Send { id: id.into(), text: text.into(), mode, attachments: vec![], overrides: None, reply_to: None, task: Some("kid".into()) }
+    }
+
+    fn feed_all(a: &mut crate::harness::kinds::Adapter, core: &mut Core, lines: &[Value]) {
+        for l in lines {
+            a.line(core, &l.to_string());
+        }
+    }
+
+    /// The latest request kiln wrote for `method`, answered with `result`.
+    fn answer_last(a: &mut crate::harness::kinds::Adapter, core: &mut Core, w: &[Value], method: &str, result: Value) -> Option<Value> {
+        let req = w.iter().rev().find(|v| v.get("method").and_then(Value::as_str) == Some(method)).cloned()?;
+        feed_all(a, core, &[json!({"id": req.get("id"), "result": result})]);
+        Some(req)
+    }
+
+    /// A multi-agent v1 subagent this process spawned takes a person's messages on its own thread
+    /// (as Codex 0.160.1 does: `turn/steer`, `turn/interrupt`, then `turn/start`, its thread's id):
+    /// steered into its turn, sent now (that turn stopped, this one starts the next), or queued
+    /// for its next turn. Codex says a message it took back under kiln's id: shown once.
+    #[test]
+    fn a_person_writes_to_a_codex_subagent_on_its_own_thread() -> anyhow::Result<()> {
+        let (c, mut core, _) = opened();
+        let mut a = crate::harness::kinds::Adapter::Codex(Box::new(c));
+        feed_all(&mut a, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}}),
+            json!({"method": "item/completed", "params": {"threadId": "th1", "turnId": "t1", "item": {"type": "collabAgentToolCall", "id": "spawn-kid", "tool": "spawnAgent", "senderThreadId": "th1", "receiverThreadIds": ["kid"], "status": "completed", "agentsStates": {"kid": {"status": "running"}}, "prompt": "Audit the changes"}}}),
+            json!({"method": "turn/started", "params": {"threadId": "kid", "turn": {"id": "kid-turn"}}}),
+        ]);
+        let kid = core.state.tasks.iter().find(|t| t.id == "kid").cloned().unwrap_or_default();
+        assert_eq!((kid.takes, kid.via), (vec![SendMode::Queue, SendMode::Steer, SendMode::Now], None));
+        written(&mut core);
+        a.command(&mut core, to_kid("m1", "only the parser", SendMode::Steer));
+        let w = written(&mut core);
+        let steer = w.iter().find(|v| v.get("method") == Some(&json!("turn/steer"))).ok_or_else(|| anyhow::anyhow!("no steer: {w:?}"))?;
+        assert_eq!((steer.pointer("/params/threadId"), steer.pointer("/params/expectedTurnId"), steer.pointer("/params/clientUserMessageId")), (Some(&json!("kid")), Some(&json!("kid-turn")), Some(&json!("m1"))));
+        assert_eq!(core.get("m1").and_then(|e| e.parent.clone()).as_deref(), Some("spawn-kid"));
+        // Its thread says it back under kiln's id: the same message, delivered.
+        feed_all(&mut a, &mut core, &[json!({"method": "item/completed", "params": {"threadId": "kid", "turnId": "kid-turn", "item": {"type": "userMessage", "id": "u9", "clientId": "m1", "content": [{"type": "text", "text": "only the parser"}]}}})]);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
+        assert_eq!(core.events().filter(|e| matches!(e.body, Body::User { .. }) && e.parent.as_deref() == Some("spawn-kid")).count(), 1);
+        // Queued: it waits for this turn to end. Now: this turn stops, and it starts the next.
+        a.command(&mut core, to_kid("m2", "then the tests", SendMode::Queue));
+        a.command(&mut core, to_kid("m3", "stop, check the lexer first", SendMode::Now));
+        // Sent: it can't be taken back while its turn stops (there's no queue it waits in).
+        assert_eq!(core.state.delivery.get("m3"), Some(&Delivery::Sent));
+        let w = written(&mut core);
+        assert_eq!(interrupts(&w), vec![pair("kid", "kid-turn")]);
+        assert!(!w.iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+        assert_eq!(core.state.tasks.iter().find(|t| t.id == "kid").map(|t| t.queue.iter().map(|q| q.id.clone()).collect::<Vec<_>>()), Some(vec!["m2".to_owned()]));
+        feed_all(&mut a, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "kid", "turn": {"id": "kid-turn", "status": "interrupted"}}})]);
+        let w = written(&mut core);
+        let start = answer_last(&mut a, &mut core, &w, "turn/start", json!({"turn": {"id": "kid-2", "status": "inProgress"}})).ok_or_else(|| anyhow::anyhow!("nothing started: {w:?}"))?;
+        assert_eq!((start.pointer("/params/threadId"), start.pointer("/params/clientUserMessageId")), (Some(&json!("kid")), Some(&json!("m3"))));
+        assert!(start.pointer("/params/approvalPolicy").is_some(), "its turn takes the session's permissions now: {start}");
+        // What was queued goes once that turn ends.
+        feed_all(&mut a, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "kid", "turn": {"id": "kid-2", "status": "completed"}}})]);
+        let w = written(&mut core);
+        let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("the queued one didn't go: {w:?}"))?;
+        assert_eq!(next.pointer("/params/clientUserMessageId"), Some(&json!("m2")));
+        // Its harness gone, it takes nothing; what waited for it is said not sent.
+        a.command(&mut core, to_kid("m4", "later", SendMode::Queue));
+        a.exited(&mut core, Some(0), None);
+        assert!(core.state.tasks.iter().find(|t| t.id == "kid").is_some_and(|t| t.takes.is_empty() && t.queue.is_empty()));
+        assert_eq!(core.state.delivery.get("m4"), Some(&Delivery::Cancelled));
+        Ok(())
+    }
+
+    /// Codex refuses a person's message on a multi-agent v2 subagent's thread ("direct app-server
+    /// input is not allowed for multi-agent v2 sub-agents"): the agent passes it on with its own
+    /// agent tools, asked in its turn, and it's delivered once the agent's call reaches it.
+    #[test]
+    fn a_codex_v2_subagent_takes_a_message_by_way_of_its_agent() -> anyhow::Result<()> {
+        let (c, mut core, _) = opened();
+        let mut a = crate::harness::kinds::Adapter::Codex(Box::new(c));
+        feed_all(&mut a, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}}),
+            json!({"method": "item/completed", "params": {"threadId": "th1", "turnId": "t1", "item": {"type": "subAgentActivity", "id": "call_2", "kind": "started", "agentThreadId": "kid", "agentPath": "/root/audit"}}}),
+            json!({"method": "turn/started", "params": {"threadId": "kid", "turn": {"id": "kid-turn"}}}),
+        ]);
+        let kid = core.state.tasks.iter().find(|t| t.id == "kid").cloned().unwrap_or_default();
+        assert_eq!((kid.takes, kid.via.as_deref()), (vec![SendMode::Queue, SendMode::Steer], Some("parent")));
+        written(&mut core);
+        a.command(&mut core, to_kid("m1", "skip the docs", SendMode::Steer));
+        let w = written(&mut core);
+        let steer = w.iter().find(|v| v.get("method") == Some(&json!("turn/steer"))).ok_or_else(|| anyhow::anyhow!("not asked: {w:?}"))?;
+        let words = steer.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or("");
+        assert_eq!(steer.pointer("/params/threadId"), Some(&json!("th1")));
+        anyhow::ensure!(words.contains("(/root/audit)") && words.contains("<message>\nskip the docs\n</message>"), "{words}");
+        assert_eq!((core.get("m1").and_then(|e| e.parent.clone()).as_deref(), core.state.delivery.get("m1")), (Some("call_2"), Some(&Delivery::Sent)));
+        feed_all(&mut a, &mut core, &[json!({"method": "item/completed", "params": {"threadId": "th1", "turnId": "t1", "item": {"type": "subAgentActivity", "id": "call_3", "kind": "interacted", "agentThreadId": "kid", "agentPath": "/root/audit"}}})]);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
+        // One the agent's turn ended without passing on: not sent, and said so.
+        a.command(&mut core, to_kid("m2", "and the tests", SendMode::Steer));
+        feed_all(&mut a, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "completed"}}})]);
+        assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Cancelled));
+        assert!(core.get("subagent-unsent-m2").is_some_and(|e| e.parent.as_deref() == Some("call_2")));
+        Ok(())
+    }
+
+    #[test]
+    fn what_permissions_allow_beyond_others() {
+        let auto = pair("on-request", "workspace-write");
+        let full = pair("never", "danger-full-access");
+        assert!(exceeds(Some(&full), &auto) && !exceeds(Some(&auto), &full) && !exceeds(Some(&auto), &auto));
+        assert!(exceeds(Some(&pair("on-request", "danger-full-access")), &auto));
+        assert!(exceeds(Some(&auto), &pair("untrusted", "workspace-write")));
+        // Unknown ones might allow more, unless nothing is more.
+        assert!(exceeds(None, &auto) && !exceeds(None, &full));
+        assert_eq!(and_list(&["a".into()]), "a");
+        assert_eq!(and_list(&["a".into(), "b".into(), "c".into()]), "a, b and c");
+    }
+
+    #[test]
+    fn under_full_access_a_subagent_started_before_asks_nobody_and_is_replaced() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        // Auto: the turn, and the subagent it starts, work in the folder and ask beyond it.
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "review the PRs".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        assert_eq!(c.children.get("kid").and_then(|k| k.permissions.clone()), Some(pair("on-request", "workspace-write")));
+        // Full access chosen mid-turn: the turn goes on with it. The subagent may now do more
+        // than it does, so it's left working.
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        assert_eq!(interrupts(&written(&mut core)), [pair("th1", "t1")]);
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        let w = written(&mut core);
+        let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("no continuation"))?;
+        let said = next.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or_default();
+        assert!(said.contains("Subagents keep the permissions they were started with"), "{said}");
+        respond(&mut c, &mut core, &w, "turn/start", json!({"turn": {"id": "t2", "status": "inProgress"}}));
+        // Then it asks, which nothing started with full access does. The person isn't asked and
+        // it isn't answered: the subagent is stopped, its parent told to start a new one.
+        feed(&mut c, &mut core, &[json!({"id": "kid-ask", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid", "turnId": "kid-turn", "itemId": "x1", "command": "gh api repos/o/r/pulls", "cwd": "/work"}})]);
+        assert!(core.state.approvals.is_empty());
+        let w = written(&mut core);
+        assert!(!w.iter().any(|v| v.get("result").is_some()));
+        assert_eq!(interrupts(&w), [pair("kid", "kid-turn")]);
+        let steer = w.iter().find(|v| v.get("method") == Some(&json!("turn/steer"))).ok_or_else(|| anyhow::anyhow!("parent not told"))?;
+        assert_eq!(steer.pointer("/params/expectedTurnId"), Some(&json!("t2")));
+        let told = steer.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or_default();
+        assert!(told.contains("kiln stopped your subagent Audit the changes (kid)") && told.contains("new ones get your current permissions"), "{told}");
+        assert!(core.events().any(|e| matches!(&e.body, Body::User { origin: Some(o), text, .. } if o == "kiln" && text.contains("kiln stopped"))));
+        // Its turn ends, and what it asked with it.
+        feed(&mut c, &mut core, &[
+            json!({"method": "turn/completed", "params": {"threadId": "kid", "turn": {"id": "kid-turn", "status": "interrupted"}}}),
+            json!({"method": "serverRequest/resolved", "params": {"threadId": "kid", "requestId": "kid-ask"}}),
+        ]);
+        assert!(c.withheld.is_empty() && !c.asks.contains_key("kid-ask") && core.state.approvals.is_empty());
+        // A subagent started now has full access: what it might still ask is the person's.
+        spawn(&mut c, &mut core, "th1", "t2", "kid2");
+        assert_eq!(c.children.get("kid2").and_then(|k| k.permissions.clone()), Some(pair("never", "danger-full-access")));
+        feed(&mut c, &mut core, &[json!({"id": "kid2-ask", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid2", "turnId": "kid2-turn", "itemId": "x2", "command": "gh api", "cwd": "/work"}})]);
+        assert!(core.state.approvals.iter().any(|a| a.id == "kid2-ask"));
+        assert!(interrupts(&written(&mut core)).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn narrowing_permissions_stops_subagents_allowed_more_and_the_parent_replaces_them() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        // A subagent's own subagent starts with its spawner's permissions.
+        spawn(&mut c, &mut core, "kid", "kid-turn", "grandkid");
+        assert_eq!(c.children.get("grandkid").and_then(|k| k.permissions.clone()), Some(pair("never", "danger-full-access")));
+        c.command(&mut core, Command::SetMode { mode: "auto".into() });
+        assert_eq!(interrupts(&written(&mut core)), [pair("grandkid", "grandkid-turn"), pair("kid", "kid-turn"), pair("th1", "t1")]);
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        let w = written(&mut core);
+        let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("no continuation"))?;
+        assert_eq!(next.pointer("/params/approvalPolicy"), Some(&json!("on-request")));
+        let said = next.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or_default();
+        assert!(said.contains("Continue the work") && said.contains("kiln stopped your subagents") && said.contains("(kid)") && said.contains("(grandkid)"), "{said}");
+        assert!(c.stopped.is_empty());
+        Ok(())
+    }
+
+    /// Signed in on its machine: Codex reads its account at once, and a new account's sign-in takes
+    /// the old one's limits away and reads the new one's.
+    #[test]
+    fn a_sign_in_reads_the_account_again_and_shows_the_new_one_s_limits() {
+        let (mut c, mut core, w) = opened();
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "a@example.com", "planType": "pro"}}));
+        let old = core.state.account.clone();
+        core.state.limits = vec![Limit { id: "codex.primary".into(), label: "Weekly".into(), used_percent: Some(95.0), account: old.clone(), ..Limit::default() }];
+        let _ = written(&mut core);
+        c.command(&mut core, Command::Control { id: "account".into(), value: None });
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method") == Some(&json!("account/read"))), "it reads its account again");
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "b@example.com", "planType": "pro"}}));
+        assert_ne!(core.state.account, old);
+        assert!(core.state.limits.is_empty(), "the old account's limits go");
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("account/rateLimits/read"))), "the new account's are read");
+    }
+
+    /// Signed in as someone else outside kiln (`codex login` in a terminal): the account read every
+    /// few minutes names the new one, the old one's limits go and the new one's are read.
+    #[test]
+    fn a_sign_in_made_outside_kiln_shows_at_the_next_look_at_the_account() {
+        let (mut c, mut core, w) = opened();
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "a@example.com", "planType": "pro"}}));
+        let old = core.state.account.clone();
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "account/rateLimits/read", json!({"rateLimits": {"limitId": "codex", "primary": {"usedPercent": 95.0, "windowDurationMins": 10080}}}));
+        assert!(!core.state.limits.is_empty());
+        c.usage_at = 0;
+        c.tick(&mut core);
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method") == Some(&json!("account/read"))), "it reads its account again");
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "b@example.com", "planType": "pro"}}));
+        assert_eq!(core.state.account, Some(account_id("codex", "Pro", Some("b@example.com"))));
+        assert_ne!(core.state.account, old);
+        assert!(core.state.limits.is_empty(), "the old account's limits go");
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("account/rateLimits/read"))), "the new account's are read");
+    }
+
+    /// A person stops a subagent from its row: its turn is interrupted, and its parent isn't told
+    /// to start it again (that's only for a permission change's stop).
+    #[test]
+    fn a_person_stops_a_subagent_from_its_row() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        assert!(core.state.tasks.iter().find(|t| t.id == "kid").is_some_and(|t| t.stoppable), "a subagent's row can stop it");
+        let _ = written(&mut core);
+        c.command(&mut core, Command::StopTask { task: "kid".into() });
+        assert_eq!(interrupts(&written(&mut core)), [pair("kid", "kid-turn")]);
+        assert!(c.stopped.is_empty(), "its parent isn't asked to start it again");
+    }
+
+    #[test]
+    fn a_change_between_turns_that_stops_subagents_goes_on_with_their_work() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "completed"}}})]);
+        written(&mut core);
+        // The subagent works on after its parent's turn; read only is chosen.
+        c.command(&mut core, Command::SetMode { mode: "read-only".into() });
+        let w = written(&mut core);
+        assert_eq!(interrupts(&w), [pair("kid", "kid-turn")]);
+        let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("parent not told"))?;
+        assert_eq!(next.pointer("/params/sandboxPolicy/type"), Some(&json!("readOnly")));
+        assert!(next.pointer("/params/input/0/text").and_then(Value::as_str).is_some_and(|s| s.starts_with("Your permissions were updated. kiln stopped your subagent")));
+        Ok(())
+    }
+
+    #[test]
+    fn an_adopted_session_already_in_full_access_moves_its_waiting_older_work_onto_it() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        for (id, thread, turn) in [("own-ask", "th1", "t1"), ("kid-ask", "kid", "kid-turn")] {
+            feed(&mut c, &mut core, &[json!({"id": id, "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": thread, "turnId": turn, "itemId": id, "command": "gh pr list", "cwd": "/work"}})]);
+        }
+        assert_eq!(core.state.approvals.len(), 2);
+        // An older kiln changed the label only: the turn and its subagent kept what they started
+        // with, and kiln didn't know what that was.
+        core.state.mode = "full-access".into();
+        c.allow_bypass = true;
+        c.turn_permissions = None;
+        if let Some(k) = c.children.get_mut("kid") {
+            k.permissions = None;
+        }
+        written(&mut core);
+        c.tick(&mut core);
+        let w = written(&mut core);
+        assert_eq!(interrupts(&w), [pair("kid", "kid-turn"), pair("th1", "t1")]);
+        assert!(!w.iter().any(|v| v.get("result").is_some()));
+        // Once each.
+        c.tick(&mut core);
+        assert!(interrupts(&written(&mut core)).is_empty());
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        let w = written(&mut core);
+        let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("no continuation"))?;
+        assert_eq!(next.pointer("/params/approvalPolicy"), Some(&json!("never")));
+        assert!(next.pointer("/params/input/0/text").and_then(Value::as_str).is_some_and(|s| s.contains("Continue the work") && s.contains("(kid)")));
+        assert_eq!(core.state.approvals.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["kid-ask"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subagent_kiln_could_not_stop_leaves_its_request_to_the_person() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        written(&mut core);
+        feed(&mut c, &mut core, &[json!({"id": "kid-ask", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid", "turnId": "kid-turn", "itemId": "x1", "command": "gh api", "cwd": "/work"}})]);
+        assert!(core.state.approvals.is_empty());
+        let w = written(&mut core);
+        let id = w.iter().find(|v| v.get("method") == Some(&json!("turn/interrupt")) && v.pointer("/params/threadId") == Some(&json!("kid"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "no active turn"}})]);
+        assert!(core.state.approvals.iter().any(|a| a.id == "kid-ask") && c.withheld.is_empty() && c.stopped.is_empty());
+        // Not tried again for that turn, and never answered: what it asks next is shown at once.
+        c.tick(&mut core);
+        feed(&mut c, &mut core, &[json!({"id": "kid-ask-2", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid", "turnId": "kid-turn", "itemId": "x2", "command": "gh run list", "cwd": "/work"}})]);
+        assert!(core.state.approvals.iter().any(|a| a.id == "kid-ask-2"));
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt")) || v.get("result").is_some()));
+    }
+
+    #[test]
+    fn a_request_held_back_is_shown_if_its_work_never_stops_and_a_refused_turn_asks_the_person() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        let interrupt = written(&mut core);
+        feed(&mut c, &mut core, &[json!({"id": "kid-ask", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid", "turnId": "kid-turn", "itemId": "x1", "command": "gh api", "cwd": "/work"}})]);
+        assert!(core.state.approvals.is_empty());
+        // The stop was acknowledged, yet the turn goes on asking: after half a minute, the person's.
+        if let Some(a) = c.withheld.get_mut("kid-ask") {
+            a.at -= WITHHELD_MS + 1;
+        }
+        c.tick(&mut core);
+        assert!(core.state.approvals.iter().any(|a| a.id == "kid-ask") && c.withheld.is_empty());
+        // The session's own turn: Codex refuses the interrupt the change sent. What the turn asks
+        // then is held back while kiln tries once more for it; refused again, it's the person's,
+        // and so is what it asks after.
+        let id = interrupt.iter().find(|v| v.get("method") == Some(&json!("turn/interrupt")) && v.pointer("/params/threadId") == Some(&json!("th1"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "cannot interrupt"}})]);
+        assert!(!c.permissions_changing);
+        written(&mut core);
+        feed(&mut c, &mut core, &[json!({"id": "own-ask", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "th1", "turnId": "t1", "itemId": "x3", "command": "gh api", "cwd": "/work"}})]);
+        assert!(!core.state.approvals.iter().any(|a| a.id == "own-ask"));
+        let again = written(&mut core);
+        assert_eq!(interrupts(&again), [pair("th1", "t1")]);
+        let id = again.iter().find(|v| v.get("method") == Some(&json!("turn/interrupt"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "cannot interrupt"}})]);
+        assert!(core.state.approvals.iter().any(|a| a.id == "own-ask"));
+        feed(&mut c, &mut core, &[json!({"id": "own-ask-2", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "th1", "turnId": "t1", "itemId": "x4", "command": "gh api", "cwd": "/work"}})]);
+        assert!(core.state.approvals.iter().any(|a| a.id == "own-ask-2"));
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt")) || v.get("result").is_some()));
+    }
+
+    #[test]
+    fn a_cold_restart_keeps_a_legacy_single_control_override() {
+        let mut core = Core::new();
+        core.state.mode = "full-access".into();
+        core.set_control("approval_policy", json!("on-request"));
+        let mut c = Codex::new(None, None, Some("full-access".into()), true);
+        c.start(&mut core);
+        assert_eq!(core.state.mode, "custom");
+        assert_eq!(c.policies(&core).0, "on-request");
+        assert_eq!(c.policies(&core).1, "danger-full-access");
+        let initialize = written(&mut core);
+        respond(&mut c, &mut core, &initialize, "initialize", json!({}));
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("thread/start"))
+            && v.pointer("/params/approvalPolicy") == Some(&json!("on-request"))
+            && v.pointer("/params/sandbox") == Some(&json!("danger-full-access"))));
     }
 
     #[test]
@@ -3567,7 +5868,7 @@ mod tests {
         c.command(&mut core, Command::SetEffort { effort: "high".into() });
         assert_eq!(core.state.effort, "high");
         let _ = written(&mut core);
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "one".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "one".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("high"), Some("custom-model")));
@@ -3575,10 +5876,488 @@ mod tests {
         feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "completed", "items": []}}})]);
         let _ = written(&mut core);
         let o = super::super::model::Overrides { model: Some("o-mini".into()), effort: Some("low".into()) };
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "two".into(), mode: SendMode::Queue, attachments: vec![], overrides: Some(o) });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "two".into(), mode: SendMode::Queue, attachments: vec![], overrides: Some(o) , reply_to: None, task: None});
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("low"), Some("o-mini")));
+        Ok(())
+    }
+
+    /// A session on a model other than Codex's default, no effort chosen, shows its own model's
+    /// default effort: only the default model's was taken, so its page showed none at all.
+    #[test]
+    fn an_unchosen_effort_is_its_own_model_s_default() {
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        let mut c = Codex::new(Some("th1".into()), Some("o-mini".into()), None, false);
+        c.start(&mut core);
+        core.state.model = "o-mini".into();
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1"}));
+        let w = written(&mut core);
+        respond(
+            &mut c,
+            &mut core,
+            &w,
+            "model/list",
+            json!({"data": [
+                {"id": "gpt-5", "model": "gpt-5", "displayName": "GPT-5", "description": "", "isDefault": true, "defaultReasoningEffort": "medium", "supportedReasoningEfforts": [{"reasoningEffort": "low", "description": ""}, {"reasoningEffort": "medium", "description": ""}]},
+                {"id": "o-mini", "model": "o-mini", "displayName": "o mini", "description": "", "defaultReasoningEffort": "high", "supportedReasoningEfforts": [{"reasoningEffort": "low", "description": ""}, {"reasoningEffort": "high", "description": ""}]}
+            ]}),
+        );
+        assert_eq!(core.state.effort, "high");
+    }
+
+    /// With no effort chosen here, the page shows the effort Codex says the thread runs at (the
+    /// person's own `model_reasoning_effort`), not its model's default: fedora's Codex agents ran
+    /// at "ultra" while their page said "low", and a resumed session went on sending "low".
+    #[test]
+    fn the_effort_codex_reports_is_shown_over_a_model_s_default() {
+        let models = json!({"data": [
+            {"id": "gpt-5", "model": "gpt-5", "displayName": "GPT-5", "description": "", "isDefault": true, "defaultReasoningEffort": "low", "supportedReasoningEfforts": [{"reasoningEffort": "low", "description": ""}, {"reasoningEffort": "high", "description": ""}, {"reasoningEffort": "ultra", "description": ""}]}
+        ]});
+        let thread = json!({"thread": {"id": "th1", "turns": []}, "model": "gpt-5", "cwd": "/work", "reasoningEffort": "ultra"});
+        let settings = |effort: &str| json!({"method": "thread/settings/updated", "params": {"threadId": "th1", "threadSettings": {"model": "gpt-5", "effort": effort}}});
+        let opening = |chosen: Option<&str>| {
+            let mut core = Core::new();
+            core.state.cwd = "/work".into();
+            let mut c = Codex::new(None, None, None, false);
+            c.start(&mut core);
+            if let Some(e) = chosen {
+                c.command(&mut core, Command::SetEffort { effort: e.into() });
+            }
+            let w = written(&mut core);
+            respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1"}));
+            let w = written(&mut core);
+            (c, core, w)
+        };
+        // Whichever answers first.
+        for model_list_first in [true, false] {
+            let (mut c, mut core, w) = opening(None);
+            for method in if model_list_first { ["model/list", "thread/start"] } else { ["thread/start", "model/list"] } {
+                respond(&mut c, &mut core, &w, method, if method == "model/list" { models.clone() } else { thread.clone() });
+            }
+            assert_eq!(core.state.effort, "ultra", "model/list answered first: {model_list_first}");
+            // Its settings change: what it runs at from then on.
+            feed(&mut c, &mut core, &[settings("high")]);
+            assert_eq!(core.state.effort, "high");
+        }
+        // One chosen here goes with every turn: what Codex says of its own doesn't replace it.
+        let (mut c, mut core, w) = opening(Some("low"));
+        respond(&mut c, &mut core, &w, "thread/start", thread.clone());
+        respond(&mut c, &mut core, &w, "model/list", models.clone());
+        feed(&mut c, &mut core, &[settings("high")]);
+        assert_eq!(core.state.effort, "low");
+    }
+
+    #[test]
+    fn streamed_plans_and_reasoning_parts_keep_their_final_shape() {
+        let (mut c, mut core, _) = opened();
+        c.item(&mut core, &json!({"type": "plan", "id": "plan", "text": "The "}), false);
+        feed(&mut c, &mut core, &[json!({"method": "item/plan/delta", "params": {"threadId": "th1", "turnId": "turn", "itemId": "plan", "delta": "plan"}})]);
+        assert!(core.get("plan").is_some_and(|e| matches!(&e.body, Body::Assistant { text, streaming: true } if text == "The plan")));
+        c.item(&mut core, &json!({"type": "plan", "id": "plan", "text": "The plan"}), true);
+        assert!(core.get("plan").is_some_and(|e| matches!(&e.body, Body::Assistant { text, streaming: false } if text == "The plan")));
+        feed(&mut c, &mut core, &[json!({"method": "item/plan/delta", "params": {"threadId": "th1", "turnId": "turn", "itemId": "delta-plan", "delta": "Another plan"}})]);
+        assert!(core.get("delta-plan").is_some_and(|e| matches!(&e.body, Body::Assistant { streaming: true, .. })));
+        for (index, text) in [(0, "First"), (1, "Second")] {
+            feed(&mut c, &mut core, &[
+                json!({"method": "item/reasoning/summaryPartAdded", "params": {"threadId": "th1", "turnId": "turn", "itemId": "thinking", "summaryIndex": index}}),
+                json!({"method": "item/reasoning/summaryTextDelta", "params": {"threadId": "th1", "turnId": "turn", "itemId": "thinking", "summaryIndex": index, "delta": text}}),
+            ]);
+        }
+        assert!(core.get("thinking").is_some_and(|e| matches!(&e.body, Body::Thinking { text, streaming: true, .. } if text == "First\n\nSecond")));
+        c.item(&mut core, &json!({"type": "reasoning", "id": "thinking", "summary": ["First", "Second"], "content": []}), true);
+        assert!(core.get("thinking").is_some_and(|e| matches!(&e.body, Body::Thinking { text, streaming: false, .. } if text == "First\n\nSecond")));
+    }
+
+    #[test]
+    fn capped_tool_previews_stop_updates_without_losing_terminal_output() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.item(&mut core, &json!({"type": "commandExecution", "id": "command", "command": "build", "cwd": "/work", "processId": "123", "status": "inProgress", "commandActions": []}), false);
+        let _ = core.take_out();
+        let output = |delta: &str| json!({"method": "item/commandExecution/outputDelta", "params": {"threadId": "th1", "turnId": "turn", "itemId": "command", "delta": delta}});
+        feed(&mut c, &mut core, &[output("")]);
+        assert!(core.take_out().is_empty());
+        let first = "x".repeat(OUTPUT_MAX * 2);
+        feed(&mut c, &mut core, &[output(&first), output("tail")]);
+        assert!(core.get("command").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.truncated)));
+        let _ = core.take_out();
+        feed(&mut c, &mut core, &[output("more")]);
+        assert!(core.take_out().is_empty());
+        let (bytes, offset, _) = core.task_output.get("terminal-command").ok_or_else(|| anyhow::anyhow!("no terminal output"))?.since(0);
+        assert!(bytes.ends_with(b"tailmore"));
+        assert_eq!(offset, first.len() as u64 + 8);
+        Ok(())
+    }
+
+    #[test]
+    fn child_notifications_cannot_end_or_replace_the_parent_turn() {
+        let (mut c, mut core, _) = opened();
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "parent-turn", "status": "inProgress", "items": []}}})]);
+        assert_eq!(core.state.status, Status::Running);
+        let started = core.state.turn_started;
+        feed(&mut c, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "child", "turn": {"id": "child-turn", "status": "inProgress", "items": []}}}),
+            json!({"method": "item/agentMessage/delta", "params": {"threadId": "child", "turnId": "child-turn", "itemId": "child-message", "delta": "Child text"}}),
+            json!({"method": "turn/completed", "params": {"threadId": "child", "turn": {"id": "child-turn", "status": "completed", "items": []}}}),
+            json!({"method": "thread/status/changed", "params": {"threadId": "child", "status": {"type": "idle"}}}),
+            json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "old-parent-turn", "status": "completed", "items": []}}}),
+        ]);
+        assert_eq!((core.state.status, c.turn.as_deref(), core.state.turn_started, core.state.usage.turns), (Status::Running, Some("parent-turn"), started, 0));
+        assert!(core.get("child-message").is_none());
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "parent-turn", "status": "completed", "items": []}}})]);
+        assert_eq!(core.state.status, Status::Idle);
+    }
+
+    #[test]
+    fn opening_a_thread_keeps_its_runtime_status_before_draining_the_queue() {
+        for (status, expected) in [
+            (json!({"type": "active", "activeFlags": []}), Status::Running),
+            (json!({"type": "active", "activeFlags": ["waitingOnUserInput"]}), Status::Waiting),
+            (json!({"type": "systemError"}), Status::Exited),
+        ] {
+            let (mut c, mut core, _) = opened();
+            c.waiting.push(QueueItem { id: "queued".into(), text: "Next task".into(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
+            c.open_thread(&mut core, "thread/resume", json!({"threadId": "th1"}));
+            let requests = written(&mut core);
+            respond(&mut c, &mut core, &requests, "thread/resume", json!({"thread": {"id": "th1", "turns": [], "status": status}, "model": "gpt-5", "cwd": "/work"}));
+            assert_eq!(core.state.status, expected);
+            assert_eq!(c.waiting.len(), 1);
+            assert!(!written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")));
+        }
+    }
+
+    #[test]
+    fn thread_runtime_status_survives_item_updates_and_keeps_approvals_waiting() {
+        let (mut c, mut core, _) = opened();
+        let status = |state: Value| json!({"method": "thread/status/changed", "params": {"threadId": "th1", "status": state}});
+        feed(&mut c, &mut core, &[status(json!({"type": "active", "activeFlags": []}))]);
+        c.item(&mut core, &json!({"type": "agentMessage", "id": "reply", "text": "Still working"}), true);
+        assert_eq!(core.state.status, Status::Running);
+        assert!(c.busy(&core));
+        for flag in ["waitingOnApproval", "waitingOnUserInput"] {
+            feed(&mut c, &mut core, &[status(json!({"type": "active", "activeFlags": [flag]}))]);
+            c.settle(&mut core);
+            assert_eq!(core.state.status, Status::Waiting);
+        }
+        feed(&mut c, &mut core, &[
+            status(json!({"type": "active", "activeFlags": []})),
+            json!({"id": "approval", "method": "item/commandExecution/requestApproval", "params": {"threadId": "th1", "turnId": "turn", "itemId": "command", "command": "build", "cwd": "/work"}}),
+            status(json!({"type": "idle"})),
+        ]);
+        assert_eq!(core.state.status, Status::Waiting);
+        // An approval's resolution can come from a child thread whose request was shown here.
+        feed(&mut c, &mut core, &[json!({"method": "serverRequest/resolved", "params": {"threadId": "child", "requestId": "approval"}})]);
+        assert_eq!(core.state.status, Status::Idle);
+        for (state, expected) in [("notLoaded", Status::Starting), ("systemError", Status::Exited), ("idle", Status::Idle)] {
+            feed(&mut c, &mut core, &[status(json!({"type": state}))]);
+            feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "turn", "status": "completed", "items": []}}})]);
+            c.settle(&mut core);
+            assert_eq!(core.state.status, expected);
+            assert_eq!(core.state.exit.is_some(), expected == Status::Exited);
+        }
+    }
+
+    #[test]
+    fn collab_calls_keep_the_receiving_agents_lifetimes() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        // codex-cli 0.162.1: the call completed, but its receiving agent is still running.
+        let call = |id: &str, tool: &str, states: Value| json!({"type": "collabAgentToolCall", "id": id, "tool": tool, "senderThreadId": "th1", "receiverThreadIds": ["child"], "status": "completed", "agentsStates": states, "prompt": "Audit the changes"});
+        c.item(&mut core, &call("spawn", "spawnAgent", json!({"child": {"status": "running"}})), true);
+        let child = core.state.tasks.first().ok_or_else(|| anyhow::anyhow!("no child task"))?;
+        assert_eq!((core.state.tasks.len(), child.id.as_str(), child.tool_id.as_deref(), child.status.as_str(), child.ended), (1, "child", Some("spawn"), "running", None));
+        assert!(core.get("spawn").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Done && t.task.as_deref() == Some("child"))));
+        c.item(&mut core, &call("spawn", "spawnAgent", json!({})), true);
+        assert_eq!(core.state.tasks.first().map(|t| t.status.as_str()), Some("running"));
+        c.item(&mut core, &call("wait", "wait", json!({"child": {"status": "completed"}, "other": {"status": "errored"}})), true);
+        assert_eq!(core.state.tasks.len(), 2);
+        let child = core.state.tasks.first().ok_or_else(|| anyhow::anyhow!("no child task"))?;
+        assert_eq!((child.status.as_str(), child.tool_id.as_deref()), ("completed", Some("spawn")));
+        assert!(child.ended.is_some());
+        assert_eq!(core.state.tasks.iter().find(|t| t.id == "other").map(|t| t.status.as_str()), Some("failed"));
+        c.item(&mut core, &call("resume", "resumeAgent", json!({"child": {"status": "pendingInit"}})), true);
+        assert_eq!(core.state.tasks.first().map(|t| (t.status.as_str(), t.ended)), Some(("pending", None)));
+        // A collab operation without any receiving agent is not itself a new task.
+        c.item(&mut core, &json!({"type": "collabAgentToolCall", "id": "list", "tool": "listAgents", "senderThreadId": "th1", "receiverThreadIds": [], "status": "completed", "agentsStates": {}}), true);
+        assert_eq!(core.state.tasks.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_activity_uses_its_kind_even_when_the_item_completed() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        // Activity items have no status field. Completing a "started" marker does not end its agent,
+        // and an interaction leaves it as it was (Codex's TUI: it "does not change liveness").
+        let activity = |id: &str, kind: &str| json!({"type": "subAgentActivity", "id": id, "agentThreadId": "child", "agentPath": "/root/audit", "kind": kind});
+        for (kind, expected) in [("started", "running"), ("completed", "completed"), ("interacted", "completed"), ("interrupted", "stopped")] {
+            c.item(&mut core, &activity(kind, kind), true);
+            let child = core.state.tasks.first().ok_or_else(|| anyhow::anyhow!("no child task"))?;
+            assert_eq!((core.state.tasks.len(), child.id.as_str(), child.tool_id.as_deref(), child.status.as_str()), (1, "child", Some("started"), expected));
+            assert_eq!(child.ended.is_none(), child.live());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_history_is_read_without_resuming_or_changing_the_parent() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        core.state.summary = "Parent answer".into();
+        core.state.goal = "Parent assignment".into();
+        c.item(&mut core, &json!({"type": "subAgentActivity", "id": "spawn", "kind": "started", "agentThreadId": "child", "agentPath": "/root/model_dropdown", "model": "gpt-6-astra"}), true);
+        let requests = written(&mut core);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("thread/read"));
+        assert_eq!(requests.first().and_then(|v| v.pointer("/params/includeTurns")).and_then(Value::as_bool), Some(false));
+        // As reported by a real native child: unloaded metadata, persisted completed turn,
+        // no plaintext assignment, and messages back to the parent in its own history.
+        respond(&mut c, &mut core, &requests, "thread/read", json!({"thread": {
+            "id": "child", "parentThreadId": "th1", "historyMode": "paginated", "status": {"type": "notLoaded"},
+            "createdAt": 100, "cwd": "/child", "preview": "", "agentNickname": "James", "turns": []
+        }}));
+        let requests = written(&mut core);
+        assert_eq!(requests.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("thread/turns/list"));
+        let history = json!({"data": [{"id": "child-turn", "status": "completed", "startedAt": 100, "completedAt": 102, "durationMs": 2000, "items": [
+            {"type": "commandExecution", "id": "command", "command": "cargo check", "cwd": "/child", "status": "completed", "durationMs": 250, "exitCode": 0, "aggregatedOutput": "passed"},
+            {"type": "subAgentActivity", "id": "message-parent", "kind": "interacted", "agentThreadId": "th1", "agentPath": "/root"},
+            {"type": "fileChange", "id": "edit", "status": "completed", "changes": [{"path": "/child/a.rs", "kind": {"type": "add"}, "diff": "+new"}]},
+            {"type": "agentMessage", "id": "answer", "text": "The dropdown now lists the available models.", "phase": "final_answer"}
+        ]}], "nextCursor": null});
+        respond(&mut c, &mut core, &requests, "thread/turns/list", history);
+        let task = core.state.tasks.first().ok_or_else(|| anyhow::anyhow!("missing child"))?;
+        assert_eq!((core.state.tasks.len(), task.status.as_str(), task.tool_id.as_deref(), task.started, task.ended, task.duration_ms), (1, "completed", Some("spawn"), 100_000, Some(102_000), 2000));
+        assert_eq!(task.summary.as_deref(), Some("The dropdown now lists the available models."));
+        assert!(task.prompt.is_none(), "encrypted assignments must not be invented");
+        assert_eq!((core.state.summary.as_str(), core.state.goal.as_str(), core.state.status), ("Parent answer", "Parent assignment", Status::Idle));
+        assert!(core.change_jobs.is_empty());
+        assert!(core.get("child:child:answer").is_some_and(|e| e.parent.as_deref() == Some("spawn")));
+        assert!(core.get("child:child:command").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.output.as_deref() == Some("passed") && t.ended == Some(t.started + 250))));
+        assert!(written(&mut core).is_empty(), "a child's messages to its parent must not read the parent as another child");
+        Ok(())
+    }
+
+    #[test]
+    fn native_subagent_output_reads_completed_history_and_streaming_messages() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.item(&mut core, &json!({"type": "collabAgentToolCall", "id": "spawn", "tool": "spawnAgent", "status": "completed",
+            "receiverThreadIds": ["child", "sibling"], "agentsStates": {"child": {"status": "running"}, "sibling": {"status": "running"}}}), true);
+        let read = |core: &Core, id: &str| -> anyhow::Result<Value> {
+            let task = core.state.tasks.iter().find(|t| t.id == id).ok_or_else(|| anyhow::anyhow!("missing child"))?;
+            Ok(super::super::session::codex_task_output(core, task))
+        };
+        let pending = read(&core, "child")?;
+        assert_eq!((pending.get("data").and_then(serde_json::Value::as_str), pending.get("pending").and_then(serde_json::Value::as_bool), pending.get("live").and_then(serde_json::Value::as_bool)), (Some(""), Some(true), Some(true)));
+        c.child_history(&mut core, "child", &[json!({"id": "child-turn", "status": "completed", "items": [
+            {"type": "userMessage", "id": "assignment", "content": [{"type": "text", "text": "Private assignment"}]},
+            {"type": "reasoning", "id": "thought", "summary": [{"text": "Private reasoning"}]},
+            {"type": "commandExecution", "id": "command", "command": "cargo check", "status": "completed", "aggregatedOutput": "passed", "exitCode": 0},
+            {"type": "agentMessage", "id": "result", "text": "Mobile and desktop checks passed.", "phase": "final_answer"}
+        ]})]);
+        c.child_history(&mut core, "sibling", &[json!({"id": "sibling-turn", "status": "completed", "items": [
+            {"type": "agentMessage", "id": "result", "text": "Sibling result", "phase": "final_answer"}
+        ]})]);
+        core.upsert("parent-answer", None, Body::Assistant { text: "Parent result".into(), streaming: false });
+        core.upsert("child:grandchild:answer", Some("grandchild-spawn".into()), Body::Assistant { text: "Grandchild result".into(), streaming: false });
+        let completed = read(&core, "child")?;
+        assert_eq!(completed.get("data").and_then(serde_json::Value::as_str), Some("cargo check\npassed\n\nMobile and desktop checks passed."));
+        assert_eq!((completed.get("live").and_then(serde_json::Value::as_bool), completed.get("reset").and_then(serde_json::Value::as_bool), completed.get("truncated").and_then(serde_json::Value::as_bool)), (Some(false), Some(true), Some(false)));
+        assert_eq!(read(&core, "sibling")?.get("data").and_then(serde_json::Value::as_str), Some("Sibling result"));
+        // Starting more work and streamed text updates are visible without reopening an
+        // executor, waiting for a final answer, or appending an earlier snapshot twice.
+        feed(&mut c, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "child", "turn": {"id": "follow-up"}}}),
+            json!({"method": "item/agentMessage/delta", "params": {"threadId": "child", "itemId": "progress", "delta": "Checking"}})
+        ]);
+        assert_eq!(read(&core, "child")?.get("data").and_then(serde_json::Value::as_str), Some("cargo check\npassed\n\nMobile and desktop checks passed.\n\nChecking"));
+        feed(&mut c, &mut core, &[json!({"method": "item/agentMessage/delta", "params": {"threadId": "child", "itemId": "progress", "delta": " again"}})]);
+        let running = read(&core, "child")?;
+        assert_eq!(running.get("data").and_then(serde_json::Value::as_str), Some("cargo check\npassed\n\nMobile and desktop checks passed.\n\nChecking again"));
+        assert_eq!(running.get("live").and_then(serde_json::Value::as_bool), Some(true));
+        // Repeated history import updates the same events, never duplicating their output.
+        c.child_history(&mut core, "child", &[json!({"id": "follow-up", "status": "completed", "items": [
+            {"type": "agentMessage", "id": "progress", "text": "Rechecked successfully.", "phase": "final_answer"}
+        ]})]);
+        assert_eq!(read(&core, "child")?.get("data").and_then(serde_json::Value::as_str), Some("cargo check\npassed\n\nMobile and desktop checks passed.\n\nRechecked successfully."));
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_notifications_are_scoped_and_outlive_the_parent_turn() {
+        let (mut c, mut core, _) = opened();
+        c.item(&mut core, &json!({"type": "subAgentActivity", "id": "spawn", "kind": "started", "agentThreadId": "child", "agentPath": "/root/audit"}), true);
+        feed(&mut c, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "parent-turn"}}}),
+            json!({"method": "turn/started", "params": {"threadId": "child", "turn": {"id": "child-turn"}}}),
+            json!({"method": "item/started", "params": {"threadId": "child", "item": {"id": "command", "type": "commandExecution", "command": "cargo test", "status": "inProgress", "processId": "42"}}}),
+            json!({"method": "item/agentMessage/delta", "params": {"threadId": "child", "itemId": "reply", "delta": "Checking"}}),
+            json!({"method": "thread/tokenUsage/updated", "params": {"threadId": "child", "tokenUsage": {"total": {"inputTokens": 100, "outputTokens": 25}}}}),
+            json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "parent-turn", "status": "completed", "items": []}}}),
+            json!({"method": "turn/completed", "params": {"threadId": "child", "turn": {"id": "older-child-turn", "status": "completed", "items": []}}}),
+        ]);
+        assert_eq!(core.state.status, Status::Idle);
+        assert_eq!(core.state.usage.input_tokens, 0);
+        assert_eq!(core.state.tasks.len(), 1, "child terminals are not parent-owned terminals");
+        assert_eq!(core.state.tasks.first().map(|t| (t.status.as_str(), t.tokens)), Some(("running", 125)));
+        assert!(core.get("child:child:command").is_some_and(|e| e.parent.as_deref() == Some("spawn") && matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Running)));
+        assert!(core.get("child:child:reply").is_some_and(|e| matches!(&e.body, Body::Assistant { streaming: true, .. })));
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "child", "turn": {"id": "child-turn", "status": "completed", "items": []}}})]);
+        assert_eq!(core.state.tasks.first().map(|t| t.status.as_str()), Some("completed"));
+        assert!(core.get("child:child:reply").is_some_and(|e| matches!(&e.body, Body::Assistant { streaming: false, .. })));
+        assert_eq!(core.state.usage.turns, 1);
+    }
+
+    #[test]
+    fn child_snapshots_preserve_waiting_status_and_ignore_stale_reads() {
+        let (mut c, mut core, _) = opened();
+        c.item(&mut core, &json!({"type": "subAgentActivity", "id": "spawn", "kind": "started", "agentThreadId": "child", "agentPath": "/root/audit"}), true);
+        let requests = written(&mut core);
+        respond(&mut c, &mut core, &requests, "thread/read", json!({"thread": {"id": "child", "status": {"type": "active", "activeFlags": ["waitingOnApproval"]}}}));
+        let requests = written(&mut core);
+        respond(&mut c, &mut core, &requests, "thread/turns/list", json!({"data": [{"id": "child-turn", "status": "inProgress", "items": []}]}));
+        assert_eq!(core.state.tasks.first().map(|t| t.status.as_str()), Some("paused"));
+        assert_eq!(core.state.status, Status::Idle);
+        c.read_child(&mut core, "child");
+        let stale = written(&mut core);
+        c.item(&mut core, &json!({"type": "subAgentActivity", "id": "finished", "kind": "completed", "agentThreadId": "child", "agentPath": "/root/audit"}), true);
+        respond(&mut c, &mut core, &stale, "thread/read", json!({"thread": {"id": "child", "status": {"type": "active", "activeFlags": []}}}));
+        assert_eq!(core.state.tasks.first().map(|t| t.status.as_str()), Some("completed"));
+        assert!(written(&mut core).is_empty(), "the stale response must not start another stale history read");
+        if let Some(child) = c.children.get_mut("child") {
+            child.read_at = 0;
+        }
+        c.tick(&mut core);
+        assert!(written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("thread/read")), "a final snapshot is retried even after the child ends");
+    }
+
+    #[test]
+    fn repeated_child_history_does_not_restart_descendants_or_follow_peer_messages() {
+        let (mut c, mut core, _) = opened();
+        c.item(&mut core, &json!({"type": "subAgentActivity", "id": "spawn", "kind": "started", "agentThreadId": "child", "agentPath": "/root/audit"}), true);
+        let turn = json!({"id": "child-turn", "status": "completed", "items": [
+            {"type": "subAgentActivity", "id": "spawn-grandchild", "kind": "started", "agentThreadId": "grandchild", "agentPath": "/root/audit/check"},
+            {"type": "commandExecution", "id": "command", "command": "check", "status": "completed", "exitCode": 0, "durationMs": 10}
+        ]});
+        c.child_history(&mut core, "child", std::slice::from_ref(&turn));
+        child_status(&mut core, "grandchild", "completed");
+        let command_end = core.get("child:child:command").and_then(|e| match &e.body { Body::Tool(t) => t.ended, _ => None });
+        let _ = written(&mut core);
+        c.child_history(&mut core, "child", std::slice::from_ref(&turn));
+        c.child_history(&mut core, "grandchild", &[json!({"id": "grandchild-turn", "status": "completed", "items": [
+            {"type": "subAgentActivity", "id": "message-parent", "kind": "interacted", "agentThreadId": "child", "agentPath": "/root/audit"},
+            {"type": "subAgentActivity", "id": "message-peer", "kind": "interacted", "agentThreadId": "sibling", "agentPath": "/root/sibling"}
+        ]})]);
+        assert_eq!(core.state.tasks.len(), 2);
+        assert!(core.state.tasks.iter().all(|t| t.status == "completed"));
+        assert_eq!(core.state.tasks.iter().find(|t| t.id == "grandchild").map(|t| (t.parent_task.as_deref(), t.depth)), Some((Some("child"), 2)));
+        assert!(written(&mut core).is_empty());
+        assert_eq!(core.get("child:child:command").and_then(|e| match &e.body { Body::Tool(t) => t.ended, _ => None }), command_end);
+    }
+
+    #[test]
+    fn child_polling_does_not_reinsert_evicted_history_or_end_parallel_running_tools() {
+        let (mut c, mut core, _) = opened();
+        c.item(&mut core, &json!({"type": "subAgentActivity", "id": "spawn", "kind": "started", "agentThreadId": "child", "agentPath": "/root/audit"}), true);
+        let history = [json!({"id": "child-turn", "status": "inProgress", "items": [
+            {"type": "commandExecution", "id": "long-running", "command": "watch tests", "status": "inProgress"},
+            {"type": "commandExecution", "id": "finished", "command": "check", "status": "completed", "durationMs": 20}
+        ]})];
+        c.child_history(&mut core, "child", &history);
+        assert!(core.get("child:child:long-running").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Running && t.ended.is_none())));
+        for n in 0..super::super::core::MAX_EVENTS {
+            core.upsert(&format!("root-{n}"), None, Body::Assistant { text: "Parent work".into(), streaming: false });
+        }
+        assert!(core.get("child:child:finished").is_none());
+        let before = (core.events().count(), core.state.dropped);
+        c.child_history(&mut core, "child", &history);
+        assert_eq!((core.events().count(), core.state.dropped), before);
+        assert!(core.get("child:child:finished").is_none(), "unchanged polled history must not evict fresh parent work");
+    }
+
+    #[test]
+    fn restored_subagents_rebuild_mappings_and_unknown_children_have_separate_threads() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        let spawn = json!({"type": "subAgentActivity", "id": "spawn", "kind": "started", "agentThreadId": "child", "agentPath": "/root/audit"});
+        c.item(&mut core, &spawn, true);
+        let _ = written(&mut core);
+        // Core::adopt retains the timeline but clears task state; the new adapter rebuilds it.
+        core.state.tasks.clear();
+        c.children.clear();
+        c.pending.retain(|_, p| !matches!(p, Pending::Child { .. } | Pending::ChildHistory { .. }));
+        c.replay(&mut core, &[json!({"id": "parent-turn", "items": [spawn]})]);
+        assert_eq!(core.state.tasks.len(), 1);
+        assert!(written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("thread/read")));
+        c.item(&mut core, &json!({"type": "collabAgentToolCall", "id": "wait", "tool": "wait", "status": "completed",
+            "receiverThreadIds": ["unknown-a", "unknown-b"], "agentsStates": {"unknown-a": {"status": "running"}, "unknown-b": {"status": "running"}}}), true);
+        let first = core.state.tasks.iter().find(|t| t.id == "unknown-a").and_then(|t| t.tool_id.clone()).ok_or_else(|| anyhow::anyhow!("missing first link"))?;
+        let second = core.state.tasks.iter().find(|t| t.id == "unknown-b").and_then(|t| t.tool_id.clone()).ok_or_else(|| anyhow::anyhow!("missing second link"))?;
+        assert_ne!(first, second);
+        for thread in ["unknown-a", "unknown-b"] {
+            c.child_history(&mut core, thread, &[json!({"id": "turn", "status": "completed", "items": [{"type": "agentMessage", "id": "result", "text": thread, "phase": "final_answer"}]})]);
+        }
+        assert_eq!(core.get("child:unknown-a:result").and_then(|e| e.parent.as_deref()), Some(first.as_str()));
+        assert_eq!(core.get("child:unknown-b:result").and_then(|e| e.parent.as_deref()), Some(second.as_str()));
+        c.item(&mut core, &json!({"type": "collabAgentToolCall", "id": "late-spawn", "tool": "spawnAgent", "status": "completed",
+            "prompt": "Audit the models", "receiverThreadIds": ["unknown-a"], "agentsStates": {"unknown-a": {"status": "completed"}}}), true);
+        assert_eq!(core.state.tasks.iter().find(|t| t.id == "unknown-a").and_then(|t| t.tool_id.as_deref()), Some(first.as_str()), "later spawn metadata must not strand imported work");
+        c.item(&mut core, &json!({"type": "collabAgentToolCall", "id": "follow-up", "tool": "followupTask", "status": "completed",
+            "prompt": "Also check mobile", "receiverThreadIds": ["unknown-a"], "agentsStates": {"unknown-a": {"status": "running"}}}), true);
+        assert_eq!(core.state.tasks.iter().find(|t| t.id == "unknown-a").map(|t| (t.status.as_str(), t.prompt.as_deref(), t.ended)), Some(("running", Some("Also check mobile"), None)));
+        Ok(())
+    }
+
+    #[test]
+    fn hot_adopted_legacy_subagents_reconcile_completion_without_replaying_the_parent() -> anyhow::Result<()> {
+        let (c, mut core, _) = opened();
+        // A hot upgrade of a pre-reader adapter carries its task rows, but no Child map.
+        // Both reported real-world cases had already completed in Codex's durable history.
+        let mut frozen = serde_json::to_value(c)?;
+        frozen.as_object_mut().ok_or_else(|| anyhow::anyhow!("missing adapter object"))?.remove("children");
+        let mut c: Codex = serde_json::from_value(frozen)?;
+        core.state.summary = "Parent answer".into();
+        core.state.goal = "Parent assignment".into();
+        core.state.tasks = vec![
+            Task { id: "stale".into(), tool_id: Some("spawn-stale".into()), class: Some("agent".into()), status: "running".into(), ..Task::default() },
+            Task { id: "ended".into(), tool_id: Some("spawn-ended".into()), class: Some("agent".into()), status: "completed".into(), ended: Some(100_000), ..Task::default() },
+            Task { id: "shell".into(), class: Some("shell".into()), status: "running".into(), ..Task::default() },
+        ];
+        written(&mut core);
+        c.tick(&mut core);
+        let reads = written(&mut core);
+        let requests: Vec<&Value> = reads.iter().filter(|v| v.get("method").and_then(Value::as_str) == Some("thread/read")).collect();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|v| v.pointer("/params/includeTurns").and_then(Value::as_bool) == Some(false)));
+        assert!(!requests.iter().any(|v| v.pointer("/params/threadId").and_then(Value::as_str) == Some("shell")));
+        assert!(core.state.tasks.iter().find(|t| t.id == "stale").is_some_and(Task::live), "the read request alone cannot claim completion");
+        for request in requests {
+            let thread = request.pointer("/params/threadId").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("missing thread"))?;
+            respond(&mut c, &mut core, std::slice::from_ref(request), "thread/read", json!({"thread": {
+                "id": thread, "status": {"type": "notLoaded"}, "createdAt": 100
+            }}));
+        }
+        let history = written(&mut core);
+        assert_eq!(history.len(), 2);
+        for request in &history {
+            let thread = request.pointer("/params/threadId").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("missing thread"))?;
+            respond(&mut c, &mut core, std::slice::from_ref(request), "thread/turns/list", json!({"data": [{
+                "id": format!("{thread}-turn"), "status": "completed", "startedAt": 100, "completedAt": 102, "durationMs": 2000,
+                "items": [{"type": "agentMessage", "id": "answer", "text": format!("{thread} finished"), "phase": "final_answer"}]
+            }], "nextCursor": null}));
+        }
+        for id in ["stale", "ended"] {
+            let task = core.state.tasks.iter().find(|t| t.id == id).ok_or_else(|| anyhow::anyhow!("missing child"))?;
+            assert_eq!((task.status.as_str(), task.ended, task.duration_ms), ("completed", Some(102_000), 2000));
+            assert!(!task.live());
+            assert_eq!(task.summary.as_deref(), Some(format!("{id} finished").as_str()));
+            assert!(core.get(&child_event_id(id, "answer")).is_some_and(|e| e.parent.as_deref() == task.tool_id.as_deref()));
+        }
+        assert_eq!((core.state.summary.as_str(), core.state.goal.as_str(), core.state.status), ("Parent answer", "Parent assignment", Status::Idle));
+        // Successful completed snapshots are not polled indefinitely; a new turn's
+        // notification (or interaction) can activate the same child again as usual.
+        for child in c.children.values_mut() { child.read_at = 0; }
+        c.tick(&mut core);
+        assert!(written(&mut core).is_empty());
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "stale", "turn": {"id": "followup"}}})]);
+        assert!(core.state.tasks.iter().find(|t| t.id == "stale").is_some_and(|t| t.live() && t.ended.is_none()));
         Ok(())
     }
 
@@ -3609,6 +6388,210 @@ mod tests {
         feed(&mut c2, &mut core2, &[json!({"method": "item/started", "params": {"item": item("inProgress", Value::Null)}}), json!({"method": "item/completed", "params": {"item": item("completed", json!(3))}})]);
         let done = core2.state.tasks.first().cloned().unwrap_or_default();
         assert_eq!((done.status.as_str(), done.exit_code), ("failed", Some(3)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_message_sent_after_a_subagent_completed_does_not_start_it_again() -> anyhow::Result<()> {
+        // As codex-cli 0.162.1 recorded /root/tracking_review and /root/column_fix_audit: the agent
+        // completes, then its parent sends it one more `send_message`. That queues a message without
+        // a turn (`trigger_turn: false`), so no turn starts and no "completed" ever follows it.
+        let (mut c, mut core, _) = opened();
+        let activity = |id: &str, kind: &str| json!({"type": "subAgentActivity", "id": id, "agentThreadId": "child", "agentPath": "/root/tracking_review", "kind": kind});
+        c.item(&mut core, &activity("call_spawn", "started"), true);
+        c.item(&mut core, &activity("call_message", "interacted"), true);
+        assert_eq!(core.state.tasks.first().map(|t| t.status.as_str()), Some("running"), "a message to a working agent leaves it working");
+        c.item(&mut core, &activity("subagent-completed-turn", "completed"), true);
+        let ended = core.state.tasks.first().and_then(|t| t.ended);
+        assert!(ended.is_some());
+        c.item(&mut core, &activity("call_late_message", "interacted"), true);
+        let task = core.state.tasks.first().ok_or_else(|| anyhow::anyhow!("no child"))?;
+        assert_eq!((core.state.tasks.len(), task.status.as_str(), task.ended), (1, "completed", ended), "an interaction is no turn");
+        assert!(core.get("call_late_message").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Done && t.task.as_deref() == Some("child"))));
+        // Its thread is read (now, or once the read under way answers) and once more later, in case
+        // a follow-up's turn starts just after.
+        assert!(c.pending.values().any(|p| matches!(p, Pending::Child { thread, .. } if thread == "child")));
+        assert!(c.children.get("child").is_some_and(|ch| ch.refresh));
+        // A follow-up's turn is heard from the agent itself.
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "child", "turn": {"id": "followup"}}})]);
+        assert!(core.state.tasks.first().is_some_and(|t| t.live() && t.ended.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_subagent_first_heard_of_by_an_interaction_is_read_not_assumed_running() -> anyhow::Result<()> {
+        // A replayed history whose spawn is older than the turns listed.
+        let (mut c, mut core, _) = opened();
+        c.replay(&mut core, &[json!({"id": "turn", "items": [{"type": "subAgentActivity", "id": "call_message", "kind": "interacted", "agentThreadId": "old", "agentPath": "/root/old"}]})]);
+        let task = core.state.tasks.first().cloned().ok_or_else(|| anyhow::anyhow!("no child"))?;
+        assert_eq!((task.id.as_str(), task.status.as_str(), task.live()), ("old", "completed", false));
+        let reads = written(&mut core);
+        assert!(reads.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("thread/read") && v.pointer("/params/threadId").and_then(Value::as_str) == Some("old")));
+        // Its thread says it is at work: then it runs.
+        respond(&mut c, &mut core, &reads, "thread/read", json!({"thread": {"id": "old", "status": {"type": "active", "activeFlags": []}}}));
+        assert!(core.state.tasks.first().is_some_and(|t| t.status == "running" && t.ended.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn terminals_codex_no_longer_runs_end_and_its_own_word_replaces_kilns() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        let item = |id: &str, pid: &str, status: &str, exit: Value| {
+            json!({"type": "commandExecution", "id": id, "command": format!("run {id}"), "cwd": "/work", "processId": pid, "status": status, "exitCode": exit, "commandActions": []})
+        };
+        // Started inside code mode (`tools.exec_command`), they are items of the parent's turn.
+        feed(&mut c, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}}),
+            json!({"method": "item/started", "params": {"threadId": "th1", "turnId": "t1", "item": item("exec-server", "41", "inProgress", Value::Null)}}),
+            json!({"method": "item/started", "params": {"threadId": "th1", "turnId": "t1", "item": item("exec-missed", "42", "inProgress", Value::Null)}}),
+        ]);
+        for t in &mut core.state.tasks {
+            t.started -= 10_000;
+        }
+        let _ = written(&mut core);
+        // The turn ends (or is interrupted): Codex keeps its terminals running, and is asked which.
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted", "items": []}}})]);
+        assert!(core.state.tasks.iter().all(|t| t.live() && t.background), "a turn's end doesn't end its terminals");
+        let asked = written(&mut core);
+        let list = asked.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("thread/backgroundTerminals/list")).ok_or_else(|| anyhow::anyhow!("not asked"))?;
+        assert_eq!(list.pointer("/params/threadId").and_then(Value::as_str), Some("th1"));
+        // Codex runs only the server: the other one's end never reached kiln.
+        let running = json!({"data": [{"itemId": "exec-server", "processId": "41", "command": "run exec-server", "cwd": "/work"}], "nextCursor": null});
+        respond(&mut c, &mut core, &asked, "thread/backgroundTerminals/list", running);
+        let missed = core.state.tasks.iter().find(|t| t.id == "terminal-exec-missed").cloned().ok_or_else(|| anyhow::anyhow!("no terminal"))?;
+        assert_eq!((missed.status.as_str(), missed.exit_code, missed.ended.is_some()), ("completed", None, true));
+        assert!(core.get("exec-missed").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Done && t.ended.is_some())));
+        assert!(core.state.tasks.iter().any(|t| t.id == "terminal-exec-server" && t.live()));
+        // Codex's own word, when it comes, says how it ended.
+        feed(&mut c, &mut core, &[json!({"method": "item/completed", "params": {"threadId": "th1", "turnId": "t1", "item": item("exec-missed", "42", "failed", json!(1))}})]);
+        let missed = core.state.tasks.iter().find(|t| t.id == "terminal-exec-missed").cloned().unwrap_or_default();
+        assert_eq!((missed.status.as_str(), missed.exit_code), ("failed", Some(1)));
+        assert!(c.unheard.is_empty());
+        // Only a whole list says what's gone, and one started just before the question waits.
+        feed(&mut c, &mut core, &[json!({"method": "item/started", "params": {"threadId": "th1", "turnId": "t2", "item": item("exec-new", "43", "inProgress", Value::Null)}})]);
+        c.terminals_at = 0;
+        c.tick(&mut core);
+        let asked = written(&mut core);
+        respond(&mut c, &mut core, &asked, "thread/backgroundTerminals/list", json!({"data": [], "nextCursor": "page-2"}));
+        assert!(core.state.tasks.iter().any(|t| t.id == "terminal-exec-server" && t.live()), "a partial list ended a terminal");
+        c.terminals_at = 0;
+        c.tick(&mut core);
+        let asked = written(&mut core);
+        respond(&mut c, &mut core, &asked, "thread/backgroundTerminals/list", json!({"data": [], "nextCursor": null}));
+        assert!(core.state.tasks.iter().any(|t| t.id == "terminal-exec-server" && !t.live()));
+        assert!(core.state.tasks.iter().any(|t| t.id == "terminal-exec-new" && t.live()), "one started as kiln asked may not be listed yet");
+        Ok(())
+    }
+
+    /// A child's rollout as codex-cli 0.162.1 writes it: its own meta, its parent's (a fork copies
+    /// the parent's history first, its turns without an initiating agent), then its own turns.
+    fn child_rollout(thread: &str) -> Vec<Value> {
+        let ev = |payload: Value| json!({"timestamp": "2026-10-20T23:20:01.000Z", "type": "event_msg", "payload": payload});
+        let done = |turn: &str, item: Value| ev(json!({"type": "item_completed", "thread_id": thread, "turn_id": turn, "item": item}));
+        vec![
+            json!({"type": "session_meta", "ordinal": 0, "payload": {"id": thread, "forked_from_id": "parent"}}),
+            json!({"type": "session_meta", "ordinal": 1, "payload": {"id": "parent"}}),
+            ev(json!({"type": "task_started", "turn_id": "inherited", "turn_attribution": null, "started_at": 90})),
+            done("inherited", json!({"type": "AgentMessage", "id": "msg_parent", "content": [{"type": "Text", "text": "The parent's words"}], "phase": "final_answer"})),
+            ev(json!({"type": "task_complete", "turn_id": "inherited", "completed_at": 91, "duration_ms": 1000})),
+            ev(json!({"type": "task_started", "turn_id": "own", "turn_attribution": {"initiating_agent_path": "/root"}, "started_at": 100})),
+            done("own", json!({"type": "Reasoning", "id": "rs_1", "summary_text": ["Checking the columns"], "raw_content": []})),
+            done("own", json!({"type": "CommandExecution", "id": "exec-1", "process_id": "44714", "command": ["/usr/bin/bash", "-lc", "git show --stat HEAD"],
+                "cwd": "file:///work", "parsed_cmd": [{"type": "unknown", "cmd": "git show --stat HEAD"}], "source": "unified_exec_startup",
+                "status": "completed", "aggregated_output": "1 file changed", "exit_code": 0, "duration": {"secs": 1, "nanos": 500_000_000}})),
+            done("own", json!({"type": "FileChange", "id": "call_patch", "status": "completed", "changes": {"/work/a.css": {"type": "update", "unified_diff": "@@ -1 +1 @@\n-a\n+b"}}})),
+            done("own", json!({"type": "SubAgentActivity", "id": "call_grandchild", "kind": "started", "agent_thread_id": "grandchild", "agent_path": "/root/audit/check"})),
+            done("own", json!({"type": "AgentMessage", "id": "msg_answer", "content": [{"type": "Text", "text": "The column fix is intact."}], "phase": "final_answer"})),
+            ev(json!({"type": "task_complete", "turn_id": "own", "started_at": 100, "completed_at": 103, "duration_ms": 3000})),
+            ev(json!({"type": "task_started", "turn_id": "cut", "turn_attribution": {"initiating_agent_path": "/root"}, "started_at": 200})),
+            done("cut", json!({"type": "AgentMessage", "id": "msg_more", "content": [{"type": "Text", "text": "Looking again"}], "phase": "commentary"})),
+        ]
+    }
+
+    #[test]
+    fn a_child_never_read_shows_its_work_from_its_rollout_once_codex_is_gone() -> anyhow::Result<()> {
+        // /root/hyperlight_design_audit: a row an older image kept without reading it, in a session
+        // that went on in Claude Code. Its thread showed "No work has been reported in this thread yet."
+        let thread = "01a15b9d-5652-7722-8f9b-c750ebfe6940";
+        let mut core = Core::new();
+        core.harness = Some("Claude Code".into());
+        core.state.tasks.push(Task { id: thread.into(), tool_id: Some("call_spawn".into()), class: Some("agent".into()), status: "completed".into(), ended: Some(5), ..Task::default() });
+        core.state.tasks.push(Task { id: "a575".into(), tool_id: Some("toolu_5".into()), class: Some("agent".into()), status: "running".into(), ..Task::default() });
+        assert_eq!(unread_children(&core), [thread], "only native Codex children, only those never read");
+        let turns = rollout_turns(&child_rollout(thread));
+        assert_eq!(turns.iter().filter_map(|t| t.get("id").and_then(Value::as_str)).collect::<Vec<_>>(), ["own", "cut"], "the parent's copied history is not the child's");
+        child_from_rollout(&mut core, thread, &turns);
+        let ev = |id: &str| core.get(&child_event_id(thread, id));
+        // Its messages, commands, reasoning summary and answer, under its spawning call: where its
+        // thread view, and its output, look for them.
+        assert!(ev("rs_1").is_some_and(|e| e.parent.as_deref() == Some("call_spawn") && matches!(&e.body, Body::Thinking { text, streaming: false, .. } if text == "Checking the columns")));
+        let command = ev("exec-1").and_then(|e| match &e.body {
+            Body::Tool(t) => Some((t.title.clone(), t.output.clone(), t.exit_code, t.status)),
+            _ => None,
+        });
+        assert_eq!(command, Some(("git show --stat HEAD".to_owned(), Some("1 file changed".to_owned()), Some(0), ToolStatus::Done)));
+        assert!(ev("call_patch").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.tool == ToolKind::Edit && t.diffs.len() == 1)));
+        assert!(ev("msg_answer").is_some_and(|e| matches!(&e.body, Body::Assistant { text, streaming: false } if text == "The column fix is intact.")));
+        assert!(ev("msg_more").is_some_and(|e| matches!(&e.body, Body::Assistant { streaming: false, .. })));
+        assert!(ev("msg_parent").is_none() && core.get("msg_parent").is_none());
+        // Said by Codex, in a session Claude Code runs now.
+        assert!(ev("msg_answer").is_some_and(|e| e.by.as_deref() == Some("Codex")));
+        assert_eq!(core.harness.as_deref(), Some("Claude Code"));
+        // As its latest turn ended (cut off, as no Codex runs it), with what it said last.
+        let task = core.state.tasks.iter().find(|t| t.id == thread).cloned().unwrap_or_default();
+        assert_eq!((task.status.as_str(), task.ended, task.duration_ms, task.summary.as_deref()), ("stopped", Some(5), 3000, Some("Looking again")));
+        assert!(core.events().all(|e| !matches!(&e.body, Body::Tool(t) if matches!(t.status, ToolStatus::Running | ToolStatus::Pending))));
+        // Nothing is asked of the harness running now, and nothing read runs.
+        assert!(core.writes.is_empty());
+        assert!(core.state.tasks.iter().filter(|t| t.id != "a575").all(|t| !t.live()));
+        assert!(core.state.tasks.iter().any(|t| t.id == "a575" && t.live()), "the running harness's own work is left alone");
+        assert!(unread_children(&core).is_empty());
+        // A turn that failed says why (/root/codex_completed_cleanup's last one did).
+        let failed = rollout_turns(&[
+            json!({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t", "turn_attribution": {"initiating_agent_path": "/root"}}}),
+            json!({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t", "error": {"message": "Selected model is at capacity."}, "completed_at": 9, "duration_ms": 10}}),
+        ]);
+        let first = failed.first().cloned().unwrap_or_default();
+        assert_eq!((first.get("status"), first.pointer("/error/message")), (Some(&json!("failed")), Some(&json!("Selected model is at capacity."))));
+        // A child whose row went while its rollout was read: nothing lands in the main thread.
+        let gone = "01a15afd-679c-7743-b019-b2450a7fa13b";
+        let before = core.events().count();
+        child_from_rollout(&mut core, gone, &rollout_turns(&child_rollout(gone)));
+        assert_eq!(core.events().count(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_childs_rollout_is_read_from_codexs_home() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let thread = "01a15afd-679c-7743-b019-b2450a7fa13b";
+        let day = home.path().join("sessions/2026/10/20");
+        std::fs::create_dir_all(&day)?;
+        let lines: Vec<String> = child_rollout(thread).iter().map(Value::to_string).collect();
+        std::fs::write(day.join(format!("rollout-2026-10-20T13-25-19-{thread}.jsonl")), lines.join("\n"))?;
+        let read = read_rollouts(home.path(), vec![thread.to_owned(), "01a15a2f-a370-7901-8100-f622fd7d31d3".to_owned()]);
+        assert_eq!(read.len(), 1, "a child without a rollout is left out");
+        let (got, records) = read.first().cloned().ok_or_else(|| anyhow::anyhow!("nothing read"))?;
+        assert_eq!((got.as_str(), records.len()), (thread, lines.len()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_codex_that_cannot_list_its_terminals_is_not_asked_again() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        feed(&mut c, &mut core, &[json!({"method": "item/started", "params": {"threadId": "th1", "turnId": "t1", "item": {
+            "type": "commandExecution", "id": "exec-dev", "command": "npm run dev", "cwd": "/work", "processId": "7", "status": "inProgress", "commandActions": []
+        }}})]);
+        let _ = written(&mut core);
+        c.tick(&mut core);
+        let asked = written(&mut core);
+        let list = asked.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("thread/backgroundTerminals/list"));
+        let id = list.and_then(|v| v.get("id")).cloned().ok_or_else(|| anyhow::anyhow!("not asked"))?;
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32601, "message": "unknown variant `thread/backgroundTerminals/list`"}})]);
+        assert!(core.state.tasks.iter().all(Task::live), "not knowing ends nothing");
+        c.terminals_at = 0;
+        c.tick(&mut core);
+        assert!(!written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("thread/backgroundTerminals/list")));
         Ok(())
     }
 }

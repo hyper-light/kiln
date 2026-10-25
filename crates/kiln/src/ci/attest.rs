@@ -198,7 +198,7 @@ async fn keep(hub: &Hub, run: String, leg: String, idx: u32, nonce: String, orig
     let digests: Vec<String> = subjects.iter().flat_map(|s| s.digest.iter().map(|(alg, hex)| format!("{}:{}", alg.to_ascii_lowercase(), hex.to_ascii_lowercase()))).collect();
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let mut ids = Vec::new();
             for (kind, bundle) in made {
@@ -245,15 +245,61 @@ pub async fn reported(hub: &Hub, leg: &str, idx: u32, nonce: &str, mut subjects:
     if subjects.is_empty() {
         subjects.push(Subject { name: format!("git+{}@{}", f.repository, f.git_ref), digest: [("gitCommit".to_owned(), f.sha.clone())].into() });
     }
-    let s = signer(hub)?;
+    // Signed as `[ci.attest] signing` says (W18-R02): kiln's key, a key file, KMS, or keyless.
+    let workload = kiln_ci::oidc::Workload { repository: &f.repository, environment: None, git_ref: Some(&f.git_ref), sha: Some(&f.sha), actor: "kiln", source: "job", app: None, deployment: None, trigger: Some(&run) };
     let mut made: Vec<(String, Value)> = Vec::new();
     if provenance {
-        made.push((a::PROVENANCE.into(), s.bundle(&a::statement(&subjects, a::PROVENANCE, a::provenance(&f)))?));
+        made.push((a::PROVENANCE.into(), super::signing::bundle(hub, &a::statement(&subjects, a::PROVENANCE, a::provenance(&f)), &workload).await?));
     }
     if let Some((kind, doc)) = doc {
-        made.push((kind.into(), s.bundle(&a::statement(&subjects, kind, doc))?));
+        made.push((kind.into(), super::signing::bundle(hub, &a::statement(&subjects, kind, doc), &workload).await?));
     }
+    // Images in kiln's registry carry them as referrers (W18, W12-R01), where `cosign` and the
+    // referrers API find them.
+    let attached: Vec<(String, String, String, Value)> = subjects
+        .iter()
+        .filter_map(|sub| {
+            let repo = crate::ci::registry::local_name(hub, &sub.name)?;
+            let digest = sub.digest.iter().find(|(alg, _)| alg.eq_ignore_ascii_case("sha256")).map(|(_, hex)| format!("sha256:{}", hex.to_ascii_lowercase()))?;
+            Some(made.iter().map(move |(kind, bundle)| (repo.clone(), digest.clone(), kind.clone(), bundle.clone())).collect::<Vec<_>>())
+        })
+        .flatten()
+        .collect();
+    // Images in another registry carry them too where an `oci` integration names it, which
+    // gives kiln a way in (W18-R02): pushed there as referrers.
+    let elsewhere: Vec<(crate::ci::integrations::oci::Reference, String, Vec<(String, Value)>)> = subjects
+        .iter()
+        .filter(|sub| crate::ci::registry::local_name(hub, &sub.name).is_none())
+        .filter_map(|sub| {
+            let r = crate::ci::integrations::oci::parse_reference(&sub.name).ok()?;
+            let digest = sub.digest.iter().find(|(alg, _)| alg.eq_ignore_ascii_case("sha256")).map(|(_, hex)| format!("sha256:{}", hex.to_ascii_lowercase()))?;
+            Some((r, digest, made.clone()))
+        })
+        .collect();
     keep(hub, run, leg.to_owned(), idx, nonce.to_owned(), "kiln", &subjects, made).await?;
+    for (r, digest, bundles) in elsewhere {
+        let registry = match crate::ci::integrations::registry_for(hub, &r.registry).await {
+            Ok(Some(x)) => x,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(registry = %r.registry, error = %format!("{e:#}"), "an attestation couldn't reach its image's registry");
+                continue;
+            }
+        };
+        for (kind, bundle) in bundles {
+            match crate::ci::integrations::oci::attach(&registry, &r.repository, &digest, bundle.to_string().as_bytes(), &kind).await {
+                Ok(d) => tracing::info!(registry = %r.registry, repo = %r.repository, subject = %digest, referrer = %d, "an attestation attached to its image"),
+                Err(e) => tracing::warn!(registry = %r.registry, repo = %r.repository, error = %format!("{e:#}"), "an attestation couldn't be attached to its image"),
+            }
+        }
+    }
+    for (repo, digest, kind, bundle) in attached {
+        match crate::ci::registry::attach(hub, &repo, &digest, bundle.to_string().as_bytes(), &kind).await {
+            Ok(Some(d)) => tracing::info!(repo = %repo, subject = %digest, referrer = %d, "an attestation attached to its image"),
+            Ok(None) => tracing::debug!(repo = %repo, subject = %digest, "the image isn't in kiln's registry; its attestation stays with the run"),
+            Err(e) => tracing::warn!(repo = %repo, error = %format!("{e:#}"), "an attestation couldn't be attached to its image"),
+        }
+    }
     Ok(())
 }
 
@@ -292,10 +338,96 @@ pub async fn for_run(hub: &Hub, run: &str) -> Result<Response, Fail> {
     Ok(srv::json(StatusCode::OK, &json!({ "attestations": list.into_iter().map(row_json).collect::<Vec<_>>() })))
 }
 
+/// What an environment's `require-provenance` asks of an image (docs/ci.md W18-R04).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct Requirement {
+    /// The builder (kiln's own, `<public_url>/ci@v1`, by default).
+    pub builder: Option<String>,
+    /// The workflows (paths, globs) it may have come from; none: any.
+    pub workflows: Vec<String>,
+    /// The branches (globs) its ref may be; none: any.
+    pub branches: Vec<String>,
+}
+
+/// What kiln's provenance says of a digest, against a requirement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Provenanced {
+    /// An attestation meets it, its signature verified: its id.
+    Verified(i64),
+    /// kiln has none about it (yet: the build that attests it may still run).
+    None(String),
+    /// Those kiln has don't meet it, and why.
+    Unmet(String),
+}
+
+/// Whether kiln's own provenance about `digest`, its signature verified, meets `req`: the
+/// attestation's id when one does, else why none did.
+pub async fn verify_provenance(hub: &Hub, digest: &str, req: &Requirement) -> anyhow::Result<Result<i64, String>> {
+    Ok(match provenance_of(hub, digest, req).await? {
+        Provenanced::Verified(id) => Ok(id),
+        Provenanced::None(why) | Provenanced::Unmet(why) => Err(why),
+    })
+}
+
+/// [`verify_provenance`], telling none from none that meets `req` (CD waits for the one, refuses
+/// the other: docs/deploy-api.md §9.1).
+pub async fn provenance_of(hub: &Hub, digest: &str, req: &Requirement) -> anyhow::Result<Provenanced> {
+    let sql = format!("SELECT {COLUMNS} FROM ci_attestations a JOIN ci_attestation_subjects s ON s.attestation_id = a.id WHERE s.digest = ?1 AND a.origin = 'kiln' AND a.predicate_type = ?2 ORDER BY a.id DESC LIMIT 50");
+    let found = rows(hub, sql, digest.to_ascii_lowercase(), a::PROVENANCE.to_owned()).await?;
+    if found.is_empty() {
+        return Ok(Provenanced::None(format!("kiln has no provenance of {digest}")));
+    }
+    let builder = req.builder.clone().unwrap_or_else(|| format!("{}/ci@v1", hub.cfg.server.public_url.trim_end_matches('/')));
+    let mut why = Vec::new();
+    for (id, _, _, _, _, _, bundle, _) in found {
+        let b: Value = serde_json::from_str(&bundle).unwrap_or(Value::Null);
+        if !super::signing::verify(hub, &b).await.unwrap_or(false) {
+            why.push(format!("#{id}: its signature doesn't verify"));
+            continue;
+        }
+        let Some(st) = a::statement_of(&b) else { continue };
+        let names_it = st.get("subject").and_then(Value::as_array).into_iter().flatten().any(|s| s.pointer("/digest/sha256").and_then(Value::as_str).is_some_and(|h| format!("sha256:{h}") == digest.to_ascii_lowercase()));
+        let p = st.get("predicate").cloned().unwrap_or(Value::Null);
+        let by = p.pointer("/runDetails/builder/id").and_then(Value::as_str).unwrap_or_default();
+        let path = p.pointer("/buildDefinition/externalParameters/workflow/path").and_then(Value::as_str).unwrap_or_default();
+        let git_ref = p.pointer("/buildDefinition/externalParameters/workflow/ref").and_then(Value::as_str).unwrap_or_default();
+        let branch = git_ref.strip_prefix("refs/heads/").unwrap_or(git_ref);
+        if !names_it {
+            why.push(format!("#{id}: about something else"));
+        } else if by != builder {
+            why.push(format!("#{id}: built by {by}, not {builder}"));
+        } else if !req.workflows.is_empty() && !req.workflows.iter().any(|w| crate::pipeline::glob_match(w, path)) {
+            why.push(format!("#{id}: from {path}, not {}", req.workflows.join(", ")));
+        } else if !req.branches.is_empty() && !req.branches.iter().any(|g| crate::pipeline::glob_match(g, branch)) {
+            why.push(format!("#{id}: from {git_ref}, not {}", req.branches.join(", ")));
+        } else {
+            return Ok(Provenanced::Verified(id));
+        }
+    }
+    Ok(Provenanced::Unmet(why.join("; ")))
+}
+
+/// `POST /api/ci/attestations/verify` `{ digest, builder?, workflows?, branches? }`: whether an
+/// image (or file) has kiln's verified provenance meeting the requirement (for CD's
+/// `require-provenance`, W18-R04).
+pub async fn verify_route(hub: &Hub, body: &Value) -> Result<Response, Fail> {
+    let digest = body.get("digest").and_then(Value::as_str).filter(|d| d.starts_with("sha256:")).ok_or_else(|| (StatusCode::BAD_REQUEST, "`digest`: sha256:<hex>".to_owned()))?;
+    let req: Requirement = serde_json::from_value(body.clone()).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
+    let v = match verify_provenance(hub, digest, &req).await.map_err(internal)? {
+        Ok(id) => json!({ "digest": digest, "verified": true, "attestation": id }),
+        Err(why) => json!({ "digest": digest, "verified": false, "why": why }),
+    };
+    Ok(srv::json(StatusCode::OK, &v))
+}
+
 /// `GET /_kiln/attestation-key.pem`: the public key kiln's bundles are signed with.
-pub fn key_pem(hub: &Hub) -> Result<Response, Fail> {
-    let s = signer(hub).map_err(internal)?;
-    Ok(srv::text(StatusCode::OK, &s.public_pem()))
+pub async fn key_pem(hub: &Hub) -> Result<Response, Fail> {
+    // The configured signer's (W18-R02): kiln's own key, the key file's, KMS's; none when keyless.
+    match super::signing::public_pem(hub).await.map_err(internal)? {
+        Some(pem) => Ok(srv::text(StatusCode::OK, &pem)),
+        None => Err((StatusCode::NOT_FOUND, "kiln signs keyless: verify with Fulcio's and Rekor's roots and kiln's identity, not a key".into())),
+    }
 }
 
 /// `GET /api/v3/repos/:o/:r/attestations/:digest` (GitHub's shape): the repository's bundles of a
@@ -329,6 +461,16 @@ pub async fn facade_create(hub: &Hub, claims: &token::Job, body: &Value) -> Resu
     }
     let ids = keep(hub, claims.run.clone(), claims.leg.clone(), 0, String::new(), "job", &subjects, vec![(kind, bundle)]).await.map_err(internal)?;
     Ok(srv::json(StatusCode::CREATED, &json!({ "id": ids.first() })))
+}
+
+/// kiln's provenance of `subjects` from the build `f` says, signed and kept as a leg's attest
+/// step's is: for tests of what asks for it (CD's `require_provenance`).
+#[cfg(test)]
+pub(crate) async fn keep_provenance(hub: &Hub, subjects: &[Subject], f: &a::Facts) -> anyhow::Result<i64> {
+    let workload = kiln_ci::oidc::Workload { repository: &f.repository, actor: "kiln", source: "job", ..kiln_ci::oidc::Workload::default() };
+    let bundle = super::signing::bundle(hub, &a::statement(subjects, a::PROVENANCE, a::provenance(f)), &workload).await?;
+    let ids = keep(hub, "run".into(), "leg".into(), 0, String::new(), "kiln", subjects, vec![(a::PROVENANCE.into(), bundle)]).await?;
+    ids.first().copied().ok_or_else(|| anyhow::anyhow!("nothing was kept"))
 }
 
 #[cfg(test)]

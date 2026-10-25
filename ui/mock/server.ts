@@ -19,9 +19,19 @@ import type { Agent, AuditEntry, Child, HostSample, Job, PlannedJob, Repo, Run, 
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
+import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
+import { handleGoals } from "./goals.ts";
+import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
+import { handleSettings } from "./settings.ts";
+import { handleMachines } from "./machines.ts";
 import { handlePlaces } from "./places.ts";
-import { handleLongSession, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { fastInfos, handleFastSession } from "./fast.ts";
+import { handlePush, pushHeard } from "./push.ts";
+import { handleReview } from "./review.ts";
+import { handleDoctor } from "./doctor.ts";
+import { handleStores } from "./stores.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -75,6 +85,8 @@ interface SimJob {
   failStep: number | null; // step index that will fail
   stepStartedMs: number | null;
   planned: PlannedJob;
+  /** Queued, it waits for a machine until then (unix seconds): one machine builds kiln's platforms in turn. */
+  holdUntil?: number;
 }
 interface LogStream {
   data: string;
@@ -457,11 +469,13 @@ function historicalRun(created: number, seed: number) {
 /* ------------------------------------------------------------------ */
 
 function emit(ev: ServerEvent) {
+  pushHeard(ev);
   const msg = JSON.stringify(ev);
   for (const ws of eventClients) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
 }
 setLongEmit((ev) => emit(ev as ServerEvent));
 setDemoEmit((ev) => emit(ev as ServerEvent));
+setFamilyEmit((ev) => emit(ev as ServerEvent));
 
 function queueCounts() {
   let queued = 0;
@@ -626,6 +640,106 @@ function startRun(repo: Repo, opts: { branch?: string; event?: string; pipeline?
   return run;
 }
 
+/** kiln's release pipeline (`.kiln/release.yaml`), as System → Builds' Build every platform runs it: a job per platform family, each on a machine of its own. */
+const RELEASE_UI = { name: "ui", run: "npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build", dur: [5, 8] as [number, number], kind: "npm" };
+const RELEASE_JOBS: JobTpl[] = [
+  {
+    key: "linux",
+    needs: [],
+    labels: ["baremetal", "linux"],
+    toolchain: "rust",
+    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl aarch64-unknown-linux-musl", dur: [14, 20], kind: "compile" }],
+  },
+  {
+    key: "windows",
+    needs: [],
+    labels: ["baremetal", "linux"],
+    toolchain: "rust",
+    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh x86_64-pc-windows-msvc", dur: [18, 26], kind: "compile" }],
+  },
+  {
+    key: "macos",
+    needs: [],
+    labels: ["baremetal", "macos"],
+    toolchain: "rust",
+    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh aarch64-apple-darwin x86_64-apple-darwin", dur: [24, 32], kind: "compile" }],
+  },
+];
+let releaseRun: Run | null = null;
+
+/**
+ * A release run: Build every platform's (a manual run of `commit`), or a push to main's. `hold`
+ * keeps a job queued that many seconds (one machine builds Linux and Windows in turn), `slow`
+ * draws its steps out, so a page shows it building for a while.
+ */
+function startRelease(commit: string, opts: { event?: string; message?: string; hold?: Record<string, number>; slow?: number } = {}): Run {
+  const repo = repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!;
+  const { run } = makeRun(repo, { created: now(), branch: "main", event: opts.event ?? "manual", pipeline: "release" });
+  Object.assign(run, { sha: commit, message: opts.message ?? "Build every platform", author: opts.event === "push" ? "ada" : "admin" });
+  const sjobs = RELEASE_JOBS.map((tpl, i) => newSimJob(run, tpl, i));
+  for (const sj of sjobs) {
+    if (opts.slow) sj.steps.forEach((s) => (s.dur *= opts.slow!));
+    if (opts.hold?.[sj.tpl.key]) sj.holdUntil = now() + opts.hold[sj.tpl.key]!;
+  }
+  runs.unshift(run);
+  jobsByRun.set(run.id, sjobs);
+  sjobs.forEach((s) => jobsById.set(s.job.id, s));
+  emit({ type: "run", run });
+  sjobs.forEach((s) => emit({ type: "job", job: s.job }));
+  releaseRun = run;
+  return run;
+}
+
+/**
+ * The release runs the kept binaries came from, newest first: two of kiln's past runs, made release
+ * runs of `sha`, every job done, so a binary's run number opens its job's log. The older one built
+ * the server's own platform, which the server's own build shadows.
+ */
+const pastReleases: Run[] = [
+  { ago: 80_000, sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678" },
+  { ago: 205_000, sha: "df17c34639ecbf9d5c9caefb6af28aa67ee01257" },
+].flatMap(({ ago, sha }) => {
+  const kiln = runs.filter((r) => r.repo_name === "hyper-light/kiln");
+  const run = kiln.reduce<Run | null>((a, r) => (a === null || Math.abs(r.created_at - (now() - ago)) < Math.abs(a.created_at - (now() - ago)) ? r : a), null);
+  if (!run) return [];
+  for (const s of jobsByRun.get(run.id) ?? []) jobsById.delete(s.job.id);
+  Object.assign(run, { pipeline: "release", event: "push", branch: "main", sha, message: "Release builds", status: "succeeded", error: null });
+  let end = run.created_at;
+  const sjobs = RELEASE_JOBS.map((tpl, i) => {
+    const sj = newSimJob(run, tpl, i);
+    const start = run.created_at + 4 + i * 3;
+    let t = start;
+    for (const s of sj.steps) {
+      s.dur *= 12;
+      Object.assign(s, { status: "succeeded", exit_code: 0, started_at: Math.floor(t), finished_at: Math.floor((t += s.dur)) });
+    }
+    const agent = tpl.labels.includes("macos") ? "metal-mac-mini" : "metal-ryzen-01";
+    Object.assign(sj.job, {
+      status: "succeeded",
+      agent,
+      executor: "baremetal",
+      queued_at: run.created_at + 2,
+      started_at: start,
+      finished_at: Math.floor(t),
+      exit_code: 0,
+      peak_rss: 3_100_000_000,
+      cpu_seconds: Math.round((t - start) * 5),
+    });
+    syncJob(sj);
+    end = Math.max(end, Math.floor(t));
+    return sj;
+  });
+  Object.assign(run, { started_at: run.created_at + 4, finished_at: end });
+  jobsByRun.set(run.id, sjobs);
+  sjobs.forEach((s) => jobsById.set(s.job.id, s));
+  return [run];
+});
+
+// A push to main builds a commit newer than the server's (main moved on since it was built): its
+// Mac builds first while Linux and Windows wait their turn on one machine. kiln keeps none of
+// it (it takes builds of the server's own commit only); the page shows it building.
+startRelease("25159ff8b2d4c6e0a1f3b5d7c9e1a3f5b7d9c1e3", { event: "push", message: "Builds open their logs under the platforms", hold: { linux: 45, windows: 100 }, slow: 4 });
+
 function finishJob(sj: SimJob, status: Status, error: string | null) {
   const j = sj.job;
   j.status = status;
@@ -663,7 +777,7 @@ function tick() {
           emit({ type: "job", job: j });
         }
       } else if (j.status === "queued") {
-        if (nowS - (j.queued_at ?? nowS) >= 1 && rnd() < 0.7 && assign(sj)) {
+        if ((sj.holdUntil ?? 0) <= nowS && nowS - (j.queued_at ?? nowS) >= 1 && rnd() < 0.7 && assign(sj)) {
           j.status = "running";
           j.started_at = nowS;
           const s0 = sj.steps[0]!;
@@ -1171,6 +1285,7 @@ const MIME: Record<string, string> = {
   ".woff": "font/woff",
   ".png": "image/png",
   ".json": "application/json",
+  ".webmanifest": "application/manifest+json",
   ".ico": "image/x-icon",
 };
 
@@ -1214,6 +1329,8 @@ const server = http.createServer(async (req, res) => {
         ].join("\n"),
       );
     }
+    // Pages agents show: open, as the server's are (their address is their key).
+    if (handleShownPages(p, res)) return;
     if (!p.startsWith("/api/")) return serveStatic(p, res);
 
     // ---- auth (open) ----
@@ -1250,7 +1367,34 @@ const server = http.createServer(async (req, res) => {
       sendAway(Number(url.searchParams.get("ms") ?? 10_000));
       return json(res, 200, { ok: true });
     }
+    // ---- files the long session's messages mention ----
+    if (handleLongFiles(p, url, req, res)) return;
+    // ---- live pages a person opens (the Tools tab): what its machine serves; no streams here ----
+    const live = /^\/api\/harness\/sessions\/([^/]+)\/(preview|preview\/stop|streams)$/.exec(p);
+    if (live) {
+      if (live[2] === "preview" && m === "GET")
+        return json(res, 200, {
+          ports: [
+            { port: 5173, address: "127.0.0.1", pid: 4242, command: "node", agents: true },
+            { port: 8080, address: "0.0.0.0", pid: 977, command: "python3", agents: false },
+          ],
+          app: { configured: true, start: "npm run dev", port: 5173, path: "/", running: null },
+        });
+      if (live[2] === "preview/stop" && m === "POST") return json(res, 200, { stopped: false });
+      if (live[2] === "streams" && m === "GET") return json(res, 200, []);
+      if (live[2] === "streams" && m === "POST") return err(res, 409, "the mock doesn't stream pages: run a kiln server and a runner for live pages");
+    }
+    if (/^\/api\/harness\/sessions\/[^/]+\/recordings$/.test(p) && m === "GET") return json(res, 200, []);
+    const opened = /^\/api\/harness\/sessions\/([^/]+)\/opened$/.exec(p);
+    if (opened && m === "GET") return json(res, 200, []);
+    if (opened && m === "POST") return err(res, 409, "opening an app on your device needs pages' own site: set [server] pages_url (docs/previews.md)");
+    // ---- goal stacks ----
+    if (await handleGoals(req, res, url)) return;
+    if (await handlePrograms(req, res, url)) return;
+    // ---- agents that run agents ----
+    if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
+    if (await handleMachines(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 
@@ -1572,8 +1716,30 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, audit.slice(0, limit));
     }
     if (p.startsWith("/api/hooks/github")) return noContent(res);
+    if (await handleReview(req, res, url, { json, err, body, emit: (ev) => emit(ev as never) })) return;
+    if (await handlePush(req, res, url, { json, err, body, emit, noContent })) return;
+    if (await handleDoctor(req, res, url, { json, err, body, runners: () => [...agents.values()].map((a) => ({ name: a.name, connected: a.connected, os: a.os })) })) return;
+    if (await handleStores(req, res, url, { json, err, runners: () => [...agents.values()].filter((a) => !a.ephemeral).map((a) => ({ name: a.name, connected: a.connected, version: a.version, last_seen: a.last_seen })) })) return;
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
-    if (await handlePages(req, res, url, { agents: () => [...agents.values()], runs: () => runs, version: VERSION, hostname: HOSTNAME, json, err, body })) return;
+    if (await handleSettings(req, res, url, { json, err, body })) return;
+    if (
+      await handlePages(req, res, url, {
+        agents: () => [...agents.values()],
+        runs: () => runs,
+        version: VERSION,
+        hostname: HOSTNAME,
+        json,
+        err,
+        body,
+        emit,
+        release: {
+          start: (commit) => startRelease(commit),
+          latest: () => (releaseRun ? { run: releaseRun, jobs: (jobsByRun.get(releaseRun.id) ?? []).map((s) => s.job) } : null),
+          past: () => pastReleases,
+        },
+      })
+    )
+      return;
 
     return err(res, 404, `no route for ${m} ${p}`);
   } catch (e) {
@@ -1611,7 +1777,14 @@ server.on("upgrade", (req, socket, head) => {
     if (lm) return handleLogs(ws, decodeURIComponent(lm[1]!), Number(url.searchParams.get("step") ?? 0));
     if (p === "/api/terminal/ws") return handleTerminal(ws, url.searchParams);
     const hm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/ws$/);
-    if (hm && (handleDemoSession(ws, decodeURIComponent(hm[1]!)) || handleLongSession(ws, decodeURIComponent(hm[1]!)))) return;
+    if (
+      hm &&
+      (handleDemoSession(ws, decodeURIComponent(hm[1]!)) ||
+        handleFamilySession(ws, decodeURIComponent(hm[1]!)) ||
+        handleFastSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("patch") === "state") ||
+        handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))
+    )
+      return;
     ws.close(1008, "no such socket");
   });
 });

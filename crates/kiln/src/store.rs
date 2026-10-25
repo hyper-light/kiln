@@ -11,11 +11,194 @@ use serde::{Deserialize, Serialize};
 
 use crate::pipeline::PlannedJob;
 
+pub mod capture;
+pub mod group;
+pub mod learner;
 pub mod migrations;
 
 #[derive(Clone)]
 pub struct Store {
-    conn: Arc<Mutex<Connection>>,
+    inner: Arc<Inner>,
+    /// A test build's store whose calls run on the calling task, each after yielding once
+    /// ([`Store::in_memory_inline`]): what kiln-sim's models drive under their seeded scheduler, a
+    /// crash able to come at each call's wait.
+    #[cfg(test)]
+    inline: bool,
+}
+
+/// The store's connection, and with the cluster group what its writes go through.
+struct Inner {
+    // Dropped in order: the connection before the watch its hook writes into.
+    conn: Mutex<Connection>,
+    watch: Option<capture::Watch>,
+    group: Option<group::Group>,
+    /// The database's file, with the cluster group (a learner's copy is made from it).
+    path: Option<std::path::PathBuf>,
+    /// A folder of its own, removed with the store (tests through the group, [`Store::in_memory`]).
+    scratch: Option<std::path::PathBuf>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(dir) = self.scratch.take() {
+            // The group's thread and connections go first: then the folder.
+            self.group.take();
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Tables this node keeps for itself: its log search index, built from its own logs. Written with
+/// [`Store::call_local`], past the cluster group; a write through the group must not touch them.
+pub const LOCAL: &[&str] = &["ci_log_indexed", "ci_log_index_data", "ci_log_index_idx", "ci_log_index_content", "ci_log_index_docsize", "ci_log_index_config"];
+
+/// Writes a copy of the database at `db` to `dest`, from one snapshot of it: every table but this
+/// node's own ([`LOCAL`]) and the virtual ones (its log search), each row with its rowid, then
+/// their indexes, triggers and views. Only what replicates is read: a log search of gigabytes stays
+/// where it is.
+fn copy_tables(db: &Path, dest: &Path) -> anyhow::Result<()> {
+    std::fs::remove_file(dest).ok();
+    if let Some(d) = dest.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let src = Connection::open(db)?;
+    let kept = |name: &str, sql: &str| !name.starts_with("sqlite_") && !LOCAL.contains(&name) && !sql.to_ascii_uppercase().starts_with("CREATE VIRTUAL TABLE");
+    // What there is, as of the snapshot the rows are read in.
+    let schema = |c: &Connection| -> rusqlite::Result<Vec<(String, String, String, String)>> {
+        let mut st = c.prepare("SELECT type, name, tbl_name, sql FROM main.sqlite_schema WHERE sql IS NOT NULL ORDER BY rowid")?;
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect()
+    };
+    let (page_size, user_version): (i64, i64) = (src.query_row("PRAGMA page_size", [], |r| r.get(0))?, src.query_row("PRAGMA user_version", [], |r| r.get(0))?);
+    let tables: Vec<(String, String)> = schema(&src)?.into_iter().filter(|(kind, name, _, sql)| kind == "table" && kept(name, sql)).map(|(_, name, _, sql)| (name, sql)).collect();
+    {
+        let d = Connection::open(dest)?;
+        d.execute_batch(&format!("PRAGMA page_size = {page_size}; PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; PRAGMA user_version = {user_version};"))?;
+        for (_, sql) in &tables {
+            d.execute_batch(sql)?;
+        }
+    }
+    src.execute("ATTACH DATABASE ?1 AS copy", [dest.to_string_lossy()])?;
+    src.execute_batch("PRAGMA copy.journal_mode = OFF; PRAGMA copy.synchronous = OFF; BEGIN")?;
+    let copied = (|| -> anyhow::Result<Vec<(String, String, String, String)>> {
+        // In the snapshot: the schema again, so what's created after is what the rows were read with.
+        let objects = schema(&src)?;
+        let known = capture::copy_columns(&src)?;
+        for (name, _) in &tables {
+            let (cols, own_rowids) = known.get(name).with_context(|| format!("table {name}"))?;
+            // Rows keep their rowids: kiln reads them (runs' are GitHub's ids, jobs' order legs).
+            let cols = if *own_rowids { format!("rowid, {}", cols.join(", ")) } else { cols.join(", ") };
+            let q = name.replace('"', "\"\"");
+            src.execute(&format!("INSERT INTO copy.\"{q}\" ({cols}) SELECT {cols} FROM main.\"{q}\""), [])?;
+        }
+        // AUTOINCREMENT's counters as kiln.db has them: the inserts above left one for every such
+        // table, empty or not.
+        if src.query_row("SELECT COUNT(*) FROM copy.sqlite_schema WHERE name = 'sqlite_sequence'", [], |r| r.get::<_, i64>(0))? > 0 {
+            src.execute_batch("DELETE FROM copy.sqlite_sequence")?;
+            let local = LOCAL.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", ");
+            src.execute_batch(&format!("INSERT INTO copy.sqlite_sequence SELECT * FROM main.sqlite_sequence WHERE name NOT IN ({local})"))?;
+        }
+        Ok(objects)
+    })();
+    let objects = match copied {
+        Ok(o) => {
+            src.execute_batch("COMMIT")?;
+            o
+        }
+        Err(e) => {
+            src.execute_batch("ROLLBACK").ok();
+            return Err(e);
+        }
+    };
+    src.execute_batch("DETACH DATABASE copy")?;
+    let names: std::collections::HashSet<&str> = tables.iter().map(|(n, _)| n.as_str()).collect();
+    let d = Connection::open(dest)?;
+    for (kind, _, table, sql) in &objects {
+        if kind == "view" || (kind != "table" && names.contains(table.as_str())) {
+            d.execute_batch(sql)?;
+        }
+    }
+    d.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL;")?;
+    Ok(())
+}
+
+/// A transaction that nests: a SQLite savepoint. At the top it opens one as `BEGIN DEFERRED`
+/// would; inside another (the one a write runs in while the cluster group takes it, docs/p2p.md
+/// P1) it becomes part of that. [`Tx::commit`] keeps what it did; dropped without, it's undone.
+pub struct Tx<'c> {
+    conn: &'c Connection,
+    open: bool,
+}
+
+/// Opens a [`Tx`] on `conn`: what every write that needs its statements together uses, rather than
+/// rusqlite's transactions, which can't be opened inside another.
+pub fn tx(conn: &Connection) -> rusqlite::Result<Tx<'_>> {
+    conn.execute_batch("SAVEPOINT kiln_tx")?;
+    Ok(Tx { conn, open: true })
+}
+
+impl Tx<'_> {
+    /// Keeps what it did: commits it at the top, makes it part of the one around it inside one.
+    pub fn commit(mut self) -> rusqlite::Result<()> {
+        self.open = false;
+        self.conn.execute_batch("RELEASE kiln_tx")
+    }
+}
+
+impl Drop for Tx<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self.conn.execute_batch("ROLLBACK TO kiln_tx; RELEASE kiln_tx");
+        }
+    }
+}
+
+impl std::ops::Deref for Tx<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+/// Runs a write through the cluster group (see [`Store::call`]).
+fn through_group<R>(conn: &mut Connection, watch: &capture::Watch, group: &group::Group, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
+    // IMMEDIATE: the write lock now, so what `f` reads is what it writes over (a transaction that
+    // read first would be refused its write had the group's thread committed meanwhile).
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    watch.begin();
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn)));
+    let change = watch.end(conn);
+    let result = match ran {
+        Ok(r) => r,
+        Err(panic) => {
+            conn.execute_batch("ROLLBACK").ok();
+            std::panic::resume_unwind(panic)
+        }
+    };
+    let change = match change {
+        Ok(c) => c,
+        Err(e) => {
+            // What it wrote couldn't be read for the log: it isn't kept.
+            conn.execute_batch("ROLLBACK").ok();
+            return Err(e);
+        }
+    };
+    if change.is_empty() {
+        conn.execute_batch("ROLLBACK")?;
+        return result;
+    }
+    // Kept as without the group (an `f` that failed after writing keeps what it wrote), with its
+    // number; then the change goes to the log.
+    let seq = group.next_seq();
+    let kept = conn
+        .execute(&format!("UPDATE {} SET seq = ?1 WHERE one = 1", group::STATE), [i64::try_from(seq)?])
+        .map_err(anyhow::Error::from)
+        .and_then(|_| conn.execute_batch("COMMIT").map_err(anyhow::Error::from));
+    if let Err(e) = kept {
+        conn.execute_batch("ROLLBACK").ok();
+        return Err(e);
+    }
+    group.append(seq, change);
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +322,10 @@ pub struct Job {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<PlannedJob>,
     pub steps: Vec<Step>,
+    /// A CI matrix leg's values, by axis: where it sits in its job's grid on the run graph
+    /// (docs/ci.md W21-R04).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,35 +415,178 @@ fn from_json<T: for<'de> Deserialize<'de> + Default>(s: &str) -> T {
 }
 
 impl Store {
+    /// The store at `path`, written to directly (no cluster group): tools that run with the server
+    /// stopped, and setups that turn the group off (`[cluster] group = false`).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let conn = Self::connect(path)?;
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }), #[cfg(test)] inline: false })
+    }
+
+    /// The store at `path` with its writes through the cluster group, its log in `cluster`
+    /// (docs/p2p.md, P1). What the log holds past the database is replayed into it first.
+    pub fn open_grouped(path: &Path, cluster: &Path) -> anyhow::Result<Self> {
+        let conn = Self::connect(path)?;
+        let group = group::Group::open(path, cluster).context("the cluster group")?;
+        let watch = capture::Watch::install(&conn, LOCAL)?;
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: Some(watch), group: Some(group), path: Some(path.to_path_buf()), scratch: None }), #[cfg(test)] inline: false })
+    }
+
+    /// A runner's replica of kiln.db (docs/p2p.md, P2), to read: its learner alone writes it, so
+    /// this connection only reads (`query_only`), and the schema is the copy's, as the server made
+    /// it.
+    pub fn open_replica(path: &Path) -> anyhow::Result<Self> {
+        let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }), #[cfg(test)] inline: false })
+    }
+
+    fn connect(path: &Path) -> anyhow::Result<Connection> {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
         }
         let mut conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("apply schema")?;
         migrations::apply(&mut conn).context("apply migrations")?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(conn)
     }
 
+    /// A store of its own for tests: in memory, or with `KILN_STORE_GROUP=1` a database in a scratch
+    /// folder with its writes through the cluster group, so the whole suite can run that way.
     pub fn in_memory() -> anyhow::Result<Self> {
+        if std::env::var("KILN_STORE_GROUP").is_ok_and(|v| v == "1") {
+            let dir = std::env::temp_dir().join(format!("kiln-store-{}", crate::util::new_id()));
+            let mut store = Self::open_grouped(&dir.join("kiln.db"), &dir.join("cluster"))?;
+            if let Some(inner) = Arc::get_mut(&mut store.inner) {
+                inner.scratch = Some(dir);
+            }
+            return Ok(store);
+        }
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }), #[cfg(test)] inline: false })
     }
 
-    /// Run `f` with the connection on the blocking pool.
+    /// An in-memory store whose calls run on the calling task, each after yielding once: kiln-sim's
+    /// models drive it under their seeded scheduler, so a crash can come at each call (CP-T6.1).
+    /// Never the cluster group's, whatever `KILN_STORE_GROUP` says.
+    #[cfg(test)]
+    pub fn in_memory_inline() -> anyhow::Result<Self> {
+        let mut conn = Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA)?;
+        migrations::apply(&mut conn)?;
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }), inline: true })
+    }
+
+    /// Run `f` with the connection on this thread: for what's read once as the server starts,
+    /// before anything else runs (a constructor that can't wait). Only reads: a write here would
+    /// go past the cluster group.
+    pub fn now<R>(&self, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
+        f(&mut self.inner.conn.lock())
+    }
+
+    /// Whether this store's writes go through the cluster group.
+    pub fn grouped(&self) -> bool {
+        self.inner.group.is_some()
+    }
+
+    /// With the cluster group, where it stands: kiln.db's last write and the last entry applied.
+    pub fn group_standing(&self) -> Option<(u64, u64)> {
+        self.inner.group.as_ref().map(group::Group::standing)
+    }
+
+    /// The database's size on disk, with its write-ahead log (with the cluster group).
+    pub fn file_bytes(&self) -> Option<u64> {
+        let path = self.inner.path.as_ref()?;
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        Some(std::fs::metadata(path).ok()?.len() + std::fs::metadata(wal).map_or(0, |m| m.len()))
+    }
+
+    /// The cluster group, with it: its messages to the runners' learners, and theirs to it.
+    pub fn group(&self) -> Option<&group::Group> {
+        self.inner.group.as_ref()
+    }
+
+    /// A copy of kiln.db for a runner's learner, written to `dest`: the database as it is now,
+    /// standing at the group's last applied entry (every entry up to it is in it, and one after it
+    /// the learner gets again is skipped by its `seq`), without this node's own tables.
+    pub async fn copy_for_learner(&self, dest: std::path::PathBuf) -> anyhow::Result<()> {
+        let (Some(g), Some(db)) = (&self.inner.group, self.inner.path.clone()) else { anyhow::bail!("kiln.db's writes don't go through the cluster group") };
+        let (at, conf) = g.point();
+        crate::rt::blocking(move || -> anyhow::Result<()> {
+            copy_tables(&db, &dest)?;
+            group::stand(&Connection::open(&dest)?, at, &conf)
+        })
+        .await?
+    }
+
+    /// Waits until every write so far is in the cluster group's log (tests; a clean stop).
+    pub fn flush_group(&self) -> anyhow::Result<()> {
+        match &self.inner.group {
+            Some(g) => g.flush(),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs `f` with the connection on the blocking pool. With the cluster group, what `f` writes
+    /// goes through it: `f` runs in a transaction while the rows it touches are noted, which
+    /// commits with the write's number and sends the rows' state (its change) to the group's log,
+    /// which a restart replays. A read is only a read.
     pub async fn call<R, F>(&self, f: F) -> anyhow::Result<R>
     where
         F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
-        let conn = self.conn.clone();
+        #[cfg(test)]
+        if self.inline {
+            let mut yielded = false;
+            futures::future::poll_fn(|cx| {
+                if std::mem::replace(&mut yielded, true) {
+                    return std::task::Poll::Ready(());
+                }
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            })
+            .await;
+            let mut g = self.inner.conn.lock();
+            return f(&mut g);
+        }
+        let inner = self.inner.clone();
         crate::rt::blocking(move || {
-            let mut g = conn.lock();
+            let mut g = inner.conn.lock();
+            match (&inner.watch, &inner.group) {
+                (Some(watch), Some(group)) => through_group(&mut g, watch, group, f),
+                _ => f(&mut g),
+            }
+        })
+        .await?
+    }
+
+    /// Runs `f` with the connection, past the cluster group: for this node's own tables ([`LOCAL`]).
+    pub async fn call_local<R, F>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        crate::rt::blocking(move || {
+            let mut g = inner.conn.lock();
             f(&mut g)
         })
         .await?
+    }
+
+    /// Runners connected just before this server started: those still marked connected (a server
+    /// that was killed didn't mark them gone), or gone within `within_s` (its shutdown, a restart).
+    /// Not a job's own pod, which doesn't come back. Read before [`Store::recover`]; how many
+    /// return is a deploy's check (`/healthz/server`).
+    pub async fn runners_before(&self, within_s: i64) -> anyhow::Result<u64> {
+        let since = crate::util::now_unix() - within_s;
+        self.call(move |c| {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM agents WHERE ephemeral = 0 AND (connected = 1 OR last_seen >= ?1)", [since], |r| r.get(0))?;
+            Ok(u64::try_from(n).unwrap_or(0))
+        })
+        .await
     }
 
     /// After a server restart every agent is marked disconnected until it reconnects. Running jobs
@@ -276,7 +606,7 @@ impl Store {
     /// before doing any work).
     pub async fn unclaim_job(&self, id: String, note: String) -> anyhow::Result<()> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute(
                 "UPDATE jobs SET status = 'queued', agent = NULL, executor = NULL, started_at = NULL,
                    error = ?2 WHERE id = ?1 AND status = 'running'",
@@ -332,6 +662,29 @@ impl Store {
             let id: String =
                 c.query_row("SELECT id FROM repos WHERE name = ?1", [&r.name], |row| row.get(0))?;
             Ok(Repo { id, ..r })
+        })
+        .await
+    }
+
+    /// Whether a native repository is public: anyone may read it over git (W14-R01).
+    pub async fn repo_public(&self, id: String) -> anyhow::Result<bool> {
+        self.call(move |c| Ok(c.query_row("SELECT public FROM repos WHERE id = ?1", [&id], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false))).await
+    }
+
+    /// The public repositories' ids.
+    pub async fn public_repos(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        self.call(|c| {
+            let mut st = c.prepare("SELECT id FROM repos WHERE public = 1")?;
+            let ids = st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
+            Ok(ids)
+        })
+        .await
+    }
+
+    pub async fn set_repo_public(&self, id: String, public: bool) -> anyhow::Result<()> {
+        self.call(move |c| {
+            c.execute("UPDATE repos SET public = ?2 WHERE id = ?1", params![id, public])?;
+            Ok(())
         })
         .await
     }
@@ -439,7 +792,7 @@ impl Store {
     /// Insert a run with its planned jobs atomically. Jobs with no `needs` start queued.
     pub async fn create_run(&self, mut run: Run, jobs: Vec<PlannedJob>) -> anyhow::Result<Run> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let number: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(number), 0) + 1 FROM runs WHERE repo_id = ?1",
                 [&run.repo_id],
@@ -521,6 +874,79 @@ impl Store {
         .await
     }
 
+    /// [`Self::runs`], of the repositories named only.
+    pub async fn runs_among(&self, names: Vec<String>, repo: Option<String>, limit: u32, before: Option<i64>) -> anyhow::Result<Vec<Run>> {
+        let names = serde_json::to_string(&names)?;
+        self.call(move |c| {
+            let mut st = c.prepare(
+                "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
+                        r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
+                        r.error, r.concurrency_group
+                 FROM runs r JOIN repos p ON p.id = r.repo_id
+                 WHERE (?1 IS NULL OR p.id = ?1 OR p.name = ?1)
+                   AND (?3 IS NULL OR r.created_at < ?3)
+                   AND p.name IN (SELECT value FROM json_each(?4))
+                 ORDER BY r.created_at DESC, r.number DESC LIMIT ?2",
+            )?;
+            let rows = st.query_map(params![repo, limit.min(500), before, names], row_run)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// Runs in another order than newest first (the runs list's sort, W21-R03): `oldest`, or
+    /// `longest` and `shortest` (a running one's time so far), from `offset` on; `among` the
+    /// repositories a person may read, when narrowed.
+    /// The runners and executors each of `ids`'s legs ran on (W21-R03's facets), by run.
+    pub async fn run_hosts(&self, ids: Vec<String>) -> anyhow::Result<std::collections::HashMap<String, (Vec<String>, Vec<String>)>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        self.call(move |c| {
+            let mut st = c.prepare("SELECT run_id, agent, executor FROM jobs WHERE run_id IN (SELECT value FROM json_each(?1)) AND (agent IS NOT NULL OR executor IS NOT NULL) ORDER BY run_id")?;
+            let rows = st.query_map([serde_json::to_string(&ids)?], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?;
+            let mut out: std::collections::HashMap<String, (Vec<String>, Vec<String>)> = std::collections::HashMap::new();
+            for row in rows {
+                let (run, agent, executor) = row?;
+                let hosts = out.entry(run).or_default();
+                for (list, v) in [(&mut hosts.0, agent), (&mut hosts.1, executor)] {
+                    if let Some(v) = v.filter(|v| !v.is_empty())
+                        && !list.contains(&v)
+                    {
+                        list.push(v);
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    pub async fn runs_sorted(&self, among: Option<Vec<String>>, repo: Option<String>, order: &str, limit: u32, offset: u32) -> anyhow::Result<Vec<Run>> {
+        const TOOK: &str = "(COALESCE(r.finished_at, CAST(strftime('%s', 'now') AS INTEGER)) - COALESCE(r.started_at, r.created_at))";
+        let by = match order {
+            "oldest" => "r.created_at ASC, r.number ASC".to_owned(),
+            "longest" => format!("{TOOK} DESC, r.created_at DESC"),
+            "shortest" => format!("{TOOK} ASC, r.created_at DESC"),
+            _ => "r.created_at DESC, r.number DESC".to_owned(),
+        };
+        let names = among.map(|n| serde_json::to_string(&n).unwrap_or_default());
+        self.call(move |c| {
+            let mut st = c.prepare(&format!(
+                "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
+                        r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
+                        r.error, r.concurrency_group
+                 FROM runs r JOIN repos p ON p.id = r.repo_id
+                 WHERE (?1 IS NULL OR p.id = ?1 OR p.name = ?1)
+                   AND (?4 IS NULL OR p.name IN (SELECT value FROM json_each(?4)))
+                 ORDER BY {by} LIMIT ?2 OFFSET ?3"
+            ))?;
+            let rows = st.query_map(params![repo, limit.min(500), offset, names], row_run)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
     pub async fn run(&self, id: String) -> anyhow::Result<Option<Run>> {
         self.call(move |c| {
             Ok(c.query_row(
@@ -578,11 +1004,16 @@ impl Store {
     }
 
     /// v1 jobs waiting for an agent, oldest first (legs of the CI engine, with a `job_id`, are its
-    /// dispatcher's, docs/ci.md §2.4).
+    /// dispatcher's, docs/ci.md §2.4). A run of a concurrency group waits while an older run of the
+    /// group is active: one of a group runs at a time.
     pub async fn queued_jobs(&self, limit: u32) -> anyhow::Result<Vec<Job>> {
         self.call(move |c| {
             let mut st = c.prepare(&format!(
-                "{JOB_SELECT} WHERE status = 'queued' AND job_id IS NULL ORDER BY queued_at, rowid LIMIT ?1"
+                "{JOB_SELECT} WHERE status = 'queued' AND job_id IS NULL AND NOT EXISTS (
+                   SELECT 1 FROM runs r JOIN runs o ON o.concurrency_group = r.concurrency_group
+                   WHERE r.id = jobs.run_id AND o.id != r.id AND o.status IN ('queued','running','pending')
+                     AND (o.created_at < r.created_at OR (o.created_at = r.created_at AND o.rowid < r.rowid)))
+                 ORDER BY queued_at, rowid LIMIT ?1"
             ))?;
             Ok(st.query_map([limit], row_job)?.collect::<Result<Vec<_>, _>>()?)
         })
@@ -598,10 +1029,28 @@ impl Store {
         .await
     }
 
+    /// Which of `ids` are the CI engine's legs (rows of a workflow's job), not v1's jobs.
+    pub async fn ci_legs(&self, ids: Vec<String>) -> anyhow::Result<std::collections::HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        self.call(move |c| {
+            let mut st = c.prepare("SELECT 1 FROM jobs WHERE id = ?1 AND job_id IS NOT NULL")?;
+            let mut out = std::collections::HashSet::new();
+            for id in ids {
+                if st.exists([&id])? {
+                    out.insert(id);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Atomically claim a queued job for an agent. Returns false if someone else got it.
     pub async fn claim_job(&self, id: String, agent: String, executor: String) -> anyhow::Result<bool> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let n = tx.execute(
                 "UPDATE jobs SET status = 'running', agent = ?2, executor = ?3, started_at = ?4,
@@ -662,7 +1111,7 @@ impl Store {
         cpu_seconds: Option<f64>,
     ) -> anyhow::Result<(String, Option<Status>)> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             tx.execute(
                 "UPDATE jobs SET status = ?2, finished_at = ?3, exit_code = ?4, error = ?5,
@@ -693,7 +1142,7 @@ impl Store {
     /// Put a running job back in the queue (agent lost) or fail it when out of retries.
     pub async fn requeue_job(&self, id: String, reason: String) -> anyhow::Result<bool> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let (attempt, spec): (u32, String) = tx.query_row(
                 "SELECT attempt, spec FROM jobs WHERE id = ?1",
                 [&id],
@@ -732,7 +1181,7 @@ impl Store {
     /// caller can tell their agents to stop.
     pub async fn cancel_run(&self, run_id: String, reason: String) -> anyhow::Result<Vec<(String, Option<String>)>> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let running: Vec<(String, Option<String>)> = {
                 let mut st = tx.prepare(
@@ -765,7 +1214,7 @@ impl Store {
     /// Re-run a finished run's failed (or all) jobs as a fresh attempt.
     pub async fn retry_run(&self, run_id: String, only_failed: bool) -> anyhow::Result<u32> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let filter = if only_failed {
                 "status IN ('failed','cancelled','timed_out','skipped')"
@@ -798,27 +1247,35 @@ impl Store {
         .await
     }
 
-    /// Runs in the same concurrency group that are still active (for cancel-in-progress).
-    pub async fn active_runs_in_group(&self, group: String, except: String) -> anyhow::Result<Vec<String>> {
+    /// The runs of `group` that run `new` supersedes, as GitHub's concurrency groups have it: with
+    /// `cancel-in-progress`, every older run still active; without it, the older ones waiting, as the
+    /// oldest active goes on and `new` waits for it ([`Store::queued_jobs`]).
+    pub async fn superseded_in_group(&self, group: String, new: String, cancel_in_progress: bool) -> anyhow::Result<Vec<String>> {
         self.call(move |c| {
             let mut st = c.prepare(
                 "SELECT id FROM runs WHERE concurrency_group = ?1 AND id != ?2
-                   AND status IN ('queued','running','pending')",
+                   AND status IN ('queued','running','pending') ORDER BY created_at, rowid",
             )?;
-            Ok(st.query_map(params![group, except], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?)
+            let older = st.query_map(params![group, new], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(older.into_iter().skip(usize::from(!cancel_in_progress)).collect())
         })
         .await
     }
 
-    pub async fn stats(&self) -> anyhow::Result<serde_json::Value> {
-        self.call(|c| {
+    /// The last day's runs and jobs (the overview's), every repository's or `among` these (by name:
+    /// a person of some repositories, W10).
+    pub async fn stats(&self, among: Option<Vec<String>>) -> anyhow::Result<serde_json::Value> {
+        let among = among.map(|names| serde_json::to_string(&names).unwrap_or_default());
+        self.call(move |c| {
             let since = crate::util::now_unix() - 86_400;
-            let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [since], |r| r.get(0)) };
+            // `?2`: the repositories, or NULL for all of them.
+            const RUNS_IN: &str = "(?2 IS NULL OR repo_id IN (SELECT id FROM repos WHERE name IN (SELECT value FROM json_each(?2))))";
+            const JOBS_IN: &str = "(?2 IS NULL OR run_id IN (SELECT r.id FROM runs r JOIN repos p ON p.id = r.repo_id WHERE p.name IN (SELECT value FROM json_each(?2))))";
+            let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(&sql.replace("{RUNS_IN}", RUNS_IN), params![since, among], |r| r.get(0)) };
             let mut by_status = serde_json::Map::new();
             {
-                let mut st =
-                    c.prepare("SELECT status, COUNT(*) FROM jobs WHERE COALESCE(finished_at, queued_at, 0) >= ?1 OR status IN ('queued','running') GROUP BY status")?;
-                let rows = st.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                let mut st = c.prepare(&format!("SELECT status, COUNT(*) FROM jobs WHERE (COALESCE(finished_at, queued_at, 0) >= ?1 OR status IN ('queued','running')) AND {JOBS_IN} GROUP BY status"))?;
+                let rows = st.query_map(params![since, among], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
                 for row in rows {
                     let (s, n) = row?;
                     by_status.insert(s, n.into());
@@ -826,13 +1283,13 @@ impl Store {
             }
             let mut hourly = Vec::new();
             {
-                let mut st = c.prepare(
+                let mut st = c.prepare(&format!(
                     "SELECT (finished_at / 3600) * 3600 AS h,
                             SUM(status = 'succeeded'), SUM(status IN ('failed','timed_out')),
                             AVG(finished_at - started_at)
-                     FROM jobs WHERE finished_at >= ?1 GROUP BY h ORDER BY h",
-                )?;
-                let rows = st.query_map([since], |r| {
+                     FROM jobs WHERE finished_at >= ?1 AND {JOBS_IN} GROUP BY h ORDER BY h"
+                ))?;
+                let rows = st.query_map(params![since, among], |r| {
                     Ok(serde_json::json!({
                         "ts": r.get::<_, i64>(0)?,
                         "succeeded": r.get::<_, Option<i64>>(1)?.unwrap_or(0),
@@ -855,16 +1312,32 @@ impl Store {
                 }
             }
             Ok(serde_json::json!({
-                "runs_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1")?,
-                "runs_failed_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status IN ('failed','timed_out')")?,
-                "runs_succeeded_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status = 'succeeded'")?,
+                "runs_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND {RUNS_IN}")?,
+                "runs_failed_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status IN ('failed','timed_out') AND {RUNS_IN}")?,
+                "runs_succeeded_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status = 'succeeded' AND {RUNS_IN}")?,
                 "median_job_seconds": c.query_row(
-                    "SELECT finished_at - started_at AS d FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL
-                     ORDER BY d LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL)",
-                    [since], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0),
+                    &format!("SELECT finished_at - started_at AS d FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL AND {JOBS_IN}
+                     ORDER BY d LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL AND {JOBS_IN})"),
+                    params![since, among], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0),
                 "jobs_by_status": by_status,
                 "hourly": hourly,
             }))
+        })
+        .await
+    }
+
+    /// How many jobs of these repositories (by name) wait and run: a person of some repositories'
+    /// queue (W10), where the server's counts are everyone's.
+    pub async fn queue_among(&self, names: Vec<String>) -> anyhow::Result<serde_json::Value> {
+        let names = serde_json::to_string(&names)?;
+        self.call(move |c| {
+            let (queued, running): (i64, i64) = c.query_row(
+                "SELECT COALESCE(SUM(j.status = 'queued'), 0), COALESCE(SUM(j.status = 'running'), 0) FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
+                 WHERE j.status IN ('queued', 'running') AND p.name IN (SELECT value FROM json_each(?1))",
+                [&names],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok(serde_json::json!({ "queued": queued, "running": running }))
         })
         .await
     }
@@ -1018,7 +1491,7 @@ impl Store {
     pub async fn prune(&self, days: u32) -> anyhow::Result<Vec<String>> {
         self.call(move |c| {
             let cutoff = crate::util::now_unix() - i64::from(days) * 86_400;
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let ids: Vec<String> = {
                 let mut st = tx.prepare(
                     "SELECT j.id FROM jobs j JOIN runs r ON r.id = j.run_id
@@ -1038,7 +1511,7 @@ impl Store {
 }
 
 const JOB_SELECT: &str = "SELECT id, run_id, key, display, status, labels, needs, agent, executor,
-    attempt, queued_at, started_at, finished_at, exit_code, error, peak_rss, cpu_seconds, spec FROM jobs";
+    attempt, queued_at, started_at, finished_at, exit_code, error, peak_rss, cpu_seconds, spec, matrix FROM jobs";
 
 fn row_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -1082,6 +1555,10 @@ fn row_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         cpu_seconds: r.get(16)?,
         spec: serde_json::from_str(&r.get::<_, String>(17)?).ok(),
         steps: Vec::new(),
+        matrix: r
+            .get::<_, Option<String>>(18)?
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty())),
     })
 }
 
@@ -1108,7 +1585,7 @@ fn steps_of(c: &Connection, job_id: &str) -> rusqlite::Result<Vec<Step>> {
 /// settle the run when every job is terminal.
 const DEP_FAILED: &str = "dependency failed";
 
-fn advance_run(tx: &rusqlite::Transaction<'_>, run_id: &str, now: i64) -> anyhow::Result<Option<Status>> {
+fn advance_run(tx: &Connection, run_id: &str, now: i64) -> anyhow::Result<Option<Status>> {
     loop {
         let jobs: Vec<(String, String, Vec<String>)> = {
             let mut st = tx.prepare("SELECT id, key, status, needs, COALESCE(error, '') FROM jobs WHERE run_id = ?1")?;
@@ -1230,6 +1707,37 @@ mod tests {
         })
     }
 
+    /// The runners a server counts as connected just before it started, so a deploy can check
+    /// they came back: still marked connected, or gone in the last minutes; not a job's pod.
+    #[test]
+    fn runners_connected_before_a_start() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let now = crate::util::now_unix();
+            let runner = |name: &str, connected: bool, last_seen: i64, ephemeral: bool| AgentRow {
+                name: name.into(),
+                labels: vec![],
+                slots: 1,
+                hostname: name.into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                version: "1".into(),
+                ephemeral,
+                connected,
+                last_seen,
+                enrolled_at: 0,
+            };
+            s.upsert_agent(runner("killed-with-its-server", true, now - 86_400, false)).await?;
+            s.upsert_agent(runner("gone-at-its-shutdown", false, now - 30, false)).await?;
+            s.upsert_agent(runner("asleep-for-hours", false, now - 7_200, false)).await?;
+            s.upsert_agent(runner("a-jobs-pod", false, now - 30, true)).await?;
+            anyhow::ensure!(s.runners_before(900).await? == 2);
+            s.recover().await?;
+            anyhow::ensure!(s.runners_before(900).await? == 1, "recovering marks them all gone; read it first");
+            anyhow::Ok(())
+        })
+    }
+
     #[test]
     fn key_values_are_kept_and_listed_by_prefix() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
@@ -1321,5 +1829,152 @@ mod tests {
         assert_eq!(s.queued_jobs(10).await?.len(), 1);
         Ok(())
     })
+    }
+
+    /// A learner's copy holds every table that replicates, row for row with its rowids, and their
+    /// indexes, and none of this node's own (its log search).
+    #[test]
+    fn a_learner_s_copy_is_the_database_but_this_node_s_own_tables() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("kiln.db");
+        let s = Store::open_grouped(&db, &dir.path().join("cluster"))?;
+        let copy = dir.path().join("copy.db");
+        crate::rt::block_on({
+            let (s, copy) = (s.clone(), copy.clone());
+            async move {
+                for i in 0..50 {
+                    s.kv_set(format!("k{i}"), format!("v{i}")).await?;
+                }
+                s.call(|c| {
+                    // A rowid table without an alias keeps its rowids, gaps and all.
+                    c.execute_batch("DELETE FROM kv WHERE k IN ('k3', 'k7')")?;
+                    Ok(())
+                })
+                .await?;
+                s.call_local(|c| Ok(c.execute_batch("INSERT INTO ci_log_indexed (leg, at, bytes) VALUES ('leg', 1, 2); INSERT INTO ci_log_index (text, leg, step, line) VALUES ('a line', 'leg', 0, 0);")?)).await?;
+                s.copy_for_learner(copy).await
+            }
+        })?;
+        let (a, b) = (Connection::open(&db)?, Connection::open(&copy)?);
+        let objects = |c: &Connection, kind: &str| -> anyhow::Result<Vec<String>> {
+            let mut st = c.prepare("SELECT name FROM sqlite_schema WHERE type = ?1 AND tbl_name NOT LIKE 'ci_log_inde%' ORDER BY name")?;
+            Ok(st.query_map([kind], |r| r.get(0))?.collect::<Result<_, _>>()?)
+        };
+        assert_eq!(objects(&a, "table")?, objects(&b, "table")?, "every table that replicates");
+        assert_eq!(objects(&a, "index")?, objects(&b, "index")?, "and their indexes");
+        let dump = |c: &Connection, t: &str| -> anyhow::Result<Vec<String>> {
+            let mut st = c.prepare(&format!("SELECT * FROM \"{t}\""))?;
+            let n = st.column_count();
+            let rows = st.query_map([], |r| Ok((0..n).map(|i| r.get_ref(i).map_or_else(|e| e.to_string(), |v| format!("{v:?}"))).collect::<Vec<_>>().join("|")))?;
+            let mut out: Vec<String> = rows.collect::<Result<_, _>>()?;
+            out.sort();
+            Ok(out)
+        };
+        for t in objects(&a, "table")? {
+            if t != group::STATE && t != group::CONF && t != group::MARK {
+                assert_eq!(dump(&a, &t)?, dump(&b, &t)?, "table {t}");
+            }
+        }
+        let rowids = |c: &Connection| -> anyhow::Result<Vec<(i64, String)>> {
+            let mut st = c.prepare("SELECT rowid, k FROM kv ORDER BY rowid")?;
+            Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?)
+        };
+        assert_eq!(rowids(&a)?, rowids(&b)?, "rows keep their rowids");
+        let local: i64 = b.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE tbl_name LIKE 'ci_log_inde%'", [], |r| r.get(0))?;
+        assert_eq!(local, 0, "this node's log search stays behind");
+        Ok(())
+    }
+
+    /// How long a learner's copy of a large store takes (`KILN_BENCH_DIR`, else the temporary
+    /// folder), with a log search the copy leaves behind: `cargo test -p kiln --lib
+    /// how_long_a_copy_takes -- --ignored --nocapture`, under the server's memory limit.
+    #[test]
+    #[ignore = "a measure, not a check: run by hand"]
+    fn how_long_a_copy_takes() -> anyhow::Result<()> {
+        let base = std::env::var("KILN_BENCH_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+        let dir = base.join(format!("kiln-copy-bench-{}", crate::util::new_id()));
+        let db = dir.join("kiln.db");
+        let rows: i64 = std::env::var("KILN_BENCH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(400_000);
+        {
+            let s = Store::open_grouped(&db, &dir.join("cluster"))?;
+            let c = Connection::open(&db)?;
+            let t = std::time::Instant::now();
+            c.execute_batch(&format!(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {rows})
+                 INSERT INTO kv (k, v) SELECT 'k' || i, hex(randomblob(250)) FROM n;
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {rows})
+                 INSERT INTO ci_log_index (text, leg, step, line) SELECT hex(randomblob(250)), 'leg', 0, i FROM n;"
+            ))?;
+            eprintln!("made {} MB in {:?}", std::fs::metadata(&db)?.len() >> 20, t.elapsed());
+            let copy = dir.join("copy.db");
+            let t = std::time::Instant::now();
+            crate::rt::block_on({
+                let (s, copy) = (s.clone(), copy.clone());
+                async move { s.copy_for_learner(copy).await }
+            })?;
+            eprintln!("copied {} MB of a {} MB store in {:?}", std::fs::metadata(&copy)?.len() >> 20, std::fs::metadata(&db)?.len() >> 20, t.elapsed());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    /// A concurrency group runs one run at a time: a newer run waits for the one under way, and a
+    /// newer one still drops the one waiting (the image pipeline built seven at once without it).
+    #[test]
+    fn a_group_runs_one_at_a_time() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let repo = s
+                .upsert_repo(Repo {
+                    id: "r1".into(),
+                    name: "hyper-light/x".into(),
+                    clone_url: "https://example/x".into(),
+                    branches: vec![],
+                    poll_seconds: 60,
+                    enabled: true,
+                    created_at: 0,
+                    last_polled_at: None,
+                    last_error: None,
+                    mode: "upstream".into(),
+                    default_branch: None,
+                    mirror: None,
+                })
+                .await?;
+            let p = pipeline::parse("name: image\njobs:\n  image: {steps: [{run: x}]}\n")?;
+            let run = |id: &str, at: i64, group: Option<&str>| Run {
+                id: id.into(),
+                repo_id: repo.id.clone(),
+                repo_name: repo.name.clone(),
+                number: 0,
+                pipeline: "image".into(),
+                event: "push".into(),
+                branch: "main".into(),
+                sha: id.into(),
+                message: String::new(),
+                author: String::new(),
+                status: Status::Queued,
+                created_at: at,
+                started_at: None,
+                finished_at: None,
+                error: None,
+                concurrency_group: group.map(str::to_owned),
+            };
+            for (id, at, group) in [("a", 1, Some("x:image")), ("b", 2, Some("x:image")), ("c", 2, Some("x:image")), ("free", 3, None)] {
+                s.create_run(run(id, at, group), pipeline::plan(&p, &pipeline::Context::default())?).await?;
+            }
+            let waiting = |s: Store| async move { anyhow::Ok(s.queued_jobs(10).await?.into_iter().map(|j| j.run_id).collect::<Vec<_>>()) };
+            // The oldest of the group goes, and a run of no group; b and c wait.
+            assert_eq!(waiting(s.clone()).await?, ["a", "free"]);
+            // c, the newest, drops b (waiting) and leaves a (under way), or cancels both.
+            assert_eq!(s.superseded_in_group("x:image".into(), "c".into(), false).await?, ["b"]);
+            assert_eq!(s.superseded_in_group("x:image".into(), "c".into(), true).await?, ["a", "b"]);
+            s.cancel_run("b".into(), "superseded by a newer run".into()).await?;
+            let a = s.jobs("a".into(), false).await?.first().map(|j| j.id.clone()).unwrap_or_default();
+            assert!(s.claim_job(a.clone(), "ag".into(), "baremetal".into()).await?);
+            assert_eq!(waiting(s.clone()).await?, ["free"], "c waits while a runs");
+            s.finish_job(a, Status::Succeeded, Some(0), None, None, None).await?;
+            assert_eq!(waiting(s.clone()).await?, ["c", "free"], "c goes once a is done");
+            Ok(())
+        })
     }
 }

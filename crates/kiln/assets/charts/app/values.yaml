@@ -1,0 +1,131 @@
+# {{kiln.app}}: its chart on kiln's base chart (charts/{{kiln.app}}/charts/kiln-base). Every key
+# below is kiln-base's; each environment's own values (kiln's release repository) are laid over
+# these, and a release fills in `image.tag` or `image.digest` from what it deploys.
+
+image:
+  repository: {{kiln.image}}
+  # The chart's appVersion when empty; a release sets it.
+  tag: ""
+  # Preferred over the tag when set (a release's artifact, by digest).
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+replicaCount: 2
+# The container's port, named `http`: the Service, the Ingress and the probes reach it.
+port: {{kiln.port}}
+command: []
+args: []
+
+# Environment variables: NAME: value (templated), or NAME: {secretKeyRef: …}.
+env: {}
+envFrom: []
+# The app's secrets from kiln, as env (docs/deploy-api.md §3.5): the Secret `<app>-kiln` each
+# release delivers on KilnCD (kiln app secret set <app> NAME --env <env>). Its pods roll when a
+# release delivers new versions.
+kilnSecrets: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+probes:
+  liveness:
+    httpGet:
+      path: /healthz
+      port: http
+  readiness:
+    httpGet:
+      path: /readyz
+      port: http
+  startup: null
+
+podAnnotations: {}
+podLabels: {}
+labels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# Spread its pods across nodes (as far as the scheduler can).
+topologySpread: true
+# How a new version replaces the old. Empty: kiln's default, RollingUpdate with maxUnavailable 0 (no
+# old pod goes before a new one is ready, so a version that can't start costs no capacity).
+strategy: {}
+# How long a rollout may go without a new pod becoming ready before Kubernetes calls it stuck
+# (Degraded): kiln fails the release on it and puts back what ran before (docs/deploy-api.md §8.1).
+progressDeadlineSeconds: 300
+
+service:
+  enabled: true
+  type: ClusterIP
+  port: 80
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # - host: {{kiln.app}}.example.com
+  #   paths: [/]
+  hosts: []
+  tls: []
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  # Target average CPU utilization, %.
+  cpu: 70
+  memory: null
+
+pdb:
+  enabled: true
+  minAvailable: 1
+  maxUnavailable: null
+
+serviceAccount:
+  create: true
+  name: ""
+  # A cloud identity: eks.amazonaws.com/role-arn, iam.gke.io/gcp-service-account, …
+  annotations: {}
+  automount: false
+
+config:
+  # Files mounted at mountPath, by name (templated).
+  files: {}
+  mountPath: /etc/{{kiln.app}}
+  # NAME: value, in a ConfigMap of its own, as env.
+  env: {}
+
+volumes: []
+volumeMounts: []
+# - name: data
+#   size: 1Gi
+#   mountPath: /data
+persistence: []
+
+# name: {schedule: "*/15 * * * *", command: [...], args: [...]}
+cronJobs: {}
+# A migration before each release: migrate: {command: [...], hook: "pre-install,pre-upgrade"}.
+# A release that runs one isn't reverted if it fails (what ran before may not run on what it
+# changed): it's held for a person. `reversible: true` says what ran before runs on it too (expand
+# now, contract in a later release), and a failed release is reverted as any other.
+jobs: {}
+
+networkPolicy:
+  enabled: false
+  # Peers besides its own namespace: [{namespaceSelector: {matchLabels: {…}}}]
+  ingressFrom: []

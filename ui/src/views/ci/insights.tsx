@@ -1,20 +1,21 @@
 /**
  * Insights (docs/ci.md W19-R01, W21-R12): where CI time goes, over a window. The overview holds
  * repositories (their share of runner time against their fair-share weight's) and runners
- * (utilization); a repository, its workflows; a workflow, its durations, success, waiting by
- * reason, jobs, slowest steps, executors and pools, cache and critical path; a runner, its
- * utilization and failures. Each chart carries one measure in one hue (p90 is the darker step of
- * p50's, an ordinal pair validated against the chart surface), with its numbers in a table too.
+ * (utilization); a repository, its workflows and its tests (the most failing, slowest or flaky);
+ * a workflow, its durations, success, waiting by reason, jobs, slowest steps, executors and pools,
+ * cache and critical path; a runner, its utilization and failures. Each chart carries one measure
+ * in one hue (p90 is the darker step of p50's, an ordinal pair validated against the chart
+ * surface), with its numbers in a table too.
  */
 import * as React from "react";
-import { ci, type CiRunnerInsight } from "@/api/ci";
+import { ci, type CiMetricTrend, type CiRunnerInsight, type CiTestSort } from "@/api/ci";
 import { Chart } from "@/components/charts/chart";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Facts, Meter, Panel, Sparkline } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { Tip } from "@/components/ui/tooltip";
-import { formatBytes, formatDuration, formatNumber } from "@/lib/format";
+import { formatBytes, formatDuration, formatNumber, relativeTime, shortSha } from "@/lib/format";
 import { Link, useSearchParams } from "@/lib/router";
 import { useSuspenseResource } from "@/lib/resource";
 
@@ -64,18 +65,21 @@ export default function Insights() {
   const [search, setSearch] = useSearchParams();
   const repo = search.get("repo") ?? "";
   const workflow = search.get("workflow") ?? "";
+  const metric = search.get("metric") ?? "";
   const runner = search.get("runner") ?? "";
   const win = (WINDOWS.find((w) => w.value === search.get("days"))?.value ?? "30") as Window;
   const days = Number(win);
-  const setWindow = (w: Window) => setSearch(Object.fromEntries(Object.entries({ repo, workflow, runner, days: w }).filter(([k, v]) => v !== "" && !(k === "days" && v === "30"))), { replace: true });
+  const setWindow = (w: Window) =>
+    setSearch(Object.fromEntries(Object.entries({ repo, workflow, metric, runner, days: w }).filter(([k, v]) => v !== "" && !(k === "days" && v === "30"))), { replace: true });
   const crumbs: { label: React.ReactNode; to?: string }[] = [
     { label: "Runs", to: "/runs" },
     { label: "Insights", to: insightsTo({ days: win }) },
   ];
-  if (repo) crumbs.push({ label: repo, to: workflow ? insightsTo({ repo, days: win }) : undefined });
+  if (repo) crumbs.push({ label: repo, to: workflow || metric ? insightsTo({ repo, days: win }) : undefined });
   if (repo && workflow) crumbs.push({ label: workflow.split("/").pop() ?? workflow });
+  else if (repo && metric) crumbs.push({ label: metric });
   if (runner) crumbs.push({ label: runner });
-  const title = runner || (workflow ? (workflow.split("/").pop() ?? workflow) : repo) || "Insights";
+  const title = runner || (workflow ? (workflow.split("/").pop() ?? workflow) : metric || repo) || "Insights";
   return (
     <div className="container-console page">
       <title>{`${title === "Insights" ? "" : `${title} · `}Insights · kiln`}</title>
@@ -86,9 +90,11 @@ export default function Insights() {
           ? "How busy this runner was, and how its legs ended."
           : workflow
             ? "How long this workflow takes, how often it passes, and where its time goes."
-            : repo
-              ? "This repository's workflows, and its share of runner time."
-              : "Where CI time goes: repositories and runners, rolled up by the hour."}
+            : repo && metric
+              ? "This benchmark on the default branch, on each kind of runner that ran it: a run is compared only with runs on its own kind."
+              : repo
+                ? "This repository's workflows, tests and benchmarks, and its share of runner time."
+                : "Where CI time goes: repositories and runners, rolled up by the hour."}
       </p>
       <div className="mt-6">
         <Segmented label="Window" value={win} onChange={setWindow} options={WINDOWS} />
@@ -98,6 +104,8 @@ export default function Insights() {
           <RunnerInsights runner={runner} days={days} />
         ) : repo && workflow ? (
           <WorkflowInsights repo={repo} workflow={workflow} days={days} />
+        ) : repo && metric ? (
+          <MetricInsights repo={repo} metric={metric} days={days} />
         ) : repo ? (
           <RepoInsights repo={repo} days={days} />
         ) : (
@@ -218,6 +226,78 @@ function classes(f: Record<string, number>) {
   return list.length ? list.map(([k, n]) => `${k} ${n}`).join(" · ") : "—";
 }
 
+const SORTS: { value: CiTestSort; label: string }[] = [
+  { value: "failing", label: "Most failing" },
+  { value: "slowest", label: "Slowest" },
+  { value: "flaky", label: "Flaky" },
+];
+
+/** A test's time, short, as the run page's Tests panel has it. */
+function testTime(ms: number | null): string {
+  if (ms == null) return "—";
+  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)} s`;
+}
+
+/** The repository's tests (W16-R03): the most failing, the slowest, or the flaky, on its default
+ * branch over the window. */
+function RepoTests({ repo, days }: { repo: string; days: number }) {
+  const [sort, setSort] = React.useState<CiTestSort>("failing");
+  return (
+    <Panel
+      title="Tests"
+      description="On the default branch: each test's runs and failures, how long it takes, and whether it's flaky."
+      actions={<Segmented label="Tests by" value={sort} onChange={setSort} options={SORTS} />}
+    >
+      <Loadable label="tests" fallback={<Hold height={240} />}>
+        <TestsTable repo={repo} days={days} sort={sort} />
+      </Loadable>
+    </Panel>
+  );
+}
+
+function TestsTable({ repo, days, sort }: { repo: string; days: number; sort: CiTestSort }) {
+  const d = useSuspenseResource(`insights/tests/${repo}/${days}/${sort}`, (s) => ci.repoTests(repo, sort, days, s)).data;
+  if (d.tests.length === 0) return <EmptyState title={sort === "flaky" ? "No flaky tests in this window." : "No test results in this window."} />;
+  return (
+    <div className="table-wrap">
+      <table className="data-table">
+        <thead>
+          <tr>
+            <th>Test</th>
+            <th className="num">Runs</th>
+            <th className="num">Failed</th>
+            <th className="num hidden sm:table-cell">p50</th>
+            <th className="num hidden sm:table-cell">p90</th>
+          </tr>
+        </thead>
+        <tbody>
+          {d.tests.map((t) => (
+            <tr key={t.id}>
+              <td className="max-w-[460px]">
+                <div className="[overflow-wrap:anywhere]">
+                  {t.suite ? <span className="text-[#7b7e88]">{t.suite} </span> : null}
+                  {t.name}
+                  {t.flaky && (
+                    <span className="ml-2 font-mono text-[10px] tracking-[0.06em] whitespace-nowrap text-[#c9a86a] uppercase" title={t.flaky.why}>
+                      {t.flaky.class === "flaky" ? "flaky" : "probably flaky"}
+                    </span>
+                  )}
+                </div>
+                {t.file && <div className="cell-mono truncate text-[11px] text-[#7b7e88]">{t.file}</div>}
+                {sort === "flaky" && t.flaky && <div className="mt-0.5 text-[11.5px] text-[#8c8f98]">{t.flaky.why}</div>}
+              </td>
+              <td className="num cell-mono">{formatNumber(t.runs)}</td>
+              <td className="num cell-mono">{t.failures > 0 ? `${formatNumber(t.failures)} · ${pct(t.failures / t.runs)}` : "—"}</td>
+              <td className="num cell-mono hidden sm:table-cell">{testTime(t.p50_ms)}</td>
+              <td className="num cell-mono hidden sm:table-cell">{testTime(t.p90_ms)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function RepoInsights({ repo, days }: { repo: string; days: number }) {
   const d = useSuspenseResource(`insights/repo/${repo}/${days}`, (s) => ci.insightsRepo(repo, days, s)).data;
   const win = String(days);
@@ -278,7 +358,162 @@ function RepoInsights({ repo, days }: { repo: string; days: number }) {
           </div>
         )}
       </Panel>
+      <RepoTests repo={repo} days={days} />
+      {/* Last on the page, so nothing moves when it arrives; a repository without benchmarks shows none. */}
+      <Loadable label="benchmarks" fallback={<></>}>
+        <RepoMetrics repo={repo} days={days} />
+      </Loadable>
     </div>
+  );
+}
+
+/** The benchmarks the repository's default branch recorded over the window (W16-R07), each
+ * opening its trend. */
+function RepoMetrics({ repo, days }: { repo: string; days: number }) {
+  const metrics = useSuspenseResource(`insights/metrics/${repo}/${days}`, (s) => ci.repoMetrics(repo, days, s)).data.data.metrics;
+  if (metrics.length === 0) return null;
+  return (
+    <Panel title="Benchmarks" description="The metrics its default branch's runs recorded. Each opens its trend on each kind of runner.">
+      <div className="table-wrap">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th className="num">Points</th>
+              <th className="hidden sm:table-cell">Better</th>
+              <th className="num">Last recorded</th>
+            </tr>
+          </thead>
+          <tbody>
+            {metrics.map((m) => (
+              <tr key={m.name}>
+                <td className="max-w-[420px]">
+                  <Link to={insightsTo({ repo, metric: m.name, days: String(days) })} className="text-link font-mono text-[12px] [overflow-wrap:anywhere]">
+                    {m.name}
+                  </Link>
+                  {m.unit && <span className="ml-2 font-mono text-[11px] text-[#7b7e88]">{m.unit}</span>}
+                </td>
+                <td className="num cell-mono">{formatNumber(m.points)}</td>
+                <td className="cell-mono hidden sm:table-cell">{m.better === "higher" ? "Higher" : "Lower"}</td>
+                <td className="num cell-mono">{relativeTime(m.last)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
+  );
+}
+
+/** Seconds per time unit a metric may be recorded in. */
+const TIME_UNITS: Record<string, number> = { s: 1, ms: 1e-3, us: 1e-6, µs: 1e-6, ns: 1e-9 };
+
+/** How one chart's values read: a time in the one unit that suits its largest value (criterion's
+ * nanoseconds as µs or ms), anything else in its own unit; compact past 10,000. */
+function metricFormat(unit: string, max: number): (v: number) => string {
+  const per = TIME_UNITS[unit];
+  let shown = unit;
+  let factor = 1;
+  if (per !== undefined) {
+    const s = Math.abs(max) * per;
+    shown = s >= 1 ? "s" : s >= 1e-3 ? "ms" : s >= 1e-6 ? "µs" : "ns";
+    factor = per / (TIME_UNITS[shown] ?? 1);
+  }
+  return (v) => {
+    const n = v * factor;
+    const a = Math.abs(n);
+    const text = new Intl.NumberFormat(undefined, a >= 10_000 ? { notation: "compact", maximumFractionDigits: 1 } : { maximumFractionDigits: a >= 100 ? 0 : a >= 1 ? 2 : 3 }).format(n);
+    return shown ? `${text} ${shown}` : text;
+  };
+}
+
+/** A point's date and time, for the chart's reading and its table. */
+const when = (ts: number) => new Date(ts * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+
+/** A benchmark's values on the default branch over the window (W16-AC05): one chart per kind of
+ * runner (its fingerprint), the latest first, since a run is compared only with its own kind's. */
+function MetricInsights({ repo, metric, days }: { repo: string; metric: string; days: number }) {
+  const d = useSuspenseResource(`insights/metric/${repo}/${metric}/${days}`, (s) => ci.repoMetric(repo, metric, days, s)).data.data;
+  const latest = (s: CiMetricTrend["series"][number]) => s.points[s.points.length - 1]?.ts ?? 0;
+  const series = [...d.series].filter((s) => s.points.length > 0).sort((a, b) => latest(b) - latest(a));
+  if (series.length === 0) {
+    return (
+      <div className="mt-8">
+        <EmptyState title="No values of this metric in this window." />
+      </div>
+    );
+  }
+  const points = series.reduce((n, s) => n + s.points.length, 0);
+  return (
+    <div className="mt-6 grid gap-6">
+      <Facts
+        items={[
+          { label: "Better", value: d.better === "higher" ? "Higher" : "Lower" },
+          { label: "Kinds of runner", value: formatNumber(series.length) },
+          { label: "Points", value: formatNumber(points) },
+          { label: "Last recorded", value: relativeTime(Math.max(...series.map(latest))) },
+        ]}
+      />
+      <div className={series.length > 1 ? "grid gap-6 lg:grid-cols-2" : "grid gap-6"}>
+        {series.map((s) => (
+          <FingerprintTrend key={s.fingerprint} metric={metric} series={s} days={days} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** One kind of runner's values of a metric, as a line over time and as a table. */
+function FingerprintTrend({ metric, series, days }: { metric: string; series: CiMetricTrend["series"][number]; days: number }) {
+  const unit = series.points[series.points.length - 1]?.unit ?? "";
+  const fmt = metricFormat(unit, Math.max(...series.points.map((p) => Math.abs(p.value))));
+  const last = series.points[series.points.length - 1];
+  // The chart spans the whole window, as the others do: empty ends, then each point where it fell.
+  const ts = series.points.map((p) => p.ts);
+  const now = Date.now() / 1000;
+  const xs = [Math.min(now - days * 86400, ...ts), ...ts, Math.max(now, ...ts)];
+  return (
+    <Panel
+      eyebrow={`${formatNumber(series.points.length)} point${series.points.length === 1 ? "" : "s"}${last ? ` · latest ${fmt(last.value)}` : ""}`}
+      title={<span className="font-mono text-[13px] [overflow-wrap:anywhere]">{series.fingerprint}</span>}
+    >
+      <Chart
+        data={[xs, [null, ...series.points.map((p) => p.value), null]]}
+        series={[{ label: "Value", color: MEASURE, width: 2, points: true }]}
+        height={180}
+        timeFormat="day"
+        xValue={when}
+        yFormat={fmt}
+        ariaLabel={`${metric} over time on ${series.fingerprint}`}
+      />
+      <details className="mt-3">
+        <summary className="cursor-pointer font-mono text-[11px] text-[#9499a5]">As a table</summary>
+        <div className="table-wrap mt-2">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Commit</th>
+                <th className="num">Value</th>
+              </tr>
+            </thead>
+            <tbody>
+              {series.points.map((p, i) => (
+                <tr key={`${p.run}\u0000${i}`}>
+                  <td className="cell-mono">{when(p.ts)}</td>
+                  <td className="cell-mono">
+                    <Link to={`/runs/${encodeURIComponent(p.run)}`} className="text-link">
+                      {shortSha(p.sha)}
+                    </Link>
+                  </td>
+                  <td className="num cell-mono">{fmt(p.value)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </Panel>
   );
 }
 

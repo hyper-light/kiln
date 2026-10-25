@@ -22,12 +22,15 @@ use crate::rt::{Interval, Shutdown};
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
-use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_LOGS, LANE_OBSERVE, LANE_REACH, LANE_SYNC, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_FILES, LANE_LOGS, LANE_OBSERVE, LANE_PORTS, LANE_REACH, LANE_STREAM, LANE_SYNC, LANE_TERM, ServerMsg};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
 /// Bytes of output/results held while disconnected before the oldest log chunks are shed.
 const UPLINK_BUFFER: usize = 128 << 20;
+/// How long a job's result is kept for a server that never says it has it: well past the grace a
+/// runner gets to reconnect, after which the server has given its legs up.
+const UNRECEIVED_FOR: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone)]
 pub struct Opts {
@@ -227,6 +230,8 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Running {
     cancel: Shutdown,
+    /// It runs in a pool's executor, not in one of this runner's slots (docs/ci.md W13-R09).
+    pooled: bool,
 }
 
 /// How long a cancelled job has to end before the runner reports it over and lets it go.
@@ -247,11 +252,15 @@ enum Ev {
     /// The front door's status changed.
     FrontDoor,
     /// A blue/green upgrade step done off the loop (`crate::bluegreen`).
+    #[cfg(unix)]
     Bg(Bg),
     /// A server frame about something another runner process of this machine handed over (or a
     /// rollback took back), handled as if the server had sent it here.
-    #[cfg_attr(not(unix), allow(dead_code))]
     Forwarded(Vec<u8>),
+    /// A test build's fault: the connection drops (W22-AC04).
+    ChaosDrop,
+    /// A test build's fault: a frame held back, due now (W22-AC04).
+    Delayed(crate::runner::chaos::Due),
 }
 
 /// Blue/green upgrade steps (`crate::bluegreen`) done off the event loop, back to it (none on
@@ -285,6 +294,9 @@ enum Bg {
     /// A server frame for [`Ev::Forwarded`].
     #[cfg(unix)]
     Forwarded(Vec<u8>),
+    /// A server frame to take again ([`Ev::Forwarded`]): a terminal into a leg this runner holds,
+    /// asked for (by its session) before the leg had its shell.
+    Again(String, Vec<u8>),
 }
 
 /// What the new build said of one thing handed to it (blue/green).
@@ -359,29 +371,12 @@ impl Item {
 /// new build that it holds what was handed over.
 #[cfg(unix)]
 const RETIRE_QUIET: Duration = Duration::from_secs(8);
+/// How long a terminal into a leg this runner holds waits for the leg's shell (its workspace and
+/// environment set up, its images pulled) before it's refused.
+const LEG_SHELL_WAIT: Duration = Duration::from_secs(60);
 
-/// This runner's arguments with `--instance` set to `id` (the new build runs as its own instance).
 #[cfg(unix)]
-fn with_instance(args: &[String], id: &str) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len() + 2);
-    let mut skip = false;
-    for a in args {
-        if std::mem::take(&mut skip) {
-            continue;
-        }
-        if a == "--instance" {
-            skip = true;
-            continue;
-        }
-        if a.starts_with("--instance=") {
-            continue;
-        }
-        out.push(a.clone());
-    }
-    out.push("--instance".to_owned());
-    out.push(id.to_owned());
-    out
-}
+use crate::upgrade::with_instance;
 
 /// This side's copies of a handed-over harness process's pipes, kept (not inherited by anything
 /// this runner starts) until the new build has them; `None` when one isn't open.
@@ -439,17 +434,225 @@ async fn announce(sessions: Vec<proto::TermInfo>, harness: Option<&Arc<crate::ha
     }
 }
 
+/// Start this machine's replica of kiln's records with the server's newest word to join (`join`),
+/// trying again until it starts: the process before this one may hold the replica's files a
+/// while yet (an old build keeps them until its last job ends and it retires, minutes later). It
+/// stops once the server takes the replica away (`join` emptied by a Leave) or this runner is
+/// going (`going`). `wait`: how long before each try again ([`replica_wait`]).
+async fn start_replica<S, F, Fut>(join: &parking_lot::Mutex<Option<(u64, String)>>, going: impl Fn() -> bool, start: F, wait: fn(u32) -> Duration) -> anyhow::Result<(S, u64)>
+where
+    F: Fn(u64, String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<S>>,
+{
+    let mut tries = 0u32;
+    loop {
+        let Some((member, token)) = join.lock().clone() else {
+            anyhow::bail!("the server no longer asks this machine for a replica");
+        };
+        let e = match start(member, token).await {
+            Ok(s) => return Ok((s, member)),
+            Err(e) => e,
+        };
+        tries += 1;
+        if going() {
+            return Err(e);
+        }
+        if tries == REPLICA_PATIENCE {
+            tracing::warn!(error = %format!("{e:#}"), tries, "this machine's replica of kiln's records hasn't started yet; it's tried again every minute until it does");
+        } else {
+            tracing::debug!(error = %format!("{e:#}"), tries, "this machine's replica of kiln's records didn't start yet");
+        }
+        crate::rt::sleep(wait(tries)).await;
+    }
+}
+
+/// The tries a replica gets 15 s apart, before it's tried each minute instead (and said so).
+const REPLICA_PATIENCE: u32 = 5;
+
+/// How long a replica that didn't start waits before it's tried again, after `tries`.
+fn replica_wait(tries: u32) -> Duration {
+    Duration::from_secs(if tries < REPLICA_PATIENCE { 15 } else { 60 })
+}
+
+/// How often a runner checks that its replica follows the server, and how many checks running it
+/// may stay behind the server's last write before it's started again.
+const REPLICA_CHECK: Duration = Duration::from_secs(60);
+const REPLICA_BEHIND: u32 = 5;
+
+/// This machine's replica of kiln's records (docs/p2p.md, P2): where it's kept once started, and
+/// what starting it takes.
+#[derive(Clone)]
+struct ReplicaStart {
+    slot: Arc<parking_lot::Mutex<Option<Arc<crate::store::learner::Learner>>>>,
+    starting: Arc<std::sync::atomic::AtomicBool>,
+    /// The server's last word to join the group as a learner (`None` once it said Leave).
+    join: Arc<parking_lot::Mutex<Option<(u64, String)>>>,
+    up: async_channel::Sender<Up>,
+    dir: PathBuf,
+    me: String,
+    server: String,
+    http: Arc<Client>,
+}
+
+impl ReplicaStart {
+    /// Starts the replica with the server's newest word to join, unless one is starting already:
+    /// on a task of its own (fetching a first copy takes a while).
+    fn start(&self) {
+        use crate::store::learner::Learner;
+        if self.starting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let r = self.clone();
+        crate::rt::spawn(async move {
+            let going = r.up.clone();
+            let (dir, me, server, http) = (r.dir.clone(), r.me.clone(), r.server.clone(), r.http.clone());
+            let started = start_replica(
+                &r.join,
+                move || going.is_closed(),
+                move |member, token| {
+                    let (dir, me, server, http) = (dir.clone(), me.clone(), server.clone(), http.clone());
+                    async move {
+                        // A thread of its own: fetching a copy takes minutes on a large store, and the
+                        // blocking pool is the runtime's.
+                        let (tx, rx) = async_channel::bounded(1);
+                        std::thread::Builder::new()
+                            .name("kiln-learner".into())
+                            .spawn(move || {
+                                let _ = tx.send_blocking(Learner::start(&dir, &me, member, http, &server, &token));
+                            })
+                            .map_err(|e| anyhow::anyhow!("starting the learner's thread: {e}"))?;
+                        rx.recv().await.map_err(|_| anyhow::anyhow!("the learner's thread ended"))?
+                    }
+                },
+                replica_wait,
+            )
+            .await;
+            match started {
+                Ok(((learner, said), member)) => {
+                    tracing::info!(member, "this machine holds a replica of kiln's records");
+                    let learner = Arc::new(learner);
+                    crate::store::learner::set_global(Some(Arc::clone(&learner)));
+                    *r.slot.lock() = Some(learner);
+                    let up = r.up.clone();
+                    crate::rt::spawn(async move {
+                        while let Ok(m) = said.recv().await {
+                            if up.send(Up::Sync(m)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "this machine's replica of kiln's records didn't start"),
+            }
+            r.starting.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    /// Keeps the replica following the server: one whose group stopped, or that stays behind the
+    /// server's last write for [`REPLICA_BEHIND`] checks running, is stopped and started again with
+    /// the newest word to join. Nothing else would start it again, and its front door would leave
+    /// every read to the server for good (adacachy's, on 2026-10-25, applied nothing for hours after
+    /// the server restarted).
+    async fn watch(self) {
+        let mut behind = 0u32;
+        loop {
+            crate::rt::sleep(REPLICA_CHECK).await;
+            if self.up.is_closed() {
+                return;
+            }
+            let Some(learner) = self.slot.lock().clone() else {
+                behind = 0;
+                continue;
+            };
+            let why = if let Some(why) = learner.stopped() {
+                format!("its cluster group stopped: {why}")
+            } else if learner.current(Duration::from_secs(30)).await {
+                behind = 0;
+                continue;
+            } else {
+                behind += 1;
+                if behind < REPLICA_BEHIND {
+                    continue;
+                }
+                format!("it stayed behind the server's last write for {behind} checks running")
+            };
+            behind = 0;
+            let (seq, applied) = learner.standing();
+            drop(learner);
+            tracing::warn!(seq, applied, "this machine's replica of kiln's records stopped following the server and starts again: {why}");
+            // Taken away as at a Leave (its files let go, waiting for its thread), then started.
+            let old = self.slot.lock().take();
+            if let Some(old) = old {
+                crate::store::learner::set_global(None);
+                let _ = crate::rt::blocking(move || drop(old)).await;
+            }
+            self.start();
+        }
+    }
+}
+
+#[cfg(test)]
+mod replica_tests {
+    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+
+    /// A replica whose files another process holds is tried again until it starts, with the
+    /// server's newest word to join; it stops once the server takes the replica away, or the
+    /// runner goes. On adacachy on 2026-10-25 the old build held them for nine minutes, and five
+    /// tries gave up after four.
+    #[test]
+    fn a_replica_is_tried_again_until_it_starts() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let no_wait: fn(u32) -> std::time::Duration = |_| std::time::Duration::ZERO;
+            let join = parking_lot::Mutex::new(Some((7u64, "first".to_owned())));
+            let tries = AtomicU32::new(0);
+            let (got, member) = super::start_replica(
+                &join,
+                || false,
+                |_, token| {
+                    let n = tries.fetch_add(1, SeqCst) + 1;
+                    if n == 3 {
+                        *join.lock() = Some((8, "renewed".into()));
+                    }
+                    async move { if n < 9 { Err(anyhow::anyhow!("another process still has kiln.db open")) } else { Ok(token) } }
+                },
+                no_wait,
+            )
+            .await?;
+            anyhow::ensure!(got == "renewed" && member == 8 && tries.load(SeqCst) == 9, "{got} {member} after {} tries", tries.load(SeqCst));
+            // Taken away while it's tried: it stops.
+            let r = super::start_replica(&join, || false, |_, _| {
+                *join.lock() = None;
+                async { Err::<String, _>(anyhow::anyhow!("held")) }
+            }, no_wait)
+            .await;
+            anyhow::ensure!(r.as_ref().is_err_and(|e| e.to_string().contains("no longer asks")), "{:?}", r.err());
+            // The runner going: it stops.
+            *join.lock() = Some((7, "t".into()));
+            let n = AtomicU32::new(0);
+            let r = super::start_replica(&join, || n.load(SeqCst) >= 2, |_, _| {
+                n.fetch_add(1, SeqCst);
+                async { Err::<String, _>(anyhow::anyhow!("held")) }
+            }, no_wait)
+            .await;
+            anyhow::ensure!(r.is_err() && n.load(SeqCst) == 2, "{} tries", n.load(SeqCst));
+            anyhow::ensure!(super::replica_wait(1).as_secs() == 15 && super::replica_wait(super::REPLICA_PATIENCE).as_secs() == 60);
+            Ok(())
+        })
+    }
+}
+
 /// Serve the machine's local sockets (`kiln run`, `kiln spawn`) from this runner process: the new
 /// build once it has taken over, or the old one again after a rollback (the paths are the same).
 #[cfg(unix)]
 fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, state_dir: &std::path::Path) {
+    crate::browser::set_home(state_dir);
     if let Some(r) = reach
-        && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(name, state_dir))
+        && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(name, state_dir), true)
     {
         tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine");
     }
     if let Some(h) = harness
-        && let Err(e) = crate::harness::socket::serve(h, crate::harness::socket::path(name, state_dir))
+        && let Err(e) = crate::harness::socket::serve(h, crate::harness::socket::path(name, state_dir), true)
     {
         tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
     }
@@ -657,6 +860,14 @@ async fn front_door_changed(fd: Option<&crate::frontdoor::runner::Handle>) {
     }
 }
 
+/// The next of `rx`, or never when there's none.
+async fn recv_opt<T>(rx: Option<&async_channel::Receiver<T>>) -> Option<T> {
+    match rx {
+        Some(r) => r.recv().await.ok(),
+        None => futures::future::pending().await,
+    }
+}
+
 async fn sleep_until_opt(t: Option<Instant>) {
     match t {
         Some(t) => crate::rt::sleep_until(t).await,
@@ -666,13 +877,7 @@ async fn sleep_until_opt(t: Option<Instant>) {
 
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
-    // What it says of its build on connecting, worked out from the start on a thread of its own:
-    // hashing its binary takes a while (a debug build's is over a gigabyte), and so can the
-    // container engine's answer.
-    if !o.ephemeral {
-        let outpost = o.outpost;
-        std::thread::spawn(move || if outpost { crate::updates::outpost_build() } else { crate::updates::runner_build() });
-    }
+    crate::updates::warm_own_binary().await;
     // A Mac set up for kiln signing: launchd's re-sign watcher as this kiln writes it.
     if cfg!(target_os = "macos") && !o.ephemeral {
         std::thread::spawn(crate::os::macsign::keep_watching);
@@ -681,6 +886,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let orphans = crate::exec::reap_orphans(&o.work_dir);
     if orphans > 0 {
         tracing::warn!(orphans, "killed job processes left over from a previous agent run");
+    }
+    if let Some(max) = o.declared.cache_max.as_deref().filter(|m| crate::runner::cache::parse_size(m).is_none()) {
+        tracing::warn!(cache_max = max, "[agent] cache_max isn't a size (`20G`, `512M`): kiln/cache keeps up to 10G");
     }
     let (ca, leaf, enrolled_quic) = credentials(&o, &shutdown).await?;
     // This process's own files (a runner beside another one of the machine shares the state
@@ -714,6 +922,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("server QUIC address unknown (pass --quic)"))?;
     // HTTP(S) to the server (source archives, artifacts): public roots plus kiln's own CA.
     let http = Arc::new(Client::new(Roots::WebPkiPlusDer(ca.clone()), None)?);
+    // A microVM's leg reaches the server as this runner does, so it trusts the same CA (W13-R05).
+    #[cfg(target_os = "linux")]
+    let microvm_ca = ca.clone();
     // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
     // from the settings it stored at once, and keeps running while the server is away.
     let front_door = (!o.ephemeral && !o.outpost).then(|| {
@@ -725,6 +936,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // What the server last heard of it on this connection.
     let mut front_door_sent: Option<String> = None;
     let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
+    // A test build's fault: frames lost below the channel, which it makes up for.
+    if let Some(rule) = crate::runner::chaos::get().and_then(|c| c.shed) {
+        net.command(net::Out::Shed(rule)).await;
+    }
     // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
     let mut paths = if o.ephemeral {
         crate::tunnel::Paths::new(&o.server_url, &quic_addr)
@@ -736,6 +951,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Repo sync: the copies of synced repos this machine holds (none in a job pod or an outpost).
     let sync = (!o.ephemeral && !o.outpost).then(|| {
         let (sync, said) = crate::sync::runner::Runner::start(&o.state_dir, &name, http.clone(), o.server_url.clone());
+        // An agent session moving between machines asks it where its folder stands.
+        crate::sync::runner::set_global(sync.clone());
         let up = up_tx.clone();
         crate::rt::spawn(async move {
             while let Ok(m) = said.recv().await {
@@ -793,6 +1010,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         });
         obs
     });
+    // The cluster group's learner: this machine's replica of kiln's records (docs/p2p.md, P2),
+    // started once the server says which member it is (never in a job pod or an outpost).
+    let cluster: Arc<parking_lot::Mutex<Option<Arc<crate::store::learner::Learner>>>> = Arc::default();
+    let cluster_starting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The server's last word to join the group as a learner (`None` once it said Leave): what a
+    // replica being started goes on with.
+    let cluster_join: Arc<parking_lot::Mutex<Option<(u64, String)>>> = Arc::default();
     // Reach: links to other runners, and the runs this machine does for them (none in a job pod).
     // Agent sessions other runners hand this one (a session moving here) are taken over by its
     // session host, once there is one (below).
@@ -812,10 +1036,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             });
             let path = crate::reach::local::path(&name, &o.state_dir);
+            crate::browser::set_home(&o.state_dir);
             if take_over_pending.is_some() {
                 crate::reach::local::set_socket(path.to_string_lossy().into_owned());
             } else {
-                match crate::reach::local::serve(handle.clone(), name.clone(), path) {
+                match crate::reach::local::serve(handle.clone(), name.clone(), path, false) {
                     Ok(p) => crate::reach::local::set_socket(p.to_string_lossy().into_owned()),
                     Err(e) => tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine"),
                 }
@@ -828,6 +1053,21 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
     });
     let uplink = Uplink(up_tx);
+    let replica = ReplicaStart {
+        slot: cluster.clone(),
+        starting: cluster_starting.clone(),
+        join: cluster_join.clone(),
+        up: uplink.0.clone(),
+        dir: o.state_dir.clone(),
+        me: name.clone(),
+        server: o.server_url.clone(),
+        http: http.clone(),
+    };
+    if !o.ephemeral && !o.outpost {
+        crate::rt::spawn(replica.clone().watch());
+    }
+    // Agent sessions handed to this machine's newer runner process go by way of the server.
+    crate::harness::handing::install(uplink.0.clone());
     // Its facts, probed again every 10 minutes (docs/ci.md W13-R01); once on each connection.
     let probing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if !o.ephemeral && !o.outpost {
@@ -841,16 +1081,49 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let (done_tx, done_rx) = async_channel::unbounded::<JobResult>();
     let mut buffer: VecDeque<(u32, Kind, Vec<u8>)> = VecDeque::new();
     let mut buffered = 0usize;
+    // Jobs' results the server hasn't said it has (`ServerMsg::Received`), each encoded, by job:
+    // sent again after a reconnect, so one sent as the connection dropped isn't lost.
+    let mut unreceived: HashMap<String, (Instant, Vec<u8>)> = HashMap::new();
+    // Each job's events (`AgentMsg::JobEvent`, numbered by their `seq`), encoded, until its result
+    // is received, by job: sent again after a reconnect too, to a server that takes each once (it
+    // said so: `receipts`). The count goes on after (a kept leg's step rerun, W17-R04).
+    let mut journal: HashMap<String, (Instant, u64, Vec<Vec<u8>>)> = HashMap::new();
+    let mut receipts = false;
     let mut connected = false;
+    // The server has taken this connection's Hello (it said Welcome). Logs, on a lane of their own,
+    // wait for that, or the server, not knowing whose they are yet, drops them; and jobs' messages
+    // with them, to come after what was held.
+    let mut welcomed = false;
     let mut dial_backoff = Duration::from_millis(500);
     let mut redial: Option<Instant> = Some(Instant::now());
     let mut dialing_since: Option<Instant> = None;
+    // A test build's faults (W22-AC04): the connection dropped every so often, and what's sent the
+    // server late.
+    let chaos = crate::runner::chaos::get();
+    let mut chaos_drop: Option<Instant> = None;
+    // A test build's link cut for a while: no dialing again before this.
+    let mut chaos_down: Option<Instant> = None;
+    let (delay_line, delayed) = match chaos.and_then(|c| c.delay).map(crate::runner::chaos::DelayLine::new) {
+        Some((line, due)) => (Some(line), Some(due)),
+        None => (None, None),
+    };
     let mut jobs: HashMap<String, Running> = HashMap::new();
+    // Pools' executors this runner started (docs/ci.md W13-R09).
+    let pool_execs = crate::runner::pool::Executors::default();
+    crate::runner::pool::sweep(&o.work_dir);
+    // And the containers and networks this runner left running when it last stopped.
+    crate::runner::docker::sweep(&o.work_dir).await;
+    // Its microVM deployments (W15-R02), booted again: they end with the runner.
+    #[cfg(target_os = "linux")]
+    crate::rt::spawn(crate::runner::firecracker::restore(o.work_dir.join("_firecracker")));
     let mut exclusive = false;
     let mut draining = false;
     // Terminals outlive the server connection: kept (with their replay state) across disconnects and
     // announced again on every reconnect.
     let mut terms: HashMap<String, (PtySession, Arc<crate::termsess::Session>)> = HashMap::new();
+    // Terminals into legs asked for before the leg had its shell, by session: taken again once it
+    // has, with what was typed meanwhile.
+    let mut shell_waits: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
     let (term_tx, term_rx) = async_channel::bounded::<(String, PtyOut)>(1024);
     // Upgrades: a new binary on disk is taken up once no job runs, every terminal handed on so
     // shells survive. On Linux this process re-executes itself (same pid). On macOS, where a
@@ -877,6 +1150,28 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // in-process agent: the server hosts those itself). They outlive the server connection and
     // this process's restarts: each continues its harness session.
     let (harness_tx, harness_rx) = async_channel::bounded::<(String, crate::harness::core::Update)>(8192);
+    // Their updates over the channel, once the server says it keeps it (docs/wire.md): kept until
+    // the server has them, and sent again after a reconnect from where it has them, never whole.
+    let mut updates = crate::wire::uplink::Updates::new(format!("{:016x}", rand::random::<u64>()));
+    // The server keeps the channel: it said so on this connection, before its Welcome.
+    let mut server_wire = false;
+    // The server takes what this runner's QUIC layer dropped (`AgentMsg::NetDrops`), and what it
+    // was last told of it on this connection.
+    let mut server_drops = false;
+    let mut drops_said: Option<Vec<proto::NetDrop>> = None;
+    // The channel's updates go (a server that keeps it welcomed this runner since it started).
+    let mut updates_on = false;
+    // The server's commands on the channel (`crate::wire::commands`): what this runner has of
+    // each stream; and the one being applied, answered at the top of the next turn of the loop
+    // (however its arm ended), taken unless its arm refused it.
+    let mut wire_in = crate::wire::channel::Receiver::new();
+    let mut answer_after: Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)> = None;
+    // What the server's copy of each session here has, said in digests on this connection: a
+    // stream that starts sends only what the copy lacks (`crate::wire::sums`).
+    let mut server_kept: HashMap<String, proto::KeptSession> = HashMap::new();
+    // The sessions that announced themselves in this process (their Open went by): one that
+    // hasn't yet starts its stream with its announcement, not before it (which then comes whole).
+    let mut announced: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Blue/green: this runner's upgrade under way (it is the old one), its steps' results, and (it is
     // the new one) the runner it takes over from.
     #[cfg_attr(not(unix), allow(unused_variables))]
@@ -908,14 +1203,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // store over this link (`crate::convo::feed`).
     let mut convo: Option<crate::convo::store::Store> = None;
     let harness = (!o.ephemeral && o.terminal).then(|| {
-        convo = crate::convo::open(&own_dir);
+        // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
+        crate::workspace::slates::init(&o.state_dir);
+        convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
         let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
         let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), Default::default());
         h.restore_from(convo.as_ref());
         h
     });
-    // A copy of the server's store this runner keeps, if the server picks it (a mirror).
+    // The harnesses its user's login shell finds are this machine's too
+    // (`crate::harness::kinds::search_path`): that shell is asked now, and every ten minutes.
+    if harness.is_some() {
+        crate::rt::spawn(crate::reach::serve::login_env());
+    }
+    // A copy of the server's store this runner keeps, if the server picks it (a mirror), and
+    // that copy sent back while the server restores its store from it.
     let mut mirror: Option<crate::convo::feed::Intake> = None;
+    let mut mirror_store: Option<crate::convo::store::Store> = None;
+    let mut restoring: Option<(String, crate::convo::feed::Shipper)> = None;
     let shipper = convo.clone().map(|st| {
         // The harnesses' own records, followed into the store.
         if let Some(h) = harness.clone() {
@@ -941,7 +1246,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         if take_over_pending.is_some() {
             return Some(path.to_string_lossy().into_owned());
         }
-        match crate::harness::socket::serve(h, path) {
+        match crate::harness::socket::serve(h, path, false) {
             Ok(p) => Some(p.to_string_lossy().into_owned()),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
@@ -969,10 +1274,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut harness_wait: Option<Instant> = None;
     // What it last told the server of its machine's say on upgrades, and the newer kiln it heard of.
     let mut accept_said: Option<bool> = None;
+    // Its battery: when it was last read, and what was last said of it, when.
+    let mut power_read_at: Option<Instant> = None;
+    let mut power_said: Option<(crate::os::battery::Battery, Instant)> = None;
     let mut noticed: Option<String> = None;
     // The harnesses this machine offers, as last reported (rechecked every minute or so).
     let mut harness_kinds_sent: Option<String> = None;
     let mut harness_kinds_tick: u32 = 0;
+    // Whether its user's login shell had said its PATH when they were last looked at.
+    let mut users_path_known = false;
     let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
@@ -996,14 +1306,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         terminal: o.terminal,
     };
 
-    loop {
+    'events: loop {
+        if let Some((stream, seq, refusal)) = answer_after.take() {
+            let a = match refusal {
+                Some((code, why)) => wire_in.refused(&stream, seq, code, why),
+                None => wire_in.took(&stream, seq),
+            };
+            uplink.0.send(Up::Term(AgentMsg::Wire(a))).await.ok();
+        }
         if let Some(until) = lingering
             && ((crate::observe::collect::get().is_none_or(|c| c.stopped()) && crate::observe::last_written()) || Instant::now() >= until)
         {
             return Ok(());
         }
-        // Ephemeral agents leave once their one job is done and everything is delivered.
-        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() {
+        // Ephemeral agents leave once their one job is done and everything is delivered: its
+        // result received, or given 30 s (a server older than receipts never says).
+        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() > Duration::from_secs(30)) {
             tracing::info!("ephemeral agent finished its job; exiting");
             crate::rt::sleep(Duration::from_millis(500)).await;
             return Ok(());
@@ -1025,6 +1343,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             if let Some(sp) = retire_span.take() {
                 sp.record("result", "ok");
             }
+            // Its other engines' browsers don't outlive it (Chromium's go with their pipes).
+            crate::browser::driven::stop_all().await;
             return Ok(());
         }
         let ev = futures::select_biased! {
@@ -1035,6 +1355,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             () = sample_tick.tick().fuse() => Ev::Sample,
             () = watchdog.tick().fuse() => Ev::Watchdog,
             () = sleep_until_opt(redial).fuse() => Ev::Redial,
+            () = sleep_until_opt(chaos_drop).fuse() => Ev::ChaosDrop,
+            d = recv_opt(delayed.as_ref()).fuse() => match d { Some(due) => Ev::Delayed(due), None => Ev::Watchdog },
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             h = harness_rx.recv().fuse() => match h { Ok((s, u)) => Ev::Harness(s, u), Err(_) => Ev::Watchdog },
@@ -1042,6 +1364,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             b = bg_rx.recv().fuse() => match b {
                 #[cfg(unix)]
                 Ok(Bg::Forwarded(data)) => Ev::Forwarded(data),
+                // Unless the terminal was closed meanwhile.
+                Ok(Bg::Again(session, data)) => if shell_waits.contains_key(&session) { Ev::Forwarded(data) } else { Ev::Watchdog },
+                #[cfg(unix)]
                 Ok(b) => Ev::Bg(b),
                 Err(_) => Ev::Watchdog,
             },
@@ -1055,6 +1380,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 for r in jobs.values() {
                     r.cancel.cancel();
                 }
+                // The browsers it drives closed before it goes.
+                crate::browser::driven::stop_all().await;
                 // What this machine collected and counted written before it goes: three seconds
                 // at the most.
                 let collecting = match crate::observe::collect::get() {
@@ -1069,8 +1396,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 lingering = Some(Instant::now() + Duration::from_secs(3));
             }
-            #[cfg(not(unix))]
-            Ev::Bg(b) => match b {},
+            Ev::Delayed(crate::runner::chaos::Due { lane, kind, data, again }) => {
+                // As an undelayed frame goes: sent while connected and welcomed, kept otherwise,
+                // unless the next connection sends it again in its place (a leg's event or result).
+                if connected && (welcomed || (lane != LANE_LOGS && lane != LANE_CONTROL)) {
+                    net.send(SERVER_PEER, lane, kind, data).await;
+                } else if kind != Kind::Term && !again {
+                    buffered += data.len();
+                    buffer.push_back((lane, kind, data));
+                }
+            }
+            Ev::ChaosDrop => {
+                chaos_drop = None;
+                if connected {
+                    chaos_down = chaos.and_then(|c| c.down_for).map(|d| Instant::now() + d);
+                    tracing::warn!(down_for = ?chaos.and_then(|c| c.down_for), "chaos: dropping the connection to the server");
+                    net.command(Out::Disconnect { peer: SERVER_PEER }).await;
+                }
+            }
             #[cfg(unix)]
             Ev::Bg(b) => {
                 use crate::bluegreen::Frame;
@@ -1362,8 +1705,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         draining = false;
                         uplink.msg(AgentMsg::Instance(instance_hello.clone())).await;
                     }
-                    // Turned into Ev::Forwarded as it's received.
-                    Bg::Forwarded(_) => {}
+                    // Turned into Ev::Forwarded as they're received.
+                    Bg::Forwarded(_) | Bg::Again(..) => {}
                 }
             }
             Ev::Redial => {
@@ -1509,6 +1852,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // and dial directly; the tunnel stays open until that connection is up.
                 if paths.tick(connected, Instant::now()) {
                     connected = false;
+                    welcomed = false;
                     if let Some(s) = &sync {
                         s.connected(false);
                     }
@@ -1525,9 +1869,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ev::Net(None) => anyhow::bail!("transport stopped"),
             Ev::Net(Some(NetEvent::Connected { binding, .. })) => {
                 tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
+                chaos_drop = chaos.and_then(|c| c.drop_every).map(|d| Instant::now() + d);
                 // How long saying what it is takes (its build's probes, its facts), told below: the
                 // server's frames wait meanwhile.
-                let (said_from, mut build_took) = (Instant::now(), Duration::ZERO);
+                let said_from = Instant::now();
                 paths.connected(binding, Instant::now());
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
@@ -1537,29 +1882,41 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
-                let msg = AgentMsg::Hello(hello(jobs.keys().cloned().collect()));
+                // Jobs whose results the server hasn't said it has are its own still: they come
+                // again below. A server that never says (one older than receipts) has them for a
+                // while only.
+                unreceived.retain(|_, (at, _)| at.elapsed() < UNRECEIVED_FOR);
+                let mut running: Vec<String> = jobs.keys().cloned().collect();
+                running.extend(unreceived.keys().filter(|j| !jobs.contains_key(*j)).cloned());
+                let msg = AgentMsg::Hello(hello(running));
                 if let Ok(b) = proto::encode(&msg) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 // Which build this is and that it takes upgrade commands (an older server skips it);
-                // an outpost says it's one instead. Worked out off the event loop (its binary's
-                // hash, the engine's probes), begun as this runner started.
-                if !o.ephemeral {
-                    let (started, outpost) = (Instant::now(), o.outpost);
-                    let built = move || if outpost { crate::updates::outpost_build() } else { crate::updates::runner_build() };
-                    let mut build = crate::rt::blocking(built).await.unwrap_or_else(|_| built());
-                    build_took = started.elapsed();
-                    if let AgentMsg::Build { caps, .. } = &mut build {
-                        // It sends its conversations' store: the server keeps them from that.
-                        if shipper.is_some() {
-                            *caps |= proto::CAP_CONVO;
-                        }
-                        // A runner that keeps no replica does not say it replicates.
-                        if observe.is_none() {
-                            *caps &= !proto::CAP_OBSERVE;
-                        }
+                // an outpost says it's one instead. Its binary's hash was worked out as this runner
+                // started (`updates::warm_own_binary`), its engine's probes off the event loop.
+                let building = Instant::now();
+                let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build().await };
+                let build_took = building.elapsed();
+                if let AgentMsg::Build { caps, .. } = &mut build {
+                    // It sends its conversations' store: the server keeps them from that.
+                    if shipper.is_some() {
+                        *caps |= proto::CAP_CONVO;
                     }
-                    if let Ok(b) = proto::encode(&build) {
+                    // A runner that keeps no replica does not say it replicates.
+                    if observe.is_none() {
+                        *caps &= !proto::CAP_OBSERVE;
+                    }
+                }
+                if !o.ephemeral
+                    && let Ok(b) = proto::encode(&build)
+                {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                }
+                // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md).
+                if !o.ephemeral {
+                    let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -1573,6 +1930,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // The rest, probed: they take a moment (docs/ci.md W13-R01).
                     probe_facts(&uplink, &o.work_dir, &o.declared, &probing);
                 }
+                // The pools' executors were the last connection's: the server starts what it wants
+                // again (docs/ci.md W13-R09).
+                for w in pool_execs.drain() {
+                    crate::rt::spawn(crate::runner::pool::discard(w));
+                }
+                #[cfg(target_os = "linux")]
+                crate::rt::spawn(crate::runner::firecracker::drain_warm());
                 // Whether this machine takes upgrades (an older server skips it).
                 if !o.ephemeral && !o.outpost {
                     let accept = takes_updates(&o);
@@ -1588,6 +1952,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 connected = true;
+                // What the server's copies have is its to say again on this connection.
+                server_kept.clear();
                 if let Some(s) = &sync {
                     s.connected(true);
                 }
@@ -1596,10 +1962,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 if let Some(f) = &shipper {
                     f.link(crate::convo::feed::Link::Up);
-                }
-                while let Some((lane, kind, data)) = buffer.pop_front() {
-                    buffered = buffered.saturating_sub(data.len());
-                    net.send(SERVER_PEER, lane, kind, data).await;
                 }
                 // How the front door does, after everything older (an older server skips it).
                 front_door_sent = None;
@@ -1624,12 +1986,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     tracing::warn!(%reason, "disconnected from server");
                     paths.disconnected();
+                    // No word comes for agent sessions on their way to a newer process: they go on here.
+                    crate::harness::handing::link_lost();
                 } else {
                     tracing::info!(%reason, via = %paths.via(), retry_in = ?dial_backoff, "dial failed");
                     // The path changed (to the tunnel, or back): dial that way now.
                     at_once = paths.dial_failed(now);
                 }
                 connected = false;
+                welcomed = false;
+                // The channel's items in flight go again once the server says what it has.
+                updates.down();
+                server_wire = false;
+                server_drops = false;
+                drops_said = None;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -1639,11 +2009,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Some(f) = &shipper {
                     f.link(crate::convo::feed::Link::Down);
                 }
+                // A copy being sent back stops: the server asks again if it still needs it.
+                restoring = None;
                 if let Some(r) = &reach {
                     r.feed(crate::reach::node::In::Server(false)).await;
                 }
                 dialing_since = None;
                 redial = Some(if at_once { now } else { now + crate::sup::jitter(dial_backoff) });
+                if let Some(until) = chaos_down.take() {
+                    redial = redial.map(|r| r.max(until));
+                }
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
             }
             Ev::Net(Some(NetEvent::Frame { data, .. })) | Ev::Forwarded(data) => {
@@ -1652,6 +2027,37 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Err(e) => {
                         tracing::warn!(error = %e, "bad frame from server");
                         continue;
+                    }
+                };
+                // A command on the channel (docs/wire.md, "Commands"): taken once, however often
+                // it comes, then applied as if it had come alone, and answered at the top of the
+                // next turn of the loop.
+                let (msg, data) = 'item: {
+                    match msg {
+                        ServerMsg::Wire(crate::wire::channel::Frame::Item { stream, seq, low, body }) => {
+                            use crate::wire::channel::{Arrival, Refusal};
+                            // A command stream's new generation: the ones before it are done with.
+                            if seq == 1
+                                && let Some(prefix) = crate::wire::commands::prefix_of(&stream)
+                            {
+                                wire_in.forget_where(|s| s != stream && crate::wire::commands::prefix_of(s) == Some(prefix));
+                            }
+                            let answer = match wire_in.on_item(&stream, seq, low, body) {
+                                Arrival::Take(body) => match proto::decode::<ServerMsg>(&body) {
+                                    Ok(ServerMsg::Wire(_)) => wire_in.refused(&stream, seq, Refusal::Malformed, "a channel frame inside a command"),
+                                    Ok(inner) => {
+                                        answer_after = Some((stream, seq, None));
+                                        break 'item (inner, body);
+                                    }
+                                    Err(e) => wire_in.refused(&stream, seq, Refusal::Malformed, e.to_string()),
+                                },
+                                Arrival::Answered(Some(a)) | Arrival::Gap(a) => a,
+                                Arrival::Answered(None) => continue 'events,
+                            };
+                            uplink.0.send(Up::Term(AgentMsg::Wire(answer))).await.ok();
+                            continue 'events;
+                        }
+                        m => (m, data),
                     }
                 };
                 // About something handed to the new build (blue/green), or new while this runner
@@ -1671,8 +2077,63 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     continue;
                 }
                 match msg {
+                    // What the server can do past Build's 32 bits (docs/wire.md): said before its
+                    // Welcome, so this runner sends its sessions over the channel, not whole. It
+                    // says what it has of the server's streams (none yet).
+                    ServerMsg::Kept { sessions } => {
+                        server_kept.extend(sessions.into_iter().map(|k| (k.session.clone(), k)));
+                    }
+                    ServerMsg::Caps { caps } => {
+                        server_wire = caps & proto::CAP_WIRE != 0;
+                        server_drops = caps & proto::CAP_NET_DROPS != 0;
+                        if server_wire {
+                            uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                        }
+                    }
+                    // Taken above, before this match: what it carries came here instead.
+                    ServerMsg::Wire(crate::wire::channel::Frame::Item { .. }) => {}
+                    // What the server has of this runner's streams, its answers and wants: what it
+                    // lacks goes; a stream it lost starts over, its snapshot first.
+                    ServerMsg::Wire(frame) => {
+                        updates.on_frame(frame);
+                        for key in updates.take_stale() {
+                            if let Some(id) = key.strip_prefix("s:") {
+                                if let Some(s) = harness.as_ref().and_then(|h| h.get(id)) {
+                                    start_stream(&mut updates, id, &s, server_kept.get(id));
+                                }
+                            } else if let Some(id) = key.strip_prefix("t:")
+                                && let Some((_, state)) = terms.get(id)
+                            {
+                                // A terminal's stream starts over with its picture now.
+                                let a = state.attach();
+                                state.detach();
+                                updates.start(&key);
+                                if let Ok(b) = proto::encode(&AgentMsg::TermReplay { session: id.to_owned(), data: a.replay }) {
+                                    updates.push(&key, b);
+                                }
+                            }
+                        }
+                        flush_updates(&mut updates, &uplink).await;
+                    }
                     ServerMsg::Welcome { server_version, sample_seconds } => {
                         tracing::info!(%server_version, "server welcomed agent");
+                        // What waited for the connection, in order: what was held while it was
+                        // down, the jobs' events again, then their results not yet received.
+                        welcomed = true;
+                        while let Some((lane, kind, data)) = buffer.pop_front() {
+                            buffered = buffered.saturating_sub(data.len());
+                            net.send(SERVER_PEER, lane, kind, data).await;
+                        }
+                        if receipts {
+                            for (_, _, events) in journal.values() {
+                                for data in events {
+                                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                                }
+                            }
+                        }
+                        for (_, data) in unreceived.values() {
+                            net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                        }
                         // Drained or not is the server's to say again on each connection (it sends
                         // Drain next when this one isn't the machine's newest).
                         if !o.ephemeral && !retiring {
@@ -1693,21 +2154,47 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(ai) = &ai {
                             ai.reset();
                         }
-                        // The server learns (again) which agent sessions run here, then all of each.
+                        // Its battery is said again too (a state: the newest, sent on every connect).
+                        power_said = None;
+                        power_read_at = None;
+                        // The server learns (again) which agent sessions run here, then what it lacks
+                        // of each: over the channel only that (a session's stream not started yet
+                        // starts with its snapshot), else all of each.
                         if let Some(h) = &harness {
-                            while harness_rx.try_recv().is_ok() {}
+                            if server_wire {
+                                updates_on = true;
+                                // Updates queued meanwhile go on their streams; those of sessions
+                                // whose stream starts now are in its snapshot.
+                                while let Ok((session, u)) = harness_rx.try_recv() {
+                                    note_announced(&mut announced, &session, &u);
+                                    if updates.started(&crate::wire::uplink::session_key(&session)) {
+                                        push_update(&mut updates, &session, &u);
+                                    }
+                                }
+                            } else {
+                                updates_on = false;
+                                updates = crate::wire::uplink::Updates::new(format!("{:016x}", rand::random::<u64>()));
+                                while harness_rx.try_recv().is_ok() {}
+                            }
                             if let Ok(json) = serde_json::to_string(&h.inventory()) {
                                 harness_kinds_sent = serde_json::to_string(&crate::harness::kinds::offered()).ok();
                                 uplink.0.send(Up::Term(AgentMsg::HarnessInventory { json })).await.ok();
                             }
                             for info in h.list() {
                                 let Some(s) = h.get(&info.id) else { continue };
+                                if updates_on {
+                                    if !updates.started(&crate::wire::uplink::session_key(&info.id)) && announced.contains(&info.id) {
+                                        start_stream(&mut updates, &info.id, &s, server_kept.get(&info.id));
+                                    }
+                                    continue;
+                                }
                                 for u in s.snapshot() {
                                     for json in harness_frames(&info.id, &u) {
                                         uplink.0.send(Up::Term(AgentMsg::Harness { session: info.id.clone(), json })).await.ok();
                                     }
                                 }
                             }
+                            flush_updates(&mut updates, &uplink).await;
                         }
                         sample_tick = Interval::new(Duration::from_secs(u64::from(sample_seconds.max(1))));
                         // A new build started to take over from the runner being upgraded (blue/green):
@@ -1733,6 +2220,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             anyhow::bail!("refused: {reason}");
                         }
                         connected = false;
+                        welcomed = false;
                         if let Some(s) = &sync {
                             s.connected(false);
                         }
@@ -1750,7 +2238,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // from here (NAT, NodePorts, cluster DNS all differ).
                         a.server_url = o.server_url.clone();
                         let id = a.job_id.clone();
-                        let full = u32::try_from(jobs.len()).unwrap_or(u32::MAX) >= o.slots.max(1);
+                        let full = u32::try_from(jobs.values().filter(|j| !j.pooled).count()).unwrap_or(u32::MAX) >= o.slots.max(1);
                         if o.outpost || draining || upgrade_pending || full || exclusive || (a.spec.exclusive && !jobs.is_empty()) || jobs.contains_key(&id) {
                             let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
@@ -1761,7 +2249,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         exclusive = a.spec.exclusive;
                         let cancel = Shutdown::new();
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone() });
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false });
                         tracing::info!(job = %id, key = %a.spec.key, "running job");
                         let exec = Exec {
                             assign: *a,
@@ -1801,6 +2289,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let error = format!("cancelled; it hadn't ended {}s later, so the runner let it go", CANCEL_GRACE.as_secs());
                                 let _ = tx.send(JobResult { job: j, status: Status::Cancelled, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
                             });
+                        } else {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no job {job} runs here"));
                         }
                     }
                     ServerMsg::Drain => draining = true,
@@ -1809,16 +2299,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // the service this instance replaces (it checks for terminals itself).
                         let state_dir = o.state_dir.clone();
                         let me = instance_id.clone();
+                        let older = instance.clone();
                         crate::rt::spawn(async move {
-                            match crate::rt::blocking(move || crate::upgrade::retire(&state_dir, &me)).await {
+                            match crate::rt::blocking(move || crate::upgrade::retire(&state_dir, &me, &older)).await {
                                 Ok(Ok(crate::upgrade::Retired::Stopped(unit))) => {
                                     tracing::info!(%instance, %unit, "retired the older runner process: its service is stopped and disabled");
                                 }
                                 Ok(Ok(crate::upgrade::Retired::Busy(n))) => {
-                                    tracing::warn!(%instance, terminals = n, "the older runner process still holds terminals; leaving it running");
+                                    tracing::warn!(%instance, held = n, "the older runner process still holds terminals or agent sessions; leaving it running");
                                 }
                                 Ok(Ok(crate::upgrade::Retired::Nothing)) => {
-                                    tracing::info!(%instance, "an older runner process of this machine can be stopped; this one did not start it, so it is left to whoever did");
+                                    tracing::info!(%instance, "an older runner process of this machine can be stopped, but not from here (it isn't running here, or it shares this runner's service)");
                                 }
                                 Ok(Err(e)) | Err(e) => tracing::warn!(%instance, error = %format!("{e:#}"), "could not retire the older runner process"),
                             }
@@ -1861,17 +2352,32 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::TermInput { session, data } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::in_microvm(&session) {
+                            crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermInput { session: session.clone(), data });
+                            continue;
+                        }
                         if let Some((pty, _)) = terms.get(&session) {
                             pty.write(data);
+                        } else if let Some(typed) = shell_waits.get_mut(&session) {
+                            typed.push(data);
                         }
                     }
                     ServerMsg::TermResize { session, cols, rows } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermResize { session: session.clone(), cols, rows }) {
+                            continue;
+                        }
                         if let Some((pty, state)) = terms.get(&session) {
                             pty.resize(cols, rows);
                             state.send(crate::termsess::Input::Resize { cols, rows });
                         }
                     }
                     ServerMsg::TermAttach { session } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermAttach { session: session.clone() }) {
+                            continue;
+                        }
                         let msg = match terms.get(&session) {
                             Some((_, state)) => {
                                 let a = state.attach();
@@ -1883,6 +2389,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         uplink.0.send(Up::Term(msg)).await.ok();
                     }
                     ServerMsg::TermClose { session } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermClose { session: session.clone() }) {
+                            continue;
+                        }
+                        shell_waits.remove(&session);
                         terms.remove(&session);
                     }
                     ServerMsg::AiTranscript { req, pid } => match &ai {
@@ -1906,7 +2417,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                         spec.env = env;
                                     }
                                 }
-                                h.open(Some(session.clone()), spec).map(|_| ())
+                                if crate::workspace::needs_preparing(&spec) {
+                                    // Its workspace first (a volume made and mounted), off this loop: then it starts there.
+                                    let (h, up, session, json) = (Arc::clone(h), uplink.0.clone(), session.clone(), json.clone());
+                                    crate::rt::spawn(async move {
+                                        let opened = match crate::workspace::prepare(&mut spec, &session).await {
+                                            Ok(()) => h.open(Some(session.clone()), spec).map(|_| ()),
+                                            Err(e) => Err(e.context("its workspace")),
+                                        };
+                                        if let Err(e) = opened {
+                                            for u in crate::harness::host::refusal(&session, &json, &format!("{e:#}")) {
+                                                if let Ok(json) = serde_json::to_string(&u) {
+                                                    up.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
+                                                }
+                                            }
+                                        }
+                                    });
+                                    Ok(())
+                                } else {
+                                    h.open(Some(session.clone()), spec).map(|_| ())
+                                }
                             }
                         };
                         if let Err(e) = opened {
@@ -1920,6 +2450,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::HarnessCmd { session, json } => {
                         let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
                         match serde_json::from_str::<crate::harness::model::Command>(&json) {
+                            // The server's word on a hand-over to this machine's newer runner
+                            // process: never "gone here", even once this process has let go.
+                            Ok(crate::harness::model::Command::HandedOver { error }) => {
+                                if let Some(h) = &harness {
+                                    h.handed_over(&session, error);
+                                }
+                            }
                             Ok(c) if known => {
                                 if let Some(h) = &harness {
                                     h.command(&session, c);
@@ -1951,17 +2488,37 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(h) = &harness {
                             h.close(&session);
                         }
+                        // What it had going live: its app, its streams.
+                        crate::browser::apps::stop(&session);
+                        let dir = o.state_dir.clone();
+                        crate::rt::spawn(async move { crate::browser::stream::streams().close_session(&dir, &session).await });
                     }
                     ServerMsg::HarnessPackage { session, offset, data, done } => {
                         // A session going on here from the server's store (its machine is gone).
                         let Some(h) = harness.clone() else { continue };
+                        // Handing everything to a new build of it, or retiring: an older process's
+                        // hand-over isn't taken here (`Host::adopt_package`).
+                        #[cfg(unix)]
+                        let leaving = retiring || moving.as_ref().is_some_and(|m| m.handing);
+                        #[cfg(not(unix))]
+                        let leaving = false;
                         match h.receive_package(&session, offset, &data, done) {
                             Ok(Some(path)) => {
                                 let up = uplink.0.clone();
                                 crate::rt::spawn(async move {
                                     let h2 = h.clone();
-                                    let taken = crate::rt::blocking(move || h2.adopt_package(&path)).await.unwrap_or_else(|e| Err(format!("{e:#}")));
-                                    if let Err(why) = taken {
+                                    let (handover, taken) = crate::rt::blocking(move || h2.adopt_package(&path, leaving)).await.unwrap_or_else(|e| (false, Err(format!("{e:#}"))));
+                                    // Handed over by an older process of this machine: that one
+                                    // goes on with it unless this one took it, so it's told either
+                                    // way, and nothing else is said here.
+                                    if handover {
+                                        if let Err(why) = &taken {
+                                            tracing::warn!(%session, %why, "couldn't take over an agent session from this machine's older runner process");
+                                        } else {
+                                            tracing::info!(%session, "took over an agent session from this machine's older runner process");
+                                        }
+                                        crate::harness::handing::adopted(&session, taken.err()).await;
+                                    } else if let Err(why) = taken {
                                         tracing::warn!(%session, %why, "an agent session couldn't go on here");
                                         let spec = serde_json::json!({ "kind": "claude" }).to_string();
                                         for u in crate::harness::host::refusal(&session, &spec, &format!("Couldn't go on here: {why}")) {
@@ -2067,6 +2624,25 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::Term(AgentMsg::HarnessTaskOutput { req, json })).await;
                         });
                     }
+                    // What's wrong with this machine, and repairs to it (`crate::doctor`): on the
+                    // blocking pool, as they read and remove files.
+                    ServerMsg::Diagnose { req } => {
+                        let here = crate::doctor::Here { state_dir: o.state_dir.clone(), work_dir: o.work_dir.clone() };
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let json = crate::rt::blocking(move || serde_json::to_string(&crate::doctor::examine(&here)).ok()).await.ok().flatten();
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json })).await;
+                        });
+                    }
+                    ServerMsg::Repair { req, action } => {
+                        let here = crate::doctor::Here { state_dir: o.state_dir.clone(), work_dir: o.work_dir.clone() };
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            tracing::info!(%action, "a repair the server asked for");
+                            let json = crate::rt::blocking(move || crate::doctor::answer_repair(&here, &action)).await.ok();
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json })).await;
+                        });
+                    }
                     ServerMsg::Reach { from, link, open, data, close } => {
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Frame { from, link, open, data, close }).await;
@@ -2087,6 +2663,38 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             ob.heard("", json, bytes);
                         }
                     }
+                    ServerMsg::Cluster { json, raft } => {
+                        use crate::store::learner::Msg;
+                        match crate::store::learner::decode(&json) {
+                            Some(Msg::Join { member, token }) if !o.ephemeral && !o.outpost => {
+                                // A replica being started goes on with the newest word to join.
+                                *cluster_join.lock() = Some((member, token));
+                                if cluster.lock().is_some() {
+                                    continue;
+                                }
+                                replica.start();
+                            }
+                            Some(Msg::Leave) => {
+                                // A replica being started stops trying.
+                                *cluster_join.lock() = None;
+                                // Another process of this machine holds it now: its files are let go
+                                // (stopping it waits for its thread: not on this loop).
+                                if let Some(old) = cluster.lock().take() {
+                                    crate::store::learner::set_global(None);
+                                    crate::rt::spawn(async move {
+                                        let _ = crate::rt::blocking(move || drop(old)).await;
+                                    });
+                                }
+                            }
+                            Some(m @ (Msg::Raft { .. } | Msg::At { .. })) => {
+                                let learner = cluster.lock().clone();
+                                if let Some(l) = learner {
+                                    l.heard(&m, raft);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     ServerMsg::Convo { json, data } => {
                         let Some(m) = crate::convo::feed::decode(&json) else { continue };
                         if convo.as_ref().is_some_and(|st| st.id() == m.store()) {
@@ -2096,30 +2704,117 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                             continue;
                         }
+                        // The server lost its store: the copy of it this runner keeps goes back.
+                        if let crate::convo::feed::Msg::Restore { .. } = &m {
+                            if mirror.is_none()
+                                && convo.is_some()
+                                && own_dir.join(crate::convo::MIRROR_FILE).exists()
+                                && let Some((st, intake)) = open_mirror(&own_dir, &uplink.0)
+                            {
+                                (mirror_store, mirror) = (Some(st), Some(intake));
+                            }
+                            if let Some(st) = &mirror_store {
+                                let (ship, out) = crate::convo::feed::Shipper::start_restore(st.clone());
+                                let up = uplink.0.clone();
+                                crate::rt::spawn(async move {
+                                    while let Ok((json, data)) = out.recv().await {
+                                        if up.send(Up::Convo(AgentMsg::Convo { json, data })).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                                ship.link(crate::convo::feed::Link::Up);
+                                tracing::info!("the server lost its conversation store: sending back the copy this runner keeps");
+                                restoring = Some((st.id().to_owned(), ship));
+                            } else {
+                                let none = crate::convo::feed::encode(&crate::convo::feed::Msg::Restored { store: String::new(), rev: 0 });
+                                uplink.0.send(Up::Convo(AgentMsg::Convo { json: none, data: Vec::new() })).await.ok();
+                            }
+                            continue;
+                        }
+                        // The server's answers about the copy being sent back.
+                        if let Some((id, ship)) = &restoring
+                            && id == m.store()
+                        {
+                            ship.link(crate::convo::feed::Link::Heard(m));
+                            continue;
+                        }
                         // The server's store, of which this runner keeps a copy (a mirror), beside
                         // its own store; opened the first time the server sends it.
-                        if mirror.is_none() && convo.is_some() {
-                            mirror = crate::convo::open_file(&own_dir, crate::convo::MIRROR_FILE).and_then(|st| match crate::convo::feed::Intake::start(st, crate::convo::feed::Brings::AsItSays) {
-                                Ok((intake, out)) => {
-                                    let up = uplink.0.clone();
-                                    crate::rt::spawn(async move {
-                                        while let Ok(o) = out.recv().await {
-                                            if up.send(Up::Convo(AgentMsg::Convo { json: o.json, data: Vec::new() })).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    });
-                                    Some(intake)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %format!("{e:#}"), "this runner can't keep a copy of the conversation store");
-                                    None
-                                }
-                            });
+                        if mirror.is_none()
+                            && convo.is_some()
+                            && let Some((st, intake)) = open_mirror(&own_dir, &uplink.0)
+                        {
+                            (mirror_store, mirror) = (Some(st), Some(intake));
                         }
                         if let Some(intake) = &mirror {
                             intake.heard(SERVER_PEER, "server", json, data);
                         }
+                    }
+                    ServerMsg::HarnessFileRead { req, session: _, path, offset, len } => {
+                        // A file one of its sessions' messages mentions, for whoever views it: a
+                        // piece, read off this loop, sent on the files' own lane.
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let read = crate::rt::blocking(move || crate::harness::files::read(&path, offset, len)).await.unwrap_or_else(|e| Err(format!("{e:#}")));
+                            let json = serde_json::to_string(&crate::harness::files::Answer::of(&read)).unwrap_or_default();
+                            let data = read.map(|(_, d)| d).unwrap_or_default();
+                            let _ = up.send(Up::File(AgentMsg::HarnessFileData { req, json, data })).await;
+                        });
+                    }
+                    // Pages streamed for whoever views one of its sessions (`crate::browser::stream`).
+                    ServerMsg::StreamOpen { stream, session, json } => {
+                        crate::rt::spawn(crate::browser::stream::serve_open(o.state_dir.clone(), stream, session, json, uplink.0.clone()));
+                    }
+                    ServerMsg::StreamControl { stream, session: _, json } => crate::browser::stream::serve_control(&stream, &json),
+                    ServerMsg::StreamInput { stream, session: _, json } => crate::browser::stream::serve_input(&stream, &json),
+                    ServerMsg::StreamClose { stream, session: _ } => {
+                        crate::rt::spawn(async move { crate::browser::stream::streams().close(&stream).await });
+                    }
+                    // A port of this machine's, for a person's own device (`crate::browser::ports`):
+                    // one its session's machine lists, on loopback.
+                    ServerMsg::PortOpen { conn, session, port } => {
+                        let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| *s.pid.lock());
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let allowed = match found {
+                                Some(root) => crate::rt::blocking(move || crate::browser::ports::allowed(&session, root, port)).await.unwrap_or(false),
+                                None => false,
+                            };
+                            crate::browser::ports::serve_open(conn, port, allowed, up).await;
+                        });
+                    }
+                    ServerMsg::PortData { conn, session: _, data } => crate::browser::ports::data(conn, data),
+                    ServerMsg::PortAck { conn, session: _, bytes } => crate::browser::ports::ack(conn, bytes),
+                    ServerMsg::PortClose { conn, session: _ } => crate::browser::ports::close(conn),
+                    // What a person opens live from one of its sessions (`crate::browser::apps`).
+                    ServerMsg::Preview { req, session, json } => {
+                        let (up, dir) = (uplink.0.clone(), o.state_dir.clone());
+                        let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| (std::path::PathBuf::from(s.info().cwd), *s.pid.lock()));
+                        crate::rt::spawn(async move {
+                            let answer = match found {
+                                None => serde_json::json!({"error": "no such session here"}),
+                                Some((cwd, pid)) => crate::browser::apps::serve(&dir, &session, &cwd, pid, &json).await,
+                            };
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
+                        });
+                    }
+                    ServerMsg::Workspace { req, session, json } => {
+                        // About one of this machine's agents' folders: the session says which, so
+                        // a question can only be about a folder an agent here works in.
+                        let up = uplink.0.clone();
+                        let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| {
+                            let ws = s.spec.lock().workspace.clone();
+                            let info = s.info();
+                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws)
+                        });
+                        crate::rt::spawn(async move {
+                            let answer = match found {
+                                None => serde_json::json!({"error": "no such agent on this machine"}),
+                                Some((cwd, work, ws)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), &json).await,
+                            };
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
+                        });
                     }
                     ServerMsg::DirList { req, path } => {
                         // The console's folder picker: this machine's folders, read off this loop.
@@ -2145,17 +2840,33 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         };
                         let id = a.job_id.clone();
-                        let full = u32::try_from(jobs.len()).unwrap_or(u32::MAX) >= o.slots.max(1);
+                        // A pool's leg runs in its executor, beside this runner's own slots.
+                        let pooled = a.executor.slot.is_some();
+                        let own = jobs.values().filter(|j| !j.pooled).count();
+                        let full = !pooled && u32::try_from(own).unwrap_or(u32::MAX) >= o.slots.max(1);
                         if o.outpost || draining || upgrade_pending || full || exclusive || jobs.contains_key(&id) {
                             let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
+                        // An ephemeral runner (a `k8s` pool's pod, docs/ci.md W13-R07) takes one leg,
+                        // then leaves.
+                        if o.ephemeral {
+                            served_dedicated = true;
+                        }
+                        // A new attempt: its events count from one.
+                        journal.remove(&id);
+                        unreceived.remove(&id);
                         // Server-relative URLs go through the address this runner reached the server
                         // at (NAT, NodePorts and cluster DNS all differ).
                         let base = o.server_url.trim_end_matches('/').to_owned();
                         let rt = &mut a.runtime;
-                        for u in [&mut rt.results_url, &mut rt.cache_url, &mut rt.facade_url, &mut rt.api_url, &mut rt.graphql_url] {
+                        for u in [&mut rt.results_url, &mut rt.cache_url, &mut rt.facade_url, &mut rt.api_url, &mut rt.graphql_url, &mut rt.registry_url] {
+                            if u.starts_with('/') {
+                                *u = format!("{base}{u}");
+                            }
+                        }
+                        for (_, u) in &mut rt.proxies {
                             if u.starts_with('/') {
                                 *u = format!("{base}{u}");
                             }
@@ -2174,16 +2885,72 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         let cancel = Shutdown::new();
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone() });
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled });
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
-                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone() };
+                        // Its pool's executor, when the leg can run in it as it is; else the leg
+                        // runs the usual way and the executor goes all the same.
+                        let warm = a.executor.slot.as_deref().and_then(|s| pool_execs.take(s));
+                        let warm = match warm {
+                            Some(w) if crate::runner::pool::adoptable(&a, &w) => Some(w),
+                            Some(w) => {
+                                crate::rt::spawn(crate::runner::pool::discard(w));
+                                None
+                            }
+                            None => None,
+                        };
+                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size) };
                         let done = done_tx.clone();
+                        // On the `firecracker` executor, in a microVM of its own (W13-R05).
+                        #[cfg(target_os = "linux")]
+                        let microvm = (leg.a.executor.kind == "firecracker").then(|| microvm_ca.clone());
                         crate::rt::spawn(async move {
+                            #[cfg(target_os = "linux")]
+                            let result = match microvm {
+                                Some(ca) => crate::runner::firecracker::run(leg, Some(ca)).await,
+                                None => leg.run().await,
+                            };
+                            #[cfg(not(target_os = "linux"))]
                             let result = leg.run().await;
                             let _ = done.send(result).await;
                         });
                     }
                     ServerMsg::ProbeFacts => probe_facts(&uplink, &o.work_dir, &o.declared, &probing),
+                    // Start or stop a pool's executor (docs/ci.md W13-R09).
+                    ServerMsg::Executor { json } => {
+                        let ask: crate::runner::pool::Ask = match serde_json::from_str(&json) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "an executor request this runner can't read");
+                                continue;
+                            }
+                        };
+                        let (execs, work, up) = (pool_execs.clone(), o.work_dir.clone(), uplink.clone());
+                        crate::rt::spawn(async move {
+                            if let Some(said) = crate::runner::pool::handle(&execs, &work, ask).await
+                                && let Ok(json) = serde_json::to_string(&said)
+                            {
+                                up.msg(AgentMsg::Executor { json }).await;
+                            }
+                        });
+                    }
+                    // A deployment this runner made, taken down: its environment, a preview, went
+                    // (docs/ci.md W15-R07).
+                    ServerMsg::Undeploy { json } => {
+                        let ask: kiln_ci::wire::Undeploy = match serde_json::from_str(&json) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "a request to take a deployment down this runner can't read");
+                                continue;
+                            }
+                        };
+                        let up = uplink.clone();
+                        crate::rt::spawn(async move {
+                            let error = crate::runner::runtime::undeploy(&ask).await.err().map(|e| format!("{e:#}"));
+                            if let Ok(json) = serde_json::to_string(&kiln_ci::wire::Undeployed { asked: ask, error }) {
+                                up.msg(AgentMsg::Undeployed { json }).await;
+                            }
+                        });
+                    }
                     // A terminal into a running or kept leg (docs/ci.md W17-R01), or a command run
                     // there (W17-R05): its workspace and environment, or its container; the leg's
                     // secrets masked in what it shows.
@@ -2200,58 +2967,48 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if terms.contains_key(&session) {
                             continue;
                         }
+                        // A leg in a microVM here (W13-R05): its terminal opens in there.
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::open_terminal(&job, &session, cols, rows, command.clone()) {
+                            continue;
+                        }
                         let Some(shell) = crate::runner::kept::shell(&job) else {
+                            // A leg this runner holds but is still setting up: its shell comes once
+                            // its workspace and environment are ready, and the ask is taken again
+                            // then (or after LEG_SHELL_WAIT).
+                            if jobs.contains_key(&job) && !shell_waits.contains_key(&session) {
+                                shell_waits.insert(session.clone(), Vec::new());
+                                let (again, frame, waiting) = (bg_tx.clone(), data.clone(), session.clone());
+                                crate::rt::spawn(async move {
+                                    let until = Instant::now() + LEG_SHELL_WAIT;
+                                    while crate::runner::kept::shell(&job).is_none() && Instant::now() < until {
+                                        crate::rt::sleep(Duration::from_millis(100)).await;
+                                    }
+                                    let _ = again.send(Bg::Again(waiting, frame)).await;
+                                });
+                                continue;
+                            }
+                            shell_waits.remove(&session);
                             uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("the leg isn't running or kept on this runner".into()) })).await.ok();
                             continue;
                         };
-                        let (program, env) = match (&shell.exec, &command) {
-                            (Some(_), Some(c)) => shell.exec_with(c).map_or((None, Vec::new()), |(argv, env)| (Some(argv), env)),
-                            (Some((argv, env)), None) => (Some(argv.clone()), env.clone()),
-                            (None, _) => (None, shell.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-                        };
-                        let env: Vec<(&str, String)> = env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                        let cwd = program.is_none().then_some(shell.workdir.as_path());
-                        // A command runs as a step would, in bash; a terminal opens the runner's shell.
-                        let sh = if command.is_some() && !cfg!(windows) { Some("bash") } else { o.shell.as_deref() };
-                        let cmd = command.as_deref().filter(|_| program.is_none());
-                        match terminal::spawn_at(sh, cmd, program.as_deref(), cwd, cols, rows, &env) {
+                        let typed = shell_waits.remove(&session).unwrap_or_default();
+                        let l = shell.launch(command.as_deref(), o.shell.as_deref());
+                        let env: Vec<(&str, String)> = l.env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                        match terminal::spawn_at(l.shell.as_deref(), l.command.as_deref(), l.program.as_deref(), l.cwd.as_deref(), cols, rows, &env) {
                             Ok((pty, rx)) => {
-                                let tx = term_tx.clone();
-                                let s = session.clone();
-                                let mut masker = kiln_ci::runner::mask::Masker::new(&shell.masks);
+                                let (tx, s, masked) = (term_tx.clone(), session.clone(), crate::runner::kept::masked(rx, &shell.masks));
                                 crate::rt::spawn(async move {
-                                    // The masker holds back what could be the start of a secret (as
-                                    // long as the leg's longest, a token of a kilobyte); a terminal
-                                    // shows the rest, masked, as soon as output pauses.
-                                    loop {
-                                        let out = match crate::rt::timeout(std::time::Duration::from_millis(25), rx.recv()).await {
-                                            Ok(Ok(out)) => out,
-                                            Ok(Err(_)) => break,
-                                            Err(_) => {
-                                                let held = masker.finish();
-                                                if !held.is_empty() && tx.send((s.clone(), PtyOut::Data(held))).await.is_err() {
-                                                    break;
-                                                }
-                                                continue;
-                                            }
-                                        };
-                                        let (out, exit) = match out {
-                                            PtyOut::Data(d) => (PtyOut::Data(masker.push(&d)), false),
-                                            PtyOut::Exit(code) => {
-                                                let rest = masker.finish();
-                                                if !rest.is_empty() && tx.send((s.clone(), PtyOut::Data(rest))).await.is_err() {
-                                                    break;
-                                                }
-                                                (PtyOut::Exit(code), true)
-                                            }
-                                        };
-                                        let empty = matches!(&out, PtyOut::Data(d) if d.is_empty());
-                                        if (!empty && tx.send((s.clone(), out)).await.is_err()) || exit {
+                                    while let Ok(out) = masked.recv().await {
+                                        if tx.send((s.clone(), out)).await.is_err() {
                                             break;
                                         }
                                     }
                                 });
                                 let state = crate::termsess::Session::detached(session.clone(), format!("leg:{job}"), None, cols, rows);
+                                for data in typed {
+                                    pty.write(data);
+                                }
                                 terms.insert(session, (pty, state));
                             }
                             Err(e) => {
@@ -2261,16 +3018,36 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     // A kept leg let go now, or kept longer (W17-R02).
                     ServerMsg::KeepRelease { job } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_leg(&job, crate::runner::guest::ToGuest::Release) {
+                            continue;
+                        }
                         crate::rt::spawn(async move {
                             crate::runner::kept::release(&job).await;
                         });
                     }
                     ServerMsg::KeepExtend { job, minutes } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_leg(&job, crate::runner::guest::ToGuest::Extend(minutes)) {
+                            continue;
+                        }
                         crate::runner::kept::extend(&job, minutes);
                     }
+                    ServerMsg::Received { job } if job.is_empty() => receipts = true,
+                    ServerMsg::Received { job } => {
+                        unreceived.remove(&job);
+                        if let Some((_, _, events)) = journal.get_mut(&job) {
+                            events.clear();
+                        }
+                    }
                     ServerMsg::JobRerunStep { job, step, idx } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_leg(&job, crate::runner::guest::ToGuest::RerunStep { step, idx }) {
+                            continue;
+                        }
                         if !crate::runner::runtime::rerun_step(&job, step, idx) {
                             tracing::info!(leg = %job, "a step rerun for a leg that isn't kept here");
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("leg {job} isn't kept here"));
                         }
                     }
                     // The rest of CI's messages (W09, W13) land with their workstreams.
@@ -2302,9 +3079,41 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         AgentMsg::TermExit { session, code, error: None }
                     }
                 };
-                uplink.0.send(Up::Term(msg)).await.ok();
+                if updates_on {
+                    // Over the channel: its output comes once, in order, through a cut too.
+                    let (key, exited) = match &msg {
+                        AgentMsg::TermExit { session, .. } => (crate::wire::uplink::terminal_key(session), true),
+                        AgentMsg::TermOutput { session, .. } => (crate::wire::uplink::terminal_key(session), false),
+                        _ => (String::new(), false),
+                    };
+                    if !updates.started(&key) {
+                        updates.start(&key);
+                    }
+                    if let Ok(b) = proto::encode(&msg) {
+                        updates.push(&key, b);
+                    }
+                    if exited {
+                        updates.closing(&key);
+                    }
+                    if connected {
+                        flush_updates(&mut updates, &uplink).await;
+                    }
+                } else {
+                    uplink.0.send(Up::Term(msg)).await.ok();
+                }
             }
-            Ev::Up(up) => {
+            Ev::Up(mut up) => {
+                // A job's event: numbered, and kept until the job's result is received.
+                let mut journaled = None;
+                if let Up::Msg(AgentMsg::JobEvent { job, json }) = &mut up {
+                    let (at, seq, _) = journal.entry(job.clone()).or_insert_with(|| (Instant::now(), 0, Vec::new()));
+                    *at = Instant::now();
+                    *seq += 1;
+                    if let Some(rest) = json.strip_prefix('{') {
+                        *json = format!("{{\"seq\":{seq}{}{rest}", if rest.trim_start().starts_with('}') { "" } else { "," });
+                    }
+                    journaled = Some(job.clone());
+                }
                 let (lane, kind, data) = match &up {
                     Up::Msg(m) => (LANE_CONTROL, Kind::Control, proto::encode(m)),
                     Up::Log(c) => (LANE_LOGS, Kind::Log, proto::encode(c)),
@@ -2313,11 +3122,28 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Reach(m) => (LANE_REACH, Kind::Term, proto::encode(m)),
                     Up::Observe(m) => (LANE_OBSERVE, Kind::Control, proto::encode(m)),
                     Up::Convo(m) => (LANE_CONVO, Kind::Log, proto::encode(m)),
+                    Up::File(m) => (LANE_FILES, Kind::Log, proto::encode(m)),
+                    Up::Stream(m) => (LANE_STREAM, Kind::Term, proto::encode(m)),
+                    Up::Port(m) => (LANE_PORTS, Kind::Term, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
-                if connected {
-                    net.send(SERVER_PEER, lane, kind, data).await;
-                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_OBSERVE && lane != LANE_CONVO {
+                if let Some((_, _, events)) = journaled.as_ref().and_then(|j| journal.get_mut(j)) {
+                    events.push(data.clone());
+                }
+                // What the next connection sends again (a leg's result not yet received, its
+                // events once the server takes them again) needn't be kept for it.
+                let again = matches!(&up, Up::Msg(AgentMsg::JobFinished(r)) if unreceived.contains_key(&r.job)) || (receipts && journaled.is_some());
+                // Logs and jobs' messages wait for the Welcome too, and come after what waited.
+                if connected && (welcomed || (lane != LANE_LOGS && lane != LANE_CONTROL)) {
+                    match &delay_line {
+                        Some(d) => d.send(lane, kind, data, again),
+                        None => {
+                            net.send(SERVER_PEER, lane, kind, data).await;
+                        }
+                    }
+                } else if again {
+                    // Sent from `unreceived` and `journal` once connected again.
+                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_OBSERVE && lane != LANE_CONVO && lane != LANE_FILES {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                     // Shed the oldest log chunks first; results and step events are kept.
@@ -2330,8 +3156,38 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Harness(session, u) => {
-                // Not kept across a disconnect: the reconnect sends every session whole.
-                if connected {
+                note_announced(&mut announced, &session, &u);
+                if updates_on {
+                    // Over the channel: kept until the server has it, down or not. A new session's
+                    // stream starts with its Open; a closed one's ends once answered.
+                    let key = crate::wire::uplink::session_key(&session);
+                    if !updates.started(&key)
+                        && let crate::harness::core::Update::Open { info, .. } = &u
+                    {
+                        // Announced after the server said what its copy has, of this epoch (a
+                        // session that started again from the store): its stream starts as the
+                        // Welcome starts one, with only what the copy lacks.
+                        let kept = server_kept.get(&session).filter(|k| k.epoch == info.epoch);
+                        if let (Some(kept), Some(s)) = (kept, harness.as_ref().and_then(|h| h.get(&session))) {
+                            start_stream(&mut updates, &session, &s, Some(kept));
+                            if connected {
+                                flush_updates(&mut updates, &uplink).await;
+                            }
+                            continue 'events;
+                        }
+                        updates.start(&key);
+                    }
+                    push_update(&mut updates, &session, &u);
+                    if matches!(u, crate::harness::core::Update::Closed) {
+                        updates.closing(&key);
+                    }
+                    if connected {
+                        flush_updates(&mut updates, &uplink).await;
+                    }
+                } else if connected && welcomed {
+                    // A server from before the channel: not kept across a disconnect, the
+                    // reconnect sends every session whole (and before its Welcome, nothing: the
+                    // Welcome brings the server all of each, over the channel or not).
                     for json in harness_frames(&session, &u) {
                         uplink.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
                     }
@@ -2346,6 +3202,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if jobs.is_empty() {
                         exclusive = false;
                     }
+                    if let Ok(b) = proto::encode(&AgentMsg::JobFinished(r.clone())) {
+                        unreceived.insert(r.job.clone(), (Instant::now(), b));
+                    }
                     uplink.msg(AgentMsg::JobFinished(r)).await;
                 } else {
                     // Reported over already: a cancelled job let go of after its grace that ended
@@ -2354,6 +3213,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Heartbeat => {
+                // Counts of jobs long done (a kept leg is let go well within a day).
+                journal.retain(|_, (at, _, events)| !events.is_empty() || at.elapsed() < Duration::from_secs(86_400));
                 if connected {
                     let free = if upgrade_pending || retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
                     uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;
@@ -2368,18 +3229,58 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Sample => {
+                if connected && updates_on {
+                    // Items whose answers are overdue (lost below the channel) go again.
+                    flush_updates(&mut updates, &uplink).await;
+                }
+                // What it has of the server's commands, said again: one lost below the channel
+                // mustn't hold the server's commands up until the next connection.
+                if connected && server_wire {
+                    uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                }
                 if connected {
                     let s = sampler.sample();
                     uplink.msg(AgentMsg::Sample(s)).await;
+                    // What its QUIC layer let go below the channel, for its page: once it changed.
+                    let dropped = crate::metrics::net().counts();
+                    if server_drops && welcomed && drops_said.as_ref() != Some(&dropped) {
+                        uplink.msg(AgentMsg::NetDrops { dropped: dropped.clone() }).await;
+                        drops_said = Some(dropped);
+                    }
+                    // What its conversation stores are doing, for the server's board (a server from
+                    // before takes it for nothing). Never waits: a full link skips one.
+                    for (st, role, feed) in [(convo.as_ref(), "own", shipper.as_ref().map(crate::convo::feed::Shipper::stats)), (mirror_store.as_ref(), "mirror", None)] {
+                        if let Some(st) = st {
+                            let report = crate::convo::telemetry::Report { role: role.into(), version: crate::convo::telemetry::version(), store: st.report(), feed };
+                            let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Stats { store: st.id().to_owned(), report: Box::new(report) });
+                            let _ = uplink.0.try_send(Up::Convo(AgentMsg::Convo { json, data: Vec::new() }));
+                        }
+                    }
+                    // Its battery, once a minute, when it has one: said when it changes, and every
+                    // 10 minutes (a machine on battery sleeps when it runs out).
+                    if !o.ephemeral && !o.outpost && power_read_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                        power_read_at = Some(Instant::now());
+                        if let Ok(Some(b)) = crate::rt::blocking(crate::os::battery::read).await
+                            && (power_said.as_ref().is_none_or(|(said, _)| said != &b) || power_said.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(600)))
+                            && let Ok(json) = serde_json::to_string(&b)
+                        {
+                            uplink.msg(AgentMsg::Power { json }).await;
+                            power_said = Some((b, Instant::now()));
+                        }
+                    }
                     if let Some(ai) = &ai {
                         let shells = terms.iter().filter_map(|(id, (pty, _))| Some((pty.pid()?, id.clone()))).collect();
                         ai.scan(shells, uplink.0.clone());
                     }
-                    // A harness installed (or removed) since: say so.
+                    // A harness installed (or removed) since, or found once its user's login shell
+                    // said its PATH (asked again every ten minutes): say so.
                     harness_kinds_tick = harness_kinds_tick.wrapping_add(1);
+                    let users_path = crate::reach::serve::login_path().is_some();
                     if let Some(h) = &harness
-                        && harness_kinds_tick.is_multiple_of(12)
+                        && (harness_kinds_tick.is_multiple_of(12) || users_path != users_path_known)
                     {
+                        users_path_known = users_path;
+                        crate::rt::spawn(crate::reach::serve::login_env());
                         let now = serde_json::to_string(&crate::harness::kinds::offered()).ok();
                         if now != harness_kinds_sent
                             && let Ok(json) = serde_json::to_string(&h.inventory())
@@ -2400,6 +3301,112 @@ pub async fn enroll_only(o: &Opts) -> anyhow::Result<()> {
 }
 
 
+/// One agent-session update onto its session's channel stream, as the frames it needs.
+fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &crate::harness::core::Update) -> usize {
+    let key = crate::wire::uplink::session_key(session);
+    let mut bytes = 0;
+    for json in harness_frames(session, u) {
+        if let Ok(b) = proto::encode(&AgentMsg::Harness { session: session.to_owned(), json }) {
+            bytes += b.len();
+            updates.push(&key, b);
+        }
+    }
+    bytes
+}
+
+/// Starts `session`'s channel stream (again), its snapshot first: when the server's copy is of
+/// the same epoch (`kept`), only what the copy lacks (`crate::wire::sums`), else all of it.
+fn start_stream(updates: &mut crate::wire::uplink::Updates, session: &str, s: &crate::harness::session::Session, kept: Option<&proto::KeptSession>) {
+    use crate::harness::core::Update;
+    let key = crate::wire::uplink::session_key(session);
+    updates.start(&key);
+    let (snapshot, delta) = go_on(s.snapshot(), kept);
+    // Its bytes, and of them its newest meta, state and changes, and its events after the copy's.
+    let (mut bytes, mut newest, mut after) = (0, 0, 0);
+    for u in &snapshot {
+        let n = push_update(updates, session, u);
+        bytes += n;
+        match u {
+            Update::Meta { .. } | Update::State { .. } | Update::Changes { .. } => newest += n,
+            Update::Events { events } if delta.as_ref().is_some_and(|d| events.first().is_some_and(|e| e.seq > d.since)) => after += n,
+            _ => {}
+        }
+    }
+    match delta {
+        Some(d) => tracing::info!(
+            %session,
+            stream = %updates.stream(&key),
+            since = d.since,
+            again = d.again.len(),
+            bytes,
+            beyond = bytes - newest - after,
+            "an agent session's updates start on the channel after what the server's copy has"
+        ),
+        None => tracing::info!(%session, stream = %updates.stream(&key), bytes, "an agent session's updates start on the channel, whole"),
+    }
+}
+
+/// A session's `snapshot` as a stream that starts sends it to a server whose copy is `kept`: when
+/// that's of the same epoch, under an Open that says through which event the copy keeps its own
+/// (`since`), with no Reset, its newest info, meta, state and changes, and only the events after
+/// that and those through it whose digest differs from the copy's. Else the snapshot as it is.
+fn go_on(snapshot: Vec<crate::harness::core::Update>, kept: Option<&proto::KeptSession>) -> (Vec<crate::harness::core::Update>, Option<crate::wire::sums::Delta>) {
+    use crate::harness::core::Update;
+    let epoch = snapshot.iter().find_map(|u| if let Update::Open { info, .. } = u { Some(info.epoch) } else { None });
+    let Some(kept) = kept.filter(|k| Some(k.epoch) == epoch) else { return (snapshot, None) };
+    // Each event as the copy keeps it, and its digest.
+    let mine: Vec<(u64, u64)> = snapshot
+        .iter()
+        .filter_map(|u| if let Update::Events { events } = u { Some(events) } else { None })
+        .flatten()
+        .filter_map(sent_event)
+        .filter_map(|e| serde_json::to_value(&e).ok().map(|v| (e.seq, crate::wire::sums::event(&v))))
+        .collect();
+    let Some(d) = crate::wire::sums::delta(kept, &mine) else { return (snapshot, None) };
+    // Those it sends again go first, on their own, then those after the copy's newest: by number.
+    let mut again = Vec::new();
+    let mut out: Vec<Update> = Vec::new();
+    for u in snapshot {
+        match u {
+            Update::Open { info, .. } => out.push(Update::Open { info, since: Some(d.since) }),
+            Update::Reset { .. } => {}
+            Update::Events { events } => {
+                let (before, after): (Vec<_>, Vec<_>) = events.into_iter().partition(|e| e.seq <= d.since);
+                again.extend(before.into_iter().filter(|e| d.again.binary_search(&e.seq).is_ok()));
+                if !after.is_empty() {
+                    out.push(Update::Events { events: after });
+                }
+            }
+            u => out.push(u),
+        }
+    }
+    if !again.is_empty() {
+        let at = out.iter().position(|u| matches!(u, Update::Events { .. })).unwrap_or(out.len());
+        out.insert(at, Update::Events { events: again });
+    }
+    (out, Some(d))
+}
+
+/// Notes a session's announcement in this process (and that it's gone, once closed).
+fn note_announced(announced: &mut std::collections::HashSet<String>, session: &str, u: &crate::harness::core::Update) {
+    match u {
+        crate::harness::core::Update::Open { .. } => {
+            announced.insert(session.to_owned());
+        }
+        crate::harness::core::Update::Closed => {
+            announced.remove(session);
+        }
+        _ => {}
+    }
+}
+
+/// Sends what the channel has to send now.
+async fn flush_updates(updates: &mut crate::wire::uplink::Updates, uplink: &Uplink) {
+    for f in updates.poll(Instant::now()) {
+        uplink.0.send(Up::Term(AgentMsg::Wire(f))).await.ok();
+    }
+}
+
 /// Most of one agent-session update a frame carries. They go on the interactive lane, which
 /// refuses frames past 1 MiB ([`net::Kiln`]); a resumed session's history can be several.
 const HARNESS_FRAME: usize = 512 * 1024;
@@ -2407,8 +3414,17 @@ const HARNESS_FRAME: usize = 512 * 1024;
 /// An agent-session update as frames that fit: a long run of events goes in parts (events are
 /// upserts by id, so the parts mean what the whole did), and an event too large on its own has
 /// its longest texts cut, saying so. Anything else too large (a state, the changeset) is cut the
-/// same way: dropped, its page would go on showing what no longer is, the agent looking stuck.
-/// Only what still doesn't fit is dropped, and logged.
+/// same way: dropped, its page would go on showing what no longer is, the agent looking stuck. A
+/// state still too large sheds its finished tasks, the oldest first. Only what still doesn't fit
+/// is dropped, and logged.
+/// The command being applied on the channel (`answer_after`) is refused, saying how and why: a
+/// message that came alone has no one to tell.
+fn refuse(answer_after: &mut Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)>, code: crate::wire::channel::Refusal, why: impl Into<String>) {
+    if let Some((_, _, refusal)) = answer_after.as_mut() {
+        *refusal = Some((code, why.into()));
+    }
+}
+
 fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
     use crate::harness::core::Update;
     let Ok(json) = serde_json::to_string(u) else { return Vec::new() };
@@ -2416,16 +3432,32 @@ fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String
         return vec![json];
     }
     let Update::Events { events } = u else {
-        let fitted = serde_json::to_value(u).ok().map(|v| cut_value(v, HARNESS_FRAME - 1024)).and_then(|v| serde_json::to_string(&v).ok());
+        let budget = HARNESS_FRAME - 1024;
+        // A state still too large once cut sheds its finished tasks first (their calls stay in
+        // the timeline): dropped whole, its page would go on showing ended work as running.
+        let fitted = serde_json::to_value(u)
+            .ok()
+            .map(|v| cut_value(v, budget))
+            .map(|v| if json_len(&v) > budget { cut_value(shed_ended_tasks(v, budget), budget) } else { v })
+            .and_then(|v| serde_json::to_string(&v).ok());
         return match fitted {
             Some(j) if j.len() <= HARNESS_FRAME => {
                 tracing::debug!(session, bytes = json.len(), sent = j.len(), "agent session update cut to fit");
                 vec![j]
             }
-            _ => {
-                tracing::warn!(session, bytes = json.len(), "agent session update too large to send, even cut; dropped");
-                Vec::new()
-            }
+            _ => match essentials(u, budget) {
+                // Still too large (its live tasks, or lists of many short entries, no text cut
+                // shortens): what a viewer can't do without, rather than nothing. Dropped whole, the
+                // page went on without its state at all: no effort, a switch never shown done.
+                Some(j) if j.len() <= HARNESS_FRAME => {
+                    tracing::warn!(session, bytes = json.len(), sent = j.len(), "agent session update too large to send whole; sent what it can't do without");
+                    vec![j]
+                }
+                _ => {
+                    tracing::warn!(session, bytes = json.len(), "agent session update too large to send, even cut; dropped");
+                    Vec::new()
+                }
+            },
         };
     };
     let one = HARNESS_FRAME - 1024;
@@ -2433,15 +3465,11 @@ fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String
     let mut part = Vec::new();
     let mut size = 0;
     for e in events {
-        let mut e = e.clone();
-        if json_len(&e) > one {
-            e = cut(e, one);
-        }
-        let n = json_len(&e).saturating_add(1);
-        if n > one {
-            tracing::warn!(session, event = %e.id, bytes = n, "agent session event too large to send, even cut; dropped");
+        let Some(e) = sent_event(e) else {
+            tracing::warn!(session, event = %e.id, "agent session event too large to send, even cut; dropped");
             continue;
-        }
+        };
+        let n = json_len(&e).saturating_add(1);
         if size + n > one && !part.is_empty() {
             frames.extend(serde_json::to_string(&Update::Events { events: std::mem::take(&mut part) }));
             size = 0;
@@ -2455,8 +3483,60 @@ fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String
     frames
 }
 
+/// An event as it goes to the server: cut to fit a frame when it's larger. None: too large even cut.
+fn sent_event(e: &crate::harness::model::Event) -> Option<crate::harness::model::Event> {
+    let one = HARNESS_FRAME - 1024;
+    let mut e = e.clone();
+    if json_len(&e) > one {
+        e = cut(e, one);
+    }
+    (json_len(&e).saturating_add(1) <= one).then_some(e)
+}
+
 fn json_len<T: Serialize>(v: &T) -> usize {
     serde_json::to_vec(v).map_or(usize::MAX, |b| b.len())
+}
+
+/// A state update too large even cut, down to what a viewer can't do without: how the session
+/// runs (status, harness, model, permissions, effort), what waits on a person, its queue, what it
+/// has going (its live tasks, cut), its usage and limits. Its lists of what it can use (servers'
+/// tools, skills, plugins, commands) and its finished tasks wait for an update that fits. None:
+/// not a state, or still too large.
+fn essentials(u: &crate::harness::core::Update, budget: usize) -> Option<String> {
+    let crate::harness::core::Update::State { state } = u else { return None };
+    let mut s = (**state).clone();
+    s.tasks.retain(crate::harness::model::Task::live);
+    s.mcp.clear();
+    s.skills.clear();
+    s.plugins.clear();
+    s.inventory = Default::default();
+    let v = serde_json::to_value(crate::harness::core::Update::State { state: Box::new(s) }).ok()?;
+    serde_json::to_string(&cut_value(v, budget)).ok()
+}
+
+/// A state update (`{"t":"state","state":{..}}`) without as many of its finished tasks, the oldest
+/// first, as it takes to come within `budget` bytes of JSON (when finished tasks can).
+fn shed_ended_tasks(mut v: serde_json::Value, budget: usize) -> serde_json::Value {
+    let excess = json_len(&v).saturating_sub(budget);
+    let Some(tasks) = v.pointer_mut("/state/tasks").and_then(serde_json::Value::as_array_mut) else { return v };
+    let live = |t: &serde_json::Value| matches!(t.get("status").and_then(serde_json::Value::as_str), Some("running" | "pending" | "paused"));
+    let mut freed = 0usize;
+    let mut drop = std::collections::HashSet::new();
+    for (i, t) in tasks.iter().enumerate() {
+        if freed >= excess {
+            break;
+        }
+        if !live(t) {
+            freed = freed.saturating_add(json_len(t).saturating_add(1));
+            drop.insert(i);
+        }
+    }
+    let mut i = 0;
+    tasks.retain(|_| {
+        i += 1;
+        !drop.contains(&(i - 1))
+    });
+    v
 }
 
 /// An event cut to about `budget` bytes of JSON: its longest texts shortened, each saying so.
@@ -2678,11 +3758,118 @@ fn adopt_handover(
     start
 }
 
+
+/// The copy of the server's conversation store this runner keeps (a mirror), beside its own, and
+/// the intake that takes the server's feed into it, its answers going up the link.
+fn open_mirror(dir: &std::path::Path, up: &async_channel::Sender<Up>) -> Option<(crate::convo::store::Store, crate::convo::feed::Intake)> {
+    let st = crate::convo::open_file(dir, crate::convo::MIRROR_FILE, crate::config::Conversations::default().upkeep())?;
+    match crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::AsItSays, None) {
+        Ok((intake, out)) => {
+            let up = up.clone();
+            crate::rt::spawn(async move {
+                while let Ok(o) = out.recv().await {
+                    if up.send(Up::Convo(AgentMsg::Convo { json: o.json, data: Vec::new() })).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Some((st, intake))
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "this runner can't keep a copy of the conversation store");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::harness::core::Update;
     use crate::harness::model::{Body, Event};
+
+    /// A stream that starts again sends a server whose copy has part of a session only what the
+    /// copy lacks. The digests it compares are of the copy as the server keeps it: every kind of
+    /// event, one cut to fit among them, taken in from the frames they went in. So an event the
+    /// copy has is never sent again, and one that changed since is.
+    #[test]
+    fn a_stream_that_starts_again_sends_only_what_the_copy_lacks() -> anyhow::Result<()> {
+        use crate::harness::model::{Level, ToolCall, ToolKind, ToolStatus};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), epoch: 2, ..Default::default() };
+            let tool = |n: u64, status| {
+                Body::Tool(Box::new(ToolCall {
+                    tool_id: format!("t{n}"),
+                    name: "Bash".into(),
+                    tool: ToolKind::Shell,
+                    title: "ls".into(),
+                    detail: None,
+                    input: serde_json::json!({"command": "ls -la", "timeout": 1.5, "nested": {"z": [1, 2.25, "\u{fc}"], "a": null}}),
+                    status,
+                    output: Some(format!("out {n}")),
+                    truncated: false,
+                    diffs: Vec::new(),
+                    todos: Vec::new(),
+                    task: None,
+                    exit_code: Some(0),
+                    started: 5,
+                    ended: None,
+                    server: None,
+                    tool_short: None,
+                    skill: None,
+                    runner: None,
+                }))
+            };
+            let body = |n: u64| match n % 5 {
+                0 => Body::User { text: format!("ask {n}"), images: 1, client_id: Some("c".into()), origin: None, attachments: vec!["/a.png".into()], reply_to: None },
+                1 => Body::Assistant { text: format!("line {n} \u{2713}"), streaming: false },
+                2 => Body::Thinking { text: format!("think {n}"), streaming: false, redacted: n.is_multiple_of(2) },
+                3 => tool(n, ToolStatus::Done),
+                _ => Body::Notice { level: Level::Warn, text: format!("notice {n}") },
+            };
+            let ev = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1_000 + i64::try_from(n).unwrap_or(0), parent: n.is_multiple_of(7).then(|| "e1".to_owned()), by: None, body: body(n) };
+            let mut timeline: Vec<Event> = (1..=200).map(ev).collect();
+            // One too large to go whole: cut on its way, and kept by the copy as cut.
+            if let Some(e) = timeline.get_mut(41) {
+                e.body = Body::Assistant { text: "y".repeat(HARNESS_FRAME * 2), streaming: false };
+            }
+            // The copy: the session's first 150 events, as they went over the wire.
+            for u in [Update::Open { info: Box::new(info.clone()), since: None }, Update::Events { events: timeline.iter().take(150).cloned().collect() }] {
+                for json in harness_frames("s", &u) {
+                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(&json)?);
+                }
+            }
+            let kept = hub.harness.kept_on("box");
+            let kept = kept.first().ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            // Meanwhile its 120th changed (a tool call that ended), and 50 more came.
+            if let Some(e) = timeline.get_mut(119) {
+                e.body = tool(120, ToolStatus::Error);
+            }
+            let snapshot = || {
+                vec![
+                    Update::Open { info: Box::new(info.clone()), since: None },
+                    Update::Reset { from: Some(1) },
+                    Update::Meta { meta: Box::default() },
+                    Update::State { state: Box::default() },
+                    Update::Events { events: timeline.iter().take(100).cloned().collect() },
+                    Update::Events { events: timeline.iter().skip(100).cloned().collect() },
+                ]
+            };
+            let (out, delta) = go_on(snapshot(), Some(kept));
+            anyhow::ensure!(delta == Some(crate::wire::sums::Delta { since: 150, again: vec![120] }), "{delta:?}");
+            anyhow::ensure!(matches!(out.first(), Some(Update::Open { since: Some(150), .. })), "under an Open that says through which event the copy keeps its own");
+            anyhow::ensure!(!out.iter().any(|u| matches!(u, Update::Reset { .. })), "no Reset: the copy keeps what it has");
+            anyhow::ensure!(out.iter().any(|u| matches!(u, Update::Meta { .. })) && out.iter().any(|u| matches!(u, Update::State { .. })), "its newest meta and state");
+            let sent: Vec<u64> = out.iter().filter_map(|u| if let Update::Events { events } = u { Some(events) } else { None }).flatten().map(|e| e.seq).collect();
+            anyhow::ensure!(sent == std::iter::once(120).chain(151..=200).collect::<Vec<_>>(), "{sent:?}");
+            // A copy of another epoch (it went on elsewhere since): all of it.
+            let (whole, none) = go_on(snapshot(), Some(&proto::KeptSession { epoch: 1, ..kept.clone() }));
+            anyhow::ensure!(none.is_none() && matches!(whole.get(1), Some(Update::Reset { .. })) && whole.len() == 6);
+            Ok(())
+        })
+    }
 
     fn said(id: usize, text: String) -> Event {
         Event { id: format!("e{id}"), seq: id as u64, at: 0, parent: None, by: None, body: Body::Assistant { text, streaming: false } }
@@ -2748,5 +3935,55 @@ mod tests {
         assert!(state.as_ref().is_some_and(|s| s.status == Status::Idle), "the state, whole");
         let summary = state.map(|s| s.summary).unwrap_or_default();
         assert!(summary.starts_with("begin ") && summary.ends_with("bytes cut by kiln to fit]"));
+    }
+
+    #[test]
+    fn a_state_too_large_for_its_tasks_sheds_the_oldest_finished_ones_not_the_update() {
+        use crate::harness::model::{State, Status, Task};
+        // A long Codex session's state: thousands of finished terminals, none long enough to cut.
+        // Dropped, its console showed a finished command running for 37 minutes, and missed two
+        // subagents that started after it.
+        let ended =
+            |i: usize| Task { id: format!("terminal-{i}"), description: "d".repeat(200), command: Some("c".repeat(200)), status: "completed".into(), class: Some("shell".into()), ..Task::default() };
+        let mut tasks: Vec<Task> = (0..3000).map(ended).collect();
+        tasks.insert(1, Task { id: "server".into(), status: "running".into(), class: Some("shell".into()), ..Task::default() });
+        let state = State { status: Status::Running, tasks, ..State::default() };
+        let frames = harness_frames("s", &Update::State { state: Box::new(state) });
+        assert_eq!(frames.len(), 1);
+        assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let state = match serde_json::from_str::<Update>(frames.first().map_or("", String::as_str)) {
+            Ok(Update::State { state }) => Some(state),
+            _ => None,
+        };
+        let ids: Vec<String> = state.as_ref().map(|s| s.tasks.iter().map(|t| t.id.clone()).collect()).unwrap_or_default();
+        assert!(state.as_ref().is_some_and(|s| s.status == Status::Running));
+        assert!(ids.iter().any(|id| id == "server") && ids.iter().any(|id| id == "terminal-2999"), "the live and the newest stay");
+        assert!(!ids.iter().any(|id| id == "terminal-0"), "the oldest finished go first");
+    }
+
+    #[test]
+    fn a_state_too_large_even_shed_still_says_how_the_session_runs() {
+        use crate::harness::model::{McpServer, State, Status, Task};
+        // Too large for a list of thousands of short entries (a server's tools) beside its live
+        // tasks: no text long enough to cut, no finished task to shed. Dropped whole, its page went
+        // on without its state at all: no effort, a harness switch never shown done.
+        let tools: Vec<serde_json::Value> = (0..12_000).map(|i| serde_json::json!({ "name": format!("tool_{i:05}"), "description": "d".repeat(40) })).collect();
+        let server = serde_json::from_value::<McpServer>(serde_json::json!({ "name": "big", "scope": "user", "transport": "stdio", "status": "connected", "enabled": true, "tools": tools }));
+        assert!(server.is_ok(), "{server:?}");
+        let Ok(server) = server else { return };
+        let live = |i: usize| Task { id: format!("bg-{i}"), status: "running".into(), class: Some("shell".into()), command: Some(format!("serve {i}")), ..Task::default() };
+        let state = State { status: Status::Running, model: "gpt-6.1-sol".into(), mode: "full-access".into(), effort: "ultra".into(), tasks: (0..7).map(live).collect(), mcp: vec![server], ..State::default() };
+        assert!(json_len(&state) > HARNESS_FRAME);
+        let frames = harness_frames("s", &Update::State { state: Box::new(state) });
+        assert_eq!(frames.len(), 1, "sent, not dropped");
+        assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let got = match serde_json::from_str::<Update>(frames.first().map_or("", String::as_str)) {
+            Ok(Update::State { state }) => Some(state),
+            _ => None,
+        };
+        let got = got.as_deref();
+        assert_eq!(got.map(|s| (s.model.as_str(), s.mode.as_str(), s.effort.as_str(), s.status)), Some(("gpt-6.1-sol", "full-access", "ultra", Status::Running)));
+        assert_eq!(got.map(|s| s.tasks.len()), Some(7), "its live tasks stay");
+        assert!(got.is_some_and(|s| s.mcp.is_empty()), "its lists wait for an update that fits");
     }
 }

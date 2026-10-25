@@ -12,10 +12,14 @@
 //! - `runners`: which machines there are, best first for what the work needs;
 //! - `run`: a command on one of them (by name, or by what it must be: `linux/amd64`), this
 //!   repository synced over first; returns its output and exit code, or runs on in the background;
-//! - `output` / `stop`: a background run's new output, and stopping it.
+//! - `output` / `stop`: a background run's new output, and stopping it;
+//! - `agents_*`, `goals_*`, `plans_*`: kiln's operations an agent uses most, as tools of their own
+//!   (the agents it starts, its own goal stack, plans kept and run), asked of the server like the
+//!   rest.
 //!
 //! The session's preferred runner (`KILN_REACH_ON`) is the default for `on`; the session itself
-//! (`KILN_SESSION`) is whom kiln's operations are asked for.
+//! (`KILN_SESSION`) is whom kiln's operations are asked for, and the instructions tell the agent
+//! that's who it is.
 
 use std::collections::HashMap;
 use std::io::{BufRead as _, Write as _};
@@ -40,22 +44,40 @@ const CODE_WALL_MAX: Duration = Duration::from_secs(3600);
 /// kiln's operations, as the server lists them, are asked for again after this.
 const REGISTRY_TTL: Duration = Duration::from_secs(60);
 
-fn instructions(prefer: Option<&str>, machines: &str) -> String {
+fn instructions(prefer: Option<&str>, machines: &str, session: &str) -> String {
     let mut s = "This is kiln's own MCP server: the machines of this kiln (its runners), and kiln itself (CI, deployments). \
 When a step has to happen on another machine (the person's Mac, a server, the box with the GPU), run it there yourself: \
 don't hand the person a command to type. When a step needs a person at that machine (a password, a system dialog to \
-allow, something physical), start it yourself and tell them exactly what will appear and what to do. Use another machine \
-too when work needs another platform or more power than this one: build and test for Linux x86-64 from a Mac (on: \
-\"linux/amd64\"), use the machine with the GPU (on: \"+gpu\"). `run` runs one command on one machine. `code_run` runs a \
+allow, something physical), start it yourself and tell them exactly what will appear and what to do. Everything else \
+runs on this machine, with your own tools: use another only when this one can't do the step, because it needs another \
+platform (build and test for Linux x86-64 from a Mac: on: \"linux/amd64\"), a GPU (on: \"+gpu\"), or more memory, disk \
+or cores than this machine has (on: \"mem>=32g\", \"cpus>=16\"). `run` runs one command on one machine. `code_run` runs a \
 JavaScript program against kiln, and only what it returns comes back to you: the same build or test on several machines at \
 once, returning just what failed (`const [mac, linux] = await Promise.all([kiln.machines.run({on: \"macos\", command: \
 \"cargo test\"}), kiln.machines.run({on: \"linux/amd64\", command: \"cargo test\"})])`), or CI runs and deployments \
 (`kiln.ci.*`, `kiln.cd.*`; `code_search` lists every operation and its input). The repository you are in is synced to \
 the other machine first (only what changed; git sees the same state there), and the command runs in the matching \
-folder, so edit here and build or test there; for a command that isn't about this repository, pass sync: false (it runs \
-in that machine's home folder). `runners` lists the machines, best first. Long commands can run in the background \
-(background: true), then `output` and `stop`."
+folder, so you edit here and it builds or tests there; for a command that isn't about this repository, pass sync: false (it runs \
+in that machine's home folder). `runners` lists the machines, this one first when it suits. Long commands can run in the background \
+(background: true), then `output` and `stop`. Nothing a command leaves running outlives it: what a run leaves behind \
+(`nohup … &`, a daemon) ends when it does, and what your own shell commands leave running on their own ends when your \
+turn does; run a server or anything that must keep going as a background task of your shell tool, or a background run. To hand parts of the work to other agents (any harness, any machine), \
+`agents_start` them with a clear brief, then carry on or end your turn: kiln tells you when each is done (`agents_wait` \
+when you can't go on without one), and `agents_result` reads what it concluded: \
+they get no more permissions than you have, and what they ask a person stays a person's to answer (the kiln-agents \
+skill says how). To show the person a file from this machine (a screenshot, a recording, a PDF, a log), write its full \
+path in your message, as a Markdown image for a picture (`![phone view](/tmp/shot.png)`) or a link for the rest: kiln \
+shows it in the conversation and keeps a copy, so it still shows after the file goes. To show something live (a chart, a \
+table, a diagram, a mock-up, a small tool to try), write a page and show it with show_page: it runs in the conversation, \
+sized to fit, in kiln's look; look at it with preview_page first. A page that needs this machine (your dev server, its files) \
+you show live with show_live: it streams to them as they look, and use_live lets you use it with them."
         .to_owned();
+    s.push(' ');
+    s.push_str(crate::mcp::GOALS_AND_PLANS);
+    if !session.is_empty() {
+        s.push(' ');
+        s.push_str(&crate::mcp::you_are(session));
+    }
     if !machines.is_empty() {
         s.push_str(&format!(" This kiln's machines: {machines}."));
     }
@@ -108,7 +130,7 @@ const WANT: &str = "What the machine must be (optional): a runner's name, or `li
 fn command_schema(waits: bool) -> Value {
     let mut props = json!({
         "command": {"type": "string", "description": "Shell text, run by bash in the synced copy of this repository."},
-        "on": {"type": "string", "description": "Where: a runner's name or what it must be (`linux/amd64`). Default: the session's preferred runner, else the best of all."},
+        "on": {"type": "string", "description": "Where: a runner's name or what it must be (`linux/amd64`). Default: the session's preferred runner, else this machine. What it must be picks this machine when it suits and has memory to spare, else the idlest that suits."},
         "sync": {"type": "boolean", "description": "Copy this repository over first and run in it (default: true inside a git repository)."},
         "cwd": {"type": "string", "description": "With sync: the folder here whose repository is synced and whose counterpart the command runs in (default: the session's folder). Without sync: the folder on the other machine (default: its home)."},
         "timeout_s": {"type": "number", "description": "Stop the command after this many seconds."},
@@ -122,7 +144,68 @@ fn command_schema(waits: bool) -> Value {
     json!({"type": "object", "properties": props, "required": ["command"]})
 }
 
+/// kiln's operations an agent has as tools of its own ([`crate::mcp::agent_ops`]: `agents_start`,
+/// `goals_plan`, `plans_run`, …), as this binary knows them: what's offered when the server can't
+/// say (one from before it said, or out of reach).
+fn agent_tools() -> Vec<Value> {
+    crate::mcp::agent_ops().iter().map(|o| tool_of(o.name, &json!(o.summary), &(o.input)(), o.read_only, o.destructive)).collect()
+}
+
+/// One operation as an agent's tool, asked of the server for this session like the rest of kiln's
+/// operations: what an agent starts here is its child, and the goals it lines up without naming an
+/// agent are its own.
+fn tool_of(op: &str, summary: &Value, input: &Value, read_only: bool, destructive: bool) -> Value {
+    json!({
+        "name": crate::mcp::tool_name(op),
+        "title": op,
+        "description": summary,
+        "inputSchema": input,
+        "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "openWorldHint": false},
+    })
+}
+
+/// The agent tools as the server lists them (`agent_tools`, each as its registry has it); `None`
+/// from a server that doesn't say.
+fn agent_tools_of(registry: &[Value], names: Option<&[String]>) -> Option<Vec<Value>> {
+    let names = names?;
+    let by_name: HashMap<&str, &Value> = registry.iter().filter_map(|o| Some((o.get("name")?.as_str()?, o))).collect();
+    Some(
+        names
+            .iter()
+            .filter_map(|n| by_name.get(n.as_str()))
+            .filter_map(|o| {
+                let op = o.get("name")?.as_str()?;
+                let flag = |k: &str| o.get(k).and_then(Value::as_bool).unwrap_or(false);
+                Some(tool_of(op, o.get("summary").unwrap_or(&Value::Null), o.get("input").unwrap_or(&json!({"type": "object"})), flag("read_only"), flag("destructive")))
+            })
+            .collect(),
+    )
+}
+
+/// The operation a tool is, by its name (`agents_start` is `agents.start`), among `tools`.
+fn op_of(tools: &[Value], tool: &str) -> Option<String> {
+    tools.iter().find(|t| t.get("name").and_then(Value::as_str) == Some(tool)).and_then(|t| t.get("title")?.as_str().map(str::to_owned))
+}
+
+/// What a list of tools is, to tell when it changes.
+fn fingerprint(tools: &Value) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tools.to_string().hash(&mut h);
+    h.finish()
+}
+
+/// The tools as this binary knows them alone.
+#[cfg(test)]
 fn tools() -> Value {
+    let mut t = base_tools();
+    if let Some(list) = t.as_array_mut() {
+        list.extend(agent_tools());
+    }
+    t
+}
+
+fn base_tools() -> Value {
     json!([
         {
             "name": "code_run",
@@ -142,13 +225,13 @@ fn tools() -> Value {
         },
         {
             "name": "runners",
-            "description": "The machines (kiln runners) commands can run on, best first for `want`: platform, idle cores, free memory, installed agents, and why others don't suit. `want` is a runner's name or what it must be: `linux/amd64`, `macos`, `arm64`, `linux,+gpu`, `cpus>=16`, `mem>=32g`.",
+            "description": "The machines (kiln runners) commands can run on, best first for `want` (this one first when it suits and has memory to spare): platform, idle cores, free memory, installed agents, and why others don't suit. `want` is a runner's name or what it must be: `linux/amd64`, `macos`, `arm64`, `linux,+gpu`, `cpus>=16`, `mem>=32g`.",
             "inputSchema": {"type": "object", "properties": {"want": {"type": "string", "description": "What the machine must be (optional)."}}},
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
         {
             "name": "run",
-            "description": "Run a shell command (bash) on another machine. `on` picks it: a runner's name, or what it must be (`linux/amd64`, `macos/arm64`, `+gpu`, `cpus>=16`); the idlest that suits is used. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id for `output` and `stop`.",
+            "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory, disk or cores than it has, or one that has to happen on that machine (everything else, run here with your own tools). `on` picks it: a runner's name, or what it must be (`linux/amd64`, `macos/arm64`, `+gpu`, `cpus>=16`): this machine when it suits and has memory to spare, else the idlest that suits. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. What the command leaves running when it ends (`nohup … &`, a daemon) ends with it: run a server with background: true, and `stop` it when done. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id for `output` and `stop`.",
             "inputSchema": command_schema(true),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
         },
@@ -163,6 +246,55 @@ fn tools() -> Value {
             "description": "Stop a background run (Ctrl-C, then terminate if it doesn't stop).",
             "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false},
+        },
+        {
+            "name": "preview_page",
+            "description": "See a page as a person will, in kiln's own browser on this machine: HTML you wrote, an HTML file, or an address (a dev server here, http://localhost:5173, or the web). You get a picture of it, what its console printed (errors with their stack), how tall it is, and how it behaved for a moment after it loaded: layout shift (0: nothing moved), long tasks, frames a second. Check your work with it before you say it's done or show it. A phone by default (390×844, 2× pixels, dark); set width, height, scale and dark to see others. measure: true also gives its height at each width a viewer's conversation might have. The picture is saved at picture_path: to show it to the person, put that path in your message as a Markdown image. The first preview on a machine downloads the browser once (about 200 MB), so it can take a minute.",
+            "inputSchema": {"type": "object", "properties": {
+                "html": {"type": "string", "description": "A whole HTML document you wrote. Full paths in it (src=\"/tmp/shot.png\") load those files."},
+                "path": {"type": "string", "description": "An HTML file on this machine (or a picture, a PDF)."},
+                "url": {"type": "string", "description": "An address: a dev server on this machine or a page on the web."},
+                "width": {"type": "number", "description": "The window's width in CSS pixels: 390 (a phone) by default, 1280 for a desktop."},
+                "height": {"type": "number", "description": "The window's height: 844 by default."},
+                "scale": {"type": "number", "description": "Pixel density: 2 by default."},
+                "dark": {"type": "boolean", "description": "A dark appearance (prefers-color-scheme): true by default."},
+                "reduced_motion": {"type": "boolean", "description": "prefers-reduced-motion: reduce."},
+                "watch_ms": {"type": "number", "description": "How long to watch it after it loads, in ms: 1500 by default, at most 10000."},
+                "measure": {"type": "boolean", "description": "Also its height at each width a viewer's conversation might have."},
+                "picture": {"type": "string", "enum": ["window", "page", "none"], "description": "The window (the default), the whole page, or none."}
+            }},
+            "annotations": {"readOnlyHint": true, "openWorldHint": true},
+        },
+        {
+            "name": "show_page",
+            "description": "Show the person a page in the conversation, live and interactive: a chart, a table, a diagram, a mock-up, a small tool to try. Write a whole HTML document (or give an HTML file). kiln keeps it with every file it uses: pictures, styles, scripts, fonts, data, by full path or next to the file; libraries from the web (pin their versions) are fetched once by the server and kept. It's shown inline at the conversation's width, as tall as it is, in kiln's look: dark, transparent background, Geist, and kiln's colors as CSS variables (--foreground, --muted-foreground, --border, --card, --accent, --success, --warning, --destructive, --chart-1 to --chart-5, --font-sans, --font-mono, --radius): use them. Make it fit any width from 320 px up (no fixed widths). It runs sandboxed: its scripts work, but it reaches nothing beyond its own files and has no cookies or storage. In it, kiln.reply(value, label) offers the person's choice back to you as their next message; kiln.save(state) keeps what they did, handed back to kiln.onrestore(state) when it's shown again. What moves (animations, video, sound) pauses while it's out of view. Look at it with preview_page first. The answer says what kiln's browser saw: errors it printed, layout shift, its height at each width.",
+            "inputSchema": {"type": "object", "properties": {
+                "title": {"type": "string", "description": "A few words for it: shown with it, and its name."},
+                "html": {"type": "string", "description": "A whole HTML document."},
+                "path": {"type": "string", "description": "Or an HTML file on this machine (files it uses are found next to it)."}
+            }, "required": ["title"]},
+            "annotations": {"readOnlyHint": false, "openWorldHint": true},
+        },
+        {
+            "name": "show_live",
+            "description": "Show the person a page live in the conversation, running here on this machine: your dev server (http://localhost:5173), a page that needs this machine's files, network or GPU, or any site. Its picture and sound stream to them while they look, at their screen's size, and what they do in it (taps, typing, scrolling) goes to it. For a page you wrote that runs on its own, use show_page instead. The answer says which stream it is. To test it in another engine, say engine: firefox (this machine's Firefox) or webkit (Safari on a Mac); to see it as a device does, say device (its window, density, touch and user agent the device's).",
+            "inputSchema": {"type": "object", "properties": {
+                "url": {"type": "string", "description": "Its address: on this machine (http://localhost:3000) or on the web."},
+                "title": {"type": "string", "description": "A few words for it."},
+                "engine": {"type": "string", "enum": ["chromium", "firefox", "webkit"], "description": "The engine it runs in (chromium by default)."},
+                "device": {"type": "string", "enum": ["iPhone 15", "iPhone SE", "Pixel 8", "iPad Air", "Laptop", "Desktop"], "description": "A device it's laid out as (by default, as the person's screen is)."}
+            }, "required": ["url"]},
+            "annotations": {"readOnlyHint": false, "openWorldHint": true},
+        },
+        {
+            "name": "use_live",
+            "description": "Use a page you showed with show_live, as the person can: click or tap at a point (CSS pixels of its window), type text, press a key by name (Enter, Tab, Escape, ArrowDown, a), scroll, go to an address, back, forward, reload, wait; its tabs: show one, open a new one, close one (a link to a new tab or a popup opens a tab of its own, shown). Its actions run in order; then you get a picture of it, its address and title, and its tabs. The person sees what you did as you do it, live, in the same page. Record it too: {\"record\": true} starts a recording (video, and a log of what's done in it by you or the person), {\"record\": false} stops it and answers with its files: the video (MP4), the log (.inputs.jsonl) and a Playwright test of what was done (.spec.ts) to turn into a real one. {\"replay\": \"<.inputs.jsonl path>\"} does a recording's log again in the page.",
+            "inputSchema": {"type": "object", "properties": {
+                "stream": {"type": "string", "description": "The stream's id, from show_live's answer."},
+                "actions": {"type": "array", "description": "In order: {\"click\": [x, y]}, {\"tap\": [x, y]}, {\"type\": \"text\"}, {\"key\": \"Enter\"}, {\"scroll\": [dx, dy]}, {\"go\": \"http://localhost:3000/\"}, {\"back\": true}, {\"forward\": true}, {\"reload\": true}, {\"tab\": {\"show\": \"<tab id>\"}}, {\"tab\": {\"new\": \"https://example.com/\"}}, {\"tab\": {\"close\": \"<tab id>\"}}, {\"wait_ms\": 500}, {\"record\": true}, {\"record\": false}, {\"replay\": \"/path/live-….inputs.jsonl\"}.", "items": {"type": "object"}},
+                "picture": {"type": "boolean", "description": "A picture of it after (true by default)."}
+            }, "required": ["stream"]},
+            "annotations": {"readOnlyHint": false, "openWorldHint": true},
         },
     ])
 }
@@ -264,6 +396,20 @@ fn follow(mut client: Client, cell: Cell) {
     });
 }
 
+/// What a preview saw (on one line, first: the conversation shows that), with its picture for the
+/// agent to look at (unless it's too big to send).
+fn picture_result(answer: &Value, picture: Option<&str>) -> Value {
+    use base64::Engine as _;
+    let mut content = vec![json!({"type": "text", "text": answer.to_string()})];
+    if let Some(path) = picture
+        && let Ok(png) = std::fs::read(path)
+        && png.len() <= 8 << 20
+    {
+        content.push(json!({"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(&png), "mimeType": "image/png"}));
+    }
+    json!({"content": content, "structuredContent": answer, "isError": false})
+}
+
 fn text_result(v: &Value, error: bool) -> Value {
     json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(v).unwrap_or_default()}], "structuredContent": v, "isError": error})
 }
@@ -323,8 +469,8 @@ fn running(v: &Value) -> bool {
 }
 
 /// kiln's operations as the server lists them for this session, when it does: (when asked, the
-/// registry, why there is none).
-type Registry = (Instant, Vec<Value>, Option<String>);
+/// registry, why there is none, which are agents' tools when it says).
+type Registry = (Instant, Vec<Value>, Option<String>, Option<Vec<String>>);
 
 struct Server {
     sock: std::path::PathBuf,
@@ -335,6 +481,11 @@ struct Server {
     runs: Runs,
     next: Mutex<u64>,
     registry: Mutex<Option<Registry>>,
+    /// The agent tools as the server last listed them: kept while it's out of reach.
+    agent_tools: Mutex<Option<Vec<Value>>>,
+    /// What the agent was last given as the tools (`fingerprint`): when the server's change, it's
+    /// told to ask again (`notifications/tools/list_changed`).
+    listed: Mutex<Option<u64>>,
 }
 
 impl Server {
@@ -436,30 +587,138 @@ impl Server {
         }
     }
 
+    /// Ask the machine's preview browser, through the runner (`crate::browser::ask`).
+    fn browser(&self, q: &Value) -> anyhow::Result<Value> {
+        let mut c = Client::connect(&self.sock)?;
+        c.send(&Req::Browser { json: q.to_string() })?;
+        match c.event()? {
+            Some(Ev::Answer(j)) => Ok(serde_json::from_str(&j)?),
+            Some(Ev::Error(e)) => anyhow::bail!("{e}"),
+            None => anyhow::bail!("the kiln runner closed the connection (a runner older than kiln's previews doesn't have a browser: upgrade it)"),
+            other => anyhow::bail!("unexpected answer {other:?}"),
+        }
+    }
+
+    /// Show a page live in the conversation (the `show_live` tool): streamed from this machine by
+    /// its runner, through the server, to whoever looks.
+    fn show_live(&self, args: &Value) -> anyhow::Result<Value> {
+        let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_owned).filter(|v| !v.trim().is_empty());
+        let url = s("url").ok_or_else(|| anyhow::anyhow!("which page? Give its address"))?;
+        let title = s("title").unwrap_or_else(|| url.clone());
+        let opened = self.ask(json!({"op": "stream", "do": "open", "url": url, "title": title, "engine": s("engine"), "device": s("device")}))?;
+        match (opened.get("ok"), opened.get("error").and_then(Value::as_str)) {
+            (Some(v), _) => Ok(json!({"kiln_stream": v})),
+            (None, Some(e)) if e.contains("unknown") => anyhow::bail!("this kiln server doesn't stream pages yet: upgrade it"),
+            (None, e) => anyhow::bail!("{}", e.unwrap_or("kiln couldn't stream the page")),
+        }
+    }
+
+    /// Show a page in the conversation (the `show_page` tool): looked at first in this machine's
+    /// browser as the conversation shows it (what it loads, and its heights at each width a viewer
+    /// might have, so its frame is the right size before it loads), then published by the server
+    /// with every file it uses. The answer, and the picture of it.
+    fn show_page(&self, args: &Value) -> anyhow::Result<(Value, Option<String>)> {
+        let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_owned).filter(|v| !v.trim().is_empty());
+        let title = s("title").unwrap_or_else(|| "A page".to_owned());
+        // The page, and where it stands: relative references are in its folder.
+        let (html, entry) = match (s("html"), s("path")) {
+            (Some(html), _) => (html, format!("{}/kiln-page.html", self.cwd.trim_end_matches('/'))),
+            (None, Some(path)) => {
+                let full = crate::harness::files::resolve(&path, &self.cwd).ok_or_else(|| anyhow::anyhow!("{path} isn't a path on this machine"))?;
+                let html = std::fs::read_to_string(&full).map_err(|e| anyhow::anyhow!("{full}: {e}"))?;
+                (html, full)
+            }
+            _ => anyhow::bail!("which page? Give its html, or the path of an HTML file"),
+        };
+        let look = json!({"op": "preview", "html": html, "entry": entry, "as_shown": true, "measure": true, "picture": "window"});
+        let (mut seen, picture, heights, loaded) = match self.browser(&look) {
+            Ok(seen) => {
+                let heights = seen.get("heights").cloned().unwrap_or(Value::Null);
+                let picture = seen.get("picture_path").and_then(Value::as_str).map(str::to_owned);
+                let loaded = seen.get("loaded").cloned().unwrap_or(Value::Null);
+                (seen, picture, heights, loaded)
+            }
+            Err(e) => (json!({"error": format!("kiln's browser here couldn't look at it ({e:#}); it's shown all the same, sized as it loads")}), None, Value::Null, Value::Null),
+        };
+        let published = self.ask(json!({"op": "page", "do": "publish", "title": title, "entry": entry, "html": html, "loaded": loaded}))?;
+        let page = match (published.get("ok"), published.get("error").and_then(Value::as_str)) {
+            (Some(p), _) => p.clone(),
+            (None, Some(e)) if e.contains("unknown") => anyhow::bail!("this kiln server doesn't show pages yet: upgrade it"),
+            (None, e) => anyhow::bail!("{}", e.unwrap_or("kiln couldn't keep the page")),
+        };
+        let id = page.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+        let page = if heights.is_array() {
+            match self.ask(json!({"op": "page", "do": "measured", "id": id, "heights": heights, "engines": seen.get("engines").cloned().unwrap_or(Value::Null)})) {
+                Ok(a) => a.get("ok").cloned().unwrap_or(page),
+                Err(_) => page,
+            }
+        } else {
+            page
+        };
+        if let Some(o) = seen.as_object_mut() {
+            // Said once, in the page's own entry; what it loaded is now the page's.
+            for k in ["heights", "url", "loaded"] {
+                o.remove(k);
+            }
+        }
+        Ok((json!({"kiln_page": page, "seen": seen}), picture))
+    }
+
     /// kiln's operations on the server, for this session (asked again after a minute). When the
     /// server can't be asked, the ones this kiln knows, and why they can't be called: a program
     /// calling one learns that, rather than finding `kiln.ci` undefined.
     fn remote(&self) -> (Vec<Value>, Option<String>) {
+        let (reg, why, _) = self.remote_with_tools();
+        (reg, why)
+    }
+
+    /// [`Self::remote`], and which of the operations are agents' tools, when the server says.
+    fn remote_with_tools(&self) -> (Vec<Value>, Option<String>, Option<Vec<String>>) {
         if let Ok(g) = self.registry.lock()
-            && let Some((at, reg, why)) = g.as_ref()
+            && let Some((at, reg, why, tools)) = g.as_ref()
             && at.elapsed() < REGISTRY_TTL
         {
-            return (reg.clone(), why.clone());
+            return (reg.clone(), why.clone(), tools.clone());
         }
-        let (reg, why) = match self.ask(json!({"op": "registry"})) {
+        let (reg, why, tools) = match self.ask(json!({"op": "registry"})) {
             Ok(a) => match (a.get("registry").and_then(Value::as_array), a.get("error").and_then(Value::as_str)) {
-                (Some(r), _) => (r.clone(), None),
-                (None, Some(e)) => (Vec::new(), Some(e.to_owned())),
+                (Some(r), _) => {
+                    let tools = a.get("agent_tools").and_then(Value::as_array).map(|t| t.iter().filter_map(|n| n.as_str().map(str::to_owned)).collect());
+                    (r.clone(), None, tools)
+                }
+                (None, Some(e)) => (Vec::new(), Some(e.to_owned()), None),
                 // A server from before: "unknown reach question".
-                (None, None) => (Vec::new(), Some("this kiln server doesn't offer its operations to agents on runners yet: upgrade it".to_owned())),
+                (None, None) => (Vec::new(), Some("this kiln server doesn't offer its operations to agents on runners yet: upgrade it".to_owned()), None),
             },
-            Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+            Err(e) => (Vec::new(), Some(format!("{e:#}")), None),
         };
         let reg = if why.is_some() { code::registry_of(&crate::ops::listed(true)).as_array().cloned().unwrap_or_default() } else { reg };
         if let Ok(mut g) = self.registry.lock() {
-            *g = Some((Instant::now(), reg.clone(), why.clone()));
+            *g = Some((Instant::now(), reg.clone(), why.clone(), tools.clone()));
         }
-        (reg, why)
+        (reg, why, tools)
+    }
+
+    /// The tools to offer: this server's own, then kiln's operations an agent has as tools, as
+    /// the kiln server lists them (those it last listed while it's out of reach; this binary's own
+    /// from a server that doesn't say), so a deploy reaches the agents at work.
+    fn tools(&self) -> Value {
+        let (reg, why, names) = self.remote_with_tools();
+        let listed = if why.is_none() { agent_tools_of(&reg, names.as_deref()) } else { None };
+        let agent = match listed {
+            Some(t) => {
+                if let Ok(mut g) = self.agent_tools.lock() {
+                    *g = Some(t.clone());
+                }
+                t
+            }
+            None => self.agent_tools.lock().ok().and_then(|g| g.clone()).unwrap_or_else(agent_tools),
+        };
+        let mut t = base_tools();
+        if let Some(list) = t.as_array_mut() {
+            list.extend(agent);
+        }
+        t
     }
 
     fn call(self: &Arc<Self>, name: &str, args: &Value) -> Value {
@@ -477,6 +736,35 @@ impl Server {
                     Err(e) => text_result(&json!({"error": e.message, "code": e.code, "calls": e.calls}), true),
                 }
             }
+            "preview_page" => {
+                let mut q = args.clone();
+                if let Some(o) = q.as_object_mut() {
+                    o.insert("op".into(), json!("preview"));
+                }
+                match self.browser(&q) {
+                    Ok(seen) => picture_result(&seen, seen.get("picture_path").and_then(Value::as_str)),
+                    Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
+                }
+            }
+            "use_live" => {
+                let mut q = args.clone();
+                if let Some(o) = q.as_object_mut() {
+                    o.insert("op".into(), json!("act"));
+                    o.insert("session".into(), json!(self.session));
+                }
+                match self.browser(&q) {
+                    Ok(done) => picture_result(&done, done.get("picture_path").and_then(Value::as_str)),
+                    Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
+                }
+            }
+            "show_live" => match self.show_live(args) {
+                Ok(answer) => json!({"content": [{"type": "text", "text": answer.to_string()}], "structuredContent": answer, "isError": false}),
+                Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
+            },
+            "show_page" => match self.show_page(args) {
+                Ok((answer, picture)) => picture_result(&answer, picture.as_deref()),
+                Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
+            },
             "runners" => match self.runners(s("want")) {
                 Ok(v) => text_result(&v, false),
                 Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
@@ -504,7 +792,17 @@ impl Server {
                 let (v, failed) = self.stop(&id, OUTPUT_MAX);
                 text_result(&v, failed)
             }
-            other => text_result(&json!({"error": format!("no tool {other}")}), true),
+            // kiln's agents, goals and plans operations, asked of the server for this session.
+            other => match op_of(self.tools().as_array().map_or(&[][..], Vec::as_slice), other) {
+                Some(op) => match self.ask(json!({"op": "call", "name": op, "input": args})) {
+                    Ok(a) => match a.get("ok") {
+                        Some(v) => text_result(v, false),
+                        None => text_result(&a, true),
+                    },
+                    Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
+                },
+                None => text_result(&json!({"error": format!("no tool {other}")}), true),
+            },
         }
     }
 }
@@ -598,7 +896,7 @@ pub fn serve() -> anyhow::Result<()> {
     let session = std::env::var("KILN_SESSION").unwrap_or_default();
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let machines = machines(&sock);
-    let server = Arc::new(Server { sock, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None) });
+    let server = Arc::new(Server { sock, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None) });
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let say = |out: &Arc<Mutex<std::io::Stdout>>, v: &Value| {
         if let Ok(mut o) = out.lock() {
@@ -606,6 +904,24 @@ pub fn serve() -> anyhow::Result<()> {
             let _ = o.flush();
         }
     };
+    // The tools the server offers change (a deploy): the agent is told to ask for them again,
+    // once it has asked for them at all.
+    {
+        let (server, out) = (Arc::clone(&server), Arc::clone(&out));
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(REGISTRY_TTL);
+                let Some(before) = server.listed.lock().ok().and_then(|g| *g) else { continue };
+                let now = fingerprint(&server.tools());
+                if now != before {
+                    if let Ok(mut g) = server.listed.lock() {
+                        *g = Some(now);
+                    }
+                    say(&out, &json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}));
+                }
+            }
+        });
+    }
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -630,15 +946,21 @@ pub fn serve() -> anyhow::Result<()> {
                         id,
                         json!({
                             "protocolVersion": version,
-                            "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false}},
+                            "capabilities": {"tools": {"listChanged": true}, "resources": {"listChanged": false}},
                             "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
-                            "instructions": instructions(server.prefer.as_deref(), &machines),
+                            "instructions": instructions(server.prefer.as_deref(), &machines, &server.session),
                         }),
                     ),
                 );
             }
             "ping" => say(&out, &rpc_ok(id, json!({}))),
-            "tools/list" => say(&out, &rpc_ok(id, json!({"tools": tools()}))),
+            "tools/list" => {
+                let t = server.tools();
+                if let Ok(mut g) = server.listed.lock() {
+                    *g = Some(fingerprint(&t));
+                }
+                say(&out, &rpc_ok(id, json!({"tools": t})));
+            }
             "tools/call" => {
                 let (server, out) = (Arc::clone(&server), Arc::clone(&out));
                 std::thread::spawn(move || {
@@ -714,6 +1036,29 @@ pub fn acp_config(kiln: &std::path::Path, sock: &str, prefer: Option<&str>, sess
 mod tests {
     use super::*;
 
+    /// The agent tools are the server's: those it names (each as its registry has it, one it
+    /// added since this binary was built included), and this binary's own from a server that
+    /// doesn't say; the list's fingerprint tells a change.
+    #[test]
+    fn agent_tools_are_the_ones_the_server_names() {
+        let registry = vec![
+            json!({"name": "goals.add", "summary": "Line goals up.", "read_only": false, "destructive": false, "input": {"type": "object", "properties": {"goals": {"type": "array"}}}}),
+            json!({"name": "goals.later", "summary": "A goal for later (new on the server).", "read_only": false, "destructive": false, "input": {"type": "object"}}),
+            json!({"name": "ci.runs.list", "summary": "Runs.", "read_only": true, "destructive": false, "input": {"type": "object"}}),
+        ];
+        let names = vec!["goals.add".to_owned(), "goals.later".to_owned(), "goals.gone".to_owned()];
+        let tools = agent_tools_of(&registry, Some(&names)).unwrap_or_default();
+        let listed: Vec<&str> = tools.iter().filter_map(|t| t.get("name").and_then(Value::as_str)).collect();
+        assert_eq!(listed, ["goals_add", "goals_later"], "named and in the registry; code mode's ci.runs.list isn't a tool");
+        assert_eq!(tools.get(1).and_then(|t| t.get("description")), Some(&json!("A goal for later (new on the server).")));
+        assert_eq!(op_of(&tools, "goals_later").as_deref(), Some("goals.later"));
+        assert!(agent_tools_of(&registry, None).is_none(), "a server that doesn't say: this binary's own");
+        let before = fingerprint(&json!(tools));
+        let fewer = agent_tools_of(&registry, names.get(..1)).unwrap_or_default();
+        assert_ne!(before, fingerprint(&json!(fewer)));
+        assert_eq!(before, fingerprint(&json!(agent_tools_of(&registry, Some(&names)).unwrap_or_default())));
+    }
+
     #[test]
     fn long_output_keeps_its_head_and_tail() {
         let s: String = (0..50_000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
@@ -740,13 +1085,42 @@ mod tests {
         assert_eq!(a.pointer("/env/1"), Some(&json!({"name": "KILN_SESSION", "value": "s1"})));
         let t = tools();
         let names: Vec<&str> = t.as_array().into_iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str)).collect();
-        assert_eq!(names, ["code_run", "code_search", "runners", "run", "output", "stop"]);
-        assert!(instructions(Some("adacachy"), "").contains("prefers commands to run on adacachy"));
-        let i = instructions(None, "");
+        assert_eq!(names.get(..6), Some(&["code_run", "code_search", "runners", "run", "output", "stop"][..]));
+        assert!(names.contains(&"agents_start") && names.contains(&"agents_wait") && names.contains(&"agents_result"), "agents' tools too: {names:?}");
+        assert_eq!(names.get(6..10), Some(&["preview_page", "show_page", "show_live", "use_live"][..]), "then pages: {names:?}");
+        // show_live offers the devices and engines kiln knows.
+        let live = t.as_array().into_iter().flatten().find(|t| t.get("name") == Some(&json!("show_live"))).cloned().unwrap_or_default();
+        let devices: Vec<&str> = crate::browser::devices::DEVICES.iter().map(|d| d.name).collect();
+        assert_eq!(live.pointer("/inputSchema/properties/device/enum"), Some(&json!(devices)));
+        assert_eq!(live.pointer("/inputSchema/properties/engine/enum"), Some(&json!(["chromium", "firefox", "webkit"])));
+        let list = t.as_array().map_or(&[][..], Vec::as_slice);
+        let agent_op = |tool: &str| op_of(list, tool);
+        assert_eq!(agent_op("agents_wait").as_deref(), Some("agents.wait"));
+        assert_eq!(agent_op("run"), None);
+        // Its own goal stack and plans are tools too, the agent's own without naming it.
+        for (tool, op) in [
+            ("goals_add", "goals.add"),
+            ("goals_get", "goals.get"),
+            ("goals_control", "goals.control"),
+            ("plans_create", "plans.create"),
+            ("plans_run", "plans.run"),
+            ("plans_runs_get", "plans.runs.get"),
+        ] {
+            assert!(names.contains(&tool), "{tool}: {names:?}");
+            assert_eq!(agent_op(tool).as_deref(), Some(op));
+        }
+        assert_eq!(agent_op("plans_delete"), None, "deleting a plan is code mode's");
+        let add = t.as_array().into_iter().flatten().find(|t| t.get("name") == Some(&json!("goals_add"))).cloned().unwrap_or_default();
+        assert_eq!(add.pointer("/inputSchema/required"), Some(&json!(["goals"])), "an agent's own goals need no id");
+        assert!(instructions(Some("adacachy"), "", "").contains("prefers commands to run on adacachy"));
+        let i = instructions(None, "", "");
         assert!(i.contains("run it there yourself") && i.contains("don't hand the person a command to type") && i.contains("code_run"));
+        assert!(i.contains("Everything else runs on this machine") && !i.contains("build or test there"), "{i}");
+        assert!(i.contains("goals_add") && i.contains("plans_run") && !i.contains("You are kiln agent"), "{i}");
+        assert!(instructions(None, "", "01a14ab9").contains("You are kiln agent 01a14ab9"), "an agent is told who it is");
         let v = json!({"me": "adacachy", "runners": [{"runner": {"name": "adacachy", "os": "linux", "arch": "x86_64"}}, {"runner": {"name": "mac", "os": "macos", "arch": "aarch64"}}], "passed": [{"runner": {"name": "box", "os": "windows", "arch": "x86_64"}}]});
         assert_eq!(describe(&v), "adacachy (linux/x86_64, this machine), mac (macos/aarch64), box (windows/x86_64)");
-        assert!(instructions(None, &describe(&v)).contains("This kiln's machines: adacachy (linux/x86_64, this machine), mac (macos/aarch64)"));
+        assert!(instructions(None, &describe(&v), "").contains("This kiln's machines: adacachy (linux/x86_64, this machine), mac (macos/aarch64)"));
         Ok(())
     }
 

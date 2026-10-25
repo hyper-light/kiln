@@ -26,7 +26,22 @@ macro_rules! skill {
     };
 }
 
-static SKILLS: &[Skill] = &[skill!("kiln-deploy"), skill!("kiln-diagnose"), skill!("kiln-apps"), skill!("kiln-argocd-migration"), skill!("kiln-ci-diagnose")];
+static SKILLS: &[Skill] = &[
+    skill!("kiln-agents"),
+    skill!("kiln-plans"),
+    skill!("kiln-deploy"),
+    skill!("kiln-diagnose"),
+    skill!("kiln-apps"),
+    skill!("kiln-argocd-migration"),
+    // CI's (docs/ci.md W20-R05).
+    skill!("kiln-ci-author"),
+    skill!("kiln-ci-diagnose"),
+    skill!("kiln-ci-runners"),
+    skill!("kiln-ci-review"),
+    skill!("kiln-ci-migrate"),
+    skill!("kiln-ci-secrets"),
+    skill!("kiln-ci-performance"),
+];
 
 /// A frontmatter field of a `SKILL.md`.
 fn field(text: &str, key: &str) -> String {
@@ -115,6 +130,34 @@ mod tests {
             assert!(read(&format!("skill://{name}/SKILL.md")).is_some());
         }
         assert!(get("kiln-deploy").is_some());
+        // How to run agents: fanning out, briefs, waiting, low permissions, merging, never answering for the person.
+        let agents = read("skill://kiln-agents/SKILL.md").and_then(|f| f.get("text").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+        for part in ["## When to fan out", "## Briefing a child", "## Waiting and reading results", "## Keeping children's permissions low", "## Merging their work", "## Putting work up for review", "## Never answering for the person"] {
+            assert!(agents.contains(part), "kiln-agents: {part}");
+        }
+        // Goal stacks and plans: one's own stack (and ending the turn after lining it up, saying each goal met, splitting
+        // one, pausing for a while), plans (steps that wait for others), an agent per step (side by side, a step for the
+        // main agent).
+        let plans = read("skill://kiln-plans/SKILL.md").and_then(|f| f.get("text").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+        for part in [
+            "## Your own goal stack",
+            "**end your turn**",
+            "### When a goal is met: `goals_done`",
+            "**Never skip a goal you met**",
+            "### Splitting a goal: `goals_split`",
+            "resume_in_s",
+            "## Plans",
+            "`needs`",
+            "## One agent per step",
+            "{agent: \"main\"}",
+            "### Turning a goal into a plan: `goals_plan`",
+            "## Research: sources and grades",
+            "**Never grade it yourself.**",
+            "**Present it with its sources and grades, always.**",
+            "## What a person decides",
+        ] {
+            assert!(plans.contains(part), "kiln-plans: {part}");
+        }
         assert!(get("skill://kiln-diagnose/SKILL.md").is_some());
     }
 }

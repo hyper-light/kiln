@@ -3,6 +3,9 @@
 //! federation), then, when the integration names a service account, for that account's token
 //! (`generateAccessToken`). No key is stored. Tokens are kept in memory until two minutes before
 //! they expire, and are never written down or printed.
+//!
+//! [`Gcp`] calls Google Cloud's REST APIs with such a token, for the `gcp-*` providers
+//! (docs/cd-targets.md §3).
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -13,7 +16,7 @@ use serde_json::{Value, json};
 
 use super::Integration;
 use crate::hub::Hub;
-use crate::http::client::{Client, Roots};
+use crate::http::client::{Client, Method, Roots};
 
 /// The scope every Google Cloud API accepts.
 pub const CLOUD_PLATFORM: &str = "https://www.googleapis.com/auth/cloud-platform";
@@ -54,7 +57,12 @@ impl std::error::Error for GcpError {}
 impl GcpError {
     /// Whether `e` is Google saying something doesn't exist.
     pub fn is_not_found(e: &anyhow::Error) -> bool {
-        e.downcast_ref::<GcpError>().is_some_and(|g| g.status == 404 || g.code == "NOT_FOUND")
+        e.downcast_ref::<GcpError>().is_some_and(|g| g.status == 404 || g.code == "NOT_FOUND" || g.code == "notFound")
+    }
+
+    /// Whether `e` is Google saying it exists already.
+    pub fn is_conflict(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<GcpError>().is_some_and(|g| g.status == 409 || g.code == "ALREADY_EXISTS" || g.code == "alreadyExists")
     }
 }
 
@@ -67,14 +75,71 @@ fn client() -> Result<&'static Client> {
     Ok(C.get_or_init(|| c))
 }
 
+/// A Google Cloud API's base (`https://run.googleapis.com` for `run`), or a test's fake.
+pub fn base(api: &str) -> String {
+    super::endpoint(&format!("gcp:{api}"), || format!("https://{api}.googleapis.com"))
+}
+
+/// Google Cloud's REST APIs, with an access token.
+pub struct Gcp<'a> {
+    pub token: &'a str,
+}
+
+impl Gcp<'_> {
+    /// `method` on `api`'s `path` (`run`, `/v2/projects/…`), with `query`: its answer (null when
+    /// it has none), or the error Google gave.
+    pub async fn call(&self, api: &str, method: Method, path: &str, query: &[(&str, &str)], body: Option<&Value>) -> Result<Value> {
+        let mut url = format!("{}{path}", base(api));
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query.iter().map(|(k, v)| format!("{k}={}", super::aws::encode(v, false))).collect::<Vec<_>>().join("&"));
+        }
+        let mut req = client()?.request(method, &url).timeout(std::time::Duration::from_secs(60)).bearer(self.token);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let resp = req.send().await.with_context(|| format!("Google Cloud {api} {path}"))?;
+        let status = resp.status();
+        let bytes = resp.bytes(32 << 20).await?;
+        if !(200..300).contains(&status) {
+            return Err(error_of(status, &bytes).into());
+        }
+        if bytes.is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_slice(&bytes).with_context(|| format!("Google Cloud {api} {path} answered something that isn't JSON"))
+    }
+
+    /// Sends a file of `len` bytes to `url`: a URL Google signed (`token: false`, as signed URLs
+    /// take none), or an upload API's. Its answer, as [`Gcp::call`]'s.
+    pub async fn upload(&self, method: Method, url: &str, headers: &[(&str, &str)], rx: async_channel::Receiver<bytes::Bytes>, len: u64, token: bool) -> Result<Value> {
+        let mut req = client()?.request(method, url).timeout(std::time::Duration::from_secs(300)).header("Content-Length", &len.to_string());
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        if token {
+            req = req.bearer(self.token);
+        }
+        // Where it goes, without a signature's query.
+        let shown = url.split('?').next().unwrap_or(url).to_owned();
+        let resp = req.body_stream(rx).send().await.with_context(|| format!("uploading to {shown}"))?;
+        let status = resp.status();
+        let bytes = resp.bytes(1 << 20).await?;
+        if !(200..300).contains(&status) {
+            return Err(error_of(status, &bytes).into());
+        }
+        Ok(serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+}
+
 /// Google's error shapes: OAuth's (`{error, error_description}`) and the APIs'
-/// (`{error: {code, message, status}}`).
+/// (`{error: {code, message, status}}`; Compute Engine's say `errors[].reason` instead).
 pub fn error_of(status: u16, body: &[u8]) -> GcpError {
     let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let (code, message) = match v.get("error") {
         Some(Value::String(e)) => (e.clone(), v.get("error_description").and_then(Value::as_str).unwrap_or_default().to_owned()),
         Some(Value::Object(o)) => (
-            o.get("status").and_then(Value::as_str).unwrap_or("ERROR").to_owned(),
+            o.get("status").or_else(|| o.get("errors").and_then(|e| e.get(0)).and_then(|e| e.get("reason"))).and_then(Value::as_str).unwrap_or("ERROR").to_owned(),
             o.get("message").and_then(Value::as_str).unwrap_or_default().to_owned(),
         ),
         _ => ("ERROR".to_owned(), String::from_utf8_lossy(body).chars().take(300).collect()),

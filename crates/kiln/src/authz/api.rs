@@ -33,26 +33,43 @@ fn forbidden(m: impl Into<String>) -> Fail {
     (StatusCode::FORBIDDEN, m.into())
 }
 
-async fn body<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, Fail> {
-    srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| bad(format!("{e:#}")))
+fn body<T: serde::de::DeserializeOwned>(v: &Value) -> Result<T, Fail> {
+    T::deserialize(v).map_err(|e| bad(format!("{e}")))
 }
 
 /// The identity routes, or `None` for a path that isn't one.
 pub async fn route(hub: &Hub, caller: &Caller, method: &Method, s: &[&str], q: &HashMap<String, String>, req: Request) -> Option<Result<Response, Fail>> {
+    if s.get(1) == Some(&"groups") {
+        return super::groups::route(hub, caller, method, s, req).await;
+    }
+    let v: Value = if matches!(*method, Method::POST | Method::PUT) {
+        match srv::body_json(req.into_body(), JSON_LIMIT).await {
+            Ok(v) => v,
+            Err(e) => return Some(Err(bad(format!("{e:#}")))),
+        }
+    } else {
+        Value::Null
+    };
+    call(hub, caller, method, s, q, &v).await
+}
+
+/// The same with the request's JSON already read: what kiln's operations call (`users.*`,
+/// `grants.*`, `roles.*`, `tokens.*`; docs/ci.md W20-AC01).
+pub async fn call(hub: &Hub, caller: &Caller, method: &Method, s: &[&str], q: &HashMap<String, String>, v: &Value) -> Option<Result<Response, Fail>> {
     Some(match (method, s) {
         (&Method::GET, ["api", "roles"]) => roles(hub).await,
-        (&Method::PUT, ["api", "roles", name]) => put_role(hub, caller, name, req).await,
+        (&Method::PUT, ["api", "roles", name]) => put_role(hub, caller, name, v).await,
         (&Method::DELETE, ["api", "roles", name]) => delete_role(hub, caller, name).await,
         (&Method::GET, ["api", "users"]) => users(hub).await,
-        (&Method::POST, ["api", "users"]) => add_user(hub, caller, req).await,
+        (&Method::POST, ["api", "users"]) => add_user(hub, caller, v).await,
         (&Method::DELETE, ["api", "users", id]) => disable_user(hub, caller, id).await,
         (&Method::POST, ["api", "users", id, "link"]) => link(hub, caller, id).await,
         (&Method::POST, ["api", "users", id, "sign-out"]) => sign_out(hub, caller, id).await,
         (&Method::GET, ["api", "grants"]) => grants(hub, q).await,
-        (&Method::POST, ["api", "grants"]) => add_grant(hub, caller, req).await,
+        (&Method::POST, ["api", "grants"]) => add_grant(hub, caller, v).await,
         (&Method::DELETE, ["api", "grants", id]) => delete_grant(hub, caller, id).await,
         (&Method::GET, ["api", "tokens"]) => tokens(hub, caller).await,
-        (&Method::POST, ["api", "tokens"]) => mint(hub, caller, req).await,
+        (&Method::POST, ["api", "tokens"]) => mint(hub, caller, v).await,
         (&Method::DELETE, ["api", "tokens", id]) => revoke(hub, caller, id).await,
         (&Method::POST, ["api", "tokens", id, "rotate"]) => rotate(hub, caller, id).await,
         _ => return None,
@@ -85,15 +102,15 @@ struct RoleBody {
     capabilities: Vec<String>,
 }
 
-async fn put_role(hub: &Hub, caller: &Caller, name: &str, req: Request) -> Result<Response, Fail> {
+async fn put_role(hub: &Hub, caller: &Caller, name: &str, v: &Value) -> Result<Response, Fail> {
     if role(name).is_some() || CAPABILITIES.contains(&name) {
         return Err(bad(format!("`{name}` is built in")));
     }
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err(bad("a role's name is letters, digits, `-` and `_`"));
     }
-    let b: RoleBody = body(req).await?;
-    if let Some(unknown) = b.capabilities.iter().find(|c| !CAPABILITIES.contains(&c.as_str())) {
+    let b: RoleBody = body(v)?;
+    if let Some(unknown) = b.capabilities.iter().find(|c| !super::capability(c)) {
         return Err(bad(format!("`{unknown}` is not a capability")));
     }
     let (n, caps) = (name.to_owned(), serde_json::to_string(&b.capabilities).unwrap_or_default());
@@ -121,7 +138,7 @@ async fn delete_role(hub: &Hub, caller: &Caller, name: &str) -> Result<Response,
 // ------------------------------------------------------------------ users
 
 /// A user by id or name: `(id, name)`.
-async fn find_user(hub: &Hub, key: &str) -> Result<(String, String), Fail> {
+pub(super) async fn find_user(hub: &Hub, key: &str) -> Result<(String, String), Fail> {
     let k = key.trim_start_matches("user:").to_owned();
     hub.store
         .call(move |c| Ok(c.query_row("SELECT id, name FROM users WHERE (id = ?1 OR name = ?1 COLLATE NOCASE) AND disabled_at IS NULL", [&k], |r| Ok((r.get(0)?, r.get(1)?))).optional()?))
@@ -159,6 +176,9 @@ struct NewUser {
     /// Grants to start with (`developer@org:acme`, …).
     #[serde(default)]
     grants: Vec<String>,
+    /// The email SSO matches them by (a host's verified one, docs/ci.md W23-R08).
+    #[serde(default)]
+    email: Option<String>,
 }
 
 fn parse_grants(texts: &[String], custom: &HashMap<String, Vec<String>>) -> Result<Vec<Grant>, Fail> {
@@ -171,25 +191,25 @@ fn parse_grants(texts: &[String], custom: &HashMap<String, Vec<String>>) -> Resu
         .collect()
 }
 
-async fn add_user(hub: &Hub, caller: &Caller, req: Request) -> Result<Response, Fail> {
-    let b: NewUser = body(req).await?;
+async fn add_user(hub: &Hub, caller: &Caller, v: &Value) -> Result<Response, Fail> {
+    let b: NewUser = body(v)?;
     let name = b.name.trim().to_owned();
     if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.@".contains(c)) || name == "admin" || name == "owner" {
         return Err(bad("a user's name is up to 64 letters, digits, `-`, `_`, `.` and `@` (and not admin or owner)"));
     }
     let grants = parse_grants(&b.grants, &custom(hub).await?)?;
-    let (id, by, n) = (crate::util::new_id(), caller.name.clone(), name.clone());
+    let (id, by, n, email) = (crate::util::new_id(), caller.name.clone(), name.clone(), b.email.clone().map(|e| e.trim().to_owned()).filter(|e| e.contains('@')));
     let uid = id.clone();
     let texts: Vec<(String, String, bool)> = grants.iter().map(|g| (g.what.clone(), g.scope.text(), g.deny)).collect();
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE name = ?1 COLLATE NOCASE)", [&n], |r| r.get(0))?;
             if taken {
                 anyhow::bail!("conflict: a user `{n}` exists (or did: names are not reused)");
             }
-            tx.execute("INSERT INTO users (id, name, created_at, created_by) VALUES (?1, ?2, ?3, ?4)", params![uid, n, now, by])?;
+            tx.execute("INSERT INTO users (id, name, created_at, created_by, email) VALUES (?1, ?2, ?3, ?4, ?5)", params![uid, n, now, by, email])?;
             for (what, scope, deny) in texts {
                 tx.execute("INSERT INTO grants (principal, what, scope, deny, created_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![format!("user:{uid}"), what, scope, deny, now, by])?;
             }
@@ -271,8 +291,8 @@ struct NewGrant {
     grant: String,
 }
 
-async fn add_grant(hub: &Hub, caller: &Caller, req: Request) -> Result<Response, Fail> {
-    let b: NewGrant = body(req).await?;
+async fn add_grant(hub: &Hub, caller: &Caller, v: &Value) -> Result<Response, Fail> {
+    let b: NewGrant = body(v)?;
     let (uid, name) = find_user(hub, &b.user).await?;
     let g = parse_grants(std::slice::from_ref(&b.grant), &custom(hub).await?)?.into_iter().next().ok_or_else(|| bad("no grant"))?;
     let (what, scope, deny, by) = (g.what.clone(), g.scope.text(), g.deny, caller.name.clone());
@@ -372,8 +392,8 @@ struct NewToken {
     expires_in_days: Option<i64>,
 }
 
-async fn mint(hub: &Hub, caller: &Caller, req: Request) -> Result<Response, Fail> {
-    let b: NewToken = body(req).await?;
+async fn mint(hub: &Hub, caller: &Caller, v: &Value) -> Result<Response, Fail> {
+    let b: NewToken = body(v)?;
     let agent = match b.kind.as_deref().unwrap_or("pat") {
         "pat" => false,
         "agent" => true,

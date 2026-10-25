@@ -6,7 +6,7 @@
  * - what you sent while it couldn't take it (its machine away), until it can.
  */
 import { create } from "zustand";
-import { createJSONStorage, persist } from "zustand/middleware";
+import { createJSONStorage, persist, type PersistStorage, type StorageValue } from "zustand/middleware";
 import type { Attachment, SendMode } from "@/api/harness";
 
 /* ------------------------------------------------------------------ send mode */
@@ -59,6 +59,39 @@ export const usePlaces = create<PlacesState>()(
   ),
 );
 
+/**
+ * A browser storage encoded and written at most this often (and as the page goes away): what
+ * changes with every key typed doesn't serialize all drafts on every key.
+ */
+function lazily<T>(store: () => Storage, ms = 600): PersistStorage<T> {
+  const pending = new Map<string, StorageValue<T>>();
+  let timer = 0;
+  const flush = () => {
+    window.clearTimeout(timer);
+    timer = 0;
+    for (const [k, v] of pending) {
+      try {
+        store().setItem(k, JSON.stringify(v));
+      } catch {
+        /* storage off (private mode): this visit only */
+      }
+    }
+    pending.clear();
+  };
+  if (typeof window !== "undefined") window.addEventListener("pagehide", flush);
+  return {
+    getItem: (k) => pending.get(k) ?? (JSON.parse(store().getItem(k) ?? "null") as StorageValue<T> | null),
+    setItem: (k, v) => {
+      pending.set(k, v);
+      if (!timer) timer = window.setTimeout(flush, ms);
+    },
+    removeItem: (k) => {
+      pending.delete(k);
+      store().removeItem(k);
+    },
+  };
+}
+
 /* ------------------------------------------------------------------ drafts */
 
 interface DraftsState {
@@ -81,7 +114,7 @@ export const useDrafts = create<DraftsState>()(
     }),
     {
       name: "kiln.agents.drafts",
-      storage: createJSONStorage(() => sessionStorage),
+      storage: lazily(() => sessionStorage),
       partialize: (s) => ({ drafts: s.drafts }),
     },
   ),
@@ -99,6 +132,12 @@ export interface Held {
   at: number;
   attachments?: Attachment[];
   overrides?: { model?: string; effort?: string };
+  /** How it was to go: "now" and "steer" keep that when it goes (older ones: queued). */
+  mode?: SendMode;
+  /** The event it answers (a messenger-style reply). */
+  reply_to?: string;
+  /** For one of its subagents (its task's id). */
+  task?: string;
 }
 
 interface HeldState {

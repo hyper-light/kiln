@@ -1,0 +1,94 @@
+Subject: No warnings in kiln's build
+Why: #[allow]s for what kiln's build leaves unused, fetch_update (deprecated on the newest Rust, its replacement missing on older ones) and the aggregate's callback comparison; an elided lifetime spelled out.
+
+diff --git a/core/mvcc/database/mod.rs b/core/mvcc/database/mod.rs
+index aea6f24af7ce389bb86783fb315481794c5186f9..a52e8bef3026902a862b12faad84cb66f5321da4 100644
+--- a/core/mvcc/database/mod.rs
++++ b/core/mvcc/database/mod.rs
+@@ -10626,6 +10626,7 @@ impl RowidAllocator {
+     }
+ 
+     /// Initialize from btree max. Called once per table, under lock.
++    #[allow(deprecated)] // kiln: `fetch_update`, kept for older Rust
+     pub fn initialize(&self, rowid: Option<i64>) {
+         tracing::trace!("initialize({rowid:?})");
+         let _ = self
+diff --git a/core/mvcc/persistent_storage/logical_log.rs b/core/mvcc/persistent_storage/logical_log.rs
+index 59645f739b75f5c165c22a0ec0404320e49b18c1..5ee659b5c00b9b257564e16908c85cd0509a605c 100644
+--- a/core/mvcc/persistent_storage/logical_log.rs
++++ b/core/mvcc/persistent_storage/logical_log.rs
+@@ -259,6 +259,7 @@ use serializer::EncryptedPayload;
+ use serializer::{
+     extension_record_len, ExtensionRecord, PortableChangePayload, PortableEndOffsetCtx,
+ };
++#[allow(unused_imports)] // kiln: `log_write` is unused in its build
+ pub(crate) use serializer::{log_write, LogBufferWrite, LogChunkStream, LogSerializer};
+ #[cfg(feature = "conn_raw_api")]
+ pub(crate) use serializer::{
+diff --git a/core/storage/btree.rs b/core/storage/btree.rs
+index 80e96d150f24914cecef210904bf3fc55f7d6913..0990caf1a0ccdbb7d9836f169c3a452fc5da7c1f 100644
+--- a/core/storage/btree.rs
++++ b/core/storage/btree.rs
+@@ -1850,6 +1850,7 @@ impl BTreeCursor {
+     /// [`BTreeCursor::move_to_root_nonblock`] so they can yield through spill
+     /// IO instead of blocking inside the pager.
+     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
++    #[allow(dead_code)] // kiln: unused in its build
+     fn move_to_root(&mut self) -> Result<Option<Completion>> {
+         let io = self.pager.io.clone();
+         io.block(|| self.move_to_root_nonblock())
+@@ -2140,6 +2141,7 @@ impl BTreeCursor {
+     /// Move cursor to position using registers directly, avoiding record serialization.
+     /// See `seek_unpacked` for rationale.
+     #[instrument(skip(self, registers), level = Level::DEBUG)]
++    #[allow(dead_code)] // kiln: unused in its build
+     fn indexbtree_move_to_unpacked(
+         &mut self,
+         registers: &[Register],
+diff --git a/core/storage/encryption.rs b/core/storage/encryption.rs
+index 1a65522b9ea8599fb39165aa9d6a8664f571c133..3de01ebaf5d06fc04df408646f22ca48aa1da007 100644
+--- a/core/storage/encryption.rs
++++ b/core/storage/encryption.rs
+@@ -1,4 +1,4 @@
+-#![allow(unused_variables, dead_code)]
++#![allow(unused_variables, dead_code, unused_imports)] // kiln: unused_imports, as its build has no encryption
+ use crate::storage::sqlite3_ondisk::PageSize;
+ use crate::turso_assert;
+ use crate::{LimboError, Result};
+diff --git a/core/storage/pager.rs b/core/storage/pager.rs
+index dda5e93a1842fe7d9f965cdb556f5b3c0ec1f928..a090f6c2c011a13e46d7286b20acaab11a552b53 100644
+--- a/core/storage/pager.rs
++++ b/core/storage/pager.rs
+@@ -1122,6 +1122,7 @@ impl Page {
+     /// Try to decrement the pin count by 1, but do nothing if it was already 0.
+     /// Returns true if the pin count was decremented.
+     #[inline]
++    #[allow(deprecated)] // kiln: `fetch_update`, kept for older Rust
+     pub fn try_unpin(&self) -> bool {
+         self.get()
+             .pin_count
+diff --git a/core/types.rs b/core/types.rs
+index f29eb74b964ca8cb8d576c7154c64e0112ae098b..38f2ba0099f0544c9815affd64cc0d3a3622845e 100644
+--- a/core/types.rs
++++ b/core/types.rs
+@@ -823,6 +823,7 @@ impl Value {
+ }
+ 
+ #[derive(Debug, Clone, PartialEq)]
++#[allow(unpredictable_function_pointer_comparisons)] // kiln: as upstream compares them
+ pub struct ExternalAggState {
+     pub context: usize,
+     pub state: *mut AggCtx,
+diff --git a/core/vector/operations/text.rs b/core/vector/operations/text.rs
+index 70d0136f72c06da0c02aceb587ddc570922206de..83d9bb2c043cb19c9dafa6f5a6cb376061add306 100644
+--- a/core/vector/operations/text.rs
++++ b/core/vector/operations/text.rs
+@@ -66,7 +66,7 @@ fn format_text<T: std::string::ToString>(values: impl Iterator<Item = T>) -> Str
+ /// [1.0, 2.0, 3.0]
+ /// ```
+ #[turso_macros::allocation_site(crate::alloc::VectorAllocationSite::Parse)]
+-pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
++pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector<'_>> {
+     let text = text.trim();
+     let mut chars = text.chars();
+     if chars.next() != Some('[') || chars.last() != Some(']') {

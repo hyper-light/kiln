@@ -1,0 +1,14 @@
+/* Ending a parent: what it started, and whether that ends too. */
+.fam-end {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+.fam-end-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: #ededee;
+  cursor: pointer;
+}

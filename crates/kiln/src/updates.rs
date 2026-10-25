@@ -1,4 +1,4 @@
-//! Upgrading kiln from its own UI (Settings → Updates).
+//! Upgrading kiln from its own UI (System → Updates).
 //!
 //! * **Runners**, without a restart and without losing anything, always through
 //!   `kiln install --agent --upgrade` on the machine: a runner from before in-place upgrades gets
@@ -20,7 +20,7 @@
 //! Jobs live in memory (the latest few) and reach the UI as `update_job` events; `updates`
 //! events say the overview changed.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -32,14 +32,15 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::hub::Hub;
-use crate::proto::{AgentMsg, CAP_UPGRADE, LANE_CONTROL, ServerMsg};
+use crate::proto::{AgentMsg, CAP_UPGRADE, ServerMsg};
 
 /// Jobs kept for the UI.
 const KEEP_JOBS: usize = 40;
 /// Output lines kept per job.
 const KEEP_LINES: usize = 400;
-/// How long a runner has to finish an upgrade.
-const RUNNER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long `install --agent --upgrade` may take on a runner. How long the server waits on an
+/// upgrade is [`Waits`].
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// How long the new runner has to report in after its install finished.
 const REPORT_IN: Duration = Duration::from_secs(90);
 /// How often GitHub is asked about releases (it allows 60 unauthenticated requests an hour).
@@ -86,10 +87,17 @@ pub struct Job {
     /// The commit it brings the machine to, when kiln knows it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// A build's: the machine that builds it, when another than the runner's own
+    /// (`crate::fleet`); the runner downloads that build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
     /// The machine reported running `to_build`.
     pub reached: bool,
     pub log: Vec<String>,
     pub error: Option<String>,
+    /// Kiln stopped waiting for it: which of its [`Waits`] ran out ("upgrade", "jobs" or "build").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<&'static str>,
     /// Its last log line is a progress line (a terminal's carriage return draws it over): the
     /// next line takes its place.
     #[serde(skip)]
@@ -160,8 +168,13 @@ pub struct Updates {
     checking_image: AtomicBool,
     /// A push to the release branch: the server's commit may be there now (`in_step_loop`).
     in_step_wake: crate::rt::Notify,
+    /// How long upgrades are waited on, once read (`waits`).
+    waits: Mutex<Option<Waits>>,
     /// Every runner on the newest kiln.
     pub fleet: crate::fleet::Fleet,
+    /// The binaries kept for other platforms, by target, as kiln's store of bytes holds them
+    /// ([`load`]).
+    kept: Mutex<HashMap<String, Binary>>,
 }
 
 impl Updates {
@@ -185,6 +198,13 @@ pub fn own_binary() -> Result<(String, u64), String> {
         hash_file(&exe).map_err(|e| format!("{e:#}"))
     })
     .clone()
+}
+
+/// Reads this build's hash ([`own_binary`]) once, off the runtime. The runner and the server ask
+/// for it from async code without waiting (`own_build()`), and the first ask reads the whole
+/// binary: seconds for a test build, a runtime shard and every task on it held that long.
+pub async fn warm_own_binary() {
+    let _ = crate::rt::blocking(own_binary).await;
 }
 
 /// This binary's build id ("unknown" if it can't be read): the build it was before kiln signed it
@@ -253,28 +273,159 @@ pub fn known_target(target: &str) -> bool {
 
 // ------------------------------------------------------------------ binaries kept here
 
-/// Binaries uploaded here or fetched from a release live in `<data>/binaries`.
-fn store_dir(hub: &Hub) -> PathBuf {
-    hub.cfg.server.data_dir.join("binaries")
+/// Binaries uploaded here, fetched from a release or built are kept in kiln's store of bytes
+/// (docs/blobs.md): the binary at `binaries/kiln-<target>`, what kiln knows of it at
+/// `binaries/kiln-<target>.json`. They were `<data>/binaries/kiln-<target>` and its `.json`; the
+/// local store takes those where they lie ([`take_in`]).
+pub fn binary_key(target: &str) -> String {
+    format!("binaries/kiln-{target}")
 }
 
-fn stored_path(hub: &Hub, target: &str) -> PathBuf {
-    store_dir(hub).join(format!("kiln-{target}"))
+fn meta_key(target: &str) -> String {
+    format!("binaries/kiln-{target}.json")
 }
 
-fn meta_path(hub: &Hub, target: &str) -> PathBuf {
-    store_dir(hub).join(format!("kiln-{target}.json"))
+/// Where binaries were kept before they were in kiln's store of bytes.
+fn old_dir(cfg: &crate::config::Config) -> PathBuf {
+    cfg.server.data_dir.join("binaries")
 }
 
-/// The binary kept here for `target`, if any (and still whole).
-pub fn stored(hub: &Hub, target: &str) -> Option<(PathBuf, Binary)> {
-    if !known_target(target) {
-        return None;
+/// The binary kept here for `target`, if any.
+pub fn stored(hub: &Hub, target: &str) -> Option<Binary> {
+    known_target(target).then(|| hub.updates.kept.lock().get(target).cloned()).flatten()
+}
+
+/// Reads what the store keeps of each platform's binary into [`Updates`]: a binary whose bytes
+/// aren't whole there is left out. Whether every one could be read (one the store couldn't answer
+/// for is read again later: [`load_until_read`]).
+pub async fn load(hub: &Hub) -> bool {
+    load_into(hub.blobs.blobs.as_ref(), &hub.updates.kept).await
+}
+
+/// [`load`] from `blobs` into `kept`.
+async fn load_into(blobs: &dyn kiln_seams::blobs::Blobs, kept: &Mutex<HashMap<String, Binary>>) -> bool {
+    use kiln_seams::blobs::Refusal;
+    // Each platform the store answered for: its binary, or none; one it couldn't is left as it is.
+    let mut answered: Vec<(&str, Option<Binary>)> = Vec::new();
+    let mut targets: Vec<&str> = crate::api::RELEASE_TARGETS.to_vec();
+    if !targets.contains(&crate::api::TARGET) {
+        targets.push(crate::api::TARGET);
     }
-    let p = stored_path(hub, target);
-    let meta: Binary = serde_json::from_slice(&std::fs::read(meta_path(hub, target)).ok()?).ok()?;
-    let len = std::fs::metadata(&p).ok()?.len();
-    (len == meta.size).then_some((p, meta))
+    let all = targets.len();
+    for t in targets {
+        let meta = match crate::blobs::io::get_all(blobs, &meta_key(t), 1 << 20).await {
+            Ok((_, bytes)) => serde_json::from_slice::<Binary>(&bytes).ok(),
+            Err(Refusal::NotFound(_)) => None,
+            Err(e @ Refusal::Unavailable(_)) => {
+                tracing::warn!(target: "kiln.blobs", event = "get", key = %meta_key(t), error = %e, "a kept binary couldn't be read: read again later");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(target: "kiln.blobs", event = "get", key = %meta_key(t), error = %e, "a kept binary couldn't be read");
+                None
+            }
+        };
+        let Some(meta) = meta else {
+            answered.push((t, None));
+            continue;
+        };
+        match blobs.head(&binary_key(t)).await {
+            Ok(m) if m.size == meta.size && m.etag == meta.sha256 => answered.push((t, Some(meta))),
+            Err(Refusal::Unavailable(e)) => tracing::warn!(target: "kiln.blobs", event = "get", key = %binary_key(t), error = %e, "a kept binary couldn't be read: read again later"),
+            Ok(_) | Err(_) => {
+                tracing::warn!(target: "kiln.blobs", event = "get", key = %binary_key(t), "a kept binary isn't whole: left out");
+                answered.push((t, None));
+            }
+        }
+    }
+    let read = answered.len() == all;
+    let mut kept = kept.lock();
+    for (t, b) in answered {
+        match b {
+            Some(b) => kept.insert(t.to_owned(), b),
+            None => kept.remove(t),
+        };
+    }
+    read
+}
+
+/// [`load`] (at once, when `now`; else a minute on), and again a while apart (a minute, doubling to
+/// a quarter of an hour), until the store answers for every binary: one unavailable when the server
+/// started isn't left out for good.
+pub async fn load_until_read(hub: Arc<Hub>, now: bool) {
+    let mut wait = Duration::from_secs(60);
+    if !now {
+        crate::rt::sleep(wait).await;
+    }
+    while !load(&hub).await {
+        crate::rt::sleep(wait).await;
+        wait = wait.saturating_mul(2).min(Duration::from_secs(900));
+    }
+    tracing::info!(target: "kiln.blobs", event = "get", "the kept binaries are all read");
+}
+
+/// Takes the binaries kept as files (`<data>/binaries`) into the local store, where they lie: each
+/// one the store doesn't hold for its platform, or holds an older one of (an older kiln run on this
+/// store again, a rollback, kept a newer one). Each start; a file taken stays where it lies.
+pub async fn take_in(hub: &Hub, local: &crate::blobs::local::LocalBlobs) -> anyhow::Result<()> {
+    take_in_from(&hub.cfg, local).await
+}
+
+/// [`take_in`] for the server `cfg` names (`kiln blobs copy`).
+pub async fn take_in_from(cfg: &crate::config::Config, local: &crate::blobs::local::LocalBlobs) -> anyhow::Result<()> {
+    use kiln_seams::blobs::{Blobs as _, Refusal};
+    let dir = old_dir(cfg);
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let d = dir.clone();
+    // Each platform's binary kept as a file whole, its modification time, and what kiln knew of it.
+    let found = crate::rt::blocking(move || -> Vec<(&'static str, PathBuf, PathBuf, i64, Binary)> {
+        let mut out = Vec::new();
+        for t in crate::api::RELEASE_TARGETS.iter().copied().chain([crate::api::TARGET]) {
+            let (bin, meta) = (d.join(format!("kiln-{t}")), d.join(format!("kiln-{t}.json")));
+            let Some(m) = std::fs::read(&meta).ok().and_then(|b| serde_json::from_slice::<Binary>(&b).ok()) else { continue };
+            let Ok(md) = std::fs::metadata(&bin) else { continue };
+            let at = crate::blobs::local::modified_ms(&md);
+            if md.len() == m.size && !out.iter().any(|(k, ..): &(&str, PathBuf, PathBuf, i64, Binary)| *k == t) {
+                out.push((t, bin, meta, at, m));
+            }
+        }
+        out
+    })
+    .await?;
+    let mut files = Vec::new();
+    for (t, bin, meta, at, m) in found {
+        match local.head(&binary_key(t)).await {
+            // The file taken before, or the same binary kept another way; or a newer one kept.
+            Ok(kept) if kept.etag == m.sha256 || kept.modified_ms >= at => continue,
+            // An older kiln kept a newer one: it's the platform's.
+            Ok(_) => {
+                for k in [binary_key(t), meta_key(t)] {
+                    match local.delete(&k).await {
+                        Ok(()) | Err(Refusal::NotFound(_)) => {}
+                        Err(e) => anyhow::bail!("{k}: {e}"),
+                    }
+                }
+            }
+            Err(Refusal::NotFound(_)) => {}
+            Err(e) => anyhow::bail!("{}: {e}", binary_key(t)),
+        }
+        files.push((binary_key(t), bin, Some(m.sha256.clone())));
+        files.push((meta_key(t), meta, None));
+    }
+    let taken = local.adopt(files).await?.taken;
+    if taken > 0 {
+        tracing::info!(target: "kiln.blobs", event = "adopt", taken, "runner binaries kept as files taken in where they lie");
+    }
+    Ok(())
+}
+
+/// The binary kept for `target` as a stream, with what kiln knows of it.
+pub fn stream(hub: &Hub, target: &str) -> Option<(Binary, async_channel::Receiver<bytes::Bytes>)> {
+    let b = stored(hub, target)?;
+    let rx = crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), binary_key(target), Some(b.sha256.clone()), 0, b.size.saturating_sub(1));
+    Some((b, rx))
 }
 
 /// It looks like an executable kiln could hand out (ELF, Mach-O or PE).
@@ -283,18 +434,14 @@ fn executable(bytes: &[u8]) -> bool {
 }
 
 /// Keep `bytes` as the binary for `target` (an upload, or a release download).
-pub fn store(hub: &Hub, target: &str, bytes: &[u8], origin: &str) -> anyhow::Result<Binary> {
-    keep(&store_dir(hub), target, bytes, origin, None)
+pub async fn store(hub: &Hub, target: &str, bytes: Vec<u8>, origin: &str) -> anyhow::Result<Binary> {
+    keep(hub, target, bytes, origin, None, None).await
 }
 
 /// Keep the binary `machine` built of `commit` for its own platform (`crate::fleet`): what the
 /// other machines of the platform download.
-pub fn keep_built(hub: &Hub, target: &str, bytes: &[u8], machine: &str, commit: &str) -> anyhow::Result<Binary> {
-    let mut b = keep(&store_dir(hub), target, bytes, "machine", None)?;
-    b.sha = Some(commit.to_ascii_lowercase());
-    b.by = Some(machine.to_owned());
-    std::fs::write(meta_path(hub, target), serde_json::to_vec(&b)?)?;
-    Ok(b)
+pub async fn keep_built(hub: &Hub, target: &str, bytes: Vec<u8>, machine: &str, commit: &str) -> anyhow::Result<Binary> {
+    keep(hub, target, bytes, "machine", None, Some((machine.to_owned(), commit.to_ascii_lowercase()))).await
 }
 
 /// Whether a run's binaries become what runners upgrade to: kiln's own release pipeline, built
@@ -312,8 +459,18 @@ pub fn adopts(u: &crate::config::Updates, run: &crate::store::Run, own: &str) ->
 /// binaries each other platform's runners upgrade to. This server's own platform keeps its own
 /// build from a run of the server's commit; a run of a newer one (`crate::fleet`) brings that
 /// platform's too.
-pub fn adopt_into(cfg: &crate::config::Config, artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<Binary>> {
-    let dir = cfg.server.data_dir.join("binaries");
+pub async fn adopt_into(hub: &Hub, artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<Binary>> {
+    let (a, r) = (artifacts.to_path_buf(), run.clone());
+    let found = crate::rt::blocking(move || binaries_in(&a, &r)).await??;
+    let mut kept = Vec::new();
+    for (target, bytes) in found {
+        kept.push(keep(hub, &target, bytes, "built", Some((run.number, run.sha.clone())), None).await?);
+    }
+    Ok(kept)
+}
+
+/// The binaries in a release run's artifacts, by target, as [`adopt_into`] takes them.
+fn binaries_in(artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     use std::io::Read as _;
     let mut archive = tar::Archive::new(std::fs::File::open(artifacts).with_context(|| format!("open {}", artifacts.display()))?);
     let mut kept = Vec::new();
@@ -327,10 +484,35 @@ pub fn adopt_into(cfg: &crate::config::Config, artifacts: &Path, run: &crate::st
         }
         let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
         entry.read_to_end(&mut bytes)?;
-        let target = target.to_owned();
-        kept.push(keep(&dir, &target, &bytes, "built", Some((run.number, run.sha.clone())))?);
+        // An archive cut short (its upload broke off) reads as a shorter file, with no error: never
+        // one runners would upgrade to. Nor what isn't its platform's program.
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != entry.size() {
+            tracing::warn!(target, run = run.number, got = bytes.len(), size = entry.size(), "a release binary cut short in its run's artifacts: not kept");
+            break;
+        }
+        if !runs_on(target, &bytes) {
+            tracing::warn!(target, run = run.number, "a release binary that isn't its platform's program: not kept");
+            continue;
+        }
+        kept.push((target.to_owned(), bytes));
     }
     Ok(kept)
+}
+
+/// Whether `bytes` is a program `target` runs: an ELF on Linux, a Mach-O (or a universal one) on
+/// macOS, a PE on Windows, by its first bytes.
+fn runs_on(target: &str, bytes: &[u8]) -> bool {
+    let head = bytes.get(..4).unwrap_or_default();
+    if target.contains("linux") {
+        head == b"\x7fELF"
+    } else if target.contains("apple-darwin") {
+        // 64-bit Mach-O, either way round, or a universal (fat) one.
+        [[0xcf, 0xfa, 0xed, 0xfe], [0xfe, 0xed, 0xfa, 0xcf], [0xca, 0xfe, 0xba, 0xbe]].iter().any(|m| head == m)
+    } else if target.contains("windows") {
+        head.get(..2) == Some(b"MZ".as_slice())
+    } else {
+        true
+    }
 }
 
 // ------------------------------------------------------------------ every platform in step
@@ -362,7 +544,7 @@ pub struct InStep {
 pub fn in_step(hub: &Hub, commit: &str) -> InStep {
     let own = commit.eq_ignore_ascii_case(crate::api::COMMIT);
     let others: Vec<&str> = crate::api::RELEASE_TARGETS.iter().copied().filter(|t| !(own && *t == crate::api::TARGET)).collect();
-    let kept: Vec<Binary> = others.iter().filter_map(|t| stored(hub, t).map(|(_, b)| b)).collect();
+    let kept: Vec<Binary> = others.iter().filter_map(|t| stored(hub, t)).collect();
     let mut s = in_step_of(&others, &kept, commit);
     if !own && !kept.iter().any(|b| b.target == crate::api::TARGET) && !s.behind.iter().any(|t| t == crate::api::TARGET) {
         s.behind.push(crate::api::TARGET.to_owned());
@@ -387,6 +569,19 @@ struct Starts {
     last: Option<i64>,
     /// Release jobs whose binaries were kept here already (`keep_in_step`).
     kept: std::collections::HashSet<String>,
+}
+
+impl Starts {
+    /// The newest kiln moved to `commit`: kept for it afresh. Another commit's binaries may have
+    /// been kept since this one's were (a server just started, its own commit not yet fetched,
+    /// takes a runner's older one as the newest for a moment): its runs' are kept again.
+    fn moved(&mut self, commit: &str, was: &mut String) {
+        if commit != was {
+            self.last = None;
+            self.kept.clear();
+            was.clone_from(&commit.to_owned());
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -445,10 +640,7 @@ pub async fn in_step_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
         }
         // The newest kiln (`crate::fleet`): the server's commit, or a newer one a runner runs.
         let commit = hub.updates.fleet.target().map_or_else(|| crate::api::COMMIT.to_owned(), |t| t.commit);
-        if commit != was {
-            starts.last = None;
-            was.clone_from(&commit);
-        }
+        starts.moved(&commit, &mut was);
         if let Err(e) = keep_in_step(&hub, &commit, &mut starts).await {
             tracing::warn!(commit = short(&commit), error = %format!("{e:#}"), "couldn't build every platform from the newest commit");
         }
@@ -488,30 +680,37 @@ async fn keep_in_step(hub: &Hub, commit: &str, starts: &mut Starts) -> anyhow::R
     }
 }
 
-/// Keeps `bytes` as the binary for `target` in `dir` (`<data>/binaries`).
-fn keep(dir: &Path, target: &str, bytes: &[u8], origin: &str, built: Option<(i64, String)>) -> anyhow::Result<Binary> {
+/// Keeps `bytes` as the binary for `target` in kiln's store of bytes: the binary, then what kiln
+/// knows of it; a release run's (`built`), or a machine's own build (`by`: the machine and commit).
+async fn keep(hub: &Hub, target: &str, bytes: Vec<u8>, origin: &str, built: Option<(i64, String)>, by: Option<(String, String)>) -> anyhow::Result<Binary> {
     anyhow::ensure!(known_target(target), "kiln has no platform called {target}");
     anyhow::ensure!(bytes.len() > 1 << 20, "that file is too small to be a kiln binary");
-    anyhow::ensure!(executable(bytes), "that file is not an executable (ELF, Mach-O or PE)");
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let tmp = dir.join(format!(".kiln-{target}.part"));
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    crate::os::make_executable(&tmp)?;
-    std::fs::rename(&tmp, dir.join(format!("kiln-{target}")))?;
-    let sha256 = hex::encode(Sha256::digest(bytes));
+    anyhow::ensure!(executable(&bytes), "that file is not an executable (ELF, Mach-O or PE)");
+    let size = bytes.len() as u64;
+    let blobs = &hub.blobs.blobs;
+    let kept = blobs.put(&binary_key(target), bytes, kiln_seams::blobs::Put::default()).await.map_err(|e| anyhow::anyhow!("keeping the binary for {target}: {e}"))?;
     let (run, sha) = built.map_or((None, None), |(n, s)| (Some(n), Some(s)));
-    let meta = Binary { target: target.to_owned(), build: build_id(&sha256), sha256, size: bytes.len() as u64, origin: origin.to_owned(), at: crate::util::now_unix(), run, sha, by: None };
-    std::fs::write(dir.join(format!("kiln-{target}.json")), serde_json::to_vec(&meta)?)?;
+    let mut meta = Binary { target: target.to_owned(), build: build_id(&kept.etag), sha256: kept.etag, size, origin: origin.to_owned(), at: crate::util::now_unix(), run, sha, by: None };
+    if let Some((machine, commit)) = by {
+        meta.sha = Some(commit);
+        meta.by = Some(machine);
+    }
+    blobs.put(&meta_key(target), serde_json::to_vec(&meta)?, kiln_seams::blobs::Put::default()).await.map_err(|e| anyhow::anyhow!("keeping what kiln knows of the binary for {target}: {e}"))?;
+    hub.updates.kept.lock().insert(target.to_owned(), meta.clone());
     Ok(meta)
 }
 
 /// Forget the binary kept for `target`.
-pub fn unstore(hub: &Hub, target: &str) -> bool {
+pub async fn unstore(hub: &Hub, target: &str) -> bool {
     if !known_target(target) {
         return false;
     }
-    let had = std::fs::remove_file(meta_path(hub, target)).is_ok();
-    let _ = std::fs::remove_file(stored_path(hub, target));
+    let had = hub.updates.kept.lock().remove(target).is_some();
+    for k in [meta_key(target), binary_key(target)] {
+        if let Err(e) = hub.blobs.blobs.delete(&k).await {
+            tracing::warn!(target: "kiln.blobs", event = "collect", key = %k, error = %e, "a binary let go couldn't be deleted");
+        }
+    }
     had
 }
 
@@ -528,7 +727,7 @@ pub fn binaries(hub: &Hub) -> Vec<Binary> {
     }
     for t in targets {
         // An upload already installed here is the server's own binary: listed once.
-        if let Some((_, b)) = stored(hub, t)
+        if let Some(b) = stored(hub, t)
             && !v.iter().any(|x| x.target == b.target && x.sha256 == b.sha256)
         {
             v.push(b);
@@ -538,7 +737,7 @@ pub fn binaries(hub: &Hub) -> Vec<Binary> {
 }
 
 /// GET with redirects followed (GitHub release assets redirect to their storage).
-async fn get_following(client: &crate::http::client::Client, url: &str, timeout: Duration) -> anyhow::Result<crate::http::client::Response> {
+pub(crate) async fn get_following(client: &crate::http::client::Client, url: &str, timeout: Duration) -> anyhow::Result<crate::http::client::Response> {
     let mut url = url.to_owned();
     for _ in 0..6 {
         let resp = client.get(&url).timeout(timeout).send().await?;
@@ -571,17 +770,17 @@ pub async fn ensure_binary(hub: &Hub, target: &str) -> anyhow::Result<(String, u
     if target == crate::api::TARGET {
         return own_binary().map_err(|e| anyhow::anyhow!("can't read this server's own binary: {e}"));
     }
-    if let Some((_, b)) = stored(hub, target) {
+    if let Some(b) = stored(hub, target) {
         return Ok((b.sha256, b.size));
     }
     let version = env!("CARGO_PKG_VERSION");
     let Some(bytes) = download_release(version, target).await? else {
         anyhow::bail!(
-            "kiln has no binary for {target}: this server is {}, none was uploaded for {target}, and GitHub has no v{version} release with one. Upload a kiln binary for {target} under Settings → Updates.",
+            "kiln has no binary for {target}: this server is {}, none was uploaded for {target}, and GitHub has no v{version} release with one. Upload a kiln binary for {target} under System → Builds.",
             crate::api::TARGET
         );
     };
-    let b = store(hub, target, &bytes, "release")?;
+    let b = store(hub, target, bytes, "release").await?;
     Ok((b.sha256, b.size))
 }
 
@@ -875,31 +1074,40 @@ impl Updates {
         hub.emit(&serde_json::json!({ "type": "updates" }));
     }
 
+    /// Kiln stops waiting for it: its `which` wait ([`Waits`]) ran out.
+    pub(crate) fn time_out(&self, hub: &Hub, id: &str, which: &'static str, error: String) {
+        self.update(hub, id, |j| j.timed_out = Some(which));
+        self.finish(hub, id, Err(error));
+    }
+
     /// [`AgentMsg::UpgradeLog`].
     pub fn on_log(&self, hub: &Hub, job: &str, line: String) {
         self.say(hub, job, line);
     }
 
     /// [`AgentMsg::UpgradeDone`]. A success completes the job once the new build has reported
-    /// in (the job's driver waits for that); a failure completes it now.
+    /// in (the job's driver waits for that); a failure completes it now. One kiln had stopped
+    /// waiting for is upgraded after all once it is through ([`Self::late`]).
     pub fn on_done(&self, hub: &Hub, job: &str, ok: bool, error: Option<String>) {
         if ok {
             self.update(hub, job, |j| {
                 j.handed_over = j.blue_green;
                 push_line(j, if j.blue_green { "the new build took over" } else { "the runner finished installing" }.to_owned());
             });
+            self.late(hub, job);
         } else {
             self.finish(hub, job, Err(error.unwrap_or_else(|| "the runner reported a failure".to_owned())));
         }
     }
 
-    /// [`AgentMsg::Build`] from a machine: an upgrade of it to that build has arrived.
+    /// [`AgentMsg::Build`] from a machine: an upgrade of it to that build has arrived, also one
+    /// kiln had stopped waiting for ([`Self::late`]).
     pub fn on_build(&self, hub: &Hub, machine: &str, build: &str) {
         let ids: Vec<String> = self
             .jobs
             .lock()
             .iter()
-            .filter(|j| j.kind == "runner" && j.target == machine && j.state == JobState::Running && !j.reached && j.to_build.as_deref() == Some(build))
+            .filter(|j| j.awaits(machine, build))
             .map(|j| j.id.clone())
             .collect();
         for id in ids {
@@ -907,7 +1115,60 @@ impl Updates {
                 j.reached = true;
                 push_line(j, format!("{machine} is running build {build}"));
             });
+            self.late(hub, &id);
         }
+        self.late_by_commit(hub, machine);
+    }
+
+    /// The commit `machine`'s runner runs may be known now ([`AgentMsg::Facts`], or a build kiln
+    /// knows the commit of): an upgrade kiln had stopped waiting for that brought it there on a build
+    /// its machine signed again ([`Self::reached_commit`]) is upgraded after all.
+    pub(crate) fn late_by_commit(&self, hub: &Hub, machine: &str) {
+        let ids: Vec<String> =
+            self.jobs.lock().iter().filter(|j| j.kind == "runner" && j.target == machine && j.state == JobState::Failed && !j.reached).map(|j| j.id.clone()).collect();
+        for id in ids {
+            self.reached_commit(hub, &id, machine);
+            self.late(hub, &id);
+        }
+    }
+
+    /// A job kiln had stopped waiting for whose machine got through after all (the new build
+    /// reported in and, on a runner that upgrades blue/green, took over): it is upgraded, and
+    /// reads so.
+    fn late(&self, hub: &Hub, id: &str) {
+        let now = crate::util::now_unix();
+        let mut through = None;
+        self.update(hub, id, |j| {
+            if j.through_late(now) {
+                through = Some(j.clone());
+            }
+        });
+        if let Some(j) = through {
+            crate::fleet::on_job_end(hub, &j, None);
+            hub.emit(&serde_json::json!({ "type": "updates" }));
+        }
+    }
+}
+
+impl Job {
+    /// It waits for `machine` to run `build`: a runner's upgrade, not done (also one kiln stopped
+    /// waiting for), whose build hasn't reported in.
+    fn awaits(&self, machine: &str, build: &str) -> bool {
+        self.kind == "runner" && self.target == machine && self.state != JobState::Done && !self.reached && self.to_build.as_deref() == Some(build)
+    }
+
+    /// Kiln had stopped waiting for it, and its machine got through since (the new build reported
+    /// in and, upgrading blue/green, took over): it is done after all, and says so. Whether it was.
+    fn through_late(&mut self, now: i64) -> bool {
+        if self.state != JobState::Failed || !self.reached || (self.blue_green && !self.handed_over) {
+            return false;
+        }
+        let was = self.error.take().unwrap_or_default();
+        self.timed_out = None;
+        self.state = JobState::Done;
+        self.ended_at = Some(now);
+        push_line(self, format!("upgraded after all: it got there after kiln had stopped waiting ({was})"));
+        true
     }
 }
 
@@ -942,9 +1203,11 @@ pub(crate) fn new_job(kind: &'static str, target: &str, method: &'static str, fr
         from_build,
         to_build,
         commit: None,
+        on: None,
         reached: false,
         log: Vec::new(),
         error: None,
+        timed_out: None,
         progress: false,
         blue_green: false,
         handed_over: false,
@@ -953,7 +1216,7 @@ pub(crate) fn new_job(kind: &'static str, target: &str, method: &'static str, fr
 
 // ------------------------------------------------------------------ runners
 
-/// A machine's runner as Settings → Updates shows it.
+/// A machine's runner as System → Updates shows it.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunnerInfo {
     pub name: String,
@@ -997,10 +1260,36 @@ pub struct RunnerInfo {
     /// Where the build it would get comes from ("this server's own build", "built by release run
     /// #141", "built by adas-macbook", ...), when there is one.
     pub from: Option<String>,
+    /// The ways a person can have it upgraded to the newest kiln now, each with what it does or
+    /// why it can't (empty when it runs the newest, or kiln knows no newest).
+    pub ways: Vec<WayOpen>,
     pub instances: Vec<crate::instances::InstanceView>,
 }
 
-/// What a runner does with a newer kiln (`crate::fleet`), as chosen for it in Settings → Updates.
+/// How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built from
+/// the server's source, on the machine itself or, for a Mac that can't, on another machine whose
+/// build it then downloads (`crate::fleet`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Way {
+    Download,
+    Build,
+}
+
+/// One way a runner can be upgraded now, or why it can't.
+#[derive(Debug, Clone, Serialize)]
+pub struct WayOpen {
+    pub way: Way,
+    pub ok: bool,
+    /// What it does ("downloads build 493003c712b0"), or why it can't ("no binary of 31c0bbaf734c
+    /// for aarch64-apple-darwin yet").
+    pub why: String,
+    /// A build's: the machine it's made on, when another than the runner's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+/// What a runner does with a newer kiln (`crate::fleet`), as chosen for it in System → Updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Policy {
@@ -1047,6 +1336,113 @@ pub async fn set_policy(hub: &Hub, machine: &str, p: Policy) -> anyhow::Result<(
     if p == Policy::default() { hub.store.kv_delete(policy_key(machine)).await } else { hub.store.kv_set(policy_key(machine), p.as_str().to_owned()).await }
 }
 
+/// How long kiln waits on a runner's upgrade before it calls it failed: `[updates]` in kiln.toml,
+/// unless changed in System → Updates. A change applies to upgrades under way too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Waits {
+    /// Minutes a runner has to switch to its new build and report in, once it has no jobs running.
+    pub upgrade_minutes: u64,
+    /// Minutes kiln keeps an upgrade open while the runner finishes the jobs it is running.
+    pub wait_for_jobs_minutes: u64,
+    /// Minutes a machine has to build kiln itself, install included.
+    pub build_minutes: u64,
+}
+
+/// What each wait may be, in minutes.
+const WAIT_LIMITS: [(&str, u64, u64); 3] = [("upgrade_minutes", 1, 24 * 60), ("wait_for_jobs_minutes", 1, 7 * 24 * 60), ("build_minutes", 5, 24 * 60)];
+
+impl Waits {
+    /// As kiln.toml sets them.
+    pub fn of(u: &crate::config::Updates) -> Self {
+        Self { upgrade_minutes: u.upgrade_minutes, wait_for_jobs_minutes: u.wait_for_jobs_minutes, build_minutes: u.build_minutes }
+    }
+
+    fn values(self) -> [u64; 3] {
+        [self.upgrade_minutes, self.wait_for_jobs_minutes, self.build_minutes]
+    }
+
+    fn from_values([upgrade_minutes, wait_for_jobs_minutes, build_minutes]: [u64; 3]) -> Self {
+        Self { upgrade_minutes, wait_for_jobs_minutes, build_minutes }
+    }
+
+    /// Each one within what kiln takes.
+    pub fn check(self) -> anyhow::Result<()> {
+        for ((name, lo, hi), v) in WAIT_LIMITS.into_iter().zip(self.values()) {
+            anyhow::ensure!((lo..=hi).contains(&v), "{name} is {v}: it can be from {lo} to {hi} minutes");
+        }
+        Ok(())
+    }
+
+    /// Brought within what kiln takes (a kiln.toml can say anything).
+    fn clamped(self) -> Self {
+        let mut v = self.values();
+        for (x, (_, lo, hi)) in v.iter_mut().zip(WAIT_LIMITS) {
+            *x = (*x).clamp(lo, hi);
+        }
+        Self::from_values(v)
+    }
+
+    pub fn upgrade(self) -> Duration {
+        minutes(self.upgrade_minutes)
+    }
+
+    pub fn jobs(self) -> Duration {
+        minutes(self.wait_for_jobs_minutes)
+    }
+
+    pub fn build(self) -> Duration {
+        minutes(self.build_minutes)
+    }
+}
+
+fn minutes(m: u64) -> Duration {
+    Duration::from_secs(m.saturating_mul(60))
+}
+
+/// A wait as a person says it: "15 minutes", "an hour", "6 hours", "90 minutes".
+pub fn said(d: Duration) -> String {
+    let m = d.as_secs() / 60;
+    match m {
+        60 => "an hour".to_owned(),
+        1 => "a minute".to_owned(),
+        m if m >= 120 && m % 60 == 0 => format!("{} hours", m / 60),
+        m => format!("{m} minutes"),
+    }
+}
+
+/// Where the waits chosen in System → Updates are kept (none: kiln.toml's).
+const WAITS_KEY: &str = "updates/waits";
+
+/// How long upgrades are waited on now.
+pub async fn waits(hub: &Hub) -> Waits {
+    if let Some(w) = *hub.updates.waits.lock() {
+        return w;
+    }
+    let chosen = hub.store.kv_get(WAITS_KEY.to_owned()).await.ok().flatten().and_then(|v| serde_json::from_str::<Waits>(&v).ok());
+    let w = chosen.unwrap_or_else(|| Waits::of(&hub.cfg.updates)).clamped();
+    *hub.updates.waits.lock() = Some(w);
+    w
+}
+
+/// The waits were changed in System → Updates: kiln.toml's don't apply.
+pub async fn waits_changed(hub: &Hub) -> bool {
+    hub.store.kv_get(WAITS_KEY.to_owned()).await.ok().flatten().is_some()
+}
+
+/// Wait this long from now on (`None`: as kiln.toml says).
+pub async fn set_waits(hub: &Hub, w: Option<Waits>) -> anyhow::Result<()> {
+    match w {
+        Some(w) => {
+            w.check()?;
+            hub.store.kv_set(WAITS_KEY.to_owned(), serde_json::to_string(&w)?).await?;
+        }
+        None => hub.store.kv_delete(WAITS_KEY.to_owned()).await?,
+    }
+    *hub.updates.waits.lock() = None;
+    Ok(())
+}
+
 /// The runners' gauges (`crate::metrics`): up, behind, update policy and the kiln each runs.
 pub async fn measure(hub: &Arc<Hub>) {
     let rs = runners(hub).await;
@@ -1085,7 +1481,7 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
             let newest = instances.iter().find(|i| i.newest);
             let build = newest.and_then(|i| i.build.clone());
             let target = target_for(&a.os, &a.arch);
-            let target_build = target.as_deref().and_then(|t| if t == crate::api::TARGET { Some(mine.clone()) } else { stored(hub, t).map(|(_, b)| b.build) });
+            let target_build = target.as_deref().and_then(|t| if t == crate::api::TARGET { Some(mine.clone()) } else { stored(hub, t).map(|b| b.build) });
             RunnerInfo {
                 up_to_date: build.is_some() && build == target_build,
                 method: if newest.is_some_and(|i| i.can_upgrade) { "native" } else { "terminal" },
@@ -1093,6 +1489,7 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
                 policy: Policy::default(),
                 locked: false,
                 from: None,
+                ways: Vec::new(),
                 target,
                 target_build,
                 build,
@@ -1136,15 +1533,19 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
             r.how = Some(how);
             r.next = Some(next);
         }
+        if r.connected && !r.up_to_date && !r.locked && r.how != Some("left") {
+            r.ways = crate::fleet::ways(hub, r, t).await;
+        }
     }
     out
 }
 
-/// Start upgrading `machine`'s runner to the newest kiln (`crate::fleet`): a binary of it when
-/// kiln has one for its platform, else a build of it on the machine itself. With no newest known
-/// (a server built without knowing its commit), to the build kiln has for its platform. Nothing it
-/// runs is stopped.
-pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str) -> anyhow::Result<Job> {
+/// Start upgrading `machine`'s runner to the newest kiln (`crate::fleet`): the `way` asked for, or
+/// a binary of it when kiln has one for its platform, else a build of it (on the machine itself,
+/// or one another machine makes for its platform, which it downloads). A person asking now isn't
+/// held back by the wait between automatic tries. With no newest known (a server built without
+/// knowing its commit), to the build kiln has for its platform. Nothing it runs is stopped.
+pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str, way: Option<Way>) -> anyhow::Result<Job> {
     if let Some(j) = hub.updates.running_for("runner", machine) {
         return Ok(j);
     }
@@ -1154,12 +1555,24 @@ pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str) -> anyhow::Result<Job
     anyhow::ensure!(r.connected, "{machine} is not connected");
     if let Some(t) = hub.updates.fleet.target() {
         anyhow::ensure!(!r.up_to_date, "{machine} already runs the newest kiln ({})", crate::fleet::short(&t.commit));
-        return match crate::fleet::plan(hub, &r, &t).await {
+        let plan = match way {
+            None => crate::fleet::plan(hub, &r, &t).await,
+            Some(w) => {
+                let open = crate::fleet::ways(hub, &r, &t).await.into_iter().find(|o| o.way == w);
+                match open {
+                    Some(o) if !o.ok => anyhow::bail!("{machine} can't be upgraded that way: {}", o.why),
+                    _ => crate::fleet::plan_by(hub, &r, &t, w)?,
+                }
+            }
+        };
+        return match plan {
             crate::fleet::Plan::Download(b) => upgrade_with(hub, &r, &b, "admin").await,
-            crate::fleet::Plan::Build(c) => crate::fleet::self_build(hub, &r, &t.commit, c, "admin").await,
+            crate::fleet::Plan::Build(b) => crate::fleet::build(hub, &r, &t.commit, &b, "admin").await,
+            crate::fleet::Plan::Join { job, on } => crate::fleet::join(hub, &r, &t.commit, &job, &on, "admin").await,
             crate::fleet::Plan::Wait(why) => anyhow::bail!("{machine} can't be upgraded yet: it {why}"),
         };
     }
+    anyhow::ensure!(way != Some(Way::Build), "{machine} can't build kiln itself while kiln knows no newest commit to build");
     let target = r.target.clone().ok_or_else(|| anyhow::anyhow!("kiln has no build for {} on {}", r.os, r.arch))?;
     let (sha256, size) = ensure_binary(hub, &target).await?;
     let b = binaries(hub).into_iter().find(|b| b.target == target && b.sha256 == sha256).unwrap_or_else(|| Binary {
@@ -1211,6 +1624,43 @@ pub async fn upgrade_with(hub: &Arc<Hub>, r: &RunnerInfo, b: &Binary, by: &str) 
     Ok(job)
 }
 
+/// Job `id` goes on to upgrade `machine` to `b`, a build another machine made for its platform
+/// (`crate::fleet`): downloaded and installed as [`upgrade_with`] has it done. Nothing it runs is
+/// stopped.
+pub(crate) async fn upgrade_into(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
+    let u = &hub.updates;
+    let Some(r) = runners(hub).await.into_iter().find(|r| r.name == machine) else {
+        u.finish(hub, id, Err(format!("there is no runner called {machine}")));
+        return;
+    };
+    let cant = if !r.connected {
+        Some(format!("{machine} is not connected"))
+    } else if r.method != "native" && !r.terminal {
+        Some(format!("{machine} runs a kiln too old to upgrade itself and has terminals turned off: run `kiln install --agent --upgrade` with a new kiln binary on it"))
+    } else {
+        None
+    };
+    if let Some(e) = cant {
+        u.finish(hub, id, Err(e));
+        return;
+    }
+    if r.build.as_deref() == Some(b.build.as_str()) {
+        u.finish(hub, id, Ok(format!("{machine} runs build {} already", b.build)));
+        return;
+    }
+    u.update(hub, id, |j| {
+        j.from_build.clone_from(&r.build);
+        j.to_build = Some(b.build.clone());
+    });
+    hub.store.audit("kiln".into(), "upgrade.runner".into(), format!("{machine} to build {} ({}, {}), built by {}", b.build, b.target, r.method, b.by.as_deref().unwrap_or("another machine"))).await;
+    u.say(hub, id, format!("upgrading {machine} to build {} ({}); nothing it runs is stopped", b.build, b.target));
+    if r.method == "native" {
+        native(hub, id, machine, b).await;
+    } else {
+        terminal(hub, id, machine, b, &instance8(&r)).await;
+    }
+}
+
 /// The runner does it itself: it fetches the binary from this server, checks it and runs
 /// `install --agent --upgrade`, reporting back (UpgradeLog / UpgradeDone). A runner that takes
 /// the binary in place restarts its own process (same pid, terminals handed over) and so may
@@ -1219,9 +1669,14 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
     let u = &hub.updates;
     // That exact build: the server may hand out more than one for a platform.
     let msg = ServerMsg::Upgrade { job: id.to_owned(), path: format!("/dl/kiln/{}/{}", b.target, b.build), sha256: b.sha256.clone(), size: b.size };
-    if !hub.send_to_agent(machine, LANE_CONTROL, &msg).await {
-        u.finish(hub, id, Err(format!("{machine} is not connected")));
-        return;
+    // A live command: refused at once while its runner is away. Refused, the upgrade ends there;
+    // unanswered (the runner restarting into its new build, say), it goes on to see what came of it.
+    match hub.command_start(machine, &msg).await.answer(crate::hub::COMMAND_WITHIN).await {
+        crate::wire::commands::Answer::Taken | crate::wire::commands::Answer::Sent | crate::wire::commands::Answer::Unanswered { .. } | crate::wire::commands::Answer::Parked => {}
+        other => {
+            u.finish(hub, id, Err(format!("{machine}: {}", other.words())));
+            return;
+        }
     }
     // A runner that upgrades blue/green is through once it says its new build took over.
     let blue_green = {
@@ -1230,8 +1685,12 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
     };
     u.update(hub, id, |j| j.blue_green = blue_green);
     u.say(hub, id, if blue_green { "asked the runner to upgrade itself: the new build starts beside it and takes over" } else { "asked the runner to upgrade itself" });
-    let deadline = Instant::now() + RUNNER_TIMEOUT;
-    while Instant::now() < deadline {
+    let since = Instant::now();
+    // The runner switches once its running jobs are done: that wait is theirs, not the upgrade's,
+    // so the upgrade's own starts once they are.
+    let mut idle_since = since;
+    let (mut waiting_on, mut waited) = (0, false);
+    loop {
         crate::rt::sleep(Duration::from_secs(1)).await;
         if !u.running(id) {
             return;
@@ -1241,8 +1700,26 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
             u.finish(hub, id, Ok(String::new()));
             return;
         }
+        let w = waits(hub).await;
+        let busy: usize = hub.runner_processes(machine).iter().map(|i| i.jobs).sum();
+        if busy > 0 {
+            if since.elapsed() > w.jobs() {
+                let e = format!("{machine} kept running jobs for {}, so it never switched; it does once it is idle", said(w.jobs()));
+                u.time_out(hub, id, "jobs", e);
+                return;
+            }
+            idle_since = Instant::now();
+            waited = true;
+            if busy != waiting_on {
+                u.say(hub, id, format!("{machine} waits for {} before it switches", if busy == 1 { "its running job".to_owned() } else { format!("its {busy} running jobs") }));
+            }
+        } else if idle_since.elapsed() > w.upgrade() {
+            let after = if waited { " of its last job ending" } else { "" };
+            u.time_out(hub, id, "upgrade", format!("the new runner didn't report in within {}{after}; see the runner's log", said(w.upgrade())));
+            return;
+        }
+        waiting_on = busy;
     }
-    u.finish(hub, id, Err("the new runner didn't report in within 15 minutes; see the runner's log".to_owned()));
 }
 
 /// The upgrade script for a runner from before [`CAP_UPGRADE`], run through its terminal support
@@ -1447,11 +1924,18 @@ async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary, inst8: &s
         }
     };
     feed(&String::from_utf8_lossy(&att.replay));
-    let deadline = Instant::now() + RUNNER_TIMEOUT;
+    let started = Instant::now();
+    let mut timed_out = false;
     let result = loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let Ok(frame) = crate::rt::timeout(left, att.live.recv()).await else {
-            break Err("the upgrade didn't finish in 15 minutes".to_owned());
+        // Looked at again at least every minute: a longer wait chosen meanwhile applies.
+        let limit = waits(hub).await.upgrade();
+        let left = limit.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            timed_out = true;
+            break Err(format!("the upgrade didn't finish in {}", said(limit)));
+        }
+        let Ok(frame) = crate::rt::timeout(left.min(Duration::from_secs(60)), att.live.recv()).await else {
+            continue;
         };
         match frame {
             Ok(Frame::Data(d)) => feed(&String::from_utf8_lossy(&d)),
@@ -1472,10 +1956,12 @@ async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary, inst8: &s
     if let Err(e) = result
         && !ok_marked
     {
-        if e.contains("15 minutes") {
+        if timed_out {
             session.close();
+            u.time_out(hub, id, "upgrade", e);
+        } else {
+            u.finish(hub, id, Err(e));
         }
-        u.finish(hub, id, Err(e));
         return;
     }
     // Installed: the new runner reports its build when it connects, which completes the job.
@@ -1500,7 +1986,7 @@ pub async fn upgrade_all(hub: &Arc<Hub>) -> Vec<Result<Job, String>> {
     for r in runners(hub).await {
         // Runners whose updates are off are left alone, with the others too.
         if r.policy != Policy::Off && !r.locked && r.connected && !r.up_to_date && !matches!(r.standing, Some(crate::fleet::Standing::Branch | crate::fleet::Standing::Local)) {
-            out.push(upgrade_runner(hub, &r.name).await.map_err(|e| format!("{}: {e:#}", r.name)));
+            out.push(upgrade_runner(hub, &r.name, None).await.map_err(|e| format!("{}: {e:#}", r.name)));
         }
     }
     out
@@ -1601,7 +2087,7 @@ pub fn server(hub: &Arc<Hub>, force: bool) -> ServerInfo {
         return s;
     }
     let mine = own_binary().ok();
-    let upload = stored(hub, crate::api::TARGET).map(|(_, b)| b).filter(|b| mine.as_ref().is_none_or(|(h, _)| *h != b.sha256));
+    let upload = stored(hub, crate::api::TARGET).filter(|b| mine.as_ref().is_none_or(|(h, _)| *h != b.sha256));
     let replacement = match (&upload, &release) {
         (Some(b), _) => Some(Replacement { origin: "upload", build: Some(b.build.clone()), version: None }),
         (None, r) if r.newer && own_release_target().is_some() => Some(Replacement { origin: "release", build: None, version: r.latest.clone() }),
@@ -1699,8 +2185,8 @@ pub async fn upgrade_server(hub: &Arc<Hub>, action: &str) -> anyhow::Result<Job>
 async fn replace_binary(hub: &Arc<Hub>, id: &str, r: &Replacement, exe: PathBuf) -> anyhow::Result<()> {
     let u = &hub.updates;
     let bytes = if r.origin == "upload" {
-        let (src, _) = stored(hub, crate::api::TARGET).ok_or_else(|| anyhow::anyhow!("the uploaded binary is gone"))?;
-        std::fs::read(&src).with_context(|| format!("read {}", src.display()))?
+        stored(hub, crate::api::TARGET).ok_or_else(|| anyhow::anyhow!("the uploaded binary is gone"))?;
+        crate::blobs::io::get_all(hub.blobs.blobs.as_ref(), &binary_key(crate::api::TARGET), MAX_BINARY as u64).await.map_err(|e| anyhow::anyhow!("reading the uploaded binary: {e}"))?.1
     } else {
         let version = r.version.clone().ok_or_else(|| anyhow::anyhow!("no release version"))?;
         let target = own_release_target().ok_or_else(|| anyhow::anyhow!("releases have no build for this platform"))?;
@@ -1727,6 +2213,11 @@ async fn replace_binary(hub: &Arc<Hub>, id: &str, r: &Replacement, exe: PathBuf)
 // ------------------------------------------------------------------ the runner's side
 
 static UPGRADING: AtomicBool = AtomicBool::new(false);
+
+/// Whether this runner is fetching an upgrade now (`crate::doctor` leaves the caches alone meanwhile).
+pub fn upgrading() -> bool {
+    UPGRADING.load(Ordering::Acquire)
+}
 
 /// The downloaded binary and its install's output, in the runner's own directory.
 fn upgrade_files(own_dir: &Path) -> (PathBuf, PathBuf) {
@@ -1884,7 +2375,7 @@ async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, orde
         if let Some(st) = exited {
             break st;
         }
-        if started.elapsed() > RUNNER_TIMEOUT {
+        if started.elapsed() > INSTALL_TIMEOUT {
             let _ = child.kill();
             let _ = std::fs::remove_file(&bin);
             anyhow::bail!("install --agent --upgrade didn't finish in 15 minutes");
@@ -1926,15 +2417,20 @@ pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
     "kiln-agent".to_owned()
 }
 
-/// What a runner announces after Hello ([`AgentMsg::Build`]): what this build can do, and
-/// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01, probed once).
-pub fn runner_build() -> AgentMsg {
-    let docker = if crate::runner::docker::available() { crate::proto::CAP_DOCKER } else { 0 };
+/// What a runner announces after Hello ([`AgentMsg::Build`]): what this build can do,
+/// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01: probed until it answers,
+/// waited for 10 s at a time), and `CAP_FIRECRACKER` when it can boot microVMs (W13-R05).
+pub async fn runner_build() -> AgentMsg {
+    let docker = if crate::rt::blocking(crate::runner::docker::available).await.unwrap_or(false) { crate::proto::CAP_DOCKER } else { 0 };
+    #[cfg(target_os = "linux")]
+    let microvms = if crate::runner::firecracker::Machine::find().is_some() { crate::proto::CAP_FIRECRACKER } else { 0 };
+    #[cfg(not(target_os = "linux"))]
+    let microvms = 0;
     // Under a supervisor that can start a new build beside it (`kiln supervise` on Unix).
     let blue_green = if crate::bluegreen::Supervisor::from_env().is_some() { crate::proto::CAP_BLUE_GREEN } else { 0 };
     // Rootless engines are where untrusted legs may run (docs/ci.md W18-R07).
-    let rootless = if docker != 0 && crate::runner::docker::rootless_engine() { crate::proto::CAP_DOCKER_ROOTLESS } else { 0 };
-    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | blue_green | rootless }
+    let rootless = if docker != 0 && crate::rt::blocking(crate::runner::docker::rootless_engine).await.unwrap_or(false) { crate::proto::CAP_DOCKER_ROOTLESS } else { 0 };
+    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | microvms | blue_green | rootless }
 }
 
 /// What a runner says of itself after its build ([`AgentMsg::Facts`]): for now, the kiln it
@@ -1974,6 +2470,7 @@ pub fn kiln_checkout() -> Option<PathBuf> {
 
 /// Everything this build's runner can do ([`AgentMsg::Build`]).
 pub const RUNNER_CAPS: u32 = CAP_UPGRADE
+    | crate::proto::CAP_DOCTOR
     | crate::proto::CAP_UPDATES
     | crate::proto::CAP_FACTS
     | crate::proto::CAP_TAKEOVER
@@ -1986,13 +2483,23 @@ pub const RUNNER_CAPS: u32 = CAP_UPGRADE
     | crate::proto::CAP_ACTIONS
     | crate::proto::CAP_REACH
     | crate::proto::CAP_JOB_TTY
+    | crate::proto::CAP_FILES
+    | crate::proto::CAP_STREAM
+    | crate::proto::CAP_PREVIEW
+    | crate::proto::CAP_PORTS
+    | crate::proto::CAP_ENGINES
+    | crate::proto::CAP_WORKSPACE
+    | crate::proto::CAP_POOLS
+    | crate::proto::CAP_RECEIVED
+    | crate::proto::CAP_UNDEPLOY
+    | crate::proto::CAP_CLUSTER
     | crate::proto::CAP_OBSERVE;
 
 /// What an outpost (`kiln outpost`) does ([`AgentMsg::Build`]): a runner's terminals, AI sessions
 /// and agents (taking a session over, listing folders), none of its jobs, upgrades, front door,
 /// repo copies or reach.
 pub const OUTPOST_CAPS: u32 =
-    crate::proto::CAP_OUTPOST | crate::proto::CAP_TAKEOVER | crate::proto::CAP_DIRS | crate::proto::CAP_TAKEOVER_STOP;
+    crate::proto::CAP_OUTPOST | crate::proto::CAP_TAKEOVER | crate::proto::CAP_DIRS | crate::proto::CAP_TAKEOVER_STOP | crate::proto::CAP_FILES;
 
 /// An outpost's [`AgentMsg::Build`].
 pub fn outpost_build() -> AgentMsg {
@@ -2003,10 +2510,85 @@ pub fn outpost_build() -> AgentMsg {
 mod tests {
     use super::*;
 
+    /// A runner upgrade kiln gave up on: the machine got there later.
+    fn given_up(blue_green: bool) -> Job {
+        let mut j = new_job("runner", "adacachy", "native", Some("1e8fb739442b".into()), Some("493003c712b0".into()));
+        j.blue_green = blue_green;
+        j.state = JobState::Failed;
+        j.error = Some("the new runner didn't report in within 15 minutes; see the runner's log".into());
+        j.timed_out = Some("upgrade");
+        j
+    }
+
+    #[test]
+    fn an_upgrade_that_got_there_late_is_upgraded_after_all() {
+        let mut j = given_up(false);
+        assert!(j.awaits("adacachy", "493003c712b0"), "a job given up on still waits for its build");
+        assert!(!j.awaits("adacachy", "another"), "only for its own build");
+        assert!(!j.awaits("fedora", "493003c712b0"), "and its own machine");
+        j.reached = true;
+        assert!(j.through_late(42));
+        assert_eq!((j.state, j.error.as_deref(), j.timed_out, j.ended_at), (JobState::Done, None, None, Some(42)));
+        assert!(j.log.last().is_some_and(|l| l.starts_with("upgraded after all") && l.contains("15 minutes")), "{:?}", j.log);
+        assert!(!j.through_late(43), "once");
+        assert!(!j.awaits("adacachy", "493003c712b0"), "done: it waits for nothing");
+    }
+
+    #[test]
+    fn a_given_up_upgrade_that_arrived_on_a_build_signed_again_is_upgraded_after_all() {
+        let mut j = given_up(false);
+        j.commit = Some("94f0847a1b2c3d4e5f60718293a4b5c6d7e8f901".into());
+        // The Mac signed the build again: it reports another build id, of the same commit.
+        assert!(!j.awaits("adacachy", "7c0ffee12345"), "not the build it was handed");
+        assert!(arrived_by_commit(&j, Some("7c0ffee12345"), Some("94F0847A1B2C3D4E5F60718293A4B5C6D7E8F901")));
+        assert!(!arrived_by_commit(&j, Some("1e8fb739442b"), Some("94f0847a1b2c3d4e5f60718293a4b5c6d7e8f901")), "still the build it ran before");
+        j.reached = true;
+        assert!(j.through_late(7));
+        assert_eq!(j.state, JobState::Done);
+    }
+
+    #[test]
+    fn a_blue_green_upgrade_needs_its_handover_too() {
+        let mut j = given_up(true);
+        j.reached = true;
+        assert!(!j.through_late(1), "the new build reported in, but the old runner never said it took over");
+        assert_eq!(j.state, JobState::Failed);
+        j.handed_over = true;
+        assert!(j.through_late(2));
+        assert_eq!(j.state, JobState::Done);
+    }
+
+    #[test]
+    fn a_failure_its_machine_never_got_past_stays_failed() {
+        let mut j = given_up(false);
+        assert!(!j.through_late(1), "nothing reported in");
+        let mut running = given_up(false);
+        running.state = JobState::Running;
+        running.reached = true;
+        assert!(!running.through_late(1), "a running job finishes the usual way");
+    }
+
+    #[test]
+    fn waits_come_from_kiln_toml_and_stay_within_reason() {
+        let w = Waits::of(&crate::config::Updates::default());
+        assert_eq!((w.upgrade(), w.jobs(), w.build()), (Duration::from_secs(15 * 60), Duration::from_secs(6 * 3600), Duration::from_secs(3600)));
+        assert!(w.check().is_ok());
+        let odd = Waits { upgrade_minutes: 0, wait_for_jobs_minutes: 1_000_000, build_minutes: 2 };
+        assert!(odd.check().is_err_and(|e| e.to_string().contains("upgrade_minutes is 0")), "a change is refused");
+        assert_eq!(odd.clamped(), Waits { upgrade_minutes: 1, wait_for_jobs_minutes: 7 * 24 * 60, build_minutes: 5 }, "a kiln.toml is brought within");
+        assert!(serde_json::from_str::<Waits>(r#"{"upgrade_minutes": 30, "wait_for_jobs_minutes": 60, "build_minutes": 90, "other": 1}"#).is_err(), "nothing unknown");
+    }
+
+    #[test]
+    fn waits_read_as_a_person_says_them() {
+        let said_of = |m: u64| said(minutes(m));
+        assert_eq!([said_of(1), said_of(15), said_of(60), said_of(90), said_of(120), said_of(360)], ["a minute", "15 minutes", "an hour", "90 minutes", "2 hours", "6 hours"]);
+    }
+
     #[test]
     fn runners_announce_every_capability_they_have() -> anyhow::Result<()> {
         use crate::proto::{CAP_DIRS, CAP_FRONT_DOOR, CAP_TAKEOVER, CAP_TAKEOVER_STOP};
-        let AgentMsg::Build { caps, build } = runner_build() else { anyhow::bail!("runner_build is not a Build") };
+        let AgentMsg::Build { caps, build } = crate::rt::block_on(async { Ok(runner_build().await) })? else { anyhow::bail!("runner_build is not a Build") };
         assert!(!build.is_empty());
         for cap in [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_FRONT_DOOR] {
             assert_eq!(caps & cap, cap, "capability {cap} is announced");
@@ -2113,23 +2695,47 @@ mod tests {
         assert_eq!(next(&failed3, &none, now), Next::Nothing);
     }
 
+    /// A server just started took a runner's older commit as the newest for a moment (its own not
+    /// fetched yet), and kept that commit's binaries over its own: back on its own, its release
+    /// run's binaries are kept again (2026-10-20: jupiter waited for a Windows build of 5806c0d
+    /// its server had, overwritten by df17c34's).
+    #[test]
+    fn the_newest_moving_back_keeps_its_binaries_again() {
+        let mut starts = Starts { last: Some(5), ..Starts::default() };
+        let mut was = String::new();
+        starts.moved("5806c0d", &mut was);
+        starts.kept.insert("release-597-windows".to_owned());
+        starts.moved("5806c0d", &mut was);
+        assert!(starts.kept.contains("release-597-windows"), "still the same commit: nothing kept again");
+        starts.moved("df17c34", &mut was);
+        starts.kept.insert("release-525-windows".to_owned());
+        starts.moved("5806c0d", &mut was);
+        assert!(starts.kept.is_empty() && starts.last.is_none() && was == "5806c0d", "{starts:?}");
+    }
+
     #[test]
     fn the_release_pipelines_binaries_are_kept_for_the_other_platforms() -> anyhow::Result<()> {
+        crate::rt::block_on(async { release_binaries_are_kept().await })
+    }
+
+    async fn release_binaries_are_kept() -> anyhow::Result<()> {
+        let hub = crate::hub::tests::scratch_hub().await?;
         let dir = tempfile::tempdir()?;
-        let mut cfg = crate::config::Config::default();
-        cfg.server.data_dir = dir.path().to_owned();
         let fake = |magic: &[u8]| -> Vec<u8> {
             let mut b = magic.to_vec();
             b.resize(2 << 20, 7);
             b
         };
+        // A Mac's and Windows' binaries, and the server's own platform's (one of those two on a
+        // server that is one).
+        const OTHERS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"];
+        let mut entries = vec![("dist/kiln-aarch64-apple-darwin".to_owned(), fake(&[0xcf, 0xfa, 0xed, 0xfe])), ("dist/kiln-x86_64-pc-windows-msvc.exe".to_owned(), fake(b"MZ"))];
+        if !OTHERS.contains(&crate::api::TARGET) {
+            entries.push((format!("dist/kiln-{}", crate::api::TARGET), fake(b"\x7fELF")));
+        }
+        entries.push(("dist/SHA256SUMS".to_owned(), b"sums".to_vec()));
         let mut tar = tar::Builder::new(Vec::new());
-        for (name, bytes) in [
-            ("dist/kiln-aarch64-apple-darwin".to_owned(), fake(&[0xcf, 0xfa, 0xed, 0xfe])),
-            ("dist/kiln-x86_64-pc-windows-msvc.exe".to_owned(), fake(b"MZ")),
-            (format!("dist/kiln-{}", crate::api::TARGET), fake(b"\x7fELF")),
-            ("dist/SHA256SUMS".to_owned(), b"sums".to_vec()),
-        ] {
+        for (name, bytes) in entries {
             let mut h = tar::Header::new_gnu();
             h.set_size(bytes.len() as u64);
             h.set_mode(0o755);
@@ -2158,23 +2764,150 @@ mod tests {
         };
         // A run of a newer commit than the server's (`crate::fleet`): every platform's, the
         // server's own included.
-        let kept = adopt_into(&cfg, &artifacts, &run)?;
+        let kept = adopt_into(&hub, &artifacts, &run).await?;
         let mut targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
         targets.sort_unstable();
         let mut all = vec!["aarch64-apple-darwin", "x86_64-pc-windows-msvc", crate::api::TARGET];
         all.sort_unstable();
+        all.dedup();
         assert_eq!(targets, all);
         assert!(kept.iter().all(|b| b.origin == "built" && b.run == Some(12) && b.sha.as_deref() == Some("0d21482abcdef")));
-        assert!(dir.path().join("binaries/kiln-aarch64-apple-darwin").exists());
+        // Kept in kiln's store of bytes, and read back as kept when the server starts again.
+        let mac = hub.blobs.blobs.head(&binary_key("aarch64-apple-darwin")).await?;
+        assert_eq!((mac.size, Some(mac.etag)), (2 << 20, stored(&hub, "aarch64-apple-darwin").map(|b| b.sha256)));
+        hub.updates.kept.lock().clear();
+        load(&hub).await;
+        assert_eq!(stored(&hub, "aarch64-apple-darwin").map(|b| b.run), Some(Some(12)));
         // A run of the server's own commit: its platform keeps the server's own build.
         if !crate::api::COMMIT.is_empty() {
             let own = crate::store::Run { sha: crate::api::COMMIT.to_owned(), ..run };
-            let kept = adopt_into(&cfg, &artifacts, &own)?;
+            let kept = adopt_into(&hub, &artifacts, &own).await?;
             let mut targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
             targets.sort_unstable();
-            assert_eq!(targets, ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"], "this server's own platform keeps its own build");
+            let others: Vec<&str> = OTHERS.into_iter().filter(|t| *t != crate::api::TARGET).collect();
+            assert_eq!(targets, others, "this server's own platform keeps its own build");
         }
         Ok(())
+    }
+
+    /// CP-T10.1: binaries kept as files (`<data>/binaries`) are taken into the local store where
+    /// they lie; one an older kiln kept since (run on the store again: a rollback) replaces the
+    /// store's older one, and an older file leaves the store's newer one alone.
+    #[test]
+    fn binaries_kept_as_files_are_taken_in_and_the_newest_is_kept() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let local = hub.blobs.local.clone().ok_or_else(|| anyhow::anyhow!("not the local store"))?;
+            let (dir, t) = (old_dir(&hub.cfg), crate::api::TARGET);
+            std::fs::create_dir_all(&dir)?;
+            let elf = |n: u8| -> Vec<u8> {
+                let mut b = b"\x7fELF".to_vec();
+                b.resize(2 << 20, n);
+                b
+            };
+            // As an older kiln keeps one: the binary and what it knows of it, as of `at`.
+            let as_files = |bytes: &[u8], at: std::time::SystemTime| -> anyhow::Result<String> {
+                let sha256 = crate::util::sha256_hex(bytes);
+                let meta = Binary { target: t.into(), sha256: sha256.clone(), size: bytes.len() as u64, origin: "upload".into(), at: 0, build: String::new(), run: None, sha: None, by: None };
+                let bin = dir.join(format!("kiln-{t}"));
+                std::fs::write(&bin, bytes)?;
+                std::fs::write(dir.join(format!("kiln-{t}.json")), serde_json::to_vec(&meta)?)?;
+                std::fs::File::options().write(true).open(&bin)?.set_modified(at)?;
+                Ok(sha256)
+            };
+            let now = std::time::SystemTime::now();
+            let first = as_files(&elf(1), now - Duration::from_secs(60))?;
+            take_in(&hub, &local).await?;
+            load(&hub).await;
+            assert_eq!(stored(&hub, t).map(|b| b.sha256), Some(first));
+            // Replaced here: the files it was taken from go.
+            let uploaded = store(&hub, t, elf(2), "upload").await?.sha256;
+            assert!(!dir.join(format!("kiln-{t}")).exists());
+            // Rolled back, the older kiln kept a newer one; started again, it's the one.
+            let newer = as_files(&elf(3), now + Duration::from_secs(60))?;
+            take_in(&hub, &local).await?;
+            load(&hub).await;
+            assert_eq!(hub.blobs.blobs.head(&binary_key(t)).await?.etag, newer);
+            assert_eq!(stored(&hub, t).map(|b| b.sha256), Some(newer.clone()));
+            assert_ne!(uploaded, newer);
+            // A file older than what the store keeps changes nothing.
+            as_files(&elf(4), now - Duration::from_secs(3600))?;
+            take_in(&hub, &local).await?;
+            assert_eq!(hub.blobs.blobs.head(&binary_key(t)).await?.etag, newer);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_release_binary_cut_short_or_not_a_program_is_never_kept() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut cfg = crate::config::Config::default();
+        cfg.server.data_dir = dir.path().to_owned();
+        let mut mac = vec![0xcf, 0xfa, 0xed, 0xfe];
+        mac.resize(2 << 20, 7);
+        // Windows' isn't its program; the Mac's is cut short, as an upload that broke off leaves it.
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, bytes) in [("dist/kiln-x86_64-pc-windows-msvc.exe", b"not a program".to_vec()), ("dist/kiln-aarch64-apple-darwin", mac)] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(bytes.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            tar.append_data(&mut h, name, bytes.as_slice())?;
+        }
+        let mut archive = tar.into_inner()?;
+        archive.truncate(archive.len().saturating_sub(1 << 20));
+        let artifacts = dir.path().join("artifacts.tar");
+        std::fs::write(&artifacts, archive)?;
+        let run = crate::store::Run {
+            id: "r".into(),
+            repo_id: "k".into(),
+            repo_name: "hyper-light/kiln".into(),
+            number: 13,
+            pipeline: "release".into(),
+            event: "push".into(),
+            branch: "main".into(),
+            sha: "0d21482abcdef".into(),
+            message: String::new(),
+            author: String::new(),
+            status: crate::store::Status::Succeeded,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            error: None,
+            concurrency_group: None,
+        };
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.server.data_dir = cfg.server.data_dir.clone()).await?;
+            let kept = adopt_into(&hub, &artifacts, &run).await?;
+            assert!(kept.is_empty(), "{kept:?}");
+            for t in ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"] {
+                assert!(matches!(hub.blobs.blobs.head(&binary_key(t)).await, Err(kiln_seams::blobs::Refusal::NotFound(_))), "{t} kept");
+            }
+            Ok(())
+        })
+    }
+
+    /// CP-T10.1, AC-T10.1.1: a store that can't answer leaves what kiln knows of each binary as it
+    /// was, and says not all of it was read; once it answers, every binary it keeps is read.
+    #[test]
+    fn binaries_are_read_again_once_the_store_answers() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use kiln_seams::blobs::{Blobs, Put, SimBlobs, SimLimits};
+            let sim: Arc<dyn Blobs> = Arc::new(SimBlobs::new(crate::rt::clock(), SimLimits::default()));
+            let t = crate::api::TARGET;
+            let binary = |bytes: &[u8]| Binary { target: t.into(), sha256: crate::util::sha256_hex(bytes), size: bytes.len() as u64, origin: "upload".into(), at: 0, build: String::new(), run: None, sha: None, by: None };
+            let (older, newer) = (binary(b"older"), binary(b"\x7fELF, newer"));
+            sim.put(&binary_key(t), b"\x7fELF, newer".to_vec(), Put::default()).await?;
+            sim.put(&meta_key(t), serde_json::to_vec(&newer)?, Put::default()).await?;
+            let flaky = crate::blobs::tests::Flaky::down(Arc::clone(&sim));
+            let kept = Mutex::new(HashMap::from([(t.to_owned(), older.clone())]));
+            assert!(!load_into(&flaky, &kept).await, "the store didn't answer");
+            assert_eq!(kept.lock().get(t).map(|b| b.sha256.clone()), Some(older.sha256), "what it knew, it knows still");
+            flaky.down.store(false, Ordering::Release);
+            assert!(load_into(&flaky, &kept).await);
+            assert_eq!(kept.lock().get(t).map(|b| b.sha256.clone()), Some(newer.sha256));
+            Ok(())
+        })
     }
 
     #[test]

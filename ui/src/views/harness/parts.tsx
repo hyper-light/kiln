@@ -7,7 +7,9 @@ import type { Status, ToolKind } from "@/api/harness";
 import { relativeTime } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
-import { MarkdownBody } from "@/lib/markdown";
+import { MarkdownBody, type LocalFile } from "@/lib/markdown";
+import { streamBlocks } from "@/lib/markdown-blocks";
+import { MessageFile, MessageSeq } from "./files";
 import { CopyBlock } from "@/components/ui/copy-block";
 
 /** "12s ago" (`ts` in unix seconds), kept current by the shared clock: only this text re-renders as it counts, not the row around it. */
@@ -107,28 +109,65 @@ export { CopyBlock };
 
 /** The agent's prose: GitHub-flavored markdown (tables, lists, task lists, quotes, code), drawn the
  *  console's way. Text only: HTML in it is never injected. */
-export const Prose = React.memo(function Prose({ text, className, ev }: { text: string; className?: string; /** The event it says (for find). */ ev?: string }) {
+export const Prose = React.memo(function Prose({
+  text,
+  className,
+  ev,
+  seq,
+  streaming,
+}: {
+  text: string;
+  className?: string;
+  /** The event it says (for find). */
+  ev?: string;
+  /** A message's `seq`: the files it mentions show in it, as they were then (files.tsx). */
+  seq?: number;
+  /** It's still coming: only its last block is read again as each word comes (the blocks before it can't change). */
+  streaming?: boolean;
+}) {
+  const files = seq == null ? undefined : MessageFile;
+  // Once it came in here a block at a time it stays so: done, nothing is drawn again.
+  const [came] = React.useState({ streaming: false });
+  if (streaming) came.streaming = true;
+  const body = came.streaming ? <StreamingBody text={text} files={files} /> : <MarkdownBody text={text} files={files} />;
   return (
     <div className={cn("hx-prose", className)} data-ev={ev}>
-      <MarkdownBody text={text} />
+      {seq == null ? body : <MessageSeq.Provider value={seq}>{body}</MessageSeq.Provider>}
     </div>
   );
 });
 
+/** A block of a message still coming: drawn once, however long the rest takes to come. */
+const Block = React.memo(MarkdownBody);
+
+/** A message still coming, a block at a time (markdown-blocks.ts): what it renders is what it would whole. */
+function StreamingBody({ text, files }: { text: string; files?: LocalFile }) {
+  return streamBlocks(text).map((block, i) => <Block key={i} text={block} files={files} />);
+}
+
 /** Output a command printed: the end matters most, so long output opens at its tail. */
 export function Output({ text, truncated, error }: { text: string; truncated?: boolean; error?: boolean }) {
-  // At its tail when it shows, and again as more comes.
+  // At its tail when it shows, and while following as more comes.
+  const following = React.useRef(true);
   const ref = React.useCallback(
     (el: HTMLPreElement | null) => {
       void text;
-      if (el) el.scrollTop = el.scrollHeight;
+      if (el && following.current) el.scrollTop = el.scrollHeight;
     },
     [text],
   );
   return (
     <div className="hx-pre-wrap">
       {text && <CopyBlock text={text} />}
-      <pre ref={ref} className="hx-out" data-error={error || undefined}>
+      <pre
+        ref={ref}
+        className="hx-out"
+        data-error={error || undefined}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          following.current = el.scrollHeight - el.scrollTop - el.clientHeight < 2;
+        }}
+      >
         {truncated && <span className="hx-out-cut">… earlier output omitted …{"\n"}</span>}
         {text || " "}
       </pre>

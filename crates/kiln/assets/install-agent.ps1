@@ -1,6 +1,8 @@
 # Install a kiln agent on this Windows machine, fetched from the kiln server that served this
-# script. Never asks for a password or elevation: installs into %LOCALAPPDATA%\Programs\kiln and
-# starts at logon through a per-user scheduled task (`kiln install --agent --unattended`).
+# script. Never asks for a password: installs into %LOCALAPPDATA%\Programs\kiln, puts that on your
+# PATH, and starts kiln at boot through a scheduled task that runs as you (`kiln install --agent`).
+# Windows asks for administrator rights once for that (an administrator PowerShell has them);
+# without them, or with nobody at the keyboard, the task starts kiln when you sign in instead.
 #
 #   & ([scriptblock]::Create((irm @@KILN_SERVER@@/install.ps1))) -Token <join-token> [-Labels windows] [-Name box1] [-Slots 4]
 #   $env:KILN_JOIN_TOKEN = '<join-token>'; irm @@KILN_SERVER@@/install.ps1 | iex
@@ -66,12 +68,14 @@ try {
 if ($Outpost) {
   Write-Host "kiln ($target) is in $dir, not installed: it runs here as an outpost until you stop it (Ctrl-C)"
   $outpostArgs = @('outpost', '--server', $Server, '--state-dir', $dir)
-  if ($Token) { $outpostArgs += @('--token', $Token) }
+  if ($Token) { $outpostArgs += @("--token=$Token") }
   if ($Name) { $outpostArgs += @('--name', $Name) }
   & $exe @outpostArgs
   return
 }
 Write-Host "kiln ($target) installed to $exe"
+# `kiln install` puts $dir on your PATH for new terminals; this one finds kiln now too.
+if (-not (($env:Path -split ';') -contains $dir)) { $env:Path = "$dir;$env:Path" }
 
 if ($Join -or -not $Token) {
   # No token: ask to join; it waits for an admin to approve the code it prints, then installs.
@@ -84,8 +88,9 @@ if ($Join -or -not $Token) {
   return
 }
 
-$installArgs = @('install', '--agent', '--unattended', '--server', $Server)
-if ($Token) { $installArgs += @('--token', $Token) }
+# Not --unattended: at a terminal, kiln asks Windows for the rights to start at boot.
+$installArgs = @('install', '--agent', '--server', $Server)
+if ($Token) { $installArgs += @("--token=$Token") }
 if ($Labels) { $installArgs += @('--labels', $Labels) }
 if ($Name) { $installArgs += @('--name', $Name) }
 if ($Slots) { $installArgs += @('--slots', $Slots) }

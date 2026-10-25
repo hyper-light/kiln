@@ -286,8 +286,7 @@ textarea.hx-input {
   height: 2px;
   border-radius: 16px 16px 0 0;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
+  animation: prism-breathe 2.4s ease-in-out infinite alternate;
 }
 .hx-card[data-status="waiting"]::before {
   background: linear-gradient(90deg, transparent, var(--color-warn), transparent);
@@ -523,6 +522,62 @@ textarea.hx-input {
   flex: 1;
   min-height: 0;
 }
+.hx-desktop {
+  position: relative;
+  min-width: 0;
+}
+.hx-desktop-tray {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+.hx-desktop-tray[hidden] {
+  display: none;
+}
+.hx-desktop-tray > .hx-side {
+  flex: 1;
+  min-width: 0;
+}
+.hx-tray-rail {
+  border-left: 1px solid #1d1f23;
+  background: #0a0b0d;
+}
+.hx-tray-toggle {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  color: var(--color-subtle);
+}
+.hx-tray-toggle:hover {
+  background: rgb(255 255 255 / 5%);
+  color: var(--color-bright);
+}
+.hx-tray-resize {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  bottom: 0;
+  width: 10px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.hx-tray-resize::after {
+  content: "";
+  position: absolute;
+  inset: 0 4px;
+}
+.hx-tray-resize:hover::after,
+.hx-tray-resize:focus-visible::after,
+.hx-desktop[data-resizing] .hx-tray-resize::after {
+  background: var(--color-secondary);
+}
+.hx-desktop[data-resizing] {
+  cursor: col-resize;
+  user-select: none;
+}
 .hx-agent-phone {
   display: flex;
   flex: 1;
@@ -709,6 +764,10 @@ textarea.hx-input {
   visibility: hidden;
 }
 .hx-turn {
+  /* Each turn is painted as one piece (a layer of its own, nothing moves): while the last one
+     streams, the browser reuses what it painted of the turns before it instead of painting the
+     whole conversation again for every word. */
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -726,16 +785,32 @@ textarea.hx-input {
   border-radius: 14px 14px 14px 4px;
   background: #0f1013;
 }
-.hx-prompt[data-origin]:not([data-origin="human"]) {
-  border-style: dashed;
-  background: transparent;
-}
 .hx-prompt-meta {
   display: flex;
   align-items: center;
   gap: 8px;
   margin-bottom: 4px;
   font-size: 11px;
+}
+/* Where a message stands, each state in its own colour (the stands' tints, stands.css): sent the
+   quietest, dropped the one that's seen. */
+.hx-delivery {
+  font-weight: 500;
+}
+.hx-delivery[data-delivery="sent"] {
+  color: var(--color-muted);
+}
+.hx-delivery[data-delivery="queued"] {
+  color: #b8c2d3;
+}
+.hx-delivery[data-delivery="started"] {
+  color: #cdc6ea;
+}
+.hx-delivery[data-delivery="completed"] {
+  color: #bfdccf;
+}
+.hx-delivery[data-delivery="cancelled"] {
+  color: #e2b9bd;
 }
 .hx-prompt-text {
   font-size: 14px;
@@ -795,11 +870,17 @@ textarea.hx-input {
   color: #b9dccb;
 }
 .hx-step-title {
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 13px;
   color: var(--color-foreground);
 }
 .hx-step-sub {
+  /* The summary keeps its natural width; even a long command uses only what remains. */
+  flex: 1 1 0%;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -871,11 +952,39 @@ textarea.hx-input {
   display: flex;
   flex: none;
   gap: 10px;
+  margin-left: auto;
 }
 .hx-cmd-why {
   padding: 0 10px 8px 25px;
   font-size: 11.5px;
   color: var(--color-subtle);
+}
+/* A command run on another machine (kiln reach): kiln's accent down its edge, and where it ran
+   ahead of the command, in its row and in its step's head (so a folded step says so too). */
+.hx-cmd[data-remote] {
+  border-color: color-mix(in srgb, var(--color-accent) 32%, #202227);
+  box-shadow: inset 2px 0 0 var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 4%, #0b0c0f);
+}
+.hx-step[data-remote] > .hx-step-head .hx-step-icon {
+  color: var(--color-accent);
+}
+.hx-where {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 3px;
+  max-width: min(45%, 260px);
+  min-width: 0;
+  padding: 1px 7px 1px 5px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 45%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  color: var(--color-link);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 16px;
+  white-space: nowrap;
 }
 .hx-out {
   max-height: 320px;
@@ -996,6 +1105,12 @@ textarea.hx-input {
   margin-left: 3px;
   vertical-align: -0.18em;
   background: linear-gradient(180deg, #b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa);
+}
+/* After a list, a code block, a quote or a table, the caret stands where the next line would start
+   without making that line: the reply doesn't grow a line for it, to lose it again when the block
+   or the reply is done. */
+.hx-streaming > :not(p):last-child::after {
+  position: absolute;
 }
 .hx-outcome {
   padding: 14px 16px;
@@ -1224,7 +1339,9 @@ textarea.hx-input {
 }
 .hx-todos li[data-status="completed"] .hx-check {
   border-color: #a5c8b3;
-  background: #a5c8b3 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M3.5 7.2l2.3 2.3 4.7-5' fill='none' stroke='%2308090a' stroke-width='1.8'/%3E%3C/svg%3E") center/12px no-repeat;
+  background: #a5c8b3
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M3.5 7.2l2.3 2.3 4.7-5' fill='none' stroke='%2308090a' stroke-width='1.8'/%3E%3C/svg%3E")
+    center/12px no-repeat;
 }
 .hx-todos li[data-status="in_progress"] {
   color: #ddd6f5;
@@ -1370,6 +1487,10 @@ textarea.hx-input {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+/* While you type, the box is a layer of its own: a keystroke repaints it, not the page around it. */
+.hx-compose-box:focus-within {
+  will-change: transform;
 }
 .hx-compose-box {
   border: 1px solid #272930;
@@ -1534,6 +1655,20 @@ textarea.hx-input {
 .hx-inspector {
   min-height: 0;
 }
+.hx-inspector-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  border-bottom: 1px solid #1d1f23;
+}
+.hx-inspector-head[hidden] {
+  display: none;
+}
+.hx-inspector-head > .hx-tabs {
+  flex: 1;
+  min-width: 0;
+  border-bottom: 0;
+}
 .hx-tabs {
   display: flex;
   flex: none;
@@ -1587,6 +1722,172 @@ textarea.hx-input {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 14px;
+}
+.hx-change-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  min-height: 44px;
+  margin-bottom: 10px;
+  padding: 6px 6px 6px 12px;
+  border: 1px solid #1f2126;
+  border-radius: 12px;
+  font-size: 12px;
+  color: #dfe3ea;
+}
+.hx-change-bar[data-state="landed"] {
+  border-color: rgb(166 205 180 / 24%);
+}
+.hx-change-what {
+  flex: 1;
+  min-width: 12ch;
+}
+.hx-change-what a:hover {
+  text-decoration: underline;
+}
+.hx-ws-bar {
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 0;
+}
+.hx-ws-bar > * {
+  min-width: 0;
+}
+.hx-ws-head {
+  display: flex;
+  align-items: center;
+  gap: 8px 12px;
+}
+.hx-ws-head .hx-change-what {
+  min-width: 0;
+}
+/* What a workspace is wraps rather than being cut: it's the line that says what this is. */
+.hx-ws-head .hx-change-sub {
+  white-space: normal;
+}
+.hx-ws-plan {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 6px 6px 26px;
+}
+.hx-ws-conflicts {
+  margin: 0;
+  padding-left: 16px;
+  list-style: disc;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.hx-ws-actions {
+  display: flex;
+  gap: 8px;
+}
+.hx-change-sub {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--color-subtle);
+}
+/* An agent's change request: its state, what it is, and what to do. On a card 400px wide or more,
+   one line, what to do at its end; on a narrower one, each on a line of its own, all from the same
+   left edge. Which, the card's width says, not how long its words are: a state changing never
+   moves the rest. */
+.hx-cr {
+  margin-bottom: 10px;
+  border: 1px solid #1f2126;
+  border-radius: 12px;
+  container-type: inline-size;
+  font-size: 12px;
+  color: #dfe3ea;
+}
+.hx-cr[aria-busy="true"] {
+  min-height: 46px;
+}
+.hx-cr[data-state="merged"] {
+  border-color: rgb(166 205 180 / 24%);
+}
+.hx-cr-in {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 44px;
+  padding: 8px 8px 8px 12px;
+}
+.hx-cr-head {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+}
+.hx-cr-state {
+  font-size: 12px;
+}
+.hx-cr-what {
+  display: flex;
+  flex: 1 1 0;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
+}
+/* Its name is cut last: what's after it gives way first. */
+.hx-cr-what > a {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hx-cr-what a:hover {
+  text-decoration: underline;
+}
+.hx-cr-sub {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: var(--color-subtle);
+}
+/* Before a change request: what puts what to do at the end of the line. */
+.hx-cr-fill {
+  flex: 1 1 0;
+}
+.hx-cr-do {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px 14px;
+  min-height: 28px;
+}
+.hx-cr-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #b4b5ba;
+  white-space: nowrap;
+  cursor: pointer;
+}
+@container (max-width: 399px) {
+  .hx-cr-in {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+  .hx-cr-what {
+    flex: none;
+    width: 100%;
+  }
+  .hx-cr-fill {
+    display: none;
+  }
+  .hx-cr-do {
+    flex-wrap: wrap;
+  }
 }
 .hx-files {
   display: flex;
@@ -1829,6 +2130,15 @@ textarea.hx-input {
   .hx-work {
     padding-left: 8px;
     margin-left: 2px;
+  }
+  .hx-step-head,
+  .hx-cmd[data-remote] .hx-cmd-head {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+  .hx-cmd[data-remote] .hx-cmd-line {
+    flex-basis: 100%;
+    order: -1;
   }
   .hx-step-body {
     padding: 4px 4px 10px 8px;
@@ -2248,6 +2558,8 @@ textarea.hx-input {
   font-size: 12px;
   line-height: 1.5;
   color: var(--color-secondary);
+  /* A path or an address in it breaks rather than widening the tab. */
+  overflow-wrap: anywhere;
 }
 .hx-skill-search {
   display: flex;
@@ -2546,23 +2858,70 @@ textarea.hx-input {
   color: #f4e0e1;
 }
 
-/* Paused for a usage limit (pause.tsx): one calm block above the composer, what it waits for and
-   what you can do, in the page's flow. */
+/* Paused for a usage limit: the same disclosure line as the work around it. Actions can be
+   folded away; their own scroll area leaves room for the conversation and composer on a phone. */
 .hx-paused {
+  min-width: 0;
+  border-block: 1px solid #25272c;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-secondary);
+}
+.hx-paused-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 9px 4px;
+  text-align: left;
+}
+.hx-paused-head:hover {
+  color: var(--color-bright);
+}
+.hx-paused-head:focus-visible {
+  outline: 2px solid #b8add8;
+  outline-offset: 2px;
+}
+.hx-paused-head > svg {
+  flex: none;
+  color: #a6b2c6;
+}
+.hx-paused-summary {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+  min-width: 0;
+}
+.hx-paused-title {
+  font-weight: 500;
+  color: var(--color-bright);
+}
+.hx-paused-until {
+  color: var(--color-subtle);
+  font-size: 12px;
+}
+.hx-paused-head .hx-paused-chev {
+  margin-left: auto;
+  color: #8f929b;
+}
+.hx-paused[data-open] .hx-paused-chev {
+  transform: rotate(90deg);
+}
+.hx-paused-body {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 12px 14px;
-  border: 1px solid rgb(166 178 198 / 32%);
-  border-radius: 10px;
-  background: rgb(166 178 198 / 6%);
-  font-size: 13px;
-  line-height: 1.5;
-  color: #d3d9e3;
+  max-height: min(240px, calc(var(--window-h, 100dvh) * 0.32));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 4px 12px 29px;
 }
-.hx-paused b {
-  font-weight: 500;
-  color: #e6eaf1;
+.hx-paused-body[hidden] {
+  display: none;
 }
 .hx-paused-what,
 .hx-paused-kept {
@@ -2572,19 +2931,87 @@ textarea.hx-input {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 10px 16px;
+  gap: 8px;
 }
 .hx-paused-auto {
   display: inline-flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   font-size: 12.5px;
-  color: #c3c8d2;
   cursor: pointer;
 }
-.hx-paused-switch {
+.hx-paused-auto input {
+  flex: none;
+  margin-top: 2px;
+}
+@media (pointer: coarse) {
+  .hx-paused-do > button {
+    min-height: 40px;
+  }
+  .hx-paused-auto {
+    min-height: 36px;
+    align-items: center;
+  }
+  .hx-paused-auto input {
+    margin-top: 0;
+  }
+  .hx-paused .hx-pick select {
+    font-size: 16px;
+  }
+}
+/* A select in a line of words (pausing, at a limit, going on now): the size of the words. */
+.hx-pick {
   min-width: 0;
   max-width: 100%;
+}
+.hx-pick select {
+  min-height: 28px;
+  padding: 3px 26px 3px 9px;
+  font-size: 12.5px;
+}
+.hx-pick > svg {
+  right: 8px;
+}
+@media (pointer: coarse) {
+  .hx-pick select {
+    min-height: 34px;
+  }
+}
+.hx-atlimit {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  min-width: 0;
+}
+.hx-pick-why {
+  color: #9aa1ad;
+  font-size: 12px;
+}
+/* Going on now, from a pause: where, in what, go. */
+.hx-goon {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+.hx-goon-label {
+  margin-right: 2px;
+  color: #c3c8d2;
+  font-size: 12.5px;
+}
+/* What you did there didn't happen: why, and what works. */
+.hx-paused-stuck {
+  margin: 0;
+  color: #d8c8b0;
+  font-size: 12.5px;
+}
+.hx-paused-stuck a,
+.hx-paused-link {
+  color: #ead8bd;
+  text-decoration: underline;
+  text-decoration-color: rgb(234 216 189 / 45%);
+  text-underline-offset: 2px;
 }
 .hx-paused-kept {
   font-size: 12px;
@@ -2625,43 +3052,323 @@ textarea.hx-input {
     opacity: 1;
   }
 }
-
-/* Copying what was said: a quiet icon on your messages and the agent's answer; on what it said
-   along the way, shown where a pointer rests or a finger taps. */
-.hx-msg-copy {
+/* A block's own head row (the language on the left, its Copy on the right in reserved space):
+   the button never sits over the block's words. */
+.hx-block-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px 3px 12px;
+  border: 1px solid #1d1f24;
+  border-bottom: 0;
+  border-radius: 10px 10px 0 0;
+  background: #0b0c0f;
+}
+.hx-block-tag {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--color-subtle);
+}
+.hx-block-head .hx-copy {
+  position: static;
   flex: none;
+  margin-left: auto;
+}
+.hx-pre-wrap > .hx-block-head + .hx-pre {
+  border-top: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+.hx-generic .hx-block-head {
+  border-color: #2b2e39;
+  border-radius: 6px 6px 0 0;
+  background: #101217;
+}
+/* An output's copy stays corner-floating (its card has its own chrome): its lane is reserved. */
+.hx-pre-wrap > .hx-out {
+  padding-right: 66px;
+}
+
+/* Each message's ⋯ menu: on what the agent said it floats top-right and the text wraps around
+   it, never beneath it; on your messages and the outcome it closes the head row. */
+.hx-said-menu {
+  float: right;
+  margin: 0 0 2px 10px;
+}
+.hx-msg-menu {
   width: 24px;
   height: 24px;
   color: var(--color-subtle);
 }
-.hx-msg-copy:hover {
+.hx-msg-menu:hover,
+.hx-msg-menu[data-state="open"] {
   color: var(--color-bright);
 }
-.hx-prompt-copy,
-.hx-outcome-copy {
+.hx-menu-group {
+  padding: 4px 10px;
+}
+.hx-menu-sep {
+  height: 1px;
+  margin: 2px 8px;
+  background: var(--color-line);
+}
+.hx-menu-dead {
+  cursor: default;
+  color: var(--color-subtle);
+}
+.hx-menu-hint {
   margin-left: auto;
+  padding-left: 14px;
+  font-size: 10px;
+  color: var(--color-subtle);
 }
-.hx-prompt-copy + .hx-turn-menu {
-  margin-left: 0;
+.hx-menu-why {
+  display: block;
+  margin-left: auto;
+  padding-left: 14px;
+  font-size: 10px;
+  font-style: normal;
+  color: var(--color-subtle);
 }
+.hx-menu-dead .hx-menu-why {
+  font-size: 9px;
+}
+
+/* Holding a message copies it as Markdown: a faint ring says it's armed, a toast when it's done. */
+.hx-said,
+.hx-prompt {
+  position: relative;
+}
+.hx-said[data-held],
+.hx-prompt[data-held] {
+  outline: 1px solid color-mix(in oklab, var(--color-accent) 55%, transparent);
+  outline-offset: 3px;
+}
+
+/* A reply's quote of what it answers: the speaker's name on a bar, its words, clamped when long. */
+.hx-quote {
+  position: relative;
+  display: block;
+  margin: 0 0 6px;
+  padding: 4px 10px 4px 12px;
+  border-left: 2px solid var(--color-accent);
+  background: color-mix(in oklab, var(--color-accent) 7%, transparent);
+  text-align: left;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-muted);
+  cursor: pointer;
+}
+.hx-quote-who {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+}
+.hx-quote-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.hx-quote-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 3px;
+  font-size: 10px;
+  color: var(--color-accent);
+}
+
+/* The full message behind a clamped quote, and an attached image at full size: one card inside
+   the conversation's own surface (solid popover, dark scrim). */
+.hx-cover {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgb(0 0 0 / 0.72);
+}
+.hx-cover-card {
+  max-width: min(560px, 92vw);
+  max-height: 82vh;
+  overflow: auto;
+  border: 1px solid var(--color-line);
+  border-radius: 9px;
+  background: var(--color-popover);
+  box-shadow: 0 18px 60px rgb(0 0 0 / 0.5);
+  padding: 14px 16px;
+}
+.hx-cover-who {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+}
+.hx-cover-text {
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.hx-cover-x {
+  float: right;
+}
+.hx-viewer {
+  display: flex;
+  flex-direction: column;
+  width: min(860px, 94vw);
+  max-width: 94vw;
+  max-height: 88vh;
+  padding: 0;
+  overflow: hidden;
+}
+.hx-viewer-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-line);
+  font-size: 12px;
+}
+.hx-viewer-name {
+  flex: 1;
+  min-width: 0;
+}
+.hx-viewer-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px;
+  overflow: auto;
+}
+.hx-viewer-body img {
+  max-width: 100%;
+  max-height: 62vh;
+  object-fit: contain;
+}
+.hx-viewer-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--color-line);
+}
+.hx-attach-view {
+  cursor: zoom-in;
+}
+.hx-attach-add {
+  border-style: dashed !important;
+  color: var(--color-subtle);
+}
+.hx-attach-add:hover {
+  color: var(--color-bright);
+}
+.qd-attach {
+  margin: 2px 0 0;
+}
+
+/* Swiping a still-waiting message right lets it go (unsend): it slides over a strip that shows
+   it will be taken back. */
+.hx-prompt-wrap {
+  position: relative;
+  align-self: flex-start;
+  max-width: min(100%, 720px);
+}
+.hx-unsend-strip {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  padding-left: 14px;
+  gap: 7px;
+  border-radius: 14px 14px 14px 4px;
+  background: color-mix(in oklab, var(--color-danger, #e5484d) 16%, var(--color-background));
+  color: var(--color-danger, #e5484d);
+  font-size: 11px;
+}
+.hx-prompt-wrap > .hx-prompt {
+  position: relative;
+  max-width: 100%;
+  touch-action: pan-y;
+  transition: transform 0.18s ease-out;
+}
+.hx-prompt-wrap[data-dragging] > .hx-prompt {
+  transition: none;
+}
+.hx-unsent {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px dashed var(--color-line);
+  border-radius: 9px;
+  font-size: 11px;
+  color: var(--color-subtle);
+}
+.hx-unsent button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--color-accent);
+}
+.hx-prompt-edit {
+  width: min(100%, 560px);
+  min-height: 64px;
+  resize: vertical;
+}
+.hx-prompt-acts {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+/* What a message answers, where it's typed (the composer's reply strip). */
+.cp-reply {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 6px;
+  padding: 5px 10px;
+  border-left: 2px solid var(--color-accent);
+  background: color-mix(in oklab, var(--color-accent) 7%, transparent);
+  font-size: 12px;
+}
+.cp-reply > svg {
+  flex: none;
+  color: var(--color-accent);
+}
+.cp-reply-who {
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+}
+.cp-reply-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-muted);
+}
+
 .hx-outcome-foot {
   align-items: center;
-}
-.hx-said {
-  position: relative;
-  outline: none;
-}
-.hx-said-copy {
-  position: absolute;
-  top: 6px;
-  right: 0;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-.hx-said:hover > .hx-said-copy,
-.hx-said:focus > .hx-said-copy,
-.hx-said-copy:focus-visible {
-  opacity: 1;
 }
 /* A touch screen takes a tap on it as a hover (as WebKit does for what looks tappable). */
 @media (pointer: coarse) {
@@ -2730,9 +3437,7 @@ textarea.hx-input {
   padding: 0;
   border: 1px solid #2a3039;
   border-radius: 9px;
-  background:
-    radial-gradient(ellipse at 0 0, #c6b08e0c, transparent 65%),
-    #0a0c0f;
+  background: radial-gradient(ellipse at 0 0, #c6b08e0c, transparent 65%), #0a0c0f;
 }
 .hx-inbox .hx-section-head {
   margin: 0;
@@ -2851,10 +3556,6 @@ textarea.hx-input {
   border-radius: 0;
   background: none;
 }
-.hx-prompt[data-origin]:not([data-origin="human"]) {
-  border: 0;
-  opacity: 0.8;
-}
 .hx-prompt-meta .hx-eyebrow {
   color: #cbc3ea;
 }
@@ -2899,7 +3600,8 @@ textarea.hx-input {
   color: #8a8e98;
 }
 .hx-step-body {
-  padding: 2px 2px 14px 26px;
+  /* Expanded content shares the header's outer inset; nested cards pad their own contents. */
+  padding: 2px 2px 14px;
 }
 .hx-note {
   padding: 12px 0;
@@ -2922,8 +3624,6 @@ textarea.hx-input {
   height: 2px;
   margin-bottom: 12px;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
 }
 .hx-outcome-foot {
   border-top-color: #1d1f24;
@@ -2975,9 +3675,7 @@ textarea.hx-input {
 .hx-approval {
   border-color: #3a352c;
   border-radius: 9px;
-  background:
-    radial-gradient(ellipse at 0 0, #c6b08e10, transparent 65%),
-    #0a0c0f;
+  background: radial-gradient(ellipse at 0 0, #c6b08e10, transparent 65%), #0a0c0f;
   box-shadow: none;
 }
 .hx-approval-danger {

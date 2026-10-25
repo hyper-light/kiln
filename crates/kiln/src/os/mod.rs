@@ -22,7 +22,13 @@ pub use unix::*;
 mod windows;
 #[cfg(windows)]
 pub use windows::*;
+/// The Win32 calls installing needs (elevation, the user's `Path`, UAC) and a volume's room,
+/// declared by hand.
+#[cfg(windows)]
+mod win32;
 
+pub mod battery;
+pub mod cgroup;
 /// kiln's own code signature on a Mac, so macOS knows every upgrade as one program.
 pub mod macsign;
 
@@ -41,6 +47,24 @@ pub mod supervise;
 #[cfg(windows)]
 #[path = "supervise_windows.rs"]
 pub mod supervise;
+
+/// Each agent session's processes held together by the system, so everything an agent started is
+/// known (however it was parented since), whose a process is takes one look, and ending them all
+/// is one call: a cgroup of its own on Linux, a job object on Windows, followed fork by fork on
+/// macOS. Where there's none, `Group::of` is `None` and an agent's processes are found by their
+/// mark (`crate::harness::survivors`).
+#[cfg(target_os = "linux")]
+#[path = "contain_linux.rs"]
+pub mod contain;
+#[cfg(windows)]
+#[path = "contain_windows.rs"]
+pub mod contain;
+#[cfg(target_os = "macos")]
+#[path = "contain_macos.rs"]
+pub mod contain;
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[path = "contain_none.rs"]
+pub mod contain;
 
 /// PTY session I/O: [`crate::terminal`]'s plumbing.
 #[cfg(unix)]
@@ -74,9 +98,13 @@ pub fn lower_thread_priority() {
 }
 
 pub fn which(name: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
+    which_in(name, &std::env::var_os("PATH")?)
+}
+
+/// [`which`] over `paths`, a `PATH` value.
+pub fn which_in(name: &str, paths: &std::ffi::OsStr) -> Option<PathBuf> {
     let candidates = exe_names(name);
-    std::env::split_paths(&paths)
+    std::env::split_paths(paths)
         .filter(|dir| !dir.as_os_str().is_empty())
         .flat_map(|dir| candidates.iter().map(move |n| dir.join(n)).collect::<Vec<_>>())
         .find(|p| p.is_file())
@@ -85,6 +113,107 @@ pub fn which(name: &str) -> Option<PathBuf> {
 /// Whether `name` is an executable on `PATH`.
 pub fn have(name: &str) -> bool {
     which(name).is_some()
+}
+
+/// This kiln's binary, as a path another process can start. On Linux, once an upgrade has put a new
+/// binary in its place (and until this process takes it up, once its jobs are done), the path
+/// reads `<path> (deleted)`: the kiln at `<path>` is the one to start.
+pub fn this_kiln() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(replaced(&exe).unwrap_or(exe))
+}
+
+/// The binary now at a running binary's path that was replaced (`<path> (deleted)`).
+fn replaced(exe: &Path) -> Option<PathBuf> {
+    exe.to_str()?.strip_suffix(" (deleted)").map(PathBuf::from).filter(|p| p.is_file())
+}
+
+/// Where [`add_to_user_path`] put a folder on the user's PATH.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathAdded {
+    /// The shell startup file that puts it there (Unix); none where the system keeps the user's
+    /// PATH itself (Windows).
+    pub file: Option<PathBuf>,
+    /// What puts it on this terminal's PATH too: only new terminals read that file.
+    pub now: Option<String>,
+    /// Whether that file was made for it.
+    pub created: bool,
+}
+
+/// A Windows `Path` value (`;`-separated, as the registry keeps it) with `dir` added at its end,
+/// or `None` when one of its entries is `dir` already. Entries are compared as Windows compares
+/// folders: without case, quotes or a trailing `\`, and with `%VARIABLES%` expanded by `var`.
+pub fn path_list_with(list: &str, dir: &str, var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let norm = |entry: &str| {
+        let expanded = expand_percent_vars(entry.trim().trim_matches('"'), &var);
+        expanded.trim_end_matches(['\\', '/']).to_lowercase()
+    };
+    let want = norm(dir);
+    if list.split(';').any(|e| norm(e) == want) {
+        return None;
+    }
+    let kept = list.trim_end_matches(';');
+    Some(if kept.is_empty() { dir.to_owned() } else { format!("{kept};{dir}") })
+}
+
+/// A Windows `Path` value without its entries that are `dir` (compared as [`path_list_with`]
+/// does), or `None` when none is.
+pub fn path_list_without(list: &str, dir: &str, var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let norm = |entry: &str| expand_percent_vars(entry.trim().trim_matches('"'), &var).trim_end_matches(['\\', '/']).to_lowercase();
+    let want = norm(dir);
+    let kept: Vec<&str> = list.split(';').filter(|e| e.is_empty() || norm(e) != want).collect();
+    (kept.len() != list.split(';').count()).then(|| kept.join(";"))
+}
+
+/// `%NAME%` replaced by `var(NAME)`; a name it doesn't know, and a lone `%`, stay as they are.
+fn expand_percent_vars(s: &str, var: &impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find('%') {
+        let (before, from) = rest.split_at(start);
+        out.push_str(before);
+        let after = from.get(1..).unwrap_or_default();
+        match after.find('%') {
+            Some(end) => {
+                let name = after.get(..end).unwrap_or_default();
+                match var(name).filter(|_| !name.is_empty()) {
+                    Some(value) => out.push_str(&value),
+                    None => out.push_str(from.get(..end + 2).unwrap_or_default()),
+                }
+                rest = after.get(end + 1..).unwrap_or_default();
+            }
+            None => {
+                out.push_str(from);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The size of the volume holding `path` and the bytes this user may still write on it (None:
+/// unknown).
+// The statvfs fields' types differ by platform: a conversion that is one elsewhere is none here.
+#[allow(clippy::useless_conversion)]
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        let s = nix::sys::statvfs::statvfs(path).ok()?;
+        let frag = u64::from(s.fragment_size());
+        Some((u64::from(s.blocks()).saturating_mul(frag), u64::from(s.blocks_available()).saturating_mul(frag)))
+    }
+    // Asked of the volume itself: `sysinfo`'s mount points (`C:\`) don't prefix the `\\?\` path
+    // `canonicalize` gives.
+    #[cfg(windows)]
+    {
+        win32::disk_space(path).ok()
+    }
+}
+
+/// Bytes this user may still write on the volume holding `path` (None: unknown).
+pub fn disk_available(path: &Path) -> Option<u64> {
+    disk_space(path).map(|(_, available)| available)
 }
 
 /// Keep git from ever prompting (terminal, askpass helper, or Git Credential Manager's window):
@@ -201,6 +330,84 @@ mod tests {
         assert_eq!(program_stem("/usr/bin/bash"), "bash");
         assert_eq!(program_stem(r"C:\Program Files\PowerShell\7\pwsh.exe"), "pwsh");
         assert_eq!(program_stem("CMD.EXE"), "cmd");
+    }
+
+    #[test]
+    fn a_replaced_binary_s_path_names_the_new_one() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let kiln = dir.path().join("kiln");
+        std::fs::write(&kiln, b"new")?;
+        let gone = |p: &Path| PathBuf::from(format!("{} (deleted)", p.display()));
+        assert_eq!(replaced(&gone(&kiln)), Some(kiln.clone()));
+        assert_eq!(replaced(&kiln), None, "not replaced");
+        assert_eq!(replaced(&gone(&dir.path().join("uninstalled"))), None, "nothing in its place");
+        assert!(this_kiln()?.is_file());
+        Ok(())
+    }
+
+    /// As an upgrade does it: a running binary's path given a new file, the process names the new
+    /// one (its own `/proc/self/exe` reads `<path> (deleted)`). The running binary is this test's,
+    /// linked into a folder of its own (a copy would be gigabytes).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_running_binary_replaced_on_disk_names_the_one_in_its_place() -> anyhow::Result<()> {
+        const GO: &str = "KILN_TEST_REPLACED_GO";
+        // The run in the replaced binary: once told, what it names.
+        if let Some(go) = std::env::var_os(GO) {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !Path::new(&go).exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            println!("exe={}", std::env::current_exe()?.display());
+            println!("this_kiln={}", this_kiln()?.display());
+            return Ok(());
+        }
+        let me = std::env::current_exe()?;
+        let dir = tempfile::tempdir_in(me.parent().unwrap_or(Path::new(".")))?;
+        let bin = dir.path().join("kiln");
+        std::fs::hard_link(&me, &bin)?;
+        let go = dir.path().join("go");
+        let child = std::process::Command::new(&bin)
+            .args(["--exact", "os::tests::a_running_binary_replaced_on_disk_names_the_one_in_its_place", "--nocapture", "--test-threads=1"])
+            .env(GO, &go)
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let new = dir.path().join("kiln.new");
+        std::fs::write(&new, b"the next kiln")?;
+        std::fs::rename(&new, &bin)?;
+        std::fs::write(&go, b"")?;
+        let said = String::from_utf8_lossy(&child.wait_with_output()?.stdout).into_owned();
+        println!("{said}");
+        assert!(said.contains(&format!("exe={} (deleted)\n", bin.display())), "the replaced binary's own path: {said}");
+        assert!(said.contains(&format!("this_kiln={}\n", bin.display())), "{said}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_folder_goes_on_a_windows_path_once() {
+        let var = |name: &str| (name == "LOCALAPPDATA").then(|| r"C:\Users\me\AppData\Local".to_owned());
+        let kiln = r"C:\Users\me\AppData\Local\Programs\kiln";
+        assert_eq!(path_list_with("", kiln, var).as_deref(), Some(kiln));
+        assert_eq!(path_list_with(r"C:\a;C:\b", kiln, var), Some(format!(r"C:\a;C:\b;{kiln}")));
+        assert_eq!(path_list_with(r"C:\a;;C:\b;", kiln, var), Some(format!(r"C:\a;;C:\b;{kiln}")), "the user's list kept as it is");
+        // Already there: another case, quoted, a trailing backslash, or through a variable.
+        assert_eq!(path_list_with(r"C:\a;c:\users\ME\appdata\local\programs\KILN", kiln, var), None);
+        assert_eq!(path_list_with(r#"C:\a;"C:\Users\me\AppData\Local\Programs\kiln\""#, kiln, var), None);
+        assert_eq!(path_list_with(r"%LOCALAPPDATA%\Programs\kiln;C:\a", kiln, var), None);
+        // A variable it can't expand stays as written, and is no match.
+        assert!(path_list_with(r"%NOPE%\Programs\kiln", kiln, var).is_some());
+        assert_eq!(expand_percent_vars(r"%NOPE%\x;100%;%%", &var), r"%NOPE%\x;100%;%%");
+    }
+
+    #[test]
+    fn a_folder_comes_off_a_windows_path_as_it_went_on() {
+        let var = |name: &str| (name == "LOCALAPPDATA").then(|| r"C:\Users\me\AppData\Local".to_owned());
+        let kiln = r"C:\Users\me\AppData\Local\Programs\kiln";
+        let list = r"C:\a;C:\b";
+        let added = path_list_with(list, kiln, var).unwrap_or_default();
+        assert_eq!(path_list_without(&added, kiln, var).as_deref(), Some(list));
+        assert_eq!(path_list_without(r"C:\a;%LOCALAPPDATA%\Programs\kiln\;;C:\b", kiln, var).as_deref(), Some(r"C:\a;;C:\b"));
+        assert_eq!(path_list_without(list, kiln, var), None, "not there: nothing to change");
     }
 
     #[test]

@@ -1,0 +1,703 @@
+/* Review (W21-R09): the inbox, a diff's page, its files' diffs and their threads, stacks and the
+   land queue. Diffs speak the agent console's code-block language (views/harness/diff.css): a
+   #101217 surface in a #2b2e39 hairline, Geist Mono, soft pass and fail tints; the syntax colours
+   are the editor's. */
+
+.rv-page {
+  --rv-surface: #101217;
+  --rv-head: #14161c;
+  --rv-border: #2b2e39;
+  --rv-hair: #24262a;
+  --rv-text: #ededee;
+  --rv-code: #c9ccd3;
+  --rv-muted: #97999f;
+  --rv-num: #61646c;
+  --rv-pass: 168 201 188;
+  --rv-fail: 213 164 173;
+  --rv-move: 184 166 213;
+  --rv-pick: 166 196 237;
+}
+
+.rv-sub {
+  margin: 0;
+  color: var(--rv-muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.rv-pad {
+  padding: 12px 14px;
+}
+.rv-link {
+  color: #a6c4ed;
+}
+
+/* ---------------------------------------------------------------- head */
+
+.rv-head {
+  margin: 4px 0 18px;
+}
+.rv-eyebrow {
+  margin: 0 0 10px;
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.rv-eyebrow a {
+  color: inherit;
+}
+.rv-eyebrow a:hover {
+  color: var(--rv-text);
+}
+.rv-title {
+  margin: 0 0 8px;
+  color: var(--rv-text);
+  font-size: 26px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+.rv-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 14px;
+  margin: 0;
+  color: var(--rv-muted);
+  font-size: 13px;
+}
+.rv-state {
+  color: var(--rv-text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.rv-state[data-state="accepted"],
+.rv-state[data-state="landed"] {
+  color: rgb(var(--rv-pass));
+}
+.rv-state[data-state="changes-requested"] {
+  color: rgb(var(--rv-fail));
+}
+.rv-state[data-state="abandoned"],
+.rv-state[data-state="draft"] {
+  color: var(--rv-muted);
+}
+.rv-summary {
+  margin-top: 12px;
+  color: var(--rv-code);
+  font-size: 14px;
+}
+.rv-summary ul,
+.rv-summary ol {
+  margin: 6px 0;
+  padding-left: 1.3em;
+}
+.rv-summary ul {
+  list-style: disc;
+}
+.rv-summary ol {
+  list-style: decimal;
+}
+.rv-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+/* ---------------------------------------------------------------- checks, landing, the bar */
+
+.rv-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin: 0 0 14px;
+  padding: 0;
+  list-style: none;
+  font-size: 13px;
+}
+.rv-checks li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* Benchmark gates (W16-R09): one a line, its level as the run page marks annotations. */
+.rv-gates {
+  display: grid;
+  gap: 4px;
+  margin: 0 0 14px;
+  padding: 0;
+  list-style: none;
+  font-size: 13px;
+}
+.rv-queue-row .rv-gates {
+  margin: 4px 0 0;
+}
+.rv-gates li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+}
+.rv-gates .rv-sub {
+  flex-basis: 100%;
+  overflow-wrap: anywhere;
+}
+.rv-gate-level {
+  color: var(--rv-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.rv-land,
+.rv-review {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--rv-border);
+  border-radius: 9px;
+  background: var(--rv-surface);
+}
+.rv-land-title {
+  margin: 0 0 6px;
+  color: var(--rv-text);
+  font-size: 13.5px;
+}
+.rv-blockers {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--rv-muted);
+  font-size: 13px;
+}
+.rv-land-go {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.rv-land-go .rv-land-title {
+  margin: 0;
+}
+.rv-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px 14px;
+  margin: 18px 0 10px;
+}
+.rv-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  color: var(--rv-code);
+  font-size: 13px;
+}
+.rv-filebar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  margin: 8px 0;
+}
+.rv-unresolved {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.rv-general:empty {
+  display: none;
+}
+.rv-interdiff {
+  margin: 10px 0;
+}
+.rv-range {
+  margin: 8px 0 0;
+  padding: 12px 14px;
+  border: 1px solid var(--rv-border);
+  border-radius: 9px;
+  background: var(--rv-surface);
+  color: var(--rv-code);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- a file */
+
+.rv-file {
+  margin: 0 0 12px;
+  border: 1px solid var(--rv-border);
+  border-radius: 9px;
+  background: var(--rv-surface);
+}
+.rv-file-head {
+  position: sticky;
+  top: var(--header-h, 64px);
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--rv-hair);
+  border-radius: 9px 9px 0 0;
+  background: var(--rv-head);
+}
+.rv-file[data-viewed] .rv-file-head {
+  border-bottom: 0;
+  border-radius: 9px;
+}
+.rv-file-toggle {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--rv-text);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  text-align: left;
+}
+.rv-chev {
+  flex: none;
+  color: var(--rv-muted);
+  transition: transform 0.12s ease;
+}
+.rv-file-toggle[aria-expanded="true"] .rv-chev {
+  transform: rotate(90deg);
+}
+.rv-path {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.rv-path-old {
+  color: var(--rv-muted);
+}
+.rv-file-facts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+.rv-chip {
+  padding: 1px 7px;
+  border: 1px solid var(--rv-border);
+  border-radius: 999px;
+  color: var(--rv-muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+}
+.rv-chip[data-status="added"] {
+  color: rgb(var(--rv-pass));
+}
+.rv-chip[data-status="deleted"] {
+  color: rgb(var(--rv-fail));
+}
+.rv-stat {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.rv-stat b {
+  color: rgb(var(--rv-pass));
+  font-weight: 400;
+}
+.rv-stat i {
+  color: rgb(var(--rv-fail));
+  font-style: normal;
+}
+.rv-viewed {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--rv-muted);
+  font-size: 12.5px;
+}
+.rv-outdated {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--rv-hair);
+}
+.rv-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px;
+}
+.rv-images figure {
+  margin: 0;
+}
+.rv-images img {
+  max-width: min(100%, 420px);
+  border: 1px solid var(--rv-hair);
+  border-radius: 6px;
+  background: repeating-conic-gradient(#1a1c22 0 25%, #121419 0 50%) 0 0 / 16px 16px;
+}
+
+/* ---------------------------------------------------------------- hunks and lines */
+
+.rv-hunk {
+  /* Laid out only as it nears the screen: long diffs scroll as short ones do. */
+  content-visibility: auto;
+  border-top: 1px solid var(--rv-hair);
+}
+.rv-hunk:first-child {
+  border-top: 0;
+}
+/* A long hunk's chunks: laid out only on screen, and drawn only as they near it (diff.tsx Chunk). */
+.rv-chunk {
+  content-visibility: auto;
+}
+.rv-chunk-hold {
+  background: repeating-linear-gradient(180deg, transparent 0 18.2px, rgb(255 255 255 / 1.5%) 18.2px 19.2px);
+}
+.rv-hunk-head {
+  padding: 3px 12px;
+  background: #0c0d11;
+  color: var(--rv-num);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.rv-row {
+  display: grid;
+  grid-template-columns: 4.5ch 4.5ch 2ch minmax(0, 1fr) auto;
+  align-items: start;
+  color: var(--rv-code);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  tab-size: 4;
+}
+.rv-row[data-kind="del"],
+.rv-half[data-kind="del"] {
+  background: rgb(var(--rv-fail) / 10%);
+}
+.rv-row[data-kind="add"],
+.rv-half[data-kind="add"] {
+  background: rgb(var(--rv-pass) / 10%);
+}
+.rv-row[data-moved],
+.rv-half[data-moved] {
+  background: rgb(var(--rv-move) / 10%);
+  box-shadow: inset 2px 0 0 rgb(var(--rv-move) / 60%);
+}
+.rv-row[data-sel],
+.rv-half[data-sel] {
+  background: rgb(var(--rv-pick) / 14%);
+}
+.rv-num {
+  padding: 0 6px 0 0;
+  color: var(--rv-num);
+  font: inherit;
+  text-align: right;
+  user-select: none;
+}
+button.rv-num {
+  cursor: pointer;
+}
+button.rv-num:hover,
+button.rv-num:focus-visible {
+  color: #a6c4ed;
+}
+.rv-sign {
+  color: var(--rv-num);
+  text-align: center;
+  user-select: none;
+}
+.rv-row[data-kind="add"] .rv-sign {
+  color: rgb(var(--rv-pass) / 70%);
+}
+.rv-row[data-kind="del"] .rv-sign {
+  color: rgb(var(--rv-fail) / 70%);
+}
+.rv-code {
+  min-width: 0;
+  padding-right: 10px;
+  padding-left: calc(var(--hang, 0) * 1ch);
+  text-indent: calc(var(--hang, 0) * -1ch);
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.rv-mark {
+  border-radius: 2px;
+}
+.rv-row[data-kind="add"] .rv-mark,
+.rv-half[data-kind="add"] .rv-mark {
+  background: rgb(var(--rv-pass) / 28%);
+}
+.rv-row[data-kind="del"] .rv-mark,
+.rv-half[data-kind="del"] .rv-mark {
+  background: rgb(var(--rv-fail) / 28%);
+}
+.rv-moved {
+  margin-right: 8px;
+  color: rgb(var(--rv-move));
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.rv-fold {
+  display: block;
+  width: 100%;
+  padding: 3px 12px;
+  background: #0c0d11;
+  color: var(--rv-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: left;
+}
+.rv-fold:hover {
+  color: var(--rv-text);
+}
+/* Side by side: a half each, its number and its code. */
+.rv-hunks[data-split] .rv-row {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+.rv-half {
+  display: grid;
+  grid-template-columns: 4.5ch minmax(0, 1fr) auto;
+  align-items: start;
+  min-width: 0;
+  min-height: 100%;
+}
+.rv-half + .rv-half {
+  border-left: 1px solid var(--rv-hair);
+}
+.rv-half[data-kind="none"] {
+  background: repeating-linear-gradient(135deg, transparent 0 5px, rgb(255 255 255 / 2.5%) 5px 6px);
+}
+
+/* ---------------------------------------------------------------- threads */
+
+.rv-under {
+  padding: 6px 12px 8px;
+  border-top: 1px solid var(--rv-hair);
+  border-bottom: 1px solid var(--rv-hair);
+  background: #0b0c0f;
+  font-family: var(--font-sans, inherit);
+}
+.rv-thread {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--rv-border);
+  border-radius: 8px;
+  background: var(--rv-surface);
+}
+.rv-thread[data-resolved] {
+  opacity: 0.8;
+}
+.rv-thread-folded {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--rv-muted);
+  font-size: 12.5px;
+}
+.rv-comment + .rv-comment {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--rv-hair);
+}
+.rv-comment-who {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  margin: 0 0 2px;
+  color: var(--rv-text);
+  font-size: 12.5px;
+}
+.rv-comment-who b {
+  font-weight: 500;
+}
+.rv-comment-body {
+  margin: 0;
+  color: var(--rv-code);
+  font-size: 13.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.rv-suggestion {
+  margin-top: 6px;
+}
+.rv-suggestion pre {
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgb(var(--rv-pass) / 10%);
+  color: var(--rv-code);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.rv-thread-acts,
+.rv-compose-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+.rv-new .rv-sub {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.rv-compose-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--rv-border);
+  border-radius: 7px;
+  background: #07080a;
+  color: var(--rv-text);
+  font-size: 13.5px;
+  line-height: 1.5;
+  resize: vertical;
+}
+.rv-compose-input:focus {
+  border-color: #4b5262;
+  outline: none;
+}
+
+/* ---------------------------------------------------------------- inbox, stack, queue */
+
+.rv-inbox-section {
+  margin: 0 0 22px;
+}
+.rv-inbox-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 6px;
+  color: var(--rv-text);
+  font-size: 15px;
+  font-weight: 500;
+}
+.rv-inbox-list,
+.rv-stack {
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--rv-hair);
+  list-style: none;
+}
+.rv-inbox-list > li,
+.rv-stack-row {
+  border-bottom: 1px solid var(--rv-hair);
+}
+.rv-inbox-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 4px;
+  min-width: 0;
+}
+.rv-inbox-row:hover .rv-inbox-what {
+  color: #ffffff;
+}
+.rv-inbox-read {
+  margin-left: auto;
+}
+/* A notification not read yet: a mark at its start. */
+.rv-inbox-list > li[data-unread] .rv-inbox-what::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin: 0 8px 2px 0;
+  border-radius: 50%;
+  background: rgb(var(--rv-pick));
+}
+.rv-inbox-what {
+  margin: 0;
+  color: var(--rv-text);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.rv-inbox-what b {
+  margin-right: 6px;
+  color: var(--rv-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 400;
+}
+.rv-stack-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.rv-stack-trunk {
+  padding: 8px 4px;
+  font-family: var(--font-mono);
+}
+.rv-queue-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 4px;
+}
+
+/* ---------------------------------------------------------------- syntax (the editor's colours) */
+
+.hl-prop {
+  color: #a6c4ed;
+}
+.hl-str {
+  color: #b8d9d2;
+}
+.hl-num {
+  color: #d8cbb0;
+}
+.hl-com {
+  color: #6d7078;
+  font-style: italic;
+}
+.hl-kw,
+.hl-punct {
+  color: #8c8f98;
+}
+.hl-meta {
+  color: #b8a6d5;
+}
+.hl-type {
+  color: #c9d6e6;
+}
+.hl-fn {
+  color: #dfe3ea;
+}
+.hl-strong {
+  color: var(--rv-text);
+  font-weight: 500;
+}
+.hl-link {
+  color: #a6c4ed;
+}
+
+@media (max-width: 760px) {
+  .rv-title {
+    font-size: 22px;
+  }
+  .rv-row {
+    grid-template-columns: 4ch 4ch 1.6ch minmax(0, 1fr) auto;
+    font-size: 11.5px;
+  }
+  .rv-file-head {
+    top: var(--header-h, 64px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rv-chev {
+    transition: none;
+  }
+}

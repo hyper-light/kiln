@@ -5,6 +5,7 @@ import { api } from "@/api/client";
 import { ci, ciRun, waitSentence, type CiRunDetail } from "@/api/ci";
 import { useServerEvents } from "@/api/events";
 import type { Job, RunDetail as RunData, Status, Step } from "@/api/types";
+import { useWindowedBox } from "@/lib/virtual";
 import { Button } from "@/components/ui/button";
 import { ErrorBoundary } from "@/components/ui/error-boundary";
 import { Hold, RowsHold } from "@/components/ui/hold";
@@ -12,11 +13,13 @@ import { Loadable } from "@/components/ui/loading";
 import { Confirm, Crumbs, EmptyState, ErrorState, Facts, Panel } from "@/components/ui/misc";
 import { Chips, StatusBadge, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
+import { Tip } from "@/components/ui/tooltip";
 import { upsert } from "@/lib/data";
 import { absoluteTime, firstLine, formatBytes, formatDuration, isActive, shortSha, spanSeconds } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
-import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { invalidate, preload, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
+import { IncidentCard } from "@/views/attach/card";
 import { EventIcon, LiveDuration, RelTime } from "../shared";
 import { AttemptSelect, CiLegExtras, CiRunActions, CiRunParts, CompareLink, criticalKeys, EditWorkflowLink, WorkflowInsightsLink } from "./ci";
 import { JobDag } from "./dag";
@@ -54,6 +57,11 @@ function RunBody({ id }: { id: string }) {
   // A CI run's attempt (docs/ci.md W05-R17): the latest unless the URL names one.
   const [search, setSearch] = useSearchParams();
   const asked = Number(search.get("attempt")) || undefined;
+  // The run, the engine's view of it and its graph, fetched at once (each read below suspends
+  // before the next would start): the graph shows without a fallback first (W21-AC03).
+  preload(`run/${id}/${asked ?? ""}`, (s) => readRun(id, s, asked));
+  preload(`ci-run/${id}/${asked ?? ""}`, (s) => ciRun(id, asked, s));
+  preload(`ci-run/${id}/graph/${asked ?? ""}`, (s) => ci.graph(id, asked, s));
   const res = useSuspenseResource(`run/${id}/${asked ?? ""}`, (s) => readRun(id, s, asked));
   // The CI engine's view of the run; null for v1 pipelines.
   const ciRes = useSuspenseResource(`ci-run/${id}/${asked ?? ""}`, (s) => ciRun(id, asked, s));
@@ -160,6 +168,7 @@ function RunBody({ id }: { id: string }) {
               <ErrorState error={run.error} compact />
             </div>
           )}
+          <IncidentCard run={id} />
         </div>
         {ciDetail ? (
           <div className="flex flex-col items-start gap-3 md:items-end">
@@ -235,7 +244,7 @@ function RunBody({ id }: { id: string }) {
           <p className="empty-line px-5 py-8 text-center">This run has no jobs (yet).</p>
         ) : ciDetail ? (
           <Loadable label="the graph" fallback={<Hold height={160} />}>
-            <CiDag detail={ciDetail} attempt={asked} jobs={jobs} selected={selected?.id ?? null} onSelect={select} />
+            <CiDag detail={ciDetail} attempt={asked} jobs={jobs} finished={!active} selected={selected?.id ?? null} onSelect={select} />
           </Loadable>
         ) : (
           <JobDag jobs={jobs} selected={selected?.id ?? null} onSelect={select} />
@@ -246,23 +255,7 @@ function RunBody({ id }: { id: string }) {
       <div className="mt-6 grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
         <nav aria-label="Jobs" className="lg:sticky lg:top-[calc(var(--header-h)+16px)] lg:self-start">
           <div className="label mb-2 px-1">Jobs</div>
-          <div className="row-list max-h-[70vh] overflow-y-auto">
-            {jobs.map((j) => (
-              <button
-                key={j.id}
-                onClick={() => select(j.id)}
-                aria-current={selected?.id === j.id ? "true" : undefined}
-                className={cn("relative flex min-h-11 w-full items-center gap-3 px-2 py-2 text-left transition-colors hover:bg-[#101114]", selected?.id === j.id && "bg-[#101114]")}
-              >
-                {selected?.id === j.id && <span className="absolute inset-y-0 left-0 w-px bg-[linear-gradient(180deg,#b8d9d2,#a6c4ed,#b8a6d5,#d6a2aa)]" />}
-                <StatusDot status={j.status} />
-                <span className="min-w-0 flex-1 truncate text-[12.5px] text-[#d4d6dc]">{j.display}</span>
-                <span className="font-mono text-[10px] text-[#8c8f98]">
-                  <LiveDuration start={j.started_at} end={j.finished_at} />
-                </span>
-              </button>
-            ))}
-          </div>
+          <JobList jobs={jobs} selected={selected?.id ?? null} onSelect={select} />
         </nav>
         <div className="min-w-0">
           {selected && (
@@ -290,12 +283,56 @@ function RunBody({ id }: { id: string }) {
   );
 }
 
+/** The run's jobs, to pick one. Past a few hundred (a big matrix's legs) only those near what the
+ *  list shows are drawn: a 1,000-leg run's page draws as fast as a small one's (W21-AC03). */
+function JobList({ jobs, selected, onSelect }: { jobs: Job[]; selected: string | null; onSelect: (id: string) => void }) {
+  const windowed = jobs.length > 200;
+  const [ref, win, row] = useWindowedBox(jobs.length, 45);
+  const shown = windowed ? jobs.slice(win.start, win.end) : jobs;
+  return (
+    <div ref={windowed ? ref : undefined} className="row-list max-h-[70vh] overflow-y-auto">
+      {windowed && <div aria-hidden="true" style={{ height: win.start * row, borderBottom: "none" }} />}
+      {shown.map((j) => (
+        <button
+          key={j.id}
+          data-row
+          onClick={() => onSelect(j.id)}
+          aria-current={selected === j.id ? "true" : undefined}
+          className={cn("relative flex min-h-11 w-full items-center gap-3 px-2 py-2 text-left transition-colors hover:bg-[#101114]", selected === j.id && "bg-[#101114]")}
+        >
+          {selected === j.id && <span className="absolute inset-y-0 left-0 w-px bg-[linear-gradient(180deg,#b8d9d2,#a6c4ed,#b8a6d5,#d6a2aa)]" />}
+          <StatusDot status={j.status} />
+          <span className="min-w-0 flex-1 truncate text-[12.5px] text-[#d4d6dc]">{j.display}</span>
+          <span className="font-mono text-[10px] text-[#8c8f98]">
+            <LiveDuration start={j.started_at} end={j.finished_at} />
+          </span>
+        </button>
+      ))}
+      {windowed && <div aria-hidden="true" style={{ height: (jobs.length - win.end) * row, borderBottom: "none" }} />}
+    </div>
+  );
+}
+
 /** A CI run's graph: the critical path drawn heavier, wait reasons and kept legs on the nodes. */
-function CiDag({ detail, attempt, jobs, selected, onSelect }: { detail: CiRunDetail; attempt: number | undefined; jobs: Job[]; selected: string | null; onSelect: (id: string) => void }) {
+function CiDag({
+  detail,
+  attempt,
+  jobs,
+  finished,
+  selected,
+  onSelect,
+}: {
+  detail: CiRunDetail;
+  attempt: number | undefined;
+  jobs: Job[];
+  finished: boolean;
+  selected: string | null;
+  onSelect: (id: string) => void;
+}) {
   const graph = useSuspenseResource(`ci-run/${detail.run.id}/graph/${attempt ?? ""}`, (s) => ci.graph(detail.run.id, attempt, s)).data;
   const critical = React.useMemo(() => criticalKeys(detail, graph.critical_path), [detail, graph]);
   const notes = React.useMemo(() => new Map(detail.legs.map((l) => [l.id, { wait: l.status === "queued" ? waitSentence(l.wait_reason) : null, reused: !!l.reused_from }])), [detail]);
-  return <JobDag jobs={jobs} selected={selected} onSelect={onSelect} critical={critical} notes={notes} />;
+  return <JobDag jobs={jobs} selected={selected} onSelect={onSelect} critical={critical} notes={notes} plan={graph.jobs} finished={finished} />;
 }
 
 function BackLink({ repo, repoId }: { repo?: string; repoId?: string }) {
@@ -433,6 +470,7 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
 
       {/* steps */}
       <div className="border-t border-[#28313d]">
+        <StepTimingBar steps={job.steps} now={now} onOpen={(idx) => !open.has(idx) && setOpen(new Set([...open, idx]))} />
         {job.steps.length === 0 && <p className="empty-line px-5 py-6">No steps reported yet.</p>}
         {inRunOrder(job.steps).map((s, i) => (
           <StepRow
@@ -471,6 +509,42 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
         </div>
       )}
     </section>
+  );
+}
+
+/** The leg's time by step (W21-R05), in the order they ran: each step's share of it as a segment of
+ * one hue (a failed step's in the failure tone), 2px of surface between them. A segment says its step
+ * and time, and opens the step; the steps below have the same numbers. */
+function StepTimingBar({ steps, now, onOpen }: { steps: Step[]; now: number; onOpen: (idx: number) => void }) {
+  const timed = inRunOrder(steps)
+    .filter((s) => s.started_at !== null)
+    .map((s) => ({ s, secs: Math.max(0, (s.finished_at ?? now / 1000) - (s.started_at ?? 0)) }));
+  const total = timed.reduce((n, t) => n + t.secs, 0);
+  if (timed.length < 2 || total <= 0) return null;
+  return (
+    <div className="flex items-center gap-[2px] px-5 pt-4 pb-1" role="list" aria-label="Time by step">
+      {timed.map(({ s, secs }, i) => (
+        <Tip key={s.idx} content={`${s.name}: ${formatDuration(secs)}`}>
+          <button
+            type="button"
+            role="listitem"
+            aria-label={`${s.name}, ${formatDuration(secs)}`}
+            onClick={() => onOpen(s.idx)}
+            className="group flex h-6 min-w-[4px] items-center outline-none"
+            style={{ flexGrow: Math.max(secs, total / 400), flexBasis: 0 }}
+          >
+            <span
+              className={cn(
+                "block h-2 w-full transition-opacity group-hover:opacity-80 group-focus-visible:ring-2 group-focus-visible:ring-[#bab0e3]",
+                i === 0 && "rounded-l-[4px]",
+                i === timed.length - 1 && "rounded-r-[4px]",
+              )}
+              style={{ background: s.status === "failed" || s.status === "timed_out" ? "#d1aaad" : "#b8a6d5", opacity: s.status === "running" ? 0.6 : 1 }}
+            />
+          </button>
+        </Tip>
+      ))}
+    </div>
   );
 }
 

@@ -1,0 +1,22 @@
+# F-22 (docs/ci.md W22-AC03, A.8): `hashFiles`' inputs: one pattern, several, an exclusion, a
+# directory, nothing matching, a path outside the workspace. Files are made before each is read.
+name: probe hashFiles
+on: [push, workflow_dispatch]
+jobs:
+  hash:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          mkdir -p a/b c
+          printf 'one\n' > a/one.txt
+          printf 'two\n' > a/b/two.txt
+          printf 'three\n' > c/three.lock
+          printf 'skip\n' > a/b/skip.txt
+      - run: |
+          echo "PROBE hash.one=${{ hashFiles('a/one.txt') }}"
+          echo "PROBE hash.glob=${{ hashFiles('**/*.txt') }}"
+          echo "PROBE hash.two-patterns=${{ hashFiles('**/*.txt', 'c/*.lock') }}"
+          echo "PROBE hash.excluded=${{ hashFiles('**/*.txt', '!a/b/skip.txt') }}"
+          echo "PROBE hash.directory=${{ hashFiles('a/b') }}"
+          echo "PROBE hash.none=${{ hashFiles('nothing/*.x') }}"
+          echo "PROBE hash.outside=${{ hashFiles('../*') }}"

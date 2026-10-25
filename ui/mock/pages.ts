@@ -1,6 +1,6 @@
 /**
  * Mock data for the pages the simulation in server.ts doesn't cover: deployments (apps, their
- * trees, history, diffs, objects, events, logs, deploy plans), kept plans, Settings → Updates, the
+ * trees, history, diffs, objects, events, logs, deploy plans), kept plans, System → Updates, the
  * runners' front doors and the tailnet, synced folders, terminal and AI sessions, and the sign-in
  * methods. Deterministic (seeded), so screenshots and layout measurements repeat.
  */
@@ -23,10 +23,16 @@ import type {
   CdSync,
   CdTree,
   FrontDoorView,
+  Job,
+  KilnBinary,
   Run,
+  ServerEvent,
   SyncView,
   TailscaleView,
+  UpdateJob,
+  UpdatePolicy,
   UpdatesOverview,
+  UpgradeWaits,
 } from "../src/api/types.ts";
 import { hashStr, mulberry32, pick } from "./data.ts";
 
@@ -38,6 +44,9 @@ export interface PagesCtx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
   err: (res: http.ServerResponse, status: number, message: string) => void;
   body: <T>(req: http.IncomingMessage) => Promise<T>;
+  emit?: (ev: ServerEvent) => void;
+  /** kiln's release pipeline in the simulation: Build every platform starts it; `past`, the runs the kept builds came from, newest first. */
+  release?: { start: (commit: string) => Run; latest: () => { run: Run; jobs: Job[] } | null; past: () => Run[] };
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -621,7 +630,74 @@ function plan(ask: { head?: string; commit?: string; pr?: number }): CdPlan {
 
 /* ------------------------------------------------------------------ plans */
 
+/** A goal turned into a plan here (Make a plan): a plan being planned, its words the goal's. */
+export function planning(goal: { agent: string; id: string; text: string }): string {
+  const id = `pl_${Math.random().toString(36).slice(2, 8)}`;
+  const now = Math.floor(Date.now() / 1000);
+  const title = goal.text.split(/[.:—]/)[0]!.trim().slice(0, 80);
+  PLANS.unshift({ ...PLANS[0]!, id, title, body: goal.text, items: [], steps: [], tags: [], version: 1, runs: 0, updated_at: now, share: undefined, phase: "planning", research: undefined, source: { goal } } as unknown as (typeof PLANS)[number]);
+  return id;
+}
+
+/** The plan Release prep proposed (plan mode), as its conversation has it and as kiln keeps it (`pl_proposed`). */
+export const PROPOSED = `# Fix: a mount taken over by a restarted daemon dropped a store
+
+The successor's handle store starts fresh, so a page re-fetched after the takeover was never tracked, and its write-back was judged fresh.
+
+1. Reproduce it: the CLI test that writes through a mount taken over by a restarted daemon fails 3 of 3.
+2. Track handles the successor never saw opened: \`WritableOpens\` keyed by handle and inode (coherence.rs).
+3. Adopt an unseen handle on a restored mount before serving its write (channel.rs).
+4. Tests, red first: the CLI test and the coherence unit tests, then the guest tests on the box.
+5. Verify: workspace clippy, the doc gate, and CI.`;
+
 const PLANS = [
+  {
+    id: "pl_search",
+    title: "Search across agents' conversations",
+    body: "Agents can search every conversation they may read.",
+    items: [
+      { title: "Store: search by agent and time", description: "", examples: "", acceptance: [], testing: [], needs: [] },
+      { title: "Op: conversations.search", description: "", examples: "", acceptance: [], testing: [], needs: [1] },
+      { title: "Agents use it in code mode", description: "", examples: "", acceptance: [], testing: [], needs: [1] },
+      { title: "UI: search in Mission Control", description: "", examples: "", acceptance: [], testing: [], needs: [2, 3] },
+      { title: "Docs and the kiln-agents skill", description: "", examples: "", acceptance: [], testing: [], needs: [2] },
+      { title: "Bench: a million events under 50 ms", description: "", examples: "", acceptance: [], testing: [], needs: [2] },
+      { title: "WebKit and phone check", description: "", examples: "", acceptance: [], testing: [], needs: [4] },
+      { title: "Ship it", description: "", examples: "", acceptance: [], testing: [], needs: [4, 5, 6, 7] },
+    ],
+    tags: [],
+    source: null,
+    share: null,
+    version: 1,
+    created_at: T0 - 7_200,
+    updated_at: T0 - 3_600,
+    steps: ["Store: search by agent and time", "Op: conversations.search", "Agents use it in code mode", "UI: search in Mission Control", "Docs and the kiln-agents skill", "Bench: a million events under 50 ms", "WebKit and phone check", "Ship it"],
+    runs: 0,
+    phase: "ready",
+    research: null,
+  },
+  {
+    id: "pl_proposed",
+    title: "Fix: a mount taken over by a restarted daemon dropped a store",
+    body: PROPOSED,
+    items: [],
+    tags: [],
+    source: { session: "fam-orch", agent: "Release prep", harness: "claude", proposed: true },
+    share: null,
+    version: 2,
+    created_at: T0 - 40 * 60,
+    updated_at: T0 - 20 * 60,
+    steps: [
+      "Reproduce it: the CLI test that writes through a mount taken over by a restarted daemon fails 3 of 3.",
+      "Track handles the successor never saw opened: `WritableOpens` keyed by handle and inode (coherence.rs).",
+      "Adopt an unseen handle on a restored mount before serving its write (channel.rs).",
+      "Tests, red first: the CLI test and the coherence unit tests, then the guest tests on the box.",
+      "Verify: workspace clippy, the doc gate, and CI.",
+    ],
+    runs: 0,
+    phase: "ready",
+    research: null,
+  },
   {
     id: "pl_release",
     title: "Cut the 0.2 release",
@@ -640,8 +716,9 @@ const PLANS = [
         examples: "",
         acceptance: [{ kind: "quantitative", target: "p99 latency", op: "rises_at_most", value: "3", unit: "%", baseline: "0.1", measured: "kiln run bench --all" }],
         testing: [{ scenario: "The full bench on metal-epyc-01", criteria: [{ kind: "qualitative", text: "Every case runs to the end." }] }],
+        needs: [1],
       },
-      { title: "Tag and publish", description: "", examples: "", acceptance: [], testing: [] },
+      { title: "Tag and publish", description: "", examples: "", acceptance: [], testing: [], needs: [1, 2] },
     ],
     tags: ["release"],
     source: null,
@@ -651,7 +728,61 @@ const PLANS = [
     updated_at: T0 - 3_600 * 5,
     steps: ["Freeze main", "Run the full bench", "Tag and publish"],
     runs: 2,
+    phase: "ready",
+    research: null,
   },
+  {
+    id: "pl_quic",
+    title: "QUIC replication",
+    body: "Goal: Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
+    items: [
+      { title: "Replicate over QUIC", description: "Carry the metadata store's raft log over hyper-quic.", examples: "", acceptance: [{ kind: "qualitative", text: "The replication suite passes on three nodes." }], testing: [], basis: ["f1", "f2"] },
+      {
+        title: "Bench with replication on",
+        description: "",
+        examples: "",
+        acceptance: [{ kind: "qualitative", text: "Fills stay at least 4x ahead of RocksDB." }, { kind: "qualitative", text: "Gets and seeks stay at least 4x ahead of Splinter." }],
+        testing: [],
+        needs: [1],
+        basis: ["f3"],
+      },
+      { title: "Document the replication protocol", description: "", examples: "", acceptance: [], testing: [], needs: [1], basis: ["f1"] },
+    ],
+    tags: ["from a goal"],
+    source: { session: "fam-orch", agent: "Release prep", goal: { agent: "fam-orch", id: "g-quic", text: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB" } },
+    share: null,
+    version: 1,
+    created_at: T0 - 3 * 3600,
+    updated_at: T0 - 2 * 3600,
+    steps: ["Replicate over QUIC", "Bench with replication on", "Document the replication protocol"],
+    runs: 1,
+    phase: "planning",
+    research: "rs_quic",
+  },
+  // Release prep's goals being planned now, each by a subagent of its own (agents.ts): a subagent at
+  // "The planner", one asked for "Store and transfer", one that stopped before "Optimize" was ready.
+  ...(
+    [
+      ["pl_planner", "The planner, researched and audited", "rs_planner", "g-planner"],
+      ["pl_store", "Build the data storage/transfer layer and replication using hyper-raft and its crates", "rs_store", "g-store"],
+      ["pl_opt", "Optimize the QUIC API and s3 HTTP API using the same benchmarking and profiling we have in steps 1-3", "rs_opt", "g-opt"],
+    ] as const
+  ).map(([id, title, research, goal]) => ({
+    id,
+    title,
+    body: "",
+    items: [],
+    tags: ["from a goal"],
+    source: { session: "fam-orch", agent: "Release prep", goal: { agent: "fam-orch", id: goal, text: title } },
+    share: null,
+    version: 1,
+    created_at: T0 - 600,
+    updated_at: T0 - 60,
+    steps: [],
+    runs: 0,
+    phase: "planning",
+    research,
+  })),
   {
     id: "pl_parser",
     title: "Fix the YAML anchor parser",
@@ -665,6 +796,8 @@ const PLANS = [
     updated_at: T0 - 86_400 * 2,
     steps: ["Read the failing test", "Fix the parser", "Run the suite"],
     runs: 0,
+    phase: "ready",
+    research: null,
   },
   {
     id: "pl_docs",
@@ -679,31 +812,355 @@ const PLANS = [
     updated_at: T0 - 86_400 * 3,
     steps: [],
     runs: 1,
+    phase: "ready",
+    research: null,
   },
 ];
+
+const conf = (score: number, why: string, extra: Record<string, number> = {}) => {
+  const grade = score >= 85 ? "A" : score >= 70 ? "B" : score >= 50 ? "C" : score >= 30 ? "D" : "F";
+  const words = { A: "high", B: "good", C: "moderate", D: "low", F: "very low" }[grade];
+  return { score, grade, words, support: score / 100, against: 0, reliability: 0.9, citation: 1, independent: 2, cites: 2, found: 2, failed: 0, why, ...extra };
+};
+
+/** Research (docs/research.md), as the server answers it: a plan's planning, its findings graded. */
+const RESEARCH = {
+  rs_quic: {
+    id: "rs_quic",
+    question: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
+    agent: "fam-orch",
+    by: "agent:Release prep",
+    plan: "pl_quic",
+    sources: [
+      { id: "s1", type: "code", title: "hyper-raft's log transport", locator: "crates/hyper-raft/src/transport.rs:88-140", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s2", type: "measurement", title: "the replication suite", locator: "cargo test -p meta-store --test replication", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s3", type: "standard", title: "RFC 9000: QUIC", locator: "https://www.rfc-editor.org/rfc/rfc9000#section-2.2", published: "2021-05", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s4", type: "blog", title: "QUIC under load", locator: "https://example.dev/quic-under-load", published: "2023", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s5", type: "forum", title: "a thread on QUIC and head-of-line blocking", locator: "https://forum.example.org/t/4812", published: "2022", retrieved_at: Date.now() - 3 * 3600_000 },
+    ],
+    findings: [
+      {
+        id: "f1",
+        claim: "hyper-raft's log transport takes any stream with ordered delivery, so a QUIC stream carries it as it is.",
+        cites: [
+          { source: "s1", quote: "pub trait LogStream: AsyncRead + AsyncWrite + Unpin + Send", at: "line 88", check: { state: "found", at: Date.now() - 3 * 3600_000 } },
+          { source: "s3", quote: "Streams in QUIC provide a lightweight, ordered byte-stream abstraction", check: { state: "found", at: Date.now() - 3 * 3600_000 } },
+        ],
+        against: [],
+        at: Date.now() - 3 * 3600_000,
+        confidence: conf(98, "2 independent sources (code, a standard); 2 of 2 quotes found where cited"),
+        against_weights: [],
+      },
+      {
+        id: "f2",
+        claim: "The replication suite passes over QUIC on three nodes today.",
+        cites: [{ source: "s2", quote: "test result: ok. 48 passed; 0 failed", check: { state: "found", at: Date.now() - 2 * 3600_000, said: "in the agent's own tool output" } }],
+        against: [],
+        at: Date.now() - 2 * 3600_000,
+        confidence: conf(95, "1 independent source (a measurement); 1 of 1 quotes found where cited", { independent: 1, cites: 1, found: 1, reliability: 0.95 }),
+        against_weights: [],
+      },
+      {
+        id: "f3",
+        claim: "QUIC's per-stream ordering keeps tail latency within 10% of TCP under load.",
+        cites: [
+          { source: "s4", quote: "p99 stayed within 8% of TCP at 40k req/s", check: { state: "not_found", at: Date.now() - 3 * 3600_000, said: "the page doesn't hold those words" } },
+        ],
+        against: [{ claim: "Head-of-line blocking returns when one stream carries everything.", cites: [{ source: "s5", check: { state: "found", at: Date.now() - 3 * 3600_000 } }] }],
+        at: Date.now() - 3 * 3600_000,
+        confidence: conf(13, "1 independent source (a blog); 0 of 1 quotes found where cited, 1 not; 1 counterclaim, the strongest moderate", { independent: 1, cites: 1, found: 0, failed: 1, reliability: 0.5, citation: 0.3, against: 0.2, support: 0.15 }),
+        against_weights: [0.2],
+      },
+    ],
+    skipped: {},
+    summary: { findings: 3, grades: { A: 2, F: 1 }, sources: 5, internal: 2, external: 3, checking: 0 },
+    created_at: Date.now() - 3 * 3600_000,
+    updated_at: Date.now() - 2 * 3600_000,
+  },
+  // The research of the goals being planned now (agents.ts): what their subagents found so far.
+  ...Object.fromEntries(
+    (
+      [
+        [
+          "rs_planner",
+          "pl_planner",
+          "The planner, researched and audited",
+          [
+            "DuckDB enumerates join orders with DPhyp and falls back to a greedy order past 12 relations.",
+            "Umbra's adaptive compilation picks its plan before it compiles, from the same cost model.",
+            "Our planner costs a join by its inputs' row counts alone, with no distinct counts.",
+          ],
+          { A: 2, B: 1 },
+        ],
+        ["rs_store", "pl_store", "Build the data storage/transfer layer", [], {}],
+        [
+          "rs_opt",
+          "pl_opt",
+          "Optimize the QUIC API and s3 HTTP API",
+          ["The s3 API's PUT path copies each part twice before it reaches the store.", "hyper-quic's send path allocates a frame per write."],
+          { B: 1, C: 1 },
+        ],
+      ] as const
+    ).map(([id, plan, question, claims, grades]) => [
+      id,
+      {
+        id,
+        question,
+        agent: "fam-orch",
+        by: "agent:Release prep",
+        plan,
+        sources: [],
+        findings: claims.map((claim, i) => ({
+          id: `${id}-f${i + 1}`,
+          claim,
+          cites: [],
+          against: [],
+          at: Date.now() - 60_000,
+          confidence: conf(80, "1 independent source; 1 of 1 quotes found where cited"),
+          against_weights: [],
+        })),
+        skipped: {},
+        summary: { findings: claims.length, grades, sources: claims.length, internal: claims.length, external: 0, checking: 0 },
+        created_at: Date.now() - 10 * 60_000,
+        updated_at: Date.now() - 60_000,
+      },
+    ]),
+  ),
+} as Record<string, unknown>;
 
 /* ------------------------------------------------------------------ the rest */
 
 const NEWEST = "94f0847a1b2c3d4e5f60718293a4b5c6d7e8f901";
 
+/** How long upgrades are waited on: kiln.toml's, unless changed in System → Updates. */
+const WAITS_CONFIG: UpgradeWaits = { upgrade_minutes: 15, wait_for_jobs_minutes: 360, build_minutes: 60 };
+let waitsChosen: UpgradeWaits | null = null;
+/** Upgrades started from the page, by runner. */
+const started = new Map<string, UpdateJob>();
+/** Runners an upgrade from the page brought to the newest kiln. */
+const upgraded = new Set<string>();
+/** Update policies chosen on the page, by runner (else automatic). */
+const policies = new Map<string, UpdatePolicy>();
+/** When each platform's kept binary was removed on the page (unix seconds), and what was uploaded, or a machine built of itself, for a platform since. */
+const removedAt = new Map<string, number>();
+const uploaded = new Map<string, KilnBinary>();
+const machineBuilt = new Map<string, KilnBinary>();
+/** The platforms each job of the release pipeline builds (`.kiln/release.yaml`), as the mock's targets name them. */
+const RELEASE_TARGETS: Record<string, string[]> = { linux: ["aarch64-unknown-linux-gnu"], windows: ["x86_64-pc-windows-msvc"], macos: ["aarch64-apple-darwin"] };
+
+/** What an upgrade started on the page says as it goes, by seconds in; done at the last. */
+function upgradeLines(name: string, build: boolean): [number, string][] {
+  const s = NEWEST.slice(0, 12);
+  return build
+    ? [
+        [3, `fetching the source of ${s} from https://kiln.lan`],
+        [6, `   Compiling kiln v0.2.0 (~/.cache/kiln/self-build/src/crates/kiln)`],
+        [11, "new runner started beside the old one; it takes new work"],
+        [16, `the old runner ended · ${name} runs ${NEWEST.slice(0, 7)}`],
+      ]
+    : [
+        [3, "downloading build 0.1.0+a1b2c3d (36.4 MiB) from the server"],
+        [5, "checksum matches"],
+        [8, "new runner started beside the old one; it takes new work"],
+        [14, `the old runner ended · ${name} runs ${NEWEST.slice(0, 7)}`],
+      ];
+}
+
+let ticking: ReturnType<typeof setInterval> | null = null;
+/** Upgrades started on the page go on by themselves: a line every few seconds, then done. */
+function tickUpgrades(ctx: PagesCtx) {
+  if (ticking) return;
+  ticking = setInterval(() => {
+    let running = 0;
+    for (const job of started.values()) {
+      if (job.state !== "running") continue;
+      running++;
+      const lines = upgradeLines(job.target, job.method === "build");
+      const t = now() - job.started_at;
+      const said = lines.filter(([at]) => at <= t).map(([, l]) => l);
+      if (said.length + 1 === job.log.length && t < lines[lines.length - 1]![0] + 2) continue;
+      job.log = [job.log[0]!, ...said];
+      if (t >= lines[lines.length - 1]![0] + 2) {
+        Object.assign(job, { state: "done", ended_at: now(), reached: true });
+        upgraded.add(job.target);
+        // A machine that built kiln of itself hands the binary back: others of its platform download it.
+        const a = job.method === "build" ? ctx.agents().find((x) => x.name === job.target) : undefined;
+        if (a) {
+          const target = `${a.arch}-${a.os === "macos" ? "apple-darwin" : "unknown-linux-gnu"}`;
+          const sha256 = hex(mulberry32(hashStr(`${target}:${job.id}`)), 64);
+          machineBuilt.set(target, { target, sha256, size: 36_400_000, build: sha256.slice(0, 12), origin: "machine", at: now(), sha: NEWEST, by: a.name });
+        }
+        ctx.emit?.({ type: "updates" });
+      }
+      ctx.emit?.({ type: "update_job", job: { ...job, log: [...job.log] } });
+    }
+    if (running === 0 && ticking) {
+      clearInterval(ticking);
+      ticking = null;
+    }
+  }, 1000);
+}
+
+function startUpgrade(ctx: PagesCtx, name: string, way?: "download" | "build"): UpdateJob {
+  const build = way === "build" || (way === undefined && ctx.agents().find((a) => a.name === name)?.os === "macos");
+  const job: UpdateJob = {
+    id: hex(mulberry32(hashStr(name + Date.now())), 16),
+    kind: "runner",
+    target: name,
+    method: build ? "build" : "native",
+    state: "running",
+    started_at: now(),
+    ended_at: null,
+    from_build: "0.0.9+0f1e2d3",
+    to_build: build ? null : "0.1.0+a1b2c3d",
+    commit: NEWEST,
+    reached: false,
+    log: [build ? `upgrading ${name}: it builds ${NEWEST.slice(0, 12)} itself; nothing it runs is stopped` : `upgrading ${name} to build 0.1.0+a1b2c3d; nothing it runs is stopped`],
+    error: null,
+  };
+  started.set(name, job);
+  tickUpgrades(ctx);
+  return job;
+}
+
+/** The Mac's build that failed, and a Linux runner's upgrade kiln stopped waiting for: what System → Updates offers to remedy. */
+function failedJobs(ctx: PagesCtx): UpdateJob[] {
+  const agents = ctx.agents().filter((a) => !a.ephemeral && a.connected);
+  const mac = agents.find((a) => a.os === "macos");
+  const old = agents.find((a) => a.os !== "macos" && a.version !== ctx.version);
+  const out: UpdateJob[] = [];
+  if (mac)
+    out.push({
+      id: "9d2f61c08b7e4a55",
+      kind: "runner",
+      target: mac.name,
+      method: "build",
+      state: "failed",
+      started_at: T0 - 1500,
+      ended_at: T0 - 1180,
+      from_build: "0.0.9+0f1e2d3",
+      to_build: null,
+      commit: NEWEST,
+      reached: false,
+      log: [
+        `upgrading ${mac.name}: it builds ${NEWEST.slice(0, 12)} itself; nothing it runs is stopped`,
+        "fetching the source of 94f0847a1b2c from https://kiln.lan",
+        "   Compiling kiln-cd v0.2.0 (/Users/ada/.cache/kiln/self-build/src-9d2f61c08b7e4a55/crates/kiln-cd)",
+        "   Compiling kiln v0.2.0 (/Users/ada/.cache/kiln/self-build/src-9d2f61c08b7e4a55/crates/kiln)",
+        "cargo exited with 101. What it said that went wrong:",
+        "error: linking with `cc` failed: exit status: 1",
+        "error: could not compile `kiln` (bin \"kiln\") due to 1 previous error",
+        "failed: kiln did not build (its full output is /Users/ada/.cache/kiln/self-build/build-9d2f61c08b7e4a55.log on this machine)",
+      ],
+      error: "kiln did not build (its full output is /Users/ada/.cache/kiln/self-build/build-9d2f61c08b7e4a55.log on this machine)",
+    });
+  if (old)
+    out.push({
+      id: "4b1e0c9a7d6f3e21",
+      kind: "runner",
+      target: old.name,
+      method: "native",
+      state: "failed",
+      started_at: T0 - 4200,
+      ended_at: T0 - 2300,
+      from_build: "0.0.9+0f1e2d3",
+      to_build: "0.1.0+a1b2c3d",
+      commit: NEWEST,
+      reached: false,
+      log: [
+        `upgrading ${old.name} to build 0.1.0+a1b2c3d (x86_64-unknown-linux-gnu); nothing it runs is stopped`,
+        "asked the runner to upgrade itself: the new build starts beside it and takes over",
+        `${old.name} waits for its running job before it switches`,
+        "failed: the new runner didn't report in within 15 minutes of its last job ending; see the runner's log",
+      ],
+      error: "the new runner didn't report in within 15 minutes of its last job ending; see the runner's log",
+      timed_out: "upgrade",
+    });
+  return out;
+}
+
+/**
+ * The binaries kept here: the server's own, then one for each platform, the newest of what kiln's
+ * release pipeline built, a machine built of itself or was uploaded (crate::updates::stored). An
+ * older release build of the server's own platform stays kept beside the server's own, which
+ * runners of it get instead. The page's release runs, uploads and removals change them.
+ */
+function binariesOf(ctx: PagesCtx): KilnBinary[] {
+  const [recent, older] = ctx.release?.past() ?? [];
+  const own: KilnBinary = { target: "x86_64-unknown-linux-gnu", sha256: "ab".repeat(32), size: 38_200_000, build: "0.1.0+a1b2c3d", origin: "server", at: T0 - 86_400 };
+  const kept: KilnBinary[] = [
+    {
+      target: "aarch64-unknown-linux-gnu",
+      sha256: "cd".repeat(32),
+      size: 36_900_000,
+      build: "0.1.0+a1b2c3d",
+      origin: "built",
+      at: recent?.finished_at ?? T0 - 80_000,
+      run: recent?.number ?? 412,
+      sha: recent?.sha ?? "a1b2c3d4e5",
+    },
+    {
+      target: "x86_64-unknown-linux-gnu",
+      sha256: "ef".repeat(32),
+      size: 37_500_000,
+      build: "0.0.9+df17c34",
+      origin: "built",
+      at: older?.finished_at ?? T0 - 205_000,
+      run: older?.number ?? 380,
+      sha: older?.sha ?? "df17c34639ecbf9d5c9caefb6af28aa67ee01257",
+    },
+  ];
+  // A release run of the server's own commit keeps its builds of the other platforms (crate::updates::adopts); one of any other commit, none.
+  const rel = ctx.release?.latest();
+  for (const j of rel && rel.run.sha === NEWEST ? rel.jobs : []) {
+    if (j.status !== "succeeded") continue;
+    for (const t of RELEASE_TARGETS[j.key] ?? []) {
+      kept.push({
+        target: t,
+        sha256: hex(mulberry32(hashStr(t)), 64),
+        size: t.includes("windows") ? 43_000_000 : t.includes("darwin") ? 36_100_000 : 39_600_000,
+        build: `0.1.0+${hex(mulberry32(hashStr(t + "b")), 7)}`,
+        origin: "built",
+        at: j.finished_at ?? now(),
+        run: rel!.run.number,
+        sha: rel!.run.sha,
+      });
+    }
+  }
+  kept.push(...machineBuilt.values(), ...uploaded.values());
+  const newest = new Map<string, KilnBinary>();
+  for (const b of kept) if (b.at > (removedAt.get(b.target) ?? 0) && b.at >= (newest.get(b.target)?.at ?? 0)) newest.set(b.target, b);
+  return [own, ...newest.values()];
+}
+
 function updates(ctx: PagesCtx): UpdatesOverview {
+  const binaries = binariesOf(ctx);
+  const rel = ctx.release?.latest() ?? null;
+  const darwin = binaries.find((b) => b.target === "aarch64-apple-darwin" && b.sha === NEWEST);
+  // While a release run of the server's commit goes, what it builds and isn't built from it yet; else the Mac's platform, until a build of it is kept.
+  const releaseTargets = Object.values(RELEASE_TARGETS).flat();
+  const behind = (rel && rel.run.sha === NEWEST ? releaseTargets : ["aarch64-apple-darwin"]).filter((t) => !binaries.some((b) => b.target === t && b.sha === NEWEST));
+  const recent = ctx.release?.past()[0];
   const runners = ctx
     .agents()
     .filter((a) => !a.ephemeral)
     .map((a) => {
       const target = `${a.arch}-${a.os === "macos" ? "apple-darwin" : "unknown-linux-gnu"}`;
-      const mac = a.os === "macos";
-      // The Mac is behind and builds the newest kiln itself (crate::fleet).
-      const up = a.version === ctx.version && !mac;
+      // The Mac is behind and builds the newest kiln itself (crate::fleet), until the release run built its platform.
+      const mac = a.os === "macos" && !darwin;
+      const up = upgraded.has(a.name) || (a.version === ctx.version && a.os !== "macos");
       return {
         name: a.name,
+        policy: policies.get(a.name) ?? ("auto" as const),
+        locked: false,
+        from: up || mac ? null : `built by release run #${recent?.number ?? 412}`,
         hostname: a.hostname,
         os: a.os,
         arch: a.arch,
         connected: a.connected,
         version: a.version,
         target,
-        target_build: a.os === "macos" ? null : "0.1.0+a1b2c3d",
+        target_build: mac ? null : a.os === "macos" ? (darwin?.build ?? null) : "0.1.0+a1b2c3d",
         build: up ? "0.1.0+a1b2c3d" : "0.0.9+0f1e2d3",
         up_to_date: up,
         method: up ? ("native" as const) : ("terminal" as const),
@@ -714,6 +1171,18 @@ function updates(ctx: PagesCtx): UpdatesOverview {
         next: up ? null : mac ? `builds ${NEWEST.slice(0, 12)} itself` : `downloads build 0.1.0+a1b2c3d (${NEWEST.slice(0, 12)})`,
         how: up ? null : mac ? ("build" as const) : ("download" as const),
         checkout: mac ? "/Users/ada/Projects/kiln" : null,
+        ways:
+          up || !a.connected
+            ? []
+            : mac
+              ? [
+                  { way: "download" as const, ok: false, why: `no binary of ${NEWEST.slice(0, 12)} for aarch64-apple-darwin yet` },
+                  { way: "build" as const, ok: true, why: `builds ${NEWEST.slice(0, 12)} on the machine, from this server's source` },
+                ]
+              : [
+                  { way: "download" as const, ok: true, why: "downloads build 0.1.0+a1b2c3d" },
+                  { way: "build" as const, ok: false, why: "it has no cargo or node to build kiln with" },
+                ],
       };
     });
   return {
@@ -733,15 +1202,13 @@ function updates(ctx: PagesCtx): UpdatesOverview {
       note: "This is the newest build: nothing to upgrade.",
     },
     runners,
-    jobs: [],
-    binaries: [
-      { target: "x86_64-unknown-linux-gnu", sha256: "ab".repeat(32), size: 38_200_000, build: "0.1.0+a1b2c3d", origin: "server", at: T0 - 86_400 },
-      { target: "aarch64-unknown-linux-gnu", sha256: "cd".repeat(32), size: 36_900_000, build: "0.1.0+a1b2c3d", origin: "built", at: T0 - 80_000, run: 412, sha: "a1b2c3d4e5" },
-    ],
+    jobs: [...started.values(), ...failedJobs(ctx).filter((j) => !started.has(j.target))],
+    binaries,
     targets: ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"],
-    build: { repo: "hyper-light/kiln", pipeline: "release", last: null, commit: NEWEST, in_step: false, behind: ["aarch64-apple-darwin"], keeps_in_step: true },
+    build: { repo: "hyper-light/kiln", pipeline: "release", last: rel?.run ?? null, commit: NEWEST, in_step: behind.length === 0, behind, keeps_in_step: true },
     newest: { commit: NEWEST, from: "server", since: T0 - 3600 },
     follow: true,
+    waits: { now: waitsChosen ?? WAITS_CONFIG, config: WAITS_CONFIG, changed: waitsChosen !== null },
   };
 }
 
@@ -873,6 +1340,63 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
   if (p === "/api/ai-sessions" && m === "GET") return (void json(res, 200, []), true);
   if (p === "/api/updates" && m === "GET") return (void json(res, 200, updates(ctx)), true);
   if (p === "/api/updates/check" && m === "POST") return (void json(res, 200, updates(ctx)), true);
+  if (p === "/api/updates/waits" && (m === "PUT" || m === "DELETE")) {
+    waitsChosen = m === "PUT" ? await ctx.body<UpgradeWaits>(req) : null;
+    res.statusCode = 204;
+    res.end();
+    return true;
+  }
+  if ((mm = p.match(/^\/api\/updates\/runners\/([^/]+)$/)) && m === "POST") {
+    const ask = await ctx.body<{ way?: "download" | "build" }>(req);
+    return (void json(res, 202, startUpgrade(ctx, decodeURIComponent(mm[1] ?? ""), ask.way)), true);
+  }
+  if ((mm = p.match(/^\/api\/updates\/runners\/([^/]+)$/)) && m === "PUT") {
+    const { policy } = await ctx.body<{ policy: UpdatePolicy }>(req);
+    policies.set(decodeURIComponent(mm[1] ?? ""), policy);
+    ctx.emit?.({ type: "updates" });
+    res.statusCode = 204;
+    res.end();
+    return true;
+  }
+  if (p === "/api/updates/policy" && m === "PUT") {
+    const ask = await ctx.body<{ policy: UpdatePolicy; runners?: string[]; all?: boolean }>(req);
+    const names = ask.all ? updates(ctx).runners.map((r) => r.name) : (ask.runners ?? []);
+    for (const n of names) policies.set(n, ask.policy);
+    ctx.emit?.({ type: "updates" });
+    res.statusCode = 204;
+    res.end();
+    return true;
+  }
+  if (p === "/api/updates/runners" && m === "POST") {
+    const behind = updates(ctx).runners.filter((r) => r.connected && !r.up_to_date && !r.locked && started.get(r.name)?.state !== "running");
+    return (void json(res, 202, { jobs: behind.map((r) => startUpgrade(ctx, r.name)), errors: [] }), true);
+  }
+  if (p === "/api/updates/build" && m === "POST") {
+    if (!ctx.release) return (void err(res, 404, "no release pipeline"), true);
+    const run = ctx.release.start(NEWEST);
+    ctx.emit?.({ type: "updates" });
+    return (void json(res, 202, run), true);
+  }
+  if (p === "/api/updates/binaries" && m === "POST") {
+    const target = url.searchParams.get("target") ?? "";
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const size = chunks.reduce((n, c) => n + c.length, 0);
+    const bin: KilnBinary = { target, sha256: hex(mulberry32(hashStr(target + size + Date.now())), 64), size, build: "0.1.0+a1b2c3d", origin: "upload", at: now() };
+    uploaded.set(target, bin);
+    ctx.emit?.({ type: "updates" });
+    return (void json(res, 201, bin), true);
+  }
+  if ((mm = p.match(/^\/api\/updates\/binaries\/([^/]+)$/)) && m === "DELETE") {
+    const target = decodeURIComponent(mm[1] ?? "");
+    uploaded.delete(target);
+    machineBuilt.delete(target);
+    removedAt.set(target, now());
+    ctx.emit?.({ type: "updates" });
+    res.statusCode = 204;
+    res.end();
+    return true;
+  }
   if (p === "/api/front-doors" && m === "GET")
     return (
       void json(
@@ -967,8 +1491,26 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     return (err(res, 404, `no route for ${p}`), true);
   }
 
+  // Research
+  if (p === "/api/research" && m === "GET") {
+    // One agent's, one plan's, or all, as the server answers.
+    const agent = url.searchParams.get("agent");
+    const plan = url.searchParams.get("plan");
+    const all = Object.values(RESEARCH) as { agent?: string | null; plan?: string | null }[];
+    return (void json(res, 200, { research: all.filter((r) => (!agent || r.agent === agent) && (!plan || r.plan === plan)) }), true);
+  }
+  if ((mm = p.match(/^\/api\/research\/([^/]+)$/)) && m === "GET") {
+    const r = RESEARCH[decodeURIComponent(mm[1]!)];
+    return (r ? json(res, 200, r) : err(res, 404, "no such research"), true);
+  }
   // Plans
-  if (p === "/api/plans" && m === "GET") return (void json(res, 200, PLANS), true);
+  if (p === "/api/plans" && m === "GET") {
+    // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked.
+    const session = url.searchParams.get("session");
+    const proposed = url.searchParams.get("proposed") === "1";
+    const of = (pl: (typeof PLANS)[number]) => (pl as { source?: { session?: string; proposed?: boolean } | null }).source;
+    return (void json(res, 200, PLANS.filter((pl) => (!session || of(pl)?.session === session) && (!proposed || of(pl)?.proposed))), true);
+  }
   if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/runs)?$/)) && m === "GET") {
     const pl = PLANS.find((x) => x.id === decodeURIComponent(mm![1]!));
     if (!pl) return (err(res, 404, "no such plan"), true);
@@ -991,6 +1533,17 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
         true
       );
     return (void json(res, 200, pl), true);
+  }
+  // A plan run (`plans.run`): some of its steps (`only`), as goals split into their criteria and tests (`split`), or an agent each.
+  if ((mm = p.match(/^\/api\/plans\/([^/]+)\/run$/)) && m === "POST") {
+    const pl = PLANS.find((x) => x.id === decodeURIComponent(mm![1]!));
+    if (!pl) return (err(res, 404, "no such plan"), true);
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const b = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as { mode?: string; only?: number[]; split?: boolean; session?: string };
+    const n = b.only?.length ?? (pl.items?.length || pl.steps?.length || 0);
+    if (b.mode === "agents") return (void json(res, 200, { run: "pr_agents1", steps: n, note: b.only?.length ? `Not in this run, taken as done: the steps step ${b.only[0]} waits for.` : null }), true);
+    return (void json(res, 200, { session: b.session ?? "fam-orch", sent: n, run: "pr_goals1", split: b.mode === "goals" && b.split ? n : 0 }), true);
   }
   if ((mm = p.match(/^\/api\/shared\/plans\/([^/]+)$/))) {
     const pl = PLANS.find((x) => x.share === decodeURIComponent(mm![1]!));

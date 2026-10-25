@@ -38,6 +38,8 @@ pub struct Pki {
     issuer: Issuer<'static, KeyPair>,
     pub ca_pem: String,
     pub ca_der: Vec<u8>,
+    /// How its files are written: synced to disk (`write_secret`), or not (a test's scratch PKI).
+    write: fn(&Path, &[u8], u32) -> std::io::Result<()>,
 }
 
 /// A certificate + private key, both PEM.
@@ -257,6 +259,17 @@ pub fn sanitize_name(name: &str) -> String {
 
 impl Pki {
     pub fn open(dir: &Path) -> anyhow::Result<Self> {
+        Self::open_writing(dir, crate::util::write_secret)
+    }
+
+    /// A test's scratch PKI: as [`Pki::open`], its files not synced to disk (nothing needs them
+    /// after a crash).
+    #[cfg(test)]
+    pub fn open_scratch(dir: &Path) -> anyhow::Result<Self> {
+        Self::open_writing(dir, crate::util::write_secret_unsynced)
+    }
+
+    fn open_writing(dir: &Path, write: fn(&Path, &[u8], u32) -> std::io::Result<()>) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let ca_pem_path = dir.join("ca.pem");
         let ca_key_path = dir.join("ca.key");
@@ -280,20 +293,22 @@ impl Pki {
                 p.not_before = now - Duration::hours(1);
                 p.not_after = now + Duration::days(365 * CA_YEARS);
                 let cert = p.self_signed(&key).context("self-sign CA")?;
-                crate::util::write_secret(&ca_key_path, key.serialize_pem().as_bytes(), 0o600)?;
-                crate::util::write_secret(&ca_pem_path, cert.pem().as_bytes(), 0o644)?;
+                write(&ca_key_path, key.serialize_pem().as_bytes(), 0o600)?;
+                write(&ca_pem_path, cert.pem().as_bytes(), 0o644)?;
                 tracing::info!(dir = %dir.display(), "created kiln CA");
                 (cert.pem(), key)
             }
         };
         let issuer = Issuer::from_ca_cert_pem(&ca_pem, key).context("load CA")?;
         let ca_der = pem_to_der(&ca_pem)?;
-        Ok(Self { dir: dir.to_path_buf(), issuer, ca_pem, ca_der })
+        Ok(Self { dir: dir.to_path_buf(), issuer, ca_pem, ca_der, write })
     }
 
     /// The server's leaf, (re)issued when missing, expiring, or when its names changed.
     pub fn server_leaf(&self, extra_names: &[String]) -> anyhow::Result<Leaf> {
-        let mut names = vec![SERVER_NAME.to_owned(), "localhost".to_owned(), "127.0.0.1".to_owned()];
+        // And the name containers on this machine reach it by (a leg's job container, Docker
+        // actions: `host.docker.internal`).
+        let mut names = vec![SERVER_NAME.to_owned(), "localhost".to_owned(), "127.0.0.1".to_owned(), crate::runner::docker::HOST_ALIAS.to_owned()];
         let host = crate::config::Config::hostname();
         names.push(host);
         for n in extra_names {
@@ -319,9 +334,9 @@ impl Pki {
         let key = KeyPair::generate()?;
         let cert = leaf_params(names, LEAF_DAYS)?.signed_by(&key, &self.issuer)?;
         let leaf = Leaf { cert_pem: cert.pem(), key_pem: key.serialize_pem() };
-        crate::util::write_secret(&key_path, leaf.key_pem.as_bytes(), 0o600)?;
-        crate::util::write_secret(&cert_path, leaf.cert_pem.as_bytes(), 0o644)?;
-        crate::util::write_secret(&names_path, wanted.as_bytes(), 0o644)?;
+        (self.write)(&key_path, leaf.key_pem.as_bytes(), 0o600)?;
+        (self.write)(&cert_path, leaf.cert_pem.as_bytes(), 0o644)?;
+        (self.write)(&names_path, wanted.as_bytes(), 0o644)?;
         tracing::info!("issued server certificate");
         Ok(leaf)
     }

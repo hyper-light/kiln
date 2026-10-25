@@ -50,6 +50,15 @@ impl Conclusion {
         }
     }
 
+    /// As kiln keeps a leg's (docs/ci.md W06-R12): a timeout stays `timed_out`, though `needs`
+    /// sees it as a failure ([`Conclusion::result`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Conclusion::TimedOut => "timed_out",
+            c => c.result(),
+        }
+    }
+
     pub fn failed(self) -> bool {
         matches!(self, Conclusion::Failure | Conclusion::TimedOut)
     }
@@ -139,6 +148,10 @@ pub struct EnvironmentSpec {
     pub url: Option<String>,
     /// `deployment: false`: the environment's rules and secrets, no deployment record.
     pub deployment: bool,
+    /// Where `name` is one of `previews:`, the preview it was bound to as the leg was queued
+    /// (W15-R07): `name` is that preview's then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<crate::wire::PreviewOf>,
 }
 
 /// A concurrency group, evaluated (W05-R06, W05-R07).
@@ -215,6 +228,12 @@ pub struct LegSpec {
     pub emulated: bool,
     /// The needs outputs and results the job's expressions read, for the run's flow (W04-R23).
     pub reads: Vec<String>,
+    /// The most its cache mode may be, when it's in a called workflow: its caller's (W08-R14).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_cap: Option<String>,
+    /// The workflow file that defines its job (W06-R03's `job.workflow_*`, the OIDC token's
+    /// `job_workflow_ref`).
+    pub defined_in: DefinedIn,
     /// The workflow whose job this is (steps, env, defaults, outputs), for the runner.
     #[serde(skip)]
     pub workflow: Arc<Workflow>,
@@ -345,8 +364,26 @@ struct Scope {
     caller: Option<(usize, usize)>,
     depth: usize,
     perms_cap: Option<perms::Resolved>,
+    /// The most its legs' cache mode may be: its caller's (W08-R14).
+    cache_cap: Option<crate::store::cache::Mode>,
     secrets: SecretsSpec,
     nodes: Vec<usize>,
+    /// The workflow file that defines its jobs (W06-R03).
+    defined: DefinedIn,
+}
+
+/// The workflow file that defines a leg's job, as `job.workflow_*` say it (W06-R03): the run's
+/// own workflow, or a called one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DefinedIn {
+    /// `owner/repo/<path>@<ref>`.
+    pub workflow_ref: String,
+    pub workflow_sha: String,
+    /// `owner/repo`.
+    pub workflow_repository: String,
+    /// The file's path in its repository: `.github/workflows/build.yml`.
+    pub workflow_file_path: String,
 }
 
 /// A run's plan in progress.
@@ -529,14 +566,14 @@ impl RunPlan {
             run_env: Vec::new(),
             removed: BTreeMap::new(),
         };
-        plan.add_scope(wf, dialect, inputs, String::new(), String::new(), None, 0, None, SecretsSpec::Run);
+        plan.add_scope(wf, dialect, inputs, String::new(), String::new(), None, 0, None, None, SecretsSpec::Run);
         let mut out = Vec::new();
         plan.advance(src, &mut out);
         Ok((plan, out))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn add_scope(&mut self, wf: Arc<Workflow>, dialect: Dialect, inputs: Value, prefix: String, id_prefix: String, caller: Option<(usize, usize)>, depth: usize, perms_cap: Option<perms::Resolved>, secrets: SecretsSpec) -> usize {
+    fn add_scope(&mut self, wf: Arc<Workflow>, dialect: Dialect, inputs: Value, prefix: String, id_prefix: String, caller: Option<(usize, usize)>, depth: usize, perms_cap: Option<perms::Resolved>, cache_cap: Option<crate::store::cache::Mode>, secrets: SecretsSpec) -> usize {
         let s = self.scopes.len();
         let first = self.nodes.len();
         for (i, j) in wf.jobs.iter().enumerate() {
@@ -578,8 +615,24 @@ impl RunPlan {
                 node.leg_needs = leg_needs;
             }
         }
-        self.scopes.push(Scope { wf, dialect, inputs, prefix, id_prefix, caller, depth, perms_cap, secrets, nodes });
+        let defined = self.defined_in(&wf);
+        self.scopes.push(Scope { wf, dialect, inputs, prefix, id_prefix, caller, depth, perms_cap, cache_cap, secrets, nodes, defined });
         s
+    }
+
+    /// The workflow file that defines `wf`'s jobs (W06-R03): a remote one's origin, else the run's
+    /// own repository at the run's ref and commit, as `github.workflow_ref` says it for the run's
+    /// own workflow and GitHub says it for a `./` or `$/` one (the same commit).
+    fn defined_in(&self, wf: &Workflow) -> DefinedIn {
+        let github = |k: &str| match &self.github {
+            Value::Object(m) => m.get(k).map(Value::coerce_string).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let (repository, git_ref, sha) = match &wf.origin {
+            Some(o) => (o.repository.clone(), o.git_ref.clone(), o.sha.clone()),
+            None => (github("repository"), github("ref"), github("sha")),
+        };
+        DefinedIn { workflow_ref: format!("{repository}/{}@{git_ref}", wf.path), workflow_sha: sha, workflow_repository: repository, workflow_file_path: wf.path.clone() }
     }
 
     /// Whether the plan has finished, and how.
@@ -1297,6 +1350,8 @@ impl RunPlan {
             items,
             emulated,
             reads: reads(job),
+            cache_cap: None,
+            defined_in: scope.map(|s| s.defined.clone()).unwrap_or_default(),
             workflow: wf.clone(),
             job_index,
         };
@@ -1346,7 +1401,7 @@ impl RunPlan {
                 Some(d) => truthy(&yval(d, dialect, cx, "environment.deployment").map_err(|e| fail(&spec, e))?),
                 None => true,
             };
-            spec.environment = Some(EnvironmentSpec { name, url: e.url.as_ref().map(|u| u.src.clone()), deployment });
+            spec.environment = Some(EnvironmentSpec { name, url: e.url.as_ref().map(|u| u.src.clone()), deployment, preview: None });
         }
         if let Some(c) = &job.concurrency {
             spec.concurrency = Some(group(c, dialect, cx, "concurrency").map_err(|e| fail(&spec, e))?);
@@ -1356,6 +1411,7 @@ impl RunPlan {
             Some(cap) => own.min(cap),
             None => own,
         };
+        spec.cache_cap = scope.and_then(|s| s.cache_cap).map(|m| m.as_str().to_owned());
         if let Some(c) = &job.container {
             spec.container = Some(template(&c.image, dialect, cx, "container.image").map_err(|e| fail(&spec, e))?);
         }
@@ -1606,8 +1662,23 @@ impl RunPlan {
                 SecretsSpec::None
             }
         };
+        // W08-R14: the caller's cache mode (its job's, else its workflow's, else what capped it)
+        // caps the called workflow's; a called workflow or job asking for more doesn't start.
+        use crate::store::cache::Mode;
+        let outer = self.scope_of(n).and_then(|s| s.cache_cap);
+        let cache_cap = job.cache_mode.as_deref().or_else(|| self.scope_of(n).and_then(|s| s.wf.cache_mode.as_deref())).and_then(Mode::parse).or(outer);
+        if let Some(cap) = cache_cap {
+            let asks = wf.cache_mode.iter().map(|m| ("the workflow".to_owned(), m.as_str())).chain(wf.jobs.iter().filter_map(|j| j.cache_mode.as_deref().map(|m| (format!("its job `{}`", j.id), m))));
+            for (who, m) in asks {
+                if let Some(asked) = Mode::parse(m)
+                    && !asked.within(cap)
+                {
+                    return Err(format!("`{uses}` asks for `cache-mode: {}` ({who}), more than its caller's `cache-mode: {}` allows", asked.as_str(), cap.as_str()));
+                }
+            }
+        }
         let id_prefix = format!("{}{}/", self.scope_of(n).map(|s| s.id_prefix.clone()).unwrap_or_default(), self.nodes.get(n).map(|x| x.local.clone()).unwrap_or_default());
-        let scope = self.add_scope(wf, called_dialect, Value::object(inputs), format!("{leg_name} / "), id_prefix, Some((n, l)), depth, Some(leg_perms), secrets);
+        let scope = self.add_scope(wf, called_dialect, Value::object(inputs), format!("{leg_name} / "), id_prefix, Some((n, l)), depth, Some(leg_perms), cache_cap, secrets);
         if let Some(leg) = self.leg_mut(n, l) {
             leg.called = Some(scope);
         }

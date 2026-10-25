@@ -1,0 +1,217 @@
+/* How your agents stand (stands.tsx): under Mission control's head, a rule with a stretch for each
+   way they stand (stands-light.ts draws it, one string of light across them all), and under it
+   each one's badge and count. What CSS moves here is transform and opacity only: the badges and the counts' digits. */
+
+.st {
+  min-height: 26px;
+  margin: -6px 0 26px;
+}
+.st-lead {
+  max-width: 560px;
+  margin: -6px 0 26px;
+  color: #a1a4ad;
+  font-size: 14px;
+  line-height: 1.8;
+}
+@media (max-width: 640px) {
+  .st,
+  .st-lead {
+    margin: -2px 0 16px;
+  }
+}
+.st [data-stand] {
+  --st-t: #a1a4ad;
+}
+.st [data-stand="needs"] {
+  --st-t: #e2cfae;
+}
+.st [data-stand="crashed"] {
+  --st-t: #e2b9bd;
+}
+.st [data-stand="paused"] {
+  --st-t: #b8c2d3;
+}
+.st [data-stand="working"] {
+  --st-t: #cdc6ea;
+}
+.st [data-stand="finished"] {
+  --st-t: #bfdccf;
+}
+.st [data-stand="ready"] {
+  --st-t: #a1a4ad;
+}
+.st [data-stand="offline"] {
+  --st-t: #8b8e96;
+}
+
+/* The rule: a canvas taller than the line it was, so what floats about the string has room; it
+   takes the same room in the page (12 points and 9 under it), the string where the line was. */
+.st-rule {
+  display: block;
+  width: 100%;
+  height: 28px;
+  margin: -8px 0 1px;
+  pointer-events: none;
+}
+
+/* Under it, each one's badge and count, and on a desktop its name. */
+.st-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.st-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--st-t);
+}
+
+/* The badges: what each state is. Working's arc turns, needs you's bubble brightens and dims,
+   ready's light breathes. */
+.st-mark {
+  display: block;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  overflow: visible;
+}
+.st-turning {
+  animation: st-turn 1.4s linear infinite;
+}
+.st-calling {
+  animation: st-call 0.8s ease-in-out infinite alternate;
+}
+.st-breathing {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: st-breathe 1.3s ease-in-out infinite alternate;
+}
+
+/* A count: a cell a digit wide (--st-dw, the widest digit, measured) for each place, two at least,
+   so 9 going to 10 moves nothing beside it. A place whose digit changes rolls: up as the count
+   rises, down as it falls. */
+.st-n {
+  display: inline-flex;
+  flex: none;
+  height: 14px;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 450;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  line-height: 14px;
+}
+.st-d {
+  position: relative;
+  display: block;
+  flex: none;
+  width: var(--st-dw, 0.56em);
+  height: 14px;
+}
+.st-d > b {
+  position: absolute;
+  inset: 0;
+  font-weight: inherit;
+  text-align: center;
+}
+.st-in.st-up {
+  animation: st-in-up 0.45s var(--ease) both;
+}
+.st-out.st-up {
+  animation: st-out-up 0.45s var(--ease) both;
+}
+.st-in.st-down {
+  animation: st-in-down 0.45s var(--ease) both;
+}
+.st-out.st-down {
+  animation: st-out-down 0.45s var(--ease) both;
+}
+.st-probe {
+  position: absolute;
+  display: inline-block;
+  height: auto;
+  overflow: visible;
+  visibility: hidden;
+}
+
+.st-quiet,
+.st-word {
+  color: #97999f;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+@media (max-width: 640px) {
+  .st-word {
+    display: none;
+  }
+}
+
+@keyframes st-turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes st-call {
+  from {
+    opacity: 0.72;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes st-breathe {
+  from {
+    transform: scale(0.86);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+@keyframes st-in-up {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+}
+@keyframes st-out-up {
+  to {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+}
+@keyframes st-in-down {
+  from {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+}
+@keyframes st-out-down {
+  to {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .st *,
+  .st *::before,
+  .st *::after {
+    animation: none !important;
+  }
+  .st-out {
+    display: none;
+  }
+}
+/* Motion paused: a changed count shows its new digit at once. */
+html[data-motion="paused"] .st-out {
+  display: none;
+}
+html[data-motion="paused"] .st-in {
+  animation: none;
+}

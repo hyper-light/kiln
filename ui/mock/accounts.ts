@@ -18,6 +18,9 @@ import { randomBytes } from "node:crypto";
 import type { WebSocket } from "ws";
 import type { Account, AccountFlow, AccountMethod, AgentInfo, HEvent, Meta, SlashCommand, State } from "../src/api/harness.ts";
 import { longInfo } from "./conversation.ts";
+import { fleetCommand, fleetInfos } from "./push.ts";
+import { familyInfos } from "./agents.ts";
+import { fastInfos } from "./fast.ts";
 
 const now = () => Math.floor(Date.now() / 1000);
 const EMAIL = "ada@lundhe.audio";
@@ -361,11 +364,12 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
   const cm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/command$/);
   if (cm && m === "POST") {
     const d = demos.get(decodeURIComponent(cm[1] ?? ""));
+    const c = await body<{ type?: string; id?: string; value?: unknown; decision?: string }>(req);
     if (!d) {
-      json(res, 404, { error: "no such agent" });
+      if (fleetCommand(decodeURIComponent(cm[1] ?? ""), c)) json(res, 200, {});
+      else json(res, 404, { error: "no such agent" });
       return true;
     }
-    const c = await body<{ type?: string; id?: string; value?: unknown }>(req);
     if (c.type === "control" && c.id === "rename") {
       const n = typeof c.value === "string" ? c.value.trim() : "";
       d.info.name = n || d.info.kind_name;
@@ -399,7 +403,7 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
     return true;
   }
   if (p === "/api/harness/sessions" && m === "GET") {
-    json(res, 200, [...[...demos.values()].map((d) => d.info), longInfo()]);
+    json(res, 200, [...[...demos.values()].map((d) => d.info), longInfo(), ...fastInfos(), ...fleetInfos(), ...familyInfos()]);
     return true;
   }
 

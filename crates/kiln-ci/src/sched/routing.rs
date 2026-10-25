@@ -181,6 +181,16 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             v.push(d);
             i += 1;
         }
+        // A lone `=`, `&` or `|` (`os = linux`) is no symbol and no word: without this it was an
+        // empty word, again and again, never moving on.
+        if v.is_empty() {
+            let meant = match c {
+                '=' => "==",
+                '&' => "&&",
+                _ => "||",
+            };
+            return Err(format!("`{s}`: `{c}` alone isn't an operator (`{meant}`?)"));
+        }
         out.push(Tok::Word(v));
     }
     Ok(out)
@@ -512,6 +522,8 @@ pub struct RuleMatch {
     pub job: Option<String>,
     /// Repository globs.
     pub repos: Vec<String>,
+    /// Whether the leg's steps run containers themselves (`podman`, `buildah`: [`runs_containers`]).
+    pub nests_containers: Option<bool>,
 }
 
 /// A routing rule (W05-R21): declared, ordered data.
@@ -545,13 +557,22 @@ pub fn github_label_rules() -> Vec<Rule> {
     };
     vec![
         rule(&["ubuntu-latest"], "linux", "x86_64", "kiln/runner-ubuntu-24.04"),
+        rule(&["ubuntu-26.04"], "linux", "x86_64", "kiln/runner-ubuntu-26.04"),
         rule(&["ubuntu-24.04"], "linux", "x86_64", "kiln/runner-ubuntu-24.04"),
         rule(&["ubuntu-22.04"], "linux", "x86_64", "kiln/runner-ubuntu-22.04"),
+        rule(&["ubuntu-26.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-26.04"),
         rule(&["ubuntu-24.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-24.04"),
         rule(&["ubuntu-22.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-22.04"),
+        // GitHub's lightweight Ubuntu 24.04 in a container. Its smaller set of tools still has
+        // Node.js and npm, the Docker CLI, gh and PowerShell, which kiln's own `-slim` (the basics
+        // alone) leaves out: the full image has them.
+        rule(&["ubuntu-slim"], "linux", "x86_64", "kiln/runner-ubuntu-24.04"),
         rule(&["macos-latest"], "macos", "aarch64", ""),
+        rule(&["macos-26"], "macos", "aarch64", ""),
         rule(&["macos-15"], "macos", "aarch64", ""),
         rule(&["macos-14"], "macos", "aarch64", ""),
+        rule(&["macos-15-intel"], "macos", "x86_64", ""),
+        rule(&["macos-13"], "macos", "x86_64", ""),
         rule(&["windows-latest"], "windows", "x86_64", ""),
         rule(&["windows-2025"], "windows", "x86_64", ""),
         rule(&["windows-2022"], "windows", "x86_64", ""),
@@ -581,6 +602,8 @@ pub struct LegRoute {
     pub caps: u64,
     /// An untrusted leg's limits (W18-R07); `None` for a trusted one.
     pub untrusted: Option<Untrusted>,
+    /// Its steps run containers themselves ([`runs_containers`]).
+    pub nests_containers: bool,
 }
 
 /// Where untrusted legs may run (`ci.untrusted`, W18-R07).
@@ -611,6 +634,8 @@ pub struct Requirement {
     pub rules: Vec<usize>,
     /// Docker only when its engine runs rootless (an untrusted leg's, W18-R07).
     pub rootless_docker: bool,
+    /// The pool whose executors run it (W13-R09).
+    pub pool: Option<String>,
 }
 
 impl Requirement {
@@ -621,7 +646,16 @@ impl Requirement {
         labels.dedup();
         let mut cs: Vec<&str> = self.constraints.iter().map(|(s, _)| s.as_str()).collect();
         cs.sort_unstable();
-        format!("labels={};group={};req={};caps={:x};exec={}{}", labels.join(","), self.group.as_deref().unwrap_or(""), cs.join(" && "), self.caps, self.executors.join(","), if self.rootless_docker { ";rootless" } else { "" })
+        format!(
+            "labels={};group={};req={};caps={:x};exec={}{}{}",
+            labels.join(","),
+            self.group.as_deref().unwrap_or(""),
+            cs.join(" && "),
+            self.caps,
+            self.executors.join(","),
+            if self.rootless_docker { ";rootless" } else { "" },
+            self.pool.as_deref().map(|p| format!(";pool={p}")).unwrap_or_default()
+        )
     }
 }
 
@@ -633,19 +667,41 @@ fn rule_applies(r: &Rule, leg: &LegRoute) -> bool {
     if !m.repos.is_empty() && !m.repos.iter().any(|g| Pattern::new(g).is_ok_and(|p| p.matches(&leg.repo))) {
         return false;
     }
-    if let Some(j) = &m.job {
-        let Ok(c) = Condition::parse(j, &ParseOptions::permissive(Dialect::Kiln)) else { return false };
-        let cx = MapContexts::default()
-            .with("job", Value::object([("id".to_owned(), Value::str(&leg.job)), ("name".to_owned(), Value::str(&leg.job_name))]))
-            .with("workflow", Value::str(&leg.workflow))
-            .with("repo", Value::str(&leg.repo))
-            .with("event", Value::str(&leg.event));
-        if !expr::eval_condition(&c, &cx, &mut Budget::default()).unwrap_or(false) {
-            return false;
-        }
+    if let Some(j) = &m.job
+        && !job_condition(j, leg)
+    {
+        return false;
+    }
+    if m.nests_containers.is_some_and(|n| n != leg.nests_containers) {
+        return false;
     }
     // A rule with nothing to match applies to every leg (a fleet-wide default).
     true
+}
+
+/// Whether a `run:` script runs containers itself: calls `podman` or `buildah` as a command (at a
+/// line's start, after `;`, `&&`, `||`, `|`, `(` or a backquote, past `sudo`, `exec`, `time` and
+/// `NAME=value`), not in a comment. Their containers need what a container executor's container
+/// doesn't give (W13).
+pub fn runs_containers(script: &str) -> bool {
+    script.lines().map(str::trim_start).filter(|l| !l.starts_with('#')).any(|line| {
+        line.split([';', '|', '&', '(', '`']).any(|cmd| {
+            let mut words = cmd.split_whitespace().skip_while(|w| matches!(*w, "sudo" | "exec" | "time" | "-E") || (w.contains('=') && !w.starts_with('-')));
+            words.next().is_some_and(|w| matches!(w.trim_start_matches('\\'), "podman" | "buildah"))
+        })
+    })
+}
+
+/// Whether a condition over a leg holds (a rule's `match.job`, a reservation's `for`): over `job`
+/// (`id`, `name`), `workflow`, `repo` and `event`. One that doesn't parse holds for none.
+pub fn job_condition(src: &str, leg: &LegRoute) -> bool {
+    let Ok(c) = Condition::parse(src, &ParseOptions::permissive(Dialect::Kiln)) else { return false };
+    let cx = MapContexts::default()
+        .with("job", Value::object([("id".to_owned(), Value::str(&leg.job)), ("name".to_owned(), Value::str(&leg.job_name))]))
+        .with("workflow", Value::str(&leg.workflow))
+        .with("repo", Value::str(&leg.repo))
+        .with("event", Value::str(&leg.event));
+    expr::eval_condition(&c, &cx, &mut Budget::default()).unwrap_or(false)
 }
 
 /// A leg's requirement (W05-R19): rules that match it, in order, add their constraints and
@@ -674,6 +730,14 @@ pub fn resolve(leg: &LegRoute, rules: &[Rule]) -> Result<Requirement, String> {
     }
     for c in &leg.requires {
         req.constraints.push((c.clone(), Constraint::parse(c)?));
+    }
+    // Steps that run containers themselves can't in a container executor's container (`docker`,
+    // `k8s`): such a leg goes where it can, the other executors the rules allow, else a microVM.
+    if leg.nests_containers && req.executors.iter().any(|e| e == "docker" || e == "k8s") {
+        req.executors.retain(|e| e != "docker" && e != "k8s");
+        if req.executors.is_empty() {
+            req.executors = vec!["firecracker".to_owned()];
+        }
     }
     // An untrusted leg: only the executors the server lets untrusted code run on, whatever the
     // rules would have chosen (W18-R07).
@@ -861,9 +925,10 @@ mod tests {
         assert!(holds("!(os == windows) && executors has docker", &f, &[]));
         // Unknown facts are false, never errors.
         assert!(!holds("gpu.memory > 0", &f, &[]) && !holds("custom.rack == a1", &f, &[]) && holds("!custom.rack", &f, &[]));
-        for bad in ["", "os ==", "(os == linux", "arch in x86_64", "os == linux ]"] {
+        for bad in ["", "os ==", "(os == linux", "arch in x86_64", "os == linux ]", "os = linux", "label a & label b", "label a | label b"] {
             assert!(Constraint::parse(bad).is_err(), "{bad}");
         }
+        assert_eq!(Constraint::parse("os = linux"), Err("`os = linux`: `=` alone isn't an operator (`==`?)".into()));
         assert_eq!(number("50Gi"), Some(50.0 * 1024.0 * 1024.0 * 1024.0));
         assert_eq!(number("8m"), Some(480.0));
     }
@@ -903,8 +968,38 @@ mod tests {
         assert_eq!((req.rules.clone(), req.executors.clone()), (vec![0], vec!["firecracker".to_owned()]));
         let other = LegRoute { repo: "other/x".into(), ..leg.clone() };
         assert!(resolve(&other, &[rule])?.rules.is_empty());
+        // GitHub's newer labels, each its image.
+        for (label, image) in [("ubuntu-26.04", "kiln/runner-ubuntu-26.04"), ("ubuntu-26.04-arm", "kiln/runner-ubuntu-26.04"), ("ubuntu-slim", "kiln/runner-ubuntu-24.04")] {
+            let req = resolve(&LegRoute { labels: vec![label.into()], ..leg.clone() }, &github_label_rules())?;
+            assert_eq!(req.image.as_deref(), Some(image), "{label}");
+        }
         // The same requirement, the same signature.
         assert_eq!(resolve(&leg, &github_label_rules())?.signature(), resolve(&LegRoute { job: "test".into(), ..leg }, &github_label_rules())?.signature());
+        Ok(())
+    }
+
+    /// Steps that run containers themselves (rails' `podman build`): such a leg leaves container
+    /// executors for the others its rules allow, else a microVM, and a rule can match it to send
+    /// it to one (docs/ci.md W13).
+    #[test]
+    fn w13_a_leg_that_runs_podman_leaves_container_executors() -> Result<(), String> {
+        for script in ["podman build -t app .", "set -e\npodman run --rm app", "cd x && sudo podman ps", "FOO=1 buildah bud .", "echo $(podman --version)", "  podman \\\n  build ."] {
+            assert!(runs_containers(script), "{script:?}");
+        }
+        for script in ["echo podman", "# podman build", "docker build .", "./podman-compose up", "apt-get install podman-docker", "grep -r podman ."] {
+            assert!(!runs_containers(script), "{script:?}");
+        }
+        let leg = LegRoute { labels: vec!["ubuntu-latest".into()], nests_containers: true, ..LegRoute::default() };
+        assert_eq!(resolve(&leg, &github_label_rules())?.executors, vec!["host".to_owned()], "not in the runner image's container");
+        let docker_only = Rule { executor: vec!["docker".into()], ..Rule::default() };
+        assert_eq!(resolve(&leg, std::slice::from_ref(&docker_only))?.executors, vec!["firecracker".to_owned()]);
+        // The rule the corpus lab has: such legs to Firecracker microVMs, the image still the label's.
+        let microvm = Rule { matches: RuleMatch { nests_containers: Some(true), ..RuleMatch::default() }, executor: vec!["firecracker".into()], ..Rule::default() };
+        let rules: Vec<Rule> = std::iter::once(microvm).chain(github_label_rules()).collect();
+        let req = resolve(&leg, &rules)?;
+        assert_eq!((req.executors, req.image.as_deref()), (vec!["firecracker".to_owned()], Some("kiln/runner-ubuntu-24.04")));
+        let plain = resolve(&LegRoute { nests_containers: false, ..leg }, &rules)?;
+        assert_eq!(plain.executors, vec!["docker".to_owned(), "host".to_owned()], "others as before");
         Ok(())
     }
 

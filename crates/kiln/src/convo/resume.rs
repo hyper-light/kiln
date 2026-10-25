@@ -84,6 +84,10 @@ pub fn package(store: &Store, id: &str, from: &str, to: &str, cwd: Option<&str>)
         mode: non_empty(&state.mode),
         effort: non_empty(&state.effort),
         reach: state.reach.clone(),
+        // Who started it, and the plan run it works for, go along; so does a ceiling it had.
+        parent: info.parent.clone(),
+        plan_run: info.plan_run.clone(),
+        allow_bypass: !info.no_bypass,
         ..Spec::default()
     };
     Ok(moving::pack(id, spec, &goes_on_in, from, &from_cwd, carry, events, state))
@@ -99,7 +103,7 @@ mod tests {
     /// What a session is, as kiln makes it from a spec.
     fn info(kind: &str, own: Option<&str>) -> anyhow::Result<Info> {
         let spec = serde_json::json!({ "kind": kind, "cwd": "/work/parser", "name": "the parser" }).to_string();
-        let mut i = crate::harness::host::refusal("s1", &spec, "").into_iter().find_map(|u| if let Update::Open { info } = u { Some(*info) } else { None }).ok_or_else(|| anyhow::anyhow!("no info"))?;
+        let mut i = crate::harness::host::refusal("s1", &spec, "").into_iter().find_map(|u| if let Update::Open { info, .. } = u { Some(*info) } else { None }).ok_or_else(|| anyhow::anyhow!("no info"))?;
         i.harness_session = own.map(str::to_owned);
         i.exit = None;
         Ok(i)
@@ -108,10 +112,10 @@ mod tests {
     #[test]
     fn a_claude_session_is_packed_from_the_store_with_its_transcript_and_timeline() -> anyhow::Result<()> {
         let (_d, store) = crate::convo::store::scratch()?;
-        store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?) });
+        store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?), since: None });
         store.send("s1", &Update::State { state: Box::new(State { harness_session: Some("cc-1".into()), model: "opus".into(), epoch: 2, ..State::default() }) });
         store.send("s1", &Update::Events { events: vec![Event { id: "m1".into(), seq: 1, at: 5, parent: None, by: None, body: Body::Assistant { text: "done".into(), streaming: false } }] });
-        let line = |n: u64, l: &str| Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n, end: (n + 1) * 10, line: l.into() }));
+        let line = |n: u64, l: &str| Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n, end: (n + 1) * 10, line: l.into(), kept: None }));
         store.put(vec![line(0, "{\"a\":1}"), line(1, "{\"b\":2}")]);
         store.sync()?;
         let pkg = package(&store, "s1", "gone-box", "here", None)?;
@@ -132,14 +136,14 @@ mod tests {
     #[test]
     fn a_record_with_a_line_missing_is_refused() -> anyhow::Result<()> {
         let (_d, store) = crate::convo::store::scratch()?;
-        store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?) });
-        store.put(vec![Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n: 1, end: 20, line: "{}".into() }))]);
+        store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?), since: None });
+        store.put(vec![Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n: 1, end: 20, line: "{}".into(), kept: None }))]);
         store.sync()?;
         let err = package(&store, "s1", "gone-box", "here", None).err().map(|e| e.to_string()).unwrap_or_default();
         assert!(err.contains("missing line 0"), "{err}");
         // And nothing at all of it: refused too, saying why.
         let (_d2, empty) = crate::convo::store::scratch()?;
-        empty.send("s2", &Update::Open { info: Box::new(info("claude", Some("cc-2"))?) });
+        empty.send("s2", &Update::Open { info: Box::new(info("claude", Some("cc-2"))?), since: None });
         empty.sync()?;
         assert!(package(&empty, "s2", "gone-box", "here", None).is_err());
         Ok(())

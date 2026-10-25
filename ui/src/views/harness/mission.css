@@ -175,6 +175,10 @@
 .ms-row[data-stand="ready"] .ms-word > i {
   background: #6f8f84;
 }
+/* A subagent of its own running: its word and dot take the prism as it sweeps through them (signals.css). */
+.ms-row[data-stand] .ms-word.sg-shimmer > i {
+  background: #b8a6d5;
+}
 .ms-row[data-stand="offline"] .ms-name {
   color: #a1a4ad;
 }
@@ -216,6 +220,13 @@
 .ms-changes i {
   color: #d1aaad;
   font-style: normal;
+}
+.ms-change a:hover {
+  color: #fff;
+  text-decoration: underline;
+}
+.ms-change[data-state="landed"] {
+  color: #a8c9bc;
 }
 .ms-actions {
   grid-area: actions;
@@ -561,6 +572,10 @@ a.ms-why:hover {
   .ms-word {
     min-width: 0;
   }
+  /* The sweep spans the word, not the row. */
+  .ms-word.sg-shimmer {
+    align-self: flex-start;
+  }
   .ms-mark {
     display: none;
   }
@@ -633,7 +648,7 @@ a.ms-why:hover {
 }
 
 /* ---------------------------------------------------------------- how the list is shown, and messaging it */
-/* The filter field and the sort, side by side; stacked on a phone. */
+/* The filter field and the sort, side by side, on a phone too: there the sort gives way. */
 .ms-bar {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 220px;
@@ -642,7 +657,13 @@ a.ms-why:hover {
 }
 @container (max-width: 760px) {
   .ms-bar {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) minmax(0, 180px);
+  }
+}
+@container (max-width: 520px) {
+  .ms-bar {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 150px);
+    gap: 8px;
   }
 }
 
@@ -656,43 +677,10 @@ a.ms-why:hover {
   max-height: 200px;
   field-sizing: content;
 }
-.ms-msg-select {
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 190px;
-  height: 30px;
-  padding: 0 26px 0 9px;
-  border: 1px solid #303239;
-  border-radius: 5px;
-  background: #0b0c0e
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5l3 3 3-3' fill='none' stroke='%238f929b' stroke-width='1.3'/%3E%3C/svg%3E") right 9px
-    center / 10px no-repeat;
-  color: #c8cad0;
-  font-size: 12.5px;
-  text-overflow: ellipsis;
-  appearance: none;
-  cursor: pointer;
-}
-/* Three short words: it never gives way; the command select does. */
-.ms-msg-mode {
-  flex: none;
-}
-.ms-msg-select:hover:not(:disabled) {
-  border-color: #47464f;
-}
-.ms-msg-select:focus-visible {
-  border-color: #a5a0bf;
-  outline: 2px solid rgb(165 160 191 / 25%);
-  outline-offset: 1px;
-}
-.ms-msg-select:disabled {
-  color: #63666e;
-  cursor: default;
-}
-@media (pointer: coarse) {
-  .ms-msg-select {
-    height: 36px;
-  }
+/* What the agents are held to (permissions, model, effort), as the agent page's line above its
+   composer: each its own until one is chosen; then only those that have it are sent to, given it. */
+.ms-tuner {
+  margin: 0 0 10px 2px;
 }
 .ms-msg-field {
   position: relative;
@@ -795,11 +783,6 @@ a.ms-why:hover {
   font-size: 12.5px;
   cursor: pointer;
 }
-.ms-refresh {
-  margin-left: auto;
-  font-size: 12.5px;
-}
-
 /* A row's name, renamed in place: the field keeps the name's size. */
 .name-field.ms-name-field {
   margin-left: -9px;
@@ -838,4 +821,215 @@ a.ms-why:hover {
 }
 .ms-recover-none {
   color: #97999f;
+}
+
+/* ---------------------------------------------------------------- notifications, and a phone's page */
+/* One quiet line: notifications could be on here (push-offer.tsx). */
+.ms-offer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 14px;
+  margin: 0 0 8px;
+  padding: 0 4px;
+  color: #97999f;
+  font-size: 12.5px;
+  line-height: 20px;
+}
+.ms-offer .ms-link {
+  font-size: 12.5px;
+}
+.ms-offer-text {
+  min-width: 0;
+}
+.ms-offer-not {
+  color: #8f939e;
+}
+/* A phone's head is one line (PageIntro's `compact`), so the page starts higher. */
+@media (max-width: 640px) {
+  .ms-page {
+    padding-top: 16px;
+  }
+}
+/* On a phone the message box opens from the list's head, and folds back into it. */
+.ms-msg-open {
+  margin-left: auto;
+  font-size: 12.5px;
+}
+.ms-msg-open[aria-expanded="true"] .ms-chev {
+  transform: rotate(90deg);
+}
+.ms-listhead + .ms-msg {
+  margin: 4px 0 14px;
+}
+
+/* ---------------------------------------------------------------- by touch (touch-select.ts): no checkbox column;
+   hold a row (or Select) to pick, a mark beside each name while picking, the count and Done held in view */
+@media (pointer: coarse) {
+  /* The checkbox stays for a screen reader; the eye goes by the mark. */
+  .ms-row .ms-check {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .ms-row:not(.ms-found-row) {
+    grid-template-columns: minmax(0, 1fr) 168px 300px;
+    grid-template-areas: "main meta actions";
+    -webkit-touch-callout: none;
+    touch-action: pan-y;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  @container (max-width: 760px) {
+    .ms-row:not(.ms-found-row) {
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-areas:
+        "main main"
+        "meta actions";
+      padding-left: 12px;
+    }
+  }
+  .ms-listhead[data-selecting] {
+    position: sticky;
+    z-index: 3;
+    top: var(--header-h);
+    background: #08090a;
+  }
+}
+.ms-count {
+  color: #a1a4ad;
+  font-size: 12.5px;
+}
+.ms-listhead[data-selecting] .ms-count {
+  color: #eceef2;
+}
+.ms-picks {
+  display: inline-flex;
+  gap: 18px;
+  margin-left: auto;
+}
+.ms-select {
+  margin-left: auto;
+}
+.ms-done {
+  color: #eceef2;
+  font-weight: 450;
+}
+/* Picking: an open ring beside each name, filled and ticked when it's picked. */
+.ms-pick {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  margin: 0 10px -3px 0;
+  border: 1.5px solid rgb(255 255 255 / 34%);
+  border-radius: 50%;
+  vertical-align: baseline;
+  transition:
+    background-color 0.12s ease,
+    border-color 0.12s ease;
+}
+.ms-row[data-selected] .ms-pick {
+  border-color: #e7e9ee;
+  background: #e7e9ee
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.4l3 3 6-6.4' fill='none' stroke='%2308090a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    center / 12px no-repeat;
+}
+/* Swiped far enough: let go and it's picked (or put back). */
+.ms-row[data-swipe="ready"] {
+  box-shadow: inset 3px 0 0 #e7e9ee;
+}
+html[data-motion="paused"] .ms-pick {
+  transition: none;
+}
+.ms-select + .ms-msg-open {
+  margin-left: 0;
+}
+
+/* ---------------------------------------------------------------- the message box's To line: those picked
+   (each with its ×; @ in the field finds more), or everyone the list shows */
+.ms-to {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 8px 12px 0;
+  font-size: 12px;
+}
+.ms-to-label {
+  margin-right: 2px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #6d7078;
+}
+.ms-to-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  height: 24px;
+  padding: 0 4px 0 9px;
+  border: 1px solid #303239;
+  border-radius: 999px;
+  background: #121318;
+  color: #dfe1e6;
+}
+.ms-to-chip > button {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  color: #8b8e97;
+}
+.ms-to-chip > button:hover {
+  background: rgb(255 255 255 / 8%);
+  color: #eceef2;
+}
+.ms-to-all,
+.ms-to-more {
+  color: #a1a4ad;
+}
+.ms-msg-note {
+  margin-top: 6px;
+}
+@media (pointer: coarse) {
+  .ms-to-chip {
+    height: 30px;
+  }
+  .ms-to-chip > button {
+    width: 24px;
+    height: 24px;
+  }
+}
+/* Before the agents are known (RowsLoading): the bar and a few rows, in their own sizes. */
+.ms-loading-bar {
+  height: 40px;
+  margin-bottom: 18px;
+  border-radius: 7px;
+}
+.ms-row.ms-loading-row {
+  min-height: 86px;
+}
+.ms-loading-row .ms-main {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ms-loading-name {
+  height: 16px;
+}
+.ms-loading-line {
+  height: 11px;
+}
+.ms-loading-meta {
+  width: 120px;
+  height: 10px;
 }

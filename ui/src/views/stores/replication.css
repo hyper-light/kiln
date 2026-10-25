@@ -1,0 +1,550 @@
+/* Replication, live (replication.tsx): the approved design (kiln-design-previews/replication-databases). */
+.rp-figure {
+  position: relative;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid #29303b;
+  border-radius: 8px;
+  background: radial-gradient(ellipse at 59% 34%, #28324713, transparent 60%), #0a0c0f;
+  container-type: inline-size;
+}
+/* A prism hairline along its top. */
+.rp-figure::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 22%;
+  left: 22%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #b5d8cf60, #b5c6e680, #bda8d460, transparent);
+}
+.rp-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 25px 28px 0;
+}
+.rp-eyebrow {
+  margin: 0 0 10px;
+  color: #8c97a7;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+.rp-title {
+  margin: 0;
+  color: #e6e8ec;
+  font-size: 24px;
+  font-weight: 450;
+  line-height: 1.2;
+  letter-spacing: -0.7px;
+}
+.rp-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  color: #a8c9bc;
+  font-size: 12px;
+  white-space: nowrap;
+  transition: color 0.3s;
+}
+.rp-status::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.rp-status[data-tone="warn"] {
+  color: #d0b591;
+}
+.rp-status[data-tone="off"] {
+  color: #8f98a6;
+}
+.rp-stage {
+  position: relative;
+  width: 100%;
+  margin-top: 6px;
+}
+.rp-scene {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+.rp-portrait {
+  display: none;
+}
+@container (max-width: 700px) {
+  .rp-landscape {
+    display: none;
+  }
+  .rp-portrait {
+    display: block;
+    max-width: 420px;
+    margin: 30px auto 0;
+  }
+  .rp-head {
+    padding: 21px 18px 0;
+  }
+  .rp-title {
+    font-size: 22px;
+  }
+}
+
+/* The scene's words. */
+.rp-heading {
+  fill: #8d9aae;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+.rp-ink {
+  fill: #a2aab7;
+  font-size: 14px;
+}
+.rp-node-name {
+  fill: #d6dde6;
+  font-size: 15px;
+  letter-spacing: -0.2px;
+}
+.rp-sub {
+  fill: #8e9bab;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  transition: fill 0.3s;
+}
+.rp-sub[data-tone="ok"] {
+  fill: #a8c9bc;
+}
+.rp-sub[data-tone="warn"] {
+  fill: #d0b591;
+}
+.rp-sub[data-tone="off"] {
+  fill: #6f7887;
+}
+
+/* The databases. */
+.rp-shadow {
+  fill: #010305;
+  opacity: 0.7;
+}
+.rp-facet {
+  stroke-width: 0.7;
+  vector-effect: non-scaling-stroke;
+}
+.rp-rear {
+  fill: none;
+  stroke: #8296ac;
+  stroke-width: 0.55;
+  stroke-opacity: 0.13;
+  vector-effect: non-scaling-stroke;
+}
+.rp-ring {
+  fill: none;
+  vector-effect: non-scaling-stroke;
+}
+.rp-inner {
+  fill: #09111b28;
+  stroke: #a5c1d1;
+  stroke-width: 0.6;
+  stroke-opacity: 0.25;
+  vector-effect: non-scaling-stroke;
+}
+.rp-etch {
+  fill: none;
+  stroke: #b5c3d5;
+  stroke-width: 0.6;
+  stroke-opacity: 0.5;
+  vector-effect: non-scaling-stroke;
+}
+.rp-commit {
+  fill: none;
+  stroke: #bad8ca;
+  stroke-width: 1.3;
+  stroke-opacity: 0.36;
+  vector-effect: non-scaling-stroke;
+}
+
+/* The cables. */
+.rp-cable {
+  transition: opacity 0.25s;
+}
+.rp-cable[data-dim] {
+  opacity: 0.28;
+}
+.rp-cable[data-tone="off"] {
+  opacity: 0.25;
+}
+.rp-cable-shadow {
+  fill: none;
+  stroke: #141b25;
+  stroke-width: 5;
+  stroke-opacity: 0.55;
+  vector-effect: non-scaling-stroke;
+}
+.rp-cable-line {
+  fill: none;
+  stroke: #526278;
+  stroke-width: 0.8;
+  stroke-opacity: 0.55;
+  vector-effect: non-scaling-stroke;
+  transition: stroke 0.3s;
+}
+.rp-cable[data-tone="warn"] .rp-cable-line {
+  stroke: #c9aa84;
+}
+.rp-arrow {
+  fill: none;
+  stroke: #8196ad;
+  stroke-width: 0.7;
+  opacity: 0.58;
+}
+.rp-mark {
+  fill: none;
+  stroke: #d0b591;
+  stroke-width: 1.8;
+  stroke-opacity: 0.75;
+}
+
+/* Light on a cable while batches move on it: comets flowing its length one after another, a bright
+   head in a soft glow, about one arriving a batch (`--rp-period`, from the store's batch rate). Idle
+   cables stay still. Under the motion setting and for reduced motion a comet holds halfway along. */
+.rp-light path {
+  fill: none;
+  stroke: #b8c9e8;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+  animation: rp-flow var(--rp-period, 2.4s) linear var(--rp-delay, 0s) infinite;
+}
+.rp-light[data-kind="out"] path {
+  stroke: #b6d5c8;
+}
+.rp-light[data-warn] path {
+  stroke: #dbbd95;
+}
+.rp-light-halo {
+  stroke-width: 5;
+  stroke-opacity: 0.2;
+  stroke-dasharray: 16 34;
+}
+.rp-light .rp-light-core {
+  stroke-width: 1.6;
+  stroke-dasharray: 6 44;
+  animation-name: rp-flow-head;
+}
+@keyframes rp-flow {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: -50;
+  }
+}
+@keyframes rp-flow-head {
+  from {
+    stroke-dashoffset: -10;
+  }
+  to {
+    stroke-dashoffset: -60;
+  }
+}
+:root[data-motion="paused"] .rp-light path {
+  animation: none;
+}
+:root[data-motion="paused"] .rp-light-halo {
+  stroke-dasharray: 16 84;
+  stroke-dashoffset: -42;
+}
+:root[data-motion="paused"] .rp-light .rp-light-core {
+  stroke-dasharray: 6 94;
+  stroke-dashoffset: -52;
+}
+
+/* A store: picked, or pickable. */
+.rp-node {
+  cursor: pointer;
+  outline: none;
+}
+.rp-hit {
+  fill: transparent;
+  stroke: transparent;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+@media (hover: hover) {
+  .rp-node:hover .rp-hit {
+    fill: #b2bbd808;
+    stroke: #788ba65c;
+  }
+}
+.rp-node:focus-visible .rp-hit {
+  stroke: #b8b0d8;
+}
+.rp-node[data-selected] .rp-hit {
+  fill: #afbbd406;
+  stroke: #809ab54d;
+}
+
+/* What a picked store is doing, or replication as a whole. */
+.rp-readout {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  margin: 0 28px;
+  padding: 13px 0;
+  border-top: 1px solid #222a35;
+}
+.rp-readout-mark {
+  flex: none;
+  width: 21px;
+  height: 21px;
+  color: #a8c9bc;
+}
+.rp-readout-text {
+  flex: 1;
+  min-width: 0;
+}
+.rp-readout-title {
+  display: block;
+  color: #bcc6d3;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.rp-readout-note {
+  display: block;
+  margin-top: 3px;
+  color: #8693a4;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.rp-reset {
+  min-height: 44px;
+  padding: 12px 0 12px 12px;
+  border: 0;
+  background: transparent;
+  color: #beb4d8;
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.rp-legend {
+  display: flex;
+  gap: 16px;
+  margin-left: auto;
+  color: #8c98a9;
+  font-family: var(--font-mono);
+  font-size: 9px;
+}
+.rp-legend span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+.rp-legend i {
+  display: block;
+  width: 12px;
+  height: 2px;
+  border-radius: 2px;
+  background: #b5c9e5;
+  box-shadow: 0 0 5px #b5c9e540;
+}
+.rp-legend span:last-child i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #a8c9bc;
+  box-shadow: none;
+}
+
+/* The three numbers. */
+.rp-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  margin: 0;
+  padding: 20px 28px 22px;
+  border-top: 1px solid #252d38;
+  background: #0e121737;
+}
+.rp-metrics > div {
+  padding-left: 28px;
+  border-left: 1px solid #252d38;
+}
+.rp-metrics > div:first-child {
+  padding: 0;
+  border: 0;
+}
+.rp-metrics dt {
+  margin-bottom: 10px;
+  color: #8c99ab;
+  font-size: 11px;
+}
+.rp-metrics dd {
+  margin: 0;
+  color: #dce3eb;
+  font-family: var(--font-mono);
+  font-size: 23px;
+  line-height: 1;
+  letter-spacing: -0.8px;
+}
+.rp-metrics dd[data-tone="warn"] {
+  color: #d0b591;
+}
+.rp-slash {
+  margin: 0 6px;
+  color: #667487;
+  font-size: 15px;
+}
+.rp-word {
+  font-size: 19px !important;
+  letter-spacing: -0.5px !important;
+}
+.rp-word[data-tone="ok"] {
+  color: #a8c9bc;
+}
+.rp-word[data-tone="off"] {
+  color: #8f98a6;
+}
+.rp-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 12px 0 0;
+  color: #7e8a9a;
+  font-size: 11px;
+}
+.rp-foot span:last-child {
+  color: #6d7a8b;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  white-space: nowrap;
+}
+@container (max-width: 700px) {
+  .rp-readout {
+    gap: 10px;
+    min-height: 64px;
+    margin: 0 18px;
+    padding: 14px 0;
+  }
+  .rp-readout-note {
+    font-size: 10px;
+  }
+  .rp-readout-mark {
+    width: 18px;
+    height: 18px;
+  }
+  .rp-legend {
+    display: none;
+  }
+  .rp-metrics {
+    grid-template-columns: 1fr 0.8fr 1.25fr;
+    padding: 18px 18px 20px;
+  }
+  .rp-metrics > div {
+    padding-left: 14px;
+  }
+  .rp-metrics dt {
+    font-size: 10px;
+    white-space: nowrap;
+  }
+  .rp-metrics dd {
+    font-size: 21px;
+  }
+  .rp-word {
+    font-size: 17px !important;
+  }
+}
+@media (max-width: 640px) {
+  .rp-foot span:last-child {
+    display: none;
+  }
+}
+
+/* The replication log. */
+.rp-log {
+  margin-top: 40px;
+}
+.rp-log-lines {
+  max-height: 420px;
+  margin: 0;
+  padding: 10px 0;
+  overflow-y: auto;
+  border: 1px solid #2b2e39;
+  border-radius: 6px;
+  background: #101217;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.7;
+}
+.rp-log-lines li {
+  display: grid;
+  grid-template-columns: 64px 76px minmax(0, 1fr);
+  gap: 12px;
+  padding: 0 16px;
+  color: #c4cbd5;
+}
+.rp-log-lines time {
+  color: #6f7887;
+}
+.rp-log-kind {
+  color: #8c97a7;
+}
+.rp-log-lines li[data-kind="batch"] .rp-log-kind {
+  color: #aab8d2;
+}
+.rp-log-lines li[data-kind="ship"] .rp-log-kind {
+  color: #a8c9bc;
+}
+.rp-log-lines li[data-kind="restore"] .rp-log-kind {
+  color: #d0b591;
+}
+.rp-log-lines li[data-level="warn"] .rp-log-text {
+  color: #d0b591;
+}
+.rp-log-lines li[data-level="error"] .rp-log-text {
+  color: #d6a2aa;
+}
+.rp-log-text {
+  overflow-wrap: anywhere;
+}
+.rp-log-more {
+  margin: 8px 0 0;
+  color: #7e8a9a;
+  font-size: 11px;
+}
+@media (max-width: 640px) {
+  .rp-log-lines li {
+    grid-template-columns: 58px minmax(0, 1fr);
+    gap: 2px 10px;
+    padding: 4px 12px;
+  }
+  .rp-log-kind {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rp-light path {
+    animation: none;
+  }
+  .rp-light-halo {
+    stroke-dasharray: 16 84;
+    stroke-dashoffset: -42;
+  }
+  .rp-light .rp-light-core {
+    stroke-dasharray: 6 94;
+    stroke-dashoffset: -52;
+  }
+  .rp-cable,
+  .rp-status,
+  .rp-sub,
+  .rp-cable-line {
+    transition: none;
+  }
+}

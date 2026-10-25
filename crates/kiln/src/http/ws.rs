@@ -1,4 +1,4 @@
-//! WebSockets: upgrades on top of the hyper server (the RFC 6455 handshake is answered here) and
+//! WebSockets: upgrades on top of kiln-http's server (the RFC 6455 handshake is answered here) and
 //! client connections over kiln's own TCP / TLS setup (agents' HTTP tunnel, `crate::tunnel`). Both
 //! are framed by `async-tungstenite` (runtime-free; driven by hyper-rt).
 
@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use http::{StatusCode, header};
-use hyper::upgrade::Upgraded;
+use kiln_http::upgrade::Upgraded;
 
 use super::io::RtFuturesIo;
 use super::server::{Request, Response, empty};
@@ -15,37 +15,11 @@ use super::tls::{ClientTls, TlsStream};
 pub use tungstenite::Message;
 use tungstenite::protocol::WebSocketConfig;
 
-/// A server-side WebSocket over an upgraded hyper connection.
-pub type WebSocket = async_tungstenite::WebSocketStream<FuturesIo<Upgraded>>;
+/// A server-side WebSocket over an upgraded connection.
+pub type WebSocket = async_tungstenite::WebSocketStream<Upgraded>;
 
-/// Adapts hyper's IO traits to `futures-io`, which async-tungstenite speaks. Safe code only: the
-/// caller's buffer is already initialised, so hyper's `ReadBuf` can wrap it directly.
-pub struct FuturesIo<T>(pub T);
-
-impl<T: hyper::rt::Read + Unpin> futures::io::AsyncRead for FuturesIo<T> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
-        let mut rb = hyper::rt::ReadBuf::new(buf);
-        match Pin::new(&mut self.0).poll_read(cx, rb.unfilled()) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(rb.filled().len())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<T: hyper::rt::Write + Unpin> futures::io::AsyncWrite for FuturesIo<T> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
-    }
-
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
-    }
-}
+/// Its sending half (`WebSocket::split`).
+pub type Sender = async_tungstenite::WebSocketSender<Upgraded>;
 
 /// Is this a WebSocket upgrade request?
 pub fn is_upgrade(req: &Request) -> bool {
@@ -68,7 +42,7 @@ pub struct Refused {
 }
 
 /// Answer the handshake. Returns the `101 Switching Protocols` response to send, and a future
-/// that yields the WebSocket once hyper has handed the connection over (spawn it).
+/// that yields the WebSocket once the connection has been handed over (spawn it).
 pub fn accept(
     req: Request,
 ) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
@@ -101,9 +75,9 @@ pub fn accept_limited(
         h.insert(header::SEC_WEBSOCKET_ACCEPT, v);
     }
     let upgrade = async move {
-        let upgraded = hyper::upgrade::on(req).await.map_err(|e| anyhow::anyhow!("upgrade: {e}"))?;
+        let upgraded = kiln_http::upgrade::on(req).await.map_err(|e| anyhow::anyhow!("upgrade: {e}"))?;
         let ws = async_tungstenite::WebSocketStream::from_raw_socket(
-            FuturesIo(upgraded),
+            upgraded,
             tungstenite::protocol::Role::Server,
             Some(limits(max_message)),
         )
@@ -120,7 +94,7 @@ fn limits(max_message: usize) -> WebSocketConfig {
 /// The connection under a client WebSocket: plain TCP, or TLS over it.
 pub enum ClientIo {
     Plain(RtFuturesIo),
-    Tls(Box<FuturesIo<TlsStream<RtFuturesIo>>>),
+    Tls(Box<TlsStream<RtFuturesIo>>),
 }
 
 impl futures::io::AsyncRead for ClientIo {
@@ -164,6 +138,12 @@ pub type ClientSocket = async_tungstenite::WebSocketStream<ClientIo>;
 /// checked), masked frames, fragments, ping / pong and close. One message (and one frame) may hold
 /// up to `max_message` bytes; a server that sends more is disconnected.
 pub async fn connect(tls: &ClientTls, url: &str, max_message: usize) -> anyhow::Result<ClientSocket> {
+    connect_with(tls, url, &[], max_message).await
+}
+
+/// [`connect`], with `headers` on the handshake (an `authorization`, say).
+pub async fn connect_with(tls: &ClientTls, url: &str, headers: &[(&str, &str)], max_message: usize) -> anyhow::Result<ClientSocket> {
+    use tungstenite::client::IntoClientRequest as _;
     let uri: http::Uri = url.parse().map_err(|e| anyhow::anyhow!("bad url {url}: {e}"))?;
     let secure = match uri.scheme_str() {
         Some("wss" | "https") => true,
@@ -180,12 +160,16 @@ pub async fn connect(tls: &ClientTls, url: &str, max_message: usize) -> anyhow::
         let stream = TlsStream::connect(RtFuturesIo::new(tcp), tls.config()?, super::tls::server_name(host)?)
             .await
             .map_err(|e| anyhow::anyhow!("TLS to {host}: {e}"))?;
-        ClientIo::Tls(Box::new(FuturesIo(stream)))
+        ClientIo::Tls(Box::new(stream))
     } else {
         ClientIo::Plain(RtFuturesIo::new(tcp))
     };
     let target = format!("{}://{authority}{path}", if secure { "wss" } else { "ws" });
-    let (ws, _) = async_tungstenite::client_async_with_config(target, io, Some(limits(max_message)))
+    let mut request = target.into_client_request().map_err(|e| anyhow::anyhow!("WebSocket request to {url}: {e}"))?;
+    for (k, v) in headers {
+        request.headers_mut().insert(http::HeaderName::from_bytes(k.as_bytes())?, http::HeaderValue::from_str(v)?);
+    }
+    let (ws, _) = async_tungstenite::client_async_with_config(request, io, Some(limits(max_message)))
         .await
         .map_err(|e| anyhow::anyhow!("WebSocket handshake with {url}: {e}"))?;
     Ok(ws)

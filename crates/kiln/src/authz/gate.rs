@@ -47,6 +47,8 @@ pub enum Kind {
     Pat,
     Agent,
     Job,
+    /// Someone from a peered cluster, by its grant (`crate::peers`).
+    Peer,
 }
 
 /// A request's caller.
@@ -60,6 +62,10 @@ pub struct Caller {
     pub user: Option<String>,
     /// The token it signed in with (`tokens.id`).
     pub token: Option<String>,
+    /// The agent session it is, when it's one kiln runs: set from how it reached kiln (its MCP
+    /// token, its runner vouching for it, the machine's socket seeing its process), never from
+    /// what it asks. An agent it starts is that agent's child (`harness::lineage`).
+    pub agent: Option<String>,
     /// What the principal may do; `None`: everything.
     rights: Option<Rights>,
     /// A token's own grant: the caller does at most what both allow.
@@ -68,12 +74,32 @@ pub struct Caller {
 
 impl Caller {
     pub fn owner() -> Caller {
-        Caller { kind: Kind::Owner, name: "admin".into(), user: None, token: None, rights: None, limit: None }
+        Caller { kind: Kind::Owner, name: "admin".into(), user: None, token: None, agent: None, rights: None, limit: None }
     }
 
     /// A caller with these rights, for tests and for checks made on someone's behalf.
     pub fn with(kind: Kind, name: &str, rights: Option<Rights>, limit: Option<Rights>) -> Caller {
-        Caller { kind, name: name.to_owned(), user: None, token: None, rights, limit }
+        Caller { kind, name: name.to_owned(), user: None, token: None, agent: None, rights, limit }
+    }
+
+    /// Someone from a peered cluster, with `role` on this whole server (`crate::peers::caller`).
+    pub fn peer(name: &str, role: &str) -> Caller {
+        let rights = Rights { grants: vec![Grant { what: role.to_owned(), scope: Scope::Server, deny: false }], custom: HashMap::new() };
+        Caller { kind: Kind::Peer, name: name.to_owned(), user: None, token: None, agent: None, rights: Some(rights), limit: None }
+    }
+
+    /// The highest built-in role it holds on the whole server (the owner: admin), which is the
+    /// most it may carry into a peered cluster; `None`: none on the whole server.
+    pub fn server_role(&self) -> Option<&'static str> {
+        let best = |r: &Rights| crate::peers::codes::ROLES.iter().rev().copied().find(|role| r.grants.iter().any(|g| !g.deny && g.what == *role && g.scope == Scope::Server));
+        let mine = match &self.rights {
+            Some(r) => best(r)?,
+            None => "admin",
+        };
+        match &self.limit {
+            Some(l) => crate::peers::codes::lower(mine, best(l)?),
+            None => Some(mine),
+        }
     }
 
     /// Whether it may do everything: the owner, or an owner's token without a grant of its own.
@@ -98,9 +124,48 @@ impl Caller {
         capability == SIGNED_IN || [&self.rights, &self.limit].into_iter().all(|r| r.as_ref().is_none_or(|r| r.allows(capability, target)))
     }
 
+    /// An agent session's caller (which has no token, so no limit of its own), doing at most what
+    /// `limit` allows too: an attached agent's capabilities (`crate::ci::attach`).
+    pub fn limited_to(mut self, limit: Rights) -> Caller {
+        if self.limit.is_none() {
+            self.limit = Some(limit);
+        }
+        self
+    }
+
+    /// Whether its token's own grant, if it has one, allows `capability` in `target`: how far a
+    /// token may go on what its user is (an app's owner team, docs/deploy-api.md §15).
+    pub fn token_allows(&self, capability: &str, target: &Scope) -> bool {
+        self.limit.as_ref().is_none_or(|l| l.allows(capability, target))
+    }
+
+    /// Whether its token's own grant, if it has one, gives `capability` anywhere.
+    pub fn token_somewhere(&self, capability: &str) -> bool {
+        self.limit.as_ref().is_none_or(|l| l.somewhere(capability))
+    }
+
     /// Whether it has `capability` anywhere (a route that narrows by itself).
     pub fn has_somewhere(&self, capability: &str) -> bool {
         capability == SIGNED_IN || [&self.rights, &self.limit].into_iter().all(|r| r.as_ref().is_none_or(|r| r.somewhere(capability)))
+    }
+
+    /// What a run it starts records of it (W10-R02's `secrets.use`), so its legs are given only
+    /// the secrets it may use: whom it acts for (their grants read again as each leg starts), or
+    /// the grants it has without a user (a peered cluster's), and a token's own grant as it was
+    /// then (an agent's token is rotated while its run waits). `None` when it may use any (the
+    /// owner, an owner's token without a grant of its own) or is a job, whose run's trust its
+    /// runs share.
+    pub fn started_by(&self) -> Option<serde_json::Value> {
+        if self.kind == Kind::Job || self.is_owner() {
+            return None;
+        }
+        let texts = |r: &Rights| r.grants.iter().map(Grant::text).collect::<Vec<_>>();
+        Some(serde_json::json!({
+            "name": self.name,
+            "user": self.user,
+            "rights": if self.user.is_none() { self.rights.as_ref().map(texts) } else { None },
+            "limit": self.limit.as_ref().map(texts),
+        }))
     }
 
     /// The grants it holds (a token's: its own), for `/api/me`.
@@ -116,9 +181,24 @@ impl Caller {
 
 // ------------------------------------------------------------------ who
 
+/// The repositories `caller` may `capability` in, by name: what a list narrowed row by row keeps
+/// (W10). `None` when it may anywhere, the server's scope.
+pub async fn readable(hub: &Hub, caller: &Caller, capability: &str) -> Option<Vec<String>> {
+    if caller.can(capability, &Scope::Server) {
+        return None;
+    }
+    let repos = hub.store.repos().await.unwrap_or_default();
+    Some(repos.into_iter().filter(|r| caller.can(capability, &Scope::Repo { repo: r.name.clone() })).map(|r| r.name).collect())
+}
+
 /// The caller of a request the owner didn't make: a token, or a user's session. `None`: nobody
 /// kiln knows (or a token that is revoked or expired).
 pub async fn caller(hub: &Hub, bearer: Option<&str>, session: Option<&str>) -> Option<Caller> {
+    // Someone a peered cluster forwards: its grant comes as the session (or a bearer token).
+    let peer = crate::peers::codes::GRANT_PREFIX;
+    if let Some(g) = bearer.map(str::trim).filter(|t| t.starts_with(peer)).or_else(|| session.filter(|s| s.starts_with(peer))) {
+        return crate::peers::caller(hub, g);
+    }
     if let Some(t) = bearer.map(str::trim) {
         if t.starts_with(PAT_PREFIX) || t.starts_with(AGENT_PREFIX) {
             return token(hub, t).await;
@@ -140,17 +220,128 @@ fn store_err(e: anyhow::Error) -> Option<Caller> {
 /// Audited as `<name> for <who>`. `None`: that user is gone or disabled.
 pub async fn agent_for(hub: &Hub, name: &str, opener: &str) -> Option<Caller> {
     if opener == "owner" {
-        return Some(Caller { kind: Kind::Agent, name: format!("{name} for admin"), user: None, token: None, rights: None, limit: None });
+        return Some(Caller { kind: Kind::Agent, name: format!("{name} for admin"), user: None, token: None, agent: None, rights: None, limit: None });
     }
     let uid = opener.strip_prefix("user:")?.to_owned();
     let name = name.to_owned();
     hub.store
         .call(move |c| {
             let Some((who, rights)) = user_rights(c, &uid)? else { return Ok(None) };
-            Ok(Some(Caller { kind: Kind::Agent, name: format!("{name} for user:{who}"), user: Some(uid), token: None, rights: Some(rights), limit: None }))
+            Ok(Some(Caller { kind: Kind::Agent, name: format!("{name} for user:{who}"), user: Some(uid), token: None, agent: None, rights: Some(rights), limit: None }))
         })
         .await
         .unwrap_or_else(store_err)
+}
+
+/// Of `names`, the secrets the principal a run recorded ([`Caller::started_by`]) may not have
+/// given to its legs in `target` (`secrets.use:<NAME>`): judged by the user it acts for as they
+/// are now (gone or disabled: none), within the grants it started with.
+pub async fn withheld_secrets(hub: &Hub, by: &serde_json::Value, names: Vec<String>, target: &Scope) -> Vec<String> {
+    // Several principals (a land queue batch's landers): what any of them may not have.
+    let each: Vec<&serde_json::Value> = match by.get("all").and_then(serde_json::Value::as_array) {
+        Some(all) => all.iter().collect(),
+        None => vec![by],
+    };
+    let mut out: Vec<String> = Vec::new();
+    for one in each {
+        for n in withheld_from(hub, one, names.clone(), target).await {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
+/// [`withheld_secrets`] for one principal.
+async fn withheld_from(hub: &Hub, by: &serde_json::Value, names: Vec<String>, target: &Scope) -> Vec<String> {
+    let grants = |k: &str| by.get(k).and_then(serde_json::Value::as_array).map(|l| l.iter().filter_map(|g| g.as_str().and_then(|t| Grant::parse(t).ok())).collect::<Vec<_>>());
+    let (user, rights, limit) = (by.get("user").and_then(serde_json::Value::as_str).map(str::to_owned), grants("rights"), grants("limit"));
+    let target = target.clone();
+    let all = names.clone();
+    hub.store
+        .call(move |c| {
+            let custom = custom_roles(c)?;
+            let live = match &user {
+                Some(uid) => match user_rights(c, uid)? {
+                    Some((_, r)) => Some(r),
+                    None => return Ok(names),
+                },
+                None => rights.map(|grants| Rights { grants, custom: custom.clone() }),
+            };
+            let limit = limit.map(|grants| Rights { grants, custom });
+            Ok(names.into_iter().filter(|n| ![&live, &limit].into_iter().flatten().all(|r| r.allows(&format!("secrets.use:{n}"), &target))).collect())
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "whose secrets these are could not be read; the leg gets none");
+            all
+        })
+}
+
+/// Whether the principal a run recorded ([`Caller::started_by`]) may `capability` at `target`, as
+/// [`withheld_secrets`] judges a secret: by the user it acts for as they are now (gone or
+/// disabled: no), within the grants it started with; every one of a batch's (`all`).
+pub async fn starter_may(hub: &Hub, by: &serde_json::Value, capability: &str, target: &Scope) -> bool {
+    let each: Vec<&serde_json::Value> = match by.get("all").and_then(serde_json::Value::as_array) {
+        Some(all) => all.iter().collect(),
+        None => vec![by],
+    };
+    for one in each {
+        let grants = |k: &str| one.get(k).and_then(serde_json::Value::as_array).map(|l| l.iter().filter_map(|g| g.as_str().and_then(|t| Grant::parse(t).ok())).collect::<Vec<_>>());
+        let (user, rights, limit) = (one.get("user").and_then(serde_json::Value::as_str).map(str::to_owned), grants("rights"), grants("limit"));
+        let (what, target) = (capability.to_owned(), target.clone());
+        let may = hub
+            .store
+            .call(move |c| {
+                let custom = custom_roles(c)?;
+                let live = match &user {
+                    Some(uid) => match user_rights(c, uid)? {
+                        Some((_, r)) => Some(r),
+                        None => return Ok(false),
+                    },
+                    None => rights.map(|grants| Rights { grants, custom: custom.clone() }),
+                };
+                let limit = limit.map(|grants| Rights { grants, custom });
+                Ok([&live, &limit].into_iter().flatten().all(|r| r.allows(&what, &target)))
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %format!("{e:#}"), "what a run's starter may do could not be read; taken as nothing");
+                false
+            });
+        if !may {
+            return false;
+        }
+    }
+    true
+}
+
+/// User `id` as a caller, as they are now (disabled or gone: none): who something they said
+/// elsewhere acts as (a reply to kiln's review email, or in a chat's thread: docs/ci.md W14-R05).
+pub async fn user_caller(hub: &Hub, id: &str) -> Option<Caller> {
+    let id = id.to_owned();
+    hub.store
+        .call(move |c| {
+            Ok(user_rights(c, &id)?.map(|(name, rights)| Caller {
+                kind: Kind::User,
+                name: format!("user:{name}"),
+                user: Some(id.clone()),
+                token: None,
+                agent: None,
+                rights: Some(rights),
+                limit: None,
+            }))
+        })
+        .await
+        .unwrap_or_else(store_err)
+}
+
+/// Whether user `id`, as they are now, may `capability` in `target` (disabled or gone: no): what a
+/// person's own notification rules are held to (W19-R06).
+pub async fn user_may(hub: &Hub, id: &str, capability: &str, target: &Scope) -> bool {
+    let (id, capability, target) = (id.to_owned(), capability.to_owned(), target.clone());
+    hub.store.call(move |c| Ok(user_rights(c, &id)?.is_some_and(|(_, r)| r.allows(&capability, &target)))).await.unwrap_or(false)
 }
 
 /// Whether anyone but the owner can sign in here.
@@ -217,7 +408,7 @@ async fn token(hub: &Hub, t: &str) -> Option<Caller> {
             let limit = Rights { grants: token_grants(&scopes), custom: custom_roles(c)? };
             let short: String = id.chars().take(12).collect();
             let name = if agent { format!("{principal} for {who}") } else { format!("pat:{short} of {who}") };
-            Ok(Some(Caller { kind: if agent { Kind::Agent } else { Kind::Pat }, name, user, token: Some(id), rights, limit: Some(limit) }))
+            Ok(Some(Caller { kind: if agent { Kind::Agent } else { Kind::Pat }, name, user, token: Some(id), agent: None, rights, limit: Some(limit) }))
         })
         .await
         .unwrap_or_else(store_err)
@@ -243,10 +434,18 @@ async fn job(hub: &Hub, t: &str) -> Option<Caller> {
     if j.may("environments", Level::Write) {
         give(&["environments.deploy"], &here);
     }
+    // kiln's registry (docs/ci.md W12-R01): its names under the job's repository, by GitHub's
+    // `packages` or kiln's `registry: push`.
+    if j.may("packages", Level::Read) || j.may("registry", Level::Read) {
+        give(&["artifacts.read"], &here);
+    }
+    if j.may("packages", Level::Write) || j.may("registry", Level::Write) {
+        give(&["artifacts.write"], &here);
+    }
     if j.may("binaries", Level::Write) {
         give(&["binaries.publish"], &Scope::Server);
     }
-    Some(Caller { kind: Kind::Job, name: format!("job:{}", j.leg), user: None, token: None, rights: Some(Rights { grants, custom: HashMap::new() }), limit: None })
+    Some(Caller { kind: Kind::Job, name: format!("job:{}", j.leg), user: None, token: None, agent: None, rights: Some(Rights { grants, custom: HashMap::new() }), limit: None })
 }
 
 // ------------------------------------------------------------------ users' sessions
@@ -282,7 +481,7 @@ async fn user_session(hub: &Hub, value: &str) -> Option<Caller> {
                 return Ok(None);
             }
             let Some((name, rights)) = user_rights(c, &id)? else { return Ok(None) };
-            Ok(Some(Caller { kind: Kind::User, name: format!("user:{name}"), user: Some(id), token: None, rights: Some(rights), limit: None }))
+            Ok(Some(Caller { kind: Kind::User, name: format!("user:{name}"), user: Some(id), token: None, agent: None, rights: Some(rights), limit: None }))
         })
         .await
         .unwrap_or_else(store_err)
@@ -371,7 +570,7 @@ async fn target(hub: &Hub, at: At, segs: &[&str], q: &HashMap<String, String>) -
             Some(r) => repo_scope(hub, r).await,
             None => Scope::Server,
         },
-        At::Server | At::Anywhere | At::Own => Scope::Server,
+        At::Server | At::Anywhere | At::Own | At::Deploy => Scope::Server,
     }
 }
 
@@ -396,7 +595,8 @@ pub async fn repo_scope(hub: &Hub, s: &str) -> Scope {
 /// anywhere, or the caller's own).
 pub fn decide(caller: &Caller, rule: &super::Rule, target: Option<&Scope>) -> bool {
     match (rule.at, target) {
-        (At::Anywhere, _) => caller.has_somewhere(rule.capability),
+        // The owner-team half of a deploy route needs the store: [`check`] adds it.
+        (At::Anywhere | At::Deploy, _) => caller.has_somewhere(rule.capability),
         (At::Own, _) => caller.kind != Kind::Job,
         (_, Some(t)) => caller.can(rule.capability, t),
         (_, None) => caller.can(rule.capability, &Scope::Server),
@@ -410,10 +610,19 @@ pub async fn check(hub: &Hub, caller: &Caller, method: &Method, segs: &[&str], q
     }
     let rule = super::rule(method, segs);
     let scope = match rule.at {
-        At::Anywhere | At::Own => None,
+        At::Anywhere | At::Own | At::Deploy => None,
         at => Some(target(hub, at, segs, q).await),
     };
     if decide(caller, rule, scope.as_ref()) {
+        return Ok(());
+    }
+    // A person in a group may be in an app's owner team (docs/deploy-api.md §15), as far as their
+    // token lets them deploy anywhere: the handler checks which app, and where.
+    if rule.at == At::Deploy
+        && let Some(user) = &caller.user
+        && caller.token_somewhere(rule.capability)
+        && !super::groups::of_user(hub, user).await.unwrap_or_default().is_empty()
+    {
         return Ok(());
     }
     let on = scope.map(|s| format!(" on {}", s.text())).unwrap_or_default();
@@ -448,7 +657,7 @@ mod tests {
                 }
                 // On one repository: that repository only (and the routes that narrow themselves).
                 let scoped = Caller::with(Kind::User, name, Some(rights(&[&format!("{name}@repo:acme/app")])), None);
-                let narrows = matches!(rule.at, At::Anywhere | At::Own);
+                let narrows = matches!(rule.at, At::Anywhere | At::Own | At::Deploy);
                 assert_eq!(decide(&scoped, rule, Some(&app)), has(rule.capability) || rule.at == At::Own, "{name}@repo: {} on its repository", rule.pattern);
                 assert_eq!(decide(&scoped, rule, Some(&other)), rule.capability == SIGNED_IN || rule.at == At::Own || (narrows && has(rule.capability)), "{name}@repo: {} elsewhere", rule.pattern);
                 assert_eq!(decide(&scoped, rule, Some(&Scope::Server)), rule.capability == SIGNED_IN || rule.at == At::Own || (narrows && has(rule.capability)), "{name}@repo: {} on the server", rule.pattern);
@@ -458,7 +667,7 @@ mod tests {
             let agent = Caller::with(Kind::Agent, "agent:fix", Some(rights(&["maintainer"])), Some(rights(&["viewer@repo:acme/app"])));
             let reads = role("viewer").unwrap_or_default().contains(&rule.capability) || rule.capability == SIGNED_IN;
             assert_eq!(decide(&agent, rule, Some(&app)), reads || rule.at == At::Own, "agent: {} on its repository", rule.pattern);
-            let narrows = matches!(rule.at, At::Anywhere | At::Own);
+            let narrows = matches!(rule.at, At::Anywhere | At::Own | At::Deploy);
             assert_eq!(decide(&agent, rule, Some(&other)), rule.capability == SIGNED_IN || rule.at == At::Own || (narrows && reads), "agent: {} elsewhere", rule.pattern);
             // A deny wins over the role.
             let denied = Caller::with(Kind::User, "d", Some(rights(&["admin", &format!("!{}@repo:acme/app", rule.capability)])), None);

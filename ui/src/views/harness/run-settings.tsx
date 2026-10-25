@@ -10,7 +10,7 @@
  *   The other harnesses' models on the agent's machine follow, by harness: choosing one goes on
  *   there (at the end of the turn under way), the conversation carried over.
  *
- * A choice applies at once, "· UNDO" waits on the line for a few seconds, and the setting folds
+ * A choice applies at once, Undo waits beside the turn timer for a few seconds, and the setting folds
  * away shortly after. Nothing pops up or covers the conversation.
  *
  * `SendWith` is the composer's row for a single message: the same, max effort, or another model.
@@ -412,6 +412,8 @@ export interface RunSettingsProps {
   mode: string;
   /** Leave out when the harness can't change permissions: the value then shows as plain text. */
   onMode?: (id: string) => void;
+  /** A running turn can be interrupted and continued with the current permission preset. */
+  modeCanReapply?: boolean;
   models: ModelOption[];
   model: string;
   /** With the harness the model is in: the agent's own (`harness`) or one of `elsewhere`. */
@@ -428,6 +430,8 @@ export interface RunSettingsProps {
   appliesNextTurn?: { mode?: boolean; model?: boolean; effort?: boolean };
   running?: boolean;
   className?: string;
+  /** Related controls on the same line, divided from the run settings. */
+  trailing?: React.ReactNode;
 }
 
 /** A change just made: what the line shows until the agent reports otherwise, and what Undo restores. */
@@ -453,6 +457,7 @@ export function RunSettings({
   modes,
   mode,
   onMode,
+  modeCanReapply = false,
   models,
   model,
   onModel,
@@ -465,6 +470,7 @@ export function RunSettings({
   appliesNextTurn,
   running = false,
   className,
+  trailing,
 }: RunSettingsProps) {
   const [open, setOpen] = React.useState<Kind | null>(null);
   const [change, setChange] = React.useState<Change | null>(null);
@@ -482,13 +488,16 @@ export function RunSettings({
 
   const actual: Record<Kind, string> = { mode, model, effort };
   const shown = (k: Kind) => (change?.kind === k && actual[k] === change.base ? change.to : actual[k]);
+  // Codex's Custom label describes separate controls; it isn't a preset that can be selected.
+  const isPreset = (id: string) => modes.some((m) => m.id === id) && !(harness === "codex" && id === "custom");
+  const availableModes = modes.filter((m) => isPreset(m.id) || m.id === shown("mode"));
   // The other harnesses' models, by harness (they switch the agent there).
   const groups = onModel ? elsewhere.filter((h) => h.models.length > 0).map((h) => ({ ...h, words: h.models.map((m) => ({ ...modelWord(m, modelLabel), kind: h.kind })) })) : [];
   const others = groups.flatMap((g) => g.words);
   // The agent's own models (its current one among them, unless that is another harness's: a switch waiting).
   const own = modelWords(models, others.some((w) => w.id === shown("model")) ? "" : shown("model"), modelLabel);
   const sets: Record<Kind, { words: Word[]; count: number; pick?: (id: string) => void }> = {
-    mode: { words: modeWords(modes, shown("mode")), count: modes.length, pick: onMode },
+    mode: { words: modeWords(availableModes, shown("mode")), count: availableModes.length, pick: onMode },
     model: { words: [...own, ...others], count: models.length + others.length, pick: onModel },
     effort: { words: effortWords(efforts, shown("effort")), count: efforts.length, pick: onEffort },
   };
@@ -505,7 +514,7 @@ export function RunSettings({
   }, []);
 
   // Undo is offered for a few seconds, longer while a keyboard or mouse is on it. The top line shows
-  // the change (and Undo) meanwhile: its timer, set again whenever either changes.
+  // the change meanwhile: its timer, set again whenever either changes.
   const lasting = React.useCallback(
     (top: HTMLDivElement | null) => {
       if (!top || !change || held) return;
@@ -538,19 +547,20 @@ export function RunSettings({
   const apply = (k: Kind, to: string) => {
     const pick = sets[k].pick;
     const prev = shown(k);
-    if (!pick || to === prev) return;
+    const reapply = k === "mode" && modeCanReapply && isPreset(to) && to === prev;
+    if (!pick || (to === prev && !reapply) || (k === "mode" && !isPreset(to))) return;
     const [prevKind, toKind] = k === "model" ? [kindOf(prev), kindOf(to)] : [undefined, undefined];
     if (k === "model" && onModel) onModel(to, toKind);
     else pick(to);
-    setChange({ kind: k, base: actual[k], prev, to, undoable: Boolean(prev), prevKind, toKind });
+    setChange({ kind: k, base: actual[k], prev, to, undoable: Boolean(prev) && !reapply && (k !== "mode" || isPreset(prev)), prevKind, toKind });
     setArmed(null);
     setTick((t) => t + 1);
     const there = groups.find((g) => g.kind === toKind)?.name;
-    setSaid(`${KEY[k]}: ${nameOf(k, to)}${there ? `, in ${there}: the conversation carries over${running ? " at the end of this turn" : ""}` : nextTurn(k) ? ", from the next turn" : ""}`);
+    setSaid(`${KEY[k]}: ${nameOf(k, to)}${there ? `, in ${there}: the conversation carries over${running ? " at the end of this turn" : ""}` : nextTurn(k) ? ", from the next turn" : reapply ? ", applying now" : ""}`);
   };
 
-  const choose = (k: Kind, w: Word) => {
-    if (w.id === shown(k)) {
+  const choose = (k: Kind, w: Word, reapply = false) => {
+    if ((w.id === shown(k) && !reapply) || (k === "mode" && !isPreset(w.id))) {
       setArmed(null);
       return;
     }
@@ -584,9 +594,12 @@ export function RunSettings({
     setTick(0);
   };
 
-  let parts = KINDS.map((k) => ({ k, text: shown(k) ? nameOf(k, shown(k)) : "", empty: false })).filter((p) => p.text);
-  if (parts.length === 0) parts = KINDS.filter(editable).map((k) => ({ k, text: KEY[k], empty: true }));
-  if (parts.length === 0) return null;
+  // Every setting keeps its column, even when a harness has no value for it yet.
+  const parts = KINDS.map((k) => ({
+    k,
+    text: shown(k) ? sets[k].words.find((w) => w.id === shown(k))?.text ?? shown(k) : editable(k) ? KEY[k] : "—",
+    empty: !shown(k),
+  }));
 
   const undoable = change?.undoable ? change : null;
   const panel = (k: Kind) => {
@@ -612,6 +625,7 @@ export function RunSettings({
       );
     }
     const w = waiting?.kind === k ? s.words.find((x) => x.id === waiting.id) : undefined;
+    const current = k === "mode" && modeCanReapply && isPreset(shown(k)) ? s.words.find((x) => x.id === shown(k)) : undefined;
     return (
       <>
         <Scale label={KEY[k]} words={s.words} value={shown(k)} armed={w?.id} onPick={pick} />
@@ -624,6 +638,16 @@ export function RunSettings({
           </p>
         )}
         {after}
+        {k === "mode" && modeCanReapply && (
+          <p className="rs-desc">
+            Applying permissions interrupts this turn, then continues it.{" "}
+            {current && !w && (
+              <button type="button" className="rs-more" aria-label={`Apply ${current.full} now`} onClick={() => choose(k, current, true)}>
+                Apply now
+              </button>
+            )}
+          </p>
+        )}
       </>
     );
   };
@@ -656,41 +680,39 @@ export function RunSettings({
     >
       <div ref={lasting} className="rs-top">
         <p className="rs-line">
-          {parts.map((p, i) => (
-            <React.Fragment key={p.k}>
-              {i > 0 && (
-                <span className="rs-sep" aria-hidden="true">
-                  {" · "}
-                </span>
-              )}
-              {editable(p.k) ? (
-                <button
-                  ref={(el) => {
-                    values.current[p.k] = el;
-                  }}
-                  type="button"
-                  className="rs-v"
-                  data-empty={p.empty ? "" : undefined}
-                  aria-expanded={open === p.k}
-                  aria-controls={open === p.k ? panelId : undefined}
-                  aria-label={`${KEY[p.k]}: ${p.empty ? "choose" : nameOf(p.k, shown(p.k))}`}
-                  onClick={() => toggle(p.k)}
-                >
-                  {p.text}
-                </button>
-              ) : (
-                <span className="rs-v" data-fixed="">
-                  {p.text}
-                </span>
-              )}
-            </React.Fragment>
-          ))}
+          <span className="rs-values">
+            {parts.map((p, i) => (
+              <React.Fragment key={p.k}>
+                {i > 0 && <span className="rs-sep" aria-hidden="true">·</span>}
+                {editable(p.k) ? (
+                  <button
+                    ref={(el) => { values.current[p.k] = el; }}
+                    type="button"
+                    className="rs-v"
+                    data-kind={p.k}
+                    data-empty={p.empty ? "" : undefined}
+                    aria-expanded={open === p.k}
+                    aria-controls={open === p.k ? panelId : undefined}
+                    aria-label={`${KEY[p.k]}: ${p.empty ? "choose" : nameOf(p.k, shown(p.k))}`}
+                    title={p.empty ? KEY[p.k] : nameOf(p.k, shown(p.k))}
+                    onClick={() => toggle(p.k)}
+                  >
+                    <span className="rs-value-text">{p.text}</span>
+                  </button>
+                ) : (
+                  <span className="rs-v" data-kind={p.k} data-fixed="" title={`${KEY[p.k]}: ${p.empty ? "unavailable" : nameOf(p.k, shown(p.k))}`}>
+                    {p.text}
+                  </span>
+                )}
+              </React.Fragment>
+            ))}
+          </span>
         </p>
+        <div className="rs-extra">
+          {trailing && <><span className="rs-divider" aria-hidden="true">|</span>{trailing}</>}
+        </div>
         {undoable && (
           <span className="rs-after">
-            <span className="rs-dot" aria-hidden="true">
-              ·
-            </span>
             <button type="button" className="rs-undo" aria-label={`Undo: back to ${nameOf(undoable.kind, undoable.prev)}`} onClick={undo}>
               Undo
             </button>

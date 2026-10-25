@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "kiln previews",
+  "description": "Streams a page kiln shows from this machine: its picture and sound, encoded here.",
+  "version": "1",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqfW+9rYwNEvQ4VVSicWBfZMQlkutIrC5cTIJab9yDLkbJAbWhYfahXPWeehAggXTdbQ9spFFdgWmxg1sCMhxFLpvYWVZ8UXzFR54CLv97fjzMIchXVoNFG6Cmpt+O90dUbQdw7NKL7A79oIRNjLMamnGy3bnE+j8TogOOXkHFLJ05SzLqH+NojctECp4D1W+D+KRuaUTsS3qqs3ggMVsd4lxFfJ0n6PGOF/nZQu5PKF7oMCOdYg+V9KLO68jeFvJJvegRGI1q4qjcR9kEI+3POYHLyLFZzeXI+A1z/aPhdWzTYWTC0Gm+EZN98xynzukrZLUi6+KNVkneJwT7+AxIQIDAQAB",
+  "minimum_chrome_version": "120",
+  "permissions": ["tabCapture", "offscreen", "tabs", "debugger"],
+  "background": { "service_worker": "sw.js" }
+}

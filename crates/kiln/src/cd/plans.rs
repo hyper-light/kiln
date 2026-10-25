@@ -450,6 +450,7 @@ fn resolutions(cd: &Cd, st: &Stack, def: &AppDef, kube_version: Option<&str>, ap
     let with_artifacts = |mut r: Resolved| {
         let (a, p) = cd.planned_artifacts(def, &r.revision);
         r.add_artifacts(a, p);
+        r.add_secrets(cd.planned_secrets(def));
         r
     };
     let trunk = with_artifacts(cd.inputs_of(def, kube_version, api_versions, None)?);

@@ -29,6 +29,42 @@ pub const LANE_OBSERVE: u32 = 5;
 /// The conversation feed's lane (`crate::convo::feed`): a runner's store sent to the server's, in
 /// bulk frames, never in the way of a job's or a terminal's (lane 5 is observe's).
 pub const LANE_CONVO: u32 = 6;
+/// Files read on a machine for the people viewing its agent sessions (`crate::harness::files`):
+/// what a message mentions, shown in the conversation. Bulk frames of their own, so a video being
+/// read never holds up a job's log, a terminal or the conversation feed. The last of a peer's eight.
+pub const LANE_FILES: u32 = 7;
+/// Pages streamed from a machine (`crate::browser::stream`): their picture and sound up, what their
+/// viewers do down. Interactive frames of their own, so a stream never waits behind a log, a file or
+/// the feed. Past the first eight lanes: a peer allows sixteen (`crate::net::limits`); only runners
+/// announcing [`CAP_STREAM`] open it, and only to a server that asked them to stream.
+pub const LANE_STREAM: u32 = 8;
+/// Ports of agents' machines opened through the server for people's own devices
+/// (`crate::browser::ports`, `crate::harness::opened`): the bytes of each connection both ways.
+/// A lane of its own, so a page's files never wait behind a stream's picture or a terminal; only to
+/// runners announcing [`CAP_PORTS`].
+pub const LANE_PORTS: u32 = 9;
+
+/// A lane's name, as metrics and runner pages say it.
+pub fn lane_name(lane: u32) -> &'static str {
+    match lane {
+        LANE_CONTROL => "control",
+        LANE_TERM => "term",
+        LANE_LOGS => "logs",
+        LANE_SYNC => "sync",
+        LANE_REACH => "reach",
+        5 => "observe",
+        LANE_CONVO => "convo",
+        LANE_FILES => "files",
+        LANE_STREAM => "stream",
+        LANE_PORTS => "ports",
+        _ => "other",
+    }
+}
+
+/// The lane a name says (as [`lane_name`] says it), or its number.
+pub fn lane_named(name: &str) -> Option<u32> {
+    (0..16).find(|l| lane_name(*l) == name).or_else(|| name.parse().ok())
+}
 
 /// Protocol version; bumped on incompatible changes. Agents with another version are refused.
 pub const VERSION: u32 = 1;
@@ -133,11 +169,86 @@ pub enum AgentMsg {
     /// `false` and the server never upgrades it, whatever its policy there. Sent on every
     /// (re)connect, and when it changes. Appended last: postcard encodes variants by index.
     UpdatePrefs { accept: bool },
+    /// This machine's battery (JSON [`crate::os::battery::Battery`]), when it has one: sent when it
+    /// changes, and every 10 minutes. A machine on battery sleeps when it runs out, and its runner
+    /// with it; the server says so first. Appended last: postcard encodes variants by index.
+    Power { json: String },
+    /// The answer to a question the server asked by `req` ([`ServerMsg::Diagnose`],
+    /// [`ServerMsg::Repair`]): JSON, or `None` when there's nothing to say. Appended last: postcard
+    /// encodes variants by index.
+    Answer { req: u64, json: Option<String> },
+    /// Answer to [`ServerMsg::HarnessFileRead`] (on [`LANE_FILES`]): `json` a
+    /// [`crate::harness::files::Answer`] (the file's size, type and dimensions, or why it can't
+    /// be read), `data` the bytes asked for. Only from runners announcing [`CAP_FILES`]. Appended
+    /// last: postcard encodes variants by index.
+    HarnessFileData { req: u64, json: String, data: Vec<u8> },
+    /// A chunk of stream `stream` (on [`LANE_STREAM`]): `crate::browser::stream::frame`'s bytes.
+    /// Only from runners announcing [`CAP_STREAM`]. Appended last: postcard encodes variants by
+    /// index.
+    StreamFrame { stream: String, data: Vec<u8> },
+    /// What stream `stream` says (JSON: opened, navigated, loaded, focus, dialog, closed, error), on
+    /// [`LANE_STREAM`]. Appended last: postcard encodes variants by index.
+    StreamEvent { stream: String, json: String },
+    /// Connection `conn` reached its port, or why not (`error`). On [`LANE_PORTS`].
+    PortOpened { conn: u64, error: Option<String> },
+    /// Bytes from connection `conn`'s port: at most `crate::browser::ports::WINDOW` the server
+    /// hasn't acknowledged ([`ServerMsg::PortAck`]).
+    PortData { conn: u64, data: Vec<u8> },
+    /// The runner took `bytes` more of what the server sent connection `conn`.
+    PortAck { conn: u64, bytes: u64 },
+    /// Connection `conn`'s port ended it (or it failed: `error`).
+    PortClose { conn: u64, error: Option<String> },
+    /// CI: one of a pool's executors this runner was asked to start is ready, or failed (JSON
+    /// `crate::runner::pool::Said`, docs/ci.md W13-R09). Only from runners announcing
+    /// [`CAP_POOLS`]. Appended last: postcard encodes variants by index.
+    Executor { json: String },
+    /// CI: a deployment it was asked to take down ([`ServerMsg::Undeploy`]) is gone, or why it
+    /// couldn't be (JSON `kiln_ci::wire::Undeployed`). Appended last: postcard encodes variants
+    /// by index.
+    Undeployed { json: String },
+    /// What this runner can do, in 64 bits ([`AgentMsg::Build`]'s 32 ran out): the first 32 are
+    /// `Build`'s, mirrored, and the rest new ([`CAP_WIRE`] on). Sent after `Build`; a runner from
+    /// before this never sends it, and an older server skips it. Appended last: postcard encodes
+    /// variants by index.
+    Caps { caps: u64 },
+    /// A frame of the channel between this runner and the server ([`crate::wire::channel`],
+    /// docs/wire.md): numbered items carrying messages, their answers, and what each side has
+    /// after a reconnect. Only once both sides announced [`CAP_WIRE`]. Appended last: postcard
+    /// encodes variants by index.
+    Wire(crate::wire::channel::Frame),
+    /// The cluster group (docs/p2p.md, P2, on [`LANE_SYNC`]): `json` a
+    /// `crate::store::learner::Msg`, `raft` the bytes of the hyper-raft message it carries (empty
+    /// when none) from this runner's learner. Only from runners announcing [`CAP_CLUSTER`].
+    /// Appended last: postcard encodes variants by index.
+    Cluster { json: String, raft: Vec<u8> },
+    /// What this runner's QUIC layer let go before it reached the wire since it started, by lane
+    /// and reason (`crate::metrics::NetMetrics`): each supersedes the last. Sent with its samples
+    /// once it changed, only to a server announcing [`CAP_NET_DROPS`]. Appended last: postcard
+    /// encodes variants by index.
+    NetDrops { dropped: Vec<NetDrop> },
+    /// Agent session `session`, packed by this runner process for its machine's newer one (a
+    /// take-over: [`ServerMsg::HarnessCmd`]'s local move), in pieces as
+    /// [`ServerMsg::HarnessPackage`] carries them: the server passes them on to the newer process.
+    /// On [`LANE_CONVO`]. Only to a server announcing [`CAP_HANDOVER`]. Appended last: postcard
+    /// encodes variants by index.
+    HarnessHandOver { session: String, offset: u64, data: Vec<u8>, done: bool },
+    /// This runner process took over agent session `session` from an older one of its machine,
+    /// or why it couldn't (`error`): the older one lets go of it, or goes on with it. Only to a
+    /// server announcing [`CAP_HANDOVER`]. Appended last: postcard encodes variants by index.
+    HarnessAdopted { session: String, error: Option<String> },
     /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): `json` a [`crate::observe::wire::Msg`],
     /// `bytes` what it carries (a raft message's, or a write's entry; empty when none). Only from
     /// runners announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard
     /// encodes variants by index.
     Observe { json: String, bytes: Vec<u8> },
+}
+
+/// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetDrop {
+    pub lane: String,
+    pub reason: String,
+    pub frames: u64,
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -205,6 +316,58 @@ pub const CAP_REACH: u32 = 1 << 17;
 /// them from that, not from the sessions' updates. Clear of CI's bits, `CAP_REPOS` and the bits
 /// observe and updates take (128, 256, 512).
 pub const CAP_CONVO: u32 = 1 << 19;
+/// [`AgentMsg::Build`] capability: the runner looks at its own machine and repairs it
+/// ([`ServerMsg::Diagnose`], [`ServerMsg::Repair`], `crate::doctor`).
+pub const CAP_DOCTOR: u32 = 1 << 21;
+/// [`AgentMsg::Build`] capability: the runner reads files for the people viewing its agent
+/// sessions ([`ServerMsg::HarnessFileRead`], answered on [`LANE_FILES`]).
+pub const CAP_FILES: u32 = 1 << 22;
+/// [`AgentMsg::Build`] capability: the runner streams pages for the people viewing its agent
+/// sessions (`crate::browser::stream`, [`ServerMsg::StreamOpen`], on [`LANE_STREAM`]).
+pub const CAP_STREAM: u32 = 1 << 23;
+/// [`AgentMsg::Build`] capability: the runner says what a person may open live from its sessions
+/// and starts their projects' apps ([`ServerMsg::Preview`], `crate::browser::apps`).
+pub const CAP_PREVIEW: u32 = 1 << 24;
+/// [`AgentMsg::Build`] capability: the runner connects the server to ports its machine's processes
+/// listen on ([`ServerMsg::PortOpen`], on [`LANE_PORTS`], `crate::browser::ports`).
+pub const CAP_PORTS: u32 = 1 << 25;
+/// [`AgentMsg::Build`] capability: the runner streams pages in other engines (Firefox, WebKit) and
+/// laid out as devices (`crate::browser::driven`, `crate::browser::devices`): a stream's spec's
+/// `engine` and `device`.
+pub const CAP_ENGINES: u32 = 1 << 26;
+/// [`AgentMsg::Build`] capability: the runner answers questions about its agents' folders and
+/// pushes their work for review ([`ServerMsg::Workspace`], `crate::workspace`).
+pub const CAP_WORKSPACE: u32 = 1 << 27;
+/// The runner starts a pool's executors when asked ([`ServerMsg::Executor`], docs/ci.md W13-R09).
+/// Clear of every bit above (1 << 21 is `CAP_DOCTOR`, 1 << 22 `CAP_FILES`, 1 << 23 `CAP_STREAM`,
+/// 1 << 24 `CAP_PREVIEW`, 1 << 25 `CAP_PORTS`, 1 << 26 `CAP_ENGINES`, 1 << 27 `CAP_WORKSPACE`).
+pub const CAP_POOLS: u32 = 1 << 28;
+/// [`AgentMsg::Build`] capability: the runner keeps a job's result and its events (each with its
+/// `seq`) until the server says it has the result ([`ServerMsg::Received`]), and sends them again
+/// after a reconnect, so what was in flight as the connection dropped isn't lost.
+pub const CAP_RECEIVED: u32 = 1 << 29;
+/// The runner takes down a deployment it made when its environment goes ([`ServerMsg::Undeploy`],
+/// docs/ci.md W15-R07), and says so ([`AgentMsg::Undeployed`]).
+pub const CAP_UNDEPLOY: u32 = 1 << 30;
+/// The runner holds a learner replica of the cluster group, kiln's records (docs/p2p.md, P2;
+/// [`AgentMsg::Cluster`], [`ServerMsg::Cluster`]). The last bit of the 32.
+pub const CAP_CLUSTER: u32 = 1 << 31;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability, the first past `Build`'s 32 bits: the
+/// peer keeps the channel (`crate::wire::channel`, docs/wire.md). What must arrive goes as
+/// numbered items, answered by the process that applied them and sent again after a reconnect.
+pub const CAP_WIRE: u64 = 1 << 32;
+
+/// [`ServerMsg::Caps`] capability: the server takes [`AgentMsg::NetDrops`], what a runner's QUIC
+/// layer let go, for its page.
+pub const CAP_NET_DROPS: u64 = 1 << 33;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: hand-overs between a machine's runner
+/// processes. A runner hands an agent session to its machine's newer process when told to
+/// ([`AgentMsg::HarnessHandOver`]) and says whether it took one over ([`AgentMsg::HarnessAdopted`]);
+/// the server passes the session on and says how it went (`Command::HandedOver`, in a
+/// [`ServerMsg::HarnessCmd`]). Bit 34 is T3's `CAP_INBOX` (docs/wire.md).
+pub const CAP_HANDOVER: u64 = 1 << 35;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -367,10 +530,107 @@ pub enum ServerMsg {
     /// commit; only to runners announcing [`CAP_UPDATES`]. Appended last: postcard encodes variants
     /// by index.
     UpdateAvailable { commit: String, build: String, from: String },
+    /// Look at this machine and say what's wrong (JSON `crate::doctor::Machine`), answered by
+    /// [`AgentMsg::Answer`]. Only to runners announcing [`CAP_DOCTOR`]. Appended last: postcard
+    /// encodes variants by index.
+    Diagnose { req: u64 },
+    /// Make repair `action` on this machine (`crate::doctor::RUNNER_ACTIONS`), answered by
+    /// [`AgentMsg::Answer`] (`{message}` or `{error}`). Only to runners announcing [`CAP_DOCTOR`].
+    /// Appended last: postcard encodes variants by index.
+    Repair { req: u64, action: String },
+    /// Read up to `len` bytes of `path` from `offset`, for whoever views agent session `session`
+    /// (a file one of its messages mentions); answered by [`AgentMsg::HarnessFileData`]. Only to
+    /// runners announcing [`CAP_FILES`]. Appended last: postcard encodes variants by index.
+    HarnessFileRead { req: u64, session: String, path: String, offset: u64, len: u32 },
+    /// Stream a page for whoever views agent session `session` (`json` a
+    /// `crate::browser::stream::Spec`), as `stream`. Only to runners announcing [`CAP_STREAM`].
+    /// Appended last: postcard encodes variants by index.
+    StreamOpen { stream: String, session: String, json: String },
+    /// What a viewer asks of stream `stream` (`crate::browser::stream::Stream::control`). Appended
+    /// last: postcard encodes variants by index.
+    StreamControl { stream: String, session: String, json: String },
+    /// What a viewer did in stream `stream`: `crate::browser::stream::Input`s, in order, as JSON.
+    /// Appended last: postcard encodes variants by index.
+    StreamInput { stream: String, session: String, json: String },
+    /// Close stream `stream`. Appended last: postcard encodes variants by index.
+    StreamClose { stream: String, session: String },
+    /// What a person opens live from agent session `session` (`crate::browser::apps`): `json` is
+    /// `{"op": "look"}` (the ports the machine serves, the project's app), `{"op": "start"}` (its
+    /// app, as its `.kiln/preview.yaml` says) or `{"op": "stop"}`; answered by
+    /// [`AgentMsg::Answer`]. Only to runners announcing [`CAP_PREVIEW`]. Appended last: postcard
+    /// encodes variants by index.
+    Preview { req: u64, session: String, json: String },
+    /// Connect connection `conn` to port `port` on agent session `session`'s machine (on loopback,
+    /// a port its processes listen on: `crate::browser::ports`); answered by
+    /// [`AgentMsg::PortOpened`]. Only to runners announcing [`CAP_PORTS`], on [`LANE_PORTS`].
+    PortOpen { conn: u64, session: String, port: u16 },
+    /// Bytes for connection `conn`'s port.
+    PortData { conn: u64, session: String, data: Vec<u8> },
+    /// The server took `bytes` more of what connection `conn`'s runner sent: it may send that many
+    /// more (`crate::browser::ports::WINDOW`).
+    PortAck { conn: u64, session: String, bytes: u64 },
+    /// Connection `conn` is done with.
+    PortClose { conn: u64, session: String },
+    /// A question about agent session `session`'s folder (`json` a [`crate::workspace::Ask`]: its
+    /// repository, or a commit of the agent's work pushed for review), answered by
+    /// [`AgentMsg::Answer`]. Only to runners announcing [`CAP_WORKSPACE`]. Appended last: postcard
+    /// encodes variants by index.
+    Workspace { req: u64, session: String, json: String },
+    /// CI: start or stop one of a pool's executors (JSON `crate::runner::pool::Ask`, docs/ci.md
+    /// W13-R09). Only to runners announcing [`CAP_POOLS`]. Appended last: postcard encodes
+    /// variants by index.
+    Executor { json: String },
+    /// The server has job `job`'s result ([`AgentMsg::JobFinished`]): the runner forgets it and
+    /// the job's events. With no `job`, said as the server hears the runner's capabilities: it
+    /// takes each event once (by its `seq`), so the runner may send them again after a reconnect.
+    /// Only to runners announcing [`CAP_RECEIVED`]. Appended last: postcard encodes variants by
+    /// index.
+    Received { job: String },
+    /// CI: take down a deployment this runner made (JSON `kiln_ci::wire::Undeploy`, docs/ci.md
+    /// W15-R07): its environment, a preview, went. Only to runners announcing [`CAP_UNDEPLOY`].
+    /// Appended last: postcard encodes variants by index.
+    Undeploy { json: String },
+    /// What this server can do, in 64 bits, as [`AgentMsg::Caps`]: sent after `Welcome` to a
+    /// runner that announced [`CAP_WIRE`]. Appended last: postcard encodes variants by index.
+    Caps { caps: u64 },
+    /// A frame of the channel between the server and this runner, as [`AgentMsg::Wire`]. Appended
+    /// last: postcard encodes variants by index.
+    Wire(crate::wire::channel::Frame),
+    /// The cluster group (docs/p2p.md, P2, on [`LANE_SYNC`]): as [`AgentMsg::Cluster`], to the
+    /// runner's learner. Only to runners announcing [`CAP_CLUSTER`]. Appended last: postcard
+    /// encodes variants by index.
+    Cluster { json: String, raft: Vec<u8> },
+    /// What the server's copy of each of this runner's agent sessions has: sent before `Welcome`
+    /// to a runner that keeps the channel (as many of these as it takes), so a stream it starts
+    /// (it started again, or the server lost its streams) sends only what the copy lacks
+    /// (docs/wire.md, "Restarts"). Appended last: postcard encodes variants by index.
+    Kept { sessions: Vec<KeptSession> },
     /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): as [`AgentMsg::Observe`]. Only to runners
     /// announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard encodes
     /// variants by index.
     Observe { json: String, bytes: Vec<u8> },
+}
+
+/// What the server's copy of one agent session has of its events, said in digests
+/// ([`ServerMsg::Kept`], `crate::wire::sums`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeptSession {
+    pub session: String,
+    /// The epoch its copy is of: a session that went on elsewhere since starts over whole.
+    pub epoch: u64,
+    /// Its newest event's number in the copy (0: it has none).
+    pub seq: u64,
+    /// Where its first run begins: its oldest event's number in the copy, or before it where a run
+    /// of `run` begins (1, 1 + `run` …; an older server says its oldest event's number, and the
+    /// runs begin there).
+    pub from: u64,
+    /// How many events a digest in `runs` covers.
+    pub run: u64,
+    /// A digest of each run of `run` events from `from` on (each of the copy's events numbered
+    /// within it), up to the events `last` has one of each.
+    pub runs: Vec<u64>,
+    /// A digest of each of its newest events, through `seq` (0: the copy lacks that one).
+    pub last: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -443,6 +703,85 @@ mod tests {
         assert!(d.first() > b.first());
         let u = encode(&ServerMsg::Upgrade { job: "j".into(), path: "/dl/kiln/x".into(), sha256: "00".into(), size: 1 })?;
         assert!(u.first() > r.first(), "Upgrade must be appended after Retire");
+        Ok(())
+    }
+
+    #[test]
+    fn the_channel_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        use crate::wire::channel::{Frame, Has, Nack, Refusal};
+        // AgentMsg had 45 variants (Undeployed last, 44) and ServerMsg 53 (Undeploy last, 52):
+        // an older peer skips what comes after.
+        let undeployed = encode(&AgentMsg::Undeployed { json: String::new() })?;
+        let undeploy = encode(&ServerMsg::Undeploy { json: String::new() })?;
+        assert_eq!((undeployed.first(), undeploy.first()), (Some(&44), Some(&52)));
+        let frames = [
+            Frame::Item { stream: "cmd".into(), seq: 3, low: 2, body: vec![1, 2, 3] },
+            Frame::Ack(Has { stream: "cmd".into(), upto: 3, nacks: vec![Nack { seq: 2, code: Refusal::Unknown, why: "gone".into() }] }),
+            Frame::Want { stream: "cmd".into(), from: 2 },
+            Frame::Have(vec![Has { stream: "s:x#1".into(), upto: 9, nacks: Vec::new() }]),
+        ];
+        let agent = [(AgentMsg::Caps { caps: CAP_WIRE | u64::from(CAP_UPGRADE) }, 45u8)].into_iter().chain(frames.iter().cloned().map(|f| (AgentMsg::Wire(f), 46)));
+        for (m, idx) in agent {
+            let b = encode(&m)?;
+            assert_eq!(b.first(), Some(&idx), "{m:?} is AgentMsg variant {idx} on the wire");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+            assert!(decode::<AgentMsg>(b.get(..b.len() - 1).unwrap_or_default()).is_err(), "a cut-off frame is an error");
+        }
+        let kept = ServerMsg::Kept { sessions: vec![KeptSession { session: "s".into(), epoch: 2, seq: 40, from: 1, run: 64, runs: Vec::new(), last: vec![7; 40] }] };
+        let server = [(ServerMsg::Caps { caps: CAP_WIRE }, 53u8)].into_iter().chain(frames.into_iter().map(|f| (ServerMsg::Wire(f), 54))).chain([(kept, 56)]);
+        for (m, idx) in server {
+            let b = encode(&m)?;
+            assert_eq!(b.first(), Some(&idx), "{m:?} is ServerMsg variant {idx} on the wire");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        assert!(CAP_WIRE.is_power_of_two() && CAP_WIRE > u64::from(u32::MAX), "CAP_WIRE is past Build's 32 bits");
+        Ok(())
+    }
+
+    #[test]
+    fn hand_overs_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        // AgentMsg ended with NetDrops (48): an older server never gets these (they go only to a
+        // server announcing CAP_HANDOVER), and decodes the rest as before. ServerMsg gains nothing:
+        // the slot after Kept is T3's HarnessSend (docs/wire.md).
+        let drops = encode(&AgentMsg::NetDrops { dropped: Vec::new() })?;
+        assert_eq!(drops.first(), Some(&48));
+        let agent = [
+            (AgentMsg::HarnessHandOver { session: "s".into(), offset: 3, data: vec![1, 2], done: true }, 49u8),
+            (AgentMsg::HarnessAdopted { session: "s".into(), error: Some("no room".into()) }, 50),
+        ];
+        for (m, idx) in agent {
+            let b = encode(&m)?;
+            assert_eq!(b.first(), Some(&idx), "{m:?} is AgentMsg variant {idx} on the wire");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+        }
+        // Bit 34 is T3's CAP_INBOX.
+        assert!(CAP_HANDOVER.is_power_of_two() && CAP_HANDOVER == 1 << 35 && CAP_HANDOVER & (CAP_WIRE | CAP_NET_DROPS) == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn the_cluster_group_is_appended_after_the_channel() -> anyhow::Result<()> {
+        // After `Wire` in both (AgentMsg 46, ServerMsg 54), so a peer from before P2 skips it.
+        let agent = AgentMsg::Cluster { json: r#"{"kind":"leave"}"#.into(), raft: vec![9, 8, 7] };
+        let server = ServerMsg::Cluster { json: r#"{"kind":"raft"}"#.into(), raft: Vec::new() };
+        let (a, s) = (encode(&agent)?, encode(&server)?);
+        assert_eq!((a.first(), s.first()), (Some(&47), Some(&55)));
+        assert_eq!((decode::<AgentMsg>(&a)?, decode::<ServerMsg>(&s)?), (agent, server));
+        assert_eq!(CAP_CLUSTER.count_ones(), 1);
+        assert_eq!(CAP_CLUSTER & CAP_UNDEPLOY, 0);
+        assert_eq!(u64::from(CAP_CLUSTER) & CAP_WIRE, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn what_a_runner_dropped_is_appended_after_the_cluster_group() -> anyhow::Result<()> {
+        // After `Cluster` (47), so a server from before skips it; and only to one that takes it.
+        let m = AgentMsg::NetDrops { dropped: vec![NetDrop { lane: lane_name(LANE_TERM).into(), reason: "shed".into(), frames: 3 }] };
+        let b = encode(&m)?;
+        assert_eq!(b.first(), Some(&48));
+        assert_eq!(decode::<AgentMsg>(&b)?, m);
+        assert!(CAP_NET_DROPS.is_power_of_two() && CAP_NET_DROPS & CAP_WIRE == 0 && CAP_NET_DROPS > u64::from(u32::MAX));
+        assert_eq!((lane_name(LANE_CONTROL), lane_name(LANE_PORTS), lane_name(99)), ("control", "ports", "other"));
         Ok(())
     }
 
@@ -537,21 +876,232 @@ mod tests {
     }
 
     #[test]
-    fn observe_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
-        // Right after main's last (deployed first): its updates' own.
+    fn a_diagnosis_is_appended_after_every_older_variant() -> anyhow::Result<()> {
         let last_server = encode(&ServerMsg::UpdateAvailable { commit: "c".into(), build: "b".into(), from: "f".into() })?;
+        for (i, m) in [ServerMsg::Diagnose { req: 7 }, ServerMsg::Repair { req: 8, action: "prune-versions".into() }].into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1 + i as u8), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let last_agent = encode(&AgentMsg::Power { json: "{}".into() })?;
+        let answer = AgentMsg::Answer { req: 7, json: Some("{}".into()) };
+        let b = encode(&answer)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|i| i + 1), "AgentMsg::Answer comes right after Power");
+        assert_eq!(decode::<AgentMsg>(&b)?, answer);
+        Ok(())
+    }
+
+    #[test]
+    fn reading_files_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::UpdateAvailable { commit: "c".into(), build: "b".into(), from: "f".into() })?;
+        let ask = ServerMsg::HarnessFileRead { req: 9, session: "s".into(), path: "/tmp/a.png".into(), offset: 1 << 20, len: 1 << 20 };
+        let b = encode(&ask)?;
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 3), "HarnessFileRead comes right after Repair");
+        assert_eq!(decode::<ServerMsg>(&b)?, ask);
+        let last_agent = encode(&AgentMsg::Power { json: "{}".into() })?;
+        let answer = AgentMsg::HarnessFileData { req: 9, json: "{}".into(), data: vec![0x89, b'P', b'N', b'G'] };
+        let b = encode(&answer)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 2), "HarnessFileData comes right after Answer");
+        assert_eq!(decode::<AgentMsg>(&b)?, answer);
+        let taken = CAP_UPGRADE
+            | CAP_TAKEOVER
+            | CAP_DIRS
+            | CAP_TAKEOVER_STOP
+            | CAP_SYNC
+            | CAP_FRONT_DOOR
+            | CAP_REPOS
+            | CAP_OUTPOST
+            | CAP_UPDATES
+            | CAP_BLUE_GREEN
+            | CAP_CI2
+            | CAP_ACTIONS
+            | CAP_DOCKER
+            | CAP_FIRECRACKER
+            | CAP_SHARDS
+            | CAP_FACTS
+            | CAP_JOB_TTY
+            | CAP_DOCKER_ROOTLESS
+            | CAP_REACH
+            | CAP_CONVO
+            | CAP_DOCTOR
+            | 128;
+        assert!(CAP_FILES.is_power_of_two() && CAP_FILES & taken == 0, "CAP_FILES is a bit of its own");
+        let lanes = [LANE_CONTROL, LANE_TERM, LANE_LOGS, LANE_SYNC, LANE_REACH, 5, LANE_CONVO];
+        assert!(LANE_FILES < 8 && !lanes.contains(&LANE_FILES), "a lane of its own, within the eight a peer has");
+        Ok(())
+    }
+
+    #[test]
+    fn ports_are_appended_after_previews() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::Preview { req: 3, session: "s".into(), json: "{}".into() })?;
+        let server = [
+            ServerMsg::PortOpen { conn: 1, session: "s".into(), port: 5173 },
+            ServerMsg::PortData { conn: 1, session: "s".into(), data: b"GET / HTTP/1.1\r\n".to_vec() },
+            ServerMsg::PortAck { conn: 1, session: "s".into(), bytes: 65536 },
+            ServerMsg::PortClose { conn: 1, session: "s".into() },
+        ];
+        for (i, m) in server.into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1 + u8::try_from(i).unwrap_or(0)), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let last_agent = encode(&AgentMsg::StreamEvent { stream: "v".into(), json: "{}".into() })?;
+        let agent = [
+            AgentMsg::PortOpened { conn: 1, error: None },
+            AgentMsg::PortData { conn: 1, data: b"HTTP/1.1 200 OK\r\n".to_vec() },
+            AgentMsg::PortAck { conn: 1, bytes: 9 },
+            AgentMsg::PortClose { conn: 1, error: Some("reset".into()) },
+        ];
+        for (i, m) in agent.into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1 + u8::try_from(i).unwrap_or(0)), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+        }
+        assert!(CAP_PORTS.is_power_of_two() && CAP_PORTS > CAP_PREVIEW);
+        assert!(CAP_ENGINES.is_power_of_two() && CAP_ENGINES > CAP_PORTS);
+        assert!(LANE_PORTS == LANE_STREAM + 1 && LANE_PORTS < crate::net::limits(true).lanes_per_peer, "a lane of its own, within what a peer allows");
+        Ok(())
+    }
+
+    #[test]
+    fn workspaces_are_appended_after_ports() -> anyhow::Result<()> {
+        let last = encode(&ServerMsg::PortClose { conn: 1, session: "s".into() })?;
+        let m = ServerMsg::Workspace { req: 4, session: "s".into(), json: r#"{"op":"git"}"#.into() };
+        let b = encode(&m)?;
+        assert_eq!(b.first().copied(), last.first().map(|n| n + 1), "it comes right after the ones before it");
+        assert_eq!(decode::<ServerMsg>(&b)?, m);
+        assert!(CAP_WORKSPACE.is_power_of_two() && CAP_WORKSPACE > CAP_ENGINES && CAP_ENGINES > CAP_PORTS);
+        Ok(())
+    }
+
+    #[test]
+    fn previews_are_appended_after_streams() -> anyhow::Result<()> {
+        let last = encode(&ServerMsg::StreamClose { stream: "v".into(), session: "s".into() })?;
+        let m = ServerMsg::Preview { req: 3, session: "s".into(), json: "{\"op\":\"look\"}".into() };
+        let b = encode(&m)?;
+        assert_eq!(b.first().copied(), last.first().map(|n| n + 1), "Preview comes right after StreamClose");
+        assert_eq!(decode::<ServerMsg>(&b)?, m);
+        assert!(CAP_PREVIEW.is_power_of_two() && CAP_PREVIEW > CAP_STREAM);
+        Ok(())
+    }
+
+    #[test]
+    fn streams_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::HarnessFileRead { req: 1, session: "s".into(), path: "/p".into(), offset: 0, len: 1 })?;
+        let after = [
+            ServerMsg::StreamOpen { stream: "v".into(), session: "s".into(), json: "{}".into() },
+            ServerMsg::StreamControl { stream: "v".into(), session: "s".into(), json: "{}".into() },
+            ServerMsg::StreamInput { stream: "v".into(), session: "s".into(), json: "[]".into() },
+            ServerMsg::StreamClose { stream: "v".into(), session: "s".into() },
+        ];
+        for (i, m) in after.into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1 + u8::try_from(i).unwrap_or(0)), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let last_agent = encode(&AgentMsg::HarnessFileData { req: 1, json: "{}".into(), data: vec![] })?;
+        for (i, m) in [AgentMsg::StreamFrame { stream: "v".into(), data: vec![b'v', b'k'] }, AgentMsg::StreamEvent { stream: "v".into(), json: "{}".into() }].into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1 + u8::try_from(i).unwrap_or(0)), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+        }
+        assert!(CAP_STREAM.is_power_of_two() && CAP_STREAM > CAP_FILES && CAP_STREAM < 1 << 24);
+        assert!(LANE_STREAM == 8 && LANE_STREAM < crate::net::limits(true).lanes_per_peer, "a lane past the first eight, within what a peer allows");
+        Ok(())
+    }
+
+    #[test]
+    fn pool_executors_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::Workspace { req: 1, session: "s".into(), json: "{}".into() })?;
+        let start = ServerMsg::Executor { json: "{}".into() };
+        let b = encode(&start)?;
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Executor comes right after Workspace");
+        assert_eq!(decode::<ServerMsg>(&b)?, start);
+        let last_agent = encode(&AgentMsg::PortClose { conn: 1, error: None })?;
+        let said = AgentMsg::Executor { json: "{}".into() };
+        let b = encode(&said)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Executor comes right after PortClose");
+        assert_eq!(decode::<AgentMsg>(&b)?, said);
+        let others = CAP_WORKSPACE | CAP_ENGINES | CAP_PORTS | CAP_PREVIEW | CAP_STREAM | CAP_FILES | CAP_DOCTOR | CAP_CONVO | CAP_DOCKER_ROOTLESS | CAP_REACH | CAP_REPOS | CAP_JOB_TTY | CAP_FACTS | CAP_SHARDS | CAP_FIRECRACKER | CAP_DOCKER | CAP_ACTIONS | CAP_CI2;
+        assert!(CAP_POOLS.is_power_of_two() && CAP_POOLS & others == 0, "CAP_POOLS is a bit of its own");
+        Ok(())
+    }
+
+    #[test]
+    fn receipts_are_appended_after_pool_executors() -> anyhow::Result<()> {
+        let last = encode(&ServerMsg::Executor { json: "{}".into() })?;
+        let got = ServerMsg::Received { job: "j".into() };
+        let b = encode(&got)?;
+        assert_eq!(b.first().copied(), last.first().map(|n| n + 1), "ServerMsg::Received comes right after Executor");
+        assert_eq!(decode::<ServerMsg>(&b)?, got);
+        assert!(CAP_RECEIVED.is_power_of_two() && CAP_RECEIVED > CAP_POOLS);
+        Ok(())
+    }
+
+    #[test]
+    fn undeploys_are_appended_after_receipts_and_executors() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::Received { job: "j".into() })?;
+        let ask = ServerMsg::Undeploy { json: "{}".into() };
+        let b = encode(&ask)?;
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Undeploy comes right after Received");
+        assert_eq!(decode::<ServerMsg>(&b)?, ask);
+        let last_agent = encode(&AgentMsg::Executor { json: "{}".into() })?;
+        let said = AgentMsg::Undeployed { json: "{}".into() };
+        let b = encode(&said)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Undeployed comes right after Executor");
+        assert_eq!(decode::<AgentMsg>(&b)?, said);
+        assert!(CAP_UNDEPLOY.is_power_of_two() && CAP_UNDEPLOY > CAP_RECEIVED);
+        Ok(())
+    }
+
+    #[test]
+    fn observe_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        // Right after main's last (deployed first): its sessions' hand-overs' and their copies'.
+        let last_server = encode(&ServerMsg::Kept { sessions: vec![] })?;
         let s = ServerMsg::Observe { json: "{}".into(), bytes: vec![1, 2] };
         let b = encode(&s)?;
-        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after UpdateAvailable");
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after Kept");
         assert_eq!(decode::<ServerMsg>(&b)?, s);
-        let last_agent = encode(&AgentMsg::UpdatePrefs { accept: true })?;
+        let last_agent = encode(&AgentMsg::HarnessAdopted { session: "s".into(), error: None })?;
         let a = AgentMsg::Observe { json: "{}".into(), bytes: vec![3] };
         let b = encode(&a)?;
-        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Observe comes right after UpdatePrefs");
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Observe comes right after HarnessAdopted");
         assert_eq!(decode::<AgentMsg>(&b)?, a);
-        let every = [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_SYNC, CAP_FRONT_DOOR, CAP_OUTPOST, CAP_REPOS, CAP_UPDATES, CAP_BLUE_GREEN, CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY, CAP_DOCKER_ROOTLESS, CAP_REACH, CAP_CONVO];
+        let every = [
+            CAP_UPGRADE,
+            CAP_TAKEOVER,
+            CAP_DIRS,
+            CAP_TAKEOVER_STOP,
+            CAP_SYNC,
+            CAP_FRONT_DOOR,
+            CAP_OUTPOST,
+            CAP_REPOS,
+            CAP_UPDATES,
+            CAP_BLUE_GREEN,
+            CAP_CI2,
+            CAP_ACTIONS,
+            CAP_DOCKER,
+            CAP_FIRECRACKER,
+            CAP_SHARDS,
+            CAP_FACTS,
+            CAP_JOB_TTY,
+            CAP_DOCKER_ROOTLESS,
+            CAP_REACH,
+            CAP_CONVO,
+            CAP_DOCTOR,
+            CAP_FILES,
+            CAP_STREAM,
+            CAP_PREVIEW,
+            CAP_PORTS,
+            CAP_ENGINES,
+            CAP_WORKSPACE,
+            CAP_POOLS,
+            CAP_RECEIVED,
+            CAP_UNDEPLOY,
+            CAP_CLUSTER,
+        ];
         assert!(CAP_OBSERVE.is_power_of_two() && every.iter().all(|c| c & CAP_OBSERVE == 0), "CAP_OBSERVE is a bit of its own");
-        const { assert!(LANE_OBSERVE != LANE_CONVO) };
+        const { assert!(LANE_OBSERVE != LANE_CONVO && LANE_OBSERVE != LANE_FILES && LANE_OBSERVE != LANE_STREAM && LANE_OBSERVE != LANE_PORTS) };
         Ok(())
     }
 

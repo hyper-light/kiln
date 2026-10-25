@@ -345,6 +345,10 @@ impl FrontDoor {
             if push.renew {
                 self.renew_now();
             }
+            // The clusters this one is peered with: their addresses are forwarded here.
+            if let Some(t) = push.peers.clone() {
+                *self.https_shared.peers.write() = (!t.peers.is_empty()).then(|| Arc::new(crate::peers::forward::Forwarder::new(t)));
+            }
         }
         self.reconcile();
     }
@@ -774,7 +778,7 @@ mod tests {
     use crate::frontdoor::{Cert, Dns, Https};
 
     fn free_port() -> anyhow::Result<u16> {
-        Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
+        Ok(crate::frontdoor::test_port()?)
     }
 
     /// The whole runner side, on loopback and high ports: settings in, listeners up, a CSR out;
@@ -797,12 +801,15 @@ mod tests {
                 cert: Cert { mode: CertMode::Kiln },
                 ..Settings::default()
             };
-            let push = |s: &Settings, issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: s.clone(), standby, issued, custom: None, renew: false });
+            let push = |s: &Settings, issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: s.clone(), standby, issued, custom: None, renew: false, peers: None });
             fd.on_push(&push(&settings, None, false)?);
             let st = fd.status();
             assert_eq!(st.settings, settings.fingerprint());
             assert_eq!(st.dns.state, State::On, "{:?}", st.dns);
-            assert!(st.dns.on.contains(&format!("127.0.0.1:{dns_port}")), "{:?}", st.dns.on);
+            // Loopback on Linux; the wildcard elsewhere (macOS lets a user bind low ports only
+            // there: `netinfo::dns_binds`).
+            let listening = if cfg!(target_os = "linux") { format!("127.0.0.1:{dns_port}") } else { format!("0.0.0.0:{dns_port}") };
+            assert!(st.dns.on.contains(&listening), "{:?}", st.dns.on);
             assert_eq!(st.https.state, State::Waiting, "no certificate yet");
             assert_eq!(st.cert.state, State::Waiting);
             let csr = st.csr.clone().ok_or_else(|| anyhow::anyhow!("a CSR"))?;
@@ -879,7 +886,7 @@ mod tests {
                 cert: Cert { mode: CertMode::Kiln },
                 ..Settings::default()
             };
-            let push = |issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: settings.clone(), standby, issued, custom: None, renew: false });
+            let push = |issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: settings.clone(), standby, issued, custom: None, renew: false, peers: None });
             let mut fd = FrontDoor::new(ctx);
             fd.on_push(&push(None, false)?);
             let st = fd.status();
@@ -894,9 +901,17 @@ mod tests {
             assert_eq!(fd.status().https.state, State::Error, "{:?}", fd.status().https);
             assert_eq!(fd.retry_in(), Some(RETRY_IN_USE));
 
-            // It lets go: the next try binds, and nothing more is tried soon.
+            // It lets go: a try soon after binds, and nothing more is tried soon. (A process
+            // another test starts just then holds a copy of the listener until it runs its
+            // program, so the port can stay held a moment longer.)
             drop(held);
-            fd.reconcile();
+            for _ in 0..100 {
+                fd.reconcile();
+                if fd.status().https.state == State::On {
+                    break;
+                }
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
             assert_eq!(fd.status().https.state, State::On, "{:?}", fd.status().https);
             assert_eq!(fd.retry_in(), None);
 
@@ -926,7 +941,7 @@ mod tests {
                 cert: Cert { mode: CertMode::Custom },
                 ..Settings::default()
             };
-            let push = |custom: Option<crate::frontdoor::CustomCert>| serde_json::to_string(&Push { settings: settings.clone(), standby: false, issued: None, custom, renew: false });
+            let push = |custom: Option<crate::frontdoor::CustomCert>| serde_json::to_string(&Push { settings: settings.clone(), standby: false, issued: None, custom, renew: false, peers: None });
             fd.on_push(&push(None)?);
             let st = fd.status();
             assert_eq!(st.cert.state, State::Error);

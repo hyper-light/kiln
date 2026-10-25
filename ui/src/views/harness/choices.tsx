@@ -553,7 +553,7 @@ function Ask({
     otherRef.current = el;
     if (el && wantOther.current) {
       wantOther.current = false;
-      el.focus();
+      el.focus({ preventScroll: true });
     }
   }, []);
 
@@ -644,7 +644,7 @@ function Ask({
     setHint("");
     // "Other…" chosen: its field is there already (chosen before), or it takes focus as it shows.
     if (o >= q.options.length && next[step]?.other) {
-      if (otherRef.current) otherRef.current.focus();
+      if (otherRef.current) otherRef.current.focus({ preventScroll: true });
       else wantOther.current = true;
     }
   };
@@ -737,6 +737,13 @@ function Ask({
       e.preventDefault();
       items[to]?.focus();
     }
+  };
+
+  // Keep the answer's keyboard up while tapping an option or Submit. Blurring first would bring
+  // the page header and composer back under the tap before the click reaches its button.
+  const keepAnswerFocus = (e: React.PointerEvent | React.MouseEvent) => {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && e.currentTarget.contains(active) && active.matches("input, textarea") && (e.target as Element).closest("button")) e.preventDefault();
   };
 
   const modal = frame !== "inline" && frame !== "flow";
@@ -898,6 +905,8 @@ function Ask({
         aria-describedby={describedBy}
         aria-busy={busy || undefined}
         onKeyDown={onKeyDown}
+        onPointerDown={keepAnswerFocus}
+        onMouseDown={keepAnswerFocus}
       >
         {content}
       </section>
@@ -925,6 +934,8 @@ function Ask({
             focusView();
           }}
           onKeyDown={onKeyDown}
+          onPointerDown={keepAnswerFocus}
+          onMouseDown={keepAnswerFocus}
         >
           {content}
         </D.Content>

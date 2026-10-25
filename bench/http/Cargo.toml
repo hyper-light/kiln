@@ -1,0 +1,60 @@
+[package]
+name = "kiln-http-bench"
+description = "kiln's HTTP against the solution it replaces, on one host: kiln-http on hyper-rt, hyper on tokio (the baseline), and a raw epoll responder (the kernel's ceiling), all driven by one load generator."
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# A workspace of its own, as hyper-raft's compare crates are: the baseline (hyper on tokio) never
+# reaches kiln's lockfile.
+[workspace]
+
+[dependencies]
+hyper = { version = "1.12", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
+http-body-util = "0.1"
+bytes = "1"
+http = "1"
+tokio = { version = "1.53", features = ["rt-multi-thread", "net"] }
+libc = "0.2"
+memchr = "2"
+futures-io = "0.3"
+futures-core = "0.3"
+http-body = "1"
+kiln-http = { path = "../../crates/kiln-http" }
+hyper-rt = "=0.1.0"
+
+# hyper-rt at kiln's one copy of hyper-raft (vendor/MANIFEST.toml), as kiln's root manifest points it
+# (docs/vendoring.md): kiln-http names it by version.
+[patch.crates-io]
+hyper-rt = { path = "../../vendor/hyper-raft/crates/hyper-rt" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+debug = "line-tables-only"
+
+[[bin]]
+name = "load"
+path = "src/bin/load.rs"
+
+[[bin]]
+name = "hyper-tokio"
+path = "src/bin/hyper_tokio.rs"
+
+[[bin]]
+name = "raw-epoll"
+path = "src/bin/raw_epoll.rs"
+
+[[bin]]
+name = "kiln-http"
+path = "src/bin/kiln_http.rs"
+
+[[bin]]
+name = "micro"
+path = "src/bin/micro.rs"
+
+[[bin]]
+name = "interop"
+path = "src/bin/interop.rs"

@@ -14,11 +14,11 @@ hashbrown = { version = "0.17.1", default-features = false }
 # Series fingerprints (`batch::fingerprint`): stable across builds and nodes, already in kiln's tree.
 sha2 = "0.11.1"
 # Replication (`docs/observe.md` §5): the store is a hyper-durable state machine on a hyper-log
-# group, at the revision the rest of kiln pins.
-hyper-raft = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-durable = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-log = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-block = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+# group: hyper-raft's crates as kiln vendors them (the root manifest's `[patch.crates-io]`).
+hyper-raft = "=0.1.0"
+hyper-durable = "=0.1.0"
+hyper-log = "=0.1.0"
+hyper-block = "=0.1.0"
 # Calendar rollups' and calendar_shift's timezones (`query::calendar`): the tz database bundled in
 # the binary, not the machine's, so every machine answers alike; kiln-ci's, already in kiln's tree.
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tzdb-bundle-always"] }
@@ -35,7 +35,7 @@ parking_lot = "0.12.5"
 tempfile = "3.27.0"
 # Only to measure LZ4 against deflate (benches/lz4.rs); kiln has it already.
 flate2 = "1.1.10"
-hyper-measure = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+hyper-measure = "=0.1.0"
 
 [[bench]]
 name = "codec"

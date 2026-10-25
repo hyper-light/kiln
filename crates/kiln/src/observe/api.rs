@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, PoisonError};
 
 use http::{Method, StatusCode, header};
-use hyper::body::Incoming;
+use crate::http::server::Incoming;
 use kiln_obs::batch::{Kind, SeriesKey};
 use kiln_obs::logs::record::Record;
 use kiln_obs::query::eval::{self, Request as QueryRequest};

@@ -37,28 +37,42 @@ fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "finished_at": r.get::<_, Option<i64>>(16)?, "error": r.get::<_, Option<String>>(17)?, "message": r.get::<_, String>(18)?, "github_run_id": r.get::<_, i64>(19)?,
         // W18-R06: `required` while an outside contributor's run waits for a maintainer.
         "approval": r.get::<_, Option<String>>(20)?, "approved_by": r.get::<_, Option<String>>(21)?,
+        // W23: where it ran (`kiln`, `github-actions`, …), and its page and number there.
+        "provider": r.get::<_, String>(22)?, "external_url": r.get::<_, Option<String>>(23)?, "external_number": r.get::<_, Option<i64>>(24)?,
     }))
 }
 
 const RUN_SELECT: &str = "SELECT r.id, r.number, p.name, r.workflow_id, r.pipeline, r.run_name, r.event, r.branch, r.sha, r.actor, r.status, r.conclusion, r.trust, r.attempt,
-     r.created_at, r.started_at, r.finished_at, r.error, r.message, r.rowid, r.approval, r.approved_by FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.workflow_id IS NOT NULL";
+     r.created_at, r.started_at, r.finished_at, r.error, r.message, r.rowid, r.approval, r.approved_by, r.provider, r.external_url, r.external_number FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.workflow_id IS NOT NULL";
 
-/// `GET /api/ci/runs?…`: the engine's runs, newest first, cursor-paged.
-pub async fn list(hub: &Hub, q: &HashMap<String, String>) -> Result<Response, Fail> {
+/// `GET /api/ci/runs?…`: the engine's runs, newest first, cursor-paged; of the repositories the
+/// caller may read (W10).
+pub async fn list(hub: &Hub, q: &HashMap<String, String>, caller: Option<&crate::authz::Caller>) -> Result<Response, Fail> {
+    let only: Option<String> = match caller {
+        Some(c) => crate::authz::gate::readable(hub, c, "runs.read").await.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())),
+        None => None,
+    };
+    Ok(srv::json(StatusCode::OK, &list_in(&hub.store, q, only).await?))
+}
+
+/// The engine's runs, newest first, a page at a time: of the repositories named in `only` (JSON,
+/// those the caller may read), or all. The server's `GET /api/ci/runs`, and a runner's from its
+/// replica (`crate::reads`).
+pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, only: Option<String>) -> Result<Value, Fail> {
     let limit = q.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(50).clamp(1, 200);
     let cursor = q.get("cursor").and_then(|c| c.parse::<i64>().ok()).unwrap_or(i64::MAX);
     let f = |k: &str| q.get(k).filter(|v| !v.is_empty()).cloned();
     let (repo, workflow, branch, event, conclusion, actor) = (f("repo"), f("workflow"), f("branch"), f("event"), f("conclusion"), f("actor"));
-    let rows = hub
-        .store
+    let rows = store
         .call(move |c| {
             let sql = format!(
                 "{RUN_SELECT} AND r.rowid < ?1 AND (?2 IS NULL OR p.name = ?2 OR p.id = ?2) AND (?3 IS NULL OR r.workflow_id = ?3 OR r.pipeline = ?3)
                  AND (?4 IS NULL OR r.branch = ?4) AND (?5 IS NULL OR r.event = ?5) AND (?6 IS NULL OR r.conclusion = ?6) AND (?7 IS NULL OR r.actor = ?7)
+                 AND (?9 IS NULL OR p.name IN (SELECT value FROM json_each(?9)))
                  ORDER BY r.rowid DESC LIMIT ?8"
             );
             let mut st = c.prepare(&sql)?;
-            let rows = st.query_map(params![cursor, repo, workflow, branch, event, conclusion, actor, limit + 1], run_row)?;
+            let rows = st.query_map(params![cursor, repo, workflow, branch, event, conclusion, actor, limit + 1, only], run_row)?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
@@ -66,12 +80,12 @@ pub async fn list(hub: &Hub, q: &HashMap<String, String>) -> Result<Response, Fa
     let more = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
     let page: Vec<Value> = rows.into_iter().take(usize::try_from(limit).unwrap_or(50)).collect();
     let next = if more { page.last().and_then(|r| r.get("github_run_id")).cloned() } else { None };
-    Ok(srv::json(StatusCode::OK, &json!({ "runs": page, "next_cursor": next })))
+    Ok(json!({ "runs": page, "next_cursor": next }))
 }
 
-async fn run_json(hub: &Hub, id: &str) -> Result<Value, Fail> {
+async fn run_json(store: &crate::store::Store, id: &str) -> Result<Value, Fail> {
     let id = id.to_owned();
-    hub.store.call(move |c| Ok(c.query_row(&format!("{RUN_SELECT} AND r.id = ?1"), [&id], run_row).optional()?)).await.map_err(internal)?.ok_or_else(|| missing("no such run"))
+    store.call(move |c| Ok(c.query_row(&format!("{RUN_SELECT} AND r.id = ?1"), [&id], run_row).optional()?)).await.map_err(internal)?.ok_or_else(|| missing("no such run"))
 }
 
 /// The legs of a run, as the API shows them.
@@ -80,9 +94,9 @@ fn attempt_of(q: &HashMap<String, String>) -> Option<i64> {
     q.get("attempt").and_then(|a| a.parse().ok())
 }
 
-async fn legs(hub: &Hub, run: &str, attempt: Option<i64>) -> Result<Vec<Value>, Fail> {
+async fn legs(store: &crate::store::Store, run: &str, attempt: Option<i64>) -> Result<Vec<Value>, Fail> {
     let run = run.to_owned();
-    hub.store
+    store
         .call(move |c| {
             let mut st = c.prepare(
                 "SELECT id, key, display, job_id, matrix, status, conclusion, agent, executor, attempt, wait_reason, queued_at, started_at, finished_at, error, needs, exit_code, reused_from,
@@ -115,30 +129,214 @@ async fn legs(hub: &Hub, run: &str, attempt: Option<i64>) -> Result<Vec<Value>, 
 
 /// `GET /api/ci/runs/:id`: the run and its legs.
 pub async fn get(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
-    let run = run_json(hub, id).await?;
-    let legs = legs(hub, id, attempt_of(q)).await?;
+    Ok(srv::json(StatusCode::OK, &get_in(&hub.store, id, q).await?))
+}
+
+/// A run and its legs, from a store: the server's `GET /api/ci/runs/:id`, and a runner's from its
+/// replica (`crate::reads`).
+pub async fn get_in(store: &crate::store::Store, id: &str, q: &HashMap<String, String>) -> Result<Value, Fail> {
+    let run = run_json(store, id).await?;
+    let legs = legs(store, id, attempt_of(q)).await?;
     // The actions the run pinned when it started (W07-R02).
     let rid = id.to_owned();
-    let input: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT input FROM ci_plans WHERE run_id = ?1", [&rid], |r| r.get(0)).optional()?)).await.map_err(internal)?;
+    let saved: Option<(String, Option<String>)> = store.call(move |c| Ok(c.query_row("SELECT input, removed FROM ci_plans WHERE run_id = ?1", [&rid], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await.map_err(internal)?;
+    let (input, removed) = saved.map_or((None, None), |(i, r)| (Some(i), r));
+    // The combinations `exclude` and `where` removed, by job, with why (W04-R29).
+    let removed: Value = removed.and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_else(|| json!({}));
     let actions: Vec<Value> = input
         .and_then(|i| serde_json::from_str::<Value>(&i).ok())
         .and_then(|v| v.get("actions").and_then(Value::as_object).cloned())
         .map(|m| m.into_iter().map(|(uses, a)| json!({ "uses": uses, "repo": a.get("repo"), "sha": a.get("sha") })).collect())
         .unwrap_or_default();
-    Ok(srv::json(StatusCode::OK, &json!({ "run": run, "legs": legs, "actions": actions })))
+    Ok(json!({ "run": run, "legs": legs, "actions": actions, "removed": removed }))
 }
 
 /// `GET /api/ci/runs/:id/graph`: the jobs as nodes (their legs inside), `needs` as edges, and the
-/// critical path, the chain of jobs that took longest end to end.
+/// critical path, the chain of jobs that took longest end to end; and the workflow's jobs as the
+/// run's plan has them (`jobs`, `plan_jobs`).
 pub async fn graph(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
-    run_json(hub, id).await?;
-    Ok(srv::json(StatusCode::OK, &graph_json(hub, id, attempt_of(q)).await?))
+    Ok(srv::json(StatusCode::OK, &graph_in(&hub.store, id, q).await?))
+}
+
+/// A run's graph, from a store: the server's `GET /api/ci/runs/:id/graph`, and a runner's from its
+/// replica (`crate::reads`).
+pub async fn graph_in(store: &crate::store::Store, id: &str, q: &HashMap<String, String>) -> Result<Value, Fail> {
+    run_json(store, id).await?;
+    let mut g = graph_json(store, id, attempt_of(q)).await?;
+    let jobs = plan_jobs(store, id).await?;
+    if let Some(o) = g.as_object_mut() {
+        o.insert("jobs".into(), Value::Array(jobs));
+    }
+    Ok(g)
+}
+
+/// `GET /api/ci/runs/:id/flow` (W04-R23), in the attempt asked for: each job output, from the
+/// step whose output it reads to the jobs that read it (where in each, and their legs), with the
+/// value each leg gave it (a secret's never, a long one cut); and each job's exported environment
+/// (the names its legs set) and the jobs that take it (`env-from`). Nothing for a run without a
+/// plan.
+pub async fn flow(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
+    run_json(&hub.store, id).await?;
+    let run = id.to_owned();
+    let model: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT workflow FROM ci_plans WHERE run_id = ?1", [&run], |r| r.get(0)).optional()?)).await.map_err(internal)?;
+    let Some(wf) = model.and_then(|m| serde_json::from_str::<kiln_ci::wf::Workflow>(&m).ok()) else {
+        return Ok(srv::json(StatusCode::OK, &json!({ "outputs": [], "exports": [] })));
+    };
+    let f = kiln_ci::wf::flow::flow(&wf);
+    let attempt = attempt_of(q);
+    let legs = legs(&hub.store, id, attempt).await?;
+    // What each leg reported, by its key.
+    let run = id.to_owned();
+    let reports: HashMap<String, Value> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT leg, report FROM ci_plan_log WHERE run_id = ?1 AND kind = 'leg' AND attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY seq")?;
+            let rows = st.query_map(params![run, attempt], |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, Option<String>>(1)?.unwrap_or_default())))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?.into_iter().map(|(k, r)| (k, serde_json::from_str(&r).unwrap_or(Value::Null))).collect())
+        })
+        .await
+        .map_err(internal)?;
+    let legs_of = |job: &str| legs.iter().filter(|l| l.get("job").and_then(Value::as_str).is_some_and(|j| j.eq_ignore_ascii_case(job))).collect::<Vec<_>>();
+    let brief = |l: &&Value| json!({ "leg": l.get("id"), "key": l.get("key"), "status": l.get("status") });
+    // A report's `[name, value]` pair of `name`, in its list `k`.
+    let pair = |r: Option<&Value>, k: &str, name: &str| -> Option<Value> {
+        r?.get(k)?.as_array()?.iter().find(|p| p.get(0).and_then(Value::as_str).is_some_and(|n| n.eq_ignore_ascii_case(name)))?.get(1).cloned()
+    };
+    let clip = |v: String| if v.chars().count() > 200 { format!("{}…", v.chars().take(200).collect::<String>()) } else { v };
+    let outputs: Vec<Value> = f
+        .outputs
+        .iter()
+        .map(|o| {
+            let values: Vec<Value> = legs_of(&o.job)
+                .into_iter()
+                .map(|l| {
+                    let key = l.get("key").and_then(Value::as_str).unwrap_or_default();
+                    let r = reports.get(key);
+                    let secret = o.secret || r.and_then(|r| r.get("secret_outputs")).and_then(Value::as_array).is_some_and(|a| a.iter().any(|n| n.as_str().is_some_and(|n| n.eq_ignore_ascii_case(&o.name))));
+                    let given = pair(r, "outputs", &o.name).and_then(|v| v.as_str().map(str::to_owned)).or_else(|| pair(r, "json_outputs", &o.name).map(|v| v.to_string()));
+                    json!({ "leg": l.get("id"), "key": key, "secret": secret, "value": if secret { None } else { given.map(clip) } })
+                })
+                .collect();
+            let readers: Vec<Value> = o.readers.iter().map(|r| json!({ "job": r.job, "at": r.at, "legs": legs_of(&r.job).iter().map(brief).collect::<Vec<_>>() })).collect();
+            json!({ "job": o.job, "name": o.name, "step": o.step.as_ref().map(|(i, id)| json!({ "index": i, "id": id })), "secret": o.secret, "values": values, "readers": readers })
+        })
+        .collect();
+    let exports: Vec<Value> = f
+        .exports
+        .iter()
+        .map(|e| {
+            let set: Vec<Value> = legs_of(&e.job)
+                .into_iter()
+                .map(|l| {
+                    let key = l.get("key").and_then(Value::as_str).unwrap_or_default();
+                    let names: Vec<String> = reports
+                        .get(key)
+                        .and_then(|r| r.get("env"))
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(|p| p.get(0).and_then(Value::as_str).map(str::to_owned)).collect())
+                        .unwrap_or_default();
+                    json!({ "leg": l.get("id"), "key": key, "names": names })
+                })
+                .collect();
+            let readers: Vec<Value> = e.readers.iter().map(|r| json!({ "job": r, "legs": legs_of(r).iter().map(brief).collect::<Vec<_>>() })).collect();
+            json!({ "job": e.job, "names": e.names, "legs": set, "readers": readers })
+        })
+        .collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "outputs": outputs, "exports": exports })))
+}
+
+/// The workflow's jobs as the run's plan has them (W21-R04), each whether its legs are made yet
+/// or not (a job's are made once what it needs is done): its name, what it needs, whether its
+/// matrix comes from what it needs (`matrix_waits`: then how many legs it has is known only once
+/// they're done), how many steps it has, whether it calls a workflow (its legs are then the
+/// called workflow's jobs, `<job>/<theirs>`), and how long it typically takes (`typical`,
+/// seconds; see `typical_spans`). None for a run without a plan (a v1 pipeline's, another
+/// provider's).
+async fn plan_jobs(store: &crate::store::Store, id: &str) -> Result<Vec<Value>, Fail> {
+    use kiln_ci::wf::ir::{Axis, Matrix};
+    let run = id.to_owned();
+    let saved: Option<(String, Option<String>, String, i64)> = store
+        .call(move |c| {
+            Ok(c.query_row("SELECT p.workflow, r.workflow_id, r.repo_id, r.number FROM ci_plans p JOIN runs r ON r.id = p.run_id WHERE p.run_id = ?1", [&run], |x| {
+                Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?))
+            })
+            .optional()?)
+        })
+        .await
+        .map_err(internal)?;
+    let Some((model, workflow, repo, number)) = saved else { return Ok(Vec::new()) };
+    let Ok(wf) = serde_json::from_str::<kiln_ci::wf::Workflow>(&model) else { return Ok(Vec::new()) };
+    let typical = match workflow {
+        Some(w) => typical_spans(store, &repo, &w, number).await?,
+        None => HashMap::new(),
+    };
+    // An expression that reads what the job needs (`fromJSON(needs.plan.outputs.matrix)`).
+    let reads_needs = |s: &str| s.contains("${{") && s.contains("needs.");
+    Ok(wf
+        .jobs
+        .iter()
+        .map(|j| {
+            let waits = match j.strategy.as_ref().and_then(|s| s.matrix.as_ref()) {
+                None => false,
+                Some(Matrix::Expr(t)) => reads_needs(&t.src),
+                Some(Matrix::Spec(m)) => {
+                    m.axes.iter().any(|(_, a)| matches!(a, Axis::Expr(t) if reads_needs(&t.src)))
+                        || [&m.include, &m.exclude].into_iter().flatten().any(|v| serde_json::to_string(v).is_ok_and(|s| reads_needs(&s)))
+                }
+            };
+            json!({
+                "job": j.id,
+                // Its name as written, unless an expression makes it (its legs then say it).
+                "name": j.name.as_ref().filter(|t| !t.has_expr()).map(|t| t.src.clone()),
+                "needs": j.needs.iter().map(|n| n.job()).collect::<Vec<_>>(),
+                "matrix_waits": waits,
+                "steps": j.steps.len(),
+                "calls": j.uses.is_some(),
+                "typical": typical.get(&j.id),
+            })
+        })
+        .collect())
+}
+
+/// How long each of a workflow's jobs typically takes, in seconds: the median of its spans (its
+/// first leg's start to its last leg's end) over the workflow's last 20 runs before run `number`
+/// that succeeded.
+async fn typical_spans(store: &crate::store::Store, repo: &str, workflow: &str, number: i64) -> Result<HashMap<String, f64>, Fail> {
+    let (repo, workflow) = (repo.to_owned(), workflow.to_owned());
+    let spans: Vec<(String, i64)> = store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT j.job_id, MAX(j.finished_at) - MIN(j.started_at)
+                 FROM (SELECT id, attempt FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND number < ?3 AND conclusion = 'success' ORDER BY number DESC LIMIT 20) r
+                 JOIN jobs j ON j.run_id = r.id AND j.run_attempt = r.attempt
+                 WHERE j.job_id IS NOT NULL AND j.started_at IS NOT NULL AND j.finished_at IS NOT NULL
+                 GROUP BY r.id, j.job_id",
+            )?;
+            let rows = st.query_map(params![repo, workflow, number], |x| Ok((x.get(0)?, x.get(1)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .map_err(internal)?;
+    let mut by_job: HashMap<String, Vec<i64>> = HashMap::new();
+    for (job, span) in spans {
+        by_job.entry(job).or_default().push(span.max(0));
+    }
+    Ok(by_job
+        .into_iter()
+        .map(|(job, mut s)| {
+            s.sort_unstable();
+            // The middle one, or the mean of the middle two.
+            let at = |i: usize| s.get(i).copied().unwrap_or(0) as f64;
+            let n = s.len();
+            (job, (at(n.saturating_sub(1) / 2) + at(n / 2)) / 2.0)
+        })
+        .collect())
 }
 
 /// A run's graph: its jobs with their legs and spans, the edges between them, and the critical
 /// path.
-pub async fn graph_json(hub: &Hub, id: &str, attempt: Option<i64>) -> Result<Value, Fail> {
-    let legs = legs(hub, id, attempt).await?;
+pub async fn graph_json(store: &crate::store::Store, id: &str, attempt: Option<i64>) -> Result<Value, Fail> {
+    let legs = legs(store, id, attempt).await?;
     let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
     // Jobs by id, in the order their first leg appeared.
     let mut order: Vec<String> = Vec::new();
@@ -195,7 +393,14 @@ pub async fn graph_json(hub: &Hub, id: &str, attempt: Option<i64>) -> Result<Val
 
 /// `GET /api/ci/runs/:id/annotations`, `/summary`, `/artifacts`.
 pub async fn part(hub: &Hub, id: &str, which: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
-    run_json(hub, id).await?;
+    run_json(&hub.store, id).await?;
+    // Another provider's run (W23-R01): its artifacts, from the provider.
+    if which == "artifacts"
+        && let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)?
+    {
+        let list = super::providers::artifacts(hub, &repo, &provider, &ext).await?;
+        return Ok(srv::json(StatusCode::OK, &json!({ "provider": provider, "artifacts": list })));
+    }
     let (run, which, attempt) = (id.to_owned(), which.to_owned(), attempt_of(q));
     let v = hub
         .store
@@ -241,17 +446,64 @@ pub async fn part(hub: &Hub, id: &str, which: &str, q: &HashMap<String, String>)
     Ok(srv::json(StatusCode::OK, &v))
 }
 
+/// `GET /api/ci/runs/:id/pending`: the deployments a run waits for a review of, whichever provider.
+pub async fn pending(hub: &Hub, id: &str) -> Result<Response, Fail> {
+    run_json(&hub.store, id).await?;
+    if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
+        let list = super::providers::pending(hub, &repo, &provider, &ext).await?;
+        return Ok(srv::json(StatusCode::OK, &json!({ "provider": provider, "pending": list })));
+    }
+    let list: Vec<Value> = super::environments::waiting(hub, id).await.map_err(internal)?.into_iter().map(|e| json!({ "environment": e })).collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "provider": super::providers::KILN, "pending": list })))
+}
+
+/// `GET /api/ci/runs/:id/artifacts/:artifact/download`: an artifact's archive, whichever provider
+/// (KilnCI's: a short-lived link to its blob).
+pub async fn download(hub: &Hub, id: &str, artifact: &str) -> Result<Response, Fail> {
+    run_json(&hub.store, id).await?;
+    if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
+        let bytes = super::providers::artifact(hub, &repo, &provider, &ext, artifact).await?;
+        return Ok(srv::response(StatusCode::OK, "application/zip", srv::full(bytes)));
+    }
+    let (run, aid) = (id.to_owned(), artifact.parse::<i64>().map_err(|_| (StatusCode::NOT_FOUND, "no such artifact".to_owned()))?);
+    let found: Option<(bool, Option<i64>)> = hub
+        .store
+        .call(move |c| Ok(c.query_row("SELECT object IS NULL, expires_at FROM ci_artifacts WHERE id = ?1 AND run_id = ?2 AND finalized = 1", params![aid, run], |r| Ok((r.get(0)?, r.get(1)?))).optional()?))
+        .await
+        .map_err(internal)?;
+    match found {
+        Some((gone, expires)) if gone || expires.is_some_and(|e| e <= crate::util::now_unix()) => Err((StatusCode::GONE, "the artifact has expired".into())),
+        Some(_) => {
+            let origin = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+            let url = super::services::blob::url(hub, &origin, super::services::blob::Target::Artifact(aid), "r", 60);
+            Ok(srv::with_header(srv::status(StatusCode::FOUND), http::header::LOCATION, &url))
+        }
+        None => Err((StatusCode::NOT_FOUND, "no such artifact".into())),
+    }
+}
+
 /// `POST /api/ci/runs/:id/cancel`.
 pub async fn cancel(hub: &Hub, id: &str) -> Result<Response, Fail> {
-    run_json(hub, id).await?;
+    run_json(&hub.store, id).await?;
+    // Another provider's run (W23): its provider cancels it.
+    if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
+        let v = super::providers::cancel(hub, &repo, &provider, &ext).await?;
+        return Ok(srv::json(StatusCode::ACCEPTED, &v));
+    }
     hub.cancel_run(id, "cancelled from the API").await.map_err(internal)?;
     Ok(srv::status(StatusCode::ACCEPTED))
 }
 
 /// `POST /api/ci/runs/:id/rerun`: the run again, from its saved event and the workflow as it
 /// was (a new run; `{ mode: "all" }`, the default).
-pub async fn rerun(hub: &Hub, id: &str, body: &Value) -> Result<Response, Fail> {
+pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Response, Fail> {
     use super::dispatch::RerunMode;
+    // Another provider's run (W23): its provider reruns it.
+    if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
+        let mode = body.get("mode").and_then(Value::as_str).unwrap_or("all");
+        let v = super::providers::rerun(hub, &repo, &provider, &ext, mode, body.get("job").and_then(Value::as_str)).await?;
+        return Ok(srv::json(StatusCode::CREATED, &v));
+    }
     let mode = match body.get("mode").and_then(Value::as_str).unwrap_or("all") {
         "all" => RerunMode::All,
         "failed" => RerunMode::Failed,
@@ -279,7 +531,7 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value) -> Result<Response, Fail> 
     // "Run anyway" (W08-R10): no leg takes an earlier result over.
     let no_reuse = body.get("no_reuse").and_then(Value::as_bool).unwrap_or(false);
     let (tx, rx) = async_channel::bounded(1);
-    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, reply: tx });
+    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, by: by.to_owned(), reply: tx });
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
         Ok(Ok(Err(e))) => Err((StatusCode::CONFLICT, e)),
@@ -287,10 +539,11 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value) -> Result<Response, Fail> 
     }
 }
 
-/// `GET /api/ci/legs/:id`: the leg, its steps and annotations.
+/// `GET /api/ci/legs/:id`: the leg, its steps and annotations, its attempts (each with its
+/// conclusion, failure class and runner) and its outputs (W21-R05).
 pub async fn leg(hub: &Hub, id: &str) -> Result<Response, Fail> {
     let leg_id = id.to_owned();
-    let found: Option<(String, Vec<Value>, Vec<Value>)> = hub
+    let found: Option<(String, Vec<Value>, Vec<Value>, Vec<Value>, Value)> = hub
         .store
         .call(move |c| {
             let Some(run) = c.query_row("SELECT run_id FROM jobs WHERE id = ?1 AND job_id IS NOT NULL", [&leg_id], |r| r.get::<_, String>(0)).optional()? else { return Ok(None) };
@@ -307,16 +560,27 @@ pub async fn leg(hub: &Hub, id: &str) -> Result<Response, Fail> {
             let notes = st
                 .query_map([&leg_id], |r| Ok(json!({ "step": r.get::<_, Option<i64>>(0)?, "level": r.get::<_, String>(1)?, "title": r.get::<_, Option<String>>(2)?, "message": r.get::<_, String>(3)?, "file": r.get::<_, Option<String>>(4)?, "line": r.get::<_, Option<i64>>(5)? })))?
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Some((run, steps, notes)))
+            let mut st = c.prepare("SELECT number, status, conclusion, failure_class, runner, executor, queued_at, started_at, finished_at, exit_code, error FROM ci_attempts WHERE leg_id = ?1 ORDER BY number")?;
+            let attempts = st
+                .query_map([&leg_id], |r| {
+                    Ok(json!({ "number": r.get::<_, i64>(0)?, "status": r.get::<_, String>(1)?, "conclusion": r.get::<_, Option<String>>(2)?, "class": r.get::<_, Option<String>>(3)?,
+                               "runner": r.get::<_, Option<String>>(4)?, "executor": r.get::<_, Option<String>>(5)?, "queued_at": r.get::<_, Option<i64>>(6)?, "started_at": r.get::<_, Option<i64>>(7)?,
+                               "finished_at": r.get::<_, Option<i64>>(8)?, "exit_code": r.get::<_, Option<i64>>(9)?, "error": r.get::<_, Option<String>>(10)? }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            // Its outputs as its job's `needs` read them (a secret one is kept sealed elsewhere).
+            let outputs: Option<String> = c.query_row("SELECT outputs FROM jobs WHERE id = ?1", [&leg_id], |r| r.get(0)).optional()?.flatten();
+            let outputs = outputs.and_then(|t| serde_json::from_str::<Value>(&t).ok()).unwrap_or_else(|| json!({}));
+            Ok(Some((run, steps, notes, attempts, outputs)))
         })
         .await
         .map_err(internal)?;
-    let Some((run, steps, annotations)) = found else { return Err(missing("no such leg of the CI engine")) };
+    let Some((run, steps, annotations, attempts, outputs)) = found else { return Err(missing("no such leg of the CI engine")) };
     let lid = id.to_owned();
     let attempt: Option<i64> = hub.store.call(move |c| Ok(c.query_row("SELECT run_attempt FROM jobs WHERE id = ?1", [&lid], |r| r.get(0)).optional()?)).await.map_err(internal)?;
-    let all = legs(hub, &run, attempt).await?;
+    let all = legs(&hub.store, &run, attempt).await?;
     let me = all.into_iter().find(|l| l.get("id").and_then(Value::as_str) == Some(id)).unwrap_or(Value::Null);
-    Ok(srv::json(StatusCode::OK, &json!({ "run": run, "leg": me, "steps": steps, "annotations": annotations })))
+    Ok(srv::json(StatusCode::OK, &json!({ "run": run, "leg": me, "steps": steps, "annotations": annotations, "attempts": attempts, "outputs": outputs })))
 }
 
 /// A leg's runner, if it is kept there now.
@@ -333,7 +597,11 @@ async fn kept_on(hub: &Hub, id: &str) -> Result<String, Fail> {
 /// `POST /api/ci/legs/:id/release`: a kept leg let go now (W17-R02).
 pub async fn release(hub: &Hub, id: &str, by: &str) -> Result<Response, Fail> {
     let agent = kept_on(hub, id).await?;
-    hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::KeepRelease { job: id.to_owned() }).await;
+    // Parked: a runner that's away lets it go once it's back. Refused, it says why.
+    let answer = hub.command(&agent, &crate::proto::ServerMsg::KeepRelease { job: id.to_owned() }, crate::hub::COMMAND_WITHIN).await;
+    if let Some(f) = answer.failure(&agent) {
+        return Err(f);
+    }
     super::runs::kept(hub, id, None).await.map_err(internal)?;
     hub.ci.keep(id, None);
     hub.store.audit(by.to_owned(), "ci.legs.release".into(), id.to_owned()).await;
@@ -347,7 +615,10 @@ pub async fn extend(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respo
     let agent = kept_on(hub, id).await?;
     let minutes = body.get("minutes").and_then(Value::as_u64).unwrap_or(30).clamp(1, u64::from(crate::runner::kept::MAX_KEEP_MINUTES));
     let minutes = u32::try_from(minutes).unwrap_or(30);
-    hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::KeepExtend { job: id.to_owned(), minutes }).await;
+    let answer = hub.command(&agent, &crate::proto::ServerMsg::KeepExtend { job: id.to_owned(), minutes }, crate::hub::COMMAND_WITHIN).await;
+    if let Some(f) = answer.failure(&agent) {
+        return Err(f);
+    }
     let until = crate::util::now_unix() + i64::from(minutes) * 60;
     super::runs::kept(hub, id, Some(until)).await.map_err(internal)?;
     hub.ci.keep(id, Some((agent.clone(), until)));
@@ -383,7 +654,10 @@ pub async fn rerun_step(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<R
     if busy {
         return Err((StatusCode::CONFLICT, "a step of this leg is running again already; rerun once it ends".into()));
     }
-    hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::JobRerunStep { job: id.to_owned(), step, idx: next }).await;
+    // Live: refused at once while its runner is away, rather than run later.
+    if let Some(f) = hub.command(&agent, &crate::proto::ServerMsg::JobRerunStep { job: id.to_owned(), step, idx: next }, crate::hub::COMMAND_WITHIN).await.failure(&agent) {
+        return Err(f);
+    }
     hub.store.audit(by.to_owned(), "ci.legs.rerun_step".into(), format!("{id} step {}", step + 1)).await;
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "leg": id, "step": step, "idx": next })))
 }
@@ -456,6 +730,13 @@ pub async fn exec(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, caller: Opt
 pub async fn logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
     let from: usize = q.get("from").and_then(|v| v.parse().ok()).unwrap_or(0);
+    // Another provider's leg (W23): its log, read from the provider.
+    if let Some((repo, provider, run, job)) = super::providers::of_leg(hub, id).await.map_err(internal)? {
+        let text = super::providers::logs(hub, &repo, &provider, &run, &job).await?;
+        let data = text.into_bytes();
+        let data = if from == 0 { data } else { data.get(from..).map(<[u8]>::to_vec).unwrap_or_default() };
+        return Ok(srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(data)));
+    }
     let mut data = hub.logs.read(id, step).await;
     // A leg a rerun kept: the logs are those of the leg whose result it keeps (W05-R17).
     if data.is_empty() {

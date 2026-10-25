@@ -7,10 +7,14 @@ import { Button } from "@/components/ui/button";
 import { Confirm, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Link } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
-import { formatBytes } from "@/lib/format";
+import { formatBytes, formatDuration } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { invalidate, preload, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
+import { DataFlow } from "./flow";
+
+/** The data flow's values come as legs end: it's read again as the run moves. */
+const FLOW_OPTS = { on: ["run"], pollMs: 30_000 } as const;
 
 const Markdown = React.lazy(() => import("@/lib/markdown").then((m) => ({ default: m.MarkdownBody })));
 const TerminalSession = React.lazy(() => import("@/views/terminal/session").then((m) => ({ default: m.TerminalSession })));
@@ -72,10 +76,12 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
   const [mode, setMode] = React.useState<string>(failed ? "failed" : "all");
   const [debug, setDebug] = React.useState(false);
   const [keepFailed, setKeepFailed] = React.useState(false);
+  const [fresh, setFresh] = React.useState(false);
   const [confirm, setConfirm] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const debugId = React.useId();
   const keepId = React.useId();
+  const freshId = React.useId();
 
   const go = async (fn: () => Promise<unknown>, ok: string) => {
     setBusy(true);
@@ -137,7 +143,13 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
         <input id={keepId} type="checkbox" className="check" checked={keepFailed} onChange={(e) => setKeepFailed(e.target.checked)} />
         Keep failed legs
       </label>
-      <Button variant="primary" disabled={busy} onClick={() => go(() => ci.rerun(run.id, m, job, debug, keepFailed), `Attempt ${run.attempt + 1} started`)}>
+      {detail.actions.length > 0 && (
+        <label htmlFor={freshId} className="inline-flex min-h-9 items-center gap-2 text-[12.5px] text-[#b0b4be]" title="The actions' versions looked up again, instead of the ones this run pinned">
+          <input id={freshId} type="checkbox" className="check" checked={fresh} onChange={(e) => setFresh(e.target.checked)} />
+          Fresh actions
+        </label>
+      )}
+      <Button variant="primary" disabled={busy} onClick={() => go(() => ci.rerun(run.id, m, job, debug, keepFailed, fresh), `Attempt ${run.attempt + 1} started`)}>
         <RotateCcw /> Rerun
       </Button>
     </div>
@@ -229,15 +241,24 @@ function DeployReview({ detail }: { detail: CiRunDetail }) {
 /** What the run left: summaries, annotations, artifacts, and the actions it pinned. */
 export function CiRunParts({ detail, attempt }: { detail: CiRunDetail; attempt: number | undefined }) {
   const id = detail.run.id;
-  const summaries = useSuspenseResource(`ci-run/${id}/summary/${attempt ?? ""}`, (s) => ci.summaries(id, attempt, s)).data.summaries;
-  const annotations = useSuspenseResource(`ci-run/${id}/annotations/${attempt ?? ""}`, (s) => ci.annotations(id, attempt, s)).data.annotations;
+  const a = attempt ?? "";
+  // Each read below suspends before the next would start: fetched at once instead.
+  preload(`ci-run/${id}/summary/${a}`, (s) => ci.summaries(id, attempt, s));
+  preload(`ci-run/${id}/annotations/${a}`, (s) => ci.annotations(id, attempt, s));
+  preload(`ci-run/${id}/artifacts`, (s) => ci.artifacts(id, s));
+  preload(`ci-run/${id}/tests/${a}`, (s) => ci.tests(id, attempt, s));
+  preload(`ci-run/${id}/metrics`, (s) => ci.metrics(id, s));
+  preload(`ci-run/${id}/flow/${a}`, (s) => ci.flow(id, attempt, s), FLOW_OPTS);
+  const summaries = useSuspenseResource(`ci-run/${id}/summary/${a}`, (s) => ci.summaries(id, attempt, s)).data.summaries;
+  const annotations = useSuspenseResource(`ci-run/${id}/annotations/${a}`, (s) => ci.annotations(id, attempt, s)).data.annotations;
   const artifacts = useSuspenseResource(`ci-run/${id}/artifacts`, (s) => ci.artifacts(id, s)).data.artifacts;
-  const tests = useSuspenseResource(`ci-run/${id}/tests/${attempt ?? ""}`, (s) => ci.tests(id, attempt, s)).data;
+  const tests = useSuspenseResource(`ci-run/${id}/tests/${a}`, (s) => ci.tests(id, attempt, s)).data;
   const metrics = useSuspenseResource(`ci-run/${id}/metrics`, (s) => ci.metrics(id, s)).data.metrics;
+  const flow = useSuspenseResource(`ci-run/${id}/flow/${a}`, (s) => ci.flow(id, attempt, s), FLOW_OPTS).data;
   return (
     <div className="mt-6 flex flex-col gap-4">
       {tests.tests.length > 0 && <Tests list={tests.tests} counts={tests.counts} />}
-      {metrics.length > 0 && <Metrics list={metrics} />}
+      {metrics.length > 0 && <Metrics list={metrics} repo={detail.run.repo} />}
       {summaries.length > 0 && (
         <Panel eyebrow={`Summaries · ${summaries.length}`} title="Job summaries">
           <div className="flex flex-col gap-6">
@@ -268,6 +289,7 @@ export function CiRunParts({ detail, attempt }: { detail: CiRunDetail; attempt: 
           </ul>
         </Panel>
       )}
+      {flow.outputs.length + flow.exports.length > 0 && <DataFlow flow={flow} run={id} />}
       {detail.actions.length > 0 && (
         <Panel
           eyebrow={`Actions · ${detail.actions.length}`}
@@ -304,8 +326,9 @@ function metricValue(v: number, unit: string): string {
 const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
 
 /** The run's benchmark metrics (W16-R07, R08): clear changes first, each with its interval
- * against the baseline (the default branch's last runs on the same kind of runner). */
-function Metrics({ list }: { list: CiMetric[] }) {
+ * against the baseline (the default branch's last runs on the same kind of runner), and a link to
+ * its trend. */
+function Metrics({ list, repo }: { list: CiMetric[]; repo: string }) {
   const sorted = [...list].sort((a, b) => (VERDICT_RANK[a.comparison?.verdict ?? ""] ?? 3) - (VERDICT_RANK[b.comparison?.verdict ?? ""] ?? 3) || a.name.localeCompare(b.name));
   const regressed = list.filter((m) => m.comparison?.verdict === "regressed").length;
   const improved = list.filter((m) => m.comparison?.verdict === "improved").length;
@@ -320,7 +343,9 @@ function Metrics({ list }: { list: CiMetric[] }) {
             <li key={i} className="flex flex-col gap-1 px-5 py-2.5">
               <span className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
                 <i className="dot" data-status={status} aria-hidden="true" />
-                <span className="min-w-0 font-mono text-[12px] [overflow-wrap:anywhere] text-[#d4dde8]">{m.name}</span>
+                <Link to={`/insights?repo=${encodeURIComponent(repo)}&metric=${encodeURIComponent(m.name)}`} className="text-link min-w-0 font-mono text-[12px] [overflow-wrap:anywhere]">
+                  {m.name}
+                </Link>
                 <span className="font-mono text-[12px] text-[#a6b2c6] tabular-nums">{metricValue(m.value, m.unit)}</span>
                 <span className="ml-auto font-mono text-[10.5px] text-[#7f8a9a]">{m.leg_key}</span>
               </span>
@@ -378,6 +403,19 @@ function Tests({ list, counts }: { list: CiTest[]; counts: Record<string, number
   );
 }
 
+/** A test's last results on the branch, oldest first (W16-R03): a bar each, a failure taller. */
+function Spark({ history }: { history: string }) {
+  const n = (of: string) => [...history].filter((o) => of.includes(o)).length;
+  const said = [`${n("p")} passed`, n("fe") ? `${n("fe")} failed` : "", n("s") ? `${n("s")} skipped` : ""].filter(Boolean).join(", ");
+  return (
+    <span className="test-spark" role="img" aria-label={`Its last ${history.length} results: ${said}`} title={`Its last ${history.length} results: ${said}`}>
+      {[...history].map((o, i) => (
+        <i key={i} data-o={o} />
+      ))}
+    </span>
+  );
+}
+
 function TestRow({ t }: { t: CiTest }) {
   return (
     <li className="flex flex-col gap-1 px-5 py-2.5">
@@ -393,6 +431,7 @@ function TestRow({ t }: { t: CiTest }) {
             {t.flaky.class === "flaky" ? "flaky" : "probably flaky"}
           </span>
         )}
+        {t.history && t.history.length > 1 && <Spark history={t.history} />}
         <span className="ml-auto font-mono text-[10.5px] text-[#7f8a9a] tabular-nums">
           {t.leg_key}
           {t.duration_ms != null ? ` · ${testTime(t.duration_ms)}` : ""}
@@ -460,6 +499,47 @@ export function Annotations({ list, title = "Annotations" }: { list: CiAnnotatio
 
 /** A CI leg's own notes on its panel: a kept result, its annotations, and why it waits or where it
  * would run (W21-R05, W05-R20). */
+/** A leg's attempts when it took more than one, or its one ended with a failure class (each
+ * attempt's end, why it failed, and where it ran), and its outputs (W21-R05). */
+function Attempts({ legId }: { legId: string }) {
+  const d = useSuspenseResource(`ci-leg/${legId}/detail`, (s) => ci.legDetail(legId, s)).data;
+  const list = d.attempts ?? [];
+  const outputs = Object.entries(d.outputs ?? {});
+  return (
+    <>
+      {(list.length > 1 || list.some((a) => a.class)) && (
+        <ul className="row-list" aria-label="Attempts">
+          {list.map((a) => {
+            const took = a.started_at && a.finished_at ? formatDuration(a.finished_at - a.started_at) : null;
+            return (
+              <li key={a.number} className="flex flex-wrap items-center gap-x-2.5 gap-y-1 px-5 py-2">
+                <i className="dot" data-status={a.conclusion === "success" ? "succeeded" : a.conclusion ? "failed" : a.status} aria-hidden="true" />
+                <span className="font-mono text-[11px] text-[#d4dde8]">Attempt {a.number}</span>
+                <span className="font-mono text-[11px] text-[#a6b2c6]">{a.conclusion ?? a.status}</span>
+                {a.class && <span className="font-mono text-[10px] tracking-[0.06em] text-[#c9a86a] uppercase">{a.class}</span>}
+                <span className="ml-auto font-mono text-[10.5px] text-[#7f8a9a]">
+                  {[a.runner, a.executor, took, a.exit_code !== null && a.exit_code !== 0 ? `exit ${a.exit_code}` : null].filter(Boolean).join(" · ")}
+                </span>
+                {a.error && <span className="w-full font-mono text-[10.5px] [overflow-wrap:anywhere] text-[#d1aaad]">{a.error}</span>}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {outputs.length > 0 && (
+        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 border-t border-[#28313d] px-5 py-3 font-mono text-[11px]" aria-label="Outputs">
+          {outputs.map(([k, v]) => (
+            <React.Fragment key={k}>
+              <dt className="text-[#93a1b4]">{k}</dt>
+              <dd className="[overflow-wrap:anywhere] text-[#d4dde8]">{v}</dd>
+            </React.Fragment>
+          ))}
+        </dl>
+      )}
+    </>
+  );
+}
+
 export function CiLegExtras({
   runId,
   attempt,
@@ -497,6 +577,9 @@ export function CiLegExtras({
           </Link>
         </p>
       )}
+      <React.Suspense fallback={null}>
+        <Attempts legId={legId} />
+      </React.Suspense>
       {status === "queued" && (
         <React.Suspense fallback={<p className="px-5 py-3 font-mono text-[11px] text-[#7f8a9a]">Asking the scheduler why it waits…</p>}>
           <WhyWaiting legId={legId} />

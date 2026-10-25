@@ -652,7 +652,7 @@ async fn poll(http: &Client, server: &str, id: &str, secret: &str) -> Result<Pol
     }
 }
 
-fn host_of(url: &str) -> Option<String> {
+pub(crate) fn host_of(url: &str) -> Option<String> {
     let rest = url.split("://").nth(1).unwrap_or(url);
     let authority = rest.split('/').next()?;
     let host = if let Some(v6) = authority.strip_prefix('[') {
@@ -663,7 +663,7 @@ fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_owned())
 }
 
-fn host_port(host: &str, port: u16) -> String {
+pub(crate) fn host_port(host: &str, port: u16) -> String {
     if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
 }
 
@@ -961,7 +961,11 @@ pub struct JoinArgs {
 pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate::agent::Opts>> {
     let interactive = interactive();
     let state_dir = crate::config::default_data_dir().join("agent");
-    if enrolled(&state_dir) && !a.yes {
+    // This machine's runner, running: joining never starts a second one beside it, nor takes the
+    // credentials it runs on from under it (docs/releases.md, "One runner a machine").
+    let running: Vec<crate::upgrade::Here> =
+        if enrolled(&state_dir) { crate::upgrade::services_here(&state_dir, "kiln-agent").into_iter().filter(|h| h.running).collect() } else { Vec::new() };
+    if enrolled(&state_dir) && running.is_empty() && !a.yes {
         let other = stored(&state_dir, "server").unwrap_or_else(|| "a kiln server".to_owned());
         anyhow::ensure!(
             interactive,
@@ -979,6 +983,32 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             choose(found, a.yes, interactive, &shutdown).await?
         }
     };
+    if !running.is_empty() {
+        let units = running.iter().map(|h| h.existing.unit.as_str()).collect::<Vec<_>>().join(", ");
+        match crate::upgrade::knows_machine(&server, &state_dir).await {
+            // The server it works for already: this kiln takes the runner over.
+            Ok(true) => {
+                anyhow::ensure!(!a.no_install, "this machine's runner ({units}) already works for {server}: one in the foreground would be a second one beside it");
+                say_stderr(&format!("This machine's runner ({units}) already works for {server}: this kiln takes it over (its name, labels and slots stay), rather than joining again beside it."));
+                crate::upgrade::take_over(&state_dir, &server, &|m| say_stderr(&format!("  {m}"))).await?;
+                say_stderr(&format!("\nTaken over: this machine's runner of {server} is this kiln now."));
+                return Ok(None);
+            }
+            // Another server's: it stops, never to go on beside the new one.
+            Ok(false) => {
+                let other = stored(&state_dir, "server").unwrap_or_else(|| "another kiln server".to_owned());
+                if !a.yes {
+                    anyhow::ensure!(interactive, "this machine's runner ({units}) works for {other}: joining {server} stops it, and its agents stay with {other}; pass --yes to");
+                    let answer = ask(&format!("This machine's runner works for {other}. Joining {server} stops it, and its agents stay with {other}. Go on? [y/N] "), &shutdown).await?;
+                    anyhow::ensure!(yes(&answer), "not joining");
+                }
+                for unit in crate::upgrade::stop_here(&state_dir)? {
+                    say_stderr(&format!("Stopped {unit}, the runner that worked for {other}."));
+                }
+            }
+            Err(e) => anyhow::bail!("this machine's runner ({units}) runs, and {server} couldn't be asked whether it works for it already ({e:#}): not joining beside it; try again once {server} answers"),
+        }
+    }
     let me = Machine::this(a.name.clone(), &a.labels);
     let joined = request(&server, &me, &state_dir, &say_stderr, &shutdown).await?;
     if a.no_install {
@@ -1008,7 +1038,8 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
         }));
     }
     crate::install::install(crate::install::InstallArgs {
-        unattended: true,
+        // At a terminal, Windows may ask for administrator rights to start kiln at boot.
+        unattended: !interactive,
         system: false,
         agent: true,
         boot: a.boot,
@@ -1021,9 +1052,16 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
         slots: a.slots,
         upgrade: false,
         service: "kiln-agent".to_owned(),
+        on: None,
+        context: None,
+        namespace: "kiln".to_owned(),
+        image: None,
+        registry: None,
+        port: 7070,
     })
     .await?;
-    say_stderr(&format!("\nJoined: this machine is agent \"{}\" of {}. It starts on boot.", joined.name, joined.server));
+    // When it starts (at boot, or at sign-in) is the install's to say: it's the `boot` line above.
+    say_stderr(&format!("\nJoined: this machine is agent \"{}\" of {}.", joined.name, joined.server));
     Ok(None)
 }
 

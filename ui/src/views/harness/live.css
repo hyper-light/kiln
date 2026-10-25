@@ -1,0 +1,287 @@
+/* Live pages (live.tsx): the page.css frame, with an address row, its picture filling a box that
+   is the page's window (this frame's width, most of a screen's height), and the field a phone's
+   keyboard types into, out of sight. */
+
+.lv-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: 2px 0 6px;
+}
+/* Its tabs (a Chromium page's), when it has more than one: the one shown, in a select of the one
+   style, as compact as the address. */
+.lv-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 2px 0 0;
+}
+.lv-tab {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* Its resolution, among its actions: the one style's select, as small as they are. */
+.lv-res select {
+  min-height: 22px;
+  padding: 1px 24px 1px 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.lv-res > .select > svg {
+  right: 6px;
+}
+.lv-tab select {
+  min-height: 28px;
+  padding: 4px 28px 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.lv-address,
+.lv-mirror {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
+  margin-left: 4px;
+  padding: 0 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+/* As tall as the conversation shows (--lv-h, set as it changes), less its own controls; while a
+   phone's keyboard is up, what's left above it (--lv-kb-h). */
+.lv-box {
+  height: var(--lv-kb-h, clamp(260px, var(--lv-h, 60dvh), 900px));
+  background: #0c0d10;
+}
+.lv-canvas {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* The page whole within the frame: as the frame's own size, or a device's window letterboxed. */
+  object-fit: contain;
+  outline: none;
+  /* The page scrolls and zooms itself: the conversation doesn't take its gestures. */
+  touch-action: none;
+  cursor: default;
+}
+.lv-canvas:focus-visible {
+  box-shadow: inset 0 0 0 2px #bab0e3;
+}
+/* WebRTC's picture (live.tsx `Viewing`), under the canvas: that takes what's done in the page,
+   and is clear while this is what's seen. */
+.lv-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+}
+/* The viewer's own field for the page's (live.tsx `shape`): in the address's place while it's
+   typed in; out of sight otherwise, yet there to take the focus in a tap's own gesture. */
+.lv-bar {
+  position: relative;
+}
+.lv-mirror-off {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  min-width: 0;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.lv-typing-what {
+  flex: none;
+  max-width: 30%;
+  margin-left: 6px;
+  overflow: hidden;
+  color: #bab0e3;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.lv-over {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: rgba(8, 9, 10, 0.72);
+  color: #c3c8d2;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: center;
+}
+.lv-over p {
+  max-width: 34ch;
+  margin: 0;
+}
+/* Where the agent just clicked or tapped: a ring that fades. */
+.lv-mark {
+  position: absolute;
+  width: 28px;
+  height: 28px;
+  margin: -14px 0 0 -14px;
+  border: 2px solid #bab0e3;
+  border-radius: 50%;
+  pointer-events: none;
+  animation: lv-mark 1.2s ease-out forwards;
+}
+@keyframes lv-mark {
+  from {
+    opacity: 1;
+    transform: scale(0.6);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.4);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lv-mark {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
+/* Live pages you open (live-pages.tsx): what to open and in which profile, in a row that wraps on
+   a phone; the ones open under it. */
+.lp {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.lp-open {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+.lp-what {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+.lp-profile {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+/* Engine and device, side by side. */
+.lp-half {
+  flex: 1 1 calc(50% - 5px);
+  min-width: 0;
+}
+.lp-go {
+  flex: none;
+  min-height: 40px;
+}
+.lp-says {
+  margin: 0;
+}
+.lp-app {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #a1a3ab;
+  font-size: 12px;
+}
+.lp-app code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: #c9cbd3;
+  overflow-wrap: anywhere;
+}
+.lp-error {
+  margin: 0;
+  color: #e3a7a0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* On the person's own device: a label, its two ways, and what's open there, each with End. */
+.lp-device {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+.lp-device-what {
+  flex: 1 1 100%;
+  color: #8f939e;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.lp-opened {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.lp-opened li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: #8f929b;
+  font-size: 12px;
+}
+.lp-opened code {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #c9cbd3;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Recording (live.tsx): its time in the head, and below the frame each recording, to watch or keep. */
+.lv-recording {
+  color: #e3a7a0;
+}
+.lv-recs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.lv-rec {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+.lv-rec-what {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.lv-rec-video {
+  display: block;
+  width: 100%;
+  max-height: 60dvh;
+  margin-top: 6px;
+  border: 1px solid #1d1f23;
+  border-radius: 8px;
+  background: #0c0d10;
+}

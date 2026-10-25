@@ -244,7 +244,7 @@ function FrontDoorPanel({ runner }: { runner: string }) {
 
 function appliedWords(v: FrontDoorView): string {
   if (!v.connected) return `${v.runner} is offline: it applies these when it connects.`;
-  if (v.supported === false) return `${v.runner} runs a kiln too old for a front door: upgrade it in Settings → Updates.`;
+  if (v.supported === false) return `${v.runner} runs a kiln too old for a front door: upgrade it in System → Updates.`;
   if (v.applied === false) return `${v.runner} is applying these…`;
   if (v.applied) return `In use on ${v.runner}.`;
   return "";

@@ -1,9 +1,10 @@
 # Repo sync
 
-> **Phases 1 and 2 are built:** the engine, each repo's Raft group, the server and runner sides,
-> the API and the synced folders on the Repositories page. So are [repositories on machines](#repositories-on-machines):
-> what each machine holds, and cloning, syncing and moving a repository between machines. Git refs
-> (phase 3) and voters on machines (phase 4) are not yet.
+> **Phases 1 to 3 are built:** the engine, each repo's Raft group, the server and runner sides,
+> the API and the synced folders on the Repositories page, and git refs (branches, tags and
+> commits, [below](#git-refs)). So are [repositories on machines](#repositories-on-machines):
+> what each machine holds, and cloning, syncing and moving a repository between machines. Voters on
+> machines (phase 4) are not yet.
 
 ## Using it
 
@@ -74,12 +75,44 @@ Every copy applies committed steps in log order. For each change:
 
 ## Modes
 
-| mode | what travels | for |
+| mode (`mode`) | what travels | for |
 | --- | --- | --- |
-| **working tree** (default) | every file but `.git/`, what `.gitignore` ignores and kiln's list (`node_modules/`, `target/`, `.venv/`, ...); uncommitted work included | repos and plain folders |
-| **+ git refs** (default on for git repos) | commits and branches too: fetched by the other copies as git bundles over kiln's links; a branch moves on a copy whose working tree already matches it, so `git status` agrees everywhere | git repos |
-| **git only** | commits and branches; working trees stay each machine's own | copies that shouldn't see work in progress |
-| **everything** (expert) | `.git/` included; one writer at a time | mirrors |
+| **files** (`files`, the API's default) | every file but `.git/`, what `.gitignore` ignores and kiln's list (`node_modules/`, `target/`, `.venv/`, ...); uncommitted work included | repos and plain folders |
+| **files, branches and commits** (`files_and_git`, the Repositories page's default for a git repository) | the files, and the branches, tags and commits, and the branch checked out: a branch moves on a copy whose working tree has (or is taking) its files, so `git status` agrees everywhere | git repos |
+| **branches and commits** (`git`) | branches, tags and commits; working trees stay each machine's own | copies that shouldn't see work in progress |
+| **everything** (expert, not built) | `.git/` included; one writer at a time | mirrors |
+
+### Git refs
+
+A synced repo's refs are paths of its tree under `.git/`: `.git/refs/heads/<branch>`,
+`.git/refs/tags/<tag>` and, with its files, `.git/HEAD`. A ref's version is the commit it names (a
+tag's object), `HEAD`'s the branch checked out (`ref: refs/heads/main`, or a commit when detached).
+Each look reads them (`git for-each-ref`) beside the files, and a ref that moved is a change like a
+file's, with a `bundle`: the blob of a git bundle of the commits it moves to that the log's refs
+don't reach, which the other copies take (`git bundle unbundle`) before any ref of the step moves.
+The tree keeps each ref's last bundle, for a copy that takes the tree whole.
+
+- **Moving a branch:** one not checked out moves (`git update-ref`). The branch checked out, the
+  files synced, moves with its index (`git reset --mixed`): the files are the log's, so `git status`
+  says what it says on the copy it came from. Without the files it moves only as `git merge
+  --ff-only` would, taking the files with it; when work in the folder is in the way it stays, and
+  moves at a later look once it can.
+- **Conflicts:** the files' rule. A branch moved on two copies from the same commit keeps the first
+  to commit; the other's goes beside it, `<branch>.conflict-<machine>-<YYYYMMDD-HHMMSS>`, on every
+  copy, so no commit is lost, and the copy that lost has its branch take the log's (its own work in
+  its files, and on the branch beside). Merging that branch (or rebasing onto the log's) moves the
+  branch past the log's commit: no conflict. A branch behind the log's commit isn't a change; the
+  log's is brought. Resolving keeps the branch, takes the other's commit, or keeps both
+  (`<branch>.kept-...`). A `HEAD` that lost goes nowhere.
+- **Waiting:** refs aren't read while git is in the middle of something (a rebase, a merge, a
+  cherry-pick, a revert, a bisect); they go once it's done.
+- **Behind:** a bundle builds on what the log's refs held; a copy that missed one no longer kept
+  asks the repository's remote (`git fetch origin`, at most a minute), else says what it couldn't
+  take.
+- **Tested** on a scratch server and two runners, files, branches and commits: a commit on one was
+  the other's within 5 s, its file there and `git status` clean; commits on both at once kept the
+  first on `main` and the other beside it, `main.conflict-<machine>-<time>`, on both, listed as a
+  conflict, and both copies' files and `git status` the same.
 
 ## Catching up
 
@@ -198,12 +231,154 @@ it adopts the group's files through) and its status `looked` and `adopting`.
 commits made after a sync joined move between copies with `git` (fetch, pull) until git refs
 (phase 3) carry them. Line endings a Windows checkout converts are a difference like any other.
 
+## Work between machines
+
+What an agent or a person does in a repository on one machine reaches every other machine that
+holds the same repository (the same key, [above](#repositories-on-machines)), with no one starting
+it, and nothing of theirs moves (`crate::sync::share`):
+
+- **Who shares:** each machine says what it holds (`Msg::Repos`, when it connects and when that
+  changes); the server tells each one the repositories others hold too (`Msg::Shares`, a batch
+  for its work in each).
+- **What goes:** when its work in one changes (a branch moved, a folder's `HEAD`, its files), a
+  machine sends its branches, and each folder's **work in progress**: a commit of its files as they
+  are (what git ignores left out), on the commit checked out, made from an index of its own so
+  nothing in the folder changes. The commits they name that the remote lacks go in a bundle (`git
+  bundle … --not --remotes=origin`), and the work in progress beyond them in a second: each goes
+  only when it changed, so a moved branch sends the first and an edit only the second, small. A
+  bundle over 256 MiB stays (the others take the branches whose commits they hold). The work in
+  progress is the folders' git worked in this week, the 16 latest; one whose changed files are
+  more than 5,000 or 64 MiB is left out. A repository's work goes at most every two minutes. A
+  machine with several clones of a repository shares the one git last worked in (with its
+  worktrees).
+- **Tested** on a scratch server and two runners: a commit and work in progress (an edit, a new
+  file) on one reached the other as `kiln/<machine>/main` and its work in progress, nothing of its
+  own moved; then commits on both showed as diverged on each.
+- **Where it lands:** the others take it in beside their own, `kiln/<machine>/<branch>`
+  (`refs/remotes/kiln/…`, as `git branch -r` shows), and its work in progress as
+  `refs/kiln/wip/<machine>/<branch>` (`git stash apply refs/kiln/wip/fedora/main`, `git checkout
+  refs/kiln/wip/fedora/main -- <file>`); what that machine no longer has goes. No branch of their
+  own, no `HEAD`, no file moves: a person or an agent merges what they want, when they want.
+- **Conflict-aware:** each folder says how its branch stands against the same branch of the others
+  (`peers` in what it holds: ahead, behind, both: diverged, and whether there's work in progress),
+  and the Repositories page shows it on each place: "fedora 2 ahead", "diverged from fedora",
+  "work in progress on fedora".
+- A machine that connects later is given the others' latest work at once. The server keeps the
+  latest of each machine in each repository (not across its own restart: the machines share again
+  then).
+
+## Watching it
+
+Sync is replication between peers, so each part of it can be watched: what each copy holds and
+lacks, every change as it goes from one machine to the others, and what was dropped, failed or
+tried again on the way.
+
+**On the Repositories page**, a section that opens and closes (*Sync*) shows it. Closed, it is one
+line: the synced repos and copies, each copy's state counted, and when the last change was made.
+Open, it shows two things:
+
+- **Each synced repo.** What its log did since the server started: changes, files, bytes,
+  conflicts, steps let go, things tried again, errors. Beside it, the files changed each minute
+  over the last half hour. Each copy has a row:
+  - its state;
+  - how many log entries its folder hasn't taken (*behind*);
+  - its own steps not in the log yet (*to send*);
+  - contents it waits for (*fetching*);
+  - how long the last change from another machine took to reach its folder;
+  - what it sent and fetched since its runner started;
+  - transfers that failed and things tried again, with the last failure;
+  - when the server last heard from it.
+- **What happened**, newest first. Each change shows:
+  - the machine that made it;
+  - its files: added (+), changed (~) or deleted (−), with their sizes, the first 40 by name;
+  - what the log did with each file: taken, already so, a conflict and the name its version went
+    under, or refused;
+  - each other copy, filled once its folder has the change and hollow while it is on its way;
+  - how long the change took to reach the log.
+
+  Between the changes it shows:
+  - copies added, removed and taking the repo's files;
+  - a copy going offline and coming back, or getting an error and getting over it;
+  - steps the server let go, and why;
+  - contents asked for again;
+  - conflicts resolved;
+  - agent sessions moving with their files. A move shows the index its files are in the log
+    through, how long the machine it left waited for that, and how long the machine it went to
+    waited for its folder to have them.
+
+  The view can be narrowed to one repo, one machine, or only file changes, problems or moves. The
+  server keeps each repo's newest 300 events in `<data>/sync/<id>.activity.json`, so a restart
+  doesn't blank the view.
+
+**Metrics** (Prometheus, at `/metrics` of the server and of each runner; Observe reads both).
+`repo` is the synced repo's name and `machine` a copy's. Histograms run from 1 ms to 10 min.
+
+*The server's* (the leader of every repo's log):
+
+| Metric | Labels | |
+| --- | --- | --- |
+| `kiln_sync_steps_committed_total` | repo | steps the log committed |
+| `kiln_sync_changes_total` | repo, kind | their changes: `added`, `changed`, `deleted` |
+| `kiln_sync_conflicts_total` | repo | changes that met another machine's (kept beside) |
+| `kiln_sync_dropped_total` | repo, what, reason | `what`: `step`, `message` or `change`. `reason`: `not_member`, `too_many_changes`, `out_of_order` (they come again), `too_big`, `stalled`, `budget`, `refused`, `fenced`, `undecodable`, `offline` (a message to a machine away) or `unsafe_path` |
+| `kiln_sync_retries_total` | repo, what | `step_again` (a step sent again, taken already) and `contents_asked` (contents asked for again) |
+| `kiln_sync_errors_total` | repo, kind | `group`: the repo's log stopped |
+| `kiln_sync_commit_seconds` | repo | histogram: a step's arrival to its commit |
+| `kiln_sync_copy_lag_steps` | repo, machine | log entries the copy's folder hasn't taken |
+| `kiln_sync_copy_unsent_steps` | repo, machine | its own steps not in the log yet |
+| `kiln_sync_copy_waiting_blobs` | repo, machine | contents it waits for |
+| `kiln_sync_copy_state` | repo, machine, state | every state 0 or 1 (`in_step`, `catching_up`, `fetching`, `sending`, `starting`, `offline`, `error`) |
+| `kiln_sync_copy_heard_age_seconds` | repo, machine | since the copy last said how it is |
+| `kiln_sync_conflict_files` | repo | conflict copies not resolved yet |
+| `kiln_sync_blob_requests_total` | machine, direction, result | contents sent (`up`) and fetched (`down`): `ok`, `present`, `missing`, `refused`, `failed`, `unauthorized` |
+| `kiln_sync_blob_bytes_total` | machine, direction | their bytes |
+
+*Each runner's* (the copies it holds):
+
+| Metric | Labels | |
+| --- | --- | --- |
+| `kiln_sync_proposed_total` | repo | steps its copies proposed |
+| `kiln_sync_applied_total` | repo | other machines' steps its folders took |
+| `kiln_sync_folder_writes_total` | repo, outcome | what those did to each file: `applied`, `conflict`, `kept` (changed here, on its way), `refused` |
+| `kiln_sync_transfers_total` | repo, direction, result | contents moved with the server: `ok`, `present`, `gone` (replaced since), `failed` (tried again in 10 s) |
+| `kiln_sync_transfer_bytes_total` | repo, direction | their bytes |
+| `kiln_sync_transfer_seconds` | direction | histogram: how long each took |
+| `kiln_sync_retries_total` | repo, what | `fetch`, `upload`, `resend` (steps sent again) |
+| `kiln_sync_errors_total` | repo, kind | `group`, `folder` (taking the log), `look` (looking at the folder) |
+| `kiln_sync_apply_lag_seconds` | repo | histogram: from the look on the machine that made a change to its file here (the two clocks apart add to it) |
+| `kiln_sync_look_seconds` | repo | histogram: a look at the folder |
+| `kiln_sync_skipped_files` | repo | files the last look left out |
+| `kiln_moves_total` | result | agent sessions moving off this machine: `ok`, `failed` |
+| `kiln_move_barrier_seconds` | | histogram: a session leaving waits for its folder's last changes to be in the log |
+| `kiln_move_files_wait_seconds` | | histogram: a session arriving waits for them in its folder |
+| `kiln_move_carried_bytes_total` | what | what moving sessions carried besides synced files: `git`, `ignored`, `worktree` (their repositories'), `home` (what their harness keeps for them, [reach.md](reach.md) §8) |
+
+**Logs and traces** use the target `kiln.sync`, which Observe takes as service `kiln.sync`. An
+event carries an `event` field and is taken whatever else it says. These are the events:
+
+- `sync.step` (info): a step committed, with its counts.
+- `sync.conflict` (warn): with `path` and `beside`.
+- `sync.copy_state`: going offline or into an error is a warn, coming back an info. Each has
+  `from` and `to`.
+- `sync.dropped` (warn, at most once a minute for the same reason from the same machine): with
+  `what` and `reason`.
+- `sync.error` (warn).
+- `sync.transfer_failed` (warn, the first failure and every tenth): with `direction`, `hash` and
+  `tries`.
+- `sync.retry` (debug).
+- `sync.move` (info).
+- `sync.blob_refused` (warn).
+
+The spans are `move` (on the machine a session leaves, with `repo`, `machine` the machine it goes to
+and `result`), its child `move.barrier`, and `move.files` on the machine it arrives on.
+
 ## API
 
 | Method | Path | |
 | --- | --- | --- |
-| GET | `/api/sync` | synced repos: name, mode, copies (machine, path, state, applied, conflicts) |
-| POST | `/api/sync` | `{name, mode?, copies: [{machine, path}]}`: start syncing |
+| GET | `/api/sync` | synced repos: name, mode, copies (machine, path, state, applied, conflicts, `lag`, `heard`, the copy's own `traffic` and `lag_ms`), `stats` since the server started |
+| GET | `/api/sync/activity?since=&repo=&limit=` | what happened, newest first (`limit` up to 500), and `next`, the number to ask `since` for what's new |
+| POST | `/api/sync` | `{name, mode?, copies: [{machine, path}], exclude?}`: start syncing (`mode`: `files`, `files_and_git` or `git`) |
 | POST | `/api/sync/:id/copies` | `{machine, path}`: add a copy (it catches up from the log) |
 | DELETE | `/api/sync/:id/copies/:machine` | stop syncing there (its files stay) |
 | GET | `/api/sync/:id/conflicts` | conflict copies, with both versions |
@@ -211,7 +386,7 @@ commits made after a sync joined move between copies with `git` (fetch, pull) un
 | DELETE | `/api/sync/:id` | stop syncing (every copy's files stay) |
 | GET | `/api/places` | every repository with its places, the machines (home, what their runners can do), the tasks |
 | POST | `/api/places/clone` | `{key, from, branch?, to: [{machine, path}]}`: clone it to those machines (`from`: `{kind: "kiln", repo}`, `{kind: "machine", machine, path}` or `{kind: "url", url}`) |
-| POST | `/api/places/sync` | the same: clone, then keep in sync |
+| POST | `/api/places/sync` | the same, and `mode?`: clone, then keep in sync |
 | POST | `/api/places/move` | `{key, from: {kind: "machine", …}, to: [{machine, path}], delete?}` |
 | POST | `/api/places/remove` | `{key, from: {kind: "machine", …}, delete?}` |
 | POST | `/api/places/look` | every machine looks at its repositories again |
@@ -223,7 +398,8 @@ commits made after a sync joined move between copies with `git` (fetch, pull) un
 
 - **Server:** one thread (`sync::server`) leads every repo's group on one hyper-log file
   (`<data>/sync/sync.log`), keeps each repo's tree beside it (`<id>.tree.json`) and its contents in
-  `<data>/sync/blobs`, and the list of repos and copies in `repos.json`. It takes a copy's steps in
+  kiln's store of bytes (`sync/<sha256>`, docs/blobs.md; those kept in `<data>/sync/blobs` before
+  are taken in where they lie), and the list of repos and copies in `repos.json`. It takes a copy's steps in
   that copy's order, once their contents are on the server, and adds or removes one learner at a
   time to match the copies. It compacts each log well within the room hyper-log keeps for a group,
   leaving about 2 MiB of entries for copies a little behind; one further behind takes an image.
@@ -231,6 +407,10 @@ commits made after a sync joined move between copies with `git` (fetch, pull) un
   learner and a saved state per copy, and a content store. Every two seconds it looks at each folder
   that has taken everything committed, sends new contents over HTTP, then the steps; it fetches the
   contents committed steps name, writes them, and states durable only what the folder took.
+  An agent moving to another machine asks it two things ([reach.md](reach.md) §8): to look at its
+  folder now, and how its copy stands (how far its folder has taken the log, what it hasn't sent
+  yet or taken yet). The machine it leaves waits until nothing of its own is unsent; the machine it
+  goes to, until its folder has taken the log that far.
 - **Links:** Raft messages ride `ServerMsg::Sync`/`AgentMsg::Sync` on a lane of their own, an image
   in parts of 512 KiB. Contents go over `GET`/`PUT /api/sync/blobs/:hash?machine=`, with a token the
   server signs for each machine and gives it with its copies.
@@ -246,5 +426,6 @@ commits made after a sync joined move between copies with `git` (fetch, pull) un
    conflict rule.
 2. **Group** (built): a hyper-durable replica per synced repo; the server as voter, copies as
    learners; relay over kiln's links; API and UI.
-3. **Git refs.**
+3. **Git refs** (built): branches, tags and commits as paths of the tree, their commits as bundles,
+   the files' conflict rule ([above](#git-refs)).
 4. **Voters on machines**, with fleet membership: no server needed.

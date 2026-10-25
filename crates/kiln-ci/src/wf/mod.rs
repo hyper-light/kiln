@@ -13,6 +13,7 @@
 
 pub mod action;
 pub mod diag;
+pub mod flow;
 pub mod front;
 pub mod ir;
 pub mod keys;
@@ -115,8 +116,14 @@ impl Checked {
 /// is given: what `kiln validate` and `POST /api/ci/validate` answer (W02-R12). A path that is
 /// none of W02-R01's reads as a kiln workflow, the dialect that accepts both.
 pub fn check(path: &str, src: &str, dialect: Option<Dialect>) -> Checked {
+    check_model(path, src, dialect).0
+}
+
+/// [`check`], and the workflow it read, for the checks that need more than the file (the
+/// server's, against a repository's rules and runners).
+pub fn check_model(path: &str, src: &str, dialect: Option<Dialect>) -> (Checked, Option<Workflow>) {
     let kind = file_kind(path);
-    let other = |kind, diagnostics| Checked { kind, dialect: Dialect::Kiln, diagnostics, outline: None };
+    let other = |kind, diagnostics| (Checked { kind, dialect: Dialect::Kiln, diagnostics, outline: None }, None);
     match (kind, dialect) {
         (Some(FileKind::Overlay { .. }), None) => other("overlay", parse_overlay(src).1),
         (Some(FileKind::Action), None) => other("action", parse_action(src).1),
@@ -124,7 +131,7 @@ pub fn check(path: &str, src: &str, dialect: Option<Dialect>) -> Checked {
         (kind, given) => {
             let dialect = given.unwrap_or(if kind == Some(FileKind::GhaWorkflow) { Dialect::Gha } else { Dialect::Kiln });
             let (wf, diagnostics) = parse_workflow(path, src, dialect);
-            Checked { kind: "workflow", dialect, diagnostics, outline: wf.as_ref().map(outline) }
+            (Checked { kind: "workflow", dialect, diagnostics, outline: wf.as_ref().map(outline) }, wf)
         }
     }
 }

@@ -264,11 +264,6 @@ pub fn ops() -> &'static [Op] {
                 input: || obj_schema(json!({"name": {"type": "string"}, "kind": {"type": "string", "enum": ["local", "registry"]}, "repository": {"type": "string"}, "integration": {"type": "string"}}), &["name", "kind"]),
                 run: images_set),
         ]
-        .into_iter()
-        // Plans share the one table (crates/kiln/src/plans/ops.rs).
-        .chain(crate::plans::ops::list_ops())
-        .chain(crate::goals::ops::list_ops())
-        .collect()
     })
 }
 
@@ -894,7 +889,12 @@ pub(super) fn display(mut v: Value) -> Value {
 
 /// Masks a Secret's values on both sides of a diff alike: equal values get equal masks and
 /// different ones different masks, so a changed value still shows as changed and no value shows.
+/// On a platform's object, what one side holds where the other holds a secret's reference
+/// (docs/deploy-api.md §3.5) is masked: a variable kiln takes over doesn't show.
 pub(super) fn mask_secrets(before: &mut Option<Value>, after: &mut Option<Value>) {
+    if let (Some(b), Some(a)) = (before.as_mut(), after.as_mut()) {
+        mask_refs(b, a);
+    }
     let secret = |v: &Value| obj::kind(v) == "Secret" && obj::group(v).is_empty();
     if !before.as_ref().or(after.as_ref()).is_some_and(secret) {
         return;
@@ -911,6 +911,30 @@ pub(super) fn mask_secrets(before: &mut Option<Value>, after: &mut Option<Value>
                 *val = Value::String("+".repeat(8 + n));
             }
         }
+    }
+}
+
+/// Masks each string of one side the other holds a secret's reference in place of.
+fn mask_refs(a: &mut Value, b: &mut Value) {
+    let is_ref = |s: &str| s.starts_with(kiln_cd::apps::SECRET_REF);
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            for (k, v) in x.iter_mut() {
+                if let Some(w) = y.get_mut(k) {
+                    mask_refs(v, w);
+                }
+            }
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            for (v, w) in x.iter_mut().zip(y.iter_mut()) {
+                mask_refs(v, w);
+            }
+        }
+        (Value::String(s), Value::String(t)) if is_ref(s) != is_ref(t) => {
+            let plain = if is_ref(s) { t } else { s };
+            *plain = "+".repeat(8);
+        }
+        _ => {}
     }
 }
 
@@ -988,13 +1012,22 @@ fn sync_request(v: &Value, by: &str) -> Result<SyncRequest, Fail> {
 
 /// Whether an app can start a sync now: none is running, and its render didn't fail.
 fn ready_to_sync(cd: &Cd, id: &str) -> Result<(), Fail> {
+    not_syncing(cd, id)?;
+    let statuses = cd.statuses.read();
+    let Some(s) = statuses.get(id) else { return Ok(()) };
+    if let Some(m) = s.message.as_deref().filter(|m| m.starts_with("render failed")) {
+        return Err(bad(format!("{id} can't sync: its {m}")));
+    }
+    Ok(())
+}
+
+/// No sync of the app is under way. All a rollback asks: git's head failing to render, or its
+/// artifacts not built yet, is no reason not to go back.
+fn not_syncing(cd: &Cd, id: &str) -> Result<(), Fail> {
     let statuses = cd.statuses.read();
     let Some(s) = statuses.get(id) else { return Ok(()) };
     if s.operation.as_ref().is_some_and(|o| matches!(o.phase, OpPhase::DryRun | OpPhase::Running | OpPhase::Failing | OpPhase::Terminating)) {
         return Err((StatusCode::CONFLICT, format!("{id} is already syncing; stop that sync first")));
-    }
-    if let Some(m) = s.message.as_deref().filter(|m| m.starts_with("render failed")) {
-        return Err(bad(format!("{id} can't sync: its {m}")));
     }
     Ok(())
 }
@@ -1080,7 +1113,7 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, prune: Op
     if super::is_shadow(&def) {
         return Err(bad(format!("kiln doesn't deploy {id} (it shadows Argo CD's): take it over first")));
     }
-    ready_to_sync(cd, &id)?;
+    not_syncing(cd, &id)?;
     let history = cd.store.read(|d| d.history.get(&id).cloned().unwrap_or_default());
     let current = history.iter().rev().find(|d| d.succeeded).and_then(|d| d.key);
     let target = match to {
@@ -1112,7 +1145,7 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, prune: Op
         (cluster.version.read().clone(), cluster.discovery.read().api_versions.clone())
     };
     let (cd2, d2, at) = (cd.clone(), def.clone(), commits.clone());
-    let (mut head, mut back) = crate::rt::blocking(move || -> anyhow::Result<_> {
+    let (head, mut back) = crate::rt::blocking(move || -> anyhow::Result<_> {
         let head = cd2.inputs_of(&d2, kube_version.as_deref(), &api_versions, None)?;
         let back = cd2.inputs_of(&d2, kube_version.as_deref(), &api_versions, Some(&at))?;
         Ok((head, back))
@@ -1120,12 +1153,13 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, prune: Op
     .await
     .and_then(|r| r)
     .map_err(|e| bad(format!("{e:#}")))?;
-    // The head's artifacts as the source poll resolves them (the pin compares its content), and
-    // the deployment's exactly as it recorded them.
-    let (a, p) = cd.resolve_artifacts(&def, &head.revision).await.map_err(|e| bad(format!("{e:#}")))?;
-    head.add_artifacts(a, p);
+    // The pin holds while git renders what it rendered: the head's content before its artifacts,
+    // as the source poll compares it. A rollback never waits for the head's artifacts: the head
+    // may be what broke, or its image still building. The deployment's are exactly as recorded.
     let (a, p) = cd.recorded_artifacts(&def, target.artifacts.clone(), &back.revision).await.map_err(|e| bad(format!("{e:#}")))?;
     back.add_artifacts(a, p);
+    // Its secrets as its definition pins them now: a rollback doesn't bring back older values.
+    back.add_secrets(cd.app_secrets(&def).await.map_err(|e| bad(format!("{e:#}")))?);
     let pin = state::Pin { to: target.id, revision: target.revision.clone(), commits, head: head.content, by: Some(by.to_owned()), at_ms: super::now_ms() };
     propose(cd, Command::Pin { app: id.clone(), pin: Some(Box::new(pin)) }).await?;
     // The held inputs and their sync as one step: nothing syncs the app in between.
@@ -1225,7 +1259,22 @@ async fn follow(cx: Cx, v: Value) -> Out {
 
 async fn create(cx: Cx, v: Value) -> Out {
     let raw = v.get("definition").cloned().ok_or_else(|| bad("`definition` is required"))?;
-    let mut def: AppDef = serde_json::from_value(raw).map_err(|e| bad(format!("the definition doesn't read: {e}")))?;
+    let def: AppDef = serde_json::from_value(raw).map_err(|e| bad(format!("the definition doesn't read: {e}")))?;
+    // An app's secrets (docs/deploy-api.md §3.5) are named only by the release that delivers them:
+    // a definition from outside could name another app's, and have them rendered where it says.
+    if def.secrets.is_some() {
+        return Err(bad("`secrets` is kiln's to set: an app's secrets reach it through its releases (/api/deploy)"));
+    }
+    put(cx, def).await
+}
+
+/// A release's definition, from the deploy service (docs/deploy-api.md §8.2): as `cd.apps.create`
+/// takes one, and it may name the app's secrets, as only a release does.
+pub(crate) async fn put_released(cx: Cx, def: AppDef) -> Out {
+    put(cx, def).await
+}
+
+async fn put(cx: Cx, mut def: AppDef) -> Out {
     def.origin = Origin::Api;
     if def.sources.is_empty() || def.name.is_empty() {
         return Err(bad("an app needs a name and a source"));
@@ -1396,4 +1445,19 @@ async fn remove_repo(cx: Cx, v: Value) -> Out {
     propose(&cx.cd, Command::DeleteRepo(url.clone())).await?;
     audit(&cx, "cd.repo.delete", url.clone()).await;
     Ok(json!({"removed": url}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_value_a_secrets_reference_takes_the_place_of_never_shows() {
+        let function = |key: &str| json!({ "apiVersion": "lambda.aws.kiln.dev/v1", "kind": "Function", "metadata": { "name": "thumbs" }, "spec": { "Environment": { "Variables": { "API_KEY": key, "MODE": "prod" } } } });
+        let (mut before, mut after) = (Some(function("handmade")), Some(function("kiln-secret:app/thumbs/production/API_KEY@1")));
+        mask_secrets(&mut before, &mut after);
+        let at = |v: &Option<Value>, k: &str| v.as_ref().and_then(|o| o.pointer(&format!("/spec/Environment/Variables/{k}"))).cloned();
+        assert_eq!((at(&before, "API_KEY"), at(&before, "MODE")), (Some(json!("++++++++")), Some(json!("prod"))));
+        assert_eq!(at(&after, "API_KEY"), Some(json!("kiln-secret:app/thumbs/production/API_KEY@1")));
+    }
 }

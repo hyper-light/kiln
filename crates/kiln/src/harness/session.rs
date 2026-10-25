@@ -6,13 +6,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::FutureExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use super::core::{Core, Update};
 use super::kinds::{Kind, Protocol};
-use super::model::{Command, ExitInfo, Level, State, Status, ToolKind};
+use super::model::{Command, ExitInfo, Level, State, Status, Task, ToolKind};
 
 fn is_zero_epoch(n: &u64) -> bool {
     *n == 0
@@ -53,6 +54,10 @@ pub struct Spec {
     /// The effort / reasoning level to start with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The most subagents it runs at once (as `State::max_subagents`): Codex takes it as its own
+    /// limit when it starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subagents: Option<u32>,
     /// With `resume`: continue only up to this point of that session (a message or turn id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_at: Option<String>,
@@ -72,6 +77,17 @@ pub struct Spec {
     /// otherwise (a runner's name, or `linux/amd64`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reach: Option<String>,
+    /// The agent that started it (`harness::lineage`): kiln sets it from who asked, never from
+    /// what was asked (`POST /api/harness/sessions` drops it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The plan run it does a step of (`plans::agents`): set by kiln, never from what was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_run: Option<String>,
+    /// Where it works when not in its folder itself: a Slates volume of its own laid over the
+    /// folder (`crate::workspace`), made on its machine before it starts and kept with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::workspace::Workspace>,
 }
 
 fn yes() -> bool {
@@ -97,11 +113,15 @@ impl Default for Spec {
             allow_bypass: true,
             program: None,
             effort: None,
+            max_subagents: None,
             resume_at: None,
             fork: false,
             takeover_pid: None,
             takeover_stop: false,
             reach: None,
+            parent: None,
+            plan_run: None,
+            workspace: None,
         }
     }
 }
@@ -114,6 +134,52 @@ pub struct ApprovalBrief {
     pub tool_name: String,
     pub title: String,
     pub at: i64,
+}
+
+/// A native subagent as lists show it. Its work still belongs to its harness's task, not a
+/// separate kiln session, so this is tracking only and carries no execution settings or output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubagentBrief {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    pub description: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task: Option<String>,
+    pub started: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<i64>,
+}
+
+impl SubagentBrief {
+    pub(super) fn of(tasks: &[Task]) -> Vec<Self> {
+        tasks
+            .iter()
+            .filter(|t| t.subagent())
+            .map(|t| Self {
+                id: t.id.clone(),
+                tool_id: t.tool_id.clone(),
+                description: super::model::clip_middle(&t.description, 200).0,
+                status: t.status.clone(),
+                parent_task: t.parent_task.clone(),
+                started: t.started,
+                ended: t.ended,
+            })
+            .collect()
+    }
+}
+
+/// Goals an agent paused for a person, until someone resumes them (`Info::held`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Held {
+    /// Why, as the stack says it ("Paused by the agent: …").
+    pub why: String,
+    /// The plan it waits for you to look at first, when that's why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// Unix ms it paused.
+    pub since: i64,
 }
 
 /// A session as lists show it.
@@ -129,6 +195,10 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
     pub cwd: String,
+    /// The working tree its work is in (`State::tree`): what's asked of git about its work is
+    /// asked there ([`Info::work_dir`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     pub created_at: i64,
     pub status: Status,
     #[serde(default)]
@@ -143,8 +213,16 @@ pub struct Info {
     pub approvals: Vec<ApprovalBrief>,
     #[serde(default)]
     pub queued: usize,
+    /// What waits in its queue, each message by its id and a digest of its words (as
+    /// `State::queue`): the server's, for the messages kiln keeps there itself
+    /// (`super::queued`). Lists don't show it.
+    #[serde(skip)]
+    pub queue: Vec<super::queued::Queued>,
     #[serde(default)]
     pub tasks_running: usize,
+    /// Native harness subagents, including finished work, for the list's child disclosure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<SubagentBrief>,
     #[serde(default)]
     pub cost_usd: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,12 +285,35 @@ pub struct Info {
     /// Kiln doesn't keep it going when it stops part-way (`goals::keep`; set on the server).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_off: bool,
+    /// Its goals wait on a person: it paused them for you, until you resume them (`goals::held_stacks`;
+    /// set on the server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<Held>,
     /// At a usage limit it goes on on another machine with room (as `State::move_on_limit`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub move_on_limit: bool,
+    /// Where it goes on then (as `State::move_plan`).
+    #[serde(default, skip_serializing_if = "super::model::MovePlan::is_empty")]
+    pub move_plan: super::model::MovePlan,
     /// Where it pauses as its limits fill (as `State::pause_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_at: Option<u8>,
+    /// The most subagents it runs at once (as `State::max_subagents`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subagents: Option<u32>,
+    /// The agent that started it (as `Spec::parent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The plan run it does a step of (as `Spec::plan_run`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_run: Option<String>,
+    /// It was started without its harness's skip-every-check mode (`Spec::allow_bypass` off), so
+    /// an agent it starts can't have it either.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_bypass: bool,
+    /// Its workspace of its own, when it has one (as `Spec::workspace`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::workspace::Workspace>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -220,6 +321,13 @@ fn is_zero(n: &u32) -> bool {
 }
 
 impl Info {
+    /// Where git is asked about its work: the working tree its latest change is in, else its
+    /// folder (an agent in a worktree commits and pushes from there, not from the checkout it
+    /// started in).
+    pub fn work_dir(&self) -> &str {
+        self.tree.as_deref().filter(|t| !t.is_empty()).unwrap_or(&self.cwd)
+    }
+
     /// Refresh the live fields from the session's state.
     pub fn apply(&mut self, s: &State) {
         if !s.name.is_empty() {
@@ -232,6 +340,7 @@ impl Info {
         if !s.cwd.is_empty() {
             self.cwd.clone_from(&s.cwd);
         }
+        self.tree.clone_from(&s.tree);
         self.harness_session.clone_from(&s.harness_session);
         self.epoch = s.epoch;
         self.approvals = s
@@ -240,7 +349,9 @@ impl Info {
             .map(|a| ApprovalBrief { id: a.id.clone(), tool: a.tool, tool_name: a.tool_name.clone(), title: a.title.clone(), at: a.at })
             .collect();
         self.queued = s.queue.len();
+        self.queue = s.queue.iter().map(|q| super::queued::Queued::of(&q.id, &q.text)).collect();
         self.tasks_running = s.tasks.iter().filter(|t| t.status == "running").count();
+        self.subagents = SubagentBrief::of(&s.tasks);
         self.cost_usd = s.usage.cost_usd;
         self.activity.clone_from(&s.activity);
         self.exit.clone_from(&s.exit);
@@ -267,12 +378,15 @@ impl Info {
         self.pause.clone_from(&s.pause);
         self.last_turn.clone_from(&s.last_turn);
         self.move_on_limit = s.move_on_limit;
+        self.move_plan.clone_from(&s.move_plan);
         self.pause_at = s.pause_at;
+        self.max_subagents = s.max_subagents;
     }
 
-    /// The parts lists care about changed (activity timestamps aside).
+    /// The parts lists care about changed (activity timestamps aside, and the words of what's queued:
+    /// a message edited while it waits changes nothing they show).
     pub fn differs(&self, o: &Self) -> bool {
-        let strip = |i: &Self| Self { last_activity: 0, ..i.clone() };
+        let strip = |i: &Self| Self { last_activity: 0, queue: Vec::new(), ..i.clone() };
         strip(self) != strip(o)
     }
 }
@@ -308,6 +422,12 @@ pub struct Seed {
     /// Not a move: the session is started again here after a restart, its timeline and state
     /// taken from the conversation store (`crate::convo`).
     pub restored: bool,
+    /// Where its folder stood in the sync log on the machine it left: it goes on once the folder
+    /// here has taken the log that far.
+    pub synced: Option<crate::sync::runner::Mark>,
+    /// Not from another machine: an older runner process of this one handed it over, taking its
+    /// leave (`super::handing`). Same folder, same record: only the process holding it changed.
+    pub local: bool,
 }
 
 /// Put a message's attachments on disk, so the harness can read them: each gets a `path`;
@@ -399,11 +519,11 @@ fn reach_words(reach: Option<&str>) -> String {
 /// A command as the adapter should see it (attachments stored first).
 async fn prepare(files: &Files, c: Command) -> Command {
     match c {
-        Command::Send { id, text, mode, attachments, overrides } if !attachments.is_empty() => {
+        Command::Send { id, text, mode, attachments, overrides, reply_to, task } if !attachments.is_empty() => {
             let files = files.clone();
             let msg = id.clone();
             let stored = crate::rt::blocking(move || store_attachments(&files, &msg, attachments)).await.unwrap_or_default();
-            Command::Send { id, text, mode, attachments: stored, overrides }
+            Command::Send { id, text, mode, attachments: stored, overrides, reply_to, task }
         }
         other => other,
     }
@@ -493,19 +613,26 @@ impl Session {
 
     /// Everything a new viewer (or a restarted server) needs, starting with the announcement.
     pub fn snapshot(&self) -> Vec<Update> {
-        let mut out = vec![Update::Open { info: Box::new(self.info()) }];
+        let mut out = vec![Update::Open { info: Box::new(self.info()), since: None }];
         out.extend(self.core.lock().snapshot(256 * 1024));
         out
     }
 
     /// A task's output after byte `since` (its last `TASK_TAIL` bytes without one), read where the
     /// harness keeps it: `{data, offset, live, truncated}` (ask from `offset` next), or `{error}`.
+    /// Native Codex children return a replaceable transcript snapshot (`reset: true`).
     /// Blocking (reads a file).
     pub fn task_output(&self, task: &str, since: Option<u64>) -> serde_json::Value {
         use serde_json::json;
-        let (t, kept, session, cwd, env) = {
+        let (t, kept, session, cwd, env, codex) = {
             let core = self.core.lock();
-            (core.state.tasks.iter().find(|x| x.id == task).cloned(), core.task_output.get(task).cloned(), core.state.harness_session.clone(), core.state.cwd.clone(), self.spec.lock().env.clone())
+            let spec = self.spec.lock();
+            let codex = core.harness.as_deref().map_or(spec.kind == "codex", |h| h == "Codex");
+            let t = core.state.tasks.iter().find(|x| x.id == task).cloned();
+            if codex && let Some(t) = t.as_ref().filter(|t| t.class.as_deref() == Some("agent")) {
+                return codex_task_output(&core, t);
+            }
+            (t, core.task_output.get(task).cloned(), core.state.harness_session.clone(), core.state.cwd.clone(), spec.env.clone(), codex)
         };
         let Some(t) = t else { return json!({"error": "no such task in this session"}) };
         // Kept by kiln (a harness that streams it).
@@ -514,7 +641,7 @@ impl Session {
             return json!({"data": String::from_utf8_lossy(&bytes), "offset": offset, "live": t.live(), "truncated": truncated});
         }
         // A file the harness writes (Claude Code: while the task lives).
-        let Some(path) = t.output.clone().or_else(|| claude_task_file(&env, &cwd, session.as_deref(), task)) else {
+        let Some(path) = t.output.clone().or_else(|| (!codex).then(|| claude_task_file(&env, &cwd, session.as_deref(), task)).flatten()) else {
             return json!({"error": "this task's output is not kept anywhere kiln can read", "live": t.live()});
         };
         let p = std::path::Path::new(&path);
@@ -566,6 +693,7 @@ impl Session {
         if !core.state.model.is_empty() {
             s.model = Some(core.state.model.clone());
         }
+        s.max_subagents = core.state.max_subagents;
         s
     }
 }
@@ -586,6 +714,36 @@ async fn stop_left(s: &Arc<Session>, task: Option<&str>) {
     for t in core.state.tasks.iter_mut().filter(|t| t.id.strip_prefix(super::survivors::LEFT).and_then(|p| p.parse::<u32>().ok()).is_some_and(|p| gone.contains(&p))) {
         t.status = "stopped".to_owned();
         t.ended = Some(Core::now());
+    }
+    core.touch_state();
+}
+
+/// Native Codex subagents whose work kiln never read, in a session that runs another harness now
+/// (it switched before kiln read them): their work comes from Codex's own record of their threads,
+/// read off the event loop; no Codex is asked. It shows at the next flush.
+fn read_unread_children(s: &Arc<Session>) {
+    let unread = super::codex::unread_children(&s.core.lock());
+    if unread.is_empty() {
+        return;
+    }
+    let home = super::handoff::codex_home(&s.spec.lock().env);
+    let s = Arc::clone(s);
+    crate::rt::spawn(async move {
+        let Ok(read) = crate::rt::blocking(move || super::codex::read_rollouts(&home, unread)).await else { return };
+        let mut core = s.core.lock();
+        for (thread, records) in read {
+            super::codex::child_from_rollout(&mut core, &thread, &super::codex::rollout_turns(&records));
+        }
+    });
+}
+
+/// The agent ended: what its harness ran ended with it, and so did what kiln took back over for it
+/// (stopped with the rest). Its last state, what an ended agent shows, says so.
+fn end_tasks(core: &mut Core) {
+    core.end_harness_work();
+    for t in core.state.tasks.iter_mut().filter(|t| t.live()) {
+        t.status = "stopped".to_owned();
+        t.ended.get_or_insert_with(Core::now);
     }
     core.touch_state();
 }
@@ -643,7 +801,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     let restored = seed.as_ref().is_some_and(|sd| sd.restored);
     if let Some(sd) = seed.as_ref().filter(|_| restored) {
         // Restarted here: its timeline and state as the store kept them, and nothing said of it.
-        core.adopt(sd.events.clone(), sd.state.clone());
+        core.restore(sd.events.clone(), sd.state.clone());
         core.state.model = spec.model.clone().unwrap_or_default();
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
@@ -655,12 +813,16 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
         let folder = if core.state.cwd == sd.from_cwd { String::new() } else { format!(" (it works in {} here; it was in {})", core.state.cwd, sd.from_cwd) };
-        let mut text = format!("Moved here from {}{folder} — the conversation, its timeline and queue came along", sd.from);
+        let mut text = if sd.local {
+            "Taken over by this machine's newer kiln runner, which replaces the older one — the conversation, its timeline and queue came along".to_owned()
+        } else {
+            format!("Moved here from {}{folder} — the conversation, its timeline and queue came along", sd.from)
+        };
         // Interrupted to move: the turn goes on here, first thing.
         if sd.picks_up {
             text.push_str(", and the turn it was in the middle of goes on here");
             let ask = format!("This conversation just moved here from {}, which interrupted your last turn. Pick up where you left off.", sd.from);
-            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: ask, at: Core::now(), attachments: Vec::new(), overrides: None });
+            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: ask, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
         }
         if let Some(n) = &sd.note {
             text.push_str(". ");
@@ -668,6 +830,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         }
         core.upsert(&format!("harness-switch:moved-{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
         items = sd.items;
+        core.state.arriving = sd.synced;
     }
     core.state.reach.clone_from(&spec.reach);
     begin(id, spec, kind, core, sink, on_change, files, items, None)
@@ -676,8 +839,9 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
 /// A session with this core, its task started (`adopt`: going on with a harness process the
 /// previous image of this process handed over).
 #[allow(clippy::too_many_arguments)]
-fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
+fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
     let now = crate::util::now_ms();
+    core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
     let cwd = core.state.cwd.clone();
     let info = Info {
         id: id.clone(),
@@ -687,6 +851,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         name: spec.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| kind.name.to_owned()),
         shell: spec.shell.clone(),
         cwd,
+        tree: None,
         created_at: now,
         status: Status::Starting,
         title: String::new(),
@@ -695,7 +860,9 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         harness_session: spec.resume.clone(),
         approvals: Vec::new(),
         queued: 0,
+        queue: Vec::new(),
         tasks_running: 0,
+        subagents: Vec::new(),
         cost_usd: 0.0,
         activity: None,
         last_activity: now,
@@ -720,8 +887,15 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         pause: None,
         last_turn: None,
         keep_off: false,
+        held: None,
         move_on_limit: false,
+        move_plan: Default::default(),
         pause_at: None,
+        max_subagents: core.state.max_subagents,
+        parent: spec.parent.clone(),
+        plan_run: spec.plan_run.clone(),
+        no_bypass: !spec.allow_bypass,
+        workspace: spec.workspace.clone(),
     };
     let (ctl, ctl_rx) = async_channel::unbounded();
     let s = Arc::new(Session {
@@ -757,7 +931,7 @@ async fn flush(s: &Session, sink: &Sink, stdin: Option<&async_channel::Sender<Ve
     let (updates, writes, previews, changes) = {
         let mut core = s.core.lock();
         let u = core.take_out();
-        (u, core.take_writes(), std::mem::take(&mut core.previews), std::mem::take(&mut core.change_jobs))
+        (u, core.take_writes(), std::mem::take(&mut core.previews), core.take_change_jobs())
     };
     if let Some(stdin) = stdin {
         for w in writes {
@@ -786,7 +960,7 @@ async fn pipe(rx: &async_channel::Receiver<Vec<u8>>, open: bool) -> Option<Vec<u
 }
 
 enum Ev {
-    Change(Option<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>),
+    Change((String, (Option<super::model::FileChange>, Option<super::core::Baseline>))),
     Out(Option<Vec<u8>>),
     Err(Option<Vec<u8>>),
     Ctl(Option<Ctl>),
@@ -828,6 +1002,60 @@ const TAKEOVER_QUIT: Duration = Duration::from_secs(10);
 const TASK_READ_MAX: u64 = 256 * 1024;
 const TASK_TAIL: u64 = 64 * 1024;
 
+/// Codex's child messages and tool results are kept with the parent's events, not in Claude's
+/// task files or the terminal byte buffer. Project only this child's output; neither its
+/// assignment nor a parent's, sibling's or descendant's messages belong in this view.
+/// History reads can replace earlier items, so byte offsets cannot safely append snapshots.
+pub(super) fn codex_task_output(core: &Core, task: &Task) -> serde_json::Value {
+    use super::core::TaskOutput;
+    use super::model::{Body, OUTPUT_MAX, clip_middle};
+    use serde_json::json;
+
+    let mut output = TaskOutput::default();
+    let mut summary_seen = false;
+    let mut truncated = false;
+    let mut add = |text: &str| {
+        if !text.trim().is_empty() {
+            if output.total > 0 {
+                output.append(b"\n\n");
+            }
+            output.append(text.as_bytes());
+        }
+    };
+    if let Some(parent) = task.tool_id.as_deref() {
+        let prefix = format!("child:{}:", task.id);
+        // A batch spawn may give siblings the same parent tool; the child thread is also
+        // part of every Codex event id, so that cannot mix their output.
+        for event in core.events().filter(|e| e.parent.as_deref() == Some(parent) && e.id.starts_with(&prefix)) {
+            match &event.body {
+                Body::Assistant { text, .. } => {
+                    summary_seen |= task.summary.as_deref().is_some_and(|s| s == text || s == clip_middle(text, OUTPUT_MAX).0);
+                    add(text);
+                }
+                Body::Tool(tool) => {
+                    if let Some(text) = tool.output.as_deref().filter(|s| !s.trim().is_empty()) {
+                        add(&format!("{}\n{text}", tool.title));
+                        truncated |= tool.truncated;
+                    }
+                }
+                Body::Notice { text, .. } => add(text),
+                _ => {}
+            }
+        }
+    }
+    // Completed children can outlive the bounded timeline, or report a result before their
+    // history is available. Keep that result readable without inventing a transcript.
+    if !summary_seen && let Some(summary) = task.summary.as_deref() {
+        add(summary);
+    }
+    if output.total == 0 && !task.live() {
+        return json!({"error": "No readable output has been received from this Codex subagent.", "live": false});
+    }
+    let (bytes, offset, skipped) = output.since(output.total.saturating_sub(TASK_TAIL));
+    json!({"data": String::from_utf8_lossy(&bytes), "offset": offset, "live": task.live(),
+        "truncated": truncated || skipped || output.total > TASK_TAIL, "reset": true, "pending": output.total == 0})
+}
+
 /// Where Claude Code streams a task's output while it lives: `<tmp>/<cwd as a name>/<session>/
 /// tasks/<task>.output`, `<tmp>` being `CLAUDE_CODE_TMPDIR` or the system's `claude-<uid>`.
 fn claude_task_file(env: &[(String, String)], cwd: &str, session: Option<&str>, task: &str) -> Option<String> {
@@ -863,6 +1091,25 @@ fn read_tail(p: &std::path::Path, since: Option<u64>) -> Option<(String, u64, bo
     let mut buf = Vec::new();
     f.take(len - start).read_to_end(&mut buf).ok()?;
     Some((String::from_utf8_lossy(&buf).into_owned(), start + buf.len() as u64, start > want || (since.is_none() && start > 0)))
+}
+
+/// An ending agent's group of processes, after `after` (its harness's time to stop): whatever is
+/// still in it ended at once, then the group removed.
+fn end_group(g: crate::os::contain::Group, after: Duration) {
+    crate::rt::spawn(async move {
+        crate::rt::sleep(after).await;
+        let _ = crate::rt::blocking(move || {
+            g.kill();
+            for _ in 0..20 {
+                if g.pids().is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            g.remove();
+        })
+        .await;
+    });
 }
 
 /// The processes under `root`, newest first: (pid, command line). Blocking.
@@ -990,6 +1237,50 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_ch
                 (files.spawn)(b);
             }
             super::core::Effect::Restart { resume_at } => restart = Some(resume_at),
+            // The go-back a harness without one gets from kiln (`harness::goback`): the store's
+            // timeline truncates, its transcript seeds a branch, the workspace's checkpoint
+            // (a hidden ref) restores its files.
+            super::core::Effect::GoBack { op, event } => {
+                match op {
+                    super::core::GoBackOp::Fork | super::core::GoBackOp::Branch => {
+                        let mut b = s.resume_spec();
+                        // No native resume: the branch is seeded with the conversation in words.
+                        b.resume = None;
+                        b.resume_at = None;
+                        b.fork = false;
+                        b.name = Some(format!("{} (branch)", s.info().name));
+                        b.prompt = Some(super::goback::branch_prompt(&s.core.lock(), if op == super::core::GoBackOp::Branch { Some(event.as_str()) } else { None }));
+                        (files.spawn)(b);
+                    }
+                    _ => {
+                        let mut core = s.core.lock();
+                        let (at, words) = match core.get(&event) {
+                            Some(e) => (e.at, match &e.body { super::model::Body::User { text, .. } => super::model::clip_middle(text.trim(), 80).0, _ => String::new() }),
+                            None => continue,
+                        };
+                        let cwd = core.state.cwd.clone();
+                        // The workspace goes back to the checkpoint the prompt's own moment made.
+                        let did = if cwd.is_empty() { "the folder isn't known".to_owned() } else { super::goback::restore_files(&cwd, &s.id, at) };
+                        if op == super::core::GoBackOp::RewindFiles {
+                            super::goback::notice(&mut core, super::model::Level::Info, format!("Restored files to \"{words}\": {did}."));
+                        } else {
+                            // The process can't come back at the point natively: it starts over
+                            // and the truncated conversation is said to it (the store keeps the
+                            // record of what went).
+                            core.truncate_from(&event);
+                            let transcript = super::goback::seed_prompt(&core, None);
+                            let keep: std::collections::HashSet<String> = core.events().map(|e| e.id.clone()).collect();
+                            core.state.delivery.retain(|k, _| keep.contains(k));
+                            core.state.harness_session = None;
+                            s.spec.lock().resume = None;
+                            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: format!("The conversation was rewound here. What it is now:\n\n{transcript}\n\nGo on from the last message."), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
+                            super::goback::notice(&mut core, super::model::Level::Info, format!("Rewound to \"{words}\": {did}. The agent starts again with the conversation up to here."));
+                            restart = Some(None);
+                        }
+                        core.touch_state();
+                    }
+                }
+            }
             super::core::Effect::AllowBypass => s.spec.lock().allow_bypass = true,
             super::core::Effect::Run { job, args } => {
                 let mut spec = s.spec.lock().clone();
@@ -1200,7 +1491,8 @@ struct Switch {
 }
 
 /// Nothing is under way: no turn, nothing waiting for a person.
-fn settled(s: &Session) -> bool {
+/// Between turns: idle, nothing waiting on a person, no turn under way.
+pub(super) fn settled(s: &Session) -> bool {
     settled_core(&s.core.lock())
 }
 
@@ -1213,6 +1505,8 @@ fn settled_core(core: &Core) -> bool {
 fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<Switch> {
     let target = Kind::get(to).filter(|k| k.switchable() && from.switchable());
     let installed = target.is_some_and(Kind::available);
+    // Its spec before its core: never the one lock inside the other.
+    let allow_bypass = s.spec.lock().allow_bypass;
     let mut core = s.core.lock();
     let Some(target) = target else {
         core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("A conversation can't be carried from {} to {to}.", from.name) });
@@ -1223,7 +1517,9 @@ fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<S
         return None;
     }
     core.hold = true;
-    core.state.switching = Some(super::model::Switching { kind: target.id.to_owned(), model: model.clone() });
+    // What it will run with there, shown while the switch waits.
+    let (mode, effort, modes, efforts) = carried_choices(from, target, &core.state.mode, &core.state.effort, allow_bypass, &model);
+    core.state.switching = Some(super::model::Switching { kind: target.id.to_owned(), model: model.clone(), mode, effort, modes, efforts });
     core.touch_state();
     if !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited) {
         let text = format!("Switching to {} ({}) when this turn ends — the conversation carries over", model_label(target, &model), target.name);
@@ -1241,6 +1537,132 @@ fn model_label(kind: &Kind, model: &str) -> String {
 /// context window with room to work (≈ 160k tokens). Larger ones lose their long tool outputs'
 /// middles first, then their oldest messages.
 const CARRY_MAX: usize = 640 * 1024;
+
+/// A conversation as the harness it goes on in keeps its own (`carried`).
+enum Record {
+    /// Claude Code: a new session's id, and its transcript's records.
+    Claude { session: String, records: Vec<serde_json::Value> },
+    /// Codex: a new thread's history.
+    Codex(Vec<serde_json::Value>),
+    /// Nothing to carry: it never said anything (or a harness that takes nothing).
+    Nothing,
+}
+
+/// A conversation carried from one harness to another (`carried`).
+struct Carried {
+    record: Record,
+    /// Its permission mode and effort there: the same latitude (never more), the nearest effort.
+    mode: Option<String>,
+    effort: Option<String>,
+    /// Older messages left out to fit.
+    dropped: usize,
+    /// There was nothing to carry.
+    empty: bool,
+}
+
+/// The conversation so far, carried from harness `from` to `to`: read from `from`'s own record of
+/// session `session` (never kiln's timeline), fitted, and put the way `to` keeps its own, with a
+/// note telling the model so (and `more`, after it); its permission mode and effort carried over.
+/// `cwd`: where it goes on (a Claude Code transcript names it); `model`: the one it goes on with
+/// (empty: the harness's default). Err: `from`'s record couldn't be read.
+#[allow(clippy::too_many_arguments)]
+async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)], session: Option<String>, cwd: &str, old_model: &str, mode: &str, effort: &str, allow_bypass: bool, model: &str, more: Option<&str>) -> Result<Carried, String> {
+    use super::handoff;
+    // What the model saw, from the harness's own record (no session yet: nothing to carry).
+    let read = match session {
+        None => Some(handoff::Conversation::default()),
+        Some(id) => {
+            let env = env.to_vec();
+            crate::rt::blocking(move || match from.protocol {
+                Protocol::ClaudeStreamJson => handoff::read_claude(&env, &id),
+                Protocol::CodexAppServer => handoff::read_codex(&env, &id),
+                Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => None,
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+    };
+    let Some(mut conv) = read else { return Err(format!("kiln could not read {}'s record of this conversation", from.name)) };
+    let dropped = handoff::fit(&mut conv, CARRY_MAX);
+    let empty = conv.entries.is_empty() && conv.summary.is_none();
+    let (mode, effort) = carried_settings(from, to, mode, effort, allow_bypass, model);
+    let mut note = handoff::note(from.name, old_model, to.name, &conv.todos, dropped);
+    if let Some(more) = more {
+        note.push(' ');
+        note.push_str(more);
+    }
+    let record = match to.protocol {
+        _ if empty => Record::Nothing,
+        Protocol::ClaudeStreamJson => {
+            let id = uuid::Uuid::now_v7().to_string();
+            let records = handoff::to_claude(&conv, Some(&format!("<system-reminder>\n{note}\n</system-reminder>")), &id, cwd, if old_model.is_empty() { "unknown" } else { old_model });
+            Record::Claude { session: id, records }
+        }
+        Protocol::CodexAppServer => Record::Codex(handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>")))),
+        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => Record::Nothing,
+    };
+    Ok(Carried { record, mode, effort, dropped, empty })
+}
+
+/// The permission mode and effort a session goes on with in harness `to`, carried from `from`: the
+/// same latitude (never more; a mode that asks nothing only where `allow_bypass`) and the nearest
+/// effort `model` takes there. With `to`'s choices of each, for a page to say them by their names.
+fn carried_settings(from: &Kind, to: &Kind, mode: &str, effort: &str, allow_bypass: bool, model: &str) -> (Option<String>, Option<String>) {
+    let (mode, effort, _, _) = carried_choices(from, to, mode, effort, allow_bypass, model);
+    (mode, effort)
+}
+
+fn carried_choices(from: &Kind, to: &Kind, mode: &str, effort: &str, allow_bypass: bool, model: &str) -> (Option<String>, Option<String>, Vec<super::model::ModeOption>, Vec<super::model::ControlOption>) {
+    use super::handoff;
+    let modes: Vec<super::model::ModeOption> = to.modes().0.into_iter().filter(|m| !m.dangerous || allow_bypass).collect();
+    let offered: Vec<String> = modes.iter().map(|m| m.id.clone()).collect();
+    let mode = handoff::mode_for(from.id, mode, to.id, &offered);
+    let efforts: Vec<super::model::ControlOption> = super::kinds::models_of(to.id)
+        .into_iter()
+        .find(|m| m.id == model)
+        .map(|m| m.efforts)
+        .filter(|e| !e.is_empty())
+        .map(|levels| levels.iter().map(|e| super::model::ControlOption { id: e.clone(), label: super::model::effort_label(e), description: String::new(), dangerous: false }).collect())
+        .unwrap_or_else(|| to.efforts());
+    let levels: Vec<String> = efforts.iter().map(|e| e.id.clone()).collect();
+    (mode, handoff::effort_for(effort, &levels), modes, efforts)
+}
+
+/// The session's state for the harness it goes on in (`session`: its conversation's id there):
+/// the model, mode and effort it runs with; what was the old harness's own (its servers, skills,
+/// account, plan and limits, what it was doing) goes with it.
+fn for_harness(st: &mut super::model::State, session: Option<String>, model: &str, mode: Option<String>, effort: Option<String>) {
+    st.harness_session = session;
+    model.clone_into(&mut st.model);
+    st.mode = mode.unwrap_or_default();
+    st.effort = effort.unwrap_or_default();
+    st.mcp.clear();
+    st.skills.clear();
+    st.plugins.clear();
+    st.inventory = Default::default();
+    st.harness_status.clear();
+    st.limits.clear();
+    st.account = None;
+    st.plan = None;
+    st.control_values.clear();
+    st.objective = None;
+    st.usage.context_tokens = None;
+    st.usage.context_window = None;
+    st.exit = None;
+    st.activity = None;
+    st.doing = None;
+}
+
+/// A paused session moving to another machine goes on there: the pause (for this machine's
+/// account) stays behind, and so do that account's limits. True when the pause had cut a turn
+/// off, which goes on there first.
+fn picks_up_there(st: &mut super::model::State) -> bool {
+    let Some(p) = st.pause.take() else { return false };
+    st.limits.clear();
+    st.stop_waived.clear();
+    p.cut.is_some()
+}
 
 /// Go on in harness `sw.to` (the one the session ran in, `from`, has ended): the conversation so
 /// far read from `from`'s own record and written the way `sw.to` keeps its own, the permission
@@ -1269,45 +1691,18 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
             e.body = super::model::Body::Notice { level: Level::Info, text: "Switch cancelled".to_owned() };
         }
     };
-    // What the model saw, from the harness's own record (no session yet: nothing to carry).
-    let read = match session {
-        None => Some(handoff::Conversation::default()),
-        Some(id) => {
-            let env = env.clone();
-            crate::rt::blocking(move || match from.protocol {
-                Protocol::ClaudeStreamJson => handoff::read_claude(&env, &id),
-                Protocol::CodexAppServer => handoff::read_codex(&env, &id),
-                Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => None,
-            })
-            .await
-            .ok()
-            .flatten()
+    let c = match carried(from, to, &env, session, &cwd, &old_model, &mode, &effort, allow_bypass, &sw.model, None).await {
+        Ok(c) => c,
+        Err(e) => {
+            fail(s, format!("{e}, so it goes on in {}.", from.name));
+            return None;
         }
     };
-    let Some(mut conv) = read else {
-        fail(s, format!("kiln could not read {}'s record of this conversation, so it goes on in {}.", from.name, from.name));
-        return None;
-    };
-    let dropped = handoff::fit(&mut conv, CARRY_MAX);
-    let empty = conv.entries.is_empty() && conv.summary.is_none();
-    // The same latitude (never more) and the nearest effort the new model takes.
-    let offered: Vec<String> = to.modes().0.into_iter().filter(|m| !m.dangerous || allow_bypass).map(|m| m.id).collect();
-    let mode = handoff::mode_for(from.id, &mode, to.id, &offered);
-    let levels: Vec<String> = super::kinds::models_of(to.id)
-        .into_iter()
-        .find(|m| m.id == sw.model)
-        .map(|m| m.efforts)
-        .filter(|e| !e.is_empty())
-        .unwrap_or_else(|| to.efforts().into_iter().map(|e| e.id).collect());
-    let effort = handoff::effort_for(&effort, &levels);
-    let note = handoff::note(from.name, &old_model, to.name, &conv.todos, dropped);
-    let (resume, seed) = match to.protocol {
-        _ if empty => (None, None),
-        Protocol::ClaudeStreamJson => {
-            let id = uuid::Uuid::now_v7().to_string();
-            let recs = handoff::to_claude(&conv, Some(&format!("<system-reminder>\n{note}\n</system-reminder>")), &id, &cwd, if old_model.is_empty() { "unknown" } else { &old_model });
+    let (dropped, empty, mode, effort) = (c.dropped, c.empty, c.mode, c.effort);
+    let (resume, seed) = match c.record {
+        Record::Claude { session: id, records } => {
             let (env, cwd, sid) = (env.clone(), cwd.clone(), id.clone());
-            match crate::rt::blocking(move || handoff::write_claude(&env, &cwd, &sid, &recs)).await {
+            match crate::rt::blocking(move || handoff::write_claude(&env, &cwd, &sid, &records)).await {
                 Ok(Ok(_)) => (Some(id), None),
                 Ok(Err(e)) | Err(e) => {
                     fail(s, format!("kiln could not write the conversation for {}: {e:#}", to.name));
@@ -1315,8 +1710,8 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
                 }
             }
         }
-        Protocol::CodexAppServer => (None, Some(handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>"))))),
-        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => (None, None),
+        Record::Codex(items) => (None, Some(items)),
+        Record::Nothing => (None, None),
     };
     {
         let mut sp = s.spec.lock();
@@ -1336,26 +1731,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
     {
         let mut core = s.core.lock();
         let st = &mut core.state;
-        st.harness_session = resume;
-        st.model.clone_from(&sw.model);
-        st.mode = mode.unwrap_or_default();
-        st.effort = effort.unwrap_or_default();
-        // What was the old harness's own goes with it.
-        st.mcp.clear();
-        st.skills.clear();
-        st.plugins.clear();
-        st.inventory = Default::default();
-        st.harness_status.clear();
-        st.limits.clear();
-        st.account = None;
-        st.plan = None;
-        st.control_values.clear();
-        st.objective = None;
-        st.usage.context_tokens = None;
-        st.usage.context_window = None;
-        st.exit = None;
-        st.activity = None;
-        st.doing = None;
+        for_harness(st, resume, &sw.model, mode, effort);
         st.status = Status::Starting;
         core.meta = super::model::Meta::default();
         core.hold = false;
@@ -1364,7 +1740,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         // the limit cut off goes on first.
         let unpaused = core.state.pause.take();
         if unpaused.as_ref().is_some_and(|p| p.cut.is_some()) {
-            core.state.queue.insert(0, super::model::QueueItem { id: format!("{}{}", super::pause::KILN_ID, crate::util::new_id()), text: super::pause::CONTINUE_ELSEWHERE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None });
+            core.state.queue.insert(0, super::model::QueueItem { id: format!("{}{}", super::pause::KILN_ID, crate::util::new_id()), text: super::pause::CONTINUE_ELSEWHERE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
         }
         let mut text = format!("Now {} ({})", model_label(to, &sw.model), to.name);
         if !empty {
@@ -1407,25 +1783,34 @@ struct Move {
     note: Option<String>,
     /// The turn under way was interrupted to move now: it is picked up over there.
     picks_up: bool,
+    /// It goes on there in this harness (its conversation carried over), with this model.
+    kind: Option<&'static Kind>,
+    model: Option<String>,
+    /// To this machine's newer runner process, which takes this one's place (`super::handing`).
+    local: bool,
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
 /// `now`: the turn under way isn't waited for (the caller interrupts it).
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool) -> Move {
+#[allow(clippy::too_many_arguments)]
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool) -> Move {
     let mut core = s.core.lock();
     core.hold = true;
     let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
     let picks_up = now && busy;
-    let text = if picks_up {
-        format!("Moving to {to} now: this turn stops here and goes on there")
+    let into = kind.map(|k| format!(", to go on in {}", k.name)).unwrap_or_default();
+    let text = if local {
+        if busy { "This machine's newer kiln runner takes this agent over when this turn ends".to_owned() } else { "This machine's newer kiln runner takes this agent over…".to_owned() }
+    } else if picks_up {
+        format!("Moving to {to}{into} now: this turn stops here and goes on there")
     } else if busy {
-        format!("Moving to {to} when this turn ends")
+        format!("Moving to {to}{into} when this turn ends")
     } else {
-        format!("Moving to {to}…")
+        format!("Moving to {to}{into}…")
     };
     core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
     core.touch_state();
-    Move { to, cwd, note, picks_up }
+    Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local }
 }
 
 /// How a move is getting on before it starts (its repository being copied there).
@@ -1433,21 +1818,382 @@ fn moving_note(s: &Session, text: &str) {
     s.core.lock().upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text: text.to_owned() });
 }
 
+/// How long a session leaving may take to get its folder's last changes into the sync log.
+const FILES_OUT_FOR: Duration = Duration::from_secs(600);
+/// How often a session leaving, or arriving, asks how its folder's copy stands.
+const FILES_EVERY: Duration = Duration::from_millis(250);
+
+/// Where a leaving session's synced folder stood once its last changes were in the log: the index
+/// the machine it goes to takes the log to before it goes on there, its copy's folder here, and
+/// the repo's name.
+struct Synced {
+    mark: crate::sync::runner::Mark,
+    folder: String,
+    name: String,
+}
+
+/// Before a session leaves: its folder's last changes into its repo's sync log (looked at now,
+/// sent, their contents on the server, the log having brought them back), then where the copy
+/// stands, for the machine it goes to to take the log that far before it goes on there. None: its
+/// folder isn't a synced copy here. An error, and it doesn't leave: it would leave work behind.
+async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<Synced>, String> {
+    let Some(sync) = crate::sync::runner::global() else { return Ok(None) };
+    let folder = std::path::Path::new(cwd);
+    let started = Instant::now();
+    let mut said = String::new();
+    loop {
+        let Some(looked) = sync.look_now(folder).await else { return Ok(None) };
+        let st = sync.standing(folder).await.unwrap_or_default();
+        if let Some(mark) = crate::sync::runner::left_at(&looked, &st) {
+            left_behind(cwd, &st).await?;
+            return Ok(Some(Synced { mark, folder: st.folder, name: st.name }));
+        }
+        let why = match (&st.error, st.connected) {
+            (Some(e), _) => format!(" ({e})"),
+            (None, false) => " (this machine isn't connected to kiln)".to_owned(),
+            (None, true) => String::new(),
+        };
+        if started.elapsed() > FILES_OUT_FOR {
+            return Err(format!("its folder's last changes didn't reach kiln in {} minutes{why}, so they'd be left behind", FILES_OUT_FOR.as_secs() / 60));
+        }
+        let now = match st.unsent + looked.proposed {
+            0 => format!("Moving to {to}: its folder's last changes are being checked{why}"),
+            n => format!("Moving to {to}: sending its folder's last changes ({n} to go){why}"),
+        };
+        if now != said {
+            moving_note(s, &now);
+            said = now;
+        }
+        crate::rt::sleep(FILES_EVERY).await;
+    }
+}
+
+/// What a session's repository carries besides its synced files.
+#[derive(Default)]
+struct GitOut {
+    git: Option<super::gitstate::GitState>,
+    ignored: Option<super::carry::Carried>,
+    worktree: Option<super::worktree::Worktree>,
+}
+
+/// Before a session leaves: its repository besides its files, less what the machine it goes to
+/// has: its branches, stash and what's staged ([`super::gitstate`]), and the files git ignores
+/// ([`super::carry`]); or, working in a worktree inside the synced repository, that worktree
+/// ([`super::worktree`]). `copy`: the synced folder it's in; `there`: its folder over there. An
+/// error, and it doesn't leave: something would be left behind.
+async fn git_out(s: &Session, cwd: &str, copy: &str, to: &str, there: &str) -> Result<GitOut, String> {
+    let (c, k) = (cwd.to_owned(), copy.to_owned());
+    let (root, nested) = crate::rt::blocking(move || {
+        let here = std::path::Path::new(&c);
+        (super::gitstate::root_of(here), super::worktree::nested(here, std::path::Path::new(&k)))
+    })
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+    let Some(root) = root else { return Ok(GitOut::default()) };
+    moving_note(s, &format!("Moving to {to}: its repository's branches, stash, what's staged and what git ignores"));
+    // Its copy over there answers for what it has: the folder it goes on in, or, for a worktree
+    // that isn't there yet, the repository it's made in.
+    let ask = match &nested {
+        Some(super::worktree::Nested::Worktree { .. }) => {
+            let depth = std::path::Path::new(cwd).strip_prefix(copy).map_or(0, |r| r.components().count());
+            let mut p = std::path::PathBuf::from(there);
+            for _ in 0..depth {
+                p.pop();
+            }
+            p.to_string_lossy().into_owned()
+        }
+        _ => there.to_owned(),
+    };
+    let theirs = match their_tips(to, &ask).await {
+        Some(t) => t,
+        // Not told: what was pushed, it likely has.
+        None => {
+            let r = root.clone();
+            crate::rt::blocking(move || super::gitstate::pushed(&r)).await.unwrap_or_default()
+        }
+    };
+    let c = cwd.to_owned();
+    crate::rt::blocking(move || -> Result<GitOut, String> {
+        match nested {
+            Some(super::worktree::Nested::Worktree { root: w, rel }) => {
+                let git = super::gitstate::capture(&w, &theirs)?;
+                let mut wt = super::worktree::capture(&w, &rel)?;
+                wt.sub = std::path::Path::new(&c).strip_prefix(&w).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                Ok(GitOut { git: Some(git), ignored: None, worktree: Some(wt) })
+            }
+            Some(super::worktree::Nested::Own(p)) => Err(format!("its folder is in {}, a repository of its own inside the synced one (or a submodule), whose files sync doesn't carry: commit and push its work, and it moves", p.display())),
+            None => Ok(GitOut { git: Some(super::gitstate::capture(&root, &theirs)?), ignored: Some(super::carry::ignored(&root)?), worktree: None }),
+        }
+    })
+    .await
+    .map_err(|e| format!("{e:#}"))?
+}
+
+/// What the copy of the folder on machine `to` (at `there`) has at the tips of its refs, as it
+/// says over reach. None when it can't be asked.
+async fn their_tips(to: &str, there: &str) -> Option<Vec<String>> {
+    use crate::reach::wire::{RunSpec, Say, Stream};
+    let reach = crate::reach::node::global()?;
+    reach.connect(to).await.ok()?;
+    let spec = RunSpec {
+        command: "git for-each-ref --format='%(objectname)' && git rev-parse -q --verify HEAD; true".into(),
+        cwd: Some(there.to_owned()),
+        timeout_ms: Some(30_000),
+        ..RunSpec::default()
+    };
+    let (tx, rx) = async_channel::unbounded();
+    reach.run(to, spec, tx).await.ok()?;
+    let mut out = Vec::new();
+    let until = Instant::now() + Duration::from_secs(40);
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        match crate::rt::timeout(left, rx.recv()).await {
+            Ok(Ok(Say::Output { stream: Stream::Out, data, .. })) => out.extend(data),
+            Ok(Ok(Say::Exit { code: Some(0), .. })) => break,
+            Ok(Ok(Say::Exit { .. })) | Ok(Err(_)) | Err(_) => return None,
+            Ok(Ok(_)) => {}
+        }
+    }
+    let tips: Vec<String> = String::from_utf8_lossy(&out).lines().map(str::trim).filter(|l| l.len() >= 40 && l.chars().all(|c| c.is_ascii_hexdigit())).map(str::to_owned).collect();
+    Some(tips)
+}
+
+/// A moved session's repository put as it was on the machine it left, once its files are in:
+/// what [`super::gitstate::restore`] did, in its timeline.
+async fn git_in(s: &Session, sink: &Sink, files: &Files) {
+    let path = super::moving::moved_git(&files.dir);
+    let Ok(bytes) = std::fs::read(&path) else { return };
+    let cwd = s.core.lock().state.cwd.clone();
+    // The synced folder a worktree goes in: the copy its folder here is in.
+    let copy = match crate::sync::runner::global() {
+        Some(sync) => sync.standing(std::path::Path::new(&cwd)).await.map(|st| st.folder),
+        None => None,
+    };
+    let said = crate::rt::blocking(move || -> Vec<String> {
+        let Ok(kept) = serde_json::from_slice::<super::moving::MovedGit>(&bytes) else { return vec!["Its repository's state from the machine it left couldn't be read".into()] };
+        if let Some(w) = &kept.worktree {
+            let copy = copy.map(std::path::PathBuf::from).or_else(|| {
+                // Without sync's word: its folder less the worktree's place in the repository.
+                let up = std::path::Path::new(&w.rel).components().count() + std::path::Path::new(&w.sub).components().count();
+                std::path::Path::new(&cwd).ancestors().nth(up).map(std::path::Path::to_path_buf)
+            });
+            let Some(copy) = copy else { return vec![format!("Its worktree couldn't be made here: no copy of its repository holds {cwd}")] };
+            if let Err(e) = super::gitstate::fetch(&copy, &kept.state, &kept.from) {
+                return vec![format!("Its worktree couldn't be made here ({e}); it stays on {}", kept.from)];
+            }
+            return match super::worktree::place(&copy, w, &kept.from) {
+                Ok((at, mut said)) => {
+                    said.extend(super::gitstate::restore_at(&copy, &at, &kept.state, &kept.from));
+                    said
+                }
+                Err(e) => vec![format!("Its worktree couldn't be made here ({e}); it stays on {}", kept.from)],
+            };
+        }
+        match super::gitstate::root_of(std::path::Path::new(&cwd)) {
+            Some(root) => {
+                let mut said = super::gitstate::restore(&root, &kept.state, &kept.from);
+                if let Some(ig) = &kept.ignored {
+                    said.extend(super::carry::place(&root, ig, &kept.from));
+                }
+                said
+            }
+            None => vec![format!("Its folder here, {cwd}, isn't a git repository, so its branches, stash and the files git ignores stay on {}", kept.from)],
+        }
+    })
+    .await
+    .unwrap_or_default();
+    {
+        let mut core = s.core.lock();
+        for (i, text) in said.into_iter().enumerate() {
+            let level = if i == 0 { Level::Info } else { Level::Warn };
+            core.upsert(&format!("move-git-{}-{i}", Core::now()), None, super::model::Body::Notice { level, text });
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    flush(s, sink, None).await;
+}
+
+/// What of a session's folder sync doesn't carry, and would be left behind: then it doesn't move.
+/// A repository of its own nested inside the synced one, or a submodule (sync carries the outer
+/// one's files, never a nested repository's; a worktree of the same repository moves with the
+/// session, [`super::worktree`]), and files too big for sync.
+async fn left_behind(cwd: &str, st: &crate::sync::runner::Standing) -> Result<(), String> {
+    let (c, copy) = (cwd.to_owned(), st.folder.clone());
+    let nested = crate::rt::blocking(move || super::worktree::nested(std::path::Path::new(&c), std::path::Path::new(&copy))).await.ok().flatten();
+    if let Some(super::worktree::Nested::Own(inner)) = nested {
+        return Err(format!(
+            "its folder is in {}, a repository of its own inside {} (or a submodule): sync carries {}'s files and not its, so its work would be left behind. Commit and push it, and it moves",
+            inner.display(),
+            st.folder,
+            st.folder
+        ));
+    }
+    let here = std::path::Path::new(cwd);
+    let big: Vec<&String> = st.skipped.iter().filter(|p| std::path::Path::new(&st.folder).join(p).starts_with(here)).collect();
+    if !big.is_empty() {
+        let names: Vec<&str> = big.iter().take(5).map(|p| p.as_str()).collect();
+        return Err(format!(
+            "{} {} too big for sync to carry ({}{}), so {} be left behind: move {} out of the repository, or have git ignore {}, and it moves",
+            big.len(),
+            if big.len() == 1 { "file is" } else { "files are" },
+            names.join(", "),
+            if big.len() > 5 { ", …" } else { "" },
+            if big.len() == 1 { "it would" } else { "they would" },
+            if big.len() == 1 { "it" } else { "them" },
+            if big.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    Ok(())
+}
+
+/// How waiting for a moved session's files ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Arrived {
+    /// They're here (or can't be waited for): it goes on.
+    GoOn,
+    /// It was closed meanwhile, or (`let_go`) went on elsewhere.
+    End { let_go: bool },
+}
+
+/// A session that moved here goes on once its folder has taken its repo's sync log as far as the
+/// machine it left had it: it never starts on files older than the ones it left. Messages sent
+/// meanwhile wait in `carry`; closing it ends the wait.
+async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ctl_rx: &async_channel::Receiver<Ctl>, carry: &mut Vec<Command>, files: &Files) -> Arrived {
+    let note = |text: String, level: Level| s.core.lock().upsert("move-files", None, super::model::Body::Notice { level, text });
+    let Some(sync) = crate::sync::runner::global() else {
+        note("This machine doesn't sync folders, so its folder here may not have its last changes".into(), Level::Warn);
+        return Arrived::GoOn;
+    };
+    let cwd = s.core.lock().state.cwd.clone();
+    let folder = std::path::Path::new(&cwd);
+    let started = Instant::now();
+    let mut said = String::new();
+    loop {
+        let now = match sync.standing(folder).await {
+            Some(st) if crate::sync::runner::arrived(&st, mark) => {
+                let waited = started.elapsed();
+                note(format!("Its folder's last changes are here (in {}s); it goes on", waited.as_secs()), Level::Info);
+                crate::metrics::sync().move_files_wait.observe(waited.as_secs_f64());
+                tracing::Span::current().record("repo", st.name.as_str());
+                // The server knows this machine as the one it arrived on.
+                tell_move(crate::sync::wire::MoveNews {
+                    repo: st.repo.clone(),
+                    index: mark.index,
+                    session: s.id.clone(),
+                    phase: "arrived".into(),
+                    waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                    ..crate::sync::wire::MoveNews::default()
+                });
+                flush(s, sink, None).await;
+                return Arrived::GoOn;
+            }
+            Some(st) if st.repo != mark.repo => {
+                note(format!("Its folder here, {cwd}, is a copy of another repository, so it goes on without waiting for its files"), Level::Warn);
+                flush(s, sink, None).await;
+                return Arrived::GoOn;
+            }
+            Some(st) => {
+                let why = st.error.as_ref().map(|e| format!(" ({e})")).unwrap_or_default();
+                format!("Waiting for its folder's last changes to arrive: {} to take, {} files coming{why}. It goes on once they're here", st.behind.max(1), st.waiting)
+            }
+            None => "Waiting for its folder's last changes to arrive: this machine's copy of it isn't syncing yet. It goes on once they're here".to_owned(),
+        };
+        if now != said {
+            note(now.clone(), Level::Info);
+            flush(s, sink, None).await;
+            said = now;
+        }
+        let tick = crate::rt::sleep(Duration::from_secs(1)).fuse();
+        let msg = ctl_rx.recv().fuse();
+        futures::pin_mut!(tick, msg);
+        futures::select_biased! {
+            m = msg => match m {
+                Ok(Ctl::Cmd(c)) => match *c {
+                    Command::Moving { text } => moving_note(s, &text),
+                    c @ (Command::Send { .. } | Command::SkillRun { .. }) => carry.push(prepare(files, c).await),
+                    c => carry.push(c),
+                },
+                // No process to hand over: the next image starts it from its record.
+                Ok(Ctl::HandOver(reply)) => {
+                    let _ = reply.send(None);
+                }
+                Ok(Ctl::LetGo) => return Arrived::End { let_go: true },
+                Ok(Ctl::Close) | Err(_) => return Arrived::End { let_go: false },
+            },
+            () = tick => {}
+        }
+    }
+}
+
 /// A move that couldn't be: the session goes on here, and the timeline says why.
 fn move_failed(s: &Session, mv: &Move, why: &str) {
     let mut core = s.core.lock();
     core.hold = false;
     core.touch_state();
-    core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text: format!("Couldn't move to {}: {why} — it goes on here", mv.to) });
+    let text = if mv.local {
+        format!("This machine's newer kiln runner couldn't take this agent over: {why} — it goes on here")
+    } else {
+        format!("Couldn't move to {}: {why} — it goes on here", mv.to)
+    };
+    core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text });
+}
+
+/// Hand the session to this machine's newer runner process (its turn is over, its harness down),
+/// which takes this one's place: its timeline, state and queue, by way of the server. Same disk,
+/// same home: its folder and its harness's own record stay where they are, and it resumes from
+/// them there under the same harness session, as it would after a restart. A harness whose own
+/// record kiln doesn't keep (ACP agents, Antigravity) may not load it again: its conversation
+/// goes in words, as a move carries it. Ok once that process has taken it over.
+async fn hand_to_newer(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(), String> {
+    use super::moving::Carry;
+    let spec = s.resume_spec();
+    let (resume, program) = (spec.resume.clone(), spec.program.clone());
+    let (events, state, cwd) = {
+        let core = s.core.lock();
+        // The note that it was about to go is this process's alone.
+        (core.events().filter(|e| e.id != "move-pending").cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone())
+    };
+    let carry = match kind.protocol {
+        super::kinds::Protocol::Acp(_) | super::kinds::Protocol::AgyStreamJson => {
+            super::moving::words(&events, "This conversation went on in this machine's newer kiln runner, which took the older one's place.")
+        }
+        _ => Carry::Nothing,
+    };
+    let mut pkg = super::moving::pack(&s.id, spec, &cwd, &mv.to, &cwd, carry, events, state);
+    // Its harness's own record is here already: it goes on from it, nothing started anew.
+    if matches!(pkg.carry, Carry::Nothing) {
+        pkg.spec.resume = resume;
+    }
+    pkg.spec.program = program;
+    pkg.handover = true;
+    let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
+    super::handing::send(&s.id, bytes).await
 }
 
 /// Hand the session to runner `mv.to` (its turn is over, its harness down): its record, timeline
 /// and queue, over reach. Ok once that runner has taken it over and runs it.
 async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(), String> {
+    use super::moving::Carry;
+    if mv.local {
+        // Its process is a terminal's: it stays with the process it runs in until it ends.
+        if matches!(kind.protocol, super::kinds::Protocol::Terminal) {
+            return Err("an agent in a terminal stays where it runs until it ends".into());
+        }
+        return hand_to_newer(s, kind, mv).await;
+    }
     let reach = crate::reach::node::global().ok_or_else(|| "this runner can't reach other runners (an older one?)".to_owned())?;
     let me = reach.name().to_owned();
-    let spec = s.resume_spec();
-    let (events, state, from_cwd, session) = {
+    let mut spec = s.resume_spec();
+    // Going on there in another harness: its timeline says so (there too, as it travels with it).
+    if let Some(to) = mv.kind {
+        if !(kind.switchable() && to.switchable()) {
+            return Err(format!("a conversation can't be carried from {} to {}", kind.name, to.name));
+        }
+        let model = mv.model.as_deref().map_or_else(|| "its default model".to_owned(), |m| model_label(to, m));
+        let text = format!("Going on in {} ({model}) on {} — the conversation carries over", to.name, mv.to);
+        s.core.lock().upsert(&format!("harness-switch:move-{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+    }
+    let (events, mut state, from_cwd, session) = {
         let core = s.core.lock();
         // The note that it was about to move is this machine's alone.
         (core.events().filter(|e| e.id != "move-pending").cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone(), core.state.harness_session.clone())
@@ -1457,14 +2203,143 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
         note.push(' ');
         note.push_str(n);
     }
-    let env = spec.env.clone();
-    let timeline = events.clone();
-    let carry = crate::rt::blocking(move || super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)).await.map_err(|e| format!("{e:#}"))??;
+    let (carry, home) = match mv.kind {
+        // Its record, and what its harness keeps for it in its home besides (`homes`).
+        None => {
+            let env = spec.env.clone();
+            let timeline = events.clone();
+            let (cwd, objective) = (from_cwd.clone(), state.objective.clone());
+            crate::rt::blocking(move || {
+                let carry = super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)?;
+                let home = super::homes::pack(kind.id, &super::homes::Dirs::here(&env), session.as_deref(), &cwd, super::moving::transcript_of(&carry), objective.as_ref());
+                Ok::<_, String>((carry, Some(home)))
+            })
+            .await
+            .map_err(|e| format!("{e:#}"))??
+        }
+        // The other harness's own record of it, as a switch writes one (`carried`).
+        Some(to) => {
+            let model = mv.model.clone().unwrap_or_default();
+            let c = carried(kind, to, &spec.env, session, &mv.cwd, &state.model, &state.mode, &state.effort, spec.allow_bypass, &model, Some(&note)).await?;
+            let (carry, there) = match c.record {
+                Record::Claude { session, records } => (Carry::ClaudeLines { session: session.clone(), lines: records.iter().map(serde_json::Value::to_string).collect() }, Some(session)),
+                Record::Codex(items) => (Carry::Seed { items }, None),
+                Record::Nothing => (Carry::Nothing, None),
+            };
+            to.id.clone_into(&mut spec.kind);
+            spec.model.clone_from(&mv.model);
+            spec.mode.clone_from(&c.mode);
+            spec.effort.clone_from(&c.effort);
+            // A program of its own was the old harness's.
+            spec.program = None;
+            for_harness(&mut state, there, &model, c.mode, c.effort);
+            // What the old harness keeps in its home is its own: the other one doesn't read it.
+            (carry, None)
+        }
+    };
+    // Its folder's last changes go first, so it goes on there from them; then its repository's
+    // state besides its files (only a synced folder's: there's a repository there to take it).
+    let barrier = tracing::info_span!(target: "kiln.sync", "move.barrier", repo = tracing::field::Empty, machine = %mv.to, result = tracing::field::Empty);
+    let started = Instant::now();
+    let synced = files_out(s, &from_cwd, &mv.to).instrument(barrier.clone()).await;
+    let waited = started.elapsed();
+    barrier.record("result", if synced.is_ok() { "ok" } else { "failed" });
+    if let Ok(Some(x)) = &synced {
+        barrier.record("repo", x.name.as_str());
+        tracing::Span::current().record("repo", x.name.as_str());
+        crate::metrics::sync().move_barrier.observe(waited.as_secs_f64());
+    }
+    drop(barrier);
+    // How this machine's part went, for the repo's activity on the server.
+    let news = |repo: &str, index: u64, phase: &str, error: Option<&str>| crate::sync::wire::MoveNews {
+        repo: repo.to_owned(),
+        index,
+        session: s.id.clone(),
+        from: me.clone(),
+        to: mv.to.clone(),
+        phase: phase.to_owned(),
+        waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        error: error.map(str::to_owned),
+    };
+    let synced = match synced {
+        Ok(x) => x,
+        Err(why) => {
+            if let Some(st) = standing(&from_cwd).await {
+                tell_move(news(&st.repo, st.reached, "failed", Some(&why)));
+            }
+            return Err(why);
+        }
+    };
+    // Said now, before the machine it goes to says it went on there.
+    if let Some(x) = &synced {
+        tell_move(news(&x.mark.repo, x.mark.index, "left", None));
+    }
+    let out = match &synced {
+        Some(x) => git_out(s, &from_cwd, &x.folder, &mv.to, &mv.cwd).await,
+        None => Ok(GitOut::default()),
+    };
+    let out = match out {
+        Ok(o) => o,
+        Err(why) => {
+            if let Some(x) = &synced {
+                tell_move(news(&x.mark.repo, x.mark.index, "failed", Some(&why)));
+            }
+            return Err(why);
+        }
+    };
+    let carried = carried_bytes(&out, home.as_ref());
+    // Paused for a limit: it goes on there, where it moved for room, the cut-off turn first.
+    let cut = picks_up_there(&mut state);
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
-    pkg.picks_up = mv.picks_up;
+    if let Some(home) = home {
+        pkg = pkg.with_home(home);
+    }
+    pkg.picks_up = mv.picks_up || cut;
+    pkg.synced = synced.as_ref().map(|x| x.mark.clone());
+    pkg.git = out.git;
+    pkg.ignored = out.ignored;
+    pkg.worktree = out.worktree;
     let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
     moving_note(s, &format!("Moving to {}: handing over the conversation ({} KB)", mv.to, bytes.len() / 1024));
-    reach.adopt(&mv.to, &bytes).await
+    let handed = reach.adopt(&mv.to, &bytes).await;
+    if let (Some(x), Err(e)) = (&synced, &handed) {
+        tell_move(news(&x.mark.repo, x.mark.index, "failed", Some(e)));
+    }
+    if handed.is_ok() {
+        for (what, n) in carried {
+            if n > 0 {
+                crate::metrics::sync().move_carried_bytes.add(&[what], n);
+            }
+        }
+    }
+    handed
+}
+
+/// How the synced copy a folder is in stands, if this machine syncs one.
+async fn standing(cwd: &str) -> Option<crate::sync::runner::Standing> {
+    crate::sync::runner::global()?.standing(std::path::Path::new(cwd)).await
+}
+
+/// Tells the server how this machine's part of a move went, for the repo's activity.
+fn tell_move(news: crate::sync::wire::MoveNews) {
+    if let Some(sync) = crate::sync::runner::global() {
+        sync.tell(crate::sync::wire::Msg::Move(news));
+    }
+}
+
+/// What a leaving session carries besides its synced files, in bytes: what the machine it goes to
+/// lacks of its git history, the files git ignores, its worktree, and what its harness keeps for
+/// it in its home.
+fn carried_bytes(out: &GitOut, home: Option<&super::homes::Home>) -> [(&'static str, u64); 4] {
+    // Base64, as the package carries them: three bytes in four.
+    let b64 = |s: &str| u64::try_from(s.len() / 4 * 3).unwrap_or(u64::MAX);
+    let files = |c: &super::carry::Carried| c.files.iter().map(|f| b64(&f.data)).sum::<u64>();
+    [
+        ("git", out.git.as_ref().and_then(|g| g.bundle.as_deref()).map_or(0, b64)),
+        ("ignored", out.ignored.as_ref().map_or(0, files)),
+        ("worktree", out.worktree.as_ref().map_or(0, |w| files(&w.changed).saturating_add(files(&w.ignored)))),
+        ("home", home.map_or(0, super::homes::Home::size)),
+    ]
 }
 
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
@@ -1474,7 +2349,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     let mut kind = kind;
     s.core.lock().harness = Some(kind.name.to_owned());
     let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
-    let (ch_tx, ch_rx) = async_channel::unbounded::<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>();
+    let mut changes = futures::stream::FuturesUnordered::new();
     let (fx_tx, fx_rx) = async_channel::unbounded::<Done>();
     // Going on with the process the previous image of this process ran: its timeline came with it.
     let mut adopt = adopt;
@@ -1503,14 +2378,44 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             }
         }
     }
-    // Announce it, whole, before anything else: whoever mirrors it starts from all of it.
+    // Announce it, whole, before anything else: whoever mirrors it starts from all of it. One
+    // that started again from the conversation store announces all but its timeline: the store
+    // has that, and the server's copy gets what it lacks as the session's stream starts.
+    let stored = std::mem::take(&mut s.core.lock().stored);
     for u in s.snapshot() {
+        if stored && matches!(u, Update::Reset { .. } | Update::Events { .. }) {
+            continue;
+        }
         let _ = sink.send((s.id.clone(), u)).await;
     }
     let mut first = !handed;
     let mut crashes: Vec<Instant> = Vec::new();
     // A message that arrived while the process was down, sent once it is back.
     let mut carry: Vec<Command> = Vec::new();
+    // Moved here: on once its folder's last changes are (after a restart too: its state says so).
+    let arriving = s.core.lock().state.arriving.clone();
+    if let Some(mark) = arriving {
+        let span = tracing::info_span!(target: "kiln.sync", "move.files", repo = tracing::field::Empty, session = %s.id, result = tracing::field::Empty);
+        let arrived = files_in(&s, &sink, &mark, &ctl_rx, &mut carry, &files).instrument(span.clone()).await;
+        span.record("result", if arrived == Arrived::GoOn { "ok" } else { "ended" });
+        drop(span);
+        if let Arrived::End { let_go } = arrived {
+            if let_go {
+                (files.release)(&s.id);
+            } else {
+                let _ = sink.send((s.id.clone(), Update::Closed)).await;
+            }
+            on_change();
+            return;
+        }
+        {
+            let mut core = s.core.lock();
+            core.state.arriving = None;
+            core.touch_state();
+        }
+        // Its files in: its repository as it was there.
+        git_in(&s, &sink, &files).await;
+    }
     // A rewind: the harness starts again, continuing its session from this point.
     let mut rewind_to: Option<Option<String>> = None;
     // A switch to another harness, waiting for the turn under way to end; and the conversation
@@ -1531,7 +2436,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         // The harness it ran in is down: on in the other one.
         // Its turn is over: on to the other runner (or, if that can't be, on here).
         if let Some(mv) = moving.take() {
-            match hand_over(&s, kind, &mv).await {
+            let span = tracing::info_span!(target: "kiln.sync", "move", repo = tracing::field::Empty, machine = %mv.to, session = %s.id, result = tracing::field::Empty);
+            let handed = hand_over(&s, kind, &mv).instrument(span.clone()).await;
+            let result = if handed.is_ok() { "ok" } else { "failed" };
+            span.record("result", result);
+            drop(span);
+            crate::metrics::sync().moves.inc(&[result]);
+            match handed {
                 Ok(()) => {
                     tracing::info!(session = %s.id, to = %mv.to, "agent session moved");
                     (files.release)(&s.id);
@@ -1592,16 +2503,22 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     adapter.seed(items.clone());
                 }
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
+                // One the machine's own PATH lacks may be on its user's: their login shell is asked
+                // first (once, then kept ten minutes).
+                if blocked.is_none() && spec.program.is_none() && !kind.available() {
+                    crate::reach::serve::login_env().await;
+                }
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
-                    // Marked as this session's, and so is everything it starts (`survivors`).
+                    // In the session's group of processes where the machine has them, and marked as
+                    // its, and so is everything it starts (`survivors`).
                     None => kind
                         .launch(&spec, &s.id)
                         .map(|mut p| {
                             p.env(super::survivors::MARK, &s.id);
                             p
                         })
-                        .and_then(crate::proc::spawn_duplex),
+                        .and_then(|p| crate::proc::spawn_duplex_in(p, crate::os::contain::Group::of(&s.id).as_ref())),
                 };
                 (adapter, spawned, Vec::new(), false)
             }
@@ -1615,8 +2532,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 *s.pid.lock() = Some(p.pid);
                 if adopted {
                     let mut core = s.core.lock();
+                    // An older image may have left what the harness before a switch ran looking live.
+                    core.settle_foreign();
                     for c in carry.drain(..) {
                         adapter.command(&mut core, c);
+                    }
+                    drop(core);
+                    if kind.protocol != super::kinds::Protocol::CodexAppServer {
+                        read_unread_children(&s);
                     }
                 } else {
                     let mut core = s.core.lock();
@@ -1625,10 +2548,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     core.touch_state();
                     adapter.start(&mut core);
                     if first && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
-                        adapter.command(&mut core, Command::Send { id: crate::util::new_id(), text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None });
+                        adapter.command(&mut core, Command::Send { id: crate::util::new_id(), text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None});
                     }
                     for c in carry.drain(..) {
                         adapter.command(&mut core, c);
+                    }
+                    drop(core);
+                    if kind.protocol != super::kinds::Protocol::CodexAppServer {
+                        read_unread_children(&s);
                     }
                 }
                 on_change();
@@ -1655,19 +2582,24 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         });
                     }
                     for job in jobs.changes.drain(..) {
-                        let tx = ch_tx.clone();
-                        crate::rt::spawn(async move {
+                        // Placed among its folder's repository's working trees (a worktree it went into).
+                        let home = {
+                            let mut core = s.core.lock();
+                            core.start_change(&job.abs);
+                            core.state.cwd.clone()
+                        };
+                        changes.push(async move {
                             let abs = job.abs.clone();
-                            let change = crate::rt::blocking(move || super::diff::file_change(&job)).await.unwrap_or((None, None));
-                            let _ = tx.send((abs, change)).await;
+                            let change = crate::rt::blocking(move || super::diff::placed_change(&job, &home)).await.unwrap_or((None, None));
+                            (abs, change)
                         });
                     }
                     let ev = futures::select_biased! {
                         c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
+                        c = changes.select_next_some() => Ev::Change(c),
                         o = pipe(&p.stdout, out_open).fuse() => Ev::Out(o),
                         e = pipe(&p.stderr, err_open).fuse() => Ev::Err(e),
                         d = pv_rx.recv().fuse() => Ev::Preview(d.ok()),
-                        c = ch_rx.recv().fuse() => Ev::Change(c.ok()),
                         f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
                         x = (&mut p.exit).fuse() => Ev::Exit(x.ok().flatten()),
                         _ = crate::rt::sleep_until(next_tick).fuse() => Ev::Tick,
@@ -1748,8 +2680,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     switching = Some(sw);
                                 }
                             }
-                            Command::MoveTo { to, cwd, note, now } => {
-                                let mv = move_wanted(&s, to, cwd, note, now);
+                            Command::MoveTo { to, cwd, note, now, kind: into, model, local } => {
+                                let mv = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local);
                                 // Not waiting for the turn: it stops here, and goes on there.
                                 if mv.picks_up {
                                     adapter.command(&mut s.core.lock(), Command::Interrupt);
@@ -1797,16 +2729,24 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 drop(core);
                                 on_change();
                             }
-                            Command::MoveOnLimit { on } => {
+                            Command::MaxSubagents { count } => {
                                 let mut core = s.core.lock();
-                                core.state.move_on_limit = on;
+                                core.state.max_subagents = count.filter(|n| *n >= 1);
                                 core.touch_state();
                                 drop(core);
                                 on_change();
                             }
-                            Command::LimitHold { window, until, said, .. } => {
+                            Command::MoveOnLimit { on, to, kind, model } => {
                                 let mut core = s.core.lock();
-                                super::pause::hold(&mut core, super::pause::LIMIT, "account", super::pause::Hit { window, until, said }, None);
+                                core.state.move_on_limit = on;
+                                core.state.move_plan = if on { super::model::MovePlan { to, kind, model } } else { super::model::MovePlan::default() };
+                                core.touch_state();
+                                drop(core);
+                                on_change();
+                            }
+                            Command::LimitHold { window, until, said, account, .. } => {
+                                let mut core = s.core.lock();
+                                super::pause::account_hold(&mut core, super::pause::Hit { window, until, said }, account);
                                 drop(core);
                                 on_change();
                             }
@@ -1879,8 +2819,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                             let root = p.pid;
                             let left = std::mem::take(&mut *s.left.lock());
+                            let group = crate::os::contain::Group::existing(&s.id);
+                            let members = group.clone();
                             let _ = crate::rt::blocking(move || {
-                                let pids: Vec<u32> = descendants(root).into_iter().map(|(pid, _)| pid).collect();
+                                // Everything in its group where it has one (what left its tree
+                                // too), else what's under it now.
+                                let pids: Vec<u32> = match &members {
+                                    Some(g) => g.pids().into_iter().filter(|p| *p != root).collect(),
+                                    None => descendants(root).into_iter().map(|(pid, _)| pid).collect(),
+                                };
                                 crate::os::stop_processes(&pids, Some(root), Duration::from_secs(2));
                                 for r in &left {
                                     super::survivors::stop_tree(r);
@@ -1889,10 +2836,21 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             .await;
                             p.terminate(Duration::from_secs(3));
                             *s.pid.lock() = None;
+                            if let Some(g) = group {
+                                end_group(g, Duration::from_millis(3500));
+                            }
                             if matches!(ctl, Some(Ctl::LetGo)) {
                                 tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");
                                 (files.release)(&s.id);
                             } else {
+                                // Its last state, what an ended agent shows, says all of it stopped
+                                // (the harness's own word on it was never read).
+                                {
+                                    let mut core = s.core.lock();
+                                    adapter.exited(&mut core, None, None);
+                                    end_tasks(&mut core);
+                                }
+                                let _ = flush(&s, &sink, None).await;
                                 let _ = sink.send((s.id.clone(), Update::Closed)).await;
                             }
                             on_change();
@@ -1905,9 +2863,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 core.touch_state();
                             }
                         }
-                        Ev::Preview(None) | Ev::Change(None) => {}
-                        Ev::Change(Some((abs, (change, resolved)))) => {
+                        Ev::Preview(None) => {}
+                        Ev::Change((abs, (change, resolved))) => {
                             s.core.lock().set_change(&abs, change, resolved);
+                            while let Some(Some((abs, (change, resolved)))) = changes.next().now_or_never() {
+                                s.core.lock().set_change(&abs, change, resolved);
+                            }
                         }
                         Ev::Fx(Some(d)) => d.apply(&mut adapter, &mut s.core.lock()),
                         Ev::Fx(None) => {}
@@ -2057,8 +3018,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                     }
                     // Another runner: it goes there, now.
-                    Command::MoveTo { to, cwd, note, now } => {
-                        moving = Some(move_wanted(&s, to, cwd, note, now));
+                    Command::MoveTo { to, cwd, note, now, kind: into, model, local } => {
+                        moving = Some(move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local));
                         break;
                     }
                     Command::Moving { text } => moving_note(&s, &text),
@@ -2068,6 +3029,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                     Command::StopTasks => {
                         stop_left(&s, None).await;
+                        on_change();
+                    }
+                    // For a subagent: it ended with its harness, so it isn't started again for it.
+                    c @ Command::Send { task: Some(_), .. } => {
+                        adapter.command(&mut s.core.lock(), c);
                         on_change();
                     }
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {
@@ -2090,6 +3056,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                         on_change();
                     }
+                    // Its threshold, set while it isn't running (a person's, or kiln's for a
+                    // program's worker): kept, and it holds from its next start.
+                    Command::PauseAt { percent } => {
+                        let mut core = s.core.lock();
+                        core.state.pause_at = percent.filter(|p| (1..=100).contains(p));
+                        core.touch_state();
+                        drop(core);
+                        on_change();
+                    }
                     c => adapter.command(&mut s.core.lock(), c),
                 },
                 // No process to hand over: the next image starts it from its record.
@@ -2097,15 +3072,21 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     let _ = reply.send(None);
                 }
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
-                    // Ending the agent ends what it left running that kiln took back over.
+                    // Ending the agent ends what it left running that kiln took back over, and the
+                    // rest of its group of processes, which then goes.
                     let left = std::mem::take(&mut *s.left.lock());
                     if !left.is_empty() {
                         let _ = crate::rt::blocking(move || left.iter().for_each(super::survivors::stop_tree)).await;
+                    }
+                    if let Some(g) = crate::os::contain::Group::existing(&s.id) {
+                        end_group(g, Duration::ZERO);
                     }
                     if matches!(ctl, Some(Ctl::LetGo)) {
                         tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");
                         (files.release)(&s.id);
                     } else {
+                        end_tasks(&mut s.core.lock());
+                        let _ = flush(&s, &sink, None).await;
                         let _ = sink.send((s.id.clone(), Update::Closed)).await;
                     }
                     on_change();
@@ -2125,6 +3106,31 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
 
 #[cfg(test)]
 mod tests {
+
+    /// A switch carries the same latitude (never more) and the nearest effort the new model takes,
+    /// named by the new harness's own choices: what its page shows while the switch waits, rather
+    /// than the old harness's (Opus shown with Codex's Full access, an empty effort, Codex's limit).
+    #[test]
+    fn a_switch_carries_the_same_latitude_and_the_nearest_effort_named_by_the_new_harness() -> anyhow::Result<()> {
+        use super::{Kind, carried_choices};
+        let codex = Kind::get("codex").ok_or_else(|| anyhow::anyhow!("no codex"))?;
+        let claude = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
+        let (mode, effort, modes, efforts) = carried_choices(codex, claude, "full-access", "ultra", true, "opus");
+        // Claude offers asking nothing only where Claude Code allows it (not as root outside a
+        // sandbox, as CI's containers run): else the most it may.
+        let top = if modes.iter().any(|m| m.id == "bypassPermissions") { "bypassPermissions" } else { "auto" };
+        assert_eq!((mode.as_deref(), effort.as_deref()), (Some(top), Some("max")));
+        assert!(modes.iter().all(|m| m.id != "bypassPermissions" || m.label == "Bypass"), "{modes:?}");
+        assert!(efforts.iter().any(|e| e.id == "max"), "{efforts:?}");
+        // Without leave to ask nothing: the most it may. Codex's auto: Claude's accept-edits.
+        assert_eq!(carried_choices(codex, claude, "full-access", "", false, "opus").0.as_deref(), Some("auto"));
+        assert_eq!(carried_choices(codex, claude, "auto", "high", true, "sonnet").0.as_deref(), Some("acceptEdits"));
+        // And back: Claude's max is the highest Codex's model takes.
+        let (_, effort, _, efforts) = carried_choices(claude, codex, "acceptEdits", "max", true, "gpt-6.1-sol");
+        let top = ["max", "xhigh", "high"].into_iter().find(|l| efforts.iter().any(|e| e.id == *l));
+        assert_eq!(effort.as_deref(), top, "{efforts:?}");
+        Ok(())
+    }
 
     #[test]
     fn a_turn_stays_open_until_it_ends_not_when_its_harness_does() {
@@ -2151,6 +3157,212 @@ mod tests {
     }
     use super::*;
 
+    /// A session that went on in Claude Code with a Codex subagent kiln never read: its work comes
+    /// from Codex's own record of its thread, off the event loop, into the running session.
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_child_never_read_is_read_from_its_rollout_in_the_harness_after_a_switch() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let quiet = dir.path().join("quiet-claude");
+            std::fs::write(&quiet, "#!/bin/sh\nexec sleep 30\n")?;
+            std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o755))?;
+            let thread = "01a15b9d-5652-7722-8f9b-c750ebfe6940";
+            let day = dir.path().join("codex/sessions/2026/10/20");
+            std::fs::create_dir_all(&day)?;
+            let ev = |payload: serde_json::Value| serde_json::json!({"type": "event_msg", "payload": payload}).to_string();
+            let rollout = [
+                serde_json::json!({"type": "session_meta", "payload": {"id": thread}}).to_string(),
+                ev(serde_json::json!({"type": "task_started", "turn_id": "own", "turn_attribution": {"initiating_agent_path": "/root"}, "started_at": 100})),
+                ev(serde_json::json!({"type": "item_completed", "turn_id": "own", "item": {"type": "AgentMessage", "id": "msg_answer", "content": [{"type": "Text", "text": "Fits."}]}})),
+                ev(serde_json::json!({"type": "task_complete", "turn_id": "own", "completed_at": 103, "duration_ms": 3000})),
+            ];
+            std::fs::write(day.join(format!("rollout-2026-10-20T16-20-00-{thread}.jsonl")), rollout.join("\n"))?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = super::super::host::Host::new(tx, None, super::super::host::Limits::default());
+            let home = dir.path().join("codex").to_string_lossy().into_owned();
+            let spec = Spec {
+                kind: "claude".into(),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                program: Some(quiet.to_string_lossy().into_owned()),
+                env: vec![("CODEX_HOME".into(), home)],
+                ..Spec::default()
+            };
+            let s = host.open(Some("switched".into()), spec)?;
+            let started = crate::rt::timeout(Duration::from_secs(10), async {
+                while s.core.lock().meta.features.is_empty() {
+                    crate::rt::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(started.is_ok(), "the harness never started");
+            s.core.lock().state.tasks.push(Task { id: thread.into(), tool_id: Some("call_spawn".into()), class: Some("agent".into()), status: "completed".into(), ..Task::default() });
+            read_unread_children(&s);
+            let read = crate::rt::timeout(Duration::from_secs(10), async {
+                while s.core.lock().get(&format!("child:{thread}:msg_answer")).is_none() {
+                    crate::rt::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(read.is_ok(), "its work never came");
+            let core = s.core.lock();
+            assert_eq!(core.get(&format!("child:{thread}:msg_answer")).and_then(|e| e.parent.clone()).as_deref(), Some("call_spawn"));
+            assert_eq!(core.state.tasks.iter().find(|t| t.id == thread).and_then(|t| t.summary.clone()).as_deref(), Some("Fits."));
+            drop(core);
+            host.close("switched");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn an_ended_agent_shows_nothing_still_running() {
+        let row = |id: &str, status: &str| Task { id: id.into(), tool_id: Some(format!("call-{id}")), class: Some("shell".into()), status: status.into(), ..Task::default() };
+        let mut core = Core::new();
+        core.state.tasks = vec![row("terminal-dev", "running"), row("left-4242", "running"), Task { ended: Some(7), ..row("terminal-done", "completed") }];
+        core.upsert("call-terminal-dev", None, super::super::model::Body::Assistant { text: "Serving".into(), streaming: true });
+        end_tasks(&mut core);
+        assert_eq!(core.state.tasks.iter().map(|t| (t.status.as_str(), t.ended.is_some())).collect::<Vec<_>>(), [("stopped", true), ("stopped", true), ("completed", true)]);
+        assert_eq!(core.state.tasks.last().and_then(|t| t.ended), Some(7));
+        assert!(core.get("call-terminal-dev").is_some_and(|e| matches!(&e.body, super::super::model::Body::Assistant { streaming: false, .. })));
+        assert!(core.take_out().iter().any(|u| matches!(u, Update::State { state } if state.tasks.iter().all(|t| !t.live()))));
+    }
+
+    #[test]
+    fn info_lists_native_subagents_and_keeps_their_finished_work() -> anyhow::Result<()> {
+        let native = |id: &str, kind: &str, status: &str| Task {
+            id: id.into(),
+            tool_id: Some(format!("spawn-{id}")),
+            description: format!("Review {id}"),
+            kind: kind.into(),
+            class: Some("agent".into()),
+            status: status.into(),
+            started: 10,
+            ..Task::default()
+        };
+        let mut state = State {
+            tasks: vec![
+                native("claude-child", "general-purpose", "running"),
+                Task {
+                    parent_task: Some("claude-child".into()),
+                    ended: Some(30),
+                    prompt: Some("The full task prompt".into()),
+                    summary: Some("A long result".into()),
+                    output: Some("/tmp/private-output".into()),
+                    ..native("codex-thread", "reviewer", "completed")
+                },
+                native("failed-child", "", "failed"),
+                native("stopped-child", "", "stopped"),
+                Task {
+                    class: None,
+                    ..native("legacy-child", "Explore", "paused")
+                },
+            ],
+            ..State::default()
+        };
+        for class in ["shell", "monitor", "workflow", "mcp"] {
+            state.tasks.push(Task {
+                class: Some(class.into()),
+                ..native(class, "", "running")
+            });
+        }
+        for kind in [
+            "local_bash",
+            "monitor",
+            "monitor_background",
+            "local_workflow",
+            "mcp_task",
+        ] {
+            state.tasks.push(Task {
+                class: None,
+                ..native(kind, kind, "running")
+            });
+        }
+        let mut info = Info::default();
+        info.apply(&state);
+        assert_eq!(
+            info.subagents
+                .iter()
+                .map(|s| (s.id.as_str(), s.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("claude-child", "running"),
+                ("codex-thread", "completed"),
+                ("failed-child", "failed"),
+                ("stopped-child", "stopped"),
+                ("legacy-child", "paused")
+            ],
+        );
+        let encoded = serde_json::to_value(&info.subagents)?;
+        assert_eq!(
+            encoded.get(1),
+            Some(&serde_json::json!({
+                "id": "codex-thread", "tool_id": "spawn-codex-thread", "description": "Review codex-thread",
+                "status": "completed", "parent_task": "claude-child", "started": 10, "ended": 30,
+            })),
+            "list entries identify native work without copying prompts, results or output",
+        );
+        assert!(
+            info.parent.is_none(),
+            "native tasks are not kiln session lineage"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn info_subagents_update_from_old_runner_state_and_notify_lists() -> anyhow::Result<()> {
+        // A list entry from before subagent briefs still loads; the runner's state fills them.
+        let old = serde_json::to_value(Info::default())?;
+        assert!(
+            old.get("subagents").is_none(),
+            "empty briefs stay absent on the wire"
+        );
+        let mut info: Info = serde_json::from_value(old)?;
+        assert!(info.subagents.is_empty());
+        let mut state = State {
+            tasks: vec![Task {
+                id: "child".into(),
+                description: "é".repeat(400),
+                kind: "Explore".into(),
+                status: "pending".into(),
+                ..Task::default()
+            }],
+            ..State::default()
+        };
+        info.apply(&state);
+        assert_eq!(info.subagents.len(), 1);
+        assert!(
+            info.subagents.iter().all(|s| s.description.len() < 256),
+            "list labels stay bounded and valid UTF-8"
+        );
+        let pending = info.clone();
+        for task in &mut state.tasks {
+            task.status = "completed".into();
+            task.ended = Some(50);
+        }
+        info.apply(&state);
+        assert!(
+            info.differs(&pending),
+            "finishing a native subagent refreshes Mission Control"
+        );
+        let finished = info.clone();
+        for task in &mut state.tasks {
+            task.description = "Renamed native task".into();
+        }
+        info.apply(&state);
+        assert!(
+            info.differs(&finished),
+            "renaming a native subagent refreshes Mission Control"
+        );
+        state.tasks.clear();
+        info.apply(&state);
+        assert!(
+            info.subagents.is_empty(),
+            "clearing task history clears the disclosure too"
+        );
+        Ok(())
+    }
+
     #[test]
     fn info_follows_state() {
         let mut i = Info {
@@ -2161,6 +3373,7 @@ mod tests {
             name: "x".into(),
             shell: None,
             cwd: "/w".into(),
+            tree: None,
             created_at: 1,
             status: Status::Starting,
             title: String::new(),
@@ -2169,7 +3382,9 @@ mod tests {
             harness_session: None,
             approvals: vec![],
             queued: 0,
+            queue: Vec::new(),
             tasks_running: 0,
+            subagents: Vec::new(),
             cost_usd: 0.0,
             activity: None,
             last_activity: 1,
@@ -2194,8 +3409,15 @@ mod tests {
             pause: None,
             last_turn: None,
             keep_off: false,
+            held: None,
             move_on_limit: false,
+            move_plan: Default::default(),
             pause_at: None,
+            max_subagents: None,
+            parent: None,
+            plan_run: None,
+            no_bypass: false,
+            workspace: None,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };
@@ -2307,6 +3529,31 @@ mod tests {
             let _ = long.wait();
             anyhow::Ok(())
         })
+    }
+
+    #[test]
+    fn native_subagent_output_keeps_results_after_history_eviction_and_bounds_snapshots() {
+        use super::super::model::Body;
+        let mut core = Core::new();
+        let mut task = Task { id: "child".into(), tool_id: Some("spawn".into()), class: Some("agent".into()), status: "completed".into(), ..Task::default() };
+        // An empty completed child is unavailable, not a successful empty file read.
+        assert!(codex_task_output(&core, &task).get("error").is_some());
+        task.summary = Some("The completed result remains available.".into());
+        let result = codex_task_output(&core, &task);
+        assert_eq!(result.get("data").and_then(serde_json::Value::as_str), task.summary.as_deref());
+        assert_eq!(result.get("live").and_then(serde_json::Value::as_bool), Some(false));
+        // Newest output is bounded; the final answer is present once even when Task.summary
+        // contains its clipped representation.
+        let long = format!("{}Final result.", "x".repeat(TASK_TAIL as usize + 20));
+        task.summary = Some(super::super::model::clip_middle(&long, super::super::model::OUTPUT_MAX).0);
+        core.upsert("child:child:answer", Some("spawn".into()), Body::Assistant { text: long.clone(), streaming: false });
+        let result = codex_task_output(&core, &task);
+        let text = result.get("data").and_then(serde_json::Value::as_str).unwrap_or_default();
+        assert_eq!(text.len(), TASK_TAIL as usize);
+        assert!(text.ends_with("Final result."));
+        assert_eq!(text.matches("Final result.").count(), 1);
+        assert_eq!(result.get("offset").and_then(serde_json::Value::as_u64), Some(long.len() as u64));
+        assert_eq!(result.get("truncated").and_then(serde_json::Value::as_bool), Some(true));
     }
 
     #[test]

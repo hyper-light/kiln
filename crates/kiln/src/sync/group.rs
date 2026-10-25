@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::task::Waker;
 use std::time::Duration;
 
@@ -17,8 +18,9 @@ use hyper_raft::proto::{ConfChangeSingle, ConfChangeTransition, ConfChangeType, 
 use hyper_raft::{Config, Elections, Limits, Stated};
 use serde::{Deserialize, Serialize};
 
+use super::fs::Fs;
 use super::scan::Limits as CopyLimits;
-use super::{Blobs, Change, Copy, Outcome, State, Step, Tree};
+use super::{Blobs, Change, Copy, Decision, Outcome, State, Step, Tree};
 
 /// The server's member of every group: its one voter.
 pub const SERVER: u64 = 1;
@@ -135,23 +137,26 @@ impl From<&Conf> for ConfState {
 /// Writes `bytes` to `path` whole or not at all, durably: a temporary file beside it, flushed,
 /// renamed over it, and the folder flushed.
 pub fn save_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    save_atomic_on(&super::fs::Std, path, bytes)
+}
+
+/// [`save_atomic`], on `fs`.
+pub fn save_atomic_on(fs: &dyn Fs, path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
     let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension(format!("tmp-{}", crate::util::new_id()));
+    fs.create_dir_all(dir)?;
+    let tmp = path.with_extension(format!("tmp-{}", fs.temp_id()));
     let written = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = fs.create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        fs.rename(&tmp, path)
     })();
     if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = fs.remove_file(&tmp);
     }
     written?;
-    #[cfg(unix)]
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(())
+    fs.sync_dir(dir)
 }
 
 // ------------------------------------------------------------------------------ the server's member
@@ -174,8 +179,16 @@ pub struct Index {
     durable: Point,
     /// Where the tree is saved; none: kept in memory alone.
     file: Option<PathBuf>,
-    /// Steps taken since the owner last looked, with their index: what the copies are told.
-    pub taken: Vec<(u64, Step)>,
+    /// Steps taken since the owner last looked: what the repo's activity shows.
+    pub taken: Vec<Taken>,
+}
+
+/// A step the server's member took, at `index` of the log: what it decided for each change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Taken {
+    pub index: u64,
+    pub step: Step,
+    pub decisions: Vec<Decision>,
 }
 
 impl Index {
@@ -215,9 +228,9 @@ impl StateMachine for Index {
     fn apply(&mut self, entry: &EntryRef<'_>, _answers: &mut Vec<()>) -> Result<(), Fatal> {
         self.applied = Point { index: entry.index, term: entry.term };
         if let Some(step) = step_of(entry)
-            && self.tree.take(&step).is_some()
+            && let Some(decisions) = self.tree.take(&step)
         {
-            self.taken.push((entry.index, step));
+            self.taken.push(Taken { index: entry.index, step, decisions });
         }
         Ok(())
     }
@@ -301,16 +314,57 @@ pub struct Feed {
     install: Option<Tree>,
     /// What the folder did, newest last.
     pub outcomes: VecDeque<Outcome>,
+    /// Steps the folder took since the runner last looked (its metrics and status).
+    pub took: Vec<Took>,
+    /// The newest of this copy's steps its saved state holds: only those go to the server
+    /// ([`Feed::sendable`]).
+    saved_seq: u64,
+}
+
+/// A committed step a copy's folder took: whose, when its machine saw it, and what it did to the
+/// files here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Took {
+    pub by: String,
+    /// Unix milliseconds, the clock of the machine that made it.
+    pub at: i64,
+    /// This copy's own step, back from the log.
+    pub ours: bool,
+    pub applied: usize,
+    pub conflicts: usize,
+    pub kept: usize,
+    pub refused: usize,
+}
+
+impl Took {
+    fn of(step: &Step, ours: bool, outcomes: &[Outcome]) -> Self {
+        let mut t = Self { by: step.by.clone(), at: step.at, ours, ..Self::default() };
+        for o in outcomes {
+            match o {
+                Outcome::Applied { .. } => t.applied += 1,
+                Outcome::Conflict { .. } => t.conflicts += 1,
+                Outcome::Kept { .. } => t.kept += 1,
+                Outcome::Refused { .. } => t.refused += 1,
+            }
+        }
+        t
+    }
 }
 
 impl Feed {
     /// The copy at `root`, its state saved at `file` (a new copy's when there is none).
     pub fn open(root: &Path, me: &str, member: u64, limits: CopyLimits, file: PathBuf) -> anyhow::Result<Self> {
-        let saved: Saved = if file.exists() { serde_json::from_slice(&std::fs::read(&file)?)? } else { Saved { conf: (&founded()).into(), ..Saved::default() } };
+        Self::open_on(super::fs::std_fs(), root, me, member, limits, file)
+    }
+
+    /// [`Feed::open`], its folder and saved state on `fs`.
+    pub fn open_on(fs: Arc<dyn Fs>, root: &Path, me: &str, member: u64, limits: CopyLimits, file: PathBuf) -> anyhow::Result<Self> {
+        let saved: Saved = if fs.exists(&file) { serde_json::from_slice(&super::fs::read(fs.as_ref(), &file)?)? } else { Saved { conf: (&founded()).into(), ..Saved::default() } };
+        let saved_seq = saved.state.sent.last().map_or(0, |s| s.seq);
         let at = Point { index: saved.index, term: saved.term };
         let conf: ConfState = (&saved.conf).into();
         Ok(Self {
-            copy: Copy::new(root, me, member, limits, saved.state),
+            copy: Copy::on(fs, root, me, member, limits, saved.state),
             file,
             queue: VecDeque::new(),
             applied: at,
@@ -321,12 +375,19 @@ impl Feed {
             reached_conf: conf,
             install: saved.install,
             outcomes: VecDeque::new(),
+            took: Vec::new(),
+            saved_seq,
         })
     }
 
     /// Through where the folder has taken the log, and how much it hasn't taken yet.
     pub fn progress(&self) -> (u64, usize) {
         (self.reached.index, self.queue.len() + usize::from(self.install.is_some()))
+    }
+
+    /// Through where the folder's saved state holds the log: where a power loss leaves it.
+    pub fn saved_through(&self) -> u64 {
+        self.durable.index
     }
 
     /// Whether the folder has taken everything the log committed so far.
@@ -337,10 +398,12 @@ impl Feed {
     /// Takes what the log committed into the folder, as far as the contents here allow: empty when
     /// it is through, else the blobs it waits for.
     pub fn work(&mut self, blobs: &Blobs) -> io::Result<Vec<String>> {
+        // What came into the store since (fetched contents): its folders synced at the next save.
+        self.copy.touched.extend(blobs.take_touched());
         let mut moved = false;
         let lacking = |needs: Vec<String>| -> Vec<String> { needs.into_iter().filter(|h| !blobs.has(h)).collect() };
         if let Some(tree) = self.install.clone() {
-            let step = Step { by: "kiln".into(), member: 0, seq: 0, at: 0, changes: self.copy.state.tree.diff(&tree.files) };
+            let step = Step { by: "kiln".into(), member: 0, seq: 0, at: 0, changes: self.copy.state.tree.diff(&tree) };
             let missing = lacking(self.copy.needs(&step));
             if !missing.is_empty() {
                 return Ok(missing);
@@ -349,6 +412,7 @@ impl Feed {
             self.note(outcomes);
             let state = &mut self.copy.state;
             state.tree.seqs = tree.seqs.clone();
+            state.tree.bundles = tree.bundles.clone();
             // What the image holds of this copy's steps needn't be sent again.
             let taken = tree.seqs.get(&self.copy.member).copied().unwrap_or(0);
             state.sent.retain(|s| s.seq > taken);
@@ -368,6 +432,8 @@ impl Feed {
                     }
                     let at = *at;
                     let outcomes = self.copy.apply(step, blobs)?;
+                    let ours = step.member != 0 && step.member == self.copy.member;
+                    self.took.push(Took::of(step, ours, &outcomes));
                     self.note(outcomes);
                     self.reached = at;
                 }
@@ -383,11 +449,15 @@ impl Feed {
         if moved {
             self.save()?;
         }
-        Ok(Vec::new())
+        // The contents of what the folder fell behind on, brought at the next look.
+        Ok(self.copy.behind_needs(blobs))
     }
 
-    /// Saves the copy's state as the folder has it; then that point is durable.
+    /// Saves the copy's state as the folder has it; then that point is durable. The folders'
+    /// changes of names go first: the state never says the folder holds what a power loss could
+    /// still take back.
     pub fn save(&mut self) -> io::Result<()> {
+        self.copy.sync_dirs()?;
         let saved = Saved {
             state: self.copy.state.clone(),
             index: self.reached.index,
@@ -395,10 +465,27 @@ impl Feed {
             conf: (&self.reached_conf).into(),
             install: self.install.clone(),
         };
-        save_atomic(&self.file, &serde_json::to_vec(&saved)?)?;
+        let bytes = serde_json::to_vec(&saved)?;
+        save_atomic_on(self.copy.fs.as_ref(), &self.file, &bytes)?;
+        self.saved_seq = self.copy.state.sent.last().map_or(self.saved_seq, |s| s.seq.max(self.saved_seq));
         self.durable = self.reached;
         self.durable_conf = self.reached_conf.clone();
         Ok(())
+    }
+
+    /// This copy's unsent steps that may go to the server: those its saved state holds. One the
+    /// state couldn't be saved with yet waits for a save that holds it: sent before, a crash could
+    /// lose the copy's record of it, and the copy would number another step the same; the server
+    /// takes each number once, and that step's changes would never reach the log.
+    pub fn sendable(&self) -> impl Iterator<Item = &Step> {
+        let saved = self.saved_seq;
+        self.copy.state.sent.iter().take_while(move |s| s.seq <= saved)
+    }
+
+    /// Whether some of this copy's steps aren't in its saved state yet (a save failed): the next
+    /// look saves again, whatever it finds.
+    pub fn unsaved(&self) -> bool {
+        self.copy.state.sent.last().is_some_and(|s| s.seq > self.saved_seq)
     }
 
     fn note(&mut self, outcomes: Vec<Outcome>) {
@@ -421,9 +508,15 @@ impl Feed {
             Fed::Step(_, s) => Some(s),
             _ => None,
         });
-        let mut out: std::collections::HashSet<String> = queued.chain(self.copy.state.sent.iter()).flat_map(|s| s.changes.iter()).filter_map(|c| file(&c.to)).collect();
+        let mut out: std::collections::HashSet<String> =
+            queued.chain(self.copy.state.sent.iter()).flat_map(|s| s.changes.iter()).flat_map(|c| file(&c.to).into_iter().chain(c.bundle.clone())).collect();
+        // The log's versions kept back from this copy (`State::behind`), brought at the look that
+        // finds the change here gone: their contents, and a ref's bundle.
+        let tree = &self.copy.state.tree;
+        out.extend(self.copy.state.behind.iter().flat_map(|p| file(&tree.files.get(p).cloned()).into_iter().chain(tree.bundles.get(p).cloned())));
         if let Some(t) = &self.install {
             out.extend(t.files.values().filter_map(|v| file(&Some(v.clone()))));
+            out.extend(t.bundles.values().cloned());
         }
         out
     }

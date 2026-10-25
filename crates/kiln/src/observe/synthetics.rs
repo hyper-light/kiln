@@ -424,7 +424,7 @@ async fn exchange(url: &str, check: &Check, out: &mut Outcome) -> anyhow::Result
         let stream = crate::http::tls::TlsStream::connect(crate::http::io::RtFuturesIo::new(tcp), tls.config()?, crate::http::tls::server_name(&host)?).await.map_err(|e| anyhow::anyhow!("TLS to {host}: {e}"))?;
         out.tls_ms = Some(ms(t.elapsed()));
         out.certificate_days = stream.peer_certificates().and_then(|c| c.first()).and_then(|c| days_left(c));
-        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, crate::http::server::Body>(stream).await?;
+        let (mut sender, conn) = kiln_http::client::http1::handshake::<_, crate::http::server::Body>(stream).await?;
         crate::rt::spawn_local(async move {
             let _ = conn.await;
         })
@@ -434,7 +434,7 @@ async fn exchange(url: &str, check: &Check, out: &mut Outcome) -> anyhow::Result
         out.firstbyte_ms = Some(ms(t.elapsed()));
         r
     } else {
-        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, crate::http::server::Body>(crate::http::io::RtIo::new(tcp)).await?;
+        let (mut sender, conn) = kiln_http::client::http1::handshake::<_, crate::http::server::Body>(crate::http::io::RtIo::new(tcp)).await?;
         crate::rt::spawn_local(async move {
             let _ = conn.await;
         })

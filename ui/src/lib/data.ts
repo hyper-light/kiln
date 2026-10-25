@@ -11,18 +11,23 @@ import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
 import { harnessApi, type AgentInfo } from "@/api/harness";
 import type { Agent, AiSession, HostSample, MetricsHistory, Overview, Repo, Run, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
-import { preload, useSuspenseResource, type ResourceOptions } from "./resource";
+import { loaded, preload, useSuspenseResource, type ResourceOptions } from "./resource";
 
 /** What a key loads, and how. */
 export interface Res<T> {
   key: string;
   fetch: (signal: AbortSignal) => Promise<T>;
-  opts?: ResourceOptions;
+  opts?: ResourceOptions<T>;
 }
 
 /** Start loading these now, without waiting (a section's keys, before it reads the first). */
 export function warm(...list: Res<unknown>[]) {
   for (const r of list) preload(r.key, r.fetch, r.opts);
+}
+
+/** Settles once one has its first data: a route's loader, so its page shows no fallback. */
+export function ready<T>(r: Res<T>) {
+  return loaded(r.key, r.fetch, r.opts);
 }
 
 /** Read one (suspends until its first data is in). */
@@ -104,7 +109,7 @@ export function lastSamples(h: MetricsHistory, name: string, n: number): HostSam
   return all.length > n ? all.slice(-n) : all;
 }
 
-/** Settings → Updates: the server's build, each runner's, the binaries handed out. */
+/** System → Updates: the server's build, each runner's, the binaries handed out. */
 export const updatesRes: Res<UpdatesOverview> = { key: "updates", fetch: (s) => api.updates(s), opts: { pollMs: 30_000, on: ["updates"] } };
 
 /** The fuller of two snapshots of one job (events and refetches can cross). */
@@ -117,7 +122,7 @@ export function fuller(a: UpdateJob | undefined, b: UpdateJob): UpdateJob {
 /**
  * Upgrades as they go (their output, their end), from `update_job` events: kept outside any page,
  * so a page opened mid-upgrade shows all of it, and its output doesn't make every page read
- * Settings → Updates again.
+ * System → Updates again.
  */
 export const useUpdateJobs = create<Record<string, UpdateJob>>(() => ({}));
 events.on((ev) => {
@@ -132,7 +137,20 @@ export function mergeJobs(data: UpdatesOverview, live: Record<string, UpdateJob>
 }
 
 /** The agents kiln runs (an older server without them: none), as their events change them. */
-export const harnessSessionsRes: Res<AgentInfo[]> = { key: "harness/sessions", fetch: () => harnessApi.list().catch(() => []), opts: { on: ["harness", "harness_closed"] } };
+export const harnessSessionsRes: Res<AgentInfo[]> = {
+  key: "harness/sessions",
+  fetch: () => harnessApi.list().catch(() => []),
+  // Each event carries the agent's whole entry (or says it closed): applied, the list isn't loaded again.
+  opts: {
+    on: ["harness", "harness_closed"],
+    apply: (list, ev) => {
+      if (ev.type === "harness_closed") return list.filter((a) => a.id !== ev.id);
+      if (ev.type !== "harness") return undefined;
+      const i = list.findIndex((a) => a.id === ev.info.id);
+      return i === -1 ? [...list, ev.info] : list.map((a, j) => (j === i ? ev.info : a));
+    },
+  },
+};
 
 /** The terminal sessions the server keeps (any device can attach to them). */
 export const terminalSessionsRes: Res<TerminalSessionInfo[]> = { key: "terminal/sessions", fetch: (s) => api.terminalSessions(s).catch(() => []), opts: { on: ["terminals"] } };

@@ -48,9 +48,16 @@ pub struct AssignmentV2 {
     pub job_defaults: Defaults,
     /// The job's `outputs`, evaluated after its steps.
     pub outputs: Vec<(String, Tpl)>,
+    /// The workflow file that defines the job, for `job.workflow_*` (W06-R03).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_workflow: Option<crate::plan::DefinedIn>,
     /// `environment.url`, evaluated after its steps too (W15-R04).
     #[serde(default)]
     pub environment_url: Option<Tpl>,
+    /// The environment the job is bound to (W15-R04): where `kiln/deploy@v1` deploys on the runner
+    /// itself, for a `container` or `microvm` one (W15-R02).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Bound>,
     pub contexts: Contexts,
     /// Secrets the leg may read (W09 narrows them to what it references).
     pub secrets: Vec<Secret>,
@@ -89,6 +96,50 @@ pub struct AssignmentV2 {
     /// `None` when they connect freely.
     #[serde(default)]
     pub network: Option<Network>,
+}
+
+/// A job's environment, as its runner deploys to it (W15-R02).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Bound {
+    pub name: String,
+    /// One of `kubernetes`, `host`, `container`, `microvm`, `platform`; `None` for one with no
+    /// targets of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// A preview's (W15-R07): the `previews:` entry it was made from and what it's for, `name`
+    /// being both (`preview-D12`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<PreviewOf>,
+}
+
+/// What a preview environment (W15-R07) was made from: its template (the name jobs give their
+/// `environment:`) and what it's for (`D12`, `CR7`, `PR42`, or a stack's lowest diff).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PreviewOf {
+    pub template: String,
+    pub id: String,
+}
+
+/// A deployment a runner made (W15-R02) that it's asked to take down, as its environment went (a
+/// preview, W15-R07): `ServerMsg::Undeploy`. `kind` is `container` (its Compose project) or
+/// `microvm`; `repo` and `environment` name it as the runner named it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Undeploy {
+    pub kind: String,
+    pub repo: String,
+    pub environment: String,
+}
+
+/// What the runner says once it's done (`AgentMsg::Undeployed`): it, gone, or why it couldn't be.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Undeployed {
+    pub asked: Undeploy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A leg's egress (W18-R08): the hosts it may reach (`*.example.com`, `host:port`) besides kiln's
@@ -137,6 +188,9 @@ pub struct ExecutorSpec {
     pub kind: String,
     pub image: Option<String>,
     pub options: serde_json::Value,
+    /// The pool's executor, ready on the runner, the leg runs in (W13-R09).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
 }
 
 /// The contexts the server knows (W06-R03).
@@ -177,6 +231,19 @@ pub struct Runtime {
     pub github_token: String,
     /// `ACTIONS_CACHE_MODE`: `read`, `write`, `write-only` or `none` (W08-R14).
     pub cache_mode: Option<String>,
+    /// kiln's own registry (W12-R01): the server's origin, as the runner reaches it.
+    pub registry_url: String,
+    /// kiln's package proxies the leg's tools are pointed at (W12-R04): `(ecosystem, url)`.
+    pub proxies: Vec<(String, String)>,
+    /// The registries kiln mirrors (W12-R02): `(upstream, prefix)`; the runner pulls their images
+    /// through kiln.
+    pub mirrors: Vec<(String, String)>,
+    /// kiln's certificate authority (PEM), when the server serves HTTPS: legs trust it beside
+    /// their machine's roots (§2.6), since jobs reach the facade through the same front door and
+    /// certificate as everything else, and GitHub Enterprise Server's clients go `https://` to the
+    /// host they're given whatever its scheme.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_ca: Option<String>,
 }
 
 /// A remote action, resolved (W07-R02).
@@ -196,11 +263,21 @@ pub struct ActionRef {
     pub secrets: Vec<(String, bool)>,
     pub requires: Vec<String>,
     pub permissions: Vec<(String, String)>,
+    /// Why it couldn't be resolved when the run started (W07-R03): its source unreachable and
+    /// never mirrored, no such ref. A job using it fails as it starts, as GitHub's fails at "Set
+    /// up job", and the run's other jobs go on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// A Docker container action (`runs.using: docker`), or a composite one with one beneath it:
+    /// where a leg uses it there must be Docker (W07-R06, W13-R07).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub docker: bool,
 }
 
 impl ActionRef {
     /// Its declarations, from its metadata.
     pub fn declares(&mut self, a: &crate::wf::ir::Action) {
+        self.docker = a.runs.using.eq_ignore_ascii_case("docker");
         self.secrets = a.secrets.iter().map(|d| (d.name.to_ascii_uppercase(), d.required)).collect();
         self.requires = a.requires.clone();
         self.permissions = match &a.permissions {
@@ -363,6 +440,16 @@ pub enum JobEventV2 {
         provenance: bool,
         #[serde(default)]
         sbom: bool,
+    },
+    /// W13-R11: an image a `kiln/build-image@v1` step built and pushed to kiln's registry.
+    ImageBuilt {
+        idx: u32,
+        name: String,
+        /// Where it is (`<registry>/<repository>:<tag>`), and its digest.
+        reference: String,
+        digest: String,
+        #[serde(default)]
+        platforms: Vec<String>,
     },
 }
 

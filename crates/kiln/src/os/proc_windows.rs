@@ -24,6 +24,8 @@ const POLL: Duration = Duration::from_millis(50);
 /// `CREATE_NEW_PROCESS_GROUP`: Ctrl-C at the agent's console does not reach job steps (the
 /// counterpart of a Unix step's own process group).
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+/// `CREATE_SUSPENDED`: an agent's harness runs nothing until it's in the agent's job.
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
 
 /// Spawn `cmd` in a new job object that is killed when its last handle closes.
 fn spawn_job(cmd: &mut Command, new_group: bool) -> io::Result<GroupChild> {
@@ -87,6 +89,15 @@ async fn wait_child(child: &mut GroupChild) -> io::Result<ExitStatus> {
 async fn wait_shared(child: &Mutex<GroupChild>) -> io::Result<ExitStatus> {
     loop {
         if let Some(status) = child.lock().try_wait()? {
+            return Ok(status);
+        }
+        crate::rt::sleep(POLL).await;
+    }
+}
+
+async fn wait_held(held: &Mutex<Held>) -> io::Result<ExitStatus> {
+    loop {
+        if let Some(status) = held.lock().try_wait()? {
             return Ok(status);
         }
         crate::rt::sleep(POLL).await;
@@ -261,7 +272,35 @@ pub struct Duplex {
     pub stdout: async_channel::Receiver<Vec<u8>>,
     pub stderr: async_channel::Receiver<Vec<u8>>,
     pub exit: oneshot::Receiver<Option<i32>>,
-    job: Arc<Mutex<GroupChild>>,
+    job: Arc<Mutex<Held>>,
+}
+
+/// What holds a harness process and what it starts: a job of its own, or the job of its agent
+/// session (`crate::os::contain`), which its next harness goes in too.
+enum Held {
+    Own(GroupChild),
+    Agent(std::process::Child, crate::os::contain::Group),
+}
+
+impl Held {
+    fn kill(&mut self) {
+        match self {
+            Held::Own(c) => {
+                let _ = c.kill();
+            }
+            Held::Agent(c, g) => {
+                g.kill();
+                let _ = c.kill();
+            }
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        match self {
+            Held::Own(c) => c.try_wait(),
+            Held::Agent(c, _) => c.try_wait(),
+        }
+    }
 }
 
 /// A harness process handed from one image of this process to the next: never on Windows, which
@@ -276,10 +315,17 @@ pub struct Detached {
     pub foreign: bool,
 }
 
+impl Detached {
+    /// Nothing to keep on Windows (no in-place upgrade).
+    pub fn keep_across_exec(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Duplex {
     /// Windows has no SIGTERM for a job: kill it at once.
     pub fn terminate(&self, _grace: Duration) {
-        let _ = self.job.lock().kill();
+        self.job.lock().kill();
     }
 
     /// Never handed over on Windows (no in-place upgrade).
@@ -294,22 +340,45 @@ pub fn adopt_duplex(_d: Detached) -> anyhow::Result<Duplex> {
     anyhow::bail!("Windows has no in-place upgrade to hand a process across")
 }
 
+/// [`spawn_duplex`] in an agent's group of processes ([`crate::os::contain`]): created suspended,
+/// put in the agent's job, then let run, so nothing it starts is outside the job.
+pub fn spawn_duplex_in(mut cmd: Command, group: Option<&crate::os::contain::Group>) -> anyhow::Result<Duplex> {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::os::windows::process::CommandExt as _;
+    let Some(group) = group else { return spawn_duplex(cmd) };
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
+    let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    let pid = child.id();
+    if !group.assign(child.as_raw_handle()) {
+        tracing::warn!(pid, "an agent's harness couldn't go in its job: what it starts is found by its mark");
+    }
+    crate::os::contain::resume(pid);
+    let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    serve(pid, stdin, stdout, stderr, Held::Agent(child, group.clone()))
+}
+
 /// Spawn `cmd` with piped stdin/stdout/stderr in its own job.
 pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
-    use std::io::Write as _;
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = spawn_job(&mut cmd, true).with_context(|| format!("spawn {:?}", cmd.get_program()))?;
     let pid = child.id();
-    let (out_tx, stdout) = async_channel::bounded::<Vec<u8>>(256);
-    let (err_tx, stderr) = async_channel::bounded::<Vec<u8>>(64);
-    if let Some(p) = child.inner().stdout.take() {
+    let (stdin, stdout, stderr) = (child.inner().stdin.take(), child.inner().stdout.take(), child.inner().stderr.take());
+    serve(pid, stdin, stdout, stderr, Held::Own(child))
+}
+
+/// A harness process's pipes served by threads, and its exit awaited.
+fn serve(pid: u32, stdin: Option<std::process::ChildStdin>, stdout: Option<std::process::ChildStdout>, stderr: Option<std::process::ChildStderr>, held: Held) -> anyhow::Result<Duplex> {
+    use std::io::Write as _;
+    let (out_tx, stdout_rx) = async_channel::bounded::<Vec<u8>>(256);
+    let (err_tx, stderr_rx) = async_channel::bounded::<Vec<u8>>(64);
+    if let Some(p) = stdout {
         pump("kiln-harness-out", p, move |c| out_tx.send_blocking(c.to_vec()).is_ok())?;
     }
-    if let Some(p) = child.inner().stderr.take() {
+    if let Some(p) = stderr {
         pump("kiln-harness-err", p, move |c| err_tx.send_blocking(c.to_vec()).is_ok())?;
     }
     let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
-    if let Some(mut stdin) = child.inner().stdin.take() {
+    if let Some(mut stdin) = stdin {
         std::thread::Builder::new().name("kiln-harness-in".to_owned()).spawn(move || {
             while let Ok(data) = in_rx.recv_blocking() {
                 if stdin.write_all(&data).and_then(|()| stdin.flush()).is_err() {
@@ -318,12 +387,12 @@ pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
             }
         })?;
     }
-    let job = Arc::new(Mutex::new(child));
+    let job = Arc::new(Mutex::new(held));
     let (exit_tx, exit_rx) = oneshot::channel();
     let waiter = Arc::clone(&job);
     crate::rt::spawn(async move {
-        let code = wait_shared(&waiter).await.ok().and_then(|s| s.code());
+        let code = wait_held(&waiter).await.ok().and_then(|s| s.code());
         let _ = exit_tx.send(code);
     });
-    Ok(Duplex { pid, stdin: in_tx, stdout, stderr, exit: exit_rx, job })
+    Ok(Duplex { pid, stdin: in_tx, stdout: stdout_rx, stderr: stderr_rx, exit: exit_rx, job })
 }

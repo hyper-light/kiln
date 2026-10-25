@@ -1,0 +1,344 @@
+/**
+ * Goal stacks in the mock (docs/goals.md), answered as the server's goals routes answer: a stack per
+ * agent, kept here. "Release prep" (/agents/fam-orch) has one like the one a person reported: a goal
+ * skipped, one under way, four to come. What the server sends the agent is played as sent at once
+ * (`push`): its goal under way, or the next. No reminders, no verdicts.
+ *
+ *   GET  /api/harness/sessions/:id/goals                 the stack
+ *   POST /api/harness/sessions/:id/goals                 {goals, start?}: goals after the others
+ *   PUT  /api/harness/sessions/:id/goals                 {goals: [{id?, text}]}: the goals still to go
+ *   POST /api/harness/sessions/:id/goals/:action         start, pause, skip, clear, restore
+ *   POST /api/harness/sessions/:id/goals/settings        {plan_big}: big goals planned first, or not
+ */
+import type http from "node:http";
+import type { GoalItem, GoalStack } from "../src/api/harness.ts";
+import { planning } from "./pages.ts";
+
+function json(res: http.ServerResponse, status: number, body: unknown) {
+  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(JSON.stringify(body));
+}
+async function body<T>(req: http.IncomingMessage): Promise<T> {
+  const chunks: Buffer[] = [];
+  for await (const c of req) chunks.push(c as Buffer);
+  const s = Buffer.concat(chunks).toString("utf8");
+  return (s ? JSON.parse(s) : {}) as T;
+}
+
+interface Kept {
+  state: GoalStack["state"];
+  reason?: string;
+  items: GoalItem[];
+  updated_at: number;
+  /** The goals the last clear kept. */
+  cleared?: GoalItem[];
+  /** Big goals planned first: on unless turned off. */
+  plan_big?: boolean;
+}
+
+const PAUSED_BY_YOU = "Paused by you: the agent isn't held to its goal (its own goal is cleared) until you resume.";
+let seq = 0;
+const newId = () => `g-${Date.now().toString(36)}-${(seq++).toString(36)}`;
+const words = (t: string) => t.split(/\s+/).filter(Boolean).join(" ");
+const toGo = (i: GoalItem) => i.status === "pending" || i.status === "active";
+
+const t0 = Date.now() - 3 * 3600_000;
+
+/** A goal's planning, as the server makes it when a person asks for a plan (a subagent of its agent's plans it now). */
+const planningOf = (goal: string, plan: string, research: string, title: string): GoalItem => ({
+  id: `${goal}-planning`,
+  text: `Plan "${title}" (plan ${plan}, research ${research}) is ready: a subagent of yours plans it now (research_add, plans_update, plans_ready), and this is met once it says it's ready`,
+  status: "pending",
+  part_of: goal,
+  part_kind: "planning",
+});
+const stacks = new Map<string, Kept>([
+  [
+    "fam-orch",
+    {
+      state: "running",
+      updated_at: Date.now() - 60_000,
+      items: [
+        {
+          id: "g-beat",
+          text: "Beat Splinter DB and RocksDB by minimum 4-5x on fills, gets, and seeks without any sacrifice in correctness or robustness.",
+          status: "skipped",
+          reason: "Skipped by you.",
+          how: "goal",
+          started_at: t0,
+          ended_at: t0 + 3600_000,
+        },
+        // Planned (`goals_plan`): its planning, then its plan's steps as its parts (the second split into
+        // its acceptance criteria and tests); met once they all are.
+        {
+          id: "g-quic-plan",
+          text: 'Plan "QUIC replication" (plan pl_quic, research rs_quic) is ready: researched inside and outside, its steps written, and said ready',
+          status: "met",
+          reason: "the agent said so: the plan is ready",
+          how: "goal",
+          part_of: "g-quic",
+          part_kind: "planning",
+          started_at: t0 + 3600_000,
+          ended_at: t0 + 3600_000 + 40 * 60_000,
+        },
+        {
+          id: "g-quic-1",
+          text: 'Step 1 of 3 of the plan "QUIC replication": The QUIC transport passes the replication suite on three nodes',
+          status: "met",
+          reason: "the agent said so: replication suite 48/48 on three nodes",
+          how: "goal",
+          part_of: "g-quic",
+          part_kind: "plan",
+          step: { plan: "pl_quic", version: 1, n: 1 },
+          started_at: t0 + 3600_000 + 40 * 60_000,
+          ended_at: t0 + 2 * 3600_000,
+        },
+        {
+          id: "g-quic-2a",
+          text: '"Bench with replication" (step 2 of the plan "QUIC replication"), acceptance criterion 1 of 2: fills stay at least 4x ahead of RocksDB',
+          status: "met",
+          reason: "the agent said so: 4.6x on fills (bench run 212)",
+          how: "goal",
+          part_of: "g-quic-2",
+          part_kind: "checks",
+          started_at: t0 + 2 * 3600_000,
+          ended_at: t0 + 2 * 3600_000 + 20 * 60_000,
+        },
+        {
+          id: "g-quic-2b",
+          text: '"Bench with replication" (step 2 of the plan "QUIC replication"), acceptance criterion 2 of 2: gets and seeks stay at least 4x ahead of Splinter',
+          status: "active",
+          how: "goal",
+          part_of: "g-quic-2",
+          part_kind: "checks",
+          started_at: t0 + 2 * 3600_000 + 20 * 60_000,
+          reminded_at: Date.now() - 4 * 60_000,
+        },
+        {
+          id: "g-quic-2",
+          text: 'Step 2 of 3 of the plan "QUIC replication": Bench with replication on — Done when: fills stay at least 4x ahead of RocksDB; gets and seeks stay at least 4x ahead of Splinter',
+          status: "pending",
+          part_of: "g-quic",
+          part_kind: "plan",
+          step: { plan: "pl_quic", version: 1, n: 2 },
+        },
+        {
+          id: "g-quic-3",
+          text: 'Step 3 of 3 of the plan "QUIC replication": Document the replication protocol',
+          status: "pending",
+          part_of: "g-quic",
+          part_kind: "plan",
+          step: { plan: "pl_quic", version: 1, n: 3 },
+        },
+        {
+          id: "g-quic",
+          text: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
+          status: "pending",
+          planned_as: "pl_quic",
+        },
+        // Being planned now, each by a subagent of Release prep's own (agents.ts), their planning first: a
+        // subagent at "The planner", one asked for "Store and transfer", one that stopped before "Optimize" was ready.
+        planningOf("g-planner", "pl_planner", "rs_planner", "The planner, researched and audited"),
+        {
+          id: "g-planner",
+          text: "The planner, researched and audited (the person's ask, 2026-10-24): newer planning techniques read at their sources, papers and the leading engines' code (DuckDB, DataFusion, Umbra), measured against ours, and the best of them planned as steps of their own",
+          status: "pending",
+          planned_as: "pl_planner",
+        },
+        planningOf("g-store", "pl_store", "rs_store", "Build the data storage/transfer layer"),
+        {
+          id: "g-store",
+          planned_as: "pl_store",
+          text: "Build the data storage/transfer layer and replication using hyper-raft and its crates. We should be transferring data via hyper-quic internally even if our front-end is through the HTTP/1.1 API. Robustly test locally by actually transferring 1k/10k/100k small files and 10k/100k 10GB-100GB files (both streamed single upload and parts). Ensure they replicate correctly given their cells and metadata.",
+          status: "pending",
+        },
+        planningOf("g-opt", "pl_opt", "rs_opt", "Optimize the QUIC API and s3 HTTP API"),
+        {
+          id: "g-opt",
+          planned_as: "pl_opt",
+          text: "Optimize the QUIC API and s3 HTTP API using the same benchmarking and profiling we have in steps 1-3, minimizing allocs, reallocs, latency, excess memory, and page faults. DO NOT sacrifice ANY ounce of correctness or robustness.",
+          status: "pending",
+        },
+        { id: "g-plat", text: "Validate and perform steps 1-3 if not already validated for Linux, Windows, Mac arm64 and amd64/x86_64.", status: "pending" },
+        { id: "g-ci", text: "Build the CI/CD pipelines and publish our single binary for Windows, Linux, MacOS, arm64/amd64/x86_64.", status: "pending" },
+      ],
+    },
+  ],
+]);
+
+function stackOf(agent: string): Kept {
+  let s = stacks.get(agent);
+  if (!s) {
+    s = { state: "paused", items: [], updated_at: 0 };
+    stacks.set(agent, s);
+  }
+  return s;
+}
+
+function view(agent: string, s: Kept): GoalStack {
+  return { agent, state: s.state, reason: s.reason, items: s.items, updated_at: s.updated_at, plan_big: s.plan_big ?? true, ...(s.cleared?.length ? { cleared: s.cleared.length } : {}) };
+}
+
+/** What's next goes to the agent now: the goal under way (sent again), else the next one. */
+function push(s: Kept) {
+  if (s.state !== "running") return;
+  const now = Date.now();
+  const active = s.items.find((i) => i.status === "active");
+  if (active) {
+    if (!active.reminded_at) Object.assign(active, { reminded_at: now, reminders: undefined });
+    return;
+  }
+  const next = s.items.find((i) => i.status === "pending");
+  if (next) Object.assign(next, { status: "active", how: "goal", started_at: now, reminded_at: now });
+  else s.state = "done";
+}
+
+/** The goals still to go, as given (as the server's `set` takes them). Returns whether the goal under way changed. */
+function set(s: Kept, given: { id?: string; text: string }[]): boolean {
+  const byId = new Map(s.items.map((i) => [i.id, i]));
+  const seen = new Set<string>();
+  const list: { id?: string; text: string }[] = [];
+  for (const g of given) {
+    const text = words(g.text);
+    if (!text) continue;
+    const i = g.id && !seen.has(g.id) ? byId.get(g.id) : undefined;
+    if (i && !toGo(i)) continue;
+    if (i) seen.add(i.id);
+    list.push({ id: i?.id, text });
+  }
+  const done = s.items.filter((i) => !toGo(i));
+  const active = s.items.find((i) => i.status === "active");
+  const at = active ? list.findIndex((g) => g.id === active.id) : -1;
+  let moved = false;
+  const out: GoalItem[] = [...done];
+  if (active && at <= 0) {
+    if (at === 0 && words(active.text) !== list[0]!.text) {
+      Object.assign(active, { text: list[0]!.text, reminded_at: undefined, reminders: undefined });
+      moved = true;
+    }
+    out.push(active);
+  }
+  list.forEach((g, k) => {
+    if (active && g.id === active.id) {
+      if (k > 0) {
+        Object.assign(active, { status: "pending", text: g.text, how: undefined, started_at: undefined, reminded_at: undefined, reminders: undefined });
+        out.push(active);
+        moved = true;
+      }
+      return;
+    }
+    const i = g.id ? byId.get(g.id) : undefined;
+    out.push(i ? Object.assign(i, { text: g.text }) : { id: newId(), text: g.text, status: "pending" });
+  });
+  s.items = out;
+  if (s.state === "done" && s.items.some(toGo)) Object.assign(s, { state: "paused", reason: undefined });
+  return moved;
+}
+
+function control(s: Kept, action: string): string | null {
+  const now = Date.now();
+  const active = s.items.find((i) => i.status === "active");
+  switch (action) {
+    case "start":
+      if (active) Object.assign(active, { reminded_at: undefined, reminders: undefined });
+      Object.assign(s, { state: s.items.some(toGo) ? "running" : "done", reason: undefined });
+      push(s);
+      return null;
+    case "pause":
+      Object.assign(s, { state: "paused", reason: PAUSED_BY_YOU });
+      return null;
+    case "skip":
+      if (active) Object.assign(active, { status: "skipped", ended_at: now, reason: "Skipped by you." });
+      push(s);
+      return null;
+    case "clear":
+      if (s.items.length) s.cleared = s.items;
+      Object.assign(s, { items: [], state: "paused", reason: undefined });
+      return null;
+    case "restore": {
+      const back = s.cleared ?? [];
+      if (!back.length) return "no goals were cleared here to bring back";
+      const busy = Boolean(active);
+      const restored = back.map((i) =>
+        i.status !== "active" ? i : busy ? { ...i, status: "pending" as const, how: undefined, started_at: undefined, reminded_at: undefined } : { ...i, reminded_at: undefined, reminders: undefined },
+      );
+      s.items = [
+        ...restored.filter((i) => !toGo(i)),
+        ...s.items.filter((i) => !toGo(i)),
+        ...s.items.filter((i) => i.status === "active"),
+        ...restored.filter(toGo),
+        ...s.items.filter((i) => i.status === "pending"),
+      ];
+      Object.assign(s, { cleared: undefined, state: s.items.some(toGo) ? "running" : "done", reason: undefined });
+      push(s);
+      return null;
+    }
+    default:
+      return "not found";
+  }
+}
+
+export async function handleGoals(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<boolean> {
+  const m = /^\/api\/harness\/sessions\/([^/]+)\/goals(?:\/([a-z]+))?$/.exec(url.pathname);
+  if (!m) return false;
+  const agent = decodeURIComponent(m[1]!);
+  const action = m[2];
+  const method = req.method ?? "GET";
+  const s = stackOf(agent);
+  if (!action && method === "GET") {
+    json(res, 200, view(agent, s));
+    return true;
+  }
+  if (!action && method === "POST") {
+    const b = await body<{ goals?: string[]; start?: boolean }>(req);
+    const texts = (b.goals ?? []).map(words).filter(Boolean);
+    if (!texts.length) {
+      json(res, 400, { error: "`goals` is a list of at least one goal" });
+      return true;
+    }
+    set(s, [...s.items.filter((i) => i.status === "pending").map((i) => ({ id: i.id, text: i.text })), ...texts.map((text) => ({ text }))]);
+    if (b.start) control(s, "start");
+  } else if (!action && method === "PUT") {
+    const b = await body<{ goals?: { id?: string; text: string }[] }>(req);
+    if (set(s, b.goals ?? [])) push(s);
+  } else if (action === "settings" && method === "POST") {
+    const b = await body<{ plan_big?: boolean }>(req);
+    if (typeof b.plan_big !== "boolean") return (json(res, 400, { error: "`plan_big` is true or false" }), true);
+    s.plan_big = b.plan_big;
+    s.updated_at = Date.now();
+  } else if (action === "plan" && method === "POST") {
+    // Turned into a plan: planning it goes first, a part of it, and the goal waits after it.
+    const b = await body<{ id?: string }>(req);
+    const goal = s.items.find((i) => i.id === b.id) ?? s.items.find((i) => i.status === "active");
+    if (!goal) return (json(res, 400, { error: "no goal to plan" }), true);
+    // Being planned already, its planning waiting its turn: a subagent plans it now (Plan it now).
+    const waiting = goal.planned_as && s.items.find((i) => i.part_of === goal.id && i.part_kind === "planning" && i.status === "pending");
+    if (waiting) return (json(res, 200, { plan: goal.planned_as, research: "", goal: goal.id, part: waiting.id, dispatched: true, why: null }), true);
+    const plan = planning({ agent, id: goal.id, text: goal.text });
+    const part: GoalItem = {
+      id: `g_${Math.random().toString(36).slice(2, 8)}`,
+      text: `Plan "${goal.text.slice(0, 60)}": research it inside and outside, write its steps, say it's ready`,
+      status: goal.status === "active" ? "active" : "pending",
+      part_of: goal.id,
+      part_kind: "planning",
+    };
+    if (goal.status === "active") goal.status = "pending";
+    goal.planned_as = plan;
+    s.items.splice(s.items.indexOf(goal), 0, part);
+    s.updated_at = Date.now();
+    // A goal it isn't on yet: a subagent of its agent's plans it now, as kiln's server says.
+    json(res, 200, { plan, research: "", goal: goal.id, part: part.id, dispatched: part.status === "pending", why: null });
+    return true;
+  } else if (action && method === "POST") {
+    const why = control(s, action);
+    if (why) {
+      json(res, why === "not found" ? 404 : 400, { error: why });
+      return true;
+    }
+  } else {
+    return false;
+  }
+  s.updated_at = Date.now();
+  json(res, 200, view(agent, s));
+  return true;
+}

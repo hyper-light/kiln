@@ -14,8 +14,8 @@ use base64::Engine as _;
 use bytes::Bytes;
 use http::{HeaderValue, Method, header};
 use http_body_util::BodyExt as _;
-use hyper::body::Incoming;
-use hyper::client::conn::http1::SendRequest;
+use kiln_http::Incoming;
+use kiln_http::client::http1::SendRequest;
 use kiln_cd::kube::{self as k, Auth, Discovery, Endpoint, Resource};
 use kiln_cd::obj::{self, GroupKind, ResKey};
 use parking_lot::Mutex;
@@ -28,6 +28,10 @@ use crate::http::tls::{ClientTls, TlsStream};
 
 /// Longest a request waits for its answer.
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// What a request that never got an answer says (no connection, none in time, or the connection
+/// dropped), as against one the API server answered, whatever it said: what was done there is
+/// unknown (`crate::deploy::kilncd::unanswered`).
+pub const NO_ANSWER: &str = "doesn't answer";
 /// Most bytes a (non-watch) response may hold.
 const BODY_LIMIT: usize = 256 << 20;
 /// Kept-alive connections a cluster's pool holds.
@@ -147,14 +151,14 @@ impl Cluster {
             let stream = TlsStream::connect(RtFuturesIo::new(tcp), self.tls.config()?, name)
                 .await
                 .map_err(|e| anyhow::anyhow!("TLS to cluster {}: {e}", self.name))?;
-            let (sender, conn) = hyper::client::conn::http1::handshake::<_, Body>(stream).await?;
+            let (sender, conn) = kiln_http::client::http1::handshake::<_, Body>(stream).await?;
             crate::rt::spawn_local(async move {
                 let _ = conn.await;
             })
             .map_err(|e| anyhow::anyhow!("spawn connection task: {e}"))?;
             Ok(sender)
         } else {
-            let (sender, conn) = hyper::client::conn::http1::handshake::<_, Body>(RtIo::new(tcp)).await?;
+            let (sender, conn) = kiln_http::client::http1::handshake::<_, Body>(RtIo::new(tcp)).await?;
             crate::rt::spawn_local(async move {
                 let _ = conn.await;
             })
@@ -205,7 +209,7 @@ impl Cluster {
                 let mut sender = match pooled {
                     Some(s) if !s.is_closed() => s,
                     Some(_) => continue,
-                    None => self.connect().await?,
+                    None => self.connect().await.map_err(|e| anyhow::anyhow!("cluster {} {NO_ANSWER}: {e:#}", self.name))?,
                 };
                 attempts += 1;
                 if sender.ready().await.is_err() {
@@ -215,13 +219,13 @@ impl Cluster {
                 let resp = match sender.send_request(req).await {
                     Ok(r) => r,
                     Err(e) if e.is_canceled() || e.is_closed() => continue,
-                    Err(e) => return Err(anyhow::anyhow!("cluster {}: {e}", self.name)),
+                    Err(e) => return Err(anyhow::anyhow!("cluster {} {NO_ANSWER}: {e}", self.name)),
                 };
                 let status = resp.status().as_u16();
                 let bytes = http_body_util::Limited::new(resp.into_body(), BODY_LIMIT)
                     .collect()
                     .await
-                    .map_err(|e| anyhow::anyhow!("cluster {}: reading the answer: {e}", self.name))?
+                    .map_err(|e| anyhow::anyhow!("cluster {} {NO_ANSWER}: its answer broke off: {e}", self.name))?
                     .to_bytes();
                 let mut pool = self.pool.lock();
                 if pool.len() < POOL {
@@ -229,11 +233,11 @@ impl Cluster {
                 }
                 return Ok((status, bytes));
             }
-            bail!("cluster {}: no connection would take the request", self.name)
+            bail!("cluster {} {NO_ANSWER}: no connection would take the request", self.name)
         };
         match crate::rt::timeout(TIMEOUT, fut).await {
             Ok(r) => r,
-            Err(_) => bail!("cluster {}: no answer within {} s", self.name, TIMEOUT.as_secs()),
+            Err(_) => bail!("cluster {} {NO_ANSWER}: nothing within {} s", self.name, TIMEOUT.as_secs()),
         }
     }
 
@@ -325,6 +329,53 @@ impl Cluster {
             bail!("{}", k::status_message(status, &bytes));
         }
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// A server-side apply of `object` as `manager`, run dry, for a release's preflight
+    /// (docs/deploy-api.md §8.1): `Ok(Err(why))` when the API server refuses it (invalid, an
+    /// admission policy's no, over a quota, a field that can't change), `Err` when it can't be
+    /// asked (unreachable, throttled, failing itself).
+    pub async fn dry_run(&self, object: &Value, manager: &str) -> Result<std::result::Result<(), String>> {
+        let key = ResKey::new(obj::group(object), obj::kind(object), obj::namespace(object), obj::name(object));
+        let r = self.resource(&key.group, &key.kind)?;
+        let path = format!("{}?{}", k::object_path(&r, &key), k::apply_query(manager, true, true));
+        let body = Bytes::from(serde_json::to_vec(object)?);
+        let (status, bytes) = self.request(Method::PATCH, &path, Some("application/apply-patch+yaml"), Some(body)).await?;
+        match status {
+            200..=299 => Ok(Ok(())),
+            408 | 429 => bail!("{}", k::status_message(status, &bytes)),
+            400..=499 => Ok(Err(k::status_message(status, &bytes))),
+            _ => bail!("{}", k::status_message(status, &bytes)),
+        }
+    }
+
+    /// A JSON merge patch of one object, as `manager` (a person's action on it: a restart, a pause).
+    pub async fn merge_patch(&self, key: &ResKey, patch: &Value, manager: &str) -> Result<Value> {
+        let r = self.resource(&key.group, &key.kind)?;
+        let path = format!("{}?fieldManager={}", k::object_path(&r, key), k::enc(manager));
+        let (status, bytes) = self.request(Method::PATCH, &path, Some("application/merge-patch+json"), Some(Bytes::from(serde_json::to_vec(patch)?))).await?;
+        match status {
+            200..=299 => Ok(serde_json::from_slice(&bytes)?),
+            404 => bail!("{key} not found"),
+            _ => bail!("{}", k::status_message(status, &bytes)),
+        }
+    }
+
+    /// Creates an object, as `manager`.
+    pub async fn create(&self, object: &Value, manager: &str) -> Result<Value> {
+        let r = self.resource(obj::group(object), obj::kind(object))?;
+        let ns = obj::namespace(object);
+        let path = format!("{}?fieldManager={}", k::collection_path(&r, (!ns.is_empty()).then_some(ns)), k::enc(manager));
+        let (status, bytes) = self.request(Method::POST, &path, Some("application/json"), Some(Bytes::from(serde_json::to_vec(object)?))).await?;
+        if !(200..300).contains(&status) {
+            bail!("{}", k::status_message(status, &bytes));
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Whether objects of a kind live in namespaces, as discovery says (`None`: not served).
+    pub fn namespaced(&self, group: &str, kind: &str) -> Option<bool> {
+        self.discovery.read().get(group, kind).map(|r| r.namespaced)
     }
 
     /// Deletes an object; `Ok` when it is gone or going.

@@ -165,6 +165,8 @@ fn dead_spec() -> LegSpec {
         items: Vec::new(),
         emulated: false,
         reads: Vec::new(),
+        cache_cap: None,
+        defined_in: DefinedIn::default(),
         workflow: Arc::new(Workflow::default()),
         job_index: 0,
     }
@@ -353,7 +355,7 @@ fn runs_on_timeouts_environment_concurrency_and_permissions() {
     let d = r.spec("d");
     assert_eq!(d.runs_on.labels, vec!["self-hosted", "staging"]);
     assert_eq!(d.timeout_minutes, 30);
-    assert_eq!(d.environment, Some(EnvironmentSpec { name: "staging".into(), url: Some("https://${{ inputs.env }}.example".into()), deployment: true }));
+    assert_eq!(d.environment, Some(EnvironmentSpec { name: "staging".into(), url: Some("https://${{ inputs.env }}.example".into()), deployment: true, preview: None }));
     assert!(d.concurrency.as_ref().is_some_and(|c| c.group == "d-staging" && c.queue_max));
     assert_eq!(d.container.as_deref(), Some("node:20"));
     assert_eq!(d.services, vec![("db".to_owned(), "postgres".to_owned())]);
@@ -408,6 +410,26 @@ fn w04_ac04_inputs_outputs_secrets_permissions() {
     assert_eq!(r.finished, Some(S));
 }
 
+/// W08-R14 (AC09's last part): a job's cache mode caps the workflow it calls. A called workflow
+/// or job asking for more doesn't start; legs that ask nothing carry the cap to the dispatcher.
+#[test]
+fn w08_r14_the_callers_cache_mode_caps_the_called() {
+    let greedy = "on: workflow_call\njobs:\n  inner:\n    runs-on: x\n    cache-mode: write\n    steps: [{run: a}]\n";
+    let modest = "on: workflow_call\njobs:\n  inner:\n    runs-on: x\n    steps: [{run: a}]\n";
+    let src = || with_called(&[("./.github/workflows/greedy.yml", greedy), ("./.github/workflows/modest.yml", modest)]);
+    let caller = |called: &str, mode: &str| format!("on: push\njobs:\n  call:\n    uses: ./.github/workflows/{called}.yml\n{mode}");
+    let r = Run::with(&caller("greedy", "    cache-mode: read\n"), Dialect::Gha, RunInput { trusted: true, ..RunInput::default() }, src());
+    assert!(r.logged("asks for `cache-mode: write` (its job `inner`), more than its caller's `cache-mode: read` allows"), "{:?}", r.log);
+    assert!(r.queued.is_empty());
+    let r = Run::with(&caller("modest", "    cache-mode: read\n"), Dialect::Gha, RunInput { trusted: true, ..RunInput::default() }, src());
+    assert_eq!(r.spec("call / inner").cache_cap.as_deref(), Some("read"));
+    // Without a mode of its own, the caller caps nothing.
+    let r = Run::with(&caller("greedy", ""), Dialect::Gha, RunInput { trusted: true, ..RunInput::default() }, src());
+    assert_eq!(r.spec("call / inner").cache_cap, None);
+    assert_eq!(crate::store::cache::Mode::Write.min(crate::store::cache::Mode::Read), crate::store::cache::Mode::Read);
+    assert_eq!(crate::store::cache::Mode::WriteOnly.min(crate::store::cache::Mode::Read), crate::store::cache::Mode::None);
+}
+
 #[test]
 fn w04_ac04_inputs_and_secrets_are_checked() {
     let run = |with: &str, secrets: &str| {
@@ -420,6 +442,31 @@ fn w04_ac04_inputs_and_secrets_are_checked() {
     let r = run("    with: { n: 1 }\n", "    secrets: { token: '${{ secrets.T }}' }\n");
     assert!(matches!(r.spec("call / inner").secrets, SecretsSpec::Mapped { ref map, .. } if map == &vec![("token".to_owned(), "${{ secrets.T }}".to_owned())]));
     assert_eq!(run("    with: { n: 1 }\n", "").spec("call / inner").secrets, SecretsSpec::None);
+}
+
+/// W06-R03: a leg knows the workflow file that defines its job, as `job.workflow_*` say it: the
+/// run's own; a `./` one's (the run's repository and commit, at its ref); a remote one's (its
+/// repository, its ref as GitHub writes it, and the commit it was pinned to).
+#[test]
+fn w06_r03_a_legs_job_knows_its_workflow() {
+    let caller = "on: push\njobs:\n  top:\n    runs-on: x\n    steps: [{run: a}]\n  local:\n    uses: ./.github/workflows/called.yml\n    with: { n: 1 }\n  remote:\n    uses: octo-org/automation/.github/workflows/deploy.yml@v1\n";
+    let at = |src: &str, path: &str, origin: Option<crate::wf::ir::Origin>| Arc::new(Workflow { path: path.into(), origin, ..(*workflow(src, Dialect::Gha)).clone() });
+    let mut src = Source::default();
+    src.workflows.insert("./.github/workflows/called.yml".into(), at(CALLED, ".github/workflows/called.yml", None));
+    let far = "on: workflow_call\njobs:\n  far:\n    runs-on: x\n    steps: [{run: b}]\n";
+    let pinned = crate::wf::ir::Origin { repository: "octo-org/automation".into(), git_ref: "refs/tags/v1".into(), sha: "f".repeat(40) };
+    src.workflows.insert("octo-org/automation/.github/workflows/deploy.yml@v1".into(), at(far, ".github/workflows/deploy.yml", Some(pinned)));
+    let github = serde_json::json!({ "repository": "acme/app", "ref": "refs/heads/main", "sha": "a".repeat(40) });
+    let r = Run::with(caller, Dialect::Gha, RunInput { trusted: true, github, ..RunInput::default() }, src);
+    let defined = |repo: &str, path: &str, git_ref: &str, sha: String| DefinedIn {
+        workflow_ref: format!("{repo}/{path}@{git_ref}"),
+        workflow_sha: sha,
+        workflow_repository: repo.into(),
+        workflow_file_path: path.into(),
+    };
+    assert_eq!(r.spec("top").defined_in, defined("acme/app", ".github/workflows/t.yml", "refs/heads/main", "a".repeat(40)), "the run's own");
+    assert_eq!(r.spec("local / inner").defined_in, defined("acme/app", ".github/workflows/called.yml", "refs/heads/main", "a".repeat(40)), "a `./` one, at the run's commit");
+    assert_eq!(r.spec("remote / far").defined_in, defined("octo-org/automation", ".github/workflows/deploy.yml", "refs/tags/v1", "f".repeat(40)), "a remote one, pinned");
 }
 
 #[test]

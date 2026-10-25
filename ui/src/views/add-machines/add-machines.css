@@ -497,8 +497,7 @@
   position: absolute;
   inset: 0 auto 0 0;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
+  animation: prism-breathe 2.4s ease-in-out infinite alternate;
   transition: width 0.4s var(--ease);
 }
 .am-probed {

@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Link, Navigate, useNavigate, useSearchParams } from "@/lib/router";
-import { ChartLine, Plus, Server, SquareTerminal, Trash2, X } from "lucide-react";
+import { Plus, Server, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Agent, Job, RunnerFacts, RunnerInstance, RunnerUpdate } from "@/api/types";
@@ -9,6 +9,7 @@ import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, EmptyState, Facts, Meter, PageIntro, SelectField } from "@/components/ui/misc";
+import { WatchedBy } from "@/views/attach/here";
 import { Chips, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
@@ -23,6 +24,10 @@ import { HostCharts } from "./host-charts";
 import { discoveryRes, joinRequestsRes } from "./add-machines/data";
 import { JoinNotice } from "./add-machines/notice";
 import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct } from "./shared";
+import { BatteryLine, LowBattery } from "./battery";
+import { lostLine } from "./runner-lost";
+import { ImagesPanel, PoolsPanel } from "./runners-pools";
+import { useAuth } from "@/lib/auth";
 
 /** The facets runners are filtered by, with each runner's values. */
 function facetValues(a: Agent): Record<string, string[]> {
@@ -66,6 +71,8 @@ function Intro({ lead }: { lead: React.ReactNode }) {
 export default function Runners() {
   const [params] = useSearchParams();
   // Old links (`?join=1`) opened a dialog; adding machines has its own page now.
+  // Pools for those who read the whole fleet; edited by those who manage them (W13-R09).
+  const can = useAuth((s) => (s.kind === "authed" ? s.me?.can : undefined));
   if (params.get("join") === "1") return <Navigate to="/runners/add" replace />;
   return (
     <div className="container-console page">
@@ -73,6 +80,18 @@ export default function Runners() {
       <Loadable label="the runners" fallback={<RunnersHold />}>
         <RunnersBody />
       </Loadable>
+      {(!can || can["runners.read"] === "server") && (
+        <>
+          <Loadable label="the pools" fallback={<Hold height={120} />}>
+            <PoolsPanel manage={!can || can["pools.manage"] === "server"} />
+          </Loadable>
+          {(!can || can["runs.read"] === "server") && (
+            <Loadable label="the images" fallback={<Hold height={120} />}>
+              <ImagesPanel />
+            </Loadable>
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -154,6 +173,10 @@ function RunnersBody() {
       />
 
       <JoinNotice requests={joinRequests} discovery={discovery} />
+      <LowBattery agents={all} what={(m) => {
+        const n = all.find((a) => a.name === m)?.running.length ?? 0;
+        return n > 0 ? `its ${n} job${n === 1 ? "" : "s"}` : "";
+      }} />
       <Upgrades />
 
       <RunnersTools q={q} onQ={setQ} facets={facets} chosen={chosen} onChosen={setChosen} view={view} onView={setView} />
@@ -228,11 +251,14 @@ function RunnersBody() {
                             </>
                           )}
                         </div>
+                        {a.connected && <BatteryLine battery={a.battery} />}
                         <UpgradeNote agent={a} />
                       </td>
                       <td className="hidden md:table-cell">
                         <Chips labels={a.labels} max={4} />
                       </td>
+                      {/* What it can run legs in, as it last probed (W21-R08). */}
+                      <td className="cell-mono hidden lg:table-cell">{a.facts ? Object.keys(a.facts.executors).join(", ") || "—" : "—"}</td>
                       <td className="min-w-[90px]">
                         {a.outpost ? (
                           // Kiln run there without installing it: its terminals and agents, no jobs.
@@ -275,7 +301,7 @@ function RunnersBody() {
                     </tr>
                     {open && (
                       <tr className="runner-detail-row">
-                        <td colSpan={10}>{details(a)}</td>
+                        <td colSpan={11}>{details(a)}</td>
                       </tr>
                     )}
                   </React.Fragment>
@@ -333,6 +359,7 @@ function RunnersHead() {
         <th className="w-6" aria-label="State" />
         <th>Runner</th>
         <th className="hidden md:table-cell">Labels</th>
+        <th className="hidden lg:table-cell">Executors</th>
         <th>Slots</th>
         <th className="num hidden sm:table-cell">CPU</th>
         <th className="num hidden lg:table-cell">Mem</th>
@@ -470,24 +497,22 @@ function AgentDetails({
         <Chips labels={agent.labels} max={12} />
       </div>
       <div className="mt-4 flex flex-wrap gap-2">
-        <Button variant="secondary" size="xs" disabled={!agent.connected} onClick={onTerminal}>
-          <SquareTerminal /> Open terminal
+        <Button variant="secondary" size="xs" disabled={!agent.connected} onClick={onTerminal} title="Open a terminal on it">
+          Terminal
         </Button>
         {!agent.outpost && (
-          <Button asChild variant="ghost" size="xs">
-            <Link to={`/insights?runner=${encodeURIComponent(agent.name)}`}>
-              <ChartLine /> Insights
-            </Link>
+          <Button asChild variant="secondary" size="xs">
+            <Link to={`/insights?runner=${encodeURIComponent(agent.name)}`}>Insights</Link>
           </Button>
         )}
         {!agent.outpost && (
-          <Button variant="ghost" size="xs" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
-            {agent.draining ? "Resume scheduling" : "Drain"}
+          <Button variant="secondary" size="xs" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
+            {agent.draining ? "Resume" : "Drain"}
           </Button>
         )}
         {!forgetting && (
-          <Button variant="ghost-danger" size="xs" onClick={() => setForgetting(true)}>
-            <Trash2 /> Forget
+          <Button variant="secondary" size="xs" className="text-[#d1aaad]" onClick={() => setForgetting(true)}>
+            Forget
           </Button>
         )}
       </div>
@@ -513,6 +538,10 @@ function AgentDetails({
         </Confirm>
       )}
 
+      <div className="mt-6">
+        <WatchedBy on={`runner:${agent.name}`} watches={(on) => on === `runner:${agent.name}` || on === "runners"} />
+      </div>
+
       <UpgradeNote agent={agent} detailed />
 
       <div className="mt-6">
@@ -525,6 +554,7 @@ function AgentDetails({
             { label: "CPU", value: s ? `${formatPct(s.cpu_pct, 1)} · ${s.cpus} cores` : "—" },
             { label: "Memory", value: s ? `${formatBytes(s.mem_used)} / ${formatBytes(s.mem_total)}` : "—" },
             { label: "Disk", value: s ? `${formatBytes(s.disk_used)} / ${formatBytes(s.disk_total)}` : "—" },
+            { label: "Lost below the channel", value: lostLine(agent) },
           ]}
         />
       </div>

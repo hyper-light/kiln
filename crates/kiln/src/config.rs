@@ -8,6 +8,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 pub mod ci;
+pub mod sso;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -32,14 +33,46 @@ pub struct Config {
     pub ci: ci::Ci,
     /// kiln's own metrics, logs and events (docs/observe.md).
     pub observe: Observe,
+    /// Signing in with GitHub, GitLab and Bitbucket (docs/ci.md W23-R08).
+    pub sso: sso::Sso,
     /// Conversations (docs/conversations.md): the runners that keep a copy of the server's store.
     pub conversations: Conversations,
+    /// Notifications to people's devices (docs/notifications.md).
+    pub push: crate::push::Push,
+    /// Agents that start agents (docs/agents.md, "Agents that run agents").
+    pub agents: Agents,
+    /// Where kiln keeps its bytes (docs/blobs.md): the server's data directory, or any S3.
+    pub blobs: crate::blobs::Config,
+    /// The bus kiln's events ride (docs/bus.md): Quiver, in the server's process.
+    pub bus: crate::bus::Config,
     /// What a runner's administrator declares of it (docs/ci.md W13-R02): `[agent.facts]` and
     /// `[agent.probes]`. The server's own runner reads them here; `kiln agent` from its config file.
     pub agent: crate::runner::probe::Declared,
     /// Environment variables injected into every job (e.g. registry mirrors). Values starting with
     /// `file:` are read from that path at job dispatch time and masked in logs.
     pub secrets: BTreeMap<String, String>,
+    /// kiln's records through the cluster group (docs/p2p.md).
+    pub cluster: Cluster,
+}
+
+/// `[cluster]` (docs/p2p.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Cluster {
+    /// The store's writes go through the cluster group (P1): one hyper-raft group with kiln.db as
+    /// its state machine, its log in `<data>/cluster`. Off (or `KILN_CLUSTER_GROUP=0`), writes go
+    /// straight to kiln.db, as before it; the database is whole either way.
+    pub group: bool,
+    /// The runners hold learner replicas of the group (P2), each fed by the server over its link,
+    /// from a copy of kiln.db. Off (or `KILN_CLUSTER_LEARNERS=0`), none is added; the learners the
+    /// group has stay in it, lagging.
+    pub learners: bool,
+}
+
+impl Default for Cluster {
+    fn default() -> Self {
+        Self { group: true, learners: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +98,17 @@ pub struct Server {
     pub https_cert: Option<PathBuf>,
     /// Its PEM private key.
     pub https_key: Option<PathBuf>,
+    /// Where pages agents show are served (docs/previews.md), as `https://kiln-pages.example`: a
+    /// site of its own, so browsers keep pages apart from kiln. Unset: kiln's own address serves
+    /// them, each sandboxed in an origin of its own.
+    pub pages_url: Option<String>,
+    /// WebRTC to streams' viewers (docs/previews.md, "Streams"): the UDP address it listens on, as
+    /// `0.0.0.0:7072`. Unset, viewers take streams over their WebSocket (WebCodecs) alone.
+    pub webrtc_addr: Option<String>,
+    /// The `host:port`s viewers reach it at (its ICE candidates), when they aren't `webrtc_addr`
+    /// itself: a forwarded or NATed port, a host's Tailscale address. Empty: `webrtc_addr`, or (on
+    /// every address) each LAN address of this machine at its port.
+    pub webrtc_advertise: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +212,48 @@ pub struct Conversations {
     pub mirrors: usize,
     /// Runners to pick first, by name (each still has to keep a store of its own).
     pub mirror_on: Vec<String>,
+    /// Days the server's store keeps an ended agent's transcript (its events stay). 0: for good.
+    /// Runners and mirrors keep them the default 30.
+    pub keep_closed_days: u32,
+    /// Days kiln's store of bytes keeps an ended agent's archived transcript after its last close
+    /// (docs/blobs.md, `transcripts/`). 0: for good.
+    pub keep_archived_days: u32,
+    /// Make the store's file compact once a third of it is free: a copy written a batch at a time
+    /// while the store has nothing else to do, then put in its place. Runners and mirrors compact
+    /// theirs.
+    pub compact: bool,
+    /// No conversation store for this server: tests that don't use one (`KILN_CONVERSATIONS=off`
+    /// does it for a whole process). Never read from a config file.
+    #[serde(skip)]
+    pub off: bool,
+}
+
+/// `[agents]`: how far agents may start agents (docs/agents.md, "Agents that run agents").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Agents {
+    /// How many agents deep a chain may go below the one a person started (that one is 0).
+    pub max_depth: u32,
+    /// How many children still running one agent may have at once.
+    pub max_children: u32,
+}
+
+impl Default for Agents {
+    fn default() -> Self {
+        Self { max_depth: 3, max_children: 24 }
+    }
+}
+
+impl Conversations {
+    /// How long ended agents' transcripts are kept (None: for good).
+    pub fn keep_closed(&self) -> Option<std::time::Duration> {
+        (self.keep_closed_days > 0).then(|| std::time::Duration::from_secs(u64::from(self.keep_closed_days) * 86_400))
+    }
+
+    /// How a store looks after its file, as this says.
+    pub fn upkeep(&self) -> crate::convo::store::Upkeep {
+        crate::convo::store::Upkeep { keep_closed: self.keep_closed(), compact: self.compact.then_some(crate::convo::store::COMPACT_MIN_FREE) }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +404,9 @@ impl Default for Server {
             https: false,
             https_cert: None,
             https_key: None,
+            pages_url: None,
+            webrtc_addr: None,
+            webrtc_advertise: Vec::new(),
         }
     }
 }
@@ -444,7 +533,7 @@ impl Default for Observe {
 
 impl Default for Conversations {
     fn default() -> Self {
-        Self { mirrors: 1, mirror_on: Vec::new() }
+        Self { mirrors: 1, mirror_on: Vec::new(), keep_closed_days: 30, keep_archived_days: 365, compact: true, off: false }
     }
 }
 
@@ -481,8 +570,20 @@ impl Config {
         if let Ok(v) = std::env::var("KILN_PUBLIC_URL") {
             cfg.server.public_url = v;
         }
+        if let Ok(v) = std::env::var("KILN_CLUSTER_GROUP") {
+            cfg.cluster.group = !matches!(v.trim(), "0" | "false" | "off" | "no");
+        }
+        if let Ok(v) = std::env::var("KILN_CLUSTER_LEARNERS") {
+            cfg.cluster.learners = !matches!(v.trim(), "0" | "false" | "off" | "no");
+        }
         if let Ok(v) = std::env::var("KILN_QUIC_ADVERTISE") {
             cfg.server.quic_advertise = v;
+        }
+        if let Ok(v) = std::env::var("KILN_WEBRTC_ADDR") {
+            cfg.server.webrtc_addr = Some(v).filter(|v| !v.trim().is_empty());
+        }
+        if let Ok(v) = std::env::var("KILN_WEBRTC_ADVERTISE") {
+            cfg.server.webrtc_advertise = v.split(',').map(str::trim).filter(|a| !a.is_empty()).map(str::to_owned).collect();
         }
         Ok(cfg)
     }
@@ -530,10 +631,28 @@ pub struct Updates {
     /// one, whatever the server's policy for it (`kiln config set updates.accept false`); the
     /// server shows it so.
     pub accept: bool,
+    /// Minutes a runner has to switch to its new build and report in, counted once it has no
+    /// jobs running. System → Updates can change it, and the two below.
+    pub upgrade_minutes: u64,
+    /// Minutes kiln keeps an upgrade open while the runner finishes the jobs it is running (it
+    /// switches only once they are done).
+    pub wait_for_jobs_minutes: u64,
+    /// Minutes a machine has to build kiln itself, install included.
+    pub build_minutes: u64,
 }
 
 impl Default for Updates {
     fn default() -> Self {
-        Self { release_repo: "hyper-light/kiln".to_owned(), release_pipeline: "release".to_owned(), release_branch: "main".to_owned(), in_step: true, follow: true, accept: true }
+        Self {
+            release_repo: "hyper-light/kiln".to_owned(),
+            release_pipeline: "release".to_owned(),
+            release_branch: "main".to_owned(),
+            in_step: true,
+            follow: true,
+            accept: true,
+            upgrade_minutes: 15,
+            wait_for_jobs_minutes: 6 * 60,
+            build_minutes: 60,
+        }
     }
 }

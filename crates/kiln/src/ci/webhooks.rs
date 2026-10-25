@@ -37,6 +37,22 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("run.succeeded", "a run succeeded"),
     ("run.cancelled", "a run was cancelled"),
     ("approval.waiting", "a run waits for a reviewer to deploy to an environment"),
+    ("deploy.succeeded", "a job deployed to an environment"),
+    ("deploy.failed", "a job's deployment to an environment failed"),
+    ("leg.flaky", "a run had flaky tests: a retry passed them, or an attempt failed them and another passed them"),
+    ("land.ejected", "diffs were taken out of the land queue, and why"),
+    ("runner.offline", "a runner went away and hasn't come back for two minutes"),
+    ("review.requested", "a diff or change request asks someone for a review"),
+    ("comment.reply", "a comment published in a thread, or on someone's diff"),
+    ("mention", "a comment or review names someone (@ada)"),
+    ("quota.near", "a repository's cache is past 90 % of its quota"),
+    ("secret.unused", "a secret no run has read in 90 days"),
+    ("machine.battery_low", "a machine on battery is low (20% or less): it sleeps soon, and its runner with it"),
+    // An agent's notes (docs/agentic.md N2, `crate::push`), as people's devices get them.
+    ("agent.needs_you", "an agent waits on a person: an approval, a question or a plan"),
+    ("agent.finished", "an agent's turn ended (not stopped by a person)"),
+    ("agent.stopped", "an agent crashed or couldn't start"),
+    ("agent.paused", "an agent reached a usage limit and waits for it to reset"),
 ];
 
 /// Sent only when named: they come too often for `*`.
@@ -329,7 +345,7 @@ mod tests {
     use super::*;
 
     fn sub(scope: &str, events: Value) -> Integration {
-        Integration { id: "i1".into(), kind: "webhook".into(), name: "audit".into(), config: json!({ "url": "http://x", "events": events }), has_secret: true, scope: scope.into(), created_by: "admin".into(), created_at: 0, updated_at: 0, verified_at: None, last_error: None, last_used_at: None }
+        Integration { id: "i1".into(), kind: "webhook".into(), name: "audit".into(), config: json!({ "url": "http://x", "events": events }), has_secret: true, has_signing_secret: false, scope: scope.into(), created_by: "admin".into(), created_at: 0, updated_at: 0, verified_at: None, last_error: None, last_used_at: None }
     }
 
     #[test]
@@ -346,5 +362,8 @@ mod tests {
         assert!(in_scope(&all, None) && !in_scope(&sub("org:acme", json!(["*"])), None), "events about no repository go to server-wide subscriptions only");
         assert!(check_events(&json!({ "events": "run, job" })).is_ok() && check_events(&json!({ "events": ["*"] })).is_ok() && check_events(&json!({})).is_ok());
         assert!(check_events(&json!({ "events": "run, sample" })).is_err() && check_events(&json!({ "events": 3 })).is_err());
+        // An agent's notes (N2): named, or with `*`; about no repository, so server-wide only.
+        assert!(takes(&wanted(&json!({ "events": "agent.needs_you" })), "agent.needs_you") && takes(&wanted(&all.config), "agent.finished"));
+        assert!(check_events(&json!({ "events": ["agent.needs_you", "agent.finished", "agent.stopped", "agent.paused"] })).is_ok());
     }
 }

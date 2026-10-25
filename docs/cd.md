@@ -120,7 +120,8 @@ Each step sees Argo CD's build environment (`ARGOCD_APP_NAME`, `ARGOCD_APP_NAMES
 and the annotation `kiln.dev/tracking: <app>:<group>/<kind>:<namespace>/<name>`. The label lets
 it watch only its own objects, filtered by the API server; the annotation is checked, so a copied
 label claims nothing. It reads Argo CD's tracking (label, annotation, or both, with the
-installation id) to adopt what Argo CD deployed.
+installation id) to adopt what Argo CD deployed. A cluster where any app tracks as Argo CD does
+is watched unfiltered, its objects listed again the moment one does.
 
 **Objects two apps deploy.** As in Argo CD, every app compares everything it renders, whatever
 other apps render the same objects: the tracking an object carries says which app it belongs

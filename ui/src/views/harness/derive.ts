@@ -3,7 +3,9 @@
  * changeset, the commands it ran. Pure functions of the event list, memoized by the caller.
  */
 import { useState } from "react";
-import type { FileDiff, HEvent, ToolCall, ToolKind } from "@/api/harness";
+import type { FileDiff, HEvent, Task, ToolCall, ToolKind } from "@/api/harness";
+import { isShowPage } from "./page-of";
+import { isShowLive } from "./live-of";
 
 export type ToolEvent = Extract<HEvent, { kind: "tool" }>;
 
@@ -19,6 +21,10 @@ export type StepGroup = "explore" | "edit" | "shell" | "web" | "agent" | "plan" 
 
 export type Item =
   | Step
+  /** A page the agent showed (`show_page`): the page itself, not a row of a step. */
+  | { type: "page"; key: string; event: ToolEvent }
+  /** A page streamed live from the agent's machine (`show_live`). */
+  | { type: "live"; key: string; event: ToolEvent }
   | { type: "note"; key: string; event: Extract<HEvent, { kind: "assistant" }> }
   | { type: "thought"; key: string; event: Extract<HEvent, { kind: "thinking" }>; more?: Extract<HEvent, { kind: "thinking" }>[] }
   /** `repeats`: the same notice said again right after itself, shown once with a count. */
@@ -65,51 +71,48 @@ const MERGES: Partial<Record<StepGroup, boolean>> = { explore: true, edit: true,
  * `openLast`: the last turn is still going, so it has no answer yet (its latest note stays where it
  * is instead of jumping to the answer slot and back as the turn goes on).
  */
-export function turnsOf(events: HEvent[], parent?: string, openLast = false): Turn[] {
-  const turns: Turn[] = [];
-  let cur: Turn | null = null;
-  const open = (prompt: Turn["prompt"], at: number, key: string) => {
-    cur = { key, prompt, items: [], outcome: null, started: at, ended: null };
-    turns.push(cur);
-    return cur;
-  };
-  for (const e of events) {
-    if ((e.parent ?? undefined) !== parent) continue;
-    if (e.kind === "user") {
-      if (cur) (cur as Turn).ended = e.at;
-      open(e, e.at, e.id);
-      continue;
+export function turnsOf(events: HEvent[], parent?: string, openLast = false, thread?: string): Turn[] {
+  return turnsFrom(null, events, parent, openLast, thread).turns;
+}
+
+/** Turns worked out from `events` (for `parent`, `openLast`), and where in `events` each began. */
+export interface TurnsMemo {
+  events: HEvent[];
+  parent: string | undefined;
+  thread: string | undefined;
+  openLast: boolean;
+  turns: Turn[];
+  starts: number[];
+}
+
+/**
+ * `turnsOf`, from what was worked out before (`was`): the turns before the one the first changed
+ * event is in (and the one before it, whose end and answer the next can change) are kept as they
+ * were, and only the rest is read again. A conversation streaming into its last turn costs that
+ * turn, not the thousands of events before it.
+ */
+export function turnsFrom(was: TurnsMemo | null, events: HEvent[], parent?: string, openLast = false, thread?: string): TurnsMemo {
+  let from = 0;
+  if (was && was.parent === parent && was.thread === thread) {
+    let k = 0;
+    const n = Math.min(events.length, was.events.length);
+    while (k < n && events[k] === was.events[k]) k++;
+    if (k === events.length && k === was.events.length) {
+      if (was.openLast === openLast) return was;
+      // Only whether the last turn goes on changed: that turn is worked out again.
+      k = was.starts.at(-1) ?? 0;
     }
-    // A switch to another harness is a line between turns, not part of the one before it.
-    const divider = switchOf(e);
-    if (divider) {
-      turns.push({ key: e.id, prompt: null, items: [], outcome: null, started: e.at, ended: null, divider });
-      cur = null;
-      continue;
-    }
-    const t: Turn = cur ?? open(null, e.at, `start-${e.id}`);
-    t.ended = e.at;
-    if (e.by && !t.by && e.kind !== "notice") t.by = e.by;
-    if (e.kind === "tool") {
-      const g = GROUP[e.tool] ?? "tool";
-      const last = t.items.at(-1);
-      if (last && last.type === "step" && last.group === g && MERGES[g]) last.calls.push(e);
-      else t.items.push({ type: "step", key: e.id, group: g, calls: [e] });
-    } else if (e.kind === "assistant") {
-      t.items.push({ type: "note", key: e.id, event: e });
-    } else if (e.kind === "thinking") {
-      // A run of thoughts is one row.
-      const last = t.items.at(-1);
-      if (last && last.type === "thought" && !last.event.streaming && !e.redacted) last.more = [...(last.more ?? []), e];
-      else t.items.push({ type: "thought", key: e.id, event: e });
-    } else {
-      const last = t.items.at(-1);
-      if (last && last.type === "notice" && last.event.level === e.level && last.event.text === e.text) last.repeats = (last.repeats ?? 1) + 1;
-      else t.items.push({ type: "notice", key: e.id, event: e });
-    }
+    // The turn event `k` is in, and the one before it.
+    let t = was.starts.length - 1;
+    while (t >= 0 && was.starts[t]! > k) t--;
+    from = Math.max(0, t - 1);
   }
+  const turns = was && from > 0 ? was.turns.slice(0, from) : [];
+  const starts = was && from > 0 ? was.starts.slice(0, from) : [];
+  readTurns(events, was && from > 0 ? (was.starts[from] ?? events.length) : 0, parent, thread, turns, starts);
   // The last assistant note of a finished turn, if nothing but thoughts follow it, is its answer.
-  for (const [ti, t] of turns.entries()) {
+  for (let ti = from; ti < turns.length; ti++) {
+    const t = turns[ti]!;
     if (openLast && ti === turns.length - 1) break;
     if (t.divider) continue;
     for (let i = t.items.length - 1; i >= 0; i--) {
@@ -122,7 +125,64 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
       break;
     }
   }
-  return turns;
+  return { events, parent, thread, openLast, turns, starts };
+}
+
+/**
+ * The turns of `events` from index `at` (where a turn begins) on, onto `turns`, with where each begins onto `starts`.
+ * `thread`: a Codex child's thread, whose own events (`child:<thread>:…`) are its whatever call they hang from.
+ */
+function readTurns(events: HEvent[], at: number, parent: string | undefined, thread: string | undefined, turns: Turn[], starts: number[]) {
+  const own = thread ? `child:${thread}:` : null;
+  let cur: Turn | null = null;
+  let i = at;
+  const open = (prompt: Turn["prompt"], at: number, key: string) => {
+    cur = { key, prompt, items: [], outcome: null, started: at, ended: null };
+    turns.push(cur);
+    starts.push(i);
+    return cur;
+  };
+  for (; i < events.length; i++) {
+    const e = events[i]!;
+    if ((e.parent ?? undefined) !== parent && !(own && e.id.startsWith(own))) continue;
+    if (e.kind === "user") {
+      if (cur) (cur as Turn).ended = e.at;
+      open(e, e.at, e.id);
+      continue;
+    }
+    // A switch to another harness is a line between turns, not part of the one before it.
+    const divider = switchOf(e);
+    if (divider) {
+      turns.push({ key: e.id, prompt: null, items: [], outcome: null, started: e.at, ended: null, divider });
+      starts.push(i);
+      cur = null;
+      continue;
+    }
+    const t: Turn = cur ?? open(null, e.at, `start-${e.id}`);
+    t.ended = e.at;
+    if (e.by && !t.by && e.kind !== "notice") t.by = e.by;
+    if (e.kind === "tool" && isShowPage(e)) {
+      t.items.push({ type: "page", key: e.id, event: e });
+    } else if (e.kind === "tool" && isShowLive(e)) {
+      t.items.push({ type: "live", key: e.id, event: e });
+    } else if (e.kind === "tool") {
+      const g = GROUP[e.tool] ?? "tool";
+      const last = t.items.at(-1);
+      if (last && last.type === "step" && last.group === g && MERGES[g]) last.calls.push(e);
+      else t.items.push({ type: "step", key: e.id, group: g, calls: [e] });
+    } else if (e.kind === "assistant") {
+      t.items.push({ type: "note", key: e.id, event: e });
+    } else if (e.kind === "thinking") {
+      // A run of thoughts is one row.
+      const last = t.items.at(-1);
+      if (last && last.type === "thought" && !last.event.streaming && !e.redacted) (last.more ??= []).push(e);
+      else t.items.push({ type: "thought", key: e.id, event: e });
+    } else {
+      const last = t.items.at(-1);
+      if (last && last.type === "notice" && last.event.level === e.level && last.event.text === e.text) last.repeats = (last.repeats ?? 1) + 1;
+      else t.items.push({ type: "notice", key: e.id, event: e });
+    }
+  }
 }
 
 const sameList = <T>(a: readonly T[] | undefined, b: readonly T[] | undefined) => (a ?? []).length === (b ?? []).length && (a ?? []).every((x, i) => x === b?.[i]);
@@ -144,7 +204,7 @@ function sameItem(a: Item, b: Item): boolean {
 export function shareTurns(kept: Map<string, Turn>, next: Turn[]): Turn[] {
   const out = next.map((t) => {
     const was = kept.get(t.key);
-    if (!was) return t;
+    if (!was || was === t) return t;
     const before = new Map(was.items.map((it) => [it.key, it]));
     const items = t.items.map((it) => {
       const b = before.get(it.key);
@@ -158,7 +218,7 @@ export function shareTurns(kept: Map<string, Turn>, next: Turn[]): Turn[] {
   return out;
 }
 
-export function diffStats(diffs: FileDiff[] | undefined): { add: number; del: number } {
+export function diffStats(diffs: Pick<FileDiff, "hunks">[] | undefined): { add: number; del: number } {
   let add = 0;
   let del = 0;
   for (const d of diffs ?? [])
@@ -172,6 +232,8 @@ export function diffStats(diffs: FileDiff[] | undefined): { add: number; del: nu
 
 export interface FileChange {
   path: string;
+  /** Its working tree's top, `path` being relative to it (the server's changeset). */
+  tree?: string;
   created: boolean;
   deleted?: boolean;
   truncated?: boolean;
@@ -201,13 +263,14 @@ export function changesetOf(events: HEvent[]): FileChange[] {
   return [...files.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
 
+/** The main agent's commands; child work stays in its own thread. */
 export function runsOf(events: HEvent[]): ToolEvent[] {
-  return events.filter((e): e is ToolEvent => e.kind === "tool" && e.tool === "shell");
+  return events.filter((e): e is ToolEvent => !e.parent && e.kind === "tool" && e.tool === "shell");
 }
 
-/** The edits it made (or proposed). */
+/** The main agent's edits (or proposals); its children's edits stay with them. */
 export function editsOf(events: HEvent[]): ToolEvent[] {
-  return events.filter((e): e is ToolEvent => e.kind === "tool" && e.tool === "edit");
+  return events.filter((e): e is ToolEvent => !e.parent && e.kind === "tool" && e.tool === "edit");
 }
 
 /**
@@ -242,8 +305,34 @@ export function stepSummary(group: StepGroup, calls: ToolCall[]): string {
       return n === 1 ? "Ran a command" : `Ran ${n} commands`;
     case "web":
       return n === 1 ? "Looked something up" : `Looked up ${n} things`;
-    case "agent":
+    case "agent": {
+      const call = calls[0];
+      const input = call?.input as { kind?: string; tool?: string } | undefined;
+      if (call?.name === "subAgentActivity") {
+        switch (input?.kind) {
+          case "started": return "Started a subagent";
+          case "interacted": return "Subagent interaction";
+          case "interrupted": return "Interrupted a subagent";
+          case "completed": return "Subagent finished";
+          default: return "Subagent activity";
+        }
+      }
+      if (call?.name === "collabAgentToolCall") {
+        switch (input?.tool) {
+          case "spawnAgent": return "Started a subagent";
+          case "sendInput":
+          case "sendMessage": return "Sent a message to a subagent";
+          case "followupTask": return "Assigned follow-up work";
+          case "resumeAgent": return "Resumed a subagent";
+          case "interruptAgent": return "Interrupted a subagent";
+          case "wait": return "Waited for subagents";
+          case "closeAgent": return "Closed a subagent";
+          case "listAgents": return "Checked subagents";
+          default: return "Subagent activity";
+        }
+      }
       return "Started a subagent";
+    }
     case "plan":
       return calls.some((c) => c.tool === "plan") ? "Proposed a plan" : "Updated the plan";
     case "ask":
@@ -263,6 +352,37 @@ export function stepStatus(calls: ToolCall[]): ToolCall["status"] {
   const order: ToolCall["status"][] = ["error", "denied", "pending", "running", "cancelled", "done"];
   for (const s of order) if (calls.some((c) => c.status === s)) return s;
   return "done";
+}
+
+/** A collaboration call can address an existing child or report several children at once. */
+export function taskOfCall(call: Pick<ToolCall, "task" | "tool_id"> | undefined, tasks: Task[]): Task | undefined {
+  if (!call) return undefined;
+  return tasks.find((task) => task.id === call.task) ?? tasks.find((task) => task.tool_id === call.tool_id);
+}
+
+/** Pausing for an approval does not finish a child's turn or its elapsed time. */
+export function taskLive(task: Task): boolean {
+  return task.status === "running" || task.status === "pending" || task.status === "paused";
+}
+
+/** A child has its own lifecycle; a successful spawn does not mean its work succeeded. */
+export function taskDot(task: Task): string {
+  switch (task.status) {
+    case "completed": return "succeeded";
+    case "failed": return "failed";
+    case "running": return "running";
+    case "pending": return "queued";
+    case "paused": return "pending";
+    case "stopped":
+    case "killed":
+    case "cancelled": return "cancelled";
+    default: return "unknown";
+  }
+}
+
+/** Older snapshots report zero duration even when they include a task's end time. */
+export function taskDuration(task: Task): number | undefined {
+  return task.duration_ms || (task.ended !== undefined ? Math.max(0, task.ended - task.started) : undefined);
 }
 
 export function tildify(path: string): string {

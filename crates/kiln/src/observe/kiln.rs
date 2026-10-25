@@ -512,6 +512,7 @@ mod tests {
             cpu_seconds: None,
             spec: None,
             steps,
+            matrix: None,
         }
     }
 

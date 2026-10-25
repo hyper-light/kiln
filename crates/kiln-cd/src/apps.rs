@@ -38,6 +38,10 @@ pub struct AppDef {
     pub ignore: Vec<IgnoreRule>,
     /// How its objects are recognized.
     pub tracking: Tracking,
+    /// The name its objects carry in Argo CD's tracking when it isn't the app's own: the Argo CD
+    /// Application it takes over (an environment moving from Argo CD to KilnCD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking_name: Option<String>,
     /// Where the definition came from.
     pub origin: Origin,
     /// The environment it deploys to, when it came from one.
@@ -60,6 +64,217 @@ pub struct AppDef {
     /// The checks its rollout uses, by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checks: BTreeMap<String, crate::rollout::CheckSpec>,
+    /// Its secrets, from kiln's secrets service (docs/deploy-api.md §3.5): one Secret in its
+    /// namespace, at exactly the versions named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<SecretsRef>,
+}
+
+/// An app's secrets as its definition names them: where kiln's secrets service keeps them, the
+/// Secret they become, and the version of each a render delivers. Never their values.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsRef {
+    /// The service's scope: `app/<app>/<environment>`.
+    pub scope: String,
+    /// The Secret's name: `<app>-kiln`.
+    pub name: String,
+    /// Each secret's version, by name.
+    pub versions: BTreeMap<String, u32>,
+}
+
+impl SecretsRef {
+    /// The versions as text: `API_KEY@1,DB_PASSWORD@4`.
+    pub fn versions_text(&self) -> String {
+        self.versions.iter().map(|(n, v)| format!("{n}@{v}")).collect::<Vec<_>>().join(",")
+    }
+}
+
+/// The annotation that holds an app's secrets' versions (`API_KEY@1,DB_PASSWORD@4`, never their
+/// values) on their Secret and on each pod template that reads it.
+pub const SECRETS: &str = "kiln.dev/secrets";
+
+/// The Secret of an app's secrets (docs/deploy-api.md §3.5), each one a key of its data. It goes
+/// first (wave -10), before what reads it.
+pub fn app_secret<'a>(name: &str, namespace: &str, versions: &str, items: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> Value {
+    use base64::Engine as _;
+    let data: serde_json::Map<String, Value> = items.into_iter().map(|(k, v)| (k.to_owned(), Value::String(base64::engine::general_purpose::STANDARD.encode(v)))).collect();
+    let mut annotations = serde_json::Map::new();
+    annotations.insert("argocd.argoproj.io/sync-wave".into(), Value::String("-10".into()));
+    annotations.insert(SECRETS.into(), Value::String(versions.to_owned()));
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": { "name": name, "namespace": namespace, "annotations": annotations },
+        "type": "Opaque",
+        "data": data,
+    })
+}
+
+/// Marks each pod template in `namespace` that reads Secret `name` (as env, or as files) with its
+/// `versions`: Kubernetes doesn't restart pods when a Secret they read changes, a new template
+/// does, so a new version rolls them.
+pub fn stamp_secrets(objects: &mut [Value], name: &str, namespace: &str, versions: &str) {
+    for o in objects.iter_mut() {
+        let template: &[&str] = match (obj::group(o), obj::kind(o)) {
+            ("apps", "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet") | ("batch", "Job") => &["spec", "template"],
+            ("batch", "CronJob") => &["spec", "jobTemplate", "spec", "template"],
+            ("", "Pod") => &[],
+            _ => continue,
+        };
+        if !(obj::namespace(o).is_empty() || obj::namespace(o) == namespace) {
+            continue;
+        }
+        let pod: Vec<&str> = template.iter().copied().chain(["spec"]).collect();
+        if !obj::get(o, &pod).is_some_and(|p| reads_secret(p, name)) {
+            continue;
+        }
+        let at: Vec<&str> = template.iter().copied().chain(["metadata", "annotations"]).collect();
+        if let Some(ann) = obj::ensure_map(o, &at) {
+            ann.insert(SECRETS.into(), Value::String(versions.to_owned()));
+        }
+    }
+}
+
+/// Whether a pod's spec reads Secret `name`: a container's env (all of it, or a key) or a volume
+/// (of its own, or projected).
+fn reads_secret(pod: &Value, name: &str) -> bool {
+    let named = |v: Option<&Value>| v.and_then(Value::as_str) == Some(name);
+    let list = |v: &Value, k: &str| v.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
+    let containers = ["containers", "initContainers", "ephemeralContainers"].iter().flat_map(|k| list(pod, k)).collect::<Vec<_>>();
+    let env = containers.iter().any(|c| {
+        list(c, "envFrom").iter().any(|e| named(e.pointer("/secretRef/name"))) || list(c, "env").iter().any(|e| named(e.pointer("/valueFrom/secretKeyRef/name")))
+    });
+    let files = list(pod, "volumes").iter().any(|v| {
+        named(v.pointer("/secret/secretName")) || v.pointer("/projected/sources").and_then(Value::as_array).into_iter().flatten().any(|s| named(s.pointer("/secret/name")))
+    });
+    env || files
+}
+
+/// What a platform's object holds of an app's secret in place of its value (docs/deploy-api.md
+/// §3.5): `kiln-secret:<scope>/<NAME>@<version>`. Its provider reads the value from kiln's secrets
+/// service as it applies the object, so no value is in a desired object, a record, a plan or a
+/// view; only kiln writes one.
+pub const SECRET_REF: &str = "kiln-secret:";
+
+/// What a live object shows of a secret kiln delivered once it can't tell the platform still holds
+/// what kiln put there: never a value.
+pub const SECRET_CHANGED: &str = "kiln-secret:changed";
+
+/// The reference to version `version` of secret `name` in `scope`.
+pub fn secret_ref(scope: &str, name: &str, version: u32) -> String {
+    format!("{SECRET_REF}{scope}/{name}@{version}")
+}
+
+/// A reference's scope, name and version.
+pub fn parse_secret_ref(text: &str) -> Option<(&str, &str, u32)> {
+    let (path, v) = text.strip_prefix(SECRET_REF)?.rsplit_once('@')?;
+    let (scope, name) = path.rsplit_once('/')?;
+    Some((scope, name, v.parse().ok()?))
+}
+
+/// Whether any string of `v` (or key) is kiln's to write: a secret reference, or what stands for one.
+pub fn holds_secret_ref(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.starts_with(SECRET_REF),
+        Value::Array(a) => a.iter().any(holds_secret_ref),
+        Value::Object(m) => m.iter().any(|(k, x)| k.starts_with(SECRET_REF) || holds_secret_ref(x)),
+        _ => false,
+    }
+}
+
+/// The SSM parameter an ECS task reads a secret from: `/kiln/<scope>/<NAME>`.
+pub fn ssm_parameter(scope: &str, name: &str) -> String {
+    format!("/kiln/{scope}/{name}")
+}
+
+/// The group of SSM parameters, which ECS tasks read their secrets from.
+pub const SSM_GROUP: &str = "ssm.aws.kiln.dev";
+
+/// Puts an app's secrets (`versions`, in `scope`) where its platform objects take them
+/// (docs/deploy-api.md §3.5), as references:
+/// - a Lambda function's environment variables;
+/// - an ECS task definition's containers' `secrets`, read from SSM SecureString parameters kiln
+///   writes before the task definition (a Parameter object each), with their versions as a
+///   docker label, so a new version is a new revision and the service's tasks roll onto it;
+/// - a Worker's `secret_text` bindings;
+/// - a Vercel project's sensitive production environment variables (`env`), with their versions
+///   on its production deployment, so a new version makes a new deployment.
+///
+/// A secret replaces a variable of its name. Err when none of the objects takes them.
+pub fn platform_secrets(objects: &mut Vec<Value>, scope: &str, versions: &[(String, u32)]) -> Result<(), String> {
+    use crate::providers::{aws_ecs, aws_lambda, cloudflare_workers, vercel};
+    let text = versions.iter().map(|(n, v)| format!("{n}@{v}")).collect::<Vec<_>>().join(",");
+    let refs = || versions.iter().map(|(n, v)| (n.as_str(), secret_ref(scope, n, *v)));
+    let mut took = false;
+    let mut parameters = Vec::new();
+    for o in objects.iter_mut() {
+        match (obj::group(o), obj::kind(o)) {
+            (aws_lambda::GROUP, "Function") => {
+                let Some(vars) = obj::ensure_map(o, &["spec", "Environment", "Variables"]) else { continue };
+                for (n, r) in refs() {
+                    vars.insert(n.to_owned(), Value::String(r));
+                }
+                took = true;
+            }
+            (aws_ecs::GROUP, "TaskDefinition") => {
+                let Some(Value::Array(containers)) = o.pointer_mut("/spec/containerDefinitions") else { continue };
+                for c in containers.iter_mut() {
+                    let Some(m) = c.as_object_mut() else { continue };
+                    let named = |e: &Value| e.get("name").and_then(Value::as_str).is_some_and(|n| versions.iter().any(|(s, _)| s == n));
+                    if let Some(Value::Array(env)) = m.get_mut("environment") {
+                        env.retain(|e| !named(e));
+                    }
+                    let list = m.entry("secrets").or_insert_with(|| Value::Array(Vec::new()));
+                    if let Value::Array(list) = list {
+                        list.retain(|e| !named(e));
+                        list.extend(versions.iter().map(|(n, _)| serde_json::json!({ "name": n, "valueFrom": ssm_parameter(scope, n) })));
+                    }
+                    let labels = m.entry("dockerLabels").or_insert_with(|| Value::Object(Map::new()));
+                    if let Value::Object(labels) = labels {
+                        labels.insert(SECRETS.into(), Value::String(text.clone()));
+                    }
+                }
+                if let Some(spec) = o.get_mut("spec") {
+                    aws_ecs::normalize_task(spec);
+                }
+                if parameters.is_empty() {
+                    for (n, r) in refs() {
+                        let mut p = crate::providers::object(SSM_GROUP, "Parameter", &ssm_parameter(scope, n), None, serde_json::json!({ "value": r }));
+                        if let Some(ann) = obj::ensure_map(&mut p, &["metadata", "annotations"]) {
+                            ann.insert(crate::sync::KILN_WAVE.into(), Value::String("-1".into()));
+                        }
+                        parameters.push(p);
+                    }
+                }
+                took = true;
+            }
+            (cloudflare_workers::GROUP, "Worker") => {
+                let Some(spec) = o.get_mut("spec").and_then(Value::as_object_mut) else { continue };
+                let bindings = spec.entry("bindings").or_insert_with(|| Value::Array(Vec::new()));
+                let Value::Array(bindings) = bindings else { continue };
+                bindings.retain(|b| !b.get("name").and_then(Value::as_str).is_some_and(|n| versions.iter().any(|(s, _)| s == n)));
+                bindings.extend(refs().map(|(n, r)| serde_json::json!({ "type": "secret_text", "name": n, "text": r })));
+                cloudflare_workers::sort_bindings(bindings);
+                took = true;
+            }
+            (vercel::GROUP, "Project") => {
+                let Some(env) = obj::ensure_map(o, &["spec", "env"]) else { continue };
+                for (n, r) in refs() {
+                    env.insert(n.to_owned(), Value::String(r));
+                }
+                took = true;
+            }
+            (vercel::GROUP, "Production") => {
+                if let Some(spec) = o.get_mut("spec").and_then(Value::as_object_mut) {
+                    spec.insert("secrets".into(), Value::String(text.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    objects.extend(parameters);
+    if took { Ok(()) } else { Err("nothing this app deploys takes secrets: a Lambda function, an ECS task definition, a Worker or a Vercel project does".into()) }
 }
 
 /// The annotation a traffic-carrying object holds its app's rollout in: `{ rollout, checks }`.
@@ -249,7 +464,7 @@ impl AppDef {
         c.ignore = self.ignore.clone();
         c.tracking = self.tracking;
         if self.tracking != Tracking::Kiln {
-            c.tracking_name = Some(self.name.as_str().into());
+            c.tracking_name = Some(self.tracking_name.as_deref().unwrap_or(&self.name).into());
             // Adopted from Argo CD: apply as Argo CD's own field manager, so what Argo CD owned
             // stays owned (and removable) after the take-over.
             c.manager = "argocd-controller".into();
@@ -658,6 +873,7 @@ pub fn from_argo(v: &Value, parent: Option<&str>, clusters: &dyn Fn(&str) -> Opt
         sync,
         ignore: spec.get("ignoreDifferences").map(ignore_of).unwrap_or_default(),
         tracking: Tracking::ArgoAnnotation,
+        tracking_name: None,
         origin: Origin::Argo { parent: parent.map(str::to_owned) },
         environment: None,
         labels: obj::map_at(v, &["metadata", "labels"])
@@ -669,6 +885,7 @@ pub fn from_argo(v: &Value, parent: Option<&str>, clusters: &dyn Fn(&str) -> Opt
         artifacts: BTreeMap::new(),
         rollout: None,
         checks: BTreeMap::new(),
+        secrets: None,
     })
 }
 
@@ -1269,6 +1486,7 @@ fn app_from_spec(
             })
             .collect(),
         tracking: Tracking::Kiln,
+        tracking_name: None,
         origin: Origin::Deploy { repo: repo.to_owned() },
         environment,
         labels: spec.labels.clone(),
@@ -1300,6 +1518,7 @@ fn app_from_spec(
             .collect(),
         rollout: spec.rollout.clone(),
         checks,
+        secrets: None,
     })
 }
 
@@ -1307,6 +1526,18 @@ fn app_from_spec(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_app_taking_argo_cd_s_objects_over_knows_them_by_its_application_s_name() {
+        let mut d = crate::state::tests::app("podinfo-staging");
+        assert_eq!(d.config().tracking_name, None, "kiln's own tracking: the app's id");
+        d.tracking = Tracking::ArgoAnnotation;
+        assert_eq!(d.config().tracking_name.as_deref(), Some("podinfo-staging"), "imported: the Application is the app");
+        d.tracking_name = Some("staging-podinfo".into());
+        let c = d.config();
+        assert_eq!(c.tracking_name.as_deref(), Some("staging-podinfo"), "taken over: the Application it was");
+        assert_eq!(&*c.manager, "argocd-controller", "what Argo CD owned stays owned");
+    }
 
     #[test]
     fn go_durations_parse() {
@@ -1543,6 +1774,68 @@ apps:
         assert!(substitute_artifacts("${{ artifacts.image.size }}", &refs).is_err());
         // Other expressions pass through.
         assert_eq!(substitute_artifacts("a ${{ env.name }} b", &refs)?, "a ${{ env.name }} b");
+        Ok(())
+    }
+
+    #[test]
+    fn an_apps_secrets_are_one_secret_and_the_pods_that_read_them_roll_with_their_versions() {
+        let s = app_secret("web-kiln", "shop", "A@1,B@2", [("A", &b"one"[..]), ("B", &b"two"[..])]);
+        assert_eq!(obj::kind(&s), "Secret");
+        assert_eq!(obj::str_at(&s, &["data", "A"]), Some("b25l"));
+        assert_eq!(obj::annotation(&s, SECRETS), Some("A@1,B@2"));
+        let reads = |spec: Value| json!({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web"}, "spec": {"template": {"spec": spec}}});
+        let mut objects = vec![
+            reads(json!({"containers": [{"name": "app", "envFrom": [{"secretRef": {"name": "web-kiln", "optional": true}}]}]})),
+            reads(json!({"containers": [{"name": "app", "env": [{"name": "A", "valueFrom": {"secretKeyRef": {"name": "web-kiln", "key": "A"}}}]}]})),
+            reads(json!({"containers": [{"name": "app"}], "volumes": [{"name": "s", "projected": {"sources": [{"secret": {"name": "web-kiln"}}]}}]})),
+            reads(json!({"containers": [{"name": "app", "envFrom": [{"secretRef": {"name": "other"}}]}]})),
+            json!({"apiVersion": "batch/v1", "kind": "CronJob", "metadata": {"name": "nightly"}, "spec": {"jobTemplate": {"spec": {"template": {"spec": {"containers": [{"name": "c"}], "volumes": [{"name": "s", "secret": {"secretName": "web-kiln"}}]}}}}}}),
+        ];
+        stamp_secrets(&mut objects, "web-kiln", "shop", "A@1,B@2");
+        let stamped: Vec<bool> = objects
+            .iter()
+            .map(|o| {
+                let at: &[&str] = if obj::kind(o) == "CronJob" { &["spec", "jobTemplate", "spec", "template", "metadata", "annotations", SECRETS] } else { &["spec", "template", "metadata", "annotations", SECRETS] };
+                obj::str_at(o, at) == Some("A@1,B@2")
+            })
+            .collect();
+        assert_eq!(stamped, [true, true, true, false, true]);
+    }
+
+    #[test]
+    fn a_platform_takes_an_apps_secrets_its_own_way_by_reference() -> Result<(), String> {
+        let o = |group: &str, kind: &str, name: &str, spec: Value| crate::providers::object(group, kind, name, None, spec);
+        let mut objects = vec![
+            o("lambda.aws.kiln.dev", "Function", "thumbs", json!({ "Environment": { "Variables": { "MODE": "prod", "A": "plain" } } })),
+            o("ecs.aws.kiln.dev", "TaskDefinition", "api", json!({ "family": "api", "containerDefinitions": [{ "name": "api", "environment": [{ "name": "Z", "value": "1" }, { "name": "A", "value": "plain" }] }] })),
+            o("workers.cloudflare.kiln.dev", "Worker", "edge", json!({ "bindings": [{ "type": "kv_namespace", "name": "KV", "namespace_id": "x" }] })),
+            o("vercel.kiln.dev", "Project", "site", json!({ "framework": "nextjs" })),
+            o("vercel.kiln.dev", "Production", "site", json!({ "project": "site", "output": "sha256:00" })),
+        ];
+        let versions = [("A".to_owned(), 2), ("B".to_owned(), 1)];
+        platform_secrets(&mut objects, "app/web/production", &versions)?;
+        let at = |i: usize, p: &str| objects.get(i).and_then(|o| o.pointer(p)).cloned();
+        let (a, b) = (json!("kiln-secret:app/web/production/A@2"), json!("kiln-secret:app/web/production/B@1"));
+        // Lambda: variables, a secret in place of a variable of its name.
+        assert_eq!((at(0, "/spec/Environment/Variables/A"), at(0, "/spec/Environment/Variables/MODE")), (Some(a.clone()), Some(json!("prod"))));
+        // ECS: read from SSM, the versions a label; a Parameter each, before the task definition.
+        assert_eq!(at(1, "/spec/containerDefinitions/0/environment"), Some(json!([{ "name": "Z", "value": "1" }])));
+        assert_eq!(at(1, "/spec/containerDefinitions/0/secrets"), Some(json!([{ "name": "A", "valueFrom": "/kiln/app/web/production/A" }, { "name": "B", "valueFrom": "/kiln/app/web/production/B" }])));
+        assert_eq!(at(1, "/spec/containerDefinitions/0/dockerLabels/kiln.dev~1secrets"), Some(json!("A@2,B@1")));
+        let params: Vec<(&str, Option<&Value>, i64)> = objects.iter().filter(|o| obj::kind(o) == "Parameter").map(|o| (obj::name(o), o.pointer("/spec/value"), crate::sync::wave_of(o))).collect();
+        assert_eq!(params, [("/kiln/app/web/production/A", Some(&a), -1), ("/kiln/app/web/production/B", Some(&b), -1)]);
+        // Workers: secret_text bindings; Vercel: the project's variables, their versions on production.
+        assert_eq!(at(2, "/spec/bindings"), Some(json!([{ "type": "secret_text", "name": "A", "text": a }, { "type": "secret_text", "name": "B", "text": b }, { "type": "kv_namespace", "name": "KV", "namespace_id": "x" }])));
+        assert_eq!((at(3, "/spec/env/A"), at(3, "/spec/env/B")), (Some(a), Some(b)));
+        assert_eq!(at(4, "/spec/secrets"), Some(json!("A@2,B@1")));
+        // The variables they took the place of are gone, and a reference reads back.
+        assert!(objects.iter().all(|o| !o.to_string().contains("\"plain\"")));
+        assert_eq!(parse_secret_ref("kiln-secret:app/web/production/A@2"), Some(("app/web/production", "A", 2)));
+        assert_eq!(parse_secret_ref("kiln-secret:A"), None);
+        assert!(holds_secret_ref(&json!({ "x": ["kiln-secret:anything"] })) && !holds_secret_ref(&json!({ "x": "kiln" })));
+        // Where nothing takes them.
+        let mut site = vec![o("s3.aws.kiln.dev", "Site", "www", json!({}))];
+        assert!(platform_secrets(&mut site, "app/web/production", &versions).is_err());
         Ok(())
     }
 

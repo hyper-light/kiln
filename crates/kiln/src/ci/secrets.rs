@@ -115,6 +115,12 @@ fn master_at(p: &std::path::Path) -> anyhow::Result<[u8; 32]> {
     }
 }
 
+/// A key of its own for `label`, from the master key: one kiln checks with and never stores (an
+/// inbound webhook's secret, W03-R02).
+pub(crate) fn derived(hub: &Hub, label: &str) -> anyhow::Result<String> {
+    Ok(crate::util::hmac_hex(&master(hub)?, label.as_bytes()))
+}
+
 fn key(bytes: &[u8; 32]) -> anyhow::Result<LessSafeKey> {
     Ok(LessSafeKey::new(UnboundKey::new(&AES_256_GCM, bytes).map_err(|_| anyhow::anyhow!("bad key"))?))
 }
@@ -405,7 +411,7 @@ pub async fn record_uses(hub: &Hub, leg: &str, ids: Vec<String>) -> anyhow::Resu
     let names: Vec<String> = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let mut names = Vec::new();
             for id in &ids {
@@ -429,7 +435,7 @@ pub async fn rotate(hub: &Hub) -> anyhow::Result<usize> {
     let m = master(hub)?;
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let keys = all_keys(&tx, &m)?;
             let (new_id, fresh) = new_key(&tx, &m)?;
             let rows: Vec<(String, String, String, String, Vec<u8>, Vec<u8>, String)> = {
@@ -548,7 +554,7 @@ async fn scope_of(hub: &Hub, q: &std::collections::HashMap<String, String>) -> R
 
 /// `/api/ci/secrets…` and `/api/ci/variables…`, behind the console's auth. Reads never carry a
 /// secret's value.
-pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::collections::HashMap<String, String>, body: hyper::body::Incoming) -> Result<crate::http::server::Response, super::Fail> {
+pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::collections::HashMap<String, String>, body: kiln_http::Incoming) -> Result<crate::http::server::Response, super::Fail> {
     use crate::http::server as srv;
     use http::{Method, StatusCode};
     let internal = |e: anyhow::Error| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));

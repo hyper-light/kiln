@@ -4,6 +4,8 @@ import { AlertTriangle, ChevronDown, RotateCcw, Search, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "./button";
 import { pad2 } from "@/lib/format";
+import { useLocalStorage } from "@/lib/hooks";
+import { setPref } from "@/lib/prefs";
 
 /* ---------------------------- page scaffolding ---------------------------- */
 
@@ -13,15 +15,18 @@ export function PageIntro({
   title,
   lead,
   actions,
+  compact,
 }: {
   index: number;
   label: string;
   title: React.ReactNode;
   lead?: React.ReactNode;
   actions?: React.ReactNode;
+  /** On a phone, one line: the title, then the lead, then the actions. */
+  compact?: boolean;
 }) {
   return (
-    <header className="page-intro">
+    <header className="page-intro" data-compact={compact || undefined}>
       <div className="min-w-0">
         <div className="eyebrow">
           <span className="spectrum-rule" />
@@ -69,24 +74,97 @@ export function SectionHeading({
   title,
   aside,
   className,
+  fold,
 }: {
   index?: string;
   label: string;
   title?: React.ReactNode;
   aside?: React.ReactNode;
   className?: string;
+  /** The heading folds its section: the whole of it is the toggle. */
+  fold?: { open: boolean; onToggle: () => void; controls: string };
 }) {
   return (
-    <div className={cn("section-heading", className)}>
+    <div className={cn("section-heading", fold && "section-fold", className)} data-open={fold?.open || undefined}>
       <div className="min-w-0">
         <div className="section-number eyebrow">
           {index ? `${index} / ` : ""}
           {label}
         </div>
-        {title && <h2>{title}</h2>}
+        {title &&
+          (fold ? (
+            <h2>
+              <button type="button" className="section-toggle" aria-expanded={fold.open} aria-controls={fold.controls} onClick={fold.onToggle}>
+                {title}
+                <ChevronDown size={16} className="section-chev" aria-hidden="true" />
+              </button>
+            </h2>
+          ) : (
+            <h2>{title}</h2>
+          ))}
       </div>
-      {aside && <div className="flex shrink-0 items-center gap-2">{aside}</div>}
+      {aside && <div className="section-aside flex shrink-0 items-center gap-2">{aside}</div>}
     </div>
+  );
+}
+
+/**
+ * Open the folded section `#hash` names (`/system#system.updates`) and bring it into view as the
+ * page draws: again as what is above it loads (its place moves), until you scroll yourself. For a
+ * page's root: called as it mounts, and when its hash changes.
+ */
+export function openFold(hash: string) {
+  let id: string;
+  try {
+    id = decodeURIComponent(hash.replace(/^#/, ""));
+  } catch {
+    return;
+  }
+  if (!/^[\w-]+\.[\w.-]+$/.test(id) || typeof window === "undefined") return;
+  setPref(`kiln.fold.${id}`, true);
+  let seeking = true;
+  const seek = () => {
+    if (seeking) document.getElementById(id)?.scrollIntoView({ block: "start" });
+  };
+  const moved = new ResizeObserver(() => requestAnimationFrame(seek));
+  const stop = () => {
+    seeking = false;
+    moved.disconnect();
+    for (const ev of ["wheel", "touchstart", "keydown"] as const) window.removeEventListener(ev, stop);
+  };
+  for (const ev of ["wheel", "touchstart", "keydown"] as const) window.addEventListener(ev, stop, { passive: true });
+  window.setTimeout(stop, 6000);
+  moved.observe(document.body);
+  requestAnimationFrame(seek);
+}
+
+/** A page section its heading folds away: open at first, then as you left it (kept in this browser). A link to `#<id>` opens it ([`openFold`]). */
+export function FoldSection({
+  id,
+  index,
+  label,
+  title,
+  aside,
+  className,
+  children,
+}: {
+  /** Where its state is kept: `kiln.fold.<id>`. */
+  id: string;
+  index?: string;
+  label: string;
+  title: React.ReactNode;
+  aside?: React.ReactNode;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useLocalStorage(`kiln.fold.${id}`, true);
+  const body = React.useId();
+  return (
+    <section id={id} className={cn("mt-12", className)}>
+      <SectionHeading index={index} label={label} title={title} aside={open ? aside : undefined} fold={{ open, onToggle: () => setOpen(!open), controls: body }} />
+      {/* Folded, it isn't there at all: nothing in it polls or moves. */}
+      <div id={body}>{open && children}</div>
+    </section>
   );
 }
 
@@ -182,7 +260,8 @@ export function TextField({
   className,
   ...props
 }: React.InputHTMLAttributes<HTMLInputElement> & { label: string; hint?: React.ReactNode }) {
-  const id = React.useId();
+  const auto = React.useId();
+  const id = props.id ?? auto;
   return (
     <div className={className}>
       <label htmlFor={id} className="field-label">
@@ -207,7 +286,7 @@ export function SelectField({
   label: string;
   value: string;
   onChange: (v: string) => void;
-  options: { value: string; label: string }[];
+  options: { value: string; label: string; disabled?: boolean }[];
   className?: string;
   hideLabel?: boolean;
 }) {
@@ -220,7 +299,7 @@ export function SelectField({
       <div className="select">
         <select id={id} value={value} onChange={(e) => onChange(e.target.value)}>
           {options.map((o) => (
-            <option key={o.value} value={o.value}>
+            <option key={o.value} value={o.value} disabled={o.disabled}>
               {o.label}
             </option>
           ))}

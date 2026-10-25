@@ -1,0 +1,13 @@
+error[E0433]: cannot find `RamStore` in `hyper_durable`
+ --> tests/build/ram_store.rs:4:33
+  |
+4 |     let _store = hyper_durable::RamStore::new();
+  |                                 ^^^^^^^^ could not find `RamStore` in `hyper_durable`
+  |
+note: found an item that was configured out
+ --> $WORKSPACE/vendor/hyper-raft/crates/hyper-durable/src/lib.rs
+  |
+  | #[cfg(any(test, feature = "test-store"))]
+  |          ------------------------------ the item is gated here
+  | pub use memory::RamStore;
+  |                 ^^^^^^^^

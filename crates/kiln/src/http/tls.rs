@@ -283,8 +283,8 @@ fn tls_error(error: rustls::Error) -> io::Error {
 }
 
 /// A TLS session over the transport `S`, owning its configuration: a client's
-/// ([`TlsStream`]) or a server's ([`ServerTlsStream`]). Plaintext through `hyper::rt` IO (for
-/// hyper) and futures-io (for anything else, such as a byte pipe).
+/// ([`TlsStream`]) or a server's ([`ServerTlsStream`]). Plaintext through futures-io, which
+/// kiln-http (and anything else, such as a byte pipe) speaks.
 pub struct Stream<S, C: Side> {
     io: S,
     conn: C,
@@ -481,43 +481,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin, C: Side> Stream<S, C> {
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin, C: Side + Unpin> hyper::rt::Read for Stream<S, C>
-where
-    C::Config: Unpin,
-{
-    /// Straight from hyper-tls's plaintext buffer into hyper's; nothing filled means end of stream.
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        ready!(this.poll_plaintext(cx))?;
-        let mut reader = this.conn.reader();
-        let chunk = match reader.fill_buf() {
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Poll::Ready(Ok(())),
-            other => other?,
-        };
-        let n = chunk.len().min(buf.remaining());
-        buf.put_slice(chunk.get(..n).unwrap_or_default());
-        reader.consume(n);
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin, C: Side + Unpin> hyper::rt::Write for Stream<S, C>
-where
-    C::Config: Unpin,
-{
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        self.get_mut().poll_write_plain(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().poll_flush_plain(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().poll_close_plain(cx)
-    }
-}
-
 impl<S: AsyncRead + AsyncWrite + Unpin, C: Side + Unpin> AsyncRead for Stream<S, C>
 where
     C::Config: Unpin,
@@ -545,7 +508,7 @@ where
     }
 }
 
-/// Plaintext through `std::io::Read`, for code that wants a reader (unused by hyper).
+/// Plaintext a read at a time, for code that wants to read without futures-io.
 impl<S: AsyncRead + AsyncWrite + Unpin, C: Side> Stream<S, C> {
     pub async fn read_some(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         poll_fn(|cx| {
@@ -597,51 +560,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_close(cx)
-    }
-}
-
-/// futures-io as hyper IO: one copy per read through a scratch buffer (safe code; hyper's
-/// uninitialised read cursor is only reachable through `unsafe`).
-pub struct HyperIo<S> {
-    io: S,
-    scratch: Box<[u8]>,
-}
-
-impl<S> HyperIo<S> {
-    pub fn new(io: S) -> Self {
-        Self { io, scratch: vec![0u8; 16 * 1024].into_boxed_slice() }
-    }
-}
-
-impl<S: AsyncRead + Unpin> hyper::rt::Read for HyperIo<S> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let want = buf.remaining().min(this.scratch.len());
-        let Some(scratch) = this.scratch.get_mut(..want) else {
-            return Poll::Ready(Ok(()));
-        };
-        if want == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        let n = ready!(Pin::new(&mut this.io).poll_read(cx, scratch))?;
-        if let Some(read) = scratch.get(..n) {
-            buf.put_slice(read);
-        }
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl<S: AsyncWrite + Unpin> hyper::rt::Write for HyperIo<S> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().io).poll_close(cx)
     }
 }

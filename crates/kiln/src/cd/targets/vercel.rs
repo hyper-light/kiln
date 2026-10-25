@@ -5,6 +5,12 @@
 //! SHA-1 (only those Vercel lacks), a deployment is made from them for production, and kiln waits
 //! until it is ready. Production reads as kiln's output while the deployment kiln made still
 //! serves it; another deployment serving production is drift, or a rollback someone made.
+//!
+//! An app's secrets (docs/deploy-api.md §3.5) are the project's sensitive production variables
+//! (`env`), their values read from kiln's secrets service as they go to Vercel; they read back as
+//! kiln's references while each is as kiln left it (Vercel never answers their values), and one
+//! the app no longer has is deleted. Production carries their versions, so new ones make a new
+//! deployment, which takes them.
 
 use std::time::Duration;
 
@@ -14,6 +20,8 @@ use kiln_cd::providers::vercel::{self as p, GROUP};
 use serde_json::{Map, Value, json};
 
 use super::{Cx, applied, until};
+use kiln_cd::apps::{SECRET_CHANGED, SECRET_REF};
+use kiln_cd::state::Applied;
 use crate::ci::integrations::aws::encode;
 use crate::ci::integrations::vercel::{Vc, VercelError, sha1_hex};
 use crate::http::client::Method;
@@ -41,13 +49,57 @@ async fn project(cx: &Cx<'_>, name: &str) -> Result<Option<Value>> {
     missing(api(cx)?.call(Method::Get, &format!("/v9/projects/{}", encode(name, false)), None).await)
 }
 
-fn project_object(name: &str, p: &Value) -> Value {
-    let spec: Map<String, Value> = SETTINGS.iter().filter_map(|k| p.get(*k).filter(|v| !v.is_null()).map(|v| ((*k).to_owned(), v.clone()))).collect();
+fn project_object(name: &str, p: &Value, env: Option<Value>) -> Value {
+    let mut spec: Map<String, Value> = SETTINGS.iter().filter_map(|k| p.get(*k).filter(|v| !v.is_null()).map(|v| ((*k).to_owned(), v.clone()))).collect();
+    if let Some(e) = env {
+        spec.insert("env".into(), e);
+    }
     let mut o = kiln_cd::providers::object(GROUP, "Project", name, None, Value::Object(spec));
     if let Value::Object(m) = &mut o {
         m.insert("status".into(), json!({ "id": p.get("id"), "updatedAt": p.get("updatedAt") }));
     }
     o
+}
+
+/// A project's environment variables, as Vercel answers (sensitive ones without their values).
+async fn envs(cx: &Cx<'_>, name: &str) -> Result<Vec<Value>> {
+    cx.conn.budget().await;
+    let v = api(cx)?.call(Method::Get, &format!("/v9/projects/{}/env", encode(name, false)), None).await?;
+    Ok(v.get("envs").and_then(Value::as_array).cloned().unwrap_or_default())
+}
+
+/// The app's secrets among a Project object's `env` (kiln's references): their names.
+fn kiln_env(o: &Value) -> Vec<String> {
+    o.pointer("/spec/env").and_then(Value::as_object).into_iter().flatten().filter(|(_, v)| v.as_str().is_some_and(|s| s.starts_with(SECRET_REF))).map(|(k, _)| k.clone()).collect()
+}
+
+/// The production variable `key`.
+fn production_var<'a>(envs: &'a [Value], key: &str) -> Option<&'a Value> {
+    envs.iter().find(|e| e.get("key").and_then(Value::as_str) == Some(key) && e.get("target").and_then(Value::as_array).is_some_and(|t| t.iter().any(|x| x == "production")))
+}
+
+/// The app's secrets as the project holds them: kiln's reference while a variable is as kiln left
+/// it (its `updatedAt`), otherwise [`SECRET_CHANGED`].
+fn env_back(rec: Option<&Applied>, envs: &[Value]) -> Option<Value> {
+    let r = rec?;
+    let mut out = Map::new();
+    for k in kiln_env(&r.object) {
+        let Some(live) = production_var(envs, &k) else { continue };
+        let same = r.made.get("env").and_then(|e| e.get(&k)).is_some_and(|u| live.get("updatedAt") == Some(u));
+        let ours = r.object.pointer("/spec/env").and_then(|e| e.get(&k)).cloned();
+        out.insert(k, if same { ours.unwrap_or(Value::Null) } else { Value::String(SECRET_CHANGED.into()) });
+    }
+    (!out.is_empty()).then_some(Value::Object(out))
+}
+
+/// The project as an object, with the app's secrets read back when kiln put any there.
+async fn project_live(cx: &Cx<'_>, name: &str, p: &Value) -> Result<Value> {
+    let rec = cx.applied(GROUP, "Project", "", name);
+    let env = match rec.as_ref().filter(|r| !kiln_env(&r.object).is_empty()) {
+        Some(r) => env_back(Some(r), &envs(cx, name).await?),
+        None => None,
+    };
+    Ok(project_object(name, p, env))
 }
 
 /// The project's production deployment as an object.
@@ -57,11 +109,17 @@ async fn production(cx: &Cx<'_>, name: &str) -> Result<Option<Value>> {
     cx.conn.budget().await;
     let d = api(cx)?.call(Method::Get, &format!("/v13/deployments/{}", encode(&id, false)), None).await?;
     let rec = cx.applied(GROUP, "Production", "", name);
-    let output = match rec.as_ref().filter(|r| r.made.get("deployment_id").and_then(Value::as_str) == Some(id.as_str())) {
+    let ours = rec.as_ref().filter(|r| r.made.get("deployment_id").and_then(Value::as_str) == Some(id.as_str()));
+    let output = match ours {
         Some(r) => r.object.pointer("/spec/output").cloned().unwrap_or(Value::Null),
         None => Value::String(format!("deployment:{id}")),
     };
-    let mut o = kiln_cd::providers::object(GROUP, "Production", name, None, json!({ "project": name, "output": output }));
+    let mut spec = json!({ "project": name, "output": output });
+    // The versions of the app's secrets the deployment took.
+    if let (Some(s), Value::Object(m)) = (ours.and_then(|r| r.object.pointer("/spec/secrets")), &mut spec) {
+        m.insert("secrets".into(), s.clone());
+    }
+    let mut o = kiln_cd::providers::object(GROUP, "Production", name, None, spec);
     if let Value::Object(m) = &mut o {
         m.insert("status".into(), json!({ "deploymentId": id, "url": d.get("url"), "readyState": d.get("readyState"), "errorMessage": d.get("errorMessage"), "createdAt": d.get("createdAt") }));
     }
@@ -82,7 +140,10 @@ pub async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result
     let mut out = Vec::new();
     for (ns, name) in names {
         let o = match kind {
-            "Project" => project(cx, name).await?.map(|p| project_object(name, &p)),
+            "Project" => match project(cx, name).await? {
+                Some(p) => Some(project_live(cx, name, &p).await?),
+                None => None,
+            },
             "Production" => production(cx, name).await?,
             "Domain" => domain(cx, ns, name).await?,
             _ => None,
@@ -103,7 +164,8 @@ pub async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
 
 async fn apply_project(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     let name = obj::name(desired);
-    let settings = desired.get("spec").cloned().unwrap_or(json!({}));
+    let mut settings = desired.get("spec").cloned().unwrap_or(json!({}));
+    let want_env = settings.as_object_mut().and_then(|m| m.remove("env")).and_then(|e| e.as_object().cloned()).unwrap_or_default();
     let vc = api(cx)?;
     let p = match project(cx, name).await? {
         None => {
@@ -112,22 +174,49 @@ async fn apply_project(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
             cx.conn.budget().await;
             vc.call(Method::Post, "/v11/projects", Some(&Value::Object(body))).await?
         }
-        Some(live) if !kiln_cd::providers::aws_lambda::covers(&settings, &project_object(name, &live).get("spec").cloned().unwrap_or(Value::Null)) => {
+        Some(live) if !kiln_cd::providers::aws_lambda::covers(&settings, &project_object(name, &live, None).get("spec").cloned().unwrap_or(Value::Null)) => {
             cx.conn.budget().await;
             vc.call(Method::Patch, &format!("/v9/projects/{}", encode(name, false)), Some(&settings)).await?
         }
         Some(live) => live,
     };
-    cx.record(GROUP, "Project", "", name, Some(applied(desired, json!({ "id": p.get("id") })))).await?;
-    Ok(project_object(name, &p))
+    // The app's secrets: each variable that doesn't read back as kiln's reference goes to
+    // Vercel (its value only there), and one the app no longer has is deleted.
+    let rec = cx.applied(GROUP, "Project", "", name);
+    let stale: Vec<String> = rec.as_ref().map(|r| kiln_env(&r.object)).unwrap_or_default().into_iter().filter(|k| !want_env.contains_key(k)).collect();
+    let mut made_env = Map::new();
+    if !want_env.is_empty() || !stale.is_empty() {
+        let live = envs(cx, name).await?;
+        let shown = env_back(rec.as_ref(), &live).unwrap_or(Value::Null);
+        let changed: Vec<Value> = want_env.iter().filter(|(k, v)| shown.get(k.as_str()) != Some(*v)).map(|(k, v)| json!({ "key": k, "value": v, "type": "sensitive", "target": ["production"] })).collect();
+        if !changed.is_empty() {
+            let body = super::resolve_secrets(cx, desired, Value::Array(changed)).await?;
+            cx.conn.budget().await;
+            vc.call(Method::Post, &format!("/v10/projects/{}/env?upsert=true", encode(name, false)), Some(&body)).await?;
+        }
+        for k in &stale {
+            if let Some(id) = production_var(&live, k).and_then(|e| e.get("id")).and_then(Value::as_str) {
+                cx.conn.budget().await;
+                missing(vc.call(Method::Delete, &format!("/v9/projects/{}/env/{}", encode(name, false), encode(id, false)), None).await)?;
+            }
+        }
+        for e in envs(cx, name).await? {
+            if let (Some(k), Some(u)) = (e.get("key").and_then(Value::as_str).filter(|k| want_env.contains_key(*k)), e.get("updatedAt")) {
+                made_env.insert(k.to_owned(), u.clone());
+            }
+        }
+    }
+    cx.record(GROUP, "Project", "", name, Some(applied(desired, json!({ "id": p.get("id"), "env": made_env })))).await?;
+    project_live(cx, name, &p).await
 }
 
 async fn apply_production(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     let name = obj::name(desired);
     let want = desired.pointer("/spec/output").and_then(Value::as_str).unwrap_or_default();
-    // Already serving it: nothing to make.
+    // Already serving it, with the app's secrets at their versions: nothing to make.
     if let Some(live) = production(cx, name).await?
         && live.pointer("/spec/output").and_then(Value::as_str) == Some(want)
+        && live.pointer("/spec/secrets") == desired.pointer("/spec/secrets")
     {
         return Ok(live);
     }
@@ -225,7 +314,7 @@ pub async fn adopt(cx: &Cx<'_>, name: &str) -> Result<Value> {
     let domains = api(cx)?.call(Method::Get, &format!("/v9/projects/{}/domains", encode(name, false)), None).await?;
     let names: Vec<Value> = domains.get("domains").and_then(Value::as_array).into_iter().flatten().filter_map(|d| d.get("name").cloned()).filter(|n| !n.as_str().is_some_and(|s| s.ends_with(".vercel.app"))).collect();
     Ok(json!({
-        "definition": { "project": name, "prebuilt": "${{ artifacts.output }}", "settings": project_object(name, &p).get("spec"), "domains": names },
+        "definition": { "project": name, "prebuilt": "${{ artifacts.output }}", "settings": project_object(name, &p, None).get("spec"), "domains": names },
         "note": "point prebuilt at the zip of .vercel/output that `vercel build` makes in CI (an artifact)",
     }))
 }
@@ -287,6 +376,53 @@ mod tests {
             let before = vercel.state.lock().deployments.len();
             apply(&cx, objs.get(1).ok_or_else(|| anyhow::anyhow!("production"))?).await?;
             assert_eq!(vercel.state.lock().deployments.len(), before);
+
+            // The app's secrets (docs/deploy-api.md §3.5): sensitive production variables, their
+            // values Vercel's alone; the project, its record and what views show hold kiln's
+            // reference; a new version is a new deployment, which takes it.
+            files.1.lock().insert("kiln-secret:app/site/production/API_KEY@1".into(), b"s3cret".to_vec());
+            files.1.lock().insert("kiln-secret:app/site/production/API_KEY@2".into(), b"n3w".to_vec());
+            let with = |version: u32| -> anyhow::Result<Vec<Value>> {
+                let mut objs = desired(&hex)?;
+                kiln_cd::apps::platform_secrets(&mut objs, "app/site/production", &[("API_KEY".into(), version)]).map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(objs)
+            };
+            let value = |st: &fake::VercelState| st.env.get("site").and_then(|l| l.first()).and_then(|e| e.get("value").cloned());
+            let objs1 = with(1)?;
+            let mut shown = Vec::new();
+            for o in &objs1 {
+                shown.push(apply(&cx, o).await?);
+            }
+            {
+                let st = vercel.state.lock();
+                assert_eq!(value(&st), Some(json!("s3cret")), "the value is Vercel's");
+                assert_eq!(st.env.get("site").and_then(|l| l.first()).and_then(|e| e.get("type").cloned()), Some(json!("sensitive")));
+                assert_eq!(st.deployments.last().and_then(|d| d.pointer("/env/API_KEY")), Some(&json!("s3cret")), "a deployment took it");
+            }
+            assert_eq!(shown.first().and_then(|p| p.pointer("/spec/env/API_KEY")), Some(&json!("kiln-secret:app/site/production/API_KEY@1")));
+            assert_eq!(shown.get(1).and_then(|p| p.pointer("/spec/secrets")), Some(&json!("API_KEY@1")));
+            assert!(!format!("{shown:?}").contains("s3cret") && !format!("{:?}", records.0.lock()).contains("s3cret"), "no value in what kiln shows or keeps");
+            let made = vercel.state.lock().deployments.len();
+            for o in &objs1 {
+                apply(&cx, o).await?;
+            }
+            assert_eq!(vercel.state.lock().deployments.len(), made, "the same secret again makes nothing");
+            for o in &with(2)? {
+                apply(&cx, o).await?;
+            }
+            {
+                let st = vercel.state.lock();
+                assert_eq!(value(&st), Some(json!("n3w")));
+                assert_eq!((st.deployments.len(), st.deployments.last().and_then(|d| d.pointer("/env/API_KEY"))), (made + 1, Some(&json!("n3w"))), "a new version, a new deployment that takes it");
+            }
+            // Changed by hand: drift, the value unshown. Taken out of the app: deleted.
+            if let Some(e) = vercel.state.lock().env.get_mut("site").and_then(|l| l.first_mut()).and_then(Value::as_object_mut) {
+                e.insert("updatedAt".into(), json!(1));
+            }
+            let drifted = list(&cx, "Project", &[(String::new(), "site".to_owned())]).await?;
+            assert_eq!(drifted.first().and_then(|p| p.pointer("/spec/env/API_KEY")), Some(&json!(kiln_cd::apps::SECRET_CHANGED)));
+            apply(&cx, objs.first().ok_or_else(|| anyhow::anyhow!("project"))?).await?;
+            assert!(vercel.state.lock().env.get("site").is_some_and(Vec::is_empty), "the variable the app no longer has is gone");
 
             // A deployment someone made serves production now: drift.
             vercel.state.lock().foreign_production("site");
