@@ -1973,7 +1973,13 @@ W20.
   cpu, memory, disk }` (1.5, 1 and 1 by default) and `default_request = { cpu, memory, disk, gpu
   }`.
   - A runner offers what its facts say it has (W13-R01): its CPUs' threads, its memory, its work
-    volume's free disk and its GPUs. Until its facts are in, it offers its slots.
+    volume's free disk and its GPUs. Until its facts are in, it offers its slots. Its memory is
+    no more than its cgroups let it use (2026-10-25): the least `memory.max` of its own cgroup
+    and those above it (v1's `memory.limit_in_bytes`), so a runner in a container, a pod or a
+    systemd scope offers that and not the machine's (the corpus lab's, in a 40G scope on a
+    124 GB machine, would have taken seven 16 GiB legs at once). Checked by
+    `w05_r03_a_runners_memory_is_the_least_limit_above_it` and
+    `w05_r03_a_runner_offers_its_cgroups_memory`.
   - A leg takes what its job's `resources:` asks, else the default. CPUs are written as
     Kubernetes writes them (`2`, `0.5`, `500m` for half of one); memory and disk with their units.
     A pool's `resources.cpu` reads `500m` the same way now, where it was 500 minutes.
@@ -1988,13 +1994,17 @@ W20.
     itself (its `Cpus_allowed_list`: its affinity within its cgroup's cpuset); each leg takes
     those no other leg holds while there are any, then the least held, and gives them back when
     it ends. A job container and its services get them as `--cpuset-cpus` (a hosted runner's
-    services share its machine), and a host step starts within them through `taskset` (Linux;
-    elsewhere a leg sees the machine's). So `nproc` says the leg's, and what sizes its work by it
-    (`make -j$(nproc)`, cargo's jobs, a test runner's workers) does as on a hosted runner's
-    machine of that size, its memory going with it: ruff's formatter check and TypeScript's API
-    tests had started a worker per CPU of the lab's 32 (corpus pass 1024b). Checked by
-    `w05_r03_legs_take_cpus_of_their_own`, `w05_r03_a_host_leg_runs_on_its_cpus` and, with
-    Docker, `w05_r03_a_containers_cpus_are_its_legs`. Not in a pod: a one-leg runner there
+    services share its machine); a pool's executor, started before its leg came (W13-R09), gets
+    them and the leg's memory by `docker update` as the leg takes it; and a host step starts
+    within them through `taskset` (Linux; elsewhere a leg sees the machine's). An engine that
+    can't hold a container to CPUs (a rootless one without the cpuset controller delegated to
+    it) drops them with a warning, as Docker and Podman do, and the leg sees the machine's. So
+    `nproc` says the leg's, and what sizes its work by it (`make -j$(nproc)`, cargo's jobs, a test
+    runner's workers) does as on a hosted runner's machine of that size, its memory going with it:
+    ruff's formatter check and TypeScript's API tests had started a worker per CPU of the lab's 32
+    (corpus pass 1024b). Checked by `w05_r03_legs_take_cpus_of_their_own`,
+    `w05_r03_a_host_leg_runs_on_its_cpus` and, with Docker, `w05_r03_a_containers_cpus_are_its_legs`
+    and `w05_r03_a_pools_container_is_held_to_its_legs`. Not in a pod: a one-leg runner there
     (`kiln agent --ephemeral`, a job's or a `k8s` pool's) has the CPUs its cluster gives it, its
     node's, which the node's other pods share, so the dispatcher leaves the leg's CPUs out (each
     pod would take the same first ones); a microVM leg has its microVM's vCPUs. *Left*: the
@@ -4082,10 +4092,14 @@ enforcement points to W18, agent isolation to W20.
   (`kiln.android-sdk-license=accepted`). There's no slim one (sdkmanager needs the JDK)
   (`runner_images_have_a_dockerfile`).
 - *Done.* The leg's machine more as a hosted runner's is (corpus pass 1024b, 2026-10-24):
-  - `/tmp` is a volume of its own: anonymous, on the engine's disk, the image's mode (1777), gone
-    with the leg's containers. The container's overlay makes no file handles, so fanotify's
-    watchers failed there (TypeScript's `fswatch` tests, 126 of them). A job's `container:` keeps
-    its own `/tmp`, as on GitHub;
+  - `/tmp` is the machine's own, on the container's file system with its home, as a hosted
+    runner's machine has one disk (2026-10-25): a rename from it into the home directory works
+    (jetli/wasm-pack-action's of wasm-pack into `~/.cargo/bin`). A `/tmp` volume of its own, as
+    kiln gave it on 2026-10-24 for fanotify's watchers, refused that rename across mounts (EXDEV,
+    ruff's `cargo-test-wasm`, corpus pass 1025a): such renames are common in setup steps, file
+    handles rare in tests. *Left*: the container's overlay makes no file handles, so fanotify's
+    watchers fail in it (TypeScript's `fswatch` tests, 126 of them, corpus pass 1024b) where a
+    hosted runner's ext4 has them; a microVM leg (W13-R05) has an ext4 of its own;
   - `/opt` is open to all, as GitHub's images leave it (`chmod -R 777 /opt`): steps make their own
     directories there without sudo (neovim's `old-cmake` job);
   - the runner user's `~/.cargo/bin`, `~/.config/composer/vendor/bin` and `~/.dotnet/tools` are

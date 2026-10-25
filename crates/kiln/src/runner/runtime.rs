@@ -2064,7 +2064,6 @@ impl Leg {
             seccomp_unconfined: false,
             user: None,
             workspace_size: None,
-            tmp_volume: false,
             memory: None,
             seed_tools: false,
             cpuset: st.cpus.as_ref().map(|l| l.list()),
@@ -2201,6 +2200,12 @@ impl Leg {
             let own = crate::githost::host_of(if a.runtime.registry_url.is_empty() { &a.runtime.facade_url } else { &a.runtime.registry_url });
             let mut c = w.containers;
             c.cli = c.cli.through(&own, a.runtime.mirrors.clone());
+            // Its pool started it without the leg's CPUs and memory (W05-R03): given them now. A
+            // leg that can't be held to them still runs, and says so.
+            let cpus = st.cpus.as_ref().map(|l| l.list());
+            if let Err(e) = c.hold(cpus.as_deref(), a.executor.options.get("memory").and_then(serde_json::Value::as_u64)).await {
+                self.note(idx, &format!("The pool's executor couldn't be held to the leg's CPUs and memory: {e:#}")).await;
+            }
             st.containers = Some(c);
             return Ok(());
         }
@@ -2248,7 +2253,6 @@ impl Leg {
                     docker_proxy,
                     seccomp_unconfined: socket,
                     env,
-                    tmp_volume: true,
                     seed_tools: true,
                     ..super::docker::Spec::default()
                 })
