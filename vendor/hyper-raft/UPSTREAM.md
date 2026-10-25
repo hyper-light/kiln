@@ -22,14 +22,18 @@ Each change is recorded in `vendor/patches/hyper-raft/`, applied in this order o
 | File | Change | Why | Recorded as |
 |---|---|---|---|
 | `crates/hyper-durable/src/lib.rs`, `crates/hyper-durable/Cargo.toml` | `RamStore` compiled only for the crate's own tests or under the `test-store` feature, which a dev-dependency asks for (the crate's own tests ask through one on itself) | the write-ahead log is mandatory in Quiver and kiln: `GroupStore` on a real device, `RamStore` test-only, and a build that names it outside a test fails (kiln's CP-T2.1, T-T2.1.2; Quiver's `crates/quiver/tests/ram_store.rs`) | `0001-ramstore-for-tests-alone-the-write-ahead-log-mandatory.patch` |
+| `crates/hyper-rt/src/iocp.rs` | widening a socket's AFD poll cancels the old poll first and issues the poll for the union once the cancelled completion is reclaimed (`widening`), so a socket never has two AFD polls in flight; a refused issue then wakes the socket's waiters to retry | issued before the narrower poll was cancelled, the wider one never completed on Windows 11: a runner whose send blocked as its receive queue emptied heard nothing more from its server, and its connection idled out ten seconds after every connect (Jupiter, 2026-10-24); wepoll and mio likewise cancel, await the completion, then poll again | `0002-iocp-a-widened-afd-poll-issued-only-once-the-old-one-s.patch` |
 
-The change is Quiver's and kiln's policy, not hyper-raft's, so it isn't offered upstream: hyper-durable
+The first change is Quiver's and kiln's policy, not hyper-raft's, so it isn't offered upstream: hyper-durable
 calls `RamStore` slates' case (each write complete as it's submitted), and gating it in hyper-raft
 would reach slates. Focal's agent agrees (2026-10-22), and notes that Focal names `RamStore` only in a
 test module (`focal-consensus`'s `shell_tests.rs`): sharing this copy, it would ask for `test-store`
 as a dev-dependency, as kiln's sync tests do.
 
+The second is a fix of hyper-raft's own, to be offered upstream: once hyper-raft carries it, the
+re-vendor drops it.
+
 ## Taking a newer upstream
 
 `python3 scripts/vendor.py hyper-raft <commit>` takes these crates at that commit and re-applies the
-change above by three-way merge; take it at the revision Focal's bus takes.
+changes above by three-way merge; take it at the revision Focal's bus takes.
