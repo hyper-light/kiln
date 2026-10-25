@@ -368,22 +368,14 @@ pub fn builtins() -> Vec<Dashboard> {
         Dashboard {
             id: "builtin:agents".into(),
             title: "kiln agents".into(),
-            description: "Agents' goals and sessions: goals sent and how they ended, each harness host's looks, its records and its journal, and messages sent to sessions: each taken once, a repeat answered as the first was and never delivered again, those refused and why, those not answered in time.".into(),
+            description: "Agents' goals and sessions: goals sent and how they ended, each harness host's looks and its records, and messages sent to sessions: each taken once, a repeat answered as the first was and never delivered again, those refused and why, those not answered in time.".into(),
             template_variables: host.clone(),
             widgets: vec![
                 // The goal driver is the server's: its counts are the server's alone.
-                widget("Goals sent", "timeseries", &["sum:kiln_goals_sent_total{*} by {kind}.as_count()"], (0, 0, 4, 4), json!({ "display": "bars" })),
-                widget("Goals ended", "timeseries", &["sum:kiln_goals_ended_total{*} by {status}.as_count()"], (4, 0, 4, 4), json!({ "display": "bars" })),
-                widget("Harness looks, by host", "timeseries", &["sum:kiln_harness_polls_total{$host} by {host}.as_count()"], (8, 0, 4, 4), json!({ "display": "bars" })),
-                widget("Session records written, by host", "timeseries", &["sum:kiln_harness_records_written_total{$host} by {host}.as_count()"], (0, 4, 4, 4), json!({ "display": "bars" })),
-                widget(
-                    "Journal commits, and those that could not be written",
-                    "timeseries",
-                    &["sum:kiln_harness_journal_commits_total{$host} by {outcome}.as_count()", "sum:kiln_harness_journal_rehanded_total{$host}.as_count()"],
-                    (4, 4, 4, 4),
-                    json!({ "display": "bars" }),
-                ),
-                widget("A journal commit, p50 and p99 (s)", "timeseries", &["p50:kiln_harness_journal_commit_seconds{$host} by {host}", "p99:kiln_harness_journal_commit_seconds{$host} by {host}"], (8, 4, 4, 4), json!({ "unit": "s" })),
+                widget("Goals sent", "timeseries", &["sum:kiln_goals_sent_total{*} by {kind}.as_count()"], (0, 0, 6, 4), json!({ "display": "bars" })),
+                widget("Goals ended", "timeseries", &["sum:kiln_goals_ended_total{*} by {status}.as_count()"], (6, 0, 6, 4), json!({ "display": "bars" })),
+                widget("Harness looks, by host", "timeseries", &["sum:kiln_harness_polls_total{$host} by {host}.as_count()"], (0, 4, 6, 4), json!({ "display": "bars" })),
+                widget("Session records written, by host", "timeseries", &["sum:kiln_harness_records_written_total{$host} by {host}.as_count()"], (6, 4, 6, 4), json!({ "display": "bars" })),
                 // Messages are the server's counts, of every machine's inboxes' answers (a runner's
                 // registry holds them at 0); how long a take was, each host's, where it was taken.
                 widget("Messages taken", "timeseries", &["sum:kiln_sends_accepted_total{*}.as_count()"], (0, 8, 4, 4), json!({ "display": "bars" })),
@@ -482,6 +474,31 @@ mod tests {
         anyhow::ensure!(d.put(bad).is_err(), "an unknown kind is refused");
         let reopened = Dashboards::open(dir.path());
         anyhow::ensure!(reopened.list().len() == builtins().len() * 2, "kept across a restart");
+        Ok(())
+    }
+
+    /// A panel of a metric kiln doesn't write stays empty for good: every `kiln_…` metric kiln's own
+    /// dashboards chart is one of its registry's families (each said, with its TYPE, before anything
+    /// happened), a histogram's `_bucket`, `_sum` and `_count` its own. The agents dashboard once
+    /// drew CP-T3.1's journal (docs/sim.md), whose families main doesn't have yet.
+    #[test]
+    fn kiln_s_own_dashboards_chart_what_kiln_s_registry_writes() -> anyhow::Result<()> {
+        let text = crate::metrics::render();
+        let typed = |name: &str, kind: &str| text.contains(&format!("# TYPE {name} {kind}"));
+        let mut unwritten = Vec::new();
+        for d in builtins() {
+            for w in &d.widgets {
+                for q in &w.queries {
+                    for name in q.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|t| t.starts_with("kiln_")) {
+                        let of_histogram = ["_bucket", "_sum", "_count"].iter().any(|s| name.strip_suffix(s).is_some_and(|base| typed(base, "histogram")));
+                        if !typed(name, "") && !of_histogram {
+                            unwritten.push(format!("{} › {}: {name}", d.title, w.title));
+                        }
+                    }
+                }
+            }
+        }
+        anyhow::ensure!(unwritten.is_empty(), "panels of metrics kiln doesn't write: {unwritten:?}");
         Ok(())
     }
 
