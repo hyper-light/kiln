@@ -519,11 +519,11 @@ fn reach_words(reach: Option<&str>) -> String {
 /// A command as the adapter should see it (attachments stored first).
 async fn prepare(files: &Files, c: Command) -> Command {
     match c {
-        Command::Send { id, text, mode, attachments, overrides } if !attachments.is_empty() => {
+        Command::Send { id, text, mode, attachments, overrides, reply_to } if !attachments.is_empty() => {
             let files = files.clone();
             let msg = id.clone();
             let stored = crate::rt::blocking(move || store_attachments(&files, &msg, attachments)).await.unwrap_or_default();
-            Command::Send { id, text, mode, attachments: stored, overrides }
+            Command::Send { id, text, mode, attachments: stored, overrides, reply_to }
         }
         other => other,
     }
@@ -822,7 +822,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         if sd.picks_up {
             text.push_str(", and the turn it was in the middle of goes on here");
             let ask = format!("This conversation just moved here from {}, which interrupted your last turn. Pick up where you left off.", sd.from);
-            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: ask, at: Core::now(), attachments: Vec::new(), overrides: None });
+            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: ask, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
         }
         if let Some(n) = &sd.note {
             text.push_str(". ");
@@ -1237,6 +1237,50 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_ch
                 (files.spawn)(b);
             }
             super::core::Effect::Restart { resume_at } => restart = Some(resume_at),
+            // The go-back a harness without one gets from kiln (`harness::goback`): the store's
+            // timeline truncates, its transcript seeds a branch, the workspace's checkpoint
+            // (a hidden ref) restores its files.
+            super::core::Effect::GoBack { op, event } => {
+                match op {
+                    super::core::GoBackOp::Fork | super::core::GoBackOp::Branch => {
+                        let mut b = s.resume_spec();
+                        // No native resume: the branch is seeded with the conversation in words.
+                        b.resume = None;
+                        b.resume_at = None;
+                        b.fork = false;
+                        b.name = Some(format!("{} (branch)", s.info().name));
+                        b.prompt = Some(super::goback::branch_prompt(&s.core.lock(), if op == super::core::GoBackOp::Branch { Some(event.as_str()) } else { None }));
+                        (files.spawn)(b);
+                    }
+                    _ => {
+                        let mut core = s.core.lock();
+                        let (at, words) = match core.get(&event) {
+                            Some(e) => (e.at, match &e.body { super::model::Body::User { text, .. } => super::model::clip_middle(text.trim(), 80).0, _ => String::new() }),
+                            None => continue,
+                        };
+                        let cwd = core.state.cwd.clone();
+                        // The workspace goes back to the checkpoint the prompt's own moment made.
+                        let did = if cwd.is_empty() { "the folder isn't known".to_owned() } else { super::goback::restore_files(&cwd, &s.id, at) };
+                        if op == super::core::GoBackOp::RewindFiles {
+                            super::goback::notice(&mut core, super::model::Level::Info, format!("Restored files to \"{words}\": {did}."));
+                        } else {
+                            // The process can't come back at the point natively: it starts over
+                            // and the truncated conversation is said to it (the store keeps the
+                            // record of what went).
+                            core.truncate_from(&event);
+                            let transcript = super::goback::seed_prompt(&core, None);
+                            let keep: std::collections::HashSet<String> = core.events().map(|e| e.id.clone()).collect();
+                            core.state.delivery.retain(|k, _| keep.contains(k));
+                            core.state.harness_session = None;
+                            s.spec.lock().resume = None;
+                            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: format!("The conversation was rewound here. What it is now:\n\n{transcript}\n\nGo on from the last message."), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
+                            super::goback::notice(&mut core, super::model::Level::Info, format!("Rewound to \"{words}\": {did}. The agent starts again with the conversation up to here."));
+                            restart = Some(None);
+                        }
+                        core.touch_state();
+                    }
+                }
+            }
             super::core::Effect::AllowBypass => s.spec.lock().allow_bypass = true,
             super::core::Effect::Run { job, args } => {
                 let mut spec = s.spec.lock().clone();
@@ -1696,7 +1740,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         // the limit cut off goes on first.
         let unpaused = core.state.pause.take();
         if unpaused.as_ref().is_some_and(|p| p.cut.is_some()) {
-            core.state.queue.insert(0, super::model::QueueItem { id: format!("{}{}", super::pause::KILN_ID, crate::util::new_id()), text: super::pause::CONTINUE_ELSEWHERE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None });
+            core.state.queue.insert(0, super::model::QueueItem { id: format!("{}{}", super::pause::KILN_ID, crate::util::new_id()), text: super::pause::CONTINUE_ELSEWHERE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
         }
         let mut text = format!("Now {} ({})", model_label(to, &sw.model), to.name);
         if !empty {
@@ -2504,7 +2548,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     core.touch_state();
                     adapter.start(&mut core);
                     if first && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
-                        adapter.command(&mut core, Command::Send { id: crate::util::new_id(), text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None });
+                        adapter.command(&mut core, Command::Send { id: crate::util::new_id(), text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None});
                     }
                     for c in carry.drain(..) {
                         adapter.command(&mut core, c);

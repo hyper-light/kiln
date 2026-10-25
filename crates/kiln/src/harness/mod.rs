@@ -32,6 +32,7 @@ pub mod elicit;
 pub mod elsewhere;
 pub mod files;
 pub mod gitstate;
+pub mod goback;
 pub mod handing;
 pub mod handoff;
 pub mod homes;

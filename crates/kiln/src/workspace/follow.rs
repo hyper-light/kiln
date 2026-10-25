@@ -152,7 +152,7 @@ pub async fn deliver(hub: &Hub, agent: &str, text: String) {
     }
     let message = crate::util::new_id();
     crate::harness::wait::sent(&info.id, info.last_turn.as_ref().map(|t| t.at));
-    let sent = hub.harness.command(hub, &info.id, Command::Send { id: message, text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None }).await;
+    let sent = hub.harness.command(hub, &info.id, Command::Send { id: message, text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None }).await;
     if !matches!(sent, crate::harness::registry::Sent::Ok) {
         tracing::info!(agent = %info.id, "a change request's news didn't reach its agent");
     }

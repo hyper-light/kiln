@@ -47,7 +47,7 @@ fn installed_devin_native_history_and_repl_ownership() -> anyhow::Result<()> {
         let s = &running.0;
         until(|| { let c = s.core.lock(); c.state.status == Status::Idle && !c.meta.models.is_empty() }).await?;
         let prompt = "Reply with exactly KILN_DEVIN_NATIVE_OK. Do not use tools or access files.";
-        assert!(s.command(Command::Send { id: "native-answer".into(), text: prompt.into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None }));
+        assert!(s.command(Command::Send { id: "native-answer".into(), text: prompt.into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None }));
         until(|| s.core.lock().state.delivery.get("native-answer") == Some(&Delivery::Completed)).await?;
         let (own, model) = {
             let c = s.core.lock();

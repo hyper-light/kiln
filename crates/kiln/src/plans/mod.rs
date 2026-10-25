@@ -859,7 +859,7 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, pick: &Pick, b
     };
     let mut sent = messages.len().saturating_sub(rest.len());
     for text in rest {
-        let c = Command::Send { id: crate::util::new_id(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None };
+        let c = Command::Send { id: crate::util::new_id(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None };
         match hub.harness.command(hub, &session, c).await {
             Sent::Ok => sent += 1,
             Sent::NoSession => return Err(Error::Bad("no such agent".into())),

@@ -662,7 +662,7 @@ impl Codex {
         if self.turn.is_some() {
             let Some(text) = self.stopped_note(core) else { return };
             let id = format!("{}{}", super::pause::KILN_ID, crate::util::new_id());
-            self.send(core, QueueItem { id: id.clone(), text, at: Core::now(), attachments: Vec::new(), overrides: None }, SendMode::Steer);
+            self.send(core, QueueItem { id: id.clone(), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Steer);
             super::pause::from_kiln(core, &id);
         } else if now && !self.busy(core) {
             let Some(note) = self.stopped_note(core) else { return };
@@ -792,6 +792,8 @@ impl Codex {
         c.push(t);
         // MCP servers and skills have their own state and commands (State::mcp, State::skills).
         core.meta.controls = c;
+        // What its own go-back doesn't reach (restoring files) kiln's does (`harness::goback`).
+        super::goback::declare(core);
         let model = core.state.model.clone();
         core.meta.efforts = match self.efforts.get(&model).or_else(|| self.efforts.get("")) {
             Some(l) => l.iter().map(|(e, d)| opt(e, &super::model::effort_label(e), d, false)).collect(),
@@ -922,7 +924,10 @@ impl Codex {
                 self.reload = Some(value.as_ref().and_then(|v| v.get("what")).and_then(Value::as_str).unwrap_or("Changed settings").to_owned());
                 self.reload_when_idle(core);
             }
-            _ => {}
+            // Its own rewind/branch/fork; a file restore is kiln's (`harness::goback`).
+            _ => {
+                super::goback::control(core, id, value.as_ref());
+            }
         }
         self.compose_status(core);
     }
@@ -1042,10 +1047,16 @@ impl Codex {
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         match cmd {
-            Command::Send { id, text, mode, attachments, overrides } => self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides }, mode),
-            Command::QueueEdit { id, text } => {
+            Command::Send { id, text, mode, attachments, overrides, reply_to } => {
+                // A checkpoint anchors the prompt's moment: kiln's go-back file restore
+                // (`harness::goback`) reaches back to it (Codex's own rewind has no files side).
+                core.effects.push(Effect::Checkpoint { at: Core::now() });
+                self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to }, mode);
+            }
+            Command::QueueEdit { id, text, attachments } => {
                 if let Some(q) = core.state.queue.iter_mut().find(|q| q.id == id) {
                     q.text = text;
+                    if let Some(a) = attachments { q.attachments = a; }
                     core.touch_state();
                 }
             }
@@ -1235,7 +1246,7 @@ impl Codex {
                     Some(a) => format!("/{name} {a}"),
                     None => format!("/{name}"),
                 };
-                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None }, mode);
+                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, mode);
             }
             Command::SkillsReload => {
                 let cwd = core.state.cwd.clone();
@@ -1631,13 +1642,13 @@ impl Codex {
         core.state.delivery.insert(m.id.clone(), d);
         let (images, names) = super::model::attachment_summary(&m.attachments);
         core.note_sent(&m.id);
-        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names });
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
         core.touch_state();
     }
 
     /// Shown for a message kiln sends on its own (feedback after a refusal).
     fn note(&mut self, core: &mut Core, id: &str, text: &str, d: Delivery) {
-        let m = QueueItem { id: id.to_owned(), text: text.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None };
+        let m = QueueItem { id: id.to_owned(), text: text.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None };
         self.show_sent(core, &m, d);
     }
 
@@ -1731,7 +1742,7 @@ impl Codex {
     pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
         if p.cut.is_some() && !self.busy(core) && core.state.status != Status::Exited {
             let id = crate::util::new_id();
-            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None }, SendMode::Queue);
+            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Queue);
             super::pause::from_kiln(core, &id);
             return;
         }
@@ -1812,7 +1823,7 @@ impl Codex {
                 // Cancelled: the feedback starts the next turn.
                 _ => {
                     self.note(core, &mid, &f, Delivery::Queued);
-                    self.waiting.insert(0, QueueItem { id: mid, text: f, at: Core::now(), attachments: Vec::new(), overrides: None });
+                    self.waiting.insert(0, QueueItem { id: mid, text: f, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
                 }
             }
         }
@@ -3280,11 +3291,12 @@ impl Codex {
                     .filter_map(|x| x.get("name").or_else(|| x.get("path")).and_then(Value::as_str))
                     .map(|p| p.rsplit('/').next().unwrap_or(p).to_owned())
                     .collect();
-                let (images, attachments) = match core.get(&key).map(|e| &e.body) {
-                    Some(Body::User { images, attachments, .. }) if !attachments.is_empty() => ((*images).max(counted), attachments.clone()),
-                    _ => (counted, named),
+                let (images, attachments, reply_to) = match core.get(&key).map(|e| &e.body) {
+                    Some(Body::User { images, attachments, reply_to, .. }) if !attachments.is_empty() => ((*images).max(counted), attachments.clone(), reply_to.clone()),
+                    Some(Body::User { reply_to, .. }) => (counted, named, reply_to.clone()),
+                    _ => (counted, named, None),
                 };
-                core.upsert(&key, parent.clone(), Body::User { text, images, client_id: client, origin: Some("human".into()), attachments });
+                core.upsert(&key, parent.clone(), Body::User { text, images, client_id: client, origin: Some("human".into()), attachments, reply_to });
             }
             "agentMessage" => {
                 let text = item.get("text").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -4225,7 +4237,7 @@ mod tests {
         feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
         feed(&mut c, &mut core, &[json!({"id": 2, "result": {"thread": {"id": "th1", "cliVersion": "0.162.1", "turns": []}, "model": "gpt-5", "cwd": "/work"}})]);
         let _ = written(&mut core);
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "port the parser".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "port the parser".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let start = written(&mut core).into_iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).unwrap_or_default();
         feed(
             &mut c,
@@ -4235,7 +4247,7 @@ mod tests {
                 json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "inProgress", "items": []}}}),
             ],
         );
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "then the tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "then the tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         assert_eq!(core.state.queue.len(), 1);
         let said = "You've hit your usage limit. Upgrade to Pro or try again in 2 hours 13 minutes.";
         let before = Core::now();
@@ -4273,7 +4285,7 @@ mod tests {
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("initialize"));
         // A message before the thread exists waits for it.
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "list files".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "list files".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         assert!(core.take_writes().is_empty());
         feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
         let w = written(&mut core);
@@ -4303,7 +4315,7 @@ mod tests {
         assert_eq!((a.command.as_deref(), a.reason.as_deref()), (Some("rm -rf build"), Some("outside the sandbox")));
         assert_eq!(a.always.len(), 2);
         // A steer while the turn runs goes in as turn/steer.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "only build/".into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "only build/".into(), mode: SendMode::Steer, attachments: vec![], overrides: None, reply_to: None});
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("turn/steer"));
         assert_eq!(w.first().and_then(|v| v.pointer("/params/expectedTurnId")).and_then(Value::as_str), Some("t1"));
@@ -4370,7 +4382,7 @@ mod tests {
         ]}]}, "model": "gpt-5"}})]);
         assert!(core.get("u0").is_some() && core.get("a0").is_some());
         core.take_writes();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "edit it".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "edit it".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/params/sandboxPolicy/type")).and_then(Value::as_str), Some("readOnly"));
         let rid = w.first().and_then(|v| v.get("id")).cloned().unwrap_or_default();
@@ -4387,14 +4399,14 @@ mod tests {
         assert_eq!(a.title, "a.rs");
         assert_eq!(a.diffs.first().and_then(|d| d.hunks.first()).map(|h| h.lines.clone()), Some(vec!["-old".to_owned(), "+new".to_owned()]));
         // Queue while busy; deny with feedback declines and steers the feedback in.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "then test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "then test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         assert_eq!(core.state.queue.len(), 1);
         c.command(&mut core, Command::Approve { id: "44".into(), decision: Decision::Deny, message: Some("keep old".into()), always: None, answers: None, choices: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/result/decision")).and_then(Value::as_str), Some("decline"));
         assert!(w.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("turn/steer") && v.pointer("/params/input/0/text").and_then(Value::as_str) == Some("keep old")));
         // Send now: interrupt, and the message starts the next turn.
-        c.command(&mut core, Command::Send { id: "m3".into(), text: "stop and do X".into(), mode: SendMode::Now, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m3".into(), text: "stop and do X".into(), mode: SendMode::Now, attachments: vec![], overrides: None, reply_to: None});
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("turn/interrupt"));
         feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "interrupted", "items": []}}})]);
@@ -4661,7 +4673,7 @@ mod tests {
     fn a_queued_message_is_steered_into_the_running_turn() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
         assert!(core.meta.features.iter().any(|f| f == "queue_steer"));
-        let send = |c: &mut Codex, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let send = |c: &mut Codex, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         // A turn is starting (no id yet); a message waits behind it.
         send(&mut c, &mut core, "m1", "build it");
         let w = written(&mut core);
@@ -4927,7 +4939,7 @@ mod tests {
         assert_eq!(core.state.mode, "read-only");
         assert_eq!(core.state.control_values.get("approval_policy"), Some(&json!("on-request")));
         assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "hi".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "hi".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!(start.pointer("/params/approvalPolicy").and_then(Value::as_str), Some("on-request"));
@@ -4946,10 +4958,10 @@ mod tests {
     #[test]
     fn a_running_permission_change_cancels_only_its_requests_and_continues_before_the_queue() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "finish the change".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "finish the change".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "then run tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "then run tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         core.state.tasks.push(Task { id: "child".into(), description: "Review".into(), class: Some("agent".into()), ..Task::default() });
         for (id, thread) in [("own-ask", "th1"), ("child-ask", "child")] {
             feed(&mut c, &mut core, &[json!({"id": id, "method": "item/commandExecution/requestApproval",
@@ -4989,7 +5001,7 @@ mod tests {
     #[test]
     fn changing_permissions_while_the_turn_starts_waits_for_its_id() {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let start = written(&mut core);
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
         assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
@@ -5003,7 +5015,7 @@ mod tests {
     #[test]
     fn a_late_start_reply_cannot_resurrect_the_turn_interrupted_for_permissions() {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let start = written(&mut core);
         feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}})]);
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
@@ -5022,7 +5034,7 @@ mod tests {
     fn a_permission_change_does_not_continue_finished_or_explicitly_stopped_work() {
         for (status, stop) in [("completed", false), ("interrupted", true)] {
             let (mut c, mut core, _) = opened();
-            c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+            c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
             let start = written(&mut core);
             respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
             c.command(&mut core, Command::SetMode { mode: "full-access".into() });
@@ -5043,7 +5055,7 @@ mod tests {
     fn an_old_permission_interrupt_cannot_block_or_cancel_the_next_turns_change() {
         for failed in [false, true] {
             let (mut c, mut core, _) = opened();
-            c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+            c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
             let start = written(&mut core);
             respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
             c.command(&mut core, Command::SetMode { mode: "full-access".into() });
@@ -5069,12 +5081,12 @@ mod tests {
     #[test]
     fn an_explicit_replacement_does_not_requeue_the_work_interrupted_for_permissions() {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "old work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "old work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
         written(&mut core);
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "do this instead".into(), mode: SendMode::Now, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "do this instead".into(), mode: SendMode::Now, attachments: vec![], overrides: None, reply_to: None});
         written(&mut core);
         feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
         let w = written(&mut core);
@@ -5171,7 +5183,7 @@ mod tests {
     fn under_full_access_a_subagent_started_before_asks_nobody_and_is_replaced() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
         // Auto: the turn, and the subagent it starts, work in the folder and ask beyond it.
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "review the PRs".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "review the PRs".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5219,7 +5231,7 @@ mod tests {
     fn narrowing_permissions_stops_subagents_allowed_more_and_the_parent_replaces_them() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5282,7 +5294,7 @@ mod tests {
     #[test]
     fn a_person_stops_a_subagent_from_its_row() {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5297,7 +5309,7 @@ mod tests {
     fn a_change_between_turns_that_stops_subagents_goes_on_with_their_work() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5316,7 +5328,7 @@ mod tests {
     #[test]
     fn an_adopted_session_already_in_full_access_moves_its_waiting_older_work_onto_it() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5353,7 +5365,7 @@ mod tests {
     #[test]
     fn a_subagent_kiln_could_not_stop_leaves_its_request_to_the_person() {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5377,7 +5389,7 @@ mod tests {
     #[test]
     fn a_request_held_back_is_shown_if_its_work_never_stops_and_a_refused_turn_asks_the_person() {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5464,7 +5476,7 @@ mod tests {
         c.command(&mut core, Command::SetEffort { effort: "high".into() });
         assert_eq!(core.state.effort, "high");
         let _ = written(&mut core);
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "one".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "one".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None});
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("high"), Some("custom-model")));
@@ -5472,7 +5484,7 @@ mod tests {
         feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "completed", "items": []}}})]);
         let _ = written(&mut core);
         let o = super::super::model::Overrides { model: Some("o-mini".into()), effort: Some("low".into()) };
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "two".into(), mode: SendMode::Queue, attachments: vec![], overrides: Some(o) });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "two".into(), mode: SendMode::Queue, attachments: vec![], overrides: Some(o) , reply_to: None});
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("low"), Some("o-mini")));
@@ -5614,7 +5626,7 @@ mod tests {
             (json!({"type": "systemError"}), Status::Exited),
         ] {
             let (mut c, mut core, _) = opened();
-            c.waiting.push(QueueItem { id: "queued".into(), text: "Next task".into(), at: Core::now(), attachments: Vec::new(), overrides: None });
+            c.waiting.push(QueueItem { id: "queued".into(), text: "Next task".into(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
             c.open_thread(&mut core, "thread/resume", json!({"threadId": "th1"}));
             let requests = written(&mut core);
             respond(&mut c, &mut core, &requests, "thread/resume", json!({"thread": {"id": "th1", "turns": [], "status": status}, "model": "gpt-5", "cwd": "/work"}));

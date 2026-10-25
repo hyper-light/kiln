@@ -31,7 +31,7 @@ import { DesktopLayout, INSPECTOR_COLLAPSED } from "./desktop";
 import { PausedLine } from "./pause";
 import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
-import { Timeline } from "./timeline";
+import { Timeline, type ReplyTarget } from "./timeline";
 import { BesideTerminals, openBeside as openTerminal } from "./beside";
 import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
@@ -75,7 +75,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const accepts = useSession(store, (s) => acceptsOf(s.meta));
   const [params, setParams] = useSearchParams();
   const taskId = params.get("task");
-  const taskInfo = useSession(store, (s) => taskId ? s.state?.tasks.find((t) => t.id === taskId || t.tool_id === taskId) : undefined);
+  const taskInfo = useSession(store, (s) => (taskId ? s.state?.tasks.find((t) => t.id === taskId || t.tool_id === taskId) : undefined));
   // Mission Control links by the stable task id; the timeline groups its events by spawn call.
   const task = taskId ? taskInfo?.tool_id || taskId : null;
   const wide = useMediaQuery("(min-width: 1100px)");
@@ -129,6 +129,8 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   });
   const attachments = useAttachments(accepts);
   const [dragging, setDragging] = React.useState(false);
+  // What the next message answers (a message's ⋯ → Reply to): the composer quotes it.
+  const [reply, setReply] = React.useState<ReplyTarget | null>(null);
   // Screenshots pasted anywhere on the page attach to the next message (text pastes are left alone).
   useListener<ClipboardEvent>(document, "paste", (e) => {
     const files = e.clipboardData?.files;
@@ -149,18 +151,22 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     },
     [store],
   );
-  const openTask = React.useCallback((toolId: string) => {
-    const child = store.get().state?.tasks.find((t) => t.tool_id === toolId || t.id === toolId);
+  const openTask = React.useCallback(
+    (toolId: string) => {
+      const child = store.get().state?.tasks.find((t) => t.tool_id === toolId || t.id === toolId);
+      setParams((previous) => {
+        previous.set("task", child?.id ?? toolId);
+        return previous;
+      });
+      setPhoneTab("work");
+    },
+    [store, setParams],
+  );
+  const mainThread = () =>
     setParams((previous) => {
-      previous.set("task", child?.id ?? toolId);
+      previous.delete("task");
       return previous;
     });
-    setPhoneTab("work");
-  }, [store, setParams]);
-  const mainThread = () => setParams((previous) => {
-    previous.delete("task");
-    return previous;
-  });
   const taskName = taskInfo?.description;
 
   // The matches, in the thread shown; a new search starts at the newest, and the one shown stays
@@ -234,14 +240,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     }
   };
 
-  const footer = React.useMemo(
-    () => (
-      <>
-        {!task && <BesideTerminals agent={id} info={info} onInsert={hand} />}
-      </>
-    ),
-    [info, task, id, hand],
-  );
+  const footer = React.useMemo(() => <>{!task && <BesideTerminals agent={id} info={info} onInsert={hand} />}</>, [info, task, id, hand]);
   const planSource = React.useMemo(
     () => (info ? { session: info.id, harness: info.kind, machine: info.target === "local" ? null : info.target.replace(/^agent:/, ""), cwd, agent: info.name } : null),
     [info, cwd],
@@ -283,6 +282,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           parent={task ?? undefined}
           onOpenTask={openTask}
           onCommand={send}
+          onReply={setReply}
           agentLabel={task ? "Subagent" : info?.kind_name}
           agentName={info?.name}
           onDecide={send}
@@ -293,7 +293,19 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           footer={footer}
         />
       </PlanSourceContext.Provider>
-      <Dock store={store} id={id} attachments={attachments} toMain={task !== null} onView={openView} onTerminal={openBeside} onOpenTask={openTask} onRemove={() => setConfirmStop(true)} send={send} />
+      <Dock
+        store={store}
+        id={id}
+        attachments={attachments}
+        toMain={task !== null}
+        onView={openView}
+        onTerminal={openBeside}
+        onOpenTask={openTask}
+        onRemove={() => setConfirmStop(true)}
+        send={send}
+        reply={reply}
+        onClearReply={() => setReply(null)}
+      />
     </div>
   );
 
@@ -335,9 +347,13 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           </Link>
         </div>
       ) : wide ? (
-        <DesktopLayout collapsed={trayCollapsed} onCollapsed={setTrayCollapsed} side={(actions) => (
-          <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} className="hx-side" actions={actions} />
-        )}>
+        <DesktopLayout
+          collapsed={trayCollapsed}
+          onCollapsed={setTrayCollapsed}
+          side={(actions) => (
+            <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} className="hx-side" actions={actions} />
+          )}
+        >
           {work}
         </DesktopLayout>
       ) : (
@@ -443,6 +459,8 @@ function Dock({
   onOpenTask,
   onRemove,
   send,
+  reply,
+  onClearReply,
 }: {
   store: SessionStore;
   id: string;
@@ -453,6 +471,9 @@ function Dock({
   onOpenTask: (toolId: string) => void;
   onRemove: () => void;
   send: (c: Command) => void;
+  /** What the next message answers (a message's ⋯ → Reply to). */
+  reply?: ReplyTarget | null;
+  onClearReply?: () => void;
 }) {
   const navigate = useNavigate();
   const status = useSession(store, (s) => s.state?.status ?? s.info?.status ?? "starting");
@@ -485,7 +506,7 @@ function Dock({
         </div>
       ) : null}
       <PausedLine store={store} send={send} onLogin={() => onView("login")} />
-      <Composer store={store} agent={id} attachments={attachments} toMain={toMain} onView={onView} onTerminal={onTerminal} />
+      <Composer store={store} agent={id} attachments={attachments} toMain={toMain} onView={onView} onTerminal={onTerminal} replyTo={reply} onClearReply={onClearReply} />
     </div>
   );
 }
@@ -568,7 +589,10 @@ function AgentLoading({ id }: { id: string }) {
         <div className="hx-composer cp">
           <div className="hx-compose-box">
             <div className="cp-field">
-              <div className="hx-compose-input cp-mirror" aria-hidden="true">{draft}{"​"}</div>
+              <div className="hx-compose-input cp-mirror" aria-hidden="true">
+                {draft}
+                {"​"}
+              </div>
               <textarea ref={sizeDraft} className="hx-compose-input cp-input" rows={1} value={draft} placeholder="Loading conversation…" disabled aria-label="Message to the agent" />
             </div>
             <div className="cp-bar">
@@ -595,7 +619,9 @@ function AgentLoading({ id }: { id: string }) {
           <div className="ag-id">
             <h1 className="ag-title hx-ghost">Agent</h1>
           </div>
-          <span className="ag-actions hx-ghost" aria-hidden="true"><span className="fig-round" /></span>
+          <span className="ag-actions hx-ghost" aria-hidden="true">
+            <span className="fig-round" />
+          </span>
         </div>
         <div className="ag-clock-row" aria-hidden="true" />
         <div className="ag-run rs-tuner" aria-hidden="true">
@@ -605,18 +631,24 @@ function AgentLoading({ id }: { id: string }) {
         </div>
       </header>
       {wide ? (
-        <DesktopLayout collapsed={trayCollapsed} onCollapsed={setTrayCollapsed} side={(actions) => (
-          <div className="hx-inspector hx-side">
-            <div className="hx-inspector-head">
-              <div className="hx-tabs" aria-hidden="true">
-                {["Changes", "Plan", "Tools"].map((t) => (
-                  <span key={t} className="hx-tab">{t}</span>
-                ))}
+        <DesktopLayout
+          collapsed={trayCollapsed}
+          onCollapsed={setTrayCollapsed}
+          side={(actions) => (
+            <div className="hx-inspector hx-side">
+              <div className="hx-inspector-head">
+                <div className="hx-tabs" aria-hidden="true">
+                  {["Changes", "Plan", "Tools"].map((t) => (
+                    <span key={t} className="hx-tab">
+                      {t}
+                    </span>
+                  ))}
+                </div>
+                {actions}
               </div>
-              {actions}
             </div>
-          </div>
-        )}>
+          )}
+        >
           {work}
         </DesktopLayout>
       ) : (
