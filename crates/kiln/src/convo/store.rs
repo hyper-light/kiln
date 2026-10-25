@@ -738,54 +738,72 @@ pub fn tee(sink: Sink, store: Store, room: usize) -> Sink {
     tx
 }
 
-/// How often a [`tee_later`] with nothing passing looks for its store.
-const LATER_LOOK: Duration = Duration::from_millis(200);
+/// Where the store a [`tee_held`] keeps what passes in stands.
+enum Keeping {
+    /// Not given yet: the rows wait for it, in order.
+    Waiting(Vec<Row>),
+    Store(Store),
+    /// Taken away: what passes after goes nowhere.
+    Gone,
+}
 
-/// The store a [`tee_later`] keeps what passes in, given once it is known.
-pub struct Later(async_channel::Sender<Store>);
+/// The store a [`tee_held`] keeps what passes through it in, held so that it can be given later
+/// (a new build taking over waits for the store the runner it takes over from hands it,
+/// `crate::bluegreen`) or taken away (that runner, handing its store over).
+#[derive(Clone)]
+pub struct Held {
+    keeping: Arc<Mutex<Keeping>>,
+    /// The tee's way in, held weakly: the tee still ends once its senders have.
+    input: async_channel::WeakSender<(String, Update)>,
+}
 
-impl Later {
+impl Held {
+    /// Keep what passes in `store` from now on, what waited for it first, in order.
     pub fn give(&self, store: Store) {
-        let _ = self.0.try_send(store);
+        let mut k = self.keeping.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Keeping::Waiting(rows) = std::mem::replace(&mut *k, Keeping::Gone) {
+            for part in rows.chunks(COMMIT_ROWS) {
+                store.put(part.to_vec());
+            }
+        }
+        *k = Keeping::Store(store);
+    }
+
+    /// The store, taken away: what is being kept is in it first, and what passes after goes
+    /// nowhere. None: it had none.
+    pub fn take(&self) -> Option<Store> {
+        match std::mem::replace(&mut *self.keeping.lock().unwrap_or_else(PoisonError::into_inner), Keeping::Gone) {
+            Keeping::Store(st) => Some(st),
+            Keeping::Waiting(_) | Keeping::Gone => None,
+        }
+    }
+
+    /// Nothing waits to pass: what was sent through it before is kept (or waits for the store).
+    pub fn drained(&self) -> bool {
+        self.input.upgrade().is_none_or(|s| s.is_empty())
     }
 }
 
-/// [`tee`], with the store given later ([`Later::give`]): what passes goes on to `sink` at once,
-/// and the rows it makes wait in memory for the store, then go into it first, in order. For a new
-/// build taking over from the runner being upgraded, until it knows the store it goes on with (the
-/// old one's, handed over, or one of its own). Never given, they go.
-pub fn tee_later(sink: Sink, room: usize) -> (Sink, Later) {
+/// [`tee`], with its store [`Held`]: given now, or later, or taken away. Rows that come before
+/// the store wait for it in memory; never given, they go.
+pub fn tee_held(sink: Sink, store: Option<Store>, room: usize) -> (Sink, Held) {
     let (tx, rx) = async_channel::bounded::<(String, Update)>(room);
-    let (gtx, grx) = async_channel::bounded::<Store>(1);
+    let keeping = Arc::new(Mutex::new(store.map_or_else(|| Keeping::Waiting(Vec::new()), Keeping::Store)));
+    let held = Held { keeping: keeping.clone(), input: tx.downgrade() };
     crate::rt::spawn(async move {
-        let mut store: Option<Store> = None;
-        let mut waiting: Vec<Row> = Vec::new();
-        loop {
-            let got = if store.is_some() { Some(rx.recv().await) } else { crate::rt::timeout(LATER_LOOK, rx.recv()).await.ok() };
-            if store.is_none()
-                && let Ok(st) = grx.try_recv()
-            {
-                for part in std::mem::take(&mut waiting).chunks(COMMIT_ROWS) {
-                    st.put(part.to_vec());
-                }
-                store = Some(st);
+        while let Ok((id, u)) = rx.recv().await {
+            // Kept before it goes on, under the lock a taker waits on.
+            match &mut *keeping.lock().unwrap_or_else(PoisonError::into_inner) {
+                Keeping::Waiting(rows) => rows.extend(rows::of(&id, &u, crate::util::now_ms())),
+                Keeping::Store(st) => st.send(&id, &u),
+                Keeping::Gone => {}
             }
-            match got {
-                Some(Ok((id, u))) => {
-                    match &store {
-                        Some(st) => st.send(&id, &u),
-                        None => waiting.extend(rows::of(&id, &u, crate::util::now_ms())),
-                    }
-                    if sink.send((id, u)).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Err(_)) => break,
-                None => {}
+            if sink.send((id, u)).await.is_err() {
+                break;
             }
         }
     });
-    (tx, Later(gtx))
+    (tx, held)
 }
 
 /// A store on a new database in a temporary folder, for tests.
@@ -838,24 +856,39 @@ mod tests {
     fn a_tee_whose_store_comes_later_passes_everything_on_and_keeps_it_all_in_order() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let (out, passed) = async_channel::unbounded();
-            let (sink, later) = tee_later(out, 16);
+            let (sink, held) = tee_held(out, None, 16);
             sink.send(("a1".to_owned(), said("m1", 1, "before the store"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             // It goes on at once, with no store yet.
             let (id, _) = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
             assert_eq!(id, "a1");
             let (_d, st) = scratch()?;
-            later.give(st.clone());
+            held.give(st.clone());
             sink.send(("a1".to_owned(), said("m2", 2, "after it"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
-            let mut texts = Vec::new();
-            for _ in 0..50 {
-                texts = st.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>()).unwrap_or_default();
-                if texts.len() == 2 {
-                    break;
-                }
-                crate::rt::sleep(Duration::from_millis(100)).await;
-            }
+            st.sync()?;
+            let texts = st.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>()).unwrap_or_default();
             assert_eq!(texts, vec!["before the store".to_owned(), "after it".to_owned()]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_tee_whose_store_is_taken_away_keeps_nothing_more_in_it_and_says_when_it_is_drained() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (out, passed) = async_channel::unbounded();
+            let (_d, st) = scratch()?;
+            let (sink, held) = tee_held(out, Some(st.clone()), 16);
+            sink.send(("a1".to_owned(), said("m1", 1, "kept"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            assert!(held.drained());
+            let taken = held.take().ok_or_else(|| anyhow::anyhow!("no store"))?;
+            assert_eq!(taken.id(), st.id());
+            assert!(held.take().is_none(), "taken once");
+            // After: it still goes on, and isn't kept.
+            sink.send(("a1".to_owned(), said("m2", 2, "not kept"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            st.sync()?;
+            assert_eq!(st.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>()), Some(vec!["kept".to_owned()]));
             Ok(())
         })
     }
