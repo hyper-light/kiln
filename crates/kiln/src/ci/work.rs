@@ -52,6 +52,10 @@ pub enum Family {
     Test,
     /// E-classes and their merges (W24-R30).
     EClass,
+    /// An object of the content store an entry refers to (a step's tree and its files, W24-R07),
+    /// keyed `<scope><sha256>`, its `at` when no result referring to it is reusable any more: the
+    /// store keeps it while it's here (`services::cas::collect`), `services::memo::sweep` lets it go.
+    Object,
 }
 
 impl Family {
@@ -64,6 +68,7 @@ impl Family {
             Family::Lane => "work.lane",
             Family::Test => "work.test",
             Family::EClass => "work.eclass",
+            Family::Object => "work.object",
         }
     }
 }
