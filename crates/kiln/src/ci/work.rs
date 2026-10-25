@@ -2134,4 +2134,101 @@ mod tests {
             Ok(())
         })
     }
+
+    /// A file's or a tree's digest as a lookup reads it now (W24-R04): a file's content, every file
+    /// under a folder for a path ending in `/`, or that it's absent.
+    fn read_now(path: &Path) -> Read {
+        fn walk(p: &Path, h: &mut Vec<u8>) {
+            if let Ok(bytes) = std::fs::read(p) {
+                h.extend(crate::util::sha256_hex(&bytes).into_bytes());
+                return;
+            }
+            let mut names: Vec<_> = std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| e.path()).collect();
+            names.sort();
+            for n in names {
+                h.extend(n.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default().into_bytes());
+                walk(&n, h);
+            }
+        }
+        if !path.exists() {
+            return Read::Absent;
+        }
+        let mut h = Vec::new();
+        walk(path, &mut h);
+        Read::File(crate::util::sha256_hex(&h))
+    }
+
+    /// W24-R04, R05, end to end with a real path set: rustc builds a crate and writes its
+    /// dependency file, which [`kiln_ci::work::pathset`] reads into the unit's path set (its
+    /// sources, the file `include_str!` read, the variable `option_env!` read); the result is
+    /// recorded under it, and a two-phase lookup that reads the files as they are now finds it
+    /// while what the crate read is unchanged, from another workspace too, and misses once a file
+    /// it read or a variable it read changes, never for a file it didn't read.
+    #[test]
+    fn w24_r04_two_phase_lookup_end_to_end_on_rustcs_own_record() -> anyhow::Result<()> {
+        use kiln_ci::work::pathset::{self, Observed, Roots};
+        use std::path::PathBuf;
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
+        if !std::process::Command::new(&rustc).arg("--version").output().is_ok_and(|o| o.status.success()) {
+            println!("w24_r04: no rustc to make a dependency file with; nothing checked");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let (one, two) = (dir.path().join("ws"), dir.path().join("elsewhere/ws"));
+        for ws in [&one, &two] {
+            std::fs::create_dir_all(ws.join("src"))?;
+            std::fs::write(ws.join("src/lib.rs"), "pub const DATA: &str = include_str!(\"data.txt\");\npub const NOTE: Option<&str> = option_env!(\"KILN_W24_NOTE\");\n")?;
+            std::fs::write(ws.join("src/data.txt"), "what the crate reads\n")?;
+            std::fs::write(ws.join("README.md"), "what it doesn't\n")?;
+        }
+        let roots = |ws: &Path| Roots::workspace(&ws.to_string_lossy()).skip(&ws.join("target").to_string_lossy());
+        // rustc's own record of what it read, as cargo has it write one.
+        let observe = |ws: &Path, note: &str| -> anyhow::Result<Observed> {
+            let out = ws.join("target");
+            std::fs::create_dir_all(&out)?;
+            let o = std::process::Command::new(&rustc)
+                .current_dir(ws)
+                .env("KILN_W24_NOTE", note)
+                .args(["--crate-name", "probe", "--crate-type", "lib", "--edition", "2021", "--emit", "dep-info,metadata", "--out-dir"])
+                .arg(&out)
+                .arg("src/lib.rs")
+                .output()?;
+            anyhow::ensure!(o.status.success(), "rustc: {}", String::from_utf8_lossy(&o.stderr));
+            let d = pathset::dep_info(&std::fs::read_to_string(out.join("probe.d"))?).map_err(anyhow::Error::msg)?;
+            let mut observed = Observed::default();
+            observed.dep_info(&d, &ws.to_string_lossy(), &roots(ws));
+            Ok(observed)
+        };
+        let observed = observe(&one, "first")?;
+        anyhow::ensure!(observed.paths == BTreeSet::from(["src/data.txt".to_owned(), "src/lib.rs".to_owned()]) && observed.outside.is_empty(), "{observed:?}");
+        anyhow::ensure!(observed.env.get("KILN_W24_NOTE") == Some(&Some("first".to_owned())), "{:?}", observed.env);
+        // The unit, keyed with the variables it was seen to read; its result recorded under the
+        // path set its record gave, each path's digest as it is.
+        let names = observed.read_env();
+        let unit_with = move |note: &str| {
+            let all = BTreeMap::from([("KILN_W24_NOTE".to_owned(), note.to_owned()), ("UNREAD".to_owned(), "x".to_owned())]);
+            let env = key::relevant_env(&all, &BTreeSet::new(), &[], "rustc probe", &names);
+            Unit { env, definition: "rustc --crate-name probe src/lib.rs".into(), ..unit(50) }
+        };
+        let now_in = move |ws: PathBuf| move |recorded: &PathSet| -> PathSet { recorded.keys().map(|p| (p.clone(), roots(&ws).resolve(p).map_or(Read::Absent, |at| read_now(Path::new(&at))))).collect() };
+        let read = observed.path_set(&|p: &str| roots(&one).resolve(p).map_or(Read::Absent, |at| read_now(Path::new(&at))));
+        let (one2, two2) = (one.clone(), two.clone());
+        in_store(move |c| {
+            let sc = scope("acme/app", "trusted");
+            let u = unit_with("first");
+            anyhow::ensure!(matches!(write(c, None, &sc, &key::weak(&u), &read, &made("trusted", "r1", &[("libprobe.rmeta", "sha256:meta")]))?, Written::New(_)));
+            let found = |u: &Unit, ws: &PathBuf| -> anyhow::Result<bool> { Ok(lookup_as(c, None, "acme/app", &Domain::Trusted, u, &now_in(ws.clone()))?.hit.is_some()) };
+            anyhow::ensure!(found(&u, &one2)?, "what it read is as it was");
+            anyhow::ensure!(found(&u, &two2)?, "from another workspace, its paths placed alike (W24-R05)");
+            std::fs::write(one2.join("README.md"), "changed, and never read\n")?;
+            anyhow::ensure!(found(&u, &one2)?, "a file it didn't read");
+            std::fs::write(one2.join("src/data.txt"), "changed\n")?;
+            anyhow::ensure!(!found(&u, &one2)?, "a file include_str! read changed");
+            anyhow::ensure!(found(&u, &two2)?, "the other workspace's is unchanged");
+            std::fs::write(one2.join("src/data.txt"), "what the crate reads\n")?;
+            anyhow::ensure!(found(&u, &one2)?, "as it was again");
+            anyhow::ensure!(!found(&unit_with("second"), &one2)?, "a variable it read changed");
+            Ok(())
+        })
+    }
 }

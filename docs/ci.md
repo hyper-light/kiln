@@ -7682,6 +7682,64 @@ jobs:
         tests: { select: affected, cache: true }
 ```
 
+**Observation and `kiln rustc` (M4: designed, not built).** What R04's second and third sources
+and R09 are to be, on what M4 built: path sets from the tools' own records
+(`kiln_ci::work::pathset`), trust domains and lineage (`work::trust`), signatures (`work::seal`)
+and verification (`work::verify`).
+
+- **The tracer** observes a unit whose tools keep no record, into the same `Observed` that the
+  records give (`Roots` places each path, temporary folders left out, paths outside the workspace
+  and named folders kept as `outside`, records that miss something marked `partial`), so a traced
+  path set keys alike on every machine. It records what decides a result: files opened for
+  reading and paths looked up (`Read::Absent` for a miss), folders listed (`Read::Dir`), programs
+  run (by digest), variables read, the working folder's changes, and connections, which mark the
+  unit non-hermetic. A file the unit wrote before reading it is its own, not an input.
+  - **Linux, unprivileged: seccomp user notification.** `kiln trace -- <command>` sets
+    `PR_SET_NO_NEW_PRIVS`, installs a filter that notifies on the path-taking calls (`openat`,
+    `openat2`, `newfstatat`, `statx`, `faccessat2`, `readlinkat`, `getdents64`, `execve`,
+    `execveat`, `chdir`, `connect`) and hands the listener to the runner over a unix socket
+    (`SCM_RIGHTS`) before it execs; children inherit the filter. The runner reads each path from the
+    tracee (`process_vm_readv`), notes it and answers `SECCOMP_USER_NOTIF_FLAG_CONTINUE`: it
+    observes and never emulates, so a tracee behaves as it would untraced. A tracee can race the
+    read of its own memory and hide a read; that weakens only its own domain's keys, which R21 keeps
+    from every domain above it, and a `strict` unit runs where only its declared inputs exist.
+  - **Interposition** (`LD_PRELOAD`, and `DYLD_INSERT_LIBRARIES` where macOS doesn't harden the
+    toolchain): a small library wraps `open`, `openat`, `fopen`, the `stat` family, `access`,
+    `opendir`, `execve` and `getenv` (which seccomp can't see) and writes records down a pipe.
+    Statically linked programs (Go's), direct system calls and binaries macOS protects escape it:
+    a unit that runs one is `partial`, and keys on its declared inputs (R04's fourth source) or the
+    whole tree (the fifth). Go's tests and cargo's units keep using their own records.
+  - **Cost and rollout.** Every notified call is a round trip to the runner: filtering only the
+    calls above and caching by device, inode and mtime should keep a compile-heavy unit within about
+    10 %, to be measured on kiln's own `rust` job before it's on by default; until then a unit opts
+    in (`work.memo.observe: true`). The decisions (which call means which `Read`, merging traces,
+    partiality) stay pure in `work::pathset`, tested on recorded traces as fixtures, as cargo's
+    dependency files are; the supervisor lives in `runner/work/observe.rs`.
+- **`kiln rustc`** (R09) is a `RUSTC_WRAPPER` (`kiln rustc <rustc> <args>`), sccache-compatible for
+  library crates, that also caches proc-macro, bin and test units:
+  1. It reads the invocation (crate name and types, `--emit`, `-C` flags, `--extern`, `-L`,
+     `--cfg`, `--out-dir`, `-C incremental`); anything it doesn't understand runs uncached. Crates
+     under edit (workspace members built with `-C incremental` in a warm workspace) run rustc
+     directly and stay incremental.
+  2. Its weak key: the toolchain (`rustc -vV`, the sysroot's digest), for units that link the
+     linker's identity and link arguments, the target, the flags with paths remapped
+     (`--remap-path-prefix`: the workspace and `$CARGO_HOME` to fixed names; output and incremental
+     folders dropped), and each `--extern` rlib's or rmeta's digest, not its path, so a dependency
+     rebuilt byte for byte leaves its dependents' keys as they were (R03).
+  3. Its path set: the previous run's dependency file, its sources and `# env-dep:` variables
+     (`work::pathset::dep_info`), so the lookup is R04's two phases and the strong key covers
+     `include_str!`'s files and `env!`'s values. A proc-macro or build script that reads what its
+     record doesn't list is traced, or keyed on its whole package (`Directives::whole_package`).
+  4. A hit (looked up through the runner's cache service, R08, under the leg's or person's scope,
+     R21, signatures checked, R22) puts the outputs in place under the names cargo expects (the
+     metadata hash is in the arguments, so names are stable), with mtimes that keep cargo's
+     fingerprints fresh, and replays rustc's JSON diagnostics and exit code. A miss runs rustc with
+     `--emit=dep-info` added, records a success, the runner signing it.
+  5. sccache can't cache units that link because linkers write absolute paths and timestamps; kiln
+     rustc remaps paths and keys on the linker, and R23's sampling checks bins and tests most: a
+     linker that still differs marks its units nondeterministic, their lineage quarantined.
+  6. Remote mode (R26) ships the toolchain as a tree in the content store.
+
 **Interfaces.**
 
 - **Wire**, added after what's there: optional `AssignmentV2.work`;
