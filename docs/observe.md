@@ -939,7 +939,8 @@ not a library. `wevtutil` writes its events one after another and no newline aft
 command's last line is read whole though no newline ends it. Neither source has a machine of its own
 platform in the scenarios' Linux fleet: the unified log's scenario runs on a Mac of the fleet, the
 Event Log's against a stand-in for `wevtutil` that answers its two queries from a channel's file of
-events, written as Windows' writes them (§13); and on a Windows machine, by hand (§13).
+events, written as Windows' writes them (§13); and on a Windows machine, through Windows's own
+`wevtutil` (§13).
 
 A source reads what kiln's process may read on each machine that reads it: a maintainer's to give.
 
@@ -2647,7 +2648,14 @@ sees them: each node looks at its own every 15 seconds, on a thread of its own.
   looking every 2 s wrote such a container's samples under a series without its name until then.)
 - **Where the cgroups are not seen** (Docker Desktop's VM, on macOS and Windows, its named pipe
   there), the engine's stats are read instead (`GET /containers/{id}/stats?stream=false&one-shot=true`),
-  a container at a time, as `docker stats` reads them.
+  a container at a time, as `docker stats` reads them. They carry no CPU limit, the VM's memory as
+  the limit of a container that has none of its own, and no OOM kills, so a container's limits are
+  read from its settings (`GET /containers/{id}/json`: `NanoCpus`, else `CpuQuota` over
+  `CpuPeriod`; `Memory`; none where it has none) at its first look and every five minutes, and its
+  OOM kills are counted from the engine's events (`GET /events`, its `oom` ones, `until` a second
+  ago so it answers at once: each look the window from where the last ended, ten seconds of it
+  asked again for an engine whose clock is a little behind, each kill counted once). They are
+  counted from the first look on, as the cgroups' are.
 - **Tags**: `host`, `container_id`, `runtime`; as known `container_name`, `image_name`, `image_tag`,
   `short_image`, `kube_namespace`, `pod_name`, `kube_container_name`, `kube_qos`, `compose_service`,
   `compose_project`. Datadog's Agent's container check reports the same names; OpenTelemetry's
@@ -4880,10 +4888,21 @@ old; a file there is now its volume's serial number and its file index
 turned a recorded Python traceback's lines into CRLF as it checked it out, and the test reading it
 failed (fixtures and test data are now `-text`). And the test fleet itself was Unix's: it stops a
 node there by closing its stdin, as kiln's supervisor does (`KILN_SUPERVISED`), passes Windows its
-own variables, and writes paths into TOML and `file:` URLs as Windows needs them. Not run there:
-DogStatsD's Unix socket (Windows has no Unix datagram sockets), the Event Log's through Windows's
-own `wevtutil` (a channel of the test's own needs an administrator; its stand-in is a shell script,
-run on Unix), macOS's unified log, kiln CD's (it needs a cluster), and those that need Docker.
+own variables, and writes paths into TOML and `file:` URLs as Windows needs them.
+
+Then (2026-10-25, at 012bc87d, 3e1c70a9 and 1cd0cc4d): the Event Log through Windows's own
+`wevtutil` (the Application channel, Windows Script Host writing to it: below); kiln CD's scenario
+against a kind cluster on Docker Desktop (89 s); and Docker's scenarios under Docker Desktop
+(Docker 29.9, its Linux VM), their containers reaching the machine's own services as Docker
+Desktop's do (`host.docker.internal`, their own ports published on 127.0.0.1; on Linux they share
+the host's network): the archives' S3 (RustFS, 2), email (Mailpit), Event Hubs (Kafka),
+Prometheus' remote write, Datadog's Agent, OpenTelemetry's traces, Datadog's tracer (4), the LLM
+apps, Error Tracking, and the profilers (Go, Python through the Agent, Java: 4). Running the
+containers' scenario there found what a runner read of Docker Desktop's containers through the
+engine's stats: no CPU limit, no OOM kills (now read from a container's settings and the engine's
+events, §10.10); with them both of its scenarios pass, the check's and the Collector's (90 s, at
+1cd0cc4d). Not run there: DogStatsD's Unix socket (Windows has no Unix datagram sockets),
+macOS's unified log, and the full disk's (it runs this machine's build in a Linux container).
 
 **Live** (`crates/kiln/tests/observe_live.rs`, `cargo test -p kiln --test observe_live -- --ignored`):
 a kiln server and two runners as processes of their own, each with a home of its own and a clean
@@ -5621,8 +5640,11 @@ throttled, written to, its working set below its limit (Docker's usage less the 
 said, its processes and uptime; its name, image (`alpine…`) and engine (`docker`) from the
 Collector's attributes. Its page's CPU chart the Collector's series' query
 (`sum:container.cpu.usage.total{container.id:…}.as_rate() / 1000000000`), its I/O and working set
-drawn; that query's answer, the median of its finished buckets, its cores. 2026-10-23: passes on
-its first run (beside the check's scenario: 132 s for both; adacachy).
+drawn; that query's answer, the median of its whole buckets, its cores, once three are whole (the
+first, which the series began within, and the newest left out). 2026-10-23: passes on its first
+run (beside the check's scenario: 132 s for both; adacachy). 2026-10-25, adacachy at a load of 60
+to 90: the query, asked once as the Collector's first figures came, had two buckets with values, the
+first part-filled (0.08 cores): it waits for three whole ones now.
 
 **Log indexes** (`crates/kiln/tests/observe_indexes.rs`): a kiln server and a runner as processes of
 their own. `main` as kiln makes it: alone, of every record, of the main part. Refused, saying why
@@ -5892,7 +5914,17 @@ those two and nothing before them. The first run found that a command's last lin
 newline was dropped as too long to read: the newest record id came out 0, the source read the
 channel from its start (25,074 records of a channel of 3,455 in 100 s) and, catching up, took the
 channel for cleared and read it again, over and over. The stand-in had ended each event with a
-newline; it now writes them as `wevtutil` does, and the scenario passes with it (115 s).
+newline; it now writes them as `wevtutil` does, and the scenario passes with it (115 s). And as a
+live scenario on Windows (`observe_collect.rs`, Windows's alone; 2026-10-25, jupiter: Windows 11,
+x86-64, its user no administrator): events a script writes to the `Application` channel through
+Windows Script Host's `LogEvent` (which needs no administrator, where a channel of the test's own
+would), read through Windows's own `wevtutil` by a runner's source of that channel and that
+provider from the channel's start: 20 there before the source, 40 more, 40 written while the
+runner is stopped, 300 while it is killed. Each stored once (the kill repeated none of the 300), its
+message as Windows renders it, an error's status `error` and its event id 1, information's 4, its
+channel, provider, keywords (`Classic`), record id and computer. The channel is the machine's own,
+not cleared (that needs an administrator): earlier runs' events are told apart by their run's
+name. Passes (28 s).
 
 **Pipelines** (`observe_collect.rs`): a server and a runner; a pipeline made through the API (a
 grok rule, an arithmetic processor, a status remapper) tried on records (a line its rule reads

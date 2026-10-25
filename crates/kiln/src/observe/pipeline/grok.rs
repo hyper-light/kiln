@@ -2005,7 +2005,8 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
         }
         let instructions: f64 = (0..8).map(per).sum();
         eprintln!("  {:<16} {instructions:>8.1} a line", "instructions");
-        assert!(instructions < 200.0 && per(12) < 20.0, "{instructions} instructions, {} ways back taken a line", per(12));
+        // 2026-10-25: 104.7 instructions a line, 1.1 ways back taken (the lines' counts are fixed).
+        assert!(instructions < 125.0 && per(12) < 2.5, "{instructions} instructions, {} ways back taken a line", per(12));
     }
 
     /// A URL's scheme ends where `str::find` says `://` first is: on random text of colons, slashes
