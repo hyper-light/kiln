@@ -640,20 +640,21 @@ impl Notifier {
             let lanes: Arc<Mutex<HashMap<(String, String), VecDeque<Job>>>> = Arc::default();
             while let Ok(job) = rx.recv().await {
                 let key = (job.name.clone(), dedup_key(&job.notice));
-                {
-                    let mut l = lock(&lanes);
-                    if let Some(waiting) = l.get_mut(&key) {
-                        if waiting.len() >= LANE
-                            && let Some(old) = waiting.pop_front()
-                        {
-                            tracing::warn!(integration = %old.name, monitor = %old.notice.monitor, "a group's notifications waited past {LANE} behind one being delivered: the oldest waiting was dropped");
-                            record_delivery(&old, false, &format!("dropped: {LANE} of the group's notifications waited behind one being delivered"));
-                        }
-                        waiting.push_back(job);
-                        continue;
+                let mut l = lock(&lanes);
+                // Taken by the lane being delivered; past its room, its oldest waiting is said with
+                // the lanes let go.
+                if let Some(waiting) = l.get_mut(&key) {
+                    let old = (waiting.len() >= LANE).then(|| waiting.pop_front()).flatten();
+                    waiting.push_back(job);
+                    drop(l);
+                    if let Some(old) = old {
+                        tracing::warn!(integration = %old.name, monitor = %old.notice.monitor, "a group's notifications waited past {LANE} behind one being delivered: the oldest waiting was dropped");
+                        record_delivery(&old, false, &format!("dropped: {LANE} of the group's notifications waited behind one being delivered"));
                     }
-                    l.insert(key.clone(), VecDeque::new());
+                    continue;
                 }
+                l.insert(key.clone(), VecDeque::new());
+                drop(l);
                 let (http, lanes) = (http.clone(), Arc::clone(&lanes));
                 crate::rt::spawn(async move {
                     let mut job = job;
