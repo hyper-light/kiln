@@ -5056,7 +5056,7 @@ than (it now waits five; and counting is 18 times faster, §12.23). Then the who
 spans' trace metrics counted 18.2 s after it), and 179 of the browser suite's 180 runs; the one
 was WebKit's on a phone, the notebooks' first navigation interrupted by the incidents scenario's
 cleanup's, which that scenario had let go on unawaited (each scenario now starts from a blank
-page, de722eb4).
+page, de722eb4: with it, all 180 pass against the same server).
 
 **On Windows** (2026-10-24, jupiter: Windows 11, x86_64, MSVC, Git for Windows' own
 `core.autocrlf`): 42 of the scenarios below pass there, at 7f607f14, ef10dc30 and 4747aca3 (the same
