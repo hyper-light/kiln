@@ -3664,7 +3664,11 @@ package registries of the top ~25 languages and the top ~10 OCI registries; publ
   CDN, and Zig's packages through the HTTP proxy.
 - *Done.* R02's runners: images from the registries kiln mirrors (`container:`, `services:`,
   `docker://` actions) are pulled through kiln, signed in with the job's token, and tagged as
-  asked; from their registry when kiln's mirror can't.
+  asked; from their registry when kiln's mirror can't. One pinned to a digest
+  (`image:tag@sha256:…`) runs as the mirror's reference: Docker refuses a tag with a digest, and
+  finds the image by the digests it was pulled by, which are the mirror's (Home Assistant's
+  `docker://hadolint/hadolint:v2.15.1@sha256:…`, corpus pass 1024b;
+  `w12_r02_a_digest_pulled_through_kiln_runs_as_the_mirrors`).
 - *Done.* More of D.2's federations through `docker-credential-kiln`: Quay's robot federation,
   JFrog's OIDC integration, Cloudsmith's OIDC, Chainguard's assumable identities.
 - *Done.* D.2's last two (`crates/kiln/src/ci/integrations/{alibaba,oracle}.rs`), an `oci`
@@ -3962,6 +3966,11 @@ enforcement points to W18, agent isolation to W20.
     failed." and its container's log, both streams, its last 400 lines), so the leg says why:
     laravel's MySQL said only "mysql is unhealthy" (corpus pass 1024b, two legs at once on the
     lab's host network, both publishing 3306; `w13_r08_an_unhealthy_service_shows_its_log`);
+  - a step in a job container whose `working-directory` is the container's own path (the
+    `docker` executor's `${{ runner.temp }}`, `/home/runner/work/_temp`) is made where its mount
+    is on the host, and one only the container has is left to it, where kiln had tried to make it
+    on the host and been refused (Home Assistant's pylint step, corpus pass 1024b;
+    `w13_r08_a_job_containers_own_path_as_working_directory`);
   - teardown;
   - Docker actions (W07-R06);
   - `CAP_DOCKER` announced when a CLI answers. One probe runs at a time, waited for 10 s from

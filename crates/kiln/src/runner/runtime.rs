@@ -2397,7 +2397,19 @@ impl Leg {
             .map(|k| (*k, st.layout.commands.join(format!("{}_{id}", k.to_ascii_lowercase()))))
             .collect();
         {
-            let (file, body, paths, wd) = (file.clone(), body.clone(), files.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(), wd.to_path_buf());
+            // The step's directory, made where it is on the host. In a job container it may be named
+            // as the container has it (`${{ runner.temp }}` there, `/__w/_temp` or the runner image's
+            // `/home/runner/work/_temp`): made where its mount is on the host, and one the container
+            // alone has is the container's (Home Assistant's pylint step, corpus pass 1024b: kiln made
+            // `/home/runner` here, and was refused).
+            let host_wd = match st.containers.as_ref().and_then(|c| c.job.as_ref()).filter(|_| in_job) {
+                None => Some(wd.to_path_buf()),
+                Some(j) => {
+                    let w = wd.to_string_lossy();
+                    if j.map.translate(&w) != w { Some(wd.to_path_buf()) } else { j.map.to_host(&w) }
+                }
+            };
+            let (file, body, paths) = (file.clone(), body.clone(), files.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>());
             crate::rt::blocking(move || -> std::io::Result<()> {
                 if let Some(f) = &file {
                     std::fs::write(f, body)?;
@@ -2405,7 +2417,10 @@ impl Leg {
                 for p in paths {
                     std::fs::write(p, b"")?;
                 }
-                std::fs::create_dir_all(wd)
+                match host_wd {
+                    Some(d) => std::fs::create_dir_all(d),
+                    None => Ok(()),
+                }
             })
             .await??;
         }
@@ -5011,6 +5026,28 @@ runs:
         if node.is_some() {
             assert!(logs.get(&3).is_some_and(|l| l.contains("node in the workspace")), "{logs:?}");
         }
+        Ok(())
+    }
+
+    /// W13-R08: a step in a job container given the container's own path as its directory runs
+    /// there, kiln making it where its mount is on the host, not at `/__w` here. The `docker`
+    /// executor's `${{ runner.temp }}` is such a path (`/home/runner/work/_temp`): Home
+    /// Assistant's pylint step was refused with "Permission denied" (corpus pass 1024b).
+    #[cfg(unix)]
+    #[test]
+    fn w13_r08_a_job_containers_own_path_as_working_directory() -> anyhow::Result<()> {
+        if super::super::docker::find().is_none() {
+            return Ok(());
+        }
+        let wf = "on: push\njobs:\n  t:\n    runs-on: x\n    container: alpine:latest\n    steps:\n      - working-directory: /__w/_temp\n        run: echo \"in $(pwd)\"\n";
+        let (w, _) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", wf, Dialect::Gha);
+        let container = w.and_then(|w| w.jobs.into_iter().next()).and_then(|j| j.container);
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Gha, &|_| Ok(()), &move |a: &mut AssignmentV2| {
+            a.container = Some("alpine:latest".into());
+            a.job_container = container.clone();
+        })?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        assert!(logs.get(&0).is_some_and(|l| l.contains("in /__w/_temp")), "{logs:?}");
         Ok(())
     }
 

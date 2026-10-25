@@ -221,6 +221,15 @@ for d in */*; do
 done
 "#;
 
+/// After a pull of `image` through kiln's mirror as `via` (W12-R02): the reference to run it by,
+/// and whether `via` is to be tagged as `image` first. A reference pinned to a digest can't be a
+/// tag (Docker refuses one), and Docker finds it by the digests the image was pulled by, which
+/// are the mirror's: it runs as `via` (Home Assistant's
+/// `docker://hadolint/hadolint:v2.15.1@sha256:…`, corpus pass 1024b).
+fn after_mirror(image: &str, via: &str) -> (String, bool) {
+    if image.contains('@') { (via.to_owned(), false) } else { (image.to_owned(), true) }
+}
+
 /// The group that owns the host's Docker socket.
 #[cfg(unix)]
 fn socket_group() -> Option<u32> {
@@ -640,22 +649,25 @@ impl Cli {
         Some(out)
     }
 
-    /// Pulls `image`: through kiln's mirror when kiln mirrors its registry (tagged as `image`
-    /// after), else, or when that fails, from its registry.
-    pub async fn pull(&self, image: &str, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
+    /// Pulls `image`: through kiln's mirror when kiln mirrors its registry, else, or when that
+    /// fails, from its registry. The reference to run it by ([`after_mirror`]).
+    pub async fn pull(&self, image: &str, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<String> {
         let none = BTreeMap::new();
         if let Some(via) = self.through_ref(image) {
             say(format!("{} pull {via} (kiln's mirror of {image})", self.bin));
             match self.run(&[s("pull"), s("--quiet"), via.clone()], &none, SLOW).await {
                 Ok(_) => {
-                    self.run(&[s("tag"), via, image.to_owned()], &none, CALL).await?;
-                    return Ok(());
+                    let (run_as, tag) = after_mirror(image, &via);
+                    if tag {
+                        self.run(&[s("tag"), via, image.to_owned()], &none, CALL).await?;
+                    }
+                    return Ok(run_as);
                 }
                 Err(e) => say(format!("kiln's mirror didn't have it ({e:#}); pulling from its registry")),
             }
         }
         say(format!("{} pull {image}", self.bin));
-        self.run(&[s("pull"), s("--quiet"), image.to_owned()], &none, SLOW).await.map(|_| ())
+        self.run(&[s("pull"), s("--quiet"), image.to_owned()], &none, SLOW).await.map(|_| image.to_owned())
     }
 
     /// `image` saved and unpacked into `dir` as it streams (Docker's archive: `manifest.json`, the
@@ -1228,8 +1240,7 @@ impl Containers {
         if let Some(tag) = runner_image(&self.cli, image, user, say).await? {
             return Ok(tag);
         }
-        self.cli.pull(image, say).await?;
-        Ok(image.to_owned())
+        self.cli.pull(image, say).await
     }
 
     async fn image_path(&self, image: &str) -> Option<String> {
@@ -1353,8 +1364,7 @@ pub fn parse_ports(out: &str) -> BTreeMap<String, String> {
 /// and kept; or pulled for `docker://…`.
 pub async fn action_image(cli: &Cli, dir: &Path, image: &str, tag: &str, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<String> {
     if let Some(i) = image.strip_prefix("docker://") {
-        cli.pull(i, say).await?;
-        return Ok(i.to_owned());
+        return cli.pull(i, say).await;
     }
     let none = BTreeMap::new();
     if cli.run(&[s("image"), s("inspect"), tag.to_owned()], &none, CALL).await.is_ok() {
@@ -1589,6 +1599,16 @@ mod tests {
         assert_eq!(seed(&stash)?, "", "nothing twice");
         assert_eq!(seed(&dir.path().join("none"))?, "", "an image without them");
         Ok(())
+    }
+
+    /// W12-R02: an image pulled through kiln's mirror runs as it was asked for, tagged so; one
+    /// pinned to a digest runs as the mirror's, which Docker finds it by and which no tag can be.
+    #[test]
+    fn w12_r02_a_digest_pulled_through_kiln_runs_as_the_mirrors() {
+        let via = "127.0.0.1:42511/docker.io/hadolint/hadolint:v2.15.1@sha256:32da";
+        assert_eq!(after_mirror("hadolint/hadolint:v2.15.1@sha256:32da", via), (via.to_owned(), false));
+        assert_eq!(after_mirror("alpine@sha256:ab", "m/docker.io/library/alpine@sha256:ab"), ("m/docker.io/library/alpine@sha256:ab".to_owned(), false));
+        assert_eq!(after_mirror("alpine:3.20", "m/docker.io/library/alpine:3.20"), ("alpine:3.20".to_owned(), true));
     }
 
     #[test]
