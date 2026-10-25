@@ -5,7 +5,7 @@
 use super::PipelineDef;
 
 /// Datadog's support rules for the common and combined log formats (nginx's, Apache's).
-const ACCESS_SUPPORT: &str = r#"_auth %{notSpace:http.auth:nullIf("-")}
+pub(crate) const ACCESS_SUPPORT: &str = r#"_auth %{notSpace:http.auth:nullIf("-")}
 _bytes_written %{integer:network.bytes_written}
 _client_ip %{ipOrHost:network.client.ip}
 _version HTTP\/%{regex("\\d+\\.\\d+"):http.version}
@@ -18,7 +18,7 @@ _method %{word:http.method}
 _date_access %{date("dd/MMM/yyyy:HH:mm:ss Z"):date_access}
 _x_forwarded_for %{regex("[^\\\"]*"):http._x_forwarded_for:nullIf("-")}"#;
 
-const ACCESS_MATCH: &str = r#"access.common %{_client_ip} %{_ident} %{_auth} \[%{_date_access}\] "(?>%{_method} |)%{_url}(?> %{_version}|)" %{_status_code} (?>%{_bytes_written}|-)
+pub(crate) const ACCESS_MATCH: &str = r#"access.common %{_client_ip} %{_ident} %{_auth} \[%{_date_access}\] "(?>%{_method} |)%{_url}(?> %{_version}|)" %{_status_code} (?>%{_bytes_written}|-)
 access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_referer}" "%{_user_agent}"( "%{_x_forwarded_for}")?.*"#;
 
 const NGINX_ERROR: &str = r#"error.format %{date("yyyy/MM/dd HH:mm:ss"):date_access} \[%{word:level}\] %{data:error.message}(, %{data::keyvalue(": ",",")})?"#;

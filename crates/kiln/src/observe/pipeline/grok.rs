@@ -1958,6 +1958,40 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
         }
     }
 
+    /// What grok's own matcher does to read an access line through kiln's nginx rules (its census, a
+    /// test build's alone): each instruction it runs by its kind, the ways back it keeps and takes,
+    /// the bytes its runs take, a line's on average over the collect bench's lines (printed with
+    /// `--nocapture`); held under bounds, so a change that makes it do more is seen.
+    #[test]
+    fn the_matcher_s_work_on_an_access_line_is_bounded() {
+        let g = Grok::compile(super::super::builtin::ACCESS_MATCH, super::super::builtin::ACCESS_SUPPORT).unwrap();
+        let (mut reading, mut out) = (Reading::default(), Attrs::default());
+        let n = 1_000u64;
+        super::super::matcher::census::take();
+        for i in 0..n {
+            let path = if i % 10 == 3 { "/healthz".to_owned() } else { format!("/api/v1/orders/{i}") };
+            let line = format!(
+                "10.{}.{}.{} - - [18/Oct/2026:12:{:02}:{:02} +0000] \"GET {path} HTTP/1.1\" 200 {} \"-\" \"Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0\"",
+                i % 250,
+                (i / 250) % 250,
+                i % 7,
+                (i / 60) % 60,
+                i % 60,
+                200 + i % 5000
+            );
+            out.clear();
+            assert_eq!(g.parse_with(&line, 0, &mut reading, &mut out), Some("access.combined"), "{line}");
+        }
+        let counts = super::super::matcher::census::take();
+        let per = |i: usize| counts[i] as f64 / n as f64;
+        for (i, name) in super::super::matcher::census::NAMES.iter().enumerate() {
+            eprintln!("  {name:<16} {:>8.1} a line", per(i));
+        }
+        let instructions: f64 = (0..8).map(per).sum();
+        eprintln!("  {:<16} {instructions:>8.1} a line", "instructions");
+        assert!(instructions < 200.0 && per(12) < 20.0, "{instructions} instructions, {} ways back taken a line", per(12));
+    }
+
     /// A URL's scheme ends where `str::find` says `://` first is: on random text of colons, slashes
     /// and what is neither.
     #[test]

@@ -265,6 +265,49 @@ impl Admit {
     }
 }
 
+/// What searches did, counted a thread at a time for the tests' census of a rule's work (grok's
+/// tests): each instruction run, by its kind; each way back kept, by its kind; the ways back taken;
+/// the bytes runs took. Nothing is counted in a build that is not a test's.
+#[cfg(test)]
+pub(crate) mod census {
+    use std::cell::Cell;
+
+    pub(crate) const NAMES: [&str; 14] = ["literal", "one", "run", "split", "jump", "save", "look", "match", "go kept", "restore kept", "give kept", "take kept", "ways back taken", "bytes runs took"];
+
+    thread_local! {
+        static COUNTS: Cell<[u64; 14]> = const { Cell::new([0; 14]) };
+    }
+
+    pub(crate) fn add(i: usize, n: u64) {
+        COUNTS.with(|c| {
+            let mut a = c.get();
+            if let Some(x) = a.get_mut(i) {
+                *x += n;
+            }
+            c.set(a);
+        });
+    }
+
+    /// The counts since they were last taken.
+    pub(crate) fn take() -> [u64; 14] {
+        COUNTS.with(|c| c.replace([0; 14]))
+    }
+}
+
+/// A census count ([`census`]): nothing outside a test's build.
+#[inline(always)]
+fn count(_what: usize, _n: u64) {
+    #[cfg(test)]
+    census::add(_what, _n);
+}
+
+const GO_KEPT: usize = 8;
+const RESTORE_KEPT: usize = 9;
+const GIVE_KEPT: usize = 10;
+const TAKE_KEPT: usize = 11;
+const TAKEN: usize = 12;
+const RUN_BYTES: usize = 13;
+
 /// Where nothing may begin (one past the last instruction).
 const NOWHERE: Admit = Admit { bytes: [0; 4], end: false, any: false };
 
@@ -842,6 +885,19 @@ impl Program {
                 continue;
             }
             let Some(&inst) = self.insts.get(pc) else { return Found::No };
+            count(
+                match inst {
+                    Inst::Lit { .. } => 0,
+                    Inst::One(_) => 1,
+                    Inst::Run { .. } => 2,
+                    Inst::Split { .. } => 3,
+                    Inst::Jmp(_) => 4,
+                    Inst::Save(_) => 5,
+                    Inst::Look(_) => 6,
+                    Inst::Match => 7,
+                },
+                1,
+            );
             next = match inst {
                 Inst::Lit { at: l, len: n } => {
                     let lit = self.lits.get(l as usize..(l + n) as usize).unwrap_or_default();
@@ -857,6 +913,7 @@ impl Program {
                     match (self.admit(a).at(hay, at), self.admit(b).at(hay, at)) {
                         (true, true) => {
                             stack.push(Frame::Go { pc: b as u32, at: at as u32 });
+                            count(GO_KEPT, 1);
                             Some((a, at))
                         }
                         (true, false) => Some((a, at)),
@@ -870,6 +927,7 @@ impl Program {
                         // Nothing to go back to: nothing to restore.
                         if !stack.is_empty() {
                             stack.push(Frame::Restore { slot, was: *x });
+                            count(RESTORE_KEPT, 1);
                         }
                         *x = at as u32;
                     }
@@ -941,6 +999,7 @@ impl Program {
             }
         }
         *steps += q - lo;
+        count(RUN_BYTES, (q - at) as u64);
         if keep {
             return (!stopped).then_some((pc + 1, q));
         }
@@ -955,6 +1014,7 @@ impl Program {
         let t = self.highest(pc + 1, hay, lo, top, steps)?;
         if t > lo {
             stack.push(Frame::Give { pc: pc as u32, lo: lo as u32, hi: prev(hay, t, lo) as u32 });
+            count(GIVE_KEPT, 1);
         }
         Some((pc + 1, t))
     }
@@ -986,6 +1046,7 @@ impl Program {
             }
             if next.at(hay, q) {
                 stack.push(Frame::Take { pc: pc as u32, at: q as u32, n });
+                count(TAKE_KEPT, 1);
                 return Some((pc + 1, q));
             }
             if n == max {
@@ -1002,6 +1063,7 @@ impl Program {
     fn back(&self, hay: &[u8], stack: &mut Vec<Frame>, slots: &mut [u32], seen: &mut Seen<'_>, steps: &mut usize) -> Option<(usize, usize)> {
         while let Some(f) = stack.pop() {
             *steps += 1;
+            count(TAKEN, 1);
             match f {
                 Frame::Go { pc, at } => return Some((pc as usize, at as usize)),
                 Frame::Restore { slot, was } => {
@@ -1014,6 +1076,7 @@ impl Program {
                     if let Some(t) = self.highest(pc + 1, hay, lo, hi as usize, steps) {
                         if t > lo {
                             stack.push(Frame::Give { pc: pc as u32, lo: lo as u32, hi: prev(hay, t, lo) as u32 });
+                            count(GIVE_KEPT, 1);
                         }
                         return Some((pc + 1, t));
                     }
