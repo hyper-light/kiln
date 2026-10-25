@@ -8013,6 +8013,10 @@ and verification (`work::verify`).
     in (`work.memo.observe: true`). The decisions (which call means which `Read`, merging traces,
     partiality) stay pure in `work::pathset`, tested on recorded traces as fixtures, as cargo's
     dependency files are; the supervisor lives in `runner/work/observe.rs`.
+  - **Built** (`runner/observe.rs`, `crates/kiln-preload`): `trace` by seccomp user notification,
+    `trace_preload` by the interposition library; a static Go program's read and rustc's are both
+    recorded under the first, rustc's reads and variables under the second. Left: their overhead on
+    kiln's debug build on fedora (at most 3 % and 15 %), measured in a quiet window, and macOS.
 - **`kiln rustc`** (R09) is a `RUSTC_WRAPPER` (`kiln rustc <rustc> <args>`), sccache-compatible for
   library crates, that also caches proc-macro, bin and test units:
   1. It reads the invocation (crate name and types, `--emit`, `-C` flags, `--extern`, `-L`,
