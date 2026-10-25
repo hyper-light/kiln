@@ -7668,6 +7668,26 @@ plan:
 | M4 | Observation, `kiln rustc`, trust, verification | R04, R05, R09, R21–R23 |
 | M5 | Warm microVMs and k8s, remote execution, the seams | R13, R14, R26 |
 
+**The `.kiln/` workflows on the engine (M0, step 4).** Each `.kiln/*.yaml` at 0886756c, checked
+(`/api/ci/validate`) and planned for a push to `main` (`/api/ci/plan-preview`) on a test server
+with the engine on; its labels compared with production's runners (`ci.workflows.labels`).
+Production's engine is off, so it can't plan them itself.
+
+| File | Kind | Plan for a push to `main` | Legs | Before it can run on the engine |
+|---|---|---|---|---|
+| `ci.yaml` | workflow | runs | 5: `rust`, `ui`, `vendor` on `[k8s]`; `ui-checks` on `[baremetal, linux]`; `release-binary` on `[baremetal, local]` | the three `k8s` legs need a `k8s` pool (W13-R07, R09): production's `k8s` label comes from a runner today; else route them to bare metal |
+| `bench.yaml` | workflow | runs | 3 on `[baremetal, bench]` | nothing: production has both labels |
+| `e2e.yaml` | workflow | doesn't run (`branches` doesn't match `main`) | 62 when it runs, its `k8s` jobs among them | the `k8s` legs, as `ci.yaml`'s |
+| `image.yaml` | workflow | runs | 1 on `[baremetal, local]` | nothing |
+| `release.yaml` | workflow | runs | 3: `linux`, `windows` on `[baremetal, local]`, `macos` on `[baremetal, macos]` | nothing from the engine |
+| `stress.yaml` | workflow | doesn't run on `push` | 113: a `gate` and a matrix on `[baremetal]`, one `k8s` job | the `k8s` leg |
+| `deploy.yaml` | KilnCD's policy, not a workflow | not planned (no `jobs:`) | | nothing: CD reads it |
+| `environments.yaml` | KilnCD's environments, not a workflow | not planned (no `jobs:`) | | nothing: CD reads it |
+
+`ui-checks` asks for `linux`, which production's runners give as `Linux`; label matching is to be
+confirmed case-insensitive. The production change, for the person to make (not deployed): `[ci]
+enabled = true` and `kiln_workflows = true`, after the `k8s` pool above.
+
 ## 4. API, events, CLI and MCP reference
 
 All routes come from the one route table (W10-R05, W20-R01) and follow access.md's conventions:
