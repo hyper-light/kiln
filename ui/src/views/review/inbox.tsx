@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { Link } from "@/lib/router";
-import { inboxRes, reviewApi, STATE_WORD, whoSaid, type Inbox, type InboxNote, type InboxThread } from "@/api/review";
+import { HOST_WORD, hostNumber, inboxRes, reviewApi, STATE_WORD, whoSaid, type Inbox, type InboxNote, type InboxThread } from "@/api/review";
 import { Button } from "@/components/ui/button";
 import { Loadable, Loading } from "@/components/ui/loading";
 import { PageIntro } from "@/components/ui/misc";
@@ -41,12 +41,13 @@ export default function InboxPage() {
 function InboxBody() {
   const inbox: Inbox = useRes(inboxRes).data;
   const notes = inbox.notifications ?? [];
-  const nothing = notes.length + inbox.waiting_for_you.length + inbox.review_requested.length + inbox.your_diffs.length + inbox.waiting_for_others.length === 0;
+  const elsewhere = inbox.elsewhere ?? [];
+  const nothing = notes.length + inbox.waiting_for_you.length + inbox.review_requested.length + elsewhere.length + inbox.your_diffs.length + inbox.waiting_for_others.length === 0;
   if (nothing) return <p className="rv-sub">Nothing waits on you, and you have no open diffs.</p>;
   return (
     <div className="rv-inbox">
       <Notes notes={notes} unread={inbox.unread ?? 0} />
-      <Section title="Waiting for you" n={inbox.waiting_for_you.length + inbox.review_requested.length}>
+      <Section title="Waiting for you" n={inbox.waiting_for_you.length + inbox.review_requested.length + elsewhere.length}>
         {inbox.review_requested.map((r) => (
           <li key={`r${r.diff}`}>
             <Link to={`/review/${r.diff}`} className="rv-inbox-row">
@@ -55,6 +56,18 @@ function InboxBody() {
               </span>
               <span className="rv-sub">
                 {r.repo} · {whoSaid(r.author)} asks your review
+              </span>
+            </Link>
+          </li>
+        ))}
+        {elsewhere.map((p) => (
+          <li key={`h${p.repo}#${p.number}`}>
+            <Link to={`/review/hosts/${encodeURIComponent(p.repo)}/${p.number}`} className="rv-inbox-row">
+              <span className="rv-inbox-what">
+                <b>{hostNumber(p.host, p.number)}</b> {p.title}
+              </span>
+              <span className="rv-sub">
+                {p.repo} on {HOST_WORD[p.host]} · {p.author} asks your review
               </span>
             </Link>
           </li>
