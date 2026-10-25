@@ -132,20 +132,28 @@ impl Following {
         }
     }
 
-    /// Where following `source` of `session` starts: where the store's copy ends.
-    fn start(&self, session: &str, source: &str, path: &Path) -> Followed {
-        let mark = self.store.marks(session).ok().and_then(|m| m.into_iter().find(|m| m.source == source));
-        match mark {
+    /// Where following `source` of `session` starts: where the store's copy ends. None while the
+    /// store can't say (busy, or stopped): asked again next look. Taken for "nothing kept", it
+    /// read the whole file again, and the store and every feed of it took it all again.
+    fn start(&self, session: &str, source: &str, path: &Path) -> Option<Followed> {
+        let marks = match self.store.marks(session) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(%session, %source, error = %format!("{e:#}"), "conversation store: where its copy of the harness's record ends couldn't be read; asked again");
+                return None;
+            }
+        };
+        Some(match marks.into_iter().find(|m| m.source == source) {
             Some(m) => Followed { path: path.to_owned(), n: m.n + 1, end: m.end, check: Some(m.line) },
             None => Followed { path: path.to_owned(), n: 0, end: 0, check: None },
-        }
+        })
     }
 
     /// What `source` of `session` has that the store hasn't, into the store.
     fn follow(&mut self, session: &str, source: &str, path: &Path) {
         let key = (session.to_owned(), source.to_owned());
         if !self.files.contains_key(&key) {
-            let f = self.start(session, source, path);
+            let Some(f) = self.start(session, source, path) else { return };
             self.files.insert(key.clone(), f);
         }
         let Some(f) = self.files.get_mut(&key) else { return };
@@ -275,6 +283,28 @@ mod tests {
         r.follow("s1", "t", &path);
         assert_eq!(rows_of(&store, "s1", "t")?.into_iter().map(|(n, _)| n).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
         assert_eq!(rows_of(&store, "s1", "t")?.get(2).map(|(_, l)| l.clone()), Some("{\"c\":3}".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_that_cannot_say_where_its_copy_ends_is_asked_again_and_nothing_is_read_twice() -> anyhow::Result<()> {
+        let (dir, store) = super::super::store::scratch()?;
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, "one\ntwo\n")?;
+        Following { store: store.clone(), files: HashMap::new(), found: HashMap::new() }.follow("s1", "t", &path);
+        store.sync()?;
+        let top = store.top()?;
+        // Restarted while its store can't answer (busy, or stopped): the file isn't taken to be
+        // new to it, read from its top and sent to the store again.
+        let mut stuck = Following { store: super::super::store::stopped(), files: HashMap::new(), found: HashMap::new() };
+        stuck.follow("s1", "t", &path);
+        assert!(stuck.files.is_empty());
+        // Asked again once it answers: it goes on where the store's copy ends.
+        std::fs::OpenOptions::new().append(true).open(&path)?.write_all(b"three\n")?;
+        let mut again = Following { store: store.clone(), files: HashMap::new(), found: HashMap::new() };
+        again.follow("s1", "t", &path);
+        assert_eq!(rows_of(&store, "s1", "t")?, vec![(0, "one".to_owned()), (1, "two".to_owned()), (2, "three".to_owned())]);
+        assert_eq!(store.top()?, top + 1);
         Ok(())
     }
 
