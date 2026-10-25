@@ -951,7 +951,15 @@ references, lints and their fixes), `schema.rs` (JSON Schemas from `keys.rs`), `
 **Progress.** Done, except W02-AC09. That criterion needs runs (W03, W05); the loader already
 returns a broken file with its diagnostics for the run to show. `[ci] kiln_workflows` (off by
 default) lets the engine run `.kiln/` workflows too, v1 standing aside for a commit the engine
-took: the kiln dialect's outputs, exports and implicit checkout run on it end to end.
+took: the kiln dialect's outputs, exports and implicit checkout run on it end to end. kiln's own
+release pipeline runs there too (W25 step 3):
+  - Each successful leg of it has its `artifacts-<key>` artifact (W08-R08) read, and the
+    `kiln-<target>` binaries in it are checked and kept for runners to upgrade to (`[updates]`,
+    docs/releases.md), as v1's jobs' tarballs are.
+  - A run of a tag (a `push` of `refs/tags/…` on the engine) counts as v1's `tag` event.
+  - `[updates] in_step`'s build of the server's commit starts the engine's run of it.
+  - The fleet reads the engine's legs, which are `jobs` rows as v1's are, for the run a machine
+    waits on.
 
 - *Code.*
   - `crates/kiln-ci/src/wf/` (above).
@@ -2680,7 +2688,11 @@ reusing the results of jobs whose inputs have not changed.
   uploads, `retention-days` (default `ci.artifact_retention_days`, 90), download by name or id
   within the run, and across runs through the facade's REST endpoints
   (`/repos/{o}/{r}/actions/runs/{id}/artifacts`, `/actions/artifacts/{id}/zip`). v1's `artifacts:`
-  tarballs become an artifact named `artifacts`, and `GET /api/jobs/:id/artifacts` keeps working.
+  become an artifact of each leg, named `artifacts-<key>` after the leg's key (`artifacts-linux`,
+  `artifacts-build (linux, 14)`; what a name can't hold becomes `_`). A name is unique within its
+  run, so one `artifacts` for every leg left the second leg's upload refused (*corrected
+  2026-10-25*: release.yaml's three legs and ci.yaml's two each upload theirs). `GET
+  /api/jobs/:id/artifacts` keeps working.
   - **GitHub Enterprise Server's refusal.** `@actions/artifact` v2 and later throw
     `GHESNotSupportedError` when `GITHUB_SERVER_URL`'s host is not github.com, `*.ghe.com` or
     `*.localhost`. That covers `upload-artifact@v4` and `download-artifact@v4` and every later

@@ -1996,6 +1996,70 @@ jobs:
     Ok(())
 }
 
+/// W08-R08: v1's `artifacts:` on the engine are an artifact of each leg (`artifacts-<key>`), so
+/// every leg of a job list that keeps them uploads its own, as release.yaml's three platforms do
+/// (W25 step 3); one name for all of them refused the second leg's.
+#[test]
+fn w08_r08_each_legs_artifacts_are_its_own() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/rel", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "rel\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/rel.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(
+        work.join(".kiln/release.yaml"),
+        r#"name: release
+on: push
+jobs:
+  linux:
+    runs-on: local
+    checkout: false
+    steps:
+      - run: mkdir -p dist && echo linux > dist/kiln-x86_64-unknown-linux-musl
+    artifacts: ["dist/*"]
+  windows:
+    runs-on: local
+    checkout: false
+    steps:
+      - run: mkdir -p dist && echo windows > dist/kiln-x86_64-pc-windows-msvc.exe
+    artifacts: ["dist/*"]
+"#,
+    )?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "release"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let run = loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/rel&limit=5", &s.admin, None)?;
+        let runs: Value = serde_json::from_str(&body)?;
+        if let Some(r) = runs.pointer("/runs/0").filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null()) && text(r, "workflow").ends_with("release.yaml")) {
+            break r.clone();
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the run didn't finish: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let (_, listed) = http(s.port, "GET", &format!("/api/ci/runs/{}/artifacts", text(&run, "id")), &s.admin, None)?;
+    assert_eq!(text(&run, "conclusion"), "success", "{listed}\n{}", s.log());
+    let names: Vec<String> = serde_json::from_str::<Value>(&listed)?.get("artifacts").and_then(Value::as_array).into_iter().flatten().map(|a| text(a, "name").to_owned()).collect();
+    assert_eq!(names.len(), 2, "{listed}");
+    assert!(names.contains(&"artifacts-linux".to_owned()) && names.contains(&"artifacts-windows".to_owned()), "{listed}");
+    Ok(())
+}
+
 /// W08-R09's `kiln/cache@v1` with its local tier: a first run misses and saves every chunk; a
 /// second restores the first's entry by a restore key with nothing downloaded (the runner kept
 /// the chunks), changes a little of it, and saves only the chunks that changed.
