@@ -719,9 +719,9 @@ impl Scheduler {
         self.admits(r, l) && self.capacity(r, l)
     }
 
-    /// Whether a runner would take a leg once it has room: connected, not draining, not kept for
-    /// other legs, not one the leg stays off, the one it's pinned to, and the repository within
-    /// its quota.
+    /// Whether a runner would take a leg once it has room: connected, not draining, not past
+    /// admission's limits for a heavy leg (W24-R19), not kept for other legs, not one the leg stays
+    /// off, the one it's pinned to, and the repository within its quota.
     fn admits(&self, r: &Runner, l: &Leg) -> bool {
         if !r.connected || r.draining {
             return false;
