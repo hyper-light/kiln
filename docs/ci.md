@@ -196,7 +196,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, the graph from the plan with matrix grids, progress and what jobs wait for, critical path, summaries, annotations, artifacts, pins); the leg page (notes, timing bar, attempts, outputs, terminal, Keep); the runs list's facets and sorts; the workflow editor (checks against its repository, the schema's keys, the plan preview and its matrix, the flow view, saving as the repository takes it); Insights (repositories, workflows, runners, tests, benchmarks); Settings → CI, → People, → Tokens and → You; the Runners page's pools (their scaling history), images and executors, and the image builder; comparing runs; log search; environments (board and pages); AC01 in kiln's CI (`ci/ui/run-all.sh`), AC02, AC03 (25–30 ms, 60 fps), AC04, the run's data flow; the editor's Agentfile lints left (shards' own: blocked on shards) |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 48 of F-21's 50 green, four of them needing accounts and passing in dry configurations against stand-ins (AWS's two, Google's, Codecov's); azure/login waits for a tenant, and attest-build-provenance for GitHub's Sigstore; AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
-| W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R28, AC01–AC12; milestones M0–M5 are kiln goals with plans |
+| W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R30, AC01–AC14; milestones M0–M6 are kiln goals with plans |
 
 ---
 
@@ -7360,8 +7360,8 @@ what can't be keyed exactly runs incrementally on kept ("warm") state; what tool
 into one content-addressed cache shared across the fleet; and the planner works out from the
 change what it could affect before anything runs. Every reuse, warm start and rebuild says why.
 W24 extends W08 (R09's cache tiers, R10's job-result reuse) and W05-R23's preferences, and is
-built on the CI engine alone. Container builds join W24 too, in kiln's own container engine instead
-of BuildKit (R29).
+built on the CI engine alone. Container builds join W24 too, as kiln's operations on Hex instead of
+BuildKit (R29).
 
 **Why.** As of 2026-10-24 (origin/main a34c9139), nothing keeps work between runs:
 
@@ -7396,12 +7396,13 @@ its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
    artifact into a release.
 5. **Remote execution last.** It needs Hex's placement (CP-T7) and sandboxes; the data model is
    ready for it from the start, so nothing built earlier has to change.
-6. **Dagger's approach, not BuildKit.** Container builds move to kiln's own engine (R29), as
-   Dagger's did in Project Theseus (v0.21, 2026-05-22). Their keys are computed and looked up on
-   the same path as every other unit's, the ledger's, not in BuildKit's separate caches. Remote
-   caching and cache observability come from W24's own store, reports and trust rules. Operations
-   are lifted out of BuildKit one at a time, so nothing breaks on the way; Theseus showed this
-   works at Dagger's scale. Like the others, this is a default the person may change.
+6. **Dagger's approach on Hex, not BuildKit.** A container build's operations, their keys and their
+   cache are kiln's (R29). One path computes and looks up every key, the ledger's, in place of
+   BuildKit's separate caches; Dagger's Project Theseus (v0.21, 2026-05-22) showed this works at
+   Dagger's scale. The runtime is Hex's (CP-T7), reached through `Sandbox` and `Placement`, not a
+   second one kiln would build and keep. Remote caching and cache observability come from W24's own
+   store, reports and trust rules, and operations leave BuildKit one at a time, so nothing breaks
+   on the way. Like the others, this is a default the person may change.
 
 **Requirements: the model**
 
@@ -7423,10 +7424,11 @@ its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
   job and step output values) as content digests, logs and test reports, path set, provenance
   (repository, run, leg, step, attempt, runner, commit, tree, duration, CPU), trust domain,
   lineage, verifications and signatures. Families `work.result`, `work.weak` (a weak key's path
-  sets, at most 8), `work.pathset`, `work.snapshot`, `work.lane`, `work.graph`, `work.test` and
-  `work.verify`, keyed under `owner/repo|domain|`. They live in SQLite through a numbered migration
-  now and in Amphora through the `Records` seam later. Bytes stay in the content-addressed store
-  (`cas/<sha256>`, through `Blobs`).
+  sets, at most 8), `work.pathset`, `work.snapshot`, `work.lane`, `work.graph`, `work.test`,
+  `work.verify` and `work.eclass` (e-classes and their merges, R30), keyed under
+  `owner/repo|domain|`. They live in SQLite through a numbered migration now and in Amphora through
+  the `Records` seam later. Bytes stay in the content-addressed store (`cas/<sha256>`, through
+  `Blobs`).
 - **W24-R03 Early cutoff.** A unit's key takes its upstream units' output digests, never their
   keys. A unit that reruns and produces byte-identical outputs leaves everything after it
   reusable.
@@ -7589,23 +7591,39 @@ its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
 
 **Requirements: containers and equivalence**
 
-- **W24-R29 kiln's own container engine.** Container builds run in kiln's own engine, not in
-  BuildKit. Each operation (git, HTTP and local sources; container exec; copy, mkdir, remove,
-  merge; export to OCI) is an action keyed by its fingerprint (R01) and recorded in the ledger
-  (R02), with its layers kept as trees in the content store, so image builds share W24's one cache,
-  its reports (R28) and its trust rules (R21). Operations are lifted out of BuildKit one at a time
-  behind a facade, as Dagger's Project Theseus did with DagOp. In a differential mode, each lifted
-  operation also runs in BuildKit and the two outputs are compared, until every operation is
-  native. BuildKit and W08-R11's caches stay until then. After that, `cache-from` and `cache-to`
+- **W24-R29 Container builds on Hex.** kiln keeps a container build's operations, their keys, the
+  ledger and the content store; Hex runs the ones that need a runtime. Each operation is an action
+  keyed by its fingerprint (R01) and recorded in the ledger (R02), its layers kept as trees in the
+  content store, so image builds share W24's one cache, its reports (R28) and its trust rules
+  (R21). The operations:
+  - exec (`RUN`): a Hex workload through the `Sandbox` seam, on the `oci` class for trusted builds
+    and the `firecracker` or `shards` class for untrusted ones, placed through `Placement` (R18's
+    warmth an input), with its cache mounts (`RUN --mount=type=cache`) as Hex volumes (CP-T7.8);
+  - file operations (copy, mkdir, remove, merge) and git, HTTP and local sources: done by kiln on
+    trees in the content store, with no runtime;
+  - image sources (`FROM`): pulled through Hex's image unpacker, or loaded lazily from Reliquary
+    once CP-T7.8 lands;
+  - exports: pushed to Reliquary through the `Artifacts` seam (CP-T9.1).
+
+  Operations are lifted out of BuildKit one at a time behind a facade, as Dagger's Project Theseus
+  did with DagOp. In a differential mode, each lifted operation also runs in BuildKit and the two
+  outputs are compared, until every operation is native. Untrusted builds stay on BuildKit behind
+  the facade until the `firecracker` and `shards` classes land (CP-T7.2), since, as of 2026-10-24,
+  Hex's `oci` class doesn't apply a spec's seccomp, AppArmor or SELinux settings. BuildKit and
+  W08-R11's caches stay until every operation is native; after that, `cache-from` and `cache-to`
   (`type=gha`, `type=registry`) are served from the ledger and the content store, for compatibility
-  with the workflows that use them.
+  with the workflows that use them. The seam contract (a tree as a workload's root, volumes, the
+  output tree) is agreed with Hex's track, never by editing Hex.
 - **W24-R30 An equivalence-aware cache.** The ledger keeps e-classes, as an e-graph does (egg,
   Willsey et al., POPL 2021, arXiv 2004.03082), the structure Dagger's new cache is built on. Keys
   whose units produced byte-identical outputs merge into one class, through union-find, and each
-  class's output digest is its e-class analysis. Lookups take upstream units by class, so congruent
-  units (the same operation over equivalent inputs) share a result before those inputs are
-  materialized. A rewrite rule that makes operations equivalent (dropping a no-op, reordering
-  operations that commute) is added only with a differential test. R23's verification guards every
+  class's output digest is its e-class analysis. Merges stay within a trust domain: a class joins
+  only entries its domain may read (R21), so untrusted evidence never enters a class that trusted
+  lookups use. Lookups take upstream units by class, so congruent units (the same operation over
+  equivalent inputs) share a result. A rewrite rule that makes operations equivalent (dropping a
+  no-op, reordering operations that commute) is added only with a differential test. R03 already
+  gives equivalence by output digest; the hits e-classes add come from rewrite rules and from
+  finding a congruent result before its inputs are materialized. R23's verification guards every
   merge: a mismatch splits the class and quarantines its lineage. As in Dagger's cache, every key
   is computed and looked up on a single code path.
 
@@ -7625,6 +7643,11 @@ its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
   workspaces, materializing, observation, `kiln rustc` and `kiln gocacheprog`. `runner/runtime.rs`
   takes or builds a workspace when a leg starts, looks steps up, and snapshots and releases the
   workspace when it ends. `reach/sync.rs` and `harness/*` change as R24 says.
+- **Container builds** (R29, R30): `kiln_ci::work::ops`, pure, holds the operation model and the
+  Dockerfile frontend (over `kiln_ci::dockerfile`'s parser); `kiln_ci::work::eclass`, pure, holds
+  union-find and congruence. The runner's build facade, beside `kiln/build-image@v1`, does file
+  operations and git, HTTP and local sources itself, runs exec on Hex, and hands BuildKit what
+  isn't native yet.
 
 ```yaml
 jobs:
@@ -7650,6 +7673,8 @@ jobs:
   `AgentMsg::WorkState` in `proto.rs`.
 - **Seams**: the ledger on `Records`; bytes on `Blobs` (Mantle, CP-T10); remote execution on
   `Placement` and `Sandbox` (Hex, CP-T7).
+- **Container builds** (R29): workloads on `Sandbox` and `Placement` (Hex, CP-T7), images on
+  `Artifacts` (Reliquary, CP-T9.1); nothing new on kiln's own wire yet.
 - **Takes** W03's changed files, W05's routing, W08's store and cache scopes, W13's executors,
   W16's test reports and W18's trust.
 - **Gives** W14's land queue its reuse, W16 and W19 their keys and reports, and W20's agents
@@ -7687,8 +7712,8 @@ jobs:
 - **W24-AC13 Native builds match BuildKit.** On a corpus of Dockerfiles (kiln's own and fixtures),
   native builds give the same layer trees and image config as BuildKit's, timestamps aside.
   *Differential test.*
-- **W24-AC14 Equivalence raises hits.** On replayed kiln history, the hit rate with e-classes is at
-  least that of plain keys, with no wrong hit in verification. *Replay and verification.*
+- **W24-AC14 Equivalence loses no hits.** On replayed kiln history, the hit rate with e-classes is
+  at least that of plain keys, with no wrong hit in verification. *Replay and verification.*
 
 **Progress.** Specified (2026-10-24). M0 built (2026-10-25), awaiting review: R24's sync keeps the
 remote's build output (`reach/sync.rs`), R11's v1 `cache:` folders are kept per repository and job
@@ -7703,7 +7728,7 @@ plan:
 | M3 | Graphs, `affected()`, tests, the land queue, admission | R10, R16, R17, R19, R20 |
 | M4 | Observation, `kiln rustc`, trust, verification | R04, R05, R09, R21–R23 |
 | M5 | Warm microVMs and k8s, remote execution, the seams | R13, R14, R26 |
-| M6 | kiln's own container engine replaces BuildKit; the equivalence-aware cache | R29, R30 |
+| M6 | Container builds on Hex replace BuildKit; the equivalence-aware cache | R29, R30 |
 
 
 **Baseline (M0, step 1).** kiln's `rust` job steps (`.kiln/ci.yaml`) on fedora, in a capped user unit
@@ -8471,3 +8496,12 @@ Integrations (checked 2026-10-17):
 - PyPI: [trusted publishers internals](https://docs.pypi.org/trusted-publishers/internals/), [expanded providers](https://blog.pypi.org/posts/2024-04-17-expanding-trusted-publisher-support/)
 - crates.io: [trusted publishing](https://crates.io/docs/trusted-publishing)
 - Trusted publishing across RubyGems, NuGet and others: [overview](https://hidekazu-konishi.com/entry/trusted_publishing_beyond_npm_and_pypi.html), [OpenSSF](https://repos.openssf.org/trusted-publishers-for-all-package-repositories.html)
+
+W24's container builds and cache (checked 2026-10-25):
+
+- Hex: <https://github.com/hyper-light/hex> (`STATUS.md` of 2026-10-24); its track's plan is kiln
+  plan `01a157fe102576a8bf44ccaa5d835de7` (CP-T7).
+- Dagger's Project Theseus, which replaced BuildKit's solver and built its new cache on e-graphs
+  (v0.21, 2026-05-22): <https://dagger.io/changelog/theseus/>.
+- egg: Fast and Extensible Equality Saturation (Willsey et al., POPL 2021):
+  <https://arxiv.org/abs/2004.03082>.
