@@ -74,13 +74,19 @@ impl Handovers {
     }
 
     /// A piece of session `id`'s package from process `from`, while `newest` is its machine's
-    /// newest process (or none other than `from` is).
-    pub fn piece(&mut self, id: &str, from: PeerId, newest: Option<PeerId>) -> Piece {
+    /// newest process (or none other than `from` is). `upgrading`: a new build of the machine's
+    /// runner is taking over, from that newest process: a package not on its way yet waits for it
+    /// (what the leaving process took would stay with it).
+    pub fn piece(&mut self, id: &str, from: PeerId, newest: Option<PeerId>, upgrading: bool) -> Piece {
         let Some(h) = self.by_session.get_mut(id).filter(|h| h.from == from) else {
             return Piece::Refused("no hand-over of it is under way on the server (it may have restarted)".into());
         };
         if let Some(to) = h.to {
             return Piece::To(to);
+        }
+        if upgrading {
+            self.by_session.remove(id);
+            return Piece::Refused("a new build of this machine's runner is taking over: it is asked for again once that's done".into());
         }
         match newest.filter(|n| *n != from) {
             Some(n) => {
@@ -142,7 +148,9 @@ impl Hub {
             let held: Vec<String> = {
                 let inst = self.instances.lock();
                 let Some(newest) = inst.newest(&name) else { continue };
-                if peer == newest || !inst.hands_over(peer) || !inst.hands_over(newest) {
+                // Nor while a new build takes the machine over: its newest is the process leaving
+                // then. Asked for once it's promoted (`Hub::newest_changed`).
+                if peer == newest || !inst.hands_over(peer) || !inst.hands_over(newest) || inst.upgrading(&name) {
                     continue;
                 }
                 inst.owned_by(peer)
@@ -177,11 +185,11 @@ impl Hub {
     /// A piece of an agent session's package, from the older process handing it over: on to the
     /// machine's newest process. Refused, the older process hears so and goes on with it.
     pub(crate) async fn handover_piece(&self, agent: &str, peer: PeerId, session: String, offset: u64, data: Vec<u8>, done: bool) {
-        let newest = {
+        let (newest, upgrading) = {
             let inst = self.instances.lock();
-            inst.newest(agent).filter(|n| inst.hands_over(*n))
+            (inst.newest(agent).filter(|n| inst.hands_over(*n)), inst.upgrading(agent))
         };
-        let piece = self.handovers.lock().piece(&session, peer, newest);
+        let piece = self.handovers.lock().piece(&session, peer, newest, upgrading);
         match piece {
             Piece::To(to) => {
                 let msg = ServerMsg::HarnessPackage { session: session.clone(), offset, data, done };
@@ -297,11 +305,11 @@ mod tests {
         // Asked already: not again while it's on its way.
         assert!(h.due("box", 1, vec!["s1".into()], t + Duration::from_secs(5)).is_empty());
         // Its pieces go to the newest at the first, and stay with it.
-        assert_eq!(h.piece("s1", 1, Some(2)), Piece::To(2));
-        assert_eq!(h.piece("s1", 1, Some(3)), Piece::To(2));
+        assert_eq!(h.piece("s1", 1, Some(2), false), Piece::To(2));
+        assert_eq!(h.piece("s1", 1, Some(3), false), Piece::To(2));
         assert!(h.going_to("s1", 2) && !h.going_to("s1", 3) && !h.going_to("s2", 2));
         // Only from the process that was asked.
-        assert!(matches!(h.piece("s1", 9, Some(2)), Piece::Refused(_)));
+        assert!(matches!(h.piece("s1", 9, Some(2), false), Piece::Refused(_)));
         // Taken over by the process it went to; nobody else ends it.
         assert_eq!(h.adopted("s1", 3), None);
         assert_eq!(h.adopted("s1", 2).map(|x| x.from), Some(1));
@@ -313,10 +321,10 @@ mod tests {
         let mut h = Handovers::default();
         let t = Instant::now();
         h.due("box", 1, vec!["s1".into()], t);
-        assert!(matches!(h.piece("s1", 1, Some(1)), Piece::Refused(_)));
+        assert!(matches!(h.piece("s1", 1, Some(1), false), Piece::Refused(_)));
         // Ended: asked again later.
         assert_eq!(h.due("box", 1, vec!["s1".into()], t), vec!["s1".to_owned()]);
-        assert!(matches!(h.piece("s1", 1, None), Piece::Refused(_)));
+        assert!(matches!(h.piece("s1", 1, None, false), Piece::Refused(_)));
     }
 
     #[test]
@@ -325,8 +333,8 @@ mod tests {
         let t = Instant::now();
         h.due("box", 1, vec!["s1".into(), "s2".into()], t);
         h.due("box", 4, vec!["s3".into()], t);
-        assert_eq!(h.piece("s1", 1, Some(2)), Piece::To(2));
-        assert_eq!(h.piece("s3", 4, Some(5)), Piece::To(5));
+        assert_eq!(h.piece("s1", 1, Some(2), false), Piece::To(2));
+        assert_eq!(h.piece("s3", 4, Some(5), false), Piece::To(5));
         // The newest went away: what went to it goes on where it was, said so.
         let lost: Vec<String> = h.lost(2).into_iter().map(|(id, x)| format!("{id}<-{}", x.from)).collect();
         assert_eq!(lost, vec!["s1<-1".to_owned()]);
@@ -342,7 +350,7 @@ mod tests {
         let t = Instant::now();
         h.due("box", 1, vec!["s1".into(), "s2".into()], t);
         h.due("mac", 7, vec!["s9".into()], t);
-        assert_eq!(h.piece("s1", 1, Some(2)), Piece::To(2));
+        assert_eq!(h.piece("s1", 1, Some(2), false), Piece::To(2));
         // The older process goes: nothing to tell it now, but both its hand-overs are kept.
         assert!(h.lost(1).is_empty());
         assert!(h.dropped_in("mac", &["s1".into()]).is_empty(), "another machine's aren't these");
@@ -352,7 +360,7 @@ mod tests {
         assert_eq!(h.dropped_in("box", &["s2".into()]), vec!["s2".to_owned()]);
         assert!(!h.dropped.contains_key("box"), "nothing left of the machine");
         // The newer process going: its older one is told at once, and nothing is kept.
-        assert_eq!(h.piece("s9", 7, Some(8)), Piece::To(8));
+        assert_eq!(h.piece("s9", 7, Some(8), false), Piece::To(8));
         assert_eq!(h.lost(8).len(), 1);
         assert!(h.dropped_in("mac", &["s9".into()]).is_empty());
     }
@@ -365,7 +373,21 @@ mod tests {
         assert!(h.due("box", 1, vec!["s1".into()], t + ASK_AGAIN - Duration::from_secs(1)).is_empty());
         assert_eq!(h.due("box", 1, vec!["s1".into()], t + ASK_AGAIN), vec!["s1".to_owned()]);
         // Once its package is on its way, it isn't.
-        assert_eq!(h.piece("s1", 1, Some(2)), Piece::To(2));
+        assert_eq!(h.piece("s1", 1, Some(2), false), Piece::To(2));
         assert!(h.due("box", 1, vec!["s1".into()], t + ASK_AGAIN * 3).is_empty());
+    }
+
+    #[test]
+    fn a_package_waits_while_a_new_build_takes_the_machine_over() {
+        let mut h = Handovers::default();
+        let t = Instant::now();
+        h.due("box", 1, vec!["s1".into(), "s2".into()], t);
+        // One on its way already goes on where it goes.
+        assert_eq!(h.piece("s1", 1, Some(2), false), Piece::To(2));
+        assert_eq!(h.piece("s1", 1, Some(2), true), Piece::To(2));
+        // One not yet doesn't go to the process leaving: refused, and asked for again later.
+        assert!(matches!(h.piece("s2", 1, Some(2), true), Piece::Refused(_)));
+        assert!(!h.going_to("s2", 2));
+        assert_eq!(h.due("box", 1, vec!["s2".into()], t), vec!["s2".to_owned()]);
     }
 }

@@ -240,12 +240,17 @@ impl Host {
 
     /// Take over the session in the package the server sent (`receive_package`). Blocking. Whether
     /// an older runner process of this machine handed it over (`super::handing`: this one says how
-    /// it went), and how it went.
-    pub fn adopt_package(&self, path: &std::path::Path) -> (bool, Result<(), String>) {
+    /// it went), and how it went. `leaving`: this process hands everything to a new build of it,
+    /// or retires after it: a hand-over isn't taken, as it would end with this process; the older
+    /// one goes on with it, and is asked for it again once the new build has taken over.
+    pub fn adopt_package(&self, path: &std::path::Path, leaving: bool) -> (bool, Result<(), String>) {
         let bytes = std::fs::read(path).map_err(|e| format!("the session's package: {e}"));
         let _ = std::fs::remove_file(path);
         let Ok(bytes) = bytes else { return (false, bytes.map(|_| ())) };
         let handover = super::moving::handed_over(&bytes);
+        if handover && leaving {
+            return (true, Err("this runner process is handing over to a new build of it, and leaving".into()));
+        }
         (handover, self.adopt(if handover { "an older kiln runner of this machine" } else { "the kiln server" }, &bytes))
     }
 
@@ -1098,6 +1103,25 @@ mod tests {
             assert_eq!(metrics.harness_records_written.get(), 1, "the write counted");
             Ok(())
         })
+    }
+
+    /// A process handing everything to a new build of it takes no hand-over (it would end with
+    /// it), and says so; what the server sends of another machine's sessions it still takes.
+    #[test]
+    fn a_process_leaving_for_its_new_build_takes_no_hand_over() -> anyhow::Result<()> {
+        let (tx, _rx) = async_channel::unbounded();
+        let host = sim(tx, None, Limits::default());
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("package.json");
+        std::fs::write(&path, br#"{"handover": true}"#)?;
+        let (handover, taken) = host.adopt_package(&path, true);
+        assert!(handover && taken.as_ref().is_err_and(|e| e.contains("leaving")), "{taken:?}");
+        assert!(!path.exists(), "its package goes, as any does");
+        // Not a hand-over: adopted as before (this one, unreadable, isn't for its own reasons).
+        std::fs::write(&path, br#"{"handover": false}"#)?;
+        let (handover, taken) = host.adopt_package(&path, true);
+        assert!(!handover && taken.as_ref().is_err_and(|e| !e.contains("leaving")), "{taken:?}");
+        Ok(())
     }
 
     /// On a simulated clock of its own, as every host in these tests is (CP-M2, AC-M2.1).

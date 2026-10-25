@@ -2150,12 +2150,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::HarnessPackage { session, offset, data, done } => {
                         // A session going on here from the server's store (its machine is gone).
                         let Some(h) = harness.clone() else { continue };
+                        // Handing everything to a new build of it, or retiring: an older process's
+                        // hand-over isn't taken here (`Host::adopt_package`).
+                        #[cfg(unix)]
+                        let leaving = retiring || moving.as_ref().is_some_and(|m| m.handing);
+                        #[cfg(not(unix))]
+                        let leaving = false;
                         match h.receive_package(&session, offset, &data, done) {
                             Ok(Some(path)) => {
                                 let up = uplink.0.clone();
                                 crate::rt::spawn(async move {
                                     let h2 = h.clone();
-                                    let (handover, taken) = crate::rt::blocking(move || h2.adopt_package(&path)).await.unwrap_or_else(|e| (false, Err(format!("{e:#}"))));
+                                    let (handover, taken) = crate::rt::blocking(move || h2.adopt_package(&path, leaving)).await.unwrap_or_else(|e| (false, Err(format!("{e:#}"))));
                                     // Handed over by an older process of this machine: that one
                                     // goes on with it unless this one took it, so it's told either
                                     // way, and nothing else is said here.
