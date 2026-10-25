@@ -3071,11 +3071,25 @@ textarea.hx-input {
   padding-right: 66px;
 }
 
-/* Each message's ⋯ menu: on what the agent said it floats top-right and the text wraps around
-   it, never beneath it; on your messages and the outcome it closes the head row. */
+/* Each message's ⋯ menu: on what the agent said it floats top-right (it is the first child, so
+   the quote's and the text's lines wrap around it, never beneath it) — said-menu drops by the
+   note's top padding so it sits level with the first line; on your messages it ends the meta row
+   at the bubble's right edge. */
 .hx-said-menu {
   float: right;
+  margin: 12px 0 2px 10px;
+}
+.hx-outcome-menu {
+  float: right;
   margin: 0 0 2px 10px;
+}
+/* A reply's quote sits above the text: the menu goes to its top-right instead of mid-quote. */
+.hx-said:has(> .hx-quote) > .hx-said-menu,
+.hx-outcome-body:has(> .hx-quote) > .hx-outcome-menu {
+  margin-top: 0;
+}
+.hx-prompt-menu {
+  margin-left: auto;
 }
 .hx-msg-menu {
   width: 24px;
