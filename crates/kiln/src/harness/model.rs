@@ -1037,6 +1037,10 @@ pub struct State {
     /// What the harness is doing right now, in a few words ("requesting", "compacting").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
+    /// Its harness is compacting a conversation now (summarizing it to free context): what its
+    /// marker, a `compaction:` notice, says once that's over. None: it isn't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacting: Option<Compacting>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<ExitInfo>,
     /// Events dropped from the front of the timeline to bound memory.
@@ -1266,6 +1270,20 @@ pub struct Checkpoint {
     pub git_ref: String,
     pub commit: String,
     pub at: i64,
+}
+
+/// A compaction under way (`State::compacting`): one at a time, the main thread's over a
+/// subagent's.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Compacting {
+    /// Unix ms it began, as kiln heard.
+    pub since: i64,
+    /// The context it compacts, in tokens, as its harness last said (the main thread's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    /// The subagent run whose conversation it is (its spawning call's id); None: the main thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// A switch the session will make (`State::switching`).
