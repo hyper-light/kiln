@@ -378,9 +378,9 @@ const RETIRE_QUIET: Duration = Duration::from_secs(8);
 /// environment set up, its images pulled) before it's refused.
 const LEG_SHELL_WAIT: Duration = Duration::from_secs(60);
 
-/// How long a new build that took its sessions over, and whose link to the runner it upgraded
-/// ended with no word of a promotion, holds their messages still (a runner that takes them back
-/// stops it well before).
+/// How long a new build whose link to the runner it upgraded ended with no word of a promotion
+/// (everything handed over, or part of it) holds messages still (a runner that takes its sessions
+/// back stops it well before).
 #[cfg(unix)]
 const TAKE_OVER_GRACE: Duration = Duration::from_secs(30);
 
@@ -1896,17 +1896,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let (done, _) = futures::channel::oneshot::channel();
                             let _ = bg_tx.try_send(Bg::Stores { own: None, done });
                         }
-                        // Its link to the runner it upgraded ended after it took everything over, and
-                        // no word of its promotion: that one is gone (one that takes its sessions
-                        // back stops this one first). It takes messages again after a while.
-                        if took_over
-                            && let Some(h) = harness.as_ref().filter(|h| h.is_held())
-                        {
-                            let h = Arc::clone(h);
+                        // Its link to the runner it upgraded ended, and no word of its promotion: that
+                        // one is gone (one that takes its sessions back stops this one first), whether
+                        // it had handed everything over or ended part-way, with what this one took
+                        // then (CP-T3.2). It takes messages again after a while.
+                        if let Some(h) = harness.as_ref().filter(|h| h.is_held()) {
+                            let (h, whole) = (Arc::clone(h), took_over);
                             crate::rt::spawn(async move {
                                 crate::rt::sleep(TAKE_OVER_GRACE).await;
                                 if h.is_held() {
-                                    tracing::warn!("no word of a promotion after taking over: this runner takes messages again");
+                                    tracing::warn!(took_over = whole, "no word of a promotion after the take-over ended: this runner takes messages again");
                                     h.hold(false);
                                 }
                             });
