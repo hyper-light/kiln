@@ -11,6 +11,7 @@
 //! - [`evict`]: what a domain keeps under quota pressure (W24-R15, R21, AC12).
 //! - [`eclass`]: equivalence classes over keys, as an e-graph's: union-find, congruence, rewrite
 //!   rules with witnesses, splits (W24-R30).
+//! - [`why`]: what each unit did, and why one ran: fingerprints compared (W24-R28).
 
 pub mod eclass;
 pub mod evict;
@@ -20,3 +21,4 @@ pub mod ops;
 pub mod queue;
 pub mod slots;
 pub mod tests;
+pub mod why;
