@@ -15,6 +15,8 @@
 //! - [`memo`]: a step's `memo:`, its key, what a success leaves and its files as trees (W24-R07).
 //! - [`pathset`]: path sets from the tools' own records (W24-R04, R05).
 //! - [`trust`]: trust domains, lineage, admission and quotas (W24-R21, R22).
+//! - [`seal`]: what runners sign of a result and the server countersigns, and what readers make
+//!   of it (W24-R22).
 
 pub mod eclass;
 pub mod evict;
@@ -24,6 +26,7 @@ pub mod memo;
 pub mod ops;
 pub mod pathset;
 pub mod queue;
+pub mod seal;
 pub mod slots;
 pub mod tests;
 pub mod trust;
