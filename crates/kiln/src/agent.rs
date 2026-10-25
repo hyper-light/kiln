@@ -3999,6 +3999,54 @@ fn open_mirror(dir: &std::path::Path, up: &async_channel::Sender<Up>) -> Option<
 mod tests {
     use super::*;
 
+    /// A runner handing its store to the new build lets go of it once what its sessions said is in,
+    /// moves it into the new build's folder and says where; the new build goes on with it, the same
+    /// store. A rollback moves it back, and the tee keeps what passes in it again.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_handed_to_the_new_build_goes_whole_and_comes_back_on_a_rollback() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        let said = |id: &str, seq: u64, text: &str| Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] };
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (blue, green) = (dir.path().join("blue"), dir.path().join("green"));
+            std::fs::create_dir_all(&blue)?;
+            let upkeep = || crate::config::Conversations::default().upkeep();
+            let texts = |st: &crate::convo::store::Store| -> anyhow::Result<Vec<String>> {
+                st.sync()?;
+                Ok(st.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect()).unwrap_or_default())
+            };
+            let st = crate::convo::open(&blue, upkeep()).ok_or_else(|| anyhow::anyhow!("no store"))?;
+            let (out, passed) = async_channel::unbounded();
+            let (sink, held) = crate::convo::store::tee_held(out, Some(st.clone()), 16);
+            sink.send(("a1".to_owned(), said("m1", 1, "before the upgrade"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            let id = st.id().to_owned();
+            let moves = vec![(blue.join(crate::convo::FILE), green.join(crate::convo::FILE))];
+            let (h, m) = (held.clone(), moves.clone());
+            let frame = crate::rt::blocking(move || give_stores(&h, Some(st), None, &m)).await?;
+            let to = green.join(crate::convo::FILE).to_string_lossy().into_owned();
+            assert!(matches!(&frame, crate::bluegreen::Frame::Stores { own: Some(o), mirror: None } if *o == to));
+            assert!(!blue.join(crate::convo::FILE).exists());
+            // The new build opens it where it was moved: the same store, what it held in it.
+            let there = crate::convo::open(&green, upkeep()).ok_or_else(|| anyhow::anyhow!("no store there"))?;
+            assert_eq!(there.id(), id);
+            assert_eq!(texts(&there)?, vec!["before the upgrade".to_owned()]);
+            there.close()?;
+            // Rolled back: moved back, opened again, given to the tee, which keeps what passes in it.
+            let g = Given { held: held.clone(), moves, own_dir: blue.clone() };
+            let mut problems = Vec::new();
+            let back = take_stores_back(&g, &mut problems).ok_or_else(|| anyhow::anyhow!("nothing came back"))?;
+            assert!(problems.is_empty(), "{problems:?}");
+            assert_eq!(back.id(), id);
+            sink.send(("a1".to_owned(), said("m2", 2, "after the rollback"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            assert_eq!(texts(&back)?, vec!["before the upgrade".to_owned(), "after the rollback".to_owned()]);
+            Ok(())
+        })
+    }
+
     /// CP-T3.2 (the thirteenth adversarial check's): a rollback takes nothing back until the new
     /// build is seen gone. One its supervisor didn't stop (none found here) is killed, and seen gone.
     #[cfg(unix)]

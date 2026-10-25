@@ -303,6 +303,19 @@ mod unix {
     mod tests {
         use super::*;
 
+        /// A new build says it takes the runner's conversation stores over; one from before says
+        /// nothing, read as not taking them, and is never sent `Stores`.
+        #[test]
+        fn a_ready_from_a_build_from_before_takes_no_stores_and_stores_read_back() -> anyhow::Result<()> {
+            let before: Frame = serde_json::from_str(r#"{"ready":{"pid":7,"instance":"g"}}"#)?;
+            assert!(matches!(before, Frame::Ready { pid: 7, stores: false, .. }));
+            assert_eq!(serde_json::to_string(&Frame::Ready { pid: 7, instance: "g".into(), stores: false })?, r#"{"ready":{"pid":7,"instance":"g"}}"#);
+            assert_eq!(serde_json::to_string(&Frame::Ready { pid: 7, instance: "g".into(), stores: true })?, r#"{"ready":{"pid":7,"instance":"g","stores":true}}"#);
+            let said = serde_json::to_string(&Frame::Stores { own: Some("/s/instances/g/conversations.db".into()), mirror: None })?;
+            assert!(matches!(serde_json::from_str::<Frame>(&said)?, Frame::Stores { own: Some(o), mirror: None } if o.ends_with("/g/conversations.db")));
+            Ok(())
+        }
+
         #[test]
         fn frames_carry_descriptors_both_ways() -> anyhow::Result<()> {
             let (a, b) = UnixStream::pair()?;
