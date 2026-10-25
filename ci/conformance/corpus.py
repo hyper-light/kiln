@@ -655,11 +655,6 @@ LEFT = [
     (r"Could not find any NDK", "it builds for Android with cargo-ndk, which needs Android's NDK: GitHub's image has one, kiln's only in its opt-in `-android` image, whose SDK licence the user accepts (the plan's step 7, left)"),
     # buildx's update-deps: another repository's releases (moby/moby's) through the facade.
     (r"(HttpError: |error: )Not Found - https://github\.com/hyper-light/kiln/blob/main/docs/ci\.md#w14", "it reads a repository kiln doesn't have through the facade's REST API (`GITHUB_API_URL`: buildx's update-deps lists moby/moby's releases), which kiln answers Not Found: its git fetches go on to GitHub (W14-R11), its API reads don't; legs' reads of github.com's API wait for W18's egress proxy and a GitHub credential (W22, left)"),
-    # Two that passed on GitHub's 4-CPU runner at the same commit, and failed twice here, where a
-    # leg sees the machine's 32: ruff's formatter check (tracing-indicatif's progress bars under
-    # its threads) and TypeScript's API tests (`node --test` runs a file per CPU, 31 here).
-    (r"footer progress bar was hidden despite there being pending progress bars", "a progress-bar library's own check failed under the threads ruff starts for the 32 CPUs a leg here sees, where GitHub's runner has 4 and passed: a leg sees the machine's CPUs, not a hosted runner's few (W05-R03, left), to be run again"),
-    (r"panic: EOF \[recovered, repanicked\]", "TypeScript's API server lost its client mid-call, with `node --test` running a test file for each of the 32 CPUs a leg here sees, where GitHub's runner has 4 and passed: a leg sees the machine's CPUs, not a hosted runner's few (W05-R03, left), to be run again"),
     # TypeScript's file watcher tests take fanotify's file handles, which the docker executor's
     # container overlay doesn't make; a `/tmp` volume of its own gave them, and broke renames out
     # of /tmp (ruff's wasm-pack-action, EXDEV), so kiln went back to one file system.

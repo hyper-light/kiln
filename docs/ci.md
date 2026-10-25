@@ -2002,7 +2002,8 @@ W20.
     `nproc` says the leg's, and what sizes its work by it (`make -j$(nproc)`, cargo's jobs, a test
     runner's workers) does as on a hosted runner's machine of that size, its memory going with it:
     ruff's formatter check and TypeScript's API tests had started a worker per CPU of the lab's 32
-    (corpus pass 1024b). Checked by `w05_r03_legs_take_cpus_of_their_own`,
+    and failed (corpus pass 1024b); at 4 CPUs a leg both pass (pass 1025c, two legs at once on CPUs
+    0-3 and 4-7, `nproc` 4). Checked by `w05_r03_legs_take_cpus_of_their_own`,
     `w05_r03_a_host_leg_runs_on_its_cpus` and, with Docker, `w05_r03_a_containers_cpus_are_its_legs`
     and `w05_r03_a_pools_container_is_held_to_its_legs`. Not in a pod: a one-leg runner there
     (`kiln agent --ephemeral`, a job's or a `k8s` pool's) has the CPUs its cluster gives it, its
