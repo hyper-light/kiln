@@ -5026,8 +5026,8 @@ assumptions (an `openssl` that binds one address; a metric read before its write
 
 Then the whole set, Docker's scenarios among them under Docker Desktop (2026-10-25, an M4 Max Mac
 Studio, at d873d6fb and again at 5a74e409): kiln-obs's tests (353, its group's 4) and kiln's
-observe, CD and transport tests (293); every one of the 29 live files below passes there, the
-unified log, the archives' S3, email, Event Hubs, Prometheus's remote write, Datadog's Agent and
+observe, CD and transport tests (293); every live file below but kiln CD's passes there (that Mac
+had no kind or minikube to make its cluster of), the unified log, the archives' S3, email, Event Hubs, Prometheus's remote write, Datadog's Agent and
 tracer, the OpenTelemetry Collector's traces, LLM apps, Error Tracking, the profilers, containers
 and the loads among them. Running them there found three things more. The tracer's scenario took
 fifty traces a second for granted, so a sampling rate of a tenth: the Mac's debug build sent 13 a
@@ -5039,9 +5039,11 @@ minutes, the CLI's process group killed, and made again; that Mac's runs give Do
 without the credential store (it keeps no credentials). And a stand-in `journalctl`'s `tail`
 outlived its reader, killed alone: a log reader is now stopped with its process group (§8.1).
 Then the whole set again on that Mac at d9480644, after counting was made faster (§12.23):
-kiln-obs's tests (354, its group's 4), kiln's observe, CD and transport tests (294) and every one of
-the 29 live files pass; the trace flood's 1,875,270 spans' trace metrics counted 18.0 s after the
-flood, where 1,691,670 had taken 76.4 s there at 5a74e409.
+kiln-obs's tests (354, its group's 4), kiln's observe, CD and transport tests (294) and every live
+file but kiln CD's pass; the trace flood's 1,875,270 spans' trace metrics counted 18.0 s after the
+flood, where 1,691,670 had taken 76.4 s there at 5a74e409. kiln CD's scenario ran on a second M4
+Max Mac Studio, its cluster kind 0.33's on Docker Desktop, at 4af1134e (this branch with main
+merged into it): it passes there too (216 s), its cluster removed after.
 
 **On Linux**, where every scenario below was first written (2026-10-25, adacachy: CachyOS, x86_64,
 32 cores shared with others' builds): the whole set as the last changes went in, at e1d39d2c:
