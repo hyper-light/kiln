@@ -1065,6 +1065,17 @@ impl Hub {
         Pending { agent: agent.to_owned(), what, away: away && !waits.is_empty(), waits, at_once: first }
     }
 
+    /// The commands that waited for runner process `peer` to say whether it keeps the channel, and
+    /// it doesn't: sent as a runner's from before the channel gets them, answered as sent (it
+    /// can't say more), or unreachable when they couldn't go.
+    async fn send_waited(&self, peer: PeerId, waited: Vec<(Vec<u8>, futures::channel::oneshot::Sender<crate::wire::commands::Answer>)>) {
+        use crate::wire::commands::Answer;
+        for (body, answer) in waited {
+            let sent = self.net.send(peer, LANE_CONTROL, Kind::Control, body).await;
+            let _ = answer.send(if sent { Answer::Sent } else { Answer::Unreachable { why: "its runner isn't connected".into() } });
+        }
+    }
+
     /// The runners' commands due now: those not sent yet on their link, and those whose answer is
     /// overdue (lost below the channel).
     async fn flush_commands(&self) {
@@ -1083,6 +1094,13 @@ impl Hub {
             futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
                 () = tick.tick().fuse() => {}
+            }
+            // Runners that never said they keep the channel: from before it, what waited for them
+            // goes their way.
+            let overdue = self.cmds.lock().overdue(Instant::now());
+            for peer in overdue {
+                let waited = self.cmds.lock().not_wire(peer);
+                self.send_waited(peer, waited).await;
             }
             self.flush_commands().await;
             // What the server has of each runner's streams, said again every few seconds: one lost
@@ -1660,6 +1678,9 @@ impl Hub {
                 if caps & proto::CAP_WIRE != 0 {
                     self.cmds.lock().connected(peer);
                     self.send_peer(peer, &ServerMsg::Wire(self.wire.have(&agent))).await;
+                } else {
+                    let waited = self.cmds.lock().not_wire(peer);
+                    self.send_waited(peer, waited).await;
                 }
             }
             AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame).await,
@@ -2038,6 +2059,11 @@ impl Hub {
             },
         )
         .await;
+        // It says in a moment whether it keeps the channel (its Caps follow its hello): until then
+        // its commands wait for that (docs/wire.md, "Commands"). A job pod never says.
+        if !live.ephemeral {
+            self.cmds.lock().coming(peer, Instant::now());
+        }
         tracing::info!(agent = %name, labels = ?live.labels, slots = live.slots, "agent connected");
         self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: name.clone(), running: h.running.clone() });
         // Older processes of this machine take no new jobs; what they run, they keep.

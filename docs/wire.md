@@ -90,6 +90,13 @@ The server's commands to a runner process ride that process's command streams on
   runners need for the legs assigned to them at once. A link that drops before it's answered ends
   it `unanswered` (`unreachable` if it never went): sent again later, it would surprise.
 
+A runner process that connects says whether it keeps the channel (its `Caps`, `CAP_WIRE`) right
+after its hello. Until then, for 3 s at the most, its commands wait for that, a live one too,
+rather than being refused as if it were away or going the old way. Once it says it does, they go
+on the channel. A process that doesn't say so in time, or says it doesn't, is one from before the
+channel: what waited for it goes the old way, answered `sent`. A job pod never says, and its
+commands go the old way at once.
+
 The runner process takes each command once however often it comes, applies it as if it had come
 alone, and answers it: an ACK, or a NACK with its kind (`unknown`, `refused`, `stale_epoch`,
 `unsupported`, `malformed`) and why. Within a live link, a command whose answer is late goes
@@ -173,6 +180,22 @@ up the same way, from the last revision it was sent, and the live frames that ca
 holds are skipped. Its socket holds at most 128 KiB the kernel hasn't sent yet
 (`TCP_NOTSENT_LOWAT`, where the platform has it): past that, the server's writer waits and the
 viewer falls behind, rather than reading megabytes of frames that are stale by then.
+
+When a session's events ride Quiver (T2's CP-T2.12), they keep both numberings apart. This was
+agreed with T2's Quiver agent on 2026-10-24:
+- **The offset is Quiver's.** A topic's offset is a u64 the topic assigns at publish, contiguous,
+  as Kafka's are. A topic carries more than events (states, streams), and Quiver tells a reader of
+  every gap by offset. So the offset is never the session's own number.
+- **A session's position is its message's topic and key.** Each epoch is a topic of its own:
+  `sessions/<id>/<epoch>`, as the live feed names its topics. Each event goes as a message whose
+  key is its `seq`, 8 bytes big-endian, so keys sort as numbers.
+- **A resend replaces an event.** Compaction by key (CP-T2.9) keeps the newest of each key, as a
+  resend replaces an event by its number.
+- **A consumer resumes after an (epoch, seq) by key**, as a stream's `since` does. How a key finds
+  its offset is CP-T2.12's to decide: an index from seq to offset, or a read on from the consumer
+  group's committed offset (CP-T2.7). Quiver leans to the committed offset, as the index is a
+  second structure to keep.
+- **(born, rev) stays the server's**: a viewer's resume token, never a Quiver offset.
 
 ## Restarts
 
