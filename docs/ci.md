@@ -7360,7 +7360,8 @@ what can't be keyed exactly runs incrementally on kept ("warm") state; what tool
 into one content-addressed cache shared across the fleet; and the planner works out from the
 change what it could affect before anything runs. Every reuse, warm start and rebuild says why.
 W24 extends W08 (R09's cache tiers, R10's job-result reuse) and W05-R23's preferences, and is
-built on the CI engine alone.
+built on the CI engine alone. Container builds join W24 too, in kiln's own container engine instead
+of BuildKit (R29).
 
 **Why.** As of 2026-10-24 (origin/main a34c9139), nothing keeps work between runs:
 
@@ -7395,6 +7396,12 @@ its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
    artifact into a release.
 5. **Remote execution last.** It needs Hex's placement (CP-T7) and sandboxes; the data model is
    ready for it from the start, so nothing built earlier has to change.
+6. **Dagger's approach, not BuildKit.** Container builds move to kiln's own engine (R29), as
+   Dagger's did in Project Theseus (v0.21, 2026-05-22). Their keys are computed and looked up on
+   the same path as every other unit's, the ledger's, not in BuildKit's separate caches. Remote
+   caching and cache observability come from W24's own store, reports and trust rules. Operations
+   are lifted out of BuildKit one at a time, so nothing breaks on the way; Theseus showed this
+   works at Dagger's scale. Like the others, this is a default the person may change.
 
 **Requirements: the model**
 
@@ -7580,6 +7587,28 @@ its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
     `kiln_warm_slots{state}`, `kiln_work_verify_mismatch_total`.
   - Operations: `kiln work why|status|warm|verify|gc` on the CLI, `ci.work.*` for agents.
 
+**Requirements: containers and equivalence**
+
+- **W24-R29 kiln's own container engine.** Container builds run in kiln's own engine, not in
+  BuildKit. Each operation (git, HTTP and local sources; container exec; copy, mkdir, remove,
+  merge; export to OCI) is an action keyed by its fingerprint (R01) and recorded in the ledger
+  (R02), with its layers kept as trees in the content store, so image builds share W24's one cache,
+  its reports (R28) and its trust rules (R21). Operations are lifted out of BuildKit one at a time
+  behind a facade, as Dagger's Project Theseus did with DagOp. In a differential mode, each lifted
+  operation also runs in BuildKit and the two outputs are compared, until every operation is
+  native. BuildKit and W08-R11's caches stay until then. After that, `cache-from` and `cache-to`
+  (`type=gha`, `type=registry`) are served from the ledger and the content store, for compatibility
+  with the workflows that use them.
+- **W24-R30 An equivalence-aware cache.** The ledger keeps e-classes, as an e-graph does (egg,
+  Willsey et al., POPL 2021, arXiv 2004.03082), the structure Dagger's new cache is built on. Keys
+  whose units produced byte-identical outputs merge into one class, through union-find, and each
+  class's output digest is its e-class analysis. Lookups take upstream units by class, so congruent
+  units (the same operation over equivalent inputs) share a result before those inputs are
+  materialized. A rewrite rule that makes operations equivalent (dropping a no-op, reordering
+  operations that commute) is added only with a differential test. R23's verification guards every
+  merge: a mismatch splits the class and quarantines its lineage. As in Dagger's cache, every key
+  is computed and looked up on a single code path.
+
 **Design.**
 
 - **Pure decisions** in `crates/kiln-ci/src/work/` (`key`, `ledger`, `pathset`, `slots`, `graph`,
@@ -7655,6 +7684,11 @@ jobs:
   *Bench.*
 - **W24-AC12 Eviction.** Under quota pressure, eviction keeps the entries with the most time saved
   per byte. *Simulation.*
+- **W24-AC13 Native builds match BuildKit.** On a corpus of Dockerfiles (kiln's own and fixtures),
+  native builds give the same layer trees and image config as BuildKit's, timestamps aside.
+  *Differential test.*
+- **W24-AC14 Equivalence raises hits.** On replayed kiln history, the hit rate with e-classes is at
+  least that of plain keys, with no wrong hit in verification. *Replay and verification.*
 
 **Progress.** Specified (2026-10-24). M0 built (2026-10-25), awaiting review: R24's sync keeps the
 remote's build output (`reach/sync.rs`), R11's v1 `cache:` folders are kept per repository and job
@@ -7669,6 +7703,7 @@ plan:
 | M3 | Graphs, `affected()`, tests, the land queue, admission | R10, R16, R17, R19, R20 |
 | M4 | Observation, `kiln rustc`, trust, verification | R04, R05, R09, R21–R23 |
 | M5 | Warm microVMs and k8s, remote execution, the seams | R13, R14, R26 |
+| M6 | kiln's own container engine replaces BuildKit; the equivalence-aware cache | R29, R30 |
 
 
 **Baseline (M0, step 1).** kiln's `rust` job steps (`.kiln/ci.yaml`) on fedora, in a capped user unit
