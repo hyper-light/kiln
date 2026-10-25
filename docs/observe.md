@@ -5698,6 +5698,46 @@ and recovery in 2 h, the second's row failed by a rollback; the third marked fai
 (put right by the rollback, in 1 h), 2 of 4 then, the API agreeing; then not failed again. Nothing on
 the page wider than a phone. 2026-10-21: passes in all four (2–3 s each; adacachy).
 
+**kiln CD** (`crates/kiln/tests/observe_cd.rs`): a kiln server as a process of its own, kiln CD on,
+deploying plain manifests from a git repository (a `file://` URL, mirrored by `[[repos]]` too) to a
+real Kubernetes cluster: the one `KOBS_KUBECONFIG` names, or a throwaway one kind or minikube starts
+and deletes (fedora: minikube's docker driver, containerd, 2 CPUs and 2 GB). The cluster added by
+its kubeconfig context through the API, the app (`default/web`: a ConfigMap and a Deployment of the
+node's own pause image) following the repository's `main`, four commits landing on it in turn, each
+synced as a person asks: c1 comes up; c2 changes the image to one no registry serves, its rollout
+past its 10 s deadline (Degraded); c3 reverts c2 (what c1 deployed, again: the same render); c4 adds
+an object the API server refuses. Each checked against what kiln CD's history and kubectl say:
+`kiln.cd.deploys` by app, trigger and result (3 succeeded, 1 failed) and `kiln.cd.deploy.applied` as
+the history records them; an event each deploy (the failed one an error) and each change of the
+app's health or sync (Degraded a warning); `kiln.cd.apps` by health and sync, a monitor of the
+degraded apps (`last(last_1m):max:kiln.cd.apps{health:Degraded} > 0`) alerting Slack (a local
+receiver) as c2 degrades and recovering as c3 comes up (the gauge reads 0 once no app is degraded);
+DORA's deployments of the app, each its commit's, the team its label's: no lead time for the first,
+c2's and the revert's from their authors' times, c2's deployment a change failure the revert's
+deploy put right (recovered as it finished), none for the refused deploy. The app deleted, its
+objects with it. 2026-10-24: passes on fedora (minikube 1.39, Kubernetes 1.37, at 745eee11; 106 s).
+Its first run found what deleting an app through the API did: the store's change of the deletion
+unregistered the app first, without its cascade, and its objects stayed in the cluster (the delete
+now says its cascade before it proposes, `Cd::deleting`). On Windows (jupiter, kind 0.33) it ran to
+Slack's alert, its own check of Slack's message then wrong.
+
+**kiln's own transport** (`crates/kiln/tests/observe_quic.rs`): a kiln server and a runner as
+processes of their own on real QUIC sockets (hyper-quic under hyper-transport, mutual TLS), each
+looking at its endpoint every 2 s. Each end's path is the path's: a smoothed round trip on loopback
+under a second, the least no more than it, a probe timeout at least it (RFC 9002 §6.2.1), a largest
+datagram of 1,200 bytes at the least (RFC 9000 §14) and a congestion window of two of them at the
+least (RFC 9002 §7.2); a connection held at each end. 2 MB of records no compressor shrinks
+(SplitMix64's hex) written to the server and replicated to the runner are counted where they cross:
+the server's bytes sent to r1 grow by them at the least, and what the server sent r1 received
+(within 5%, each end counted every 2 s). Losses never past what was sent, at either end. The runner
+killed: the server's connection goes at its idle timeout (10 s) and leaves the count; started again,
+it replicates again past where the group was as it came back, and its new connection's counters are
+read from their own start (a counter's reset is never negative traffic). 2026-10-24: passes on
+fedora (77 s) and on macOS (an M4 Max Mac Studio, 47 s), at 745eee11. Its first run waited for the
+runner "caught up" (its report holding all the leader has), which no report can be where every node
+writes every 2 s and a runner reports every 10 s: it waits for the replica to pass where the group
+was instead.
+
 **Sensitive Data Scanner** (`crates/kiln/tests/observe_scanner.rs`): a kiln server and a runner as
 processes of their own; a scanning group made through the API before the runner joins (it is told
 the group as it connects): cards replaced, emails hashed, AWS key IDs replaced, a password given its
