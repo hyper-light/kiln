@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::expr::{self, Budget, Condition, Contexts, Dialect, ExprError, ParseOptions, StatusView, Template, Value};
 use crate::trigger::pattern::Patterns;
 use crate::wf::ir::{Axis, Job, JobSecrets, Matrix, Need, RunsOn, Tpl, Workflow, YVal};
+use crate::work::graph::{self, Ecosystem, Graph};
 use matrix::Combo;
 
 /// How a leg, a job or a run ended.
@@ -73,7 +74,8 @@ pub struct RunInput {
     pub inputs: serde_json::Value,
     /// `vars`.
     pub vars: serde_json::Value,
-    /// The event's changed files, for `changed()` (W03-R12); `None` when not known.
+    /// The event's changed files, for `changed()` (W03-R12) and `affected()` (W24-R17); `None`
+    /// when not known.
     pub changed: Option<Arc<Vec<String>>>,
     /// Untrusted runs (W03-R08) get read-only permissions.
     pub trusted: bool,
@@ -122,6 +124,11 @@ pub trait PlanSource {
     fn files(&self, pattern: &str) -> Vec<String> {
         let _ = pattern;
         Vec::new()
+    }
+    /// The package graph at the run's commit, for `affected()` (W24-R16, R17), asked for once as
+    /// the run starts; `None` when it isn't read, and `affected()` then says so.
+    fn graph(&self) -> Option<Arc<Graph>> {
+        None
     }
 }
 
@@ -389,6 +396,8 @@ pub struct RunPlan {
     run_env: Vec<(usize, String, String)>,
     /// The combinations `exclude` and `where:` removed, by job, with why: for the preview.
     removed: BTreeMap<String, Vec<(serde_json::Value, String)>>,
+    /// The commit's package graph ([`PlanSource::graph`]), for `affected()`.
+    graph: Option<Arc<Graph>>,
 }
 
 /// One job, as the run page and persistence see it.
@@ -413,6 +422,8 @@ struct Cx {
     values: Vec<(&'static str, Value)>,
     status: StatusView,
     changed: Option<Arc<Vec<String>>>,
+    /// The commit's package graph, for `affected()` (W24-R17).
+    graph: Option<Arc<Graph>>,
 }
 
 impl Contexts for Cx {
@@ -430,6 +441,25 @@ impl Contexts for Cx {
         };
         let p = Patterns::new(globs).map_err(|e| ExprError::new("KCI2020", e.to_string(), None))?;
         Ok(p.any(files.iter().map(String::as_str)))
+    }
+
+    /// The event's changed files mapped to their packages, and every package that depends on
+    /// them ([`graph::affected`]). A graph with problems in the ecosystem may be short of
+    /// packages, so it isn't used: the problem is the error.
+    fn affected(&self, ecosystem: &str) -> Result<Vec<String>, ExprError> {
+        let eco = Ecosystem::parse(ecosystem).ok_or_else(|| ExprError::new("KCI2020", format!("affected(): `{ecosystem}` is not an ecosystem: cargo, npm (pnpm, yarn), uv or go"), None))?;
+        let Some(files) = &self.changed else {
+            return Err(ExprError::new("KCI2011", "affected() needs the event's changed files, which this event doesn't have", None));
+        };
+        let Some(g) = &self.graph else {
+            return Err(ExprError::new("KCI2013", "affected() needs the repository's package graph, which this run doesn't have", None));
+        };
+        if let Some(p) = g.problems_of(eco).next() {
+            let more = g.problems_of(eco).count().saturating_sub(1);
+            let more = if more == 0 { String::new() } else { format!(" (and {more} more)") };
+            return Err(ExprError::new("KCI2013", format!("affected('{eco}'): the {eco} package graph couldn't be read: {p}{more}"), None));
+        }
+        Ok(graph::affected(g, eco, files).into_iter().collect())
     }
 }
 
@@ -520,7 +550,7 @@ impl RunPlan {
         let github = Value::from_json(&input.github);
         let vars = Value::from_json(&input.vars);
         let inputs = Value::from_json(&input.inputs);
-        let cx = Cx { values: vec![("github", github.clone()), ("inputs", inputs.clone()), ("vars", vars.clone())], status: StatusView::default(), changed: None };
+        let cx = Cx { values: vec![("github", github.clone()), ("inputs", inputs.clone()), ("vars", vars.clone())], status: StatusView::default(), changed: None, graph: None };
         let name = match &wf.run_name {
             Some(t) => Some(template(t, dialect, &cx, "run-name")?).filter(|n| !n.trim().is_empty()),
             None => None,
@@ -546,6 +576,7 @@ impl RunPlan {
             output_bytes: 0,
             run_env: Vec::new(),
             removed: BTreeMap::new(),
+            graph: src.graph(),
         };
         plan.add_scope(wf, dialect, inputs, String::new(), String::new(), None, 0, None, None, SecretsSpec::Run);
         let mut out = Vec::new();
@@ -999,7 +1030,7 @@ impl RunPlan {
         if self.scope_of(n).is_some_and(|s| s.dialect == Dialect::Kiln) {
             values.push(("run", self.run_context(n)));
         }
-        Cx { values, status: self.status(n), changed: self.input.changed.clone() }
+        Cx { values, status: self.status(n), changed: self.input.changed.clone(), graph: self.graph.clone() }
     }
 
     /// kiln's `run` context: `run.env` as written by the job's needs, transitively (W04-R21).
@@ -1219,7 +1250,7 @@ impl RunPlan {
         if let Some(f) = &filter {
             let mut kept = Vec::new();
             for c in combos {
-                let mut wcx = Cx { values: cx.values.clone(), status: cx.status, changed: cx.changed.clone() };
+                let mut wcx = Cx { values: cx.values.clone(), status: cx.status, changed: cx.changed.clone(), graph: cx.graph.clone() };
                 wcx.values.push(("matrix", combo_value(&c)));
                 if condition(f, dialect, &wcx, "strategy.matrix.where")? {
                     kept.push(c);
@@ -1580,7 +1611,7 @@ impl RunPlan {
             }
         }
         let called_dialect = wf.dialect.unwrap_or(Dialect::Gha);
-        let dcx = Cx { values: vec![("github", self.github.clone()), ("inputs", Value::Null), ("vars", self.vars.clone())], status: StatusView::default(), changed: None };
+        let dcx = Cx { values: vec![("github", self.github.clone()), ("inputs", Value::Null), ("vars", self.vars.clone())], status: StatusView::default(), changed: None, graph: None };
         let mut inputs: Vec<(String, Value)> = Vec::new();
         for i in &call.inputs {
             let given = with.iter().find(|(k, _)| k.eq_ignore_ascii_case(&i.name)).map(|(_, v)| v.clone());
@@ -1698,7 +1729,7 @@ impl RunPlan {
             let all: Vec<usize> = (0..x.legs.len()).collect();
             Some((x.local.clone(), self.need_value(*m, &all, scope.dialect)))
         }));
-        let cx = Cx { values: vec![("github", self.github.clone()), ("jobs", jobs), ("vars", self.vars.clone()), ("inputs", scope.inputs.clone())], status: StatusView::default(), changed: None };
+        let cx = Cx { values: vec![("github", self.github.clone()), ("jobs", jobs), ("vars", self.vars.clone()), ("inputs", scope.inputs.clone())], status: StatusView::default(), changed: None, graph: None };
         let mut outputs = Vec::new();
         if let Some(call) = scope.wf.trigger("workflow_call") {
             for o in &call.outputs {
