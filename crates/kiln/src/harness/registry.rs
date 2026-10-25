@@ -2173,8 +2173,20 @@ impl Registry {
             Location::Machine(machine) => {
                 let Ok(json) = serde_json::to_string(&c) else { return Pending::Now(Sent::NoSession) };
                 // A runner with inboxes takes a message for an epoch, and answers it.
-                let caps = hub.instances.lock().wide_caps_for(&machine, &crate::instances::Owned::Agent(id.to_owned()));
+                let (caps, away) = {
+                    let inst = hub.instances.lock();
+                    (inst.wide_caps_for(&machine, &crate::instances::Owned::Agent(id.to_owned())), inst.newest(&machine).is_none())
+                };
                 let had_id = message.is_some();
+                // A message with an id is refused at once while its runner is away (docs/wire.md's
+                // `Send`), as before the command streams: parked on one, it would go with no epoch
+                // to the copy there once that runner was back, though its session went on elsewhere
+                // meanwhile (resumed, moved) and took it there too, sent again under its id: one
+                // message, two harnesses (CP-T3.2, the twenty-second adversarial check's). CP-T3.3
+                // parks it under its epoch.
+                if had_id && away {
+                    return Pending::Now(Sent::Unreachable);
+                }
                 if let Some(m) = message.filter(|_| caps & crate::proto::CAP_INBOX != 0) {
                     let wait = self.wait_for(id, &m);
                     if !hub.send_to_agent(&machine, LANE_TERM, &ServerMsg::HarnessSend { session: id.to_owned(), epoch, json }).await {

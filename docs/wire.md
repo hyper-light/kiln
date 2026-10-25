@@ -145,7 +145,11 @@ An agent session's commands ride these streams too: `HarnessOpen`, `HarnessCmd`,
 `HarnessPackage` and `HarnessRelease`. A `HarnessCmd` rides the stream its `Command`'s class says
 (`crate::wire::command_class`):
 - **Parked** (waits for a runner that's away): a message (`Send`, `SkillRun`), a change to the
-  queue (`QueueEdit`, `QueueRemove`, `QueueMove`) and an approval (`Approve`).
+  queue (`QueueEdit`, `QueueRemove`, `QueueMove`) and an approval (`Approve`). A message with an
+  id never rides it to a runner that's away: it's refused at once (`Unreachable`, 409) and sent
+  again under its id, wherever its session runs then; parked, it would go to the copy there with
+  no epoch even after its session went on elsewhere (CP-T3.2, until CP-T3.3 parks it under its
+  epoch).
 - **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `McpAuth`
   and `SkillView`.
 - **Live**, refused at once while its runner is away: every other command (an interrupt, a model,
