@@ -640,15 +640,28 @@ fn a_monitor_s_group_is_one_jira_issue_and_one_servicenow_incident_until_it_reco
         })),
     )?;
     let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
-    let depth = |v: f64| f.write("e2e.queue", &["q1"], crate_now() - 50_000, 6, |_, _| v);
+    // Each depth the newest buckets' alone: the monitor reads the last whole ten seconds, so a
+    // depth before it whose points shared them would be averaged in (150 and 90 make 120, still
+    // past 100: the group stayed alerting).
+    let last_written = std::cell::Cell::new(0i64);
+    let depth = |v: f64| -> anyhow::Result<()> {
+        while crate_now() < last_written.get() + 25_000 {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let now = crate_now();
+        last_written.set(now);
+        f.write("e2e.queue", &["q1"], now - 50_000, 6, |_, _| v)
+    };
     let wait = |what: &str, done: &dyn Fn() -> bool| -> anyhow::Result<()> {
         let start = Instant::now();
         while !done() {
             anyhow::ensure!(
                 start.elapsed() < Duration::from_secs(90),
-                "{what}: Jira {:?}, ServiceNow {:?}\n{}",
+                "{what}: Jira {:?}, ServiceNow {:?}\nthe monitor: {}\nthe queue's depth: {:?}\n{}",
                 issues.lock().map(|i| i.clone()).unwrap_or_default(),
                 incidents.lock().map(|i| i.clone()).unwrap_or_default(),
+                f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None).map(|m| at(&m, &["groups"]).to_string()).unwrap_or_default(),
+                f.query("max:e2e.queue{*} by {host}", crate_now() - 120_000, crate_now()),
                 f.logs()
             );
             std::thread::sleep(Duration::from_millis(250));

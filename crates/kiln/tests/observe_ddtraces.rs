@@ -575,10 +575,14 @@ fn a_tracer_straight_to_kiln_keeps_its_share_and_every_trace_is_counted() -> any
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Some fifty a second against five: its share a tenth, once the window has seen it.
-    anyhow::ensure!((0.05..0.2).contains(&rate), "the rate it was given: {rate}");
+    // Five a second of what it sends (some fifty a second where a request is quick, fewer where
+    // it is not: a Mac's debug build sent 13 and was given 0.373, five of them), its share once the
+    // window has seen it: the rate within its bounds of that share, and what it kept at the end too.
+    let tps = late_sent as f64 / (started.elapsed().as_secs_f64() - 16.0).max(1.0);
+    let want = (5.0 / tps).min(1.0);
+    anyhow::ensure!((want * 0.5..want * 2.0).contains(&rate), "the rate it was given: {rate}, its share of {tps:.1} traces a second {want:.3}");
     let share = late_kept as f64 / late_sent.max(1) as f64;
-    anyhow::ensure!((0.03..0.3).contains(&share), "kept at the end: {late_kept} of {late_sent}");
+    anyhow::ensure!((want * 0.3..want * 3.0).contains(&share), "kept at the end: {late_kept} of {late_sent}, its share {want:.3}");
     // Stored: the traces it kept, whole, and none of those it dropped.
     let (from, to) = (t0 - 60_000, now_ms() + 60_000);
     until("the kept traces stored", Duration::from_secs(60), || Ok(span_count(&f, "service:busy", from, to)? >= 2 * kept.len() as u64), &|| f.logs())?;
