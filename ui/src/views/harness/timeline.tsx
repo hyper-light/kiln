@@ -943,11 +943,12 @@ function Said({
   const replyTo = (item.event as { reply_to?: string }).reply_to;
   return (
     <div className="hx-said" data-ev={item.event.id} data-held={hold.held || undefined} tabIndex={-1} {...hold.props}>
-      {replyTo && lookup && <Quote id={replyTo} lookup={lookup} />}
-      <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} streaming={item.event.streaming} />
+      {/* The menu floats right: it has to come first, the quote's and the text's lines wrap around it. */}
       {!item.event.streaming && item.event.text && (
         <MsgMenu groups={saidGroups(item.event, who ?? "Agent", onReply, () => setSpawning(true))} label="Actions on this message" className="hx-said-menu" />
       )}
+      {replyTo && lookup && <Quote id={replyTo} lookup={lookup} />}
+      <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} streaming={item.event.streaming} />
       {spawning && <SpawnDialog open={spawning} onOpenChange={setSpawning} defaults={{ ...spawn, prompt: item.event.text }} onStarted={(s) => navigate(s[0] ? `/agents/${s[0].id}` : "/agents")} />}
     </div>
   );
@@ -1047,9 +1048,10 @@ function OutcomeBody({
   const hold = useHoldCopy(() => outcome.text);
   return (
     <div className="hx-outcome-body" data-ev={outcome.id} data-held={hold.held || undefined} {...hold.props}>
+      {/* The menu floats right: it has to come first, the quote's and the text's lines wrap around it. */}
+      {outcome.text && <MsgMenu groups={saidGroups(outcome, who ?? "Agent", onReply, () => setSpawning(true))} label="Actions on the answer" className="hx-outcome-menu" />}
       {outcome.reply_to && lookup && <Quote id={outcome.reply_to} lookup={lookup} />}
       <Prose text={outcome.text} seq={outcome.seq} />
-      {outcome.text && <MsgMenu groups={saidGroups(outcome, who ?? "Agent", onReply, () => setSpawning(true))} label="Actions on the answer" className="hx-outcome-menu" />}
       {spawning && <SpawnDialog open={spawning} onOpenChange={setSpawning} defaults={{ ...spawn, prompt: outcome.text }} onStarted={(s) => navigate(s[0] ? `/agents/${s[0].id}` : "/agents")} />}
     </div>
   );

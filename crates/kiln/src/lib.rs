@@ -65,6 +65,7 @@ pub mod secrets;
 pub mod server;
 #[cfg(test)]
 mod sim;
+pub mod skew;
 pub mod store;
 pub mod sync;
 pub mod sup;
@@ -72,6 +73,7 @@ pub mod supervise;
 pub mod tailscale;
 pub mod terminal;
 pub mod termsess;
+pub mod toolfix;
 pub mod tunnel;
 pub mod ui;
 pub mod uiserver;

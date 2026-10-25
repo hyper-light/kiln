@@ -2836,6 +2836,10 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
     it, and "run anyway" ran it; now an integration test too
     (`w08_ac06_a_leg_takes_a_result_for_the_same_inputs`: the reused leg names its source run and
     shows its log, and the run-anyway rerun builds again at the reused commit).
+  - Where the leg's job is defined (W06-R03's `job.workflow_*`) isn't one of its inputs: for the
+    run's own workflow it names the run's commit, as `github.sha` does, and in the hash it made
+    every push's inputs new, so nothing was reused (main's CI #1250, 2026-10-25); the job's
+    definition is.
 - *Done.* R09's `kiln/cache@v1` and the kiln dialect's `cache:` key, on the chunked protocol
   (`crates/kiln/src/ci/services/chunks.rs`, `crates/kiln/src/runner/cache.rs`):
   - `/_kiln/cache` answers for a leg's token:
@@ -3879,8 +3883,8 @@ support (G-11, G-18, G-25, G-27, G-28).
   `kiln/runner-ubuntu-24.04` (the commonly used tools of GitHub's Ubuntu image: build essentials,
   git, curl, jq, Node, Python, Go, Rust, Java, Docker CLI, …), a larger `-full` variant, today's
   toolchain images, and example Agentfiles.
-- **W13-R12 Platforms** (G-18): host runners on Linux (x86_64, aarch64), macOS (arm64, x86_64)
-  and Windows (x86_64, arm64); Docker on Linux, macOS (Docker Desktop, Colima, Podman) and Windows
+- **W13-R12 Platforms** (G-18): host runners on Linux (x86_64, aarch64), macOS (arm64; kiln
+  doesn't run on Intel Macs) and Windows (x86_64, arm64); Docker on Linux, macOS (Docker Desktop, Colima, Podman) and Windows
   with Linux containers; Firecracker on Linux with KVM; shards where shards runs, which gives Apple
   silicon Macs Linux arm64 microVMs; QEMU emulation as a declared fact (W04-R13).
 

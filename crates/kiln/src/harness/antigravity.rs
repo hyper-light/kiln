@@ -267,6 +267,8 @@ impl Agy {
                 core.touch_state();
                 self.reload_for(core, format!("{} effort", capitalize(&effort)));
             }
+            // The Antigravity CLI has no faster speed (`meta.speeds` stays empty).
+            Command::SetSpeed { .. } => {}
             Command::Suggest { client, .. } => core.reply(client, json!({"suggestions": []})),
             Command::Control { id, value } if id == "export" => {
                 let client = value.as_ref().and_then(|v| v.get("client")).and_then(Value::as_str).unwrap_or("").to_owned();

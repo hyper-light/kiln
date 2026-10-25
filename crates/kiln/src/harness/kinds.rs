@@ -79,7 +79,7 @@ impl Kind {
 
     pub fn adapter(&self, spec: &Spec) -> Adapter {
         match self.protocol {
-            Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)))),
+            Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)).with_speed(spec.speed.clone()))),
             Protocol::CodexAppServer => Adapter::Codex(Box::new(Codex::from_spec(spec))),
             Protocol::AgyStreamJson => Adapter::Agy(Box::new(Agy::new(spec))),
             Protocol::Acp(_) | Protocol::Terminal => Adapter::Acp(Box::new(Acp::from_spec(spec))),

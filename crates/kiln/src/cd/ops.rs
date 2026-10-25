@@ -200,14 +200,31 @@ pub fn ops() -> &'static [Op] {
             op!("cd.apps.terminate", "Stop an app's running sync.", ro: false, destructive: false, input: app_only, run: terminate),
             op!("cd.apps.take_over", "Stop shadowing an app adopted from Argo CD: kiln syncs it from now on.", ro: false, destructive: false,
                 input: app_only, run: take_over),
-            op!("cd.apps.rollback", "Roll an app back to an earlier deployment (`to`, its history id; by default the one before what runs now). kiln renders that deployment's commits again and syncs them; the app holds there until git changes it, then follows git again.", ro: false, destructive: true,
+            op!("cd.apps.rollback", "Roll an app back to an earlier deployment that succeeded: by its id (`to`), or by what it ran (`revision`: a commit, 7 or more of its first hex digits, a tag of the app's git sources, or a chart version as recorded); by default the one before what runs now. kiln renders that deployment's commits again and syncs them; the app holds there until git changes it, then follows git again. cd.apps.rollback_targets lists what it can go back to.", ro: false, destructive: true,
                 input: || obj_schema(json!({
                     "app": {"type": "string", "description": APP},
-                    "to": {"type": "integer", "minimum": 1, "description": "The deployment's id (cd.apps.history)."},
+                    "to": {"type": "integer", "minimum": 1, "description": "The deployment's id (cd.apps.history, cd.apps.rollback_targets)."},
+                    "revision": {"type": "string", "description": "What the deployment ran: a commit (whole, or 7 or more of its first hex digits), a tag, or a revision as recorded (a chart's version). Not with `to`."},
                     "prune": {"type": "boolean", "description": "Also delete what that deployment didn't have."}
                 }), &["app"]), run: rollback),
+            op!("cd.apps.rollback_targets", "What an app can be rolled back to, newest first: each deployment that succeeded and can be rendered again (what runs now and repeats of one render left out), with its commit (author, time, the whole message) and the tags that name it; and what runs now.", ro: true, destructive: false,
+                input: app_only, run: rollback_targets),
             op!("cd.apps.follow", "Let a rolled-back app follow git again (an automatic app then deploys what git says).", ro: false, destructive: false,
                 input: app_only, run: follow),
+            op!("cd.apps.auto_rollback", "Whether kiln goes back on its own when one of an app's deploys fails (its rollout aborts, kiln's own restart doesn't take, a release fails after its commit), and who said so: `from` is `app` (set for it), `repo` (set for its repository), `deploy-file` (its rollout's `auto-rollback`) or `default` (on).", ro: true, destructive: false,
+                input: app_only, run: auto_rollback),
+            op!("cd.apps.set_auto_rollback", "Turn auto-rollback on or off for one app (`on`: true or false), or clear it (`on`: null) to follow its repository's, then its deploy file's. The app's word beats both.", ro: false, destructive: false,
+                input: || obj_schema(json!({
+                    "app": {"type": "string", "description": APP},
+                    "on": {"type": ["boolean", "null"], "description": "true, false, or null to clear."}
+                }), &["app", "on"]), run: set_auto_rollback),
+            op!("cd.repos.auto_rollback", "Auto-rollback by repository: every repository apps deploy from and every one people set it for, each with its setting (null: not set) and how many apps follow it.", ro: true, destructive: false,
+                input: || obj_schema(json!({}), &[]), run: repo_auto_rollbacks),
+            op!("cd.repos.set_auto_rollback", "Turn auto-rollback on or off for every app a repository deploys (`on`: true or false), or clear it (`on`: null). An app's own setting beats its repository's. A person's to change.", ro: false, destructive: false,
+                input: || obj_schema(json!({
+                    "repo": {"type": "string", "description": "The repository's URL, as apps name it (cd.repos.auto_rollback lists them)."},
+                    "on": {"type": ["boolean", "null"], "description": "true, false, or null to clear."}
+                }), &["repo", "on"]), run: set_repo_auto_rollback),
             op!("cd.apps.rollout", "An app's rollouts on targets beyond Kubernetes (docs/cd-targets.md §5), the one under way first: each with where it stands (state, green's share, the step it's at), its steps, its checks and what they measured, what happened, and the approvals it waits for.", ro: true, destructive: false,
                 input: app_only, run: rollouts),
             op!("cd.apps.rollout_act", "Act on an app's rollout: `promote` it past the step it waits at (`full`: past every step and check), `pause` or `resume` it, `abort` it (traffic back to blue; with auto-rollback the app goes back to the deployment before), `retry` an aborted one from its first step, or `approve` or `deny` an approval check it waits for (`check`).", ro: false, destructive: true,
@@ -552,6 +569,7 @@ async fn get(cx: Cx, v: Value) -> Out {
         // What its inputs deploy now: each artifact pinned (docs/cd-targets.md §1.3).
         let artifacts = entry.key.and_then(|k| entry.resolved.iter().find(|r| r.key == k)).map(|r| r.artifacts.clone()).unwrap_or_default();
         m.insert("artifacts".into(), json!(artifacts));
+        m.insert("auto_rollback".into(), cx.cd.auto_rollback_of(&id, &entry.def).json());
     }
     Ok(out)
 }
@@ -964,16 +982,9 @@ async fn history(cx: Cx, v: Value) -> Out {
     let entry = cx.cd.apps.read().get(&id).cloned().ok_or_else(|| missing(format!("no app {id}")))?;
     let list = cx.cd.store.read(|d| d.history.get(&id).cloned().unwrap_or_default());
     let mut out = Vec::new();
+    // What the deployed commit says, as the header says it of the revision, and its tags.
     for h in list.iter().rev() {
-        let mut row = serde_json::to_value(h).unwrap_or(Value::Null);
-        // What the deployed commit says, as the header says it of the revision.
-        if let Some((url, sha)) = source_commit(&entry, h.revision.as_deref())
-            && let Some(c) = cx.cd.live.commit(&cx.cd, &url, &sha).await
-            && let Some(m) = row.as_object_mut()
-        {
-            m.insert("commit".into(), c);
-        }
-        out.push(row);
+        out.push(super::rollback::row(&cx.cd, &entry.def, h).await);
     }
     Ok(json!({"history": out}))
 }
@@ -1099,15 +1110,22 @@ async fn take_over(cx: Cx, v: Value) -> Out {
 async fn rollback(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     agents_may(&cx, &id, "roll back")?;
-    let out = roll_back(&cx.cd, &id, v.get("to").and_then(Value::as_u64), v.get("prune").and_then(Value::as_bool), &cx.actor).await?;
-    audit(&cx, "cd.rollback", format!("{id} to deployment {}", out.get("to").and_then(Value::as_u64).unwrap_or(0))).await;
+    let out = roll_back(&cx.cd, &id, v.get("to").and_then(Value::as_u64), str_in(&v, "revision"), v.get("prune").and_then(Value::as_bool), &cx.actor).await?;
+    let to = out.get("to").and_then(Value::as_u64).unwrap_or(0);
+    let what = match (out.get("tag").and_then(Value::as_str), out.get("revision").and_then(Value::as_str)) {
+        (Some(t), _) => format!(" (tag {t})"),
+        (None, Some(r)) => format!(" ({})", r.get(..12).unwrap_or(r)),
+        _ => String::new(),
+    };
+    audit(&cx, "cd.rollback", format!("{id} to deployment {to}{what}")).await;
     Ok(out)
 }
 
-/// Rolls an app back to an earlier deployment (`to`, by default the one before what runs now)
-/// and holds it there until git changes it: the rollback operation's, and a rollout's after it
+/// Rolls an app back to an earlier deployment and holds it there until git changes it: the one
+/// `to` names, or the one that ran `revision` (a commit, a revision as recorded, or a tag), by
+/// default the one before what runs now. The rollback operation's, and a rollout's after it
 /// aborted (docs/cd-targets.md §5).
-pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, prune: Option<bool>, by: &str) -> Out {
+pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, revision: Option<&str>, prune: Option<bool>, by: &str) -> Out {
     let id = id.to_owned();
     let def = cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
     if super::is_shadow(&def) {
@@ -1115,26 +1133,11 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, prune: Op
     }
     not_syncing(cd, &id)?;
     let history = cd.store.read(|d| d.history.get(&id).cloned().unwrap_or_default());
-    let current = history.iter().rev().find(|d| d.succeeded).and_then(|d| d.key);
-    let target = match to {
-        Some(n) => history.iter().find(|d| d.id == n).ok_or_else(|| missing(format!("{id} has no deployment {n}")))?,
-        None => history
-            .iter()
-            .rev()
-            .find(|d| d.succeeded && d.key != current)
-            .ok_or_else(|| bad(format!("{id} has no earlier deployment to roll back to")))?,
-    };
-    if !target.succeeded {
-        return Err(bad(format!("deployment {} of {id} failed; roll back to one that succeeded", target.id)));
-    }
-    // Each source's commit; entries kept before kiln recorded them carry the revision only.
-    let commits = if !target.commits.is_empty() {
-        target.commits.clone()
-    } else if def.sources.len() == 1 && target.revision.is_some() {
-        vec![target.revision.clone()]
-    } else {
-        return Err(bad(format!("deployment {} of {id} was kept without its sources' commits, so it can't be rendered again", target.id)));
-    };
+    let (n, tag) = super::rollback::target(cd, &id, &def, &history, to, revision).await?;
+    let target = history.iter().find(|d| d.id == n).ok_or_else(|| missing(format!("{id} has no deployment {n}")))?;
+    // Each source's commit; entries kept before kiln recorded them carry the revision only
+    // (`kiln_cd::rollback::renderable` let only a lone source's through).
+    let commits = if target.commits.is_empty() { vec![target.revision.clone()] } else { target.commits.clone() };
     // A Kubernetes cluster's version and APIs shape the render; a target beyond Kubernetes has none.
     let (kube_version, api_versions) = if kiln_cd::providers::is_target(&def.destination.cluster) {
         (None, Vec::new())
@@ -1169,7 +1172,82 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, prune: Op
         cd.keep_inputs(&id, &back);
         cd.input(Input::SyncTo { app: id.as_str().into(), revision: back.revision.as_str().into(), key: back.key, content: back.content, request });
     }
-    Ok(json!({"rolling_back": id, "to": target.id, "revision": target.revision}))
+    Ok(json!({"rolling_back": id, "to": target.id, "revision": target.revision, "commits": target.commits, "tag": tag}))
+}
+
+/// What an app can be rolled back to, newest first (`kiln_cd::rollback::candidates`), and what
+/// runs now: each with its commit's message and the tags that name it.
+async fn rollback_targets(cx: Cx, v: Value) -> Out {
+    let id = app_id(&v)?;
+    let def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
+    let history = cx.cd.store.read(|d| d.history.get(&id).cloned().unwrap_or_default());
+    let current = match kiln_cd::rollback::current(&history) {
+        Some(d) => super::rollback::row(&cx.cd, &def, d).await,
+        None => Value::Null,
+    };
+    let mut targets = Vec::new();
+    for d in kiln_cd::rollback::candidates(&history, def.sources.len()) {
+        targets.push(super::rollback::row(&cx.cd, &def, d).await);
+    }
+    let shadow = super::is_shadow(&def);
+    // The store keeps at least one, whatever the definition says (`Command::Deployed`).
+    Ok(json!({"app": id, "current": current, "targets": targets, "kept": def.history_limit.max(1), "shadow": shadow}))
+}
+
+/// An app's auto-rollback: whether kiln goes back on its own after a failure, and who said so.
+async fn auto_rollback(cx: Cx, v: Value) -> Out {
+    let id = app_id(&v)?;
+    let def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
+    Ok(cx.cd.auto_rollback_of(&id, &def).json())
+}
+
+/// `on`: `true`, `false`, or `null` to clear (follow the repository, then the deploy file).
+fn on_in(v: &Value) -> Result<Option<bool>, Fail> {
+    match v.get("on") {
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(Value::Null) => Ok(None),
+        _ => Err(bad("`on` is required: true, false, or null to clear it")),
+    }
+}
+
+async fn set_auto_rollback(cx: Cx, v: Value) -> Out {
+    let id = app_id(&v)?;
+    let on = on_in(&v)?;
+    let def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
+    agents_may(&cx, &id, "change the auto-rollback of")?;
+    cx.cd.set_auto_rollback(kiln_cd::rollback::app_setting(&id), on, &cx.actor).await?;
+    audit(&cx, "cd.auto_rollback", format!("{id}: {}", on.map_or("cleared", |on| if on { "on" } else { "off" }))).await;
+    Ok(cx.cd.auto_rollback_of(&id, &def).json())
+}
+
+/// The repositories apps deploy from, and those people set auto-rollback for: each one's
+/// setting, and how many apps follow it.
+async fn repo_auto_rollbacks(cx: Cx, _: Value) -> Out {
+    let set = cx.cd.repo_auto_rollbacks();
+    let mut repos: std::collections::BTreeMap<String, (Option<kiln_cd::rollback::Setting>, usize)> = set.into_iter().map(|(r, s)| (r, (Some(s), 0))).collect();
+    for e in cx.cd.apps.read().values() {
+        if let Some(r) = super::rollback::repo_of(&e.def) {
+            repos.entry(kiln_cd::rollback::repo_name(&r)).or_default().1 += 1;
+        }
+    }
+    let list: Vec<Value> = repos
+        .into_iter()
+        .map(|(repo, (s, apps))| json!({"repo": repo, "setting": s.map_or(Value::Null, |s| json!({"on": s.on, "by": s.by, "at_ms": s.at_ms})), "apps": apps}))
+        .collect();
+    Ok(json!({"repos": list}))
+}
+
+async fn set_repo_auto_rollback(cx: Cx, v: Value) -> Out {
+    let repo = str_in(&v, "repo").map(kiln_cd::rollback::repo_name).filter(|r| !r.is_empty()).ok_or_else(|| bad("`repo` is required: the repository's URL"))?;
+    let on = on_in(&v)?;
+    // Every app the repository deploys at once: a person's to say.
+    if cx.actor.starts_with("agent:") {
+        return Err((StatusCode::FORBIDDEN, format!("agents may not change auto-rollback for every app of {repo}: ask a person to, or change one app's (cd.apps.set_auto_rollback)")));
+    }
+    cx.cd.set_auto_rollback(kiln_cd::rollback::repo_setting(&repo), on, &cx.actor).await?;
+    audit(&cx, "cd.auto_rollback", format!("repository {repo}: {}", on.map_or("cleared", |on| if on { "on" } else { "off" }))).await;
+    let apps = cx.cd.apps.read().values().filter(|e| super::rollback::repo_of(&e.def).is_some_and(|r| kiln_cd::rollback::repo_name(&r) == repo)).count();
+    Ok(json!({"repo": repo, "setting": on.map(|on| json!({"on": on, "by": cx.actor})), "apps": apps}))
 }
 
 /// An app's rollouts, the one under way first, then the newest.
@@ -1188,7 +1266,7 @@ async fn rollouts(cx: Cx, v: Value) -> Out {
                 "environment": rec.environment, "blue": rec.blue, "green": rec.green, "preview_url": rec.preview_url, "stable_url": rec.stable_url,
                 "started_ms": rec.started_ms, "updated_ms": rec.updated_ms,
                 "status": r.summary(), "state": r.state, "steps": r.plan.steps, "step": r.step, "background": r.plan.background,
-                "auto_rollback": r.plan.auto_rollback, "ready": r.ready, "unready": r.unready, "moving": r.moving,
+                "auto_rollback": cx.cd.auto_rollback(&rec.app, Some(r.plan.auto_rollback)).decision.on, "ready": r.ready, "unready": r.unready, "moving": r.moving,
                 "checks": r.checks, "watching": r.background, "release": r.release,
                 "log": r.log, "dropped": r.dropped, "waiting": cx.cd.rollouts.waiting(&rid),
             })

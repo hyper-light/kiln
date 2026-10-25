@@ -417,6 +417,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/runs/*/cancel", "runs.cancel", At::Run(2)),
     r("POST", "/api/runs/*/retry", "runs.rerun", At::Run(2)),
     r("GET", "/api/jobs/*", "runs.read", At::Job(2)),
+    r("GET", "/api/jobs/*/tools", "runs.read", At::Job(2)),
+    // The agent it starts is the asker's (`agents.start`), so at most their permissions.
+    r("POST", "/api/jobs/*/tools/fix", "runs.rerun", At::Job(2)),
     r("GET", "/api/jobs/*/logs", "logs.read", At::Job(2)),
     r("GET", "/api/jobs/*/logs/ws", "logs.read", At::Job(2)),
     r("GET", "/api/jobs/*/artifacts", "artifacts.read", At::Job(2)),

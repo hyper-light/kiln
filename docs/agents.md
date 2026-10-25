@@ -38,7 +38,8 @@ finishes.
 ACP sessions prefer [config options](https://agentclientprotocol.com/protocol/v1/session-config-options)
 (`configOptions`) over the older `modes` and `models` fields. The first select
 in the `mode`, `model` and `thought_level` categories drives kiln's existing permission, model
-and effort selectors; additional options, including ones with no category or an unknown
+and effort selectors, and a select with the id `speed` (Devin's Standard and Fast, on the models
+that go faster) drives kiln's speed; additional options, including ones with no category or an unknown
 category, are ordinary session controls. Grouped choices keep their group names in the labels.
 Boolean options use the existing toggles, advertised with `session.configOptions.boolean`.
 Unrecognized option types are kept with the adapter's state but have no control. The agent's
@@ -511,7 +512,7 @@ goals and plan runs are theirs alone. Agents that work for different people aren
 | Bypass | only under a parent in bypass that was itself allowed it (`allow_bypass`); a child of a parent without it can't be switched to bypass either |
 | Its reach | a parent whose commands run only on its own machine (`reach` off) has children that run there too, with reach off |
 | Depth | at most `[agents] max_depth` (3) agents deep below the one a person started |
-| Children | at most `[agents] max_children` (24) running at once per agent, or fewer as its own settings say (Subagents → At once) |
+| Children | as many subagents at work at once as its own settings say (Subagents → At once), one pool whatever each does: the agents it started that work, wait on a person or are held to a goal still to go on a stack that runs, and its harness's own still going; one idle with its work done, or ended, holds no place. None set: no limit, unless kiln's config sets `[agents] max_children` for every agent |
 | Messages | an agent may send a queued message to any agent that works for the same person, whoever started it (`agents.send`, `queue`): its receiver is told who sent it, that it isn't from its person, and how to answer ("Messages between agents") |
 | Steering | an agent steers into a turn, sends now, interrupts and ends only itself and the agents it started (and theirs); the same holds for their goals (`goals.add`, `goals.set`, `goals.control`, and the console's goal routes when an agent calls them) and for running a plan on an agent that runs (`plans.run` with `session`); it stops and retries only the plan runs it ran, or that the agents it started ran (`plans.runs.stop`, `plans.runs.retry`) |
 | Plans | a plan run on a new agent (`plans.run` with `new`, any mode) starts it as `agents.start` would: the caller's child, under every rule above |
@@ -809,6 +810,7 @@ console picks) and are answered with a `reply` update to that client.
 | `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, choices?` (or the older `answers?`) | see "Questions" below |
 | `interrupt`, `restart`, `snapshot` | | |
 | `set_mode` / `set_model` / `set_effort` | `mode` / `model` / `effort` | `state.mode` / `state.model` / `state.effort` |
+| `set_speed` | `speed`: `""` (standard) or one of `meta.speeds` (the model's faster speeds, slowest first) | `state.speed`, from the next turn when one is under way; `state.speed_blocked` says why it can't go faster (its account), `state.speed_cooldown` that fast mode's own rate limit is cooling down; feature `"set_speed"` (Claude Code's fast mode, Codex's service tiers, Devin's `speed` option) |
 | `stop_task` | `task` | the task's `status` (stopped) |
 | `stop_tasks` | | every live task stopped |
 | `suggest` | `client, query` | `{suggestions: [{path}], cwd}` |
@@ -824,7 +826,7 @@ console picks) and are answered with a `reply` update to that client.
 | `resume` | | ends a pause now (`state.pause`): the turn it cut off goes on, then the queue |
 | `auto_resume` | `on` | whether a pause ends by itself at its limit's reset (`state.pause.auto`, and `state.manual_resume` for later pauses) |
 | `pause_at` | `percent` (null: off) | pause once a limit is this full, between turns or at the next step of one under way (`state.pause_at`) |
-| `max_subagents` | `count` (null: no limit of its own) | the most subagents it runs at once (`state.max_subagents`, Settings → Subagents): its harness's own and the agents it starts through kiln, each. Claude Code's Agent tool asks kiln first (a PreToolUse hook kiln registers at `initialize`, whatever its permissions), counting those running and those let start that haven't yet, and past the limit is told to wait for one to finish; Codex takes it as its own `agents.max_concurrent_threads_per_session` when it next starts; kiln refuses `agents.start` past it |
+| `max_subagents` | `count` (null: no limit of its own) | the most subagents it has at work at once (`state.max_subagents`, Settings → Subagents): its harness's own and the agents it starts through kiln, one pool whatever each does. Claude Code's Agent tool asks kiln first (a PreToolUse hook kiln registers at `initialize`, whatever its permissions), counting those running and those let start that haven't yet, and past the limit is told to wait for one to finish; Codex takes it as its own `agents.max_concurrent_threads_per_session` when it next starts; kiln refuses `agents.start` past it, counting the agents it started that are at work (working, waiting on a person, or held to a goal still to go on a stack that runs) and its harness's own still going, so one idle or ended holds no place; a plan's steps side by side go to subagents within it, on its goal stack (docs/goals.md, "A plan's steps side by side") or in a run with an agent per step, the rest waiting for room; and a plan run on it as one message or a step a turn tells it so |
 | `move_on_limit` | `on, to?, kind?, model?` | at a limit, go on on another machine with room (`state.move_on_limit`): `to` (`agent:<name>`) that machine alone, `kind` and `model` that harness and model there (`state.move_plan`) |
 | `limit_hold` | `window?, label?, until?, said?, account?` | the server's: another session on `account` reached a usage limit, so this one pauses until it resets too, if it's signed in to that account and its own usage, asked then, says the limit is its own as well |
 
@@ -1262,6 +1264,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (interrupts and continues an active turn) | ✓ (the agent's modes) | ? |
 | `set_model` mid-session | ✓ | ✓ (from the next turn) | ? (sent as session/set_model) | ? |
 | effort from the start (`meta.efforts`), `set_effort` | ✓ | ✓ (from the next turn) | — | — |
+| speed where the model goes faster (`meta.speeds`), `set_speed` | unit (fast mode, a setting of the session's alone; what keeps it off and its cooldown from each turn) | unit (each model's service tiers, with every turn) | unit (an agent's `speed` option, as Devin offers it) | ? |
 | one message's own model and effort | unit | ✓ | — | — |
 | attachments: images inline, files by path | ✓ | ✓ | ? (images when offered) | ? |
 | diffs, approval previews, cumulative changeset | ✓ | ✓ | ✓ | ? |

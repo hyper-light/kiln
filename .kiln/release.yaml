@@ -40,19 +40,19 @@ jobs:
     artifacts: ["dist/*"]
 
   macos:
-    name: macOS (ARM64, x86-64), on a Mac
-    # Built with the Mac's own toolchain and SDK. Its runners build kiln themselves meanwhile, if
-    # this hasn't started (crate::fleet).
+    name: macOS (ARM64), on a Mac
+    # Apple silicon only: kiln doesn't run on Intel Macs. Built with the Mac's own toolchain and
+    # SDK, so on a Mac whose runner finds them: on one whose service's PATH lacks node (node from
+    # nvm, kiln installed before it, as on the Mac Studios) `npm` isn't found and the build fails
+    # at once (2026-10-24). Both engines route by `requires`. Its runners build kiln themselves
+    # meanwhile, if this hasn't started (crate::fleet).
     runs-on: [baremetal, macos]
-    # A Mac whose runner finds node: on one whose service's PATH lacks it (node from nvm, kiln
-    # installed before it, as on the Mac Studios) `npm` isn't found and the build fails at once.
-    # The engine routes by `requires`; v1 by the labels alone.
-    requires: ["os == macos", "tools has node"]
+    requires: ["os == macos", "arch == aarch64", "tools has cargo", "tools has node"]
     timeout-minutes: 90
     steps:
       # A launchd service's PATH has none of the usual tools in it.
       - name: ui
         run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build
       - name: build
-        run: nice -n 10 ci/release/build.sh aarch64-apple-darwin x86_64-apple-darwin
+        run: nice -n 10 ci/release/build.sh aarch64-apple-darwin
     artifacts: ["dist/*"]

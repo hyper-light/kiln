@@ -982,7 +982,7 @@ impl Dispatch {
 
     async fn runner_facts(&mut self, agent: &str) {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
-        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: a.slots, capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
+        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
         self.commands(cmds).await;
     }
@@ -1000,7 +1000,7 @@ impl Dispatch {
             self.hub.command_start(agent, &ServerMsg::Cancel { job: leg, reason: "the leg was given up while this runner was away".into() }).await.log_when_answered(crate::hub::LOG_WITHIN);
         }
         // The hub keeps at least 1 for runners that take jobs; 0 (an outpost) takes no legs.
-        let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots, capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
+        let r = RunnerIn { id: agent.to_owned(), view, slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());
         cmds.extend(self.lose(gone, "the runner lost it").await);
         self.commands(cmds).await;
@@ -2976,6 +2976,12 @@ fn graphql_of(api: &str) -> String {
         Some(base) => format!("{base}/graphql"),
         None => format!("{}/graphql", api.trim_end_matches('/')),
     }
+}
+
+/// The slots a runner offers legs: none while its kiln is to be upgraded (`crate::skew`), as an
+/// outpost offers none.
+fn work_slots(a: &crate::hub::AgentLive) -> u32 {
+    if a.skew.takes_work() { a.slots } else { 0 }
 }
 
 #[cfg(test)]

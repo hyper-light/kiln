@@ -580,6 +580,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::PUT, ["api", "updates", "policy"]) => boxed(|| set_policies(&hub, req)).await,
         (&Method::PUT, ["api", "updates", "waits"]) => boxed(|| set_waits(&hub, req)).await,
         (&Method::DELETE, ["api", "updates", "waits"]) => boxed(|| reset_waits(&hub)).await,
+        (&Method::GET, ["api", "updates", "skew"]) => Ok(srv::json(StatusCode::OK, &boxed(|| skew_view(&hub)).await)),
+        (&Method::PUT, ["api", "updates", "skew"]) => boxed(|| set_skew(&hub, req)).await,
+        (&Method::DELETE, ["api", "updates", "skew"]) => boxed(|| reset_skew(&hub)).await,
         (&Method::POST, ["api", "updates", "server"]) => boxed(|| upgrade_server(&hub, req)).await,
         (&Method::POST, ["api", "updates", "binaries"]) => boxed(|| upload_binary(&hub, &q, req)).await,
         (&Method::DELETE, ["api", "updates", "binaries", target]) => boxed(|| delete_binary(&hub, target)).await,
@@ -607,6 +610,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| retry(&hub, &id, req)).await
         }
         (&Method::GET, ["api", "jobs", id]) => boxed(|| job(&hub, id)).await,
+        // What a job lacks, and an agent to install it (crate::toolfix).
+        (&Method::GET, ["api", "jobs", id, "tools"]) => boxed(|| crate::toolfix::report(&hub, id)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "jobs", id, "tools", "fix"]) => {
+            let (id, ask) = ((*id).to_owned(), boxed(|| srv::body_json::<crate::toolfix::Ask>(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?);
+            boxed(|| crate::toolfix::fix(Arc::clone(&hub), caller.clone(), &id, ask)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+        }
         (&Method::GET, ["api", "jobs", id, "logs"]) => boxed(|| job_logs(&hub, id, &q)).await,
         (&Method::GET, ["api", "jobs", id, "logs", "ws"]) => {
             let (id, step) = ((*id).to_owned(), q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0));
@@ -949,6 +958,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "harness", "sessions", id, "goals", what]) => {
             let (name, field) = match *what {
                 "done" => ("goals.done", None),
+                "order" => ("goals.order", None),
                 "split" => ("goals.split", None),
                 "plan" => ("goals.plan", None),
                 "settings" => ("goals.settings", None),
@@ -3049,11 +3059,11 @@ pub const COMMIT: &str = env!("KILN_COMMIT");
 /// `kiln-<version>-<target>` (`.exe` on Windows) of release `v<version>`.
 pub const RELEASES: &str = "https://github.com/hyper-light/kiln/releases/download";
 
-/// The targets the release workflow builds.
-pub const RELEASE_TARGETS: [&str; 6] = [
+/// The targets the release workflow builds. Macs are Apple silicon only: kiln doesn't run on Intel
+/// Macs.
+pub const RELEASE_TARGETS: [&str; 5] = [
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
-    "x86_64-apple-darwin",
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
     "aarch64-pc-windows-msvc",
@@ -3517,8 +3527,46 @@ async fn updates_overview(hub: &Arc<Hub>, force: bool) -> Response {
                 "config": crate::updates::Waits::of(&hub.cfg.updates),
                 "changed": crate::updates::waits_changed(hub).await,
             },
+            "skew": skew_view(hub).await,
         }),
     )
+}
+
+/// `GET /api/updates/skew`: the version-skew tolerances (`crate::skew`), kiln.toml's beside
+/// them, the commits each takes (the server's first), and where each connected runner stands.
+async fn skew_view(hub: &Hub) -> serde_json::Value {
+    let now = crate::skew::tolerance(hub).await;
+    let runners: Vec<serde_json::Value> =
+        hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral).map(|a| json!({ "name": a.name, "skew": a.skew })).collect();
+    json!({
+        "now": now,
+        "config": crate::skew::Tolerance::of(&hub.cfg.updates),
+        "changed": crate::skew::changed(hub).await,
+        "most": crate::skew::MOST,
+        "server": COMMIT,
+        "commits": crate::skew::window(hub, now).await,
+        "runners": runners,
+    })
+}
+
+/// `PUT /api/updates/skew` `{"full": 100, "upgrade": 1000}`: how many commits behind the server's a
+/// runner may be and do everything, or connect to be upgraded; every connected runner is weighed
+/// again (kiln.toml's `[updates]` says until then).
+async fn set_skew(hub: &Arc<Hub>, req: Request) -> R {
+    let t: crate::skew::Tolerance = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    t.check().map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    crate::skew::set(hub, Some(t)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit("admin".into(), "upgrade.skew".into(), format!("full within {} commits, upgrade within {}", t.full, t.upgrade)).await;
+    hub.emit(&json!({ "type": "updates" }));
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `DELETE /api/updates/skew`: back to what kiln.toml says.
+async fn reset_skew(hub: &Arc<Hub>) -> R {
+    crate::skew::set(hub, None).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit("admin".into(), "upgrade.skew".into(), "as kiln.toml says".to_owned()).await;
+    hub.emit(&json!({ "type": "updates" }));
+    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 /// The pipeline that builds kiln for every platform (`[updates]`), and its latest run.
@@ -3947,6 +3995,10 @@ async fn create_terminal(hub: &Arc<Hub>, req: Request) -> R {
             if !hub.agents.lock().get(machine).is_some_and(|a| a.connected) {
                 return Err(err(StatusCode::CONFLICT, format!("{machine} is not connected")));
             }
+            // Its kiln is to be upgraded: no new terminal (`crate::skew`).
+            if let Some(why) = hub.skew_holds(machine) {
+                return Err(err(StatusCode::CONFLICT, why));
+            }
             hub.store.audit("admin".into(), "terminal.open".into(), t.target.clone()).await;
             crate::termsess::open_agent(hub, machine.to_owned(), t.cmd, cols, rows)
         }
@@ -4047,6 +4099,11 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
             if let Some((job, machine)) = target.strip_prefix("leg:").and_then(|t| t.split_once('@')) {
                 crate::termsess::open_leg(&hub, machine.to_owned(), job, cols, rows)
             } else if let Some(machine) = target.strip_prefix("agent:") {
+                // Its kiln is to be upgraded: no new terminal (`crate::skew`).
+                if let Some(why) = hub.skew_holds(machine) {
+                    tx.send(ws::text(json!({"type": "error", "message": why}).to_string())).await?;
+                    return Ok(());
+                }
                 crate::termsess::open_agent(&hub, machine.to_owned(), cmd, cols, rows)
             } else {
                 match crate::termsess::open_local(&hub, cmd, cols, rows) {
@@ -4274,18 +4331,15 @@ async fn goals_set(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     Ok(srv::json(StatusCode::OK, &s))
 }
 
-#[derive(Deserialize)]
-struct GoalsAdd {
-    goals: Vec<String>,
-    #[serde(default)]
-    start: bool,
-}
-
-/// Goals lined up after the agent's others (`crate::goals::add`).
+/// Goals lined up after the agent's others (`crate::goals::add_at`): `{goals, start?, parallel?}`,
+/// each goal its words or `{text, needs}` (`crate::goals::ops::goals_of`).
 async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
     may_steer_goals(hub, caller, id).await?;
-    let b: GoalsAdd = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let s = crate::goals::add(hub, id, b.goals, b.start).await.map_err(goals_err)?;
+    let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let by = crate::goals::By::of(hub, caller, id);
+    let goals = crate::goals::ops::goals_of(&b, &by.name()).map_err(|m| err(StatusCode::BAD_REQUEST, m))?;
+    let start = b.get("start").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let s = crate::goals::add_at(hub, id, goals, start, &crate::goals::At::End).await.map_err(goals_err)?;
     hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
 }

@@ -340,6 +340,12 @@ export interface State {
   exit?: ExitInfo;
   dropped: number;
   effort?: string;
+  /** The speed it runs at: absent or "" standard, else one of `Meta.speeds`. */
+  speed?: string;
+  /** Why its faster speeds can't serve it now (its account doesn't allow them), as its harness said. */
+  speed_blocked?: string;
+  /** Fast, but at standard speed for now: fast mode's own rate limit is cooling down (Claude Code). */
+  speed_cooldown?: boolean;
   /** Live values of Meta.controls, by id. */
   control_values?: Record<string, unknown>;
   limits?: Limit[];
@@ -482,6 +488,8 @@ export interface GoalItem {
   planned_as?: string;
   /** The plan run it waits for. */
   waits_on?: string;
+  /** The subagent a plan's step was handed to, side by side with the plan's other steps (docs/goals.md, "A plan's steps side by side"): under way there while it's still to go here; once met, who met it. */
+  subagent?: string;
 }
 
 /** An agent's goals, one after another: each goes once the one before is met. */
@@ -608,11 +616,13 @@ export interface Meta {
   hooks?: HookInfo[];
   /** Reasoning effort levels, when the harness has them. */
   efforts?: ControlOption[];
+  /** The speeds faster than standard the model in use runs at, slowest first (absent: none). */
+  speeds?: ControlOption[];
   modes: ModeOption[];
   models: ModelOption[];
   commands: SlashCommand[];
   agents: string[];
-  /** "steer", "send_now", "queue_cancel", "interrupt", "set_mode", "set_model", "stop_task", "file_suggestions", "resume", "switch_harness" */
+  /** "steer", "send_now", "queue_cancel", "interrupt", "set_mode", "set_model", "set_speed", "stop_task", "file_suggestions", "resume", "switch_harness" */
   features: string[];
 }
 
@@ -806,6 +816,7 @@ export type Command =
   | { type: "skill_view"; name: string; client: string }
   | { type: "skill_run"; name: string; args?: string }
   | { type: "set_effort"; effort: string }
+  | { type: "set_speed"; speed: string }
   | { type: "queue_edit"; id: string; text: string; attachments?: Attachment[] }
   | { type: "queue_remove"; id: string }
   | { type: "queue_move"; id: string; index: number }

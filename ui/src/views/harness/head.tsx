@@ -1,7 +1,8 @@
 /**
  * The agent page's head, in hyper-light.dev's figure-header voice: a mono eyebrow (where you are),
- * the agent's name, state on the stop control's border; then how it runs — permissions, model, effort —
- * as one line of words that opens in place to change them (no popups). Settings live in ⋯.
+ * the agent's name, state on the stop control's border; then how it runs — permissions, model, effort,
+ * and its speed where the model goes faster — as one line that changes them in place (no popups).
+ * Settings live in ⋯.
  */
 import * as React from "react";
 import { Link, useNavigate } from "@/lib/router";
@@ -143,6 +144,12 @@ export function AgentHeader({
     efforts: switching ? (switching.efforts ?? []) : (meta?.efforts ?? []),
     effort: switching ? (switching.effort ?? "") : (state?.effort ?? ""),
     onEffort: !switching && (features.includes("set_effort") || (meta?.efforts?.length ?? 0) > 0) ? (e) => send({ type: "set_effort", effort: e }) : undefined,
+    // The bolt, where the model goes faster: a speed is its harness's own, so none while a switch waits.
+    speeds: switching ? [] : (meta?.speeds ?? []),
+    speed: state?.speed ?? "",
+    onSpeed: features.includes("set_speed") ? (s) => send({ type: "set_speed", speed: s }) : undefined,
+    speedBlocked: state?.speed_blocked,
+    speedCooldown: state?.speed_cooldown,
     appliesNextTurn: nextTurn,
     running,
   };

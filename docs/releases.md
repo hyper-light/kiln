@@ -11,8 +11,9 @@ Build every platform** (or the Runners page, when a machine's platform has no bu
 1. Three jobs, at once, each building the UI first, then its binaries with `ci/release/build.sh`:
    - `linux`, on the server's own Linux runner: x86_64 and aarch64, static musl.
    - `windows`, on the same runner: x86_64, cross-built with zig.
-   - `macos`, on a Mac: Apple Silicon and Intel, built natively with the Mac's own toolchain and
-     SDK, minimum macOS 11. On Linux, `build.sh` can cross-build them too (zig, linking against
+   - `macos`, on a Mac: Apple silicon only (kiln doesn't run on Intel Macs), built natively with
+     the Mac's own toolchain and SDK, minimum macOS 11. It `requires` a Mac with cargo and node,
+     so it waits for one rather than going to a Mac without developer tools. On Linux, `build.sh` can cross-build them too (zig, linking against
      `ci/release/macos-stubs`: text stubs listing the symbols kiln imports from CoreFoundation,
      IOKit and libobjc, which macOS binds to the real libraries at load time). If a dependency
      starts importing something new, `ci/release/regen-macos-stubs.sh` rebuilds the stubs.
@@ -129,6 +130,31 @@ done once the runner reports the commit it was upgraded to, even on a binary sig
 Some runners still upgrade as before: those not under a supervisor (`kiln agent` run by hand), and
 Windows runners. On Unix they upgrade in place: the process re-executes itself, keeping its
 terminals and agent sessions. Otherwise they upgrade through `kiln install --agent --upgrade`.
+
+## Version skew
+
+How far a runner's kiln may be behind the server's is counted in commits of the release branch
+before the server's own (its first parents), by sha, under two tolerances:
+
+- **Full** (`[updates] skew_full`, 100 by default): a runner on the server's commit or one of the
+  `skew_full` before it does everything.
+- **Upgrade** (`skew_upgrade`, 1000 by default, never less than `skew_full`): a runner on one of
+  the commits past those, within `skew_upgrade`, connects so it can be brought up to date. Until
+  it is, it takes no new work: no jobs or legs, no new agents, no new terminals (kiln's own, for
+  upgrading it, still open).
+- Further behind, a runner is **refused**: it's told how far behind it is and how to catch up
+  (`kiln install --agent --upgrade` with a newer kiln, or a larger upgrade tolerance), and it
+  tries again a minute later.
+
+Main moves about 30 commits a day, so the defaults let a runner a few days behind do everything,
+and one a month behind catch up. A runner ahead of the server, on a commit off the release branch
+(a build on purpose) or of a local tree is left alone, as the fleet leaves it; so is one that says
+no commit (a kiln from before it said one), which is upgraded as any runner behind is. Where the
+server can't tell (it knows no commit of its own, or can't read its release repository), every
+runner does everything: kiln never shuts a fleet out on what it can't see.
+
+System → Updates sets both tolerances (kiln.toml's say until then; `GET`, `PUT` and `DELETE
+/api/updates/skew`), lists the commits each takes, and shows each runner's standing.
 
 ## One runner a machine
 
