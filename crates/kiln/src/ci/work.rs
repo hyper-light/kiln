@@ -79,6 +79,8 @@ pub struct Provenance {
     pub tree: String,
     pub ms: u64,
     pub cpu_ms: u64,
+    /// When it finished, in seconds since the epoch.
+    pub finished_at: i64,
 }
 
 /// A row, written or replaced.

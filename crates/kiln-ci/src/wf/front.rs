@@ -737,6 +737,12 @@ impl Fe<'_> {
                     ]));
                 }
                 "reuse" => kiln.reuse = Some(self.yval(v)),
+                // W24-R06: `work: { memo }` is what `reuse:` is shorthand for.
+                "work" => {
+                    if let Some(memo) = v.get("memo") {
+                        kiln.reuse = Some(self.yval(memo));
+                    }
+                }
                 "cache" => kiln.cache = v.as_seq().map(|s| s.iter().map(|x| self.yval(x)).collect()).unwrap_or_default(),
                 "exports" => kiln.exports_env = v.get("env").map(|e| self.str_list(e, &format!("{at}.env"))).unwrap_or_default(),
                 "env-from" => kiln.env_from = self.str_list(v, &at),

@@ -327,6 +327,7 @@ pub const JOB: &[Key] = &[
     kiln("retry", Ty::Any, "kiln: the retry policy (W05-R14)."),
     kiln_only("retries", Ty::Num, "kiln v1: retries after a lost runner."),
     kiln("reuse", Ty::Any, "kiln: reuse an earlier result when the inputs are unchanged (W08-R10)."),
+    kiln("work", Ty::Any, "kiln: doing the least work (W24): `memo` takes an earlier result when the inputs are unchanged, as `reuse:` (W24-R06)."),
     kiln("cache", Ty::Any, "kiln: caches (W08-R09), or v1's list of kept directories."),
     kiln("exports", Ty::Any, "kiln: `{ env: [names] }` published to later jobs (W04-R21)."),
     kiln("env-from", Ty::StrList, "kiln: import jobs' exported environment (W04-R21)."),

@@ -111,10 +111,53 @@ pub async fn inputs(hub: &Hub, repo: &Repo, sha: &str, leg: &LegSpec, reuse: &Sp
 
 /// A leg that succeeded under `hash` within `max_age` seconds, whose artifacts are all still
 /// there: it and the report it gave.
-pub async fn lookup(hub: &Hub, hash: &str, max_age: u64) -> anyhow::Result<Option<(String, String)>> {
+/// The trust domain a leg's results are kept in (W24-R21): untrusted ones never meet trusted ones.
+pub fn domain(trusted: bool) -> &'static str {
+    if trusted { "trusted" } else { "untrusted" }
+}
+
+/// A leg's work key (docs/ci.md W24-R06): a leg's unit whose definition is its input hash, which
+/// covers its definition, pins, images, platform, listed variables and listed paths' trees.
+pub fn work_key(hash: &str, trusted: bool) -> kiln_ci::work::key::Key {
+    use kiln_ci::work::key::{Kind, Platform, Unit, weak};
+    weak(&Unit {
+        kind: Kind::Leg,
+        definition: format!("w08-r10 {hash}"),
+        secrets: Default::default(),
+        env: Default::default(),
+        platform: Platform::default(),
+        inputs: Default::default(),
+        upstream: Default::default(),
+        trust: domain(trusted).to_owned(),
+    })
+}
+
+/// Whether a succeeded leg can still be taken over: it's there, succeeded, and its artifacts all are.
+fn stands(c: &rusqlite::Connection, leg: &str, now: i64) -> rusqlite::Result<bool> {
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.id = ?1 AND j.status = 'succeeded'
+           AND NOT EXISTS (SELECT 1 FROM ci_artifacts a WHERE a.leg_id = j.id AND (a.finalized = 0 OR (a.expires_at IS NOT NULL AND a.expires_at <= ?2))))",
+        params![leg, now],
+        |r| r.get(0),
+    )
+}
+
+/// The newest succeeded leg for `hash` within `max_age` whose artifacts are all still there, with
+/// its report: from the work ledger first (W24-R06), then from W08-R10's own table, which holds
+/// the results kept before the ledger.
+pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u64) -> anyhow::Result<Option<(String, String)>> {
     let (hash, since) = (hash.to_owned(), crate::util::now_unix().saturating_sub(i64::try_from(max_age).unwrap_or(i64::MAX)));
+    let (scope, weak) = (crate::ci::work::scope(repo, domain(trusted)), work_key(&hash, trusted));
     hub.store
         .call(move |c| {
+            let now = crate::util::now_unix();
+            let same = |p: &kiln_ci::work::key::PathSet| p.clone();
+            if let Some((_, found)) = crate::ci::work::lookup(c, &scope, &weak, &same)?
+                && found.provenance.finished_at >= since
+                && stands(c, &found.provenance.leg, now)?
+            {
+                return Ok(Some((found.provenance.leg.clone(), found.outputs.get("report").cloned().unwrap_or_default())));
+            }
             Ok(c.query_row(
                 "SELECT r.leg_id, r.report FROM ci_reuse r JOIN jobs j ON j.id = r.leg_id
                  WHERE r.input_hash = ?1 AND r.created_at >= ?2 AND j.status = 'succeeded'
@@ -128,12 +171,22 @@ pub async fn lookup(hub: &Hub, hash: &str, max_age: u64) -> anyhow::Result<Optio
         .await
 }
 
-/// A leg that succeeded under `hash`: kept for those that come after.
-pub async fn remember(hub: &Hub, leg: &str, run: &str, hash: &str, report: &str) -> anyhow::Result<()> {
-    let (leg, run, hash, report) = (leg.to_owned(), run.to_owned(), hash.to_owned(), report.to_owned());
+/// A leg that succeeded under `hash`: kept for those that come after, in the work ledger under its
+/// work key (W24-R06) and in W08-R10's own table.
+pub async fn remember(hub: &Hub, repo: &str, trusted: bool, leg: &str, run: &str, hash: &str, report: &str) -> anyhow::Result<()> {
+    let (repo, leg, run, hash, report) = (repo.to_owned(), leg.to_owned(), run.to_owned(), hash.to_owned(), report.to_owned());
     hub.store
         .call(move |c| {
-            c.execute("INSERT OR REPLACE INTO ci_reuse (input_hash, leg_id, run_id, report, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![hash, leg, run, report, crate::util::now_unix()])?;
+            let now = crate::util::now_unix();
+            c.execute("INSERT OR REPLACE INTO ci_reuse (input_hash, leg_id, run_id, report, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![hash, leg, run, report, now])?;
+            let result = crate::ci::work::Recorded {
+                outcome: "success".into(),
+                outputs: BTreeMap::from([("report".to_owned(), report)]),
+                provenance: crate::ci::work::Provenance { repo: repo.clone(), run, leg, finished_at: now, ..Default::default() },
+                domain: domain(trusted).to_owned(),
+                ..Default::default()
+            };
+            crate::ci::work::record(c, &crate::ci::work::scope(&repo, domain(trusted)), &work_key(&hash, trusted), &kiln_ci::work::key::PathSet::new(), &result)?;
             Ok(())
         })
         .await

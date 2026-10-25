@@ -1639,7 +1639,8 @@ impl Dispatch {
         // W08-R10: a job that opted in takes an earlier leg's result for the same inputs.
         let reuse = self.reuse_hash(run, &spec).await;
         if let Some((hash, max_age)) = &reuse {
-            match super::reuse::lookup(&self.hub, hash, *max_age).await {
+            let (repo, trusted) = self.runs.get(run).map(|r| (r.repo.name.clone(), r.trusted)).unwrap_or_default();
+            match super::reuse::lookup(&self.hub, &repo, trusted, hash, *max_age).await {
                 Ok(Some((source, report))) => return Box::pin(self.take_over(run, spec, &source, hash, report_from_json(&report))).await,
                 Ok(None) => {}
                 Err(e) => tracing::warn!(leg = %spec.key, error = %format!("{e:#}"), "reuse couldn't be looked up; the leg runs"),
@@ -2505,10 +2506,12 @@ impl Dispatch {
         runs::finish_leg(&self.hub, leg, status_of(c), c.as_str(), outputs, reason).await?;
         self.hub.emit_job(leg).await;
         let report = LegReport { conclusion: Some(c), ..l.report };
-        // W08-R10: a success of a job that opted in is kept for the legs with its inputs.
+        // W08-R10: a success of a job that opted in is kept for the legs with its inputs, in the work
+        // ledger too (W24-R06).
+        let (repo, trusted) = self.runs.get(&l.run).map(|r| (r.repo.name.clone(), r.trusted)).unwrap_or_default();
         if c == PlanC::Success
             && let Ok(Some(hash)) = super::reuse::hash_of(&self.hub, leg).await
-            && let Err(e) = super::reuse::remember(&self.hub, leg, &l.run, &hash, &report_json(&report)).await
+            && let Err(e) = super::reuse::remember(&self.hub, &repo, trusted, leg, &l.run, &hash, &report_json(&report)).await
         {
             tracing::warn!(leg = %leg, error = %format!("{e:#}"), "a result couldn't be kept for reuse");
         }
