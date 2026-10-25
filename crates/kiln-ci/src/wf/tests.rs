@@ -156,6 +156,30 @@ fn kiln_keys_are_refused_in_github_workflows() {
     assert!(codes(&d).contains(&"KCI5001"), "{d:?}");
 }
 
+/// W05-R03, W05-R22: a job's `resources:` and `requires:` are checked at their lines, not when a
+/// leg waits for a runner none can be (or, for a lone `=`, never stops reading the constraint).
+#[test]
+fn resources_and_requires_are_checked_at_their_lines() {
+    let src = "on: push\njobs:\n  a:\n    resources: { cpu: lots, memory: 512m, gpu: two, memroy: 1Gi }\n    requires: ['os == linux', 'os = linux', '${{ matrix.needs }}']\n    steps:\n      - run: make\n";
+    let (_, d) = kiln(src);
+    let found = errors(&d);
+    for want in [
+        "KCI1011 4:",
+        "resources.cpu` isn't a number of CPUs (`2`, `0.5`, `500m`): `lots`",
+        "resources.memory` isn't a size (`512Mi`, `32Gi`, `2G`): `512m`",
+        "resources.gpu` isn't a number of GPUs: `two`",
+        "KCI1010 4:",
+        "unknown key `memroy` in `resources`",
+        "KCI1011 5:",
+        "`os = linux`: `=` alone isn't an operator (`==`?)",
+    ] {
+        assert!(found.iter().any(|e| e.contains(want)), "{want}: {found:?}");
+    }
+    assert_eq!(found.len(), 5, "the good constraint and the templated one pass: {found:?}");
+    let (_, d) = kiln("on: push\njobs:\n  a:\n    resources: { cpu: 500m, memory: 32Gi, disk: 50G, gpu: 1 }\n    requires: ['os == linux && arch == x86_64']\n    steps:\n      - run: make\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+}
+
 #[test]
 fn w02_r06_v1_forms() {
     let src = "name: ci\non:\n  push: { branches: [main] }\n  tag: { branches: ['v*'] }\n  schedule: ['0 6 * * *']\njobs:\n  test:\n    toolchain: rust\n    matrix: { profile: [dev, release] }\n    retries: 2\n    artifacts: ['target/**']\n    cache: ['.cargo/registry']\n    exclusive: true\n    if: branch == 'main'\n    steps:\n      - run: cargo test --profile ${{ matrix.profile }}\n        tty: true\n";
