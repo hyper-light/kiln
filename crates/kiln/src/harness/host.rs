@@ -372,6 +372,10 @@ impl Handovers {
     }
 }
 
+/// What a session's hand-over or move hears when its host has gone (CP-T3.2): it stays, as its
+/// inbox's ids can't go with it.
+const HOST_GONE: &str = "this runner's host of its sessions is gone, so it stays here";
+
 /// What kiln says first to a session whose turn its restart cut short.
 const CUT_BY_RESTART: &str = "kiln restarted on this machine part-way through your last turn, which stopped it. Pick up where you left off.";
 
@@ -1012,6 +1016,74 @@ impl Host {
         }
     }
 
+    /// What session `id` reaches its host through: its attached files, branches, letting go, and its
+    /// inbox's ids, fence and hand-overs' record. Its host gone, the session can neither read its
+    /// inbox's ids nor fence it (CP-T3.2): a hand-over or move of it stays, never going without them.
+    fn files_for(&self, id: &str) -> session::Files {
+        let me = self.me.clone();
+        let me2 = self.me.clone();
+        let me3 = self.me.clone();
+        let me4 = self.me.clone();
+        let me5 = self.me.clone();
+        let me6 = self.me.clone();
+        session::Files {
+            dir: self.files_dir.join(id),
+            take: Arc::new(move |f: &str| me.upgrade().and_then(|h| h.take_file(f))),
+            // A branch: another session on this machine.
+            spawn: Arc::new(move |spec: Spec| {
+                if let Some(h) = me2.upgrade()
+                    && let Err(e) = h.open(None, spec)
+                {
+                    tracing::warn!(error = %format!("{e:#}"), "could not branch an agent session");
+                }
+            }),
+            release: Arc::new(move |id: &str| {
+                if let Some(h) = me3.upgrade() {
+                    h.release(id);
+                }
+            }),
+            carried: Arc::new(move |id: String| {
+                let h = me4.upgrade();
+                Box::pin(async move {
+                    match h {
+                        Some(h) => h.carried(&id).await.map_err(|e| e.to_string()),
+                        None => Err(HOST_GONE.into()),
+                    }
+                })
+            }),
+            fence: Arc::new(move |id: String, on: bool| {
+                let h = me5.upgrade();
+                Box::pin(async move {
+                    match h {
+                        Some(h) => h.moving_fence(&id, on).await.map_err(|e| e.to_string()),
+                        None => Err(HOST_GONE.into()),
+                    }
+                })
+            }),
+            settle: Arc::new(move |attempt: String, id: String, take_back: bool| {
+                let h = me6.upgrade();
+                Box::pin(async move {
+                    match h {
+                        Some(h) => crate::rt::blocking(move || h.settle(&attempt, &id, take_back)).await.map_err(|e| format!("{e:#}")).and_then(|r| r),
+                        None => Ok(None),
+                    }
+                })
+            }),
+            room: {
+                let (me, id) = (self.me.clone(), id.to_owned());
+                Arc::new(move || me.upgrade().is_none_or(|h| h.room_for(&id)))
+            },
+            work: {
+                let (me, id) = (self.me.clone(), id.to_owned());
+                Arc::new(move |work, waits| {
+                    if let Some(h) = me.upgrade() {
+                        h.stands(&id, work, waits);
+                    }
+                })
+            },
+        }
+    }
+
     /// `brought`: the ids of the messages it had where it was before (its inbox's newest, from a
     /// move or blue/green), taken by its inbox here; a seed brings more (its queue and its
     /// timeline's messages). `back`: this host takes it back at the epoch it left at (blue/green
@@ -1051,68 +1123,7 @@ impl Host {
                 h.mark_dirty();
             }
         });
-        let me = self.me.clone();
-        let me2 = self.me.clone();
-        let me3 = self.me.clone();
-        let me4 = self.me.clone();
-        let me5 = self.me.clone();
-        let me6 = self.me.clone();
-        let files = session::Files {
-            dir: self.files_dir.join(&id),
-            take: Arc::new(move |f: &str| me.upgrade().and_then(|h| h.take_file(f))),
-            // A branch: another session on this machine.
-            spawn: Arc::new(move |spec: Spec| {
-                if let Some(h) = me2.upgrade()
-                    && let Err(e) = h.open(None, spec)
-                {
-                    tracing::warn!(error = %format!("{e:#}"), "could not branch an agent session");
-                }
-            }),
-            release: Arc::new(move |id: &str| {
-                if let Some(h) = me3.upgrade() {
-                    h.release(id);
-                }
-            }),
-            carried: Arc::new(move |id: String| {
-                let h = me4.upgrade();
-                Box::pin(async move {
-                    match h {
-                        Some(h) => h.carried(&id).await.map_err(|e| e.to_string()),
-                        None => Ok(Vec::new()),
-                    }
-                })
-            }),
-            fence: Arc::new(move |id: String, on: bool| {
-                let h = me5.upgrade();
-                Box::pin(async move {
-                    match h {
-                        Some(h) => h.moving_fence(&id, on).await.map_err(|e| e.to_string()),
-                        None => Ok(()),
-                    }
-                })
-            }),
-            settle: Arc::new(move |attempt: String, id: String, take_back: bool| {
-                let h = me6.upgrade();
-                Box::pin(async move {
-                    match h {
-                        Some(h) => crate::rt::blocking(move || h.settle(&attempt, &id, take_back)).await.map_err(|e| format!("{e:#}")).and_then(|r| r),
-                        None => Ok(None),
-                    }
-                })
-            }),
-            room: {
-                let (me, id) = (self.me.clone(), id.clone());
-                Arc::new(move || me.upgrade().is_none_or(|h| h.room_for(&id)))
-            },
-            work: {
-                let (me, id) = (self.me.clone(), id.clone());
-                Arc::new(move |work, waits| {
-                    if let Some(h) = me.upgrade() {
-                        h.stands(&id, work, waits);
-                    }
-                })
-            },
-        };
+        let files = self.files_for(&id);
         // What its timeline and queue show first, what its inbox took last (in its own order, the
         // newest last): past its inbox's bound, the newest are the ones its inbox here keeps.
         let brought = match &seed {
@@ -2717,6 +2728,26 @@ mod tests {
     /// A host whose sessions' inboxes keep their records in the simulator's.
     fn with_inbox(tx: Sink) -> Arc<Host> {
         Host::with_records(tx, None, Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())))
+    }
+
+    /// CP-T3.2 (seen as a failed test's session, left behind its host, was handed over later with
+    /// no ids): a session whose host is gone can neither read its inbox's ids nor fence it, so a
+    /// hand-over or move of it stays here. It never goes without the ids its inbox took, which the
+    /// process it went to would need to answer one sent again as a repeat, not a new prompt.
+    #[test]
+    fn a_session_whose_host_is_gone_goes_nowhere_without_its_inbox_s_ids() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let files = host.files_for("s1");
+            assert!((files.carried)("s1".into()).await.is_ok(), "its host there, its inbox's ids are read");
+            drop(host);
+            let read = (files.carried)("s1".into()).await;
+            assert!(read.as_ref().is_err_and(|e| e.contains("stays here")), "{read:?}");
+            let fenced = (files.fence)("s1".into(), true).await;
+            assert!(fenced.as_ref().is_err_and(|e| e.contains("stays here")), "{fenced:?}");
+            Ok(())
+        })
     }
 
     /// CP-T3.2: a message sent to a session twice under its id is handed to the session once, and
