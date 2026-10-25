@@ -2011,6 +2011,9 @@ W20.
     containers a leg's steps start through its Docker socket see the machine's CPUs, where a
     hosted runner's share its machine's few; two runners on one machine give out the same CPUs,
     each as if alone.
+  - With Docker inside its container (W13-R04's `docker = "socket"`), a leg keeps the memory and
+    CPUs it was given: the dispatcher had put Docker's option in their place, so such a leg ran
+    free of both (corpus pass 1025b, 2026-10-25; `w05_r03_docker_inside_keeps_the_legs_resources`).
 - *Left.* AC11 on the live cluster.
 - *Done* (2026-10-23), R16's retry where only the runner that lost the leg could take it, which
   waited for good. Of the options put to the user (wait; prefer another runner and take the same

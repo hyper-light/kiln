@@ -351,6 +351,18 @@ fn executor_options(mode: &str, request: &kiln_ci::sched::state::Resources) -> s
     if o.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(o) }
 }
 
+/// The executor's options with Docker inside its container (W13-R04): beside what resource mode
+/// gave the leg (its memory and CPUs), not in their place, which left a leg with Docker free of
+/// both (corpus pass 1025b).
+fn with_docker(options: serde_json::Value, docker: &str) -> serde_json::Value {
+    let mut o = match options {
+        serde_json::Value::Object(o) => o,
+        _ => serde_json::Map::new(),
+    };
+    o.insert("docker".into(), serde_json::json!(docker));
+    serde_json::Value::Object(o)
+}
+
 /// The hub's handle on the dispatcher.
 pub struct Handle {
     tx: async_channel::Sender<Msg>,
@@ -2005,7 +2017,7 @@ impl Dispatch {
         // Docker inside the `docker` executor's container: the host's socket, for trusted runs
         // only (W13-R04).
         if let Some(d) = docker.filter(|_| r.trusted && a.executor.kind == "docker") {
-            a.executor.options = serde_json::json!({ "docker": d });
+            a.executor.options = with_docker(std::mem::take(&mut a.executor.options), &d);
         }
         a.executor.slot = slot;
         // Needed jobs' secret outputs, as masked environment only (W04-R22).
@@ -3024,5 +3036,14 @@ mod tests {
         assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { mem: 0, ..asked }), serde_json::json!({ "cpus": 4 }));
         assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { cpu: 0.5, mem: 0, ..asked }), serde_json::json!({ "cpus": 1 }), "whole CPUs");
         assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { cpu: 0.0, mem: 0, ..asked }), serde_json::Value::Null);
+    }
+
+    /// W05-R03, W13-R04: Docker inside a leg's container goes beside the memory and CPUs it was
+    /// given, not in their place.
+    #[test]
+    fn w05_r03_docker_inside_keeps_the_legs_resources() {
+        let given = serde_json::json!({ "memory": 17179869184u64, "cpus": 4 });
+        assert_eq!(super::with_docker(given, "socket"), serde_json::json!({ "memory": 17179869184u64, "cpus": 4, "docker": "socket" }));
+        assert_eq!(super::with_docker(serde_json::Value::Null, "socket"), serde_json::json!({ "docker": "socket" }), "slot mode: Docker alone");
     }
 }
