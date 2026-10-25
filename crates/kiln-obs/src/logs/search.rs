@@ -93,6 +93,13 @@ pub enum Node {
     Or(usize, usize),
 }
 
+/// Room [`Search::block_with`] keeps from block to block.
+#[derive(Debug, Default)]
+pub struct BlockScratch {
+    vals: Vec<Maybe>,
+    buf: String,
+}
+
 /// A parsed search: nodes, children before parents.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Search {
@@ -526,12 +533,18 @@ impl Search {
     /// As [`Search::block`], of a block of spans when `spans` (its filter holds trace ids, and not
     /// [`super::block::UNTOKENIZED`]'s values).
     pub fn block_in(&self, b: &LogBlock, spans: bool) -> Maybe {
-        let mut v: Vec<Maybe> = Vec::with_capacity(self.nodes.len());
-        let mut buf = String::new();
+        self.block_with(b, spans, &mut BlockScratch::default())
+    }
+
+    /// [`Search::block_in`] in room kept from block to block: nothing allocated once it has grown
+    /// (a scan asks it of every block it might read).
+    pub fn block_with(&self, b: &LogBlock, spans: bool, s: &mut BlockScratch) -> Maybe {
+        let BlockScratch { vals: v, buf } = s;
+        v.clear();
         for n in &self.nodes {
             let get = |i: usize| v.get(i).copied().unwrap_or(Maybe::Unknown);
             let m = match n {
-                Node::Leaf(l) => leaf_block(l, b, &mut buf, spans),
+                Node::Leaf(l) => leaf_block(l, b, buf, spans),
                 Node::Not(x) => match get(*x) {
                     Maybe::Yes => Maybe::No,
                     Maybe::No => Maybe::Yes,

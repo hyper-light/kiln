@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::block::{BLOCK_TEXT, LogBlock};
 use super::file::{LogFile, LogFileError};
 use super::record::{Record, RecordRef, RowError, Rows};
-use super::search::{Maybe, RowScratch, Search};
+use super::search::{BlockScratch, Maybe, RowScratch, Search};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LogStoreError {
@@ -793,7 +793,7 @@ impl LogSnapshot {
         // among the last: a block is read oldest first, and each newer row made a record at once
         // was most often let go again (45,000 allocations for the newest 100 of 2,000,000).
         let mut best: Best = Best { rows: Vec::with_capacity(limit.min(4096) + 1), kept: Vec::new(), live: 0, limit };
-        let mut scratch = RowScratch::default();
+        let (mut scratch, mut room) = (RowScratch::default(), BlockScratch::default());
         let (mut text, mut raw) = (Vec::new(), Vec::new());
         let consider = |r: &RecordRef<'_>, row: &[u8], floor: i64, best: &mut Best, scratch: &mut RowScratch, found: &mut Found| {
             found.rows_scanned += 1;
@@ -825,7 +825,7 @@ impl LogSnapshot {
                 Src::File(f, i) => f.blocks.get(*i),
                 Src::Sealed(b) => Some(*b),
             };
-            if summary.is_some_and(|b| search.block_in(b, self.spans) == Maybe::No) {
+            if summary.is_some_and(|b| search.block_with(b, self.spans, &mut room) == Maybe::No) {
                 found.blocks_pruned += 1;
                 continue;
             }
@@ -876,9 +876,10 @@ impl LogSnapshot {
             Ok::<(), LogStoreError>(())
         })?;
         let (srcs, _) = self.candidates(&all, from, to);
+        let mut room = BlockScratch::default();
         for src in &srcs {
             for (m, q) in may.iter_mut().zip(searches) {
-                *m = q.block_in(src.block(), self.spans) != Maybe::No;
+                *m = q.block_with(src.block(), self.spans, &mut room) != Maybe::No;
             }
             if !may.contains(&true) {
                 continue;
@@ -920,7 +921,8 @@ impl LogSnapshot {
     /// The blocks a scan of `[from, to]` for `search` reads, sealed then files' in order, and how
     /// many it rules out.
     fn candidates(&self, search: &Search, from: i64, to: i64) -> (Vec<Src<'_>>, u64) {
-        let consider = |b: &LogBlock, floor: i64| b.max_ts >= from && b.max_ts >= floor && b.min_ts <= to && search.block_in(b, self.spans) != Maybe::No;
+        let mut room = BlockScratch::default();
+        let mut consider = |b: &LogBlock, floor: i64| b.max_ts >= from && b.max_ts >= floor && b.min_ts <= to && search.block_with(b, self.spans, &mut room) != Maybe::No;
         let sealed = self.open.iter().flat_map(|o| o.sealed.iter().map(move |b| Src::Sealed(b, o.floor)));
         let all = sealed.chain(self.files.iter().flat_map(|f| f.log.blocks.iter().enumerate().map(move |(i, b)| Src::File(&f.log, i, b, f.floor))));
         let (mut srcs, mut pruned) = (Vec::new(), 0u64);
