@@ -4973,6 +4973,21 @@ resolve, not at all (it advertises its listener now; a runner that cannot resolv
 address never trying the tunnel is kiln's own, said, not changed here); and two tests' own
 assumptions (an `openssl` that binds one address; a metric read before its write landed).
 
+Then the whole set, Docker's scenarios among them under Docker Desktop (2026-10-25, an M4 Max Mac
+Studio, at d873d6fb and again at 5a74e409): kiln-obs's tests (353, its group's 4) and kiln's
+observe, CD and transport tests (293); every one of the 29 live files below passes there, the
+unified log, the archives' S3, email, Event Hubs, Prometheus's remote write, Datadog's Agent and
+tracer, the OpenTelemetry Collector's traces, LLM apps, Error Tracking, the profilers, containers
+and the loads among them. Running them there found three things more. The tracer's scenario took
+fifty traces a second for granted, so a sampling rate of a tenth: the Mac's debug build sent 13 a
+second and was given 0.373, its share of five, as it should be (the rate is now held to its share
+of what was sent). A test image's build waited 31 minutes for its base image's manifest, Docker
+Desktop's credential helper never answering (`docker-credential-desktop get`, its keychain not
+open to that session) and holding the build's output open: builds are now given up on past ten
+minutes, the CLI's process group killed, and made again; that Mac's runs give Docker a config
+without the credential store (it keeps no credentials). And a stand-in `journalctl`'s `tail`
+outlived its reader, killed alone: a log reader is now stopped with its process group (§8.1).
+
 **On Windows** (2026-10-24, jupiter: Windows 11, x86_64, MSVC, Git for Windows' own
 `core.autocrlf`): 42 of the scenarios below pass there, at 7f607f14, ef10dc30 and 4747aca3 (the same
 kiln): `observe_live` (17: CI through a Windows runner, every integration a monitor names, the group
@@ -5009,6 +5024,15 @@ transport tests (287); every live file above, kiln CD's and Docker's among them,
 two checks of the tests' own: a runner just caught up refused one OTLP/gRPC export as behind on its
 writes (UNAVAILABLE, which an exporter tries again: the scenario now does), and Prometheus scraped
 itself 7 times in 20 s where its check counted on 8 to 12 (now held to Prometheus's own samples).
+And again at a26bf7eb and 5a74e409: kiln-obs's tests (353, its group's 4) and kiln's observe, CD
+and transport tests (291); every live file passes there, the Event Log, kiln CD's kind cluster
+and Docker's among them, but for two things of the tests' own. The synthetic tests' failing event
+was looked for the moment the state said failing (a connection to a closed port is refused there
+only after its retries, and the event follows): the check now waits for it. And at 5a74e409 the
+collector's, the scanner's and the tracer's scenarios found no runner caught up: their server's
+QUIC listener was refused its port (`bind`: 10013, an access forbidden), the fleet having asked TCP
+for a free port it then listened on over UDP, and Windows reserving ranges of each apart
+(Hyper-V's, Docker Desktop's); a QUIC port is now asked of UDP, and the three pass at b903c978.
 Not run there: DogStatsD's Unix socket (Windows has no Unix datagram sockets),
 macOS's unified log, and the full disk's (it runs this machine's build in a Linux container).
 
