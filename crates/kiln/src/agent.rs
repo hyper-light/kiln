@@ -1366,6 +1366,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut mirror: Option<crate::convo::feed::Intake> = None;
     let mut mirror_store: Option<crate::convo::store::Store> = None;
     let mut restoring: Option<(String, crate::convo::feed::Shipper)> = None;
+    // Started again by a blue/green upgrade's hand-over and its rollback (Unix).
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut shipper = convo.as_ref().map(|st| start_feed(st, harness.as_ref(), &uplink.0));
     // What `kiln spawn` in this machine's terminals talks to.
     let harness_sock = harness.as_ref().and_then(|h| {
