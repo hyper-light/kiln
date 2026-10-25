@@ -30,3 +30,8 @@ lto = "thin"
 codegen-units = 4
 strip = true
 panic = "unwind"
+
+# A runner hashes its own binary when it starts (`updates::own_binary`): a debug build's is over a
+# gigabyte, which sha2 unoptimized takes 27 s over (48 MB/s), optimized 1.7 s.
+[profile.dev.package.sha2]
+opt-level = 3

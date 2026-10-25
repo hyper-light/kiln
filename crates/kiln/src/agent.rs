@@ -666,6 +666,13 @@ async fn sleep_until_opt(t: Option<Instant>) {
 
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
+    // What it says of its build on connecting, worked out from the start on a thread of its own:
+    // hashing its binary takes a while (a debug build's is over a gigabyte), and so can the
+    // container engine's answer.
+    if !o.ephemeral {
+        let outpost = o.outpost;
+        std::thread::spawn(move || if outpost { crate::updates::outpost_build() } else { crate::updates::runner_build() });
+    }
     // A Mac set up for kiln signing: launchd's re-sign watcher as this kiln writes it.
     if cfg!(target_os = "macos") && !o.ephemeral {
         std::thread::spawn(crate::os::macsign::keep_watching);
@@ -1518,6 +1525,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ev::Net(None) => anyhow::bail!("transport stopped"),
             Ev::Net(Some(NetEvent::Connected { binding, .. })) => {
                 tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
+                // How long saying what it is takes (its build's probes, its facts), told below: the
+                // server's frames wait meanwhile.
+                let (said_from, mut build_took, mut facts_took) = (Instant::now(), Duration::ZERO, Duration::ZERO);
                 paths.connected(binding, Instant::now());
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
@@ -1532,29 +1542,33 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 // Which build this is and that it takes upgrade commands (an older server skips it);
-                // an outpost says it's one instead.
-                let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build() };
-                // It sends its conversations' store: the server keeps them from that.
-                if shipper.is_some()
-                    && let AgentMsg::Build { caps, .. } = &mut build
-                {
-                    *caps |= proto::CAP_CONVO;
-                }
-                if !o.ephemeral
-                    && let Ok(b) = proto::encode(&match build {
+                // an outpost says it's one instead. Worked out off the event loop (its binary's
+                // hash, the engine's probes), begun as this runner started.
+                if !o.ephemeral {
+                    let (started, outpost) = (Instant::now(), o.outpost);
+                    let built = move || if outpost { crate::updates::outpost_build() } else { crate::updates::runner_build() };
+                    let mut build = crate::rt::blocking(built).await.unwrap_or_else(|_| built());
+                    build_took = started.elapsed();
+                    if let AgentMsg::Build { caps, .. } = &mut build {
+                        // It sends its conversations' store: the server keeps them from that.
+                        if shipper.is_some() {
+                            *caps |= proto::CAP_CONVO;
+                        }
                         // A runner that keeps no replica does not say it replicates.
-                        AgentMsg::Build { build, caps } if observe.is_none() => AgentMsg::Build { build, caps: caps & !proto::CAP_OBSERVE },
-                        m => m,
-                    })
-                {
-                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                        if observe.is_none() {
+                            *caps &= !proto::CAP_OBSERVE;
+                        }
+                    }
+                    if let Ok(b) = proto::encode(&build) {
+                        net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                    }
                 }
                 // The kiln it runs, so the server knows its commit (`crate::fleet`; outposts aren't
                 // part of the fleet).
-                if !o.ephemeral
-                    && !o.outpost
-                    && let Ok(b) = proto::encode(&crate::updates::runner_facts())
-                {
+                let started = Instant::now();
+                let facts = (!o.ephemeral && !o.outpost).then(crate::updates::runner_facts);
+                facts_took = started.elapsed();
+                if let Some(Ok(b)) = facts.as_ref().map(proto::encode) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     // The rest, probed: they take a moment (docs/ci.md W13-R01).
                     probe_facts(&uplink, &o.work_dir, &o.declared, &probing);
@@ -1594,6 +1608,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     front_door_sent = Some(json);
+                }
+                // Its frames waited all that while (the server's Welcome, observe's join): a slow one said.
+                let took = said_from.elapsed();
+                let (took_ms, build_ms, facts_ms) = (took.as_millis() as u64, build_took.as_millis() as u64, facts_took.as_millis() as u64);
+                if took > Duration::from_secs(2) {
+                    tracing::warn!(took_ms, build_ms, facts_ms, "saying what this runner is took long: the server's frames waited");
+                } else {
+                    tracing::debug!(took_ms, build_ms, facts_ms, "said what this runner is to the server");
                 }
             }
             Ev::Net(Some(NetEvent::Closed { reason, .. } | NetEvent::Unreachable { reason, .. })) => {
