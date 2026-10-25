@@ -298,6 +298,9 @@ pub struct Info {
     /// set on the server).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held: Option<Held>,
+    /// What of its messages couldn't be read (`crate::wire::unread`; set on the server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<crate::wire::unread::Kept>,
     /// At a usage limit it goes on on another machine with room (as `State::move_on_limit`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub move_on_limit: bool,
@@ -955,6 +958,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         last_turn: None,
         keep_off: false,
         held: None,
+        refused: None,
         move_on_limit: false,
         move_plan: Default::default(),
         pause_at: None,
@@ -3911,6 +3915,7 @@ mod tests {
             last_turn: None,
             keep_off: false,
             held: None,
+            refused: None,
             move_on_limit: false,
             move_plan: Default::default(),
             pause_at: None,

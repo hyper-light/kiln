@@ -13,6 +13,7 @@ pub mod commands;
 pub mod keep;
 pub mod link;
 pub mod sums;
+pub mod unread;
 pub mod uplink;
 
 use crate::harness::core::Update;

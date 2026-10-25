@@ -214,6 +214,62 @@ said as `kiln_runner_net_frames_dropped{runner,lane,reason}`. A frame QUIC took 
 connection isn't counted here: the channel resends it after the reconnect, as it does what the
 queue let go.
 
+## What can't be read
+
+A message a wire can't read is refused to its sender, typed, and noted in one place
+(`crate::wire::unread`), as one record, `Unread`. It holds the wire, where the message came from,
+what it was, a code, and why. Where it came from is a runner and its instance (before its Hello:
+its certificate and address), a person, an agent session, or an address. What it was is a
+variant's index, a tag, a method or a tool, never what it said. An unknown field in a known
+message isn't refused: that's how peers of different versions work together.
+
+| Code | When | On the channel and in the UI's nacks |
+|---|---|---|
+| `unknown` | A kind of message this build doesn't know: a newer peer's. | `unsupported` |
+| `malformed` | It couldn't be read: cut short, bytes left over, too large, out of order, or not this sender's link. | `malformed` |
+
+Each refusal noted:
+- is counted in `kiln_wire_refused_total{wire,code}`. Every series is there from the start, and
+  no label names the sender;
+- is kept for its sender's page, and for the agent session it's about when it's about one: how
+  many by wire and code, and the newest 16, for at most 4,096 senders (the least recent let go
+  first). The runner record (`GET /api/agents`) and an agent session's info carry them as
+  `refused`, and the UI's `agent` and `harness` events say when they change;
+- is written to the audit log as `security.wire_refused`: its sender as the principal, the wire as
+  the target, the code as the result, and what and why as the detail, 512 bytes at most. The
+  first for a sender, wire and code in a minute is written at once, and the rest as one row a
+  minute saying how many;
+- is told to its sender, 16 a second each at most: the rest are counted and folded into the next.
+
+What each wire's sender is told today. No wire notes its refusals here yet: the later steps of
+the typed-messages plan move each one onto `Refusals::note` and fill in its row. "Nothing yet":
+what it can't read is let go as before.
+
+| Wire | What it carries | Its sender is told |
+|---|---|---|
+| `runner` | A runner's frames, as the server reads them. | Nothing yet. |
+| `server` | The server's frames, as a runner reads them. | Nothing yet. |
+| `runner_item` | The items of a runner's channel streams, as the server reads them. | A NACK, `malformed`. |
+| `server_item` | The items of the server's channel streams, as a runner reads them. | A NACK, `malformed`. |
+| `runner_payload` | The JSON a runner's frame carries (a session's updates, an inventory), as the server reads it. | Nothing yet: its item is answered as taken. |
+| `server_payload` | The JSON the server's frame carries (a session's commands), as a runner reads it. | Nothing yet. |
+| `relay` | What runners send the server's relay for one another. | Nothing yet. |
+| `reach_link` | What a runner reads inside a reach link, from the runner at its other end. | Nothing yet: the link ends. |
+| `session_up` | The session socket: what a page sends up. | A nack, `malformed`. |
+| `session_down` | The session socket: what a page couldn't read of what came down. | Nothing yet. |
+| `terminal_up` | A terminal's socket (a session's, a runner's, a CI leg's): what a page sends up. | Nothing yet. |
+| `terminal_down` | A terminal's socket: what a page couldn't read of what came down. | Nothing yet. |
+| `stream_up` | A stream's socket: what a page sends up. | Nothing yet. |
+| `stream_down` | A stream's socket: what a page couldn't read of what came down. | Nothing yet. |
+| `events_up` | The events socket: what a page sends up. | Nothing yet. |
+| `events_down` | The events socket: what a page couldn't read of what came down. | Nothing yet. |
+| `log_up` | A log's socket: what a page sends up. | Nothing yet. |
+| `log_down` | A log's socket: what a page couldn't read of what came down. | Nothing yet. |
+| `tunnel_up` | A tunnel's socket: what a page sends up. | Nothing yet. |
+| `tunnel_down` | A tunnel's socket: what a page couldn't read of what came down. | Nothing yet. |
+| `mcp_http` | kiln's MCP endpoint, over HTTP. | Nothing yet. |
+| `mcp_reach` | kiln's MCP calls a runner makes through reach. | Nothing yet. |
+
 ## Revisions
 
 Each of the server's copies of a session counts the updates it takes: its revision (`rev`). The

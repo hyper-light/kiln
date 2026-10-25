@@ -1450,6 +1450,7 @@ mod tests {
             battery: None,
             dropped: Vec::new(),
             dropped_toward: Vec::new(),
+            refused: None,
             terminal: true,
             outpost: false,
             dedicated_job: None,

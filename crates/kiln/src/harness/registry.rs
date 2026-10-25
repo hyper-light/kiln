@@ -903,6 +903,24 @@ impl Registry {
         }
     }
 
+    /// What of session `id`'s messages couldn't be read (`crate::wire::unread`) changed: told to its
+    /// viewers.
+    pub fn set_refused(&self, hub: &Hub, id: &str, refused: Option<crate::wire::unread::Kept>) {
+        let info = {
+            let mut g = self.mirrors.lock();
+            match g.get_mut(id) {
+                Some(m) if m.info.refused != refused => {
+                    m.info.refused = refused;
+                    Some(m.info.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(info) = info {
+            hub.emit(&json!({"type": "harness", "info": info}));
+        }
+    }
+
     /// A session is given a name here (the "rename" control from any device; empty gives it its
     /// harness's name back): its page and every list show it at once.
     fn rename(&self, hub: &Hub, id: &str, value: Option<&Value>) {
@@ -1277,6 +1295,8 @@ impl Registry {
                 let mut info = (**info).clone();
                 // What its goals wait on a person for is the server's to say (`goals::held_stacks`): kept.
                 info.held = g.get(id).and_then(|m| m.info.held.clone());
+                // So is what of its messages couldn't be read (`crate::wire::unread`).
+                info.refused = g.get(id).and_then(|m| m.info.refused.clone());
                 // What kiln's own words were handed is kept too, and what waits in its queue until
                 // the state after this says again (neither goes in an Open): a runner that comes
                 // back doesn't make a word handed look lost (CP-T3.2, the fourteenth adversarial check's).
@@ -1782,6 +1802,7 @@ impl Registry {
                         last_turn: None,
                         keep_off: false,
                         held: None,
+                        refused: None,
                         move_on_limit: false,
                         move_plan: Default::default(),
                         pause_at: None,
