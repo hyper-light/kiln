@@ -1056,9 +1056,6 @@ impl Host {
         }
     }
 
-    /// The ids of the messages session `id` took that go with it when it moves: its inbox's newest
-    /// (after what its lane holds is done; it takes no messages while it moves). None without an
-    /// inbox, or when it can't be read (logged).
     /// Session `id`'s inbox fenced as it moves to another machine, before its conversation goes
     /// (`on`), or the fence lifted: its move failed, and it goes on here.
     pub async fn moving_fence(&self, id: &str, on: bool) -> Result<(), inbox::Refusal> {
@@ -1067,10 +1064,17 @@ impl Host {
         if on { inbox.fence(id, epoch).await } else { inbox.take_back(id, epoch).await.map(|_| ()) }
     }
 
+    /// The ids of the messages session `id` took that go with it when it moves: its inbox's newest,
+    /// once what its lane holds is done (a message its inbox took and its session then refused, as
+    /// it moves, is taken back by then). None without an inbox. Refused when they can't be read, or
+    /// while its lane isn't done within [`SETTLE_WAIT`]: an id read then may be one its inbox takes
+    /// back after, which would go without its message, and a retry of that message would be taken
+    /// where it went as a repeat and never delivered (the hand-over review's point 2).
     pub async fn carried(&self, id: &str) -> Result<Vec<(String, String)>, inbox::Refusal> {
         let Some(inbox) = &self.inbox else { return Ok(Vec::new()) };
         if crate::rt::timeout(SETTLE_WAIT, self.settled(id)).await.is_err() {
-            tracing::warn!(target: "kiln.sends", event = "settle_timed_out", session = %id, "a moving session's lane didn't settle in time: the ids its inbox took go as they stand");
+            tracing::warn!(target: "kiln.sends", event = "settle_timed_out", session = %id, "a moving session's lane didn't settle in time: it doesn't go, so no id goes without its message");
+            return Err(inbox::Refusal::Unavailable { session: id.to_owned(), why: "a message it was being sent is still being taken".to_owned() });
         }
         carry(inbox, id).await
     }

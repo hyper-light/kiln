@@ -2310,6 +2310,19 @@ where
 {
     use super::handing::NotHanded;
     use super::moving::Carry;
+    // Its inbox here fenced first, so it takes nothing more: a copy of it this process goes on with
+    // takes nothing the newer one may have taken (CP-T3.2). Then the ids of the messages it took,
+    // read once what its lane holds is done (a message its inbox took before the fence, and it then
+    // refused, is taken back by then), and only then what it holds, copied. So no id goes without
+    // its message, which a retry would find taken there and never deliver, and nothing it holds
+    // stays behind (the hand-over review's point 2).
+    fence(s.id.clone(), true).await.map_err(|e| format!("its inbox couldn't be fenced, so it stays here: {e}"))?;
+    // The ids go with it (it takes none while it's handed over): the newer process's inbox would
+    // take one sent again as new. Never without them: it stays here.
+    let kept = match ids(s.id.clone()).await {
+        Ok(kept) => kept,
+        Err(e) => return Err(unfenced(s, fence, format!("its inbox couldn't be read, so it stays here: {e}")).await),
+    };
     let spec = s.resume_spec();
     let (resume, program) = (spec.resume.clone(), spec.program.clone());
     let (events, state, cwd) = {
@@ -2333,14 +2346,11 @@ where
     // The same try each time it's sent again: the machine decides it once.
     let attempt = crate::util::new_id();
     pkg.attempt = Some(attempt.clone());
-    // The ids of the messages it took go with it (it takes none while it's handed over): the newer
-    // process's inbox would take one sent again as new. Never without them: it stays here.
-    let kept = ids(s.id.clone()).await.map_err(|e| format!("its inbox couldn't be read, so it stays here: {e}"))?;
     (pkg.inbox, pkg.inbox_digests) = super::host::split_kept(kept);
-    let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
-    // Its inbox here fenced before it goes: a copy of it this process goes on with takes nothing
-    // the newer one may have taken (CP-T3.2).
-    fence(s.id.clone(), true).await.map_err(|e| format!("its inbox couldn't be fenced, so it stays here: {e}"))?;
+    let bytes = match serde_json::to_vec(&pkg) {
+        Ok(bytes) => bytes,
+        Err(e) => return Err(unfenced(s, fence, e.to_string()).await),
+    };
     // How it went, until it's known (CP-T3.2, the eighteenth and nineteenth adversarial checks'):
     // the machine decides each try once, whichever of its processes comes first (`settle`), so the
     // server's word, which may be an earlier try's come late, says only when to look. Taken over,
@@ -2386,6 +2396,15 @@ where
 /// each time, up to [`UNKNOWN_MOST`].
 const UNKNOWN_FIRST: Duration = Duration::from_secs(5);
 const UNKNOWN_MOST: Duration = Duration::from_secs(60);
+
+/// Session `s`'s inbox, fenced as it began to go, takes messages again: nothing of it went, and it
+/// goes on here. `why` it didn't go, as it's said.
+async fn unfenced(s: &Session, fence: &FenceFor, why: String) -> String {
+    if let Err(e) = fence(s.id.clone(), false).await {
+        tracing::warn!(target: "kiln.sends", event = "unfence_failed", session = %s.id, error = %e, "a session that couldn't go couldn't take messages again: its inbox stays fenced until it goes");
+    }
+    why
+}
 
 /// Hand the session to runner `mv.to` (its turn is over, its harness down): its record, timeline
 /// and queue, over reach. Ok once that runner has taken it over and runs it. One that may have taken
@@ -2519,17 +2538,25 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
     pkg.git = out.git;
     pkg.ignored = out.ignored;
     pkg.worktree = out.worktree;
+    // Its inbox here fenced before its conversation goes: a copy of it this host goes on with
+    // after a crash takes nothing for it (it may have gone on there), and is moved again
+    // (CP-T3.2). Fenced before the ids of the messages it took are read, once what its lane holds
+    // is done, so no id goes without its message (the hand-over review's point 2). What it holds
+    // was copied above, after it stopped taking messages: none reached it since.
+    fence(s.id.clone(), true).await.map_err(|e| format!("its inbox couldn't be fenced, so it stays here: {e}"))?;
     // The ids of the messages it took go with it (it takes none while it moves).
     // Never without them: a message sent again where it went would be taken there as new. It
     // stays here, and the move can be tried again.
-    let kept = ids(s.id.clone()).await.map_err(|e| format!("its inbox couldn't be read, so it stays here: {e}"))?;
+    let kept = match ids(s.id.clone()).await {
+        Ok(kept) => kept,
+        Err(e) => return Err(unfenced(s, fence, format!("its inbox couldn't be read, so it stays here: {e}")).await),
+    };
     (pkg.inbox, pkg.inbox_digests) = super::host::split_kept(kept);
-    let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
+    let bytes = match serde_json::to_vec(&pkg) {
+        Ok(bytes) => bytes,
+        Err(e) => return Err(unfenced(s, fence, e.to_string()).await),
+    };
     moving_note(s, &format!("Moving to {}: handing over the conversation ({} KB)", mv.to, bytes.len() / 1024));
-    // Its inbox here fenced before its conversation goes: a copy of it this host goes on with
-    // after a crash takes nothing for it (it may have gone on there), and is moved again
-    // (CP-T3.2).
-    fence(s.id.clone(), true).await.map_err(|e| format!("its inbox couldn't be fenced, so it stays here: {e}"))?;
     let mut handed = reach.adopt(&mv.to, &bytes, false).await;
     // All of it went and no answer came: it may run there now. Going on here, it could take a
     // message it takes there too, so it doesn't: its inbox stays fenced, and it asks that runner
@@ -3470,7 +3497,8 @@ mod tests {
                 (&kept, vec![not_passed()], none(), vec![true, false], false, 1, vec![true]),
                 (&kept, vec![unknown(), unknown(), Ok(())], none(), vec![true], true, 3, vec![false, false]),
                 (&kept, vec![unknown(), not_passed(), refused()], none(), vec![true, false], false, 3, vec![false, false, true]),
-                (&unreadable, vec![Ok(())], none(), vec![], false, 0, vec![]),
+                // Its ids unreadable: fenced first, then the fence lifted, and it stays.
+                (&unreadable, vec![Ok(())], none(), vec![true, false], false, 0, vec![]),
                 // A refusal that's an earlier try's, come late: the record says it was taken over.
                 (&kept, vec![refused()], vec![Ok(Some(Decided::Taken))], vec![true], true, 1, vec![true]),
                 (&kept, vec![not_passed()], vec![Ok(Some(Decided::Taken))], vec![true], true, 1, vec![true]),
@@ -3522,6 +3550,45 @@ mod tests {
                 attempts.extend(asked.into_iter().map(|(a, _)| Some(a)));
                 anyhow::ensure!(attempts.len() <= 1 && !attempts.contains(&None), "the tries' attempts: {attempts:?}");
             }
+            Ok(())
+        })
+    }
+
+    /// The hand-over review's point 2: a session handed to its machine's newer runner process fences
+    /// its inbox, then reads the ids that go with it, then copies what it holds. What it holds once
+    /// its ids are read goes, with every id, so no id goes without its message.
+    #[test]
+    fn a_hand_over_fences_its_inbox_then_reads_its_ids_then_copies_what_it_holds() -> anyhow::Result<()> {
+        let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
+        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true };
+        crate::rt::block_on(async move {
+            let (s, _rx) = idle("h1");
+            let s = Arc::new(s);
+            let log = Arc::new(Mutex::new(Vec::<String>::new()));
+            let l = Arc::clone(&log);
+            let fence: FenceFor = Arc::new(move |_, on| {
+                l.lock().push(format!("fence {on}"));
+                Box::pin(async { Ok(()) })
+            });
+            // As its ids are read, what it holds is as its lane left it: m1 in its queue.
+            let (l, held) = (Arc::clone(&log), Arc::clone(&s));
+            let ids: CarriedIds = Arc::new(move |_| {
+                l.lock().push("ids".into());
+                held.core.lock().state.queue.push(super::super::model::QueueItem { id: "m1".into(), text: "then test it".into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None });
+                Box::pin(async { Ok(vec![("m1".to_owned(), "d1".to_owned())]) })
+            });
+            let settle: SettleFor = Arc::new(|_, _, _| Box::pin(async { Ok(None) }));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let got = Arc::clone(&sent);
+            let send = move |bytes: Vec<u8>| {
+                got.lock().push(bytes);
+                async { Ok(()) }
+            };
+            hand_to_newer_by(&s, kind, &mv, &ids, &fence, &settle, send, |_| async {}).await.map_err(|e| anyhow::anyhow!(e))?;
+            anyhow::ensure!(*log.lock() == ["fence true", "ids"], "{:?}", log.lock());
+            let bytes = sent.lock().first().cloned().ok_or_else(|| anyhow::anyhow!("nothing went"))?;
+            let pkg: serde_json::Value = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(pkg.pointer("/state/queue/0/id") == Some(&serde_json::json!("m1")) && pkg.get("inbox") == Some(&serde_json::json!(["m1"])), "{pkg}");
             Ok(())
         })
     }

@@ -68,10 +68,14 @@ session is at, and the inbox refuses, naming both epochs:
 
 **Moves.** As a move begins, a session takes no more messages: those it was sent and hadn't taken go
 with it at the end of its queue, and those after are refused `moved` before its inbox takes them, so
-sent again they go where it went. Once what its lane holds is done, the newest ids its inbox took
-(its last 4,096) go with it, each with its digest; its inbox can't be read, it doesn't go (the move
-fails, and it takes messages again where it is). Its inbox is fenced before its conversation goes to
-the machine it moves to, and the fence is lifted if that machine refuses it. All of it gone and no
+sent again they go where it went. Its inbox is fenced first, before its conversation goes to the
+machine it moves to. Then, once what its lane holds is done (a message its inbox took before the
+fence, and the session then refused, is taken back by then), the newest ids its inbox took (its last
+4,096) go with it, each with its digest; and what it holds is copied after it stopped taking
+messages. So no id goes without its message, which a retry would find taken there and never
+deliver. Its inbox can't be read, or its lane isn't done within 10 s, it doesn't go: the fence is
+lifted, the move fails, and it takes messages again where it is. The fence is lifted, too, if that
+machine refuses it. All of it gone and no
 answer come (the link closed, or that machine took too long), it may run there now: its inbox stays
 fenced, and it takes nothing here while it asks that machine again (after 5 s, then twice as long
 each time, up to a minute) until it says. A machine remembers each hand-over it took (the newest
