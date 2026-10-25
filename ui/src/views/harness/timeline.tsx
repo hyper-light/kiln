@@ -6,7 +6,7 @@
  */
 import * as React from "react";
 import { ArrowDown, ArrowUpRight, ChevronRight, CircleAlert, Copy, CornerDownRight, Download, FileDown, GitBranch, GitFork, Info, Pencil, Reply, SquarePlus, TriangleAlert, Undo2, X } from "lucide-react";
-import { useSession, type Approval, type Command, type Compacting, type Delivery, type HEvent, type Meta, type QueueItem, type SessionStore, type Task } from "@/api/harness";
+import { useSession, type Approval, type Command, type Compacting, type Delivery, type HEvent, type Meta, type Outgoing, type QueueItem, type SessionStore, type Task } from "@/api/harness";
 import { useNavigate } from "@/lib/router";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -37,6 +37,7 @@ import { MsgMenu, type MenuGroup, type MenuRow } from "./msgmenu";
 import { SpawnDialog } from "./spawn";
 import { fileUrl, keptFor, kindOf, resolvePath } from "./files";
 import { toast } from "@/components/ui/toast";
+import { Button } from "@/components/ui/button";
 import { bringIntoView, elementOf, FindNowContext, mark, useRevealed, type FindNow } from "./find";
 import { Output, Prose, ToolIcon } from "./parts";
 import { FilesContext, type ConversationFiles } from "./files";
@@ -883,7 +884,10 @@ const Prompt = React.memo(function Prompt({
           <span className="hx-dim">{SAID_AT.format(e.at)}</span>
           {delivery && (
             <span className="hx-dim">
-              · <span className="hx-delivery" data-delivery={delivery}>{DELIVERY[delivery]}</span>
+              ·{" "}
+              <span className="hx-delivery" data-delivery={delivery}>
+                {DELIVERY[delivery]}
+              </span>
             </span>
           )}
           {e.attachments?.length ? (
@@ -923,6 +927,68 @@ const Prompt = React.memo(function Prompt({
         <SpawnDialog open={spawning} onOpenChange={setSpawning} defaults={{ ...spawn, prompt: e.text }} onStarted={(started) => navigate(started[0] ? `/agents/${started[0].id}` : "/agents")} />
       )}
     </div>
+  );
+});
+
+/**
+ * Something you sent that the conversation doesn't show yet, where it will show: at once, as it
+ * goes, and as sent once its machine says it has it, until the agent's session shows it (its own
+ * prompt then takes its place). One refused for good says why, and goes again as a new message
+ * (its id's answer stays the refusal) or is let go.
+ */
+const Sending = React.memo(function Sending({
+  m,
+  live,
+  lookup,
+  onResend,
+  onDiscard,
+}: {
+  m: Outgoing;
+  /** Connected: it can go again now. */
+  live: boolean;
+  lookup?: (id: string) => HEvent | undefined;
+  onResend: (id: string) => void;
+  onDiscard: (id: string) => void;
+}) {
+  const failed = m.state === "failed";
+  const why = m.why ? `${m.why.charAt(0).toUpperCase()}${m.why.slice(1)}.` : "It didn't get there.";
+  return (
+    <section className="hx-turn hx-sending" data-state={m.state}>
+      <div className="hx-prompt-wrap">
+        <div className="hx-prompt" data-origin="human">
+          <div className="hx-prompt-meta">
+            <span className="hx-eyebrow">You</span>
+            <span className="hx-dim">{SAID_AT.format(m.at)}</span>
+            <span className="hx-dim">
+              ·{" "}
+              <span className="hx-delivery" data-delivery={m.state}>
+                {failed ? "failed to send" : m.state === "sent" ? "sent" : "sending…"}
+              </span>
+            </span>
+            {m.attachments.length > 0 && (
+              <span className="hx-dim hx-trunc" title={m.attachments.join(", ")}>
+                · {m.attachments.join(", ")}
+              </span>
+            )}
+          </div>
+          {m.reply_to && lookup && <Quote id={m.reply_to} lookup={lookup} />}
+          <div className="hx-prompt-text">{m.text}</div>
+          {failed && (
+            <div className="hx-send-failed" role="alert">
+              <span>{why}</span>
+              <span className="hx-prompt-acts">
+                <Button size="xs" variant="secondary" disabled={!live} title={live ? undefined : "Not connected: it can go again once the page is"} onClick={() => onResend(m.id)}>
+                  Retry
+                </Button>
+                <Button size="xs" variant="ghost" onClick={() => onDiscard(m.id)}>
+                  Remove
+                </Button>
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
   );
 });
 
@@ -1540,6 +1606,16 @@ export const Timeline = React.memo(function Timeline({
     const call = events.find((e) => e.id === parent);
     return call?.kind === "tool" ? call.task : undefined;
   }, [parent, task, events]);
+  // What you sent to this thread (the main one, or this subagent) that it doesn't show yet: at its end.
+  const outgoing = useSession(store, (s) => s.outgoing);
+  const live = useSession(store, (s) => s.conn === "open");
+  const mine = React.useMemo(() => outgoing.filter((m) => (thread ? m.task === thread : !m.task)), [outgoing, thread]);
+  const resend = React.useCallback(
+    (id: string) => {
+      if (!store.resend(id)) toast.error("Not connected", "The page is reconnecting to the agent; try again in a moment.");
+    },
+    [store],
+  );
   const going = parent ? Boolean(task && taskLive(task)) : state?.status === "running" || state?.status === "waiting" || state?.status === "starting";
   // Turns that didn't change stay the same objects, so only what changed renders again; and only
   // the turns from the first change on are worked out again (derive.ts), not the whole history.
@@ -1752,7 +1828,7 @@ export const Timeline = React.memo(function Timeline({
                 {task?.summary ? <Prose text={task.summary} className="hx-sub-result" /> : <p className="hx-dim text-[12px]">No work has been reported in this thread yet.</p>}
               </div>
             ) : (
-              <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
+              mine.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
             ))}
           {turns.slice(from, to).map((t, j) => (
             <TurnView
@@ -1778,6 +1854,7 @@ export const Timeline = React.memo(function Timeline({
           ))}
           {/* A window further back: what came after joins as you scroll down to it. */}
           {!tail && <div key={`to-${to}`} ref={later} className="hx-earlier" aria-hidden="true" />}
+          {tail && mine.map((m) => <Sending key={m.id} m={m} live={live} lookup={lookup} onResend={resend} onDiscard={store.discard} />)}
           {tail && hasAsks && onDecide && (
             <div ref={asksRef} className="hx-asks">
               {pending.map((a) => (
