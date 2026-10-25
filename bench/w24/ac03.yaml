@@ -1,7 +1,9 @@
 # W24-AC03 (docs/ci.md, "How AC03 will be measured"): kiln's own rust job with W24's reuse, warm
-# workspaces and test selection, measured against M0's baseline. It runs on a trusted push to a
-# `w24/ac03/...` branch, on a bare-metal runner (pods keep no warm workspace before M5), so each
-# scenario's three commits run alike: a docs-only change and a one-file change in crates/kiln.
+# workspaces and test selection, measured against M0's baseline. Kept out of `.kiln/`, whose
+# workflows v1 pipelines read too: the measurement's branch copies it there. It runs on a trusted
+# push to a `w24/ac03/...` branch, on a bare-metal runner (pods keep no warm workspace before M5),
+# so each scenario's three commits run alike: a docs-only change and a one-file change in
+# crates/kiln.
 on:
   push:
     branches: ["w24/ac03/**"]

@@ -8125,7 +8125,8 @@ let go for the content store to collect (`ci/work.rs`'s `evict`, `w24_ac12_the_s
 
 **How AC03 will be measured.** On the live server, once `.kiln/ci.yaml` runs on the engine (`[ci]
 kiln_workflows`, the change above) with leg and step reuse, warm workspaces (M1) and R10's test
-selection in its `rust` job. `.kiln/ac03.yaml` is that job, for the measure: on a trusted push to a
+selection in its `rust` job. `bench/w24/ac03.yaml` is that job, for the measure (copied into
+`.kiln/` on the measurement's branch, since v1 pipelines read every workflow there): on a trusted push to a
 `w24/ac03/...` branch, on a bare-metal runner (pods keep no warm workspace before M5), clippy a
 `memo` step over the Rust sources and the tests a `tests:` step. What M0's logs forecast (`cargo test`'s own
 times, binary by binary): the docs-only change should pass, since every binary replays and M0's
