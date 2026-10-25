@@ -92,6 +92,8 @@ pub fn parse(args: &[String], remaps: &[(String, String)]) -> Parsed {
             inv.keyed.push(format!("-C{}", remap(&v, remaps)));
         } else if let Some(v) = ["--cfg", "--check-cfg", "--edition", "--target", "--cap-lints", "--error-format", "--json", "--diagnostic-width", "--color", "-W", "-A", "-D", "-F"].iter().find_map(|f| value(f, a, &mut it).map(|v| (f, v))) {
             inv.keyed.extend([v.0.to_string(), v.1]);
+        } else if a == "--test" {
+            inv.keyed.push(a.to_owned());
         } else if !a.starts_with('-') && (a.ends_with(".rs") || inv.input.is_empty()) {
             inv.input = a.to_owned();
             inv.keyed.push(remap(a, remaps));
