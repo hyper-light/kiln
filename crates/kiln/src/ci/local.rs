@@ -476,7 +476,7 @@ struct Seen {
 }
 
 /// What a leg waits for, in words, and whether that can't change on a server of this machine
-/// alone; `None` for waits that end by themselves (a busy runner, a retry's delay).
+/// alone; `None` for waits that end by themselves unsaid (any busy runner, a retry's delay).
 fn waiting(w: &Value) -> Option<(String, bool)> {
     let o = match w {
         Value::String(s) if !s.is_empty() => return Some((s.clone(), false)),
@@ -493,6 +493,15 @@ fn waiting(w: &Value) -> Option<(String, bool)> {
         "other-runner" if o.get("refused").and_then(Value::as_bool) == Some(true) => (format!("a runner other than {}, which refused it", text("avoided")), true),
         "other-runner" => (format!("a runner other than {}, as its retry asks (`runner: different`)", text("avoided")), true),
         "load" => (format!("a runner whose disk isn't under pressure or nearly full: it's heavy on I/O ({})", held(o)), false),
+        "warm" => (
+            format!(
+                "{}, busy, where it runs warm: about {} s sooner, until {} at most",
+                text("runner"),
+                o.get("saves_s").and_then(Value::as_u64).unwrap_or(0),
+                super::cli::when(o.get("until").and_then(Value::as_i64).map(|ms| ms / 1000))
+            ),
+            false,
+        ),
         "approval" => (format!("a reviewer's approval to deploy to {} ({})", text("environment"), list("reviewers")), true),
         "wait-timer" => (format!("the wait timer of {}", text("environment")), false),
         "window" => (format!("a deploy window of {}: {}", text("environment"), text("window")), false),
@@ -687,5 +696,13 @@ mod tests {
         let said = waiting(&w).map(|(s, _)| s).unwrap_or_default();
         anyhow::ensure!(said == "a runner whose disk isn't under pressure or nearly full: it's heavy on I/O (fedora: I/O pressure 55.5 %, past 40.0 %; jupiter: 5.0 GiB free, under 20.0 GiB)", "{said}");
         Ok(())
+    }
+
+    /// W24-R18: a leg waiting for a busy warm runner says for which, what it saves, and until
+    /// when; a wait that ends by itself, not one that stops a run here.
+    #[test]
+    fn w24_r18_a_warm_wait_in_words() {
+        let said = waiting(&json!({ "reason": "warm", "runner": "fedora", "saves_s": 100, "until": 1_798_761_600_000_i64 }));
+        assert_eq!(said, Some(("fedora, busy, where it runs warm: about 100 s sooner, until 2027-01-01T00:00:00Z at most".to_owned(), false)));
     }
 }
