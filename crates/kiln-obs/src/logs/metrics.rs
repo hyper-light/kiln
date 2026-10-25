@@ -164,10 +164,10 @@ impl Groups {
         Self { hash, groups: Vec::new(), by_key: HashTable::new(), overflow: None }
     }
 
-    /// The group of `values`, made if new; the overflow's once [`GROUPS`] are made.
-    fn acc(&mut self, values: &[&str]) -> &mut Acc {
+    /// The group of `values` (`h` their [`values_hash`], of this hash's key), made if new; the
+    /// overflow's once [`GROUPS`] are made.
+    fn acc(&mut self, h: u64, values: &[&str]) -> &mut Acc {
         let Self { hash, groups, by_key, overflow } = self;
-        let h = values_hash(hash, values.iter().copied());
         let found = by_key.find(h, |&i| groups.get(i as usize).is_some_and(|(k, _)| k.iter().map(String::as_str).eq(values.iter().copied()))).copied();
         let i = match found {
             Some(i) => i as usize,
@@ -203,6 +203,8 @@ pub struct Counted {
     pub series: Vec<(SeriesKey, Vec<(i64, f64)>)>,
     /// Each metric's, in the order given (those the window is before are left at nothing).
     pub tallies: Vec<Tally>,
+    /// Rows read, as a search says them: every row of each block read (those past the window's
+    /// edges too), none of a block every metric's search rules out.
     pub rows_scanned: u64,
 }
 
@@ -221,22 +223,57 @@ fn number(v: Option<&str>) -> Option<f64> {
 }
 
 /// Every metric's points for the window that starts at `window` (ns, a multiple of [`WINDOW`]):
-/// the records `logs` holds in it, read once.
+/// the records `logs` holds in it, read once. A search is asked once a record however many metrics
+/// share it (a filter's count and its distribution), and of a block's records only where the
+/// block's summary does not rule it out (LLM Observability's of a web service's spans); a
+/// grouping's values are read once a record however many metrics group by it.
 pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<Counted, LogStoreError> {
     let mut out = Counted { tallies: vec![Tally::default(); metrics.len()], ..Counted::default() };
-    let live: Vec<usize> = metrics.iter().enumerate().filter(|(_, m)| m.since <= window).map(|(i, _)| i).collect();
+    // Each metric counted: its place, its search's among the distinct ones, its grouping's.
+    let (mut searches, mut bys): (Vec<&Search>, Vec<&[(Facet, String)]>) = (Vec::new(), Vec::new());
+    let mut live: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, m) in metrics.iter().enumerate().filter(|(_, m)| m.since <= window) {
+        let s = searches.iter().position(|q| **q == m.search).unwrap_or(searches.len());
+        if s == searches.len() {
+            searches.push(&m.search);
+        }
+        let b = bys.iter().position(|b| b.iter().map(|(f, _)| f).eq(m.by.iter().map(|(f, _)| f))).unwrap_or(bys.len());
+        if b == bys.len() {
+            bys.push(&m.by);
+        }
+        live.push((i, s, b));
+    }
     if live.is_empty() {
         return Ok(out);
     }
+    // A grouping's metrics one after another: its values read once a record.
+    live.sort_by_key(|&(i, _, b)| (b, i));
     let hash = Keyed::new();
     let mut groups: Vec<Groups> = metrics.iter().map(|_| Groups::new(hash)).collect();
     let mut scratch = RowScratch::default();
-    let mut rows = 0u64;
-    logs.each_record(window, window.saturating_add(WINDOW - 1), |r| {
-        rows += 1;
-        for &i in &live {
+    // What a record was found to be of each search: 0 not asked, 1 not matched, 2 matched.
+    let mut said = vec![0u8; searches.len()];
+    let rows = logs.each_record_for(&searches, window, window.saturating_add(WINDOW - 1), |r, may| {
+        said.fill(0);
+        let mut duration: Option<Option<f64>> = None;
+        let mut grouped: Option<(usize, [&str; MAX_BY], u64)> = None;
+        for &(i, s, b) in &live {
             let (Some(m), Some(g)) = (metrics.get(i), groups.get_mut(i)) else { continue };
-            if !m.search.row(r, &mut scratch) {
+            if !may.get(s).copied().unwrap_or(true) {
+                continue;
+            }
+            let matched = match said.get(s).copied() {
+                Some(1) => false,
+                Some(2) => true,
+                _ => {
+                    let yes = m.search.row(r, &mut scratch);
+                    if let Some(v) = said.get_mut(s) {
+                        *v = 1 + u8::from(yes);
+                    }
+                    yes
+                }
+            };
+            if !matched {
                 continue;
             }
             let (v, percentiles) = match &m.compute {
@@ -245,22 +282,32 @@ pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<C
                     Some(v) => (Some(v), *percentiles),
                     None => continue,
                 },
-                Compute::Duration { percentiles } => match number(r.attr("duration")) {
-                    Some(ns) => (Some(ns / 1e9), *percentiles),
+                Compute::Duration { percentiles } => match *duration.get_or_insert_with(|| number(r.attr("duration")).map(|ns| ns / 1e9)) {
+                    Some(v) => (Some(v), *percentiles),
                     None => continue,
                 },
             };
             let n = m.by.len().min(MAX_BY);
-            let mut values: [&str; MAX_BY] = [""; MAX_BY];
-            for (slot, (f, _)) in values.iter_mut().zip(&m.by) {
-                *slot = tag_value(f.of(r));
-            }
-            g.acc(values.get(..n).unwrap_or_default()).take(v, percentiles);
+            let (values, h) = match grouped {
+                Some((at, values, h)) if at == b => (values, h),
+                _ => {
+                    let mut values: [&str; MAX_BY] = [""; MAX_BY];
+                    for (slot, (f, _)) in values.iter_mut().zip(&m.by) {
+                        *slot = tag_value(f.of(r));
+                    }
+                    let h = values_hash(&hash, values.iter().take(n).copied());
+                    grouped = Some((b, values, h));
+                    (values, h)
+                }
+            };
+            g.acc(h, values.get(..n).unwrap_or_default()).take(v, percentiles);
         }
     })?;
     out.rows_scanned = rows;
     let ms = window.div_euclid(1_000_000);
-    for &i in &live {
+    // The series in the metrics' order.
+    live.sort_unstable_by_key(|&(i, ..)| i);
+    for &(i, ..) in &live {
         let (Some(m), Some(g), Some(tally)) = (metrics.get(i), groups.get(i), out.tallies.get_mut(i)) else { continue };
         let named = g.groups.iter().map(|(k, a)| (Some(k), a));
         for (key, acc) in named.chain(g.overflow.as_ref().map(|a| (None, a))) {
@@ -583,6 +630,107 @@ mod tests {
             assert_eq!(all, want.len(), "{service}: no bucket besides");
         }
         assert!(c.series.iter().all(|(_, p)| p == &[(T0 / 1_000_000, p[0].1)]), "each at the window's start");
+    }
+
+    /// Metrics that share a search, a grouping, both or neither, counted at once over blocks of an
+    /// LLM app's records and of a web service's (none with the attribute the LLM metrics ask for)
+    /// and a head of both: each what its search finds of the window's records, grouped, and as it
+    /// is counted alone; a block every search rules out not read.
+    #[test]
+    fn metrics_counted_at_once_are_each_as_its_search_finds_them() {
+        let mut rng = Rng::new(11);
+        let mut records: Vec<Record> = Vec::new();
+        let mut s = LogStore::default();
+        let mut ts = T0 - WINDOW / 10;
+        for (llm, n) in [(true, 3_000), (false, 3_000), (true, 200), (false, 200)] {
+            let batch: Vec<Record> = (0..n)
+                .map(|_| {
+                    ts += WINDOW / 5_000;
+                    let mut attrs = if llm {
+                        vec![
+                            ("kind".to_owned(), ["llm", "embedding"][rng.below(2) as usize].to_owned()),
+                            ("model".to_owned(), ["a", "b", "c"][rng.below(3) as usize].to_owned()),
+                            ("tokens".to_owned(), rng.below(1_000).to_string()),
+                        ]
+                    } else {
+                        vec![("http.status_code".to_owned(), ["200", "500"][rng.below(2) as usize].to_owned())]
+                    };
+                    attrs.push(("note".to_owned(), "x".repeat(64)));
+                    let service = ["chat", "web", "api"][rng.below(3) as usize].to_owned();
+                    Record { ts, severity: if rng.below(10) == 0 { 17 } else { 9 }, service, host: format!("h{}", rng.below(4)), source: "app".into(), message: "m".into(), attrs, ..Record::default() }
+                })
+                .collect();
+            let (mut raw, mut prev) = (Vec::new(), 0);
+            for r in &batch {
+                put_row(&mut raw, r, prev);
+                prev = r.ts;
+            }
+            s.append(raw, batch.len() as u32).unwrap();
+            records.extend(batch);
+        }
+        let metrics = [
+            metric("llm.calls", "@kind:llm", &["service", "@model"], Compute::Count),
+            metric("llm.tokens", "@kind:llm", &["service", "@model"], Compute::Distribution { path: "@tokens".into(), percentiles: false }),
+            metric("llm.hosts", "@kind:llm", &["host"], Compute::Count),
+            metric("embeddings", "@kind:embedding", &["service", "@model"], Compute::Count),
+            metric("errors", "status:error", &["service", "@model"], Compute::Count),
+            metric("all", "*", &["host"], Compute::Count),
+        ];
+        // What each search finds of the window's records, by its grouping's values: their number
+        // and their tokens' sum.
+        let mut scratch = RowScratch::default();
+        let mut want: std::collections::BTreeMap<(String, Vec<(String, String)>), (f64, f64)> = std::collections::BTreeMap::new();
+        for r in records.iter().filter(|r| (T0..T0 + WINDOW).contains(&r.ts)) {
+            let attr = |k: &str| r.attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+            for m in &metrics {
+                if !m.search.record(r, &mut scratch) {
+                    continue;
+                }
+                let of = |f: &Facet| match f {
+                    Facet::Service => Some(r.service.as_str()),
+                    Facet::Host => Some(r.host.as_str()),
+                    Facet::Attr(k) => attr(k),
+                    _ => None,
+                };
+                let tags = m.by.iter().map(|(f, t)| (t.clone(), tag_value(of(f)).to_owned())).collect();
+                let e = want.entry((m.name.clone(), tags)).or_default();
+                e.0 += 1.0;
+                e.1 += attr("tokens").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+            }
+        }
+        let c = count(&s.snapshot(), &metrics, T0).unwrap();
+        assert_eq!(c.rows_scanned, 6_400, "every block reaches into the window");
+        for ((name, tags), (n, tokens)) in &want {
+            let tags: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            if name == "llm.tokens" {
+                assert_eq!(value(&c, "llm.tokens.count", &tags), Some(*n), "{tags:?}");
+                assert_eq!(value(&c, "llm.tokens.sum", &tags), Some(*tokens), "{tags:?}");
+            } else {
+                assert_eq!(value(&c, name, &tags), Some(*n), "{name} {tags:?}");
+            }
+        }
+        let groups = |name: &str| want.keys().filter(|(n, _)| n == name).count();
+        for (m, t) in metrics.iter().zip(&c.tallies) {
+            assert_eq!(t.groups, groups(&m.name), "{}: no group besides", m.name);
+        }
+        assert!(groups("errors") > groups("llm.calls"), "the web service's errors are in groups of their own");
+        // Each as it is counted alone.
+        let name_of = |k: &SeriesKey| {
+            let mut at: &[u8] = &k.key;
+            let n = crate::varint::get(&mut at).unwrap() as usize;
+            String::from_utf8(at[..n].to_vec()).unwrap()
+        };
+        for (i, m) in metrics.iter().enumerate() {
+            let alone = count(&s.snapshot(), std::slice::from_ref(m), T0).unwrap();
+            assert_eq!(alone.tallies[0], c.tallies[i], "{}", m.name);
+            let names: Vec<String> = m.names().into_iter().map(|(n, _)| n).collect();
+            let mine: Vec<_> = c.series.iter().filter(|(k, _)| names.contains(&name_of(k))).cloned().collect();
+            assert_eq!(alone.series, mine, "{}", m.name);
+        }
+        // The LLM metrics alone: the web service's block is not read.
+        let llm = count(&s.snapshot(), &metrics[..4], T0).unwrap();
+        assert_eq!(llm.rows_scanned, 3_400);
+        assert_eq!(llm.tallies[..], c.tallies[..4]);
     }
 
     #[test]

@@ -1054,7 +1054,7 @@ fn metrics_bench() {
     let one = vec![trace[0].clone()];
     let windows: Vec<i64> = (window_of(at as i64)..=window_of(end as i64 - 1)).step_by(WINDOW as usize).collect();
     println!("{spans} spans of a web service, {} windows of {} s", windows.len(), WINDOW / 1_000_000_000);
-    println!("{:<34} {:>8} {:>12} {:>10} {:>10} {:>14}", "counted (median of 5)", "metrics", "ms/window", "ns/span", "points", "allocs/window");
+    println!("{:<34} {:>8} {:>12} {:>10} {:>10} {:>14} {:>10}", "counted (median of 5)", "metrics", "ms/window", "ns/span", "points", "allocs/window", "rows/span");
     for (what, set) in [("every metric of spans kiln counts", &all), ("the trace metrics", &trace), (trace[0].name.as_str(), &one)] {
         let (mut runs, mut allocs, mut points, mut rows) = (Vec::new(), u64::MAX, 0usize, 0u64);
         for _ in 0..5 {
@@ -1070,8 +1070,18 @@ fn metrics_bench() {
             allocs = allocs.min(alloc::end().calls());
             (points, rows) = (p, n);
         }
-        assert_eq!(rows, spans, "every span read once");
+        // Rows read: a block across a window's edge is read for each window it reaches, one every
+        // search rules out not at all.
         let ns = median(runs);
-        println!("{:<34} {:>8} {:>12.3} {:>10.0} {:>10} {:>14.1}", what, set.len(), ns as f64 / 1e6 / windows.len() as f64, ns as f64 / spans as f64, points, allocs as f64 / windows.len() as f64);
+        println!(
+            "{:<34} {:>8} {:>12.3} {:>10.0} {:>10} {:>14.1} {:>10.3}",
+            what,
+            set.len(),
+            ns as f64 / 1e6 / windows.len() as f64,
+            ns as f64 / spans as f64,
+            points,
+            allocs as f64 / windows.len() as f64,
+            rows as f64 / spans as f64
+        );
     }
 }

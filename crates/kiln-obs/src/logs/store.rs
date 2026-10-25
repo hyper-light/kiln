@@ -859,6 +859,38 @@ impl LogSnapshot {
         .map(|_| ())
     }
 
+    /// Every record in `[from, to]` (ns), in no order, to `f` with which of `searches` its block may
+    /// match ([`Search::block_in`]: false where the block's summary rules the search out; a head's
+    /// rows have none, so every search may): what counting many metrics at once asks
+    /// (`super::metrics::count`), each block's rows asked only the searches it may match, and a
+    /// block every search rules out not read. How many rows were read.
+    pub fn each_record_for(&self, searches: &[&Search], from: i64, to: i64, mut f: impl FnMut(&RecordRef<'_>, &[bool])) -> Result<u64, LogStoreError> {
+        if to < from {
+            return Ok(0);
+        }
+        let all = Search::all();
+        let mut scan = Scan::new(&all, from, to);
+        let mut may = vec![true; searches.len()];
+        let mut rows = scan.head(self, &mut |r: &RecordRef<'_>| {
+            f(r, &may);
+            Ok::<(), LogStoreError>(())
+        })?;
+        let (srcs, _) = self.candidates(&all, from, to);
+        for src in &srcs {
+            for (m, q) in may.iter_mut().zip(searches) {
+                *m = q.block_in(src.block(), self.spans) != Maybe::No;
+            }
+            if !may.contains(&true) {
+                continue;
+            }
+            rows += scan.block(*src, &mut |r: &RecordRef<'_>| {
+                f(r, &may);
+                Ok::<(), LogStoreError>(())
+            })?;
+        }
+        Ok(rows)
+    }
+
     /// Every record in `[from, to]` (ns) that `search` matches, to `f`, one at a time, none kept:
     /// the blocks it rules out never read.
     pub fn each_matching(&self, search: &Search, from: i64, to: i64, mut f: impl FnMut(&RecordRef<'_>)) -> Result<(), LogStoreError> {
