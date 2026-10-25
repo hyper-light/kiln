@@ -255,6 +255,7 @@ classes! {
         ServerMsg::Wire(..) => CHANNEL,
         ServerMsg::Cluster { .. } => CLUSTER,
         ServerMsg::Kept { .. } => Class::State,
+        ServerMsg::HarnessSend { .. } => PARKED,
         ServerMsg::Observe { .. } => OBSERVE,
     }
 }
@@ -316,6 +317,7 @@ classes! {
         Update::Changes { .. } => Class::State,
         Update::Stream { .. } => Class::Stream,
         Update::Reply { .. } => Class::Answer,
+        Update::Inbox { .. } => Class::Answer,
         Update::Reset { .. } => Class::Stream,
     }
 }
@@ -384,8 +386,12 @@ const TERMINAL: &str = "/api/terminal/ws";
 const LEG_TERMINAL: &str = "/api/ci/legs/:id/terminal";
 
 /// Every kind of message on the UI's sockets. A session socket's commands up are [`Command`]s,
-/// each classed by [`command_class`].
+/// each classed by [`command_class`]: under an id their client made (`cmd`), each answered `ack`
+/// or `nack`, or bare, as clients from before ids send them.
 pub const SOCKETS: &[SocketMsg] = &[
+    msg(SESSION, Way::Up, "cmd", Class::Command(Away::AsItsCommand)),
+    msg(SESSION, Way::Down, "ack", Class::Ack),
+    msg(SESSION, Way::Down, "nack", Class::Ack),
     msg(SESSION, Way::Down, "open", Class::Stream),
     msg(SESSION, Way::Down, "resumed", Class::Stream),
     msg(SESSION, Way::Down, "meta", Class::State),

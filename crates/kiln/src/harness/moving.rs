@@ -101,6 +101,17 @@ pub struct Package {
     /// The git worktree it works in, inside its repository (`super::worktree`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<super::worktree::Worktree>,
+    /// The ids of the messages it took where it was, its inbox's newest (CP-T3.2): taken by its
+    /// inbox where it goes, so a message sent again after the move is answered there, never a
+    /// second prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbox: Vec<String>,
+    /// Each of `inbox`'s ids' digest, in the same order (empty where its words weren't known): with
+    /// them, another message under one of its ids is refused `reused` where it goes, as where it
+    /// was. A package from a runner before them has none, and whatever comes under an id is its
+    /// repeat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbox_digests: Vec<String>,
     /// What its harness keeps for it in its own home: its memories, its tasks, plans and
     /// checkpoints, its goal (`super::homes`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,6 +121,11 @@ pub struct Package {
     /// says whether it did ([`crate::proto::AgentMsg::HarnessAdopted`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub handover: bool,
+    /// Which try at handing it over this is, the same each time it's sent again (CP-T3.2, the
+    /// nineteenth adversarial check's): the machine's processes decide each once
+    /// (`super::host::Decided`). None from a runner before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<String>,
 }
 
 impl Package {
@@ -231,7 +247,10 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
         ignored: None,
         worktree: None,
         home: None,
+        inbox: Vec::new(),
+        inbox_digests: Vec::new(),
         handover: false,
+        attempt: None,
     }
 }
 

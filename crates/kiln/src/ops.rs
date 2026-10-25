@@ -224,6 +224,26 @@ mod tests {
         assert!(listed(false).iter().any(|o| o.name == "plans.create"));
     }
 
+    /// CP-T3.2 (the twelfth adversarial check's): an operation that takes an idempotency key (or,
+    /// a step tried again, the try it replaces) says what a call without it is, and tells its caller
+    /// to pass it: an agent that asks again after a lost answer without it is a second prompt, or a
+    /// second agent. Every one that ends in a prompt takes one.
+    #[test]
+    fn a_keyed_operation_tells_its_caller_to_pass_its_key() {
+        let mut keyed = Vec::new();
+        for op in own() {
+            let input = (op.input)();
+            for field in ["key", "try"] {
+                let Some(said) = input.pointer(&format!("/properties/{field}/description")).and_then(Value::as_str) else { continue };
+                keyed.push(op.name);
+                assert!(said.contains("Without it") && said.contains("pass it"), "{}'s `{field}` doesn't tell its caller to pass it: {said}", op.name);
+            }
+        }
+        for name in ["agents.send", "goals.add", "goals.control", "goals.done", "plans.run", "plans.runs.retry"] {
+            assert!(keyed.contains(&name), "{name} takes no key");
+        }
+    }
+
     /// An agent's own goal stack and change request need no id: left out, `agent` is the agent
     /// calling. One it names stays; a person's input, and other operations', are as they came.
     #[test]

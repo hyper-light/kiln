@@ -361,6 +361,11 @@ pub const CAP_WIRE: u64 = 1 << 32;
 /// [`ServerMsg::Caps`] capability: the server takes [`AgentMsg::NetDrops`], what a runner's QUIC
 /// layer let go, for its page.
 pub const CAP_NET_DROPS: u64 = 1 << 33;
+/// [`AgentMsg::Caps`] capability: the runner's sessions have inboxes (CP-T3.2): it takes a message
+/// as [`ServerMsg::HarnessSend`], for an epoch, and answers what became of it
+/// (`crate::harness::core::Update::Inbox`). Past `Build`'s 32 bits, which ran out; a bit of its
+/// own (1 << 33 is the server's `CAP_NET_DROPS`).
+pub const CAP_INBOX: u64 = 1 << 34;
 
 /// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: hand-overs between a machine's runner
 /// processes. A runner hands an agent session to its machine's newer process when told to
@@ -605,6 +610,13 @@ pub enum ServerMsg {
     /// (it started again, or the server lost its streams) sends only what the copy lacks
     /// (docs/wire.md, "Restarts"). Appended last: postcard encodes variants by index.
     Kept { sessions: Vec<KeptSession> },
+    /// A message for agent session `session` (JSON [`crate::harness::model::Command`], a send or a
+    /// skill run with its id), sent for the session's epoch `epoch` as the server last heard it: the
+    /// session's inbox takes it once, refuses it if the session has left that epoch, and answers
+    /// either way (CP-T3.2). Only to runners announcing [`CAP_INBOX`]. Appended last, after the
+    /// wire's, the cluster group's and the restarts' `Kept` (CP-T3.2 landed after them): postcard
+    /// encodes variants by index.
+    HarnessSend { session: String, epoch: u64, json: String },
     /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): as [`AgentMsg::Observe`]. Only to runners
     /// announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard encodes
     /// variants by index.
@@ -963,6 +975,23 @@ mod tests {
         Ok(())
     }
 
+    /// CP-T3.2: a message for an epoch goes on the wire after everything there was before it, so a
+    /// runner from before reads every older frame as it did.
+    #[test]
+    fn messages_for_an_epoch_are_appended_after_the_wires() -> anyhow::Result<()> {
+        // After the wire's `Caps` (53) and `Wire` (54), the cluster group's `Cluster` (55) and the
+        // restarts' `Kept` (56), which landed first.
+        let kept = encode(&ServerMsg::Kept { sessions: Vec::new() })?;
+        let m = ServerMsg::HarnessSend { session: "s".into(), epoch: 3, json: r#"{"type":"send","id":"m1","text":"hi"}"#.into() };
+        let b = encode(&m)?;
+        assert_eq!(b.first().copied(), kept.first().map(|n| n + 1), "it comes right after the ones before it");
+        assert_eq!(b.first().copied(), Some(57));
+        assert_eq!(decode::<ServerMsg>(&b)?, m);
+        // Past `Build`'s 32 bits (the last of which is `CAP_CLUSTER`), clear of `CAP_WIRE`.
+        assert!(CAP_INBOX.is_power_of_two() && CAP_INBOX > u64::from(u32::MAX) && CAP_INBOX & (CAP_WIRE | CAP_NET_DROPS) == 0);
+        Ok(())
+    }
+
     #[test]
     fn workspaces_are_appended_after_ports() -> anyhow::Result<()> {
         let last = encode(&ServerMsg::PortClose { conn: 1, session: "s".into() })?;
@@ -1056,11 +1085,12 @@ mod tests {
 
     #[test]
     fn observe_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
-        // Right after main's last (deployed first): its sessions' hand-overs' and their copies'.
-        let last_server = encode(&ServerMsg::Kept { sessions: vec![] })?;
+        // Right after main's last (deployed first): a session inbox's sends (CP-T3.2), and its
+        // sessions' hand-overs.
+        let last_server = encode(&ServerMsg::HarnessSend { session: "s".into(), epoch: 1, json: "{}".into() })?;
         let s = ServerMsg::Observe { json: "{}".into(), bytes: vec![1, 2] };
         let b = encode(&s)?;
-        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after Kept");
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after HarnessSend");
         assert_eq!(decode::<ServerMsg>(&b)?, s);
         let last_agent = encode(&AgentMsg::HarnessAdopted { session: "s".into(), error: None })?;
         let a = AgentMsg::Observe { json: "{}".into(), bytes: vec![3] };

@@ -2860,6 +2860,43 @@ textarea.hx-input {
 
 /* Paused for a usage limit: the same disclosure line as the work around it. Actions can be
    folded away; their own scroll area leaves room for the conversation and composer on a phone. */
+/* What was asked here and waits for its answer, or was refused (asked.tsx). */
+.hx-asked {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  margin: 0;
+  padding: 6px 4px;
+  list-style: none;
+  border-block: 1px solid #25272c;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-secondary);
+}
+.hx-asked-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.hx-asked-row > svg {
+  flex: none;
+  color: var(--color-subtle);
+}
+.hx-asked-row[data-state="refused"] > svg {
+  color: var(--color-fail);
+}
+.hx-asked-what {
+  flex: none;
+  color: var(--color-foreground);
+}
+.hx-asked-how {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-subtle);
+}
 .hx-paused {
   min-width: 0;
   border-block: 1px solid #25272c;
@@ -3173,6 +3210,8 @@ textarea.hx-input {
   font-size: 12px;
   line-height: 1.5;
   color: var(--color-muted);
+}
+.hx-quote[role="button"] {
   cursor: pointer;
 }
 .hx-quote-who {
@@ -3187,8 +3226,25 @@ textarea.hx-input {
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+/* Its words render as markdown; the strip itself is the one tap target. */
+.hx-quote-text .hx-prose {
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+  pointer-events: none;
+}
+.hx-quote-text .hx-prose > * {
+  margin-top: 0;
+}
+.hx-quote-text .hx-prose > * + * {
+  margin-top: 0.25em;
+}
+/* A long quote fades out where it clamps. */
+.hx-quote-clamp {
+  mask-image: linear-gradient(180deg, #000 55%, transparent 96%);
+  -webkit-mask-image: linear-gradient(180deg, #000 55%, transparent 96%);
 }
 .hx-quote-more {
   display: inline-flex;
@@ -3221,6 +3277,55 @@ textarea.hx-input {
   box-shadow: 0 18px 60px rgb(0 0 0 / 0.5);
   padding: 14px 16px;
 }
+.hx-cover-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: -4px -4px 10px;
+}
+.hx-cover-head .hx-cover-who {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 0;
+}
+.hx-cover-x {
+  flex: none;
+}
+/* The whole quoted message: conversation prose on the popover card, then its attachments. */
+.hx-quote-full {
+  min-width: min(430px, 78vw);
+}
+.hx-quote-full .hx-prose {
+  font-size: 13.5px;
+}
+.hx-quote-files {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--color-line);
+}
+.hx-quote-img {
+  display: block;
+  max-width: 100%;
+  max-height: 50vh;
+  border-radius: 6px;
+  border: 1px solid var(--color-line);
+}
+.hx-quote-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border: 1px solid var(--color-line);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--color-muted);
+}
 .hx-cover-who {
   display: block;
   margin-bottom: 6px;
@@ -3234,9 +3339,6 @@ textarea.hx-input {
   line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-}
-.hx-cover-x {
-  float: right;
 }
 .hx-viewer {
   display: flex;

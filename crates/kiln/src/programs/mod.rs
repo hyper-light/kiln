@@ -765,7 +765,7 @@ async fn enforce_all(hub: &Hub) -> anyhow::Result<()> {
             let want = wanted.get(&agent).copied();
             match threshold_change(info.pause_at, last.get(&agent).copied(), want) {
                 Some(set) => {
-                    if matches!(hub.harness.command(hub, &agent, Command::PauseAt { percent: set }).await, crate::harness::registry::Sent::Ok) {
+                    if hub.harness.command(hub, &agent, Command::PauseAt { percent: set }).await.went() {
                         match set {
                             Some(v) => last.insert(agent.clone(), v),
                             None => last.remove(&agent),
@@ -801,14 +801,19 @@ async fn enforce_all(hub: &Hub) -> anyhow::Result<()> {
 /// Sends a notice to agent `to` (queued after its turn): delivered, with its message's id, once its
 /// session takes it; else why not, to be tried again.
 pub async fn deliver(hub: &Hub, to: &str, mut n: Notice) -> Notice {
-    let message = crate::util::new_id();
+    // Its id is made once, from the notice (CP-T3.2): tried again, it's the same message, which the
+    // coordinator's inbox takes once.
+    let message = crate::util::derive_id(&["programs.notice", to, &n.at.to_string(), &n.text]);
     let send = Command::Send { id: message.clone(), text: n.text.clone(), mode: crate::harness::model::SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
     match hub.harness.command(hub, to, send).await {
-        crate::harness::registry::Sent::Ok => {
+        // Parked, it goes once the coordinator's machine is back, once: not sent again from here.
+        crate::harness::registry::Sent::Ok | crate::harness::registry::Sent::Accepted(_) | crate::harness::registry::Sent::Taken | crate::harness::registry::Sent::Parked => {
             n.delivered = true;
             n.message = Some(message);
             n.why = None;
         }
+        crate::harness::registry::Sent::Refused(r) => n.why = Some(r.to_string()),
+        s @ (crate::harness::registry::Sent::Rejected { .. } | crate::harness::registry::Sent::Unanswered(_)) => n.why = s.failure().map(|(_, why)| why),
         crate::harness::registry::Sent::NoSession => n.why = Some("kiln doesn't know the coordinator's session right now".into()),
         crate::harness::registry::Sent::Unreachable => n.why = Some("the coordinator's machine isn't connected right now".into()),
     }

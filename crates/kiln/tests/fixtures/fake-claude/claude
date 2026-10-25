@@ -1,26 +1,57 @@
 #!/usr/bin/env python3
 """A stand-in for Claude Code's stream-json mode, for kiln's tests (crates/kiln/tests/wire_updates.rs).
 
-It answers kiln's control requests with success. Each user message it's sent gets a turn of
-FAKE_CLAUDE_LINES assistant messages ("line 00000", "line 00001" ...), FAKE_CLAUDE_EVERY_MS apart,
-then a result. Each message's id is its own (this process's, this turn's, its line's), as Claude
+It answers kiln's control requests with success, and writes each one, a line of JSON, to
+`.fake-claude-controls` in its folder when that file is there (and each user message it's sent to
+`.fake-claude-messages`, likewise, with this process's pid and the message's uuid). Each user message it's sent gets a turn of
+FAKE_CLAUDE_LINES assistant messages ("line 00000", "line 00001" ...; a new session's first turn
+FAKE_CLAUDE_FIRST_LINES of them when that's set, not one taken up again with --resume),
+FAKE_CLAUDE_EVERY_MS apart, a new session's first turn once the file FAKE_CLAUDE_GO names is there
+when that's set (a test that opens many sessions says go once they're all open),
+then a result, said started and completed as Claude Code says it (`command_lifecycle`, under the
+user message's uuid), so kiln sends the next. As Claude Code does, it answers control requests as
+they come, a turn under way or not; user messages wait their turn. Each message's id is its own (this process's, this turn's, its line's), as Claude
 Code's are, so a second turn's lines are new events, not the first's again. It calls no model and
 reads no account.
 """
 import json
 import os
+import queue
 import sys
+import threading
 import time
 import uuid
 
 LINES = int(os.environ.get("FAKE_CLAUDE_LINES", "100"))
+# The first turn's, when it's to be longer (or shorter) than the rest.
+FIRST = int(os.environ.get("FAKE_CLAUDE_FIRST_LINES", str(LINES)))
 EVERY = int(os.environ.get("FAKE_CLAUDE_EVERY_MS", "50")) / 1000.0
+# A file a new session's first turn waits for, when that's set.
+GO = os.environ.get("FAKE_CLAUDE_GO")
 VERSION = "2.1.296"
 
 
+LOCK = threading.Lock()
+
+
 def out(o):
-    sys.stdout.write(json.dumps(o) + "\n")
-    sys.stdout.flush()
+    with LOCK:
+        sys.stdout.write(json.dumps(o) + "\n")
+        sys.stdout.flush()
+
+
+def answer(m):
+    """A control request, answered (and written down where a test asks for it) at once."""
+    req = m.get("request") or {}
+    # Each control request, one line each, where a test asks for them (it made the file).
+    controls = os.path.join(os.getcwd(), ".fake-claude-controls")
+    if os.path.exists(controls):
+        with open(controls, "a") as f:
+            f.write(json.dumps(req) + "\n")
+    resp = {}
+    if req.get("subtype") == "initialize":
+        resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": VERSION}
+    out({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
 
 
 def main():
@@ -33,31 +64,50 @@ def main():
         if flag in args and args.index(flag) + 1 < len(args):
             session = args[args.index(flag) + 1]
     turn = 0
-    for line in sys.stdin:
-        try:
-            m = json.loads(line)
-        except ValueError:
-            continue
-        kind = m.get("type")
-        if kind == "control_request":
-            req = m.get("request") or {}
-            resp = {}
-            if req.get("subtype") == "initialize":
-                resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": VERSION}
-            out({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
-        elif kind == "user":
-            turn += 1
-            out({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "claude-opus-5-5", "permissionMode": "default", "claude_code_version": VERSION})
-            for n in range(LINES):
-                out({
-                    "type": "assistant",
-                    "message": {"id": f"msg_{os.getpid()}_{turn}_{n:05d}", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": f"line {n:05d}"}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}},
-                    "parent_tool_use_id": None,
-                    "session_id": session,
-                })
-                time.sleep(EVERY)
-            out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+    first = LINES if "--resume" in args else FIRST
+    waiting = queue.Queue()
 
+    def read():
+        for line in sys.stdin:
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            kind = m.get("type")
+            if kind == "control_request":
+                answer(m)
+            elif kind == "user":
+                waiting.put(m)
+        waiting.put(None)
+
+    threading.Thread(target=read, daemon=True).start()
+    while True:
+        m = waiting.get()
+        if m is None:
+            return
+        turn += 1
+        said = os.path.join(os.getcwd(), ".fake-claude-messages")
+        if os.path.exists(said):
+            with open(said, "a") as f:
+                f.write(json.dumps({"pid": os.getpid(), "uuid": m.get("uuid"), "message": m.get("message")}) + "\n")
+        command = m.get("uuid")
+        if command is not None:
+            out({"type": "command_lifecycle", "command_uuid": command, "state": "started", "uuid": str(uuid.uuid4()), "session_id": session})
+        out({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "claude-opus-5-5", "permissionMode": "default", "claude_code_version": VERSION})
+        if turn == 1 and GO and "--resume" not in args:
+            while not os.path.exists(GO):
+                time.sleep(0.05)
+        for n in range(first if turn == 1 else LINES):
+            out({
+                "type": "assistant",
+                "message": {"id": f"msg_{os.getpid()}_{turn}_{n:05d}", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": f"line {n:05d}"}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}},
+                "parent_tool_use_id": None,
+                "session_id": session,
+            })
+            time.sleep(EVERY)
+        out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+        if command is not None:
+            out({"type": "command_lifecycle", "command_uuid": command, "state": "completed", "uuid": str(uuid.uuid4()), "session_id": session})
 
 if __name__ == "__main__":
     main()

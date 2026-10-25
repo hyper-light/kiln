@@ -299,7 +299,7 @@ fn w14_ac01_stacks() -> anyhow::Result<()> {
 
 /// `kiln` with `args` in `dir`, as a developer whose token is `token` would run it.
 fn kiln(home: &Path, dir: &Path, s: &Server, token: &str, args: &[&str]) -> anyhow::Result<(bool, String)> {
-    let o = Command::new(env!("CARGO_BIN_EXE_kiln"))
+    let o = common::kiln()
         .args(args)
         .current_dir(dir)
         .env("HOME", home)
@@ -1081,9 +1081,11 @@ fn w14_generated_files_and_blobs() -> anyhow::Result<()> {
 }
 
 /// The facade's runs and code scanning (docs/ci.md W14-R11): a job reads its own run, the
-/// repository's runs and its workflow as GitHub serves them, and code scanning takes SARIF (gzipped
-/// and in base64), reads it into alerts, says it's complete, and marks an alert fixed when a
-/// later analysis no longer finds it.
+/// repository's runs and its workflow as GitHub serves them, and people's permissions on the
+/// repository as actions check them (the owner admin, a developer write, a viewer read, someone
+/// without a grant none, no such person 404); code scanning takes SARIF (gzipped and in base64),
+/// reads it into alerts, says it's complete, and marks an alert fixed when a later analysis no
+/// longer finds it.
 #[test]
 fn w14_r11_runs_and_code_scanning() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1094,6 +1096,8 @@ fn w14_r11_runs_and_code_scanning() -> anyhow::Result<()> {
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "native repository: {st} {body}");
     let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    person(&s, "reader", &["viewer@repo:acme/app"])?;
+    person(&s, "stranger", &[])?;
     must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
     let work = dir.path().join("work");
     // The first trunk: the poller's first look takes it as it is.
@@ -1133,6 +1137,14 @@ jobs:
           # custom properties (none).
           test "$(api "$R/code-scanning/codeql-action/features")" = "{}"
           test "$(api "$R/properties/values")" = "[]"
+          # What openai/codex-action asks before it acts for the run's actor: their access here,
+          # as GitHub's legacy base permission.
+          perm() { api "$R/collaborators/$1/permission" | sed -n 's/.*"permission":"\([a-z]*\)".*/\1/p'; }
+          test "$(perm admin)" = admin
+          test "$(perm dev)" = write
+          test "$(perm reader)" = read
+          test "$(perm stranger)" = none
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$R/collaborators/nobody/permission")" = 404
           sarif() { printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Lint","rules":[{"id":"no-eval","defaultConfiguration":{"level":"error"}}]}},"results":[%s]}]}' "$1" | gzip -c | base64 -w0; }
           found='{"ruleId":"no-eval","message":{"text":"eval is evil"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/a.js"},"region":{"startLine":3}}}]}'
           up() { api -X POST "$R/code-scanning/sarifs" -d "{\"commit_sha\":\"$GITHUB_SHA\",\"ref\":\"$GITHUB_REF\",\"sarif\":\"$(sarif "$1")\",\"tool_name\":\"Lint\"}" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'; }
@@ -2866,7 +2878,7 @@ fn w17_r01_kiln_debug_terminal() -> anyhow::Result<()> {
         anyhow::ensure!(Instant::now() < deadline, "the leg never ran: {body}\n{}", s.log());
         std::thread::sleep(Duration::from_millis(500));
     };
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kiln"))
+    let mut child = common::kiln()
         .args(["debug", "terminal", &leg])
         .env("HOME", &home)
         .env("KILN_URL", format!("http://127.0.0.1:{}", s.port))

@@ -81,9 +81,13 @@ KNOWN = [
     # ruff's ecosystem check builds its base first, checked out (`HEAD is now at … F-03: an empty
     # trunk`) steps before the build that finds no Cargo.toml.
     (r"Build baseline version: error: could not find `Cargo\.toml`", "it builds the pull request's base to compare, and the base is the corpus's empty trunk"),
+    # openai/codex-action (ruff's security review) starts its Responses API proxy only with an
+    # OpenAI API key (`if: inputs['openai-api-key'] != ''`), the upstream's secrets.OPENAI_API_KEY.
+    (r"Failed to read server info from \S*codex", "openai/codex-action starts its Responses API proxy only with an OpenAI API key, the upstream's secrets.OPENAI_API_KEY, which the corpus's copy hasn't: it then finds no proxy's server info"),
     # ruff's publish dry run resolves its crates against crates.io as it is today: ruff_cache 0.0.19
-    # came out on 2026-10-22, after the corpus's commit (2026-10-16), which GitHub ran.
-    (r"multiple different versions of crate `ruff_cache` in the dependency graph", "its publish dry run resolves against crates.io as it is now, which has ruff_cache 0.0.19 (out 2026-10-22, after the commit of 2026-10-16 that GitHub ran): the registry moved on"),
+    # came out on 2026-10-22, after the corpus's commit (2026-10-16), which GitHub ran; pass 1025a's
+    # met ruff_python_parser's the same way.
+    (r"multiple different versions of crate `ruff_\w+` in the dependency graph", "its publish dry run resolves against crates.io as it is now, which has ruff's crates of later versions (ruff_cache 0.0.19, out 2026-10-22, after the commit of 2026-10-16 that GitHub ran): the registry moved on"),
     # Home Assistant's: its recorder's database versions against endoflife.date as it is now; its
     # translations to Lokalise and its wheels' SSH key with the repository's secrets.
     (r"is out of date with the latest MariaDB or MySQL release data from endoflife\.date", "it compares the repository's list of database versions with endoflife.date's today, which has releases since the commit"),
@@ -651,11 +655,10 @@ LEFT = [
     (r"Could not find any NDK", "it builds for Android with cargo-ndk, which needs Android's NDK: GitHub's image has one, kiln's only in its opt-in `-android` image, whose SDK licence the user accepts (the plan's step 7, left)"),
     # buildx's update-deps: another repository's releases (moby/moby's) through the facade.
     (r"(HttpError: |error: )Not Found - https://github\.com/hyper-light/kiln/blob/main/docs/ci\.md#w14", "it reads a repository kiln doesn't have through the facade's REST API (`GITHUB_API_URL`: buildx's update-deps lists moby/moby's releases), which kiln answers Not Found: its git fetches go on to GitHub (W14-R11), its API reads don't; legs' reads of github.com's API wait for W18's egress proxy and a GitHub credential (W22, left)"),
-    # Two that passed on GitHub's 4-CPU runner at the same commit, and failed twice here, where a
-    # leg sees the machine's 32: ruff's formatter check (tracing-indicatif's progress bars under
-    # its threads) and TypeScript's API tests (`node --test` runs a file per CPU, 31 here).
-    (r"footer progress bar was hidden despite there being pending progress bars", "a progress-bar library's own check failed under the threads ruff starts for the 32 CPUs a leg here sees, where GitHub's runner has 4 and passed: a leg sees the machine's CPUs, not a hosted runner's few (W05-R03, left), to be run again"),
-    (r"panic: EOF \[recovered, repanicked\]", "TypeScript's API server lost its client mid-call, with `node --test` running a test file for each of the 32 CPUs a leg here sees, where GitHub's runner has 4 and passed: a leg sees the machine's CPUs, not a hosted runner's few (W05-R03, left), to be run again"),
+    # TypeScript's file watcher tests take fanotify's file handles, which the docker executor's
+    # container overlay doesn't make; a `/tmp` volume of its own gave them, and broke renames out
+    # of /tmp (ruff's wasm-pack-action, EXDEV), so kiln went back to one file system.
+    (r"fswatch: watcher backend unsupported on this filesystem", "TypeScript's file watcher tests take fanotify's file handles, which the docker executor's container overlay doesn't make, where a hosted runner's ext4 does (W13-R04, left: a microVM leg has an ext4 of its own)"),
     # PyO3/maturin-action reads maturin's releases from api.github.com with the job's token.
     (r"HttpClientError: Bad credentials|Build wheels: error: Bad credentials|BadCredentialsException: 401", "an action or tool reads api.github.com with the job's token (PyO3/maturin-action: maturin's releases; arrow's archery: its release changelog), which github.com refuses: legs' authenticated reads of github.com wait for W18's egress proxy and a GitHub credential (W22, left)"),
     # rails' devcontainer smoke test logs in to ghcr.io with the job's token, as GitHub's works there.

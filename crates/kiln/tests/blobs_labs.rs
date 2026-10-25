@@ -532,7 +532,7 @@ fn a_server_moves_its_bytes_to_s3() -> anyhow::Result<()> {
     anyhow::ensure!(r.status == 201, "sync's contents: {}", r.status);
     drop(s);
     let copy = || -> anyhow::Result<String> {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_kiln")).args(["--config", &dir.path().join("kiln.toml").to_string_lossy(), "blobs", "copy"]).env("HOME", dir.path().join("home")).output()?;
+        let out = common::kiln().args(["--config", &dir.path().join("kiln.toml").to_string_lossy(), "blobs", "copy"]).env("HOME", dir.path().join("home")).output()?;
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         anyhow::ensure!(out.status.success(), "kiln blobs copy: {text}");
         Ok(text)

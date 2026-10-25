@@ -5,8 +5,8 @@
  * the files it read, the subagent it started.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUpRight, ChevronRight, CircleAlert, Copy, CornerDownRight, Download, FileDown, GitBranch, GitFork, Info, Pencil, Reply, SquarePlus, TriangleAlert, Undo2 } from "lucide-react";
-import { clientId, useSession, type Approval, type Command, type Delivery, type HEvent, type Meta, type QueueItem, type SessionStore, type Task } from "@/api/harness";
+import { ArrowDown, ArrowUpRight, ChevronRight, CircleAlert, Copy, CornerDownRight, Download, FileDown, GitBranch, GitFork, Info, Pencil, Reply, SquarePlus, TriangleAlert, Undo2, X } from "lucide-react";
+import { useSession, type Approval, type Command, type Delivery, type HEvent, type Meta, type QueueItem, type SessionStore, type Task } from "@/api/harness";
 import { useNavigate } from "@/lib/router";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -34,7 +34,7 @@ import { ApprovalCard, type Decide } from "./approval";
 import { DiffStat, FileDiffView } from "./diff";
 import { MsgMenu, type MenuGroup, type MenuRow } from "./msgmenu";
 import { SpawnDialog } from "./spawn";
-import { fileUrl, keptFor, resolvePath } from "./files";
+import { fileUrl, keptFor, kindOf, resolvePath } from "./files";
 import { toast } from "@/components/ui/toast";
 import { bringIntoView, elementOf, FindNowContext, mark, useRevealed, type FindNow } from "./find";
 import { Output, Prose, ToolIcon } from "./parts";
@@ -52,6 +52,7 @@ import { latestThought, thinkingStarted, thoughtIsLive, thoughtShown, type Thoug
 import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
 import { useHeld, useRecent } from "./dom";
+import { unsending } from "./unsend";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
@@ -593,41 +594,84 @@ function Quote({ id, who, lookup }: { id: string; who?: string; lookup: (id: str
   if (!text) return null;
   const said = who ?? (src.kind === "user" ? (src.origin && src.origin !== "human" ? src.origin : "You") : "Agent");
   const long = text.length > 140 || text.split("\n").length > 3;
+  const open = () => {
+    if (long) setFull(true);
+  };
   return (
     <>
-      <button type="button" className="hx-quote" onClick={() => long && setFull(true)}>
+      {/* A div, not a button: the quote's words render as markdown, and a button can't hold blocks. */}
+      <div
+        className="hx-quote"
+        role={long ? "button" : undefined}
+        tabIndex={long ? 0 : undefined}
+        onClick={open}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            open();
+          }
+        }}
+      >
         <span className="hx-quote-who">
           <CornerDownRight size={11} aria-hidden="true" />
           {said}
         </span>
-        <span className={cn("hx-quote-text", long && "hx-quote-clamp")}>{text}</span>
+        <div className={cn("hx-quote-text", long && "hx-quote-clamp")}>
+          <Prose text={text} />
+        </div>
         {long && <span className="hx-quote-more">the whole message ↗</span>}
-      </button>
-      {full && <QuoteDialog who={said} text={text} onClose={() => setFull(false)} />}
+      </div>
+      {full && <QuoteDialog src={src} who={said} text={text} onClose={() => setFull(false)} />}
     </>
   );
 }
 
-/** The whole of a quoted message, on the conversation's surface. */
-function QuoteDialog({ who, text, onClose }: { who: string; text: string; onClose: () => void }) {
+/** The whole of a quoted message, on the conversation's surface: its markdown and the files it
+ *  mentions drawn as the message drew them (`seq`), its attachments after. */
+function QuoteDialog({ src, who, text, onClose }: { src: HEvent; who: string; text: string; onClose: () => void }) {
+  const files = React.useContext(FilesContext);
+  const atts = src.kind === "user" ? (src.attachments ?? []) : [];
   return (
     <DialogLike onClose={onClose}>
       <div className="hx-quote-full">
-        <div className="hx-quote-who">
-          <CornerDownRight size={12} aria-hidden="true" />
-          {who}
+        <div className="hx-cover-head">
+          <span className="hx-cover-who">
+            <CornerDownRight size={12} aria-hidden="true" /> {who}
+          </span>
+          <button type="button" className="hx-icon hx-cover-x" aria-label="Close" onClick={onClose}>
+            <X size={15} />
+          </button>
         </div>
-        <Prose text={text} />
+        <Prose text={text} seq={src.seq} />
+        {atts.length > 0 && (
+          <div className="hx-quote-files">
+            {atts.map((name) => {
+              const full = (files && resolvePath(name, files.cwd)) || name;
+              const kept = files && (keptFor(files.files, full, src.seq) ?? files.files.find((f) => f.path === full || f.path.endsWith(`/${name}`)));
+              const url = files ? fileUrl(files.session, full, kept || undefined) : undefined;
+              return kindOf(full, kept?.meta?.mime) === "image" && url ? (
+                <a key={name} href={url} target="_blank" rel="noopener noreferrer">
+                  <img src={url} alt={name} className="hx-quote-img" />
+                </a>
+              ) : (
+                <a key={name} className="hx-quote-file" href={url} target="_blank" rel="noopener noreferrer">
+                  <Download size={11} aria-hidden="true" /> {name}
+                </a>
+              );
+            })}
+          </div>
+        )}
       </div>
     </DialogLike>
   );
 }
 
-/** An in-surface card over the conversation (the same shape the full-size viewer uses). */
+/** An in-surface card over the conversation (the same shape the full-size viewer uses): tap away,
+ *  ✕, or Esc to close. */
 function DialogLike({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
   return (
-    <div className="hx-cover" role="dialog" aria-modal="true" onClick={onClose}>
-      <div className="hx-cover-card" onClick={(e) => e.stopPropagation()}>
+    <div className="hx-cover" role="dialog" aria-modal="true" onClick={onClose} onKeyDown={(e) => e.key === "Escape" && onClose()}>
+      <div className="hx-cover-card" ref={(el) => el?.focus({ preventScroll: true })} tabIndex={-1} onClick={(e) => e.stopPropagation()}>
         {children}
       </div>
     </div>
@@ -739,13 +783,14 @@ const Prompt = React.memo(function Prompt({
   const navigate = useNavigate();
   const why = delivery ? DELIVERY[delivery] : "sent";
   const unsend = () => {
-    if (!onCommand || (!queueItem?.id && !e.client_id)) return;
-    onCommand({ type: "queue_remove", id: queueItem?.id ?? e.client_id ?? "" });
+    const { unsend: remove } = unsending(queueItem?.id ?? e.client_id);
+    if (!onCommand || !remove) return;
+    onCommand(remove);
     setUnsent(true);
   };
+  // What it unsent still goes (unsend.ts): Undo shows it again, sending nothing.
   const undo = () => {
-    if (!onCommand) return;
-    onCommand({ type: "send", id: clientId(), text: e.text, mode: "queue", attachments: queueItem?.attachments, reply_to: queueItem?.reply_to ?? e.reply_to });
+    unsending(queueItem?.id ?? e.client_id).undo.forEach((c) => onCommand?.(c));
     setUnsent(false);
   };
   const swipe = useUnsendSwipe(queued && !editing && !unsent, unsend);

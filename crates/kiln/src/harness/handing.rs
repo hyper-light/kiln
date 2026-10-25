@@ -10,17 +10,22 @@
 //! so nothing of the session's folder or its harness's record travels: the newer process resumes
 //! the harness's own session from them, as it would after a restart.
 //!
-//! Two processes never run one session: until the server's word comes, the session waits here
-//! (its queue holds what is sent meanwhile); without it, it goes on here — and should the newer
-//! process have taken it over after all, the server's word reaches this one later and it lets go
-//! then (`super::host::Host::handed_over`).
+//! Two processes never run one session: until it's known how it went, the session waits here (its
+//! queue holds what is sent meanwhile). Each try at handing it over is decided once for the machine,
+//! by whichever of its processes comes first (`super::host::Decided`, CP-T3.2, the nineteenth
+//! adversarial check's), so the server's word, which may be an earlier try's come late, says when to
+//! look: refused, it takes the try back unless a newer process took it first, and goes on here.
+//! With no word of it (the link dropped, or nothing came, or the newer process went away once its
+//! whole package went to it), the newer process may run it now: it stays waiting here, and its
+//! package goes again until it's decided (CP-T3.2, the eighteenth adversarial check's). A hand-over's
+//! word is waited for across its tries ([`done`] once it's known), so one that comes between two
+//! tries isn't lost.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use futures::FutureExt as _;
-use futures::channel::oneshot;
 use parking_lot::Mutex;
 
 use crate::exec::Up;
@@ -29,68 +34,159 @@ use crate::proto::AgentMsg;
 /// The pieces a package goes in, as the server sends packages (`super::registry`).
 const PIECE: usize = 3 << 20;
 
-/// How long a hand-over waits for the server's word before the session goes on here.
+/// How long a try waits for the server's word before it's taken as not known.
 const ANSWER_WITHIN: Duration = Duration::from_secs(600);
 
-struct Relay {
-    up: async_channel::Sender<Up>,
-    waiting: Mutex<HashMap<String, oneshot::Sender<Result<(), String>>>>,
+/// Why a hand-over didn't go through (CP-T3.2: `super::session` keeps the session's inbox fenced,
+/// and the session waiting, while it isn't known).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotHanded {
+    /// The newer process said no.
+    Refused(String),
+    /// This try went to no process: it never all went out, or the server couldn't pass it on. Sure
+    /// only when no try before it went without a word.
+    NotPassed(String),
+    /// Not known: the link dropped, no word came, or the server can't say (the newer process went
+    /// away once its whole package went to it). The newer process may have taken it.
+    Unknown(String),
 }
 
-static RELAY: OnceLock<Relay> = OnceLock::new();
+impl std::fmt::Display for NotHanded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) | Self::NotPassed(why) | Self::Unknown(why) => f.write_str(why),
+        }
+    }
+}
 
-/// This runner's link to the server, set once as it starts.
+/// The server's word on a hand-over.
+type Word = Result<(), NotHanded>;
+
+/// This runner's link to the server, and the hand-overs under way, each waiting for its word.
+struct Relay {
+    up: Mutex<Option<async_channel::Sender<Up>>>,
+    waiting: Mutex<HashMap<String, (async_channel::Sender<Word>, async_channel::Receiver<Word>)>>,
+}
+
+static RELAY: LazyLock<Relay> = LazyLock::new(|| Relay { up: Mutex::new(None), waiting: Mutex::new(HashMap::new()) });
+
+/// This runner's link to the server, set as it starts.
 pub fn install(up: async_channel::Sender<Up>) {
-    let _ = RELAY.set(Relay { up, waiting: Mutex::new(HashMap::new()) });
+    // A test holding this process's link keeps it: a runner another test starts here meanwhile (a
+    // server's local agent) doesn't take it over.
+    #[cfg(test)]
+    if HELD.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    *RELAY.up.lock() = Some(up);
 }
 
 /// Send session `id`, packed (`bytes`), to the server for this machine's newer runner process, and
-/// wait for the server's word on it: Ok once that process has taken it over.
-pub async fn send(id: &str, bytes: Vec<u8>) -> Result<(), String> {
-    let relay = RELAY.get().ok_or_else(|| "this runner has no link to the server".to_owned())?;
-    let (tx, rx) = oneshot::channel();
-    relay.waiting.lock().insert(id.to_owned(), tx);
+/// wait for the server's word on it: Ok once that process has taken it over. Sent again, it waits
+/// for the same word: one that came since the last try is its answer at once.
+pub async fn send(id: &str, bytes: &[u8]) -> Word {
+    let Some(up) = RELAY.up.lock().clone() else { return Err(NotHanded::NotPassed("this runner has no link to the server".to_owned())) };
+    let rx = RELAY.waiting.lock().entry(id.to_owned()).or_insert_with(async_channel::unbounded).1.clone();
+    if let Ok(word) = rx.try_recv() {
+        return word;
+    }
     let pieces: Vec<&[u8]> = bytes.chunks(PIECE).collect();
     let mut offset = 0u64;
     for (n, piece) in pieces.iter().enumerate() {
         let msg = AgentMsg::HarnessHandOver { session: id.to_owned(), offset, data: piece.to_vec(), done: n + 1 == pieces.len() };
-        if relay.up.send(Up::Convo(msg)).await.is_err() {
-            relay.waiting.lock().remove(id);
-            return Err("this runner's link to the server closed".into());
+        if up.send(Up::Convo(msg)).await.is_err() {
+            // Its last piece never went: the server can't have passed this try on.
+            return Err(NotHanded::NotPassed("this runner's link to the server closed".into()));
         }
         offset += piece.len() as u64;
     }
-    let word = futures::select! {
-        w = rx.fuse() => w.unwrap_or_else(|_| Err("this runner's link to the server dropped".into())),
-        () = crate::rt::sleep(ANSWER_WITHIN).fuse() => Err(format!("the server said nothing of it in {} minutes", ANSWER_WITHIN.as_secs() / 60)),
-    };
-    relay.waiting.lock().remove(id);
-    word
-}
-
-/// The server's word on session `id`'s hand-over (`Command::HandedOver`): whether a hand-over was
-/// waiting for it.
-pub fn answered(id: &str, error: Option<String>) -> bool {
-    let Some(relay) = RELAY.get() else { return false };
-    let Some(tx) = relay.waiting.lock().remove(id) else { return false };
-    tx.send(error.map_or(Ok(()), Err)).is_ok()
-}
-
-/// The link to the server dropped: no word comes for what was on its way, and those sessions go
-/// on here. Taken over meanwhile, one is let go of when the server's word comes after all.
-pub fn link_lost() {
-    let Some(relay) = RELAY.get() else { return };
-    let waiting: Vec<_> = relay.waiting.lock().drain().collect();
-    for (_, tx) in waiting {
-        let _ = tx.send(Err("this runner's link to the server dropped".into()));
+    futures::select! {
+        w = rx.recv().fuse() => w.unwrap_or_else(|_| Err(NotHanded::Unknown("its hand-over was ended here".into()))),
+        () = crate::rt::sleep(ANSWER_WITHIN).fuse() => Err(NotHanded::Unknown(format!("the server said nothing of it in {} minutes", ANSWER_WITHIN.as_secs() / 60))),
     }
+}
+
+/// Session `id`'s hand-over is over (its word known, or the session gone): nothing waits for its
+/// word any more.
+pub fn done(id: &str) {
+    RELAY.waiting.lock().remove(id);
+}
+
+/// The server's word on session `id`'s hand-over (`Command::HandedOver`: `error`, and whether the
+/// newer process said it, `by_newest`, or the server can't say, `unsure`): whether a hand-over was
+/// waiting for it.
+pub fn answered(id: &str, error: Option<String>, unsure: bool, by_newest: bool) -> bool {
+    let Some(tx) = RELAY.waiting.lock().get(id).map(|(tx, _)| tx.clone()) else { return false };
+    let word = match error {
+        None => Ok(()),
+        Some(why) if by_newest => Err(NotHanded::Refused(why)),
+        Some(why) if unsure => Err(NotHanded::Unknown(why)),
+        Some(why) => Err(NotHanded::NotPassed(why)),
+    };
+    tx.try_send(word).is_ok()
+}
+
+/// The link to the server dropped: no word comes now for what was on its way. Each waits on (the
+/// server's word, parked, comes once the link is back) and is asked again.
+pub fn link_lost() {
+    let waiting: Vec<_> = RELAY.waiting.lock().values().map(|(tx, _)| tx.clone()).collect();
+    for tx in waiting {
+        let _ = tx.try_send(Err(NotHanded::Unknown("this runner's link to the server dropped".into())));
+    }
+}
+
+/// This runner's link to the server dropped (`crate::agent::run`): [`link_lost`], but for a runner a
+/// test starts in this process while another test holds the link, which is that test's alone.
+pub fn runner_link_lost() {
+    #[cfg(test)]
+    if HELD.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    link_lost();
 }
 
 /// This process took over session `id` from an older one of its machine, or couldn't (`error`):
 /// said to the server, which tells that process.
 pub async fn adopted(id: &str, error: Option<String>) {
-    let Some(relay) = RELAY.get() else { return };
-    let _ = relay.up.send(Up::Msg(AgentMsg::HarnessAdopted { session: id.to_owned(), error })).await;
+    let Some(up) = RELAY.up.lock().clone() else { return };
+    let _ = up.send(Up::Msg(AgentMsg::HarnessAdopted { session: id.to_owned(), error })).await;
+}
+
+/// Tests that use this process's link to the server (it's one a process) hold it ([`hold_link`]).
+#[cfg(test)]
+static TEST_LINK: Mutex<()> = Mutex::new(());
+
+/// A test holds this process's link to the server.
+#[cfg(test)]
+static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process's link to the server is the calling test's until what's returned goes, one test at a
+/// time ([`set_held_link`] sets it): a runner another test starts in this process meanwhile (a
+/// server's local agent, `crate::agent::run`) neither takes it over nor says it dropped
+/// ([`runner_link_lost`]).
+#[cfg(test)]
+pub fn hold_link() -> HeldLink {
+    let guard = TEST_LINK.lock();
+    HELD.store(true, std::sync::atomic::Ordering::Release);
+    HeldLink { _guard: guard }
+}
+
+/// The link of the test holding it ([`hold_link`]).
+#[cfg(test)]
+pub fn set_held_link(up: async_channel::Sender<Up>) {
+    *RELAY.up.lock() = Some(up);
+}
+
+#[cfg(test)]
+pub struct HeldLink {
+    _guard: parking_lot::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for HeldLink {
+    fn drop(&mut self) {
+        HELD.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[cfg(test)]
@@ -99,11 +195,12 @@ mod tests {
 
     #[test]
     fn a_hand_over_goes_in_pieces_and_waits_for_the_servers_word() -> anyhow::Result<()> {
+        let _link = hold_link();
         crate::rt::block_on(async {
             let (tx, rx) = async_channel::unbounded();
-            install(tx);
+            set_held_link(tx);
             let bytes = vec![7u8; PIECE + 10];
-            let sending = crate::rt::spawn(async move { send("s1", bytes).await });
+            let sending = crate::rt::spawn(async move { send("s1", &bytes).await });
             let mut got = Vec::new();
             while got.len() < 2 {
                 match rx.recv().await? {
@@ -113,26 +210,38 @@ mod tests {
             }
             assert_eq!(got, vec![("s1".to_owned(), 0, PIECE, false), ("s1".to_owned(), PIECE as u64, 10, true)]);
             // Nothing for a session no hand-over waits on.
-            assert!(!answered("s2", None));
-            while !answered("s1", None) {
-                crate::rt::sleep(Duration::from_millis(5)).await;
-            }
+            assert!(!answered("s2", None, false, false));
+            assert!(answered("s1", None, false, false));
             assert_eq!(sending.await?, Ok(()));
-            // Its word, an error: the session goes on there, saying why.
-            let failing = crate::rt::spawn(async move { send("s3", vec![1]).await });
-            let _ = rx.recv().await?;
-            while !answered("s3", Some("no room".into())) {
-                crate::rt::sleep(Duration::from_millis(5)).await;
+            done("s1");
+            // The newer process's no, the server's own, and the server unsure.
+            for (unsure, by_newest, word) in [
+                (false, true, Err(NotHanded::Refused("no room".into()))),
+                (false, false, Err(NotHanded::NotPassed("no room".into()))),
+                (true, false, Err(NotHanded::Unknown("no room".into()))),
+            ] {
+                let failing = crate::rt::spawn(async move { send("s3", &[1]).await });
+                let _ = rx.recv().await?;
+                while !answered("s3", Some("no room".into()), unsure, by_newest) {
+                    crate::rt::sleep(Duration::from_millis(5)).await;
+                }
+                assert_eq!(failing.await?, word);
             }
-            assert_eq!(failing.await?, Err("no room".to_owned()));
-            // The link drops: what waits goes on here.
-            let dropped = crate::rt::spawn(async move { send("s4", vec![1]).await });
+            done("s3");
+            // The link drops: the word isn't known. The hand-over waits on: the word that comes
+            // once the link is back (between two tries, here) answers its next try at once.
+            let dropped = crate::rt::spawn(async move { send("s4", &[1]).await });
             let _ = rx.recv().await?;
-            while RELAY.get().is_some_and(|r| !r.waiting.lock().contains_key("s4")) {
+            while !RELAY.waiting.lock().contains_key("s4") {
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
             link_lost();
-            assert!(dropped.await?.is_err());
+            assert!(matches!(dropped.await?, Err(NotHanded::Unknown(_))), "the link dropped: not known whether it was taken");
+            assert!(answered("s4", None, false, false), "still waited for");
+            assert_eq!(send("s4", &[1]).await, Ok(()), "the word that came between the tries");
+            assert!(rx.try_recv().is_err(), "nothing sent again once the word was in");
+            done("s4");
+            assert!(!answered("s4", None, false, false), "done: nothing waits for it");
             Ok(())
         })
     }

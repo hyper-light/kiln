@@ -11,7 +11,7 @@
 import * as React from "react";
 import "./console.css";
 import { ArrowUp, ChevronRight, CornerDownLeft, Paperclip, Square, X } from "lucide-react";
-import { harnessApi, type AgentInfo, type BroadcastBody, type BroadcastPreview, type BroadcastReport, type Command, type SendMode, type SlashCommand } from "@/api/harness";
+import { clientId, harnessApi, type AgentInfo, type BroadcastBody, type BroadcastPreview, type BroadcastReport, type Command, type SendMode, type SlashCommand } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
@@ -132,6 +132,8 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
   const picker = React.useRef<HTMLInputElement>(null);
   const [ask, setAsk] = React.useState<Ask | null>(null);
   const [busy, setBusy] = React.useState(false);
+  /** The last thing sent and its key, until it comes back sent. */
+  const lastTry = React.useRef<{ said: string; key: string } | null>(null);
   const [report, setReport] = React.useState<BroadcastReport | null>(null);
   /** On its way to this many agents (0: nothing is). */
   const [sending, setSending] = React.useState(0);
@@ -159,8 +161,16 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
 
   const send = async (body: Omit<BroadcastBody, "to">) => {
     setBusy(true);
+    // The same thing sent again after a try that didn't come back goes under the same key: each
+    // agent gets it once (CP-T3.2), its id made from the key and the agent. Anything else is new.
+    // The key is for what was said, not for the list's order or whose turn it shows, which change
+    // as agents start working.
+    const said = JSON.stringify(body);
+    const key = lastTry.current?.said === said ? lastTry.current.key : clientId();
+    lastTry.current = { said, key };
     try {
-      setReport(await harnessApi.broadcastTo({ to: { ids }, ...body }));
+      setReport(await harnessApi.broadcastTo({ to: { ids }, ...body, key }));
+      lastTry.current = null;
       setReportOpen(false);
       if (body.attachments) attachments.clear();
       return true;

@@ -431,7 +431,7 @@ impl Agy {
         self.tools.clear();
         core.state.delivery.insert(m.id.clone(), Delivery::Started);
         let (images, names) = super::model::attachment_summary(&m.attachments);
-        core.note_sent(&m.id);
+        core.note_sent(&m.id, &m.text);
         core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
         core.state.turn_started = Some(Core::now());
         core.state.doing = Some("Thinking".to_owned());

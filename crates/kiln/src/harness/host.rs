@@ -6,6 +6,10 @@
 //! Its time is its clock's (kiln-seams' `Clock`, docs/seams.md): its watch of what the harnesses
 //! run, and the pause that gathers changes into one write of its record, go by kiln's runtime in
 //! production and by a simulated clock in tests.
+//!
+//! What it's told for a session goes down that session's lane, in the order it came, a command at a
+//! time. A message goes through the session's inbox first (CP-T3.2, `super::inbox`): taken once,
+//! fenced by the session's epoch, its answer said back as [`Update::Inbox`](super::core::Update).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,8 +22,10 @@ use kiln_seams::Clock;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use super::core::Update;
+use super::inbox::{self, Answer, Inbox, Said};
 use super::kinds::{Kind, KindInfo};
-use super::model::{Command, QueueItem, Status};
+use super::model::{Body, Command, QueueItem, Status};
 use super::session::{self, Info, Session, Sink, Spec};
 
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +80,15 @@ pub struct Saved {
     harness: Option<super::survivors::Ran>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ran: Vec<super::survivors::Ran>,
+    /// The newest ids its inbox took (its last [`inbox::KEEP`]; the oldest of them first), as it goes
+    /// to another runner process of this machine (blue/green): taken there too, so a repeat of one
+    /// is answered there, never a second prompt. In its record on disk, the ids it brought that its
+    /// inbox hasn't taken in yet ([`Host::recorded`]), taken in as it's started again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inbox: Vec<String>,
+    /// Each of `inbox`'s ids' digest, in the same order (`moving::Package::inbox_digests`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inbox_digests: Vec<String>,
 }
 
 impl Saved {
@@ -102,6 +117,219 @@ fn record(s: &Session) -> Saved {
         cut: s.turn_open.load(Ordering::Relaxed),
         harness: ran.0,
         ran: ran.1,
+        inbox: Vec::new(),
+        inbox_digests: Vec::new(),
+    }
+}
+
+/// What a runner answers a hand-over of a session it runs from before it ([`Host::adopt`]: a copy
+/// left behind), after [`crate::reach::node::NOT_TAKEN`]. A runner from before that said it alone,
+/// and to a hand-over tried again after one whose answer never came, it meant that one took it over
+/// (`crate::reach::node::Handle::adopt`).
+pub const RUNS_HERE: &str = "that session runs here already";
+
+/// What a machine's newest runner process answers a local hand-over ([`Host::adopt`] of a package
+/// marked `handover`) its machine took over before, where this process doesn't run it: another of
+/// its processes does (or did, and it ended there or went on elsewhere). The process that handed it
+/// over lets go, and the server doesn't take this one for its holder (CP-T3.2, the nineteenth
+/// adversarial check's).
+pub const TAKEN_ELSEWHERE: &str = "taken over on this machine before, and not run by this process: ";
+
+/// What a runner process handing everything to a new build of it, or retiring after it, answers a
+/// local hand-over, after [`crate::reach::node::NOT_TAKEN`]: it takes none (it would end with it);
+/// the older process goes on with it, asked for it again once the new build has taken over.
+const LEAVING: &str = "this runner process is handing over to a new build of it, and leaving";
+
+/// Why a hand-over wasn't taken over here ([`Host::adopt`]).
+enum Refused {
+    /// It isn't here: the runner that handed it over goes on with it.
+    NotTaken(String),
+    /// Whether it was taken over here before can't be said now: that runner asks again.
+    Unsure(String),
+    /// A local hand-over its machine took over, that this process doesn't run ([`TAKEN_ELSEWHERE`]).
+    Elsewhere(String),
+}
+
+/// How a try at handing a session to its machine's newer runner process went
+/// ([`super::moving::Package::attempt`]): decided once for the machine, by whichever of its processes
+/// came first ([`Host::settle`], [`Host::adopt`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decided {
+    /// A newer process took it over: the one that handed it over lets go of it.
+    Taken,
+    /// Not taken over (refused, or taken back by the process that handed it over), and no process
+    /// takes that try over now: that process goes on with it.
+    Refused,
+}
+
+/// A try's decision as the machine keeps it ([`Handovers`]): its session, whether it was taken over,
+/// the epoch the session goes on at there, and when (unix ms).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Decision {
+    session: String,
+    taken: bool,
+    epoch: u64,
+    at: i64,
+}
+
+/// Hand-overs a machine remembers taking ([`Handovers`]), at most: past it, the oldest go.
+pub const HANDOVERS_MAX: usize = 4096;
+
+/// The hand-overs a machine took ([`Host::adopt`]): each session's newest epoch taken over at, and
+/// when (unix ms); its newest [`HANDOVERS_MAX`]. Kept in the machine's state folder, where each of
+/// its runner processes finds them (blue/green's new build is a process of its own, its folder
+/// `<state>/instances/<id>`), written whole and synced (and its folder), one process at a time.
+/// Those that couldn't be written are still known to the process that took them, and go with the
+/// next written.
+///
+/// Beside them, how each try at handing a session to the machine's newer runner process went
+/// (`decided`, its newest [`HANDOVERS_MAX`]): decided once, under the same lock, by whichever of its
+/// processes comes first (one taking it over, or refusing it; or the process that handed it over
+/// taking it back), written and synced before it's said or acted on. So whatever word of it reaches
+/// the process that handed it over, from whichever try and however late, two of the machine's
+/// processes never run it (CP-T3.2, the nineteenth adversarial check's).
+struct Handovers {
+    path: PathBuf,
+    decided: PathBuf,
+    unwritten: Mutex<HashMap<String, (u64, i64)>>,
+}
+
+/// The machine's hand-overs, this process's alone until it's dropped ([`Handovers::locked`]).
+struct Locked<'a> {
+    handovers: &'a Handovers,
+    _lock: std::fs::File,
+}
+
+impl Locked<'_> {
+    fn decisions(&self) -> std::io::Result<HashMap<String, Decision>> {
+        match std::fs::read(&self.handovers.decided) {
+            Ok(raw) => serde_json::from_slice(&raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// How try `attempt` went: none while it isn't decided.
+    fn decided(&self, attempt: &str) -> std::io::Result<Option<Decided>> {
+        Ok(self.decisions()?.get(attempt).map(|d| if d.taken { Decided::Taken } else { Decided::Refused }))
+    }
+
+    /// Whether a try at handing session `id` over was taken over, to go on above `epoch`.
+    fn taken_above(&self, id: &str, epoch: u64) -> std::io::Result<bool> {
+        Ok(self.decisions()?.values().any(|d| d.taken && d.session == id && d.epoch > epoch))
+    }
+
+    /// Try `attempt` at handing session `id` over went `how` (taken: to go on at `epoch`), at `at`:
+    /// written and synced, its folder too.
+    fn decide(&self, attempt: &str, id: &str, how: Decided, epoch: u64, at: i64) -> std::io::Result<()> {
+        let mut all = self.decisions()?;
+        all.insert(attempt.to_owned(), Decision { session: id.to_owned(), taken: how == Decided::Taken, epoch, at });
+        if all.len() > HANDOVERS_MAX {
+            let mut by_age: Vec<(String, i64)> = all.iter().map(|(k, d)| (k.clone(), d.at)).collect();
+            by_age.sort_by_key(|(_, at)| *at);
+            for (k, _) in by_age.into_iter().take(all.len().saturating_sub(HANDOVERS_MAX)) {
+                all.remove(&k);
+            }
+        }
+        let json = serde_json::to_vec(&all).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        crate::util::write_secret(&self.handovers.decided, &json, 0o600)?;
+        self.handovers.decided.parent().map_or(Ok(()), crate::blobs::chunks::sync_dir)
+    }
+
+    /// [`Handovers::note`], with this lock held.
+    fn note(&self, id: &str, epoch: u64, at: i64) -> std::io::Result<()> {
+        self.handovers.note_by(id, epoch, at, |held| self.handovers.write_held(held))
+    }
+}
+
+impl Handovers {
+    /// The machine's, for a runner process whose own folder is `own_dir`.
+    fn of(own_dir: &std::path::Path) -> Self {
+        let state = match own_dir.parent() {
+            Some(instances) if instances.file_name().is_some_and(|n| n == "instances") => instances.parent().unwrap_or(own_dir),
+            _ => own_dir,
+        };
+        Self { path: state.join("handovers-taken.json"), decided: state.join("handovers-decided.json"), unwritten: Mutex::new(HashMap::new()) }
+    }
+
+    /// The machine's hand-overs, this process's (and this thread's) alone until what's returned is
+    /// dropped.
+    fn locked(&self) -> std::io::Result<Locked<'_>> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // One process at a time: blue/green's two may both take one over, and a machine's newer
+        // processes may each be handed one.
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(self.path.with_extension("lock"))?;
+        lock.lock()?;
+        Ok(Locked { handovers: self, _lock: lock })
+    }
+
+    fn read(&self) -> std::io::Result<HashMap<String, (u64, i64)>> {
+        match std::fs::read(&self.path) {
+            Ok(raw) => serde_json::from_slice(&raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The epoch session `id` was last taken over at on this machine: none if never.
+    fn taken(&self, id: &str) -> std::io::Result<Option<u64>> {
+        let held = self.unwritten.lock().get(id).map(|(epoch, _)| *epoch);
+        match self.read() {
+            Ok(all) => Ok(all.get(id).map(|(epoch, _)| *epoch).max(held)),
+            Err(_) if held.is_some() => Ok(held),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Session `id` taken over on this machine at `epoch`, at `at`: written with any not written
+    /// before. Not written, it's still known here.
+    fn note(&self, id: &str, epoch: u64, at: i64) -> std::io::Result<()> {
+        // The machine's lock first, then what this process holds, as every path takes them (the
+        // twentieth adversarial check's: the other way round, a take holding the lock would wait for
+        // this note, and this note for the lock).
+        match self.locked() {
+            Ok(locked) => locked.note(id, epoch, at),
+            Err(e) => self.note_by(id, epoch, at, |_| Err(e)),
+        }
+    }
+
+    /// [`Handovers::note`], written by `write`.
+    fn note_by(&self, id: &str, epoch: u64, at: i64, write: impl FnOnce(&HashMap<String, (u64, i64)>) -> std::io::Result<()>) -> std::io::Result<()> {
+        let mut held = self.unwritten.lock();
+        let was = held.get(id).map_or(0, |(e, _)| *e);
+        held.insert(id.to_owned(), (epoch.max(was), at));
+        // While its writes fail, its newest [`HANDOVERS_MAX`] are what's kept here, as in the file
+        // (the twelfth adversarial check's): one more at a time, the oldest goes.
+        if held.len() > HANDOVERS_MAX
+            && let Some(oldest) = held.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| k.clone())
+        {
+            held.remove(&oldest);
+        }
+        write(&held)?;
+        held.clear();
+        Ok(())
+    }
+
+    /// `new` written into the machine's hand-overs, their lock held.
+    fn write_held(&self, new: &HashMap<String, (u64, i64)>) -> std::io::Result<()> {
+        let mut all = self.read()?;
+        for (id, (epoch, at)) in new {
+            let was = all.get(id).map_or(0, |(e, _)| *e);
+            all.insert(id.clone(), ((*epoch).max(was), *at));
+        }
+        if all.len() > HANDOVERS_MAX {
+            let mut by_age: Vec<(String, i64)> = all.iter().map(|(k, (_, at))| (k.clone(), *at)).collect();
+            by_age.sort_by_key(|(_, at)| *at);
+            for (k, _) in by_age.into_iter().take(all.len().saturating_sub(HANDOVERS_MAX)) {
+                all.remove(&k);
+            }
+        }
+        let json = serde_json::to_vec(&all).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        crate::util::write_secret(&self.path, &json, 0o600)?;
+        // Its new name lasts too: a power loss after it keeps the note.
+        self.path.parent().map_or(Ok(()), crate::blobs::chunks::sync_dir)
     }
 }
 
@@ -128,6 +356,44 @@ pub struct Host {
     /// Where its looks and record writes are counted for /metrics (kiln's, `metrics::agents()`).
     metrics: &'static crate::metrics::AgentMetrics,
     changed: event_listener::Event,
+    /// Its sessions' inboxes (CP-T3.2): none without their records (`KILN_INBOX` off, or they
+    /// couldn't be opened), and messages then go on as they come, unchecked.
+    inbox: Option<Arc<Inbox>>,
+    /// Each session's lane: what it's told, in order, a command at a time; and what says it's done.
+    lanes: Mutex<HashMap<String, (async_channel::Sender<Lane>, async_channel::Receiver<()>)>>,
+    /// Lanes on their way out, each done once what it holds is done: a session's next lane waits for
+    /// its last (a session taken back right after it went: its fence first, then its opening).
+    ending: Mutex<HashMap<String, async_channel::Receiver<()>>>,
+    /// It took its sessions over from the runner process it upgrades (blue/green) and isn't
+    /// promoted yet: that one takes them back if it never is, so this one takes no messages till
+    /// then (each refused `moved`, and sent again).
+    held: AtomicBool,
+    /// The hand-overs this machine took (CP-T3.2), kept for every runner process of it: none
+    /// without a record file.
+    handovers: Option<Handovers>,
+}
+
+/// Most of what waits in one session's lane: past it, what's sent is refused (a message, `Full`).
+pub const LANE: usize = 1024;
+
+/// Longest a move waits for what its sessions' lanes hold to be done before it reads what their
+/// inboxes took: a lane can wait on a sink nobody drains while its runner hands its sessions over.
+const SETTLE_WAIT: Duration = Duration::from_secs(10);
+
+/// What goes down a session's lane.
+enum Lane {
+    /// The session is here at `epoch`: the ids of the messages it brought from where it was taken in
+    /// ([`Inbox::bring`]), and its inbox opened; `back`: taken back by this host at the epoch it left
+    /// at (its inbox's fence lifted).
+    Open { epoch: u64, back: bool },
+    Cmd { c: Box<Command>, epoch: Option<u64> },
+    /// Everything before it is done.
+    Mark(futures::channel::oneshot::Sender<()>),
+    /// It went on elsewhere from `epoch`, the epoch it was at here: its inbox here takes nothing
+    /// more for it.
+    Fence { epoch: u64, handover: bool },
+    /// It ended for good: its inbox goes.
+    Forget,
 }
 
 /// Largest file a message can carry.
@@ -140,13 +406,25 @@ impl Host {
         Self::with_clock(sink, file, limits, crate::rt::clock())
     }
 
-    /// A host whose time is `clock`'s.
+    /// A host whose time is `clock`'s, its sessions' inboxes keeping their records beside its own
+    /// record of them.
     pub fn with_clock(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>) -> Arc<Self> {
         Self::counting_into(sink, file, limits, clock, crate::metrics::agents())
     }
 
-    /// A host whose time is `clock`'s, its looks and record writes counted into `metrics`.
+    /// A host whose time is `clock`'s, its looks and record writes counted into `metrics`, its
+    /// sessions' inboxes keeping their records beside its own record of them.
     pub fn counting_into(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
+        let records = file.as_ref().and_then(|f| f.parent()).and_then(open_records);
+        Self::build(sink, file, limits, clock, records, metrics)
+    }
+
+    /// A host whose sessions' inboxes keep their records in `records` (none: no inboxes).
+    pub fn with_records(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>) -> Arc<Self> {
+        Self::build(sink, file, limits, clock, records, crate::metrics::agents())
+    }
+
+    fn build(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
         // The models its harnesses' sessions list are kept beside its record of them.
         if let Some(dir) = file.as_ref().and_then(|f| f.parent()) {
             super::kinds::keep_models_in(dir.join("harness-models.json"));
@@ -157,6 +435,7 @@ impl Host {
             || std::env::temp_dir().join(format!("kiln-attachments-{}", crate::os::uid())),
             |d| d.join("attachments"),
         );
+        let handovers = file.as_ref().and_then(|f| f.parent()).map(Handovers::of);
         Arc::new_cyclic(|me| Self {
             sessions: Mutex::new(HashMap::new()),
             sink,
@@ -172,7 +451,29 @@ impl Host {
             saves: AtomicU64::new(0),
             metrics,
             changed: event_listener::Event::new(),
+            inbox: records.map(|r| Arc::new(Inbox::new(r, inbox::Limits::default()))),
+            lanes: Mutex::new(HashMap::new()),
+            ending: Mutex::new(HashMap::new()),
+            held: AtomicBool::new(false),
+            handovers,
         })
+    }
+
+    /// Takes no messages (`on`), or takes them again: a new build that takes its sessions over from
+    /// the runner process it upgrades takes none until it's promoted, as that one takes them back
+    /// (with what they'd taken) if it never is.
+    pub fn hold(&self, on: bool) {
+        self.held.store(on, Ordering::Release);
+    }
+
+    /// It takes no messages now ([`Host::hold`]).
+    pub fn is_held(&self) -> bool {
+        self.held.load(Ordering::Acquire)
+    }
+
+    /// Its sessions' inboxes, when it keeps them.
+    pub fn inbox(&self) -> Option<&Arc<Inbox>> {
+        self.inbox.as_ref()
     }
 
     /// Looks the watch has taken at what the harnesses run.
@@ -248,23 +549,85 @@ impl Host {
         let _ = std::fs::remove_file(path);
         let Ok(bytes) = bytes else { return (false, bytes.map(|_| ())) };
         let handover = super::moving::handed_over(&bytes);
-        if handover && leaving {
-            return (true, Err("this runner process is handing over to a new build of it, and leaving".into()));
-        }
-        (handover, self.adopt(if handover { "an older kiln runner of this machine" } else { "the kiln server" }, &bytes))
+        (handover, self.adopt_as(if handover { "an older kiln runner of this machine" } else { "the kiln server" }, &bytes, handover && leaving))
     }
 
     /// The server's word on a hand-over of session `id` to this machine's newer runner process
-    /// (`Command::HandedOver`). The session waiting on it goes on, or lets go; one that gave up
-    /// waiting and went on here lets go once it hears the newer process has it after all, so the
-    /// two never both run it.
-    pub fn handed_over(&self, id: &str, error: Option<String>) {
-        if super::handing::answered(id, error.clone()) {
+    /// (`Command::HandedOver`). The session waiting on it goes on, or lets go (it waits until it's
+    /// known: `super::handing`). Heard with nothing waiting for it: taken, it lets go; refused,
+    /// the fence its hand-over left lifts, unless the machine's record says a try at handing it over
+    /// was taken over (this word an earlier try's: it lets go then); not known, it stays as it is. A
+    /// session handing itself over now decides by itself ([`Host::settle`]).
+    pub fn handed_over(&self, id: &str, error: Option<String>, unsure: bool, by_newest: bool) {
+        if super::handing::answered(id, error.clone(), unsure, by_newest) || self.get(id).is_some_and(|s| s.is_moving()) {
             return;
         }
-        if error.is_none() && self.let_go(id) {
-            tracing::info!(session = %id, "this machine's newer runner process took the agent session over after all: let go of it here");
+        match error {
+            None => {
+                if self.let_go(id) {
+                    tracing::info!(session = %id, "this machine's newer runner process took the agent session over after all: let go of it here");
+                }
+            }
+            // Not known still: it stays as it is.
+            Some(_) if unsure => {}
+            // It didn't, after all: its inbox, fenced while that wasn't known, takes messages here
+            // again (CP-T3.2) — unless the machine's record says a newer process took it over.
+            Some(_) => {
+                if let (Some(h), Some(s)) = (self.me.upgrade(), self.get(id)) {
+                    let (id, epoch) = (id.to_owned(), s.epoch());
+                    crate::rt::spawn(async move {
+                        let looked = Arc::clone(&h);
+                        let at = id.clone();
+                        match crate::rt::blocking(move || looked.taken_on_machine(&at, epoch)).await.map_err(|e| format!("{e:#}")).and_then(|r| r) {
+                            Ok(true) => {
+                                if h.let_go(&id) {
+                                    tracing::info!(session = %id, "a word that a hand-over was refused came late, while this machine's record says a newer runner process took it over: let go of it here");
+                                }
+                                return;
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                tracing::warn!(target: "kiln.sends", event = "unfence_failed", session = %id, error = %e, "a word that a hand-over was refused came late, and this machine's record of its hand-overs can't be read: its inbox stays fenced until it's handed over");
+                                return;
+                            }
+                        }
+                        if let Err(e) = h.moving_fence(&id, false).await {
+                            tracing::warn!(target: "kiln.sends", event = "unfence_failed", session = %id, error = %e, "a session whose hand-over failed couldn't take messages again: its inbox stays fenced until it's handed over");
+                        }
+                    });
+                }
+            }
         }
+    }
+
+    /// The machine's decision on try `attempt` at handing session `id` to its newer runner process
+    /// (CP-T3.2, the nineteenth adversarial check's): as whichever of its processes came first
+    /// decided it; or, none yet and `take_back`, decided now, not taken over (this process goes on
+    /// with it, and no process takes that try over after). None while it isn't decided, or where
+    /// this host keeps no record of the machine's hand-overs (the server's word alone says then).
+    /// Blocking.
+    pub fn settle(&self, attempt: &str, id: &str, take_back: bool) -> Result<Option<Decided>, String> {
+        let Some(h) = &self.handovers else { return Ok(None) };
+        let locked = h.locked().map_err(|e| format!("this machine's record of its hand-overs: {e}"))?;
+        match locked.decided(attempt).map_err(|e| format!("this machine's record of its hand-overs: {e}"))? {
+            Some(how) => Ok(Some(how)),
+            None if take_back => {
+                let epoch = self.get(id).map_or(0, |s| s.epoch());
+                locked.decide(attempt, id, Decided::Refused, epoch, self.clock.unix_ms()).map_err(|e| format!("this machine's record of its hand-overs: {e}"))?;
+                Ok(Some(Decided::Refused))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Whether this machine's record says session `id`, here at `epoch`, was taken over by a newer
+    /// runner process of it (a try at handing it over taken, or its note of the hand-overs it took).
+    /// Blocking.
+    fn taken_on_machine(&self, id: &str, epoch: u64) -> Result<bool, String> {
+        let Some(h) = &self.handovers else { return Ok(false) };
+        let locked = h.locked().map_err(|e| e.to_string())?;
+        let decided = locked.taken_above(id, epoch).map_err(|e| e.to_string())?;
+        Ok(decided || h.taken(id).map_err(|e| e.to_string())?.is_some_and(|at| at > epoch))
     }
 
     /// Session `id` went on on another machine since: its harness here stops, and this machine
@@ -318,23 +681,119 @@ impl Host {
 
     /// Start a session (`id` keeps a known one's identity, e.g. one the server named).
     pub fn open(&self, id: Option<String>, spec: Spec) -> anyhow::Result<Arc<Session>> {
-        self.open_seeded(id, spec, None, None)
+        self.open_seeded(id, spec, None, None, Vec::new(), false)
     }
 
     /// Take over a session another runner handed this one (`super::moving`): its record where its
     /// harness here looks, then the session, under its own id, its timeline as it was. Blocking
-    /// (writes the record).
+    /// (writes the record). A hand-over taken over here before (sent again, its answer lost on the
+    /// way back) is answered as taken, whatever became of the session since: it ended here, or went
+    /// on elsewhere (CP-T3.2). Each refusal says it wasn't taken
+    /// ([`crate::reach::node::NOT_TAKEN`]); but whether it was can't be said while this host's
+    /// records can't be read, and the runner that handed it over asks again. A try at handing it over
+    /// from an older runner process of this machine is decided once for the machine
+    /// ([`Decided`]): taken over before where this process doesn't run it, it's answered
+    /// [`TAKEN_ELSEWHERE`].
     pub fn adopt(&self, from: &str, data: &[u8]) -> Result<(), String> {
-        let pkg: super::moving::Package = serde_json::from_slice(data).map_err(|e| format!("the session from {from} is unreadable: {e}"))?;
+        self.adopt_as(from, data, false)
+    }
+
+    /// [`Host::adopt`]; `leaving`: this process hands everything to a new build of it, or retires
+    /// after it, so a hand-over isn't taken here (it would end with this process), as the machine's
+    /// record says (a try taken here before is answered so).
+    fn adopt_as(&self, from: &str, data: &[u8], leaving: bool) -> Result<(), String> {
+        self.take_over(from, data, leaving).map_err(|r| match r {
+            Refused::NotTaken(why) => format!("{}{why}", crate::reach::node::NOT_TAKEN),
+            Refused::Unsure(why) => why,
+            Refused::Elsewhere(why) => format!("{TAKEN_ELSEWHERE}{why}"),
+        })
+    }
+
+    fn take_over(&self, from: &str, data: &[u8], leaving: bool) -> Result<(), Refused> {
+        let pkg: super::moving::Package = match serde_json::from_slice(data) {
+            Ok(pkg) => pkg,
+            Err(_) if leaving => return Err(Refused::NotTaken(LEAVING.into())),
+            Err(e) => return Err(Refused::NotTaken(format!("the session from {from} is unreadable: {e}"))),
+        };
+        // It goes on here an epoch up (`session::start_seeded`).
+        let epoch = pkg.state.epoch.saturating_add(1);
+        // One take at a time on the machine (CP-T3.2, the nineteenth adversarial check's): two of its
+        // processes given one package (a try sent again, the newest gone meanwhile; a move's sent
+        // again after a blue/green upgrade) take it over once, the second finding the first's note.
+        // A try at handing it over from an older process of this machine is decided once besides,
+        // by whichever of its processes comes first: decided, it's answered so; not, it's decided
+        // here, written before it's said or acted on. Its record unreadable or unwritable now, it's
+        // neither: that process asks again. A package that names no try (a move, or a process from
+        // before) is taken over as before where the lock can't be had.
+        let attempt = pkg.attempt.clone().filter(|_| pkg.handover);
+        let unsure = |e: std::io::Error| Refused::Unsure(format!("how this machine's hand-overs went can't be read or written now: {e}"));
+        let locked = match (&self.handovers, &attempt) {
+            (None, _) => None,
+            (Some(h), Some(_)) => Some(h.locked().map_err(unsure)?),
+            (Some(h), None) => match h.locked() {
+                Ok(locked) => Some(locked),
+                Err(e) => {
+                    tracing::warn!(target: "kiln.sends", event = "adopt_unlocked", session = %pkg.id, error = %e, "this machine's lock on its hand-overs couldn't be had: a session is taken over here without it");
+                    None
+                }
+            },
+        };
+        if let (Some(locked), Some(attempt)) = (&locked, &attempt) {
+            match locked.decided(attempt).map_err(unsure)? {
+                Some(Decided::Taken) if self.get(&pkg.id).is_some_and(|s| s.epoch() >= epoch) => return Ok(()),
+                Some(Decided::Taken) => return Err(Refused::Elsewhere("this try at handing it over was taken over before".into())),
+                Some(Decided::Refused) => return Err(Refused::NotTaken("this try at handing it over was decided before: not taken over".into())),
+                None => {}
+            }
+        }
+        let id = pkg.id.clone();
+        let taken = self.take_over_now(from, pkg, epoch, locked.as_ref(), attempt.as_deref(), leaving);
+        // Not taken over, for good: whatever comes of this try after, from any process, says so.
+        if let (Err(Refused::NotTaken(why)), Some(locked), Some(attempt)) = (&taken, &locked, &attempt)
+            && let Err(e) = locked.decide(attempt, &id, Decided::Refused, epoch, self.clock.unix_ms())
+        {
+            return Err(Refused::Unsure(format!("{why}; and that it wasn't taken over couldn't be written down: {e}")));
+        }
+        taken
+    }
+
+    /// [`Host::take_over`], its try at handing it over (if it's one) not decided yet, with the
+    /// machine's hand-overs `locked` (where they could be): `attempt`, the try, is written as taken
+    /// before the session opens here (or it's answered as taken).
+    fn take_over_now(&self, from: &str, pkg: super::moving::Package, epoch: u64, locked: Option<&Locked<'_>>, attempt: Option<&str>, leaving: bool) -> Result<(), Refused> {
+        let taken = |id: &str| match (locked, attempt) {
+            (Some(locked), Some(attempt)) => locked.decide(attempt, id, Decided::Taken, epoch, self.clock.unix_ms()).map_err(|e| Refused::Unsure(format!("that it was taken over couldn't be written down: {e}"))),
+            _ => Ok(()),
+        };
+        // A local hand-over is answered as taken only by the process that runs it: the machine's
+        // note of the hand-overs it took is every one of its processes', and another of them may
+        // run it (or did, and it ended there), so the one that handed it over lets go without this
+        // one becoming its holder.
+        if pkg.handover && !self.get(&pkg.id).is_some_and(|s| s.epoch() >= epoch) && self.taken_before(&pkg.id, epoch)? {
+            taken(&pkg.id)?;
+            return Err(Refused::Elsewhere(format!("the machine's note says it went on at epoch {epoch} or later")));
+        }
+        if self.taken_before(&pkg.id, epoch)? {
+            taken(&pkg.id)?;
+            tracing::info!(target: "kiln.sends", event = "adopt_again", session = %pkg.id, from = %from, epoch, "a hand-over taken over here before, sent again: answered as taken");
+            return Ok(());
+        }
+        // Leaving: not taken over here (it would end with this process), as written down for the try.
+        if leaving {
+            return Err(Refused::NotTaken(LEAVING.into()));
+        }
         if !super::moving::takes(pkg.version) {
-            return Err(format!("a session packed as version {} (this runner takes up to {})", pkg.version, super::moving::VERSION));
+            return Err(Refused::NotTaken(format!("a session packed as version {} (this runner takes up to {})", pkg.version, super::moving::VERSION)));
         }
-        let kind = Kind::get(&pkg.spec.kind).ok_or_else(|| format!("this runner doesn't know {}", pkg.spec.kind))?;
-        if !kind.available() {
-            return Err(format!("{} is not installed on this machine", kind.name));
+        let kind = Kind::get(&pkg.spec.kind).ok_or_else(|| Refused::NotTaken(format!("this runner doesn't know {}", pkg.spec.kind)))?;
+        // Its harness: the program the session names (a local hand-over keeps its own), else its
+        // kind's.
+        if !pkg.spec.program.as_deref().map_or_else(|| kind.available(), |p| crate::os::which(p).is_some()) {
+            return Err(Refused::NotTaken(format!("{} is not installed on this machine", kind.name)));
         }
+        // A copy of it from before this hand-over (left behind here).
         if self.get(&pkg.id).is_some() {
-            return Err("that session runs here already".into());
+            return Err(Refused::NotTaken(RUNS_HERE.into()));
         }
         let mut pkg = pkg;
         let mut cwd = session::resolve_cwd(pkg.spec.cwd.as_deref());
@@ -346,7 +805,7 @@ impl Host {
             cwd = session::resolve_cwd(None);
             pkg.spec.cwd = Some(cwd.clone());
         }
-        let items = super::moving::install(&pkg, &cwd)?;
+        let items = super::moving::install(&pkg, &cwd).map_err(Refused::NotTaken)?;
         // What its harness keeps for it in its home (its memories, tasks, plans, checkpoints), said
         // with the move.
         let said = super::moving::install_home(&pkg, &cwd, note.is_none());
@@ -357,21 +816,59 @@ impl Host {
         if let Some(g) = pkg.git.take() {
             let dir = self.files_dir.join(&pkg.id);
             let kept = super::moving::MovedGit { from: pkg.from.clone(), state: g, ignored: pkg.ignored.take(), worktree: pkg.worktree.take() };
-            std::fs::create_dir_all(&dir).and_then(|()| super::moving::keep_private(&super::moving::moved_git(&dir), &serde_json::to_vec(&kept).unwrap_or_default())).map_err(|e| format!("keeping its repository's state: {e}"))?;
+            std::fs::create_dir_all(&dir).and_then(|()| super::moving::keep_private(&super::moving::moved_git(&dir), &serde_json::to_vec(&kept).unwrap_or_default())).map_err(|e| Refused::NotTaken(format!("keeping its repository's state: {e}")))?;
         }
+        let id = pkg.id.clone();
         let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced, local: pkg.handover };
-        self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None).map(|_| ()).map_err(|e| format!("{e:#}"))
+        // Taken over, written so before anything of it runs here: no other process of the machine
+        // takes this try over, and the one that handed it over doesn't go on with it.
+        taken(&id)?;
+        self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None, kept_pairs(pkg.inbox, pkg.inbox_digests), false).map_err(|e| Refused::NotTaken(format!("{e:#}")))?;
+        // Its record written as it arrives, with the ids it brought until they're taken in: a
+        // restart a moment later still has them (CP-T3.2).
+        self.save_now();
+        // Kept past its end here, and past this runner process (blue/green), so this hand-over
+        // sent again is answered as taken.
+        let noted = match (locked, &self.handovers) {
+            (Some(locked), _) => locked.note(&id, epoch, self.clock.unix_ms()),
+            (None, Some(h)) => h.note(&id, epoch, self.clock.unix_ms()),
+            (None, None) => Ok(()),
+        };
+        if let Err(e) = noted {
+            tracing::warn!(target: "kiln.sends", event = "adopt_unnoted", session = %id, error = %e, "a hand-over taken over couldn't be written down: this process still knows it, and writes it with the next; restarted first, it wouldn't know it (sent again after the session left, it would be taken over again)");
+        }
+        Ok(())
+    }
+
+    /// Session `id` was taken over here at `epoch` or later: it runs here so, or this machine's
+    /// note of the hand-overs it took says it was (whatever became of it since). The note
+    /// unreadable now, that can't be said.
+    fn taken_before(&self, id: &str, epoch: u64) -> Result<bool, Refused> {
+        if self.get(id).is_some_and(|s| s.epoch() >= epoch) {
+            return Ok(true);
+        }
+        let Some(h) = &self.handovers else { return Ok(false) };
+        match h.taken(id) {
+            Ok(at) => Ok(at.is_some_and(|at| at >= epoch)),
+            Err(e) => Err(Refused::Unsure(format!("whether it was taken over here before can't be read now: {e}"))),
+        }
     }
 
     /// Let go of a session that went on on another machine: it is no longer this machine's, and it
-    /// isn't closed (its viewers follow it there).
+    /// isn't closed (its viewers follow it there). Its inbox here takes nothing more for it.
     pub fn release(&self, id: &str) {
-        if self.sessions.lock().remove(id).is_some() {
+        let gone = self.sessions.lock().remove(id);
+        self.end_lane(id, Lane::Fence { epoch: gone.as_ref().map_or(0, |s| s.epoch()), handover: false });
+        if gone.is_some() {
             self.mark_dirty();
         }
     }
 
-    fn open_seeded(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>, handed: Option<Box<session::Handed>>) -> anyhow::Result<Arc<Session>> {
+    /// `brought`: the ids of the messages it had where it was before (its inbox's newest, from a
+    /// move or blue/green), taken by its inbox here; a seed brings more (its queue and its
+    /// timeline's messages). `back`: this host takes it back at the epoch it left at (blue/green
+    /// that never happened), lifting its inbox's fence.
+    fn open_seeded(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>, handed: Option<Box<session::Handed>>, brought: Vec<(String, String)>, back: bool) -> anyhow::Result<Arc<Session>> {
         if Kind::get(&spec.kind).is_none() {
             anyhow::bail!("unknown harness {:?}", spec.kind);
         }
@@ -402,6 +899,9 @@ impl Host {
         let me = self.me.clone();
         let me2 = self.me.clone();
         let me3 = self.me.clone();
+        let me4 = self.me.clone();
+        let me5 = self.me.clone();
+        let me6 = self.me.clone();
         let files = session::Files {
             dir: self.files_dir.join(&id),
             take: Arc::new(move |f: &str| me.upgrade().and_then(|h| h.take_file(f))),
@@ -418,23 +918,234 @@ impl Host {
                     h.release(id);
                 }
             }),
+            carried: Arc::new(move |id: String| {
+                let h = me4.upgrade();
+                Box::pin(async move {
+                    match h {
+                        Some(h) => h.carried(&id).await.map_err(|e| e.to_string()),
+                        None => Ok(Vec::new()),
+                    }
+                })
+            }),
+            fence: Arc::new(move |id: String, on: bool| {
+                let h = me5.upgrade();
+                Box::pin(async move {
+                    match h {
+                        Some(h) => h.moving_fence(&id, on).await.map_err(|e| e.to_string()),
+                        None => Ok(()),
+                    }
+                })
+            }),
+            settle: Arc::new(move |attempt: String, id: String, take_back: bool| {
+                let h = me6.upgrade();
+                Box::pin(async move {
+                    match h {
+                        Some(h) => crate::rt::blocking(move || h.settle(&attempt, &id, take_back)).await.map_err(|e| format!("{e:#}")).and_then(|r| r),
+                        None => Ok(None),
+                    }
+                })
+            }),
         };
+        // What its timeline and queue show first, what its inbox took last (in its own order, the
+        // newest last): past its inbox's bound, the newest are the ones its inbox here keeps.
+        let brought = match &seed {
+            Some(sd) => {
+                let mut all = brought_ids(sd);
+                all.extend(brought);
+                all
+            }
+            None => brought,
+        };
+        // Whatever is sent to it waits until it's in and its lane is open, its first word there.
+        let mut lanes = self.lanes.lock();
+        // Started meanwhile (by another call, its lock first): that one.
+        if let Some(s) = self.sessions.lock().get(&id) {
+            return Ok(Arc::clone(s));
+        }
         let s = match handed {
             Some(h) => session::start_handed(id.clone(), spec, self.sink.clone(), on_change, files, h)?,
             None => session::start_seeded(id.clone(), spec, self.sink.clone(), on_change, files, seed)?,
         };
-        self.sessions.lock().insert(id, Arc::clone(&s));
+        let epoch = s.epoch();
+        // The ids it brought wait in its inbox until they're taken in (its lane's first word): its
+        // record keeps them meanwhile, from the first time it's written, so a restart before then
+        // brings them again.
+        if let Some(inbox) = &self.inbox {
+            inbox.bring(&id, &brought);
+        }
+        self.sessions.lock().insert(id.clone(), Arc::clone(&s));
+        self.open_lane(&mut lanes, &id, epoch, back);
+        drop(lanes);
         self.mark_dirty();
         self.watch();
         Ok(s)
     }
 
+    /// Hands `c` to session `id`; see [`Host::command_at`].
     pub fn command(&self, id: &str, c: Command) -> bool {
-        self.get(id).is_some_and(|s| s.command(c))
+        self.command_at(id, c, None)
+    }
+
+    /// Hands `c` to session `id`, sent for its `epoch` when the sender says so (the server, from what
+    /// it last heard of the session): after whatever it was told before, in order. A message goes
+    /// through its inbox first, and what became of it is said back ([`Update::Inbox`]). False when
+    /// there's no session `id` here, or its lane holds its most (a message is answered `Full`).
+    pub fn command_at(&self, id: &str, c: Command, epoch: Option<u64>) -> bool {
+        let Some(lane) = self.lanes.lock().get(id).map(|(lane, _)| lane.clone()) else { return false };
+        match lane.try_send(Lane::Cmd { c: Box::new(c), epoch }) {
+            Ok(()) => true,
+            Err(async_channel::TrySendError::Full(Lane::Cmd { c, .. })) => {
+                if let Some((message, _)) = message_of(&c) {
+                    let said = Said { message, answer: Err(inbox::Refusal::Full { session: id.to_owned(), limit: LANE }) };
+                    let (sink, id) = (self.sink.clone(), id.to_owned());
+                    crate::rt::spawn(async move {
+                        let _ = sink.send((id, Update::Inbox { said: Box::new(said) })).await;
+                    });
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Opens session `id`'s lane (with `lanes` held), its first word that the session is here at
+    /// `epoch` (`back`: taken back). It goes once its last lane is done.
+    fn open_lane(&self, lanes: &mut HashMap<String, (async_channel::Sender<Lane>, async_channel::Receiver<()>)>, id: &str, epoch: u64, back: bool) {
+        let (tx, rx) = async_channel::bounded(LANE);
+        let _ = tx.try_send(Lane::Open { epoch, back });
+        // Dropped as the lane ends: what waits on it goes on.
+        let (done, ended) = async_channel::bounded::<()>(1);
+        lanes.insert(id.to_owned(), (tx, ended.clone()));
+        let before = self.ending.lock().remove(id);
+        let (me, id) = (self.me.clone(), id.to_owned());
+        crate::rt::spawn(async move {
+            if let Some(before) = before {
+                let _ = before.recv().await;
+            }
+            while let Ok(item) = rx.recv().await {
+                let Some(h) = me.upgrade() else { return };
+                h.step(&id, item).await;
+            }
+            drop(done);
+            if let Some(h) = me.upgrade() {
+                let mut ending = h.ending.lock();
+                if ending.get(&id).is_some_and(|e| e.same_channel(&ended)) {
+                    ending.remove(&id);
+                }
+            }
+        });
+    }
+
+    /// Session `id`'s lane ends with `last` (its inbox fenced, or forgotten), once what's ahead of
+    /// it is done.
+    fn end_lane(&self, id: &str, last: Lane) {
+        let Some((lane, ended)) = self.lanes.lock().remove(id) else { return };
+        self.ending.lock().insert(id.to_owned(), ended);
+        crate::rt::spawn(async move {
+            let _ = lane.send(last).await;
+        });
+    }
+
+    /// Once everything session `id`'s lane holds now is done (a message its inbox took and its
+    /// session then refused is taken back by then).
+    async fn settled(&self, id: &str) {
+        let Some(lane) = self.lanes.lock().get(id).map(|(lane, _)| lane.clone()) else { return };
+        let (tx, rx) = futures::channel::oneshot::channel();
+        if lane.send(Lane::Mark(tx)).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    /// Session `id`'s inbox fenced as it moves to another machine, before its conversation goes
+    /// (`on`), or the fence lifted: its move failed, and it goes on here.
+    pub async fn moving_fence(&self, id: &str, on: bool) -> Result<(), inbox::Refusal> {
+        let (Some(inbox), Some(s)) = (&self.inbox, self.get(id)) else { return Ok(()) };
+        let epoch = s.epoch();
+        if on { inbox.fence(id, epoch).await } else { inbox.take_back(id, epoch).await.map(|_| ()) }
+    }
+
+    /// The ids of the messages session `id` took that go with it when it moves: its inbox's newest,
+    /// once what its lane holds is done (a message its inbox took and its session then refused, as
+    /// it moves, is taken back by then). None without an inbox. Refused when they can't be read, or
+    /// while its lane isn't done within [`SETTLE_WAIT`]: an id read then may be one its inbox takes
+    /// back after, which would go without its message, and a retry of that message would be taken
+    /// where it went as a repeat and never delivered (the hand-over review's point 2).
+    pub async fn carried(&self, id: &str) -> Result<Vec<(String, String)>, inbox::Refusal> {
+        let Some(inbox) = &self.inbox else { return Ok(Vec::new()) };
+        if crate::rt::timeout(SETTLE_WAIT, self.settled(id)).await.is_err() {
+            tracing::warn!(target: "kiln.sends", event = "settle_timed_out", session = %id, "a moving session's lane didn't settle in time: it doesn't go, so no id goes without its message");
+            return Err(inbox::Refusal::Unavailable { session: id.to_owned(), why: "a message it was being sent is still being taken".to_owned() });
+        }
+        carry(inbox, id).await
+    }
+
+    /// One thing down session `id`'s lane.
+    async fn step(&self, id: &str, item: Lane) {
+        match item {
+            Lane::Cmd { c, epoch } => self.take(id, *c, epoch).await,
+            Lane::Mark(done) => {
+                let _ = done.send(());
+            }
+            Lane::Open { epoch, back } => {
+                if let Some(inbox) = &self.inbox {
+                    arrive(inbox, id, epoch, &[], back, self.clock.unix_ms()).await;
+                    // What it brought may have taken it past its bound.
+                    let _ = inbox.tidy(id).await;
+                }
+            }
+            // Only for a session not here (again) by now.
+            Lane::Fence { epoch, handover } => {
+                if let Some(inbox) = &self.inbox
+                    && self.get(id).is_none()
+                {
+                    if let Err(e) = inbox.fence_for(id, epoch, handover).await {
+                        tracing::warn!(target: "kiln.sends", event = "inbox_fence_failed", session = %id, error = %e, "a session's inbox couldn't be fenced after it went on elsewhere");
+                    }
+                    // What it brought and hadn't taken in went with it.
+                    inbox.let_go(id);
+                }
+            }
+            Lane::Forget => {
+                if let Some(inbox) = &self.inbox
+                    && self.get(id).is_none()
+                    && let Err(e) = inbox.forget(id).await
+                {
+                    tracing::warn!(target: "kiln.sends", event = "inbox_forget_failed", session = %id, error = %e, "an ended session's inbox couldn't be let go of");
+                }
+            }
+        }
+    }
+
+    /// Command `c` for session `id`, in its turn: a message through its inbox, and on to the
+    /// session if it's new there; anything else straight on.
+    async fn take(&self, id: &str, c: Command, epoch: Option<u64>) {
+        let s = self.get(id);
+        // Held (a new build not promoted yet): a message is refused before anything takes it.
+        if self.is_held()
+            && let Some(s) = &s
+            && let Some((message, _)) = message_of(&c)
+        {
+            self.say(id, Said { message, answer: Err(inbox::Refusal::Moved { session: id.to_owned(), epoch: s.epoch() }) }).await;
+            return;
+        }
+        let at = self.clock.unix_ms();
+        if let Some(said) = take_message(self.inbox.as_deref(), id, s.as_deref(), c, epoch, at).await {
+            self.say(id, said).await;
+            // Its answer gone: an inbox past its bound lets its oldest ids go now, off the answer's way.
+            if let Some(inbox) = &self.inbox {
+                let _ = inbox.tidy(id).await;
+            }
+        }
+    }
+
+    /// Tells whoever sent a message to session `id` what became of it.
+    async fn say(&self, id: &str, said: Said) {
+        let _ = self.sink.send((id.to_owned(), Update::Inbox { said: Box::new(said) })).await;
     }
 
     pub fn close(&self, id: &str) -> bool {
         let s = self.sessions.lock().remove(id);
+        self.end_lane(id, Lane::Forget);
         let found = s.is_some();
         if let Some(s) = s {
             s.close();
@@ -518,7 +1229,15 @@ impl Host {
     /// longer this runner's.
     pub async fn move_out(&self) -> Vec<(Saved, Option<Box<session::Handed>>)> {
         let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+        // They take no messages as they're handed over: sent again, those go where they went.
+        for s in &sessions {
+            s.stop_taking();
+        }
         let handed = futures::future::join_all(sessions.iter().map(|s| async move { (Arc::clone(s), crate::rt::timeout(Duration::from_secs(15), s.hand_over()).await.ok().flatten()) })).await;
+        // What their lanes hold is done first, all at once and for a while at most.
+        if crate::rt::timeout(SETTLE_WAIT, futures::future::join_all(sessions.iter().map(|s| self.settled(&s.id)))).await.is_err() {
+            tracing::warn!(target: "kiln.sends", event = "settle_timed_out", "the sessions' lanes didn't settle in time as they were handed over: the ids their inboxes took go as they stand");
+        }
         let mut out = Vec::new();
         for (s, h) in handed {
             if h.is_none()
@@ -528,8 +1247,33 @@ impl Host {
                 #[cfg(unix)]
                 let _ = crate::os::try_reap(pid);
             }
-            let rec = record(&s);
+            let mut rec = record(&s);
+            // What its inbox took goes with it (its newest ids), and this one takes nothing more for
+            // it. Its harness is handed over already, so it goes either way: its inbox unreadable
+            // (tried a few times), it takes the ids it holds itself, said.
+            if let Some(inbox) = &self.inbox {
+                let mut kept = Err(inbox::Refusal::Unavailable { session: s.id.clone(), why: "not read yet".into() });
+                for wait in [0u64, 50, 250] {
+                    crate::rt::sleep(Duration::from_millis(wait)).await;
+                    kept = carry(inbox, &s.id).await;
+                    if kept.is_ok() {
+                        break;
+                    }
+                }
+                let kept = kept.unwrap_or_else(|_| {
+                    tracing::warn!(target: "kiln.sends", event = "carry_own_ids", session = %s.id, "a session handed to the next runner process goes with the ids it holds itself (its queue, its timeline, those it brought and hasn't taken in): its inbox couldn't be read");
+                    // Those it brought last: it took nothing since (it refuses messages until
+                    // they're in), so they're its newest.
+                    let mut ids = own_ids(&s);
+                    ids.extend(inbox.waiting(&s.id));
+                    ids
+                });
+                (rec.inbox, rec.inbox_digests) = split_kept(kept);
+            }
             self.sessions.lock().remove(&s.id);
+            // A handover's fence: started again with its session (the handover never finished),
+            // this runner goes on with it.
+            self.end_lane(&s.id, Lane::Fence { epoch: s.epoch(), handover: true });
             out.push((rec, h));
         }
         self.mark_dirty();
@@ -543,7 +1287,7 @@ impl Host {
         match handed {
             Some(h) => {
                 let (harness, ran) = (rec.harness.clone(), rec.ran.clone());
-                let session = self.open_seeded(Some(rec.id), rec.spec, None, Some(h))?;
+                let session = self.open_seeded(Some(rec.id), rec.spec, None, Some(h), kept_pairs(rec.inbox, rec.inbox_digests), true)?;
                 // What its harness runs stays under it; the watch finds the rest again.
                 *session.ran.lock() = (harness, ran);
                 Ok(())
@@ -556,7 +1300,7 @@ impl Host {
                 let found = super::survivors::scan(&[(rec.id.clone(), None)]);
                 let apart = found.get(&rec.id).map(|f| f.apart.clone()).unwrap_or_default();
                 let now_s = u64::try_from(self.clock.unix_s()).unwrap_or(0);
-                self.open_record(rec, None, apart, now_s).map(|_| ())
+                self.open_record(rec, None, apart, now_s, true).map(|_| ())
             }
         }
     }
@@ -565,6 +1309,15 @@ impl Host {
     /// them, their processes included.
     pub fn take_back(&self) {
         self.sessions.lock().clear();
+        // Their lanes end as what they hold is done, and each session's next lane waits for its
+        // last: what it was sent before goes first.
+        let lanes: Vec<(String, (async_channel::Sender<Lane>, async_channel::Receiver<()>))> = self.lanes.lock().drain().collect();
+        {
+            let mut ending = self.ending.lock();
+            for (id, (_, ended)) in lanes {
+                ending.insert(id, ended);
+            }
+        }
         self.restore();
     }
 
@@ -621,7 +1374,8 @@ impl Host {
             let id = s.id.clone();
             if let Some(h) = handed.remove(&id) {
                 let pid = h.process.pid;
-                match self.open_seeded(Some(s.id.clone()), s.spec.clone(), None, Some(h)) {
+                // With the ids it brought and hasn't taken in, which its record keeps (CP-T3.2).
+                match self.open_seeded(Some(s.id.clone()), s.spec.clone(), None, Some(h), kept_pairs(s.inbox.clone(), s.inbox_digests.clone()), false) {
                     Ok(session) => {
                         // What its harness runs stays under it; the watch finds the rest again.
                         *session.ran.lock() = (s.harness.clone(), s.ran.clone());
@@ -637,7 +1391,7 @@ impl Host {
             let from_store = seed.is_some();
             let cut = s.cut;
             let apart = found.get(&id).map(|f| f.apart.clone()).unwrap_or_default();
-            match self.open_record(s, seed, apart, now_s) {
+            match self.open_record(s, seed, apart, now_s, false) {
                 Ok(left) => tracing::info!(session = %id, from_store, cut, left_running = left, "agent session continued after a restart"),
                 Err(e) => tracing::warn!(session = %id, error = %format!("{e:#}"), "could not continue an agent session"),
             }
@@ -652,8 +1406,9 @@ impl Host {
     /// its was cut short, that turn picked up first.
     /// `apart`: what it started that still runs on its own, found by its mark (`survivors::scan`).
     /// What it started that still runs (that, and what its record says) is taken back over as
-    /// left running. How many such were found.
-    fn open_record(&self, s: Saved, seed: Option<session::Seed>, apart: Vec<super::survivors::Ran>, now_s: u64) -> anyhow::Result<usize> {
+    /// left running. How many such were found. `back`: this host takes it back (blue/green that
+    /// never happened).
+    fn open_record(&self, s: Saved, seed: Option<session::Seed>, apart: Vec<super::survivors::Ran>, now_s: u64, back: bool) -> anyhow::Result<usize> {
         let cut = s.cut;
         // What it started that still runs, taken back over (its stopped harness not among it).
         let mut alive = apart;
@@ -666,7 +1421,7 @@ impl Host {
             alive.retain(|r| r.pid != h.pid);
         }
         let trees = super::survivors::trees(&alive);
-        let session = self.open_seeded(Some(s.id), s.spec, seed, None)?;
+        let session = self.open_seeded(Some(s.id), s.spec, seed, None, kept_pairs(s.inbox, s.inbox_digests), back)?;
         let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume || s.move_on_limit;
         if !trees.is_empty() {
             session.ran.lock().1.clone_from(&alive);
@@ -809,10 +1564,24 @@ impl Host {
         });
     }
 
+    /// `s`'s record ([`record`]), with the ids it brought that its inbox hasn't taken in yet
+    /// ([`Inbox::waiting`]): a restart before they're in brings them again, so a message it took
+    /// where it was, sent again here, is still its repeat.
+    fn recorded(&self, s: &Session) -> Saved {
+        let mut rec = record(s);
+        if let Some(inbox) = &self.inbox {
+            let waiting = inbox.waiting(&s.id);
+            if !waiting.is_empty() {
+                (rec.inbox, rec.inbox_digests) = split_kept(waiting);
+            }
+        }
+        rec
+    }
+
     fn save_now(&self) {
         let Some(file) = &self.file else { return };
         let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
-        let saved: Vec<Saved> = sessions.iter().map(|s| record(s)).collect();
+        let saved: Vec<Saved> = sessions.iter().map(|s| self.recorded(s)).collect();
         let Ok(json) = serde_json::to_vec_pretty(&saved) else { return };
         let tmp = file.with_extension("tmp");
         let wrote = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| crate::util::write_secret(&tmp, &json, 0o600)).and_then(|()| std::fs::rename(&tmp, file));
@@ -825,6 +1594,181 @@ impl Host {
         }
         self.changed.notify(usize::MAX);
     }
+}
+
+/// The records a host's sessions' inboxes keep, in its folder `dir`: none when `KILN_INBOX` is off,
+/// or they can't be opened (said, and messages then go on unchecked).
+fn open_records(dir: &std::path::Path) -> Option<Arc<dyn kiln_seams::Records>> {
+    if std::env::var("KILN_INBOX").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")) {
+        tracing::info!(target: "kiln.sends", event = "inbox_off", "sessions' inboxes are off (KILN_INBOX): messages aren't checked for repeats");
+        return None;
+    }
+    let path = dir.join(crate::records::FILE);
+    match crate::records::open(&path) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!(target: "kiln.sends", event = "inbox_unavailable", file = %path.display(), error = %format!("{e:#}"), "sessions' inboxes couldn't open their records: messages aren't checked for repeats");
+            None
+        }
+    }
+}
+
+/// A message's id and digest ([`inbox::digest`]): what a session's inbox takes once. None for a
+/// command that isn't a message, or a message without an id.
+/// A session as the lane hands it what it's sent: `Session` here, a stand-in in the sends
+/// simulation, which runs this code (`inbox::sim`).
+pub(crate) trait Taker {
+    /// It's on its way elsewhere: it takes no messages.
+    fn is_moving(&self) -> bool;
+    /// The epoch it's at.
+    fn epoch(&self) -> u64;
+    /// Hands `c` to it: false when it can't take it (it's on its way elsewhere, or it ended).
+    fn hand(&self, c: Command) -> bool;
+}
+
+impl Taker for Session {
+    fn is_moving(&self) -> bool {
+        Session::is_moving(self)
+    }
+
+    fn epoch(&self) -> u64 {
+        Session::epoch(self)
+    }
+
+    fn hand(&self, c: Command) -> bool {
+        self.command(c)
+    }
+}
+
+/// Command `c` for session `id` (held here as `s`; none: it isn't), in its turn down its lane, sent
+/// for `epoch` when the sender says, at `at`: a message through its `inbox` (none: unchecked), and
+/// on to the session if it's new there; anything else straight on. What to tell the message's
+/// sender (none for a command that isn't a message).
+pub(crate) async fn take_message<T: Taker + ?Sized>(inbox: Option<&Inbox>, id: &str, s: Option<&T>, c: Command, epoch: Option<u64>, at: i64) -> Option<Said> {
+    let message = message_of(&c);
+    let Some(s) = s else {
+        return message.map(|(message, _)| Said { message, answer: Err(inbox::Refusal::NoSession { session: id.to_owned() }) });
+    };
+    let Some((message, digest)) = message else {
+        s.hand(c);
+        return None;
+    };
+    // On its way elsewhere: refused before its inbox takes it, so what goes with it stays as it
+    // was when it began to move.
+    if s.is_moving() {
+        return Some(Said { message, answer: Err(gone(s, id)) });
+    }
+    let answer = match inbox {
+        Some(inbox) => {
+            let took = std::time::Instant::now();
+            let mut answer = inbox.accept(id, &message, &digest, epoch, at).await;
+            // Its inbox isn't at the epoch it's at (opening it failed): behind it, or fenced at one
+            // it has left (it came back here higher). Opened now, and the message taken again.
+            let lagging = match &answer {
+                Err(inbox::Refusal::Behind { here, .. }) => *here < s.epoch(),
+                Err(inbox::Refusal::Moved { epoch: at, .. }) => *at < s.epoch(),
+                _ => false,
+            };
+            if lagging {
+                match inbox.open(id, s.epoch()).await {
+                    Ok(_) => answer = inbox.accept(id, &message, &digest, epoch, at).await,
+                    Err(e) => tracing::warn!(target: "kiln.sends", event = "inbox_open_failed", session = %id, error = %e, "a session's inbox couldn't be opened: its messages are refused until it can"),
+                }
+            }
+            crate::metrics::sends().take_seconds.observe(took.elapsed().as_secs_f64());
+            if let Ok(a) = &answer
+                && !a.repeat
+                && !s.hand(c)
+            {
+                // It couldn't take it after all: it's on its way elsewhere, or it ended. Taken
+                // back, so it's taken where it goes when it's sent again.
+                if let Err(e) = inbox.unaccept(id, &message).await {
+                    tracing::warn!(target: "kiln.sends", event = "unaccept_failed", session = %id, %message, error = %e, "a message a session couldn't take stays taken: its repeat would be answered, not delivered");
+                }
+                answer = Err(gone(s, id));
+            }
+            answer
+        }
+        // No inbox: on as it comes, unchecked (place 0).
+        None if s.hand(c) => Ok(Answer { session: id.to_owned(), message: message.clone(), epoch: s.epoch(), at, seq: 0, repeat: false }),
+        None => Err(gone(s, id)),
+    };
+    Some(Said { message, answer })
+}
+
+/// Session `id` is here at `epoch` (`back`: taken back by this host at the epoch it left at), with
+/// the ids of the messages it `brought`: its inbox opened (or taken back), and those taken as its own.
+pub(crate) async fn arrive(inbox: &Inbox, id: &str, epoch: u64, brought: &[(String, String)], back: bool, at: i64) {
+    if let Err(e) = inbox.arrive(id, epoch, brought, back, at).await {
+        tracing::warn!(target: "kiln.sends", event = "inbox_open_failed", session = %id, error = %e, "a session's inbox couldn't take in what it brought, or be opened: its messages are refused until it can");
+    }
+}
+
+/// The ids of the messages session `id` took that go with it when it leaves, each with its digest:
+/// its inbox's newest ([`inbox::KEEP`]), the oldest of them first. Refused when they can't be read:
+/// a session doesn't leave without them (CP-T3.2), or a message sent again where it went would be
+/// taken there as new.
+pub(crate) async fn carry(inbox: &Inbox, id: &str) -> Result<Vec<(String, String)>, inbox::Refusal> {
+    inbox.carried(id, usize::try_from(inbox::KEEP).unwrap_or(usize::MAX)).await.inspect_err(|e| {
+        tracing::warn!(target: "kiln.sends", event = "carry_failed", session = %id, error = %e, "a leaving session's inbox couldn't be read: it doesn't leave without the ids it took");
+    })
+}
+
+/// The ids of the messages session `s` holds itself (each without a digest): those in its queue,
+/// and those its timeline shows it was sent. What its inbox handed it: what goes with it when its
+/// inbox can't be read and it must go (handed to this machine's next runner process).
+fn own_ids(s: &Session) -> Vec<(String, String)> {
+    let core = s.core.lock();
+    let mut ids: Vec<String> = core.events().filter_map(|e| match &e.body {
+        Body::User { client_id: Some(c), .. } if !c.is_empty() => Some(c.clone()),
+        _ => None,
+    }).collect();
+    ids.extend(core.state.queue.iter().map(|q| q.id.clone()).filter(|q| !q.is_empty()));
+    ids.into_iter().map(|id| (id, String::new())).collect()
+}
+
+pub(crate) fn message_of(c: &Command) -> Option<(String, String)> {
+    match c {
+        Command::Send { id, text, attachments, .. } if !id.is_empty() => {
+            let names: Vec<&str> = attachments.iter().map(|a| a.name.as_str()).collect();
+            // A message from another agent is its words: kiln's note of who sent it changes as its
+            // sender does, and a retry under its key is the same message.
+            Some((id.clone(), inbox::digest(super::ops::peer_words(text), &names)))
+        }
+        Command::SkillRun { id: Some(id), name, args, .. } if !id.is_empty() => Some((id.clone(), inbox::digest(&format!("/{name} {}", args.as_deref().unwrap_or_default()), &[]))),
+        _ => None,
+    }
+}
+
+/// Why session `s` couldn't take a message its inbox took: it's on its way elsewhere, or ended.
+fn gone<T: Taker + ?Sized>(s: &T, id: &str) -> inbox::Refusal {
+    if s.is_moving() { inbox::Refusal::Moved { session: id.to_owned(), epoch: s.epoch() } } else { inbox::Refusal::NoSession { session: id.to_owned() } }
+}
+
+/// Carried ids with their digests, from the lists a package or a record keeps them in (`ids`, and
+/// `digests` in the same order): one from a runner before digests has none, and each is empty.
+fn kept_pairs(ids: Vec<String>, digests: Vec<String>) -> Vec<(String, String)> {
+    let mut d = digests.into_iter();
+    ids.into_iter().map(|id| (id, d.next().unwrap_or_default())).collect()
+}
+
+/// `kept` (ids with their digests) as the lists a package or a record keeps them in: no digests
+/// when none is known.
+pub(crate) fn split_kept(kept: Vec<(String, String)>) -> (Vec<String>, Vec<String>) {
+    let digests = if kept.iter().all(|(_, d)| d.is_empty()) { Vec::new() } else { kept.iter().map(|(_, d)| d.clone()).collect() };
+    (kept.into_iter().map(|(id, _)| id).collect(), digests)
+}
+
+/// The ids of the messages a session brings from where it was: those in its queue, and those its
+/// timeline shows it was sent (their words as its timeline keeps them may differ from how they
+/// came: no digest).
+fn brought_ids(seed: &session::Seed) -> Vec<(String, String)> {
+    let mut ids: Vec<String> = seed.events.iter().filter_map(|e| match &e.body {
+        Body::User { client_id: Some(c), .. } if !c.is_empty() => Some(c.clone()),
+        _ => None,
+    }).collect();
+    ids.extend(seed.state.queue.iter().map(|q| q.id.clone()).filter(|q| !q.is_empty()));
+    ids.into_iter().map(|id| (id, String::new())).collect()
 }
 
 /// What a session shows as left running, against what runs apart from it now (`apart`, by pid):
@@ -972,6 +1916,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         approvals: Vec::new(),
         queued: 0,
         queue: Vec::new(),
+        said: Vec::new(),
         tasks_running: 0,
         subagents: Vec::new(),
         cost_usd: 0.0,
@@ -1464,6 +2409,335 @@ mod tests {
         })
     }
 
+    /// What a host says of the messages sent its sessions (`Update::Inbox`), the next `n` of them,
+    /// whatever else it says between.
+    async fn answers(rx: &async_channel::Receiver<(String, super::super::core::Update)>, n: usize) -> anyhow::Result<Vec<Said>> {
+        let mut out = Vec::new();
+        let got = crate::rt::timeout(Duration::from_secs(30), async {
+            while out.len() < n {
+                match rx.recv().await {
+                    Ok((_, super::super::core::Update::Inbox { said })) => out.push(*said),
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        })
+        .await;
+        anyhow::ensure!(got.is_ok() && out.len() == n, "{} of {n} answers came: {out:?}", out.len());
+        Ok(out)
+    }
+
+    fn message(id: &str, text: &str) -> Command {
+        Command::Send { id: id.into(), text: text.into(), mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None }
+    }
+
+    /// A host whose sessions' inboxes keep their records in the simulator's.
+    fn with_inbox(tx: Sink) -> Arc<Host> {
+        Host::with_records(tx, None, Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())))
+    }
+
+    /// CP-T3.2: a message sent to a session twice under its id is handed to the session once, and
+    /// both sends are answered: the first taken, the second its repeat, with the first's answer. The
+    /// harness is sent one prompt.
+    #[cfg(unix)]
+    #[test]
+    fn a_message_sent_twice_reaches_its_harness_once_and_both_are_answered() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let heard = dir.path().join("heard.jsonl");
+            let program = dir.path().join("recording-claude");
+            std::fs::write(&program, format!("#!/bin/sh\nexec cat >> '{}'\n", heard.display()))?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+            let (tx, rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("twice".into()), spec)?;
+            let started = crate::rt::timeout(Duration::from_secs(10), async {
+                while s.pid.lock().is_none() || s.core.lock().meta.features.is_empty() {
+                    crate::rt::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(started.is_ok(), "the recording harness never started");
+            assert!(host.command("twice", message("m1", "build it")));
+            assert!(host.command("twice", message("m1", "build it")));
+            let said = answers(&rx, 2).await?;
+            let first = said.first().and_then(|s| s.answer.clone().ok()).ok_or_else(|| anyhow::anyhow!("{said:?}"))?;
+            assert!(!first.repeat && first.seq > 0 && first.at == kiln_seams::clock::SIM_EPOCH_MS, "{first:?}");
+            assert_eq!(said.get(1).map(|s| s.answer.clone()), Some(Ok(Answer { repeat: true, ..first })));
+            let prompts = || -> Vec<String> {
+                std::fs::read_to_string(&heard).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("user")).filter_map(|v| v.get("uuid").and_then(serde_json::Value::as_str).map(str::to_owned)).collect()
+            };
+            let reached = crate::rt::timeout(Duration::from_secs(10), async {
+                while prompts().is_empty() {
+                    crate::rt::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(reached.is_ok(), "no prompt reached the harness");
+            assert_eq!(prompts(), ["m1"]);
+            assert!(s.core.lock().state.queue.is_empty(), "no copy waits behind it");
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2, AC-T3.2.4: a session's host refuses a message sent for an epoch the session has
+    /// left, typed and naming both epochs, and one for an epoch it hasn't reached; one for its
+    /// epoch is taken.
+    #[test]
+    fn a_host_refuses_a_message_for_another_epoch_naming_both() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            host.open(Some("fenced".into()), no_harness(dir.path()))?;
+            // Gone on elsewhere and back twice: epoch 2.
+            let inbox = host.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
+            // (Its lane's first word, the epoch it opened at, goes first: what follows comes after.)
+            assert!(host.command_at("fenced", message("m0", "x"), Some(0)));
+            answers(&rx, 1).await?;
+            inbox.open("fenced", 2).await?;
+            assert!(host.command_at("fenced", message("m1", "hello"), Some(1)));
+            assert!(host.command_at("fenced", message("m1", "hello"), Some(3)));
+            assert!(host.command_at("fenced", message("m1", "hello"), Some(2)));
+            let said: Vec<Result<Answer, inbox::Refusal>> = answers(&rx, 3).await?.into_iter().map(|s| s.answer).collect();
+            assert_eq!(said.first(), Some(&Err(inbox::Refusal::StaleEpoch { session: "fenced".into(), sent: 1, current: 2 })));
+            assert_eq!(said.get(1), Some(&Err(inbox::Refusal::Behind { session: "fenced".into(), here: 2, sent: 3 })));
+            assert!(said.get(2).is_some_and(|a| a.as_ref().is_ok_and(|a| a.epoch == 2 && !a.repeat)), "{said:?}");
+            // A session that isn't here: refused, saying so.
+            assert!(!host.command_at("nowhere", message("m2", "x"), None));
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: what a host's inboxes took is still taken after the host starts again: the same
+    /// message sent after a restart is answered as a repeat, never handed to the session again.
+    #[test]
+    fn what_a_host_took_is_still_taken_after_it_restarts() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let first = {
+                let (tx, rx) = async_channel::unbounded();
+                let host = sim(tx, Some(file.clone()), Limits::default());
+                anyhow::ensure!(host.inbox().is_some(), "a host with a record keeps inboxes beside it");
+                host.open(Some("kept".into()), no_harness(dir.path()))?;
+                host.save_now();
+                assert!(host.command("kept", message("m1", "ship it")));
+                let said = answers(&rx, 1).await?;
+                said.into_iter().next().and_then(|s| s.answer.ok()).ok_or_else(|| anyhow::anyhow!("not taken"))?
+            };
+            let (tx, rx) = async_channel::unbounded();
+            let again = sim(tx, Some(file.clone()), Limits::default());
+            again.restore();
+            assert!(again.command("kept", message("m1", "ship it")));
+            let said = answers(&rx, 1).await?;
+            assert_eq!(said.first().map(|s| s.answer.clone()), Some(Ok(Answer { repeat: true, ..first })));
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: a blue/green handover carries the newest ids its session's inbox took (the likeliest
+    /// to be sent again), however many it keeps: on the new runner process a message taken before
+    /// the handover is a repeat, never a second prompt.
+    #[test]
+    fn a_blue_green_handover_carries_the_newest_ids() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let blue = with_inbox(tx);
+            blue.open(Some("bg".into()), no_harness(dir.path()))?;
+            let inbox = blue.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
+            let d = inbox::digest("x", &[]);
+            let most = inbox::KEEP.saturating_add(10);
+            for n in 0..most {
+                inbox.accept("bg", &format!("m{n}"), &d, None, 1).await?;
+            }
+            let newest = format!("m{}", most.saturating_sub(1));
+            let moved = blue.move_out().await;
+            anyhow::ensure!(moved.len() == 1, "one session handed over");
+            let (tx2, rx2) = async_channel::unbounded();
+            let green = with_inbox(tx2);
+            for (rec, handed) in moved {
+                green.move_in(rec, handed)?;
+            }
+            assert!(green.command("bg", message(&newest, "x")));
+            let said = answers(&rx2, 1).await?;
+            assert!(matches!(said.first().map(|s| &s.answer), Some(Ok(a)) if a.repeat), "{newest}, taken before the handover, was taken again after it: {said:?}");
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: a blue/green handover that's rolled back (the new build never took over, and this
+    /// host takes its sessions back at the epoch they left at) leaves them taking messages again,
+    /// and what they took before still counts.
+    #[test]
+    fn a_rolled_back_handover_takes_messages_again() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, rx) = async_channel::unbounded();
+            let blue = with_inbox(tx);
+            blue.open(Some("rb".into()), no_harness(dir.path()))?;
+            assert!(blue.command("rb", message("m0", "before")));
+            anyhow::ensure!(matches!(answers(&rx, 1).await?.first().map(|s| &s.answer), Some(Ok(_))), "taken before");
+            let moved = blue.move_out().await;
+            anyhow::ensure!(moved.len() == 1, "one session handed over");
+            // Its inbox here fenced, as it is by the time a rollback comes.
+            let inbox = blue.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
+            let mut fenced = false;
+            for _ in 0..500 {
+                if inbox.epoch("rb").await?.is_some_and(|(_, moved)| moved) {
+                    fenced = true;
+                    break;
+                }
+                crate::rt::sleep(Duration::from_millis(10)).await;
+            }
+            anyhow::ensure!(fenced, "the session's old lane never fenced its inbox");
+            for (rec, handed) in moved {
+                blue.move_in(rec, handed)?;
+            }
+            assert!(blue.command("rb", message("m1", "after the rollback")));
+            assert!(blue.command("rb", message("m0", "before")));
+            let said = answers(&rx, 2).await?;
+            assert!(matches!(said.first().map(|s| &s.answer), Some(Ok(a)) if !a.repeat), "a new message after the rollback is taken: {said:?}");
+            assert!(matches!(said.get(1).map(|s| &s.answer), Some(Ok(a)) if a.repeat), "one taken before still counts: {said:?}");
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: a new build that took its sessions over takes no messages till it's promoted (if it
+    /// never is, its sessions go back to the runner it upgrades, which never heard of what this one
+    /// took): each is refused `moved`, its inbox taking nothing; promoted, it takes them.
+    #[test]
+    fn a_new_build_takes_no_messages_till_it_is_promoted() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, rx) = async_channel::unbounded();
+            let green = with_inbox(tx);
+            green.hold(true);
+            green.open(Some("g".into()), no_harness(dir.path()))?;
+            assert!(green.command("g", message("m1", "x")));
+            let said = answers(&rx, 1).await?;
+            assert!(matches!(said.first().map(|s| &s.answer), Some(Err(inbox::Refusal::Moved { .. }))), "{said:?}");
+            assert!(green.carried("g").await.is_ok_and(|v| v.is_empty()), "its inbox took nothing");
+            green.hold(false);
+            assert!(green.command("g", message("m1", "x")));
+            let said = answers(&rx, 1).await?;
+            assert!(matches!(said.first().map(|s| &s.answer), Some(Ok(a)) if !a.repeat), "{said:?}");
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2 (the merge with main's one runner a machine): a session whose hand-over to its
+    /// machine's newer runner process got no word stays fenced, taking no messages (the newer one may
+    /// run it); the server's word coming late, a refusal, it takes messages here again.
+    #[test]
+    fn a_hand_over_s_late_refusal_lets_its_session_take_messages_again() -> anyhow::Result<()> {
+        let _link = super::super::handing::hold_link();
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            host.open(Some("late".into()), no_harness(dir.path()))?;
+            host.moving_fence("late", true).await?;
+            assert!(host.command("late", message("m1", "x")));
+            let said = answers(&rx, 1).await?;
+            assert!(matches!(said.first().map(|s| &s.answer), Some(Err(inbox::Refusal::Moved { .. }))), "fenced: {said:?}");
+            // The server's word, late (no hand-over waits for it now): the newer process refused it.
+            host.handed_over("late", Some("no room".into()), false, true);
+            let mut taken = false;
+            for _ in 0..100 {
+                assert!(host.command("late", message("m1", "x")));
+                let said = answers(&rx, 1).await?;
+                if matches!(said.first().map(|s| &s.answer), Some(Ok(a)) if !a.repeat) {
+                    taken = true;
+                    break;
+                }
+                crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(taken, "it takes messages here again");
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: a session back on a host at a higher epoch, its inbox there still fenced at the one it
+    /// left at (opening it failed as it came back), has it opened as a message comes: it takes the
+    /// message rather than refuse every one.
+    #[test]
+    fn a_session_back_higher_whose_inbox_is_still_fenced_takes_messages() -> anyhow::Result<()> {
+        struct Back(u64, Mutex<Vec<String>>);
+        impl Taker for Back {
+            fn is_moving(&self) -> bool {
+                false
+            }
+            fn epoch(&self) -> u64 {
+                self.0
+            }
+            fn hand(&self, c: Command) -> bool {
+                if let Command::Send { id, .. } = c {
+                    self.1.lock().push(id);
+                }
+                true
+            }
+        }
+        crate::rt::block_on(async move {
+            let inbox = Inbox::new(Arc::new(kiln_seams::records::SimRecords::new()), inbox::Limits::default());
+            inbox.open("s1", 1).await?;
+            inbox.fence("s1", 1).await?;
+            let back = Back(3, Mutex::new(Vec::new()));
+            let said = take_message(Some(&inbox), "s1", Some(&back), message("m1", "x"), Some(3), 1).await;
+            assert!(matches!(said.map(|s| s.answer), Some(Ok(a)) if !a.repeat && a.epoch == 3), "taken at the epoch it's at");
+            assert_eq!(*back.1.lock(), ["m1"]);
+            // A copy left behind at the epoch it left at isn't opened again: it takes nothing.
+            inbox.fence("s1", 3).await?;
+            let left = Back(3, Mutex::new(Vec::new()));
+            let said = take_message(Some(&inbox), "s1", Some(&left), message("m2", "x"), Some(3), 2).await;
+            assert!(matches!(said.map(|s| s.answer), Some(Err(inbox::Refusal::Moved { epoch: 3, .. }))));
+            assert!(left.1.lock().is_empty());
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: handing sessions over ends even when their lanes wait on a sink nobody drains (the
+    /// runner's loop that drains it is the one handing them over): it waits for them a while at most.
+    #[test]
+    fn a_handover_ends_when_its_sessions_lanes_wait_on_a_full_sink() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, rx) = async_channel::bounded(4);
+            let host = Host::with_records(tx, None, Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())));
+            host.open(Some("full".into()), no_harness(dir.path()))?;
+            for n in 0..16 {
+                let _ = host.command("full", message(&format!("m{n}"), "x"));
+            }
+            crate::rt::sleep(Duration::from_secs(1)).await;
+            let out = crate::rt::timeout(Duration::from_secs(45), host.move_out()).await;
+            drop(rx);
+            anyhow::ensure!(out.is_ok_and(|m| m.len() == 1), "the handover hung on a full sink");
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: a session on its way elsewhere refuses a message before its inbox takes it (`moved`),
+    /// so what goes with it is what it took before it began to move, and the message, sent again,
+    /// is taken where it went.
+    #[test]
+    fn a_moving_session_refuses_a_message_before_its_inbox_takes_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let s = host.open(Some("mv".into()), no_harness(dir.path()))?;
+            s.stop_taking();
+            assert!(host.command("mv", message("m1", "now")));
+            let said = answers(&rx, 1).await?;
+            assert!(matches!(said.first().map(|s| &s.answer), Some(Err(inbox::Refusal::Moved { .. }))), "{said:?}");
+            assert!(host.carried("mv").await.is_ok_and(|v| v.is_empty()), "its inbox took nothing");
+            Ok(())
+        })
+    }
+
     /// Ending an agent while its harness runs (and while it's down): the last state it sends
     /// before it closes, what the ended agent shows, has nothing still running.
     #[cfg(unix)]
@@ -1522,5 +2796,444 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    /// CP-T3.2 (the twelfth adversarial check's): while a machine's note of the hand-overs it took
+    /// can't be written, the process that took them keeps its newest [`HANDOVERS_MAX`], as the file
+    /// would, and no more: one more noted, the oldest goes.
+    #[test]
+    fn hand_overs_not_written_down_are_kept_to_the_newest_bound() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Its lock can't be opened: every write fails.
+        std::fs::create_dir_all(dir.path().join("handovers-taken.lock"))?;
+        let h = Handovers::of(dir.path());
+        for n in 0..HANDOVERS_MAX + 10 {
+            anyhow::ensure!(h.note(&format!("s{n}"), 1, i64::try_from(n)?).is_err(), "a write that can't happen didn't fail");
+        }
+        let kept = h.unwritten.lock().len();
+        anyhow::ensure!(kept == HANDOVERS_MAX, "{kept} kept");
+        let newest = format!("s{}", HANDOVERS_MAX + 9);
+        anyhow::ensure!(h.taken("s9")?.is_none() && h.taken("s10")? == Some(1) && h.taken(&newest)? == Some(1), "the oldest 10 went, the newest are kept");
+        Ok(())
+    }
+
+    /// CP-T3.2 (the nineteenth adversarial check's): a try at handing a session over is decided once
+    /// for its machine, by whichever of its processes comes first: two deciding at once (one taking
+    /// it over, the other taking it back) both find the one decision. Its record keeps the newest
+    /// [`HANDOVERS_MAX`]; unreadable, it decides nothing.
+    #[test]
+    fn a_try_at_a_hand_over_is_decided_once_for_its_machine() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().to_path_buf();
+        for round in 0..4 {
+            let attempt = format!("a{round}");
+            let decide = |name: &str, how: Decided| -> anyhow::Result<Decided> {
+                let h = Handovers::of(&state.join("instances").join(name));
+                let locked = h.locked()?;
+                if let Some(was) = locked.decided(&attempt)? {
+                    return Ok(was);
+                }
+                // A moment between looking and deciding, for the other to come.
+                std::thread::sleep(Duration::from_millis(30));
+                locked.decide(&attempt, "s1", how, 2, 1)?;
+                Ok(how)
+            };
+            let (one, two) = std::thread::scope(|sc| {
+                let one = sc.spawn(|| decide("one", Decided::Taken));
+                let two = sc.spawn(|| decide("two", Decided::Refused));
+                (one.join(), two.join())
+            });
+            let (one, two) = (one.map_err(|_| anyhow::anyhow!("a decider panicked"))??, two.map_err(|_| anyhow::anyhow!("a decider panicked"))??);
+            anyhow::ensure!(one == two, "round {round}: decided {one:?} and {two:?}");
+        }
+        let h = Handovers::of(dir.path());
+        h.locked()?.decide("b1", "s3", Decided::Taken, 5, 2)?;
+        let locked = h.locked()?;
+        anyhow::ensure!(locked.taken_above("s3", 4)? && !locked.taken_above("s3", 5)? && !locked.taken_above("s4", 0)?, "taken above an epoch it wasn't");
+        drop(locked);
+        // Full: one more decided, the oldest goes.
+        let full: HashMap<String, Decision> = (0..HANDOVERS_MAX).map(|n| (format!("old{n}"), Decision { session: "s2".into(), taken: false, epoch: 1, at: i64::try_from(n).unwrap_or(0) })).collect();
+        std::fs::write(&h.decided, serde_json::to_vec(&full)?)?;
+        h.locked()?.decide("new", "s2", Decided::Taken, 2, i64::MAX)?;
+        let locked = h.locked()?;
+        anyhow::ensure!(locked.decided("old0")?.is_none() && locked.decided("old1")? == Some(Decided::Refused) && locked.decided("new")? == Some(Decided::Taken), "the oldest didn't go");
+        drop(locked);
+        // Unreadable: nothing decided, and nothing said of it.
+        std::fs::write(&h.decided, b"{")?;
+        anyhow::ensure!(h.locked()?.decided("new").is_err(), "an unreadable record read as decided");
+        Ok(())
+    }
+
+    /// CP-T3.2 (the nineteenth adversarial check's): a word that a hand-over was refused, come with
+    /// nothing waiting for it (late), while the machine's record says a newer process took a try of
+    /// it over: the session lets go here, rather than take messages again.
+    #[cfg(unix)]
+    #[test]
+    fn a_late_refusal_of_a_hand_over_its_machine_took_lets_go() -> anyhow::Result<()> {
+        let _link = super::super::handing::hold_link();
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = Host::with_records(tx, Some(dir.path().join("harness-sessions.json")), Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())));
+            host.open(Some("late".into()), no_harness(dir.path()))?;
+            host.moving_fence("late", true).await?;
+            let epoch = host.get("late").map_or(0, |s| s.epoch());
+            let h = host.handovers.as_ref().ok_or_else(|| anyhow::anyhow!("no record of the machine's hand-overs"))?;
+            h.locked()?.decide("a1", "late", Decided::Taken, epoch + 1, 1)?;
+            host.handed_over("late", Some("no room".into()), false, true);
+            until_it("it let go", 30, || host.get("late").is_none()).await
+        })
+    }
+
+    /// CP-T3.2 (the twentieth adversarial check's): the machine's lock on its hand-overs is taken
+    /// before what a process holds of them, on every path. A note made while a take holds the lock
+    /// waits for it without holding up that take, which reads and notes what the process holds.
+    #[test]
+    fn a_note_waits_for_the_machines_lock_without_holding_up_a_take() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let h = Arc::new(Handovers::of(dir.path()));
+        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        // A take holding the machine's lock reads what this process holds, and notes its own.
+        let take = {
+            let (h, tx) = (Arc::clone(&h), tx.clone());
+            std::thread::spawn(move || {
+                let took = (|| -> std::io::Result<()> {
+                    let locked = h.locked()?;
+                    let _ = held_tx.send(());
+                    std::thread::sleep(Duration::from_millis(300));
+                    let _ = h.taken("s1")?;
+                    locked.note("s2", 3, 2)
+                })();
+                let _ = tx.send(if took.is_ok() { "take" } else { "the take failed" });
+            })
+        };
+        held_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| anyhow::anyhow!("the take never held the lock"))?;
+        // Meanwhile a note made without it in hand.
+        let note = {
+            let h = Arc::clone(&h);
+            std::thread::spawn(move || {
+                let noted = h.note("s1", 2, 1);
+                let _ = tx.send(if noted.is_ok() { "note" } else { "the note failed" });
+            })
+        };
+        let mut done = Vec::new();
+        for _ in 0..2 {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(what) => done.push(what),
+                Err(_) => anyhow::bail!("a deadlock: in 10 s only {done:?} finished"),
+            }
+        }
+        take.join().map_err(|_| anyhow::anyhow!("the take panicked"))?;
+        note.join().map_err(|_| anyhow::anyhow!("the note panicked"))?;
+        done.sort_unstable();
+        anyhow::ensure!(done == ["note", "take"], "{done:?}");
+        anyhow::ensure!(h.taken("s1")? == Some(2) && h.taken("s2")? == Some(3), "both noted");
+        Ok(())
+    }
+
+    /// What a host said of message `id` (`Update::Inbox`), whatever else it says before it.
+    #[cfg(unix)]
+    async fn answer_to(rx: &async_channel::Receiver<(String, super::super::core::Update)>, id: &str) -> anyhow::Result<Said> {
+        let got = crate::rt::timeout(Duration::from_secs(30), async {
+            while let Ok((_, u)) = rx.recv().await {
+                if let super::super::core::Update::Inbox { said } = u
+                    && said.message == id
+                {
+                    return Some(*said);
+                }
+            }
+            None
+        })
+        .await;
+        got.ok().flatten().ok_or_else(|| anyhow::anyhow!("no answer to {id} came"))
+    }
+
+    #[cfg(unix)]
+    async fn until_it(what: &str, secs: u64, holds: impl Fn() -> bool) -> anyhow::Result<()> {
+        let ok = crate::rt::timeout(Duration::from_secs(secs), async {
+            while !holds() {
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        anyhow::ensure!(ok.is_ok(), "{what} didn't come in {secs} s");
+        Ok(())
+    }
+
+    /// CP-T3.2, AC-T3.2.1 (the eighteenth adversarial check's; the merge with main's one runner a
+    /// machine). An older runner process hands a session to its machine's newer one, m2 waiting in
+    /// its queue behind m1's turn: its package goes by way of the server, and the newer process
+    /// takes it over (`Host::adopt`), the queue with it, and runs it. Then the older process hears
+    /// no word of it (`went_away` false: its own link to the server dropped, `handing::link_lost`,
+    /// `NotHanded::Unknown`), or hears a refusal that isn't one (`went_away`: the newer process's
+    /// link dropped after it took the session over, before its word reached the server, and the
+    /// server tells the older one it went away: `crate::handovers::Handovers::lost`). m2 must reach
+    /// one harness. And (`went_away`) m3, taken by the older process then, sent again once the newer
+    /// one is back and holds the session (the older told to let go of it, as `Hub::let_go_of`
+    /// does), must be answered there as its repeat, never taken again. Each case runs alone
+    /// (`handing`'s link is one a process).
+    #[cfg(unix)]
+    fn local_hand_over(mode: u8) -> anyhow::Result<()> {
+        let _link = super::super::handing::hold_link();
+        let went_away = mode == 2;
+        use std::os::unix::fs::PermissionsExt;
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let heard = dir.path().join("heard.jsonl");
+            let fake = dir.path().join("fake-claude.py");
+            std::fs::write(&fake, r##"import json, os, sys, time, uuid
+HEARD = sys.argv[1]
+args = sys.argv[2:]
+def out(o):
+    sys.stdout.write(json.dumps(o) + "\n")
+    sys.stdout.flush()
+if "--version" in args:
+    print("2.1.296 (Claude Code)")
+    sys.exit(0)
+session = str(uuid.uuid4())
+for flag in ("--session-id", "--resume"):
+    if flag in args and args.index(flag) + 1 < len(args):
+        session = args[args.index(flag) + 1]
+turn = 0
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    with open(HEARD, "a") as f:
+        f.write(json.dumps({"pid": os.getpid(), "line": line.strip()}) + "\n")
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    kind = m.get("type")
+    if kind == "control_request":
+        req = m.get("request") or {}
+        resp = {}
+        if req.get("subtype") == "initialize":
+            resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": "2.1.296"}
+        out({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
+    elif kind == "user":
+        turn += 1
+        uid = m.get("uuid")
+        out({"type": "command_lifecycle", "command_uuid": uid, "state": "started", "session_id": session})
+        out({"type": "system", "subtype": "init", "cwd": ".", "session_id": session, "tools": [], "mcp_servers": [], "model": "claude-opus-5-5", "permissionMode": "default", "claude_code_version": "2.1.296"})
+        for n in range(20):
+            out({"type": "assistant", "message": {"id": "msg_%d_%d_%d" % (id(m), turn, n), "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "line %d" % n}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}}, "parent_tool_use_id": None, "session_id": session})
+            time.sleep(0.1)
+        out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+        out({"type": "command_lifecycle", "command_uuid": uid, "state": "completed", "session_id": session})
+"##)?;
+            let program = dir.path().join("claude-stand-in");
+            std::fs::write(&program, format!("#!/bin/sh\nexec python3 '{}' '{}' \"$@\"\n", fake.display(), heard.display()))?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+            // The prompts the stand-in harnesses (both processes') were sent under id `id`.
+            let handed = |id: &str| -> Vec<u64> {
+                std::fs::read_to_string(&heard)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .filter_map(|w| {
+                        let v: serde_json::Value = serde_json::from_str(w.get("line")?.as_str()?).ok()?;
+                        (v.get("type").and_then(serde_json::Value::as_str) == Some("user") && v.get("uuid").and_then(serde_json::Value::as_str) == Some(id)).then(|| w.get("pid").and_then(serde_json::Value::as_u64).unwrap_or(0))
+                    })
+                    .collect()
+            };
+            let prompts = |id: &str| handed(id).len();
+            let (up, pieces) = async_channel::unbounded();
+            super::super::handing::set_held_link(up);
+            let (tx_old, rx_old) = async_channel::unbounded();
+            let (tx_new, rx_new) = async_channel::unbounded();
+            // Modes 3 on (the nineteenth adversarial check's): both keep the machine's record of its
+            // hand-overs, in its state folder, as a runner's processes do: the older one there, the
+            // newer one in a folder of its own under it.
+            let state = dir.path().join("state");
+            let (older, newer) = if mode >= 3 {
+                let own = state.join("instances").join("newer");
+                std::fs::create_dir_all(&own)?;
+                let at = |file: PathBuf, tx| Host::with_records(tx, Some(file), Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())));
+                (at(state.join("harness-sessions.json"), tx_old), at(own.join("harness-sessions.json"), tx_new))
+            } else {
+                (with_inbox(tx_old), with_inbox(tx_new))
+            };
+            let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = older.open(Some("h".into()), spec)?;
+            until_it("the stand-in harness's start", 30, || s.pid.lock().is_some() && !s.core.lock().meta.features.is_empty()).await?;
+            assert!(older.command("h", message("m1", "build it")));
+            until_it("m1's turn", 30, || s.core.lock().state.status == Status::Running).await?;
+            assert!(older.command("h", message("m2", "then test it")));
+            until_it("m2 waiting behind m1's turn", 30, || s.core.lock().state.queue.iter().any(|q| q.id == "m2")).await?;
+            // The server asks the older process to hand it to the newest (`crate::handovers`): it
+            // goes once m1's turn is over.
+            assert!(older.command("h", Command::MoveTo { to: String::new(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true }));
+            // Its package, in pieces, as the server gets them, passed on to the newer process.
+            let mut bytes = Vec::new();
+            let got = crate::rt::timeout(Duration::from_secs(60), async {
+                while let Ok(up) = pieces.recv().await {
+                    if let crate::exec::Up::Convo(crate::proto::AgentMsg::HarnessHandOver { data, done, .. }) = up {
+                        bytes.extend(data);
+                        if done {
+                            return true;
+                        }
+                    }
+                }
+                false
+            })
+            .await;
+            if !matches!(got, Ok(true)) {
+                let core = s.core.lock();
+                let notes: Vec<String> = core.events().map(|e| format!("{}: {}", e.id, format!("{:?}", e.body).chars().take(120).collect::<String>())).collect();
+                let heard_lines = std::fs::read_to_string(&heard).unwrap_or_default();
+                anyhow::bail!("no package came: status {:?}, turn_started {:?}, moving {}, hold {}, queue {:?}, notes {notes:?}, heard {} lines: {}", core.state.status, core.state.turn_started, s.is_moving(), core.hold, core.state.queue.iter().map(|q| q.id.clone()).collect::<Vec<_>>(), heard_lines.lines().count(), heard_lines.lines().map(|l| l.chars().take(160).collect::<String>()).collect::<Vec<_>>().join("\n"));
+            }
+            let pkg: serde_json::Value = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(
+                pkg.pointer("/state/queue/0/id") == Some(&serde_json::json!("m2")) && pkg.get("inbox").is_some_and(|i| i.to_string().contains("m2")),
+                "m2 goes in its queue, its id with its inbox's: {:?} {:?}",
+                pkg.pointer("/state/queue"),
+                pkg.get("inbox")
+            );
+            newer.adopt("an older kiln runner of this machine", &bytes).map_err(anyhow::Error::msg)?;
+            if went_away {
+                // The newer process's link drops before its word that it took it reaches the
+                // server, which tells the older one it went away (`Hub::handovers_lost`).
+                let mut server = crate::handovers::Handovers::default();
+                let _ = server.due("box", 1, vec!["h".into()], std::time::Instant::now());
+                anyhow::ensure!(server.piece("box", "h", 1, Some(2), false) == crate::handovers::Piece::To(2), "its package goes to the newest");
+                server.went_whole("h");
+                let told = server.lost(2);
+                anyhow::ensure!(told.iter().any(|(id, x)| id == "h" && x.from == 1 && x.whole), "the server tells the older process it can't say: {told:?}");
+                older.handed_over("h", Some("this machine's newest runner process went away".into()), true, false);
+            } else if mode == 1 {
+                // The older process's link drops before the server's word comes.
+                super::super::handing::link_lost();
+            } else if mode == 3 {
+                // The machine's record can't be read now (a disk fault): the newer process, sent the
+                // package again, can't say whether it took it over, and the server passes that on as
+                // not known (`Word::from_newest`); the older process, looking, can't read it either.
+                // It waits, fenced, and asks again.
+                let decided = state.join("handovers-decided.json");
+                let kept = std::fs::read(&decided)?;
+                std::fs::write(&decided, b"{")?;
+                let why = match newer.adopt("an older kiln runner of this machine", &bytes) {
+                    Ok(()) => anyhow::bail!("answered as taken with the machine's record unreadable"),
+                    Err(why) => why,
+                };
+                let Command::HandedOver { error, unsure, by_newest, .. } = crate::handovers::Word::from_newest(Some(why.clone())).command() else { anyhow::bail!("not a word on a hand-over") };
+                anyhow::ensure!(unsure && !by_newest, "the newest's {why:?} passed on as more than not known");
+                older.handed_over("h", error, unsure, by_newest);
+                // A while for the older process to go on with it, which it mustn't.
+                crate::rt::sleep(Duration::from_secs(8)).await;
+                std::fs::write(&decided, kept)?;
+                // Readable again: its link drops, it looks, and lets go.
+                super::super::handing::link_lost();
+            } else if mode == 4 {
+                // The session goes on in the newer process (m2 reaches its harness), then ends there
+                // (the person ends it), and the older process's link drops: it looks, finds it taken
+                // over, and lets go.
+                until_it("m2 handed to the newer process's harness", 30, || prompts("m2") >= 1).await?;
+                assert!(newer.close("h"));
+                super::super::handing::link_lost();
+            } else if mode == 5 {
+                // A refusal comes: an earlier try's, late (a hand-over waits for one word across its
+                // tries). The machine's record says this try was taken over: it lets go.
+                older.handed_over("h", Some(format!("{}no room", crate::reach::node::NOT_TAKEN)), false, true);
+            } else {
+                // The control: the server's word comes, the newer process took it.
+                older.handed_over("h", None, false, false);
+            }
+            until_it("m2 handed to a harness", 30, || prompts("m2") >= 1).await?;
+            // A while for a second harness to be handed it too.
+            let _ = crate::rt::timeout(Duration::from_secs(15), async {
+                while prompts("m2") < 2 {
+                    crate::rt::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            let m2 = prompts("m2");
+            let mut m3 = None;
+            if went_away {
+                // m3 comes to the older process, which the server still has holding the session: it
+                // waits, fenced, so m3 is refused there (`moved`) and goes where the session is.
+                assert!(older.command("h", message("m3", "and deploy it")));
+                let there = answer_to(&rx_old, "m3").await?;
+                anyhow::ensure!(matches!(there.answer, Err(inbox::Refusal::Moved { .. })), "the older process, not knowing, takes nothing: {:?}", there.answer);
+                // The newer process is back and says it holds the session: the older lets go.
+                older.handed_over("h", None, false, false);
+                assert!(newer.command("h", message("m3", "and deploy it")));
+                let first = answer_to(&rx_new, "m3").await?;
+                // m3's sender, its answer lost, sends it again.
+                assert!(newer.command("h", message("m3", "and deploy it")));
+                let again = answer_to(&rx_new, "m3").await?;
+                anyhow::ensure!(first.answer.as_ref().is_ok_and(|a| !a.repeat), "taken where the session is: {:?}", first.answer);
+                until_it("m3 handed to the newer process's harness", 30, || prompts("m3") >= 1).await?;
+                let _ = crate::rt::timeout(Duration::from_secs(15), async {
+                    while prompts("m3") < 2 {
+                        crate::rt::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await;
+                m3 = Some((again, prompts("m3")));
+            } else if mode == 1 {
+                // The word comes once the link is back: the newer process took it.
+                older.handed_over("h", None, false, false);
+            }
+            if mode >= 3 {
+                until_it("the older process letting go of it", 60, || older.get("h").is_none()).await?;
+            }
+            let m3_once = m3.as_ref().is_none_or(|(again, n)| again.answer.as_ref().is_ok_and(|a| a.repeat) && *n == 1);
+            anyhow::ensure!(m2 == 1 && m3_once, "m2 reached {m2} harnesses (handed by the processes {:?}; the newer one's harness, as its package says, and the older one's); m3 sent again to the newer process (answer, prompts): {m3:?}", handed("m2"));
+            Ok(())
+        })
+    }
+
+    /// The control: the server's word comes (the newer process took it), and m2 reaches one harness.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_hand_over_answered_hands_its_queue_to_one_harness() -> anyhow::Result<()> {
+        local_hand_over(0)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /// With no word back (its link to the server dropped), the older process waits, fenced, its
+    /// harness down: m2 reaches the newer process's harness alone.
+    fn a_local_hand_over_with_no_word_hands_its_queue_to_one_harness() -> anyhow::Result<()> {
+        local_hand_over(1)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /// The newest went away once its whole package went to it: the server can't say, and the older
+    /// process waits, fenced; m2 reaches one harness, and m3 is taken once, where the session is.
+    fn a_local_hand_over_whose_newest_went_away_after_taking_it_is_one_prompt() -> anyhow::Result<()> {
+        local_hand_over(2)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /// The nineteenth adversarial check's (AC-T3.2.1): the machine's record of its hand-overs can't
+    /// be read now, so the newer process, sent the package again, can't say whether it took it over.
+    /// That isn't a refusal: the older process keeps waiting (it can't read the record either), and
+    /// m2 reaches one harness; readable again, it lets go.
+    fn a_local_hand_over_the_newest_cannot_say_it_took_keeps_waiting() -> anyhow::Result<()> {
+        local_hand_over(3)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /// Taken over, and ended there since: the older process, its link dropped, looks at the machine's
+    /// record and lets go; m2 reaches one harness.
+    fn a_local_hand_over_taken_and_ended_there_is_let_go_of_by_the_older_process() -> anyhow::Result<()> {
+        local_hand_over(4)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /// The nineteenth adversarial check's (AC-T3.2.1): a refusal that's an earlier try's, come late
+    /// while the newer process took this one over, doesn't make the older process go on with it: the
+    /// machine's record says it was taken over, and m2 reaches one harness.
+    fn a_late_refusal_of_a_local_hand_over_taken_over_is_one_prompt() -> anyhow::Result<()> {
+        local_hand_over(5)
     }
 }

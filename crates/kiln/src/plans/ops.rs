@@ -145,7 +145,9 @@ async fn runs_stop(cx: Cx, v: Value) -> Out {
 async fn runs_retry(cx: Cx, v: Value) -> Out {
     let run = run_of(&v)?;
     may_steer_run(&cx, &run).await?;
-    json_of(&super::agents::retry(&cx.hub, &run, step_of(&v)?, &cx.caller.name).await.map_err(fail)?)
+    // The try it replaces (asked again after it was tried again, nothing more starts: CP-T3.2).
+    let seen = v.get("try").and_then(Value::as_i64);
+    json_of(&super::agents::retry(&cx.hub, &run, step_of(&v)?, seen, &cx.caller.name).await.map_err(fail)?)
 }
 
 fn goals_fail(e: crate::goals::Error) -> Fail {
@@ -205,7 +207,7 @@ async fn ready(cx: Cx, v: Value) -> Out {
                 actor: cx.caller.name.clone(),
                 ..super::agents::Config::default()
             };
-            let started = super::agents::start(&cx.hub, &plan, cfg).await.map_err(fail)?;
+            let started = super::agents::start(&cx.hub, &plan, cfg, None).await.map_err(fail)?;
             (crate::goals::Then::Run(started.run.clone()), started.run)
         } else {
             let run = super::note_run(&cx.hub, &plan, &g.agent, "goals", &cx.caller.name).await.map_err(fail)?;
@@ -255,6 +257,12 @@ fn only_of(v: &Value) -> Result<Option<Vec<usize>>, Fail> {
     Ok(Some(n))
 }
 
+/// `v`'s idempotency `key` (CP-T3.2), scoped to whose it is (`harness::ops::key_scope`): asked for
+/// again by the same caller, wherever its agent has moved since, it's the same run.
+fn scoped_key(cx: &Cx, v: &Value) -> Result<Option<String>, crate::ops::Fail> {
+    Ok(crate::harness::ops::key_of(v)?.map(|k| format!("{}\u{0}{k}", crate::harness::ops::key_scope(&cx.caller))))
+}
+
 async fn run(cx: Cx, v: Value) -> Out {
     let id = id_of(&v)?;
     let mode: Mode = v.get("mode").cloned().map(serde_json::from_value).transpose().map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?.unwrap_or_default();
@@ -277,7 +285,8 @@ async fn run(cx: Cx, v: Value) -> Out {
         {
             cfg.place.kind = Some(me.kind);
         }
-        let started = super::agents::start(&cx.hub, &p, cfg).await.map_err(fail)?;
+        let key = scoped_key(&cx, &v)?;
+        let started = super::agents::start(&cx.hub, &p, cfg, key.as_deref()).await.map_err(fail)?;
         cx.hub.store.audit(cx.caller.name.clone(), "plan.run".into(), format!("{id}: one agent per step ({} steps), run {}", started.steps, started.run)).await;
         return json_of(&started);
     }
@@ -298,8 +307,9 @@ async fn run(cx: Cx, v: Value) -> Out {
             None => return Err((StatusCode::BAD_REQUEST, "say where to run it: `session`, or `new` {target, kind, cwd}".into())),
         },
     };
+    let key = scoped_key(&cx, &v)?;
     let pick = super::Pick { only: only_of(&v)?, split: v.get("split").and_then(Value::as_bool).unwrap_or(false) };
-    let ran = super::run(&cx.hub, &id, target, mode, &pick, &crate::harness::ops::starter(&cx)?).await.map_err(fail)?;
+    let ran = super::run(&cx.hub, &id, target, mode, &pick, &crate::harness::ops::starter(&cx)?, key.as_deref()).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "plan.run".into(), format!("{id} on {} ({} messages)", ran.session, ran.sent)).await;
     json_of(&ran)
 }
@@ -397,7 +407,8 @@ pub fn list_ops() -> Vec<Op> {
                         "parallel": {"type": "boolean", "description": "agents: in a plan whose steps don't say what they wait for (`needs`), run them all side by side rather than each once the one before is met. Side by side in one folder, each step's agent keeps to its own files; give steps folders or machines of their own with `steps`."},
                         "max_parallel": {"type": "integer", "minimum": 1, "description": "agents: steps at work at once, at the most (left out: every step that's ready)."},
                         "only": {"type": "array", "items": {"type": "integer", "minimum": 1}, "description": "Only these steps, by their numbers from 1 (left out: every step); each keeps its number. The steps they wait for outside them are taken as done."},
-                        "split": {"type": "boolean", "description": "goals: each step goes on the stack as a goal stack of its own: its acceptance criteria and tests, a goal each, before it."}
+                        "split": {"type": "boolean", "description": "goals: each step goes on the stack as a goal stack of its own: its acceptance criteria and tests, a goal each, before it."},
+                        "key": {"type": "string", "description": "An idempotency key of yours, made once for this run (1 to 256 bytes). Run again with it (its answer lost), it's the same run, in every mode: its messages go once, its steps' agents start once, and it's answered as it was. Without it, each call is another run: pass it whenever you may ask again."}
                     }),
                     &["id"],
                 )
@@ -437,7 +448,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Try a step of a plan run again with a new agent (its agent before, if it still runs, ends), the run going on from there.",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"run": {"type": "string"}, "step": {"type": "integer", "minimum": 1, "description": "The step's number, from 1."}}), &["run", "step"]),
+            input: || schema(json!({"run": {"type": "string"}, "step": {"type": "integer", "minimum": 1, "description": "The step's number, from 1."}, "try": {"type": "integer", "description": "The try it replaces: the step's `tries` as plans_runs_get shows them. Asked again (its answer lost) once the step was tried again, nothing more starts. Without it, each call starts another agent: pass it."}}), &["run", "step"]),
             route: |v| Ok((Method::POST, path(&["api", "plans", "runs", &run_of(v)?, "steps", &step_of(v)?.to_string(), "retry"]))),
             run: |cx, v| Box::pin(runs_retry(cx, v)),
         },

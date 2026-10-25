@@ -20,9 +20,17 @@
 //!   variant index, is `variant`, when given), picked by a seeded draw, as a frame lost below the
 //!   channel would be, counted as `chaos` (docs/wire.md, "Loss below the channel"). A runner's
 //!   or, from `KILN_CHAOS`, a server's.
+//! - `twice=<lane>[/<variant>]:<every>` and `late=<lane>[/<variant>]:<every>`: as `shed`, the
+//!   frames it picks sent twice, or held back and sent after the next frame on their lane (out of
+//!   order), not dropped. Each may be given beside the others, each drawing on its own.
+//! - `seed=<n>`: the frames those faults pick are another seed's, the same each run (a lab run
+//!   again on a seed goes wrong as it did).
 //! - `fanout=<frames>`: the server's: each session's live feed keeps that many frames for its
 //!   viewers (`crate::harness::live`), so one that stops reading falls behind sooner (and is caught
 //!   up in-band).
+//! - `old`: the runner says nothing of what it can do past `Build`'s 32 bits (no `Caps`), as a
+//!   runner from before the channel says nothing (docs/wire.md): the server sends it commands and
+//!   takes its updates as it did such runners'.
 //!
 //! A leg's faults (`oom`, `disk`, `corrupt`) hit its first attempt only, so a retry shows how it
 //! recovers; `drop` and `delay` are the connection's.
@@ -49,8 +57,12 @@ pub struct Chaos {
     pub corrupt: bool,
     pub platform: Option<String>,
     pub rebuild_after: Option<Duration>,
-    pub shed: Option<crate::net::Shed>,
+    /// What goes wrong below the channel: `shed`, `twice`, `late`, in the order given, drawn from
+    /// `seed`.
+    pub faults: Vec<crate::net::Shed>,
+    pub seed: u64,
     pub fanout: Option<usize>,
+    pub old: bool,
 }
 
 /// `300ms`, `2s`, `1m`.
@@ -66,15 +78,15 @@ fn duration(s: &str) -> Option<Duration> {
 }
 
 /// `term/46:7`: one frame in 7 of lane `term` whose first byte is 46; `control:5`: one in 5 of
-/// lane `control`.
-fn shed(v: &str) -> Option<crate::net::Shed> {
+/// lane `control`. Done to as `act` says.
+fn shed(v: &str, act: crate::net::Act) -> Option<crate::net::Shed> {
     let (what, every) = v.split_once(':')?;
     let (lane, variant) = match what.split_once('/') {
         Some((lane, variant)) => (lane, Some(variant.parse().ok()?)),
         None => (what, None),
     };
     let every: u64 = every.parse().ok().filter(|n| *n > 0)?;
-    Some(crate::net::Shed { lane: crate::proto::lane_named(lane)?, variant, every })
+    Some(crate::net::Shed { lane: crate::proto::lane_named(lane)?, variant, every, act })
 }
 
 /// A `--chaos` spec.
@@ -95,9 +107,18 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 c.platform = Some(v.to_owned());
             }
             "rebuild" => c.rebuild_after = Some(d()?),
-            "shed" => c.shed = Some(shed(v).ok_or_else(|| anyhow::anyhow!("chaos `shed` takes <lane>[/<variant>]:<every> (term/46:7), not `{v}`"))?),
+            "shed" | "twice" | "late" => {
+                let act = match k {
+                    "shed" => crate::net::Act::Drop,
+                    "twice" => crate::net::Act::Twice,
+                    _ => crate::net::Act::Late,
+                };
+                c.faults.push(shed(v, act).ok_or_else(|| anyhow::anyhow!("chaos `{k}` takes <lane>[/<variant>]:<every> (term/46:7), not `{v}`"))?);
+            }
             "fanout" => c.fanout = Some(v.parse().ok().filter(|n: &usize| *n > 0).ok_or_else(|| anyhow::anyhow!("chaos `fanout` takes a number of frames, not `{v}`"))?),
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, platform, rebuild, shed or fanout"),
+            "old" => c.old = true,
+            "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, platform, rebuild, shed, twice, late, seed, fanout or old"),
         }
     }
     Ok(c)
@@ -305,11 +326,14 @@ mod tests {
                 corrupt: true,
                 platform: None,
                 rebuild_after: None,
-                shed: None,
-                fanout: None
+                faults: Vec::new(),
+                seed: 0,
+                fanout: None,
+                old: false
             }
         );
         assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
+        assert!(parse("drop=6s,old")?.old);
         assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
         assert_eq!(parse("drop=5s,down=30s")?.down_for, Some(Duration::from_secs(30)));
         assert!(parse("platform=plan9/mips").is_err());
@@ -317,9 +341,16 @@ mod tests {
         assert!(parse("oom=soon").is_err());
         assert_eq!(parse("")?, Chaos::default());
         // Frames lost below the channel: a lane by name or number, of one message variant or all.
-        assert_eq!(parse("shed=term/46:7")?.shed, Some(crate::net::Shed { lane: crate::proto::LANE_TERM, variant: Some(46), every: 7 }));
-        assert_eq!(parse("shed=0:5")?.shed, Some(crate::net::Shed { lane: crate::proto::LANE_CONTROL, variant: None, every: 5 }));
+        use crate::net::{Act, Shed};
+        assert_eq!(parse("shed=term/46:7")?.faults, [Shed { lane: crate::proto::LANE_TERM, variant: Some(46), every: 7, act: Act::Drop }]);
+        assert_eq!(parse("shed=0:5")?.faults, [Shed { lane: crate::proto::LANE_CONTROL, variant: None, every: 5, act: Act::Drop }]);
         assert!(parse("shed=term:0").is_err() && parse("shed=nowhere:3").is_err() && parse("shed=term/x:3").is_err());
+        // Frames sent twice, or late, beside those dropped, each its own.
+        let faults = parse("shed=term/46:7,twice=term/46:5,late=control:9")?.faults;
+        assert_eq!(faults.iter().map(|f| (f.act, f.every)).collect::<Vec<_>>(), [(Act::Drop, 7), (Act::Twice, 5), (Act::Late, 9)]);
+        assert!(parse("twice=term:0").is_err() && parse("late=nowhere:2").is_err());
+        assert_eq!(parse("shed=term:3,seed=42")?.seed, 42);
+        assert!(parse("seed=x").is_err());
         assert_eq!(parse("fanout=32")?.fanout, Some(32));
         assert!(parse("fanout=0").is_err());
         Ok(())

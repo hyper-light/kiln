@@ -1943,7 +1943,7 @@ impl Codex {
     fn show_sent(&mut self, core: &mut Core, m: &QueueItem, d: Delivery) {
         core.state.delivery.insert(m.id.clone(), d);
         let (images, names) = super::model::attachment_summary(&m.attachments);
-        core.note_sent(&m.id);
+        core.note_sent(&m.id, &m.text);
         core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
         core.touch_state();
     }
