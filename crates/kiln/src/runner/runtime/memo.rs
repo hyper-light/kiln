@@ -147,6 +147,8 @@ pub(super) struct Hit {
     replay: Replay,
     memo: Memo,
     source: Value,
+    /// The class it was found in, when through equivalence rather than its own key (W24-R30).
+    class: Option<String>,
 }
 
 /// Renews a lease every quarter of its life while the step runs (W28-R72); dropped, it stops.
@@ -263,7 +265,7 @@ impl Leg {
                                 match replay {
                                     Ok(replay) => {
                                         let key = v.get("key").and_then(Value::as_str).unwrap_or_default().to_owned();
-                                        return Prepared::Hit(Box::new(Hit { key, weak: weak.hex(), replay, memo: m, source: v.get("source").cloned().unwrap_or_default() }));
+                                        return Prepared::Hit(Box::new(Hit { key, weak: weak.hex(), replay, memo: m, source: v.get("source").cloned().unwrap_or_default(), class: v.get("class").and_then(Value::as_str).map(str::to_owned) }));
                                     }
                                     Err(e) => self.note(idx, &format!("memo: the recorded result doesn't read ({e}): the step runs")).await,
                                 }
@@ -462,7 +464,7 @@ impl Leg {
     /// A hit, replayed (W24-R07): what it left for the steps after it, its files put in place once
     /// one runs; and where it came from, said in its log and as a notice. Its outputs.
     pub(super) async fn memo_replay(&self, st: &mut State, idx: u32, hit: Hit) -> BTreeMap<String, String> {
-        let Hit { key, weak, replay, memo: m, source } = hit;
+        let Hit { key, weak, replay, memo: m, source, class } = hit;
         for (k, v) in &replay.env {
             st.env.insert(k.clone(), v.clone());
         }
@@ -482,7 +484,11 @@ impl Leg {
         let runner = Some(text("runner")).filter(|r| !r.is_empty()).map(|r| format!(" on {r}")).unwrap_or_default();
         let took = source.get("ms").and_then(Value::as_u64).map(|ms| format!(", in {:.1} s", ms as f64 / 1000.0)).unwrap_or_default();
         let files = if replay.files.is_some() { "; its files are put in place when a later step runs" } else { "" };
-        let why = format!("Reused from {from}: this step succeeded there with the same inputs{runner}{took} (key {}), so it isn't run again: its log above is that run's{files}.", short(&key));
+        let why = match &class {
+            // Found by its class (W24-R30): another definition the rules make one with it.
+            Some(c) => format!("Reused through equivalence with {from}: a step its rewrite rules make one with this one succeeded there{runner}{took} (class {}, key {}), so it isn't run again: its log above is that run's{files}.", short(c.trim_start_matches("sha256:")), short(&key)),
+            None => format!("Reused from {from}: this step succeeded there with the same inputs{runner}{took} (key {}), so it isn't run again: its log above is that run's{files}.", short(&key)),
+        };
         self.note(idx, &format!("memo: {why}")).await;
         self.annotate(idx, "notice", &why).await;
         replay.outputs

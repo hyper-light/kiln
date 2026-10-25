@@ -465,7 +465,7 @@ pub fn write(c: &Connection, seal: Option<&Seal>, scope: &str, unit: &Unit, read
             }
         }
     };
-    join(&mut Rows { c: &tx, scope }, &keyed, &strong, read, &id, &result.domain, &digest(result))?;
+    join(&mut Rows { c: &tx, scope }, &keyed, &strong, read, &id, &result.domain, &digest(result), layer(unit.kind))?;
     tx.commit()?;
     Ok(written)
 }
@@ -485,13 +485,27 @@ pub fn record(c: &Connection, scope: &str, unit: &Unit, read: &PathSet, result: 
 
 /// Puts a recorded key in the class of its outputs (W24-R30), notes what its unit took by class,
 /// and claims its canonical key into its class when that isn't its own.
-fn join(rows: &mut Rows, keyed: &Keyed, strong: &Key, read: &PathSet, set: &str, writer: &str, produced: &str) -> anyhow::Result<()> {
+/// A unit kind's layer, as metrics name it (W24-R28).
+pub fn layer(kind: kiln_ci::work::key::Kind) -> &'static str {
+    use kiln_ci::work::key::Kind;
+    match kind {
+        Kind::Run => "run",
+        Kind::Leg => "leg",
+        Kind::Step => "step",
+        Kind::Action => "action",
+        Kind::Test => "test",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn join(rows: &mut Rows, keyed: &Keyed, strong: &Key, read: &PathSet, set: &str, writer: &str, produced: &str, layer: &str) -> anyhow::Result<()> {
     match eclass::producing(strong, rows.entry(strong)?.as_ref(), writer, produced) {
         Ok(member) => rows.place(strong, &Placed { member, source: None })?,
         // Its unit produced other outputs before, or its class holds others: the class splits
         // where it is, as verification's mismatch would split it (W24-R23).
         Err(Refused::Conflict { .. }) => {
             eclass::split(rows, strong, Some(produced))?;
+            crate::metrics::global().work_classes.inc(&[layer, "split"]);
         }
         // Nondeterministic already: it joins no class.
         Err(Refused::Nondeterministic(_)) => {}
@@ -511,6 +525,7 @@ fn join(rows: &mut Rows, keyed: &Keyed, strong: &Key, read: &PathSet, set: &str,
             let member = Member { class: own.class, writer: writer.to_owned(), produced: None, quarantined: false, nondeterministic: false };
             rows.place(&canonical, &Placed { member, source: Some(strong.hex()) })?;
             rows.claim(&canonical, strong, &keyed.canonical.why)?;
+            crate::metrics::global().work_classes.inc(&[layer, "merge"]);
         }
         // Quarantined or nondeterministic, it takes no claim.
         Some(p) if !p.member.claimable() => {}
@@ -520,6 +535,7 @@ fn join(rows: &mut Rows, keyed: &Keyed, strong: &Key, read: &PathSet, set: &str,
                     rows.place(&canonical, &Placed { member: p.member, source: Some(strong.hex()) })?;
                 }
                 rows.claim(&canonical, strong, &keyed.canonical.why)?;
+            crate::metrics::global().work_classes.inc(&[layer, "merge"]);
             }
             // Its canonical form's class holds other outputs: the rules, or the classes it took
             // upstream units by, made one what isn't. That class splits, its lineage quarantined.

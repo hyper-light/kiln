@@ -7,6 +7,10 @@ use std::collections::BTreeSet;
 
 use kiln_ci::work::eclass::{Case, Pattern, Rewrite, Rule, Witness};
 use kiln_ci::work::key::Kind;
+#[cfg(unix)]
+use sha2::{Digest as _, Sha256};
+#[cfg(unix)]
+use std::path::Path;
 
 /// A rule, and the definitions its differential test runs both ways.
 #[derive(Debug, Clone)]
@@ -52,50 +56,58 @@ pub fn witness(p: &Proven, run: &dyn Fn(&str) -> anyhow::Result<String>) -> anyh
     Ok(Witness { test: format!("kiln::ci::rules::{}", p.rule.name), cases })
 }
 
+/// Every file and folder under `dir`, by path from it, with a file's bytes.
+#[cfg(unix)]
+fn tree(dir: &Path, at: &Path, out: &mut Vec<(String, Vec<u8>)>) -> anyhow::Result<()> {
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let p = e.path();
+        let rel = p.strip_prefix(at)?.to_string_lossy().into_owned();
+        if e.file_type()?.is_dir() {
+            out.push((format!("{rel}/"), Vec::new()));
+            tree(&p, at, out)?;
+        } else {
+            out.push((rel, std::fs::read(&p)?));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+/// The differential tests' runner: runs `def` with `sh` in a folder of its own: the digest of what it printed, how it exited
+/// and every file and folder it left.
+fn run_in(d: &Path, def: &str) -> anyhow::Result<String> {
+    let out = std::process::Command::new("sh").arg("-c").arg(def).current_dir(d).env_clear().env("PATH", std::env::var("PATH").unwrap_or_default()).output()?;
+    let mut files = Vec::new();
+    tree(d, d, &mut files)?;
+    files.sort();
+    let mut h = Sha256::new();
+    h.update(&out.stdout);
+    h.update(out.status.code().unwrap_or(-1).to_le_bytes());
+    for (path, bytes) in files {
+        h.update(path.as_bytes());
+        h.update([0]);
+        h.update(&bytes);
+        h.update([0]);
+    }
+    Ok(format!("sha256:{}", h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()))
+}
+
+/// [`run_in`] a folder made for it, and gone after.
+#[cfg(unix)]
+pub fn run(def: &str) -> anyhow::Result<String> {
+    let d = std::env::temp_dir().join(format!("kiln-rule-{}", crate::util::new_id()));
+    std::fs::create_dir_all(&d)?;
+    let out = run_in(&d, def);
+    let _ = std::fs::remove_dir_all(&d);
+    out
+}
+
 #[cfg(all(test, unix))]
 mod tests {
-    use std::path::Path;
-
     use kiln_ci::work::eclass::Rules;
-    use sha2::{Digest as _, Sha256};
 
     use super::*;
-
-    /// Every file and folder under `dir`, by path from it, with a file's bytes.
-    fn tree(dir: &Path, at: &Path, out: &mut Vec<(String, Vec<u8>)>) -> anyhow::Result<()> {
-        for e in std::fs::read_dir(dir)? {
-            let e = e?;
-            let p = e.path();
-            let rel = p.strip_prefix(at)?.to_string_lossy().into_owned();
-            if e.file_type()?.is_dir() {
-                out.push((format!("{rel}/"), Vec::new()));
-                tree(&p, at, out)?;
-            } else {
-                out.push((rel, std::fs::read(&p)?));
-            }
-        }
-        Ok(())
-    }
-
-    /// Runs `def` with `sh` in a folder of its own: the digest of what it printed, how it exited
-    /// and every file and folder it left.
-    fn run(def: &str) -> anyhow::Result<String> {
-        let d = tempfile::tempdir()?;
-        let out = std::process::Command::new("sh").arg("-c").arg(def).current_dir(d.path()).env_clear().env("PATH", std::env::var("PATH").unwrap_or_default()).output()?;
-        let mut files = Vec::new();
-        tree(d.path(), d.path(), &mut files)?;
-        files.sort();
-        let mut h = Sha256::new();
-        h.update(&out.stdout);
-        h.update(out.status.code().unwrap_or(-1).to_le_bytes());
-        for (path, bytes) in files {
-            h.update(path.as_bytes());
-            h.update([0]);
-            h.update(&bytes);
-            h.update([0]);
-        }
-        Ok(format!("sha256:{}", h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()))
-    }
 
     /// W24-R30: each of kiln's rules, its witness run for real: both definitions of every case
     /// leave identical outputs, the rule registers on that witness, and it makes them one.

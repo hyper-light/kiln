@@ -296,7 +296,13 @@ pub struct Facts {
 /// A step's unit (W24-R01): its definition as canonical JSON, the environment
 /// [`key::relevant_env`] keeps of it, and the rest as found. Its weak key is the step's work key.
 pub fn unit(f: &Facts) -> Unit {
-    let definition = serde_json::to_string(&f.definition).unwrap_or_default();
+    // The rest of its definition on its first line, then its script's lines: the operations
+    // rewrite rules work on (W24-R30).
+    let head = serde_json::to_string(&Definition { run: None, ..f.definition.clone() }).unwrap_or_default();
+    let definition = match &f.definition.run {
+        Some(run) => format!("{head}\n{run}"),
+        None => head,
+    };
     let env = key::relevant_env(&f.env, &f.declared, TOOLCHAIN_ENV, &definition, &BTreeSet::new());
     Unit {
         kind: Kind::Step,
