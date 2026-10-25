@@ -140,6 +140,21 @@ Nothing else changes:
 
 Observe's built-in Blobs dashboard (`builtin:blobs`, on the observe branch) lands with observe.
 
+**Also in T10's next goal: new chunk folders made to last.** This was found by CP-T6.1
+(docs/trains/cp-t6.1.md), and the coordinator put it here on 2026-10-25.
+- **What's synced:** `blobs::chunks::keep` (crates/kiln/src/blobs/chunks.rs) writes a chunk to a
+  temporary file, flushes it, renames it into place and flushes its folder.
+- **What isn't:** the folders `create_dir_all` makes for it, `chunks/<aa>/` and
+  `chunks/<aa>/<bb>/`, aren't flushed into the folders above them. POSIX needs that, or a crash
+  can lose a new folder and the acknowledged chunk inside it.
+- **Where it matters:** ext4's single journal orders it anyway. Production's store is on
+  adacachy's btrfs (kernel 7.2.9), so check what btrfs's fsync log guarantees for a new folder
+  above an fsynced one. That says whether production has been exposed.
+- **The fix either way:** flush the parent of each folder it makes. It's cheap: there are at most
+  65,536 such folders, each made once.
+- **Testing:** no kiln-sim model covers the server's store yet, so a crash test of the fix is the
+  local store's own.
+
 ## Risks
 
 - **No capability gate.** §6 puts every migration behind a capability, with read fallback for one
