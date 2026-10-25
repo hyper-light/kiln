@@ -318,7 +318,11 @@ fn holds_lit(hay: &[u8], at: usize, lit: &[u8]) -> bool {
     hay.get(at..).is_some_and(|h| h.len() >= lit.len() && h.iter().zip(lit).all(|(a, b)| a == b))
 }
 
+/// An instruction. Its kind a byte of its own (no field's spare values holding it, as they would
+/// without `repr`): a search's dispatch on it is a table of jumps, not a chain of comparisons
+/// (§12.17's profile).
 #[derive(Debug, Clone, Copy)]
+#[repr(u8)]
 enum Inst {
     /// These bytes: `lits[at..at + len]`.
     Lit {
