@@ -116,6 +116,13 @@ pub fn domain(trusted: bool) -> &'static str {
     if trusted { "trusted" } else { "untrusted" }
 }
 
+/// Whether a run's work is trusted (W24-R20, R21): a trusted run's, except a change's own as it's
+/// reviewed (a diff, a pull request), which writes untrusted work and reads trusted. The land queue,
+/// trusted, never takes a diff's own results: its candidate runs what the diffs touched itself.
+pub fn work_trusted(trusted: bool, event: &str) -> bool {
+    trusted && !matches!(event, "diff" | "pull_request" | "pull_request_target")
+}
+
 /// A leg's work unit (docs/ci.md W24-R06): a leg whose definition is its input hash, which covers
 /// its definition, pins, images, platform, listed variables and listed paths' trees. The work
 /// ledger keys it, on the one path its records and lookups share (W24-R30).

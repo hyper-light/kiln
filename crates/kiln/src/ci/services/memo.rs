@@ -93,20 +93,21 @@ impl LegOf {
 
 async fn leg_of(hub: &Hub, claims: &token::Claims) -> anyhow::Result<Option<LegOf>> {
     let (leg, run) = (claims.sub.clone(), claims.run.clone());
-    let row: Option<(String, String, String, String, i64, String, String, String, String, i64)> = hub
+    let row: Option<(String, String, String, String, i64, String, String, String, String, i64, String)> = hub
         .store
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT j.id, j.run_id, p.name, r.trust, j.attempt, COALESCE(j.agent, ''), r.sha, COALESCE(j.key, j.id), r.branch, COALESCE(j.run_attempt, 1)
+                "SELECT j.id, j.run_id, p.name, r.trust, j.attempt, COALESCE(j.agent, ''), r.sha, COALESCE(j.key, j.id), r.branch, COALESCE(j.run_attempt, 1), COALESCE(r.event, '')
                  FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id WHERE j.id = ?1 AND j.run_id = ?2",
                 params![leg, run],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)),
             )
             .optional()?)
         })
         .await?;
-    Ok(row.map(|(id, run, repo, trust, attempt, runner, sha, key, branch, run_attempt)| {
-        let domain = crate::ci::reuse::domain(trust == "trusted");
+    Ok(row.map(|(id, run, repo, trust, attempt, runner, sha, key, branch, run_attempt, event)| {
+        // A diff's own work, as it's reviewed, is untrusted: the land queue never takes it (W24-R20).
+        let domain = crate::ci::reuse::domain(crate::ci::reuse::work_trusted(trust == "trusted", &event));
         LegOf { scope: work::scope(&repo, domain), id, run, repo, domain, attempt: u32::try_from(attempt).unwrap_or(0), runner, sha, key, branch, run_attempt }
     }))
 }

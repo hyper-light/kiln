@@ -3654,3 +3654,107 @@ jobs:
     assert!(leg_json.contains("GraphQL API for something kiln doesn't answer yet (query field `licenses`)"), "{leg_json}");
     Ok(())
 }
+
+/// W24-R20, R21 end to end: the land queue's candidate takes trusted results for the crates its
+/// diff left alone and runs the crate the diff touched itself, after the trunk moved under the
+/// diff. Three crates (beta depends on alpha; gamma on neither), one `tests:` step in a warm
+/// workspace. D1 changes gamma, and its own run passes gamma's tests: a diff's work, untrusted.
+/// The trunk then moves (beta changes) and D1 lands: its candidate replays alpha's and beta's
+/// passes from the trunk's runs, and runs gamma's binary itself rather than take D1's pass.
+#[test]
+fn w24_r20_a_land_candidate_reuses_trusted_results_and_runs_what_its_diff_touched() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/lands.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/lands", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/lands"])?;
+    let rev = person(&s, "rev", &["developer@repo:acme/lands"])?;
+    let lead = person(&s, "lead", &["maintainer@repo:acme/lands"])?;
+    // Not the runner's work folder, whose files would go with each commit.
+    must(git(&home, dir.path(), &["clone", "-q", &url(&lead), "tree"]), "clone")?;
+    let work = dir.path().join("tree");
+    std::fs::write(work.join("README.md"), "lands\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let owner = url(&s.admin);
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    let lib = |value: &str| format!("pub fn value() -> u32 {{ {value} }}\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn positive() {{ assert!(super::value() > 0); }}\n}}\n");
+    let krate = |name: &str, deps: &str, value: &str| -> anyhow::Result<()> {
+        std::fs::create_dir_all(work.join(name).join("src"))?;
+        std::fs::write(work.join(name).join("Cargo.toml"), format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}"))?;
+        std::fs::write(work.join(name).join("src/lib.rs"), lib(value))?;
+        Ok(())
+    };
+    std::fs::write(work.join("Cargo.toml"), "[workspace]\nmembers = [\"alpha\", \"beta\", \"gamma\"]\nresolver = \"2\"\n")?;
+    std::fs::write(work.join(".gitignore"), "target/\nCargo.lock\n")?;
+    krate("alpha", "", "1")?;
+    krate("beta", "alpha = { path = \"../alpha\" }\n", "alpha::value() + 1")?;
+    krate("gamma", "", "3")?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n")?;
+    std::fs::write(work.join(".kiln/ci.yaml"), "on: [push, diff, land]\njobs:\n  test:\n    runs-on: local\n    work: { warm: [target] }\n    steps:\n      - name: tests\n        tests: { cargo: [--workspace] }\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "crates"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    let trunk = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    let runs = || -> anyhow::Result<Vec<Value>> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/lands&limit=50", &s.admin, None)?;
+        Ok(serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default())
+    };
+    let finished = |pick: &dyn Fn(&Value) -> bool, what: &str| -> anyhow::Result<Value> {
+        let mut last = Value::Null;
+        until(300, what, || {
+            last = runs()?.into_iter().find(|r| pick(r) && r.get("finished_at").is_some_and(|f| !f.is_null())).unwrap_or(Value::Null);
+            Ok(last.is_null().then(|| s.log()))
+        })?;
+        Ok(last)
+    };
+    let log_of = |run: &Value| -> anyhow::Result<String> {
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(run, "id")), &s.admin, None)?;
+        let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let mut all = String::new();
+        for step in 0..4 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+            all.push_str(&t);
+        }
+        Ok(all)
+    };
+    let a = finished(&|r| text(r, "sha") == trunk, "the trunk's first run")?;
+    let a_log = log_of(&a)?;
+    anyhow::ensure!(text(&a, "conclusion") == "success" && ["alpha", "beta", "gamma"].iter().all(|c| a_log.contains(&format!("tests: running {c}/lib"))), "{a}\n{a_log}");
+    // D1 changes gamma; its own run passes, as a diff's work.
+    let d1 = commit(&home, &work, "gamma/src/lib.rs", &lib("2 + 1"), "Gamma, computed", &format!("I{}", "5".repeat(40)))?;
+    must(git(&home, &work, &["push", "-q", &url(&dev), "HEAD:refs/for/main"]), "submit")?;
+    let own = finished(&|r| text(r, "sha") == d1, "D1's run")?;
+    let own_log = log_of(&own)?;
+    anyhow::ensure!(text(&own, "conclusion") == "success" && own_log.contains("tests: running gamma/lib"), "{own}\n{own_log}");
+    // The trunk moves under it: beta changes.
+    must(git(&home, &work, &["checkout", "-q", &trunk]), "checkout")?;
+    std::fs::write(work.join("beta/src/lib.rs"), lib("alpha::value() + 2"))?;
+    must(git(&home, &work, &["commit", "-qam", "beta, bigger"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    let moved = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    let b = finished(&|r| text(r, "sha") == moved, "the trunk's second run")?;
+    let b_log = log_of(&b)?;
+    anyhow::ensure!(text(&b, "conclusion") == "success" && b_log.contains("tests: running beta/lib"), "{b}\n{b_log}");
+    let b_number = b.get("number").and_then(Value::as_i64).unwrap_or_default();
+    // D1 lands: its candidate is the moved trunk with D1 on it.
+    let (st, r) = post(&s, &rev, "/api/diffs/D1/review", &json!({ "action": "accept" }))?;
+    anyhow::ensure!(st == 200, "accept: {r}");
+    let (st, e) = post(&s, &lead, "/api/diffs/D1/land", &json!({}))?;
+    anyhow::ensure!(st == 200, "land: {e}");
+    let candidate = finished(&|r| text(r, "event") == "land", "the candidate's run")?;
+    let c_log = log_of(&candidate)?;
+    anyhow::ensure!(text(&candidate, "conclusion") == "success", "{candidate}\n{c_log}");
+    anyhow::ensure!(c_log.contains("tests: running gamma/lib") && !c_log.contains("tests: gamma/lib replayed"), "the diff's own pass isn't taken: {c_log}");
+    anyhow::ensure!(c_log.contains("tests: alpha/lib replayed from run #") && c_log.contains(&format!("tests: beta/lib replayed from run #{b_number}")), "untouched crates take the trunk's trusted passes: {c_log}");
+    anyhow::ensure!(!c_log.contains("tests: running alpha/lib") && !c_log.contains("tests: running beta/lib"), "{c_log}");
+    Ok(())
+}

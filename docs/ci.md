@@ -7904,16 +7904,23 @@ warm workspace an unchanged crate isn't rebuilt, so its binary keeps its digest:
 and only its test binaries and its dependents' run (`tests/memo.rs`). Left: what a test reads
 beyond its package, traced; nextest's archives and partitions across machines.
 
-**The land queue's reuse (M3, R20).** Decided as pure code, awaiting the queue's wiring
-(`kiln_ci::work::queue`). A package's inputs on a candidate are its state on the trunk and the
+**The land queue's reuse (M3, R20).** Built, awaiting review (`kiln_ci::work::queue`,
+`ci/reuse.rs`). A package's inputs on a candidate are its state on the trunk and the
 batch's diffs that can affect it (R17's graph). A package no diff affects reuses the trunk's trusted
 entry; a bisection step that keeps every diff affecting a package shares the batch's (or another
 step's) entry for it; an untrusted diff's own results, or a person's, are never taken, though they
 have the very inputs: the candidate runs those packages itself, as trusted, and its results are the
 ones kept. Only passes are kept, so a package that failed runs again on every step that keeps the
 diffs affecting it. Each decision says why. Tested on decisions, and over random ledgers: only
-trusted entries with exactly a package's inputs are ever reused. Left: W14-R08's candidates and
-bisection steps (`ci/land.rs`) keyed and looked up this way.
+trusted entries with exactly a package's inputs are ever reused. On the queue, a diff's own runs
+(a diff, a pull request, as it's reviewed) write untrusted work even when they run trusted
+(`work_trusted`), so a candidate, trusted, never finds them; its test binaries (a `tests:` step,
+R10) and its legs (R06) take the trunk's trusted results for what the batch's diffs left alone,
+bisection steps share what earlier ones kept, and it runs the rest itself. End to end
+(`tests/hosting.rs`): D1 changes one crate of three, the trunk moves under it, and D1's candidate
+replays the two untouched crates' passes from the trunk's runs and runs D1's crate itself, not
+taking D1's own pass. Left: selection told which packages the batch's diffs affect (its replays
+say "affected" today, and rely on binaries' digests alone).
 
 **Admission by load (M3, R19).** Built, off until set (`kiln_ci::sched::admit`). Runners report
 their I/O pressure in their facts (`work.io_full`: PSI's `full avg10` from `/proc/pressure/io`)
