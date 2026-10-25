@@ -1,16 +1,38 @@
 /**
  * A goal being planned now, by a subagent of the agent's (Make a plan, Plan it now), as the agent's
- * session shows it (goal-stack.ts `plannerOf`): asked for, at work (its last calls, a line each,
- * cut to fit, the older fainter), or stopped with the plan not ready (why, and planning it again).
- * Under the planning step, on the goal's line; the step's own glyph turns while the subagent works.
+ * session shows it (goal-stack.ts `plannerOf`): how far it has got in dots (the research, the steps,
+ * ready), its latest call (cut to fit), who's at it; or, stopped with the plan not ready, why and
+ * planning it again. Under the planning step, on the goal's line; the step's own glyph turns while
+ * the subagent works, and the dot of the stage it's at.
  */
 import type * as React from "react";
 import { relativeTime } from "@/lib/format";
 import { callWords, type Planner } from "./goal-stack";
 import { TaskElapsed } from "./timeline";
 
-/** `again`: the subagent stopped short, what plans it again (shown by why). */
-type Props = { p: Planner; agent: string; onOpen?: (toolId: string) => void; again?: React.ReactNode };
+/** `wrote`: the plan has its steps; `again`: the subagent stopped short, what plans it again (shown by why). */
+type Props = { p: Planner; agent: string; wrote: boolean; onOpen?: (toolId: string) => void; again?: React.ReactNode };
+
+/** How far the planning has got, in the console's status dots: the research, then the steps, then ready. */
+function Dots({ p, wrote }: { p: Planner; wrote: boolean }) {
+  const at = p.kind === "asked" ? "next" : p.kind === "ended" ? "stopped" : "now";
+  const stages = [
+    { word: "Research", at: wrote ? "done" : at },
+    { word: "Steps", at: wrote ? at : "later" },
+    { word: "Ready", at: "later" },
+  ];
+  const dot: Record<string, string | undefined> = { done: "succeeded", now: "running", next: "queued", later: "skipped" };
+  return (
+    <ol className="gp-dots" aria-label="How far the planning has got">
+      {stages.map((s) => (
+        <li key={s.word} data-at={s.at}>
+          <i className="dot" data-status={dot[s.at]} aria-hidden="true" />
+          {s.word}
+        </li>
+      ))}
+    </ol>
+  );
+}
 
 /** Who's at it, for how long, and the subagent to open. */
 function Meta({ p, agent, onOpen }: Props) {
@@ -44,23 +66,12 @@ function Meta({ p, agent, onOpen }: Props) {
 }
 
 export function PlannerLive(props: Props) {
-  const { p, again } = props;
+  const { p, wrote, again } = props;
+  const last = p.kind === "asked" ? undefined : p.calls.at(-1);
   return (
     <div className="gp-live" data-kind={p.kind}>
-      {p.kind === "ended" && p.task.summary ? (
-        <p className="gp-live-why">{p.task.summary}</p>
-      ) : (
-        p.kind !== "asked" &&
-        p.calls.length > 0 && (
-          <ol className="gp-tail" aria-label="The subagent's last calls">
-            {p.calls.map((c, i) => (
-              <li key={c.id} data-age={p.calls.length - 1 - i}>
-                {callWords(c)}
-              </li>
-            ))}
-          </ol>
-        )
-      )}
+      <Dots p={p} wrote={wrote} />
+      {p.kind === "ended" && p.task.summary ? <p className="gp-live-why">{p.task.summary}</p> : last && <p className="gp-last">{callWords(last)}</p>}
       <Meta {...props} />
       {again && <span className="gp-again">{again}</span>}
     </div>

@@ -162,7 +162,7 @@ const call = (parent: string | undefined, name: string, title: string, rest: Rec
   ({ id: `e${++seq}`, seq, at: NOW - 1000, parent, kind: "tool", tool_id: `c${seq}`, name, tool: "read", title, input: {}, status: "done", started: NOW - 1000, ...rest }) as HEvent;
 const asked = (plan: string, at: number): HEvent => ({ id: `u${++seq}`, seq, at, kind: "user", text: `Your person asked… The brief: plan ${plan}, research rs1.`, client_id: `kiln-plan-${seq}` });
 
-test("a subagent whose brief names the plan is its planner: its last calls, oldest first, none of another's", () => {
+test("a subagent whose brief names the plan is its planner: its latest call, or its last few oldest first, none of another's", () => {
   const tasks = [sub("t1", "p1", "running", NOW - 60_000), sub("t2", "p2", "running", NOW - 50_000), { ...sub("t3", "p1", "running", NOW - 40_000), class: "shell" as const }];
   const events = [
     call("tu-t1", "Read", "a.rs"),
@@ -172,15 +172,27 @@ test("a subagent whose brief names the plan is its planner: its last calls, olde
     call("tu-t1", "Read", "c.rs"),
     call("tu-t1", "Read", "d.rs"),
   ];
+  const titles = (p: ReturnType<typeof plannerOf>) => (p && p.kind !== "asked" ? p.calls.map((c) => (c.kind === "tool" ? c.title : "")) : []);
   const p = plannerOf("p1", tasks, events, [], NOW);
   assert.equal(p?.kind, "planning");
   assert.ok(p && p.kind !== "asked");
   assert.equal(p.task.id, "t1", "a shell naming the plan isn't a planner");
-  assert.deepEqual(
-    p.calls.map((c) => (c.kind === "tool" ? c.title : "")),
-    ["b.rs", "c.rs", "d.rs"],
-  );
+  assert.deepEqual(titles(p), ["d.rs"], "its latest call");
+  assert.deepEqual(titles(plannerOf("p1", tasks, events, [], NOW, 3)), ["b.rs", "c.rs", "d.rs"]);
   assert.equal(plannerOf("p3", tasks, events, [], NOW), null, "none for a plan nobody plans");
+});
+
+test("a planner has written the steps once its plans_update is done", () => {
+  const tasks = [sub("t1", "p1", "running", NOW - 60_000)];
+  const update = (status: string) => call("tu-t1", "mcp__kiln__plans_update", "kiln · plans_update", { server: "kiln", tool_short: "plans_update", status });
+  const wrote = (events: HEvent[]) => {
+    const p = plannerOf("p1", tasks, events, [], NOW);
+    return p && p.kind !== "asked" ? p.wrote : null;
+  };
+  assert.equal(wrote([call("tu-t1", "Read", "a.rs")]), false, "researching");
+  assert.equal(wrote([update("running")]), false, "writing them now");
+  assert.equal(wrote([update("done"), ...["a", "b", "c"].map((f) => call("tu-t1", "Read", f))]), true, "written, calls since");
+  assert.equal(wrote([call("tu-t2", "mcp__kiln__plans_update", "kiln · plans_update", { server: "kiln", tool_short: "plans_update" })]), false, "another subagent's");
 });
 
 test("the latest planner counts; one that stopped short is ended, one that said the plan is ready is none", () => {

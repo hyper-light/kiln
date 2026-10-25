@@ -16,31 +16,34 @@ const PLAN_ASK = "kiln-plan-";
 /**
  * A goal's planning, as its agent's session shows it (Make a plan, Plan it now): kiln asked the
  * agent to send a subagent (`asked`, none started yet), a subagent of its is at it (`planning`, its
- * last calls), or one was and ended with the plan not ready (`ended`).
+ * latest calls; `wrote`: it has written the plan's steps), or one was and ended with the plan not
+ * ready (`ended`).
  */
-export type Planner = { kind: "asked"; at: number } | { kind: "planning" | "ended"; task: Task; calls: ToolEvent[] };
+export type Planner = { kind: "asked"; at: number } | { kind: "planning" | "ended"; task: Task; calls: ToolEvent[]; wrote: boolean };
 
 /**
  * Who's planning plan `plan` in its agent's session: its subagent (the one its brief, which names the
- * plan, went to; the latest), with its last `shown` calls; else kiln's ask, while it stands, said
+ * plan, went to; the latest), with its last `shown` calls and whether it has written the steps; else kiln's ask, while it stands, said
  * or still in the agent's queue. A subagent that ended having said the plan is ready: none (the
  * stack shows its steps next).
  */
-export function plannerOf(plan: string, tasks: readonly Task[], events: readonly HEvent[], queue: readonly QueueItem[], now: number, shown = 3): Planner | null {
+export function plannerOf(plan: string, tasks: readonly Task[], events: readonly HEvent[], queue: readonly QueueItem[], now: number, shown = 1): Planner | null {
   let task: Task | undefined;
   for (const t of tasks) if (isSubagent(t) && t.prompt?.includes(plan) && (!task || t.started > task.started)) task = t;
   if (task) {
     const live = taskLive(task);
     const calls: ToolEvent[] = [];
+    let wrote = false;
     let ready = false;
-    for (let i = events.length - 1; i >= 0 && (calls.length < shown || (!live && !ready)); i--) {
+    for (let i = events.length - 1; i >= 0 && !(calls.length >= shown && wrote && (live || ready)); i--) {
       const e = events[i];
       if (e?.kind !== "tool" || e.parent === undefined || e.parent !== task.tool_id) continue;
       if (calls.length < shown) calls.unshift(e);
-      if (e.server === "kiln" && e.tool_short === "plans_ready" && e.status === "done") ready = true;
+      if (e.server === "kiln" && e.status === "done" && e.tool_short === "plans_update") wrote = true;
+      if (e.server === "kiln" && e.status === "done" && e.tool_short === "plans_ready") ready = true;
     }
     if (!live && ready) return null;
-    return { kind: live ? "planning" : "ended", task, calls };
+    return { kind: live ? "planning" : "ended", task, calls, wrote };
   }
   const asked = (id: string | undefined, text: string) => !!id?.startsWith(PLAN_ASK) && text.includes(plan);
   for (const q of queue) if (asked(q.id, q.text) && q.at >= now - ASK_STANDS_MS) return { kind: "asked", at: q.at };

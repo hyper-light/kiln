@@ -1,8 +1,9 @@
 /**
- * Your plans, in an agent's Plan tab: write one right here, step by step (each with its
+ * Your plans, in an agent's Plan tab: the plans kept with this agent session (written here, made by
+ * the agent, from its goals, or proposed by it). Write one right here, step by step (each with its
  * description, examples, acceptance criteria and testing), keep it, change it, and run it on this
  * agent as one message, step by step, or as goals (each step a /goal once the one before is met).
- * Kept plans are the same ones Agents › Plans lists; everything stays in the page's flow.
+ * Everything stays in the page's flow.
  */
 import * as React from "react";
 import { Link } from "@/lib/router";
@@ -14,7 +15,7 @@ import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { plansRes } from "./data";
+import { sessionPlansRes } from "./data";
 import { PlanItemsEditor } from "./items";
 import "./plans.css";
 
@@ -44,7 +45,7 @@ export function PlansHere({ session }: { session: string }) {
 }
 
 function Here({ session }: { session: string }) {
-  const res = useRes(plansRes);
+  const res = useRes(sessionPlansRes(session));
   const [draft, setDraft] = React.useState<Draft | null>(null);
   const [picked, setPicked] = React.useState("");
   const [mode, setMode] = React.useState<HereMode>("message");

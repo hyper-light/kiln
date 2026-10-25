@@ -149,9 +149,10 @@ doesn't need a person for any of it:
   goal being planned whose planning still waits its turn has **Plan it now**, which does the same.
   The panel shows the planning live, from the agent's session (the subagent is the one whose brief
   names the plan): **Asked** until a subagent starts, then **Planning**, with the step's light
-  turning, the subagent's last three calls a line each, how many it made, for how long, and
-  **Open** for its thread. A subagent that stops with the plan not ready shows **Stopped**, why in
-  its own words, and **Plan it again**. One subagent a plan at a time: another goes once the last
+  turning, how far it has got in dots (**Research**, **Steps** once it has written them,
+  **Ready**), its latest call, how many it made, for how long, and **Open** for its thread. A
+  subagent that stops with the plan not ready shows **Stopped**, the dot it stopped at in amber, why
+  in its own words, and **Plan it again**. One subagent a plan at a time: another goes once the last
   one stopped, or half an hour after kiln asked when none started. The agent planning a goal of its
   own plans it itself.
 - **Changing one goal: `goals_update`** by its `id`, without giving the whole list: other words

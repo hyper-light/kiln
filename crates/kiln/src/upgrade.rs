@@ -137,7 +137,7 @@ pub enum Retired {
     Stopped(String),
     /// Nothing to do (already retired, or this instance replaces nothing).
     Nothing,
-    /// The old process still holds terminals: left alone.
+    /// The old process still holds terminals or agent sessions (how many): left alone.
     Busy(usize),
 }
 
@@ -199,8 +199,8 @@ pub fn duties(state_dir: &Path, me: &str) -> Vec<PathBuf> {
 /// the server says holds nothing: whether an instance here was set up to replace it, a second
 /// runner was started beside the first by hand, or an upgrade made it the older one. The service
 /// its process runs in (its cgroup's) is stopped and disabled, unless it's the one this runner
-/// runs in too (a blue/green upgrade's two builds share one), or it holds terminals. Blocking;
-/// Linux (systemd) alone.
+/// runs in too (a blue/green upgrade's two builds share one), or it holds terminals or agent
+/// sessions. Blocking; Linux (systemd) alone.
 pub fn retire_instance(state_dir: &Path, instance: &str) -> anyhow::Result<Retired> {
     let procs = crate::install::processes();
     let pids = pids_of_instance(&procs, state_dir, instance);
@@ -213,7 +213,9 @@ pub fn retire_instance(state_dir: &Path, instance: &str) -> anyhow::Result<Retir
         return Ok(Retired::Nothing);
     }
     let r = Replaces { boot: "systemd".into(), system, unit, cli_bin: None, retired_at: None };
-    let held: usize = service_pids(&r).iter().map(|p| crate::os::pty_masters(*p).unwrap_or(0)).sum();
+    // Nor while it holds a terminal, or an agent session the server didn't know of (its word that
+    // the process holds nothing is checked here too).
+    let held: usize = service_pids(&r).iter().map(|p| crate::os::pty_masters(*p).unwrap_or(0)).sum::<usize>() + agents_under(&r);
     if held > 0 {
         return Ok(Retired::Busy(held));
     }
@@ -265,22 +267,44 @@ fn output(cmd: &mut Command) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// The old service's cgroup folder, where the platform has one (systemd). None when it is not
+/// running.
+fn service_cgroup(r: &Replaces) -> Option<PathBuf> {
+    if r.boot != "systemd" {
+        return None;
+    }
+    let mut cmd = Command::new("systemctl");
+    if !r.system {
+        cmd.arg("--user");
+    }
+    cmd.args(["show", "-p", "ControlGroup", "--value", &format!("{}.service", r.unit)]);
+    let cg = output(&mut cmd).filter(|c| !c.is_empty())?;
+    Some(Path::new("/sys/fs/cgroup").join(cg.trim_start_matches('/')))
+}
+
 /// The old service's processes (its supervisor and everything under it), where the platform can
 /// tell. Empty when it is not running.
 fn service_pids(r: &Replaces) -> Vec<u32> {
-    match r.boot.as_str() {
-        "systemd" => {
-            let mut cmd = Command::new("systemctl");
-            if !r.system {
-                cmd.arg("--user");
-            }
-            cmd.args(["show", "-p", "ControlGroup", "--value", &format!("{}.service", r.unit)]);
-            let Some(cg) = output(&mut cmd).filter(|c| !c.is_empty()) else { return vec![] };
-            let procs = Path::new("/sys/fs/cgroup").join(cg.trim_start_matches('/')).join("cgroup.procs");
-            std::fs::read_to_string(procs).map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect()).unwrap_or_default()
-        }
-        _ => vec![],
-    }
+    service_cgroup(r)
+        .and_then(|cg| std::fs::read_to_string(cg.join("cgroup.procs")).ok())
+        .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// The agent sessions running under the old service: each runs in a cgroup of its own below
+/// `kiln-agents` (`crate::os::contain`), and one with a process in it runs still.
+fn agents_under(r: &Replaces) -> usize {
+    service_cgroup(r).map_or(0, |cg| populated_children(&cg.join("kiln-agents")))
+}
+
+/// How many of the cgroups right below `dir` have a process in them (or below them).
+fn populated_children(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir() && std::fs::read_to_string(e.path().join("cgroup.events")).is_ok_and(|s| s.lines().any(|l| l.trim() == "populated 1")))
+        .count()
 }
 
 fn stop_service(r: &Replaces) -> anyhow::Result<()> {
@@ -858,6 +882,20 @@ mod tests {
         assert_eq!(unit_in_cgroup("0::/system.slice/kiln-agent.service\n"), Some(("kiln-agent".to_owned(), true)));
         assert_eq!(unit_in_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-ghostty-surface-transient-1.scope\n"), None);
         assert_eq!(unit_in_cgroup("12:pids:/\n"), None);
+    }
+
+    #[test]
+    fn a_service_with_an_agent_session_running_under_it_is_busy() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let agents = dir.path().join("kiln-agents");
+        for (session, populated) in [("s1", true), ("s2", false), ("s3", true)] {
+            std::fs::create_dir_all(agents.join(session))?;
+            std::fs::write(agents.join(session).join("cgroup.events"), format!("populated {}\nfrozen 0\n", u8::from(populated)))?;
+        }
+        std::fs::write(agents.join("cgroup.procs"), "")?;
+        assert_eq!(populated_children(&agents), 2, "two sessions run; one ended, and a file isn't one");
+        assert_eq!(populated_children(&dir.path().join("none")), 0);
+        Ok(())
     }
 
     #[test]

@@ -191,7 +191,9 @@ function PlannedSteps({
   const planned = usePlanned(goal, items, paused, agent, planner);
   const name = useRes(harnessSessionsRes).data.find((x) => x.id === agent)?.name || "the agent";
   if (!planned?.steps.length) return null;
-  const live = planner && planned.planning ? <PlannerLive p={planner} agent={name} onOpen={onOpenTask} again={again} /> : null;
+  // The steps written: the subagent said so (its calls), or the plan has them.
+  const wrote = (planner?.kind !== "asked" && planner?.wrote) || (planned.plan.items?.length ?? 0) > 0 || planned.plan.steps.length > 0;
+  const live = planner && planned.planning ? <PlannerLive p={planner} agent={name} wrote={wrote} onOpen={onOpenTask} again={again} /> : null;
   return <GoalPlan steps={planned.steps} label={`Plan “${planned.plan.title}”`} under={live ? (s: GoalStep) => (s.n === 1 ? live : null) : undefined} />;
 }
 

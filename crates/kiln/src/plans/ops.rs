@@ -73,9 +73,21 @@ async fn get(cx: Cx, v: Value) -> Out {
 
 async fn create(cx: Cx, v: Value) -> Out {
     let n: New = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let p = super::create(&cx.hub, n, &cx.caller.name).await.map_err(fail)?;
+    let p = super::create(&cx.hub, kept_with(n, cx.caller.agent.as_deref()), &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "plan.create".into(), p.title.clone()).await;
     json_of(&p)
+}
+
+/// A plan an agent keeps is kept with its own session, as its Plan tab lists them (docs/plans.md,
+/// "Keeping one"), unless it names another.
+fn kept_with(mut n: New, agent: Option<&str>) -> New {
+    if let Some(agent) = agent {
+        let s = n.source.get_or_insert_with(super::Source::default);
+        if s.session.as_deref().is_none_or(|x| x.trim().is_empty()) {
+            s.session = Some(agent.to_owned());
+        }
+    }
+    n
 }
 
 async fn update(cx: Cx, v: Value) -> Out {
@@ -315,7 +327,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "plans.create",
-            summary: "Keep a plan in kiln (the plan you made, for the person to change, share and run later): its text and/or its steps (`items`: each with description, examples, acceptance criteria, testing); without them, its text's top-level list items are its steps.",
+            summary: "Keep a plan in kiln (the plan you made, for the person to change, share and run later), with your session (its Plan tab lists it): its text and/or its steps (`items`: each with description, examples, acceptance criteria, testing); without them, its text's top-level list items are its steps.",
             read_only: false,
             destructive: false,
             input: || {
@@ -439,4 +451,31 @@ pub fn list_ops() -> Vec<Op> {
             run: |cx, v| Box::pin(delete(cx, v)),
         },
     ]
+}
+
+/// Where a plan is kept: with the session of the agent that keeps it.
+#[cfg(test)]
+mod kept {
+    use super::kept_with;
+    use crate::plans::{New, Source};
+
+    fn session(n: &New) -> Option<&str> {
+        n.source.as_ref().and_then(|s| s.session.as_deref())
+    }
+
+    #[test]
+    fn an_agent_s_plan_is_kept_with_its_session() {
+        assert_eq!(session(&kept_with(New::default(), Some("a1"))), Some("a1"));
+        let blank = New { source: Some(Source { session: Some(" ".into()), harness: Some("claude".into()), ..Source::default() }), ..New::default() };
+        let n = kept_with(blank, Some("a1"));
+        assert_eq!(session(&n), Some("a1"));
+        assert_eq!(n.source.and_then(|s| s.harness).as_deref(), Some("claude"), "what else it says stays");
+    }
+
+    #[test]
+    fn a_session_named_stays_and_a_person_s_plan_is_as_given() {
+        let named = New { source: Some(Source { session: Some("a2".into()), ..Source::default() }), ..New::default() };
+        assert_eq!(session(&kept_with(named, Some("a1"))), Some("a2"));
+        assert_eq!(kept_with(New::default(), None).source, None);
+    }
 }
