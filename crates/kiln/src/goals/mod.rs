@@ -24,6 +24,7 @@
 //! registry; in tests, a simulated clock and agents, so a 15-minute back-off is checked in
 //! microseconds.
 
+mod graph;
 pub mod keep;
 pub mod ops;
 mod subagents;
@@ -91,6 +92,9 @@ pub struct Stack {
     pub held_for: Option<String>,
     /// Its big goals planned first (`plans_first`): on unless you turn it off.
     pub plan_big: bool,
+    /// Its goals that don't wait for each other run side by side, on subagents of the agent's
+    /// (docs/goals.md, "What a goal waits for"): on unless a person turns it off.
+    pub side_by_side: bool,
     /// When kiln last cleared the goal in the agent itself (pause, skip, clear).
     #[serde(skip)]
     dropped_at: i64,
@@ -162,6 +166,15 @@ pub struct Item {
     /// It came back from its subagent unmet: this agent takes it, not another subagent.
     #[serde(skip)]
     back: bool,
+    /// The goals of this stack it waits for, by id, when it says (`graph`). None: it says nothing
+    /// yet, so the agent orders it while subagents can take goals; otherwise it waits for the goal
+    /// still to go before it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs: Option<Vec<String>>,
+    /// Who said what it waits for: `you`, `the agent`, another agent's name, or `kiln` (it couldn't
+    /// get it ordered, so it goes in turn).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_by: Option<String>,
 }
 
 /// The plan step a goal was made from (`crate::plans`): its plan, the version run, its number (from
@@ -186,7 +199,21 @@ pub struct NewGoal {
     pub kind: Option<&'static str>,
     /// The plan run it waits for.
     pub waits_on: Option<String>,
+    /// What it waits for, when it says (none: it says nothing yet), and who said so.
+    pub needs: Option<Vec<Need>>,
+    pub needs_by: Option<String>,
 }
+
+/// A goal a goal added waits for: another added with it (its place among them, from 1), or a goal
+/// of the stack, by id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Need {
+    Added(usize),
+    Id(String),
+}
+
+/// What a goal still to go can wait for, at the most.
+const NEEDS: usize = 100;
 
 impl From<String> for NewGoal {
     fn from(text: String) -> Self {
@@ -215,6 +242,8 @@ pub struct Change {
     pub after: Option<String>,
     pub next: bool,
     pub remove: bool,
+    /// The goals of the stack it waits for, by id (none: nothing): what it says it needs.
+    pub needs: Option<Vec<String>>,
 }
 
 /// Who changes a stack, as what it keeps says so: a person (you), the agent itself, or another
@@ -238,7 +267,7 @@ impl By {
     }
 
     /// As a sentence says it: "you", "the agent", its name.
-    fn name(&self) -> String {
+    pub(crate) fn name(&self) -> String {
         match self {
             Self::You => "you".to_owned(),
             Self::Itself => "the agent".to_owned(),
@@ -335,20 +364,22 @@ async fn stack_of(store: &crate::store::Store, agent: &str) -> R<Stack> {
 }
 
 fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
-    let head: Option<(String, Option<String>, i64, i64, i64, i64, Option<String>, bool)> = c
+    let head: Option<(String, Option<String>, i64, i64, i64, i64, Option<String>, bool, bool)> = c
         .query_row(
-            "SELECT state, reason, updated_at, dropped_at, COALESCE(json_array_length(cleared), 0), resume_at, held_for, COALESCE(plan_big, 1) FROM goal_stacks WHERE agent = ?1",
+            "SELECT state, reason, updated_at, dropped_at, COALESCE(json_array_length(cleared), 0), resume_at, held_for, COALESCE(plan_big, 1), COALESCE(side_by_side, 1) FROM goal_stacks WHERE agent = ?1",
             params![agent],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
         )
         .optional()?;
     let mut st = c.prepare(
-        "SELECT id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at, part_of, plan_id, plan_version, plan_step, plan_run, sent_id, planned_as, part_kind, waits_on, delegated_to, subagent, subagent_back FROM goal_items WHERE agent = ?1 ORDER BY pos",
+        "SELECT id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at, part_of, plan_id, plan_version, plan_step, plan_run, sent_id, planned_as, part_kind, waits_on, delegated_to, subagent, subagent_back, needs, needs_by FROM goal_items WHERE agent = ?1 ORDER BY pos",
     )?;
     let items = st
         .query_map(params![agent], |r| {
             let plan: Option<String> = r.get(12)?;
             let (version, at, run): (Option<i64>, Option<i64>, Option<String>) = (r.get(13)?, r.get(14)?, r.get(15)?);
+            // What it waits for, as kept: a list that can't be read says nothing.
+            let needs = r.get::<_, Option<String>>(23)?.and_then(|n| serde_json::from_str::<Vec<String>>(&n).ok());
             Ok(Item {
                 id: r.get(0)?,
                 text: r.get(1)?,
@@ -370,11 +401,13 @@ fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
                 on: r.get(20)?,
                 subagent: r.get(21)?,
                 back: r.get(22)?,
+                needs,
+                needs_by: r.get(24)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let (state, reason, updated_at, dropped_at, cleared, resume_at, held_for, plan_big) = head.unwrap_or_else(|| ("paused".into(), None, 0, 0, 0, 0, None, true));
-    Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, held_for, plan_big, dropped_at })
+    let (state, reason, updated_at, dropped_at, cleared, resume_at, held_for, plan_big, side_by_side) = head.unwrap_or_else(|| ("paused".into(), None, 0, 0, 0, 0, None, true, true));
+    Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, held_for, plan_big, side_by_side, dropped_at })
 }
 
 /// What a goal stack last said to its agent through its queue (`say`): the message, while it may
@@ -568,6 +601,98 @@ fn descendants(items: &[Item], id: &str) -> Vec<String> {
     out
 }
 
+/// The stack's goals as its graph sees them (`graph`), in its order: what each waits for, as it
+/// says (none: it says nothing yet; kiln couldn't get it ordered: in turn) and, for a plan's step,
+/// as its plan says (`plans`); where it's under way (on a subagent, or about to go to one).
+fn nodes_of(items: &[Item], plans: &subagents::Graph) -> Vec<graph::Node> {
+    items
+        .iter()
+        .map(|i| graph::Node {
+            id: i.id.clone(),
+            open: matches!(i.status.as_str(), "pending" | "active"),
+            here: i.status == "active",
+            away: if i.on.is_some() {
+                graph::Away::Other
+            } else if i.subagent.is_some() || plans.handing(&i.id) {
+                graph::Away::Sub
+            } else {
+                graph::Away::No
+            },
+            part_of: i.part_of.clone(),
+            needs: match (plans.waits_of(&i.id), &i.needs, i.needs_by.as_deref()) {
+                (Some(plan), own, _) => graph::Needs::Given(plan.iter().chain(own.iter().flatten()).cloned().collect()),
+                (None, Some(v), _) => graph::Needs::Given(v.clone()),
+                (None, None, Some(KILN)) => graph::Needs::InTurn,
+                (None, None, _) => graph::Needs::Unknown,
+            },
+            back: i.back,
+        })
+        .collect()
+}
+
+/// Who says what a goal waits for when kiln couldn't get it ordered: it goes in turn.
+const KILN: &str = "kiln";
+
+/// A goal's words, short, as a refusal names it.
+fn short(text: &str) -> String {
+    let t: String = text.chars().take(60).collect();
+    if t.chars().count() < text.chars().count() { format!("\u{201c}{t}…\u{201d}") } else { format!("\u{201c}{t}\u{201d}") }
+}
+
+/// Refuses what goals of `items` would wait for (`changes`: a goal's id, and the goals it would wait
+/// for) when one of those isn't in the stack, is the goal itself, or makes a loop of waiting.
+fn check_needs(items: &[Item], changes: &[(String, Vec<String>)]) -> R<()> {
+    for (id, needs) in changes {
+        if needs.len() > NEEDS {
+            return Err(Error::Bad(format!("a goal waits for {NEEDS} others at the most")));
+        }
+        if let Some(n) = needs.iter().find(|n| *n == id) {
+            return Err(Error::Bad(format!("goal {n} can't wait for itself")));
+        }
+        if let Some(n) = needs.iter().find(|n| !items.iter().any(|i| i.id == **n)) {
+            return Err(Error::Bad(format!("no goal {n} in this stack to wait for (goals_get lists them)")));
+        }
+    }
+    let mut nodes = nodes_of(items, &subagents::Graph::default());
+    for (id, needs) in changes {
+        if let Some(n) = nodes.iter_mut().find(|n| n.id == *id) {
+            n.needs = graph::Needs::Given(needs.clone());
+        }
+    }
+    let looped = graph::loops(&nodes);
+    if looped.is_empty() {
+        return Ok(());
+    }
+    let words: Vec<String> = looped.iter().filter_map(|id| items.iter().find(|i| i.id == *id)).map(|i| short(&i.text)).collect();
+    Err(Error::Bad(format!("those goals would wait for each other in a loop: {}", words.join(", "))))
+}
+
+/// Goals of `items` taken out of the stack (`gone`) leave the goals that waited for them waiting
+/// for what they waited for, so the order they kept holds.
+fn rewire(c: &rusqlite::Connection, items: &[Item], gone: &[String]) -> anyhow::Result<()> {
+    if gone.is_empty() {
+        return Ok(());
+    }
+    let theirs: HashMap<&str, &[String]> = items.iter().filter(|i| gone.contains(&i.id)).map(|i| (i.id.as_str(), i.needs.as_deref().unwrap_or_default())).collect();
+    for i in items.iter().filter(|i| !gone.contains(&i.id)) {
+        let Some(needs) = i.needs.as_ref().filter(|n| n.iter().any(|d| gone.contains(d))) else { continue };
+        let (mut next, mut todo, mut seen): (Vec<String>, Vec<&str>, Vec<&str>) = (Vec::new(), needs.iter().rev().map(String::as_str).collect(), Vec::new());
+        while let Some(d) = todo.pop() {
+            if seen.contains(&d) {
+                continue;
+            }
+            seen.push(d);
+            match theirs.get(d) {
+                Some(more) => todo.extend(more.iter().rev().map(String::as_str)),
+                None if d != i.id => next.push(d.to_owned()),
+                None => {}
+            }
+        }
+        c.execute("UPDATE goal_items SET needs = ?2 WHERE id = ?1", params![i.id, serde_json::to_string(&next)?])?;
+    }
+    Ok(())
+}
+
 /// The goals still to go, in order (the one under way first), each by its id: what `set_locked`
 /// takes to keep them as they are.
 fn to_go(items: &[Item]) -> Vec<(Option<String>, String)> {
@@ -658,7 +783,7 @@ async fn set_unsent(hub: &Hub, info: &Info, agent: &str, given: Vec<(Option<Stri
     if moved {
         withdraw(hub, agent, &stack.items, |i| i.status == "active").await;
     }
-    let agent_s = agent.to_owned();
+    let (agent_s, items) = (agent.to_owned(), stack.items);
     let now = now_ms(hub);
     let running = hub
         .store
@@ -681,6 +806,7 @@ async fn set_unsent(hub: &Hub, info: &Info, agent: &str, given: Vec<(Option<Stri
             for id in &gone {
                 tx.execute("DELETE FROM goal_items WHERE id = ?1", params![id])?;
             }
+            rewire(&tx, &items, &gone)?;
             touch(&tx, &agent_s, None, None, now)?;
             // Its goal under way changed: what the agent still pursues of the one before doesn't join
             // the stack again (`adopt`).
@@ -788,15 +914,20 @@ pub async fn add_at(hub: &Hub, agent: &str, goals: Vec<NewGoal>, start: bool, at
         for (j, g) in goals.iter().enumerate() {
             given.insert(k + j, (None, g.text.clone()));
         }
+        check_added(&now.items, &goals)?;
         let before: Vec<String> = now.items.iter().map(|i| i.id.clone()).collect();
         let s = set_locked(hub, &info, agent, given).await?;
-        // Each new one, in the order given, with the step it's made from.
-        if goals.iter().any(|g| g.step.is_some() || g.part_of.is_some() || g.kind.is_some() || g.waits_on.is_some()) {
-            let pairs: Vec<(String, NewGoal)> = added(&s, &before).into_iter().zip(goals).collect();
+        // Each new one, in the order given, with the step it's made from and what it waits for.
+        if goals.iter().any(|g| g.step.is_some() || g.part_of.is_some() || g.kind.is_some() || g.waits_on.is_some() || g.needs.is_some()) {
+            let ids = added(&s, &before);
+            let pairs: Vec<(String, Option<Vec<String>>, NewGoal)> = ids.iter().cloned().zip(goals).map(|(id, g)| (id, g.needs.as_deref().map(|n| resolved(n, &ids)), g)).collect();
             hub.store
                 .call(move |c| {
-                    for (id, g) in &pairs {
+                    for (id, needs, g) in &pairs {
                         note(c, std::slice::from_ref(id), Noted { part_of: g.part_of.as_deref(), kind: g.kind, step: g.step.as_ref(), waits_on: g.waits_on.as_deref() })?;
+                        if let Some(n) = needs {
+                            c.execute("UPDATE goal_items SET needs = ?2, needs_by = ?3 WHERE id = ?1", params![id, serde_json::to_string(n)?, g.needs_by])?;
+                        }
                     }
                     Ok(())
                 })
@@ -807,6 +938,57 @@ pub async fn add_at(hub: &Hub, agent: &str, goals: Vec<NewGoal>, start: bool, at
         }
     };
     if start { control(hub, agent, Action::Start).await } else { Ok(stack) }
+}
+
+/// What goals added wait for, by id: another added with them (`added`, their ids in order), or a
+/// goal of the stack.
+fn resolved(needs: &[Need], added: &[String]) -> Vec<String> {
+    needs
+        .iter()
+        .filter_map(|n| match n {
+            Need::Added(k) => k.checked_sub(1).and_then(|i| added.get(i)).cloned(),
+            Need::Id(id) => Some(id.clone()),
+        })
+        .collect()
+}
+
+/// Refuses what goals about to be added after `items` say they wait for: a goal that isn't in the
+/// stack, one of them that isn't there or is the goal itself, too many, or a loop among them.
+fn check_added(items: &[Item], goals: &[NewGoal]) -> R<()> {
+    let n = goals.len();
+    // An id no goal has, for the k-th of these (from 1).
+    let temp = |k: usize| format!("\u{1}{k}");
+    let mut nodes = nodes_of(items, &subagents::Graph::default());
+    for (j, g) in goals.iter().enumerate() {
+        let me = j.saturating_add(1);
+        let mut ids: Vec<String> = Vec::new();
+        for need in g.needs.iter().flatten() {
+            match need {
+                Need::Added(k) if *k == me => return Err(Error::Bad(format!("goal {k} of these can't wait for itself"))),
+                Need::Added(k) if *k == 0 || *k > n => return Err(Error::Bad(format!("goal {me} of these waits for goal {k} of them, but they count from 1 to {n}"))),
+                Need::Added(k) => ids.push(temp(*k)),
+                Need::Id(id) if items.iter().any(|i| i.id == *id) => ids.push(id.clone()),
+                Need::Id(id) => return Err(Error::Bad(format!("no goal {id} in this stack to wait for (goals_get lists them)"))),
+            }
+        }
+        if ids.len() > NEEDS {
+            return Err(Error::Bad(format!("a goal waits for {NEEDS} others at the most")));
+        }
+        let needs = if g.needs.is_some() { graph::Needs::Given(ids) } else { graph::Needs::Unknown };
+        nodes.push(graph::Node { id: temp(me), open: true, needs, ..graph::Node::default() });
+    }
+    let looped = graph::loops(&nodes);
+    if looped.is_empty() {
+        return Ok(());
+    }
+    let words: Vec<String> = looped
+        .iter()
+        .filter_map(|id| match items.iter().find(|i| i.id == *id) {
+            Some(i) => Some(short(&i.text)),
+            None => (1..=n).find(|k| temp(*k) == *id).and_then(|k| k.checked_sub(1)).and_then(|k| goals.get(k)).map(|g| short(&g.text)),
+        })
+        .collect();
+    Err(Error::Bad(format!("those goals would wait for each other in a loop: {}", words.join(", "))))
 }
 
 /// Goal `id` (without: the one under way) is met, as `by` says (`evidence`: what shows it). It ends
@@ -894,17 +1076,38 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
         (None, None, true) => Some(At::Next),
         _ => return Err(Error::Bad("move it one way: `before`, `after` or `next`".into())),
     };
-    if change.remove && (text.is_some() || at.is_some()) {
+    if change.remove && (text.is_some() || at.is_some() || change.needs.is_some()) {
         return Err(Error::Bad("a goal taken out isn't changed or moved too".into()));
     }
-    if !change.remove && text.is_none() && at.is_none() {
-        return Err(Error::Bad("say what changes: `text`, `before`, `after`, `next` or `remove`".into()));
+    if !change.remove && text.is_none() && at.is_none() && change.needs.is_none() {
+        return Err(Error::Bad("say what changes: `text`, `before`, `after`, `next`, `needs` or `remove`".into()));
     }
     let _one = CHANGING.lock().await;
     let stack = get(hub, agent).await?;
     let it = stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?;
     if !matches!(it.status.as_str(), "pending" | "active") {
         return Err(Error::Bad(format!("that goal is {} already and stays as it was: add it again (goals_add) to pursue it once more", it.status)));
+    }
+    // What it waits for: set first, so a move or other words go on with it.
+    if let Some(needs) = change.needs.clone() {
+        if it.status == "active" || it.subagent.is_some() {
+            return Err(Error::Bad("that goal is under way already: what it waits for no longer holds it back".into()));
+        }
+        let changes = vec![(id.to_owned(), needs)];
+        check_needs(&stack.items, &changes)?;
+        let (who, now, agent_s) = (by.name(), now_ms(hub), agent.to_owned());
+        hub.store
+            .call(move |c| {
+                let tx = crate::store::tx(c)?;
+                set_needs(&tx, &changes, &who)?;
+                touch(&tx, &agent_s, None, None, now)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+        if text.is_none() && at.is_none() {
+            return get(hub, agent).await;
+        }
     }
     if change.remove {
         let (active, gone, who, now, agent_s) = (it.status == "active", id.to_owned(), by.name(), now_ms(hub), agent.to_owned());
@@ -914,6 +1117,7 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
         let parts = descendants(&stack.items, id);
         let gone_parts: Vec<String> = stack.items.iter().filter(|i| parts.contains(&i.id) && i.status == "pending").map(|i| i.id.clone()).collect();
         withdraw(hub, agent, &stack.items, |i| i.id == id || (parts.contains(&i.id) && i.status == "pending")).await;
+        let items = stack.items.clone();
         let running = hub
             .store
             .call(move |c| {
@@ -926,6 +1130,8 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
                     for p in &gone_parts {
                         tx.execute("DELETE FROM goal_items WHERE id = ?1", params![p])?;
                     }
+                    let all: Vec<String> = std::iter::once(gone.clone()).chain(gone_parts.iter().cloned()).collect();
+                    rewire(&tx, &items, &all)?;
                 }
                 renumber(&tx, &agent_s)?;
                 touch(&tx, &agent_s, None, None, now)?;
@@ -957,6 +1163,50 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
         given.insert(to.min(given.len()), me);
     }
     set_locked(hub, &info, agent, given).await
+}
+
+/// Notes what goals wait for (`changes`: a goal's id, and the goals it waits for), as `who` says.
+fn set_needs(c: &rusqlite::Connection, changes: &[(String, Vec<String>)], who: &str) -> anyhow::Result<()> {
+    for (id, needs) in changes {
+        c.execute("UPDATE goal_items SET needs = ?2, needs_by = ?3 WHERE id = ?1", params![id, serde_json::to_string(needs)?, who])?;
+    }
+    Ok(())
+}
+
+/// What goals still to go wait for, said of several at once (`goals_order`), as `by` says: each
+/// goal by its id, with the goals of the stack it waits for (none: nothing). Each goal named is
+/// still to go and not under way, and is named once; what it waits for is in the stack; and no loop
+/// of waiting comes of it. Otherwise nothing changes. While subagents can take its goals, a goal
+/// that says nothing waits for this before it goes anywhere (docs/goals.md, "What a goal waits for").
+pub async fn order(hub: &Hub, agent: &str, given: Vec<(String, Vec<String>)>, by: &By) -> R<Stack> {
+    known(hub, agent)?;
+    if given.is_empty() {
+        return Err(Error::Bad("say what at least one goal waits for: `goals`, each {id, needs}".into()));
+    }
+    let _one = CHANGING.lock().await;
+    let stack = get(hub, agent).await?;
+    for (k, (id, _)) in given.iter().enumerate() {
+        let it = stack.items.iter().find(|i| i.id == *id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?;
+        if it.status != "pending" || it.subagent.is_some() {
+            let stands = if it.status == "active" || it.subagent.is_some() { "under way" } else { it.status.as_str() };
+            return Err(Error::Bad(format!("goal {id} is {stands} already: what it waits for no longer holds it back")));
+        }
+        if given.iter().take(k).any(|(d, _)| d == id) {
+            return Err(Error::Bad(format!("goal {id} is named twice: say what it waits for once")));
+        }
+    }
+    check_needs(&stack.items, &given)?;
+    let (who, now, agent_s) = (by.name(), now_ms(hub), agent.to_owned());
+    hub.store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            set_needs(&tx, &given, &who)?;
+            touch(&tx, &agent_s, None, None, now)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    get(hub, agent).await
 }
 
 /// Goal `id` (without: the one under way) split into parts, pursued first, each in turn, before
@@ -1159,10 +1409,11 @@ fn restore(c: &rusqlite::Connection, agent: &str, said_at: i64, now: i64) -> any
         if i.id.is_empty() || c.query_row("SELECT EXISTS(SELECT 1 FROM goal_items WHERE id = ?1)", params![i.id], |r| r.get::<_, bool>(0))? {
             i.id = crate::util::new_id();
         }
+        let needs = i.needs.as_ref().map(serde_json::to_string).transpose()?;
         c.execute(
-            "INSERT INTO goal_items (id, agent, pos, text, status, reason, how, prior_at, started_at, ended_at, reminders, reminded_at, busy_at, delegated_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![i.id, agent, i64::try_from(pos).unwrap_or(i64::MAX), i.text, i.status, i.reason, i.how, i.prior_at, i.started_at, i.ended_at, i.reminders, i.reminded_at, i.busy_at, i.on],
+            "INSERT INTO goal_items (id, agent, pos, text, status, reason, how, prior_at, started_at, ended_at, reminders, reminded_at, busy_at, delegated_to, needs, needs_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![i.id, agent, i64::try_from(pos).unwrap_or(i64::MAX), i.text, i.status, i.reason, i.how, i.prior_at, i.started_at, i.ended_at, i.reminders, i.reminded_at, i.busy_at, i.on, needs, i.needs_by],
         )?;
         note(c, std::slice::from_ref(&i.id), Noted { part_of: i.part_of.as_deref(), kind: i.part_kind.as_deref(), step: i.step.as_ref(), waits_on: i.waits_on.as_deref() })?;
     }
@@ -1718,15 +1969,17 @@ fn plans_first(stack: &Stack, id: &str) -> bool {
         && stack.items.iter().find(|i| i.id == id).is_some_and(|i| i.part_of.is_none() && i.step.is_none() && i.planned_as.is_none() && i.waits_on.is_none() && i.on.is_none() && big(&i.text))
 }
 
-/// Agent `agent`'s stack set to plan its big goals first, or not (`plans_first`).
-pub async fn settings(hub: &Hub, agent: &str, plan_big: bool) -> R<Stack> {
+/// Agent `agent`'s stack set to plan its big goals first, or not (`plans_first`), and to run its
+/// goals that don't wait for each other side by side on subagents, or one at a time (`side_by_side`):
+/// each as given, the other as it was.
+pub async fn settings(hub: &Hub, agent: &str, plan_big: Option<bool>, side_by_side: Option<bool>) -> R<Stack> {
     known(hub, agent)?;
     let _one = CHANGING.lock().await;
     let (a, now) = (agent.to_owned(), now_ms(hub));
     hub.store
         .call(move |c| {
             touch(c, &a, None, None, now)?;
-            c.execute("UPDATE goal_stacks SET plan_big = ?2 WHERE agent = ?1", params![a, plan_big])?;
+            c.execute("UPDATE goal_stacks SET plan_big = COALESCE(?2, plan_big), side_by_side = COALESCE(?3, side_by_side) WHERE agent = ?1", params![a, plan_big, side_by_side])?;
             Ok(())
         })
         .await?;
@@ -1760,7 +2013,7 @@ pub async fn planned(hub: &Hub, agent: &str, goal: &str, plan: &crate::plans::Pl
             part_of: Some(goal.to_owned()),
             kind: Some("run"),
             waits_on: Some(r.clone()),
-            step: None,
+            ..NewGoal::default()
         }],
         Then::Goals | Then::Review => (0..n)
             .map(|i| NewGoal {
@@ -1768,7 +2021,7 @@ pub async fn planned(hub: &Hub, agent: &str, goal: &str, plan: &crate::plans::Pl
                 step: Some(StepRef { plan: plan.id.clone(), version: plan.version, n: i + 1, run: Some(run.to_owned()) }),
                 part_of: Some(goal.to_owned()),
                 kind: Some("plan"),
-                waits_on: None,
+                ..NewGoal::default()
             })
             .collect(),
     };
@@ -1813,11 +2066,11 @@ fn decide(stack: &Stack, info: Option<&Info>, now: i64, children: bool, push: bo
     decide_on(stack, &subagents::Graph::default(), info, now, children, push)
 }
 
-/// What a running stack does next, at `now`, its plan steps going as `graph` says (what waits for
-/// what, what's out on subagents or about to go to them: `subagents::next_up`). `children`: agents
-/// it started are at work. `push`: you just started or resumed the stack, skipped its goal or
-/// changed what's under way, so what's next goes now, whatever the agent is doing.
-fn decide_on(stack: &Stack, graph: &subagents::Graph, info: Option<&Info>, now: i64, children: bool, push: bool) -> Next {
+/// What a running stack does next, at `now`, its plan steps going as `plans` says (what waits for
+/// what, and what's about to go to subagents: `subagents::leave`). `children`: agents it started
+/// are at work. `push`: you just started or resumed the stack, skipped its goal or changed what's
+/// under way, so what's next goes now, whatever the agent is doing.
+fn decide_on(stack: &Stack, plans: &subagents::Graph, info: Option<&Info>, now: i64, children: bool, push: bool) -> Next {
     // An agent kiln doesn't know right now is waited for: its runner is reconnecting, or the
     // server has just started. (A closed agent's stack goes when it's closed.)
     let Some(info) = info else { return Next::Wait };
@@ -1867,10 +2120,14 @@ fn decide_on(stack: &Stack, graph: &subagents::Graph, info: Option<&Info>, now: 
         let worked = item.busy_at > 0 && info.last_activity.saturating_sub(item.busy_at) >= WORKED_MS;
         return Next::Remind { id, text: item.text.clone(), how, worked, stopped: info.status == Status::Exited, fresh };
     }
-    // A goal under way on another agent (delegated: docs/programs.md) or a subagent isn't this one's
-    // to start, nor a plan's step still waiting for others, and while one is open the stack isn't
-    // done.
-    match subagents::next_up(stack, graph) {
+    // The next goal as the stack's graph says (`graph`): the first ready, what it waits for ended, a
+    // plan's steps as their plan says, and the rest in the stack's order where nothing says
+    // otherwise (docs/agentic.md G1). A goal under way on another agent (delegated: docs/programs.md)
+    // or a subagent, or about to go to one, isn't this one's to start, and while one is open the
+    // stack isn't done.
+    let nodes = nodes_of(&stack.items, plans);
+    let next = graph::assign(&graph::build(&nodes, false), &nodes, graph::Room::Never).agent;
+    match next.and_then(|id| stack.items.iter().find(|i| i.id == id)) {
         Some(i) if free => Next::Start { id: i.id.clone(), text: i.text.clone() },
         Some(_) => Next::Wait,
         None if stack.items.iter().any(|i| i.status == "pending") => Next::Wait,
@@ -2240,6 +2497,34 @@ mod tests {
             Command::Send { id, .. } => Some(id.clone()),
             _ => None,
         }
+    }
+
+    /// What a goal says it waits for holds it back: the next goal is the first whose waits have
+    /// ended, and where nothing says otherwise the first in the stack's order, as ever
+    /// (docs/agentic.md G1).
+    #[test]
+    fn g1_the_next_goal_is_the_first_whose_waits_have_ended() {
+        let goal = |id: &str, status: &str, needs: Option<&[&str]>| Item {
+            id: id.into(),
+            text: format!("goal {id}"),
+            status: status.into(),
+            needs: needs.map(|n| n.iter().map(|s| (*s).to_owned()).collect()),
+            ..Item::default()
+        };
+        let idle = info(Status::Idle, None);
+        let next = |items: Vec<Item>| match decide(&stack(items), Some(&idle), 2_000, false, false) {
+            Next::Start { id, .. } => Some(id),
+            _ => None,
+        };
+        assert_eq!(next(vec![goal("a", "pending", None), goal("b", "pending", None)]).as_deref(), Some("a"), "nothing said: the stack's order");
+        assert_eq!(next(vec![goal("a", "pending", Some(&["b"])), goal("b", "pending", None)]).as_deref(), Some("b"), "a waits for b");
+        // Both ready, what `a` waits for having ended: breadth first, `b` (a round earlier, waiting
+        // for nothing) goes first; in the same round, the stack's order.
+        assert_eq!(next(vec![goal("m", "met", None), goal("a", "pending", Some(&["m"])), goal("b", "pending", Some(&[]))]).as_deref(), Some("b"), "an earlier round first");
+        assert_eq!(next(vec![goal("m", "met", None), goal("a", "pending", Some(&["m"])), goal("b", "pending", Some(&["m"]))]).as_deref(), Some("a"), "one round: the stack's order");
+        // Waiting only for a goal under way on another agent, nothing here is ready: the stack waits.
+        let away = Item { on: Some("worker".into()), ..goal("w", "pending", None) };
+        assert!(matches!(decide(&stack(vec![away, goal("a", "pending", Some(&["w"]))]), Some(&idle), 2_000, false, false), Next::Wait));
     }
 
     #[test]
@@ -3770,6 +4055,162 @@ mod stack_tests {
             assert!(now.text.starts_with("Plan \"Document the replication protocol."), "{}", now.text);
             let p = crate::plans::get(&hub, &pid).await?;
             assert_eq!((p.phase.as_str(), p.research.is_some()), ("planning", true));
+            Ok(())
+        })
+    }
+
+    /// A person's caller, for the operations.
+    fn person(hub: &Arc<Hub>) -> crate::ops::Cx {
+        crate::ops::Cx { hub: Arc::clone(hub), caller: crate::authz::Caller::owner() }
+    }
+
+    /// The 400's words, when `r` was refused so.
+    fn refused(r: Result<serde_json::Value, crate::ops::Fail>) -> Option<String> {
+        r.err().filter(|(c, _)| *c == 400).map(|(_, m)| m)
+    }
+
+    /// The id of the goal with words `text`.
+    fn id_of(s: &Stack, text: &str) -> String {
+        s.items.iter().find(|i| i.text == text).map(|i| i.id.clone()).unwrap_or_default()
+    }
+
+    /// What the goal with words `text` waits for, as kept.
+    fn needs_of(s: &Stack, text: &str) -> Option<Vec<String>> {
+        s.items.iter().find(|i| i.text == text).and_then(|i| i.needs.clone())
+    }
+
+    /// Goals say what they wait for as they're added: a goal of the stack by id, or one added with
+    /// them by its place among them; one that says nothing says nothing, and `parallel` has those
+    /// that say nothing wait for nothing. Who said so is kept (docs/agentic.md G1).
+    #[test]
+    fn g1_goals_say_what_they_wait_for_as_theyre_added() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["schema"]).await?;
+            let (id, cx) = (id.as_str(), person(&hub));
+            let schema = id_of(&get(&hub, id).await?, "schema");
+            let goals = serde_json::json!([{"text": "api", "needs": [schema]}, {"text": "ui", "needs": [1]}, "docs"]);
+            call_ok(crate::ops::call(cx.clone(), "goals.add", serde_json::json!({"agent": id, "start": false, "goals": goals})).await)?;
+            let s = get(&hub, id).await?;
+            assert_eq!(needs_of(&s, "api"), Some(vec![schema.clone()]));
+            assert_eq!(needs_of(&s, "ui"), Some(vec![id_of(&s, "api")]));
+            assert_eq!(needs_of(&s, "docs"), None, "a goal that says nothing says nothing");
+            assert_eq!(s.items.iter().find(|i| i.text == "api").and_then(|i| i.needs_by.as_deref()), Some("you"));
+            let goals = serde_json::json!(["notes", {"text": "ship", "needs": [1]}]);
+            call_ok(crate::ops::call(cx.clone(), "goals.add", serde_json::json!({"agent": id, "start": false, "parallel": true, "goals": goals})).await)?;
+            let s = get(&hub, id).await?;
+            assert_eq!(needs_of(&s, "notes"), Some(Vec::new()), "parallel: it waits for nothing");
+            assert_eq!(needs_of(&s, "ship"), Some(vec![id_of(&s, "notes")]));
+            // Refused, with nothing added: a goal that isn't there, one of them that isn't, itself.
+            let before = s.items.len();
+            for (goals, says) in [
+                (serde_json::json!([{"text": "x", "needs": ["nope"]}]), "no goal nope"),
+                (serde_json::json!([{"text": "x", "needs": [2]}]), "count from 1 to 1"),
+                (serde_json::json!([{"text": "x", "needs": [1]}]), "itself"),
+            ] {
+                let m = refused(crate::ops::call(cx.clone(), "goals.add", serde_json::json!({"agent": id, "start": false, "goals": goals})).await);
+                assert!(m.as_deref().is_some_and(|m| m.contains(says)), "{says}: {m:?}");
+            }
+            assert_eq!(get(&hub, id).await?.items.len(), before, "nothing added");
+            Ok(())
+        })
+    }
+
+    /// A loop of waiting is refused whichever way it would be made: goals added together, one
+    /// goal's needs changed, several ordered at once. Nothing changes (docs/agentic.md G1).
+    #[test]
+    fn g1_a_loop_of_waiting_is_refused_whichever_way_its_made() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&[]).await?;
+            let (id, cx) = (id.as_str(), person(&hub));
+            let looped = serde_json::json!([{"text": "a", "needs": [2]}, {"text": "b", "needs": [1]}]);
+            let m = refused(crate::ops::call(cx.clone(), "goals.add", serde_json::json!({"agent": id, "start": false, "goals": looped})).await);
+            assert!(m.as_deref().is_some_and(|m| m.contains("loop") && m.contains("\u{201c}a\u{201d}") && m.contains("\u{201c}b\u{201d}")), "{m:?}");
+            assert!(get(&hub, id).await?.items.is_empty(), "nothing added");
+            let chain = serde_json::json!(["a", {"text": "b", "needs": [1]}, {"text": "c", "needs": [2]}]);
+            call_ok(crate::ops::call(cx.clone(), "goals.add", serde_json::json!({"agent": id, "start": false, "goals": chain})).await)?;
+            let s = get(&hub, id).await?;
+            let (a, c) = (id_of(&s, "a"), id_of(&s, "c"));
+            let m = refused(crate::ops::call(cx.clone(), "goals.update", serde_json::json!({"agent": id, "id": a, "needs": [c]})).await);
+            assert!(m.as_deref().is_some_and(|m| m.contains("loop")), "{m:?}");
+            let m = refused(crate::ops::call(cx.clone(), "goals.order", serde_json::json!({"agent": id, "goals": [{"id": a, "needs": [c]}]})).await);
+            assert!(m.as_deref().is_some_and(|m| m.contains("loop")), "{m:?}");
+            assert_eq!(needs_of(&get(&hub, id).await?, "a"), None, "unchanged");
+            Ok(())
+        })
+    }
+
+    /// The agent says what several goals wait for at once (`goals_order`): goals still to go only,
+    /// each once, waiting for goals of the stack (docs/agentic.md G1).
+    #[test]
+    fn g1_goals_order_says_what_several_goals_wait_for() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["first"]).await?;
+            let (id, cx) = (id.as_str(), person(&hub));
+            add(&hub, id, strs(&["a", "b", "c"]), false).await?;
+            let s = get(&hub, id).await?;
+            let (first, a, b, c) = (id_of(&s, "first"), id_of(&s, "a"), id_of(&s, "b"), id_of(&s, "c"));
+            assert_eq!(s.items.iter().find(|i| i.id == first).map(|i| i.status.as_str()), Some("active"), "{:?}", words(&s));
+            let order = serde_json::json!([{"id": b, "needs": [a]}, {"id": c, "needs": []}]);
+            call_ok(crate::ops::call(cx.clone(), "goals.order", serde_json::json!({"agent": id, "goals": order})).await)?;
+            let s = get(&hub, id).await?;
+            assert_eq!(needs_of(&s, "b"), Some(vec![a.clone()]));
+            assert_eq!(needs_of(&s, "c"), Some(Vec::new()));
+            assert_eq!(needs_of(&s, "a"), None, "one not named is as it was");
+            for (order, says) in [
+                (serde_json::json!([{"id": "nope", "needs": []}]), "no goal nope"),
+                (serde_json::json!([{"id": first, "needs": []}]), "under way"),
+                (serde_json::json!([{"id": a, "needs": []}, {"id": a, "needs": [b]}]), "twice"),
+                (serde_json::json!([{"id": a, "needs": [a]}]), "itself"),
+                (serde_json::json!([{"id": a, "needs": ["nope"]}]), "no goal nope"),
+            ] {
+                let m = refused(crate::ops::call(cx.clone(), "goals.order", serde_json::json!({"agent": id, "goals": order})).await);
+                assert!(m.as_deref().is_some_and(|m| m.contains(says)), "{says}: {m:?}");
+            }
+            Ok(())
+        })
+    }
+
+    /// A goal taken out, one at a time or by a new list, leaves the goals that waited for it waiting
+    /// for what it waited for, so the order it kept holds. Brought back, goals wait as they did
+    /// (docs/agentic.md G1).
+    #[test]
+    fn g1_a_goal_taken_out_leaves_what_waited_for_it_waiting_for_what_it_waited_for() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["first"]).await?;
+            let (id, cx) = (id.as_str(), person(&hub));
+            let goals = serde_json::json!([{"text": "a", "needs": []}, {"text": "b", "needs": [1]}, {"text": "c", "needs": [2]}, {"text": "d", "needs": [2]}]);
+            call_ok(crate::ops::call(cx.clone(), "goals.add", serde_json::json!({"agent": id, "start": false, "goals": goals})).await)?;
+            let s = get(&hub, id).await?;
+            let (a, b) = (id_of(&s, "a"), id_of(&s, "b"));
+            call_ok(crate::ops::call(cx.clone(), "goals.update", serde_json::json!({"agent": id, "id": b, "remove": true})).await)?;
+            let s = get(&hub, id).await?;
+            assert_eq!((needs_of(&s, "c"), needs_of(&s, "d")), (Some(vec![a.clone()]), Some(vec![a.clone()])), "{:?}", words(&s));
+            // Cleared and brought back: as they were.
+            control(&hub, id, Action::Clear).await?;
+            let s = control(&hub, id, Action::Restore).await?;
+            assert_eq!(needs_of(&s, "c"), Some(vec![a.clone()]), "{:?}", words(&s));
+            // A new list leaving `a` out: what waited for it waits for what it waited for (nothing).
+            let keep: Vec<serde_json::Value> = ["c", "d"].iter().map(|t| serde_json::json!({"id": id_of(&s, t), "text": t})).collect();
+            call_ok(crate::ops::call(cx.clone(), "goals.set", serde_json::json!({"agent": id, "goals": keep})).await)?;
+            let s = get(&hub, id).await?;
+            assert!(s.items.iter().all(|i| i.text != "a"), "{:?}", words(&s));
+            assert_eq!(needs_of(&s, "d"), Some(Vec::new()), "{:?}", words(&s));
+            Ok(())
+        })
+    }
+
+    /// Whether a stack's goals run side by side is a person's setting, on unless turned off, set
+    /// alone or with planning big goals first, and said (docs/agentic.md G1).
+    #[test]
+    fn g1_a_stack_runs_its_goals_side_by_side_unless_turned_off() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["a"]).await?;
+            let (id, cx) = (id.as_str(), person(&hub));
+            assert!(get(&hub, id).await?.side_by_side, "on unless turned off");
+            let off = call_ok(crate::ops::call(cx.clone(), "goals.settings", serde_json::json!({"agent": id, "side_by_side": false})).await)?;
+            assert_eq!((off.get("side_by_side"), off.get("plan_big")), (Some(&serde_json::json!(false)), Some(&serde_json::json!(true))), "{off}");
+            let m = refused(crate::ops::call(cx.clone(), "goals.settings", serde_json::json!({"agent": id})).await);
+            assert!(m.as_deref().is_some_and(|m| m.contains("side_by_side")), "{m:?}");
             Ok(())
         })
     }

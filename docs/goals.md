@@ -244,6 +244,32 @@ A program's coordinator can hand a goal of its stack to a track's worker
 doesn't start it here; while it's out, the stack isn't done. It's met, or comes back to the stack,
 when the coordinator says so.
 
+## What a goal waits for
+
+A goal can say what it waits for (`needs`): goals of its stack, by id. It goes once each of them
+has ended (met, or skipped), and goals with nothing left to wait for are ready together. It's said:
+
+- as goals are added: `goals_add` takes each goal as its words or `{text, needs}`, `needs` naming
+  goals of the stack by id, or goals added with it by their place among them (from 1); with
+  `parallel`, those that say nothing wait for nothing;
+- of one goal (`goals_update` with `needs`), or of several at once (`goals_order`:
+  `{goals: [{id, needs}]}`), for goals still to go and not under way.
+
+A goal waits for its parts, and a part waits for what its goal says it waits for. A loop of
+waiting is refused, naming the goals that would be in it, and nothing changes. A goal taken out
+leaves the goals that waited for it waiting for what it waited for, so the order it kept holds.
+What each goal waits for is kept with it, with who said so (`needs_by`). Bring back keeps both.
+
+A goal that says nothing waits for the goal still to go before it, passing over one handed to
+another agent, so a stack whose goals say nothing runs in its order, as it always has. Of the goals
+ready, the agent takes up the first: by round over the whole stack (a goal that waits for nothing
+is in round 0, and one that waits for others is a round after the latest of them), then in the
+stack's order.
+
+Goals ready together going to subagents of the agent's, side by side, is being built
+(docs/agentic.md G). `goals/settings` `{side_by_side}` is a person's switch for that, on unless
+turned off. Until it's built, the stack runs its goals one at a time, as described above.
+
 ## Keep going
 
 An agent with no goal stack under way is still kept at its work: when a turn stops part-way,
@@ -306,18 +332,19 @@ What the driver sends, and the goals it sees end, are counted on `/metrics`
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/harness/sessions/:id/goals` | the stack: `{agent, state: "running" \| "paused" \| "done", reason?, items: [{id, text, status: "pending" \| "active" \| "met" \| "unmet" \| "skipped", reason?, how?, started_at?, ended_at?, reminders?, reminded_at?, part_of?, part_kind?, step?: {plan, version, n, run?}, planned_as?, waits_on?, subagent?}], updated_at, cleared?, resume_at?}` (`subagent`: the subagent a plan's step was handed to, side by side with its others, while it's still to go here, and once it met it; `part_kind`: who made it a part: `own` (the agent), or kiln: `checks`, `plan`, `planning`, `run`; `planned_as`: the plan the goal became; `waits_on`: the plan run a part waits for; `reminders`: times the goal under way was sent again in a row without real work; `reminded_at`: when it was last sent, unix ms, none since it was resumed; `part_of`: the goal it's a part of; `step`: the plan step it was made from; `cleared`: how many goals the last clear kept, to bring back; `resume_at`: when a stack paused for a while resumes, unix ms; `held_for`: paused for you, until you resume it: `""`, or the plan it waits for you to look at; `plan_big`: whether it plans its big goals first) |
-| POST | `/api/harness/sessions/:id/goals` | `{goals: [text], start?, next?, before?, after?}`: goals after the others, or right after the goal under way (`next`), or before or after a goal still to go (by id) (a stack that was done, given more, is paused until started) |
+| GET | `/api/harness/sessions/:id/goals` | the stack: `{agent, state: "running" \| "paused" \| "done", reason?, items: [{id, text, status: "pending" \| "active" \| "met" \| "unmet" \| "skipped", reason?, how?, started_at?, ended_at?, reminders?, reminded_at?, part_of?, part_kind?, step?: {plan, version, n, run?}, planned_as?, waits_on?, subagent?, needs?, needs_by?}], updated_at, cleared?, resume_at?, side_by_side}` (`subagent`: the subagent a plan's step was handed to, side by side with its others, while it's still to go here, and once it met it; `needs`: the goals it waits for, by id, when it says ("What a goal waits for"); `needs_by`: who said so, `kiln` when it couldn't get it ordered and it goes in turn; `side_by_side`: whether goals ready together go to subagents, once that's built; `part_kind`: who made it a part: `own` (the agent), or kiln: `checks`, `plan`, `planning`, `run`; `planned_as`: the plan the goal became; `waits_on`: the plan run a part waits for; `reminders`: times the goal under way was sent again in a row without real work; `reminded_at`: when it was last sent, unix ms, none since it was resumed; `part_of`: the goal it's a part of; `step`: the plan step it was made from; `cleared`: how many goals the last clear kept, to bring back; `resume_at`: when a stack paused for a while resumes, unix ms; `held_for`: paused for you, until you resume it: `""`, or the plan it waits for you to look at; `plan_big`: whether it plans its big goals first) |
+| POST | `/api/harness/sessions/:id/goals` | `{goals: [text \| {text, needs?}], parallel?, start?, next?, before?, after?}`: goals after the others, or right after the goal under way (`next`), or before or after a goal still to go (by id) (a stack that was done, given more, is paused until started); `needs`: what each waits for, goals of the stack by id or of these by their place from 1; `parallel`: those that say nothing wait for nothing |
+| POST | `/api/harness/sessions/:id/goals/order` | `{goals: [{id, needs}]}`: what goals still to go wait for, several at once ("What a goal waits for"); a loop of waiting is refused |
 | POST | `/api/harness/sessions/:id/goals/done` | `{id?, evidence?}`: the goal under way (or `id`) is met |
 | POST | `/api/harness/sessions/:id/goals/split` | `{id?, goals?}`: the goal under way (or `id`) split into parts pursued first (none given: a plan step's acceptance criteria and tests) |
 | POST | `/api/harness/sessions/:id/goals/plan` | `{id?, title?}`: the goal under way (or `id`) turned into a plan in its planning phase: `{plan, research, goal, part, next}` |
-| POST | `/api/harness/sessions/:id/goals/settings` | `{plan_big}`: whether the stack plans its big goals first ("Big goals, planned first"); answers the stack (`goals.settings`, not an agent's tool) |
-| PATCH | `/api/harness/sessions/:id/goals/:goal` | `{text?, next?, before?, after?, remove?}`: one goal still to go changed, moved or taken out |
+| POST | `/api/harness/sessions/:id/goals/settings` | `{plan_big?, side_by_side?}` (one at least): whether the stack plans its big goals first ("Big goals, planned first"), and whether its goals ready together go to subagents ("What a goal waits for"); answers the stack (`goals.settings`, not an agent's tool) |
+| PATCH | `/api/harness/sessions/:id/goals/:goal` | `{text?, next?, before?, after?, needs?, remove?}`: one goal still to go changed, moved, said to wait for other goals (`needs`, by id), or taken out (what waited for it then waits for what it waited for) |
 | PUT | `/api/harness/sessions/:id/goals` | `{goals: [{id?, text}]}`: the goals still to go, as they should be (reordered, edited, removed, added; one without `id` is the goal still to go with its words, if one wasn't named, else a new one). The goal under way may be among them: first, it stays (with other words, it's sent again as they say); after others, it goes back among them and the first goes next; left out, it stays under way. Goals done, given by id, are left as they are, not added again |
 | POST | `/api/harness/sessions/:id/goals/{start,resume,pause,skip,done,clear,restore}` | as above (`resume`: `start`; `restore`: **Bring back**); `pause` takes `{why?, resume_in_s?, resume_at?}` |
 
 Agents use the same through kiln's MCP tools (`goals_get`, `goals_add`, `goals_done`,
-`goals_split`, `goals_plan`, `goals_update`, `goals_set`, `goals_control`) or `kiln.goals.*` in code mode: an agent can line goals up for itself and for
+`goals_split`, `goals_plan`, `goals_update`, `goals_order`, `goals_set`, `goals_control`) or `kiln.goals.*` in code mode: an agent can line goals up for itself and for
 the agents it started (and theirs), and change or clear only theirs (docs/agents.md, "No more than
 its parent"). Without `agent`, they're about the agent calling: its own stack. `plans_run` takes
 `mode: "goals"` (on the agent calling, when it gives neither `session` nor `new`); on a new agent,

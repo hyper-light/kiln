@@ -21,8 +21,9 @@
 //! A plan whose steps say nothing of waiting runs one after another, as before. Which subagent has
 //! which step is kept with the step's goal (`Item::subagent`) and by the subagent (`MARK`), so the
 //! driver follows each across restarts. What's decided here is the driver's, each tick ([`tick`]),
-//! outside the stacks' lock, which each change takes as it goes; [`next_up`] and [`to_hand`] are
-//! pure.
+//! outside the stacks' lock, which each change takes as it goes; [`to_hand`] is pure, and what the
+//! agent takes up next is its stack's graph's (`goals::graph`), with what's about to go to subagents
+//! left for them.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -91,6 +92,17 @@ impl Graph {
     fn is_empty(&self) -> bool {
         self.waits.is_empty()
     }
+
+    /// What step goal `id` waits for, as its plan says (none: its plan says nothing of waiting, or
+    /// it's no step).
+    pub(super) fn waits_of(&self, id: &str) -> Option<&[String]> {
+        self.waits.get(id).map(Vec::as_slice)
+    }
+
+    /// Step goal `id` is about to go to a subagent: the agent leaves it for one.
+    pub(super) fn handing(&self, id: &str) -> bool {
+        self.handing.iter().any(|h| h == id)
+    }
 }
 
 /// A goal made from a plan's step in a run: the step's own goal, not one of its parts (its
@@ -121,59 +133,10 @@ fn group_of<'a>(i: &'a Item, items: &'a [Item], g: &Graph) -> Option<&'a str> {
     u.step.as_ref().and_then(|s| s.run.as_deref())
 }
 
-/// `i` is out on a subagent: it, or the step it's a part of, is still to go here and handed to one.
-fn out(i: &Item, items: &[Item]) -> bool {
-    i.subagent.is_some() || unit_of(i, items).is_some_and(|u| open(u) && u.subagent.is_some())
-}
-
 /// Every step step `u` waits for has ended here (met, or left behind: a stack goes on past a goal
 /// skipped).
 fn ready(u: &Item, items: &[Item], g: &Graph) -> bool {
     g.waits.get(&u.id).is_none_or(|w| w.iter().all(|d| items.iter().find(|i| i.id == *d).is_none_or(|i| !open(i))))
-}
-
-/// A part of `i`, at any depth, is out on a subagent.
-fn parts_out(i: &Item, items: &[Item]) -> bool {
-    let parts = descendants(items, &i.id);
-    items.iter().any(|p| open(p) && p.subagent.is_some() && parts.contains(&p.id))
-}
-
-/// What the stack's agent takes up next, with nothing under way: the first goal still to go in the
-/// stack's order (one under way on another agent passed over, as before). Among the steps of a plan
-/// that says what they wait for, the first whose waits have all ended (its parts first), those out on
-/// subagents, about to go to them, or still waiting passed over; nothing past those steps until
-/// they've ended, nor a goal whose parts are out on subagents. None: nothing for it now.
-pub(super) fn next_up<'a>(stack: &'a Stack, g: &Graph) -> Option<&'a Item> {
-    let items = stack.items.as_slice();
-    let any_out = items.iter().any(|i| open(i) && i.subagent.is_some());
-    // No plan's steps side by side here: the first goal to go, as ever.
-    if g.is_empty() && !any_out {
-        return items.iter().find(|i| i.status == "pending" && i.on.is_none());
-    }
-    let mut group: Option<&str> = None;
-    for i in items.iter().filter(|i| i.status == "pending") {
-        let at = group_of(i, items, g);
-        if group.is_some() && at != group {
-            return None;
-        }
-        if any_out && out(i, items) {
-            group = at.or(group);
-            continue;
-        }
-        if i.on.is_some() {
-            continue;
-        }
-        if any_out && parts_out(i, items) {
-            return None;
-        }
-        let unit = unit_of(i, items);
-        if at.is_some() && !unit.is_some_and(|u| ready(u, items, g) && !g.handing.contains(&u.id)) {
-            group = at;
-            continue;
-        }
-        return Some(i);
-    }
-    None
 }
 
 /// Whether kiln hands `info`'s steps to subagents now: not while it's paused at a usage limit, or
@@ -621,6 +584,15 @@ mod tests {
 
     fn ids(v: &[&Item]) -> Vec<String> {
         v.iter().map(|i| i.id.clone()).collect()
+    }
+
+    /// What the agent takes up next, as the driver decides it (`goals::decide_on`): its stack's
+    /// graph, `g`'s steps as their plan says, those about to go to subagents left for them.
+    fn next_up<'a>(s: &'a Stack, g: &Graph) -> Option<&'a Item> {
+        use crate::goals::graph::{Room, assign, build};
+        let nodes = crate::goals::nodes_of(&s.items, g);
+        let id = assign(&build(&nodes, false), &nodes, Room::Never).agent?;
+        s.items.iter().find(|i| i.id == id)
     }
 
     /// docs/agentic.md P2: the first step alone goes to the agent; once it's met, the three that

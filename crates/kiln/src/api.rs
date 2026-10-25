@@ -880,6 +880,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "harness", "sessions", id, "goals", what]) => {
             let (name, field) = match *what {
                 "done" => ("goals.done", None),
+                "order" => ("goals.order", None),
                 "split" => ("goals.split", None),
                 "plan" => ("goals.plan", None),
                 "settings" => ("goals.settings", None),
@@ -4203,18 +4204,15 @@ async fn goals_set(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     Ok(srv::json(StatusCode::OK, &s))
 }
 
-#[derive(Deserialize)]
-struct GoalsAdd {
-    goals: Vec<String>,
-    #[serde(default)]
-    start: bool,
-}
-
-/// Goals lined up after the agent's others (`crate::goals::add`).
+/// Goals lined up after the agent's others (`crate::goals::add_at`): `{goals, start?, parallel?}`,
+/// each goal its words or `{text, needs}` (`crate::goals::ops::goals_of`).
 async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
     may_steer_goals(hub, caller, id).await?;
-    let b: GoalsAdd = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let s = crate::goals::add(hub, id, b.goals, b.start).await.map_err(goals_err)?;
+    let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let by = crate::goals::By::of(hub, caller, id);
+    let goals = crate::goals::ops::goals_of(&b, &by.name()).map_err(|m| err(StatusCode::BAD_REQUEST, m))?;
+    let start = b.get("start").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let s = crate::goals::add_at(hub, id, goals, start, &crate::goals::At::End).await.map_err(goals_err)?;
     hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
 }

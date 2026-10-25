@@ -6,7 +6,7 @@
 use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use super::{Action, At, By, Change, Error, Given, NewGoal, Pausing};
+use super::{Action, At, By, Change, Error, Given, Need, NewGoal, Pausing};
 use crate::ops::{Cx, Fail, Op, Out, path};
 
 fn fail(e: Error) -> Fail {
@@ -81,16 +81,71 @@ async fn get(cx: Cx, v: Value) -> Out {
     json_of(&super::get(&cx.hub, &agent).await.map_err(fail)?)
 }
 
+/// The goals `goals_add` takes (`goals`): each its words, or `{text, needs}` (`needs`: the goals it
+/// waits for, a number for one of these from 1, or a goal's id). `parallel`: those that say nothing
+/// wait for nothing. What they wait for is said by `by`.
+pub(crate) fn goals_of(v: &Value, by: &str) -> Result<Vec<NewGoal>, String> {
+    let parallel = v.get("parallel").and_then(Value::as_bool).unwrap_or(false);
+    let each = "each goal is its words, or {text, needs}";
+    let need = |n: &Value| match n {
+        Value::Number(k) => k.as_u64().and_then(|k| usize::try_from(k).ok()).map(Need::Added).ok_or_else(|| "`needs` counts these goals from 1".to_owned()),
+        Value::String(s) if !s.trim().is_empty() => Ok(Need::Id(s.trim().to_owned())),
+        _ => Err("`needs` lists goals: a number (one of these, from 1) or a goal's id".to_owned()),
+    };
+    let goals = v.get("goals").and_then(Value::as_array).ok_or_else(|| "`goals` is a list of at least one goal".to_owned())?;
+    if goals.is_empty() {
+        return Err("`goals` is a list of at least one goal".into());
+    }
+    goals
+        .iter()
+        .map(|g| {
+            let (text, needs) = match g {
+                Value::String(s) => (s.clone(), None),
+                Value::Object(o) => {
+                    let text = o.get("text").and_then(Value::as_str).ok_or_else(|| each.to_owned())?.to_owned();
+                    let needs = match o.get("needs") {
+                        None | Some(Value::Null) => None,
+                        Some(Value::Array(a)) => Some(a.iter().map(need).collect::<Result<Vec<_>, _>>()?),
+                        Some(_) => return Err("`needs` is a list".to_owned()),
+                    };
+                    (text, needs)
+                }
+                _ => return Err(each.to_owned()),
+            };
+            let needs = needs.or_else(|| parallel.then(Vec::new));
+            Ok(NewGoal { text, needs_by: needs.as_ref().map(|_| by.to_owned()), needs, ..NewGoal::default() })
+        })
+        .collect()
+}
+
 async fn add(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
     crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
-    let goals: Vec<String> = v.get("goals").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
-    if goals.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "`goals` is a list of at least one goal".into()));
-    }
+    let goals = goals_of(&v, &By::of(&cx.hub, &cx.caller, &agent).name()).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
     let start = v.get("start").and_then(Value::as_bool).unwrap_or(true);
-    let s = super::add_at(&cx.hub, &agent, goals.into_iter().map(NewGoal::from).collect(), start, &at_of(&v)?).await.map_err(fail)?;
+    let s = super::add_at(&cx.hub, &agent, goals, start, &at_of(&v)?).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.add".into(), agent).await;
+    json_of(&s)
+}
+
+/// What several goals wait for, said at once (`super::order`).
+async fn order(cx: Cx, v: Value) -> Out {
+    let agent = agent_of(&v)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
+    let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_owned());
+    let goals = v.get("goals").and_then(Value::as_array).ok_or_else(|| bad("`goals` lists goals, each {id, needs}"))?;
+    let given = goals
+        .iter()
+        .map(|g| {
+            let id = g.get("id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| bad("each goal is {id, needs}: its id, as goals_get gives it"))?;
+            let needs = g.get("needs").and_then(Value::as_array).ok_or_else(|| bad("each goal is {id, needs}: `needs` lists the ids of the goals it waits for ([] for none)"))?;
+            let needs = needs.iter().map(|n| n.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).ok_or_else(|| bad("`needs` lists goals' ids"))).collect::<Result<Vec<_>, _>>()?;
+            Ok((id.to_owned(), needs))
+        })
+        .collect::<Result<Vec<_>, Fail>>()?;
+    let by = By::of(&cx.hub, &cx.caller, &agent);
+    let s = super::order(&cx.hub, &agent, given, &by).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "goals.order".into(), agent).await;
     json_of(&s)
 }
 
@@ -215,9 +270,18 @@ fn dispatch_words(p: &super::Planned) -> String {
 async fn settings(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
     crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
-    let plan_big = v.get("plan_big").and_then(Value::as_bool).ok_or_else(|| (StatusCode::BAD_REQUEST, "`plan_big` is true or false".to_owned()))?;
-    let s = super::settings(&cx.hub, &agent, plan_big).await.map_err(fail)?;
-    cx.hub.store.audit(cx.caller.name.clone(), "goals.settings".into(), format!("{agent}: plan big goals first {}", if plan_big { "on" } else { "off" })).await;
+    let flag = |k: &str| match v.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(b) => b.as_bool().map(Some).ok_or_else(|| (StatusCode::BAD_REQUEST, format!("`{k}` is true or false"))),
+    };
+    let (plan_big, side_by_side) = (flag("plan_big")?, flag("side_by_side")?);
+    if plan_big.is_none() && side_by_side.is_none() {
+        return Err((StatusCode::BAD_REQUEST, "say what's set: `plan_big`, `side_by_side`, or both".to_owned()));
+    }
+    let s = super::settings(&cx.hub, &agent, plan_big, side_by_side).await.map_err(fail)?;
+    let on = |b: bool| if b { "on" } else { "off" };
+    let said: Vec<String> = [plan_big.map(|b| format!("plan big goals first {}", on(b))), side_by_side.map(|b| format!("goals side by side {}", on(b)))].into_iter().flatten().collect();
+    cx.hub.store.audit(cx.caller.name.clone(), "goals.settings".into(), format!("{agent}: {}", said.join(", "))).await;
     json_of(&s)
 }
 
@@ -244,14 +308,26 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.add",
-            summary: "Line goals up for an agent (for yourself, without `agent`), after the ones it has (or `next`, right after the goal under way; or `before` or `after` a goal still to go, by id): each goes to it once the one before is met (its harness's own /goal where it has one), like giving it /goal again and again. Runs the stack unless `start` is false. To pursue a document or list as a goal stack, give one goal per item, in order, each saying what done is.",
+            summary: "Line goals up for an agent (for yourself, without `agent`), after the ones it has (or `next`, right after the goal under way; or `before` or `after` a goal still to go, by id). Say what each waits for (`needs`, [] for nothing): a goal goes once what it waits for has ended, and goals that don't wait for each other run side by side, on subagents while there's room. One that says nothing is ordered before it goes (kiln asks the agent: goals_order). Each goes as its harness's own /goal where it has one, like giving it /goal again and again. Runs the stack unless `start` is false. To pursue a document or list as a goal stack, give one goal per item, each saying what done is and what it needs.",
             read_only: false,
             destructive: false,
             input: || {
                 schema(
                     json!({
                         "agent": {"type": "string", "description": AGENT},
-                        "goals": {"type": "array", "items": {"type": "string"}, "description": "Each a condition or objective, one line."},
+                        "goals": {
+                            "type": "array",
+                            "description": "Each a condition or objective, one line: its words, or {text, needs}.",
+                            "items": {
+                                "type": ["string", "object"],
+                                "properties": {
+                                    "text": {"type": "string"},
+                                    "needs": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "The goals it waits for: a number for one of these (from 1), or a goal's id. [] for none."}
+                                },
+                                "required": ["text"]
+                            }
+                        },
+                        "parallel": {"type": "boolean", "description": "Those of these that don't say what they need wait for nothing."},
                         "start": {"type": "boolean"},
                         "next": {"type": "boolean", "description": "Right after the goal under way, before the rest."},
                         "before": {"type": "string", "description": "Before this goal still to go (its id). Before the goal under way, they go first and it waits after them."},
@@ -320,7 +396,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.update",
-            summary: "Change one goal still to go, by its `id`, without giving the whole list: `text` gives it other words (the goal under way goes to the agent again as they say); `next`, `before` or `after` (a goal id) moves it (put before the goal under way, it goes next and that one waits); `remove` takes it out (the goal under way ends as skipped; one to come goes, with its parts).",
+            summary: "Change one goal still to go, by its `id`, without giving the whole list: `text` gives it other words (the goal under way goes to the agent again as they say); `next`, `before` or `after` (a goal id) moves it (put before the goal under way, it goes next and that one waits); `needs` says what it waits for (goals' ids, [] for none); `remove` takes it out (the goal under way ends as skipped; one to come goes, with its parts, and what waited for it waits for what it waited for).",
             read_only: false,
             destructive: true,
             input: || {
@@ -332,6 +408,7 @@ pub fn list_ops() -> Vec<Op> {
                         "next": {"type": "boolean", "description": "Move it right after the goal under way."},
                         "before": {"type": "string", "description": "Move it before this goal still to go (its id)."},
                         "after": {"type": "string", "description": "Move it after this goal still to go (its id)."},
+                        "needs": {"type": "array", "items": {"type": "string"}, "description": "What it waits for: the ids of goals of the stack ([] for nothing)."},
                         "remove": {"type": "boolean", "description": "Take it out."}
                     }),
                     &["id"],
@@ -339,6 +416,30 @@ pub fn list_ops() -> Vec<Op> {
             },
             route: |v| Ok((Method::PATCH, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", &opt(v, "id").unwrap_or_default()]))),
             run: |cx, v| Box::pin(update(cx, v)),
+        },
+        Op {
+            name: "goals.order",
+            summary: "Say what goals still to go wait for, several at once: `goals`, each {id, needs} (`needs`: the ids of the goals of the stack it waits for, [] for none). A goal goes once what it waits for has ended; goals that don't wait for each other run side by side, on subagents of yours while there's room, and you coordinate. While they can, kiln asks you to order the goals that say nothing before any of them goes: say only what you're sure of from the goals, the conversation and the code, and give every goal it asks about its needs. A loop of waiting is refused.",
+            read_only: false,
+            destructive: false,
+            input: || {
+                schema(
+                    json!({
+                        "agent": {"type": "string", "description": AGENT},
+                        "goals": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {"id": {"type": "string", "description": GOAL_ID}, "needs": {"type": "array", "items": {"type": "string"}, "description": "The ids of the goals it waits for ([] for none)."}},
+                                "required": ["id", "needs"]
+                            }
+                        }
+                    }),
+                    &["goals"],
+                )
+            },
+            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "order"]))),
+            run: |cx, v| Box::pin(order(cx, v)),
         },
         Op {
             name: "goals.plan",
@@ -360,10 +461,19 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.settings",
-            summary: "Whether an agent's goal stack plans its big goals first (`plan_big`, on unless turned off): a goal of the agent's own longer than a couple of sentences is researched and planned before it's worked on, as goals_plan does, its planning going to the agent in its place. A person's setting: not one of the agents' own tools.",
+            summary: "Whether an agent's goal stack plans its big goals first (`plan_big`, on unless turned off): a goal of the agent's own longer than a couple of sentences is researched and planned before it's worked on, as goals_plan does, its planning going to the agent in its place. And whether its goals that don't wait for each other run side by side on subagents (`side_by_side`, on unless turned off), or one at a time on the agent. A person's settings: not one of the agents' own tools.",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}, "plan_big": {"type": "boolean", "description": "Plan big goals first."}}), &["agent", "plan_big"]),
+            input: || {
+                schema(
+                    json!({
+                        "agent": {"type": "string", "description": AGENT},
+                        "plan_big": {"type": "boolean", "description": "Plan big goals first."},
+                        "side_by_side": {"type": "boolean", "description": "Run goals that don't wait for each other side by side, on subagents."}
+                    }),
+                    &["agent"],
+                )
+            },
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "settings"]))),
             run: |cx, v| Box::pin(settings(cx, v)),
         },
