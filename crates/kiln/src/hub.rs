@@ -2243,6 +2243,10 @@ impl Hub {
         // (ranked oldest), and nothing else tells it to hold it now (until 2026-10-25 a machine
         // upgraded so held no replica until its runner next connected).
         self.cluster_announced(name).await;
+        // And observe's: the newest replicates it (the group's messages go to it), and the build it
+        // took over from lets its own go. Until then that one held it, hearing nothing, until it
+        // ended (its jobs finished), and the new build waited for its folder.
+        crate::observe::hub::announced(self, name).await;
     }
 
     /// A machine's runner processes, while it has more than one, with what each holds.

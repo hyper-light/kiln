@@ -362,7 +362,9 @@ learner, which takes the log, or an image and its files, and answers queries on 
 Runners reach each other only through the server, so a quorum of runners could never stand without
 it: a voter on a runner would add a wait to every write and no availability. The newest
 replicating runner process of a machine replicates; another of the machine lets go of the folder
-(a file lock, as sync's).
+(a file lock, as sync's). A blue/green upgrade's new build joins ranked oldest, so it waits; once
+it is promoted it replicates, and the build it took over from lets go at once, though it runs on
+until its jobs end (before 2026-10-25 that one held the replica, unheard, until it ended).
 
 **Determinism.** Replicas that apply the same entries answer every query alike, whenever each cut,
 compacted, retained or restarted (§13):
