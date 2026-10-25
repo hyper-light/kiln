@@ -2249,8 +2249,17 @@ impl Leg {
                 }
                 Err(e) => self.note(idx, &format!("The leg container's mounts: {e:#}")).await,
             }
-            // The BuildKit containers it makes reach kiln by the GHES stand-in's name (W08-R08).
-            if let Some(l) = super::egress::relay_binary().and_then(|b| super::docker_sock::Loopback::new(b, &a.runtime.facade_url, started.cli.clone())) {
+            // The BuildKit containers it makes reach kiln by the GHES stand-in's name (W08-R08), and
+            // pull through kiln's caches (W12-R02): their config beside the leg's directory, where
+            // nothing the leg mounts reaches it.
+            if let Some(mut l) = super::egress::relay_binary().and_then(|b| super::docker_sock::Loopback::new(b, &a.runtime.facade_url, started.cli.clone())) {
+                if !a.runtime.mirrors.is_empty() {
+                    let at = st.layout.runner_workspace.with_extension("buildkitd.toml");
+                    match super::docker_sock::buildkitd_config(&a.runtime.mirrors, l.port).and_then(|c| Ok(std::fs::write(&at, c)?)) {
+                        Ok(()) => l.buildkitd = Some(at),
+                        Err(e) => self.note(idx, &format!("BuildKit's config for kiln's caches: {e:#}")).await,
+                    }
+                }
                 p.set_loopback(l);
             }
             st.docker_sock = Some(std::sync::Arc::new(p));

@@ -124,6 +124,10 @@ enum Pending {
     /// thread/backgroundTerminals/list, asked at `at` while kiln showed these terminal tasks
     /// running.
     Terminals { at: i64, live: Vec<String> },
+    /// turn/start on a subagent's own thread, for a person's message.
+    ChildTurn { thread: String, m: QueueItem },
+    /// turn/steer into a subagent's turn, for a person's message.
+    ChildSteer { thread: String, m: QueueItem },
 }
 
 /// A run of the CLI (or a fetch) kiln is waiting on.
@@ -184,6 +188,27 @@ struct Child {
     /// Its turn Codex wouldn't stop (what it asks is the person's).
     #[serde(default)]
     unstoppable: Option<String>,
+    /// It takes a person's messages on its own thread (`turn/start`, `turn/steer`): a multi-agent
+    /// v1 agent this process spawned. Codex refuses them for a v2 agent (it reports its spawn as
+    /// `subAgentActivity`) and for one it didn't spawn (unloaded): those go by way of the agent.
+    #[serde(default)]
+    direct: bool,
+    /// Its path among the agents (v2's `agentPath`), which the agent's tools address it by.
+    #[serde(default)]
+    path: Option<String>,
+    /// Closed (`close_agent`): it takes nothing until it's resumed.
+    #[serde(default)]
+    closed: bool,
+    /// A message sent now: it starts its next turn once the one under way is stopped.
+    #[serde(default)]
+    now: Option<QueueItem>,
+    /// A message kiln asked the agent to pass on to it while it was idle: what waits next goes
+    /// once its turn for that one has started and ended.
+    #[serde(default)]
+    relaying: bool,
+    /// Its turn that ended last (one kiln started may say it began after it ended).
+    #[serde(default)]
+    done_turn: Option<String>,
 }
 
 /// Whether a turn's error is the account's usage limit: `codexErrorInfo` says so
@@ -366,6 +391,10 @@ pub struct Codex {
     /// conversation is in (`thread/goal/set`'s params, but the thread).
     #[serde(default)]
     goal: Option<Value>,
+    /// Messages a person wrote to a subagent Codex takes none for from kiln, which the agent is
+    /// to pass on with its own agent tools: by subagent (its thread), their ids, oldest first.
+    #[serde(default)]
+    relays: HashMap<String, std::collections::VecDeque<String>>,
 }
 
 impl Codex {
@@ -439,6 +468,7 @@ impl Codex {
             seeded: false,
             injecting: false,
             goal: None,
+            relays: HashMap::new(),
         }
     }
 
@@ -662,7 +692,7 @@ impl Codex {
         if self.turn.is_some() {
             let Some(text) = self.stopped_note(core) else { return };
             let id = format!("{}{}", super::pause::KILN_ID, crate::util::new_id());
-            self.send(core, QueueItem { id: id.clone(), text, at: Core::now(), attachments: Vec::new(), overrides: None }, SendMode::Steer);
+            self.send(core, QueueItem { id: id.clone(), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Steer);
             super::pause::from_kiln(core, &id);
         } else if now && !self.busy(core) {
             let Some(note) = self.stopped_note(core) else { return };
@@ -703,17 +733,225 @@ impl Codex {
         self.settle(core);
     }
 
-    /// Subagents a spawn the session saw start: Codex gives each its spawner's permissions.
-    fn note_spawns(&mut self, item: &Value, spawner: Option<&str>) {
-        let targets: Vec<String> = match item.get("type").and_then(Value::as_str) {
-            Some("collabAgentToolCall") if item.get("tool").and_then(Value::as_str) == Some("spawnAgent") => {
-                item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect()
+    // ------------------------------------------------------------------ messages to subagents
+
+    /// How a person's message reaches subagent `t` now. One this process spawned with
+    /// multi-agent v1 takes them on its own thread: as a turn of its own when idle, steered into
+    /// the one under way, or sent now (that turn interrupted). Codex refuses them for a v2 agent and
+    /// for one it didn't spawn here (`direct app-server input is not allowed …`), so the agent
+    /// passes those on with its own agent tools: steered into a turn, or a turn once it's idle
+    /// (agents it started itself only; a deeper one can't be reached that way).
+    pub fn takes(&self, core: &Core, t: &Task) -> (Vec<SendMode>, Option<&'static str>) {
+        let none = (Vec::new(), None);
+        let Some(child) = self.children.get(&t.id) else { return none };
+        if child.closed || t.tool_id.is_none() || self.thread.is_none() || matches!(core.state.status, Status::Exited | Status::Starting) {
+            return none;
+        }
+        let working = child.turn.is_some() || t.live();
+        match (child.direct, working) {
+            (true, true) if child.turn.is_some() => (vec![SendMode::Queue, SendMode::Steer, SendMode::Now], None),
+            (true, _) => (vec![SendMode::Queue], None),
+            (false, _) if t.parent_task.is_some() => none,
+            (false, true) => (vec![SendMode::Queue, SendMode::Steer], Some(super::subagent::PARENT)),
+            (false, false) => (vec![SendMode::Queue], Some(super::subagent::PARENT)),
+        }
+    }
+
+    /// A person's message to subagent `t`, `mode` one it takes now (`takes`).
+    pub fn send_task(&mut self, core: &mut Core, t: &Task, m: QueueItem, mode: SendMode) {
+        let Some(child) = self.children.get(&t.id) else {
+            super::subagent::refuse(core, &t.id, &m, "Codex no longer has that subagent.");
+            return;
+        };
+        if !child.direct {
+            self.relay(core, t, m, mode);
+            return;
+        }
+        let turn = child.turn.clone();
+        let starting = self.pending.values().any(|p| matches!(p, Pending::ChildTurn { thread, .. } if *thread == t.id)) || turn.is_some();
+        match (mode, turn) {
+            (SendMode::Steer, Some(turn)) => {
+                let items = self.items(&m);
+                self.request(core, Pending::ChildSteer { thread: t.id.clone(), m: m.clone() }, "turn/steer", json!({"threadId": t.id, "expectedTurnId": turn, "input": items, "clientUserMessageId": m.id}));
+                super::subagent::show(core, &t.id, &m, Delivery::Sent);
             }
+            // Its turn stops; this one starts the next, before what waits for it (sent: it can't be
+            // taken back from there).
+            (SendMode::Now, Some(turn)) => {
+                super::subagent::show(core, &t.id, &m, Delivery::Sent);
+                if let Some(c) = self.children.get_mut(&t.id) {
+                    c.now = Some(m);
+                }
+                self.request(core, Pending::ChildInterrupt(t.id.clone()), "turn/interrupt", json!({"threadId": t.id, "turnId": turn}));
+            }
+            // At work (or about to be): it waits for that to end.
+            _ if starting || !super::pause::open(core) => {
+                super::subagent::hold(core, &t.id, m);
+            }
+            _ => self.start_child_turn(core, &t.id, m),
+        }
+    }
+
+    /// A turn of subagent `thread`'s own for the person's message `m`, under the session's
+    /// permissions now (which it keeps from then on).
+    fn start_child_turn(&mut self, core: &mut Core, thread: &str, m: QueueItem) {
+        let (approval, sandbox_mode, sandbox) = self.policies(core);
+        let items = self.items(&m);
+        self.request(
+            core,
+            Pending::ChildTurn { thread: thread.to_owned(), m: m.clone() },
+            "turn/start",
+            json!({"threadId": thread, "input": items, "clientUserMessageId": m.id, "approvalPolicy": approval, "sandboxPolicy": sandbox}),
+        );
+        let child = self.children.entry(thread.to_owned()).or_default();
+        child.permissions = Some((approval, sandbox_mode));
+        child.relaying = false;
+        super::subagent::show(core, thread, &m, Delivery::Sent);
+    }
+
+    /// Codex takes nothing for subagent `t` from kiln: the agent passes `m` on with its own agent
+    /// tools, asked in its turn (or in one of its own when none runs). One for a subagent at work
+    /// that's to wait for it to finish waits for that first.
+    fn relay(&mut self, core: &mut Core, t: &Task, m: QueueItem, mode: SendMode) {
+        let working = self.children.get(&t.id).is_some_and(|c| c.turn.is_some() || c.relaying) || t.live();
+        if mode == SendMode::Queue && (working || !super::pause::open(core)) {
+            super::subagent::hold(core, &t.id, m);
+            return;
+        }
+        let path = self.children.get(&t.id).and_then(|c| c.path.clone());
+        let how = match &path {
+            Some(p) => format!("Send it to that agent ({p}) with your agent tools: send_message while it works, followup_task once it has finished."),
+            None => "Send it to that agent with your agent tools (send_input; resume_agent first if it was closed).".to_owned(),
+        };
+        let words = super::subagent::relay_words(t, &m, &how);
+        super::subagent::show(core, &t.id, &m, Delivery::Sent);
+        self.relays.entry(t.id.clone()).or_default().push_back(m.id.clone());
+        if let Some(c) = self.children.get_mut(&t.id)
+            && !working
+        {
+            c.relaying = true;
+        }
+        let id = super::subagent::relay_id(&m);
+        self.send(core, QueueItem { id: id.clone(), text: words, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Steer);
+        super::pause::from_kiln(core, &id);
+    }
+
+    /// The agent's collab call `item` reached subagents (`send_input`, `send_message`,
+    /// `followup_task`; v2's "interacted"): the oldest message it was to pass on to each went.
+    fn relayed(&mut self, core: &mut Core, item: &Value, done: bool) {
+        let ty = item.get("type").and_then(Value::as_str);
+        let targets: Vec<String> = match (ty, item.get("tool").and_then(Value::as_str)) {
+            (Some("collabAgentToolCall"), Some("sendInput" | "sendMessage" | "followupTask")) => item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect(),
+            (Some("subAgentActivity"), _) if item.get("kind").and_then(Value::as_str) == Some("interacted") => item.get("agentThreadId").and_then(Value::as_str).map(str::to_owned).into_iter().collect(),
+            _ => return,
+        };
+        if !done {
+            return;
+        }
+        let failed = ty == Some("collabAgentToolCall") && item.get("status").and_then(Value::as_str) == Some("failed");
+        for target in targets {
+            let Some(msg) = self.relays.get_mut(&target).and_then(std::collections::VecDeque::pop_front) else { continue };
+            self.relays.retain(|_, q| !q.is_empty());
+            super::subagent::delivered(core, &msg, if failed { Delivery::Cancelled } else { Delivery::Completed });
+            if failed {
+                if let Some(c) = self.children.get_mut(&target) {
+                    c.relaying = false;
+                }
+                let parent = core.state.tasks.iter().find(|t| t.id == target).and_then(|t| t.tool_id.clone());
+                core.upsert(&format!("subagent-unsent-{msg}"), parent, Body::Notice { level: Level::Warn, text: "Not sent to the subagent: the agent's call to pass it on failed.".to_owned() });
+            }
+        }
+    }
+
+    /// The agent's turn that was to pass messages on ended: those it didn't pass on didn't go.
+    fn unrelayed(&mut self, core: &mut Core, turn_messages: &[String]) {
+        for id in turn_messages {
+            let Some(msg) = id.strip_prefix(super::subagent::RELAY_ID) else { continue };
+            let Some(task) = self.relays.iter().find(|(_, q)| q.iter().any(|m| m == msg)).map(|(t, _)| t.clone()) else { continue };
+            if let Some(q) = self.relays.get_mut(&task) {
+                q.retain(|m| m != msg);
+            }
+            self.relays.retain(|_, q| !q.is_empty());
+            if let Some(c) = self.children.get_mut(&task) {
+                c.relaying = false;
+            }
+            super::subagent::delivered(core, msg, Delivery::Cancelled);
+            let parent = core.state.tasks.iter().find(|t| t.id == task).and_then(|t| t.tool_id.clone());
+            core.upsert(&format!("subagent-unsent-{msg}"), parent, Body::Notice { level: Level::Warn, text: "Not sent to the subagent: the agent didn't pass it on.".to_owned() });
+        }
+    }
+
+    /// Subagent `thread` is between turns: a message sent now goes first, then what waits for it.
+    fn drain_child(&mut self, core: &mut Core, thread: &str) {
+        let Some(child) = self.children.get(thread) else { return };
+        if child.turn.is_some() || child.relaying || child.closed || !super::pause::open(core) || matches!(core.state.status, Status::Exited | Status::Starting) {
+            return;
+        }
+        if self.pending.values().any(|p| matches!(p, Pending::ChildTurn { thread: t, .. } if t == thread)) {
+            return;
+        }
+        let direct = child.direct;
+        let now = self.children.get_mut(thread).and_then(|c| c.now.take());
+        let Some(m) = now.or_else(|| super::subagent::next(core, thread)) else { return };
+        let Some(t) = core.state.tasks.iter().find(|t| t.id == thread).cloned() else { return };
+        if direct {
+            self.start_child_turn(core, thread, m);
+        } else if self.takes(core, &t).0.is_empty() {
+            super::subagent::refuse(core, thread, &m, "it can't be reached now.");
+        } else {
+            self.relay(core, &t, m, SendMode::Steer);
+        }
+    }
+
+    /// What waits for its subagents goes, to each between turns.
+    pub fn drain_subagents(&mut self, core: &mut Core) {
+        let waiting: Vec<String> = super::subagent::waiting(core).into_iter().chain(self.children.iter().filter(|(_, c)| c.now.is_some()).map(|(t, _)| t.clone())).collect();
+        for thread in waiting {
+            if core.state.tasks.iter().any(|t| t.id == thread && !t.live()) || self.children.get(&thread).is_some_and(|c| c.turn.is_none() && c.direct) {
+                self.drain_child(core, &thread);
+            }
+        }
+    }
+
+    /// Subagents a spawn the session saw start: Codex gives each its spawner's permissions. A
+    /// multi-agent v1 spawn (`collabAgentToolCall`) takes a person's messages on its own thread; a
+    /// v2 one (`subAgentActivity`) doesn't (Codex refuses them). Closing one and resuming it are
+    /// noted too.
+    fn note_spawns(&mut self, item: &Value, spawner: Option<&str>) {
+        let receivers = || item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<String>>();
+        let done = item.get("status").and_then(Value::as_str) == Some("completed");
+        let v1 = item.get("type").and_then(Value::as_str) == Some("collabAgentToolCall");
+        match item.get("tool").and_then(Value::as_str) {
+            Some("closeAgent") if v1 && done => {
+                for t in receivers() {
+                    self.children.entry(t).or_default().closed = true;
+                }
+                return;
+            }
+            Some("resumeAgent") if v1 => {
+                for t in receivers() {
+                    self.children.entry(t).or_default().closed = false;
+                }
+                return;
+            }
+            _ => {}
+        }
+        let targets: Vec<String> = match item.get("type").and_then(Value::as_str) {
+            Some("collabAgentToolCall") if item.get("tool").and_then(Value::as_str) == Some("spawnAgent") => receivers(),
             Some("subAgentActivity") if item.get("kind").and_then(Value::as_str) == Some("started") => {
                 item.get("agentThreadId").and_then(Value::as_str).map(str::to_owned).into_iter().collect()
             }
             _ => return,
         };
+        for target in &targets {
+            if self.thread.as_deref() != Some(target.as_str()) && spawner != Some(target.as_str()) {
+                let child = self.children.entry(target.clone()).or_default();
+                child.direct = v1;
+                if let Some(p) = item.get("agentPath").and_then(Value::as_str) {
+                    child.path = Some(p.to_owned());
+                }
+            }
+        }
         let permissions = match spawner {
             None => self.turn_permissions.clone(),
             Some(t) => self.children.get(t).and_then(|c| c.permissions.clone()),
@@ -792,6 +1030,8 @@ impl Codex {
         c.push(t);
         // MCP servers and skills have their own state and commands (State::mcp, State::skills).
         core.meta.controls = c;
+        // What its own go-back doesn't reach (restoring files) kiln's does (`harness::goback`).
+        super::goback::declare(core);
         let model = core.state.model.clone();
         core.meta.efforts = match self.efforts.get(&model).or_else(|| self.efforts.get("")) {
             Some(l) => l.iter().map(|(e, d)| opt(e, &super::model::effort_label(e), d, false)).collect(),
@@ -922,7 +1162,10 @@ impl Codex {
                 self.reload = Some(value.as_ref().and_then(|v| v.get("what")).and_then(Value::as_str).unwrap_or("Changed settings").to_owned());
                 self.reload_when_idle(core);
             }
-            _ => {}
+            // Its own rewind/branch/fork; a file restore is kiln's (`harness::goback`).
+            _ => {
+                super::goback::control(core, id, value.as_ref());
+            }
         }
         self.compose_status(core);
     }
@@ -1029,6 +1272,18 @@ impl Codex {
         self.withheld.clear();
         self.stopped.clear();
         self.unheard.clear();
+        // Its subagents' threads aren't loaded in the next process (Codex refuses input to those),
+        // and what was on its way to them didn't get there.
+        let mut unsent: Vec<String> = self.relays.drain().flat_map(|(_, q)| q).collect();
+        for c in self.children.values_mut() {
+            c.direct = false;
+            c.relaying = false;
+            c.turn = None;
+            unsent.extend(c.now.take().map(|m| m.id));
+        }
+        for m in unsent {
+            super::subagent::delivered(core, &m, Delivery::Cancelled);
+        }
         core.state.approvals.clear();
         core.state.exit = Some(ExitInfo::now(code, error));
         core.state.activity = None;
@@ -1042,10 +1297,16 @@ impl Codex {
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         match cmd {
-            Command::Send { id, text, mode, attachments, overrides } => self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides }, mode),
-            Command::QueueEdit { id, text } => {
+            Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => {
+                // A checkpoint anchors the prompt's moment: kiln's go-back file restore
+                // (`harness::goback`) reaches back to it (Codex's own rewind has no files side).
+                core.effects.push(Effect::Checkpoint { at: Core::now() });
+                self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to }, mode);
+            }
+            Command::QueueEdit { id, text, attachments } => {
                 if let Some(q) = core.state.queue.iter_mut().find(|q| q.id == id) {
                     q.text = text;
+                    if let Some(a) = attachments { q.attachments = a; }
                     core.touch_state();
                 }
             }
@@ -1128,7 +1389,7 @@ impl Codex {
             }
             Command::Control { id, value } => self.control(core, &id, value),
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } => {}
             // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
             // the process itself (the newest one under Codex running that command).
             // A subagent: its turn under way is interrupted, as a person asked.
@@ -1235,7 +1496,7 @@ impl Codex {
                     Some(a) => format!("/{name} {a}"),
                     None => format!("/{name}"),
                 };
-                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None }, mode);
+                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, mode);
             }
             Command::SkillsReload => {
                 let cwd = core.state.cwd.clone();
@@ -1631,13 +1892,13 @@ impl Codex {
         core.state.delivery.insert(m.id.clone(), d);
         let (images, names) = super::model::attachment_summary(&m.attachments);
         core.note_sent(&m.id);
-        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names });
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
         core.touch_state();
     }
 
     /// Shown for a message kiln sends on its own (feedback after a refusal).
     fn note(&mut self, core: &mut Core, id: &str, text: &str, d: Delivery) {
-        let m = QueueItem { id: id.to_owned(), text: text.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None };
+        let m = QueueItem { id: id.to_owned(), text: text.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None };
         self.show_sent(core, &m, d);
     }
 
@@ -1731,7 +1992,7 @@ impl Codex {
     pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
         if p.cut.is_some() && !self.busy(core) && core.state.status != Status::Exited {
             let id = crate::util::new_id();
-            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None }, SendMode::Queue);
+            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Queue);
             super::pause::from_kiln(core, &id);
             return;
         }
@@ -1812,7 +2073,7 @@ impl Codex {
                 // Cancelled: the feedback starts the next turn.
                 _ => {
                     self.note(core, &mid, &f, Delivery::Queued);
-                    self.waiting.insert(0, QueueItem { id: mid, text: f, at: Core::now(), attachments: Vec::new(), overrides: None });
+                    self.waiting.insert(0, QueueItem { id: mid, text: f, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
                 }
             }
         }
@@ -1869,6 +2130,24 @@ impl Codex {
                     self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
                     core.touch_state();
                 }
+                // Codex takes nothing on that subagent's thread from kiln (a multi-agent v2 agent,
+                // or one this process didn't spawn): the agent passes it on instead.
+                Pending::ChildTurn { thread, m } | Pending::ChildSteer { thread, m } if msg.contains("direct app-server input is not allowed") => {
+                    if let Some(c) = self.children.get_mut(&thread) {
+                        c.direct = false;
+                    }
+                    match core.state.tasks.iter().find(|t| t.id == thread).cloned() {
+                        Some(t) if !self.takes(core, &t).0.is_empty() => self.relay(core, &t, m, SendMode::Steer),
+                        _ => super::subagent::refuse(core, &thread, &m, "Codex takes no message for it from kiln."),
+                    }
+                }
+                // The turn it was to be steered into ended first: it starts the next one.
+                Pending::ChildSteer { thread, m } if self.children.get(&thread).is_some_and(|c| c.turn.is_none()) => {
+                    super::subagent::show(core, &thread, &m, Delivery::Queued);
+                    super::subagent::hold_first(core, &thread, m);
+                    self.drain_child(core, &thread);
+                }
+                Pending::ChildTurn { thread, m } | Pending::ChildSteer { thread, m } => super::subagent::refuse(core, &thread, &m, &format!("Codex refused it: {msg}")),
                 // Not yet: tried again at the next tick.
                 Pending::Thread if wait.is_some() => {
                     self.reopen = true;
@@ -2131,6 +2410,19 @@ impl Codex {
                 core.state.delivery.insert(id, Delivery::Started);
                 core.touch_state();
             }
+            // Its turn has its id (unless it ended already): nothing else starts on its thread
+            // before Codex says it began.
+            Pending::ChildTurn { thread, m } => {
+                let child = self.children.entry(thread).or_default();
+                if let Some(t) = result.pointer("/turn/id").and_then(Value::as_str)
+                    && child.turn.is_none()
+                    && child.done_turn.as_deref() != Some(t)
+                {
+                    child.turn = Some(t.to_owned());
+                }
+                super::subagent::delivered(core, &m.id, Delivery::Started);
+            }
+            Pending::ChildSteer { m, .. } => super::subagent::delivered(core, &m.id, Delivery::Started),
             Pending::Models => {
                 let data = result.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
                 for m in &data {
@@ -2744,6 +3036,8 @@ impl Codex {
                 let child = self.children.entry(thread.to_owned()).or_default();
                 child.runtime = Some("running".into());
                 child.turn = p.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned);
+                // What the agent passed on to it has its turn now.
+                child.relaying = false;
                 child_status(core, thread, "running");
             }
             "turn/completed" => {
@@ -2755,6 +3049,7 @@ impl Codex {
                 }
                 child.runtime = None;
                 child.turn = None;
+                child.done_turn = p.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned);
                 // What it asked goes with its turn (Codex withdraws it).
                 let ended = p.pointer("/turn/id").and_then(Value::as_str);
                 let gone: Vec<String> = core.state.approvals.iter().chain(self.withheld.values())
@@ -2774,6 +3069,8 @@ impl Codex {
                     self.child_history(core, thread, std::slice::from_ref(turn));
                 }
                 self.read_child(core, thread);
+                // Between turns: a message sent now, then what waits for it, goes.
+                self.drain_child(core, thread);
             }
             "thread/status/changed" => {
                 let runtime = p.get("status").and_then(child_runtime_status);
@@ -2852,11 +3149,14 @@ impl Codex {
                     _ => {}
                 }
                 let done = if status == "completed" { Delivery::Completed } else { Delivery::Cancelled };
-                for id in std::mem::take(&mut self.turn_messages) {
-                    if core.state.delivery.contains_key(&id) {
-                        core.state.delivery.insert(id, done);
+                let took = std::mem::take(&mut self.turn_messages);
+                for id in &took {
+                    if core.state.delivery.contains_key(id) {
+                        core.state.delivery.insert(id.clone(), done);
                     }
                 }
+                // Messages for its subagents it was to pass on in this turn and didn't.
+                self.unrelayed(core, &took);
                 // Calls the turn left open were cut off with it; terminals still running were left
                 // behind (they go on after the turn).
                 let terminals: Vec<String> = core.state.tasks.iter().filter(|t| t.live() && t.process.is_some()).filter_map(|t| t.tool_id.clone()).collect();
@@ -2935,6 +3235,7 @@ impl Codex {
                     }
                     self.item(core, item, method == "item/completed");
                     self.note_spawns(item, None);
+                    self.relayed(core, item, method == "item/completed");
                 }
             }
             "item/agentMessage/delta" | "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" | "item/plan/delta" => {
@@ -3260,7 +3561,8 @@ impl Codex {
                     .map(|c| c.iter().filter_map(|x| x.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"))
                     .unwrap_or_default();
                 let text = text.split("\n\nAttached files:\n").next().unwrap_or(&text).to_owned();
-                let client = thread.is_none().then(|| item.get("clientId").and_then(Value::as_str).map(str::to_owned)).flatten();
+                // A subagent's own: one kiln sent it for a person (its id, as Codex says it back).
+                let client = item.get("clientId").and_then(Value::as_str).map(str::to_owned).filter(|c| thread.is_none() || core.state.delivery.contains_key(c));
                 let key = client.clone().unwrap_or_else(|| id.clone());
                 if let Some(c) = &client
                     && core.state.delivery.contains_key(c)
@@ -3280,11 +3582,12 @@ impl Codex {
                     .filter_map(|x| x.get("name").or_else(|| x.get("path")).and_then(Value::as_str))
                     .map(|p| p.rsplit('/').next().unwrap_or(p).to_owned())
                     .collect();
-                let (images, attachments) = match core.get(&key).map(|e| &e.body) {
-                    Some(Body::User { images, attachments, .. }) if !attachments.is_empty() => ((*images).max(counted), attachments.clone()),
-                    _ => (counted, named),
+                let (images, attachments, reply_to) = match core.get(&key).map(|e| &e.body) {
+                    Some(Body::User { images, attachments, reply_to, .. }) if !attachments.is_empty() => ((*images).max(counted), attachments.clone(), reply_to.clone()),
+                    Some(Body::User { reply_to, .. }) => (counted, named, reply_to.clone()),
+                    _ => (counted, named, None),
                 };
-                core.upsert(&key, parent.clone(), Body::User { text, images, client_id: client, origin: Some("human".into()), attachments });
+                core.upsert(&key, parent.clone(), Body::User { text, images, client_id: client, origin: Some("human".into()), attachments, reply_to });
             }
             "agentMessage" => {
                 let text = item.get("text").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -4225,7 +4528,7 @@ mod tests {
         feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
         feed(&mut c, &mut core, &[json!({"id": 2, "result": {"thread": {"id": "th1", "cliVersion": "0.162.1", "turns": []}, "model": "gpt-5", "cwd": "/work"}})]);
         let _ = written(&mut core);
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "port the parser".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "port the parser".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core).into_iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).unwrap_or_default();
         feed(
             &mut c,
@@ -4235,7 +4538,7 @@ mod tests {
                 json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "inProgress", "items": []}}}),
             ],
         );
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "then the tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "then the tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         assert_eq!(core.state.queue.len(), 1);
         let said = "You've hit your usage limit. Upgrade to Pro or try again in 2 hours 13 minutes.";
         let before = Core::now();
@@ -4273,7 +4576,7 @@ mod tests {
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("initialize"));
         // A message before the thread exists waits for it.
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "list files".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "list files".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         assert!(core.take_writes().is_empty());
         feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
         let w = written(&mut core);
@@ -4303,7 +4606,7 @@ mod tests {
         assert_eq!((a.command.as_deref(), a.reason.as_deref()), (Some("rm -rf build"), Some("outside the sandbox")));
         assert_eq!(a.always.len(), 2);
         // A steer while the turn runs goes in as turn/steer.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "only build/".into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "only build/".into(), mode: SendMode::Steer, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("turn/steer"));
         assert_eq!(w.first().and_then(|v| v.pointer("/params/expectedTurnId")).and_then(Value::as_str), Some("t1"));
@@ -4370,7 +4673,7 @@ mod tests {
         ]}]}, "model": "gpt-5"}})]);
         assert!(core.get("u0").is_some() && core.get("a0").is_some());
         core.take_writes();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "edit it".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "edit it".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/params/sandboxPolicy/type")).and_then(Value::as_str), Some("readOnly"));
         let rid = w.first().and_then(|v| v.get("id")).cloned().unwrap_or_default();
@@ -4387,14 +4690,14 @@ mod tests {
         assert_eq!(a.title, "a.rs");
         assert_eq!(a.diffs.first().and_then(|d| d.hunks.first()).map(|h| h.lines.clone()), Some(vec!["-old".to_owned(), "+new".to_owned()]));
         // Queue while busy; deny with feedback declines and steers the feedback in.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "then test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "then test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         assert_eq!(core.state.queue.len(), 1);
         c.command(&mut core, Command::Approve { id: "44".into(), decision: Decision::Deny, message: Some("keep old".into()), always: None, answers: None, choices: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/result/decision")).and_then(Value::as_str), Some("decline"));
         assert!(w.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("turn/steer") && v.pointer("/params/input/0/text").and_then(Value::as_str) == Some("keep old")));
         // Send now: interrupt, and the message starts the next turn.
-        c.command(&mut core, Command::Send { id: "m3".into(), text: "stop and do X".into(), mode: SendMode::Now, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m3".into(), text: "stop and do X".into(), mode: SendMode::Now, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("turn/interrupt"));
         feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "interrupted", "items": []}}})]);
@@ -4661,7 +4964,7 @@ mod tests {
     fn a_queued_message_is_steered_into_the_running_turn() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
         assert!(core.meta.features.iter().any(|f| f == "queue_steer"));
-        let send = |c: &mut Codex, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let send = |c: &mut Codex, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         // A turn is starting (no id yet); a message waits behind it.
         send(&mut c, &mut core, "m1", "build it");
         let w = written(&mut core);
@@ -4927,7 +5230,7 @@ mod tests {
         assert_eq!(core.state.mode, "read-only");
         assert_eq!(core.state.control_values.get("approval_policy"), Some(&json!("on-request")));
         assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "hi".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "hi".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!(start.pointer("/params/approvalPolicy").and_then(Value::as_str), Some("on-request"));
@@ -4946,10 +5249,10 @@ mod tests {
     #[test]
     fn a_running_permission_change_cancels_only_its_requests_and_continues_before_the_queue() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "finish the change".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "finish the change".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "then run tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "then run tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         core.state.tasks.push(Task { id: "child".into(), description: "Review".into(), class: Some("agent".into()), ..Task::default() });
         for (id, thread) in [("own-ask", "th1"), ("child-ask", "child")] {
             feed(&mut c, &mut core, &[json!({"id": id, "method": "item/commandExecution/requestApproval",
@@ -4989,7 +5292,7 @@ mod tests {
     #[test]
     fn changing_permissions_while_the_turn_starts_waits_for_its_id() {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core);
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
         assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
@@ -5003,7 +5306,7 @@ mod tests {
     #[test]
     fn a_late_start_reply_cannot_resurrect_the_turn_interrupted_for_permissions() {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core);
         feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}})]);
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
@@ -5022,7 +5325,7 @@ mod tests {
     fn a_permission_change_does_not_continue_finished_or_explicitly_stopped_work() {
         for (status, stop) in [("completed", false), ("interrupted", true)] {
             let (mut c, mut core, _) = opened();
-            c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+            c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
             let start = written(&mut core);
             respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
             c.command(&mut core, Command::SetMode { mode: "full-access".into() });
@@ -5043,7 +5346,7 @@ mod tests {
     fn an_old_permission_interrupt_cannot_block_or_cancel_the_next_turns_change() {
         for failed in [false, true] {
             let (mut c, mut core, _) = opened();
-            c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+            c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
             let start = written(&mut core);
             respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
             c.command(&mut core, Command::SetMode { mode: "full-access".into() });
@@ -5069,12 +5372,12 @@ mod tests {
     #[test]
     fn an_explicit_replacement_does_not_requeue_the_work_interrupted_for_permissions() {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "old work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "old work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
         written(&mut core);
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "do this instead".into(), mode: SendMode::Now, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "do this instead".into(), mode: SendMode::Now, attachments: vec![], overrides: None, reply_to: None, task: None});
         written(&mut core);
         feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
         let w = written(&mut core);
@@ -5154,6 +5457,107 @@ mod tests {
         (a.to_owned(), b.to_owned())
     }
 
+    fn to_kid(id: &str, text: &str, mode: SendMode) -> Command {
+        Command::Send { id: id.into(), text: text.into(), mode, attachments: vec![], overrides: None, reply_to: None, task: Some("kid".into()) }
+    }
+
+    fn feed_all(a: &mut crate::harness::kinds::Adapter, core: &mut Core, lines: &[Value]) {
+        for l in lines {
+            a.line(core, &l.to_string());
+        }
+    }
+
+    /// The latest request kiln wrote for `method`, answered with `result`.
+    fn answer_last(a: &mut crate::harness::kinds::Adapter, core: &mut Core, w: &[Value], method: &str, result: Value) -> Option<Value> {
+        let req = w.iter().rev().find(|v| v.get("method").and_then(Value::as_str) == Some(method)).cloned()?;
+        feed_all(a, core, &[json!({"id": req.get("id"), "result": result})]);
+        Some(req)
+    }
+
+    /// A multi-agent v1 subagent this process spawned takes a person's messages on its own thread
+    /// (as Codex 0.160.1 does: `turn/steer`, `turn/interrupt`, then `turn/start`, its thread's id):
+    /// steered into its turn, sent now (that turn stopped, this one starts the next), or queued
+    /// for its next turn. Codex says a message it took back under kiln's id: shown once.
+    #[test]
+    fn a_person_writes_to_a_codex_subagent_on_its_own_thread() -> anyhow::Result<()> {
+        let (c, mut core, _) = opened();
+        let mut a = crate::harness::kinds::Adapter::Codex(Box::new(c));
+        feed_all(&mut a, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}}),
+            json!({"method": "item/completed", "params": {"threadId": "th1", "turnId": "t1", "item": {"type": "collabAgentToolCall", "id": "spawn-kid", "tool": "spawnAgent", "senderThreadId": "th1", "receiverThreadIds": ["kid"], "status": "completed", "agentsStates": {"kid": {"status": "running"}}, "prompt": "Audit the changes"}}}),
+            json!({"method": "turn/started", "params": {"threadId": "kid", "turn": {"id": "kid-turn"}}}),
+        ]);
+        let kid = core.state.tasks.iter().find(|t| t.id == "kid").cloned().unwrap_or_default();
+        assert_eq!((kid.takes, kid.via), (vec![SendMode::Queue, SendMode::Steer, SendMode::Now], None));
+        written(&mut core);
+        a.command(&mut core, to_kid("m1", "only the parser", SendMode::Steer));
+        let w = written(&mut core);
+        let steer = w.iter().find(|v| v.get("method") == Some(&json!("turn/steer"))).ok_or_else(|| anyhow::anyhow!("no steer: {w:?}"))?;
+        assert_eq!((steer.pointer("/params/threadId"), steer.pointer("/params/expectedTurnId"), steer.pointer("/params/clientUserMessageId")), (Some(&json!("kid")), Some(&json!("kid-turn")), Some(&json!("m1"))));
+        assert_eq!(core.get("m1").and_then(|e| e.parent.clone()).as_deref(), Some("spawn-kid"));
+        // Its thread says it back under kiln's id: the same message, delivered.
+        feed_all(&mut a, &mut core, &[json!({"method": "item/completed", "params": {"threadId": "kid", "turnId": "kid-turn", "item": {"type": "userMessage", "id": "u9", "clientId": "m1", "content": [{"type": "text", "text": "only the parser"}]}}})]);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
+        assert_eq!(core.events().filter(|e| matches!(e.body, Body::User { .. }) && e.parent.as_deref() == Some("spawn-kid")).count(), 1);
+        // Queued: it waits for this turn to end. Now: this turn stops, and it starts the next.
+        a.command(&mut core, to_kid("m2", "then the tests", SendMode::Queue));
+        a.command(&mut core, to_kid("m3", "stop, check the lexer first", SendMode::Now));
+        // Sent: it can't be taken back while its turn stops (there's no queue it waits in).
+        assert_eq!(core.state.delivery.get("m3"), Some(&Delivery::Sent));
+        let w = written(&mut core);
+        assert_eq!(interrupts(&w), vec![pair("kid", "kid-turn")]);
+        assert!(!w.iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+        assert_eq!(core.state.tasks.iter().find(|t| t.id == "kid").map(|t| t.queue.iter().map(|q| q.id.clone()).collect::<Vec<_>>()), Some(vec!["m2".to_owned()]));
+        feed_all(&mut a, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "kid", "turn": {"id": "kid-turn", "status": "interrupted"}}})]);
+        let w = written(&mut core);
+        let start = answer_last(&mut a, &mut core, &w, "turn/start", json!({"turn": {"id": "kid-2", "status": "inProgress"}})).ok_or_else(|| anyhow::anyhow!("nothing started: {w:?}"))?;
+        assert_eq!((start.pointer("/params/threadId"), start.pointer("/params/clientUserMessageId")), (Some(&json!("kid")), Some(&json!("m3"))));
+        assert!(start.pointer("/params/approvalPolicy").is_some(), "its turn takes the session's permissions now: {start}");
+        // What was queued goes once that turn ends.
+        feed_all(&mut a, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "kid", "turn": {"id": "kid-2", "status": "completed"}}})]);
+        let w = written(&mut core);
+        let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("the queued one didn't go: {w:?}"))?;
+        assert_eq!(next.pointer("/params/clientUserMessageId"), Some(&json!("m2")));
+        // Its harness gone, it takes nothing; what waited for it is said not sent.
+        a.command(&mut core, to_kid("m4", "later", SendMode::Queue));
+        a.exited(&mut core, Some(0), None);
+        assert!(core.state.tasks.iter().find(|t| t.id == "kid").is_some_and(|t| t.takes.is_empty() && t.queue.is_empty()));
+        assert_eq!(core.state.delivery.get("m4"), Some(&Delivery::Cancelled));
+        Ok(())
+    }
+
+    /// Codex refuses a person's message on a multi-agent v2 subagent's thread ("direct app-server
+    /// input is not allowed for multi-agent v2 sub-agents"): the agent passes it on with its own
+    /// agent tools, asked in its turn, and it's delivered once the agent's call reaches it.
+    #[test]
+    fn a_codex_v2_subagent_takes_a_message_by_way_of_its_agent() -> anyhow::Result<()> {
+        let (c, mut core, _) = opened();
+        let mut a = crate::harness::kinds::Adapter::Codex(Box::new(c));
+        feed_all(&mut a, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}}),
+            json!({"method": "item/completed", "params": {"threadId": "th1", "turnId": "t1", "item": {"type": "subAgentActivity", "id": "call_2", "kind": "started", "agentThreadId": "kid", "agentPath": "/root/audit"}}}),
+            json!({"method": "turn/started", "params": {"threadId": "kid", "turn": {"id": "kid-turn"}}}),
+        ]);
+        let kid = core.state.tasks.iter().find(|t| t.id == "kid").cloned().unwrap_or_default();
+        assert_eq!((kid.takes, kid.via.as_deref()), (vec![SendMode::Queue, SendMode::Steer], Some("parent")));
+        written(&mut core);
+        a.command(&mut core, to_kid("m1", "skip the docs", SendMode::Steer));
+        let w = written(&mut core);
+        let steer = w.iter().find(|v| v.get("method") == Some(&json!("turn/steer"))).ok_or_else(|| anyhow::anyhow!("not asked: {w:?}"))?;
+        let words = steer.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or("");
+        assert_eq!(steer.pointer("/params/threadId"), Some(&json!("th1")));
+        anyhow::ensure!(words.contains("(/root/audit)") && words.contains("<message>\nskip the docs\n</message>"), "{words}");
+        assert_eq!((core.get("m1").and_then(|e| e.parent.clone()).as_deref(), core.state.delivery.get("m1")), (Some("call_2"), Some(&Delivery::Sent)));
+        feed_all(&mut a, &mut core, &[json!({"method": "item/completed", "params": {"threadId": "th1", "turnId": "t1", "item": {"type": "subAgentActivity", "id": "call_3", "kind": "interacted", "agentThreadId": "kid", "agentPath": "/root/audit"}}})]);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
+        // One the agent's turn ended without passing on: not sent, and said so.
+        a.command(&mut core, to_kid("m2", "and the tests", SendMode::Steer));
+        feed_all(&mut a, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "completed"}}})]);
+        assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Cancelled));
+        assert!(core.get("subagent-unsent-m2").is_some_and(|e| e.parent.as_deref() == Some("call_2")));
+        Ok(())
+    }
+
     #[test]
     fn what_permissions_allow_beyond_others() {
         let auto = pair("on-request", "workspace-write");
@@ -5171,7 +5575,7 @@ mod tests {
     fn under_full_access_a_subagent_started_before_asks_nobody_and_is_replaced() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
         // Auto: the turn, and the subagent it starts, work in the folder and ask beyond it.
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "review the PRs".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "review the PRs".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5219,7 +5623,7 @@ mod tests {
     fn narrowing_permissions_stops_subagents_allowed_more_and_the_parent_replaces_them() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5282,7 +5686,7 @@ mod tests {
     #[test]
     fn a_person_stops_a_subagent_from_its_row() {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5297,7 +5701,7 @@ mod tests {
     fn a_change_between_turns_that_stops_subagents_goes_on_with_their_work() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5316,7 +5720,7 @@ mod tests {
     #[test]
     fn an_adopted_session_already_in_full_access_moves_its_waiting_older_work_onto_it() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5353,7 +5757,7 @@ mod tests {
     #[test]
     fn a_subagent_kiln_could_not_stop_leaves_its_request_to_the_person() {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5377,7 +5781,7 @@ mod tests {
     #[test]
     fn a_request_held_back_is_shown_if_its_work_never_stops_and_a_refused_turn_asks_the_person() {
         let (mut c, mut core, _) = opened();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let start = written(&mut core);
         respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
         spawn(&mut c, &mut core, "th1", "t1", "kid");
@@ -5464,7 +5868,7 @@ mod tests {
         c.command(&mut core, Command::SetEffort { effort: "high".into() });
         assert_eq!(core.state.effort, "high");
         let _ = written(&mut core);
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "one".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "one".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("high"), Some("custom-model")));
@@ -5472,7 +5876,7 @@ mod tests {
         feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "completed", "items": []}}})]);
         let _ = written(&mut core);
         let o = super::super::model::Overrides { model: Some("o-mini".into()), effort: Some("low".into()) };
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "two".into(), mode: SendMode::Queue, attachments: vec![], overrides: Some(o) });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "two".into(), mode: SendMode::Queue, attachments: vec![], overrides: Some(o) , reply_to: None, task: None});
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("low"), Some("o-mini")));
@@ -5614,7 +6018,7 @@ mod tests {
             (json!({"type": "systemError"}), Status::Exited),
         ] {
             let (mut c, mut core, _) = opened();
-            c.waiting.push(QueueItem { id: "queued".into(), text: "Next task".into(), at: Core::now(), attachments: Vec::new(), overrides: None });
+            c.waiting.push(QueueItem { id: "queued".into(), text: "Next task".into(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
             c.open_thread(&mut core, "thread/resume", json!({"threadId": "th1"}));
             let requests = written(&mut core);
             respond(&mut c, &mut core, &requests, "thread/resume", json!({"thread": {"id": "th1", "turns": [], "status": status}, "model": "gpt-5", "cwd": "/work"}));

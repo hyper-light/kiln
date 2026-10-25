@@ -177,6 +177,179 @@ const family = new Map<string, Member>(
     ended: t0 + 56_000,
   } as unknown as HEvent);
 }
+// Asked to plan three of its goals now (goals.ts, Make a plan), each by a subagent of its own: kiln's
+// steer for each (`kiln-plan-…`, the plan's id in it), a subagent at "The planner" (its calls so far,
+// the last still going), none yet for "Store and transfer", and one that stopped before "Optimize"
+// was ready.
+{
+  const m = family.get("fam-orch");
+  const now = Date.now();
+  const brief = (plan: string, research: string, goal: string) =>
+    `Plan the goal "${goal}" as plan ${plan}, its research ${research}. Research it inside and out, record what you find (research_add), write its steps (plans_update) and say it's ready (plans_ready). Report back the plan's title and steps.`;
+  const ask = (plan: string, research: string, goal: string, seq: number, at: number) =>
+    ({
+      id: `fam-orch-ask-${plan}`,
+      seq,
+      at,
+      kind: "user",
+      client_id: `kiln-plan-${plan}`,
+      origin: "kiln",
+      text: `Your person asked for one of your goals to be planned now, beside what you're doing: "${goal}". Dispatch a subagent for it, give it the brief below, and go on with your own work meanwhile.\n\nThe brief: ${brief(plan, research, goal)}`,
+    }) as HEvent;
+  let seq = 5;
+  const call = (parent: string | undefined, at: number, name: string, tool: string, title: string, input: unknown, going = false, extra: Record<string, unknown> = {}) =>
+    ({
+      id: `fam-orch-c${seq}`,
+      seq: seq++,
+      at,
+      ...(parent && { parent }),
+      kind: "tool",
+      tool_id: `toolu_c${seq}`,
+      name,
+      tool,
+      title,
+      input,
+      status: going ? "running" : "done",
+      started: at,
+      ...(!going && { ended: at + 1500 }),
+      ...extra,
+    }) as unknown as HEvent;
+  const kiln = (tool: string) => ({ server: "kiln", tool_short: tool });
+  const PLANNER = "The planner, researched and audited";
+  const OPT = "Optimize the QUIC API and s3 HTTP API";
+  m?.events.push(
+    ask("pl_planner", "rs_planner", PLANNER, seq++, now - 80_000),
+    call(
+      undefined,
+      now - 74_000,
+      "Agent",
+      "agent",
+      "Plan the planner goal",
+      { description: "Plan the planner goal", subagent_type: "general-purpose", prompt: brief("pl_planner", "rs_planner", PLANNER) },
+      true,
+      { task: "a-planner", tool_id: "toolu_planner" },
+    ),
+    call("toolu_planner", now - 70_000, "mcp__kiln__research_get", "mcp", "kiln · research_get", { id: "rs_planner" }, false, kiln("research_get")),
+    call("toolu_planner", now - 62_000, "WebSearch", "web", "DPhyp join enumeration DuckDB optimizer", { query: "DPhyp join enumeration DuckDB optimizer" }),
+    call("toolu_planner", now - 51_000, "WebFetch", "web", "https://duckdb.org/2024/11/14/optimizers.html", { url: "https://duckdb.org/2024/11/14/optimizers.html" }),
+    call(
+      "toolu_planner",
+      now - 38_000,
+      "mcp__kiln__research_add",
+      "mcp",
+      "kiln · research_add",
+      {
+        id: "rs_planner",
+        findings: [
+          { claim: "DuckDB enumerates join orders with DPhyp and falls back to a greedy order past 12 relations." },
+          { claim: "Umbra's adaptive compilation picks its plan before it compiles." },
+        ],
+      },
+      false,
+      kiln("research_add"),
+    ),
+    call("toolu_planner", now - 21_000, "Grep", "search", "fn join_order", { pattern: "fn join_order" }),
+    call("toolu_planner", now - 6_000, "Read", "read", "crates/amphora/src/planner/cost.rs", { file_path: "/home/ada/src/amphora/crates/amphora/src/planner/cost.rs" }, true),
+    ask("pl_store", "rs_store", "Build the data storage/transfer layer", seq++, now - 25_000),
+    ask("pl_opt", "rs_opt", OPT, seq++, now - 9 * 60_000),
+    call(
+      undefined,
+      now - 8.8 * 60_000,
+      "Agent",
+      "agent",
+      "Plan the API optimization goal",
+      { description: "Plan the API optimization goal", subagent_type: "general-purpose", prompt: brief("pl_opt", "rs_opt", OPT) },
+      false,
+      { task: "a-opt", tool_id: "toolu_opt" },
+    ),
+    call(
+      "toolu_opt",
+      now - 8.5 * 60_000,
+      "mcp__kiln__research_add",
+      "mcp",
+      "kiln · research_add",
+      { id: "rs_opt", findings: [{ claim: "The s3 API's PUT path copies each part twice before it reaches the store." }, { claim: "hyper-quic's send path allocates a frame per write." }] },
+      false,
+      kiln("research_add"),
+    ),
+    call("toolu_opt", now - 6 * 60_000, "Bash", "shell", "ssh fedora 'cd ~/src/amphora && ./bench/run.sh s3-put'", { command: "ssh fedora 'cd ~/src/amphora && ./bench/run.sh s3-put'" }, false, {
+      status: "error",
+      exit_code: 255,
+    }),
+  );
+  if (m) {
+    m.tasks = [
+      {
+        id: "a-planner",
+        tool_id: "toolu_planner",
+        description: "Plan the planner goal",
+        class: "agent",
+        kind: "general-purpose",
+        status: "running",
+        started: now - 74_000,
+        prompt: brief("pl_planner", "rs_planner", PLANNER),
+        last_tool: "Read",
+        tool_uses: 14,
+        tokens: 48_200,
+        stoppable: true,
+      },
+      {
+        id: "a-opt",
+        tool_id: "toolu_opt",
+        description: "Plan the API optimization goal",
+        class: "agent",
+        kind: "general-purpose",
+        status: "completed",
+        started: now - 8.8 * 60_000,
+        ended: now - 5.5 * 60_000,
+        prompt: brief("pl_opt", "rs_opt", OPT),
+        summary: "I couldn't reach fedora to measure the current read path (ssh: connection refused), so the plan isn't ready: 2 findings, no steps.",
+        tool_uses: 9,
+        tokens: 21_400,
+        stoppable: true,
+      },
+    ];
+    m.info.subagents = m.tasks.map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, started: t.started, ended: t.ended }));
+    // "The planner"'s subagent at work: every few seconds its call under way ends and the next starts.
+    const next: [string, string, string, unknown, Record<string, unknown>?][] = [
+      ["WebSearch", "web", "Umbra adaptive query compilation cost model", { query: "Umbra adaptive query compilation cost model" }],
+      [
+        "mcp__kiln__research_add",
+        "mcp",
+        "kiln · research_add",
+        { id: "rs_planner", findings: [{ claim: "DataFusion's join selection reorders by estimated rows, with no histograms." }] },
+        kiln("research_add"),
+      ],
+      ["Read", "read", "crates/amphora/src/planner/joins.rs", { file_path: "/home/ada/src/amphora/crates/amphora/src/planner/joins.rs" }],
+      [
+        "mcp__kiln__plans_update",
+        "mcp",
+        "kiln · plans_update",
+        { id: "pl_planner", items: [{ title: "Measure our planner on the TPC-H joins" }, { title: "Order joins by DPhyp, greedy past 12" }, { title: "Cost joins from distinct counts" }] },
+        kiln("plans_update"),
+      ],
+      ["Grep", "search", "fn estimate_rows", { pattern: "fn estimate_rows" }],
+      ["WebFetch", "web", "https://db.in.tum.de/~neumann/papers/umbra-cidr.pdf", { url: "https://db.in.tum.de/~neumann/papers/umbra-cidr.pdf" }],
+    ];
+    let k = 0;
+    const task = m.tasks[0]!;
+    const tick = setInterval(() => {
+      if (task.status !== "running") return clearInterval(tick);
+      const at = Date.now();
+      const going = m.events.findLast((e) => e.parent === "toolu_planner" && e.kind === "tool" && e.status === "running");
+      const done = going && ({ ...going, status: "done", ended: at } as HEvent);
+      if (done) m.events[m.events.indexOf(going)] = done;
+      const [name, tool, title, input, extra] = next[k++ % next.length]!;
+      const fresh = call("toolu_planner", at, name, tool, title, input, true, extra);
+      m.events.push(fresh);
+      task.tool_uses = (task.tool_uses ?? 0) + 1;
+      task.last_tool = name;
+      const out = [JSON.stringify({ t: "events", events: [...(done ? [done] : []), fresh] }), JSON.stringify({ t: "state", state: stateOf(m) })];
+      for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) out.forEach((o) => ws.send(o));
+    }, 4000);
+    tick.unref?.();
+  }
+}
 const ORCH_TODOS: Todo[] = [
   { text: "Reproduce it with the CLI test", status: "completed" },
   { text: "Key WritableOpens by handle and inode", status: "completed" },
@@ -526,6 +699,47 @@ const META: Meta = {
   features: ["interrupt", "set_mode", "steer"],
 };
 
+/** How a person's message reaches one of its subagents, as its harness lets one in (harness/subagent.rs): a Codex one on its own thread, a Claude Code one by way of its agent (not once stopped). */
+function withTakes(m: Member, t: Task): Task {
+  if (t.class !== "agent" || !t.tool_id) return t;
+  const live = t.status === "running" || t.status === "pending" || t.status === "paused";
+  if (m.info.kind === "codex") return { ...t, takes: live ? ["queue", "steer", "now"] : ["queue"] };
+  if (t.status === "stopped" || t.status === "killed") return t;
+  return { ...t, takes: live && t.background ? ["queue", "steer"] : ["queue"], via: "parent" };
+}
+
+/** A person's message to subagent `task`: in its thread, or waiting in its queue for it to finish. */
+function tellSubagent(m: Member, task: string, id: string, text: string, mode: string) {
+  const t = m.tasks?.find((x) => x.id === task);
+  if (!t?.tool_id) return;
+  const live = t.status === "running" || t.status === "pending" || t.status === "paused";
+  const out: unknown[] = [];
+  if (mode === "queue" && live) t.queue = [...(t.queue ?? []), { id, text, at: Date.now() }];
+  else {
+    const e = { id, seq: Math.max(0, ...m.events.map((x) => x.seq)) + 1, at: Date.now(), parent: t.tool_id, kind: "user", text, client_id: id } as HEvent;
+    m.events.push(e);
+    out.push({ t: "events", events: [e] });
+  }
+  out.unshift({ t: "state", state: stateOf(m) });
+  for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) for (const u of out) ws.send(JSON.stringify(u));
+}
+
+/** A command about a message waiting in one of its subagents' queues (harness/subagent.rs): edited, moved or taken out there, or sent to it now. */
+function subagentQueue(m: Member, c: { type?: string; id?: string; text?: string; index?: number }) {
+  const t = m.tasks?.find((x) => x.queue?.some((q) => q.id === c.id));
+  const queue = t?.queue ?? [];
+  const at = queue.findIndex((q) => q.id === c.id);
+  const q = queue[at];
+  if (!t || !q) return;
+  if (c.type === "queue_edit" && c.text !== undefined) q.text = c.text;
+  else if (c.type === "queue_move" && c.index !== undefined) queue.splice(Math.max(0, Math.min(c.index, queue.length - 1)), 0, ...queue.splice(at, 1));
+  else if (c.type === "queue_remove" || c.type === "queue_steer" || c.type === "queue_send_now") queue.splice(at, 1);
+  else return;
+  if (c.type === "queue_steer" || c.type === "queue_send_now") return tellSubagent(m, t.id, q.id, q.text, "steer");
+  const state = JSON.stringify({ t: "state", state: stateOf(m) });
+  for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
+}
+
 function stateOf(m: Member): State {
   return {
     status: m.info.status,
@@ -538,7 +752,7 @@ function stateOf(m: Member): State {
     approvals: m.approval ? [m.approval] : [],
     queue: [],
     delivery: {},
-    tasks: m.tasks ?? [],
+    tasks: (m.tasks ?? []).map((t) => withTakes(m, t)),
     todos: m.info.id === "fam-orch" ? ORCH_TODOS : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
@@ -555,8 +769,10 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   ws.on("close", () => seen.delete(ws));
   ws.on("message", (raw) => {
     try {
-      const c = JSON.parse(raw.toString()) as { type?: string; task?: string };
+      const c = JSON.parse(raw.toString()) as { type?: string; task?: string; id?: string; text?: string; mode?: string; index?: number };
       if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
+      if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
+      if (c.type?.startsWith("queue_")) subagentQueue(m, c);
     } catch {
       // Not a command.
     }

@@ -395,7 +395,7 @@ export function Inspector({
                   <PlansHere session={agentId} />
                 </Fold>
               )}
-              {agentId && <Goals agent={agentId} harness={harness} working={working} />}
+              {agentId && <Goals agent={agentId} harness={harness} working={working} store={store} onOpenTask={onOpenTask} />}
             </PlanSourceContext.Provider>
           </div>
         )}

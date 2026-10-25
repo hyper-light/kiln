@@ -416,7 +416,7 @@ where
             (Sent::Delivered, Some(waits))
         }
         Some((waits, false)) => {
-            let sent = port.send(agent, Command::QueueEdit { id: waits.clone(), text: text.clone() }).await;
+            let sent = port.send(agent, Command::QueueEdit { id: waits.clone(), text: text.clone(), attachments: None }).await;
             if sent == Sent::Delivered
                 && let Some(w) = SAID.lock().get_mut(agent)
             {
@@ -1248,7 +1248,7 @@ fn reminder_command(how: &str, text: &str, stopped: bool) -> Command {
 
 /// A message of the stack's (its id says so: `queued::GOAL`).
 fn send(text: String) -> Command {
-    Command::Send { id: crate::harness::queued::made(GOAL), text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None }
+    Command::Send { id: crate::harness::queued::made(GOAL), text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }
 }
 
 /// The same goal: the same words, however they're spaced (a goal is kept as one line).
@@ -2585,7 +2585,7 @@ mod tests {
         for d in port.heard(id) {
             match d.command {
                 Command::Send { id, text, .. } => q.push((id, text)),
-                Command::QueueEdit { id, text } => {
+                Command::QueueEdit { id, text, .. } => {
                     if let Some(m) = q.iter_mut().find(|m| m.0 == id) {
                         m.1 = text;
                     }
@@ -2705,7 +2705,7 @@ mod tests {
             anyhow::ensure!(went == Sent::Delivered && by.as_deref() == Some(old) && port.heard(id).is_empty(), "the same word, left as it is: {:?}", port.heard(id));
             let (_, by) = say(&port, id, Some("g2"), send("/goal docs build".into()), clock.unix_ms()).await;
             let heard = port.heard(id);
-            anyhow::ensure!(by.as_deref() == Some(old) && matches!(heard.as_slice(), [d] if matches!(&d.command, Command::QueueEdit { id: e, text } if e == old && text == "/goal docs build")), "{heard:?}");
+            anyhow::ensure!(by.as_deref() == Some(old) && matches!(heard.as_slice(), [d] if matches!(&d.command, Command::QueueEdit { id: e, text, .. } if e == old && text == "/goal docs build")), "{heard:?}");
             // The agent took it before the edit came, and its machine is away when it's said again.
             port.update(id, |i| {
                 i.queue.clear();
@@ -3061,7 +3061,7 @@ mod stack_tests {
             });
             hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
             let folder = tempfile::tempdir()?;
-            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None };
+            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask {
                 kind: "claude".into(),
                 on: Some("local".into()),
@@ -3306,7 +3306,7 @@ mod stack_tests {
             });
             hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
             let folder = tempfile::tempdir()?;
-            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None };
+            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask {
                 kind: "claude".into(),
                 on: Some("local".into()),
@@ -3474,7 +3474,7 @@ mod stack_tests {
         });
         hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
         let folder = tempfile::tempdir()?;
-        let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None };
+        let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
         let ask = Ask {
             kind: "claude".into(),
             on: Some("local".into()),
@@ -3608,7 +3608,7 @@ mod stack_tests {
             if dispatched {
                 let again = call_ok(crate::ops::call(person.clone(), "goals.plan", serde_json::json!({"agent": id, "id": two})).await)?;
                 assert_eq!(again.get("dispatched").and_then(serde_json::Value::as_bool), Some(false), "{again}");
-                assert!(again.get("why").and_then(serde_json::Value::as_str).is_some_and(|w| w.contains("on it already")), "{again}");
+                assert!(again.get("why").and_then(serde_json::Value::as_str).is_some_and(|w| w.contains("moments ago")), "{again}");
             }
             // The agent planning a goal of its own: as before, nobody sent.
             let mut itself = crate::authz::Caller::owner();

@@ -35,14 +35,22 @@ on a repository covers its pipelines and environments.
 | Code | `diffs.read`, `diffs.submit`, `diffs.review`, `diffs.land`, `queue.manage` |
 | Pipelines | `pipelines.edit` (always as a reviewed diff), `environments.deploy` |
 | Machines | `machines.read`, `machines.manage`, `machines.terminal`, `binaries.publish` |
-| Agents | `agents.run`, `agents.attach`, `agents.stop`, `experiments.run` |
+| Agents | `agents.run`, `agents.manage`, `agents.attach`, `agents.stop`, `experiments.run` |
 | Secrets | `secrets.use:<name>`, `secrets.manage` |
 | Server | `settings.manage`, `tokens.manage`, `users.manage`, `audit.read` |
 
 **Roles** are named sets of capabilities: `viewer`, `developer` (trigger, rerun, submit, review),
-`maintainer` (plus land, attach agents, manage the queue), `admin` (everything but ownership) and
-`owner`. Custom roles are allowed. A user holds roles per scope. Grants add up across scopes, and
-an explicit deny wins.
+`maintainer` (plus land, attach agents, manage everyone's agents, manage the queue), `admin`
+(everything but ownership) and `owner`. Custom roles are allowed. A user holds roles per scope.
+Grants add up across scopes, and an explicit deny wins.
+
+**Whose agents.** A person reaches the agent sessions they opened, and those sessions' children.
+The owner and anyone with `agents.manage` reach every session. Anyone else gets 404 for a session
+that isn't theirs: it isn't in their list, and no route, socket or operation finds it. Opening an
+agent on a machine needs `runners.terminal` there (the server's own scope for the server), as a
+terminal does. So does listing, reading, taking over or branching the sessions found running on
+it, and reading the sessions it keeps. Commands and closes are audited as the person who made them.
+docs/agents.md, "Whose agents", has the whole rule, agents' own reach included.
 
 ## Tokens
 

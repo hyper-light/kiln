@@ -10,6 +10,11 @@
 //!   the ones of them it refused (the NACKs) with how and why. A refusal is never mistaken for a
 //!   taking when a frame is lost: each item carries `low`, through which its sender has every
 //!   answer, and the receiver repeats every refusal after it.
+//! - **Gaps.** An item past a gap is dropped, and its receiver asks (`Want`) for what follows the
+//!   gap once, and again only every so many items past it: its sender sends that again at once, and a want that comes after (made before the
+//!   receiver had them again, one for each item that was past the gap) sends it again only once
+//!   [`WANT_AGAIN`] has passed. A receiver that's behind its sender's `low` (it started again with
+//!   less than that) goes on from there: every item through it is answered.
 //! - **Reconnects.** When a link comes up, each side says through which item it has each stream
 //!   it receives (`Have`), and its sender sends again only what follows. Nothing goes until then.
 //!   Each side says it again every few seconds, so a `Have` lost below the channel doesn't hold a
@@ -98,11 +103,41 @@ pub enum Event {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Full;
 
+/// How long after an item went again for a want another want for it is taken as made before the
+/// receiver had it again (each item past a gap brings one): until then it doesn't send it again.
+pub const WANT_AGAIN: Duration = Duration::from_millis(250);
+
+/// Whether an item was wanted since it last went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wanted {
+    No,
+    /// Its first want since it went: it goes again at once.
+    Now,
+    /// A want after it went again for one: it goes again once [`WANT_AGAIN`] has passed since.
+    Again,
+}
+
 struct Pending {
     seq: Seq,
     body: Vec<u8>,
     /// When it was last sent since the link came up; `None`: not yet.
     sent: Option<Instant>,
+    wanted: Wanted,
+    /// When it last went again for a want, on this link.
+    went_for_want: Option<Instant>,
+}
+
+impl Pending {
+    fn new(seq: Seq, body: Vec<u8>) -> Self {
+        Self { seq, body, sent: None, wanted: Wanted::No, went_for_want: None }
+    }
+
+    /// Not sent on this link yet: it goes as if new.
+    fn unsent(&mut self) {
+        self.sent = None;
+        self.wanted = Wanted::No;
+        self.went_for_want = None;
+    }
 }
 
 struct Out {
@@ -147,7 +182,7 @@ impl Sender {
         let seq = o.next;
         o.next = o.next.saturating_add(1);
         o.bytes = o.bytes.saturating_add(body.len());
-        o.pending.push_back(Pending { seq, body, sent: None });
+        o.pending.push_back(Pending::new(seq, body));
         Ok(seq)
     }
 
@@ -155,7 +190,7 @@ impl Sender {
     /// had sent and not had answered (`crate::wire::keep`), in order.
     pub fn restore(&mut self, stream: &str, next: Seq, pending: Vec<(Seq, Vec<u8>)>) {
         let o = self.streams.entry(stream.to_owned()).or_default();
-        o.pending = pending.into_iter().map(|(seq, body)| Pending { seq, body, sent: None }).collect();
+        o.pending = pending.into_iter().map(|(seq, body)| Pending::new(seq, body)).collect();
         o.bytes = o.pending.iter().map(|p| p.body.len()).sum();
         o.answered = o.pending.front().map_or(next.saturating_sub(1), |p| p.seq.saturating_sub(1));
         o.next = next.max(o.pending.back().map_or(1, |p| p.seq.saturating_add(1)));
@@ -171,8 +206,20 @@ impl Sender {
         for (stream, o) in &mut self.streams {
             let low = o.answered;
             for p in &mut o.pending {
-                let due = p.sent.is_none_or(|at| now.saturating_duration_since(at) >= self.patience);
+                let due = match p.sent {
+                    None => true,
+                    Some(at) if now.saturating_duration_since(at) >= self.patience => true,
+                    Some(_) => match p.wanted {
+                        Wanted::No => false,
+                        Wanted::Now => true,
+                        Wanted::Again => p.went_for_want.is_none_or(|at| now.saturating_duration_since(at) >= WANT_AGAIN),
+                    },
+                };
                 if due {
+                    if p.wanted != Wanted::No {
+                        p.went_for_want = Some(now);
+                    }
+                    p.wanted = Wanted::No;
                     p.sent = Some(now);
                     out.push(Frame::Item { stream: stream.clone(), seq: p.seq, low, body: p.body.clone() });
                 }
@@ -186,7 +233,7 @@ impl Sender {
         self.up = false;
         for o in self.streams.values_mut() {
             for p in &mut o.pending {
-                p.sent = None;
+                p.unsent();
             }
         }
     }
@@ -211,7 +258,7 @@ impl Sender {
                 if !self.up {
                     for o in self.streams.values_mut() {
                         for p in &mut o.pending {
-                            p.sent = None;
+                            p.unsent();
                         }
                     }
                 }
@@ -221,7 +268,7 @@ impl Sender {
             Frame::Want { stream, from } => {
                 if let Some(o) = self.streams.get_mut(&stream) {
                     for p in o.pending.iter_mut().filter(|p| p.seq >= from) {
-                        p.sent = None;
+                        p.wanted = if p.went_for_want.is_none() { Wanted::Now } else { Wanted::Again };
                     }
                 }
                 Vec::new()
@@ -293,7 +340,14 @@ struct In {
     taking: Option<Seq>,
     /// Refusals after the sender's `low`: repeated in every answer until it has them.
     nacks: BTreeMap<Seq, (Refusal, String)>,
+    /// What it last asked for (`Want`), until it has it, and how many items past that gap came
+    /// since: asked again once every [`WANT_EVERY`] of them (a want lost below the channel), not
+    /// for each.
+    wanted: Option<(Seq, u32)>,
 }
+
+/// Items past one gap a receiver takes in before it asks for the gap again.
+const WANT_EVERY: u32 = 64;
 
 impl In {
     fn has(&self, stream: &str) -> Has {
@@ -314,6 +368,8 @@ pub enum Arrival {
     /// answer comes once it is.
     Answered(Option<Frame>),
     /// It's past a gap: send this `Want` back. The item is dropped, and comes again in order.
+    /// (Once for a gap: the items after it that come before the gap's are dropped answered
+    /// `Answered(None)`.)
     Gap(Frame),
 }
 
@@ -335,14 +391,30 @@ impl Receiver {
         if i.taking == Some(seq) {
             return Arrival::Answered(None);
         }
+        // Its sender has every answer through `low`: what this side doesn't know of them (it
+        // started again since, and the stream went on) isn't missing.
+        if i.taking.is_none() && i.upto < low {
+            i.upto = low;
+        }
         if seq <= i.upto {
             return Arrival::Answered(Some(Frame::Ack(i.has(stream))));
         }
         if seq == i.upto.saturating_add(1) && i.taking.is_none() {
             i.taking = Some(seq);
+            i.wanted = None;
             return Arrival::Take(body);
         }
-        Arrival::Gap(Frame::Want { stream: stream.to_owned(), from: i.upto.saturating_add(1) })
+        let from = i.upto.saturating_add(1);
+        match &mut i.wanted {
+            Some((asked, past)) if *asked == from => {
+                *past += 1;
+                if *past % WANT_EVERY != 0 {
+                    return Arrival::Answered(None);
+                }
+            }
+            w => *w = Some((from, 0)),
+        }
+        Arrival::Gap(Frame::Want { stream: stream.to_owned(), from })
     }
 
     /// The item being applied was taken: the answer to send.
@@ -545,6 +617,52 @@ mod tests {
         assert_eq!(items(&s.poll(base)), vec![1, 2, 3]);
         s.on_frame(Frame::Want { stream: "a".into(), from: 2 });
         assert_eq!(items(&s.poll(base)), vec![2, 3]);
+    }
+
+    /// Each item past a gap brings a want: the receiver asks once, and its sender sends what
+    /// follows the gap again once, not once for each.
+    #[test]
+    fn a_gap_is_asked_for_and_sent_again_once() -> anyhow::Result<()> {
+        let mut r = Receiver::new();
+        assert!(matches!(r.on_item("a", 1, 0, Vec::new()), Arrival::Take(_)));
+        r.took("a", 1);
+        assert_eq!(r.on_item("a", 3, 0, Vec::new()), Arrival::Gap(Frame::Want { stream: "a".into(), from: 2 }));
+        assert_eq!(r.on_item("a", 4, 0, Vec::new()), Arrival::Answered(None), "asked for once");
+        // Asked again only after many more past it (that want lost below the channel).
+        let wants = (5..200).filter(|n| matches!(r.on_item("a", *n, 0, Vec::new()), Arrival::Gap(_))).count();
+        assert_eq!(wants, 3, "once every 64 past the gap");
+        assert!(matches!(r.on_item("a", 2, 0, Vec::new()), Arrival::Take(_)));
+        r.took("a", 2);
+        // A gap further on is asked for in its turn.
+        assert_eq!(r.on_item("a", 5, 0, Vec::new()), Arrival::Gap(Frame::Want { stream: "a".into(), from: 3 }));
+
+        let base = Instant::now();
+        let mut s = Sender::new(1 << 20, Duration::from_secs(10));
+        s.on_frame(Frame::Have(Vec::new()));
+        for n in 0..4u8 {
+            s.push("a", vec![n]).map_err(|_| anyhow::anyhow!("full"))?;
+        }
+        assert_eq!(items(&s.poll(base)), vec![1, 2, 3, 4]);
+        // An older receiver's wants, one for each of 3 and 4 past a lost 2.
+        s.on_frame(Frame::Want { stream: "a".into(), from: 2 });
+        assert_eq!(items(&s.poll(t(base, 1))), vec![2, 3, 4], "the first want: at once");
+        s.on_frame(Frame::Want { stream: "a".into(), from: 2 });
+        assert!(s.poll(t(base, 2)).is_empty(), "one made before they got there again: not yet");
+        assert_eq!(items(&s.poll(t(base, 1 + 250))), vec![2, 3, 4], "once WANT_AGAIN has passed");
+        assert!(s.poll(t(base, 600)).is_empty());
+        Ok(())
+    }
+
+    /// A receiver that started again with nothing kept, while its sender's stream went on (it
+    /// didn't hear the receiver say so): it goes on from its sender's `low`, and asks for nothing
+    /// before it.
+    #[test]
+    fn a_receiver_behind_its_senders_low_goes_on_from_there() {
+        let mut r = Receiver::new();
+        assert!(matches!(r.on_item("p:7.1", 41, 40, b"x".to_vec()), Arrival::Take(_)));
+        assert_eq!(r.took("p:7.1", 41), Frame::Ack(Has { stream: "p:7.1".into(), upto: 41, nacks: Vec::new() }));
+        // One answered already, by the one before it: answered so again.
+        assert!(matches!(r.on_item("p:7.1", 39, 40, Vec::new()), Arrival::Answered(Some(_))));
     }
 
     #[test]

@@ -186,6 +186,8 @@ classes! {
         AgentMsg::Wire(..) => CHANNEL,
         AgentMsg::Cluster { .. } => CLUSTER,
         AgentMsg::NetDrops { .. } => Class::Telemetry,
+        AgentMsg::HarnessHandOver { .. } => Class::Stream,
+        AgentMsg::HarnessAdopted { .. } => Class::Answer,
     }
 }
 
@@ -271,6 +273,7 @@ classes! {
         Command::SetEffort { .. } => REFUSED,
         Command::MoveTo { .. } => REFUSED,
         Command::Moving { .. } => REFUSED,
+        Command::HandedOver { .. } => PARKED,
         Command::Control { .. } => REFUSED,
         Command::StopTask { .. } => REFUSED,
         Command::Restart => REFUSED,

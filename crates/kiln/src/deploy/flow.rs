@@ -429,7 +429,7 @@ pub async fn ensure_release_repo(d: &Deploy, rr: &super::model::RepoRef) -> Resu
         .await
         .map_err(|e| format!("{e:#}"))?;
     d.hub.store.audit("kiln".into(), "repo.add".into(), format!("{} (a release repository, docs/deploy-api.md §6)", rr.repo)).await;
-    d.hub.gitops_kick.notify();
+    crate::gitops::wake(&d.hub);
     Ok(())
 }
 

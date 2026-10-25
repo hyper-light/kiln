@@ -188,7 +188,9 @@ impl Feed {
         if self.made {
             return true;
         }
-        match at_once(self.shared.bus.create(&self.shared.topic, Topic { class: Class::Ephemeral, retain: RETAIN })) {
+        // A test build's may keep fewer, so a viewer that stops reading falls behind sooner.
+        let retain = crate::runner::chaos::get().and_then(|c| c.fanout).unwrap_or(RETAIN);
+        match at_once(self.shared.bus.create(&self.shared.topic, Topic { class: Class::Ephemeral, retain })) {
             Ok(()) => {
                 self.made = true;
                 self.shared.deleted.store(false, Ordering::Release);

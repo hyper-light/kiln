@@ -67,6 +67,17 @@ again on the same conversation. A new model, effort or mode is a flag, so it sta
 between turns. Files you attach go to it as their paths on its machine; its models come from
 `agy models`.
 
+## Where a harness is found
+
+A machine offers a harness (`/api/harness/kinds`, the machines the new-agent dialog lists) when its
+program is on the runner's PATH or on the PATH a login shell of the machine's user has, asked as
+reach asks it for runs (`$SHELL -l -i`; as the runner starts, then kept ten minutes). A runner's
+service keeps the PATH of the terminal it was installed from, so a harness installed since in a
+folder that PATH lacks (Claude Code's and Codex's installers put theirs in `~/.local/bin`) is
+found all the same, within a minute, without the runner starting again. The harness runs with
+that PATH too: the runner's folders first, then those only the login shell has. An agent started
+from a kiln shell (`kiln spawn`) has that shell's PATH, as it has the rest of its environment.
+
 ## What an agent left running
 
 Every agent session's processes are held together by the system where it can (`crate::os::contain`):
@@ -111,6 +122,11 @@ counted.
 
 ## Mission control
 
+- **How they stand.** Under the page's title, one rule across the page has a length for each way
+  your agents stand (needs you, stopped, paused, working, finished, ready, offline), as long as
+  its share of them; under it, each one's count (and on a desktop its name). Working's length
+  carries the prism flowing along it and needs you's brightens and dims; the rest hold still, and
+  nothing moves with reduced motion or kiln's motion paused.
 - **Order.** By default (Needs you first) the agents that wait on you (a request, or goals they
   paused for you) come first, longest waiting first, then those stopped, paused, finished since
   you last looked, working, ready, offline and ended. The list follows the agents as they change:
@@ -334,6 +350,40 @@ timeline when the session turns idle (Codex's latest 100 turns, listed with
 `/rename` into its transcript with the next exchange: a name given just before the session ends
 is not kept.
 
+## Whose agents
+
+Each agent session is someone's: the person who opened it, whatever token they used, or the person
+it acts for (`crate::mcp::whose`). A child is its parent's person's.
+
+| Caller | Reaches |
+|---|---|
+| The owner, or a person with `agents.manage` (the `maintainer` role has it) | every session: lists, reads, watches, commands and closes it |
+| Any other person | their own sessions, their children included, as fully; no other |
+| An agent | itself and the agents it started (and theirs), to steer, interrupt and end; it sees (lists, reads, watches) the other agents that work for its person, and may send them queued messages ("Messages between agents") |
+| A job, a peer | no session |
+
+A session a caller doesn't reach is one kiln doesn't run, as far as they can tell. It isn't in their
+list (`GET /api/harness/sessions`, `agents.list`, the events socket's agent events, conversation
+search). Every route under `/api/harness/sessions/<id>` and the session's socket answer 404, the
+socket before it's upgraded. So do the agents operations (`get`, `children`, `result`, `changes`,
+`workspace`, `send`, `interrupt`, `stop`, `change`, `land`, `wait`), over MCP and `/api/ops`. A
+session they see but don't act on (an agent watching a fellow agent) is read-only: its socket
+answers each command with an error. A broadcast and `POST /api/harness/command` pick only among
+the sessions the caller acts on, and name the others they were asked for (`unreached`). A session
+kiln can't say whose it is (opened before kiln kept that) is reached by the owner and managers
+alone.
+
+Agents run programs as their machine's user, as terminals do, so opening one needs
+`runners.terminal` on that machine: `runner:<name>`, or the server's own scope for `local`. That
+holds for `POST /api/harness/sessions`, for `agents.start`, and for a plan's steps, which start
+only where the person who ran the plan could start them. The sessions found running on a machine
+(`/api/ai-sessions`: listed, read, taken over or branched) and the ones it keeps
+(`/api/harness/history`) need it too. A session taken over or branched is the person's who did it.
+
+Commands and closes are audited as the person who made them. A request's own row names them, and
+what its handlers note joins that row. A command sent on a session's socket gets a row of its own,
+`agent.command`, which names the command's kind but not what it says.
+
 ## Agents that run agents
 
 An agent can start agents for parts of its work, on any machine, wait for them and read what
@@ -483,8 +533,9 @@ across restarts.
 Runners advertise this behavior as `permissions_live`; the picker can also reapply the current
 preset to a turn inherited from an older runner. Older runners still show "From the next turn."
 
-A native Codex subagent keeps the settings it started with (its spawner's) for its whole life:
-Codex has no way to change them, and refuses kiln's input to a subagent. kiln notes them when it
+A native Codex subagent keeps the settings it started with (its spawner's) until a turn kiln
+starts on its thread for a person's message ("Messages to its subagents", below), which takes the
+session's settings then; Codex has no other way to change them. kiln notes them when it
 sees the spawn. A change stops (interrupts) subagents still working with more than the new
 settings allow. Under an approval policy of `never` (Full access), nothing started with the
 session's settings asks, so a request for approval comes from work started with earlier ones: the
@@ -752,7 +803,7 @@ console picks) and are answered with a `reply` update to that client.
 
 | type | fields | answer |
 |---|---|---|
-| `send` | `id, text, mode: "queue"\|"steer"\|"now", attachments?, overrides?: {model?, effort?}` | `state.delivery[id]`: queued → sent → started → completed / cancelled |
+| `send` | `id, text, mode: "queue"\|"steer"\|"now", attachments?, overrides?: {model?, effort?}, task?` | `state.delivery[id]`: queued → sent → started → completed / cancelled; with `task`, to that subagent ("Messages to its subagents") |
 | `queue_edit` / `queue_remove` / `queue_move` / `queue_send_now` | `id` (+ `text` / `index`) | |
 | `queue_steer` | `id` | the queued message goes into the running turn as steering, without interrupting it (sent as the next turn when none runs); feature `"queue_steer"` (Claude Code, Codex, Devin when advertised) |
 | `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, choices?` (or the older `answers?`) | see "Questions" below |
@@ -1034,6 +1085,33 @@ sends to the background, monitors and workflows. Besides `id`, `description`, `s
 - `events`, `last_event`: a monitor's events so far and the latest (one line). `wakes`: who they
   wake, "agent" or the subagent task that started the monitor.
 - `stoppable`: `stop_task` can stop it.
+- `takes`, `via`, `queue` (subagents): how a person's message reaches it now (`queue`, `steer`,
+  `now`; none: it takes none), `"parent"` when its agent passes it on, and the messages waiting
+  for it to finish ("Messages to its subagents", below).
+
+### Messages to its subagents
+
+With a subagent's thread open (`?task=`), the agent page's composer writes to that subagent,
+as the agent's own composer writes to the agent: queued for when it finishes, steered into its
+turn, or sent now (its turn stopped, this one the next), as its `takes` allows; Stop (and Esc)
+stops it (`stop_task`). Its queue shows above the field, edited, moved, steered or sent now from
+there (`queue_edit`, `queue_move`, `queue_steer`, `queue_send_now`, `queue_remove`, by id). One
+that takes none (it ended, or its harness has no way in) leaves the composer writing to the
+agent, as before. The message is a `send` with `task` (its task's id); it shows in the
+subagent's thread, its delivery as any message's. One a subagent can't take, or one that waited
+for a subagent that ended, is said not sent in its thread, and why. While the session is paused,
+messages for its subagents wait in their queues too.
+
+| Harness | How it reaches the subagent | takes |
+|---|---|---|
+| Codex (multi-agent v1, its default) | on the subagent's own thread: `turn/start` (with the session's permissions then), `turn/steer` into its turn, `turn/interrupt` then `turn/start` for now; Codex says it back under kiln's id (`clientUserMessageId`) | queue, steer, now while it works; queue (a turn at once) between turns |
+| Codex (multi-agent v2; a subagent this process didn't spawn) | Codex refuses input there (`direct app-server input is not allowed for multi-agent v2 sub-agents`), so kiln asks the agent, in its turn, to pass it on with its own agent tools (`send_message`, `followup_task`; v1's `send_input`); delivered once the agent's call reaches it | queue, steer; agents it started itself only |
+| Claude Code | it takes nothing for a subagent from kiln (2.1.309 and 2.1.310 answer `send_task_message` "Unsupported control request subtype" in `-p`, and a prompt naming the subagent's call goes to the agent), so kiln asks the agent, in its turn, to pass it on with its SendMessage tool: at the subagent's next tool round while it works in the background, or resuming it once it has finished; under way when the agent's SendMessage to it starts, delivered when that succeeds | queue, steer while it works in the background; queue while in the foreground (its agent's turn waits on it) or once it finished; none once stopped (Claude Code doesn't resume one stopped) |
+| ACP agents, Antigravity CLI | kiln has no subagent threads for them | none |
+
+What kiln asks an agent to pass on carries the person's words as written (the files attached by
+their paths) and is kiln's own message in its timeline (`kiln-relay-<message id>`); a turn that
+took it and ended without passing it on leaves the message not sent, saying so.
 
 Codex's native subagents keep their own threads and execution settings. kiln tracks each one by
 its native thread ID and keeps its work under the original spawning call, including later
@@ -1189,6 +1267,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | diffs, approval previews, cumulative changeset | ✓ | ✓ | ✓ | ? |
 | calls waiting behind a prompt read as pending | ✓ | — (Codex reports each call's own state) | — | — |
 | subagents: tasks, nested messages, stop | ✓ | unit (read-only task and thread tracking; no direct stop) | — | — |
+| a person's message to a subagent: queue, steer, now | unit (by way of its agent's SendMessage; no now) | unit (v1 on its own thread; v2 by way of its agent) | — | — |
 | rewind, branch, compact, rename | ✓ | ✓ | — | — |
 | restore files on rewind | ✓ | — | — | — |
 | thinking display / budget, output style | ✓ | ✓ (reasoning summaries) | — | — |

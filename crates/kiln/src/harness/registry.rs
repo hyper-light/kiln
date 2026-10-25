@@ -19,6 +19,9 @@ use super::session::{Held, Info, MAX_NAME, Spec, SubagentBrief};
 use super::live::{Feed, Viewer};
 use crate::hub::Hub;
 use crate::proto::{LANE_TERM, ServerMsg};
+/// How long a session this server opened on a machine waits for the machine to announce it before
+/// a report from the machine that leaves it out ends it.
+const OPEN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
@@ -71,6 +74,9 @@ struct Mirror {
     /// Each event's digest as a runner that starts again compares it (`crate::wire::sums`), by
     /// its id: made when first asked for, and again once the event changes.
     sums: HashMap<String, u64>,
+    /// When this server opened it, until its machine announces it: a report from the machine
+    /// that left it out was made before its open got there, and doesn't end it.
+    opened_at: Option<std::time::Instant>,
 }
 
 /// This server process's incarnation: viewers resume from a copy's revision only under it. 53
@@ -99,6 +105,7 @@ impl Mirror {
             changed: HashMap::new(),
             started_over_pending: false,
             sums: HashMap::new(),
+            opened_at: None,
         }
     }
 
@@ -167,7 +174,16 @@ impl Mirror {
         self.index.insert(id, self.events.len());
         self.events.push(Arc::new(e));
         if self.events.len() > MAX_EVENTS + MAX_EVENTS / 4 {
-            let drop = self.events.len() - MAX_EVENTS;
+            // From where a run of the digests begins, as its machine's timeline lets go of its
+            // oldest (`crate::wire::sums::run_after`).
+            let over = self.events.len() - MAX_EVENTS;
+            let drop = match self.events.get(over).and_then(|e| seq(e)) {
+                Some(q) => {
+                    let from = crate::wire::sums::run_after(q);
+                    self.events.partition_point(|x| seq(x).is_some_and(|s| s < from))
+                }
+                None => over,
+            };
             self.events.drain(..drop);
             self.reindex();
         }
@@ -449,6 +465,11 @@ pub struct Registry {
     /// Sessions kiln doesn't keep going when they stop part-way (`goals::keep`; the "keep_going"
     /// control), kept in `keep-off.json` so it holds across restarts.
     keep_off: Mutex<std::collections::HashSet<String>>,
+    /// Which of its machine's runner processes holds each session on a machine (its instance:
+    /// `main`, a uuid, `legacy`), kept in `holders.json` so it holds across restarts: a process
+    /// that says what it holds speaks for its own sessions, never for another's that is away
+    /// ([`Registry::inventory`]).
+    holders: Mutex<HashMap<String, String>>,
     /// Each session's latest epoch (`State::epoch`) seen, those that went on on another machine at
     /// least once, kept in `epochs.json`: a machine that announces an older copy lets go of it.
     epochs: Mutex<HashMap<String, u64>>,
@@ -570,6 +591,7 @@ impl Registry {
             local_shells: Mutex::new(HashMap::new()),
             names: Mutex::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             keep_off: Mutex::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
+            holders: Mutex::new(std::fs::read(dir.join("holders.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             epochs: Mutex::new(std::fs::read(dir.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             proposed: Mutex::new(HashMap::new()),
             dir,
@@ -864,7 +886,15 @@ impl Registry {
             let mut out = Vec::new();
             for u in st.unended(since)? {
                 let keep = if recent.contains(&u.id) { MAX_EVENTS } else { AWAY_EVENTS };
-                let events = st.events(&u.id, None, keep)?;
+                let mut events = st.events(&u.id, None, keep)?;
+                // Cut at `keep`: from where a run of the digests begins, as a live copy lets go of
+                // its oldest (`crate::wire::sums::run_after`).
+                if events.len() >= keep
+                    && let Some(first) = events.first().map(|e| e.seq)
+                {
+                    let from = crate::wire::sums::run_after(first);
+                    events.retain(|e| e.seq >= from);
+                }
                 out.push((u, events));
             }
             Ok(out)
@@ -919,7 +949,7 @@ impl Registry {
             // What the server's own terminals and agents ask of kiln (`kiln spawn --on`, `kiln
             // agents wait`) is answered here.
             let forward = Some(crate::harness::ops::forward(Arc::clone(&hub)));
-            match super::socket::serve_with(&hub.harness.local, super::socket::path("server", &hub.harness.dir), forward) {
+            match super::socket::serve_with(&hub.harness.local, super::socket::path("server", &hub.harness.dir), forward, false) {
                 Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
                 Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
             }
@@ -1093,6 +1123,8 @@ impl Registry {
                 // What its goals wait on a person for is the server's to say (`goals::held_stacks`): kept.
                 info.held = g.get(id).and_then(|m| m.info.held.clone());
                 let m = g.entry(id.to_owned()).or_insert_with(|| Mirror::new(info.clone(), from.clone(), Arc::clone(&self.bus)));
+                // Its machine announced it: what it reports from now on counts.
+                m.opened_at = None;
                 m.info = info.clone();
                 m.reported = reported;
                 m.location = from.clone();
@@ -1239,6 +1271,7 @@ impl Registry {
         if gone {
             self.keeper.forget(id);
             self.visuals.forget(id);
+            self.forget_holders(&[id.to_owned()]);
             self.opened.forget(id);
             super::archive::closed(hub, id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
@@ -1283,14 +1316,39 @@ impl Registry {
         }
     }
 
-    /// A machine (re)connected and said what it runs: forget sessions it no longer has.
-    pub fn inventory(&self, hub: &Hub, machine: &str, inv: Inventory) {
+    /// A machine (re)connected and said what it runs: forget sessions it no longer has. Its
+    /// runner process `instance` speaks for the sessions it holds: one another process of the
+    /// machine holds ([`Registry::holder`]) stays, and while that process isn't among those
+    /// connected (`present`), it is said to be away, as a machine's sessions are when it is.
+    pub fn inventory(&self, hub: &Hub, machine: &str, instance: Option<&str>, present: &[String], inv: Inventory) {
         let keep: std::collections::HashSet<String> = inv.sessions.into_iter().collect();
+        let (others, away): (std::collections::HashSet<String>, Vec<String>) = match instance {
+            Some(me) => {
+                let g = self.holders.lock();
+                let others: std::collections::HashSet<String> = g.iter().filter(|(_, h)| h.as_str() != me).map(|(id, _)| id.clone()).collect();
+                let away = g.iter().filter(|(id, h)| h.as_str() != me && !present.contains(h) && !keep.contains(*id)).map(|(id, _)| id.clone()).collect();
+                (others, away)
+            }
+            None => Default::default(),
+        };
+        let at = Location::Machine(machine.to_owned());
+        let away: Vec<String> = {
+            let g = self.mirrors.lock();
+            away.into_iter().filter(|id| g.get(id).is_some_and(|m| m.location == at && m.info.status != Status::Disconnected)).collect()
+        };
+        if !away.is_empty() {
+            tracing::info!(%machine, sessions = away.len(), "agent sessions another runner process of this machine holds, which isn't connected: kept, away");
+            self.sessions_lost(hub, &away);
+        }
         let gone: Vec<String> = {
             let mut g = self.mirrors.lock();
+            // Not one this server opened there that the machine hasn't announced yet: the report
+            // was made before the open got there.
             let gone: Vec<String> = g
                 .iter()
-                .filter(|(id, m)| m.location == Location::Machine(machine.to_owned()) && !keep.contains(*id))
+                .filter(|(id, m)| {
+                    m.location == Location::Machine(machine.to_owned()) && !keep.contains(*id) && !others.contains(*id) && m.opened_at.is_none_or(|t| t.elapsed() > OPEN_GRACE)
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &gone {
@@ -1302,9 +1360,48 @@ impl Registry {
             gone
         };
         self.kinds.lock().insert(format!("agent:{machine}"), inv.kinds);
+        self.forget_holders(&gone);
         for id in gone {
             super::archive::closed(hub, &id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
+        }
+    }
+
+    /// Session `id` is held by runner process `instance` of its machine, as that process said:
+    /// kept (across restarts too) once it changes.
+    pub fn held_by(&self, id: &str, instance: &str) {
+        {
+            let mut g = self.holders.lock();
+            if g.get(id).is_some_and(|h| h == instance) {
+                return;
+            }
+            g.insert(id.to_owned(), instance.to_owned());
+        }
+        self.save_holders();
+    }
+
+    /// The runner process of its machine that last said it holds session `id`, if one did.
+    pub fn holder(&self, id: &str) -> Option<String> {
+        self.holders.lock().get(id).cloned()
+    }
+
+    fn forget_holders(&self, ids: &[String]) {
+        let mut changed = false;
+        {
+            let mut g = self.holders.lock();
+            for id in ids {
+                changed |= g.remove(id).is_some();
+            }
+        }
+        if changed {
+            self.save_holders();
+        }
+    }
+
+    fn save_holders(&self) {
+        let holders = self.holders.lock().clone();
+        if let Err(e) = self.keep_json("holders.json", &holders) {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't keep which runner process holds each agent session");
         }
     }
 
@@ -1402,6 +1499,8 @@ impl Registry {
     /// Files a finished message mentioned, kept now (`super::kept`): its viewers hear of them.
     pub fn files_added(&self, id: &str, added: &[Kept]) {
         if let Some(m) = self.mirrors.lock().get_mut(id) {
+            // A revision of its own, past what its viewers have: else they'd take it as had.
+            m.rev = m.rev.saturating_add(1);
             m.send(Frame::of(json!({"t": "files", "files": added}).to_string()));
         }
     }
@@ -1523,7 +1622,7 @@ impl Registry {
                         no_bypass: !spec.allow_bypass,
                         workspace: spec.workspace.clone(),
                     };
-                    self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone(), Arc::clone(&self.bus)));
+                    self.mirrors.lock().entry(id).or_insert_with(|| Mirror { opened_at: Some(std::time::Instant::now()), ..Mirror::new(info.clone(), loc.clone(), Arc::clone(&self.bus)) });
                     out.push(info);
                 }
             }
@@ -1575,9 +1674,9 @@ impl Registry {
     /// for a machine, every file sent ahead in pieces (the message then refers to them by id).
     async fn route_attachments(&self, hub: &Hub, id: &str, loc: &Location, c: Command) -> Result<Command, Sent> {
         use base64::Engine as _;
-        let Command::Send { id: mid, text, mode, attachments, overrides } = c else { return Ok(c) };
+        let Command::Send { id: mid, text, mode, attachments, overrides, reply_to, task } = c else { return Ok(c) };
         if attachments.is_empty() {
-            return Ok(Command::Send { id: mid, text, mode, attachments, overrides });
+            return Ok(Command::Send { id: mid, text, mode, attachments, overrides, reply_to, task });
         }
         let b64 = base64::engine::general_purpose::STANDARD;
         let mut out = Vec::new();
@@ -1630,7 +1729,7 @@ impl Registry {
             }
             out.push(a);
         }
-        Ok(Command::Send { id: mid, text, mode, attachments: out, overrides })
+        Ok(Command::Send { id: mid, text, mode, attachments: out, overrides, reply_to, task })
     }
 
     /// A harness signed in on a machine (kiln's /login): each of that machine's sessions of it is
@@ -2069,6 +2168,72 @@ mod tests {
             hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(13)] });
             want.extend(names(12..=14));
             anyhow::ensure!(copy_of(&hub, "s") == want, "{:?}", copy_of(&hub, "s"));
+            Ok(())
+        })
+    }
+
+    /// A session this server opened on a machine isn't ended by a report the machine made before
+    /// the open got there; one it had announced is, once a report leaves it out.
+    #[test]
+    fn a_report_made_before_an_open_got_there_doesnt_end_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let info = |id: &str| Info { id: id.into(), kind: "claude".into(), ..Info::default() };
+            let bus: Arc<dyn kiln_seams::Bus> = Arc::new(hub.bus.clone());
+            hub.harness.mirrors.lock().insert("opened".into(), Mirror { opened_at: Some(std::time::Instant::now()), ..Mirror::new(info("opened"), there.clone(), bus) });
+            hub.harness.ingest(&hub, &there, "announced", Update::Open { info: Box::new(info("announced")), since: None });
+            let att = hub.harness.attach("announced").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let at = att.at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
+            hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default());
+            let left: Vec<String> = hub.harness.mirrors.lock().keys().cloned().collect();
+            anyhow::ensure!(left == vec!["opened".to_owned()], "{left:?}");
+            // Its viewer hears it's gone: its feed's last frame.
+            let read = futures::executor::block_on(kiln_seams::Bus::read(&hub.bus, &att.topic, at, 100))?;
+            let said: Vec<String> = read.messages.iter().filter_map(|m| super::super::live::decode(&m.payload)).map(|f| f.text.to_string()).collect();
+            anyhow::ensure!(said.last().is_some_and(|t| t == super::super::live::CLOSED), "its viewer heard {said:?}");
+            // Its machine announces it: from then on its reports count.
+            hub.harness.ingest(&hub, &there, "opened", Update::Open { info: Box::new(info("opened")), since: None });
+            hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default());
+            anyhow::ensure!(hub.harness.mirrors.lock().is_empty());
+            Ok(())
+        })
+    }
+
+    /// A runner process's report speaks for the sessions it holds: those another process of its
+    /// machine holds stay, listed away while that process isn't connected, never ended (a second
+    /// runner on adacachy once ended every agent of the first, which was away).
+    #[test]
+    fn a_report_never_ends_what_another_process_of_the_machine_holds() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let info = |id: &str| Info { id: id.into(), kind: "claude".into(), ..Info::default() };
+            for id in ["old-1", "old-2", "mine"] {
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info(id)), since: None });
+            }
+            hub.harness.held_by("old-1", "01a14794");
+            hub.harness.held_by("old-2", "01a14794");
+            hub.harness.held_by("mine", "main");
+            let report = |ids: &[&str]| crate::harness::host::Inventory { sessions: ids.iter().map(|s| (*s).to_owned()).collect(), ..Default::default() };
+            let left = |hub: &crate::hub::Hub| {
+                let mut v: Vec<String> = hub.harness.mirrors.lock().keys().cloned().collect();
+                v.sort();
+                v
+            };
+            // `main` says what it holds while the other process is away.
+            hub.harness.inventory(&hub, "box", Some("main"), &["main".to_owned()], report(&["mine"]));
+            anyhow::ensure!(left(&hub) == ["mine", "old-1", "old-2"], "{:?}", left(&hub));
+            let status = |id: &str| hub.harness.info(id).map(|i| i.status);
+            anyhow::ensure!(status("old-1") == Some(Status::Disconnected) && status("old-2") == Some(Status::Disconnected), "away: {:?} {:?}", status("old-1"), status("old-2"));
+            anyhow::ensure!(status("mine") != Some(Status::Disconnected), "{:?}", status("mine"));
+            // The process that holds them says it holds one of them: the other ends.
+            hub.harness.inventory(&hub, "box", Some("01a14794"), &["main".to_owned(), "01a14794".to_owned()], report(&["old-1"]));
+            anyhow::ensure!(left(&hub) == ["mine", "old-1"], "{:?}", left(&hub));
+            anyhow::ensure!(hub.harness.holder("old-2").is_none(), "its holder goes with it");
+            // Who holds what is kept for the next start.
+            let kept: HashMap<String, String> = serde_json::from_slice(&std::fs::read(hub.harness.dir.join("holders.json"))?)?;
+            anyhow::ensure!(kept.get("old-1").map(String::as_str) == Some("01a14794") && !kept.contains_key("old-2"), "{kept:?}");
             Ok(())
         })
     }

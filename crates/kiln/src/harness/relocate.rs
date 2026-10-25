@@ -156,7 +156,7 @@ async fn say(hub: &Arc<Hub>, id: &str, text: &str) {
 #[allow(clippy::too_many_arguments)]
 async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, now: bool, kind: Option<String>, model: Option<String>) -> Result<(), String> {
     let (there, note) = folder(hub, id, from, to, cwd, false).await?;
-    match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note, now, kind, model }).await {
+    match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note, now, kind, model, local: false }).await {
         Sent::Ok => Ok(()),
         _ => Err(format!("{from} is not connected")),
     }

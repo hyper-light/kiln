@@ -12,7 +12,8 @@ import { headline } from "@/views/plans/graph-layout";
 import { STAND_WORDS, StandTitle, StepGlyph } from "@/views/plans/status";
 import { goalPlanRows, shortTitle, type GoalStep } from "./goal-plan-layout";
 
-export function GoalPlan({ steps, label }: { steps: GoalStep[]; label: string }) {
+/** `under`: what shows under a step, beside its words (a planner at work: its last calls). */
+export function GoalPlan({ steps, label, under }: { steps: GoalStep[]; label: string; under?: (s: GoalStep) => React.ReactNode }) {
   const [open, setOpen] = React.useState(false);
   return (
     <ol className="gp" aria-label={label}>
@@ -72,7 +73,8 @@ export function GoalPlan({ steps, label }: { steps: GoalStep[]; label: string })
               {r.after.length > 0 && <span className="gp-sub">after {r.after.map((a) => `“${shortTitle(a.title)}”`).join(", ")}</span>}
               {r.start && <span className="gp-sub">from the start</span>}
             </span>
-            <span className="gp-word">{STAND_WORDS[s.stand]}</span>
+            <span className="gp-word">{s.word ?? STAND_WORDS[s.stand]}</span>
+            {under?.(s)}
           </li>
         );
       })}

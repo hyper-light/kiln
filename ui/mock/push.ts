@@ -180,6 +180,20 @@ const STEPS = ["Reading src/lib.rs", "Running cargo test", "Editing src/api.rs",
 for (let i = 0; i < BUSY; i++) {
   fleet.push({ ...base(`busy-${i}`, `Busy agent ${i + 1}`, `agent:metal-ryzen-0${(i % 3) + 1}`, i % 2 ? "codex" : "claude", 9 - (i % 9)), status: "running", doing: STEPS[i % STEPS.length] });
 }
+/**
+ * `MOCK_STANDS=paused:7,finished:16,offline:3,stopped:1`: that many more agents standing each of
+ * those ways, for a fleet the size of a real one in Mission control's head.
+ */
+const TASKS = ["Port the scheduler", "Trim the release notes", "Docs for reach", "Fix the flaky retry test", "Phone layout for Runs", "Benchmark the codec"];
+for (const [stand, n] of (process.env.MOCK_STANDS ?? "").split(",").filter(Boolean).map((s) => s.split(":"))) {
+  for (let i = 0; i < Number(n); i++) {
+    const a = base(`${stand}-${i}`, TASKS[i % TASKS.length]!, `agent:metal-ryzen-0${(i % 3) + 1}`, i % 2 ? "codex" : "claude", 50 + i);
+    if (stand === "paused") fleet.push({ ...a, pause: { reason: "limit", label: "Session", said: "", since: t0, auto: true, by: "harness", tries: 0 } });
+    else if (stand === "finished") fleet.push({ ...a, summary: "Done: the change is in and its tests pass." });
+    else if (stand === "offline") fleet.push({ ...a, target: "agent:jupiter", status: "disconnected" });
+    else if (stand === "stopped") fleet.push({ ...a, status: "exited", exit: { code: 1, error: "claude: the session ended unexpectedly" } });
+  }
+}
 if (BUSY > 0)
   setInterval(() => {
     for (let i = 0; i < fleet.length; i++) {

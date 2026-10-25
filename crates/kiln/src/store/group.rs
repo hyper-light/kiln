@@ -47,15 +47,26 @@ use hyper_raft::proto::{ConfChangeV2, ConfState, Message, MessageType};
 use hyper_raft::wire::Record as _;
 use hyper_raft::{Config, Elections, Limits, Stated};
 use parking_lot::Mutex;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
 
 use super::capture::{self, Change, Row, TableInfo};
 use crate::sync::group::Conf;
 
 /// The table that says where kiln.db stands: the last write it holds (`seq`) and the last entry
-/// made durable with it (`applied`, `term`). One row.
+/// made durable with it (`applied`, `term`). One row, of exactly these four columns: every release
+/// since P1 fills them by position as it starts, so one more there would stop each from starting on
+/// this database, and a rollback to it with them.
 pub const STATE: &str = "cluster_state";
+/// The group's configuration where [`STATE`] stands (its voters and learners, as JSON), in a table of
+/// its own for that reason. One row; none said means the server alone, as before the group had
+/// learners.
+pub const CONF: &str = "cluster_conf";
+/// Where a build whose learners take a copy at a gap in the log's writes last said kiln.db stands
+/// (its `applied`), in a table of its own too. A learner's replica whose [`STATE`] says otherwise
+/// was kept by a build before those (or rolled back to one), which went on past such a gap without
+/// the write, its replica looking whole: it's copied again as it starts.
+pub const MARK: &str = "cluster_mark";
 /// The log's id, the same in every kiln's file.
 const LOG_ID: u128 = u128::from_be_bytes(*b"kiln-cluster-gp1");
 /// The group, the log's only one.
@@ -90,18 +101,69 @@ const CHANGE_PATIENCE: Duration = Duration::from_secs(30);
 const OUTGOING: usize = 4096;
 /// How many times a learner tries to fetch a copy of the database before its replica stops.
 const FETCH_TRIES: u32 = 4;
+/// Writes kept, at most, while the log has no room for them ([`Held`]): past it a write kiln.db
+/// holds goes without its entry, and says so.
+const HELD_BYTES: u64 = 256 << 20;
+/// How long a stop waits for the log to have room for what's held.
+const STOP_PATIENCE: Duration = Duration::from_secs(30);
+/// How long a learner waits for another process to let its replica go (a machine's older runner
+/// process, told to let its learner go as the newest takes it).
+const ALONE_PATIENCE: Duration = Duration::from_secs(30);
 
 /// Fetches a copy of the server's kiln.db into a file, made now (a learner's way to the database:
 /// the runner's HTTP client to the server).
 pub type Fetch = Arc<dyn Fn(&Path) -> anyhow::Result<()> + Send + Sync>;
 
-/// Whether `db` is a copy of kiln.db a learner opens on: it says where it stands.
+/// Whether `db` is a copy of kiln.db a learner opens on: it says where it stands, and this build
+/// said so last ([`MARK`]).
 fn holds_a_copy(db: &Path) -> bool {
     db.exists()
         && Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .ok()
-            .and_then(|c| c.query_row(&format!("SELECT applied FROM {STATE}"), [], |r| r.get::<_, i64>(0)).ok())
-            .is_some()
+            .and_then(|c| c.query_row(&format!("SELECT s.applied = m.applied FROM {STATE} s, {MARK} m"), [], |r| r.get::<_, bool>(0)).ok())
+            .unwrap_or(false)
+}
+
+/// Says a copy just taken stands where its [`STATE`] says ([`MARK`]).
+fn mark(db: &Path) -> anyhow::Result<()> {
+    let conn = Connection::open(db).with_context(|| format!("opening {} to mark it", db.display()))?;
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {MARK} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL);
+         INSERT INTO {MARK} (one, applied) SELECT 1, applied FROM {STATE} WHERE one = 1 ON CONFLICT (one) DO UPDATE SET applied = excluded.applied;"
+    ))
+    .with_context(|| format!("marking {}", db.display()))
+}
+
+/// The file beside `db` named with `suffix` after it (its `-wal`).
+fn beside(db: &Path, suffix: &str) -> PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Removes `file`, if it's there.
+fn remove(file: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(file) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(anyhow::Error::from(e).context(format!("removing {}", file.display()))),
+        _ => Ok(()),
+    }
+}
+
+/// Waits until no other process has the database at `db` open. SQLite leaves WAL mode only then,
+/// its WAL checkpointed and gone: so nothing of theirs writes to the replica or its log after this,
+/// nor takes the WAL of a copy put in its place as it closes (SQLite removes a WAL by name). A file
+/// that isn't a database is nobody's.
+fn alone(db: &Path) -> anyhow::Result<()> {
+    let since = Instant::now();
+    loop {
+        let left = Connection::open(db).and_then(|c| c.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get::<_, String>(0)));
+        match left {
+            Ok(mode) if mode.eq_ignore_ascii_case("delete") => return Ok(()),
+            Err(rusqlite::Error::SqliteFailure(e, _)) if !matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => return Ok(()),
+            _ if since.elapsed() >= ALONE_PATIENCE => bail!("another process still has {} open", db.display()),
+            _ => thread::sleep(Duration::from_millis(250)),
+        }
+    }
 }
 
 /// A runner's member in the group: from its machine's name, stable, never the server's.
@@ -236,10 +298,24 @@ impl Group {
         if let Some(d) = db.parent() {
             std::fs::create_dir_all(d).with_context(|| format!("making {}", d.display()))?;
         }
+        // A machine's older runner process lets its replica go as the newest takes it (the server
+        // tells both at once): nothing here touches the replica, its log or its WAL until it has.
+        if db.exists() {
+            alone(db)?;
+        }
         if !holds_a_copy(db) {
+            // None yet, or one an earlier build kept: a copy made now, its log starting again at it
+            // (and the replica's WAL gone, which would be read into the copy).
+            if db.exists() {
+                tracing::info!("this machine's replica of kiln's records was kept by an earlier build, which could go past writes the log lacked: it's copied again");
+            }
             let part = db.with_extension("copy");
             fetch(&part).context("fetching a copy of kiln.db")?;
+            for gone in [dir.join("cluster.log"), beside(db, "-wal"), beside(db, "-shm")] {
+                remove(&gone)?;
+            }
             std::fs::rename(&part, db).with_context(|| format!("keeping the copy at {}", db.display()))?;
+            mark(db)?;
         }
         match Self::start(db, dir, member, Some(fetch.clone())) {
             Ok(g) => Ok(g),
@@ -321,6 +397,7 @@ impl Group {
                     wanted: None,
                     changing: None,
                     beat: Instant::now(),
+                    held: Held::default(),
                 };
                 d.run(ready_tx);
             })
@@ -416,6 +493,107 @@ impl Drop for Group {
     }
 }
 
+/// What waits to go into the log, in order, while it has no room. A replica stalled for room
+/// refuses every proposal and makes again only the writes it had taken, so a write the store sent
+/// then would be in kiln.db and never in the log, and every learner would need a new copy of the
+/// database for it. So each part and barrier is offered from here, oldest first, and nothing goes
+/// before one the log had no room for.
+#[derive(Default)]
+struct Held {
+    items: std::collections::VecDeque<Item>,
+    /// The parts' bytes.
+    bytes: u64,
+}
+
+/// A thing for the log: a write's part (its `seq` and the entry's bytes), or a barrier (its id).
+enum Item {
+    Part(u64, Vec<u8>),
+    Barrier(u64),
+}
+
+/// What an [`Item`] was, to say what became of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum What {
+    Part(u64),
+    Barrier(u64),
+}
+
+/// Where held items go: the replica (a stand-in in tests).
+trait Proposer {
+    /// Whether it takes a proposal now (a replica stalled for room refuses each).
+    fn room(&self) -> bool;
+    /// Proposes `item`; an error is a refusal for good, not for room.
+    fn offer(&mut self, item: Item) -> Result<(), String>;
+}
+
+impl Proposer for Member {
+    fn room(&self) -> bool {
+        !self.is_stalled()
+    }
+
+    fn offer(&mut self, item: Item) -> Result<(), String> {
+        let proposed = match item {
+            Item::Part(_, data) => self.propose(Vec::new(), data),
+            Item::Barrier(id) => self.propose(id.to_le_bytes().to_vec(), Vec::new()),
+        };
+        proposed.map_err(|e| format!("{e:?}"))
+    }
+}
+
+impl Item {
+    fn what(&self) -> What {
+        match self {
+            Item::Part(seq, _) => What::Part(*seq),
+            Item::Barrier(id) => What::Barrier(*id),
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        match self {
+            Item::Part(_, data) => data.len() as u64,
+            Item::Barrier(_) => 0,
+        }
+    }
+}
+
+impl Held {
+    fn push(&mut self, item: Item) {
+        self.bytes = self.bytes.saturating_add(item.bytes());
+        self.items.push_back(item);
+    }
+
+    /// Offers what's held to `to`, oldest first, while it has room: what it refused for good, and
+    /// why.
+    fn drain(&mut self, to: &mut impl Proposer) -> Vec<(What, String)> {
+        let mut refused = Vec::new();
+        while to.room() {
+            let Some(item) = self.items.pop_front() else { break };
+            self.bytes = self.bytes.saturating_sub(item.bytes());
+            let what = item.what();
+            if let Err(why) = to.offer(item) {
+                refused.push((what, why.clone()));
+                // A write goes into the log whole or not at all: its parts after a refused one go
+                // too, so a learner meets its absence as a gap in the writes' numbers.
+                if let What::Part(seq) = what {
+                    while matches!(self.items.front(), Some(Item::Part(s, _)) if *s == seq) {
+                        if let Some(rest) = self.items.pop_front() {
+                            self.bytes = self.bytes.saturating_sub(rest.bytes());
+                            refused.push((rest.what(), why.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        refused
+    }
+
+    /// Everything held, given up (the group failed, or stopped with no room).
+    fn give_up(&mut self) -> Vec<What> {
+        self.bytes = 0;
+        self.items.drain(..).map(|i| i.what()).collect()
+    }
+}
+
 struct Driver {
     replica: Member,
     // Kept open for as long as the replica writes to it.
@@ -446,6 +624,8 @@ struct Driver {
     changing: Option<(u64, bool, Instant)>,
     /// When the server's member last beat.
     beat: Instant,
+    /// Writes' parts and barriers waiting for room in the log, in order.
+    held: Held,
 }
 
 impl Driver {
@@ -466,7 +646,7 @@ impl Driver {
         }
         self.since = self.replica.applied().index;
         ready.send(Ok(())).ok();
-        let mut stopping = false;
+        let mut stopping: Option<Instant> = None;
         loop {
             while let Ok(req) = self.rx.try_recv() {
                 match req {
@@ -481,14 +661,14 @@ impl Driver {
                     Request::Unreachable(member) => {
                         self.replica.report_unreachable(member).ok();
                     }
-                    Request::Stop if !stopping => {
+                    Request::Stop if stopping.is_none() => {
                         // What was sent before goes into the log first (the server's; a learner
                         // proposes nothing).
                         if self.server {
                             let (reply, _answer) = mpsc::sync_channel(1);
                             self.barrier(reply);
                         }
-                        stopping = true;
+                        stopping = Some(Instant::now());
                     }
                     Request::Stop => {}
                 }
@@ -499,6 +679,11 @@ impl Driver {
                     reply.send(Err(format!("the cluster group failed: {e:#}"))).ok();
                 }
                 self.broken = Some(format!("{e:#}"));
+                for what in self.held.give_up() {
+                    if let What::Part(seq) = what {
+                        tracing::error!(seq, "a write kiln.db holds isn't in the cluster log: {e:#}");
+                    }
+                }
                 // What the store sends from now on can't be logged: take it and say so.
                 while let Ok(req) = self.rx.recv() {
                     match req {
@@ -527,9 +712,16 @@ impl Driver {
             if let Ok((start, _)) = self.replica.log_mut().bounds() {
                 self.log_start.store(start.index, Ordering::SeqCst);
             }
-            if stopping && self.pending.is_empty() {
-                self.replica.machine_mut().persist().ok();
-                return;
+            // What waited for room goes in now there's some, in order.
+            self.propose_held();
+            if let Some(since) = stopping {
+                if since.elapsed() >= STOP_PATIENCE {
+                    self.give_up_held("the log had no room before the group stopped");
+                }
+                if self.pending.is_empty() {
+                    self.replica.machine_mut().persist().ok();
+                    return;
+                }
             }
             let wait = self.replica.deadline().map(|d| Duration::from_nanos(d.saturating_sub(self.now()))).unwrap_or(Duration::from_millis(100)).min(Duration::from_millis(100));
             thread::park_timeout(wait.max(Duration::from_micros(50)));
@@ -614,25 +806,52 @@ impl Driver {
                 return;
             }
         };
+        // Whole or not at all: a learner joins a write's parts before it applies them.
+        let bytes: u64 = parts.iter().map(|p| p.len() as u64).sum();
+        if self.held.bytes.saturating_add(bytes) > HELD_BYTES {
+            tracing::error!(seq, held = self.held.bytes, "a write kiln.db holds isn't in the cluster log: no room for {} MiB of writes (a learner takes a copy at the gap)", HELD_BYTES >> 20);
+            return;
+        }
         for data in parts {
-            if let Err(e) = self.replica.propose(Vec::new(), data) {
-                tracing::error!(seq, "a write kiln.db holds isn't in the cluster log: {e:?}");
+            self.held.push(Item::Part(seq, data));
+        }
+        self.propose_held();
+    }
+
+    /// Offers the log what's held, oldest first, while it has room ([`Held`]), and says what it
+    /// refused for good.
+    fn propose_held(&mut self) {
+        for (what, why) in self.held.drain(&mut self.replica) {
+            self.refused(what, &why);
+        }
+    }
+
+    /// Gives up what's held, saying why: each write it held isn't in the log, each barrier fails.
+    fn give_up_held(&mut self, why: &str) {
+        for what in self.held.give_up() {
+            self.refused(what, why);
+        }
+    }
+
+    fn refused(&mut self, what: What, why: &str) {
+        match what {
+            What::Part(seq) => tracing::error!(seq, "a write kiln.db holds isn't in the cluster log: {why}"),
+            What::Barrier(id) => {
+                if let Some(reply) = self.pending.remove(&id) {
+                    reply.send(Err(format!("the cluster group refused an entry: {why}"))).ok();
+                }
             }
         }
     }
 
-    /// Proposes an entry of no change, answered once applied: everything before it is too.
+    /// Proposes an entry of no change, answered once applied: everything before it is too (it goes
+    /// in behind what's held).
     fn barrier(&mut self, reply: mpsc::SyncSender<Result<(), String>>) {
         let id = self.next;
         self.next += 1;
-        match self.replica.propose(id.to_le_bytes().to_vec(), Vec::new()) {
-            Ok(()) => {
-                self.pending.insert(id, reply);
-            }
-            Err(e) => {
-                reply.send(Err(format!("the cluster group refused an entry: {e:?}"))).ok();
-            }
-        }
+        self.pending.insert(id, reply);
+        self.held.push(Item::Barrier(id));
+        self.propose_held();
     }
 
     /// Drives until the barriers proposed are applied.
@@ -640,6 +859,7 @@ impl Driver {
         let until = Instant::now() + Duration::from_secs(120);
         while !self.pending.is_empty() {
             self.drive()?;
+            self.propose_held();
             if Instant::now() >= until {
                 bail!("the cluster group didn't apply its log within 120 s");
             }
@@ -702,26 +922,31 @@ struct Machine {
 }
 
 /// Where kiln.db stands, as [`STATE`] says: its last entry applied (with its term), its last
-/// write, and the group's configuration there.
+/// write, and the group's configuration there ([`CONF`]).
 fn stands(conn: &Connection) -> anyhow::Result<(Point, u64, ConfState)> {
-    let (index, term, seq, conf): (i64, i64, i64, Option<String>) =
-        conn.query_row(&format!("SELECT applied, term, seq, conf FROM {STATE}"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    let (index, term, seq): (i64, i64, i64) = conn.query_row(&format!("SELECT applied, term, seq FROM {STATE}"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let conf: Option<String> = conn.query_row(&format!("SELECT conf FROM {CONF} WHERE one = 1"), [], |r| r.get(0)).optional()?.flatten();
     let at = Point { index: u64::try_from(index).unwrap_or(0), term: u64::try_from(term).unwrap_or(0) };
     // Before the group had learners, its configuration was the server alone, unsaid.
     let conf = conf.and_then(|c| serde_json::from_str::<Conf>(&c).ok()).map_or_else(|| ConfState { voters: vec![SERVER], ..ConfState::default() }, |c| ConfState::from(&c));
     Ok((at, u64::try_from(seq).unwrap_or(0), conf))
 }
 
-/// Says in [`STATE`] that kiln.db stands at `at` under `conf`, in a commit that waits for the disk
-/// (kiln.db's others don't): everything before it is durable too.
+/// Says in [`STATE`], [`CONF`] and [`MARK`] that kiln.db stands at `at` under `conf`, in one commit
+/// that waits for the disk (kiln.db's others don't): everything before it is durable too.
 pub(super) fn stand(conn: &Connection, at: Point, conf: &ConfState) -> anyhow::Result<()> {
+    let (index, term, conf) = (i64::try_from(at.index)?, i64::try_from(at.term)?, serde_json::to_string(&Conf::from(conf))?);
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {CONF} (one INTEGER PRIMARY KEY CHECK (one = 1), conf TEXT);
+         CREATE TABLE IF NOT EXISTS {MARK} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL);"
+    ))?;
     conn.execute_batch("PRAGMA synchronous = FULL")?;
     let done = (|| -> anyhow::Result<()> {
         conn.execute_batch("BEGIN IMMEDIATE")?;
-        let wrote = conn.execute(
-            &format!("UPDATE {STATE} SET applied = ?1, term = ?2, conf = ?3 WHERE one = 1"),
-            rusqlite::params![i64::try_from(at.index)?, i64::try_from(at.term)?, serde_json::to_string(&Conf::from(conf))?],
-        );
+        let wrote = conn
+            .execute(&format!("UPDATE {STATE} SET applied = ?1, term = ?2 WHERE one = 1"), rusqlite::params![index, term])
+            .and_then(|_| conn.execute(&format!("INSERT INTO {CONF} (one, conf) VALUES (1, ?1) ON CONFLICT (one) DO UPDATE SET conf = excluded.conf"), [&conf]))
+            .and_then(|_| conn.execute(&format!("INSERT INTO {MARK} (one, applied) VALUES (1, ?1) ON CONFLICT (one) DO UPDATE SET applied = excluded.applied"), [index]));
         match wrote {
             Ok(_) => Ok(conn.execute_batch("COMMIT")?),
             Err(e) => {
@@ -734,6 +959,28 @@ pub(super) fn stand(conn: &Connection, at: Point, conf: &ConfState) -> anyhow::R
     done
 }
 
+/// A database that builds from before [`CONF`] kept the configuration on [`STATE`] in, as a fifth
+/// column: it moves to [`CONF`] and the column goes, in one commit, so the releases before them
+/// start on it again. The column's, when it says one, is the newest: only those builds write it.
+fn unwiden(conn: &Connection) -> anyhow::Result<()> {
+    let wide: bool = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{STATE}') WHERE name = 'conf'"), [], |r| r.get::<_, i64>(0))? > 0;
+    if !wide {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let done = conn.execute_batch(&format!(
+        "INSERT INTO {CONF} (one, conf) SELECT 1, conf FROM {STATE} WHERE one = 1 AND conf IS NOT NULL ON CONFLICT (one) DO UPDATE SET conf = excluded.conf;
+         ALTER TABLE {STATE} DROP COLUMN conf;"
+    ));
+    match done {
+        Ok(()) => Ok(conn.execute_batch("COMMIT")?),
+        Err(e) => {
+            conn.execute_batch("ROLLBACK").ok();
+            Err(anyhow::Error::from(e).context(format!("moving the cluster group's configuration off {STATE}")))
+        }
+    }
+}
+
 impl Machine {
     /// Opens kiln.db at `db` to apply entries: foreign keys off (an entry's rows hold its cascades
     /// already), and where it stands read from [`STATE`] (made, at 0, on the first start).
@@ -741,14 +988,12 @@ impl Machine {
         let conn = Connection::open(db).with_context(|| format!("opening {} for the cluster group", db.display()))?;
         conn.execute_batch(&format!(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = OFF; PRAGMA busy_timeout = 5000;
-             CREATE TABLE IF NOT EXISTS {STATE} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL, term INTEGER NOT NULL, seq INTEGER NOT NULL, conf TEXT);
-             INSERT OR IGNORE INTO {STATE} (one, applied, term, seq) VALUES (1, 0, 0, 0);"
+             CREATE TABLE IF NOT EXISTS {STATE} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL, term INTEGER NOT NULL, seq INTEGER NOT NULL);
+             INSERT OR IGNORE INTO {STATE} (one, applied, term, seq) VALUES (1, 0, 0, 0);
+             CREATE TABLE IF NOT EXISTS {CONF} (one INTEGER PRIMARY KEY CHECK (one = 1), conf TEXT);
+             CREATE TABLE IF NOT EXISTS {MARK} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL);"
         ))?;
-        // P1's table had no configuration (the server alone).
-        let has_conf: bool = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{STATE}') WHERE name = 'conf'"), [], |r| r.get::<_, i64>(0))? > 0;
-        if !has_conf {
-            conn.execute_batch(&format!("ALTER TABLE {STATE} ADD COLUMN conf TEXT"))?;
-        }
+        unwiden(&conn)?;
         let (at, seq, configuration) = stands(&conn)?;
         Ok(Machine {
             conn,
@@ -769,6 +1014,56 @@ impl Machine {
         if seq > self.logged && self.applied.index > 1 {
             tracing::warn!(seq, logged = self.logged, "kiln.db holds writes the cluster log doesn't (a stop before they reached it); a learner (P2) takes a copy of the database");
         }
+    }
+
+    /// Fetches a copy of the database made now and takes it in whole, as its readers see it at
+    /// once; says it stands at `at` under `configuration`. Its last write's number, now this one's.
+    fn take_a_copy(&mut self, at: Point, configuration: &ConfState) -> Result<u64, Fatal> {
+        let Some(fetch) = self.fetch.clone() else { return Err(Fatal("only a learner takes a copy of the database")) };
+        let part = self.path.with_extension("copy");
+        let took = (|| -> anyhow::Result<u64> {
+            // The server may be busy or a moment away: a few tries before the learner gives up.
+            let mut tried = 0;
+            while let Err(e) = fetch(&part) {
+                tried += 1;
+                if tried >= FETCH_TRIES {
+                    return Err(e.context("fetching a copy of kiln.db"));
+                }
+                tracing::warn!(tried, "fetching a copy of kiln.db: {e:#}");
+                thread::sleep(Duration::from_secs(2 << tried));
+            }
+            {
+                let copy = Connection::open_with_flags(&part, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                rusqlite::backup::Backup::new(&copy, &mut self.conn)?.run_to_completion(4096, Duration::ZERO, None)?;
+            }
+            self.conn.execute_batch("PRAGMA journal_mode = WAL")?;
+            let (_, seq, _) = stands(&self.conn)?;
+            stand(&self.conn, at, configuration)?;
+            Ok(seq)
+        })();
+        std::fs::remove_file(&part).ok();
+        match took {
+            Ok(seq) => {
+                self.seq.store(seq, Ordering::SeqCst);
+                self.known.clear();
+                Ok(seq)
+            }
+            Err(e) => {
+                tracing::error!("a learner couldn't take a copy of kiln.db: {e:#}");
+                Err(Fatal("a copy of kiln.db couldn't be taken"))
+            }
+        }
+    }
+
+    /// A learner meets writes its log lacks: a copy of the database now, said to stand where this
+    /// one is durable (its log holds everything after that; what it applies of it the copy holds
+    /// already is skipped by its `seq`). Its replica answers nothing meanwhile: its last write stays
+    /// behind the server's.
+    fn copy_again(&mut self) -> Result<(), Fatal> {
+        let (at, configuration) = (self.durable, self.configuration.clone());
+        let seq = self.take_a_copy(at, &configuration)?;
+        tracing::info!(index = at.index, seq, "a learner took a copy of kiln.db over writes its log lacked");
+        Ok(())
     }
 
     /// Applies an entry's rows (a write kiln.db doesn't hold) and, with its last part, its `seq`.
@@ -815,6 +1110,15 @@ impl StateMachine for Machine {
         match postcard::from_bytes::<Entry>(entry.data) {
             Ok(e) => {
                 self.logged = self.logged.max(e.seq);
+                // A learner hears the writes one number after another. A number past the next is
+                // writes the log lacks (the server stopped before they reached it, or its log had no
+                // room for them), and its replica would answer without them: it takes a copy of the
+                // database first, which has them (the server's kiln.db holds every write).
+                let have = self.seq.load(Ordering::SeqCst);
+                if self.fetch.is_some() && e.part == 0 && e.seq > have.saturating_add(1) {
+                    tracing::warn!(index = entry.index, seq = e.seq, have, "the cluster log lacks writes this replica doesn't hold: it takes a copy of kiln.db");
+                    self.copy_again()?;
+                }
                 // kiln.db holds what this node wrote (it committed it first); a write past that is
                 // one the disk lost from kiln.db and the log kept.
                 // (A large write's number is recorded with its last part, so its parts all apply.)
@@ -865,45 +1169,13 @@ impl StateMachine for Machine {
     fn install(&mut self, _image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {
         // The image is only where the group stands: a learner fetches a copy of the database made
         // now, which stands in for `at` (the entries after `at` it holds already are skipped by
-        // their `seq`), and takes it in whole, as its readers see it at once.
-        let Some(fetch) = self.fetch.clone() else { return Err(Fatal("only a learner takes a copy of the database")) };
-        let part = self.path.with_extension("copy");
-        let took = (|| -> anyhow::Result<u64> {
-            // The server may be busy or a moment away: a few tries before the learner gives up.
-            let mut tried = 0;
-            while let Err(e) = fetch(&part) {
-                tried += 1;
-                if tried >= FETCH_TRIES {
-                    return Err(e.context("fetching a copy of kiln.db"));
-                }
-                tracing::warn!(tried, "fetching a copy of kiln.db: {e:#}");
-                thread::sleep(Duration::from_secs(2 << tried));
-            }
-            {
-                let copy = Connection::open_with_flags(&part, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-                rusqlite::backup::Backup::new(&copy, &mut self.conn)?.run_to_completion(4096, Duration::ZERO, None)?;
-            }
-            self.conn.execute_batch("PRAGMA journal_mode = WAL")?;
-            let (_, seq, _) = stands(&self.conn)?;
-            stand(&self.conn, at, configuration)?;
-            Ok(seq)
-        })();
-        std::fs::remove_file(&part).ok();
-        match took {
-            Ok(seq) => {
-                tracing::info!(index = at.index, seq, "a learner took a copy of kiln.db");
-                self.seq.store(seq, Ordering::SeqCst);
-                self.known.clear();
-                self.applied = at;
-                self.durable = at;
-                self.configuration = configuration.clone();
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!("a learner couldn't take a copy of kiln.db: {e:#}");
-                Err(Fatal("a copy of kiln.db couldn't be taken"))
-            }
-        }
+        // their `seq`).
+        let seq = self.take_a_copy(at, configuration)?;
+        tracing::info!(index = at.index, seq, "a learner took a copy of kiln.db");
+        self.applied = at;
+        self.durable = at;
+        self.configuration = configuration.clone();
+        Ok(())
     }
 
     fn persist(&mut self) -> Result<(), Fatal> {
@@ -957,6 +1229,58 @@ mod tests {
         assert_eq!(kv(&store, "nothing")?, None);
         set(&store, "b", "2")?;
         assert_eq!(state(&db)?.0, 2, "a read takes no number");
+        Ok(())
+    }
+
+    /// What every release since P1 does to [`STATE`] as it starts (8adeadba's own statements): its
+    /// four columns filled by position, then where kiln.db stands read and said again.
+    fn start_a_release_from_before(db: &Path) -> anyhow::Result<()> {
+        let c = Connection::open(db)?;
+        c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cluster_state (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL, term INTEGER NOT NULL, seq INTEGER NOT NULL);
+             INSERT OR IGNORE INTO cluster_state VALUES (1, 0, 0, 0);",
+        )?;
+        let (applied, term): (i64, i64) = c.query_row("SELECT applied, term, seq FROM cluster_state", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        c.execute("UPDATE cluster_state SET applied = ?1, term = ?2 WHERE one = 1", [applied, term])?;
+        Ok(())
+    }
+
+    /// A rollback starts the release before on what this one left. A fifth column on [`STATE`]
+    /// stopped 8adeadba there: "table cluster_state has 5 columns but 4 values were supplied".
+    #[test]
+    fn the_release_before_starts_on_a_database_this_one_ran() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("kiln.db");
+        {
+            let store = Store::open_grouped(&db, &dir.path().join("cluster"))?;
+            set(&store, "a", "1")?;
+            store.flush_group()?;
+        }
+        start_a_release_from_before(&db)
+    }
+
+    /// A database an earlier build of this release ran keeps the configuration on [`STATE`], in a
+    /// fifth column. Opened, the column goes and the configuration moves to [`CONF`], learners and
+    /// all, and the release before starts on it again.
+    #[test]
+    fn a_database_an_earlier_build_widened_is_narrowed_and_keeps_its_configuration() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("kiln.db");
+        let conf = Conf { voters: vec![SERVER], learners: vec![7, 9], ..Conf::default() };
+        {
+            let c = Connection::open(&db)?;
+            c.execute_batch(&format!("CREATE TABLE {STATE} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL, term INTEGER NOT NULL, seq INTEGER NOT NULL, conf TEXT);"))?;
+            c.execute(&format!("INSERT INTO {STATE} (one, applied, term, seq, conf) VALUES (1, 4, 2, 6, ?1)"), [serde_json::to_string(&conf)?])?;
+        }
+        let m = Machine::open(&db, None)?;
+        assert_eq!(m.configuration.learners, vec![7, 9], "its learners kept");
+        assert_eq!((m.applied.index, m.applied.term, m.seq.load(Ordering::SeqCst)), (4, 2, 6), "where it stands kept");
+        drop(m);
+        let columns: i64 = Connection::open(&db)?.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{STATE}')"), [], |r| r.get(0))?;
+        assert_eq!(columns, 4, "the four columns every release since P1 fills");
+        start_a_release_from_before(&db)?;
+        // And this release again: the configuration still there.
+        assert_eq!(Machine::open(&db, None)?.configuration.learners, vec![7, 9]);
         Ok(())
     }
 
@@ -1104,6 +1428,81 @@ mod tests {
         })
     }
 
+    /// A log that has room for `left` more proposals, then none until given more; what it took,
+    /// in order; and an item it refuses for good, once.
+    struct Room {
+        left: usize,
+        took: Vec<What>,
+        refuse: Option<What>,
+    }
+
+    impl Proposer for Room {
+        fn room(&self) -> bool {
+            self.left > 0
+        }
+
+        fn offer(&mut self, item: Item) -> Result<(), String> {
+            self.left = self.left.saturating_sub(1);
+            if self.refuse == Some(item.what()) {
+                self.refuse = None;
+                return Err("refused".into());
+            }
+            self.took.push(item.what());
+            Ok(())
+        }
+    }
+
+    /// The lab's stall (2026-10-24): a replica stalled for room refused the store's writes, and
+    /// each was in kiln.db and never in the log. Held, a write the log had no room for goes in
+    /// once there is, and before every write sent after it, its parts and the barriers too.
+    #[test]
+    fn a_write_the_log_had_no_room_for_goes_in_before_every_write_after_it() {
+        let mut held = Held::default();
+        let mut log = Room { left: 1, took: Vec::new(), refuse: None };
+        // Room for one: write 1 goes in; write 2 (two parts) and a flush's barrier wait.
+        for item in [Item::Part(1, vec![1; 10]), Item::Part(2, vec![2; 10]), Item::Part(2, vec![2; 5]), Item::Barrier(7)] {
+            held.push(item);
+        }
+        assert!(held.drain(&mut log).is_empty());
+        assert_eq!(log.took, [What::Part(1)]);
+        assert_eq!(held.bytes, 15, "write 2's parts are held");
+        // Write 3, sent while write 2 waits, waits behind it.
+        held.push(Item::Part(3, vec![3; 4]));
+        assert!(held.drain(&mut log).is_empty());
+        assert_eq!(log.took, [What::Part(1)], "nothing goes in without room");
+        // Room for two: write 2's parts, and the log is full again before the barrier.
+        log.left = 2;
+        assert!(held.drain(&mut log).is_empty());
+        assert_eq!(log.took, [What::Part(1), What::Part(2), What::Part(2)]);
+        // Room: the barrier, then write 3, in the order sent.
+        log.left = usize::MAX;
+        assert!(held.drain(&mut log).is_empty());
+        assert_eq!(log.took, [What::Part(1), What::Part(2), What::Part(2), What::Barrier(7), What::Part(3)]);
+        assert_eq!((held.items.len(), held.bytes), (0, 0));
+        // A refusal for good, not for room, is said, and what's after it still goes in.
+        log.refuse = Some(What::Part(4));
+        held.push(Item::Part(4, Vec::new()));
+        held.push(Item::Part(5, Vec::new()));
+        assert_eq!(held.drain(&mut log), [(What::Part(4), "refused".to_string())]);
+        assert_eq!(log.took.last(), Some(&What::Part(5)));
+        // Its first part refused, a write's other parts go with it, never offered: the write is
+        // in the log whole or not at all. The write after it goes in.
+        log.refuse = Some(What::Part(9));
+        for item in [Item::Part(9, vec![9; 3]), Item::Part(9, vec![9; 2]), Item::Part(10, Vec::new())] {
+            held.push(item);
+        }
+        let took = log.took.len();
+        assert_eq!(held.drain(&mut log), [(What::Part(9), "refused".to_string()), (What::Part(9), "refused".to_string())]);
+        assert_eq!(log.took.get(took..), Some(&[What::Part(10)][..]), "only the write after it went in");
+        assert_eq!(held.bytes, 0);
+        // Given up, everything held is said, in order.
+        log.left = 0;
+        held.push(Item::Part(6, vec![6]));
+        held.push(Item::Barrier(8));
+        assert_eq!(held.give_up(), [What::Part(6), What::Barrier(8)]);
+        assert_eq!((held.items.len(), held.bytes), (0, 0));
+    }
+
     #[test]
     fn a_learner_starts_from_a_copy_follows_the_log_and_takes_a_new_copy_once_left_behind() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1154,6 +1553,172 @@ mod tests {
         until("a write after the new copy", || Ok(read("later")?.as_deref() == Some("3")))?;
         done.store(true, Ordering::SeqCst);
         links.join().ok();
+        Ok(())
+    }
+
+    /// A write kiln.db holds and the log never got (the server stopped before it reached the log,
+    /// or the log had no room past what's held): a learner meets it as a write number past the
+    /// next, and takes a copy of the database before it applies anything after it. Its last write
+    /// stays behind the server's until then, so its front door answers nothing from it.
+    #[test]
+    fn a_learner_that_meets_a_write_the_log_lacks_takes_a_copy_before_it_goes_on() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("kiln.db");
+        let server = Store::open_grouped(&db, &dir.path().join("cluster"))?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        let g = server.group().context("grouped")?;
+        g.learners([member].into());
+        until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        let copies = Arc::new(AtomicU64::new(0));
+        let fetch: Fetch = {
+            let (server, copies) = (server.clone(), copies.clone());
+            Arc::new(move |dest: &Path| {
+                copies.fetch_add(1, Ordering::SeqCst);
+                crate::rt::block_on({
+                    let (s, d) = (server.clone(), dest.to_path_buf());
+                    async move { s.copy_for_learner(d).await }
+                })
+            })
+        };
+        let replica = dir.path().join("runner").join("kiln.db");
+        let learner = Arc::new(Group::learner(&replica, &dir.path().join("runner").join("cluster"), member, fetch)?);
+        let read = |k: &str| -> anyhow::Result<Option<String>> {
+            let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
+        };
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone());
+        set(&server, "after", "2")?;
+        until("the write after the copy on the learner", || Ok(read("after")?.as_deref() == Some("2")))?;
+        assert_eq!(copies.load(Ordering::SeqCst), 1, "it started from a copy");
+        // A write kiln.db commits that never reaches the log, as a stop before it did leaves one.
+        let lost = g.next_seq();
+        {
+            let c = Connection::open(&db)?;
+            c.execute("INSERT INTO kv (k, v) VALUES ('lost', 'l')", [])?;
+            c.execute(&format!("UPDATE {STATE} SET seq = ?1 WHERE one = 1"), [i64::try_from(lost)?])?;
+        }
+        g.seq.store(lost, Ordering::SeqCst);
+        // The next write is numbered past it: the learner meets the gap.
+        set(&server, "next", "3")?;
+        until("the write after the gap on the learner", || Ok(read("next")?.as_deref() == Some("3")))?;
+        assert_eq!(read("lost")?.as_deref(), Some("l"), "it holds the write the log lacked");
+        assert_eq!(copies.load(Ordering::SeqCst), 2, "it took a copy for it");
+        set(&server, "later", "4")?;
+        until("a write after the copy", || Ok(read("later")?.as_deref() == Some("4")))?;
+        assert_eq!(copies.load(Ordering::SeqCst), 2, "one copy for the gap, not one a write");
+        assert_eq!(learner.standing().0, server.group_standing().map_or(0, |s| s.0), "the learner holds the server's last write");
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        Ok(())
+    }
+
+    /// A replica a build before the mark kept may have gone on past a write the log lacked (its
+    /// learners took no copy at a gap), its last write past the hole and looking whole: it's copied
+    /// again as it starts, once. So is one a build before stood since (a rollback, then forward).
+    #[test]
+    fn a_replica_an_earlier_build_kept_is_copied_again_as_it_starts_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let server = Store::open_grouped(&dir.path().join("kiln.db"), &dir.path().join("cluster"))?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        let g = server.group().context("grouped")?;
+        g.learners([member].into());
+        until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        let copies = Arc::new(AtomicU64::new(0));
+        let fetch: Fetch = {
+            let (server, copies) = (server.clone(), copies.clone());
+            Arc::new(move |dest: &Path| {
+                copies.fetch_add(1, Ordering::SeqCst);
+                crate::rt::block_on({
+                    let (s, d) = (server.clone(), dest.to_path_buf());
+                    async move { s.copy_for_learner(d).await }
+                })
+            })
+        };
+        let (replica, logs) = (dir.path().join("runner").join("kiln.db"), dir.path().join("runner").join("cluster"));
+        let read = |k: &str| -> anyhow::Result<Option<String>> {
+            let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
+        };
+        // The learner starts, follows the server until it holds `k`, and stops.
+        let follow = |k: &str| -> anyhow::Result<()> {
+            let learner = Arc::new(Group::learner(&replica, &logs, member, fetch.clone())?);
+            let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            let links = link(server.clone(), learner.clone(), member, up, done.clone());
+            let held = until(&format!("{k} on the learner"), || Ok(read(k)?.is_some()));
+            done.store(true, Ordering::SeqCst);
+            links.join().ok();
+            held
+        };
+        set(&server, "after", "2")?;
+        follow("after")?;
+        assert_eq!(copies.load(Ordering::SeqCst), 1, "it started from a copy");
+        // As a build before the mark leaves it: the write the log lacked missing, its last write
+        // past it, and no mark.
+        {
+            let c = Connection::open(&replica)?;
+            c.execute_batch(&format!("DELETE FROM kv WHERE k = 'after'; DROP TABLE {MARK};"))?;
+        }
+        set(&server, "next", "3")?;
+        follow("next")?;
+        assert_eq!(copies.load(Ordering::SeqCst), 2, "it took a copy as it started");
+        assert_eq!(read("after")?.as_deref(), Some("2"), "the copy holds the write it lacked");
+        // This build's replica goes on from where it is.
+        set(&server, "later", "4")?;
+        follow("later")?;
+        assert_eq!(copies.load(Ordering::SeqCst), 2, "a replica this build kept isn't copied again");
+        // A build before stood it since: where it stands moved on past the mark.
+        {
+            let c = Connection::open(&replica)?;
+            c.execute(&format!("UPDATE {MARK} SET applied = applied - 1"), [])?;
+        }
+        set(&server, "last", "5")?;
+        follow("last")?;
+        assert_eq!(copies.load(Ordering::SeqCst), 3, "one a build before stood since is copied again");
+        Ok(())
+    }
+
+    /// A machine's older runner process lets its replica go as the newest takes it, told both at
+    /// once: the newest's learner leaves the replica alone until the older has closed it, and then
+    /// copies it again (it was kept by a build before the mark).
+    #[test]
+    fn a_learner_waits_for_another_process_to_let_its_replica_go() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let server = Store::open_grouped(&dir.path().join("kiln.db"), &dir.path().join("cluster"))?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        let g = server.group().context("grouped")?;
+        g.learners([member].into());
+        until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        let copies = Arc::new(AtomicU64::new(0));
+        let fetch: Fetch = {
+            let (server, copies) = (server.clone(), copies.clone());
+            Arc::new(move |dest: &Path| {
+                copies.fetch_add(1, Ordering::SeqCst);
+                crate::rt::block_on({
+                    let (s, d) = (server.clone(), dest.to_path_buf());
+                    async move { s.copy_for_learner(d).await }
+                })
+            })
+        };
+        let (replica, logs) = (dir.path().join("runner").join("kiln.db"), dir.path().join("runner").join("cluster"));
+        drop(Group::learner(&replica, &logs, member, fetch.clone())?);
+        assert_eq!(copies.load(Ordering::SeqCst), 1, "it started from a copy");
+        // The older process, from a build before the mark, with the replica open.
+        let older = Connection::open(&replica)?;
+        older.execute_batch(&format!("DROP TABLE {MARK}"))?;
+        let starting = {
+            let (replica, logs, fetch) = (replica.clone(), logs.clone(), fetch.clone());
+            thread::spawn(move || Group::learner(&replica, &logs, member, fetch).map(drop))
+        };
+        thread::sleep(Duration::from_secs(2));
+        assert!(!starting.is_finished(), "it waits while another process has the replica open");
+        assert_eq!(copies.load(Ordering::SeqCst), 1, "and takes no copy meanwhile");
+        drop(older);
+        starting.join().map_err(|_| anyhow::anyhow!("the learner's start panicked"))??;
+        assert_eq!(copies.load(Ordering::SeqCst), 2, "let go, the replica is copied again");
         Ok(())
     }
 

@@ -238,11 +238,28 @@ impl Host {
         Ok(done.then_some(path))
     }
 
-    /// Take over the session in the package the server sent (`receive_package`). Blocking.
-    pub fn adopt_package(&self, path: &std::path::Path) -> Result<(), String> {
+    /// Take over the session in the package the server sent (`receive_package`). Blocking. Whether
+    /// an older runner process of this machine handed it over (`super::handing`: this one says how
+    /// it went), and how it went.
+    pub fn adopt_package(&self, path: &std::path::Path) -> (bool, Result<(), String>) {
         let bytes = std::fs::read(path).map_err(|e| format!("the session's package: {e}"));
         let _ = std::fs::remove_file(path);
-        self.adopt("the kiln server", &bytes?)
+        let Ok(bytes) = bytes else { return (false, bytes.map(|_| ())) };
+        let handover = super::moving::handed_over(&bytes);
+        (handover, self.adopt(if handover { "an older kiln runner of this machine" } else { "the kiln server" }, &bytes))
+    }
+
+    /// The server's word on a hand-over of session `id` to this machine's newer runner process
+    /// (`Command::HandedOver`). The session waiting on it goes on, or lets go; one that gave up
+    /// waiting and went on here lets go once it hears the newer process has it after all, so the
+    /// two never both run it.
+    pub fn handed_over(&self, id: &str, error: Option<String>) {
+        if super::handing::answered(id, error.clone()) {
+            return;
+        }
+        if error.is_none() && self.let_go(id) {
+            tracing::info!(session = %id, "this machine's newer runner process took the agent session over after all: let go of it here");
+        }
     }
 
     /// Session `id` went on on another machine since: its harness here stops, and this machine
@@ -337,7 +354,7 @@ impl Host {
             let kept = super::moving::MovedGit { from: pkg.from.clone(), state: g, ignored: pkg.ignored.take(), worktree: pkg.worktree.take() };
             std::fs::create_dir_all(&dir).and_then(|()| super::moving::keep_private(&super::moving::moved_git(&dir), &serde_json::to_vec(&kept).unwrap_or_default())).map_err(|e| format!("keeping its repository's state: {e}"))?;
         }
-        let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced };
+        let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced, local: pkg.handover };
         self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None).map(|_| ()).map_err(|e| format!("{e:#}"))
     }
 
@@ -840,7 +857,7 @@ fn picks_up(queue: &mut Vec<QueueItem>, also: &str) {
         return;
     }
     let now = super::core::Core::now();
-    queue.insert(0, QueueItem { id: format!("{}restart-{now}", super::core::KEEP_ID), text: format!("{CUT_BY_RESTART}{also}"), at: now, attachments: Vec::new(), overrides: None });
+    queue.insert(0, QueueItem { id: format!("{}restart-{now}", super::core::KEEP_ID), text: format!("{CUT_BY_RESTART}{also}"), at: now, attachments: Vec::new(), overrides: None, reply_to: None });
 }
 
 /// How often what the harnesses run is looked at.
@@ -860,11 +877,19 @@ fn kept_seed(store: &crate::convo::store::Store, id: &str) -> Option<session::Se
         }
     };
     let state: super::model::State = kept.state.as_deref().and_then(|s| serde_json::from_str(s).ok())?;
-    let events: Vec<super::model::Event> = kept.events.iter().filter_map(|e| serde_json::from_str(&e.body).ok()).collect();
+    let mut events: Vec<super::model::Event> = kept.events.iter().filter_map(|e| serde_json::from_str(&e.body).ok()).collect();
+    // Cut at the bound: from where a run of the server's digests begins, as the timeline lets go
+    // of its oldest (`crate::wire::sums::run_after`).
+    if kept.events.len() >= super::core::MAX_EVENTS
+        && let Some(first) = events.first().map(|e| e.seq)
+    {
+        let from = crate::wire::sums::run_after(first);
+        events.retain(|e| e.seq >= from);
+    }
     if events.is_empty() {
         return None;
     }
-    Some(session::Seed { events, state, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None })
+    Some(session::Seed { events, state, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: false })
 }
 
 /// SIGTERM a harness's process group, then SIGKILL it if it is still there after 3 s.
@@ -1131,13 +1156,26 @@ mod tests {
             store.send("timeline", &said("m2", 3, "second"));
             store.sync()?;
             // After it: the session comes back with that timeline, in order, by id.
-            let (tx, _rx) = async_channel::unbounded();
+            let (tx, rx) = async_channel::unbounded();
             let again = sim(tx, Some(file.clone()), Limits::default());
             again.restore_from(Some(&store));
             let back = again.sessions.lock().get("timeline").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
-            let core = back.core.lock();
-            assert_eq!(core.events().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["m1", "n1", "m2"]);
-            assert_eq!(core.state.title, "the parser");
+            {
+                let core = back.core.lock();
+                assert_eq!(core.events().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["m1", "n1", "m2"]);
+                assert_eq!(core.state.title, "the parser");
+            }
+            // It announces itself without it: the store has it as it was, and its feed to the
+            // server carries only what's new (docs/wire.md, "Restarts").
+            crate::rt::sleep(Duration::from_millis(500)).await;
+            let said: Vec<Update> = std::iter::from_fn(|| rx.try_recv().ok()).filter(|(s, _)| s == "timeline").map(|(_, u)| u).collect();
+            assert!(said.iter().any(|u| matches!(u, Update::Open { .. })), "{said:?}");
+            let again_said = |u: &Update| match u {
+                Update::Reset { .. } => true,
+                Update::Events { events } => events.iter().any(|e| ["m1", "n1", "m2"].contains(&e.id.as_str())),
+                _ => false,
+            };
+            assert!(!said.iter().any(again_said), "{said:?}");
             Ok(())
         })
     }

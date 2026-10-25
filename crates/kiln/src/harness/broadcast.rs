@@ -78,6 +78,9 @@ pub struct Report {
     pub skipped: usize,
     pub failed: usize,
     pub results: Vec<Outcome>,
+    /// Agents asked for by id that the caller doesn't act on (or kiln doesn't run): not sent to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreached: Vec<String>,
 }
 
 /// The machine an agent runs on, as people name it.
@@ -112,7 +115,7 @@ pub fn pick(infos: &[Info], to: &To) -> Vec<Info> {
 fn plan(b: &Broadcast, info: &Info, meta: Option<&Value>, approvals: &[(String, bool)], client: &str) -> Result<Vec<Command>, String> {
     let text = b.text.as_deref().map_or("", str::trim);
     if !text.is_empty() || !b.attachments.is_empty() {
-        let send = |text: String| Command::Send { id: client.to_owned(), text, mode: b.mode.unwrap_or_default(), attachments: b.attachments.clone(), overrides: None };
+        let send = |text: String| Command::Send { id: client.to_owned(), text, mode: b.mode.unwrap_or_default(), attachments: b.attachments.clone(), overrides: None, reply_to: None, task: None };
         let Some(rest) = text.strip_prefix('/') else { return Ok(vec![send(text.to_owned())]) };
         let (name, args) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(n, a)| (n, a.trim()));
         let found = meta.and_then(|m| m.get("commands")).and_then(Value::as_array).and_then(|cs| {
@@ -172,7 +175,9 @@ fn fill(v: Value, args: &str, client: &str) -> Value {
 }
 
 /// Send it: every picked agent at once.
-pub async fn run(hub: &Arc<Hub>, b: &Broadcast) -> anyhow::Result<Report> {
+/// Send `b` to the agents it asks for among `among`, the agents its caller acts on
+/// (`lineage::reached`).
+pub async fn run(hub: &Arc<Hub>, b: &Broadcast, among: &[Info]) -> anyhow::Result<Report> {
     let prompt = b.text.as_deref().is_some_and(|t| !t.trim().is_empty()) || !b.attachments.is_empty();
     let given = [prompt, b.command.is_some(), b.approvals.is_some()].into_iter().filter(|x| *x).count();
     anyhow::ensure!(given == 1, "send one of text (or attachments), command or approvals");
@@ -181,7 +186,8 @@ pub async fn run(hub: &Arc<Hub>, b: &Broadcast) -> anyhow::Result<Report> {
     b.attachments = hub.harness.inline_uploads(std::mem::take(&mut b.attachments));
     let b = &b;
     let id = format!("bc-{}", crate::util::new_id());
-    let picked = pick(&hub.harness.list(), &b.to);
+    let picked = pick(among, &b.to);
+    let unreached: Vec<String> = b.to.ids.iter().filter(|id| !among.iter().any(|i| &i.id == *id)).cloned().collect();
     let sends = picked.iter().enumerate().map(|(n, info)| {
         let client = format!("{id}-{n}");
         async move {
@@ -211,7 +217,7 @@ pub async fn run(hub: &Arc<Hub>, b: &Broadcast) -> anyhow::Result<Report> {
     });
     let results = futures::future::join_all(sends).await;
     let count = |r: &str| results.iter().filter(|o| o.result == r).count();
-    Ok(Report { id, sent: count("sent"), skipped: count("skipped"), failed: count("failed"), results })
+    Ok(Report { id, sent: count("sent"), skipped: count("skipped"), failed: count("failed"), results, unreached })
 }
 
 #[cfg(test)]

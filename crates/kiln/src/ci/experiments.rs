@@ -546,7 +546,7 @@ async fn implement(hub: &Arc<Hub>, e: &mut Experiment, repo: &Repo, deadline: Op
     let parent = e.agent.as_ref().and_then(|a| hub.harness.info(a));
     let mut started: Vec<(usize, String)> = Vec::new();
     for (i, o) in e.options.clone().iter().enumerate().filter(|(_, o)| o.implement.is_some() && o.to.is_empty()) {
-        let starter = crate::harness::lineage::Starter { parent: parent.clone(), opener: Some(e.opener.clone()), actor: format!("experiment:{}", e.id), plan_run: None };
+        let starter = crate::harness::lineage::Starter { parent: parent.clone(), opener: Some(e.opener.clone()), actor: format!("experiment:{}", e.id), plan_run: None, asker: None };
         let ask = crate::harness::lineage::Ask {
             kind: h.kind.clone(),
             on: h.on.clone(),
@@ -730,7 +730,7 @@ async fn glue_start(hub: &Arc<Hub>, e: &Experiment, name: &str, why: &str) -> Op
         steps = steps.join("\n"),
     );
     let parent = e.agent.as_ref().and_then(|a| hub.harness.info(a));
-    let starter = crate::harness::lineage::Starter { parent, opener: Some(e.opener.clone()), actor: format!("experiment:{}", e.id), plan_run: None };
+    let starter = crate::harness::lineage::Starter { parent, opener: Some(e.opener.clone()), actor: format!("experiment:{}", e.id), plan_run: None, asker: None };
     let ask =
         crate::harness::lineage::Ask { kind: h.kind, on: h.on, cwd: h.cwd, prompt: Some(brief), model: h.model, name: Some(format!("{} glue {name}", e.id)), count: Some(1), ..Default::default() };
     crate::harness::lineage::start(hub, &starter, ask).await.ok()?.first().map(|i| i.id.clone())

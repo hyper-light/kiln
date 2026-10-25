@@ -1012,7 +1012,7 @@ async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[E
     hub.emit(&json!({ "type": "landed", "repo": repo.id, "repo_name": repo.name, "trunk": trunk, "tip": tip, "diffs": names, "by": by }));
     super::hosting::mirror_trunk(hub, repo, path, trunk);
     // The trunk's push runs (the poller sees it now).
-    hub.gitops_kick.notify();
+    crate::gitops::want(hub, &repo.id);
     for id in &all {
         if let Ok(Some(d)) = diffs::find(hub, id).await
             && let Err(e) = diffs::closed(hub, repo, &d, true, landed_by.get(id).map_or("kiln", String::as_str)).await

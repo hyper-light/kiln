@@ -243,6 +243,8 @@ const enc = encodeURIComponent;
 
 export const plansApi = {
   list: (signal?: AbortSignal) => request<Plan[]>("GET", "/api/plans", undefined, { signal }),
+  /** The plans kept with agent `session`: made in its Plan tab, by it, from its goals, or proposed by it. */
+  of: (session: string, signal?: AbortSignal) => request<Plan[]>("GET", `/api/plans?session=${enc(session)}`, undefined, { signal }),
   get: (id: string, signal?: AbortSignal) => request<Plan>("GET", `/api/plans/${enc(id)}`, undefined, { signal }),
   /** The plan agent `session` proposed (plan mode), as kiln keeps it: one at most. */
   proposedBy: (session: string, signal?: AbortSignal) => request<Plan[]>("GET", `/api/plans?session=${enc(session)}&proposed=1`, undefined, { signal }),

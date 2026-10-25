@@ -63,6 +63,9 @@ pub const CAPABILITIES: &[&str] = &[
     "diffs.land",
     "queue.manage",
     "agents.run",
+    // Seeing and acting on every agent, whoever started it (docs/agents.md, "Whose agents");
+    // without it a person reaches only the agents that act for them.
+    "agents.manage",
     "agents.attach",
     "experiments.run",
     "settings.manage",
@@ -77,8 +80,8 @@ pub const SIGNED_IN: &str = "signed-in";
 
 /// The built-in roles (W10-R02, access.md): `viewer` reads; `developer` also triggers, reruns,
 /// submits and reviews, its runs given any secret; `maintainer` also lands, attaches agents,
-/// debugs, approves, deploys and manages the queue, secrets and variables; `admin` and `owner`
-/// have every capability.
+/// manages everyone's agents, debugs, approves, deploys and manages the queue, secrets and
+/// variables; `admin` and `owner` have every capability.
 pub fn role(name: &str) -> Option<Vec<&'static str>> {
     const VIEWER: &[&str] = &["runs.read", "logs.read", "artifacts.read", "runners.read", "diffs.read"];
     const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run", "secrets.use"];
@@ -88,6 +91,7 @@ pub fn role(name: &str) -> Option<Vec<&'static str>> {
         "diffs.land",
         "queue.manage",
         "agents.attach",
+        "agents.manage",
         "experiments.run",
         "environments.deploy",
         "variables.manage",

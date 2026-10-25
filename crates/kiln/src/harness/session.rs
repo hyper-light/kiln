@@ -156,16 +156,7 @@ impl SubagentBrief {
     pub(super) fn of(tasks: &[Task]) -> Vec<Self> {
         tasks
             .iter()
-            .filter(|t| match t.class.as_deref() {
-                Some(class) => class == "agent",
-                // Older machines only report the harness's own task kind. Keep this the same
-                // as the task inspector's classOf fallback.
-                None => {
-                    !t.kind.starts_with("monitor")
-                        && !matches!(t.kind.as_str(), "local_bash" | "local_workflow")
-                        && !t.kind.contains("mcp")
-                }
-            })
+            .filter(|t| t.subagent())
             .map(|t| Self {
                 id: t.id.clone(),
                 tool_id: t.tool_id.clone(),
@@ -434,6 +425,9 @@ pub struct Seed {
     /// Where its folder stood in the sync log on the machine it left: it goes on once the folder
     /// here has taken the log that far.
     pub synced: Option<crate::sync::runner::Mark>,
+    /// Not from another machine: an older runner process of this one handed it over, taking its
+    /// leave (`super::handing`). Same folder, same record: only the process holding it changed.
+    pub local: bool,
 }
 
 /// Put a message's attachments on disk, so the harness can read them: each gets a `path`;
@@ -525,11 +519,11 @@ fn reach_words(reach: Option<&str>) -> String {
 /// A command as the adapter should see it (attachments stored first).
 async fn prepare(files: &Files, c: Command) -> Command {
     match c {
-        Command::Send { id, text, mode, attachments, overrides } if !attachments.is_empty() => {
+        Command::Send { id, text, mode, attachments, overrides, reply_to, task } if !attachments.is_empty() => {
             let files = files.clone();
             let msg = id.clone();
             let stored = crate::rt::blocking(move || store_attachments(&files, &msg, attachments)).await.unwrap_or_default();
-            Command::Send { id, text, mode, attachments: stored, overrides }
+            Command::Send { id, text, mode, attachments: stored, overrides, reply_to, task }
         }
         other => other,
     }
@@ -807,7 +801,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     let restored = seed.as_ref().is_some_and(|sd| sd.restored);
     if let Some(sd) = seed.as_ref().filter(|_| restored) {
         // Restarted here: its timeline and state as the store kept them, and nothing said of it.
-        core.adopt(sd.events.clone(), sd.state.clone());
+        core.restore(sd.events.clone(), sd.state.clone());
         core.state.model = spec.model.clone().unwrap_or_default();
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
@@ -819,12 +813,16 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
         let folder = if core.state.cwd == sd.from_cwd { String::new() } else { format!(" (it works in {} here; it was in {})", core.state.cwd, sd.from_cwd) };
-        let mut text = format!("Moved here from {}{folder} — the conversation, its timeline and queue came along", sd.from);
+        let mut text = if sd.local {
+            "Taken over by this machine's newer kiln runner, which replaces the older one — the conversation, its timeline and queue came along".to_owned()
+        } else {
+            format!("Moved here from {}{folder} — the conversation, its timeline and queue came along", sd.from)
+        };
         // Interrupted to move: the turn goes on here, first thing.
         if sd.picks_up {
             text.push_str(", and the turn it was in the middle of goes on here");
             let ask = format!("This conversation just moved here from {}, which interrupted your last turn. Pick up where you left off.", sd.from);
-            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: ask, at: Core::now(), attachments: Vec::new(), overrides: None });
+            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: ask, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
         }
         if let Some(n) = &sd.note {
             text.push_str(". ");
@@ -1239,6 +1237,50 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_ch
                 (files.spawn)(b);
             }
             super::core::Effect::Restart { resume_at } => restart = Some(resume_at),
+            // The go-back a harness without one gets from kiln (`harness::goback`): the store's
+            // timeline truncates, its transcript seeds a branch, the workspace's checkpoint
+            // (a hidden ref) restores its files.
+            super::core::Effect::GoBack { op, event } => {
+                match op {
+                    super::core::GoBackOp::Fork | super::core::GoBackOp::Branch => {
+                        let mut b = s.resume_spec();
+                        // No native resume: the branch is seeded with the conversation in words.
+                        b.resume = None;
+                        b.resume_at = None;
+                        b.fork = false;
+                        b.name = Some(format!("{} (branch)", s.info().name));
+                        b.prompt = Some(super::goback::branch_prompt(&s.core.lock(), if op == super::core::GoBackOp::Branch { Some(event.as_str()) } else { None }));
+                        (files.spawn)(b);
+                    }
+                    _ => {
+                        let mut core = s.core.lock();
+                        let (at, words) = match core.get(&event) {
+                            Some(e) => (e.at, match &e.body { super::model::Body::User { text, .. } => super::model::clip_middle(text.trim(), 80).0, _ => String::new() }),
+                            None => continue,
+                        };
+                        let cwd = core.state.cwd.clone();
+                        // The workspace goes back to the checkpoint the prompt's own moment made.
+                        let did = if cwd.is_empty() { "the folder isn't known".to_owned() } else { super::goback::restore_files(&cwd, &s.id, at) };
+                        if op == super::core::GoBackOp::RewindFiles {
+                            super::goback::notice(&mut core, super::model::Level::Info, format!("Restored files to \"{words}\": {did}."));
+                        } else {
+                            // The process can't come back at the point natively: it starts over
+                            // and the truncated conversation is said to it (the store keeps the
+                            // record of what went).
+                            core.truncate_from(&event);
+                            let transcript = super::goback::seed_prompt(&core, None);
+                            let keep: std::collections::HashSet<String> = core.events().map(|e| e.id.clone()).collect();
+                            core.state.delivery.retain(|k, _| keep.contains(k));
+                            core.state.harness_session = None;
+                            s.spec.lock().resume = None;
+                            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: format!("The conversation was rewound here. What it is now:\n\n{transcript}\n\nGo on from the last message."), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
+                            super::goback::notice(&mut core, super::model::Level::Info, format!("Rewound to \"{words}\": {did}. The agent starts again with the conversation up to here."));
+                            restart = Some(None);
+                        }
+                        core.touch_state();
+                    }
+                }
+            }
             super::core::Effect::AllowBypass => s.spec.lock().allow_bypass = true,
             super::core::Effect::Run { job, args } => {
                 let mut spec = s.spec.lock().clone();
@@ -1698,7 +1740,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         // the limit cut off goes on first.
         let unpaused = core.state.pause.take();
         if unpaused.as_ref().is_some_and(|p| p.cut.is_some()) {
-            core.state.queue.insert(0, super::model::QueueItem { id: format!("{}{}", super::pause::KILN_ID, crate::util::new_id()), text: super::pause::CONTINUE_ELSEWHERE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None });
+            core.state.queue.insert(0, super::model::QueueItem { id: format!("{}{}", super::pause::KILN_ID, crate::util::new_id()), text: super::pause::CONTINUE_ELSEWHERE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
         }
         let mut text = format!("Now {} ({})", model_label(to, &sw.model), to.name);
         if !empty {
@@ -1744,17 +1786,22 @@ struct Move {
     /// It goes on there in this harness (its conversation carried over), with this model.
     kind: Option<&'static Kind>,
     model: Option<String>,
+    /// To this machine's newer runner process, which takes this one's place (`super::handing`).
+    local: bool,
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
 /// `now`: the turn under way isn't waited for (the caller interrupts it).
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>) -> Move {
+#[allow(clippy::too_many_arguments)]
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool) -> Move {
     let mut core = s.core.lock();
     core.hold = true;
     let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
     let picks_up = now && busy;
     let into = kind.map(|k| format!(", to go on in {}", k.name)).unwrap_or_default();
-    let text = if picks_up {
+    let text = if local {
+        if busy { "This machine's newer kiln runner takes this agent over when this turn ends".to_owned() } else { "This machine's newer kiln runner takes this agent over…".to_owned() }
+    } else if picks_up {
         format!("Moving to {to}{into} now: this turn stops here and goes on there")
     } else if busy {
         format!("Moving to {to}{into} when this turn ends")
@@ -1763,7 +1810,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     };
     core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
     core.touch_state();
-    Move { to, cwd, note, picks_up, kind, model }
+    Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local }
 }
 
 /// How a move is getting on before it starts (its repository being copied there).
@@ -2083,13 +2130,57 @@ fn move_failed(s: &Session, mv: &Move, why: &str) {
     let mut core = s.core.lock();
     core.hold = false;
     core.touch_state();
-    core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text: format!("Couldn't move to {}: {why} — it goes on here", mv.to) });
+    let text = if mv.local {
+        format!("This machine's newer kiln runner couldn't take this agent over: {why} — it goes on here")
+    } else {
+        format!("Couldn't move to {}: {why} — it goes on here", mv.to)
+    };
+    core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text });
+}
+
+/// Hand the session to this machine's newer runner process (its turn is over, its harness down),
+/// which takes this one's place: its timeline, state and queue, by way of the server. Same disk,
+/// same home: its folder and its harness's own record stay where they are, and it resumes from
+/// them there under the same harness session, as it would after a restart. A harness whose own
+/// record kiln doesn't keep (ACP agents, Antigravity) may not load it again: its conversation
+/// goes in words, as a move carries it. Ok once that process has taken it over.
+async fn hand_to_newer(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(), String> {
+    use super::moving::Carry;
+    let spec = s.resume_spec();
+    let (resume, program) = (spec.resume.clone(), spec.program.clone());
+    let (events, state, cwd) = {
+        let core = s.core.lock();
+        // The note that it was about to go is this process's alone.
+        (core.events().filter(|e| e.id != "move-pending").cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone())
+    };
+    let carry = match kind.protocol {
+        super::kinds::Protocol::Acp(_) | super::kinds::Protocol::AgyStreamJson => {
+            super::moving::words(&events, "This conversation went on in this machine's newer kiln runner, which took the older one's place.")
+        }
+        _ => Carry::Nothing,
+    };
+    let mut pkg = super::moving::pack(&s.id, spec, &cwd, &mv.to, &cwd, carry, events, state);
+    // Its harness's own record is here already: it goes on from it, nothing started anew.
+    if matches!(pkg.carry, Carry::Nothing) {
+        pkg.spec.resume = resume;
+    }
+    pkg.spec.program = program;
+    pkg.handover = true;
+    let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
+    super::handing::send(&s.id, bytes).await
 }
 
 /// Hand the session to runner `mv.to` (its turn is over, its harness down): its record, timeline
 /// and queue, over reach. Ok once that runner has taken it over and runs it.
 async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(), String> {
     use super::moving::Carry;
+    if mv.local {
+        // Its process is a terminal's: it stays with the process it runs in until it ends.
+        if matches!(kind.protocol, super::kinds::Protocol::Terminal) {
+            return Err("an agent in a terminal stays where it runs until it ends".into());
+        }
+        return hand_to_newer(s, kind, mv).await;
+    }
     let reach = crate::reach::node::global().ok_or_else(|| "this runner can't reach other runners (an older one?)".to_owned())?;
     let me = reach.name().to_owned();
     let mut spec = s.resume_spec();
@@ -2287,8 +2378,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             }
         }
     }
-    // Announce it, whole, before anything else: whoever mirrors it starts from all of it.
+    // Announce it, whole, before anything else: whoever mirrors it starts from all of it. One
+    // that started again from the conversation store announces all but its timeline: the store
+    // has that, and the server's copy gets what it lacks as the session's stream starts.
+    let stored = std::mem::take(&mut s.core.lock().stored);
     for u in s.snapshot() {
+        if stored && matches!(u, Update::Reset { .. } | Update::Events { .. }) {
+            continue;
+        }
         let _ = sink.send((s.id.clone(), u)).await;
     }
     let mut first = !handed;
@@ -2406,6 +2503,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     adapter.seed(items.clone());
                 }
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
+                // One the machine's own PATH lacks may be on its user's: their login shell is asked
+                // first (once, then kept ten minutes).
+                if blocked.is_none() && spec.program.is_none() && !kind.available() {
+                    crate::reach::serve::login_env().await;
+                }
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
                     // In the session's group of processes where the machine has them, and marked as
@@ -2446,7 +2548,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     core.touch_state();
                     adapter.start(&mut core);
                     if first && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
-                        adapter.command(&mut core, Command::Send { id: crate::util::new_id(), text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None });
+                        adapter.command(&mut core, Command::Send { id: crate::util::new_id(), text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None});
                     }
                     for c in carry.drain(..) {
                         adapter.command(&mut core, c);
@@ -2578,8 +2680,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     switching = Some(sw);
                                 }
                             }
-                            Command::MoveTo { to, cwd, note, now, kind: into, model } => {
-                                let mv = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model);
+                            Command::MoveTo { to, cwd, note, now, kind: into, model, local } => {
+                                let mv = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local);
                                 // Not waiting for the turn: it stops here, and goes on there.
                                 if mv.picks_up {
                                     adapter.command(&mut s.core.lock(), Command::Interrupt);
@@ -2916,8 +3018,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                     }
                     // Another runner: it goes there, now.
-                    Command::MoveTo { to, cwd, note, now, kind: into, model } => {
-                        moving = Some(move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model));
+                    Command::MoveTo { to, cwd, note, now, kind: into, model, local } => {
+                        moving = Some(move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local));
                         break;
                     }
                     Command::Moving { text } => moving_note(&s, &text),
@@ -2927,6 +3029,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                     Command::StopTasks => {
                         stop_left(&s, None).await;
+                        on_change();
+                    }
+                    // For a subagent: it ended with its harness, so it isn't started again for it.
+                    c @ Command::Send { task: Some(_), .. } => {
+                        adapter.command(&mut s.core.lock(), c);
                         on_change();
                     }
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {

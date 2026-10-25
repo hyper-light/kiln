@@ -100,7 +100,11 @@ For tracing (OTel), each upgrade is a span under `kiln::upgrade` named `upgrade`
 `rolled_back` on the root) and `error`.
 
 The machine's local sockets, for `kiln spawn` and `kiln run`, are the same for every runner process
-of a machine. Shells opened before an upgrade keep using them.
+of a machine. Shells opened before an upgrade keep using them. The process that runs the machine's
+sessions serves them: a new build takes them once it has taken over, and the old one takes them
+back after a rollback. No other kiln process takes one a live process serves (a local `kiln
+server`'s own agent given the runner's name and state folder, say), and a socket left with nothing
+behind it (something took its file, then ended) is served again within seconds.
 
 **On a Mac, run `kiln signing setup` once.** macOS's local network privacy judges every program
 by its code signature. kiln's builds are ad hoc signed, so to macOS each upgrade is a program it
@@ -119,6 +123,43 @@ done once the runner reports the commit it was upgraded to, even on a binary sig
 Some runners still upgrade as before: those not under a supervisor (`kiln agent` run by hand), and
 Windows runners. On Unix they upgrade in place: the process re-executes itself, keeping its
 terminals and agent sessions. Otherwise they upgrade through `kiln install --agent --upgrade`.
+
+## One runner a machine
+
+A machine runs one kiln runner. `kiln join` (or `kiln install --agent`) on a machine whose runner
+is running never starts a second one beside it, and never enrolls the machine again under it (the
+runner's credentials would change under it):
+
+- **Its runner works for that server already**, by whatever address it was given (the server
+  vouches for the machine's own certificate, so a LAN address and a NodePort are one server): the
+  new kiln takes it over. It starts beside the runner as the machine's newest process, with the
+  runner's name, labels and slots, reaching the server at the address given. The old runner takes
+  no new work, hands the new one its agent sessions as their turns end, and is retired (its service
+  stopped and disabled) once it holds nothing.
+- **It works for another server:** joining stops it first, once asked (or with `--yes`). Its agents
+  stay with that server.
+- **The server can't be asked:** nothing is joined. Try again once it answers.
+
+**Handing over.** While a machine has more than one runner process (a take-over, an upgrade beside
+the running runner, or one left over from before), the server has each older process hand its
+agent sessions to the newest. A session waits for its turn to end, and kiln's queue holds what is
+sent meanwhile. Then the older process packs its timeline, state and queue and sends it to the
+server, which passes it on to the newest process. The two share the machine's disk and home, so
+the session's folder and its harness's record stay where they are: the newest resumes the
+harness's own session from them, as after a restart, and the timeline says it was taken over. The
+older process lets go only once the newest says it took the session over. If it couldn't, the
+session goes on where it was, and the timeline says why. Should two processes ever both hold one
+session (an answer lost as a link dropped), the newer keeps it and the older lets go. Terminals stay
+with the process they run in until they close, and jobs finish where they run. Once an older
+process holds nothing, the newest retires it.
+
+**Nothing vanishes.** The server keeps which process of its machine holds each session, across
+restarts (`holders.json` beside its agents' names). A process that says what it runs speaks for its
+own sessions only: another process's, while that one isn't connected, are listed as away, never
+closed.
+
+Hand-overs take a server and runner processes that know them (`CAP_HANDOVER`, docs/wire.md). A
+runner from before keeps what it runs until that ends, as it always did.
 
 ## When an upgrade fails
 

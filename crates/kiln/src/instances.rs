@@ -85,6 +85,9 @@ pub struct Instance {
     pub retire_sent: Option<Instant>,
     /// It was told to stop taking jobs (it is not the newest).
     pub drained: bool,
+    /// It said which agent sessions it holds since it connected (its inventory): until then what
+    /// it holds isn't known here, and it is never retired.
+    pub reported: bool,
     /// The build it runs ([`crate::proto::AgentMsg::Build`]); `None` for runners from before.
     pub build: Option<String>,
     /// What it can do ([`crate::proto::CAP_UPGRADE`] ...).
@@ -177,6 +180,7 @@ impl Instances {
                 connected_at: now,
                 retire_sent: None,
                 drained: false,
+                reported: false,
                 build: None,
                 caps: 0,
                 wide: 0,
@@ -343,6 +347,28 @@ impl Instances {
         v
     }
 
+    /// Runner process `peer` said which agent sessions it holds (its inventory).
+    pub fn reported(&mut self, peer: PeerId) {
+        if let Some(i) = self.by_peer.get_mut(&peer) {
+            i.reported = true;
+        }
+    }
+
+    /// Of two runner processes of one machine, the newer (the one new work goes to). None when
+    /// either is gone, or they are of different machines.
+    pub fn newer_of(&self, a: PeerId, b: PeerId) -> Option<PeerId> {
+        let (x, y) = (self.by_peer.get(&a)?, self.by_peer.get(&b)?);
+        (x.name == y.name).then(|| if x.rank() >= y.rank() { a } else { b })
+    }
+
+    /// Whether runner process `peer` takes hand-overs between its machine's processes
+    /// ([`crate::proto::CAP_HANDOVER`]): never a blue/green upgrade's new build before it takes
+    /// over (it ranks oldest meanwhile, and the runner it replaces moves its sessions to it itself:
+    /// `crate::bluegreen`).
+    pub fn hands_over(&self, peer: PeerId) -> bool {
+        self.by_peer.get(&peer).is_some_and(|i| i.wide & crate::proto::CAP_HANDOVER != 0 && !(i.id.is_some() && i.created_at < 0))
+    }
+
     /// Every connected peer of every machine with more than one instance, with its machine.
     pub fn crowded(&self) -> Vec<(String, PeerId)> {
         let mut by_name: HashMap<&str, Vec<PeerId>> = HashMap::new();
@@ -436,6 +462,45 @@ mod tests {
         assert_eq!(inst.reannounce(2, &ih("green", 100)), Some(vec![]), "drained once");
         // Before its hello, an announcement is the one its hello comes with.
         assert_eq!(inst.reannounce(3, &ih("other", 5)), None);
+    }
+
+    #[test]
+    fn hand_overs_are_between_processes_that_take_them_never_a_new_build_before_it_takes_over() {
+        use crate::proto::{CAP_HANDOVER, CAP_WIRE};
+        let mut m = Instances::default();
+        m.announce(1, ih("main", 0));
+        m.join(1, "box", hello("a"), 1);
+        m.announce(2, ih("0199-new", 100));
+        m.join(2, "box", hello("b"), 2);
+        m.join(3, "other", hello("c"), 3);
+        assert_eq!(m.newer_of(1, 2), Some(2));
+        assert_eq!(m.newer_of(2, 1), Some(2));
+        assert_eq!(m.newer_of(1, 3), None, "of different machines");
+        assert_eq!(m.newer_of(1, 9), None, "one gone");
+        assert!(!m.hands_over(1), "a runner from before says nothing of it");
+        m.set_wide(1, CAP_WIRE | CAP_HANDOVER);
+        m.set_wide(2, CAP_HANDOVER);
+        assert!(m.hands_over(1) && m.hands_over(2));
+        // A blue/green upgrade's new build, before it takes over: ranked oldest, and left alone.
+        m.announce(4, ih("green", -1));
+        m.join(4, "box", hello("d"), 4);
+        m.set_wide(4, CAP_HANDOVER);
+        assert!(!m.hands_over(4));
+        assert_eq!(m.reannounce(4, &ih("green", 200)), Some(vec![2]), "the one drained before stays so");
+        assert!(m.hands_over(4), "once it took over, it's a process like the others");
+    }
+
+    #[test]
+    fn a_process_has_said_what_it_holds_only_once_its_inventory_came() {
+        let mut m = Instances::default();
+        m.join(1, "box", hello("a"), 1);
+        assert!(m.get(1).is_some_and(|i| !i.reported), "just connected: not yet");
+        m.reported(1);
+        assert!(m.get(1).is_some_and(|i| i.reported));
+        // The same process on a new connection says it again.
+        m.join(2, "box", hello("a"), 2);
+        assert!(m.get(2).is_some_and(|i| !i.reported));
+        m.reported(9);
     }
 
     #[test]

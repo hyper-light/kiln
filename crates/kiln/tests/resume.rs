@@ -100,6 +100,24 @@ fn field(line: &str, key: &str) -> Option<usize> {
     line.split_whitespace().find_map(|w| w.strip_prefix(&format!("{key}="))).and_then(|v| v.trim_matches('"').parse().ok())
 }
 
+/// How many of its turn's `lines` a session's copy holds, once it holds more than ten: the turn is
+/// under way, however slowly a loaded machine started it, and the test stops its runner or server
+/// there. A fixed wait didn't do: under a full workspace gate, three seconds went by before the
+/// turn's first line.
+fn mid_turn(s: &common::Server, id: &str, lines: u64) -> anyhow::Result<usize> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (frames, _) = agents::attach(s.port, &s.admin, id, "")?;
+        let had = agents::lines(&agents::events(&frames)).len();
+        if had > 10 {
+            anyhow::ensure!((had as u64) < lines, "the turn was over ({had} lines) before the test could stop it mid-turn");
+            return Ok(had);
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the turn was {had} lines in after a minute: the test needs it mid-turn");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 #[test]
 fn a_runner_that_starts_again_sends_only_what_the_server_lacks() -> anyhow::Result<()> {
     const LINES: u64 = 150;
@@ -113,10 +131,7 @@ fn a_runner_that_starts_again_sends_only_what_the_server_lacks() -> anyhow::Resu
     let id = agents::open_session(s.port, &s.admin, "restart-runner", &work, Duration::from_secs(60))?;
 
     // Killed mid-turn, as a crash would: its session's copy holds part of the turn.
-    std::thread::sleep(Duration::from_secs(3));
-    let (before, _) = agents::attach(s.port, &s.admin, &id, "")?;
-    let had = agents::lines(&agents::events(&before)).len();
-    anyhow::ensure!(had > 10 && had < LINES as usize, "the turn was {had} lines in when its runner stopped: the test needs it mid-turn");
+    let had = mid_turn(&s, &id, LINES)?;
     first.0.kill()?;
     first.0.wait()?;
     let runner_log = || std::fs::read_to_string(&log).unwrap_or_default();
@@ -189,10 +204,7 @@ fn a_server_that_starts_again_has_its_runners_send_only_what_its_copies_lack() -
     let id = agents::open_session(s.port, &s.admin, "steady-runner", &work, Duration::from_secs(60))?;
 
     // Killed mid-turn, as a crash would; the turn goes on on its runner meanwhile.
-    std::thread::sleep(Duration::from_secs(3));
-    let (before, _) = agents::attach(s.port, &s.admin, &id, "")?;
-    let had = agents::lines(&agents::events(&before)).len();
-    anyhow::ensure!(had > 10 && (had as u64) < LINES, "the turn was {had} lines in when its server stopped: the test needs it mid-turn");
+    mid_turn(&s, &id, LINES)?;
     let runner_log = || std::fs::read_to_string(&log).unwrap_or_default();
     let server_log = || std::fs::read_to_string(dir.path().join("server.log")).unwrap_or_default();
     let connections = |text: &str| text.matches("connected to server").count();

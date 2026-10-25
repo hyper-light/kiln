@@ -20,6 +20,8 @@ export interface GoalStep {
   who?: string;
   /** Its own parts (a plan step's acceptance criteria and tests): how many are met, of how many. */
   checks?: { met: number; of: number };
+  /** Where it stands in its own word, when its stand's isn't the one ("Planning"). */
+  word?: string;
 }
 
 export type GoalPlanRow =

@@ -127,11 +127,27 @@ pub struct ChangeJob {
     pub baseline: Baseline,
 }
 
+/// A go-back operation done by kiln (`harness::goback`) where a harness lacks it natively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoBackOp {
+    /// Undo the prompt and everything after it: the conversation and the file changes.
+    Rewind,
+    /// Undo the file changes made since the prompt; keep the conversation.
+    RewindFiles,
+    /// A new session with the conversation up to the end of the prompt's turn.
+    Branch,
+    /// A new session with the whole conversation.
+    Fork,
+}
+
 /// Something only the session (which owns the process) can do, asked for by an adapter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     /// Start the harness again, continuing its session from `resume_at` (a rewind).
     Restart { resume_at: Option<String> },
+    /// The go-back (rewind, restore files, branch, fork) that `harness::goback` does where the
+    /// harness has none of its own: `event` is the prompt it goes back to (empty for a fork).
+    GoBack { op: GoBackOp, event: String },
     /// From its next start the harness may skip every permission check: a person chose a mode
     /// that turns checks off, which it was not started able to use.
     AllowBypass,
@@ -240,6 +256,9 @@ pub struct Core {
     pub task_output: HashMap<String, TaskOutput>,
     /// The timeline was cut (a rewind): viewers start over from a snapshot.
     reset: bool,
+    /// Its timeline is the conversation store's as the store has it (it started again from it,
+    /// [`Core::restore`]): its announcement needn't write the store it again.
+    pub stored: bool,
     /// kiln's queue waits: the session goes on in another harness once the turn under way ends,
     /// and what is queued goes to that one.
     pub hold: bool,
@@ -301,6 +320,7 @@ impl Core {
             effects: Vec::new(),
             task_output: HashMap::new(),
             reset: false,
+            stored: false,
             hold: false,
             harness: None,
             limit_ask: None,
@@ -362,18 +382,40 @@ impl Core {
     /// Take over the timeline and state the session had on another machine (it moved here): its
     /// events as they were (ids, order, times, who said them), its queue, todos and title. What
     /// belonged to the process over there (its tasks, a turn's state) stays there.
-    pub fn adopt(&mut self, mut events: Vec<Event>, state: State) {
+    pub fn adopt(&mut self, events: Vec<Event>, state: State) {
+        self.take_in(events, state);
+        self.reset = true;
+    }
+
+    /// Go on from the timeline and state the conversation store kept of this session (it starts
+    /// again on this machine). Its events go out again only when their numbers had to change (the
+    /// store lacked some of them): else the store has them as they are, and the server's copy
+    /// gets what it lacks when the session's stream starts (`crate::wire::sums`). True: they kept
+    /// their numbers.
+    pub fn restore(&mut self, events: Vec<Event>, state: State) -> bool {
+        let kept = self.take_in(events, state);
+        self.reset = !kept;
+        self.stored = kept;
+        kept
+    }
+
+    /// The timeline and state as [`Core::adopt`] and [`Core::restore`] take them in: whether the
+    /// events kept their numbers.
+    fn take_in(&mut self, mut events: Vec<Event>, state: State) -> bool {
         // A conversation cleared since: what came before it is history, not the timeline.
         if let Some(from) = state.cleared {
             events.retain(|e| e.seq >= from);
         }
         let first = events.first().map_or(1, |e| e.seq.max(1));
+        let mut kept = true;
         // Numbers stay contiguous: an event's place is found from its number.
         self.events = events
             .into_iter()
             .enumerate()
             .map(|(i, mut e)| {
-                e.seq = first + i as u64;
+                let seq = first + i as u64;
+                kept &= e.seq == seq;
+                e.seq = seq;
                 e
             })
             .collect();
@@ -394,9 +436,9 @@ impl Core {
         self.state.switching = None;
         self.changed.clear();
         self.stream.clear();
-        self.reset = true;
         self.state_dirty = true;
         self.meta_dirty = true;
+        kept
     }
 
     /// Drop `id` and every event after it (a rewind); viewers get the timeline again.
@@ -587,11 +629,17 @@ impl Core {
         self.events.push_back(Event { id: id.to_owned(), seq, at: Self::now(), parent, by: self.harness.clone(), body });
         self.index.insert(id.to_owned(), seq);
         self.changed.push(id.to_owned());
-        while self.events.len() > MAX_EVENTS {
-            if let Some(old) = self.events.pop_front() {
-                self.index.remove(&old.id);
-                self.state.dropped += 1;
-                self.state_dirty = true;
+        if self.events.len() > MAX_EVENTS {
+            // Whole runs of the server's digests at a time (`crate::wire::sums::run_after`): its
+            // copy, which keeps more, compares run for run with what's here after a restart.
+            let over = self.events.len() - MAX_EVENTS;
+            let from = self.events.get(over).map_or(0, |e| crate::wire::sums::run_after(e.seq));
+            while self.events.front().is_some_and(|e| e.seq < from) {
+                if let Some(old) = self.events.pop_front() {
+                    self.index.remove(&old.id);
+                    self.state.dropped += 1;
+                    self.state_dirty = true;
+                }
             }
         }
     }
@@ -862,7 +910,7 @@ mod tests {
     fn a_turn_end_says_what_the_turn_did() {
         let mut core = Core::new();
         core.note_sent("u1");
-        core.upsert("u1", None, Body::User { text: "go".into(), images: 0, client_id: Some("u1".into()), origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("u1", None, Body::User { text: "go".into(), images: 0, client_id: Some("u1".into()), origin: Some("human".into()), attachments: Vec::new(), reply_to: None });
         core.upsert("a1", None, said("Running it."));
         core.upsert("t1", None, tool(ToolStatus::Done));
         core.upsert("t2", None, tool(ToolStatus::Error));
@@ -879,9 +927,9 @@ mod tests {
     #[test]
     fn child_work_cannot_change_the_parent_turns_keep_going_decision() -> anyhow::Result<()> {
         let mut core = Core::new();
-        core.upsert("parent-prompt", None, Body::User { text: "go".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("parent-prompt", None, Body::User { text: "go".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new(), reply_to: None });
         core.upsert("parent-tool", None, tool(ToolStatus::Error));
-        core.upsert("child-prompt", Some("spawn".into()), Body::User { text: "audit".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("child-prompt", Some("spawn".into()), Body::User { text: "audit".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new(), reply_to: None });
         core.upsert("child-tool", Some("spawn".into()), tool(ToolStatus::Done));
         core.upsert("child-answer", Some("spawn".into()), said("Should I try again?"));
         // Distinct times also exercise the fallback to the parent's prompt when no start
@@ -966,14 +1014,40 @@ mod tests {
         for i in 0..(MAX_EVENTS + 10) {
             c.upsert(&format!("e{i}"), None, Body::Assistant { text: "x".repeat(100), streaming: false });
         }
-        assert_eq!(c.events().count(), MAX_EVENTS);
-        assert_eq!(c.state.dropped, 10);
-        assert!(c.get("e0").is_none() && c.get("e10").is_some());
+        // Past the bound it lets go of a whole run (`crate::wire::sums`): it begins where one does.
+        let run = usize::try_from(crate::wire::sums::RUN).unwrap_or(64);
+        let n = c.events().count();
+        assert_eq!(n, MAX_EVENTS + 10 - run);
+        assert_eq!(c.state.dropped, crate::wire::sums::RUN);
+        assert_eq!(c.events().next().map(|e| e.seq), Some(crate::wire::sums::RUN + 1));
+        assert!(c.get("e63").is_none() && c.get("e64").is_some());
         let snap = c.snapshot(64 * 1024);
         assert!(matches!(snap.first(), Some(Update::Reset { .. })));
         let total: usize = snap.iter().map(|u| if let Update::Events { events } = u { events.len() } else { 0 }).sum();
-        assert_eq!(total, MAX_EVENTS);
+        assert_eq!(total, n);
         assert!(snap.len() > 4);
+    }
+
+    /// Started again from the conversation store: its events go out again only when their numbers
+    /// had to change.
+    #[test]
+    fn a_timeline_restored_as_the_store_kept_it_goes_out_once() {
+        let ev = |seq: u64| Event { id: format!("e{seq}"), seq, at: 0, parent: None, by: None, body: Body::Assistant { text: format!("line {seq}"), streaming: false } };
+        let mut c = Core::new();
+        assert!(c.restore((1..=5).map(ev).collect(), State::default()));
+        assert!(c.stored);
+        let out = c.take_out();
+        assert!(!out.iter().any(|u| matches!(u, Update::Reset { .. } | Update::Events { .. })), "the store has them: {out:?}");
+        // A gap in what the store kept: numbered again, so they go out again.
+        let mut c = Core::new();
+        assert!(!c.restore([1, 2, 4, 5].into_iter().map(ev).collect(), State::default()));
+        assert!(!c.stored);
+        let out = c.take_out();
+        assert!(matches!(out.first(), Some(Update::Reset { .. })), "{out:?}");
+        // One that moved here goes out whole, as it always did.
+        let mut c = Core::new();
+        c.adopt((1..=5).map(ev).collect(), State::default());
+        assert!(matches!(c.take_out().first(), Some(Update::Reset { .. })));
     }
 
     #[test]

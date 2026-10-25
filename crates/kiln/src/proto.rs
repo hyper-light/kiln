@@ -223,6 +223,16 @@ pub enum AgentMsg {
     /// once it changed, only to a server announcing [`CAP_NET_DROPS`]. Appended last: postcard
     /// encodes variants by index.
     NetDrops { dropped: Vec<NetDrop> },
+    /// Agent session `session`, packed by this runner process for its machine's newer one (a
+    /// take-over: [`ServerMsg::HarnessCmd`]'s local move), in pieces as
+    /// [`ServerMsg::HarnessPackage`] carries them: the server passes them on to the newer process.
+    /// On [`LANE_CONVO`]. Only to a server announcing [`CAP_HANDOVER`]. Appended last: postcard
+    /// encodes variants by index.
+    HarnessHandOver { session: String, offset: u64, data: Vec<u8>, done: bool },
+    /// This runner process took over agent session `session` from an older one of its machine,
+    /// or why it couldn't (`error`): the older one lets go of it, or goes on with it. Only to a
+    /// server announcing [`CAP_HANDOVER`]. Appended last: postcard encodes variants by index.
+    HarnessAdopted { session: String, error: Option<String> },
 }
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
@@ -340,6 +350,13 @@ pub const CAP_WIRE: u64 = 1 << 32;
 /// [`ServerMsg::Caps`] capability: the server takes [`AgentMsg::NetDrops`], what a runner's QUIC
 /// layer let go, for its page.
 pub const CAP_NET_DROPS: u64 = 1 << 33;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: hand-overs between a machine's runner
+/// processes. A runner hands an agent session to its machine's newer process when told to
+/// ([`AgentMsg::HarnessHandOver`]) and says whether it took one over ([`AgentMsg::HarnessAdopted`]);
+/// the server passes the session on and says how it went (`Command::HandedOver`, in a
+/// [`ServerMsg::HarnessCmd`]). Bit 34 is T3's `CAP_INBOX` (docs/wire.md).
+pub const CAP_HANDOVER: u64 = 1 << 35;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -588,11 +605,14 @@ pub struct KeptSession {
     pub epoch: u64,
     /// Its newest event's number in the copy (0: it has none).
     pub seq: u64,
-    /// Its oldest event's number in the copy.
+    /// Where its first run begins: its oldest event's number in the copy, or before it where a run
+    /// of `run` begins (1, 1 + `run` …; an older server says its oldest event's number, and the
+    /// runs begin there).
     pub from: u64,
     /// How many events a digest in `runs` covers.
     pub run: u64,
-    /// A digest of each run of `run` events from `from` on, up to the events `last` has one of each.
+    /// A digest of each run of `run` events from `from` on (each of the copy's events numbered
+    /// within it), up to the events `last` has one of each.
     pub runs: Vec<u64>,
     /// A digest of each of its newest events, through `seq` (0: the copy lacks that one).
     pub last: Vec<u64>,
@@ -700,6 +720,27 @@ mod tests {
             assert_eq!(decode::<ServerMsg>(&b)?, m);
         }
         assert!(CAP_WIRE.is_power_of_two() && CAP_WIRE > u64::from(u32::MAX), "CAP_WIRE is past Build's 32 bits");
+        Ok(())
+    }
+
+    #[test]
+    fn hand_overs_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        // AgentMsg ended with NetDrops (48): an older server never gets these (they go only to a
+        // server announcing CAP_HANDOVER), and decodes the rest as before. ServerMsg gains nothing:
+        // the slot after Kept is T3's HarnessSend (docs/wire.md).
+        let drops = encode(&AgentMsg::NetDrops { dropped: Vec::new() })?;
+        assert_eq!(drops.first(), Some(&48));
+        let agent = [
+            (AgentMsg::HarnessHandOver { session: "s".into(), offset: 3, data: vec![1, 2], done: true }, 49u8),
+            (AgentMsg::HarnessAdopted { session: "s".into(), error: Some("no room".into()) }, 50),
+        ];
+        for (m, idx) in agent {
+            let b = encode(&m)?;
+            assert_eq!(b.first(), Some(&idx), "{m:?} is AgentMsg variant {idx} on the wire");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+        }
+        // Bit 34 is T3's CAP_INBOX.
+        assert!(CAP_HANDOVER.is_power_of_two() && CAP_HANDOVER == 1 << 35 && CAP_HANDOVER & (CAP_WIRE | CAP_NET_DROPS) == 0);
         Ok(())
     }
 

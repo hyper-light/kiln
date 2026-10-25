@@ -555,7 +555,13 @@ async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
         Some(p) => Some(hub.harness.info(p).ok_or_else(|| Error::Bad("the agent that ran this plan has ended, so its steps can't be held to it: run the plan again".into()))?),
         None => None,
     };
-    let starter = Starter { parent, opener: head.config.opener.clone(), actor: head.config.actor.clone(), plan_run: Some(run.to_owned()) };
+    // The person who ran the plan needs runners.terminal where each step's agent starts, as they
+    // would to start it themselves (docs/agents.md, "Whose agents").
+    let asker = match head.config.opener.as_deref() {
+        Some(o) => crate::authz::gate::agent_for(hub, &head.config.actor, o).await,
+        None => None,
+    };
+    let starter = Starter { parent, opener: head.config.opener.clone(), actor: head.config.actor.clone(), plan_run: Some(run.to_owned()), asker };
     let name: String = format!("Step {}: {}", at + 1, row.title).chars().take(80).collect();
     let ask = Ask {
         kind: pick(&own.kind, &base.kind).unwrap_or_default(),
@@ -1101,7 +1107,7 @@ mod tests {
             Box::pin(async move {
                 let folder = tempfile::tempdir()?;
                 let cwd = folder.path().to_string_lossy().into_owned();
-                let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None };
+                let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
                 let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd.clone()), mode: Some("default".into()), name: Some("Main".into()), count: Some(1), ..Ask::default() };
                 let main = crate::harness::lineage::start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?.id;
                 crate::goals::add(&hub, &main, vec!["keep the docs current".into()], false).await?;

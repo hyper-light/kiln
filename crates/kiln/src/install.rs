@@ -288,7 +288,30 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
     }
     if a.agent && a.upgrade {
         eprintln_header("Upgrading the kiln agent beside the running one");
-        return crate::upgrade::install_alongside(&a.service, &|m| say(m)).await;
+        return crate::upgrade::install_alongside(&a.service, None, &|m| say(m)).await;
+    }
+    // A runner set up beside this machine's usual one runs: a fresh one would run beside it on
+    // credentials enrolled from under it. It is taken over instead (or, for another server, not).
+    if a.agent && !a.system {
+        let state_dir = crate::config::default_data_dir().join("agent");
+        let beside: Vec<String> = if crate::join::enrolled(&state_dir) {
+            crate::upgrade::services_here(&state_dir, &a.service).into_iter().filter(|h| h.running && h.created_at > 0).map(|h| h.existing.unit).collect()
+        } else {
+            Vec::new()
+        };
+        if !beside.is_empty() {
+            let server = a.server.clone().ok_or_else(|| anyhow::anyhow!("--server is required for an agent"))?;
+            let units = beside.join(", ");
+            return match crate::upgrade::knows_machine(&server, &state_dir).await {
+                Ok(true) => {
+                    eprintln_header("Taking over this machine's kiln agent");
+                    say(format!("runner      {units} works for {server} already: this kiln takes it over (its name, labels and slots stay)"));
+                    crate::upgrade::take_over(&state_dir, &server, &|m| say(m)).await
+                }
+                Ok(false) => anyhow::bail!("this machine's runner ({units}) works for another kiln server: `kiln join --yes --server {server}` stops it and joins this one"),
+                Err(e) => anyhow::bail!("this machine's runner ({units}) runs, and {server} couldn't be asked whether it works for it already ({e:#}): not installing beside it"),
+            };
+        }
     }
     let system = a.system || is_root();
     let bin = bin_path(system);
@@ -716,6 +739,11 @@ fn user_procs() -> (sysinfo::System, Vec<(u32, Vec<String>)>) {
         .map(|(pid, p)| (pid.as_u32(), p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect()))
         .collect();
     (sys, procs)
+}
+
+/// This user's processes, but this one: each one's pid and command line.
+pub(crate) fn processes() -> Vec<(u32, Vec<String>)> {
+    user_procs().1
 }
 
 /// This user's supervisors running the service `ours` (what follows `supervise --`) as it is.
@@ -1829,7 +1857,7 @@ mod tests {
         create_task(&i, TaskStart::SignIn, false).map_err(anyhow::Error::msg)?;
         let mut runner = Command::new(&bin).args(["-n", "60", "127.0.0.1"]).stdout(Stdio::null()).spawn()?;
         let owned = unit.clone();
-        let upgraded = crate::rt::block_on(async move { crate::upgrade::install_alongside(&owned, &|_: String| {}).await });
+        let upgraded = crate::rt::block_on(async move { crate::upgrade::install_alongside(&owned, None, &|_: String| {}).await });
         let _ = runner.kill();
         let _ = runner.wait();
         remove_task(&unit);

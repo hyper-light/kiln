@@ -74,12 +74,16 @@ fn until_of(v: &Value, now: i64) -> Result<Option<i64>, Fail> {
 }
 
 async fn get(cx: Cx, v: Value) -> Out {
-    json_of(&super::get(&cx.hub, &agent_of(&v)?).await.map_err(fail)?)
+    let agent = agent_of(&v)?;
+    if cx.hub.harness.info(&agent).is_some() {
+        crate::harness::lineage::may_see(&cx.hub, &cx.caller, &agent).await?;
+    }
+    json_of(&super::get(&cx.hub, &agent).await.map_err(fail)?)
 }
 
 async fn add(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let goals: Vec<String> = v.get("goals").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
     if goals.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "`goals` is a list of at least one goal".into()));
@@ -92,7 +96,7 @@ async fn add(cx: Cx, v: Value) -> Out {
 
 async fn set(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let given: Vec<Given> = serde_json::from_value(v.get("goals").cloned().unwrap_or_else(|| json!([]))).map_err(|e| (StatusCode::BAD_REQUEST, format!("`goals`: {e}")))?;
     let s = super::set(&cx.hub, &agent, given).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.set".into(), agent).await;
@@ -101,7 +105,7 @@ async fn set(cx: Cx, v: Value) -> Out {
 
 async fn control(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let action: Action =
         serde_json::from_value(v.get("action").cloned().unwrap_or(Value::Null)).map_err(|_| (StatusCode::BAD_REQUEST, "`action` is start (or resume), pause, skip, done, clear or restore".into()))?;
     let until = until_of(&v, cx.hub.clock.unix_ms())?;
@@ -116,7 +120,7 @@ async fn control(cx: Cx, v: Value) -> Out {
 
 async fn done(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let by = By::of(&cx.hub, &cx.caller, &agent);
     let s = super::done(&cx.hub, &agent, opt(&v, "id").as_deref(), opt(&v, "evidence").as_deref(), &by).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.done".into(), format!("{agent}: {}", opt(&v, "id").unwrap_or_else(|| "the goal under way".into()))).await;
@@ -125,7 +129,7 @@ async fn done(cx: Cx, v: Value) -> Out {
 
 async fn update(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let id = opt(&v, "id").ok_or_else(|| (StatusCode::BAD_REQUEST, "`id` is the goal's id (goals_get lists them)".to_owned()))?;
     let change: Change = serde_json::from_value(v.clone()).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let by = By::of(&cx.hub, &cx.caller, &agent);
@@ -137,12 +141,13 @@ async fn update(cx: Cx, v: Value) -> Out {
 /// What an agent does once its goal has become a plan.
 const PLANNING: &str = "Plan it now, in this order. 1. Research it, inside and outside, and record what you find as you go (research_add, with this research's id): inside, the files on your machine and on others (code, docs, data, pictures, frames of video) and kiln's own records (conversations_search, plans, CI runs, deployments); outside, the web, official docs and standards, papers (arXiv, Semantic Scholar, Crossref, PubMed), blogs and forums. Each finding is a claim with its citations (the source, the exact words you quote, where they are) and any counterclaims you found. kiln looks for each quote where you say it is and grades each finding: describe the evidence, never the grade. 2. Write the plan's steps (plans_update with the plan's id: `items`, each with what to do, its acceptance criteria, its tests, the steps it waits for in `needs`, and the findings it rests on in `basis`). 3. Say it's ready (plans_ready, with `then`: `goals` to carry on here with its steps as this goal's parts, `agents` to run it with an agent per step, `review` to pause for the person to look first). It answers with the research, graded: show it to the person in your reply, as it is, every claim with its sources and grade. Once every step is met, so is the goal.";
 
-/// How long a subagent sent to plan a goal is left at it before another may be.
+/// How long kiln's ask for a subagent to plan a goal stands, none started yet, before another may be
+/// asked for (the console's `ASK_STANDS_MS`).
 const DISPATCH_AGAIN_MS: i64 = 30 * 60_000;
 
 async fn plan(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     // A person's Make a plan (or another agent's): a goal the agent isn't on yet is planned now, by
     // a subagent of its own, beside what it's doing.
     let asked_by_another = cx.caller.agent.as_deref() != Some(agent.as_str());
@@ -160,22 +165,39 @@ async fn plan(cx: Cx, v: Value) -> Out {
 }
 
 /// Tells agent `agent`, steered into what it's doing, to plan goal `p` now with a subagent of its
-/// own ([`dispatch_words`]); else why it couldn't be (sent moments ago, not running, unreachable).
+/// own ([`dispatch_words`]); else why it couldn't be (one at it, asked for moments ago, the agent
+/// not running or unreachable).
 async fn dispatch(hub: &crate::hub::Hub, agent: &str, p: &super::Planned) -> Result<(), String> {
     let key = format!("goals.plan.dispatched:{}", p.plan);
     let now = crate::util::now_ms();
-    if hub.store.kv_get(key.clone()).await.ok().flatten().and_then(|at| at.parse::<i64>().ok()).is_some_and(|at| now - at < DISPATCH_AGAIN_MS) {
-        return Err("a subagent is on it already: it was sent to plan it within the last half hour".into());
-    }
+    let asked = hub.store.kv_get(key.clone()).await.ok().flatten().and_then(|at| at.parse::<i64>().ok());
+    let tasks = hub.harness.state(agent).map(|s| s.tasks).unwrap_or_default();
+    may_send(&tasks, &p.plan, asked, now).map_err(str::to_owned)?;
     let id = format!("{}plan-{}", crate::harness::pause::KILN_ID, crate::util::new_id());
-    let send = crate::harness::model::Command::Send { id, text: dispatch_words(p), mode: crate::harness::model::SendMode::Steer, attachments: Vec::new(), overrides: None };
+    let send = crate::harness::model::Command::Send { id, text: dispatch_words(p), mode: crate::harness::model::SendMode::Steer, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
     match hub.harness.command(hub, agent, send).await {
         crate::harness::registry::Sent::Ok => {
             let _ = hub.store.kv_set(key, now.to_string()).await;
             Ok(())
         }
-        crate::harness::registry::Sent::NoSession => Err("its agent isn't running: its planning waits its turn in the stack".into()),
-        crate::harness::registry::Sent::Unreachable => Err("its agent's machine can't be reached now: its planning waits its turn in the stack".into()),
+        crate::harness::registry::Sent::NoSession => Err("the agent isn't running, so it's planned when the stack gets to it".into()),
+        crate::harness::registry::Sent::Unreachable => Err("the agent's machine can't be reached, so it's planned when the stack gets to it".into()),
+    }
+}
+
+/// Whether a subagent may be sent to plan plan `plan` now, as the agent's session shows its
+/// subagents (`tasks`: the one planning it is the latest whose brief names the plan) and as kiln
+/// last asked for one (`asked`, unix ms): not while one is at it, nor moments after kiln asked
+/// when none has started since; once the last one stopped with the plan not ready, it may.
+fn may_send(tasks: &[crate::harness::model::Task], plan: &str, asked: Option<i64>, now: i64) -> Result<(), &'static str> {
+    let last = tasks.iter().filter(|t| t.subagent() && t.prompt.as_deref().is_some_and(|b| b.contains(plan))).max_by_key(|t| t.started);
+    if last.is_some_and(crate::harness::model::Task::live) {
+        return Err("a subagent is planning it now");
+    }
+    let ended = last.map(|t| t.ended.unwrap_or(t.started));
+    match asked {
+        Some(at) if now - at < DISPATCH_AGAIN_MS && ended.is_none_or(|e| at > e) => Err("a subagent was asked for moments ago: it starts at the agent's next step"),
+        _ => Ok(()),
     }
 }
 
@@ -183,7 +205,7 @@ async fn dispatch(hub: &crate::hub::Hub, agent: &str, p: &super::Planned) -> Res
 /// with [`PLANNING`]'s brief, the plan's and the research's ids in it, and to go on with its work.
 fn dispatch_words(p: &super::Planned) -> String {
     format!(
-        "Your person asked for one of your goals to be planned now, beside what you're doing: \"{goal}\". Dispatch a subagent for it (your Agent or Task tool; without one, start an agent with agents_start), give it the brief below, and go on with your own work meanwhile. When it reports back, check the plan is ready (plans_get {plan}) and say so in a line.\n\nThe brief: plan the goal \"{goal}\" as plan {plan}, its research {research}. {PLANNING} Say it's ready with `then: goals`. Report back the plan's title and steps, and its research as research_get presents it.",
+        "Your person asked for one of your goals to be planned now, beside what you're doing: \"{goal}\". Dispatch a subagent for it (your Agent or Task tool; without one, start an agent with agents_start), give it the brief below, and go on with your own work meanwhile. When it reports back, check the plan is ready (plans_get {plan}) and say so in a line.\n\nThe brief: plan {plan}, research {research}, for the goal \"{goal}\". {PLANNING} Say it's ready with `then: goals`. Report back the plan's title and steps, and its research as research_get presents it.",
         goal = p.words,
         plan = p.plan,
         research = p.research,
@@ -192,7 +214,7 @@ fn dispatch_words(p: &super::Planned) -> String {
 
 async fn settings(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let plan_big = v.get("plan_big").and_then(Value::as_bool).ok_or_else(|| (StatusCode::BAD_REQUEST, "`plan_big` is true or false".to_owned()))?;
     let s = super::settings(&cx.hub, &agent, plan_big).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.settings".into(), format!("{agent}: plan big goals first {}", if plan_big { "on" } else { "off" })).await;
@@ -201,7 +223,7 @@ async fn settings(cx: Cx, v: Value) -> Out {
 
 async fn split(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
-    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
     let parts: Vec<String> = v.get("goals").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
     let s = super::split(&cx.hub, &agent, opt(&v, "id").as_deref(), parts).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.split".into(), format!("{agent}: {}", opt(&v, "id").unwrap_or_else(|| "the goal under way".into()))).await;
@@ -366,6 +388,69 @@ pub fn list_ops() -> Vec<Op> {
     ]
 }
 
+/// Whether another subagent may be sent to plan a goal (Make a plan, Plan it now, Plan it again).
+#[cfg(test)]
+mod planners {
+    use super::{DISPATCH_AGAIN_MS, may_send};
+    use crate::harness::model::Task;
+
+    const NOW: i64 = 10 * DISPATCH_AGAIN_MS;
+
+    fn planner(plan: &str, status: &str, started: i64, ended: Option<i64>) -> Task {
+        Task {
+            id: format!("t{started}"),
+            description: "Plan it".into(),
+            class: Some("agent".into()),
+            status: status.into(),
+            started,
+            ended,
+            prompt: Some(format!("The brief: plan {plan}, research rs_1, for the goal \"x\".")),
+            ..Task::default()
+        }
+    }
+
+    #[test]
+    fn none_asked_for_nor_at_it_may_go() {
+        assert_eq!(may_send(&[], "pl_1", None, NOW), Ok(()));
+    }
+
+    #[test]
+    fn asked_for_moments_ago_and_not_started_waits_but_not_past_half_an_hour() {
+        assert!(may_send(&[], "pl_1", Some(NOW - 60_000), NOW).is_err_and(|w| w.contains("moments ago")));
+        assert_eq!(may_send(&[], "pl_1", Some(NOW - DISPATCH_AGAIN_MS - 1), NOW), Ok(()));
+    }
+
+    #[test]
+    fn one_at_it_holds_off_another_whenever_it_was_asked_for() {
+        let at_it = [planner("pl_1", "running", NOW - 2 * DISPATCH_AGAIN_MS, None)];
+        assert!(may_send(&at_it, "pl_1", Some(NOW - 2 * DISPATCH_AGAIN_MS), NOW).is_err_and(|w| w.contains("planning it now")));
+        assert!(may_send(&at_it, "pl_1", None, NOW).is_err_and(|w| w.contains("planning it now")));
+    }
+
+    #[test]
+    fn one_that_stopped_short_may_be_sent_again_at_once() {
+        let stopped = [planner("pl_1", "completed", NOW - 120_000, Some(NOW - 30_000))];
+        assert_eq!(may_send(&stopped, "pl_1", Some(NOW - 125_000), NOW), Ok(()));
+    }
+
+    #[test]
+    fn asked_again_since_the_last_stopped_waits_for_the_new_one() {
+        let stopped = [planner("pl_1", "completed", NOW - 300_000, Some(NOW - 200_000))];
+        assert!(may_send(&stopped, "pl_1", Some(NOW - 10_000), NOW).is_err_and(|w| w.contains("moments ago")));
+    }
+
+    #[test]
+    fn the_latest_counts_and_only_subagents_planning_this_plan() {
+        let earlier_then_now = [planner("pl_1", "completed", NOW - 400_000, Some(NOW - 300_000)), planner("pl_1", "running", NOW - 60_000, None)];
+        assert!(may_send(&earlier_then_now, "pl_1", Some(NOW - 70_000), NOW).is_err_and(|w| w.contains("planning it now")));
+        let others = [
+            planner("pl_2", "running", NOW - 60_000, None),
+            Task { class: Some("shell".into()), status: "running".into(), command: Some("plan pl_1".into()), prompt: Some("pl_1".into()), ..Task::default() },
+        ];
+        assert_eq!(may_send(&others, "pl_1", None, NOW), Ok(()));
+    }
+}
+
 /// The steering rule on a hub of its own, under a timeout: an agent changes the goals of itself and
 /// the agents it started, never another's; runs a plan on those only; and a plan run on a new agent
 /// makes that agent its child, held to its mode (docs/agents.md, "No more than its parent"). No
@@ -409,7 +494,7 @@ mod tests {
             hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
             let folder = tempfile::tempdir()?;
             let cwd = folder.path().to_string_lossy().into_owned();
-            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None };
+            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = |name: &str, kind: &str| Ask { kind: kind.into(), on: Some("local".into()), cwd: Some(cwd.clone()), mode: Some(if kind == "claude" { "default" } else { "untrusted" }.into()), name: Some(name.into()), count: Some(1), ..Ask::default() };
             let one = |v: Vec<crate::harness::session::Info>| v.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent started"));
             let a = one(start(&hub, &person, ask("A", "claude")).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?)?;
