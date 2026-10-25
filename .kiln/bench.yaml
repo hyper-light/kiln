@@ -4,6 +4,10 @@ name: bench
 on:
   push: { branches: [main], paths: ["crates/**"] }
   manual: true
+# One bench run at a time per event and branch (W25): the newest push waits for the run under way
+# and replaces an older one waiting, so a backlog comes down to the newest commit, and a person's
+# manual run isn't dropped for a push.
+concurrency: { group: "bench-${{ event }}-${{ branch }}", cancel-in-progress: false }
 jobs:
   quic-transport:
     name: QUIC transport bench (hardware)
