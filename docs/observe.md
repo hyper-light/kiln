@@ -793,8 +793,11 @@ time, sent again until answered; §5), from:
   "sync.conflict", repo = %r, path = %p, "kept the server's copy")`) is an event too, its level its
   status, every field and its spans' an attribute; one without stays the log's. `kiln.sync` is
   written as a name, not a module's path, so the sync's own tracing (`kiln::sync::…`) is not
-  taken. A layer of kiln's subscriber with its own filter: `KILN_LOG` does not hide these from
-  observe, nor do they reach the log.
+  taken. What the stores kiln keeps its bytes in and sessions' live feeds say (`kiln.blobs`,
+  `kiln.bus`: a read that ends short, an archive given up, a feed the bus refused) are events of
+  `service:kiln.blobs` and `service:kiln.bus` from INFO up; their DEBUG lines (each put of the CI
+  cache's) stay the log's. A layer of kiln's subscriber with its own filter: `KILN_LOG` does not
+  hide these from observe, nor do they reach the log.
 
 - **Logs collected on every machine** (§8.1): files, containers' logs and the journal, as a source
   says.

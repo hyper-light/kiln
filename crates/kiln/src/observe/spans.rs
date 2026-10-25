@@ -31,11 +31,13 @@ use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 
-/// The targets whose spans are observe's: runners' blue/green upgrades (`upgrade`, `upgrade.start`,
-/// `upgrade.healthy`, `upgrade.move`, `upgrade.retire`, `upgrade.rollback`); repositories' sync and
-/// agents' moves (`kiln.sync`: written as its own, not a module's path, so that only what is meant
-/// for observe is).
-pub const TARGETS: &[&str] = &["kiln::upgrade", "kiln.sync"];
+/// The targets whose spans and events are observe's, each from its level: runners' blue/green
+/// upgrades (`upgrade`, `upgrade.start`, `upgrade.healthy`, `upgrade.move`, `upgrade.retire`,
+/// `upgrade.rollback`); repositories' sync and agents' moves (`kiln.sync`: written as its own, not a
+/// module's path, so that only what is meant for observe is); and what the stores kiln keeps its
+/// bytes in and sessions' live feeds say (`kiln.blobs`, `kiln.bus`) from INFO up: a request's own
+/// DEBUG lines (each put of the CI cache's, each refusal) stay the log's.
+pub const TARGETS: &[(&str, Level)] = &[("kiln::upgrade", Level::TRACE), ("kiln.sync", Level::TRACE), ("kiln.blobs", Level::INFO), ("kiln.bus", Level::INFO)];
 
 /// Fields that become tags: few values each. Any other (an id, a path, an error's words) is an
 /// attribute of the event alone.
@@ -205,13 +207,13 @@ where
     }
 }
 
-/// The layer kiln's subscriber holds: [`TARGETS`]' spans, at any level, written to this node's
-/// observe once it started (none before).
+/// The layer kiln's subscriber holds: [`TARGETS`]' spans and events, each from its level, written
+/// to this node's observe once it started (none before).
 pub fn layer<S>() -> impl Layer<S>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    let filter = TARGETS.iter().fold(Targets::new(), |t, target| t.with_target(*target, Level::TRACE));
+    let filter = TARGETS.iter().fold(Targets::new(), |t, (target, level)| t.with_target(*target, *level));
     Spans { sink: write }.with_filter(filter)
 }
 
@@ -313,7 +315,7 @@ mod tests {
     fn bridged_by(f: impl FnOnce()) -> Vec<Bridged> {
         let got: Arc<Mutex<Vec<Bridged>>> = Arc::default();
         let sink = got.clone();
-        let filter = TARGETS.iter().fold(Targets::new(), |t, target| t.with_target(*target, Level::TRACE));
+        let filter = TARGETS.iter().fold(Targets::new(), |t, (target, level)| t.with_target(*target, *level));
         // The log's own layer, filtered to warnings: the bridge sees what it hides.
         let subscriber = tracing_subscriber::registry().with(Spans { sink: move |b| sink.lock().unwrap_or_else(PoisonError::into_inner).push(b) }.with_filter(filter)).with(tracing_subscriber::fmt::layer().with_test_writer().with_filter(tracing_subscriber::filter::LevelFilter::WARN));
         tracing::subscriber::with_default(subscriber, f);
@@ -355,6 +357,33 @@ mod tests {
         assert_eq!(record.service, "kiln.sync");
         let key = points.first().and_then(|(k, _)| kiln_obs::batch::parse_key(&k.key).ok());
         assert_eq!(key.map(|k| (k.metric.to_owned(), k.tags.iter().map(|(a, b)| format!("{a}:{b}")).collect::<Vec<_>>())), Some(("kiln.move.duration".to_owned(), vec!["machine:mac-mini".to_owned(), "repo:kiln".to_owned(), "result:ok".to_owned()])));
+    }
+
+    /// The byte stores' and the live feeds' events are observe's from INFO up, each its service's: a
+    /// read that ends short and a feed the bus refused; a put's own DEBUG line is the log's alone.
+    #[test]
+    fn the_byte_stores_and_the_live_feeds_events_from_info_up_are_observe_s() {
+        let got = bridged_by(|| {
+            tracing::debug!(target: "kiln.blobs", event = "put", object = "sha256:ab12", size = 3, "kept");
+            tracing::warn!(target: "kiln.blobs", event = "get", key = "cas/ab12", error = "connection reset", "a read ends short");
+            tracing::info!(target: "kiln.bus", event = "feed.refused", topic = "s-7f3a", error = "no such topic", "a session's live feed couldn't be let go");
+        });
+        let said: Vec<(String, u8, String, String)> = got
+            .iter()
+            .filter_map(|b| if let Bridged::Happened(h) = b { Some(happened(h)) } else { None })
+            .map(|r| {
+                let kind = r.attrs.iter().find(|(k, _)| k == "event.type").map(|(_, v)| v.clone()).unwrap_or_default();
+                (r.service, r.severity, kind, r.message)
+            })
+            .collect();
+        assert_eq!(
+            said,
+            vec![
+                ("kiln.blobs".to_owned(), 13, "get".to_owned(), "a read ends short".to_owned()),
+                ("kiln.bus".to_owned(), 9, "feed.refused".to_owned(), "a session's live feed couldn't be let go".to_owned()),
+            ],
+            "{got:?}"
+        );
     }
 
     /// An upgrade as the runners' will make one: the root's fields reach its children, results
