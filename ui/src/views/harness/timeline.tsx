@@ -835,7 +835,11 @@ const Prompt = React.memo(function Prompt({
         <div className="hx-prompt-meta">
           <span className="hx-eyebrow">{system ? e.origin : "You"}</span>
           <span className="hx-dim">{SAID_AT.format(e.at)}</span>
-          {delivery && <span className="hx-dim">· {DELIVERY[delivery]}</span>}
+          {delivery && (
+            <span className="hx-dim">
+              · <span className="hx-delivery" data-delivery={delivery}>{DELIVERY[delivery]}</span>
+            </span>
+          )}
           {e.attachments?.length ? (
             <span className="hx-dim hx-trunc" title={e.attachments.join(", ")}>
               · {e.attachments.join(", ")}

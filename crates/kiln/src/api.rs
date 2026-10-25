@@ -3398,8 +3398,8 @@ fn build_token_ok(hub: &Hub, headers: &HeaderMap, job: &str) -> bool {
     bearer(headers).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), crate::fleet::token(hub, job).as_bytes()))
 }
 
-/// `GET /api/updates/jobs/{id}/source`: the source of the commit a machine builds itself
-/// (`crate::fleet`), as tar.
+/// `GET /api/updates/jobs/{id}/source`: the source of the commit a machine builds, for itself or
+/// for another machine's platform (`crate::fleet`), as tar.
 async fn build_source(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
     if !build_token_ok(hub, headers, id) {
         return Err(err(StatusCode::UNAUTHORIZED, "bad build token"));
@@ -3408,8 +3408,8 @@ async fn build_source(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
     Ok(srv::response(StatusCode::OK, "application/x-tar", srv::channel_body(stdout)))
 }
 
-/// `POST /api/updates/jobs/{id}/binary?sha256=<hex>`: what a machine built of itself; the binary
-/// as the body when it is kept for the machine's platform, else nothing.
+/// `POST /api/updates/jobs/{id}/binary?sha256=<hex>`: what a machine built; the binary as the body
+/// when it is kept for its platform, else nothing.
 async fn build_binary(hub: &Arc<Hub>, id: &str, q: &HashMap<String, String>, req: Request) -> R {
     if !build_token_ok(hub, req.headers(), id) {
         return Err(err(StatusCode::UNAUTHORIZED, "bad build token"));

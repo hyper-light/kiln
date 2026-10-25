@@ -63,8 +63,14 @@ each runner's state as Prometheus gauges: `kiln_runner_up`, `kiln_runner_behind`
 `kiln_runner_update_policy{policy}` and `kiln_runner_version_info{version}`.
 
 A runner with no binary of the server's commit yet doesn't wait on another machine: it waits only
-while its own platform's job is building, and otherwise a Mac or Linux machine with a kiln checkout
-builds the commit itself (a Mac's build is kept for the other Macs).
+while its own platform's job is building, and otherwise the commit is built from the server's
+source right away. No checkout of kiln is needed anywhere. A machine with the tools (cargo and
+node, as its runner reports them) builds the commit itself; a Mac's build is kept, so the other
+Macs download it. A Mac without them (no developer tools) gets its build over the wire: a Mac
+that has them builds the commit natively, else a Linux machine cross-builds it
+(`ci/release/build.sh`: zig, against the macOS stubs). The binary comes back to the server, and the
+Mac downloads it in the same upgrade. One build of a commit serves every Mac: while one is under
+way, the other Macs wait for it rather than start another.
 
 ## How a runner is upgraded: blue/green
 
@@ -173,23 +179,25 @@ row reads *upgrade failed* or *build failed*, with the upgrade's output under it
 - **Retry** tries the same way again now, without waiting for kiln's next automatic try (a failed
   automatic upgrade is tried again after 30 minutes, twice per commit).
 - **Download instead** / **Build it instead**: the other way, when it's open. A download needs a
-  binary of the newest kiln for the machine's platform; a build needs a kiln checkout on the
-  machine. A way that can't be taken now says why (no binary yet, a release run still building one,
-  no checkout, terminals turned off), so a runner kiln is waiting on can still be upgraded the
-  other way.
+  binary of the newest kiln for the machine's platform. A build needs a machine with the tools to
+  make it: the runner's own, or for a Mac without them, another Mac (or a Linux machine,
+  cross-building) whose build it then downloads. A way that can't be taken now says why (no binary
+  yet, a release run still building one, no machine with the tools for it, terminals turned off),
+  so a runner kiln is waiting on can still be upgraded the other way.
 - **Diagnose** (on every connected runner) looks at it, and lists in its row what's wrong, worst
   first, each with the repair that fixes it when kiln can make it (below).
 - **Ask an agent**, under a diagnosis, opens New agents on that machine with a first message
   written for it: what kiln knows (the build it runs and the one it was going to, the error, the
   upgrade's last lines, what the diagnosis found) and where to look (the runner's log, a build's
-  whole output in `~/.cache/kiln/self-build/build-<job>.log`, disk, memory, toolchains). It asks the
-  agent to fix the cause on the machine without stopping or reinstalling the runner, and to say what
-  it changed. Read and change the message before starting it; the agent asks before commands and
-  edits unless you choose otherwise.
+  whole output in `~/.cache/kiln/self-build/build-<job>.log` on the machine that built it, disk,
+  memory, toolchains). It asks the agent to fix the cause on the machine without stopping or
+  reinstalling the runner, and to say what it changed. Read and change the message before starting
+  it; the agent asks before commands and edits unless you choose otherwise.
 
 `POST /api/updates/runners/{name}` with `{"way": "download" | "build"}` does the same as the
 buttons (no body: the way kiln picks). `GET /api/updates` lists each runner's `ways`, each with `ok`
-and `why`.
+and `why`, and for a build another machine makes, `on` (that machine); an upgrade job made that way
+carries `on` too.
 
 ### Diagnosing and repairing a runner
 

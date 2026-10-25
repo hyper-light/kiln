@@ -417,12 +417,13 @@ export function runnerView(r: RunnerUpdate, job: UpdateJob | undefined, newest: 
   if (job?.state === "running" || (r.connected && r.how === "upgrading")) {
     const build = job?.method === "build";
     const toWords = to ?? "the new build";
+    const doing = build && job?.on ? `getting ${toWords} from ${job.on}` : build ? `building ${toWords} itself` : `upgrading to ${toWords}`;
     return {
       ...base,
       tone: "run",
-      word: build ? "Building itself" : "Upgrading",
-      sub: switching ? `old runner holds ${oldHolds}` : build ? `building ${toWords} itself` : `upgrading to ${toWords}`,
-      scene: switching ? "switching · nothing stops" : build ? `building ${toWords} itself` : `upgrading to ${toWords}`,
+      word: build && !job?.on ? "Building itself" : "Upgrading",
+      sub: switching ? `old runner holds ${oldHolds}` : doing,
+      scene: switching ? "switching · nothing stops" : doing,
       lit: true,
     };
   }
@@ -714,9 +715,9 @@ export function diagnosisPrompt(r: RunnerUpdate, job: UpdateJob | undefined, new
     `- ${r.name} runs kiln ${r.version}${r.commit ? `, commit ${r.commit}` : ""}${r.build ? `, build ${r.build}` : ""}.`,
     newest ? `- The newest kiln is commit ${newest.commit}.` : "",
     failed
-      ? `- Its upgrade, ${failed.method === "build" ? `a build of ${failed.commit ? shortSha(failed.commit) : "the newest kiln"} on the machine` : `to build ${failed.to_build ?? "the new build"}`}, started ${at(failed.started_at)} and failed: ${failed.error ?? "kiln wasn't told why"}`
+      ? `- Its upgrade, ${failed.method === "build" ? `a build of ${failed.commit ? shortSha(failed.commit) : "the newest kiln"} on ${failed.on ? `${failed.on}, for it to download` : "the machine"}` : `to build ${failed.to_build ?? "the new build"}`}, started ${at(failed.started_at)} and failed: ${failed.error ?? "kiln wasn't told why"}`
       : "",
-    ...stuck.map((w) => `- ${w.way === "build" ? "It can't build kiln itself now" : "It can't download a build now"}: ${w.why}.`),
+    ...stuck.map((w) => `- ${w.way === "build" ? "kiln can't be built for it now" : "It can't download a build now"}: ${w.why}.`),
     r.next ? `- What kiln does next: it ${r.next}.` : "",
     tail.length ? `- Its last lines, as kiln kept them:\n\n${tail.map((l) => `    ${l}`).join("\n")}` : "",
     ...(findings ?? [])
@@ -730,7 +731,9 @@ export function diagnosisPrompt(r: RunnerUpdate, job: UpdateJob | undefined, new
       : r.os === "macos"
         ? "- The runner's log: kiln.log in its state directory, usually ~/.local/share/kiln/agent/kiln.log."
         : "- The runner's log, in its state directory.",
-    failed?.method === "build" ? `- The build's whole output: ~/.cache/kiln/self-build/build-${failed.id}.log (the build works in ~/.cache/kiln/self-build).` : "",
+    failed?.method === "build"
+      ? `- The build's whole output: ~/.cache/kiln/self-build/build-${failed.id}.log${failed.on ? ` on ${failed.on}, where it ran` : ""} (the build works in ~/.cache/kiln/self-build).`
+      : "",
     "- Free disk and memory, and for a build the Rust toolchain (rustup show, cargo --version) and npm.",
     "",
     "Rules:",
