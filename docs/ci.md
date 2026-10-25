@@ -7668,6 +7668,24 @@ plan:
 | M4 | Observation, `kiln rustc`, trust, verification | R04, R05, R09, R21–R23 |
 | M5 | Warm microVMs and k8s, remote execution, the seams | R13, R14, R26 |
 
+
+**Baseline (M0, step 1).** kiln's `rust` job steps (`.kiln/ci.yaml`) on fedora, in a capped user unit
+(`systemd-run --user`, MemoryMax 32G, nice 10, CPU and I/O weight 20, `CARGO_BUILD_JOBS=8`, `RUST_TEST_THREADS=4`,
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only`, its own target dir and TMPDIR). Units rebuilt are cargo's
+`compiler-artifact` messages with `fresh: false`; the test step's own builds aren't counted.
+
+| Scenario | Commit | Machine | Date | clippy (units) | test --lib --no-run (units) | test --no-fail-fast | Total |
+|---|---|---|---|---|---|---|---|
+| cold | 58ddfad4 | fedora | 2026-10-24 | 124.8 s (581) | 183.3 s (386) | 1902 s (exit 101) | 2211 s |
+| one file (`crates/kiln/src/lib.rs` touched) | 58ddfad45 | fedora | 2026-10-24 | 17.2 s (71) | 20.8 s (1) | 2575 s (exit 101) | 2613 s |
+| docs only (`docs/ci.md` touched) | 58ddfad45 | fedora | 2026-10-24 | 0.4 s (0) | 0.2 s (0) | 2488 s (exit 101) | 2489 s |
+| one file, repeated | 58ddfad45 | fedora | 2026-10-25 | 18.7 s (71) | 19.9 s (1) | 2608 s (exit 101) | 2647 s |
+
+The two one-file runs differ by 1.3 % in total wall time. Running the tests, not building them, dominates: even
+with nothing rebuilt, the docs-only run spent over 40 minutes in `cargo test`, which is what leg and test-result reuse
+(R06, R10) remove. The test step exited 101 in every scenario: tests were already failing at that commit (among them
+`-p kiln --test ops`), so these are wall times, not a green gate.
+
 **The `.kiln/` workflows on the engine (M0, step 4).** Each `.kiln/*.yaml` at 0886756c, checked
 (`/api/ci/validate`) and planned for a push to `main` (`/api/ci/plan-preview`) on a test server
 with the engine on; its labels compared with production's runners (`ci.workflows.labels`).
