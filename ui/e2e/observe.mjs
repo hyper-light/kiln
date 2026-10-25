@@ -316,15 +316,20 @@ const scenarios = {
       attributes: { "error.kind": "ValueError", "error.message": `bad item ${i} in cart 'c-${i * 7}'`, "error.stack": stack, env: "e2e", version: "1.0" },
     }));
     expect((await api("POST", "/api/observe/v1/logs", logs)).status === 202, "posting the errors");
+    // What it last saw, said if it never comes right: no issue, or its count.
+    let seen = null;
     const issue = await until(
       "its issue, every error counted",
       async () => {
         const r = await api("GET", `/api/observe/v1/errors/issues?from=${Date.now() - 3_600_000}&to=${Date.now() + 60_000}&all=true&query=${encodeURIComponent(service)}`);
         const i = r.body?.issues?.find((x) => x.service === service);
+        seen = i ?? { status: r.status, issues: r.body?.issues?.length };
         return i && i.errors === 6 ? i : null;
       },
       120_000,
-    );
+    ).catch((e) => {
+      throw new Error(`${e.message}; it last saw ${JSON.stringify(seen)?.slice(0, 800)}`);
+    });
     expect(issue.type === "ValueError" && issue.function === fn && issue.status === "for_review" && issue.source === "log", JSON.stringify(issue));
     await page.goto(`${BASE}/observe/errors`);
     await fillIn(page.locator("#observe-search"), service);
