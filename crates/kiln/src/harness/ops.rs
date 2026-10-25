@@ -950,7 +950,7 @@ mod end_to_end {
                 crate::rt::sleep(Duration::from_millis(20)).await;
             }
             let cx = as_agent(&hub, &id).await?;
-            // Under kiln's own 24, its settings say one at once.
+            // Its settings say one at once.
             let two = call(cx, "agents.start", json!({"kind": "claude", "mode": "plan", "cwd": NOWHERE, "count": 2})).await;
             anyhow::ensure!(two.as_ref().is_err_and(|(_, m)| m.contains("its settings")), "{two:?}");
             Ok(())
@@ -962,7 +962,7 @@ mod end_to_end {
         run(async {
             let hub = hub_with(|c| {
                 c.agents.max_depth = 1;
-                c.agents.max_children = 1;
+                c.agents.max_children = Some(1);
             })
             .await?;
             // A parent in bypass that was started without it may not hand it on.

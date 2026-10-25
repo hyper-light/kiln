@@ -1094,9 +1094,9 @@ pub struct State {
     /// limit cuts a turn off. None: only when a limit is reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_at: Option<u8>,
-    /// The most subagents it runs at once (Agent settings): its harness's own, and the agents it
-    /// starts through kiln, each. None: as many as its harness and kiln's `[agents] max_children`
-    /// let it.
+    /// The most subagents it has at work at once (Agent settings): its harness's own and the agents
+    /// it starts through kiln, one pool (`lineage::room`). None: no limit of its own (kiln's `[agents]
+    /// max_children`, only when its config sets one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_subagents: Option<u32>,
     /// A pause ends only when a person resumes it, not by itself at the reset.

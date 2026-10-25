@@ -3,8 +3,9 @@
  * goal's line (status.tsx: met closed in mint, waiting sketched, not met broken in amber, skipped
  * dashed in pink, stopped faint, needs you the amber rings), the steps that run at once on one
  * branch beside it, where each stands in a word at the right, and who's at one that's worked on or
- * needs you under it. The one at work has the light turning in its glyph and its words in the
- * holographic shimmer. Only that moves.
+ * needs you under it. Those at work (as many as run at once: the agent's own, its subagents', its
+ * run's agents') have the light turning in their glyphs and their words in the holographic shimmer,
+ * each its own way. Only they move.
  */
 import * as React from "react";
 import { TitleText } from "@/views/plans/graph";

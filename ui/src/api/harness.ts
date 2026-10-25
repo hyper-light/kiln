@@ -482,6 +482,8 @@ export interface GoalItem {
   planned_as?: string;
   /** The plan run it waits for. */
   waits_on?: string;
+  /** The subagent a plan's step was handed to, side by side with the plan's other steps (docs/goals.md, "A plan's steps side by side"): under way there while it's still to go here; once met, who met it. */
+  subagent?: string;
 }
 
 /** An agent's goals, one after another: each goes once the one before is met. */

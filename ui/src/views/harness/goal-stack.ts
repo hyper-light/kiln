@@ -102,9 +102,9 @@ export function callWords(c: Pick<ToolCall, "tool" | "name" | "title" | "status"
 }
 
 /** The goal that stopped a paused stack with none under way (the last to end, not met or skipped), to try again first. */
-/** One of its own goals still to go, not a part, a plan's step or planned already: it can become a plan (Make a plan). */
+/** One of its own goals still to go, not a part, a plan's step, planned already or out on a subagent: it can become a plan (Make a plan). */
 export function canPlan(g: GoalItem): boolean {
-  return (g.status === "pending" || g.status === "active") && !g.part_of && !g.planned_as && !g.step && !g.waits_on;
+  return (g.status === "pending" || g.status === "active") && !g.part_of && !g.planned_as && !g.step && !g.waits_on && !outOn(g);
 }
 
 /** A goal still to go that's being planned, its planning waiting its turn: a subagent of its agent can plan it now (Plan it now). */
@@ -116,14 +116,38 @@ const PART_STAND = { pending: "waiting", active: "working", met: "met", unmet: "
 
 /**
  * Where step `n` of the plan `goal` became stands, as its part on the stack says: under way while it
- * is, or while one of its own parts (its criteria and tests) is; none when it isn't on the stack.
+ * is, while one of its own parts (its criteria and tests) is, or while a subagent has it (side by side
+ * with the plan's other steps); none when it isn't on the stack.
  */
 export function stepStand(goal: GoalItem, items: readonly GoalItem[], n: number, paused: boolean): Stand | undefined {
   const part = items.find((i) => i.part_of === goal.id && i.part_kind === "plan" && i.step?.n === n);
   if (!part) return undefined;
-  const busy = part.status === "active" || (part.status === "pending" && items.some((i) => i.part_of === part.id && i.status === "active"));
+  const busy = part.status === "active" || (part.status === "pending" && (!!part.subagent || items.some((i) => i.part_of === part.id && i.status === "active")));
   if (busy) return paused ? "paused" : "working";
   return PART_STAND[part.status];
+}
+
+/** A goal still to go that a subagent has: a plan's step, side by side with the plan's others (its subagent's id). */
+export function outOn(g: GoalItem): string | undefined {
+  return g.status === "pending" ? g.subagent : undefined;
+}
+
+/**
+ * A goal's line as it stands, `parts` its parts at any depth: under way (`active`) while it is, while
+ * a subagent has it, or while any of its parts is (its plan's steps on the agent or on subagents, its
+ * run's agents); `away`, the agent it's under way on when that's another (its subagent, or a
+ * program's worker it was handed to); `busy`, its light turning: always while subagents or a run
+ * are at it, whatever else is under way beside them, and while the agent works on it itself
+ * (`working`: the agent is at work now).
+ */
+export function lineOf(g: GoalItem, parts: readonly GoalItem[], working: boolean): { status: GoalItem["status"]; away?: string; busy: boolean } {
+  const sub = outOn(g);
+  if (sub) return { status: "active", away: sub, busy: true };
+  const pending = g.status === "pending";
+  const own = pending && parts.some((p) => p.status === "active" && !p.waits_on);
+  const others = pending && parts.some((p) => !!outOn(p) || (p.status === "active" && !!p.waits_on));
+  const status = own || others ? "active" : g.status;
+  return { status, away: pending && !own && !others ? g.on : undefined, busy: others || (status === "active" && working && !g.waits_on) };
 }
 
 export function stoppedBy(stack: GoalStack | null): GoalItem | undefined {

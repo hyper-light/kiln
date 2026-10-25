@@ -164,6 +164,55 @@ const stacks = new Map<string, Kept>([
       ],
     },
   ],
+  // Its plan's steps side by side (docs/goals.md, "A plan's steps side by side"): step 1 met, then 2, 3
+  // and 4 at once, each on a subagent of Replication lead's own (agents.ts), 3's asking you something;
+  // 5 waits for all three. Then a goal of its own out on a subagent too.
+  [
+    "fan-lead",
+    {
+      state: "running",
+      updated_at: Date.now() - 30_000,
+      items: [
+        {
+          id: "g-fan-1",
+          text: 'Step 1 of 5 of the plan "Replicated log": The log\'s schema',
+          status: "met",
+          reason: "the agent said so: the schema migrates on three nodes",
+          how: "goal",
+          part_of: "g-fan",
+          part_kind: "plan",
+          step: { plan: "pl_fan", version: 1, n: 1, run: "pr_fan" },
+          started_at: t0 + 600_000,
+          ended_at: t0 + 1_800_000,
+        },
+        ...(
+          [
+            [2, "Leader election over QUIC", "fan-s2"],
+            [3, "Follower catch-up", "fan-s3"],
+            [4, "Snapshot transfer", "fan-s4"],
+          ] as const
+        ).map(([n, title, sub]): GoalItem => ({
+          id: `g-fan-${n}`,
+          text: `Step ${n} of 5 of the plan "Replicated log": ${title}`,
+          status: "pending",
+          part_of: "g-fan",
+          part_kind: "plan",
+          step: { plan: "pl_fan", version: 1, n, run: "pr_fan" },
+          subagent: sub,
+        })),
+        {
+          id: "g-fan-5",
+          text: 'Step 5 of 5 of the plan "Replicated log": Land it, with docs',
+          status: "pending",
+          part_of: "g-fan",
+          part_kind: "plan",
+          step: { plan: "pl_fan", version: 1, n: 5, run: "pr_fan" },
+        },
+        { id: "g-fan", text: "Replicate the metadata store's log over QUIC: elect, catch up, snapshot", status: "pending", planned_as: "pl_fan" },
+        { id: "g-sign", text: "Rotate the release signing key and re-sign 0.2.1's binaries", status: "pending", subagent: "fan-sign" },
+      ],
+    },
+  ],
 ]);
 
 function stackOf(agent: string): Kept {

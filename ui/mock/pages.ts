@@ -759,6 +759,30 @@ const PLANS = [
     phase: "planning",
     research: "rs_quic",
   },
+  // Replication lead's "Replicated log" (goals.ts): steps 2, 3 and 4 wait only for 1, so they go side
+  // by side, each on a subagent of its own; 5 waits for all three.
+  {
+    id: "pl_fan",
+    title: "Replicated log",
+    body: "Goal: Replicate the metadata store's log over QUIC: elect, catch up, snapshot",
+    items: [
+      { title: "The log's schema", description: "", examples: "", acceptance: [], testing: [], basis: [] },
+      { title: "Leader election over QUIC", description: "", examples: "", acceptance: [], testing: [], needs: [1], basis: [] },
+      { title: "Follower catch-up", description: "", examples: "", acceptance: [], testing: [], needs: [1], basis: [] },
+      { title: "Snapshot transfer", description: "", examples: "", acceptance: [], testing: [], needs: [1], basis: [] },
+      { title: "Land it, with docs", description: "", examples: "", acceptance: [], testing: [], needs: [2, 3, 4], basis: [] },
+    ],
+    tags: ["from a goal"],
+    source: { session: "fan-lead", agent: "Replication lead", goal: { agent: "fan-lead", id: "g-fan", text: "Replicate the metadata store's log over QUIC: elect, catch up, snapshot" } },
+    share: null,
+    version: 1,
+    created_at: T0 - 2 * 3600,
+    updated_at: T0 - 3600,
+    steps: ["The log's schema", "Leader election over QUIC", "Follower catch-up", "Snapshot transfer", "Land it, with docs"],
+    runs: 1,
+    phase: "ready",
+    research: null,
+  },
   // Release prep's goals being planned now, each by a subagent of its own (agents.ts): a subagent at
   // "The planner", one asked for "Store and transfer", one that stopped before "Optimize" was ready.
   ...(
