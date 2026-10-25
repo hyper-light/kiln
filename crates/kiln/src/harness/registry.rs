@@ -949,7 +949,7 @@ impl Registry {
             // What the server's own terminals and agents ask of kiln (`kiln spawn --on`, `kiln
             // agents wait`) is answered here.
             let forward = Some(crate::harness::ops::forward(Arc::clone(&hub)));
-            match super::socket::serve_with(&hub.harness.local, super::socket::path("server", &hub.harness.dir), forward) {
+            match super::socket::serve_with(&hub.harness.local, super::socket::path("server", &hub.harness.dir), forward, false) {
                 Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
                 Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
             }
