@@ -7684,7 +7684,8 @@ plan:
 The two one-file runs differ by 1.3 % in total wall time. Running the tests, not building them, dominates: even
 with nothing rebuilt, the docs-only run spent over 40 minutes in `cargo test`, which is what leg and test-result reuse
 (R06, R10) remove. The test step exited 101 in every scenario: tests were already failing at that commit (among them
-`-p kiln --test ops`), so these are wall times, not a green gate.
+`-p kiln --test ops`), so these are wall times, not a green gate. They were taken while fedora was shared (load about 29 at the start, other
+capped jobs alongside); a re-run in a quiet slot from Kiln Distro, fedora's queue, will replace them.
 
 **The `.kiln/` workflows on the engine (M0, step 4).** Each `.kiln/*.yaml` at 0886756c, checked
 (`/api/ci/validate`) and planned for a push to `main` (`/api/ci/plan-preview`) on a test server
