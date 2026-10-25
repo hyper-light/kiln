@@ -1,6 +1,6 @@
-/* How your agents stand (stands.tsx): a spectral rule under Mission control's head, a length for
-   each way they stand, and under it the counts. Motion is transform and opacity only, so the GPU
-   runs it and nothing is painted again; only what goes on moves. */
+/* How your agents stand (stands.tsx): under Mission control's head, a rule with a stretch for each
+   way they stand (stands-wave.ts draws it, one wave across them all), and under it each one's badge
+   and count. What CSS moves here is transform and opacity only: the badges and the counts' digits. */
 
 .st {
   min-height: 26px;
@@ -20,82 +20,40 @@
   }
 }
 .st [data-stand] {
-  --st-c: #7e818a;
   --st-t: #a1a4ad;
 }
 .st [data-stand="needs"] {
-  --st-c: #d8bb95;
   --st-t: #e2cfae;
 }
 .st [data-stand="crashed"] {
-  --st-c: #d1aaad;
   --st-t: #e2b9bd;
 }
 .st [data-stand="paused"] {
-  --st-c: #a6b2c6;
   --st-t: #b8c2d3;
 }
 .st [data-stand="working"] {
-  --st-c: #bab0e3;
   --st-t: #cdc6ea;
 }
 .st [data-stand="finished"] {
-  --st-c: #a8c9bc;
   --st-t: #bfdccf;
 }
 .st [data-stand="ready"] {
-  --st-c: #6f8f84;
   --st-t: #a1a4ad;
 }
 .st [data-stand="offline"] {
-  --st-c: #7e818a;
   --st-t: #8b8e96;
 }
 
-/* The rule: one length for each way they stand, as long as its share of your agents. */
+/* The rule: drawn into this box; its ends and beads may reach a little past it. */
 .st-rule {
-  display: flex;
-  width: 100%;
-  height: 3px;
-  margin-bottom: 12px;
-  gap: 3px;
-}
-.st-rule > i {
-  position: relative;
   display: block;
-  min-width: 4px;
-  height: 100%;
-  overflow: hidden;
-  border-radius: 2px;
-  background: var(--st-c);
-}
-/* Working: the prism as a current flowing along it (a strip twice the prism long, slid one prism on). */
-.st-rule > i[data-stand="working"] {
-  background: none;
-}
-.st-rule > i[data-stand="working"]::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: 300%;
-  background: linear-gradient(90deg, #b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa, #d8cbb0, #b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa, #d8cbb0, #b8d9d2);
-  animation: st-flow 5s linear infinite;
-}
-/* Needs you: it brightens and dims. Paused and offline: broken into dashes, still. */
-.st-rule > i[data-stand="needs"] {
-  animation: st-hold 1.6s ease-in-out infinite alternate;
-}
-.st-rule > i[data-stand="paused"],
-.st-rule > i[data-stand="offline"] {
-  background: repeating-linear-gradient(90deg, var(--st-c) 0 6px, transparent 6px 9px);
-}
-.st-rule > i[data-stand="offline"] {
-  opacity: 0.6;
+  width: 100%;
+  height: 12px;
+  margin-bottom: 9px;
+  overflow: visible;
 }
 
-/* Under it, each one's count after a tick of its length, and on a desktop its name. */
+/* Under it, each one's badge and count, and on a desktop its name. */
 .st-row {
   display: flex;
   flex-wrap: wrap;
@@ -108,31 +66,78 @@
 .st-item {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   color: var(--st-t);
 }
-.st-tick {
+
+/* The badges: what each state is. Working's arc turns, needs you's bubble brightens and dims,
+   ready's light breathes. */
+.st-mark {
   display: block;
   flex: none;
-  width: 10px;
-  height: 3px;
-  border-radius: 2px;
-  background: var(--st-c);
+  width: 14px;
+  height: 14px;
+  overflow: visible;
 }
-.st [data-stand="working"] > .st-tick {
-  background: var(--prism);
+.st-turning {
+  animation: st-turn 1.4s linear infinite;
 }
-.st [data-stand="paused"] > .st-tick,
-.st [data-stand="offline"] > .st-tick {
-  background: repeating-linear-gradient(90deg, var(--st-c) 0 4px, transparent 4px 6px);
+.st-calling {
+  animation: st-call 0.8s ease-in-out infinite alternate;
 }
+.st-breathing {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: st-breathe 1.3s ease-in-out infinite alternate;
+}
+
+/* A count: a cell a digit wide (--st-dw, the widest digit, measured) for each place, two at least,
+   so 9 going to 10 moves nothing beside it. A place whose digit changes rolls: up as the count
+   rises, down as it falls. */
 .st-n {
-  font-size: 15px;
+  display: inline-flex;
+  flex: none;
+  height: 14px;
+  overflow: hidden;
+  font-size: 12px;
   font-weight: 450;
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.01em;
-  line-height: 1;
+  letter-spacing: 0;
+  line-height: 14px;
 }
+.st-d {
+  position: relative;
+  display: block;
+  flex: none;
+  width: var(--st-dw, 0.56em);
+  height: 14px;
+}
+.st-d > b {
+  position: absolute;
+  inset: 0;
+  font-weight: inherit;
+  text-align: center;
+}
+.st-in.st-up {
+  animation: st-in-up 0.45s var(--ease) both;
+}
+.st-out.st-up {
+  animation: st-out-up 0.45s var(--ease) both;
+}
+.st-in.st-down {
+  animation: st-in-down 0.45s var(--ease) both;
+}
+.st-out.st-down {
+  animation: st-out-down 0.45s var(--ease) both;
+}
+.st-probe {
+  position: absolute;
+  display: inline-block;
+  height: auto;
+  overflow: visible;
+  visibility: hidden;
+}
+
 .st-quiet,
 .st-word {
   color: #97999f;
@@ -147,17 +152,49 @@
   }
 }
 
-@keyframes st-flow {
+@keyframes st-turn {
   to {
-    transform: translateX(-50%);
+    transform: rotate(360deg);
   }
 }
-@keyframes st-hold {
+@keyframes st-call {
   from {
-    opacity: 0.45;
+    opacity: 0.72;
   }
   to {
     opacity: 1;
+  }
+}
+@keyframes st-breathe {
+  from {
+    transform: scale(0.86);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+@keyframes st-in-up {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+}
+@keyframes st-out-up {
+  to {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+}
+@keyframes st-in-down {
+  from {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+}
+@keyframes st-out-down {
+  to {
+    transform: translateY(100%);
+    opacity: 0;
   }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -166,4 +203,14 @@
   .st *::after {
     animation: none !important;
   }
+  .st-out {
+    display: none;
+  }
+}
+/* Motion paused: a changed count shows its new digit at once. */
+html[data-motion="paused"] .st-out {
+  display: none;
+}
+html[data-motion="paused"] .st-in {
+  animation: none;
 }
