@@ -4826,6 +4826,29 @@ enum Live {
     Quiet,
 }
 
+/// A viewer's place among its session's viewers, given back as the viewer goes: the last of a
+/// running session's viewers lets its feed's topic go then (`Registry::viewer_left`), not at the
+/// session's next change, so a session left idle once its page closed holds none of the bus.
+struct Watching {
+    viewer: Option<crate::harness::live::Viewer>,
+    hub: Arc<Hub>,
+    id: String,
+}
+
+impl Watching {
+    /// The feed's refusals so far, as the viewer reads them.
+    fn refusals(&self) -> u64 {
+        self.viewer.as_ref().map_or(0, crate::harness::live::Viewer::refusals)
+    }
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        drop(self.viewer.take());
+        self.hub.harness.viewer_left(&self.id);
+    }
+}
+
 /// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
 /// viewer sends commands (JSON tagged `type`). `{"t": "synced"}` follows each snapshot sent here
 /// (on attach, and again after falling behind): the history resent since its `open` is complete,
@@ -4844,9 +4867,9 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
         tx.send(ws::text(json!({"t": "closed"}).to_string())).await?;
         return Ok(());
     };
+    // Its place among the session's viewers, given back as it goes, mid-snapshot too.
+    let viewer = Watching { viewer: Some(att.viewer), hub: Arc::clone(&hub), id: id.clone() };
     send_snapshot(&mut tx, att.frames, takes.packed).await?;
-    // Its place among the session's viewers, given back as it goes.
-    let viewer = att.viewer;
     let topic = att.topic;
     let mut at = att.at;
     // The feed's refusals as of the snapshot it has.

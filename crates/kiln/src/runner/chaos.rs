@@ -23,6 +23,9 @@
 //! - `fanout=<frames>`: the server's: each session's live feed keeps that many frames for its
 //!   viewers (`crate::harness::live`), so one that stops reading falls behind sooner (and is caught
 //!   up in-band).
+//! - `starve=<path>`: the server's: while `path` exists, the bus refuses every frame a session's
+//!   live feed publishes, its resync marker too, as a bus with no room would; a viewer learns of
+//!   it only by its feed's refusals (CP-T2.1's T4, its marker refused).
 //!
 //! A leg's faults (`oom`, `disk`, `corrupt`) hit its first attempt only, so a retry shows how it
 //! recovers; `drop` and `delay` are the connection's.
@@ -51,6 +54,7 @@ pub struct Chaos {
     pub rebuild_after: Option<Duration>,
     pub shed: Option<crate::net::Shed>,
     pub fanout: Option<usize>,
+    pub starve: Option<std::path::PathBuf>,
 }
 
 /// `300ms`, `2s`, `1m`.
@@ -97,7 +101,11 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "rebuild" => c.rebuild_after = Some(d()?),
             "shed" => c.shed = Some(shed(v).ok_or_else(|| anyhow::anyhow!("chaos `shed` takes <lane>[/<variant>]:<every> (term/46:7), not `{v}`"))?),
             "fanout" => c.fanout = Some(v.parse().ok().filter(|n: &usize| *n > 0).ok_or_else(|| anyhow::anyhow!("chaos `fanout` takes a number of frames, not `{v}`"))?),
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, platform, rebuild, shed or fanout"),
+            "starve" => {
+                anyhow::ensure!(!v.is_empty(), "chaos `starve` takes a file's path");
+                c.starve = Some(std::path::PathBuf::from(v));
+            }
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, platform, rebuild, shed, fanout or starve"),
         }
     }
     Ok(c)
@@ -306,7 +314,8 @@ mod tests {
                 platform: None,
                 rebuild_after: None,
                 shed: None,
-                fanout: None
+                fanout: None,
+                starve: None
             }
         );
         assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
@@ -322,6 +331,8 @@ mod tests {
         assert!(parse("shed=term:0").is_err() && parse("shed=nowhere:3").is_err() && parse("shed=term/x:3").is_err());
         assert_eq!(parse("fanout=32")?.fanout, Some(32));
         assert!(parse("fanout=0").is_err());
+        assert_eq!(parse("starve=/tmp/full")?.starve, Some(std::path::PathBuf::from("/tmp/full")));
+        assert!(parse("starve=").is_err());
         Ok(())
     }
 }

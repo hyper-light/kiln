@@ -114,6 +114,18 @@ impl Mirror {
         self.feed.publish(&frame.stamped(self.rev));
     }
 
+    /// The state changed here, not on its machine (a name given, the machine gone): a revision of
+    /// its own, past what its viewers have (at the copy's, a viewer would take the frame as one its
+    /// catch-up held and skip it), and the state's frame to them; none watching, the feed lets its
+    /// topic go.
+    fn send_state(&mut self) {
+        self.rev = self.rev.saturating_add(1);
+        match self.state_frame() {
+            Some(frame) => self.send(frame),
+            None => self.feed.unwatched(),
+        }
+    }
+
     /// The state as a frame for its viewers, with what changed in it since the last one.
     fn state_frame(&mut self) -> Option<Frame> {
         if self.feed.viewers() == 0 {
@@ -788,9 +800,7 @@ impl Registry {
             m.info.name = if name.is_empty() { m.info.kind_name.clone() } else { name };
             if let Some(o) = m.state.as_object_mut() {
                 o.insert("name".into(), json!(m.info.name));
-                if let Some(frame) = m.state_frame() {
-                    m.send(frame);
-                }
+                m.send_state();
             }
             m.info.clone()
         };
@@ -1234,11 +1244,22 @@ impl Registry {
                 }
                 Update::Open { since: Some(_), .. } => None,
                 Update::State { .. } => m.state_frame(),
+                // The session's last frame goes as every close does, the bare marker its viewers'
+                // loop ends at: stamped, it would read as one more frame and keep them waiting.
+                Update::Closed => {
+                    if m.feed.viewers() > 0 {
+                        m.feed.publish(&Frame::of(super::live::CLOSED.to_owned()));
+                    }
+                    None
+                }
                 _ if m.feed.viewers() > 0 => serde_json::to_string(&u).ok().map(Frame::of),
                 _ => None,
             };
-            if let Some(frame) = frame {
-                m.send(frame);
+            match frame {
+                Some(frame) => m.send(frame),
+                // Nobody watches: what the feed's topic kept goes with it (`Feed::unwatched`).
+                None if m.feed.viewers() == 0 => m.feed.unwatched(),
+                None => {}
             }
             if gone {
                 g.remove(id);
@@ -1417,9 +1438,7 @@ impl Registry {
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
-                if let Some(frame) = m.state_frame() {
-                    m.send(frame);
-                }
+                m.send_state();
                 infos.push(m.info.clone());
             }
         }
@@ -1441,9 +1460,7 @@ impl Registry {
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
-                if let Some(frame) = m.state_frame() {
-                    m.send(frame);
-                }
+                m.send_state();
                 infos.push(m.info.clone());
             }
         }
@@ -1494,6 +1511,14 @@ impl Registry {
         let (parts, at, refusals) = self.mirrors.lock().get_mut(id).map(|m| (m.parts_since(rev).unwrap_or_else(|| m.parts()), m.feed.position(), m.feed.refusals()))?;
         let now = parts.rev;
         Some((parts.frames(files), at, refusals, now))
+    }
+
+    /// A viewer of session `id` went: the last of them lets its feed's topic go (`Feed::unwatched`),
+    /// under the mirrors' lock as every publish is, so a viewer attaching meanwhile keeps it.
+    pub fn viewer_left(&self, id: &str) {
+        if let Some(m) = self.mirrors.lock().get_mut(id) {
+            m.feed.unwatched();
+        }
     }
 
     /// Files a finished message mentioned, kept now (`super::kept`): its viewers hear of them.
@@ -2196,6 +2221,110 @@ mod tests {
             hub.harness.ingest(&hub, &there, "opened", Update::Open { info: Box::new(info("opened")), since: None });
             hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default());
             anyhow::ensure!(hub.harness.mirrors.lock().is_empty());
+            Ok(())
+        })
+    }
+
+    /// What a viewer whose revision is `have` takes of its session's feed since `at`, as the
+    /// viewers' loop does (api.rs): a frame at or below what it has is one its catch-up held.
+    fn taken(hub: &Hub, topic: &str, at: &mut u64, have: &mut u64) -> Vec<String> {
+        use kiln_seams::Bus as _;
+        let Ok(read) = futures::executor::block_on(hub.bus.read(topic, *at, 1000)) else { return Vec::new() };
+        *at = read.next;
+        let mut took = Vec::new();
+        for frame in read.messages.iter().filter_map(|m| super::super::live::decode(&m.payload)) {
+            if frame.rev != 0 && frame.rev <= *have {
+                continue;
+            }
+            *have = (*have).max(frame.rev);
+            took.push(frame.text.to_string());
+        }
+        took
+    }
+
+    /// What changes here, not on its machine (a name given, the machine gone, the runner process
+    /// that held it gone), reaches a viewer that has everything: each goes out at a revision of
+    /// its own, past the viewer's (CP-T2.1's adversarial check: at the copy's revision, every
+    /// viewer up to date skipped them as held).
+    #[test]
+    fn what_changes_here_reaches_a_viewer_that_has_everything() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let info = Info { id: "s".into(), kind: "claude".into(), ..Info::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None });
+            // A session states itself as it opens: what a name given here goes into.
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::default() });
+            let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let (_watching, topic, mut at, mut have) = (att.viewer, att.topic, att.at.unwrap_or_default(), att.rev);
+            let state = |took: &[String]| {
+                took.iter().rev().filter_map(|t| serde_json::from_str::<Value>(t).ok()).find(|v| v.get("t").and_then(Value::as_str) == Some("state"))
+            };
+            let field = |v: &Value, k: &str| v.get("state").and_then(|s| s.get(k)).and_then(Value::as_str).map(str::to_owned);
+            hub.harness.rename(&hub, "s", Some(&json!("Mantle")));
+            let took = taken(&hub, &topic, &mut at, &mut have);
+            anyhow::ensure!(state(&took).is_some_and(|v| field(&v, "name").as_deref() == Some("Mantle")), "the name given: {took:?}");
+            hub.harness.machine_lost(&hub, "box");
+            let took = taken(&hub, &topic, &mut at, &mut have);
+            anyhow::ensure!(state(&took).is_some_and(|v| field(&v, "status").as_deref() == Some("disconnected")), "its machine gone: {took:?}");
+            hub.harness.sessions_lost(&hub, &["s".to_owned()]);
+            let took = taken(&hub, &topic, &mut at, &mut have);
+            anyhow::ensure!(state(&took).is_some(), "its runner process gone: {took:?}");
+            Ok(())
+        })
+    }
+
+    /// A session its machine ends ends its viewers: the feed's last frame is the bare closed
+    /// marker their loop ends at, as when this server ends it (CP-T2.1's adversarial check:
+    /// stamped with a revision, it read as one more frame and its viewers waited on).
+    #[test]
+    fn a_session_its_machine_ends_sends_its_viewers_the_closed_marker() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let info = Info { id: "s".into(), kind: "claude".into(), ..Info::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None });
+            let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let (_watching, topic, mut at) = (att.viewer, att.topic, att.at.unwrap_or_default());
+            hub.harness.ingest(&hub, &there, "s", Update::Closed);
+            let said = sent(&hub, &topic, &mut at);
+            anyhow::ensure!(said.last().is_some_and(|t| t == super::super::live::CLOSED), "its viewer heard {said:?}");
+            anyhow::ensure!(!hub.harness.mirrors.lock().contains_key("s"), "the copy goes");
+            Ok(())
+        })
+    }
+
+    /// A running session nobody watches holds nothing on the bus: its last viewer going lets its
+    /// topic go, and so does its next change if a viewer went without saying so; a viewer after
+    /// starts from a snapshot on the topic made again (CP-T2.1's adversarial check: the copy builds
+    /// no frame with no viewer, so the feed's publish never came to let it go).
+    #[test]
+    fn a_running_session_nobody_watches_lets_its_topic_go() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        use kiln_seams::Bus as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let info = Info { id: "s".into(), kind: "claude".into(), ..Info::default() };
+            let said = |n: u64| Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None });
+            let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let topic = att.topic.clone();
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(1)] });
+            anyhow::ensure!(futures::executor::block_on(hub.bus.bounds(&topic)).is_ok_and(|(first, end)| end > first), "watched, it keeps the frame");
+            let gone = |topic: &str| matches!(futures::executor::block_on(hub.bus.bounds(topic)), Err(kiln_seams::bus::Refusal::NoTopic(_)));
+            // Its last viewer goes, as the viewers' socket does (api.rs's `Watching`): the topic with it.
+            drop(att);
+            hub.harness.viewer_left("s");
+            anyhow::ensure!(gone(&topic), "its last viewer gone, its topic goes at once");
+            // A viewer that went without saying so: the session's next change lets the topic go.
+            let again = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            anyhow::ensure!(again.at.is_some() && !gone(&again.topic), "the next viewer's topic is made again");
+            drop(again);
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(2)] });
+            anyhow::ensure!(gone(&topic), "nobody watching, its next change lets its topic go");
+            let last = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            anyhow::ensure!(ids(&last.frames) == ["m1", "m2"], "from a snapshot: {:?}", ids(&last.frames));
             Ok(())
         })
     }

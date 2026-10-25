@@ -17,7 +17,8 @@
 //! them both. And the frames went over the bus: its counters say so.
 //!
 //! A third lab fills a small bus with one session's feed, so another's frames and its resync marker
-//! are refused, and holds every viewer of that feed to starting over within 5 s.
+//! are refused, and holds every viewer of that feed to starting over within 5 s; a fourth, in a test
+//! build (`--features chaos`), starves the bus so the marker is refused for certain.
 
 #![cfg(unix)]
 
@@ -183,6 +184,8 @@ struct Shown {
     events: Vec<(String, Value)>,
     synced: bool,
     closed: bool,
+    /// The server closed the socket: what a viewer's loop does at the session's last frame.
+    ended: bool,
     frames: usize,
     /// Frames after its first snapshot: what came live.
     live: usize,
@@ -280,7 +283,10 @@ impl Viewer {
             while !s.load(std::sync::atomic::Ordering::Acquire) {
                 match socket.next(Instant::now() + Duration::from_millis(500)) {
                     Ok(Some(frame)) => sh.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.apply(&frame)?,
-                    Ok(None) => return Ok(()),
+                    Ok(None) => {
+                        sh.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.ended = true;
+                        return Ok(());
+                    }
                     Err(e) if e.to_string().contains("in time") => {}
                     Err(e) => return Err(e),
                 }
@@ -487,7 +493,13 @@ fn lab(runner: Option<&str>) -> anyhow::Result<()> {
     // The session ends: both viewers are told.
     let (st, body) = common::http(port, "DELETE", &format!("/api/harness/sessions/{id}"), &admin, None)?;
     anyhow::ensure!((200..300).contains(&st), "closing the session: {st} {body}");
-    wait_for("both viewers told the session ended", Duration::from_secs(60), || Ok(whole.shown()?.closed && patched.shown()?.closed))?;
+    // Each told, and let go: the server ends its socket at the session's last frame (CP-T2.1's
+    // adversarial check: a closed frame stamped with a revision was sent on as one more, and its
+    // viewers waited on).
+    wait_for("both viewers told the session ended, their sockets closed", Duration::from_secs(60), || {
+        let (w, p) = (whole.shown()?, patched.shown()?);
+        Ok(w.closed && w.ended && p.closed && p.ended)
+    })?;
     whole.end()?;
     patched.end()?;
     Ok(())
@@ -573,5 +585,54 @@ fn a_full_bus_refusing_a_feed_sends_every_viewer_of_it_back_within_5_s() -> anyh
         v.end()?;
     }
     keeper.end()?;
+    Ok(())
+}
+
+/// T4 with the marker refused, end to end (CP-T2.1's adversarial check: the full bus above leaves
+/// to chance whether its resync marker finds room). A test build's starved bus (chaos `starve`)
+/// refuses every frame a feed publishes, its resync marker too, so nothing on the feed tells its
+/// viewers: each must learn it from the feed's refusals, at its socket's quiet wake (api.rs's
+/// FEEDLESS, 4 s), and start over within 5 s of the first refusal; none waits on silently.
+/// `cargo test -p kiln --features chaos --test live_feed_labs starved`
+#[cfg(feature = "chaos")]
+#[test]
+fn a_starved_bus_refusing_a_feed_and_its_marker_sends_every_viewer_back_within_5_s() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    let starve = dir.path().join("starve");
+    let spec = format!("starve={}", starve.display());
+    let s = common::start_env(dir.path(), &Options { extra: "[terminal]\nenabled = true\n", ..Options::default() }, false, &[("KILN_CHAOS", &spec)])?;
+    let (port, admin) = (s.port, s.admin.clone());
+    let program = stand_in_as(dir.path(), "starved", "starved.go", 3, 256)?;
+    let id = session(port, &admin, "local", &work, &program, "starved")?;
+    let viewers = [Viewer::watch(port, &id, &admin, false)?, Viewer::watch(port, &id, &admin, true)?];
+    wait_for("the viewers sent their snapshots", Duration::from_secs(30), || {
+        for v in &viewers {
+            if !v.shown()?.synced {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })?;
+    let catchups = viewers.iter().map(|v| v.shown().map(|s| s.catchups)).collect::<anyhow::Result<Vec<_>>>()?;
+    let refused = total(port, &admin, "kiln_bus_refused_total")?;
+    // The bus starves, then the session speaks: its frames refused, and every resync marker after them.
+    std::fs::write(&starve, b"")?;
+    std::fs::write(dir.path().join("starved.go"), b"")?;
+    wait_for("the feed's frames refused", Duration::from_secs(60), || Ok(total(port, &admin, "kiln_bus_refused_total")? > refused))?;
+    wait_for("every viewer starting over with nothing on its feed to say so", Duration::from_secs(5), || {
+        for (v, before) in viewers.iter().zip(&catchups) {
+            if v.shown()?.catchups <= *before {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })
+    .map_err(|e| anyhow::anyhow!("{e:#}\nthe viewers' catch-ups: {:?}, before: {catchups:?}\nthe server's log:\n{}", viewers.iter().map(|v| v.shown().map(|s| s.catchups).unwrap_or(0)).collect::<Vec<_>>(), s.log()))?;
+    std::fs::remove_file(&starve)?;
+    for v in viewers {
+        v.end()?;
+    }
     Ok(())
 }

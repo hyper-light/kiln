@@ -6,7 +6,27 @@ open: the metric names Kiln Metrics hasn't answered and the decisions that are A
 
 **Where it stands (2026-10-24):**
 - **Landed** on kiln's main at 545e9967 (2026-10-24 08:20 PDT, a fast-forward from cc1de07a), on
-  Ada's word, Kiln Distro holding main for the train. Not deployed yet: production ran 8adeadba then.
+  Ada's word, Kiln Distro holding main for the train. It was pushed from this branch's clone, not by
+  the train, and its full gate (below) ran on 359c8949 with main merged, not on the landed tree. It
+  is in production since main's 7111c61c went out (23:48Z), by Devin's account of the day's
+  redeploys, not checked here.
+- **The adversarial check** (step 6: a fresh read-only verifier, then its recheck). Every CP-T2.1
+  verdict in Quiver's records held, recomputed from the raw runs; their wording took fixes (one short
+  run of Quiver's said, the soak's end load, the floor's cells, the p99.9 margins against the least
+  competitor, each grid judged round by round). In the live feed it found three bugs, each fixed
+  with a test on `cp/t2-feed-fixes` that fails on main's code and passes on the branch:
+  - what changes on the server (a name given, the machine gone, a runner process gone) went out at
+    the copy's revision, which every up-to-date viewer skips: main's own since the viewer resume's
+    revisions (07d06775), carried through this branch's merge;
+  - a session its machine ended sent its viewers a stamped `closed`, which they didn't end at: this
+    branch's merge, which stamped every frame a mirror sends;
+  - a running session nobody watches kept its topic: this branch's own from before the merge
+    (dbaef21b), review fix 2, which never fired. A viewer's leaving now lets the topic go at once.
+  **Until the branch lands and deploys, main and production carry all three.** A lab in a chaos build
+  (`starve`) drives T4 with the resync marker refused for certain; no gate builds with the chaos
+  feature, so it runs by hand (`cargo test -p kiln --features chaos --test live_feed_labs starved`),
+  as the resume lab does. The fix branch goes through kiln's full gate on its own tree, and through
+  the train.
 - **Gated** on fedora, on Ada's go: cp/t2-quiver at 359c8949, main 264d8cc6 merged: clippy for
   Linux, macOS and Windows, every target, `-D warnings`, clean; the workspace's tests, 2,219 passed
   and 1 failed, `w20_ac05_the_ci_skills_programs`, main's own runner-channel race ("AssignV2 ...
@@ -52,12 +72,20 @@ open: the metric names Kiln Metrics hasn't answered and the decisions that are A
     systems interleaved load by load: 180 runs at a load average of 21 to 143, so no record of
     any bar. Under that load Quiver led the best competitor tenfold in 8 of 12 loads.
   - The hour's soak lost no frame, twice, on adacachy beside production: at Quiver 08d3dc9 (load
-    36 to 62) and at 88409dd, the commit kiln vendors (load 39 to 58): each 360,529,149 published,
+    36 to 62) and at 88409dd, the commit kiln vendors (load 39 to 61): each 360,529,149 published,
     359,979,959,000 deliveries measured, none lost, doubled or undelivered, all 1,000 subscribers
     kept up, no lag notice (AC-T2.1.4). At 88409dd the subscribers' threads allocated nothing in
     the hour, and a publish 2.010 times.
-  - AC-T2.1.2 and AC-T2.1.3's records (p99 at most 300 µs at 100,000 messages a second to 1,000
-    subscribers) and the comparison's want a quiet machine: asked of the coordinator.
+  - On a quiet fedora (Quiver's `bench/records/2026-10-24-fedora-quiet/`): AC-T2.1.2 and AC-T2.1.3
+    met, a p99 of 133.1 µs polling and 122.9 µs waiting at 100,000 messages a second to 1,000
+    subscribers in the runs begun under a load of 2 (the bar 300 µs); and the comparison's two
+    interleaved grids, the second with the floor over TCP on Ada's drain of fedora's runner: where
+    subscribers poll Quiver's p99 and p99.9 are at most a tenth of the best competitor's at every
+    load, over every run in both grids and in every round of the second (Q-1.1). One cell, polling
+    at 100,000 a second to 1,000, has no clean run in either grid: Build Caching's W24 builds
+    overlapped the second grid's last hour, by its word. By Ada's rule it reruns alone in a quiet
+    slot, though its verdict isn't in doubt in any run: no broker delivered every message, and the
+    floor over TCP did.
 - **Quiver** is at 88409dd, hyper-light/quiver's main, its gate passed in kiln CI (run 16 on the
   branch, run 17 on Quiver's main: fmt,
   clippy on Linux, macOS and Windows, the production check, the tests, the vendor check). Since
@@ -186,20 +214,19 @@ A rename Kiln Metrics asks for is one change: crates/kiln/src/metrics.rs, docs/b
 - **Still to do (§6):** drill the rollback in the lab with the real binaries: the older release on
   a store this one wrote, then this release again.
 
-## Ada's open decisions
+## Ada's decisions
 
-- **The comparison's bar.** Ada asked for an order of magnitude over Kafka, Redis and NATS. Smoke
-  runs (no record) show it where subscribers poll and at 100 or more subscribers, where every
-  competitor falls behind. With one subscriber whose thread sleeps when idle, the lead is
-  bounded by the kernel's wake-up from a CPU's idle state, up to 127 µs on fedora. Quiver pays that
-  wake once per message and a broker pays it at least twice. The quiet window's runs say where it
-  stands. Running the comparison with deep idle states disabled would take root on fedora, so it's
-  hers to decide.
+- **The comparison's bar** (decided 2026-10-24, 14:30 PDT). Ada asked for an order of magnitude over
+  Kafka, Redis and NATS. Both grids meet it where subscribers poll. With one subscriber whose thread
+  sleeps, two cells (10,000 and 100,000 messages a second) miss it at the kernel's wake-up, measured
+  alone beside them: Quiver's p99 is within a few µs of that floor, and a tenth of the best
+  competitor's is under it. Ada settled them: polling where latency matters, fedora's idle states
+  left as they are (Quiver's docs/design/topics.md).
 
 ## Open with others
 
-- **The coordinator:** the bench window (about 2.3 hours of fedora with nothing beside it).
-- **The wire owner:** its read of the merge's resync choice (a marker each viewer pulls the copy
-  whole on, not the copy pushed on the feed), and the runner-channel race above.
+- **The wire owner:** agreed the merge's resync choice (a marker each viewer pulls the copy whole
+  on), and is fixing the runner-channel race above (w20_ac05) on its side, by its word (2026-10-24).
+  It asked to read the next merge of main before its gate: this fix branch is that.
 - **Mantle's agent:** re-vendors Mantle at hyper-raft 25cf889 after its current change. kiln's
   T10 agent takes it from there (CP-T10.2), against this branch's copy.

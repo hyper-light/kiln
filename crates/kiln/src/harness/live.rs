@@ -167,6 +167,12 @@ impl Drop for Viewer {
     }
 }
 
+/// A test build's starved bus (`crate::runner::chaos`, `starve=`): while its file is there, the bus
+/// refuses what a feed publishes, the resync marker too, as a bus with no room would.
+fn starved() -> bool {
+    crate::runner::chaos::get().and_then(|c| c.starve.as_deref()).is_some_and(std::path::Path::exists)
+}
+
 /// The bus answers a feed at once: Quiver's ephemeral class never waits, nor does the simulator.
 /// An answer that would wait is a refusal here (counted, and the viewers resynced), never a frame
 /// dropped silently.
@@ -237,20 +243,30 @@ impl Feed {
         at_once(self.shared.bus.bounds(&self.shared.topic)).ok().map(|(_, end)| end)
     }
 
-    /// Publishes `frame` to the feed's viewers: none watching, nothing goes, and what the topic
-    /// kept goes too (the next viewer starts from a snapshot, on the topic made again), so a
-    /// session nobody watches holds none of the bus's memory.
+    /// None watching: what the topic kept goes (the next viewer starts from a snapshot, on the
+    /// topic made again), so a session nobody watches holds none of the bus's memory. The copy
+    /// calls it as it changes with no viewer, under the mirrors' lock as every publish is: it
+    /// builds no frame then, so a publish wouldn't come to say so.
+    pub fn unwatched(&mut self) {
+        if self.viewers() == 0 && self.made {
+            self.made = false;
+            self.broken = false;
+            self.shared.delete();
+        }
+    }
+
+    /// Publishes `frame` to the feed's viewers: none watching, nothing goes, and the topic with
+    /// what it kept goes too ([`Feed::unwatched`]).
     pub fn publish(&mut self, frame: &Frame) -> Published {
         if self.viewers() == 0 {
-            if self.made {
-                self.made = false;
-                self.broken = false;
-                self.shared.delete();
-            }
+            self.unwatched();
             return Published::Unwatched;
         }
         if !self.make() {
             return Published::Refused;
+        }
+        if starved() {
+            return self.refused(&Refusal::Unavailable("a test build's starved bus (chaos `starve`)".to_owned()));
         }
         let m = crate::metrics::bus();
         if self.broken {

@@ -17,8 +17,9 @@ on any device (`crate::harness::live`):
   has a feed: a topic of its own, `sessions/<id>/<n>` (`<n>` the feed's number in this process, so a
   mirror made again never shares a topic it could delete; an id outside a topic name's alphabet is
   its SHA-256 in its place), keeping its last 2048 frames. It's made with the mirror, and let go
-  whenever nobody watches: the first frame after its last viewer leaves deletes it, and the next
-  viewer makes it again, so a session nobody watches holds none of the bus's memory.
+  whenever nobody watches: as its last viewer leaves (and at the session's next change, should a
+  viewer go without saying so), and the next viewer makes it again, so a session nobody watches
+  holds none of the bus's memory.
 - **Frames go out only while someone watches,** as before: the JSON a viewer's page reads (`open`,
   `meta`, `state`, `state_patch`, `events`, `stream`, `changes`, `files`, `closed`). A state goes
   whole and as what changed in it, and each viewer takes the form it asked for (`?patch=state`).
@@ -28,7 +29,8 @@ on any device (`crate::harness::live`):
   mirrors' lock, which every publish takes too. The lock holds only while the parts are taken (the
   events by reference); the frames are made after it's let go, so a viewer starting over never holds
   up another session's frames. Each frame on the feed carries the copy's revision, and one a
-  catch-up already held is skipped.
+  catch-up already held is skipped; what changes here rather than on the machine (a name given, the
+  machine gone) takes a revision of its own, so a viewer that has everything never skips it.
 - **A viewer that falls behind catches up, alone.** One further behind than the feed keeps is
   refused `Behind` by the bus (its typed lag notice), and it catches up from the last revision it
   was sent: only what changed since (`resumed`), or the session whole (`open`) when the copy can't
@@ -43,8 +45,9 @@ on any device (`crate::harness::live`):
   nothing to read for 4 seconds, starts over if there were more since its snapshot, so every viewer
   of a broken feed starts over within 5 seconds of the refusal. While the bus can't make a session's
   feed at all, its viewers are sent a snapshot every 4 seconds.
-- **The end.** When the session ends its last frame is `closed`, and each viewer ends with it,
-  having read whatever it hadn't yet. The topic goes with the last of them (at once if none
+- **The end.** When the session ends its last frame is `closed`, the bare marker whether its machine
+  or this server ended it, and each viewer ends with it, having read whatever it hadn't yet: the
+  server closes its socket. The topic goes with the last of them (at once if none
   watches); a viewer that finds it gone is told `closed` too.
 
 ## Settings
