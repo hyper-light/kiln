@@ -1131,6 +1131,39 @@ mod tests {
         Ok(())
     }
 
+    /// W24-R18: what the runner tells the server it holds warm: each lane a lease made, with its
+    /// slots and the history its trusted legs left there, warm and cold. A run of a lane no lease
+    /// made leaves nothing, and every change moves [`changes`].
+    #[test]
+    fn w24_r18_what_the_runner_says_it_holds_warm() -> anyhow::Result<()> {
+        let d = tempfile::tempdir()?;
+        let src = d.path().join("src");
+        std::fs::create_dir_all(&src)?;
+        let (one, _) = source(&src)?;
+        let work = d.path().join("work");
+        assert!(state(&work).lanes.is_empty(), "nothing yet");
+        let before = changes();
+        let first = warm(lease_with(&work, &ask(&one, true), Clones::No, &ROOMY))?;
+        assert!(!first.warm, "a new, empty slot: the leg starts cold");
+        check_out(&first.dir.join("app"), &one, &[], Some(&src))?;
+        let lane = first.lane.clone();
+        release(&work, first);
+        ran(&lane, false, 90_000);
+        ran(&lane, true, 20_000);
+        ran(&d.path().join("no-lane"), true, 1);
+        assert!(changes() >= before + 4, "a lease, a release and two runs");
+        let s = state(&work);
+        let [l] = s.lanes.as_slice() else { anyhow::bail!("one lane: {s:?}") };
+        assert_eq!((l.key.clone(), l.lane.clone()), (slots::lane(&ask(&one, true).lane).hex(), ask(&one, true).lane));
+        assert!(matches!(l.slots.as_slice(), [x] if x.state == State::Free && x.base.as_deref() == Some(one.as_str())), "{:?}", l.slots);
+        assert_eq!((l.runs.warm_ms.clone(), l.runs.cold_ms.clone()), (vec![20_000], vec![90_000]));
+        // The lane's next leg starts from that checkout: warm.
+        let next = warm(lease_with(&work, &ask(&one, true), Clones::No, &ROOMY))?;
+        assert!(next.warm, "{}", next.said);
+        release(&work, next);
+        Ok(())
+    }
+
     #[test]
     fn w24_r11_kept_folders_are_paths_in_the_workspace() {
         let given: Vec<String> = ["target", "target/", "node_modules", "/etc", "../up", "a/../b", "**/dist", ".git", "C:/x", "", "crates/x/target"].map(str::to_owned).into();
