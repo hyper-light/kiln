@@ -4865,6 +4865,14 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
   - workflow runs as GitHub shapes them, from kiln's: `/actions/runs` (with GitHub's filters),
     `/actions/runs/{id}`, `/actions/workflows/{id}` and `/actions/workflows/{id}/runs` (by file
     name or number);
+  - a person's permission on the repository, `GET /collaborators/{username}/permission`, as
+    actions check the run's actor's before they act for it (openai/codex-action: ruff's security
+    review, corpus pass 1025a, 2026-10-25). It's GitHub's legacy base permission (`admin`,
+    `write`, `read`, `none`; maintain is write) and role, from what kiln grants the person there
+    as its git serves them: the server's owner is the repository's admin, then `settings.manage`
+    an admin, `diffs.land` a maintainer, `diffs.submit` a writer, `diffs.read` or `git.read` a
+    reader. No such person: 404 (`w14_r11_runs_and_code_scanning`,
+    `w14_r11_a_collaborators_permission_in_githubs_shape`);
   - code scanning (`crates/kiln/src/ci/rest/scanning.rs`), for W11-R10:
     - `POST /code-scanning/sarifs` (the public API) and `PUT /code-scanning/analysis` (what
       codeql-action uploads with) take SARIF 2.1.0 in base64, gzipped or not, up to 64 MiB
