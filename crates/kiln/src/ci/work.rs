@@ -929,4 +929,212 @@ mod tests {
             .await
         })
     }
+
+    /// The replay's history: runs of a five-unit pipeline (each unit's name, what it runs over, and
+    /// its script: features added, then its command).
+    const PIPELINE: [(&str, &[&str], &[&str]); 5] = [
+        ("fetch", &[], &["fetch"]),
+        ("build", &["fetch"], &["add a", "add b", "make"]),
+        ("test", &["build"], &["add x", "add y", "test"]),
+        ("lint", &["fetch"], &["lint"]),
+        ("pack", &["build", "test"], &["add a", "add z", "pack"]),
+    ];
+
+    const RUNS: usize = 80;
+
+    /// A run: its sources' and docs' trees, and each unit's script as it was written that time.
+    #[derive(Debug, Clone)]
+    struct Run {
+        src: u64,
+        docs: u64,
+        scripts: Vec<String>,
+    }
+
+    /// A deterministic stream (xorshift64*), so the replay is the same every time.
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n.max(1)
+        }
+    }
+
+    /// The history: sources recur, docs change on their own (fetching alike), and scripts are
+    /// written with their added features in either order and a no-op now and then, and once in a
+    /// while a build adds another feature.
+    fn history() -> Vec<Run> {
+        let mut rng = Seeded(0x9E37_79B9_7F4A_7C15);
+        (0..RUNS)
+            .map(|_| {
+                let (src, docs) = (rng.below(3), rng.below(3));
+                let scripts = PIPELINE
+                    .iter()
+                    .map(|(name, _, ops)| {
+                        let mut ops: Vec<String> = ops.iter().map(|op| (*op).to_owned()).collect();
+                        if rng.below(2) == 0
+                            && let [a, b, ..] = ops.as_mut_slice()
+                            && a.starts_with("add ")
+                            && b.starts_with("add ")
+                        {
+                            std::mem::swap(a, b);
+                        }
+                        if *name == "build" && rng.below(8) == 0 {
+                            ops.insert(0, "add c".into());
+                        }
+                        if rng.below(3) == 0 {
+                            let at = usize::try_from(rng.below(ops.len() as u64 + 1)).unwrap_or_default().min(ops.len());
+                            ops.insert(at, "true".into());
+                        }
+                        ops.join("\n")
+                    })
+                    .collect();
+                Run { src, docs, scripts }
+            })
+            .collect()
+    }
+
+    /// What a script does, by the replay's semantics: the features it adds, as a set, and each
+    /// other command with the features it saw. `true` does nothing; adding features commutes.
+    fn effect(script: &str) -> String {
+        let (mut features, mut steps) = (BTreeSet::new(), Vec::new());
+        for op in script.split('\n').map(str::trim).filter(|op| !op.is_empty() && *op != "true") {
+            match op.strip_prefix("add ") {
+                Some(f) => {
+                    features.insert(f);
+                }
+                None => steps.push(format!("{op} {features:?}")),
+            }
+        }
+        format!("{features:?} {steps:?}")
+    }
+
+    /// What a unit of the replay really produces: its script's effect over what it's given.
+    fn truth(name: &str, script: &str, given: &[String]) -> String {
+        format!("sha256:{}", crate::util::sha256_hex(format!("{name}|{}|{}", effect(script), given.join("|")).as_bytes()))
+    }
+
+    /// The replay's rewrite rules, each with its differential test's witness: both scripts run by
+    /// the replay's semantics, their outputs compared.
+    fn rewrites() -> Vec<(Rule, Witness)> {
+        let witness = |name: &str, cases: &[(&str, &str)]| Witness {
+            test: format!("{name}: both ways, outputs compared"),
+            cases: cases.iter().map(|(before, after)| Case { before: (*before).into(), after: (*after).into(), before_output: truth("witness", before, &[]), after_output: truth("witness", after, &[]) }).collect(),
+        };
+        vec![
+            (Rule { name: "drop-true".into(), kinds: BTreeSet::new(), rewrite: Rewrite::Drop { op: Pattern::Is("true".into()) } }, witness("drop-true", &[("make\ntrue", "make"), ("true\ntest", "test")])),
+            (
+                Rule { name: "adds-commute".into(), kinds: BTreeSet::new(), rewrite: Rewrite::Commute { a: Pattern::Starts("add ".into()), b: Pattern::Starts("add ".into()) } },
+                witness("adds-commute", &[("add a\nadd b\nmake", "add b\nadd a\nmake")]),
+            ),
+        ]
+    }
+
+    /// What a replay saw.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct Tally {
+        lookups: u64,
+        hits: u64,
+        by_class: u64,
+        verified: u64,
+        wrong: u64,
+    }
+
+    /// A unit done in a run of the replay: how the units after it name it (its outputs' digest, or
+    /// after a class-based hit its key), the digest of what they'd be given, and of what it really
+    /// produces.
+    struct Done {
+        named: String,
+        given: String,
+        truly: String,
+    }
+
+    /// Replays the history through a ledger of its own, with e-classes (the rules registered, and a
+    /// unit after a class-based hit naming it by key) or with plain keys (neither). Each unit is
+    /// looked up; a hit is taken; a class-based one is re-checked by verification, which runs it over
+    /// what its inputs really are, compares and is recorded; a miss runs over what it's given and
+    /// is recorded.
+    fn replay(history: &[Run], classes: bool) -> anyhow::Result<Tally> {
+        let (s, history) = (crate::store::Store::in_memory()?, history.to_vec());
+        crate::rt::block_on(async move {
+            s.call(move |c| {
+                let sc = scope("acme/app", "trusted");
+                if classes {
+                    for (rule, witness) in rewrites() {
+                        register(c, &sc, &rule, &witness)?;
+                    }
+                }
+                let mut t = Tally::default();
+                for (n, run) in history.iter().enumerate() {
+                    let mut done: BTreeMap<&str, Done> = BTreeMap::new();
+                    for ((name, ups, _), script) in PIPELINE.iter().zip(&run.scripts) {
+                        let over = |pick: &dyn Fn(&Done) -> String| -> Vec<(&'static str, String)> { ups.iter().map(|u| (*u, done.get(u).map(pick).unwrap_or_default())).collect() };
+                        let (named, given, truly) = (over(&|d| d.named.clone()), over(&|d| d.given.clone()), over(&|d| d.truly.clone()));
+                        let unit = |upstream: &[(&str, String)]| Unit {
+                            inputs: if *name == "fetch" { BTreeMap::from([("docs".to_owned(), format!("docs{}", run.docs)), ("src".to_owned(), format!("src{}", run.src))]) } else { BTreeMap::new() },
+                            ..step(script, upstream)
+                        };
+                        // A fetch makes what its sources hold, whatever its docs; the rest make what
+                        // their scripts do over what they're given.
+                        let runs_over = |upstream: &[(&str, String)]| -> Recorded {
+                            let inputs: Vec<String> = if *name == "fetch" { vec![format!("src{}", run.src)] } else { upstream.iter().map(|(_, d)| d.clone()).collect() };
+                            made(&truth(name, script, &inputs), &format!("r{n}"))
+                        };
+                        let real = runs_over(&truly);
+                        t.lookups += 1;
+                        let now = match lookup(c, &sc, &unit(&named), &same)? {
+                            Some(hit) => {
+                                t.hits += 1;
+                                let gave = digest(&hit.recorded);
+                                if gave != digest(&real) {
+                                    t.wrong += 1;
+                                }
+                                if hit.class.is_some() {
+                                    t.by_class += 1;
+                                    t.verified += 1;
+                                    verified(c, &sc, &hit, &digest(&real))?;
+                                    record(c, &sc, &unit(&truly), &lock(), &real)?;
+                                    Done { named: eclass::refer(&hit.key), given: gave, truly: digest(&real) }
+                                } else {
+                                    Done { named: gave.clone(), given: gave, truly: digest(&real) }
+                                }
+                            }
+                            None => {
+                                let ran = runs_over(&given);
+                                record(c, &sc, &unit(&given), &lock(), &ran)?;
+                                Done { named: digest(&ran), given: digest(&ran), truly: digest(&real) }
+                            }
+                        };
+                        done.insert(*name, now);
+                    }
+                }
+                Ok(t)
+            })
+            .await
+        })
+    }
+
+    /// W24-AC14: equivalence loses no hits. A deterministic replay of a synthetic history (80 runs
+    /// of a five-unit pipeline whose sources recur, whose docs change without changing what's
+    /// fetched, and whose scripts are written with commuting operations in either order and no-ops
+    /// put in) through the ledger with e-classes and with plain keys. With e-classes the hits are
+    /// at least as many (here more, by the rules and by what follows a class-based hit), and when
+    /// verification re-checks every class-based hit, none is wrong.
+    #[test]
+    fn w24_ac14_equivalence_loses_no_hits() -> anyhow::Result<()> {
+        let history = history();
+        let (with, plain) = (replay(&history, true)?, replay(&history, false)?);
+        println!(
+            "w24_ac14: {} lookups each; plain keys {} hits; e-classes {} hits, {} of them by class, {} verified, {} wrong",
+            with.lookups, plain.hits, with.hits, with.by_class, with.verified, with.wrong
+        );
+        anyhow::ensure!(plain.by_class == 0 && plain.wrong == 0, "plain keys find only what a unit's own key holds: {plain:?}");
+        anyhow::ensure!(with.lookups == plain.lookups && with.hits >= plain.hits, "e-classes lose no hits: {with:?} against {plain:?}");
+        anyhow::ensure!(with.by_class > 0 && with.hits > plain.hits, "and the rules add some: {with:?} against {plain:?}");
+        anyhow::ensure!(with.verified == with.by_class && with.wrong == 0, "verification re-checked every class-based hit, and none was wrong: {with:?}");
+        anyhow::ensure!(replay(&history, true)? == with, "the replay is deterministic");
+        Ok(())
+    }
 }
