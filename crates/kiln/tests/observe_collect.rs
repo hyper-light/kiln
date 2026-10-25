@@ -633,3 +633,124 @@ fn windows_event_channels_are_read_once_each_through_a_stop_a_kill_and_a_clear()
     anyhow::ensure!(repeated(&c, 1001..1006).is_empty(), "{:?}", repeated(&c, 1001..1006));
     Ok(())
 }
+
+/// What writes events to Windows's Application channel as Windows Script Host's provider (`WSH`):
+/// its `LogEvent`, which needs no administrator (a channel of the test's own would). Its arguments:
+/// the run's name, and the first and past the last event's `seq`; an error each tenth (`seq % 10 ==
+/// 3`), else information.
+#[cfg(windows)]
+const LOG_EVENTS: &str = r#"var s = WScript.CreateObject("WScript.Shell");
+var a = WScript.Arguments, from = parseInt(a(1), 10), to = parseInt(a(2), 10);
+for (var i = from; i < to; i++) s.LogEvent(i % 10 == 3 ? 1 : 4, a(0) + " seq=" + i);
+"#;
+
+/// Events `seqs` of run `run` written to the Application channel by `script` ([`LOG_EVENTS`]).
+#[cfg(windows)]
+fn log_events(script: &Path, run: &str, seqs: std::ops::Range<u64>) -> anyhow::Result<()> {
+    let out = std::process::Command::new("cscript").arg("//nologo").arg(script).args([run, &seqs.start.to_string(), &seqs.end.to_string()]).output()?;
+    anyhow::ensure!(out.status.success(), "cscript: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    Ok(())
+}
+
+/// Each of run `run`'s events' count of records stored, by its `seq` (its data's text, `<run>
+/// seq=<n>`: the Application channel keeps earlier runs' too).
+#[cfg(windows)]
+fn wsh_counts(f: &Fleet, run: &str, from: i64) -> anyhow::Result<BTreeMap<u64, u64>> {
+    let a = f.call(
+        "POST",
+        "/api/observe/v1/logs/aggregate",
+        Some(&json!({ "query": "source:windows_event @windows.provider:WSH", "from": from, "to": now_ms() + 60_000, "by": ["@windows.event_data.0"] })),
+    )?;
+    let prefix = format!("{run} seq=");
+    let mut out = BTreeMap::new();
+    for g in at(&a, &["groups"]).as_array().into_iter().flatten() {
+        let text = at(g, &["group"]).as_object().and_then(|o| o.values().next()).and_then(Value::as_str).unwrap_or_default();
+        if let Some(seq) = text.strip_prefix(&prefix).and_then(|s| s.parse().ok()) {
+            out.insert(seq, at(g, &["value"]).as_f64().unwrap_or(0.0) as u64);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(windows)]
+fn wsh_settled(f: &Fleet, run: &str, from: i64, seqs: std::ops::Range<u64>) -> anyhow::Result<BTreeMap<u64, u64>> {
+    let start = Instant::now();
+    loop {
+        let c = wsh_counts(f, run, from)?;
+        let missing: Vec<u64> = seqs.clone().filter(|s| !c.contains_key(s)).collect();
+        if missing.is_empty() {
+            return Ok(c);
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(90), "{} events of {seqs:?} never stored, the first {:?}\n{}", missing.len(), &missing[..missing.len().min(20)], f.logs());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// The Event Log read through Windows's own `wevtutil`, on Windows: events a script writes to the
+/// Application channel (Windows Script Host's, [`LOG_EVENTS`]), read by a runner's source of that
+/// channel and that provider from the channel's start: each once, its message as Windows renders
+/// it, its level its status, what its event names; then through a stop (none repeated) and a kill
+/// while events come (none lost, those in flight stored twice at the most). The channel is the
+/// machine's own (it cannot be cleared without an administrator): its other providers' events are
+/// left out by the source's query, earlier runs' told apart by their run's name.
+#[cfg(windows)]
+#[test]
+#[ignore = "starts real processes"]
+fn windows_events_are_read_through_windows_own_wevtutil_once_each_through_a_stop_and_a_kill() -> anyhow::Result<()> {
+    let t0 = now_ms() - 60_000;
+    let mut f = Fleet::new()?;
+    let script = f.root.path().join("log-events.js");
+    std::fs::write(&script, LOG_EVENTS)?;
+    let run = format!("kobs-e2e-{}-{}", std::process::id(), now_ms());
+    // Events there before the source: read from the channel's start, as it says.
+    log_events(&script, &run, 1..21)?;
+    f.start_runner("r1")?;
+    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    put_source(&f, "win", &json!({ "type": "windows_event", "channels": ["Application"], "query": "*[System[Provider[@Name='WSH']]]", "start": "beginning", "tags": ["team:win"], "on": "r1" }))?;
+    let c = wsh_settled(&f, &run, t0, 1..21)?;
+    anyhow::ensure!(repeated(&c, 1..21).is_empty(), "{:?}", repeated(&c, 1..21));
+    // A record as stored: its message as Windows renders it, its level, what its event names.
+    let r = found(&f, t0, &format!("source:windows_event @windows.event_data.0:\"{run} seq=13\""), 1)?.into_iter().next().unwrap_or(Value::Null);
+    anyhow::ensure!(at(&r, &["message"]) == format!("{run} seq=13").as_str() && at(&r, &["status"]) == "error" && at(&r, &["service"]) == "WSH" && at(&r, &["host"]) == "r1", "{r:#}");
+    for (k, v) in [("windows.channel", "Application"), ("windows.provider", "WSH"), ("windows.event_id", "1"), ("windows.keywords", "Classic"), ("team", "win")] {
+        anyhow::ensure!(at(&r, &["attributes", k]) == v, "{k}: {r:#}");
+    }
+    anyhow::ensure!(
+        at(&r, &["attributes", "windows.record_id"]).as_str().is_some_and(|id| id.parse::<u64>().is_ok()) && at(&r, &["attributes", "windows.computer"]).as_str().is_some_and(|c| !c.is_empty()),
+        "{r:#}"
+    );
+    let info = found(&f, t0, &format!("source:windows_event @windows.event_data.0:\"{run} seq=14\""), 1)?.into_iter().next().unwrap_or(Value::Null);
+    anyhow::ensure!(at(&info, &["status"]) == "info" && at(&info, &["attributes", "windows.event_id"]) == "4", "{info:#}");
+    log_events(&script, &run, 21..61)?;
+    let c = wsh_settled(&f, &run, t0, 1..61)?;
+    anyhow::ensure!(repeated(&c, 1..61).is_empty(), "{:?}", repeated(&c, 1..61));
+
+    // Stopped while events come, started again: from its place, none repeated.
+    f.stop_runner("r1");
+    log_events(&script, &run, 61..101)?;
+    f.start_runner("r1")?;
+    let c = wsh_settled(&f, &run, t0, 1..101)?;
+    anyhow::ensure!(repeated(&c, 1..101).is_empty(), "a stop repeated {:?}", repeated(&c, 1..101));
+
+    // Killed while events come: none lost; those in flight stored twice at the most.
+    let writer = {
+        let (script, run) = (script.clone(), run.clone());
+        std::thread::spawn(move || -> anyhow::Result<()> {
+            for start in (101..401).step_by(10) {
+                log_events(&script, &run, start..start + 10)?;
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            Ok(())
+        })
+    };
+    std::thread::sleep(Duration::from_millis(400));
+    f.kill_runner("r1");
+    std::thread::sleep(Duration::from_millis(300));
+    f.start_runner("r1")?;
+    writer.join().map_err(|_| anyhow::anyhow!("the writer panicked"))??;
+    let c = wsh_settled(&f, &run, t0, 1..401)?;
+    let twice = repeated(&c, 101..401);
+    anyhow::ensure!(twice.iter().all(|&(_, n)| n == 2) && twice.len() <= 300, "a kill repeated {} events", twice.len());
+    eprintln!("a kill repeated {} of 300 events (in flight when it came); a stop none", twice.len());
+    Ok(())
+}

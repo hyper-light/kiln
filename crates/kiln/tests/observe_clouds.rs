@@ -1478,9 +1478,13 @@ fn a_prometheus_exporter_is_read_where_its_target_says_and_tagged_as_prometheus_
     // A counter read as a rate: the hundred a second it climbs.
     let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "sum:e2e_requests_total{job:srv}", "from": t1, "to": now_ms() - 2_000, "step": 5_000 })))?;
     let rates: Vec<f64> = a["series"][0]["values"].as_array().into_iter().flatten().filter_map(Value::as_f64).collect();
-    // The whole buckets: not the first nor the last, which the range cuts.
+    // The whole buckets: not the first nor the last, which the range cuts. A scrape's increase is in
+    // its sample's bucket (as Datadog's counts are), so a 5 s bucket of 1 s scrapes holds four or six
+    // of them where one is stamped across its edge (a loaded machine's timers late): each bucket
+    // within one scrape's increase of the hundred, and the buckets together within a tenth of it.
     let whole = rates.get(1..rates.len().saturating_sub(1)).unwrap_or(&[]);
-    anyhow::ensure!(whole.len() >= 2 && whole.iter().all(|r| (90.0..=110.0).contains(r)), "the counter's rate: {rates:?}");
+    let mean = whole.iter().sum::<f64>() / whole.len().max(1) as f64;
+    anyhow::ensure!(whole.len() >= 2 && whole.iter().all(|r| (75.0..=125.0).contains(r)) && (90.0..=110.0).contains(&mean), "the counter's rate: {rates:?} (whole buckets' mean {mean})");
     // The exporter down: `up` 0, said once; up again, said too.
     failing.store(true, Ordering::Relaxed);
     let start = Instant::now();

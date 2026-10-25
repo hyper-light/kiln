@@ -5979,9 +5979,14 @@ with its complement (`v<x`) every value. 2026-10-20: passes (16 s).
 a hundred a second, a gauge), and four targets: one the server reads, one the runner reads, one
 every machine reads, one that asks for a token. Each is read where it says (the store's `up` by job
 and host; each machine's own report), its samples tagged `job` and `instance` (the sample's own
-`job` kept as `exported_job`) and the target's tags; the counter read as a rate is 90–110 a second;
-the exporter failing makes `up` 0 and is said once, its recovery too; a target deleted is read no
-more, by the runner either; the token is sent and never shown. 2026-10-18: passes (109 s).
+`job` kept as `exported_job`) and the target's tags; the counter read as a rate is 90–110 a second
+over its whole 5 s buckets, each within one scrape's increase of the hundred (a scrape's increase is
+in its sample's bucket, as Datadog's counts are: a bucket of 1 s scrapes holds four or six where one
+is stamped across its edge); the exporter failing makes `up` 0 and is said once, its recovery too; a
+target deleted is read no more, by the runner either; the token is sent and never shown.
+2026-10-18: passes (109 s). 2026-10-25, adacachy at a load of 60 to 90: one bucket of four scrapes
+and the next of six (80 and 120 a second) failed its check of each bucket within a tenth, which
+asked more than a count's buckets hold; now checked as above.
 
 **A soak** (`observe_load.rs`, `KOBS_SOAK_SECS`, 300 unless said; hours for a soak worth the
 name): a server and a runner, 200,000 points a second held steady (4 senders paced, OTLP protobuf,
