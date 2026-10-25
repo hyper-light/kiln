@@ -26,4 +26,5 @@ pub mod probe;
 pub mod rootfs;
 pub mod runtime;
 pub mod setup;
+pub mod warm;
 pub mod workspaces;

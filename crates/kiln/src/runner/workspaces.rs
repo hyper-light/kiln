@@ -91,7 +91,7 @@ pub fn kept_until(ws: &Path) -> Option<i64> {
 }
 
 /// Removes a workspace. Files a Docker action wrote as root are removed by a container, as root.
-fn remove(p: &Path) {
+pub(super) fn remove(p: &Path) {
     if std::fs::remove_dir_all(p).is_ok() || !p.exists() {
         return;
     }
