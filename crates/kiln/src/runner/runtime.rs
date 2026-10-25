@@ -2084,6 +2084,17 @@ impl Leg {
         if a.job_container.is_none() && a.executor.kind == "docker" { a.executor.image.as_deref() } else { None }
     }
 
+    /// A host path as the leg's expressions see it: the container's in the `docker` executor's
+    /// container (the leg's machine), as `runner.temp` is; the host's elsewhere, a job's
+    /// `container:` included, as on GitHub.
+    fn seen_path(&self, l: &Layout, p: &Path) -> String {
+        let s = p.to_string_lossy();
+        match self.hosted_image() {
+            Some(_) => self.container_map(l).translate(&s),
+            None => s.into_owned(),
+        }
+    }
+
     /// Whether the `docker` executor's container gets the host's Docker socket (W13-R04: the
     /// routing rules' `docker: socket`, for trusted runs).
     fn docker_inside(&self) -> bool {
@@ -4252,7 +4263,9 @@ impl Leg {
         st.base.push(("inputs", str_map(inputs)));
         if let Value::Object(m) = &st.github {
             let mut members: Vec<(String, Value)> = m.0.iter().filter(|(k, _)| &**k != "action_path").map(|(k, v)| (k.to_string(), v.clone())).collect();
-            members.push(("action_path".to_owned(), Value::str(&loc.dir.to_string_lossy())));
+            // Where the leg's machine has it (next.js's cargo-binstall runs
+            // `bash "${{ github.action_path }}/install-from-binstall-release.sh"`).
+            members.push(("action_path".to_owned(), Value::str(&self.seen_path(&st.layout, &loc.dir))));
             st.github = Value::object(members);
         }
         st.failed = false;
@@ -5048,6 +5061,40 @@ runs:
         })?;
         assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
         assert!(logs.get(&0).is_some_and(|l| l.contains("in /__w/_temp")), "{logs:?}");
+        Ok(())
+    }
+
+    /// W07-R07: a composite action's `github.action_path` is where the leg's machine has it: the
+    /// container's path in the `docker` executor's container, the host's on the host and for a
+    /// job's `container:` (as GitHub's is). next.js's cargo-binstall ran its script by the host's
+    /// path in the container, where nothing was (corpus pass 1024b).
+    #[test]
+    fn w07_r07_an_actions_path_is_where_the_machine_has_it() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let leg = |executor: kiln_ci::wire::ExecutorSpec, job_container: Option<kiln_ci::wf::ir::Container>| -> anyhow::Result<Leg> {
+            let (tx, _rx) = async_channel::unbounded();
+            let a = AssignmentV2 { job_id: "leg-1".into(), repo: "acme/app".into(), executor, job_container, ..AssignmentV2::default() };
+            Ok(Leg {
+                a,
+                work_dir: tmp.path().to_path_buf(),
+                runner_name: "r".into(),
+                up: Uplink(tx),
+                cancel: Shutdown::new(),
+                http: std::sync::Arc::new(crate::http::client::Client::public()?),
+                warm: Default::default(),
+                cache_max: None,
+            })
+        };
+        let dir = tmp.path().join("_actions/cargo-bins/cargo-binstall/dc19f1e4");
+        let docker = kiln_ci::wire::ExecutorSpec { kind: "docker".into(), image: Some("kiln/runner-ubuntu-24.04".into()), ..Default::default() };
+        let machine = leg(docker.clone(), None)?;
+        assert_eq!(machine.seen_path(&machine.layout(), &dir), "/home/runner/work/_actions/cargo-bins/cargo-binstall/dc19f1e4", "the machine's");
+        let host = leg(kiln_ci::wire::ExecutorSpec { kind: "host".into(), ..Default::default() }, None)?;
+        assert_eq!(host.seen_path(&host.layout(), &dir), dir.to_string_lossy(), "the host's");
+        let (w, _) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", "on: push\njobs:\n  t:\n    runs-on: x\n    container: alpine\n    steps: [{run: a}]\n", Dialect::Gha);
+        let container = w.and_then(|w| w.jobs.into_iter().next()).and_then(|j| j.container);
+        let job = leg(docker, container)?;
+        assert_eq!(job.seen_path(&job.layout(), &dir), dir.to_string_lossy(), "a job's `container:` sees the host's, as on GitHub");
         Ok(())
     }
 

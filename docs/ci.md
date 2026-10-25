@@ -2553,7 +2553,11 @@ Gives step execution for `uses:`.
   on its own (its `pre` too) has none. kiln gave every action its own, so CodSpeed's composite,
   whose github-script step reads `${GITHUB_ACTION_PATH}/.codspeed-runner-installer-hashes.json`,
   looked for it in github-script's directory (ruff's benchmarks). Checked by
-  `w07_r07_a_composites_path_is_its_steps_own`.
+  `w07_r07_a_composites_path_is_its_steps_own`. And `${{ github.action_path }}` is where the
+  leg's machine has it: in the `docker` executor's container the container's path, as
+  `runner.temp` is there; on the host, and for a job's `container:` (as GitHub's runner gives
+  it), the host's. next.js's cargo-binstall ran its script by the host's path in the container,
+  where nothing was (corpus pass 1024b; `w07_r07_an_actions_path_is_where_the_machine_has_it`).
 - *Done.* R09: GitHub's API-calling actions against the facade, unmodified. `github-script`,
   `softprops/action-gh-release` with an asset, and the code-scanning, labeler, pull-request and
   pages actions are W14's and W22-AC02's checks. `tests/hosted_actions.rs`
