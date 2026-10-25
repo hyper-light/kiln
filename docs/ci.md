@@ -7751,6 +7751,14 @@ and verification (`work::verify`).
   `Placement` and `Sandbox` (Hex, CP-T7).
 - **Container builds** (R29): workloads on `Sandbox` and `Placement` (Hex, CP-T7), images on
   `Artifacts` (Reliquary, CP-T9.1); nothing new on kiln's own wire yet.
+- **Operations for W25's engine** (R29, R21): `work::ops` has a JSON Schema
+  (`work::ops::schema`, published as `docs/work-ops.schema.json` and held to the types by its
+  tests) and a `service` operation, which an exec reaches through an input of role
+  `service.<hostname>`. A leg looks an operation up and records its result through the work
+  service, `POST /_kiln/work/v1/ops/lookup` and `ops/record` (`{ op, inputs, outputs }`, its
+  inputs by role as their outputs' digests, its outputs stored objects), on the ledger's one path
+  and in the leg's own domain whatever the request says: a diff's result for an operation never
+  reaches a trusted lookup (`tests/hosting.rs`). `Kind::Plan` keys a code workflow's plan leg.
 - **Takes** W03's changed files, W05's routing, W08's store and cache scopes, W13's executors,
   W16's test reports and W18's trust.
 - **Gives** W14's land queue its reuse, W16 and W19 their keys and reports, and W20's agents

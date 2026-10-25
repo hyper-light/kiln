@@ -3758,3 +3758,91 @@ fn w24_r20_a_land_candidate_reuses_trusted_results_and_runs_what_its_diff_touche
     anyhow::ensure!(!c_log.contains("tests: running alpha/lib") && !c_log.contains("tests: running beta/lib"), "{c_log}");
     Ok(())
 }
+
+/// W25 on W24-R29, R21 end to end: a step calls the work service's `ops` routes as an SDK would,
+/// with its leg's token. The trunk's first run records a container operation's result; a diff's
+/// run records another result for the very same operation, in its own (untrusted) domain; the
+/// trunk's next run looks the operation up and gets the trunk's result, from its first run.
+#[test]
+fn w25_container_operations_through_the_work_service_stay_in_their_domain() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/ops.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/ops", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/ops"])?;
+    let lead = person(&s, "lead", &["maintainer@repo:acme/ops"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&lead), "tree"]), "clone")?;
+    let work = dir.path().join("tree");
+    std::fs::write(work.join("README.md"), "ops\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let owner = url(&s.admin);
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    // The step: look the operation up, then record what this commit says it made.
+    let script = r#"origin=$(printf '%s' "$ACTIONS_RESULTS_URL" | sed -E 's#^(https?://[^/]+).*#\1#')
+auth="Authorization: Bearer $ACTIONS_RUNTIME_TOKEN"
+op='"op":{"mkfile":{"path":"/f","mode":420,"data":"x","owner":null}},"inputs":{}'
+echo "lookup: $(curl -s -X POST -H "$auth" -H 'content-type: application/json' "$origin/_kiln/work/v1/ops/lookup" -d "{$op}")"
+d=$(sha256sum made.txt | cut -d' ' -f1)
+curl -s -o /dev/null -X PUT -H "$auth" --data-binary @made.txt "$origin/_kiln/work/v1/blobs/$d"
+echo "record: $(curl -s -X POST -H "$auth" -H 'content-type: application/json' "$origin/_kiln/work/v1/ops/record" -d "{$op,\"outputs\":{\"tree\":\"sha256:$d\"}}")"
+"#;
+    let wf = format!("on: [push, diff]\njobs:\n  op:\n    runs-on: local\n    steps:\n      - name: op\n        run: |\n{}", script.lines().map(|l| format!("          {l}\n")).collect::<String>());
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/ci.yaml"), wf)?;
+    std::fs::write(work.join("made.txt"), "the trunk's\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "the op"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    let trunk = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    let runs = || -> anyhow::Result<Vec<Value>> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/ops&limit=50", &s.admin, None)?;
+        Ok(serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default())
+    };
+    let finished = |sha: &str, what: &str| -> anyhow::Result<Value> {
+        let mut last = Value::Null;
+        until(240, what, || {
+            last = runs()?.into_iter().find(|r| text(r, "sha") == sha && r.get("finished_at").is_some_and(|f| !f.is_null())).unwrap_or(Value::Null);
+            Ok(last.is_null().then(|| s.log()))
+        })?;
+        Ok(last)
+    };
+    let log_of = |run: &Value| -> anyhow::Result<String> {
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(run, "id")), &s.admin, None)?;
+        let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let mut all = String::new();
+        for step in 0..3 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+            all.push_str(&t);
+        }
+        Ok(all)
+    };
+    let a = finished(&trunk, "the trunk's first run")?;
+    let a_log = log_of(&a)?;
+    anyhow::ensure!(text(&a, "conclusion") == "success" && a_log.contains("lookup: {\"hit\":false}") && a_log.contains("record: {\"key\":"), "{a}\n{a_log}");
+    // A diff records another result for the same operation.
+    let d1 = commit(&home, &work, "made.txt", "the diff's\n", "Another result", &format!("I{}", "6".repeat(40)))?;
+    must(git(&home, &work, &["push", "-q", &url(&dev), "HEAD:refs/for/main"]), "submit")?;
+    let d = finished(&d1, "D1's run")?;
+    let d_log = log_of(&d)?;
+    anyhow::ensure!(text(&d, "conclusion") == "success" && d_log.contains("record: {\"key\":"), "{d}\n{d_log}");
+    // The trunk's next run gets the trunk's result, from its first run.
+    must(git(&home, &work, &["checkout", "-q", &trunk]), "checkout")?;
+    std::fs::write(work.join("README.md"), "ops, again\n")?;
+    must(git(&home, &work, &["commit", "-qam", "again"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    let again = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    let b = finished(&again, "the trunk's next run")?;
+    let b_log = log_of(&b)?;
+    let trunks = format!("sha256:{}", hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"the trunk's\n")));
+    let number = a.get("number").and_then(Value::as_i64).unwrap_or_default();
+    anyhow::ensure!(b_log.contains("lookup: {\"hit\":true") && b_log.contains(&trunks) && b_log.contains(&format!("\"number\":{number}")), "the trunk's result, never the diff's: {b_log}");
+    Ok(())
+}

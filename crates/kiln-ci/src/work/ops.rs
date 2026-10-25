@@ -663,6 +663,18 @@ impl Op {
     }
 }
 
+/// An operation's unit (W24-R01): its canonical text as its definition, the secrets an exec
+/// receives, and its inputs by role as `upstream` (each an output's digest, R03, or a node's id
+/// until that's known). What [`Graph::unit`] makes of a node, and the work service of an SDK's
+/// request (W25).
+pub fn unit_of(op: &Op, upstream: BTreeMap<String, String>) -> Unit {
+    let secrets = match op {
+        Op::Exec(e) => e.secrets(),
+        _ => BTreeSet::new(),
+    };
+    Unit { kind: Kind::Action, definition: op.canonical(), secrets, env: BTreeMap::new(), platform: key::Platform::default(), inputs: BTreeMap::new(), upstream, trust: String::new() }
+}
+
 /// A node's id: a digest of its operation's canonical text and its inputs' roles, ids and paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub [u8; 32]);
@@ -878,20 +890,7 @@ impl Graph {
     pub fn unit(&self, id: &NodeId, digest: impl Fn(&Input) -> Option<String>) -> Option<Unit> {
         let node = self.nodes.get(id)?;
         let upstream = node.inputs.iter().map(|i| (i.role.clone(), digest(i).unwrap_or_else(|| format!("node:{}", i.node.hex())))).collect();
-        let secrets = match &node.op {
-            Op::Exec(e) => e.secrets(),
-            _ => BTreeSet::new(),
-        };
-        Some(Unit {
-            kind: Kind::Action,
-            definition: node.op.canonical(),
-            secrets,
-            env: BTreeMap::new(),
-            platform: key::Platform::default(),
-            inputs: BTreeMap::new(),
-            upstream,
-            trust: String::new(),
-        })
+        Some(unit_of(&node.op, upstream))
     }
 
     /// Node `id`'s weak key ([`Graph::unit`]).

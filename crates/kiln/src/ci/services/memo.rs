@@ -27,6 +27,10 @@
 //!   files they may have read, as they are now.
 //! - `POST tests/record` `{ binary, context, reads, ran }`: a test binary's run, a pass kept for
 //!   the runs after it, every run counted in its key's flaky marks (W24-R10).
+//! - `POST ops/lookup` `{ op, inputs }` and `POST ops/record` `{ op, inputs, outputs, ms? }`: a
+//!   container operation (`work::ops`, its JSON in `docs/work-ops.schema.json`), its inputs by role
+//!   as their outputs' digests, looked up and recorded on the ledger's one path, in the leg's own
+//!   trust domain whatever the request says (W24-R29, R21; W25's engine).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -125,6 +129,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         (Method::POST, ["missing"]) => missing(hub, &leg, req).await,
         (Method::POST, ["tests", "select"]) => tests_select(hub, &leg, req).await,
         (Method::POST, ["tests", "record"]) => tests_record(hub, &leg, req).await,
+        (Method::POST, ["ops", "lookup"]) => ops_lookup(hub, &leg, req).await,
+        (Method::POST, ["ops", "record"]) => ops_record(hub, &leg, req).await,
         (Method::PUT, ["blobs", digest]) => put_blob(hub, digest, req).await,
         (Method::GET, ["blobs", digest]) => get_blob(hub, &leg, digest).await,
         _ => Ok(msg(StatusCode::NOT_FOUND, "not found")),
@@ -169,6 +175,77 @@ async fn tests_select(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Respo
         .await
         .map_err(internal)?;
     Ok(srv::json(StatusCode::OK, &json!({ "binaries": out })))
+}
+
+#[derive(Deserialize)]
+struct OpIn {
+    op: kiln_ci::work::ops::Op,
+    /// Its inputs by role, each its output's digest.
+    #[serde(default)]
+    inputs: BTreeMap<String, String>,
+    /// For `record`: what it made, by name (`tree`, `config`, …), each a stored object's digest.
+    #[serde(default)]
+    outputs: BTreeMap<String, String>,
+    #[serde(default)]
+    ms: u64,
+}
+
+/// A container operation's result, if one stands for it in the leg's domain (W24-R29, W25).
+async fn ops_lookup(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fail> {
+    let o: OpIn = srv::body_json(req.into_body(), 16 << 20).await.map_err(bad)?;
+    let unit = leg.unit(kiln_ci::work::ops::unit_of(&o.op, o.inputs));
+    let scope = leg.scope.clone();
+    let found = hub
+        .store
+        .call(move |c| {
+            let same = |p: &PathSet| p.clone();
+            let Some(work::Hit { key, recorded, .. }) = work::lookup(c, &scope, &unit, &same)? else { return Ok(None) };
+            let number: Option<i64> = c.query_row("SELECT number FROM runs WHERE id = ?1", [&recorded.provenance.run], |r| r.get(0)).optional()?;
+            Ok(Some(json!({ "hit": true, "key": key.hex(), "outputs": recorded.outputs, "source": { "run": recorded.provenance.run, "number": number, "leg": recorded.provenance.leg } })))
+        })
+        .await
+        .map_err(internal)?;
+    Ok(srv::json(StatusCode::OK, &found.unwrap_or_else(|| json!({ "hit": false }))))
+}
+
+/// A container operation's result, kept for the operations after it: each output a stored object.
+async fn ops_record(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fail> {
+    let o: OpIn = srv::body_json(req.into_body(), 16 << 20).await.map_err(bad)?;
+    if o.outputs.is_empty() {
+        return Ok(msg(StatusCode::BAD_REQUEST, "an operation's result names what it made (`outputs`)"));
+    }
+    let unit = leg.unit(kiln_ci::work::ops::unit_of(&o.op, o.inputs));
+    let now = crate::util::now_unix();
+    let objects: Vec<String> = o.outputs.values().filter_map(|d| d.strip_prefix("sha256:").map(str::to_owned)).collect();
+    let result = Recorded {
+        outcome: "success".into(),
+        exit: Some(0),
+        outputs: o.outputs,
+        provenance: Provenance { repo: leg.repo.clone(), run: leg.run.clone(), leg: leg.id.clone(), attempt: leg.attempt, runner: leg.runner.clone(), commit: leg.sha.clone(), ms: o.ms, finished_at: now, ..Provenance::default() },
+        domain: leg.domain.to_owned(),
+        ..Recorded::default()
+    };
+    let scope = leg.scope.clone();
+    let kept: Result<Key, String> = hub
+        .store
+        .call(move |c| {
+            for d in &objects {
+                let stored: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM cas_index WHERE digest = ?1)", [d], |r| r.get(0))?;
+                if !stored {
+                    return Ok(Err(format!("sha256:{d} isn't stored: upload it first")));
+                }
+            }
+            let tx = crate::store::tx(c)?;
+            let key = work::record(&tx, &scope, &unit, &PathSet::new(), &result)?;
+            tx.commit()?;
+            Ok(Ok(key))
+        })
+        .await
+        .map_err(internal)?;
+    match kept {
+        Ok(key) => Ok(srv::json(StatusCode::CREATED, &json!({ "key": key.hex() }))),
+        Err(e) => Ok(msg(StatusCode::BAD_REQUEST, &e)),
+    }
 }
 
 #[derive(Deserialize)]
