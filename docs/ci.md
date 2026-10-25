@@ -7944,7 +7944,10 @@ cases) every domain fits its quota, keeps only entries at least as dense as each
 evicts no other domain's; over a stream of 6,000 lookups (240 units of 1 MiB to 4 GiB taking 2 s to
 30 min, wanted by a Zipf law, in two domains each held to a tenth of its entries' bytes) it saved
 1.5 to 2.3 times the time least-recently-used eviction saved in the same bytes, for each of five
-seeds. Left: the server's sweep of the ledger's entries and their `cas/` blobs by domain quota.
+seeds. The server sweeps with its upkeep, hourly, once `[ci.work]` sets a quota (`trusted_gb`,
+`protected_gb`, `untrusted_gb`, `person_gb`; 0 keeps everything): each repository's entries per
+domain, their worth from the hits each lookup counts beside the entry, the evicted ones' kept files
+let go for the content store to collect (`ci/work.rs`'s `evict`, `w24_ac12_the_sweep_…`).
 
 **How AC03 will be measured.** On the live server, once `.kiln/ci.yaml` runs on the engine (`[ci]
 kiln_workflows`, the change above) with leg and step reuse, warm workspaces (M1) and R10's test

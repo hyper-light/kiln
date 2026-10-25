@@ -608,6 +608,7 @@ fn judge(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, read
     }
     entry.verified_by = named.into_iter().skip(1).collect();
     let nondeterministic = nondeterministic(c, scope, weak)?.map(|m| m.outputs);
+    bump_hits(c, scope, &strong)?;
     Ok(Ok(Hit { key: strong, domain: domain.clone(), recorded: entry, class: None, nondeterministic }))
 }
 
@@ -708,7 +709,7 @@ pub fn evict(c: &Connection, repo: &str, quotas: &Quotas) -> anyhow::Result<Vec<
     for (k, v, at) in scan(c, Family::Result, &prefix)? {
         let Some(domain) = k.strip_prefix(&prefix).and_then(|rest| rest.split_once('|')).and_then(|(d, _)| Domain::parse(d).ok()) else { continue };
         let entry: Recorded = serde_json::from_slice(&v).unwrap_or_default();
-        usage.push(Usage { domain, bytes: (v.len() as u64).saturating_add(entry.size), saved_ms: entry.provenance.ms, hits: 0, last_used: at });
+        usage.push(Usage { domain, bytes: (v.len() as u64).saturating_add(entry.size), saved_ms: entry.provenance.ms, hits: hits_of(c, &k)?, last_used: at });
         keys.push(k);
     }
     let mut gone = Vec::new();
@@ -718,9 +719,27 @@ pub fn evict(c: &Connection, repo: &str, quotas: &Quotas) -> anyhow::Result<Vec<
         for (v, _, _) in scan(c, Family::Verify, &format!("{k}|"))? {
             delete(c, Family::Verify, &v)?;
         }
+        // The files it kept go with it: the content store collects those nothing else holds.
+        if let Some((domain, strong)) = k.strip_prefix(&prefix).and_then(|rest| rest.split_once('|')) {
+            let sc = format!("{prefix}{domain}|");
+            c.execute("DELETE FROM work_records WHERE family = ?1 AND substr(key, 1, length(?2)) = ?2 AND value = ?3", rusqlite::params![Family::Object.name(), sc, strong.as_bytes()])?;
+        }
         gone.push(k.clone());
     }
     Ok(gone)
+}
+
+/// One more hit of `scope`'s entry `strong` (W24-R28, AC12): what its worth under quota counts.
+fn bump_hits(c: &Connection, scope: &str, strong: &Key) -> anyhow::Result<()> {
+    let at = format!("{}hits", verify_prefix(scope, strong));
+    let n: u64 = get(c, Family::Verify, &at)?.and_then(|v| String::from_utf8(v).ok()).and_then(|s| s.parse().ok()).unwrap_or(0);
+    put(c, Family::Verify, &at, n.saturating_add(1).to_string().as_bytes(), crate::util::now_unix())?;
+    Ok(())
+}
+
+/// The hits `scope`'s entry at `entry` (`<scope><strong>`) has had.
+fn hits_of(c: &Connection, entry: &str) -> anyhow::Result<u64> {
+    Ok(get(c, Family::Verify, &format!("{entry}|hits"))?.and_then(|v| String::from_utf8(v).ok()).and_then(|s| s.parse().ok()).unwrap_or(0))
 }
 
 // ------------------------------------------------------------------ signatures (W24-R22)
@@ -2262,6 +2281,38 @@ mod tests {
             std::fs::write(one2.join("src/data.txt"), "what the crate reads\n")?;
             anyhow::ensure!(found(&u, &one2)?, "as it was again");
             anyhow::ensure!(!found(&unit_with("second"), &one2)?, "a variable it read changed");
+            Ok(())
+        })
+    }
+
+    /// W24-AC12, the server's sweep: under quota pressure the entry that saves the least time per
+    /// byte goes, with the files it kept, its hits counted from its lookups; a domain within its
+    /// quota evicts nothing.
+    #[test]
+    fn w24_ac12_the_sweep_keeps_the_most_time_saved_per_byte() -> anyhow::Result<()> {
+        in_store(|c| {
+            let sc = scope("acme/app", "trusted");
+            let rec = |ms: u64, out: &str| Recorded { provenance: Provenance { ms, ..Provenance::default() }, size: 1 << 20, ..made("trusted", "", &[("bin", out)]) };
+            let (quick, slow) = (unit(60), unit(61));
+            let kq = record(c, &sc, &quick, &reads(60, 0), &rec(10_000, "sha256:a1"))?;
+            let ks = record(c, &sc, &slow, &reads(61, 0), &rec(100_000, "sha256:b1"))?;
+            for (k, obj) in [(&kq, "o1"), (&ks, "o2")] {
+                c.execute("INSERT INTO work_records (family, key, value, at) VALUES ('work.object', ?1, ?2, 0)", rusqlite::params![format!("{sc}{obj}"), k.hex().as_bytes()])?;
+            }
+            let held: u64 = scan(c, Family::Result, "acme/app|")?.iter().map(|(_, v, _)| (v.len() as u64).saturating_add(1 << 20)).sum();
+            let tight = Quotas { trusted: held - 1, protected: u64::MAX, untrusted: u64::MAX, person: u64::MAX };
+            let roomy = Quotas { trusted: held, ..tight };
+            anyhow::ensure!(evict(c, "acme/app", &roomy)?.is_empty(), "within its quota, nothing goes");
+            // Twenty hits make the quick one worth more than the slow one: 10 s × 21 over 100 s × 1.
+            let same = |p: &PathSet| p.clone();
+            for _ in 0..20 {
+                anyhow::ensure!(lookup(c, &sc, &quick, &same)?.is_some());
+            }
+            let gone = evict(c, "acme/app", &tight)?;
+            anyhow::ensure!(gone == [format!("{sc}{}", ks.hex())], "{gone:?}");
+            anyhow::ensure!(lookup(c, &sc, &slow, &same)?.is_none() && lookup(c, &sc, &quick, &same)?.is_some());
+            let objects: Vec<String> = scan(c, Family::Object, &sc)?.into_iter().map(|(k, _, _)| k).collect();
+            anyhow::ensure!(objects == [format!("{sc}o1")], "the evicted entry's file goes with it: {objects:?}");
             Ok(())
         })
     }

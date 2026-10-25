@@ -58,6 +58,8 @@ pub struct Ci {
     /// ```
     pub reservations: Vec<kiln_ci::sched::reserve::ReservationSpec>,
     pub cache: Cache,
+    /// `[ci.work]`: the work ledger's quotas (docs/ci.md W24-R15, R21, AC12).
+    pub work: Work,
     pub artifacts: Artifacts,
     pub oidc: Oidc,
     pub actions: Actions,
@@ -589,6 +591,35 @@ pub struct ActionSource {
     pub url: Option<String>,
     /// `owner/repo` is one of kiln's native repositories.
     pub native: bool,
+}
+
+/// `[ci.work]`: what the work ledger keeps of each repository's results, by trust domain (docs/ci.md
+/// W24-R15, R21, AC12). Past a domain's quota, its entries that save the least time per byte go,
+/// with the files they kept; one domain's entries never evict another's. Every quota 0, the
+/// default, keeps everything.
+///
+/// ```toml
+/// [ci.work]
+/// trusted_gb = 200
+/// untrusted_gb = 20
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Work {
+    pub trusted_gb: u64,
+    pub protected_gb: u64,
+    pub untrusted_gb: u64,
+    /// Each person's (`person:<id>`).
+    pub person_gb: u64,
+}
+
+impl Work {
+    /// The quotas, once any is set; a domain whose quota is 0 keeps everything.
+    pub fn quotas(&self) -> Option<kiln_ci::work::trust::Quotas> {
+        let gb = |g: u64| if g == 0 { u64::MAX } else { g.saturating_mul(1 << 30) };
+        let any = [self.trusted_gb, self.protected_gb, self.untrusted_gb, self.person_gb].iter().any(|g| *g > 0);
+        any.then(|| kiln_ci::work::trust::Quotas { trusted: gb(self.trusted_gb), protected: gb(self.protected_gb), untrusted: gb(self.untrusted_gb), person: gb(self.person_gb) })
+    }
 }
 
 /// `[ci.cache]`: GitHub's cache service (docs/ci.md W08-R06).

@@ -62,6 +62,24 @@ pub async fn maintain(hub: &Hub) -> anyhow::Result<()> {
     if let Err(e) = crate::ci::oidc::publish(hub).await {
         tracing::warn!(error = %format!("{e:#}"), "OIDC: publishing the issuer's documents failed");
     }
+    // The work ledger past its quotas (W24-R15, R21, AC12): each domain keeps the results that save
+    // the most time per byte; what the rest kept is collected below.
+    if let Some(quotas) = hub.cfg.ci.work.quotas() {
+        let gone = hub
+            .store
+            .call(move |c| {
+                let repos: Vec<String> = c.prepare("SELECT name FROM repos")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                let mut n = 0usize;
+                for repo in repos {
+                    n = n.saturating_add(crate::ci::work::evict(c, &repo, &quotas)?.len());
+                }
+                Ok(n)
+            })
+            .await?;
+        if gone > 0 {
+            tracing::info!(entries = gone, "work ledger entries evicted under quota, the least time saved per byte first (W24-AC12)");
+        }
+    }
     // Steps' kept files no result can reuse any more go first, to be collected too (W24-R07).
     memo::sweep(hub).await?;
     let collected = cas::collect(hub).await?;
