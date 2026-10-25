@@ -80,6 +80,35 @@ pub async fn fetch(store: &Arc<Store>, peers: &dyn Peers, repo: &str, digest: &s
     Ok(done)
 }
 
+/// Peers over reach's end-to-end links (W24-R27): the server's directory says which runners hold
+/// an object for a repository, and this runner's node fetches it from one of them.
+pub struct Reach;
+
+impl Peers for Reach {
+    fn holders<'a>(&'a self, repo: &'a str, digest: &'a str) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(async move {
+            let Some(node) = crate::reach::node::global() else { return Vec::new() };
+            let ask = serde_json::json!({ "op": "holders", "repo": repo, "digest": digest }).to_string();
+            let answer: serde_json::Value = node.query(ask).await.ok().and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default();
+            answer.get("runners").and_then(serde_json::Value::as_array).map(|a| a.iter().filter_map(|r| r.as_str().map(str::to_owned)).collect()).unwrap_or_default()
+        })
+    }
+
+    fn get<'a>(&'a self, peer: &'a str, repo: &'a str, digest: &'a str, into: &'a Path) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(async move {
+            let node = crate::reach::node::global().ok_or_else(|| anyhow::anyhow!("this runner has no reach node"))?;
+            node.object(peer, repo, digest, into).await
+        })
+    }
+}
+
+/// Tells the server's directory this runner holds `digest` for `repo`, for its peers (W24-R27).
+pub async fn announce(repo: &str, digest: &str) {
+    if let Some(node) = crate::reach::node::global() {
+        let _ = node.query(serde_json::json!({ "op": "holds", "repo": repo, "digest": digest }).to_string()).await;
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

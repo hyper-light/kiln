@@ -755,6 +755,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let (adopt_tx, adopt_rx) = async_channel::bounded::<crate::reach::node::Adoption>(4);
     let reach = o.reach.filter(|_| !o.ephemeral).and_then(|accept| match crate::reach::node::start(crate::reach::node::Config {
         adopt: Some(adopt_tx.clone()),
+        objects: None,
         ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept)
     }) {
         Ok((handle, said)) => {

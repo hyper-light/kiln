@@ -1667,6 +1667,19 @@ impl Hub {
                         let answer = serde_json::json!({ "runners": self.reach_directory() });
                         self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                     }
+                    // Which runner holds which object of the runners' caches (docs/ci.md W24-R27).
+                    Some(op @ ("holds" | "holders")) => {
+                        let s = |k: &str| ask.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+                        let (repo, digest) = (s("repo"), s("digest"));
+                        let answer = if op == "holds" {
+                            crate::reach::directory::holds(&agent, &repo, &digest);
+                            serde_json::json!({})
+                        } else {
+                            let up: Vec<String> = crate::reach::directory::holders(&repo, &digest, &agent).into_iter().filter(|r| self.agents.lock().get(r).is_some_and(|a| a.connected)).collect();
+                            serde_json::json!({ "runners": up })
+                        };
+                        self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    }
                     // An agent's MCP server on the runner asks for kiln's operations: answered on
                     // their own, so a slow one holds up nothing else the runner says.
                     Some("registry" | "call" | "page" | "stream") => {

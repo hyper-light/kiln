@@ -52,12 +52,18 @@ fn info(name: &str, fp: &str) -> RunnerInfo {
 }
 
 async fn lab() -> anyhow::Result<Lab> {
+    lab_with([None, None]).await
+}
+
+/// [`lab`], mac and linux serving their peers from these caches (docs/ci.md W24-R27).
+async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) -> anyhow::Result<Lab> {
+    let [mac_objects, linux_objects] = objects;
     let dirs = vec![tempfile::tempdir()?, tempfile::tempdir()?, tempfile::tempdir()?];
     let mirrors = dirs.get(2).map(|d| d.path().to_path_buf()).unwrap_or_default();
     let (adopt_tx, adoptions) = async_channel::unbounded();
-    let cfg = |name: &str, d: &tempfile::TempDir, adopt: Option<async_channel::Sender<node::Adoption>>| Config { name: name.into(), dir: d.path().join("reach"), accept: true, mirrors: mirrors.clone(), adopt };
-    let (mac, mac_out) = node::start(cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None))?;
-    let (linux, linux_out) = node::start(cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)))?;
+    let cfg = |name: &str, d: &tempfile::TempDir, adopt: Option<async_channel::Sender<node::Adoption>>| Config { name: name.into(), dir: d.path().join("reach"), accept: true, mirrors: mirrors.clone(), adopt, objects: None };
+    let (mac, mac_out) = node::start(Config { objects: mac_objects, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) })?;
+    let (linux, linux_out) = node::start(Config { objects: linux_objects, ..cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)) })?;
     let directory = Arc::new(Mutex::new(vec![info("mac", mac.fingerprint()), info("linux", linux.fingerprint())]));
     // Each runner's current connection, as the server would number them.
     let peers: Arc<Mutex<HashMap<&'static str, u64>>> = Arc::new(Mutex::new(HashMap::from([("mac", 10), ("linux", 20)])));
@@ -508,6 +514,70 @@ fn w24_r24_kiln_run_reuse_gives_back_an_identical_runs_result() -> anyhow::Resul
         // Input isn't part of any key: it runs, saying why.
         let input = reuse_from_mac(&lab, &svc, RunReq { stdin: true, ..req.clone() }).await;
         assert!(input.is_ok_and(|evs| noted(&evs, "not reused: it reads input")));
+        Ok(())
+    })
+}
+
+/// Peers as a test names them: these runners, through this node.
+struct Via(Handle, Vec<String>);
+
+impl crate::runner::work::peers::Peers for Via {
+    fn holders<'a>(&'a self, _repo: &'a str, _digest: &'a str) -> futures::future::BoxFuture<'a, Vec<String>> {
+        Box::pin(async move { self.1.clone() })
+    }
+
+    fn get<'a>(&'a self, peer: &'a str, repo: &'a str, digest: &'a str, into: &'a std::path::Path) -> futures::future::BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(async move { self.0.object(peer, repo, digest, into).await })
+    }
+}
+
+/// W24-R27: two runners, one holding a 1 GiB object of a repository's cache. The other fetches it
+/// from that peer over their link, not the server, and keeps it once its digest checks out; a
+/// repository it wasn't held for gets nothing; a copy that isn't what its name says is refused,
+/// and nothing of it is kept.
+#[test]
+fn a_peers_1_gib_object_comes_over_the_link_and_a_corrupted_copy_is_refused() -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use crate::runner::work::peers::fetch;
+    use crate::runner::work::store::{Scope, Store};
+    crate::rt::block_on(async move {
+        let d = tempfile::tempdir()?;
+        let holder = Arc::new(Store::open(&d.path().join("linux"))?);
+        let big = d.path().join("big");
+        {
+            let mut f = std::fs::File::create(&big)?;
+            let block: Vec<u8> = (0..1u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+            for n in 0..1024u32 {
+                let mut b = block.clone();
+                if let Some(head) = b.get_mut(..4) {
+                    head.copy_from_slice(&n.to_le_bytes());
+                }
+                f.write_all(&b)?;
+            }
+        }
+        let (digest, size) = holder.put_file(&big)?;
+        anyhow::ensure!(size == 1 << 30, "{size}");
+        holder.hold(&Scope::new("acme/app", "trusted"), &digest)?;
+        let lab = lab_with([None, Some(Arc::clone(&holder))]).await?;
+        let peers = Via(lab.mac.clone(), vec!["linux".to_owned()]);
+        let mac = Arc::new(Store::open(&d.path().join("mac"))?);
+        let got = fetch(&mac, &peers, "acme/app", &digest).await?;
+        anyhow::ensure!(got.from.as_deref() == Some("linux") && got.refused.is_empty() && mac.has(&digest), "{got:?}");
+        // Another repository's ask finds nothing of it.
+        let other = Arc::new(Store::open(&d.path().join("other"))?);
+        let none = fetch(&other, &peers, "acme/else", &digest).await?;
+        anyhow::ensure!(none.from.is_none() && !other.has(&digest), "{none:?}");
+        // The copy linux serves from, corrupted: refused, and not kept.
+        let served = holder.root().join("peers").join(digest.replace(':', "-"));
+        let mut bytes = std::fs::read(&served)?;
+        if let Some(b) = bytes.get_mut(12_345) {
+            *b ^= 0xff;
+        }
+        std::fs::write(&served, &bytes)?;
+        drop(bytes);
+        let fresh = Arc::new(Store::open(&d.path().join("fresh"))?);
+        let bad = fetch(&fresh, &peers, "acme/app", &digest).await?;
+        anyhow::ensure!(bad.from.is_none() && bad.refused == ["linux"] && !fresh.has(&digest), "{bad:?}");
         Ok(())
     })
 }

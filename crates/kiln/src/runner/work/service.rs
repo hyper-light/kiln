@@ -168,6 +168,10 @@ pub fn running() -> Option<&'static Arc<Service>> {
 
 /// Makes `s` this runner's service, for what reaches it without a handle (the harness).
 pub fn set_running(s: Arc<Service>) {
+    // Objects it lacks are asked of its LAN peers first, over reach (W24-R27).
+    if s.peers.lock().is_none() {
+        s.set_peers(Arc::new(super::peers::Reach));
+    }
     let _ = RUNNING.set(s);
 }
 
@@ -244,7 +248,11 @@ impl Service {
         let Some(peers) = self.peers.lock().clone() else { return false };
         match super::peers::fetch(&self.store, peers.as_ref(), &c.repo, digest).await {
             Ok(f) if f.from.is_some() => match self.store.hold(&c.scope(), digest) {
-                Ok(_) => true,
+                Ok(_) => {
+                    let (repo, d) = (c.repo.clone(), digest.to_owned());
+                    crate::rt::spawn(async move { super::peers::announce(&repo, &d).await });
+                    true
+                }
                 Err(e) => {
                     tracing::warn!(target: "kiln.work", object = %digest, error = %format!("{e:#}"), "an object from a peer couldn't be kept");
                     false
@@ -564,6 +572,9 @@ impl Service {
         if self.store.hold(&scope, digest)? {
             self.send_up(c, Up { scope, ns: "cas".to_owned(), name: digest.to_owned(), digest: digest.to_owned(), size });
         }
+        // Its peers may ask it for it now (W24-R27).
+        let (repo, d) = (c.repo.clone(), digest.to_owned());
+        crate::rt::spawn(async move { super::peers::announce(&repo, &d).await });
         Ok(())
     }
 

@@ -172,6 +172,16 @@ input (`-i`), runs in a named shell, is detached, or has no tree (`--no-sync` el
 git repository) isn't keyed: it runs, saying why. The runner's cache service opens the first time
 it's asked to reuse.
 
+### 5.2 Objects from peers
+
+An object a runner's cache lacks (docs/ci.md W24-R27) is asked of runners that hold it before the
+server: the server's directory says which (`reach/directory.rs`, from what each runner said it
+holds, by repository, as `holds` and `holders` questions), and the object comes over the reach
+link (`Ask::Object`, `Say::ObjectData`, `Say::ObjectMissing`), a window at a time from the offset
+asked, in pieces of 1 MiB. The holder serves only an object held for the repository asked about,
+from a local file of it beside its cache, put together once. The asker hashes what came before it
+keeps it: a copy that isn't what its digest says is refused, never kept, and the next holder asked.
+
 ## 6. Local socket
 
 `<runtime dir>/kiln/reach-<runner>-<hash>.sock` (`0600` in a `0700` folder), beside `kiln spawn`'s.
