@@ -27,6 +27,9 @@ use crate::proto::{AgentMsg, JobResult, LOG_CHUNK};
 use crate::rt::{Interval, Shutdown};
 use crate::store::Status;
 
+/// Step reuse (docs/ci.md W24-R07).
+mod memo;
+
 /// One leg, run on this machine.
 #[derive(Clone)]
 pub struct Leg {
@@ -488,6 +491,8 @@ struct State {
     egress: Option<std::sync::Arc<super::egress::Pool>>,
     /// Its warm workspace, when its job keeps one (W24-R11).
     warm: Option<Warmed>,
+    /// Its memo steps so far (W24-R07).
+    memo: memo::Chain,
 }
 
 /// A warm leg's workspace (W24-R11), as its checkout needs it.
@@ -1333,6 +1338,7 @@ impl Leg {
             kiln_bin: None,
             egress: None,
             warm,
+            memo: memo::Chain::default(),
         };
         // The job's environment: the workflow's, `env-from`, then the job's (W04-R21, W06-R04).
         for (k, v) in &a.env_from {
@@ -1934,6 +1940,23 @@ impl Leg {
                 return None;
             }
         };
+        // W24-R07: a `memo:` step is looked up before it runs, a hit replayed instead; what earlier
+        // hits left is put in place before anything runs.
+        let keyed = match self.memo_prepare(st, idx, step, nested, &env, &wd, shell.as_deref(), script.as_deref(), &with).await {
+            memo::Prepared::Hit(hit) => {
+                let outputs = self.memo_replay(st, idx, *hit).await;
+                self.finish(st, idx, id, Conclusion::Success, Conclusion::Success, Some(0), outputs, nested).await;
+                return Some(End::Exit(Some(0)));
+            }
+            memo::Prepared::Fail(e) => {
+                self.note(idx, &format!("Error: {e}")).await;
+                let c = if continue_on_error { Conclusion::Success } else { Conclusion::Failure };
+                st.failed |= c == Conclusion::Failure;
+                self.finish(st, idx, id, Conclusion::Failure, c, None, BTreeMap::new(), nested).await;
+                return None;
+            }
+            memo::Prepared::Run(keyed) => keyed,
+        };
         let deadline = match timeout {
             Some(t) => job_deadline.min(Instant::now() + t),
             None => job_deadline,
@@ -1993,6 +2016,10 @@ impl Leg {
             if st.class.is_none() {
                 st.class = class;
             }
+        }
+        // W24-R07: only a success is kept for reuse.
+        if let Some(k) = keyed {
+            self.memo_record(st, idx, *k, outcome, &outputs).await;
         }
         self.finish(st, idx, id, outcome, conclusion, exit_code, outputs, nested).await;
         Some(end)
@@ -4526,6 +4553,13 @@ impl Leg {
             self.start(idx, &p.name, "post", Some(p.uses.clone())).await;
             if !run {
                 self.event(&JobEventV2::StepFinished { idx, outcome: Conclusion::Skipped, conclusion: Conclusion::Skipped, exit_code: None, outputs: BTreeMap::new() }).await;
+                continue;
+            }
+            // W24-R07: what reused steps left is in place before a post step runs too.
+            if let Err(e) = self.memo_materialize(st, idx).await {
+                self.note(idx, &format!("Error: {e}")).await;
+                st.failed = true;
+                self.event(&JobEventV2::StepFinished { idx, outcome: Conclusion::Failure, conclusion: Conclusion::Failure, exit_code: None, outputs: BTreeMap::new() }).await;
                 continue;
             }
             let r = match p.run {
