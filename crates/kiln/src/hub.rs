@@ -1469,6 +1469,14 @@ impl Hub {
         if let Some(a) = self.agents.lock().get_mut(&agent) {
             a.last_seen = now;
         }
+        // A runner process that keeps the channel says so (its Caps) right after its Build, before
+        // anything else on its control lane. One that says its facts or its upgrade preference
+        // first is from before the channel: what waited for it goes its way now, however long the
+        // server took to hear it (docs/wire.md, "Commands").
+        if matches!(msg, AgentMsg::Facts { .. } | AgentMsg::UpdatePrefs { .. }) && self.cmds.lock().is_coming(peer) {
+            let waited = self.cmds.lock().not_wire(peer);
+            self.send_waited(peer, waited).await;
+        }
         match msg {
             AgentMsg::Hello(_) | AgentMsg::Instance(_) => {}
             AgentMsg::Heartbeat { .. } | AgentMsg::JobStarted { .. } => {}
@@ -1915,6 +1923,12 @@ impl Hub {
             return Ok(());
         }
         let now = crate::util::now_unix();
+        // It says in a moment whether it keeps the channel (its Caps follow its hello and Build):
+        // until then its commands wait for that (docs/wire.md, "Commands"), from before it can be
+        // sent any. A job pod never says.
+        if !h.ephemeral {
+            self.cmds.lock().coming(peer, Instant::now());
+        }
         // A machine may connect more than one runner process (a new one beside an old one that
         // keeps its terminals, see `crate::instances`). The same process on a new connection
         // replaces its stale one.
@@ -2075,11 +2089,6 @@ impl Hub {
             },
         )
         .await;
-        // It says in a moment whether it keeps the channel (its Caps follow its hello): until then
-        // its commands wait for that (docs/wire.md, "Commands"). A job pod never says.
-        if !live.ephemeral {
-            self.cmds.lock().coming(peer, Instant::now());
-        }
         tracing::info!(agent = %name, labels = ?live.labels, slots = live.slots, "agent connected");
         self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: name.clone(), running: h.running.clone() });
         // Older processes of this machine take no new jobs; what they run, they keep.
@@ -2901,6 +2910,37 @@ pub(crate) mod tests {
             hub.on_agent_msg(2, say(&crate::harness::core::Update::Inbox { said: Box::new(refused) })?).await?;
             assert!(hub.harness.runs_on("s1", "box-a"), "it still runs on box-a");
             assert_eq!(hub.instances.lock().owner(&crate::instances::Owned::Agent("s1".into())), Some(1), "box-a's runner still holds it");
+            Ok(())
+        })
+    }
+
+    /// A runner process from before the channel is known by what it says, not by the clock: its
+    /// upgrade preference before any Caps sends what waited for it its way at once. One that keeps
+    /// the channel isn't taken for one from before it while the server is slow to hear its Caps.
+    #[test]
+    fn a_runner_from_before_the_channel_is_known_by_what_it_says_not_by_the_clock() -> anyhow::Result<()> {
+        use crate::wire::commands::{Answer, COMING_FOR, Kind};
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            hub.peers.lock().insert(1, "box-a".into());
+            hub.peers.lock().insert(2, "box-b".into());
+            let now = Instant::now();
+            for peer in [1, 2] {
+                hub.cmds.lock().coming(peer, now);
+            }
+            let mut old = hub.cmds.lock().push(1, Kind::Parked, b"close s1".to_vec(), now);
+            let mut new = hub.cmds.lock().push(2, Kind::Parked, b"close s2".to_vec(), now);
+            // Heard long after its hello, a runner that keeps the channel still has time to say so.
+            anyhow::ensure!(hub.cmds.lock().overdue(now + Duration::from_secs(10)).is_empty(), "taken for old on the clock");
+            // box-a says its upgrade preference before any Caps: from before the channel.
+            hub.on_agent_msg(1, AgentMsg::UpdatePrefs { accept: true }).await?;
+            anyhow::ensure!(!hub.cmds.lock().is_coming(1), "still waiting for box-a's Caps");
+            anyhow::ensure!(matches!(old.try_recv(), Ok(Some(Answer::Sent | Answer::Unreachable { .. }))), "what waited for box-a didn't go its way");
+            // box-b says its Caps: what waited for it goes on the channel.
+            hub.on_agent_msg(2, AgentMsg::Caps { caps: proto::CAP_WIRE }).await?;
+            anyhow::ensure!(!hub.cmds.lock().is_coming(2) && hub.cmds.lock().keeps(2), "box-b doesn't keep the channel");
+            anyhow::ensure!(matches!(new.try_recv(), Ok(None)), "box-b's command was answered before it went");
+            anyhow::ensure!(hub.cmds.lock().overdue(now + COMING_FOR).is_empty(), "box-b was taken for old after all");
             Ok(())
         })
     }

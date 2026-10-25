@@ -91,11 +91,14 @@ The server's commands to a runner process ride that process's command streams on
   it `unanswered` (`unreachable` if it never went): sent again later, it would surprise.
 
 A runner process that connects says whether it keeps the channel (its `Caps`, `CAP_WIRE`) right
-after its hello. Until then, for 3 s at the most, its commands wait for that, a live one too,
-rather than being refused as if it were away or going the old way. Once it says it does, they go
-on the channel. A process that doesn't say so in time, or says it doesn't, is one from before the
-channel: what waited for it goes the old way, answered `sent`. A job pod never says, and its
-commands go the old way at once.
+after its hello and its `Build`, before anything else on its control lane. Until then its commands
+wait for that, a live one too, rather than being refused as if it were away or going the old way.
+Once it says it does, they go on the channel. A process that says its facts or its upgrade
+preference first, or says it doesn't keep the channel, is one from before the channel: what waited
+for it goes the old way, answered `sent`. The server reads what its runners say in order, and a
+busy one can hear a runner's `Caps` long after its hello, so the clock decides only for a process
+that says nothing at all: after 60 s. A job pod never says, and its commands go the old way at
+once.
 
 The runner process takes each command once however often it comes, applies it as if it had come
 alone, and answers it: an ACK, or a NACK with its kind (`unknown`, `refused`, `stale_epoch`,

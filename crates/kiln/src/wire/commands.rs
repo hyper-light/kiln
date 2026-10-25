@@ -133,9 +133,12 @@ struct Peer {
     coming: Option<Instant>,
 }
 
-/// How long a runner process that connected has to say it keeps the channel (its `Caps`, which
-/// follow its hello at once) before it's taken for one from before the channel.
-pub const COMING_FOR: Duration = Duration::from_secs(3);
+/// How long a runner process that connected has, at the most, to say whether it keeps the channel
+/// (its `Caps`, which follow its `Build` at once) when it says nothing else meanwhile: one that
+/// says something else first is from before the channel at once ([`Commands::is_coming`]). The
+/// server reads what its runners say in order, so a busy one can hear a runner's `Caps` long after
+/// its hello: the clock is for a runner that says nothing, not a short wait.
+pub const COMING_FOR: Duration = Duration::from_secs(60);
 
 /// Every runner process's command streams, on the server.
 pub struct Commands {
@@ -199,6 +202,11 @@ impl Commands {
     /// the channel.
     pub fn overdue(&self, now: Instant) -> Vec<PeerId> {
         self.peers.iter().filter(|(_, p)| p.coming.is_some_and(|at| now.saturating_duration_since(at) >= COMING_FOR)).map(|(peer, _)| *peer).collect()
+    }
+
+    /// Whether runner process `peer` connected and hasn't said yet whether it keeps the channel.
+    pub fn is_coming(&self, peer: PeerId) -> bool {
+        self.peers.get(&peer).is_some_and(|p| p.coming.is_some())
     }
 
     /// Whether runner process `peer`'s link is up and it said what it has.
