@@ -1360,10 +1360,24 @@ pub(crate) struct Reading {
     pub errors: std::thread::JoinHandle<String>,
 }
 
+impl Reading {
+    /// Stopped: its process group (what it started too: a wrapper's own reader, a stand-in
+    /// script's `tail`, which outlived the reader killed alone), then it, waited for. Called before
+    /// it is waited for, so its id is still its own.
+    pub(crate) fn stop(&mut self) {
+        crate::reach::serve::signal_group(self.child.id(), crate::reach::wire::Signal::Kill);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Starts `cmd`, its output read a line at a time (`what` names its threads).
 pub(crate) fn read_lines(cmd: &mut std::process::Command, what: &str) -> std::io::Result<Reading> {
     use std::io::{BufRead as _, Read as _};
     use std::process::Stdio;
+    // A process group of its own, so that what it starts is stopped with it (`Reading::stop`).
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(cmd, 0);
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let (tx, rx) = std::sync::mpsc::sync_channel::<String>(LINES_AHEAD);
     let out = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
@@ -1431,8 +1445,7 @@ pub(crate) fn output_lines(cmd: &mut std::process::Command, what: &str, within: 
                     break;
                 }
                 if Instant::now() >= end {
-                    let _ = r.child.kill();
-                    let _ = r.child.wait();
+                    r.stop();
                     return Ok((out, None, String::new()));
                 }
             }
@@ -2189,6 +2202,28 @@ mod tests {
                 anyhow::ensure!(m.len() == t.len() && m.iter().zip(&t).all(|(a, b)| a.0 == b.0 && alike(&a.1, &b.1)), "{text}\n{m:?}\n{t:?}");
             }
         }
+        Ok(())
+    }
+
+    /// A reader stopped takes what it started with it: a script's own child (a stand-in
+    /// `journalctl`'s `tail` outlived its reader killed alone, on a Mac Studio) is gone too.
+    #[cfg(unix)]
+    #[test]
+    fn a_reader_stopped_takes_what_it_started_with_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pid = dir.path().join("child.pid");
+        let script = format!("sleep 300 & echo $! > '{}'; echo started; wait", pid.display());
+        let mut r = read_lines(std::process::Command::new("sh").args(["-c", &script]), "test")?;
+        anyhow::ensure!(r.lines.recv_timeout(Duration::from_secs(10))?.trim() == "started");
+        let child = std::fs::read_to_string(&pid)?.trim().to_owned();
+        let alive = |p: &str| std::process::Command::new("kill").args(["-0", p]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+        anyhow::ensure!(alive(&child), "its child {child} running");
+        r.stop();
+        let start = Instant::now();
+        while alive(&child) && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        anyhow::ensure!(!alive(&child), "its child {child} outlived it");
         Ok(())
     }
 }

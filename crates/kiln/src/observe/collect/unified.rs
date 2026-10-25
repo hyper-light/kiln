@@ -249,8 +249,7 @@ impl Run<'_> {
         let mut quiet = None;
         loop {
             if stop.stopped() {
-                let _ = reading.child.kill();
-                let _ = reading.child.wait();
+                reading.stop();
                 return Err(());
             }
             // An offer refused before goes first: nothing more is taken until it is.
@@ -331,8 +330,7 @@ pub(crate) fn run(c: &Compiled, saved_to: &Path, stop: &Stop, state: &Mutex<Stat
             match spawn(&show_args(c, from, now_s() + 1)) {
                 Ok(mut show) => {
                     if run.pump(&mut show, stop, offer, &save, &mut saved).is_err() {
-                        let _ = stream.child.kill();
-                        let _ = stream.child.wait();
+                        stream.stop();
                         break 'run;
                     }
                     let _ = show.child.wait();

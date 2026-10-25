@@ -121,8 +121,7 @@ pub(crate) fn run(c: &Compiled, saved_to: &Path, stop: &Stop, state: &Mutex<Stat
         let started = Instant::now();
         loop {
             if stop.stopped() {
-                let _ = reading.child.kill();
-                let _ = reading.child.wait();
+                reading.stop();
                 break 'run;
             }
             // An offer refused before goes first: nothing more is taken until it is.
