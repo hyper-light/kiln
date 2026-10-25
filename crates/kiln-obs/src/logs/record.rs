@@ -161,7 +161,46 @@ pub fn severities(level: &str) -> Option<std::ops::RangeInclusive<u8>> {
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
     varint::put(out, s.len() as u64);
-    out.extend_from_slice(s.as_bytes());
+    put_bytes(out, s.as_bytes());
+}
+
+/// `b` appended to `out`. Sixteen bytes or fewer (a row's names and most of its values) as at most
+/// two moves of a word, overlapping, into a block of sixteen, the block appended and what is past
+/// `b` cut: a call to `memcpy` for each costs more than its copy (§12.17's profile). Longer, at
+/// once.
+#[inline]
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    let n = b.len();
+    if n == 0 || n > 16 {
+        out.extend_from_slice(b);
+        return;
+    }
+    let mut block = [0u8; 16];
+    if n >= 8 {
+        move_in::<8>(&mut block, b, 0);
+        move_in::<8>(&mut block, b, n - 8);
+    } else if n >= 4 {
+        move_in::<4>(&mut block, b, 0);
+        move_in::<4>(&mut block, b, n - 4);
+    } else {
+        // One to three: the first, the middle and the last.
+        for i in [0, n / 2, n - 1] {
+            if let (Some(d), Some(&s)) = (block.get_mut(i), b.get(i)) {
+                *d = s;
+            }
+        }
+    }
+    let end = out.len() + n;
+    out.extend_from_slice(&block);
+    out.truncate(end);
+}
+
+/// `b`'s `W` bytes from `at` into `block` at the same place.
+#[inline(always)]
+fn move_in<const W: usize>(block: &mut [u8; 16], b: &[u8], at: usize) {
+    if let (Some(d), Some(s)) = (block.get_mut(at..at + W), b.get(at..at + W).and_then(|s| <[u8; W]>::try_from(s).ok())) {
+        d.copy_from_slice(&s);
+    }
 }
 
 fn get_str<'a>(at: &mut &'a [u8]) -> Option<&'a str> {
@@ -425,6 +464,23 @@ impl<'a> Rows<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// Bytes appended in a block of sixteen are those appended at once: every length to forty, after
+    /// rows of every length.
+    #[test]
+    fn bytes_put_in_a_block_are_the_bytes() {
+        let mut rng = crate::testkit::Rng::new(3);
+        for before in 0..20 {
+            for n in 0..=40 {
+                let b: Vec<u8> = (0..n).map(|_| rng.below(256) as u8).collect();
+                let lead: Vec<u8> = (0..before).map(|i| i as u8).collect();
+                let (mut ours, mut theirs) = (lead.clone(), lead.clone());
+                super::put_bytes(&mut ours, &b);
+                theirs.extend_from_slice(&b);
+                assert_eq!(ours, theirs, "{n} bytes after {before}");
+            }
+        }
+    }
+
     use super::*;
 
     pub(crate) fn sample(i: i64) -> Record {
