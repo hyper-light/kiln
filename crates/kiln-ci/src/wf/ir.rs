@@ -468,6 +468,11 @@ pub struct StepKiln {
     /// when unset, so a step without it hashes as it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memo: Option<YVal>,
+    /// `tests:` (W24-R10): the step runs a build's test binaries itself, those whose binary or
+    /// what they read changed, and replays the others' recorded passes: `{ cargo: [args] }`.
+    /// Skipped when unset, so a step without it hashes as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<YVal>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

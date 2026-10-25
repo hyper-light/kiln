@@ -293,6 +293,7 @@ pub const STEP: &[Key] = &[
     kiln("integrations", Ty::StrList, "kiln: integrations this step authenticates to (W11-R03)."),
     kiln_only("tty", Ty::Bool, "kiln v1: run under a pseudo-terminal."),
     kiln("memo", Ty::StrOrMap(MEMO), "kiln: reuse the step's earlier success while its inputs are unchanged: `check` (nothing to restore), or `{ inputs, outputs, env, max-age }` (W24-R07)."),
+    kiln("tests", Ty::Any, "kiln: run a build's test binaries, those whose binary or what they read changed, and replay the others' recorded passes: `{ cargo: [args] }` (W24-R10)."),
 ];
 
 /// A step's `memo:` (W24-R07).

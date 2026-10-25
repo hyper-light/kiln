@@ -1084,14 +1084,24 @@ impl Fe<'_> {
                     }
                     kiln.memo = Some(memo);
                 }
+                // W24-R10: a build's test binaries, run or replayed.
+                "tests" => {
+                    let tests = self.yval(v);
+                    if let Err(e) = crate::work::tests::Spec::from_yval(&tests) {
+                        self.err("KCI1015", e, v.range, &at);
+                    }
+                    kiln.tests = Some(tests);
+                }
                 _ => {}
             }
         }
         s.kiln = kiln;
         if !self.overlay {
+            let tests = s.kiln.tests.is_some();
             match (&s.run, &s.uses, s.is_control()) {
+                (Some(_), _, _) | (_, Some(_), _) if tests => self.err("KCI1012", "a `tests` step runs its test binaries itself: it can't have `run` or `uses`", n.range, path),
                 (Some(_), Some(_), _) => self.err("KCI1012", "a step has `run` or `uses`, not both", n.range, path),
-                (None, None, false) => self.err("KCI1012", "a step needs `run` or `uses` (or `wait`, `wait-all`, `cancel` or `parallel`)", n.range, path),
+                (None, None, false) if !tests => self.err("KCI1012", "a step needs `run` or `uses` (or `wait`, `wait-all`, `cancel` or `parallel`)", n.range, path),
                 (Some(_) | None, Some(_) | None, true) if s.run.is_some() || s.uses.is_some() => {
                     self.err("KCI1012", "a `wait`, `wait-all`, `cancel` or `parallel` step runs nothing itself: it can't have `run` or `uses`", n.range, path)
                 }

@@ -22,12 +22,18 @@
 //!   (what other repositories or domains hold is never said).
 //! - `PUT blobs/<sha256>`: an object, checked against its digest.
 //! - `GET blobs/<sha256>`: an object the scope's entries refer to.
+//! - `POST tests/select` `{ binaries, context, files, affected? }`: which of a build's test
+//!   binaries run and which replay a recorded pass, each saying why (W24-R10); `files` are the
+//!   files they may have read, as they are now.
+//! - `POST tests/record` `{ binary, context, reads, ran }`: a test binary's run, a pass kept for
+//!   the runs after it, every run counted in its key's flaky marks (W24-R10).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use http::{Method, StatusCode, header};
-use kiln_ci::work::key::{Key, PathSet, Unit};
+use kiln_ci::work::key::{Key, PathSet, Read, Unit};
+use kiln_ci::work::tests::{self as test_results, Choice};
 use kiln_ci::work::memo::{self, Digest, Replay};
 use rusqlite::{OptionalExtension as _, params};
 use serde::Deserialize;
@@ -116,10 +122,72 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         (Method::POST, ["lookup"]) => lookup(hub, &leg, req).await,
         (Method::POST, ["record"]) => record(hub, &leg, req).await,
         (Method::POST, ["missing"]) => missing(hub, &leg, req).await,
+        (Method::POST, ["tests", "select"]) => tests_select(hub, &leg, req).await,
+        (Method::POST, ["tests", "record"]) => tests_record(hub, &leg, req).await,
         (Method::PUT, ["blobs", digest]) => put_blob(hub, digest, req).await,
         (Method::GET, ["blobs", digest]) => get_blob(hub, &leg, digest).await,
         _ => Ok(msg(StatusCode::NOT_FOUND, "not found")),
     }
+}
+
+#[derive(Deserialize)]
+struct TestsSelectIn {
+    binaries: Vec<test_results::Binary>,
+    context: test_results::Context,
+    /// The files the binaries may have read, as they are now, by path from the workspace.
+    #[serde(default)]
+    files: BTreeMap<String, Read>,
+    /// The packages the change can affect (W24-R17); every binary's when none.
+    #[serde(default)]
+    affected: Option<BTreeSet<String>>,
+}
+
+/// Which of a build's test binaries run and which replay a recorded pass (W24-R10), each saying
+/// why: what the binaries read checked against `files`, a path not among them counting as gone.
+async fn tests_select(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fail> {
+    let t: TestsSelectIn = srv::body_json(req.into_body(), 64 << 20).await.map_err(bad)?;
+    let cx = test_results::Context { trust: leg.domain.to_owned(), ..t.context };
+    let affected = t.affected.unwrap_or_else(|| t.binaries.iter().map(|b| b.package.clone()).collect());
+    let (scope, binaries, files) = (leg.scope.clone(), t.binaries, t.files);
+    let out: Vec<serde_json::Value> = hub
+        .store
+        .call(move |c| {
+            let now = |p: &PathSet| p.keys().map(|path| (path.clone(), files.get(path).cloned().unwrap_or(Read::Absent))).collect::<PathSet>();
+            let mut out = Vec::new();
+            for (b, choice) in work::select_tests(c, &scope, &binaries, &cx, &affected, &now)? {
+                out.push(match choice {
+                    Choice::Run { why } => json!({ "package": b.package, "name": b.name, "run": true, "why": why }),
+                    Choice::Replay { from, why } => {
+                        let number: Option<i64> = c.query_row("SELECT number FROM runs WHERE id = ?1", [&from.run], |r| r.get(0)).optional()?;
+                        json!({ "package": b.package, "name": b.name, "run": false, "why": why, "from": { "run": from.run, "number": number, "leg": from.leg, "ran": from.ran, "flaky": from.flaky } })
+                    }
+                });
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(internal)?;
+    Ok(srv::json(StatusCode::OK, &json!({ "binaries": out })))
+}
+
+#[derive(Deserialize)]
+struct TestsRecordIn {
+    binary: test_results::Binary,
+    context: test_results::Context,
+    #[serde(default)]
+    reads: PathSet,
+    ran: test_results::Ran,
+}
+
+/// A test binary's run (W24-R10): a pass kept for the runs after it; every run counted in its
+/// key's flaky marks. The leg's own domain, whatever the runner sent.
+async fn tests_record(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fail> {
+    let t: TestsRecordIn = srv::body_json(req.into_body(), 64 << 20).await.map_err(bad)?;
+    let cx = test_results::Context { trust: leg.domain.to_owned(), ..t.context };
+    let provenance = Provenance { repo: leg.repo.clone(), run: leg.run.clone(), leg: leg.id.clone(), attempt: leg.attempt, runner: leg.runner.clone(), commit: leg.sha.clone(), ms: t.ran.ms, finished_at: crate::util::now_unix(), ..Provenance::default() };
+    let scope = leg.scope.clone();
+    let kept = hub.store.call(move |c| work::record_test(c, &scope, &t.binary, &cx, &t.reads, &t.ran, &provenance)).await.map_err(internal)?;
+    Ok(srv::json(StatusCode::CREATED, &json!({ "kept": kept.map(|k| k.hex()) })))
 }
 
 #[derive(Deserialize)]

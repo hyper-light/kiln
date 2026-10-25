@@ -28,6 +28,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::store::Status;
 
 /// Step reuse (docs/ci.md W24-R07).
+mod binaries;
 mod memo;
 
 /// One leg, run on this machine.
@@ -1981,11 +1982,19 @@ impl Leg {
             Some(t) => job_deadline.min(Instant::now() + t),
             None => job_deadline,
         };
-        let ran = match (&script, &step.uses) {
-            (Some(script), _) => self.exec(st, idx, Run::Script { script, shell: shell.as_deref() }, &wd, env, deadline).await,
-            (None, Some(uses)) => Box::pin(self.action(st, idx, step, uses, with, &wd, env, deadline)).await,
-            (None, None) if step.is_control() => Err(anyhow::anyhow!("`wait`, `wait-all`, `cancel` and `parallel` can't be steps of a composite action (docs/ci.md W06-R17)")),
-            (None, None) => Err(anyhow::anyhow!("the step runs neither a script nor an action")),
+        // W24-R10: a `tests:` step runs its build's test binaries itself, or replays them.
+        let ran = if let Some(t) = &step.kiln.tests {
+            match kiln_ci::work::tests::Spec::from_yval(t) {
+                Ok(spec) => Box::pin(self.tests_step(st, idx, &spec, &wd, env, deadline, shell.as_deref())).await,
+                Err(e) => Err(anyhow::anyhow!(e)),
+            }
+        } else {
+            match (&script, &step.uses) {
+                (Some(script), _) => self.exec(st, idx, Run::Script { script, shell: shell.as_deref() }, &wd, env, deadline).await,
+                (None, Some(uses)) => Box::pin(self.action(st, idx, step, uses, with, &wd, env, deadline)).await,
+                (None, None) if step.is_control() => Err(anyhow::anyhow!("`wait`, `wait-all`, `cancel` and `parallel` can't be steps of a composite action (docs/ci.md W06-R17)")),
+                (None, None) => Err(anyhow::anyhow!("the step runs neither a script nor an action")),
+            }
         };
         // A step that couldn't run says why, as its annotation too (an action's `setFailed`).
         let mut error = None;

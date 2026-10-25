@@ -139,7 +139,7 @@ impl Leg {
         format!("{}/_kiln/work/v1/{what}", crate::runner::artifacts::Service::origin_of(&self.a.runtime.results_url))
     }
 
-    async fn work_post(&self, what: &str, body: &Value, wait: Duration) -> anyhow::Result<(u16, Value)> {
+    pub(super) async fn work_post(&self, what: &str, body: &Value, wait: Duration) -> anyhow::Result<(u16, Value)> {
         let resp = self.http.post(&self.work_url(what)).bearer(&self.a.runtime.runtime_token).json(body).timeout(wait).send().await?;
         let status = resp.status();
         let v = if status == 204 { Value::Null } else { resp.json(64 << 20).await.unwrap_or_default() };

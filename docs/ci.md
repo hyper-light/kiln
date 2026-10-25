@@ -7885,8 +7885,8 @@ inputs, `reused_from` naming it, so a required check stays green with provenance
 result (a file the job lists changed outside every package, or none is recorded yet) the leg is
 skipped as its `if` said, saying why. End to end in `tests/affected.rs`.
 
-**Test results (M3, R10).** Built as pure code and on the ledger, awaiting the runner's side
-(`kiln_ci::work::tests`, `ci/work.rs`). A test binary is a unit: its package, name and arguments as
+**Test results (M3, R10).** Built, awaiting review (`kiln_ci::work::tests`, `ci/work.rs`,
+`runner/runtime/binaries.rs`). A test binary is a unit: its package, name and arguments as
 its definition, its digest as its input, the environment, the platform and the trust domain; what
 it read makes its test key. A pass goes in under that key through the ledger's one path
 (`record_test`, onto `work.result` and `work.weak`); a failure, a crash or a timeout never does.
@@ -7894,10 +7894,15 @@ Every run counts in its test key's flaky marks (`work.test`), so a test that fai
 nothing it depends on changed is flaky, and its replay says so (W16-R04). Selection
 (`select_tests`) replays a binary whose key has a pass, runs one whose digest or reads changed, and
 replays the newest pass of a binary not rebuilt (its package unaffected) while every file that pass
-read holds, since a test may read files outside its package; each says why. Left: the runner's
-side, which builds only the affected packages' test binaries, reports their digests and what they
-read, and runs what selection says (a step's `tests: { select: affected, cache: true }`), and
-nextest's archives across machines.
+read holds, since a test may read files outside its package; each says why. A step's `tests: {
+cargo: [--workspace] }` runs it: the runner builds the test binaries (`cargo test --no-run
+--message-format=json`), hashes each executable and its package's files (what it reads, for now),
+and asks the ledger which run (`/_kiln/work/v1/tests/select`); it runs those in their packages'
+folders, each recorded with its outcome per test and its time in seconds (`tests/record`, the
+timing W16-R06 balances by), and says of each other where its pass is replayed from and why. In a
+warm workspace an unchanged crate isn't rebuilt, so its binary keeps its digest: change one crate
+and only its test binaries and its dependents' run (`tests/memo.rs`). Left: what a test reads
+beyond its package, traced; nextest's archives and partitions across machines.
 
 **The land queue's reuse (M3, R20).** Decided as pure code, awaiting the queue's wiring
 (`kiln_ci::work::queue`). A package's inputs on a candidate are its state on the trunk and the

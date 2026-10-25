@@ -197,3 +197,66 @@ fn w24_r07_steps_are_reused_on_an_unchanged_tree() -> anyhow::Result<()> {
     anyhow::ensure!(check5.conclusion == "success" && check5.reused_from(&fourth) && check5.line("checked as ") == check.line("checked as "), "{five:#?}");
     Ok(())
 }
+
+/// W24-R10 end to end: a `tests:` step over a cargo workspace of three crates (beta depends on
+/// alpha; gamma on neither), in a warm workspace so unchanged crates aren't rebuilt. The first run
+/// runs every test binary; after a change to gamma only gamma's runs and the others replay their
+/// passes from run #1; after a change to alpha, alpha's and beta's run and gamma's replays.
+#[test]
+fn w24_r10_only_affected_test_binaries_run_and_the_rest_replay() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/memo", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let home = dir.path().join("githome");
+    let work = dir.path().join("tree");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/memo.git", s.admin, s.port);
+    std::fs::write(work.join("README.md"), "tests\n")?;
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    let commit = |what: &str| -> anyhow::Result<()> {
+        git(&home, &work, &["add", "."])?;
+        git(&home, &work, &["commit", "-qm", what])?;
+        git(&home, &work, &["push", "-q", &push, "main"])?;
+        Ok(())
+    };
+    commit("init")?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    let krate = |name: &str, deps: &str, body: &str| -> anyhow::Result<()> {
+        std::fs::create_dir_all(work.join(name).join("src"))?;
+        std::fs::write(work.join(name).join("Cargo.toml"), format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}"))?;
+        std::fs::write(work.join(name).join("src/lib.rs"), body)?;
+        Ok(())
+    };
+    std::fs::write(work.join("Cargo.toml"), "[workspace]\nmembers = [\"alpha\", \"beta\", \"gamma\"]\nresolver = \"2\"\n")?;
+    std::fs::write(work.join(".gitignore"), "target/\nCargo.lock\n")?;
+    krate("alpha", "", "pub fn one() -> u32 { 1 }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn one_is_one() { assert_eq!(super::one(), 1); }\n}\n")?;
+    krate("beta", "alpha = { path = \"../alpha\" }\n", "pub fn two() -> u32 { alpha::one() + 1 }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn two_is_two() { assert_eq!(super::two(), 2); }\n}\n")?;
+    krate("gamma", "", "pub fn three() -> u32 { 3 }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn three_is_three() { assert_eq!(super::three(), 3); }\n}\n")?;
+    std::fs::write(work.join(".kiln/ci.yaml"), "on: push\njobs:\n  test:\n    runs-on: local\n    work: { warm: [target] }\n    steps:\n      - name: tests\n        tests: { cargo: [--workspace] }\n")?;
+    let tests_log = |seen: &BTreeMap<String, StepSeen>| seen.values().find(|h| h.log.contains("tests: ")).cloned().unwrap_or_default();
+    commit("one")?;
+    let (_, first) = finished(&s, 1)?;
+    let one = tests_log(&first);
+    anyhow::ensure!(one.conclusion == "success" && ["alpha", "beta", "gamma"].iter().all(|c| one.log.contains(&format!("tests: running {c}/lib"))), "{first:#?}");
+    // gamma changes: only its binary runs.
+    std::fs::write(work.join("gamma/src/lib.rs"), "pub fn three() -> u32 { 2 + 1 }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn three_is_three() { assert_eq!(super::three(), 3); }\n}\n")?;
+    commit("two")?;
+    let (_, second) = finished(&s, 2)?;
+    let two = tests_log(&second);
+    anyhow::ensure!(two.conclusion == "success" && two.log.contains("tests: running gamma/lib"), "{}", two.log);
+    anyhow::ensure!(two.log.contains("tests: alpha/lib replayed from run #1") && two.log.contains("tests: beta/lib replayed from run #1"), "{}", two.log);
+    anyhow::ensure!(!two.log.contains("tests: running alpha/lib") && !two.log.contains("tests: running beta/lib"), "{}", two.log);
+    // alpha changes: it and beta, which depends on it, run; gamma replays.
+    std::fs::write(work.join("alpha/src/lib.rs"), "pub fn one() -> u32 { 2 - 1 }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn one_is_one() { assert_eq!(super::one(), 1); }\n}\n")?;
+    commit("three")?;
+    let (_, third) = finished(&s, 3)?;
+    let three = tests_log(&third);
+    anyhow::ensure!(three.conclusion == "success" && three.log.contains("tests: running alpha/lib") && three.log.contains("tests: running beta/lib"), "{}", three.log);
+    anyhow::ensure!(three.log.contains("tests: gamma/lib replayed from run #2") && !three.log.contains("tests: running gamma/lib"), "{}", three.log);
+    Ok(())
+}
