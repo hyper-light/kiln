@@ -1029,7 +1029,8 @@ fn map_bench() {
 /// seconds counted, by the whole set, by the trace metrics alone and by one of them; the time a
 /// span, the allocations a window. Then the same of a web service's and an LLM agent's spans in the
 /// same requests (one in ten an LLM agent's), so every block holds both: none of the LLM metrics'
-/// searches is ruled out by a block. `metrics` alone: `cargo bench -p kiln-obs --bench traces -- metrics`.
+/// searches is ruled out by a block. `metrics` alone: `cargo bench -p kiln-obs --bench traces --
+/// metrics` (`KOBS_CASE=web` or `mixed`: that case alone, for a profile of it).
 fn metrics_bench() {
     use kiln_obs::logs::metrics::WINDOW;
     let mut all = kiln_obs::apm::trace_metrics();
@@ -1045,7 +1046,11 @@ fn metrics_bench() {
         req.extend(llm_request(50, r, at));
         req
     };
-    for (case, make) in [("a web service", &web as &dyn Fn(u64, u64) -> Vec<u8>), ("a web service and an LLM agent", &mixed)] {
+    let only = std::env::var("KOBS_CASE").unwrap_or_default();
+    for (name, case, make) in [("web", "a web service", &web as &dyn Fn(u64, u64) -> Vec<u8>), ("mixed", "a web service and an LLM agent", &mixed)] {
+        if !only.is_empty() && only != name {
+            continue;
+        }
         let (store, spans, windows) = span_store(make);
         println!("\n{spans} spans of {case}, {} windows of {} s", windows.len(), WINDOW / 1_000_000_000);
         println!("{:<34} {:>8} {:>12} {:>10} {:>10} {:>14} {:>10}", "counted (median of 5)", "metrics", "ms/window", "ns/span", "points", "allocs/window", "rows/span");

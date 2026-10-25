@@ -14,6 +14,7 @@ use std::sync::{Mutex, PoisonError};
 
 use hashbrown::HashTable;
 
+use super::record::RecordRef;
 use super::search::{RowScratch, Search};
 use super::store::{Facet, LogSnapshot, LogStoreError};
 use crate::batch::{Kind, SeriesKey};
@@ -185,6 +186,65 @@ impl Groups {
     }
 }
 
+/// A metric counted, as a record is asked of it: its place among the metrics, its search's among
+/// the distinct ones, its grouping's, and the slots ([`Keys`]) of the attributes it groups by and
+/// measures ([`NO_SLOT`]: none).
+struct Asked {
+    i: usize,
+    search: usize,
+    grouping: usize,
+    by: [u32; MAX_BY],
+    value: u32,
+}
+
+/// No slot: a field, not an attribute, or nothing measured.
+const NO_SLOT: u32 = u32::MAX;
+
+/// The attribute keys the metrics counted ask a record for, each a slot of a [`Memo`].
+#[derive(Default)]
+struct Keys<'m> {
+    keys: Vec<&'m str>,
+}
+
+impl<'m> Keys<'m> {
+    fn slot(&mut self, key: &'m str) -> u32 {
+        let at = self.keys.iter().position(|k| *k == key).unwrap_or(self.keys.len());
+        if at == self.keys.len() {
+            self.keys.push(key);
+        }
+        u32::try_from(at).unwrap_or(NO_SLOT)
+    }
+}
+
+/// Where each key of a [`Keys`] is in the record whose turn it is: found the first time a search, a
+/// grouping or a measure asks for it, and taken from here the times after (kiln's metrics of
+/// spans ask a span for some 40 attributes, a dozen keys). Each entry says the turn it was found
+/// in, so nothing is cleared between records.
+struct Memo {
+    turn: u64,
+    at: Vec<(u64, Option<(u32, u32)>)>,
+}
+
+impl Memo {
+    fn new(slots: usize) -> Self {
+        Self { turn: 0, at: vec![(0, None); slots] }
+    }
+
+    /// The next record's turn.
+    fn next(&mut self) {
+        self.turn += 1;
+    }
+
+    /// `key`'s value (its slot `slot`) in `r`, the record whose turn it is.
+    fn get<'a>(&mut self, r: &RecordRef<'a>, slot: u32, key: &str) -> Option<&'a str> {
+        let Some(e) = self.at.get_mut(slot as usize) else { return r.attr(key) };
+        if e.0 != self.turn {
+            *e = (self.turn, r.attr_place(key));
+        }
+        r.attr_at(e.1?)
+    }
+}
+
 /// What counting a window found of each metric.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tally {
@@ -229,45 +289,74 @@ fn number(v: Option<&str>) -> Option<f64> {
 /// grouping's values are read once a record however many metrics group by it.
 pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<Counted, LogStoreError> {
     let mut out = Counted { tallies: vec![Tally::default(); metrics.len()], ..Counted::default() };
-    // Each metric counted: its place, its search's among the distinct ones, its grouping's.
+    // Each metric counted: its search's place among the distinct ones, its grouping's, and the
+    // slots of the attributes it groups by and measures.
     let (mut searches, mut bys): (Vec<&Search>, Vec<&[(Facet, String)]>) = (Vec::new(), Vec::new());
-    let mut live: Vec<(usize, usize, usize)> = Vec::new();
+    let mut keys = Keys::default();
+    let mut live: Vec<Asked> = Vec::new();
     for (i, m) in metrics.iter().enumerate().filter(|(_, m)| m.since <= window) {
-        let s = searches.iter().position(|q| **q == m.search).unwrap_or(searches.len());
-        if s == searches.len() {
+        let search = searches.iter().position(|q| **q == m.search).unwrap_or(searches.len());
+        if search == searches.len() {
             searches.push(&m.search);
         }
-        let b = bys.iter().position(|b| b.iter().map(|(f, _)| f).eq(m.by.iter().map(|(f, _)| f))).unwrap_or(bys.len());
-        if b == bys.len() {
+        let grouping = bys.iter().position(|b| b.iter().map(|(f, _)| f).eq(m.by.iter().map(|(f, _)| f))).unwrap_or(bys.len());
+        if grouping == bys.len() {
             bys.push(&m.by);
         }
-        live.push((i, s, b));
+        let mut by = [NO_SLOT; MAX_BY];
+        for (slot, (f, _)) in by.iter_mut().zip(&m.by) {
+            if let Facet::Attr(k) = f {
+                *slot = keys.slot(k);
+            }
+        }
+        let value = match &m.compute {
+            Compute::Count => NO_SLOT,
+            Compute::Distribution { path, .. } => keys.slot(path.trim_start_matches('@')),
+            Compute::Duration { .. } => keys.slot("duration"),
+        };
+        live.push(Asked { i, search, grouping, by, value });
     }
     if live.is_empty() {
         return Ok(out);
     }
+    // Each distinct search's leaves' slots, by node.
+    let leaves: Vec<Vec<u32>> = searches
+        .iter()
+        .map(|q| {
+            let mut slots = vec![NO_SLOT; q.nodes.len()];
+            for (node, k) in q.attr_leaves() {
+                if let Some(x) = slots.get_mut(node) {
+                    *x = keys.slot(k);
+                }
+            }
+            slots
+        })
+        .collect();
     // A grouping's metrics one after another: its values read once a record.
-    live.sort_by_key(|&(i, _, b)| (b, i));
+    live.sort_by_key(|a| (a.grouping, a.i));
     let hash = Keyed::new();
     let mut groups: Vec<Groups> = metrics.iter().map(|_| Groups::new(hash)).collect();
     let mut scratch = RowScratch::default();
+    let mut memo = Memo::new(keys.keys.len());
     // What a record was found to be of each search: 0 not asked, 1 not matched, 2 matched.
     let mut said = vec![0u8; searches.len()];
     let rows = logs.each_record_for(&searches, window, window.saturating_add(WINDOW - 1), |r, may| {
         said.fill(0);
+        memo.next();
         let mut duration: Option<Option<f64>> = None;
         let mut grouped: Option<(usize, [&str; MAX_BY], u64)> = None;
-        for &(i, s, b) in &live {
-            let (Some(m), Some(g)) = (metrics.get(i), groups.get_mut(i)) else { continue };
-            if !may.get(s).copied().unwrap_or(true) {
+        for a in &live {
+            let (Some(m), Some(g)) = (metrics.get(a.i), groups.get_mut(a.i)) else { continue };
+            if !may.get(a.search).copied().unwrap_or(true) {
                 continue;
             }
-            let matched = match said.get(s).copied() {
+            let matched = match said.get(a.search).copied() {
                 Some(1) => false,
                 Some(2) => true,
                 _ => {
-                    let yes = m.search.row(r, &mut scratch);
-                    if let Some(v) = said.get_mut(s) {
+                    let slots = leaves.get(a.search);
+                    let yes = m.search.row_by(r, &mut scratch, |node, k| memo.get(r, slots.and_then(|s| s.get(node)).copied().unwrap_or(NO_SLOT), k));
+                    if let Some(v) = said.get_mut(a.search) {
                         *v = 1 + u8::from(yes);
                     }
                     yes
@@ -278,25 +367,28 @@ pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<C
             }
             let (v, percentiles) = match &m.compute {
                 Compute::Count => (None, false),
-                Compute::Distribution { path, percentiles } => match number(r.attr(path.trim_start_matches('@'))) {
+                Compute::Distribution { path, percentiles } => match number(memo.get(r, a.value, path.trim_start_matches('@'))) {
                     Some(v) => (Some(v), *percentiles),
                     None => continue,
                 },
-                Compute::Duration { percentiles } => match *duration.get_or_insert_with(|| number(r.attr("duration")).map(|ns| ns / 1e9)) {
+                Compute::Duration { percentiles } => match *duration.get_or_insert_with(|| number(memo.get(r, a.value, "duration")).map(|ns| ns / 1e9)) {
                     Some(v) => (Some(v), *percentiles),
                     None => continue,
                 },
             };
             let n = m.by.len().min(MAX_BY);
             let (values, h) = match grouped {
-                Some((at, values, h)) if at == b => (values, h),
+                Some((at, values, h)) if at == a.grouping => (values, h),
                 _ => {
                     let mut values: [&str; MAX_BY] = [""; MAX_BY];
-                    for (slot, (f, _)) in values.iter_mut().zip(&m.by) {
-                        *slot = tag_value(f.of(r));
+                    for ((value, (f, _)), &slot) in values.iter_mut().zip(&m.by).zip(&a.by) {
+                        *value = tag_value(match f {
+                            Facet::Attr(k) => memo.get(r, slot, k),
+                            f => f.of(r),
+                        });
                     }
                     let h = values_hash(&hash, values.iter().take(n).copied());
-                    grouped = Some((b, values, h));
+                    grouped = Some((a.grouping, values, h));
                     (values, h)
                 }
             };
@@ -306,8 +398,8 @@ pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<C
     out.rows_scanned = rows;
     let ms = window.div_euclid(1_000_000);
     // The series in the metrics' order.
-    live.sort_unstable_by_key(|&(i, ..)| i);
-    for &(i, ..) in &live {
+    live.sort_unstable_by_key(|a| a.i);
+    for &Asked { i, .. } in &live {
         let (Some(m), Some(g), Some(tally)) = (metrics.get(i), groups.get(i), out.tallies.get_mut(i)) else { continue };
         let named = g.groups.iter().map(|(k, a)| (Some(k), a));
         for (key, acc) in named.chain(g.overflow.as_ref().map(|a| (None, a))) {

@@ -582,13 +582,33 @@ impl Search {
         self.matches(r, s)
     }
 
+    /// [`Search::row`], the attribute each leaf asks for given by `attr` (the leaf's node, its
+    /// key): what a caller asking many searches of a record answers from what it found once
+    /// (`super::metrics::count`: kiln's metrics of spans ask a span for `span.kind` a dozen times).
+    pub fn row_by<'a>(&self, r: &RecordRef<'a>, s: &mut RowScratch, mut attr: impl FnMut(usize, &str) -> Option<&'a str>) -> bool {
+        self.eval(r, s, |i, k| attr(i, k))
+    }
+
+    /// Each attribute a leaf asks for: its node, and the key.
+    pub fn attr_leaves(&self) -> impl Iterator<Item = (usize, &str)> {
+        self.nodes.iter().enumerate().filter_map(|(i, n)| match n {
+            Node::Leaf(Leaf::Attr(k, _)) => Some((i, k.as_str())),
+            _ => None,
+        })
+    }
+
     fn matches<F: Fields>(&self, r: &F, s: &mut RowScratch) -> bool {
+        self.eval(r, s, |_, k| r.attr(k))
+    }
+
+    fn eval<'v, F: Fields>(&self, r: &'v F, s: &mut RowScratch, mut attr: impl FnMut(usize, &str) -> Option<&'v str>) -> bool {
         s.lower.clear();
         let mut lowered = false;
         s.vals.clear();
-        for n in &self.nodes {
+        for (i, n) in self.nodes.iter().enumerate() {
             let get = |vals: &Vec<bool>, i: usize| vals.get(i).copied().unwrap_or(false);
             let m = match n {
+                Node::Leaf(Leaf::Attr(k, m)) => attr_matches(m, attr(i, k)),
                 Node::Leaf(l) => leaf_row(l, r, &mut s.lower, &mut lowered, &mut s.tok),
                 Node::Not(x) => !get(&s.vals, *x),
                 Node::And(a, c) => get(&s.vals, *a) && get(&s.vals, *c),
@@ -597,6 +617,22 @@ impl Search {
             s.vals.push(m);
         }
         s.vals.get(self.root).copied().unwrap_or(false)
+    }
+}
+
+/// Whether an attribute's value (none: the record lacks it) is what a leaf asks.
+fn attr_matches(m: &AttrMatch, v: Option<&str>) -> bool {
+    let Some(v) = v else { return false };
+    match m {
+        AttrMatch::Exists => true,
+        AttrMatch::Text(t) => t.matches(v),
+        AttrMatch::Cmp(c, x) => number(v).is_some_and(|n| match c {
+            Cmp::Gt => n > *x,
+            Cmp::Ge => n >= *x,
+            Cmp::Lt => n < *x,
+            Cmp::Le => n <= *x,
+        }),
+        AttrMatch::Range(lo, hi) => number(v).is_some_and(|n| n >= *lo && n <= *hi),
     }
 }
 
@@ -771,20 +807,7 @@ fn leaf_row<F: Fields>(l: &Leaf, r: &F, lower: &mut String, lowered: &mut bool, 
         Leaf::HasTraceId => r.trace_id().is_some(),
         Leaf::HasSpanId => r.span_id().is_some(),
         Leaf::Name(t) => t.matches(r.message()),
-        Leaf::Attr(k, m) => match r.attr(k) {
-            None => false,
-            Some(v) => match m {
-                AttrMatch::Exists => true,
-                AttrMatch::Text(t) => t.matches(v),
-                AttrMatch::Cmp(c, x) => number(v).is_some_and(|n| match c {
-                    Cmp::Gt => n > *x,
-                    Cmp::Ge => n >= *x,
-                    Cmp::Lt => n < *x,
-                    Cmp::Le => n <= *x,
-                }),
-                AttrMatch::Range(lo, hi) => number(v).is_some_and(|n| n >= *lo && n <= *hi),
-            },
-        },
+        Leaf::Attr(k, m) => attr_matches(m, r.attr(k)),
         Leaf::Word(w) => {
             let mut found = false;
             tokens(r.message(), tok, |t| {

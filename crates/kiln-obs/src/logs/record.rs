@@ -59,16 +59,30 @@ impl<'a> RecordRef<'a> {
     /// The attribute `key`'s value (its first, given twice): the keys compared as bytes, the values
     /// passed unread, the one found alone read as text (a row's text is checked as its batch is
     /// applied, `crate::store`'s `within_logs`). A search asks a span for some fifty attributes it
-    /// mostly lacks: each ask read every key and value before as text (§12.17).
+    /// mostly lacks: each ask read every key and value before as text (§12.23).
     pub fn attr(&self, key: &str) -> Option<&'a str> {
+        self.attr_at(self.attr_place(key)?)
+    }
+
+    /// Where the attribute `key`'s value is among the record's attributes (its bytes' start and
+    /// end), as [`RecordRef::attr`] finds it, to be read with [`RecordRef::attr_at`]: what a caller
+    /// asking many searches of a record keeps, each key found once (`super::metrics::count`).
+    pub fn attr_place(&self, key: &str) -> Option<(u32, u32)> {
         let mut at = self.attrs_raw;
         for _ in 0..self.attr_count {
             if get_bytes(&mut at)? == key.as_bytes() {
-                return get_str(&mut at);
+                let n = usize::try_from(varint::get(&mut at)?).ok()?;
+                let start = self.attrs_raw.len() - at.len();
+                return Some((u32::try_from(start).ok()?, u32::try_from(start.checked_add(n)?).ok()?));
             }
             skip_str(&mut at)?;
         }
         None
+    }
+
+    /// The value at a place [`RecordRef::attr_place`] found in this record.
+    pub fn attr_at(&self, (start, end): (u32, u32)) -> Option<&'a str> {
+        std::str::from_utf8(self.attrs_raw.get(start as usize..end as usize)?).ok()
     }
 
     pub fn to_owned(&self) -> Record {
