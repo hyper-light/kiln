@@ -93,6 +93,10 @@ pub struct AssignmentV2 {
     /// `None` when they connect freely.
     #[serde(default)]
     pub network: Option<Network>,
+    /// The leg runs trusted code (W18-R07): only such a leg gets v1's kept `cache:` folders
+    /// (W02-R06, W24-R11). An older server never says so, so its legs keep none.
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 /// A job's environment, as its runner deploys to it (W15-R02).

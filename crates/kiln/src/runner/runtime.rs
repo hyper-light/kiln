@@ -3533,6 +3533,7 @@ impl Leg {
                 true
             }
             "cache" => self.cache_step(st, idx, &with, &mut outputs).await?,
+            "keep" => self.keep_step(st, idx, &with).await?,
             // A `container` or `microvm` environment's deployment is the runner's own to make
             // (W15-R02).
             "deploy" if self.a.environment.as_ref().and_then(|b| b.kind.as_deref()) == Some("container") => self.deploy_containers(st, idx, &with, wd, &mut outputs).await?,
@@ -3883,8 +3884,53 @@ impl Leg {
         Ok(true)
     }
 
-    /// A built-in's post step: `kiln/cache@v1`'s save.
+    /// `kiln/keep@v1`: v1's `cache: [dirs]` (W02-R06, W24-R11), folders this runner keeps per
+    /// repository and job. A trusted leg gets what the job's last leg here kept and keeps it again
+    /// after its steps; an untrusted leg gets them empty, and nothing it writes is kept.
+    async fn keep_step(&self, st: &mut State, idx: u32, with: &BTreeMap<String, String>) -> anyhow::Result<bool> {
+        let given: Vec<String> = with.get("path").map(|v| v.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect()).unwrap_or_default();
+        let (paths, unreachable) = self.cache_paths(st, &given);
+        let trusted = self.a.trusted;
+        for (dir, at) in paths.given.iter().zip(paths.resolved.iter()) {
+            if unreachable.contains(dir) {
+                self.annotate(idx, "warning", &format!("`{dir}` isn't in a directory the runner shares with the job container: it can't be kept")).await;
+                continue;
+            }
+            let (kept, at) = (super::cache::kept_at(&self.work_dir, &self.a.repo, &self.a.leg.job_id, dir), at.clone());
+            match crate::rt::blocking(move || super::cache::put_kept(&kept, &at, trusted)).await? {
+                Ok(how) => self.note(idx, &format!("`{dir}`: {how}")).await,
+                Err(e) => self.annotate(idx, "warning", &format!("`{dir}` couldn't be put in place: {e:#}")).await,
+            }
+        }
+        if trusted {
+            st.posts.push(Post { name: "Post keep v1 cache directories".to_owned(), run: PostRun::Builtin { name: "keep", with: with.clone() }, env: BTreeMap::new(), cond: Some(Tpl::new("always()".to_owned(), Default::default())), wd: st.layout.workspace.clone(), uses: "kiln/keep@v1".to_owned() });
+        }
+        Ok(true)
+    }
+
+    /// `kiln/keep@v1`'s post step: a trusted leg's folders kept for the job's next leg here.
+    async fn keep_post(&self, st: &State, idx: u32, with: &BTreeMap<String, String>) -> anyhow::Result<Ran> {
+        let given: Vec<String> = with.get("path").map(|v| v.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect()).unwrap_or_default();
+        let (paths, unreachable) = self.cache_paths(st, &given);
+        for (dir, at) in paths.given.iter().zip(paths.resolved.iter()) {
+            if !self.a.trusted || unreachable.contains(dir) {
+                continue;
+            }
+            let (kept, at) = (super::cache::kept_at(&self.work_dir, &self.a.repo, &self.a.leg.job_id, dir), at.clone());
+            match crate::rt::blocking(move || super::cache::keep(&at, &kept)).await? {
+                Ok(true) => self.note(idx, &format!("`{dir}` kept on this runner for the job's next leg")).await,
+                Ok(false) => {}
+                Err(e) => self.annotate(idx, "warning", &format!("`{dir}` couldn't be kept: {e:#}")).await,
+            }
+        }
+        Ok(Ran { end: End::Exit(Some(0)), outputs: BTreeMap::new(), state: Vec::new() })
+    }
+
+    /// A built-in's post step: `kiln/cache@v1`'s save, or `kiln/keep@v1`'s keep.
     async fn builtin_post(&self, st: &mut State, idx: u32, name: &str, with: &BTreeMap<String, String>) -> anyhow::Result<Ran> {
+        if name == "keep" {
+            return self.keep_post(st, idx, with).await;
+        }
         anyhow::ensure!(name == "cache", "kiln/{name}@v1 has no post step");
         let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
         let key = get("key").unwrap_or_default();

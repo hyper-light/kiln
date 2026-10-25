@@ -2263,6 +2263,7 @@ impl Dispatch {
             integrations: Vec::new(),
             limits: wire::Limits::default(),
             network: egress_of(job.and_then(|j| j.kiln.network.as_ref()), r.trusted, &self.hub.cfg.ci.untrusted.allow_hosts, leg),
+            trusted: r.trusted,
         }
     }
 

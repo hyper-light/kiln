@@ -1984,6 +1984,70 @@ jobs:
     Ok(())
 }
 
+/// W02-R06 through W24-R11: a v1 `cache:` folder is kept on the runner between legs of the same
+/// job: the second run reads what the first wrote.
+#[test]
+fn w24_r11_v1_cache_dirs_persist_between_legs() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/kept", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "kept\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "init"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/kept.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    std::fs::write(
+        work.join(".kiln/keep.yaml"),
+        "on: push\njobs:\n  build:\n    runs-on: local\n    checkout: false\n    cache: [kept]\n    steps:\n      - run: |\n          echo \"saw=$(cat kept/f 2>/dev/null || echo none)\"\n          echo \"run-${{ github.run_number }}\" > kept/f\n",
+    )?;
+    let finished = |n: usize| -> anyhow::Result<Vec<Value>> {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/kept&limit=10", &s.admin, None)?;
+            let list: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+            let done: Vec<Value> = list.into_iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).collect();
+            if done.len() >= n {
+                return Ok(done);
+            }
+            anyhow::ensure!(Instant::now() < deadline, "{n} runs didn't finish: {body}\n{}", s.log());
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    let log_of = |run: &Value| -> anyhow::Result<String> {
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(run, "id")), &s.admin, None)?;
+        let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let mut all = String::new();
+        for step in 0..4 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+            all.push_str(&t);
+        }
+        Ok(all)
+    };
+    for (n, what) in [(1, "first"), (2, "second")] {
+        std::fs::write(work.join("README.md"), format!("{what}\n"))?;
+        must(git(&home, &work, &["add", "."]), "add")?;
+        must(git(&home, &work, &["commit", "-qm", what]), "commit")?;
+        must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+        finished(n)?;
+    }
+    let runs = finished(2)?;
+    let logs: Vec<String> = runs.iter().map(log_of).collect::<anyhow::Result<_>>()?;
+    assert!(runs.iter().all(|r| text(r, "conclusion") == "success"), "{runs:?}\n{}", s.log());
+    assert!(logs.iter().any(|l| l.contains("saw=none")), "the first leg starts empty: {logs:?}");
+    assert!(logs.iter().any(|l| l.contains("saw=run-1")), "the second leg reads what the first wrote: {logs:?}");
+    Ok(())
+}
+
 /// W08-R09's `kiln/cache@v1` with its local tier: a first run misses and saves every chunk; a
 /// second restores the first's entry by a restore key with nothing downloaded (the runner kept
 /// the chunks), changes a little of it, and saves only the chunks that changed.
