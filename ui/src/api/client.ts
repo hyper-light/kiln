@@ -1,5 +1,5 @@
 import { apiPath } from "@/lib/peer-base";
-import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncMode, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
+import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JobTools, ToolFix, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncMode, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -244,6 +244,8 @@ export const api = {
   retryRun: (id: string, onlyFailed: boolean) => post<void>(`/api/runs/${enc(id)}/retry`, { only_failed: onlyFailed }),
 
   job: (id: string, signal?: AbortSignal) => get<Job>(`/api/jobs/${enc(id)}`, signal),
+  jobTools: (id: string, signal?: AbortSignal) => get<JobTools>(`/api/jobs/${enc(id)}/tools`, signal),
+  fixJobTools: (id: string, body: { runner?: string; kind?: string; mode?: string }) => post<{ fix: ToolFix }>(`/api/jobs/${enc(id)}/tools/fix`, body),
   jobLogsUrl: (id: string, step: number) => apiPath(`/api/jobs/${enc(id)}/logs${qs({ step })}`),
   jobLogs: (id: string, step: number) => request<string>("GET", `/api/jobs/${enc(id)}/logs${qs({ step })}`, undefined, { raw: true }),
 

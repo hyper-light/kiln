@@ -105,6 +105,40 @@ fn facts_meet(requires: &[String], facts: Option<&kiln_ci::facts::RunnerFacts>, 
     requires.iter().all(|r| kiln_ci::sched::routing::Constraint::parse(r).is_ok_and(|c| c.eval(f, labels)))
 }
 
+/// For a job waiting on its `requires`: each connected runner its labels fit, with the constraints
+/// its facts don't meet (every one, when it hasn't reported facts) and the tools they name, those
+/// an install would fix first, then those that lack least. None when one already meets them all:
+/// the job waits for its slot, not a tool.
+pub fn unmet(hub: &Hub, labels: &[String], requires: &[String]) -> Vec<crate::toolfix::Unmet> {
+    let g = hub.agents.lock();
+    let fits: Vec<Fit<'_>> = g
+        .values()
+        .filter(|a| a.connected && !a.ephemeral && labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l)))
+        .map(|a| (a.name.as_str(), a.facts.as_deref(), a.labels.as_slice(), crate::toolfix::agent_cannot(Some(a), &a.name)))
+        .collect();
+    unmet_of(&fits, requires)
+}
+
+/// A runner as [`unmet_of`] weighs it: its name, facts and labels, and why it hosts no agent.
+type Fit<'a> = (&'a str, Option<&'a kiln_ci::facts::RunnerFacts>, &'a [String], Option<String>);
+
+/// [`unmet`] for these runners.
+fn unmet_of(fits: &[Fit<'_>], requires: &[String]) -> Vec<crate::toolfix::Unmet> {
+    if fits.iter().any(|(_, facts, labels, _)| facts_meet(requires, *facts, labels)) {
+        return Vec::new();
+    }
+    let mut out: Vec<crate::toolfix::Unmet> = fits
+        .iter()
+        .map(|(name, facts, labels, no_agent)| {
+            let unmet: Vec<String> = requires.iter().filter(|r| !facts_meet(std::slice::from_ref(*r), *facts, labels)).cloned().collect();
+            let fixable = no_agent.is_none() && unmet.iter().all(|r| crate::toolfix::only_tools(r));
+            crate::toolfix::Unmet { runner: (*name).to_owned(), tools: crate::toolfix::tools_in(&unmet), unmet, fixable, no_agent: no_agent.clone() }
+        })
+        .collect();
+    out.sort_by(|a, b| b.fixable.cmp(&a.fixable).then_with(|| a.unmet.len().cmp(&b.unmet.len())).then_with(|| a.runner.cmp(&b.runner)));
+    out
+}
+
 /// The labels a runner's platform gives it.
 fn platform_labels<'a>(os: &'a str, arch: &'a str) -> Vec<&'a str> {
     let mut v = vec!["self-hosted", os, arch];
@@ -317,6 +351,8 @@ pub struct Hub {
     pub gitops_kick: Notify,
     /// Repositories (by id) asked to be polled now: a push, a webhook, a new repository.
     pub gitops_wanted: Mutex<HashSet<String>>,
+    /// Agents installing what jobs lack, by job ([`crate::toolfix`]).
+    pub tool_fixes: Mutex<HashMap<String, crate::toolfix::Fix>>,
     pub shutdown: Shutdown,
     /// Time, as the goal driver and what else moves onto it take it: kiln's runtime in production,
     /// a simulated clock in tests (kiln-seams' `Clock`, docs/seams.md).
@@ -447,6 +483,7 @@ impl Hub {
             k8s: std::sync::OnceLock::new(),
             gitops_kick: Notify::new(),
             gitops_wanted: Mutex::new(HashSet::new()),
+            tool_fixes: Mutex::new(HashMap::new()),
             shutdown,
             clock,
             cancel_sent: Mutex::new(HashMap::new()),
@@ -2694,6 +2731,29 @@ pub(crate) mod tests {
         assert!(!facts_meet(&["tools has".to_owned()], Some(&mac(&["node"])), &labels), "a requirement that doesn't parse holds nowhere");
     }
 
+    /// What a waiting job's runners lack, for an agent to install (`GET /api/jobs/:id/tools`):
+    /// nothing while one meets it all (the job waits for a slot), else each runner with what it
+    /// doesn't meet: a Mac that only lacks tools and hosts agents first, then one without
+    /// terminals, then one that hasn't said what it has.
+    #[test]
+    fn a_waiting_job_says_what_its_runners_lack() {
+        let mac = |tools: &[&str]| kiln_ci::facts::RunnerFacts {
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            tools: tools.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(),
+            ..Default::default()
+        };
+        let release: Vec<String> = ["os == macos", "arch == aarch64", "tools has cargo", "tools has node"].iter().map(|r| (*r).to_owned()).collect();
+        let labels = vec!["macos".to_owned()];
+        let (studio, mbp) = (mac(&["git"]), mac(&["git", "cargo", "node"]));
+        assert!(unmet_of(&[("studio-3", Some(&studio), &labels, None), ("mbp", Some(&mbp), &labels, None)], &release).is_empty(), "one meets it: it waits for a slot");
+        let shut = Some("its runner was started without terminals".to_owned());
+        let lacks = unmet_of(&[("old", None, &labels, None), ("studio-3", Some(&studio), &labels, None), ("studio-2", Some(&studio), &labels, shut)], &release);
+        let seen: Vec<(&str, bool, usize, Vec<String>)> = lacks.iter().map(|u| (u.runner.as_str(), u.fixable, u.unmet.len(), u.tools.clone())).collect();
+        let tools = vec!["cargo".to_owned(), "node".to_owned()];
+        assert_eq!(seen, vec![("studio-3", true, 2, tools.clone()), ("studio-2", false, 2, tools.clone()), ("old", false, 4, tools)], "an agent can fix only the one that hosts agents and lacks only tools");
+    }
+
     /// A job's labels fit a runner by its own labels, its name, or its platform (`linux`, `amd64`,
     /// `arm64`, `self-hosted`), in any case: `[linux]` isn't only for runners labelled so.
     #[test]
@@ -2707,6 +2767,39 @@ pub(crate) mod tests {
             assert!(!fits(w), "{w}");
         }
         assert!(carries(&[], "macos", "aarch64", "mac", "arm64") && carries(&[], "macos", "aarch64", "mac", "darwin"));
+    }
+
+    /// A connected runner on `os`/`arch` that hosts agents (its terminals on), for a test's hub.
+    pub(crate) fn live_runner(name: &str, os: &str, arch: &str) -> AgentLive {
+        AgentLive {
+            name: name.into(),
+            peer: None,
+            labels: vec![],
+            slots: 1,
+            hostname: name.into(),
+            os: os.into(),
+            arch: arch.into(),
+            version: String::new(),
+            ephemeral: false,
+            connected: true,
+            last_seen: 0,
+            enrolled_at: 0,
+            running: vec![],
+            busy: 0,
+            draining: false,
+            sample: None,
+            battery: None,
+            dropped: Vec::new(),
+            dropped_toward: Vec::new(),
+            terminal: true,
+            outpost: false,
+            dedicated_job: None,
+            exclusive: false,
+            lost_at: None,
+            facts: None,
+            instances: Vec::new(),
+            transport: None,
+        }
     }
 
     /// A hub of its own for a test: its data in a folder that lives as long as the process (tests

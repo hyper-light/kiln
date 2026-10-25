@@ -58,24 +58,27 @@ async fn output(program: &str, args: &[&str]) -> Option<String> {
     o.status.success().then(|| format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
 }
 
+/// The tools a runner's facts report when they're on `PATH`: each as its fact names it, the program
+/// and the arguments that print its version.
+pub const TOOLS: &[(&str, &str, &[&str])] = &[
+    ("git", "git", &["--version"]),
+    ("node", "node", &["--version"]),
+    ("python3", "python3", &["--version"]),
+    ("cargo", "cargo", &["--version"]),
+    ("go", "go", &["version"]),
+    ("java", "java", &["-version"]),
+    ("dotnet", "dotnet", &["--version"]),
+    ("docker", "docker", &["--version"]),
+    ("docker buildx", "docker", &["buildx", "version"]),
+    ("podman", "podman", &["--version"]),
+    ("shards", "shards", &["--version"]),
+    ("firecracker", "firecracker", &["--version"]),
+    ("kubectl", "kubectl", &["version", "--client"]),
+];
+
 /// Tools found on `PATH`, with the version each reports.
 async fn tools() -> BTreeMap<String, String> {
-    let list: &[(&str, &str, &[&str])] = &[
-        ("git", "git", &["--version"]),
-        ("node", "node", &["--version"]),
-        ("python3", "python3", &["--version"]),
-        ("cargo", "cargo", &["--version"]),
-        ("go", "go", &["version"]),
-        ("java", "java", &["-version"]),
-        ("dotnet", "dotnet", &["--version"]),
-        ("docker", "docker", &["--version"]),
-        ("docker buildx", "docker", &["buildx", "version"]),
-        ("podman", "podman", &["--version"]),
-        ("shards", "shards", &["--version"]),
-        ("firecracker", "firecracker", &["--version"]),
-        ("kubectl", "kubectl", &["version", "--client"]),
-    ];
-    let found = futures::future::join_all(list.iter().map(|(name, program, args)| async move { output(program, args).await.as_deref().and_then(version_in).map(|v| ((*name).to_owned(), v)) })).await;
+    let found = futures::future::join_all(TOOLS.iter().map(|(name, program, args)| async move { output(program, args).await.as_deref().and_then(version_in).map(|v| ((*name).to_owned(), v)) })).await;
     found.into_iter().flatten().collect()
 }
 
