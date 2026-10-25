@@ -4401,6 +4401,9 @@ a window's edge is read for each window. Allocations: 1,396 a window of a web se
 1,404), 5,177 of both, nearly all the points' series keys; the searches' block summaries asked in
 room kept from block to block (the first sharing step allocated some 320 a window more, 217486fa).
 What remains is reading the rows (their LZ4, their fields as text), the searches, and the groups.
+Live, the load scenario's trace flood (§13: eight senders, some 1.6 to 1.9 million spans in 20 s, a
+debug build) had its trace metrics counted 18 s after the flood on the Mac Studio and on adacachy,
+against 76 s on the Mac before, and on adacachy more than the two minutes the scenario then waited.
 
 The varint's change measured elsewhere (2303c5da against the commit before it, the same three
 rounds): OTLP spans decoded 593 to 559 ns a span (a web service's, 512 a request), an Agent's
@@ -5035,6 +5038,25 @@ open to that session) and holding the build's output open: builds are now given 
 minutes, the CLI's process group killed, and made again; that Mac's runs give Docker a config
 without the credential store (it keeps no credentials). And a stand-in `journalctl`'s `tail`
 outlived its reader, killed alone: a log reader is now stopped with its process group (§8.1).
+Then the whole set again on that Mac at d9480644, after counting was made faster (§12.23):
+kiln-obs's tests (354, its group's 4), kiln's observe, CD and transport tests (294) and every one of
+the 29 live files pass; the trace flood's 1,875,270 spans' trace metrics counted 18.0 s after the
+flood, where 1,691,670 had taken 76.4 s there at 5a74e409.
+
+**On Linux**, where every scenario below was first written (2026-10-25, adacachy: CachyOS, x86_64,
+32 cores shared with others' builds): the whole set as the last changes went in, at e1d39d2c:
+kiln's observe tests (268), every live file, and the browser suite against a seeded server (its 45
+scenarios in Chromium and WebKit, desktop and phone: 180 runs, every one passing). Every live file
+passed but two, each a check of the test's own: the indexes' scenario looked for its runner caught
+up at the leader's latest index while the leader wrote on (a runner is caught up now when its
+digest agrees with the leader's at the runner's own index, `Fleet::until_caught_up`), and the trace
+flood waited two minutes for its 700,230 traces' trace metrics, which their counting took longer
+than (it now waits five; and counting is 18 times faster, §12.23). Then the whole set again at
+79485048, the counting's: kiln's observe tests (268), every live file (the trace flood's 1,615,170
+spans' trace metrics counted 18.2 s after it), and 179 of the browser suite's 180 runs; the one
+was WebKit's on a phone, the notebooks' first navigation interrupted by the incidents scenario's
+cleanup's, which that scenario had let go on unawaited (each scenario now starts from a blank
+page, de722eb4).
 
 **On Windows** (2026-10-24, jupiter: Windows 11, x86_64, MSVC, Git for Windows' own
 `core.autocrlf`): 42 of the scenarios below pass there, at 7f607f14, ef10dc30 and 4747aca3 (the same
