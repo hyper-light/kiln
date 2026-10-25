@@ -7769,6 +7769,35 @@ Production's engine is off, so it can't plan them itself.
 confirmed case-insensitive. The production change, for the person to make (not deployed): `[ci]
 enabled = true` and `kiln_workflows = true`, after the `k8s` pool above.
 
+**M2 (built 2026-10-25, awaiting review).**
+
+- **The runner's cache service** (R08, `crates/kiln/src/runner/work`): objects at `<work>/_cas`,
+  whole up to 8 MiB and in the store's content-defined chunks above; loopback and a unix socket;
+  tokens scoped to a repository, a domain and read or write; writes up to the server by scope (a
+  leg's grant), existence checks by repository. The tools' entries are on the work ledger
+  (`<work>/_cas/ledger.db`, `crate::ci::work`'s rows, recorded and looked up on its one path, R30).
+  A runner opens it the first time something asks for it (`kiln run --reuse`); legs and agents
+  aren't given it yet. Local hits under 1 MiB: p99 1.20 ms and 1.54 ms in two runs (p50 0.61 and
+  0.76 ms; a debug build on a shared fedora).
+- **Its protocols** (AC08): sccache's WebDAV, Bazel's `/ac/` and `/cas/`, Gradle's and ccache's HTTP
+  caches, Turborepo's v8 API and `kiln gocacheprog`. On fedora, Go 1.26.8 and Turborepo 2.11.10 each
+  build a fixture twice against a runner's service, the second from it: 63 packages compiled, then
+  none; a cache miss, then `FULL TURBO` (`tests/cache_tools.rs`). sccache, Bazel, Gradle and ccache
+  aren't installed there, so their requests are checked as each client sends them (`tools.rs`).
+  macOS is still to run.
+- **Agents' builds** (R24, `harness/builds.rs`): the cache variables under the agent's person's
+  scope, each scope with folders of its own for what the tools keep on disk, and a new worktree's
+  `target/` as a copy-on-write clone of the nearest warm one, the files the two share dated alike.
+  Nothing calls them as agents start yet. On a fixture workspace, a second worktree's first build
+  compiles 0 of 4 units (AC04), and ten agents' worktrees hold 1.0× one target folder's bytes on
+  btrfs (AC05); kiln's own workspace is still to measure.
+- **Peers** (R27, `runner/work/peers.rs`): an object this runner lacks is asked of the LAN peers that
+  hold it for the asker's repository, each copy hashed before it's kept and a wrong one refused.
+  Reach doesn't carry objects yet: the interface and a test LAN are built, not the transport over
+  reach's links nor the directory of which runner holds what.
+- **`kiln run --reuse`** (R24, `reach/reuse.rs`, docs/reach.md §5.1): an identical run's recorded
+  success, from the ledger.
+
 ## 4. API, events, CLI and MCP reference
 
 All routes come from the one route table (W10-R05, W20-R01) and follow access.md's conventions:
