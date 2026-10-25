@@ -217,8 +217,14 @@ pub(crate) async fn commit_info(hub: &Hub, repo: &Repo, sha: &str) -> (String, S
     }
 }
 
+/// Where `repo`'s commits are read: kiln's own repository when kiln hosts it, whose diffs'
+/// versions (`refs/kiln/diffs/…`) its mirror never fetches, else its mirror.
+pub(crate) fn git_dir(hub: &Hub, repo: &Repo) -> PathBuf {
+    crate::ci::hosting::native_path(hub, repo).unwrap_or_else(|| mirror_path(hub, &repo.name))
+}
+
 pub(crate) async fn changed_files(hub: &Hub, repo: &Repo, old: &str, new: &str) -> Option<Vec<String>> {
-    let p = mirror_path(hub, &repo.name).to_string_lossy().to_string();
+    let p = git_dir(hub, repo).to_string_lossy().to_string();
     let o = run_git(hub, &["-C", &p, "diff", "--name-only", old, new], LS_REMOTE_TIMEOUT).await.ok()?;
     Some(String::from_utf8_lossy(&o).lines().map(str::to_owned).collect())
 }
@@ -230,7 +236,7 @@ pub(crate) async fn pr_counts(hub: &Hub, repo: &Repo, base: &str, head: &str) ->
     if base.is_empty() || head.is_empty() {
         return c;
     }
-    let p = mirror_path(hub, &repo.name).to_string_lossy().to_string();
+    let p = git_dir(hub, repo).to_string_lossy().to_string();
     if let Ok(o) = run_git(hub, &["-C", &p, "rev-list", "--count", &format!("{base}..{head}")], LS_REMOTE_TIMEOUT).await {
         c.commits = String::from_utf8_lossy(&o).trim().parse().unwrap_or(0);
     }

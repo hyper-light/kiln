@@ -1271,7 +1271,10 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
   version's commit as the head and the trunk as the base, with GitHub's counts (`commits`,
   `additions`, `deletions`, `changed_files`; cpython's change detection fetches
   `--depth=$(( commits + 1 ))`, so a 0 there lost its merge base). A GitHub workflow
-  `on: pull_request` ran on both and said so.
+  `on: pull_request` ran on both and said so, and one with `paths: ['docs/**']` ran on neither:
+  a hosted repository's diffs are read in its own repository, as their versions
+  (`refs/kiln/diffs/…`) are never in its mirror, where their counts and changed files had been
+  read and not found (changed files unknown, so every `paths:` filter ran).
 - *Done.* AC01 (`kiln_ci::trigger::matcher`): GitHub's documented matching, example by example.
   - `push`: no filters; branches only, tags only and both, each ref by its own kind; the
     "Including", "Excluding" and "Including and excluding" branches and tags examples as written
