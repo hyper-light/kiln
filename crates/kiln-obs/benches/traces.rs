@@ -588,9 +588,13 @@ fn median(mut v: Vec<u64>) -> u64 {
 }
 
 fn main() {
-    // `map`: the service map's alone.
+    // `map`: the service map's alone; `metrics`, the trace metrics' counting alone.
     if std::env::args().any(|a| a == "map") {
         map_bench();
+        return;
+    }
+    if std::env::args().any(|a| a == "metrics") {
+        metrics_bench();
         return;
     }
     println!("{:<30} {:>6} {:>9} {:>10} {:>10} {:>11} {:>10} {:>8}", "request", "spans", "bytes", "rows B/s", "lz4 B/s", "decode ns/s", "allocs/s", "faults");
@@ -1017,4 +1021,57 @@ fn map_bench() {
         println!("its figures over {name:<10}: {:>8.2} ms ({} series of the metrics)", ns as f64 / 1e6, keys.len());
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Trace metrics counted as the server counts them (`kiln_obs::apm::trace_metrics`, with LLM
+/// Observability's and Error Tracking's: every metric of spans kiln counts itself): a web service's
+/// spans, a thousand a second for five minutes, taken as a node's writes, then every window of ten
+/// seconds counted, by the whole set, by the trace metrics alone and by one of them; the time a
+/// span, the allocations a window. `metrics` alone: `cargo bench -p kiln-obs --bench traces -- metrics`.
+fn metrics_bench() {
+    use kiln_obs::batch::Builder;
+    use kiln_obs::logs::metrics::{WINDOW, window_of};
+    const REQUESTS: u64 = 586;
+    let at = 1_800_000_000_000_000_000u64;
+    let end = at + REQUESTS * 512_000_000;
+    let written = i64::try_from(end / 1_000_000).unwrap() + 60_000;
+    let mut store = kiln_obs::store::Store::default();
+    let (mut d, mut b, mut spans) = (Decoder::new(), Builder::new(), 0u64);
+    for r in 0..REQUESTS {
+        let mut o = Spans::default();
+        d.decode(&request(512, r, at + r * 512_000_000), 0, &mut o).unwrap();
+        for (raw, n) in &o.segments {
+            b.spans(raw, *n);
+            spans += u64::from(*n);
+        }
+        store.apply_entry(r + 1, &kiln_obs::command::write(7, r + 1, written, &b.finish())).unwrap();
+        d.give(o);
+    }
+    let mut all = kiln_obs::apm::trace_metrics();
+    let trace = all.clone();
+    all.extend(kiln_obs::llm::metrics::metrics());
+    all.extend(kiln_obs::errors::metrics(true));
+    let one = vec![trace[0].clone()];
+    let windows: Vec<i64> = (window_of(at as i64)..=window_of(end as i64 - 1)).step_by(WINDOW as usize).collect();
+    println!("{spans} spans of a web service, {} windows of {} s", windows.len(), WINDOW / 1_000_000_000);
+    println!("{:<34} {:>8} {:>12} {:>10} {:>10} {:>14}", "counted (median of 5)", "metrics", "ms/window", "ns/span", "points", "allocs/window");
+    for (what, set) in [("every metric of spans kiln counts", &all), ("the trace metrics", &trace), (trace[0].name.as_str(), &one)] {
+        let (mut runs, mut allocs, mut points, mut rows) = (Vec::new(), u64::MAX, 0usize, 0u64);
+        for _ in 0..5 {
+            let (mut p, mut n) = (0usize, 0u64);
+            alloc::begin();
+            let t = Instant::now();
+            for &w in &windows {
+                let c = store.count_span_metrics(set, w).unwrap().unwrap();
+                p += c.series.len();
+                n += c.rows_scanned;
+            }
+            runs.push(t.elapsed().as_nanos() as u64);
+            allocs = allocs.min(alloc::end().calls());
+            (points, rows) = (p, n);
+        }
+        assert_eq!(rows, spans, "every span read once");
+        let ns = median(runs);
+        println!("{:<34} {:>8} {:>12.3} {:>10.0} {:>10} {:>14.1}", what, set.len(), ns as f64 / 1e6 / windows.len() as f64, ns as f64 / spans as f64, points, allocs as f64 / windows.len() as f64);
+    }
 }
