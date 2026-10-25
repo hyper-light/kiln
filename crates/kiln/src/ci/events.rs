@@ -220,7 +220,15 @@ async fn synthesize(hub: &Hub, repo: &Repo, t: &Trigger) -> Event {
             e.head_ref = Some(format!("pr/{number}"));
             e.changed = gitops::changed_files(hub, repo, &default_branch, &t.sha).await;
             let base_sha = gitops::run_git(hub, &["-C", &mirror, "rev-parse", &default_branch], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_default();
-            let pr = PullRequest { number, state: "open".into(), head: Side { branch: format!("pr/{number}"), sha: t.sha.clone(), repo: ctx_repo.clone() }, base: Side { branch: default_branch.clone(), sha: base_sha, repo: ctx_repo.clone() }, ..PullRequest::default() };
+            let counts = gitops::pr_counts(hub, repo, &default_branch, &t.sha).await;
+            let pr = PullRequest {
+                number,
+                state: "open".into(),
+                head: Side { branch: format!("pr/{number}"), sha: t.sha.clone(), repo: ctx_repo.clone() },
+                base: Side { branch: default_branch.clone(), sha: base_sha, repo: ctx_repo.clone() },
+                counts,
+                ..PullRequest::default()
+            };
             e.payload = context::pull_request(&e, &ctx_repo, &pr);
             // Polling can't see where the head lives: one on none of the repository's branches
             // came from a fork, and is untrusted (W03-R08, W18-R05). Its author counts as a

@@ -1058,7 +1058,9 @@ as a hint).
   as in GitHub's payload for Actions, no `added`, `removed` or `modified`), `head_commit`,
   `repository`, `pusher`, `sender`; for
   `pull_request` the `action`, `number`, `pull_request` (`number`, `title`, `body`, `state`,
-  `draft`, `user`, `labels`, `head` and `base` with `ref`, `sha`, `repo`), `repository`, `sender`.
+  `draft`, `user`, `labels`, `head` and `base` with `ref`, `sha`, `repo`, and GitHub's counts:
+  `commits` on the head and not the base, `additions`, `deletions` and `changed_files` since their
+  merge base), `repository`, `sender`.
   Fields kiln cannot know (labels of a polled PR without a token) are absent, and
   `payload.kiln.partial` is `true`. Every synthesized payload validates against GitHub's published
   webhook schemas (W03-AC04).
@@ -1266,8 +1268,13 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
   - `schedule` has no webhook, so it has no schema.
 - *Done.* AC07 (`w03_ac07_a_diffs_versions_are_pull_request_events`): a diff's first version is
   `pull_request` `opened` and its second `synchronize`. Each carries the diff's number, the
-  version's commit as the head and the trunk as the base. A GitHub workflow `on: pull_request`
-  ran on both and said so.
+  version's commit as the head and the trunk as the base, with GitHub's counts (`commits`,
+  `additions`, `deletions`, `changed_files`; cpython's change detection fetches
+  `--depth=$(( commits + 1 ))`, so a 0 there lost its merge base). A GitHub workflow
+  `on: pull_request` ran on both and said so, and one with `paths: ['docs/**']` ran on neither:
+  a hosted repository's diffs are read in its own repository, as their versions
+  (`refs/kiln/diffs/…`) are never in its mirror, where their counts and changed files had been
+  read and not found (changed files unknown, so every `paths:` filter ran).
 - *Done.* AC01 (`kiln_ci::trigger::matcher`): GitHub's documented matching, example by example.
   - `push`: no filters; branches only, tags only and both, each ref by its own kind; the
     "Including", "Excluding" and "Including and excluding" branches and tags examples as written
@@ -1580,6 +1587,15 @@ contexts to every later evaluation, and plan previews to W20 and W21.
   environment, the names its legs set, and the jobs that take it with `env-from`. Where a value
   is read comes from the workflow itself, the values from what each leg reported. The run page
   shows it (W21-R04). Checked by `wf::flow`'s unit test and `tests/run_graph.rs`.
+- *Done.* R28 as GitHub's runner has it (corrected 2026-10-24, corpus pass 1024b): `defaults.run`
+  are the job's own `run:` steps'. An action runs in the workspace (JavaScript, Docker and kiln's
+  alike: actions/runner's `NodeScriptActionHandler` and `ContainerActionHandler`), and a
+  composite action's steps take no defaults (its `ScriptHandler` applies them outside an action
+  only). kiln ran actions in `defaults.run.working-directory`, so react's setup-node, under
+  `working-directory: compiler`, looked for `compiler/yarn.lock` in `compiler/` and failed
+  ("Some specified paths were not resolved"). Checked by
+  `w04_r28_defaults_are_the_jobs_run_steps_own`: a `run:` step in the default directory, a
+  composite action's and a JavaScript action's in the workspace.
 - *Left.* AC08 on the live cluster's runners: F-10 as it is, on runners of its three platforms.
 
 ### W05 Scheduler: queues, concurrency, priorities, routing, retries
@@ -1964,6 +1980,14 @@ W20.
   - Checked end to end (`tests/capacity.rs`): two legs each asking more than half of the
     machine's CPUs times 1.5 ran one after the other on a runner with two slots, and a small one
     ran beside one of them. Unit-tested: requests as written (`w05_r03_requests_as_written`).
+  - The executor holds a leg to the memory it was given (the assignment's `executor.options`): a
+    container executor's job container has it as its limit (W13-R04, 2026-10-24). CPUs aren't
+    capped: a quota stalls a test's many threads where a hosted runner's machine wouldn't. Tools
+    still see the machine's CPUs and size their work by them (`make -j$(nproc)`, cargo's jobs),
+    so a leg given less memory than that takes runs out of it, where a hosted runner's few CPUs
+    and its memory go together. *Left*: CPUs of the leg's own to count (a cpuset as large as its
+    request), so a leg can be a hosted runner's size; until then the corpus lab stays in slot
+    mode.
 - *Left.* AC11 on the live cluster.
 - *Done* (2026-10-23), R16's retry where only the runner that lost the leg could take it, which
   waited for good. Of the options put to the user (wait; prefer another runner and take the same
@@ -2015,8 +2039,21 @@ It replaces `exec.rs` for `AssignV2`.
   `KILN_OUTPUT` (= `GITHUB_OUTPUT`), `KILN_OUTPUT_JSON`, `KILN_RUN_ENV`, `KILN_METRICS`,
   `KILN_SHARD_ITEMS`, `KILN_EXECUTOR`, `KILN_TOKEN` (the job token, W10).
 - **W06-R03 Contexts on the runner**: `github`, `env`, `vars`, `job` (`status`, `container`,
-  `services`, `check_run_id`), `steps`, `runner` (`name`, `os`, `arch`, `temp`, `tool_cache`,
-  `debug`, `environment`, and kiln's `facts`), `secrets`, `strategy`, `matrix`, `needs`, `inputs`.
+  `services`, `check_run_id`, and `workflow_ref`, `workflow_sha`, `workflow_repository` and
+  `workflow_file_path`: the workflow file that defines the job, a called workflow's for its jobs),
+  `steps`, `runner` (`name`, `os`, `arch`, `temp`, `tool_cache`, `debug`, `environment`, and
+  kiln's `facts`), `secrets`, `strategy`, `matrix`, `needs`, `inputs`.
+  - *Done* (2026-10-24, found in corpus pass 1024b): `job`'s four `workflow_*`. A called workflow
+    checks itself out by them (astral-sh/github-actions' security review: `repository: ${{
+    job.workflow_repository }}`, `ref: ${{ job.workflow_sha }}`), and without them its checkout
+    took the caller's repository (ruff's `security-review`). The plan gives each leg the workflow
+    that defines its job (`LegSpec::defined_in`): the run's own (`github.workflow_ref` as it
+    reads), a `./` or `$/` one at the run's ref and commit, a remote one's repository, its ref as
+    GitHub writes it (`refs/tags/v1`, `refs/heads/main`, or a commit) and the commit pinned at the
+    run's start. The assignment carries it (`job_workflow`), and the OIDC token's
+    `job_workflow_ref` and `job_workflow_sha` read it (W10) where they read the caller's before.
+    Checked by `w06_r03_a_legs_job_knows_its_workflow` (the plan) and
+    `w06_r03_the_job_context_names_its_workflow` (the runner). *Left*: `job.check_run_id`.
 - **W06-R04 Step evaluation**, GitHub-exact order: `if` (with status functions over earlier steps)
   → display `name` → `env` (step over job over workflow) → `with` → `working-directory` → `shell`
   → `timeout-minutes` → `continue-on-error` → run → process the environment files → record
@@ -2510,6 +2547,17 @@ Gives step execution for `uses:`.
   the SHA-256 digest its release lists; on arm64, which GitHub has none for, the Node project's
   unofficial build, checked against its `SHASUMS256.txt`, which needs the image's `libstdc++`.
   `w07_r05_musl_node_in_an_alpine_container` runs the `pre`/`main`/`post` action in `alpine:3.20`.
+- *Done.* R07's `GITHUB_ACTION_PATH` as GitHub's runner has it (corrected 2026-10-24, corpus pass
+  1024b): a composite action's, for its steps (its `CompositeActionHandler` sets
+  `github.action_path` on each). An action among those steps keeps the composite's, and an action
+  on its own (its `pre` too) has none. kiln gave every action its own, so CodSpeed's composite,
+  whose github-script step reads `${GITHUB_ACTION_PATH}/.codspeed-runner-installer-hashes.json`,
+  looked for it in github-script's directory (ruff's benchmarks). Checked by
+  `w07_r07_a_composites_path_is_its_steps_own`. And `${{ github.action_path }}` is where the
+  leg's machine has it: in the `docker` executor's container the container's path, as
+  `runner.temp` is there; on the host, and for a job's `container:` (as GitHub's runner gives
+  it), the host's. next.js's cargo-binstall ran its script by the host's path in the container,
+  where nothing was (corpus pass 1024b; `w07_r07_an_actions_path_is_where_the_machine_has_it`).
 - *Done.* R09: GitHub's API-calling actions against the facade, unmodified. `github-script`,
   `softprops/action-gh-release` with an asset, and the code-scanning, labeler, pull-request and
   pages actions are W14's and W22-AC02's checks. `tests/hosted_actions.rs`
@@ -3623,7 +3671,11 @@ package registries of the top ~25 languages and the top ~10 OCI registries; publ
   CDN, and Zig's packages through the HTTP proxy.
 - *Done.* R02's runners: images from the registries kiln mirrors (`container:`, `services:`,
   `docker://` actions) are pulled through kiln, signed in with the job's token, and tagged as
-  asked; from their registry when kiln's mirror can't.
+  asked; from their registry when kiln's mirror can't. One pinned to a digest
+  (`image:tag@sha256:…`) runs as the mirror's reference: Docker refuses a tag with a digest, and
+  finds the image by the digests it was pulled by, which are the mirror's (Home Assistant's
+  `docker://hadolint/hadolint:v2.15.1@sha256:…`, corpus pass 1024b;
+  `w12_r02_a_digest_pulled_through_kiln_runs_as_the_mirrors`).
 - *Done.* More of D.2's federations through `docker-credential-kiln`: Quay's robot federation,
   JFrog's OIDC integration, Cloudsmith's OIDC, Chainguard's assumable identities.
 - *Done.* D.2's last two (`crates/kiln/src/ci/integrations/{alibaba,oracle}.rs`), an `oci`
@@ -3917,6 +3969,15 @@ enforcement points to W18, agent isolation to W20.
     translated;
   - services on a per-leg network, health checks awaited, ports published, with the
     `job.services` context;
+  - a service that isn't healthy shown as GitHub's runner shows one ("Service container <name>
+    failed." and its container's log, both streams, its last 400 lines), so the leg says why:
+    laravel's MySQL said only "mysql is unhealthy" (corpus pass 1024b, two legs at once on the
+    lab's host network, both publishing 3306; `w13_r08_an_unhealthy_service_shows_its_log`);
+  - a step in a job container whose `working-directory` is the container's own path (the
+    `docker` executor's `${{ runner.temp }}`, `/home/runner/work/_temp`) is made where its mount
+    is on the host, and one only the container has is left to it, where kiln had tried to make it
+    on the host and been refused (Home Assistant's pylint step, corpus pass 1024b;
+    `w13_r08_a_job_containers_own_path_as_working_directory`);
   - teardown;
   - Docker actions (W07-R06);
   - `CAP_DOCKER` announced when a CLI answers. One probe runs at a time, waited for 10 s from
@@ -4003,6 +4064,61 @@ enforcement points to W18, agent isolation to W20.
   so the administrator who names it accepts it, and the image is labelled so
   (`kiln.android-sdk-license=accepted`). There's no slim one (sdkmanager needs the JDK)
   (`runner_images_have_a_dockerfile`).
+- *Done.* The leg's machine more as a hosted runner's is (corpus pass 1024b, 2026-10-24):
+  - `/tmp` is a volume of its own: anonymous, on the engine's disk, the image's mode (1777), gone
+    with the leg's containers. The container's overlay makes no file handles, so fanotify's
+    watchers failed there (TypeScript's `fswatch` tests, 126 of them). A job's `container:` keeps
+    its own `/tmp`, as on GitHub;
+  - `/opt` is open to all, as GitHub's images leave it (`chmod -R 777 /opt`): steps make their own
+    directories there without sudo (neovim's `old-cmake` job);
+  - the runner user's `~/.cargo/bin`, `~/.config/composer/vendor/bin` and `~/.dotnet/tools` are
+    on `PATH`, as GitHub's are: tools put themselves there without asking (jetli/wasm-pack-action's
+    wasm-pack, for ruff's build-wasm), where kiln's Rust is in `/usr/local/cargo`;
+  - the full image has the Node.js tools GitHub's install globally (their toolset's
+    `node_modules`: Grunt, Gulp, n, Parcel, TypeScript, Newman, webpack and its CLI, Lerna and
+    Yarn 1), so `yarn` is on `PATH` whichever Node setup-node puts first (react's
+    `yarn install`);
+  - in resource mode the job container's memory limit is what the leg was given (W05-R03), swap
+    none beyond it, so what sizes itself by its cgroup fits the leg: CodeQL's analysis asked for
+    the machine's 118 GB and was killed (neovim's `codeql.yml`);
+  - the full image has the libraries a browser or an Electron app loads (GTK 3, ATK, NSS, ALSA,
+    GBM and the rest), as GitHub's has them with its Chrome: VS Code's test runner needs them
+    (rust-analyzer's editor tests), as do a Chromium a test downloads and winit's X11 backend
+    (bevy's examples under Xvfb failed with `XNotSupport`, no libXcursor or libXi). And what GitHub's
+    machines have from their apt lists or Ubuntu's server image that kiln's lacked: strace
+    (tauri's benchmarks trace their apps), GNU time, lsof, psmisc, ICU's headers, NSS's tools,
+    D-Bus, Tk and Noto's emoji font;
+  - the full image has the rest of the release's LLVM beside its Clang, as GitHub's images have
+    it: LLVM's tools (cpython's JIT build calls `llvm-objdump-21`), clang-format, clang-tidy, and
+    the sanitizers' runtimes and headers (cpython's TSan build stopped on
+    `sanitizer/tsan_interface.h`, and its UBSan and MSan configure found no function, every link
+    failing). 22.04's Clang has the runtimes already. And MySQL's and PostgreSQL's client
+    libraries and headers, as GitHub's images have them with their servers: rails' `bundle
+    install` builds the `mysql2` and `pg` gems against them;
+  - apt's package lists are left in place, as GitHub's images leave them (their cleanup runs
+    `apt-get clean` alone), so `apt-get install` and `apt-get remove` know every package without an
+    `apt-get update` first: deno's sysroot step removes man-db, which kiln's image hasn't, and
+    stopped on apt's "Unable to locate package". The lists are the image build's;
+  - apt reads its mirrors from `/etc/apt/apt-mirrors.txt` (`mirror+file:`), as on GitHub's images,
+    where workflows read and change the list (ruff's and uv's benchmark jobs); the list holds the
+    image's own archive (Ubuntu's, its ports' on arm64), where GitHub's has Azure's first;
+  - the full image's `sysctl` does what a container can, as its `snap` does: a container's
+    `/proc/sys` is read-only, so a write of what a setting is already succeeds, as `sudo sysctl
+    -w` does on a hosted runner's machine, and the rest goes to the real one, which refuses it.
+    cpython's and arrow's sanitizer jobs ask for `vm.mmap_rnd_bits=28` (TSan and MSan need
+    Ubuntu 24.04's ASLR narrowed), which this machine has already;
+  - the full image keeps the Pythons GitHub's images have in their tool cache (their toolsets'
+    `toolcache`: the newest 3.11 to 3.15 built for the release, from actions/python-versions as
+    setup-python installs them), and a leg's tool cache gets each it hasn't as the leg starts,
+    whole, so setup-python resolves a range as it does on GitHub (`3.x` is 3.15): with only
+    another leg's 3.11 in the cache, cpython's Emscripten build got a Python without 3.12's
+    `delete_on_close`. Left: the rest of GitHub's tool cache (PyPy, Node.js, Go, Ruby, CodeQL),
+    whose setup actions download the version asked, so only an open range can resolve otherwise.
+
+  Checked live with Docker (`w13_r04_the_machines_tmp_and_memory`), and by
+  `runner_images_have_a_dockerfile`, `w13_r04_sysctl_does_what_a_container_can`,
+  `w13_r04_a_legs_tool_cache_gets_the_images_tools` and
+  `w05_r03_a_legs_memory_is_its_executors_limit`.
 - *Done.* R04's opt-in Docker access: a routing rule's `docker: socket` gives a trusted run's
   `docker` legs the host's Docker socket, reached through the socket's group. The image has the
   Docker CLI with buildx and compose. The leg's machine is a container the daemon doesn't look
