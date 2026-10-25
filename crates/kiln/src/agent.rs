@@ -663,6 +663,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         std::thread::spawn(crate::os::macsign::keep_watching);
     }
     std::fs::create_dir_all(&o.work_dir).with_context(|| format!("create {}", o.work_dir.display()))?;
+    // Where the runner's cache service opens once something asks for it (docs/ci.md W24-R08).
+    crate::runner::work::service::set_home(&o.work_dir);
     let orphans = crate::exec::reap_orphans(&o.work_dir);
     if orphans > 0 {
         tracing::warn!(orphans, "killed job processes left over from a previous agent run");

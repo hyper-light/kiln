@@ -10,6 +10,7 @@ pub mod local;
 pub mod mcp;
 pub mod node;
 pub mod relay;
+pub mod reuse;
 pub mod serve;
 pub mod sync;
 pub mod wire;

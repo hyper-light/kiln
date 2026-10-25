@@ -156,6 +156,10 @@ impl std::fmt::Debug for Service {
 }
 
 static RUNNING: OnceLock<Arc<Service>> = OnceLock::new();
+/// Where this runner's work is ([`set_home`]).
+static HOME: OnceLock<PathBuf> = OnceLock::new();
+/// The one start of the service on demand ([`ensure`]), and whether it worked.
+static STARTED: async_lock::OnceCell<bool> = async_lock::OnceCell::new();
 
 /// This runner's service, once it serves one.
 pub fn running() -> Option<&'static Arc<Service>> {
@@ -165,6 +169,49 @@ pub fn running() -> Option<&'static Arc<Service>> {
 /// Makes `s` this runner's service, for what reaches it without a handle (the harness).
 pub fn set_running(s: Arc<Service>) {
     let _ = RUNNING.set(s);
+}
+
+/// Where this runner's work is (`<work>`): its service opens there the first time something asks
+/// for it ([`ensure`]), and until then nothing of it exists.
+pub fn set_home(work: &Path) {
+    let _ = HOME.set(work.to_path_buf());
+}
+
+/// This runner's service: the one it serves, else opened under its work folder now and served on
+/// loopback and on `<work>/_cas/cas.sock` (the first `kiln run --reuse` on a runner starts it).
+/// `None` outside a runner, or when it can't open (said once).
+pub async fn ensure() -> Option<&'static Arc<Service>> {
+    if let Some(s) = RUNNING.get() {
+        return Some(s);
+    }
+    let work = HOME.get()?;
+    let started = STARTED
+        .get_or_init(|| async move {
+            match serve_at(work).await {
+                Ok(svc) => {
+                    tracing::info!(target: "kiln.work", at = ?svc.endpoints(), "the runner's cache service is serving");
+                    set_running(svc);
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(target: "kiln.work", error = %format!("{e:#}"), "the runner's cache service couldn't start");
+                    false
+                }
+            }
+        })
+        .await;
+    if *started { RUNNING.get() } else { None }
+}
+
+/// The service over `<work>/_cas`, listening on a free loopback port and, on Unix, its socket.
+async fn serve_at(work: &Path) -> anyhow::Result<Arc<Service>> {
+    let svc = Service::open(work)?;
+    svc.listen_tcp(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+    #[cfg(unix)]
+    if let Err(e) = svc.listen_unix(&svc.store().root().join("cas.sock")).await {
+        tracing::warn!(target: "kiln.work", error = %format!("{e:#}"), "the runner's cache service is on loopback only");
+    }
+    Ok(svc)
 }
 
 impl Service {

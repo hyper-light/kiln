@@ -427,3 +427,87 @@ fn a_hand_over_arrives_whole_and_says_how_it_went() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// Run `req` from mac as `kiln run --reuse` does, against `svc`; every event until the end.
+async fn reuse_from_mac(lab: &Lab, svc: &Arc<crate::runner::work::service::Service>, req: RunReq) -> anyhow::Result<Vec<Ev>> {
+    let (ev_tx, ev_rx) = async_channel::unbounded();
+    let (_ctl_tx, ctl_rx) = async_channel::unbounded();
+    let (mac, svc) = (lab.mac.clone(), Arc::clone(svc));
+    crate::rt::spawn(async move { super::reuse::run_with(Some(&svc), &mac, "mac", req, ev_tx, ctl_rx).await });
+    let mut evs = Vec::new();
+    loop {
+        match crate::rt::timeout(Duration::from_secs(60), ev_rx.recv()).await {
+            Ok(Ok(e)) => {
+                let end = matches!(e, Ev::Exit { .. } | Ev::Error(_));
+                evs.push(e);
+                if end {
+                    return Ok(evs);
+                }
+            }
+            Ok(Err(_)) => return Ok(evs),
+            Err(_) => anyhow::bail!("timed out; so far: {evs:?}"),
+        }
+    }
+}
+
+fn noted(evs: &[Ev], what: &str) -> bool {
+    evs.iter().any(|e| matches!(e, Ev::Note(n) if n.starts_with(what)))
+}
+
+/// W24-R24: `kiln run --reuse` runs a command once and records its success; the same run over an
+/// identical tree gives that result back, its output as it was, without running (nor syncing); a
+/// changed tree runs again; a failure is never recorded; a run that reads input isn't keyed.
+#[cfg(unix)]
+#[test]
+fn w24_r24_kiln_run_reuse_gives_back_an_identical_runs_result() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let cas = tempfile::tempdir()?;
+        let svc = crate::runner::work::service::Service::open(cas.path())?;
+        let repo = tempfile::tempdir()?;
+        let r = repo.path();
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(r).args(args).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").output();
+        git(&["init", "-q"])?;
+        std::fs::create_dir_all(r.join("crates/app"))?;
+        std::fs::write(r.join("crates/app/data.txt"), "one\n")?;
+        git(&["add", "."])?;
+        git(&["commit", "-qm", "init"])?;
+        // What ran, counted outside the tree.
+        let ran = tempfile::tempdir()?;
+        let count = ran.path().join("count");
+        let req = RunReq {
+            target: "linux".into(),
+            command: format!("echo x >> {}; cat data.txt; echo to-stderr >&2", count.display()),
+            cwd: Some(r.join("crates/app").to_string_lossy().into_owned()),
+            sync: true,
+            ..RunReq::default()
+        };
+        let runs = || std::fs::read_to_string(&count).map(|s| s.lines().count()).unwrap_or(0);
+        let first = reuse_from_mac(&lab, &svc, req.clone()).await?;
+        assert_eq!((exit(&first), output(&first, false), output(&first, true)), (Some((Some(0), None, 0)), "one\n".to_owned(), "to-stderr\n".to_owned()), "{first:?}");
+        assert!(noted(&first, "recorded") && runs() == 1, "{first:?}");
+        // Identical: the same result, nothing run or synced.
+        let again = reuse_from_mac(&lab, &svc, req.clone()).await?;
+        assert_eq!((exit(&again), output(&again, false), output(&again, true)), (Some((Some(0), None, 0)), "one\n".to_owned(), "to-stderr\n".to_owned()), "{again:?}");
+        assert!(noted(&again, "reused") && runs() == 1, "{again:?}");
+        assert!(!again.iter().any(|e| matches!(e, Ev::Synced { .. } | Ev::Started { .. })), "{again:?}");
+        // The tree changed: it runs.
+        std::fs::write(r.join("crates/app/data.txt"), "two\n")?;
+        let changed = reuse_from_mac(&lab, &svc, req.clone()).await?;
+        assert!(output(&changed, false) == "two\n" && noted(&changed, "recorded") && runs() == 2, "{changed:?}");
+        // Back as it was: the first result again.
+        std::fs::write(r.join("crates/app/data.txt"), "one\n")?;
+        let back = reuse_from_mac(&lab, &svc, req.clone()).await?;
+        assert!(output(&back, false) == "one\n" && noted(&back, "reused") && runs() == 2, "{back:?}");
+        // A failure isn't recorded: it runs each time.
+        let failing = RunReq { command: format!("echo x >> {}; exit 3", count.display()), ..req.clone() };
+        for n in [3, 4] {
+            let f = reuse_from_mac(&lab, &svc, failing.clone()).await?;
+            assert!(exit(&f) == Some((Some(3), None, 0)) && !noted(&f, "recorded") && runs() == n, "{f:?}");
+        }
+        // Input isn't part of any key: it runs, saying why.
+        let input = reuse_from_mac(&lab, &svc, RunReq { stdin: true, ..req.clone() }).await;
+        assert!(input.is_ok_and(|evs| noted(&evs, "not reused: it reads input")));
+        Ok(())
+    })
+}
