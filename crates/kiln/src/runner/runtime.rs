@@ -888,6 +888,12 @@ impl Leg {
         }
         let (kept, refused) = super::warm::kept_paths(&w.paths);
         let mut said: String = refused.iter().map(|p| format!("`{p}` isn't kept: a kept folder is a path inside the workspace.\n")).collect();
+        // A cold run (`kiln rerun --cold`, W24-R23) leases no warm slot: it starts from nothing
+        // kept, and its lane's workspaces stay as they were for the legs after it.
+        if a.cold {
+            said.push_str("No warm workspace: a cold run (`kiln rerun --cold`) starts from nothing kept. The leg runs cold.");
+            return Some(Warmed { dir: None, said, kept });
+        }
         let sha = if a.sha.is_empty() { a.contexts.github.get("sha").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned() } else { a.sha.clone() };
         let name = a.repo.rsplit('/').next().unwrap_or("repo").to_owned();
         let ask = super::warm::Ask { repo: a.repo.clone(), lane: super::warm::lane_of(a), leg: a.job_id.clone(), sha, trusted: a.trusted, kept: kept.clone(), budget: w.budget, name };
@@ -5763,6 +5769,56 @@ jobs:
         assert_eq!(second.status, Status::Succeeded, "{log}");
         assert!(log.contains("slot 0 of the job's lane") && log.contains("saw=leg-w1") && log.contains("no-stray"), "{log}");
         assert_eq!(at(&log), slot, "at the slot's stable path");
+        Ok(())
+    }
+
+    /// W24-R23 with W24-R11: a cold rerun (`AssignmentV2.cold`) leases no warm slot. Its leg starts
+    /// from nothing kept, saying why, and the lane's slot stays as the last warm leg left it for
+    /// the next one.
+    #[cfg(unix)]
+    #[test]
+    fn w24_r23_a_cold_rerun_takes_no_warm_workspace() -> anyhow::Result<()> {
+        let src = "on: push\njobs:\n  b:\n    runs-on: x\n    steps:\n      - run: |\n          echo \"saw=$(cat target/f 2>/dev/null || echo none)\"\n          echo \"at=$PWD\"\n          mkdir -p target && echo \"$KILN_JOB\" > target/f\n";
+        let (w, d) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", src, Dialect::Gha);
+        anyhow::ensure!(d.iter().all(|x| !x.is_error()), "{d:?}");
+        let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
+        let tmp = tempfile::tempdir()?;
+        let run = |leg: &str, cold: bool| -> anyhow::Result<(JobResult, String)> {
+            let a = AssignmentV2 {
+                job_id: leg.into(),
+                repo: "acme/app".into(),
+                dialect: "gha".into(),
+                steps: job.steps.clone(),
+                timeout_minutes: 5,
+                trusted: true,
+                warm: Some(kiln_ci::wire::Warm { paths: vec!["target".into()], budget: None }),
+                cold,
+                contexts: kiln_ci::wire::Contexts { github: serde_json::json!({"event_name": "push", "sha": "abc", "repository": "acme/app", "workflow_ref": "acme/app/.github/workflows/t.yml@refs/heads/main", "event": {}}), ..Default::default() },
+                ..AssignmentV2::default()
+            };
+            let (tx, rx) = async_channel::unbounded();
+            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+            let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
+            let mut log = String::new();
+            while let Ok(m) = rx.try_recv() {
+                if let crate::exec::Up::Log(c) = m {
+                    log.push_str(&String::from_utf8_lossy(&c.data));
+                }
+            }
+            Ok((result, log))
+        };
+        let at = |log: &str| log.lines().find_map(|l| l.trim().strip_prefix("at=")).map(str::to_owned);
+        let (first, log) = run("leg-c1", false)?;
+        assert_eq!(first.status, Status::Succeeded, "{log}");
+        let slot = at(&log);
+        assert!(slot.as_deref().is_some_and(|p| p.contains("/warm/")), "the warm leg works in a slot: {log}");
+        let (cold, log) = run("leg-c2", true)?;
+        assert_eq!(cold.status, Status::Succeeded, "{log}");
+        assert!(log.contains("a cold run (`kiln rerun --cold`) starts from nothing kept") && log.contains("saw=none"), "{log}");
+        assert!(at(&log).is_some_and(|p| !p.contains("/warm/")), "the cold leg works outside the lane's slots: {log}");
+        let (after, log) = run("leg-c3", false)?;
+        assert_eq!(after.status, Status::Succeeded, "{log}");
+        assert!(log.contains("saw=leg-c1") && at(&log) == slot, "the slot as the last warm leg left it: {log}");
         Ok(())
     }
 }
