@@ -7965,7 +7965,10 @@ split into crates its tests depend on apart. Both scenarios also need a suite th
 never kept, so a failing binary runs every time. M0's docs-only and one-file runs each had eleven
 failing binaries, 1,920 s of their test time (`image_pool` 911 s, `post_steps` 311 s, `leftovers`
 and `pools` 301 s each, the shapes of timeouts under load), against two in the cold run; until they
-pass or are quarantined (`.kiln/quarantine.yaml`, W16-R05), no docs-only run can be under 60 s. From a trunk commit whose trusted run of `ci.yaml` is complete (its
+pass or are quarantined (`.kiln/quarantine.yaml`, W16-R05), no docs-only run can be under 60 s.
+They are load's failures, not the code's: on `ci-w24-m3-runner`, with fedora quieter (2026-10-25,
+capped as the checks are), all four passed, `image_pool` in 12.7 s, `leftovers` 16.8 s, `pools`
+115.9 s and `post_steps` 93.5 s, so AC03 is to be measured in a quiet window, not under shared load. From a trunk commit whose trusted run of `ci.yaml` is complete (its
 warm state and ledger entries are the baseline), three pushes of a docs-only change (`docs/ci.md`
 touched) and three of a one-file change in `crates/kiln` (`crates/kiln/src/lib.rs` touched, as
 M0's), each its own commit on that parent, pushed to a branch of kiln's own repository (trusted)
