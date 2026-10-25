@@ -1050,6 +1050,18 @@ pub struct State {
     /// The effort / reasoning level in use, where the harness has one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub effort: String,
+    /// The speed it runs at: "" standard, else one of `Meta::speeds` (Claude Code's fast mode,
+    /// Codex's service tiers, an ACP agent's `speed` option).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub speed: String,
+    /// Why its faster speeds can't serve it now, in words, as its harness said (its account
+    /// doesn't allow them). None: nothing it said stands in the way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_blocked: Option<String>,
+    /// Fast, but at standard speed for now: fast mode's own rate limit was reached, and it goes
+    /// back to fast by itself once that cools down (Claude Code).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub speed_cooldown: bool,
     /// The live value of each control (`Meta::controls`), by id.
     #[serde(default)]
     pub control_values: std::collections::BTreeMap<String, serde_json::Value>,
@@ -1308,7 +1320,7 @@ pub struct Meta {
     #[serde(default)]
     pub agents: Vec<String>,
     /// Features this adapter drives for this harness: "steer", "send_now", "queue_cancel",
-    /// "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions",
+    /// "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions",
     /// "resume", "attachments", "images", "overrides", "switch_harness" (a model of another
     /// harness: `Command::SetModel::kind`).
     #[serde(default)]
@@ -1316,6 +1328,10 @@ pub struct Meta {
     /// Effort / reasoning levels the harness offers (empty: none).
     #[serde(default)]
     pub efforts: Vec<ControlOption>,
+    /// The speeds faster than standard the model in use runs at, slowest first (empty: none, or
+    /// a harness without them): what `Command::SetSpeed` takes besides "" (standard).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speeds: Vec<ControlOption>,
     /// Every other control the harness offers.
     #[serde(default)]
     pub controls: Vec<Control>,
@@ -1415,6 +1431,11 @@ pub enum Command {
     },
     SetEffort {
         effort: String,
+    },
+    /// The speed it runs at: "" standard, else one of `Meta::speeds` (feature "set_speed").
+    SetSpeed {
+        #[serde(default)]
+        speed: String,
     },
     /// Go on on runner `to`, in its folder `cwd` (a path there, or `~/…`), once the turn under way
     /// ends: the session moves there, conversation, timeline and queue alike (`harness::moving`).

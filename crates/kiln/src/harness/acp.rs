@@ -173,6 +173,10 @@ pub struct Acp {
     /// Only a new conversation with no prompt or history may be replaced after signing in.
     #[serde(default)]
     empty: bool,
+    /// The speed the session had (`Spec::speed`: a restart, a move), set once it's ready where
+    /// the model in use has a `speed` option.
+    #[serde(default)]
+    speed_start: Option<String>,
 }
 
 fn ready() -> bool {
@@ -183,6 +187,10 @@ fn ready() -> bool {
 /// kiln answers every request to go ahead itself.
 pub const KILN_ASK: &str = "kiln-ask";
 pub const KILN_BYPASS: &str = "kiln-bypass";
+
+/// The config option an agent offers its speeds as (Devin's Standard and Fast, on the models that
+/// go faster): kiln's speed (`Meta::speeds`), not a control of its own.
+const SPEED: &str = "speed";
 
 fn kiln_ask() -> ModeOption {
     ModeOption { id: KILN_ASK.into(), label: "Ask".into(), description: "Ask before anything the agent asks to do".into(), dangerous: false }
@@ -230,6 +238,7 @@ impl Acp {
             account: false,
             refresh: false,
             empty,
+            speed_start: None,
         }
     }
 
@@ -241,6 +250,7 @@ impl Acp {
                 a.settings.push((category.into(), v.clone()));
             }
         }
+        a.speed_start.clone_from(&spec.speed);
         a
     }
 
@@ -408,6 +418,7 @@ impl Acp {
             Command::SetMode { mode } => self.change(core, "mode".into(), json!(mode)),
             Command::SetModel { model, .. } => self.change(core, "model".into(), json!(model)),
             Command::SetEffort { effort } => self.change(core, "thought_level".into(), json!(effort)),
+            Command::SetSpeed { speed } => self.set_speed(core, &speed),
             Command::Suggest { client, .. } => core.reply(client, json!({"suggestions": []})),
             // kiln exports the conversation from its timeline.
             Command::Control { id, value } if id == "export" => {
@@ -586,10 +597,27 @@ impl Acp {
         core.meta.efforts.clear();
         core.meta.controls.retain(|c| !c.id.starts_with("acp:"));
         core.state.control_values.retain(|id, _| !id.starts_with("acp:"));
-        core.meta.features.retain(|f| f != "set_model" && f != "set_effort");
+        core.meta.features.retain(|f| f != "set_model" && f != "set_effort" && f != "set_speed");
+        // Its speeds are kiln's own selector (the head's bolt), not a control.
+        let speed = self.speed_option();
+        match &speed {
+            Some((standard, faster)) => {
+                let current = self.config.iter().find(|c| c.get("id").and_then(Value::as_str) == Some(SPEED)).and_then(|c| c.get("currentValue")).and_then(Value::as_str).unwrap_or_default();
+                core.state.speed = if current == standard { String::new() } else { current.to_owned() };
+                core.meta.speeds.clone_from(faster);
+                core.meta.features.push("set_speed".into());
+            }
+            None => {
+                core.state.speed.clear();
+                core.meta.speeds.clear();
+            }
+        }
         let mut primary = std::collections::HashSet::new();
         for c in options {
             let Some(id) = c.get("id").and_then(Value::as_str) else { continue };
+            if id == SPEED && speed.is_some() {
+                continue;
+            }
             let category = c.get("category").and_then(Value::as_str).unwrap_or("");
             let current = c.get("currentValue").cloned().unwrap_or(Value::Null);
             let kind = match c.get("type").and_then(Value::as_str) {
@@ -734,7 +762,28 @@ impl Acp {
         self.startup_mode = None;
         self.ready = true;
         core.set_status(Status::Idle);
+        // The speed it had, where the model in use has one: a speed it can't take holds no prompt.
+        if let Some(speed) = self.speed_start.take() {
+            self.set_speed(core, &speed);
+        }
         self.next(core);
+    }
+
+    /// The agent's `speed` option (Devin's, on the models that go faster), as kiln says it: its
+    /// standard value ("standard", else its first), and the faster ones in its order.
+    fn speed_option(&self) -> Option<(String, Vec<ControlOption>)> {
+        let c = self.config.iter().find(|c| c.get("id").and_then(Value::as_str) == Some(SPEED) && c.get("type").and_then(Value::as_str) == Some("select") && c.get("currentValue").is_some_and(Value::is_string))?;
+        let choices = config_choices(c);
+        let standard = choices.iter().find(|o| o.id == "standard").or_else(|| choices.first())?.id.clone();
+        let faster: Vec<ControlOption> = choices.into_iter().filter(|o| o.id != standard).collect();
+        (!faster.is_empty()).then_some((standard, faster))
+    }
+
+    /// The speed it runs at ("" standard), set as its `speed` option, where the model in use has one.
+    fn set_speed(&mut self, core: &mut Core, speed: &str) {
+        let Some((standard, _)) = self.speed_option() else { return };
+        let value = if speed.is_empty() { standard } else { speed.to_owned() };
+        self.change(core, format!("acp:{SPEED}"), json!(value));
     }
 
     fn setting_done(&mut self, core: &mut Core, id: &Value, category: Option<&str>) {

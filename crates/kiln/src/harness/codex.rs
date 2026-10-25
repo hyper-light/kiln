@@ -239,6 +239,12 @@ fn not_yet(msg: &str) -> Option<&'static str> {
 /// list.
 pub(super) const EFFORTS: &[&str] = &["low", "medium", "high"];
 
+/// The service tier Codex takes for a speed as `State::speed` says it: a tier's id ("priority",
+/// "ultrafast"), or "default" for standard.
+fn service_tier(speed: &str) -> &str {
+    if speed.is_empty() { "default" } else { speed }
+}
+
 /// The efforts a new Codex session can start at, before its model/list answers: its default
 /// model's, as Codex on this machine last listed them, else the newest model kiln knows of
 /// (`kinds::models_of`).
@@ -292,6 +298,10 @@ pub struct Codex {
     waiting: Vec<QueueItem>,
     /// The reasoning effort for turns (None: the model's default).
     effort: Option<String>,
+    /// The service tier for the thread and its turns, as kiln set it ("" standard, else a tier's
+    /// id); None: the person's own Codex configuration (`service_tier`).
+    #[serde(default)]
+    speed: Option<String>,
     resume: Option<String>,
     model: Option<String>,
     allow_bypass: bool,
@@ -328,6 +338,10 @@ pub struct Codex {
     applied: Option<String>,
     /// Effort levels per model, from model/list.
     efforts: HashMap<String, Vec<(String, String)>>,
+    /// The service tiers faster than standard each model runs at, from model/list (its
+    /// `serviceTiers`: id, name, what it does), by model; the default model's also under "".
+    #[serde(default)]
+    speeds: HashMap<String, Vec<ControlOption>>,
     /// The turn each prompt started (rewinds and branches name a prompt).
     turns: HashMap<String, String>,
     /// Skills (custom commands): name → path.
@@ -401,6 +415,7 @@ impl Codex {
     pub fn from_spec(spec: &super::session::Spec) -> Self {
         let mut c = Self::new(spec.resume.clone(), spec.model.clone(), spec.mode.clone(), spec.allow_bypass);
         c.effort = spec.effort.clone().filter(|e| !e.is_empty());
+        c.speed.clone_from(&spec.speed);
         if spec.fork {
             c.fork_at = Some(spec.resume_at.clone());
         }
@@ -420,6 +435,7 @@ impl Codex {
             turn_messages: Vec::new(),
             waiting: Vec::new(),
             effort: None,
+            speed: None,
             resume,
             model: model.filter(|m| !m.is_empty()),
             allow_bypass,
@@ -436,6 +452,7 @@ impl Codex {
             withheld: HashMap::new(),
             applied: None,
             efforts: HashMap::new(),
+            speeds: HashMap::new(),
             turns: HashMap::new(),
             skills: HashMap::new(),
             fork_at: None,
@@ -1037,7 +1054,30 @@ impl Codex {
             Some(l) => l.iter().map(|(e, d)| opt(e, &super::model::effort_label(e), d, false)).collect(),
             None => default_efforts().iter().map(|e| opt(e, &super::model::effort_label(e), "", false)).collect(),
         };
+        self.refresh_speeds(core);
         core.touch_meta();
+    }
+
+    /// The service tiers past standard the model in use runs at (the default model's while
+    /// Codex hasn't said which it runs; none for a model model/list doesn't list).
+    fn refresh_speeds(&self, core: &mut Core) {
+        let model = core.state.model.as_str();
+        let speeds = self.speeds.get(if model.is_empty() { "" } else { model }).cloned().unwrap_or_default();
+        if core.meta.speeds != speeds {
+            core.meta.speeds = speeds;
+            core.touch_meta();
+        }
+    }
+
+    /// The speed Codex says the thread runs at (its service tier, when the thread opens and as
+    /// its settings change): what the page shows unless kiln set one, which goes with every
+    /// turn. "default", or none at all, is standard.
+    fn speed_reported(&mut self, core: &mut Core, tier: Option<&str>) {
+        let speed = tier.filter(|t| *t != "default").map(|t| if t == "fast" { "priority" } else { t }).unwrap_or("");
+        if self.speed.is_none() && core.state.speed != speed {
+            speed.clone_into(&mut core.state.speed);
+            core.touch_state();
+        }
     }
 
     fn control(&mut self, core: &mut Core, id: &str, value: Option<Value>) {
@@ -1244,7 +1284,7 @@ impl Codex {
         // Full access is always a choice; choosing it allows it.
         core.meta.modes = modes(true);
         self.permission_controls(core);
-        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "permissions_live", "set_model", "set_effort", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness"]
+        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "permissions_live", "set_model", "set_effort", "set_speed", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
@@ -1376,6 +1416,8 @@ impl Codex {
                 self.model = Some(model.clone()).filter(|m| !m.is_empty());
                 core.state.model = model;
                 core.touch_state();
+                // Each model has its own tiers.
+                self.refresh_speeds(core);
             }
             Command::Suggest { client, query } => {
                 let root = core.state.cwd.clone();
@@ -1387,6 +1429,13 @@ impl Codex {
                 core.state.effort = effort;
                 core.touch_state();
             }
+            // Its service tier goes with every turn too: from the next one.
+            Command::SetSpeed { speed } if speed.is_empty() || self.speeds.values().flatten().any(|t| t.id == speed) => {
+                self.speed = Some(speed.clone());
+                core.state.speed = speed;
+                core.touch_state();
+            }
+            Command::SetSpeed { speed } => self.notice(core, Level::Warn, format!("{speed}: not a speed Codex lists for its models")),
             Command::Control { id, value } => self.control(core, &id, value),
             // The session itself does these (a move is not the harness's business).
             Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } => {}
@@ -1875,6 +1924,9 @@ impl Codex {
             if let Some(effort) = o.effort.or_else(|| self.effort.clone()) {
                 obj.insert("effort".into(), json!(effort));
             }
+            if let Some(speed) = &self.speed {
+                obj.insert("serviceTier".into(), json!(service_tier(speed)));
+            }
             if let Some(summary) = self.summary.clone() {
                 obj.insert("summary".into(), json!(summary));
             }
@@ -2256,6 +2308,9 @@ impl Codex {
                 if let (Some(m), Some(o)) = (&self.model, params.as_object_mut()) {
                     o.insert("model".into(), json!(m));
                 }
+                if let (Some(s), Some(o)) = (&self.speed, params.as_object_mut()) {
+                    o.insert("serviceTier".into(), json!(service_tier(s)));
+                }
                 match (self.resume.clone(), self.fork_at.take()) {
                     // A branch: a new thread with that one's turns up to `at`.
                     // (Its history comes after, page by page: thread/turns/list.)
@@ -2306,6 +2361,9 @@ impl Codex {
                 }
                 if let Some(e) = result.get("reasoningEffort").and_then(Value::as_str) {
                     self.effort_reported(core, e);
+                }
+                if let Some(tier) = result.get("serviceTier") {
+                    self.speed_reported(core, tier.as_str());
                 }
                 if let Some(c) = result.get("cwd").and_then(Value::as_str) {
                     core.state.cwd = c.to_owned();
@@ -2438,11 +2496,25 @@ impl Codex {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    // Its tiers past standard ("flex" is slower).
+                    let tiers: Vec<ControlOption> = m
+                        .get("serviceTiers")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|t| {
+                            let id = t.get("id").and_then(Value::as_str).filter(|id| !matches!(*id, "" | "default" | "flex"))?;
+                            let label = t.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(id);
+                            Some(ControlOption { id: id.to_owned(), label: label.to_owned(), description: t.get("description").and_then(Value::as_str).unwrap_or("").to_owned(), dangerous: false })
+                        })
+                        .collect();
                     for key in [m.get("model"), m.get("id")].into_iter().flatten().filter_map(Value::as_str) {
                         self.efforts.insert(key.to_owned(), levels.clone());
+                        self.speeds.insert(key.to_owned(), tiers.clone());
                     }
                     if m.get("isDefault").and_then(Value::as_bool) == Some(true) {
                         self.efforts.insert(String::new(), levels.clone());
+                        self.speeds.insert(String::new(), tiers);
                     }
                 }
                 // An effort to show when none was chosen and Codex hasn't said what the thread runs
@@ -3352,6 +3424,9 @@ impl Codex {
             "thread/settings/updated" => {
                 if let Some(e) = p.pointer("/threadSettings/effort").and_then(Value::as_str) {
                     self.effort_reported(core, e);
+                }
+                if let Some(tier) = p.pointer("/threadSettings/serviceTier") {
+                    self.speed_reported(core, tier.as_str());
                 }
             }
             "serverRequest/resolved" => {
@@ -5880,6 +5955,74 @@ mod tests {
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("low"), Some("o-mini")));
+        Ok(())
+    }
+
+    /// Each model's service tiers past standard (model/list's `serviceTiers`) are the speeds the
+    /// head's bolt goes through. One chosen here goes with the thread and every turn ("default"
+    /// for standard), from the next; one Codex reports shows while none is chosen here.
+    #[test]
+    fn service_tiers_per_model_go_with_every_turn() -> anyhow::Result<()> {
+        let models = json!({"data": [
+            {"id": "gpt-6.1-sol", "model": "gpt-6.1-sol", "displayName": "GPT-6.1 Sol", "description": "", "isDefault": true, "supportedReasoningEfforts": [],
+             "serviceTiers": [{"id": "priority", "name": "Fast", "description": "2x speed, increased usage"}, {"id": "ultrafast", "name": "Ultrafast", "description": "The fastest available responses"}]},
+            {"id": "gpt-6-sol", "model": "gpt-6-sol", "displayName": "GPT-6 Sol", "description": "", "supportedReasoningEfforts": [],
+             "serviceTiers": [{"id": "priority", "name": "Fast", "description": "1.5x speed"}, {"id": "flex", "name": "Flex", "description": "Slower, for less"}]},
+            {"id": "o-mini", "model": "o-mini", "displayName": "o mini", "description": "", "supportedReasoningEfforts": []}
+        ]});
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut core);
+        assert!(core.meta.features.iter().any(|f| f == "set_speed"));
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1"}));
+        let w = written(&mut core);
+        // None chosen here: the thread opens on the person's own configuration.
+        assert!(w.iter().filter(|v| v.get("method") == Some(&json!("thread/start"))).all(|v| v.pointer("/params/serviceTier").is_none()));
+        respond(&mut c, &mut core, &w, "model/list", models);
+        respond(&mut c, &mut core, &w, "thread/start", json!({"thread": {"id": "th1", "turns": []}, "model": "gpt-6.1-sol", "cwd": "/work", "serviceTier": "priority"}));
+        let ids = |core: &Core| core.meta.speeds.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&core), ["priority", "ultrafast"]);
+        assert_eq!(core.meta.speeds.first().map(|s| (s.label.as_str(), s.description.as_str())), Some(("Fast", "2x speed, increased usage")));
+        // The tier Codex says it runs at; none is standard.
+        assert_eq!(core.state.speed, "priority");
+        feed(&mut c, &mut core, &[json!({"method": "thread/settings/updated", "params": {"threadId": "th1", "threadSettings": {"model": "gpt-6.1-sol", "serviceTier": null}}})]);
+        assert_eq!(core.state.speed, "");
+        // Each model its own tiers ("flex" is slower); a model with none, none.
+        for (model, tiers) in [("gpt-6-sol", vec!["priority"]), ("o-mini", vec![]), ("gpt-6.1-sol", vec!["priority", "ultrafast"])] {
+            c.command(&mut core, Command::SetModel { model: model.into(), kind: None });
+            assert_eq!(ids(&core), tiers, "{model}");
+        }
+        // A turn, and the tier it asked for (null: none).
+        let turn = |c: &mut Codex, core: &mut Core, id: &str| -> anyhow::Result<Value> {
+            c.command(core, Command::Send { id: id.into(), text: "go".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+            let w = written(core);
+            let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn for {id}"))?;
+            respond(c, core, &w, "turn/start", json!({"turn": {"id": format!("t-{id}"), "status": "inProgress", "items": []}}));
+            feed(c, core, &[json!({"method": "turn/completed", "params": {"turn": {"id": format!("t-{id}"), "status": "completed", "items": []}}})]);
+            Ok(start.pointer("/params/serviceTier").cloned().unwrap_or(Value::Null))
+        };
+        assert_eq!(turn(&mut c, &mut core, "m0")?, Value::Null);
+        c.command(&mut core, Command::SetSpeed { speed: "ultrafast".into() });
+        assert_eq!(core.state.speed, "ultrafast");
+        assert_eq!(turn(&mut c, &mut core, "m1")?, json!("ultrafast"));
+        // Chosen here, what Codex says of its own doesn't replace it.
+        feed(&mut c, &mut core, &[json!({"method": "thread/settings/updated", "params": {"threadId": "th1", "threadSettings": {"serviceTier": "priority"}}})]);
+        assert_eq!(core.state.speed, "ultrafast");
+        // Standard is Codex's "default"; a tier no model lists changes nothing.
+        c.command(&mut core, Command::SetSpeed { speed: String::new() });
+        assert_eq!(turn(&mut c, &mut core, "m2")?, json!("default"));
+        c.command(&mut core, Command::SetSpeed { speed: "warp".into() });
+        assert_eq!(core.state.speed, "");
+        // A session going on (a restart, a move) opens its thread at the speed it had.
+        let mut c2 = Codex::from_spec(&super::super::session::Spec { kind: "codex".into(), resume: Some("th1".into()), speed: Some("priority".into()), ..Default::default() });
+        let mut core2 = Core::new();
+        core2.state.cwd = "/work".into();
+        c2.start(&mut core2);
+        let w = written(&mut core2);
+        respond(&mut c2, &mut core2, &w, "initialize", json!({"userAgent": "kiln/0.162.1"}));
+        assert!(written(&mut core2).iter().any(|v| v.get("method") == Some(&json!("thread/resume")) && v.pointer("/params/serviceTier") == Some(&json!("priority"))));
         Ok(())
     }
 

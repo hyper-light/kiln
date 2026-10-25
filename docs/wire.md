@@ -404,6 +404,7 @@ travels in `HarnessCmd`.
 | `SetMode` | command, refused while away | The person sees it didn't apply, and sets it again. | Fire-and-forget. |
 | `SetModel` | command, refused while away | As `SetMode`. | Fire-and-forget. |
 | `SetEffort` | command, refused while away | As `SetMode`. | Fire-and-forget. |
+| `SetSpeed` | command, refused while away | As `SetMode`. | Fire-and-forget. |
 | `MoveTo` | command, refused while away | A move starts from a machine that's up. | Fire-and-forget. |
 | `Moving` | command, refused while away | A move's progress note. | Fire-and-forget. |
 | `HandedOver` | command, parked | How handing a session to the machine's newest runner process went: let go of it, or go on with it. Parked, so a process whose link dropped hears it once back, and never runs a session the newest took. | New: only to runners announcing `CAP_HANDOVER`. |

@@ -54,6 +54,9 @@ pub struct Spec {
     /// The effort / reasoning level to start with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The speed to start at (`State::speed`: "" standard); None: the harness's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
     /// The most subagents it runs at once (as `State::max_subagents`): Codex takes it as its own
     /// limit when it starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +116,7 @@ impl Default for Spec {
             allow_bypass: true,
             program: None,
             effort: None,
+            speed: None,
             max_subagents: None,
             resume_at: None,
             fork: false,
@@ -686,6 +690,10 @@ impl Session {
         s.fork = false;
         if !core.state.effort.is_empty() {
             s.effort = Some(core.state.effort.clone());
+        }
+        // Standard too, once it has a faster speed to choose: its harness's own settings may name one.
+        if !core.state.speed.is_empty() || !core.meta.speeds.is_empty() {
+            s.speed = Some(core.state.speed.clone());
         }
         if !core.state.mode.is_empty() {
             s.mode = Some(core.state.mode.clone());
@@ -1637,6 +1645,10 @@ fn for_harness(st: &mut super::model::State, session: Option<String>, model: &st
     model.clone_into(&mut st.model);
     st.mode = mode.unwrap_or_default();
     st.effort = effort.unwrap_or_default();
+    // A speed is its harness's own (Claude Code's fast mode isn't one of Codex's tiers).
+    st.speed.clear();
+    st.speed_blocked = None;
+    st.speed_cooldown = false;
     st.mcp.clear();
     st.skills.clear();
     st.plugins.clear();
@@ -1719,6 +1731,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         sp.model = Some(sw.model.clone());
         sp.mode.clone_from(&mode);
         sp.effort.clone_from(&effort);
+        sp.speed = None;
         sp.resume.clone_from(&resume);
         sp.resume_at = None;
         sp.fork = false;
@@ -2230,6 +2243,7 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
             spec.model.clone_from(&mv.model);
             spec.mode.clone_from(&c.mode);
             spec.effort.clone_from(&c.effort);
+            spec.speed = None;
             // A program of its own was the old harness's.
             spec.program = None;
             for_harness(&mut state, there, &model, c.mode, c.effort);
