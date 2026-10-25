@@ -236,6 +236,15 @@ fn io_full(text: &str) -> Option<f64> {
     line.split_whitespace().find_map(|w| w.strip_prefix("avg10=")).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0)
 }
 
+/// This machine's size, as its facts give it: its CPUs (threads) and memory. What a runner's own
+/// admission counts what exclusive legs hold against (docs/ci.md W05-R03).
+pub(crate) fn size() -> Option<kiln_ci::sched::state::Resources> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    (threads > 0 && sys.total_memory() > 0).then(|| kiln_ci::sched::state::Resources { cpu: threads as f64, mem: sys.total_memory(), ..Default::default() })
+}
+
 /// The machine: its OS, CPU, memory, the work directory's volume, virtualization and emulation.
 fn machine(work_dir: &Path) -> RunnerFacts {
     use sysinfo::{Disks, System};

@@ -23,8 +23,10 @@ use super::retry::{self, Failed, FailureClass, RetryPolicy, RunnerChoice};
 use super::routing::{self, Check, LegRoute, Preference, Requirement, Rule, RunnerView};
 use super::warm::{self, Held, Wants};
 
-/// What a leg asks for and a runner offers, in resource mode (W05-R03).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+/// What a leg asks for and a runner offers, in resource mode (W05-R03); and what an exclusive leg
+/// holds of its runner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Resources {
     pub cpu: f64,
     pub mem: u64,
@@ -345,9 +347,53 @@ fn size(r: &Runner) -> Option<Resources> {
     (cpus > 0 && f.mem.total > 0).then(|| Resources { cpu: f64::from(cpus), mem: f.mem.total, disk: f.disk.free, gpu: u32::try_from(f.gpus.len()).unwrap_or(u32::MAX) })
 }
 
+/// What a leg coming to a runner holds of it (W05-R03): nothing of its own, the whole runner, or
+/// a share of its CPUs and memory.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Incoming {
+    Ordinary,
+    Whole,
+    Share(Resources),
+}
+
+impl Incoming {
+    /// An exclusive leg asking for CPUs holds them and the memory it asks; asking for none, the
+    /// whole runner; any other leg, nothing.
+    pub fn of(exclusive: bool, request: &Resources) -> Self {
+        match (exclusive, request.cpu > 0.0) {
+            (false, _) => Incoming::Ordinary,
+            (true, true) => Incoming::Share(*request),
+            (true, false) => Incoming::Whole,
+        }
+    }
+}
+
+/// The rule both dispatchers and a runner's own admission use, counting in slots (W05-R03):
+/// whether a runner of `slots` and `size` (its CPUs and memory; `None` not known) has room for
+/// one more, its exclusive legs holding `held` (one holding it `whole`), `ordinary` of its
+/// `running` legs running beside them. An ordinary leg takes a slot of what isn't held; one
+/// holding the whole runner needs it empty; a share needs as much neither held nor taken by the
+/// ordinary legs there (a slot's share each), never more than the runner is, and on a runner
+/// whose size isn't known, the runner empty.
+pub fn room(slots: u32, size: Option<Resources>, held: &Resources, whole: bool, ordinary: usize, running: usize, incoming: Incoming) -> bool {
+    if whole {
+        return false;
+    }
+    match incoming {
+        Incoming::Ordinary => ordinary < slots_left(slots, size, held),
+        Incoming::Whole => running == 0,
+        Incoming::Share(q) => {
+            let Some(s) = size else { return running == 0 };
+            let each = 1.0 / f64::from(slots.max(1));
+            let (cpu, mem) = (ordinary as f64 * s.cpu * each, (ordinary as f64 * s.mem as f64 * each) as u64);
+            held.cpu + cpu + q.cpu <= s.cpu + 1e-9 && held.mem.saturating_add(mem).saturating_add(q.mem) <= s.mem
+        }
+    }
+}
+
 /// The slots a runner keeps for ordinary legs beside what's held of it: its slots in the share of
 /// its CPUs and memory no exclusive leg holds.
-fn slots_left(slots: u32, size: Option<Resources>, held: &Resources) -> usize {
+pub fn slots_left(slots: u32, size: Option<Resources>, held: &Resources) -> usize {
     let slots = slots.max(1) as usize;
     let Some(s) = size else { return slots };
     if held.cpu <= 0.0 && held.mem == 0 {
@@ -846,14 +892,13 @@ impl Scheduler {
             // share holds and the ordinary legs there don't take, never more than the runner is.
             Some(Claim::Share(q)) => {
                 let Some(s) = size else { return false };
-                let (cpu, mem) = match (c.resources, r.input.capacity) {
-                    (true, Some(_)) => ((r.used.cpu - held.cpu).max(0.0), r.used.mem.saturating_sub(held.mem)),
-                    _ => {
-                        let each = 1.0 / f64::from(r.input.slots.max(1));
-                        (ordinary as f64 * s.cpu * each, (ordinary as f64 * s.mem as f64 * each) as u64)
+                return match (c.resources, r.input.capacity) {
+                    (true, Some(_)) => {
+                        let (cpu, mem) = ((r.used.cpu - held.cpu).max(0.0), r.used.mem.saturating_sub(held.mem));
+                        held.cpu + cpu + q.cpu <= s.cpu + 1e-9 && held.mem.saturating_add(mem).saturating_add(q.mem) <= s.mem
                     }
+                    _ => room(r.input.slots, size, &held, false, ordinary, r.running.len(), Incoming::Share(q)),
                 };
-                return held.cpu + cpu + q.cpu <= s.cpu + 1e-9 && held.mem.saturating_add(mem).saturating_add(q.mem) <= s.mem;
             }
             None => {}
         }
@@ -866,7 +911,7 @@ impl Scheduler {
                     && (r.used.disk + q.disk) as f64 <= cap.disk as f64 * c.overcommit_disk
                     && r.used.gpu + q.gpu <= cap.gpu
             }
-            _ => ordinary < slots_left(r.input.slots, size, &held),
+            _ => room(r.input.slots, size, &held, false, ordinary, r.running.len(), Incoming::Ordinary),
         }
     }
 
