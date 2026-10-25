@@ -1328,6 +1328,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The store's tee, which holds it so that it can be handed to a new build
     // (`crate::bluegreen::Frame::Stores`), or in a new build taking over, come from the runner it
     // takes over from.
+    #[cfg_attr(not(unix), allow(unused_variables, unused_assignments))]
     let mut convo_held: Option<crate::convo::store::Held> = None;
     // A new build taking over doesn't know yet which store it goes on with: its feed starts then.
     #[cfg_attr(not(unix), allow(unused_mut))]
