@@ -33,6 +33,7 @@ pub mod ops;
 pub mod pathset;
 pub mod queue;
 pub mod reap;
+pub mod rustc;
 pub mod seal;
 pub mod slots;
 pub mod tests;
