@@ -97,6 +97,23 @@ pub struct AssignmentV2 {
     /// (W02-R06, W24-R11). An older server never says so, so its legs keep none.
     #[serde(default)]
     pub trusted: bool,
+    /// W24-R11: the job keeps a warm workspace (`work: { warm }`). An older server never sends
+    /// it, so its legs get fresh workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm: Option<Warm>,
+}
+
+/// A leg's warm workspace (W24-R11, R15), from its job's `work: { warm }`: the runner keeps it for
+/// the next leg of its lane, checked out in place with these folders kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Warm {
+    /// The folders kept, relative to the workspace (`target`).
+    pub paths: Vec<String>,
+    /// The most the lane's workspaces keep on a runner, in bytes; else only the runner's own
+    /// budget holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u64>,
 }
 
 /// A job's environment, as its runner deploys to it (W15-R02).

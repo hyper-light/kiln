@@ -27,6 +27,36 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::key::{Key, VERSION};
+use crate::wf::ir::YVal;
+use crate::wire::Warm;
+
+/// A job's `work: { warm }` (W24-R11, R15), as its legs' assignments carry it: `warm: [target]`,
+/// or `warm: { paths: [target], budget: 60Gi }`. `None` when it keeps no folders warm.
+pub fn warm(work: Option<&YVal>) -> Option<Warm> {
+    let w = work?.get("warm")?;
+    let list = |v: &YVal| -> Vec<String> {
+        match v {
+            YVal::Seq(items) => items.iter().filter_map(YVal::as_str).map(str::to_owned).collect(),
+            YVal::Str(t) => vec![t.src.clone()],
+            _ => Vec::new(),
+        }
+    };
+    let (paths, budget) = match w {
+        YVal::Map(_) => (w.get("paths").map(list).unwrap_or_default(), w.get("budget").and_then(bytes)),
+        other => (list(other), None),
+    };
+    (!paths.is_empty()).then_some(Warm { paths, budget })
+}
+
+/// A size as written: bytes, or with a unit (`60Gi`, `500M`).
+fn bytes(v: &YVal) -> Option<u64> {
+    let n = match v {
+        YVal::Num(n) => *n,
+        YVal::Str(t) => crate::sched::routing::number(t.src.trim())?,
+        _ => return None,
+    };
+    (n.is_finite() && n >= 0.0).then_some(n as u64)
+}
 
 /// What a lane is made of (W24-R11): the workspaces of one lane can stand in for one another.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +384,31 @@ mod tests {
 
     fn lane_of() -> LaneOf {
         LaneOf { repo: "acme/app".into(), job: ".kiln/ci.yaml#rust".into(), matrix: BTreeMap::from([("os".into(), "linux".into())]), toolchain: "host".into(), profile: String::new() }
+    }
+
+    /// W24-R11: the kiln dialect's `work: { warm }` as the assignment carries it.
+    #[test]
+    fn w24_r11_a_jobs_warm_folders_from_the_dialect() {
+        let wf = |job: &str| crate::wf::parse_workflow(".kiln/ci.yaml", &format!("on: push\njobs:\n  build:\n    runs-on: local\n{job}    steps:\n      - run: make\n"), crate::expr::Dialect::Kiln);
+        let of = |job: &str| wf(job).0.and_then(|w| w.jobs.first().and_then(|j| warm(j.kiln.work.as_ref())));
+        assert_eq!(of("    work: { warm: [target, node_modules] }\n"), Some(Warm { paths: vec!["target".into(), "node_modules".into()], budget: None }));
+        assert_eq!(of("    work: { warm: target }\n"), Some(Warm { paths: vec!["target".into()], budget: None }));
+        assert_eq!(of("    work:\n      warm: { paths: [target], budget: 60Gi }\n"), Some(Warm { paths: vec!["target".into()], budget: Some(60 << 30) }));
+        assert_eq!(of("    work: { warm: { paths: [target], budget: 1048576 } }\n"), Some(Warm { paths: vec!["target".into()], budget: Some(1 << 20) }));
+        assert_eq!(of("    work: { warm: [] }\n"), None, "nothing kept, no warm workspace");
+        assert_eq!(of("    work: { memo: { inputs: [src/**] } }\n"), None);
+        assert_eq!(of(""), None);
+        let (_, diags) = wf("    work: { warm: [target] }\n");
+        assert!(diags.iter().all(|d| !d.is_error()), "a key the dialect knows: {diags:?}");
+        let (_, diags) = crate::wf::parse_workflow(".github/workflows/ci.yml", "on: push\njobs:\n  b:\n    runs-on: x\n    work: { warm: [target] }\n    steps: [{run: make}]\n", crate::expr::Dialect::Gha);
+        assert!(diags.iter().any(|d| d.code == "KCI5002"), "and kiln's alone: {diags:?}");
+        // An overlay gives a GitHub workflow's job its warm folders (W02-R07, W24-R25).
+        let (gha, _) = crate::wf::parse_workflow(".github/workflows/ci.yml", "on: push\njobs:\n  b:\n    runs-on: x\n    steps: [{run: make}]\n", crate::expr::Dialect::Gha);
+        let (ov, diags) = crate::wf::parse_overlay("jobs:\n  b:\n    work: { warm: [target] }\n");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let mut gha = gha.unwrap_or_default();
+        let _ = crate::wf::apply_overlay(&mut gha, &ov.unwrap_or_default());
+        assert_eq!(gha.jobs.first().and_then(|j| warm(j.kiln.work.as_ref())), Some(Warm { paths: vec!["target".into()], budget: None }));
     }
 
     #[test]

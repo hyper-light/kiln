@@ -737,8 +737,10 @@ impl Fe<'_> {
                     ]));
                 }
                 "reuse" => kiln.reuse = Some(self.yval(v)),
-                // W24-R06: `work: { memo }` is what `reuse:` is shorthand for.
+                // W24: `work:` is kept as written, its `warm` read by `work::slots::warm` (W24-R11);
+                // `work: { memo }` is what `reuse:` is shorthand for (W24-R06).
                 "work" => {
+                    kiln.work = Some(self.yval(v));
                     if let Some(memo) = v.get("memo") {
                         kiln.reuse = Some(self.yval(memo));
                     }

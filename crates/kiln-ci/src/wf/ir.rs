@@ -356,6 +356,10 @@ pub struct JobKiln {
     pub priority: Option<YVal>,
     pub retry: Option<YVal>,
     pub reuse: Option<YVal>,
+    /// `work:` (W24), as written: its `warm` read by `work::slots::warm`. Left out of the model's
+    /// JSON when unset, so a workflow without it hashes as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<YVal>,
     pub cache: Vec<YVal>,
     pub exports_env: Vec<String>,
     pub env_from: Vec<String>,

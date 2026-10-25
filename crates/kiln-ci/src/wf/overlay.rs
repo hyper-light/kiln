@@ -247,7 +247,11 @@ fn merge_kiln(dst: &mut JobKiln, src: &JobKiln, set: &[String]) {
             "prefer" => dst.prefer = src.prefer.clone(),
             "priority" => dst.priority = src.priority.clone(),
             "retry" => dst.retry = src.retry.clone(),
-            "reuse" | "work" => dst.reuse = src.reuse.clone(),
+            "reuse" => dst.reuse = src.reuse.clone(),
+            "work" => {
+                dst.reuse = src.reuse.clone();
+                dst.work = src.work.clone();
+            }
             "cache" => dst.cache = src.cache.clone(),
             "exports" => dst.exports_env = src.exports_env.clone(),
             "env-from" => dst.env_from = src.env_from.clone(),
