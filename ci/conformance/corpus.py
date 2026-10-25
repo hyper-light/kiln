@@ -89,6 +89,13 @@ KNOWN = [
     (r"is out of date with the latest MariaDB or MySQL release data from endoflife\.date", "it compares the repository's list of database versions with endoflife.date's today, which has releases since the commit"),
     (r"API request error 400 Invalid `X-Api-Token` header", "it uploads translations to Lokalise with the repository's secret (its API token), which the corpus's copy hasn't"),
     (r'Load key "\.ssh/[\w.-]+": error in libcrypto', "it loads an SSH key from the repository's secret, which the corpus's copy hasn't (its cleanup's `docker rm -f` then finds no container to remove)"),
+    # next.js's: its link checker makes a check with the job's token and no `permissions:`, the
+    # repository's default (an older repository's writes on GitHub; the corpus's copy has GitHub's
+    # restricted default, and the upstream's own only its admins can read); a preview tarball its
+    # Vercel deployment publishes; evals with its Vercel project.
+    (r"Failed to create check: HttpError: Resource not accessible by integration: the job's token lacks `checks: write`", "it makes a check with the job's token and no `permissions:`, which takes the repository's default: the corpus's copy has GitHub's restricted default, where the upstream's (an older repository's) writes"),
+    (r"Preview tarball for commit \w+ was not published within", "it waits for the preview tarball the upstream's Vercel deployment publishes for the pull request's commit, which nothing publishes for the corpus's copy"),
+    (r"Missing CI authentication variable: VERCEL_PROJECT_ID", "it pulls a Vercel OIDC token with the repository's Vercel project settings, which the corpus's copy hasn't"),
     # rails' Markdown API check reads the files the pull request adds: the corpus's adds them all.
     (r"Check Markdown APIs in new files", "it checks the files a pull request adds, and the corpus's adds every file to an empty trunk"),
     # TypeScript's tag-vscode-typescript: the pushed commit's parent, the empty trunk too.
