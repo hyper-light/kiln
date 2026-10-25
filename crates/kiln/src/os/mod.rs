@@ -84,9 +84,13 @@ pub mod metrics;
 
 /// The first executable called `name` on `PATH` (on Windows also `name` + each `PATHEXT`).
 pub fn which(name: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
+    which_in(name, &std::env::var_os("PATH")?)
+}
+
+/// [`which`] over `paths`, a `PATH` value.
+pub fn which_in(name: &str, paths: &std::ffi::OsStr) -> Option<PathBuf> {
     let candidates = exe_names(name);
-    std::env::split_paths(&paths)
+    std::env::split_paths(paths)
         .filter(|dir| !dir.as_os_str().is_empty())
         .flat_map(|dir| candidates.iter().map(move |n| dir.join(n)).collect::<Vec<_>>())
         .find(|p| p.is_file())

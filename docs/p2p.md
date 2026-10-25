@@ -295,7 +295,9 @@ reads from it (`crates/kiln/src/store/learner.rs`, `crates/kiln/src/frontdoor/re
 - **Joining.** A runner that can hold one says so (`CAP_CLUSTER`). The server adds it as a learner,
   one change at a time through the group, and tells its newest process which member it is (an id
   from its machine's name) and the token its copies are fetched with. Other processes of the
-  machine let go of theirs, so one process at a time holds the replica's files.
+  machine let go of theirs, so one process at a time holds the replica's files. A newest process
+  whose older one holds them yet (finishing its last jobs before it retires) tries again until it
+  lets go: 15 s apart at first, then each minute, with the server's newest word to join.
 - **A copy, then the log.** A learner starts from a copy of kiln.db, `GET /api/cluster/copy`, made
   with `VACUUM INTO` at the group's last applied entry. The server's own log index stays behind. Any
   copy made later stands in for that point: an entry its `seq` holds already is skipped, as a restart
