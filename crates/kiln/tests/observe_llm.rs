@@ -17,7 +17,6 @@
 //! Datadog's `ml_obs` metrics count every call once.
 //!
 //! It needs Docker: `cargo test -p kiln --test observe_llm -- --ignored --nocapture`.
-#![cfg(unix)]
 
 mod common;
 
@@ -175,11 +174,17 @@ fn metric_sum(f: &Fleet, q: &str, from: i64, to: i64) -> anyhow::Result<f64> {
 fn run_app(mode: &str, app: &str, apm: u16, otlp: u16, env: &[(&str, &str)]) -> anyhow::Result<(Value, String)> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("app.py"), APP)?;
+    #[cfg(unix)]
     Command::new("chmod").args(["-R", "a+rX"]).arg(dir.path()).output()?;
-    let mut args: Vec<String> =
-        ["run", "--rm", "--network", "host", "--user", "1000:1000", "-e", "HOME=/tmp", "-v", &format!("{}:/e2e:ro", dir.path().display())].iter().map(|s| (*s).to_owned()).collect();
+    // The app in a container (its model a server of its own, at its own 127.0.0.1), the runner's
+    // receivers where the container reaches this machine.
+    let net = common::DockerNet::get();
+    let mut args: Vec<String> = vec!["run".into(), "--rm".into()];
+    args.extend(net.args(&[], &[]));
+    args.extend(["--user", "1000:1000", "-e", "HOME=/tmp", "-v"].map(str::to_owned));
+    args.push(format!("{}:/e2e:ro", dir.path().display()));
     let mut all = vec![
-        ("DD_AGENT_HOST", "127.0.0.1".to_owned()),
+        ("DD_AGENT_HOST", net.host().to_owned()),
         ("DD_TRACE_AGENT_PORT", apm.to_string()),
         ("DD_SERVICE", app.to_owned()),
         ("DD_LLMOBS_ML_APP", app.to_owned()),
@@ -195,7 +200,7 @@ fn run_app(mode: &str, app: &str, apm: u16, otlp: u16, env: &[(&str, &str)]) -> 
         args.push(format!("{k}={v}"));
     }
     let model = free_port()?.to_string();
-    let endpoint = format!("http://127.0.0.1:{otlp}/v1/traces");
+    let endpoint = format!("http://{}:{otlp}/v1/traces", net.host());
     args.extend([IMAGE, "python", "-u", "/e2e/app.py", mode, &model, app, &endpoint].map(str::to_owned));
     let out = docker(&args.iter().map(String::as_str).collect::<Vec<_>>(), None)?;
     let ids = out.lines().find_map(|l| l.strip_prefix("IDS ")).map(serde_json::from_str).transpose()?.ok_or_else(|| anyhow::anyhow!("the app's ids:\n{out}"))?;

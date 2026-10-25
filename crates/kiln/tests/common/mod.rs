@@ -47,6 +47,50 @@ pub fn free_port() -> anyhow::Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
+/// How a test's containers and this machine reach each other. Under Linux's own engine a container
+/// shares this machine's network (`--network host`): it reaches this machine's services, and this
+/// machine its, at 127.0.0.1. Under Docker Desktop (macOS, Windows: its containers in a VM of its
+/// own, whose network `--network host` is) a container reaches this machine as
+/// `host.docker.internal` (a published port of another container too, through this machine),
+/// listens on every address of its own, and this machine reaches its ports where they are
+/// published, on 127.0.0.1.
+#[derive(Debug, Clone, Copy)]
+pub struct DockerNet {
+    pub desktop: bool,
+}
+
+impl DockerNet {
+    /// The engine's, as `docker info` names it (once a process).
+    pub fn get() -> Self {
+        static DESKTOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let desktop = *DESKTOP.get_or_init(|| {
+            Command::new("docker").args(["info", "--format", "{{.OperatingSystem}}"]).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("Docker Desktop"))
+        });
+        Self { desktop }
+    }
+
+    /// The address a container reaches this machine's services at.
+    pub fn host(&self) -> &'static str {
+        if self.desktop { "host.docker.internal" } else { "127.0.0.1" }
+    }
+
+    /// The address a container's own server listens on, for this machine to reach it.
+    pub fn listen(&self) -> &'static str {
+        if self.desktop { "0.0.0.0" } else { "127.0.0.1" }
+    }
+
+    /// `docker run`'s arguments for its network: this machine's, or the container's ports `tcp` and
+    /// `udp` published on 127.0.0.1.
+    pub fn args(&self, tcp: &[u16], udp: &[u16]) -> Vec<String> {
+        if !self.desktop {
+            return vec!["--network".into(), "host".into()];
+        }
+        let tcp = tcp.iter().map(|p| format!("127.0.0.1:{p}:{p}"));
+        let udp = udp.iter().map(|p| format!("127.0.0.1:{p}:{p}/udp"));
+        tcp.chain(udp).flat_map(|p| ["-p".to_owned(), p]).collect()
+    }
+}
+
 /// One process of the fleet; killed (SIGKILL) when dropped.
 pub struct Proc {
     pub child: Child,

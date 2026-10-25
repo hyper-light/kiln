@@ -8,7 +8,6 @@
 //! over its scrapes), its histograms answer percentiles; what is not a writer's is refused.
 //!
 //! It needs Docker: `cargo test -p kiln --test observe_remote_write -- --ignored --nocapture`.
-#![cfg(unix)]
 
 mod common;
 
@@ -21,7 +20,8 @@ use serde_json::{Value, json};
 
 const IMAGE: &str = "prom/prometheus:v3.7.0";
 
-/// Prometheus in a container on the host's network, its config `yml`, listening on `port`.
+/// Prometheus in a container, its config `yml`, listening on `port` (on this machine's network, or
+/// published to it: [`common::DockerNet`]).
 struct Prometheus {
     name: String,
     port: u16,
@@ -32,9 +32,12 @@ impl Prometheus {
         let config = dir.join("prometheus.yml");
         std::fs::write(&config, yml)?;
         let name = format!("kiln-prom-{}-{port}", std::process::id());
+        let net = common::DockerNet::get();
         let out = Command::new("docker")
-            .args(["run", "-d", "--rm", "--name", &name, "--network", "host", "-v", &format!("{}:/etc/prometheus/prometheus.yml:ro", config.display()), IMAGE])
-            .args(["--config.file=/etc/prometheus/prometheus.yml", &format!("--web.listen-address=127.0.0.1:{port}"), "--storage.tsdb.path=/prometheus", "--enable-feature=native-histograms"])
+            .args(["run", "-d", "--rm", "--name", &name])
+            .args(net.args(&[port], &[]))
+            .args(["-v", &format!("{}:/etc/prometheus/prometheus.yml:ro", config.display()), IMAGE])
+            .args(["--config.file=/etc/prometheus/prometheus.yml", &format!("--web.listen-address={}:{port}", net.listen()), "--storage.tsdb.path=/prometheus", "--enable-feature=native-histograms"])
             .output()?;
         anyhow::ensure!(out.status.success(), "docker run: {}", String::from_utf8_lossy(&out.stderr));
         let p = Self { name, port };
@@ -102,23 +105,24 @@ scrape_configs:
     static_configs:
       - targets: ["127.0.0.1:{port}"]
 remote_write:
-  - url: http://127.0.0.1:{http}/api/v1/write
+  - url: http://{host}:{http}/api/v1/write
     authorization:
       credentials: {ingest}
     queue_config: {{ batch_send_deadline: 1s }}
     metadata_config: {{ send_interval: 2s }}
     send_native_histograms: true
     write_relabel_configs: [{{ target_label: rw, replacement: v1 }}]
-  - url: http://127.0.0.1:{http}/api/v1/write
+  - url: http://{host}:{http}/api/v1/write
     protobuf_message: io.prometheus.write.v2.Request
     basic_auth: {{ username: prometheus, password: {ingest} }}
     queue_config: {{ batch_send_deadline: 1s }}
     write_relabel_configs: [{{ target_label: rw, replacement: v2 }}]
-  - url: http://127.0.0.1:{runner}/api/v1/write
+  - url: http://{host}:{runner}/api/v1/write
     queue_config: {{ batch_send_deadline: 1s }}
     write_relabel_configs: [{{ target_label: rw, replacement: runner }}]
 "#,
-        http = f.http
+        http = f.http,
+        host = common::DockerNet::get().host()
     );
     let t0 = now_ms();
     let prom = Prometheus::start(dir.path(), &yml, port)?;

@@ -9,7 +9,6 @@
 //! calls invalid refused and said so.
 //!
 //! It needs Docker: `cargo test -p kiln --test observe_traces -- --ignored --nocapture`.
-#![cfg(unix)]
 
 mod common;
 
@@ -218,36 +217,27 @@ fn traces_from_opentelemetry_s_sdk_are_kiln_s_traces_services_and_map() -> anyho
 
     // The services, and the driver's requests.
     std::fs::write(dir.path().join("apps.py"), APPS)?;
+    #[cfg(unix)]
     std::process::Command::new("chmod").args(["-R", "a+rX"]).arg(dir.path()).output()?;
     let (fe, cart) = (free_port()?, free_port()?);
-    let out = docker(
-        &[
-            "run",
-            "--rm",
-            "--network",
-            "host",
-            "-v",
-            &format!("{}:/e2e:ro", dir.path().display()),
-            "-e",
-            &format!("KILN=http://127.0.0.1:{}", f.http),
-            "-e",
-            &format!("TOKEN={ingest}"),
-            "-e",
-            &format!("GRPC=http://127.0.0.1:{grpc}"),
-            "-e",
-            &format!("FE_PORT={fe}"),
-            "-e",
-            &format!("CART_PORT={cart}"),
-            "-e",
-            &format!("ORDERS={ORDERS}"),
-            IMAGE,
-            "python",
-            "-u",
-            "/e2e/apps.py",
-            "all",
-        ],
-        None,
-    )?;
+    // The services and their driver in one container: each other at its own 127.0.0.1, the server and
+    // the runner where the container reaches this machine.
+    let net = common::DockerNet::get();
+    let mut args: Vec<String> = vec!["run".into(), "--rm".into()];
+    args.extend(net.args(&[], &[]));
+    for (flag, value) in [
+        ("-v", format!("{}:/e2e:ro", dir.path().display())),
+        ("-e", format!("KILN=http://{}:{}", net.host(), f.http)),
+        ("-e", format!("TOKEN={ingest}")),
+        ("-e", format!("GRPC=http://{}:{grpc}", net.host())),
+        ("-e", format!("FE_PORT={fe}")),
+        ("-e", format!("CART_PORT={cart}")),
+        ("-e", format!("ORDERS={ORDERS}")),
+    ] {
+        args.extend([flag.to_owned(), value]);
+    }
+    args.extend([IMAGE, "python", "-u", "/e2e/apps.py", "all"].map(str::to_owned));
+    let out = docker(&args.iter().map(String::as_str).collect::<Vec<_>>(), None)?;
     let ids: Value = out.lines().find_map(|l| l.strip_prefix("IDS ")).map(serde_json::from_str).transpose()?.ok_or_else(|| anyhow::anyhow!("the driver's trace ids:\n{out}"))?;
     let failing = |i: u64| i % 10 == 3;
     for i in 0..ORDERS {

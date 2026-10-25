@@ -7,7 +7,6 @@
 //! one is refused as Datadog refuses it.
 //!
 //! It needs Docker: `cargo test -p kiln --test observe_ddagent -- --ignored --nocapture`.
-#![cfg(unix)]
 
 mod common;
 
@@ -22,7 +21,8 @@ use serde_json::{Value, json};
 const IMAGE: &str = "gcr.io/datadoghq/agent:7.84.4";
 const HOST: &str = "kiln-agent-e2e";
 
-/// The Agent in a container on the host's network.
+/// The Agent in a container, on this machine's network or its DogStatsD port published to it
+/// ([`common::DockerNet`]).
 struct Agent {
     name: String,
 }
@@ -31,12 +31,14 @@ impl Agent {
     fn start(http: u16, key: &str, dogstatsd: u16, conf: &std::path::Path, logs: &std::path::Path) -> anyhow::Result<Self> {
         let name = format!("kiln-ddagent-{}-{http}", std::process::id());
         let (cmd_port, expvar) = (free_port()?, free_port()?);
-        let env = [
+        let net = common::DockerNet::get();
+        let host = net.host();
+        let mut env = vec![
             ("DD_API_KEY", key.to_owned()),
-            ("DD_DD_URL", format!("http://127.0.0.1:{http}")),
+            ("DD_DD_URL", format!("http://{host}:{http}")),
             ("DD_HOSTNAME", HOST.to_owned()),
             ("DD_LOGS_ENABLED", "true".to_owned()),
-            ("DD_LOGS_CONFIG_LOGS_DD_URL", format!("127.0.0.1:{http}")),
+            ("DD_LOGS_CONFIG_LOGS_DD_URL", format!("{host}:{http}")),
             ("DD_LOGS_CONFIG_LOGS_NO_SSL", "true".to_owned()),
             ("DD_LOGS_CONFIG_FORCE_USE_HTTP", "true".to_owned()),
             ("DD_DOGSTATSD_PORT", dogstatsd.to_string()),
@@ -46,8 +48,13 @@ impl Agent {
             ("DD_EXPVAR_PORT", expvar.to_string()),
             ("DD_INVENTORIES_ENABLED", "false".to_owned()),
         ];
+        if net.desktop {
+            // Its DogStatsD reached through its published port: from outside the container.
+            env.push(("DD_DOGSTATSD_NON_LOCAL_TRAFFIC", "true".to_owned()));
+        }
         let mut c = Command::new("docker");
-        c.args(["run", "-d", "--rm", "--name", &name, "--network", "host"]);
+        c.args(["run", "-d", "--rm", "--name", &name]);
+        c.args(net.args(&[], &[dogstatsd]));
         c.args(["-v", &format!("{}:/etc/datadog-agent/conf.d/e2e.d:ro", conf.display()), "-v", &format!("{}:/e2e-logs", logs.display())]);
         for (k, v) in &env {
             c.args(["-e", &format!("{k}={v}")]);
@@ -117,6 +124,7 @@ fn datadog_s_agent_submits_to_kiln_as_to_datadog() -> anyhow::Result<()> {
     std::fs::create_dir_all(&logs)?;
     std::fs::write(conf.join("conf.yaml"), "logs:\n  - type: file\n    path: /e2e-logs/app.log\n    service: e2e-svc\n    source: e2e-src\n")?;
     std::fs::write(logs.join("app.log"), "")?;
+    #[cfg(unix)]
     for p in [&conf, &logs] {
         std::process::Command::new("chmod").args(["-R", "a+rwX"]).arg(p).output()?;
     }

@@ -17,7 +17,6 @@
 //!   them, its wall time.
 //!
 //! `cargo test -p kiln --test observe_profiles -- --ignored --nocapture` (the last three need Docker).
-#![cfg(unix)]
 
 mod common;
 
@@ -293,30 +292,35 @@ fn a_go_service_s_own_profiler_through_a_runner_shows_its_own_hot_functions() ->
         &|| f.logs(),
     )?;
     let name = format!("kiln-ddprof-go-{}", std::process::id());
-    docker(&[
-        "run",
-        "-d",
-        "--name",
-        &name,
-        "--network",
-        "host",
-        "-e",
-        "DD_AGENT_HOST=127.0.0.1",
-        "-e",
-        &format!("DD_TRACE_AGENT_PORT={apm}"),
-        "-e",
-        "DD_SERVICE=kiln-e2e-go",
-        "-e",
-        "DD_ENV=e2e",
-        "-e",
-        "DD_VERSION=1.0.0",
-        "-e",
-        "DD_INSTRUMENTATION_TELEMETRY_ENABLED=false",
-        "-e",
-        "RUN_FOR=35s",
-        GO_IMAGE,
-        "/profiled",
-    ])?;
+    // The runner's receiver where the container reaches this machine.
+    let net = common::DockerNet::get();
+    let (network, agent_host) = (net.args(&[], &[]), format!("DD_AGENT_HOST={}", net.host()));
+    let network: Vec<&str> = network.iter().map(String::as_str).collect();
+    docker(
+        &[
+            &["run", "-d", "--name", &name][..],
+            &network,
+            &[
+                "-e",
+                &agent_host,
+                "-e",
+                &format!("DD_TRACE_AGENT_PORT={apm}"),
+                "-e",
+                "DD_SERVICE=kiln-e2e-go",
+                "-e",
+                "DD_ENV=e2e",
+                "-e",
+                "DD_VERSION=1.0.0",
+                "-e",
+                "DD_INSTRUMENTATION_TELEMETRY_ENABLED=false",
+                "-e",
+                "RUN_FOR=35s",
+                GO_IMAGE,
+                "/profiled",
+            ],
+        ]
+        .concat(),
+    )?;
     let c = Container(name);
     let logs = || format!("--- service\n{}\n{}", c.logs(), f.logs());
     until("two uploads of the service", Duration::from_secs(120), || Ok(list(&f, "service:kiln-e2e-go", t0)?.len() >= 2), &logs)?;
@@ -386,8 +390,9 @@ fn a_python_service_s_profiler_through_datadog_s_agent_shows_its_own_hot_functio
     let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
     let apm = free_port()?;
     let agent = Container(format!("kiln-ddprof-agent-{}", std::process::id()));
-    let kiln = format!("http://127.0.0.1:{}", f.http);
-    let env = [
+    let net = common::DockerNet::get();
+    let kiln = format!("http://{}:{}", net.host(), f.http);
+    let mut env = vec![
         format!("DD_API_KEY={ingest}"),
         format!("DD_DD_URL={kiln}"),
         format!("DD_HOSTNAME={AGENT_HOST}"),
@@ -404,7 +409,12 @@ fn a_python_service_s_profiler_through_datadog_s_agent_shows_its_own_hot_functio
         "DD_INVENTORIES_ENABLED=false".to_owned(),
         "DD_REMOTE_CONFIGURATION_ENABLED=false".to_owned(),
     ];
-    let mut args: Vec<String> = ["run", "-d", "--name", &agent.0, "--network", "host"].iter().map(|s| (*s).to_owned()).collect();
+    if net.desktop {
+        // Its receiver reached through its published port: from outside the container.
+        env.push("DD_APM_NON_LOCAL_TRAFFIC=true".to_owned());
+    }
+    let mut args: Vec<String> = ["run", "-d", "--name", &agent.0].iter().map(|s| (*s).to_owned()).collect();
+    args.extend(net.args(&[apm], &[]));
     for e in &env {
         args.push("-e".to_owned());
         args.push(e.clone());
@@ -414,42 +424,47 @@ fn a_python_service_s_profiler_through_datadog_s_agent_shows_its_own_hot_functio
     until("the Agent's receiver", Duration::from_secs(90), || Ok(common::raw(apm, "GET", "/info", "", b"").is_ok_and(|(c, _)| c == 200)), &|| agent.logs())?;
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("app.py"), PY_APP)?;
+    #[cfg(unix)]
     Command::new("chmod").args(["-R", "a+rX"]).arg(dir.path()).output()?;
     let app = Container(format!("kiln-ddprof-py-{}", std::process::id()));
-    docker(&[
-        "run",
-        "-d",
-        "--name",
-        &app.0,
-        "--network",
-        "host",
-        "-v",
-        &format!("{}:/e2e:ro", dir.path().display()),
-        "-e",
-        "DD_AGENT_HOST=127.0.0.1",
-        "-e",
-        &format!("DD_TRACE_AGENT_PORT={apm}"),
-        "-e",
-        "DD_SERVICE=kiln-e2e-py",
-        "-e",
-        "DD_ENV=e2e",
-        "-e",
-        "DD_VERSION=2.0.0",
-        "-e",
-        "DD_PROFILING_ENABLED=true",
-        "-e",
-        "DD_PROFILING_UPLOAD_INTERVAL=10",
-        "-e",
-        "DD_INSTRUMENTATION_TELEMETRY_ENABLED=false",
-        "-e",
-        "DD_REMOTE_CONFIGURATION_ENABLED=false",
-        "-e",
-        "RUN_FOR=35",
-        PY_IMAGE,
-        "python",
-        "-u",
-        "/e2e/app.py",
-    ])?;
+    // The Agent where the container reaches this machine (its published port).
+    let (network, agent_host, mount) = (net.args(&[], &[]), format!("DD_AGENT_HOST={}", net.host()), format!("{}:/e2e:ro", dir.path().display()));
+    let network: Vec<&str> = network.iter().map(String::as_str).collect();
+    docker(
+        &[
+            &["run", "-d", "--name", &app.0][..],
+            &network,
+            &[
+                "-v",
+                &mount,
+                "-e",
+                &agent_host,
+                "-e",
+                &format!("DD_TRACE_AGENT_PORT={apm}"),
+                "-e",
+                "DD_SERVICE=kiln-e2e-py",
+                "-e",
+                "DD_ENV=e2e",
+                "-e",
+                "DD_VERSION=2.0.0",
+                "-e",
+                "DD_PROFILING_ENABLED=true",
+                "-e",
+                "DD_PROFILING_UPLOAD_INTERVAL=10",
+                "-e",
+                "DD_INSTRUMENTATION_TELEMETRY_ENABLED=false",
+                "-e",
+                "DD_REMOTE_CONFIGURATION_ENABLED=false",
+                "-e",
+                "RUN_FOR=35",
+                PY_IMAGE,
+                "python",
+                "-u",
+                "/e2e/app.py",
+            ],
+        ]
+        .concat(),
+    )?;
     let logs = || format!("--- app\n{}\n--- agent\n{}\n{}", app.logs(), agent.logs(), f.logs());
     until("two uploads of the service", Duration::from_secs(150), || Ok(list(&f, "service:kiln-e2e-py", t0)?.len() >= 2), &logs)?;
     let u = list(&f, "service:kiln-e2e-py", t0)?;
@@ -534,46 +549,51 @@ fn a_java_service_s_recordings_through_a_runner_show_its_own_hot_functions() -> 
         &|| f.logs(),
     )?;
     let app = Container(format!("kiln-ddprof-java-{}", std::process::id()));
-    docker(&[
-        "run",
-        "-d",
-        "--name",
-        &app.0,
-        "--network",
-        "host",
-        "-e",
-        "DD_AGENT_HOST=127.0.0.1",
-        "-e",
-        &format!("DD_TRACE_AGENT_PORT={apm}"),
-        "-e",
-        "DD_SERVICE=kiln-e2e-java",
-        "-e",
-        "DD_ENV=e2e",
-        "-e",
-        "DD_VERSION=3.0.0",
-        "-e",
-        "DD_PROFILING_ENABLED=true",
-        "-e",
-        "DD_PROFILING_START_DELAY=1",
-        "-e",
-        "DD_PROFILING_UPLOAD_PERIOD=10",
-        // Its wall-clock samples of every thread, not of those in a trace alone (its default: the
-        // app has no trace).
-        "-e",
-        "DD_PROFILING_DDPROF_WALL_CONTEXT_FILTER=false",
-        "-e",
-        "DD_INSTRUMENTATION_TELEMETRY_ENABLED=false",
-        "-e",
-        "DD_REMOTE_CONFIGURATION_ENABLED=false",
-        "-e",
-        "RUN_MS=40000",
-        JAVA_IMAGE,
-        "java",
-        "-javaagent:/dd-java-agent.jar",
-        "-cp",
-        "/app",
-        "Burn",
-    ])?;
+    // The runner's receiver where the container reaches this machine.
+    let net = common::DockerNet::get();
+    let (network, agent_host) = (net.args(&[], &[]), format!("DD_AGENT_HOST={}", net.host()));
+    let network: Vec<&str> = network.iter().map(String::as_str).collect();
+    docker(
+        &[
+            &["run", "-d", "--name", &app.0][..],
+            &network,
+            &[
+                "-e",
+                &agent_host,
+                "-e",
+                &format!("DD_TRACE_AGENT_PORT={apm}"),
+                "-e",
+                "DD_SERVICE=kiln-e2e-java",
+                "-e",
+                "DD_ENV=e2e",
+                "-e",
+                "DD_VERSION=3.0.0",
+                "-e",
+                "DD_PROFILING_ENABLED=true",
+                "-e",
+                "DD_PROFILING_START_DELAY=1",
+                "-e",
+                "DD_PROFILING_UPLOAD_PERIOD=10",
+                // Its wall-clock samples of every thread, not of those in a trace alone (its default: the
+                // app has no trace).
+                "-e",
+                "DD_PROFILING_DDPROF_WALL_CONTEXT_FILTER=false",
+                "-e",
+                "DD_INSTRUMENTATION_TELEMETRY_ENABLED=false",
+                "-e",
+                "DD_REMOTE_CONFIGURATION_ENABLED=false",
+                "-e",
+                "RUN_MS=40000",
+                JAVA_IMAGE,
+                "java",
+                "-javaagent:/dd-java-agent.jar",
+                "-cp",
+                "/app",
+                "Burn",
+            ],
+        ]
+        .concat(),
+    )?;
     let logs = || format!("--- app\n{}\n{}", app.logs(), f.logs());
     until("two uploads of the service", Duration::from_secs(150), || Ok(list(&f, "service:kiln-e2e-java", t0)?.len() >= 2), &logs)?;
     let u = list(&f, "service:kiln-e2e-java", t0)?;

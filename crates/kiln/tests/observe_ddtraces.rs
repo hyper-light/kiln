@@ -13,7 +13,6 @@
 //! twice, each series of the host that counted it.
 //!
 //! It needs Docker: `cargo test -p kiln --test observe_ddtraces -- --ignored --nocapture`.
-#![cfg(unix)]
 
 mod common;
 
@@ -105,7 +104,8 @@ def get(url):
 
 def drive():
     url = lambda p: "http://127.0.0.1:" + os.environ[p]
-    shop, shop_ctl, cart_ctl, agent = url("SHOP_PORT"), url("SHOP_CTL"), url("CART_CTL"), url("APM_PORT")
+    shop, shop_ctl, cart_ctl = url("SHOP_PORT"), url("SHOP_CTL"), url("CART_CTL")
+    agent = "http://" + os.environ["DD_AGENT_HOST"] + ":" + os.environ["APM_PORT"]
     for _ in range(600):
         try:
             if get(agent + "/info")[0] == 200 and get(shop_ctl + "/ready")[0] == 200 and get(cart_ctl + "/ready")[0] == 200:
@@ -149,7 +149,8 @@ fn docker(args: &[&str], stdin: Option<&str>) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The Agent in a container on the host's network, its trace agent's receiver on `apm`.
+/// The Agent in a container, its trace agent's receiver on `apm` (on this machine's network, or
+/// published to it: [`common::DockerNet`]).
 struct Agent {
     name: String,
 }
@@ -157,8 +158,9 @@ struct Agent {
 impl Agent {
     fn start(http: u16, key: &str, apm: u16) -> anyhow::Result<Self> {
         let name = format!("kiln-ddapm-{}-{http}", std::process::id());
-        let kiln = format!("http://127.0.0.1:{http}");
-        let env = [
+        let net = common::DockerNet::get();
+        let kiln = format!("http://{}:{http}", net.host());
+        let mut env = vec![
             ("DD_API_KEY", key.to_owned()),
             ("DD_DD_URL", kiln.clone()),
             ("DD_HOSTNAME", HOST.to_owned()),
@@ -174,8 +176,13 @@ impl Agent {
             ("DD_INVENTORIES_ENABLED", "false".to_owned()),
             ("DD_REMOTE_CONFIGURATION_ENABLED", "false".to_owned()),
         ];
+        if net.desktop {
+            // Its receiver reached through its published port: from outside the container.
+            env.push(("DD_APM_NON_LOCAL_TRAFFIC", "true".to_owned()));
+        }
         let mut c = Command::new("docker");
-        c.args(["run", "-d", "--rm", "--name", &name, "--network", "host"]);
+        c.args(["run", "-d", "--rm", "--name", &name]);
+        c.args(net.args(&[apm], &[]));
         for (k, v) in &env {
             c.args(["-e", &format!("{k}={v}")]);
         }
@@ -228,9 +235,15 @@ fn image() -> anyhow::Result<()> {
 fn orders(apm: u16) -> anyhow::Result<Value> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("apps.py"), APPS)?;
+    #[cfg(unix)]
     Command::new("chmod").args(["-R", "a+rX"]).arg(dir.path()).output()?;
     let (shop, cart, shop_ctl, cart_ctl) = (free_port()?, free_port()?, free_port()?, free_port()?);
-    let mut args: Vec<String> = ["run", "--rm", "--network", "host", "-v", &format!("{}:/e2e:ro", dir.path().display())].iter().map(|s| (*s).to_owned()).collect();
+    // The services and their driver in one container (each other at its own 127.0.0.1); the
+    // receiver where the container reaches this machine (an Agent's published port, or kiln's).
+    let net = common::DockerNet::get();
+    let mut args: Vec<String> = vec!["run".into(), "--rm".into()];
+    args.extend(net.args(&[], &[]));
+    args.extend(["-v".to_owned(), format!("{}:/e2e:ro", dir.path().display())]);
     for (k, v) in [
         ("SHOP_PORT", shop.to_string()),
         ("CART_PORT", cart.to_string()),
@@ -238,7 +251,7 @@ fn orders(apm: u16) -> anyhow::Result<Value> {
         ("CART_CTL", cart_ctl.to_string()),
         ("APM_PORT", apm.to_string()),
         ("ORDERS", ORDERS.to_string()),
-        ("DD_AGENT_HOST", "127.0.0.1".to_owned()),
+        ("DD_AGENT_HOST", net.host().to_owned()),
         ("DD_TRACE_AGENT_PORT", apm.to_string()),
         ("DD_ENV", "e2e".to_owned()),
         ("DD_VERSION", "1.2.3".to_owned()),

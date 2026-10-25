@@ -17,7 +17,6 @@
 //! an hour) tells the issues past it while for review, none resolved.
 //!
 //! It needs Docker: `cargo test -p kiln --test observe_errors -- --ignored --nocapture`.
-#![cfg(unix)]
 
 mod common;
 
@@ -209,8 +208,13 @@ fn until(what: &str, within: Duration, mut done: impl FnMut() -> anyhow::Result<
 fn fail(mode: &str, places: &str, first: u64, version: &str, env: &[(&str, String)]) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("shop.py"), SHOP)?;
+    #[cfg(unix)]
     Command::new("chmod").args(["-R", "a+rX"]).arg(dir.path()).output()?;
-    let mut args: Vec<String> = ["run", "--rm", "--network", "host", "-v", &format!("{}:/e2e:ro", dir.path().display())].iter().map(|s| (*s).to_owned()).collect();
+    // The shop and its driver in one container (each other at its own 127.0.0.1); the server and the
+    // runner where the container reaches this machine.
+    let mut args: Vec<String> = vec!["run".into(), "--rm".into()];
+    args.extend(common::DockerNet::get().args(&[], &[]));
+    args.extend(["-v".to_owned(), format!("{}:/e2e:ro", dir.path().display())]);
     let mut all: Vec<(&str, String)> = vec![
         ("PORT", free_port()?.to_string()),
         ("CTL", free_port()?.to_string()),
@@ -313,10 +317,11 @@ fn a_shop_s_failures_are_issues_grouped_as_datadog_groups_them_and_regress_in_a_
         || Ok(at(&f.call("GET", "/api/observe/v1/status", None)?, &["machines"]).as_array().is_some_and(|m| m.iter().any(|m| at(m, &["up"]) == true))),
         &|| f.logs(),
     )?;
-    let otel = |token: &str| vec![("KILN", format!("http://127.0.0.1:{}", f.http)), ("TOKEN", token.to_owned())];
+    let host = common::DockerNet::get().host();
+    let otel = |token: &str| vec![("KILN", format!("http://{host}:{}", f.http)), ("TOKEN", token.to_owned())];
     let dd = vec![
         ("DD_SERVICE", "shop-dd".to_owned()),
-        ("DD_AGENT_HOST", "127.0.0.1".to_owned()),
+        ("DD_AGENT_HOST", host.to_owned()),
         ("DD_TRACE_AGENT_PORT", apm.to_string()),
         ("DD_ENV", "e2e".to_owned()),
         ("DD_VERSION", "1.0".to_owned()),

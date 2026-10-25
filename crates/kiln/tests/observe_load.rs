@@ -1287,6 +1287,7 @@ fn a_runner_whose_server_is_away_refuses_in_time_and_loses_nothing_it_took() -> 
 /// This machine's dynamic loader, wherever its distribution keeps it (`/usr/lib`, `/usr/lib64`,
 /// `/usr/lib/x86_64-linux-gnu`), found from the path its ABI names: its folder (its libraries
 /// beside it) and its name.
+#[cfg(target_os = "linux")]
 fn host_loader() -> anyhow::Result<(String, String)> {
     let abi = if cfg!(target_arch = "aarch64") { "/lib/ld-linux-aarch64.so.1" } else { "/lib64/ld-linux-x86-64.so.2" };
     let real = std::fs::canonicalize(abi)?;
@@ -1296,6 +1297,7 @@ fn host_loader() -> anyhow::Result<(String, String)> {
 }
 
 /// A container's last lines, what it wrote to either stream.
+#[cfg(target_os = "linux")]
 fn container_log(name: &str) -> String {
     std::process::Command::new("docker")
         .args(["logs", "--tail", "80", name])
@@ -1305,6 +1307,7 @@ fn container_log(name: &str) -> String {
 }
 
 /// Runs `docker` with `args`, its output.
+#[cfg(target_os = "linux")]
 fn docker(args: &[&str]) -> anyhow::Result<String> {
     let out = std::process::Command::new("docker").args(args).output()?;
     anyhow::ensure!(out.status.success(), "docker {args:?}: {}", String::from_utf8_lossy(&out.stderr));
@@ -1315,7 +1318,9 @@ fn docker(args: &[&str]) -> anyhow::Result<String> {
 /// beside it): it refuses exporters before the disk is full (room kept for the cut that frees its
 /// log), never spins while refusing, takes again once room is freed, and stores everything it took.
 /// The container runs this machine's build with this machine's loader and libraries (mounted
-/// read-only), so it needs Docker and an image with a shell (`KOBS_FULLDISK_IMAGE`).
+/// read-only), so it needs Docker and an image with a shell (`KOBS_FULLDISK_IMAGE`), and Linux: a
+/// container runs Linux's binaries, this machine's build one only there.
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "needs Docker; fills a disk"]
 fn a_full_disk_is_refused_in_time_never_spun_on_and_nothing_it_took_is_lost() -> anyhow::Result<()> {

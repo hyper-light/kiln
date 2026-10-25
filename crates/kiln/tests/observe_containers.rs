@@ -282,13 +282,23 @@ service:
         "its I/O and working set drawn: {}",
         one["charts"]
     );
-    // Its buckets' cores but the newest (still filling: a counter's rise over a whole bucket's
-    // width), their median.
-    let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": query, "from": now_ms() - 120_000, "to": now_ms(), "step": 10_000 })))?;
-    let mut cores: Vec<f64> = a["series"][0]["values"].as_array().into_iter().flatten().filter_map(Value::as_f64).collect();
-    cores.pop();
-    cores.sort_by(f64::total_cmp);
-    let median = cores.get(cores.len() / 2).copied().unwrap_or(f64::NAN);
+    // Its buckets' cores but the first (the series began within it) and the newest (still filling:
+    // a counter's rise over a whole bucket's width), their median, once three are whole (the
+    // Collector's first reports come a while after it starts; on a loaded machine, later).
+    let start = Instant::now();
+    let (median, cores, a) = loop {
+        let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": query, "from": now_ms() - 120_000, "to": now_ms(), "step": 10_000 })))?;
+        let mut cores: Vec<f64> = a["series"][0]["values"].as_array().into_iter().flatten().filter_map(Value::as_f64).collect();
+        cores.pop();
+        if !cores.is_empty() {
+            cores.remove(0);
+        }
+        if cores.len() >= 3 || start.elapsed() > Duration::from_secs(120) {
+            cores.sort_by(f64::total_cmp);
+            break (cores.get(cores.len() / 2).copied().unwrap_or(f64::NAN), cores, a);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    };
     anyhow::ensure!(cores.len() >= 3 && (0.35..=0.55).contains(&median), "the chart's query, its cores: {median} of {cores:?} ({a})");
     drop(started);
     Ok(())

@@ -6,7 +6,6 @@
 //! said, in the relay's words; a relay on its own network, plain, takes mail too.
 //!
 //! It needs Docker: `cargo test -p kiln --test observe_email -- --ignored`.
-#![cfg(unix)]
 
 mod common;
 
@@ -109,7 +108,9 @@ fn a_monitor_s_alert_and_recovery_are_mailed_through_a_relay_that_asks_for_tls_a
     let certs = tempfile::tempdir()?;
     std::fs::write(certs.path().join("cert.pem"), &cert)?;
     std::fs::write(certs.path().join("key.pem"), &key)?;
-    // Mailpit reads its files as its own user.
+    // Mailpit reads its files as its own user (Docker Desktop's shares, macOS's and Windows's, are
+    // readable by it as they are).
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         for f in ["cert.pem", "key.pem"] {
