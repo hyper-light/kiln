@@ -1,6 +1,6 @@
 /* How your agents stand (stands.tsx): under Mission control's head, a rule with a stretch for each
-   way they stand (stands-wave.ts draws it, one wave across them all), and under it each one's badge
-   and count. What CSS moves here is transform and opacity only: the badges and the counts' digits. */
+   way they stand (stands-light.ts draws it, one string of light across them all), and under it
+   each one's badge and count. What CSS moves here is transform and opacity only: the badges and the counts' digits. */
 
 .st {
   min-height: 26px;
@@ -44,13 +44,14 @@
   --st-t: #8b8e96;
 }
 
-/* The rule: drawn into this box; its ends and beads may reach a little past it. */
+/* The rule: a canvas taller than the line it was, so what floats about the string has room; it
+   takes the same room in the page (12 points and 9 under it), the string where the line was. */
 .st-rule {
   display: block;
   width: 100%;
-  height: 12px;
-  margin-bottom: 9px;
-  overflow: visible;
+  height: 28px;
+  margin: -8px 0 1px;
+  pointer-events: none;
 }
 
 /* Under it, each one's badge and count, and on a desktop its name. */
