@@ -64,6 +64,7 @@ pub mod token;
 pub mod trackers;
 pub mod uploads;
 pub mod webhooks;
+pub mod work;
 pub mod workflows;
 
 /// A failure: an HTTP status and why (as `cd::ops::Fail`).
