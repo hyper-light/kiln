@@ -38,6 +38,12 @@
 //! runner signs what it records with its identity key ([`RunnerKey`]), [`write`] checks that
 //! against the key the server knows for the runner and countersigns it into the scope with the
 //! server's own, and [`lookup_as`] checks both before it takes an entry.
+//!
+//! Verification (W24-R23) is [`kiln_ci::work::verify`]'s: whatever brings a key's result again (a
+//! sampled hit run again, a cold rerun, another runner's ordinary run) is a reproduction or a
+//! conflict, and a conflict has the entry judged again on all its runs ([`verdict`]): a unit whose
+//! outputs differ is marked nondeterministic ([`nondeterministic`]), and an entry in doubt has its
+//! lineage quarantined ([`quarantined`]), which lookups pass over.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,6 +58,7 @@ use kiln_ci::work::seal::{self, Check, Checked};
 use kiln_ci::work::tests as test_results;
 use kiln_ci::work::tests::{Binary, Choice, Context, Kept, Marks, Ran};
 use kiln_ci::work::trust::{self, Comparison, Domain, Found, Outcome, Passed, Quotas, Usage};
+use kiln_ci::work::verify::{self, Verdict};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
@@ -77,7 +84,8 @@ pub enum Family {
     /// store keeps it while it's here (`services::cas::collect`), `services::memo::sweep` lets it go.
     Object,
     /// What's known of an entry beside it (W24-R22, R23): its reproductions, conflicts and
-    /// verdicts, under `<scope><strong>|<kind>|…`.
+    /// quarantine, under `<scope><strong>|<kind>…`; and a unit's nondeterministic mark, under
+    /// `<scope><weak>|nondeterministic`.
     Verify,
 }
 
@@ -298,8 +306,9 @@ pub enum Written {
     /// kept beside it as a verification (W24-R23); by the same runner, nothing new.
     Reproduced { strong: Key, by_another: bool },
     /// The key holds another result: entries are never overwritten, so this one is refused and
-    /// kept beside the entry as evidence for verification to judge (W24-R23).
-    Conflict { strong: Key, comparison: Comparison },
+    /// kept beside the entry as evidence, and the entry judged again on all its runs (W24-R23):
+    /// `verdict` says what that did.
+    Conflict { strong: Key, comparison: Comparison, verdict: Verdict },
     /// Not the scope's to take (W24-R21): another domain's result, or one built on what the
     /// scope's domain doesn't read. Nothing is written to the ledger, and the audit log says so.
     Refused(String),
@@ -335,8 +344,14 @@ fn runners(c: &Connection, scope: &str, strong: &Key, entry: &Recorded) -> anyho
 /// A row of the audit log (W19-R05) for what the ledger refused or passed over as a breach of the
 /// trust rules (W24-R21, AC06). It's no request's, so it's a row of its own.
 fn audit(c: &Connection, principal: &str, action: &str, target: &str, detail: &str) -> rusqlite::Result<()> {
+    audit_as(c, principal, action, target, "refused", detail)
+}
+
+/// A row of the audit log with how it ended: what the ledger did on its own (W24-R23's
+/// quarantines) says so there, and why.
+fn audit_as(c: &Connection, principal: &str, action: &str, target: &str, result: &str, detail: &str) -> rusqlite::Result<()> {
     let principal = if principal.is_empty() { "kiln" } else { principal };
-    c.execute("INSERT INTO audit2 (ts, principal, action, target, result, detail) VALUES (?1, ?2, ?3, ?4, 'refused', ?5)", params![crate::util::now_unix(), principal, action, target, detail])?;
+    c.execute("INSERT INTO audit2 (ts, principal, action, target, result, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![crate::util::now_unix(), principal, action, target, result, detail])?;
     Ok(())
 }
 
@@ -418,6 +433,10 @@ pub fn write(c: &Connection, seal: Option<&Seal>, scope: &str, unit: &Unit, read
                 if by_another {
                     let reproduced = Recorded { verified_by: Vec::new(), ..result.clone() };
                     put(&tx, Family::Verify, &format!("{}by|{}", verify_prefix(scope, &strong), p.runner), &serde_json::to_vec(&verification("reproduced", Some(Comparison::Same), Some(reproduced)))?, now)?;
+                    // A reproduction of an entry already in doubt tells nondeterminism from corruption.
+                    if !conflicts(&tx, scope, &strong)?.is_empty() {
+                        judge_again(&tx, scope, weak, &strong)?;
+                    }
                 }
                 Written::Reproduced { strong, by_another }
             }
@@ -426,7 +445,8 @@ pub fn write(c: &Connection, seal: Option<&Seal>, scope: &str, unit: &Unit, read
                 let row = format!("{}conflict|{}|{}|{}|{}", verify_prefix(scope, &strong), p.runner, p.run, p.leg, p.attempt);
                 put(&tx, Family::Verify, &row, &serde_json::to_vec(&verification("conflict", Some(comparison.clone()), Some(evidence)))?, now)?;
                 tracing::warn!(scope, strong = %strong, ?comparison, run = %p.run, leg = %p.leg, "a result differs from the entry its key holds; the entry stands (W24-R22)");
-                Written::Conflict { strong, comparison }
+                let verdict = judge_again(&tx, scope, weak, &strong)?;
+                Written::Conflict { strong, comparison, verdict }
             }
         }
     };
@@ -443,7 +463,7 @@ pub fn write(c: &Connection, seal: Option<&Seal>, scope: &str, unit: &Unit, read
 pub fn record(c: &Connection, scope: &str, unit: &Unit, read: &PathSet, result: &Recorded) -> anyhow::Result<Key> {
     match write(c, None, scope, unit, read, result)? {
         Written::New(strong) | Written::Reproduced { strong, .. } => Ok(strong),
-        Written::Conflict { strong, comparison } => anyhow::bail!("{strong} already holds another result ({comparison:?}); entries are never overwritten (W24-R22)"),
+        Written::Conflict { strong, comparison, verdict } => anyhow::bail!("{strong} already holds another result ({comparison:?}); entries are never overwritten (W24-R22), and it's judged again: {}", verdict.why()),
         Written::Refused(why) => anyhow::bail!("{why}"),
     }
 }
@@ -509,6 +529,10 @@ pub struct Hit {
     /// How it was found by class, when it wasn't under the unit's own key: what verification
     /// re-checks (W24-R23).
     pub class: Option<ByClass>,
+    /// The outputs its unit's runs disagree on, when verification marked the unit nondeterministic
+    /// (W24-R23): shown with the hit, and early cutoff off for it, since its outputs' digests don't
+    /// stand for what it does.
+    pub nondeterministic: Option<Vec<String>>,
 }
 
 /// How a hit was found by class (W24-R30).
@@ -550,13 +574,14 @@ fn candidates(c: &Connection, scope: &str, weak: &Key, now: &dyn Fn(&PathSet) ->
     Ok(None)
 }
 
-/// Whether a unit of `reader` takes `entry`, found under `strong` among `domain`'s entries: its
-/// hit, or why not. With a [`Seal`], its signatures are checked first (W24-R22), and a protected
-/// unit counts the runners that produced it by their keys: the entry's runner and each that
-/// reproduced it, whose signatures, its runner's and the server's, both verify. A breach of the
-/// trust rules is audited (AC06).
+/// Whether a unit of `reader` takes `entry`, found under `strong` (for the unit of `weak`) among
+/// `domain`'s entries: its hit, or why not. With a [`Seal`], its signatures are checked first
+/// (W24-R22), and a protected unit counts the runners that produced it by their keys: the entry's
+/// runner and each that reproduced it, whose signatures, its runner's and the server's, both
+/// verify. A quarantined entry is passed over (W24-R23). A breach of the trust rules is audited
+/// (AC06).
 #[allow(clippy::too_many_arguments)]
-fn judge(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, reader: &Domain, strong: Key, mut entry: Recorded) -> anyhow::Result<Result<Hit, Passed>> {
+fn judge(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, reader: &Domain, weak: &Key, strong: Key, mut entry: Recorded) -> anyhow::Result<Result<Hit, Passed>> {
     let named = runners(c, scope, &strong, &entry)?;
     let mut keyed = Vec::new();
     let mut verdict = Ok(());
@@ -572,7 +597,8 @@ fn judge(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, read
         }
     }
     let runners = if seal.is_some() { &keyed } else { &named };
-    let found = Found { scope: domain, writer: &entry.domain, lineage: &entry.lineage, runners: runners.iter().map(String::as_str).collect(), quarantined: None };
+    let quarantine = quarantined(c, scope, &strong)?;
+    let found = Found { scope: domain, writer: &entry.domain, lineage: &entry.lineage, runners: runners.iter().map(String::as_str).collect(), quarantined: quarantine.as_ref().map(|q| q.why.as_str()) };
     if let Err(why) = verdict.and_then(|()| trust::admit(reader, &found)) {
         if why.is_breach() {
             audit(c, "kiln", "work.lookup", &format!("{scope}{strong}"), &format!("passed over for a {reader} unit: {why}"))?;
@@ -581,7 +607,8 @@ fn judge(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, read
         return Ok(Err(why));
     }
     entry.verified_by = named.into_iter().skip(1).collect();
-    Ok(Ok(Hit { key: strong, domain: domain.clone(), recorded: entry, class: None }))
+    let nondeterministic = nondeterministic(c, scope, weak)?.map(|m| m.outputs);
+    Ok(Ok(Hit { key: strong, domain: domain.clone(), recorded: entry, class: None, nondeterministic }))
 }
 
 /// The ledger's one lookup path (W24-R04, R21, R30): a unit, keyed in `scope` ([`keyed`]), found
@@ -596,7 +623,7 @@ fn judge(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, read
 fn find(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, reader: &Domain, unit: &Unit, now: &dyn Fn(&PathSet) -> PathSet, passed: &mut dyn FnMut(Key, Passed)) -> anyhow::Result<Option<Hit>> {
     let keyed = keyed(c, scope, unit)?;
     let own = candidates(c, scope, &keyed.weak, now, &mut |strong, entry| {
-        Ok(match judge(c, seal, scope, domain, reader, strong, entry)? {
+        Ok(match judge(c, seal, scope, domain, reader, &keyed.weak, strong, entry)? {
             Ok(hit) => Some(hit),
             Err(why) => {
                 passed(strong, why);
@@ -629,7 +656,7 @@ fn find(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, reade
         if p.member.class.output() != Some(digest(&recorded).as_str()) {
             continue;
         }
-        let hit = match judge(c, seal, scope, domain, reader, source, recorded)? {
+        let hit = match judge(c, seal, scope, domain, reader, &keyed.weak, source, recorded)? {
             Ok(hit) => hit,
             Err(why) => {
                 passed(source, why);
@@ -838,6 +865,106 @@ impl RunnerKey {
         let sigs = seal::Signatures { runner: Some(seal::RunnerSig::new(self.spki.clone(), sig.as_ref().to_vec())), server: None };
         Ok(Recorded { signatures: sigs.to_list(), ..result.clone() })
     }
+}
+
+// ------------------------------------------------------------------ verification (W24-R23)
+
+/// What quarantined an entry, kept beside it (W24-R23): lookups pass it over, saying why.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Quarantine {
+    /// The verdict's words.
+    pub why: String,
+    /// The entry whose verdict it was (`<scope><strong>`): this one, or one it was built on.
+    pub root: String,
+    /// When, in seconds since the epoch.
+    pub at: i64,
+}
+
+/// A unit verification marked nondeterministic (W24-R23), kept under its weak key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Nondeterministic {
+    /// The outputs its runs disagree on.
+    pub outputs: Vec<String>,
+    /// The entry whose runs showed it (`<scope><strong>`).
+    pub entry: String,
+    pub at: i64,
+}
+
+/// An entry's row key: `<scope><strong>`.
+fn entry_key(scope: &str, strong: &Key) -> String {
+    format!("{scope}{}", strong.hex())
+}
+
+/// What quarantined the entry `scope` holds under `strong`, if anything did.
+pub fn quarantined(c: &Connection, scope: &str, strong: &Key) -> anyhow::Result<Option<Quarantine>> {
+    Ok(get(c, Family::Verify, &format!("{}quarantine", verify_prefix(scope, strong)))?.map(|v| serde_json::from_slice(&v)).transpose()?)
+}
+
+/// Whether verification marked the unit of `weak` nondeterministic in `scope`.
+pub fn nondeterministic(c: &Connection, scope: &str, weak: &Key) -> anyhow::Result<Option<Nondeterministic>> {
+    Ok(get(c, Family::Verify, &format!("{}nondeterministic", weak_prefix(scope, weak)))?.map(|v| serde_json::from_slice(&v)).transpose()?)
+}
+
+/// The results an entry's key refused, kept as evidence.
+fn conflicts(c: &Connection, scope: &str, strong: &Key) -> anyhow::Result<Vec<Recorded>> {
+    let mut out = Vec::new();
+    for (_, v, _) in scan(c, Family::Verify, &format!("{}conflict|", verify_prefix(scope, strong)))? {
+        let v: Verification = serde_json::from_slice(&v)?;
+        out.extend(v.result);
+    }
+    Ok(out)
+}
+
+/// What every other run of an entry's key says of it (W24-R23, [`verify::judge`]): its
+/// reproductions, which gave its outcome and outputs, and the results its key refused. `None` when
+/// the key holds no entry.
+pub fn verdict(c: &Connection, scope: &str, strong: &Key) -> anyhow::Result<Option<Verdict>> {
+    let Some(entry) = get(c, Family::Result, &entry_key(scope, strong))? else { return Ok(None) };
+    let entry: Recorded = serde_json::from_slice(&entry)?;
+    let mut runs: Vec<Recorded> = reproductions(c, scope, strong)?.into_iter().map(|v| v.result.unwrap_or_else(|| entry.clone())).collect();
+    runs.extend(conflicts(c, scope, strong)?);
+    let outcomes: Vec<Outcome> = runs.iter().map(Recorded::outcome).collect();
+    Ok(Some(verify::judge(&entry.outcome(), &outcomes)))
+}
+
+/// The entry `scope` holds under `strong` (of `weak`) judged again on all its runs, and what the
+/// verdict does (W24-R23): a nondeterministic unit is marked; an entry in doubt has its lineage
+/// quarantined, the entry and every entry of the repository built on it, through what each says
+/// it reused, in whatever domain. Kiln decides this on its own, so it writes why to the audit log.
+fn judge_again(c: &Connection, scope: &str, weak: &Key, strong: &Key) -> anyhow::Result<Verdict> {
+    let Some(verdict) = verdict(c, scope, strong)? else { return Ok(Verdict::Verified) };
+    let now = crate::util::now_unix();
+    let root = entry_key(scope, strong);
+    let marked = format!("{}nondeterministic", weak_prefix(scope, weak));
+    if let Verdict::Nondeterministic { names } = &verdict {
+        let mark = Nondeterministic { outputs: names.clone(), entry: root.clone(), at: now };
+        put(c, Family::Verify, &marked, &serde_json::to_vec(&mark)?, now)?;
+    } else if matches!(verdict, Verdict::Corrupted { .. }) && nondeterministic(c, scope, weak)?.is_some_and(|m| m.entry == root) {
+        // Its first run again only said it differed; now runs agree that the entry is what's
+        // wrong, so the unit loses the mark that run gave it.
+        delete(c, Family::Verify, &marked)?;
+    }
+    if verdict.quarantines() {
+        let repo = scope.strip_suffix('|').and_then(|s| s.rsplit_once('|')).map_or(scope, |(repo, _)| repo);
+        let mut reused: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (k, v, _) in scan(c, Family::Result, &format!("{repo}|"))? {
+            let r: Recorded = serde_json::from_slice(&v).unwrap_or_default();
+            if !r.reused.is_empty() {
+                reused.insert(k, r.reused);
+            }
+        }
+        let lineage = verify::lineage(&root, &reused);
+        let why = verdict.why();
+        let q = serde_json::to_vec(&Quarantine { why: why.clone(), root: root.clone(), at: now })?;
+        for entry in &lineage {
+            put(c, Family::Verify, &format!("{entry}|quarantine"), &q, now)?;
+        }
+        audit_as(c, "kiln", "work.verify", &root, "quarantined", &format!("{why}; its lineage quarantined: {}", lineage.join(", ")))?;
+        tracing::warn!(entry = %root, why = %why, entries = lineage.len(), "an entry's lineage quarantined (W24-R23)");
+    }
+    Ok(verdict)
 }
 
 /// What verification saw re-running a hit's unit (W24-R23): `observed`, its outputs' digest
@@ -1663,14 +1790,17 @@ mod tests {
             let same = |p: &PathSet| p.clone();
             let found = lookup(c, &sc, &u, &same)?.map(|h| h.recorded).ok_or_else(|| anyhow::anyhow!("no hit"))?;
             anyhow::ensure!(found.provenance.runner == "r1" && found.verified_by == ["r2"], "{found:?}");
-            // Another output, then another outcome: refused, the entry as it was.
+            // Another output, then another outcome: refused, the entry as it was, and judged again
+            // on all its runs (W24-R23): quarantined.
             let poisoned = made("trusted", "r3", &[("bin", "sha256:bad")]);
-            anyhow::ensure!(write(c, None, &sc, &u, &read, &poisoned)? == Written::Conflict { strong, comparison: Comparison::Outputs { names: vec!["bin".into()] } });
+            let names = vec!["bin".to_owned()];
+            anyhow::ensure!(write(c, None, &sc, &u, &read, &poisoned)? == Written::Conflict { strong, comparison: Comparison::Outputs { names: names.clone() }, verdict: Verdict::Nondeterministic { names } });
             let failed = Recorded { outcome: "failure".into(), exit: Some(1), ..made("trusted", "r4", &[("bin", "sha256:aa")]) };
-            anyhow::ensure!(matches!(write(c, None, &sc, &u, &read, &failed)?, Written::Conflict { comparison: Comparison::Outcome { .. }, .. }));
+            anyhow::ensure!(matches!(write(c, None, &sc, &u, &read, &failed)?, Written::Conflict { comparison: Comparison::Outcome { .. }, verdict: Verdict::Outcome { .. }, .. }));
             anyhow::ensure!(record(c, &sc, &u, &read, &poisoned).is_err_and(|e| e.to_string().contains("never overwritten")));
-            let kept = lookup(c, &sc, &u, &same)?.map(|h| h.recorded).ok_or_else(|| anyhow::anyhow!("no hit"))?;
-            anyhow::ensure!(kept.outputs.get("bin").map(String::as_str) == Some("sha256:aa"), "{kept:?}");
+            let kept: Recorded = serde_json::from_slice(&get(c, Family::Result, &entry_key(&sc, &strong))?.unwrap_or_default())?;
+            anyhow::ensure!(kept.outputs.get("bin").map(String::as_str) == Some("sha256:aa") && kept.provenance.runner == "r1", "{kept:?}");
+            anyhow::ensure!(lookup(c, &sc, &u, &same)?.is_none(), "quarantined, it's passed over");
             let evidence = scan(c, Family::Verify, &format!("{}conflict|", verify_prefix(&sc, &strong)))?;
             anyhow::ensure!(evidence.len() == 2, "both conflicts kept: {}", evidence.len());
             let first_conflict: Verification = serde_json::from_slice(&evidence.iter().find(|(k, _, _)| k.contains("|r3|")).ok_or_else(|| anyhow::anyhow!("r3's conflict"))?.1)?;
@@ -1781,12 +1911,16 @@ mod tests {
             put(c, Family::Result, &format!("{trusted}{}", strong.hex()), &serde_json::to_vec(&forged)?, 1)?;
             anyhow::ensure!(lookup_as(c, None, "acme/app", &Domain::Trusted, &u, &same)?.passed_over.iter().any(|w| w.contains("reads go down only")));
             anyhow::ensure!(audited(c, "work.lookup")?.last().is_some_and(|(_, _, why)| why.contains("reads go down only")));
-            // A trusted entry of its own stands: the poison written over it is refused and kept as evidence.
+            // A trusted entry of its own stands: the poison written over it is refused and kept as
+            // evidence, and the entry, in doubt now, is quarantined (W24-R23): nothing is reused
+            // until runs again settle which is right.
             delete(c, Family::Result, &format!("{trusted}{}", strong.hex()))?;
             write(c, None, &trusted, &tu, &read, &made("trusted", "r1", &[("target/debug/deps/libfoo.rlib", "sha256:honest")]))?;
-            anyhow::ensure!(matches!(write(c, None, &trusted, &tu, &read, &made("trusted", "r1", &poison))?, Written::Conflict { .. }));
-            let hit = lookup_as(c, None, "acme/app", &Domain::Trusted, &u, &same)?.hit.ok_or_else(|| anyhow::anyhow!("no hit"))?;
-            anyhow::ensure!(hit.recorded.outputs.get("target/debug/deps/libfoo.rlib").map(String::as_str) == Some("sha256:honest"));
+            anyhow::ensure!(matches!(write(c, None, &trusted, &tu, &read, &made("trusted", "r1", &poison))?, Written::Conflict { verdict: Verdict::Nondeterministic { .. }, .. }));
+            let kept: Recorded = serde_json::from_slice(&get(c, Family::Result, &format!("{trusted}{}", strong.hex()))?.unwrap_or_default())?;
+            anyhow::ensure!(kept.outputs.get("target/debug/deps/libfoo.rlib").map(String::as_str) == Some("sha256:honest"), "the entry as it was");
+            let l = lookup_as(c, None, "acme/app", &Domain::Trusted, &u, &same)?;
+            anyhow::ensure!(l.hit.is_none() && l.passed_over.iter().any(|w| w.contains("quarantined")), "{l:?}");
             Ok(())
         })
     }
@@ -1913,6 +2047,90 @@ mod tests {
                 let p = take(&u, &Domain::Protected)?;
                 anyhow::ensure!(p.hit.is_none() && p.passed_over.iter().any(|w| w.contains("their runners signed")), "{p:?}");
             }
+            Ok(())
+        })
+    }
+
+    /// W24-AC07's fault injector, deterministic: a unit's run gives the outputs that follow from the
+    /// unit alone, unless nondeterminism is injected into it, when each runner's run gives its own.
+    fn run_of(n: u64, runner: &str, nondeterministic: bool, reused: &[String]) -> Recorded {
+        let out = if nondeterministic { format!("sha256:{n}-{runner}") } else { format!("sha256:{n}") };
+        Recorded { reused: reused.to_vec(), ..made("trusted", runner, &[("out", &out)]) }
+    }
+
+    /// W24-R23, AC07, by deterministic fault injection: hits sampled at the host's 10 % are run
+    /// again on other runners. A result corrupted after it was recorded (its output's digest
+    /// flipped where it's kept) and a unit with nondeterminism injected are each detected, and their
+    /// lineage quarantined: what was built on them, through what each reused, is passed over with
+    /// them, and the rest of the ledger isn't. Runs that agree with each other tell the corrupted
+    /// entry from the nondeterministic unit, which alone stays marked, and the mark shows on its
+    /// other entries. Kiln quarantines on its own, so the audit log says why.
+    #[test]
+    fn w24_ac07_corruption_and_nondeterminism_are_detected_and_quarantined() -> anyhow::Result<()> {
+        in_store(|c| {
+            let sc = scope("acme/app", "trusted");
+            let same = |p: &PathSet| p.clone();
+            let at = |n: u64| {
+                let weak = weak_as(&unit(n), "trusted");
+                let strong = key::strong(&weak, &reads(n, 0));
+                (weak, strong)
+            };
+            let row = |n: u64| entry_key(&sc, &at(n).1);
+            // a <- b <- c, each reusing the one before; d alone; nd, nondeterministic, <- e.
+            let (a, b, cc, d, nd, e) = (40, 41, 42, 43, 44, 45);
+            let uses = BTreeMap::from([(b, vec![a]), (cc, vec![b]), (e, vec![nd])]);
+            let reused = |n: u64| uses.get(&n).map(|u| u.iter().map(|x| row(*x)).collect::<Vec<_>>()).unwrap_or_default();
+            for n in [a, b, cc, d, nd, e] {
+                anyhow::ensure!(matches!(write(c, None, &sc, &unit(n), &reads(n, 0), &run_of(n, "r1", n == nd, &reused(n)))?, Written::New(_)));
+            }
+            // Corrupted after it was recorded: a's output's digest flipped where it's kept.
+            let stored: Recorded = serde_json::from_slice(&get(c, Family::Result, &row(a))?.unwrap_or_default())?;
+            let flipped = Recorded { outputs: BTreeMap::from([("out".to_owned(), "sha256:4O".to_owned())]), ..stored };
+            put(c, Family::Result, &row(a), &serde_json::to_vec(&flipped)?, 1)?;
+            // 1,200 hits of a, d and nd, sampled at 10 %; each unit's first two sampled run again,
+            // on r2 then r3.
+            let (mut drawn, mut checked) = (0, BTreeMap::<u64, usize>::new());
+            for hit in 0..400u64 {
+                for n in [a, d, nd] {
+                    if !verify::sampled(b"the server's seed", &at(n).1, &format!("run{hit}/build/1"), verify::Hermeticity::Host.rate()) {
+                        continue;
+                    }
+                    drawn += 1;
+                    let k = checked.entry(n).or_default();
+                    if *k < 2 {
+                        *k += 1;
+                        write(c, None, &sc, &unit(n), &reads(n, 0), &run_of(n, &format!("r{}", *k + 1), n == nd, &reused(n)))?;
+                    }
+                }
+            }
+            anyhow::ensure!((60..=180).contains(&drawn), "about 10 % of 1,200 hits drawn: {drawn}");
+            anyhow::ensure!(checked.values().all(|k| *k == 2) && checked.len() == 3, "{checked:?}");
+            // The corrupted result: two runs agree against it; a, b and c quarantined; a unmarked.
+            let va = verdict(c, &sc, &at(a).1)?;
+            anyhow::ensure!(matches!(va, Some(Verdict::Corrupted { runs: 2, .. })), "{va:?}");
+            anyhow::ensure!(nondeterministic(c, &sc, &at(a).0)?.is_none(), "corrupted, not nondeterministic");
+            // The nondeterministic unit: marked; nd and e quarantined.
+            anyhow::ensure!(matches!(verdict(c, &sc, &at(nd).1)?, Some(Verdict::Nondeterministic { .. })));
+            anyhow::ensure!(nondeterministic(c, &sc, &at(nd).0)?.is_some_and(|m| m.outputs == ["out"] && m.entry == row(nd)));
+            for n in [a, b, cc, nd, e] {
+                let q = quarantined(c, &sc, &at(n).1)?.ok_or_else(|| anyhow::anyhow!("{n} isn't quarantined"))?;
+                anyhow::ensure!(q.root == row(if n <= cc { a } else { nd }), "{n}: {q:?}");
+                let l = lookup_as(c, None, "acme/app", &Domain::Trusted, &unit(n), &same)?;
+                anyhow::ensure!(l.hit.is_none() && l.passed_over.iter().any(|w| w.contains("quarantined (W24-R23)")), "{n}: {l:?}");
+            }
+            // d, run again alike twice: verified, and taken.
+            anyhow::ensure!(verdict(c, &sc, &at(d).1)? == Some(Verdict::Verified) && quarantined(c, &sc, &at(d).1)?.is_none());
+            let hit = lookup_as(c, None, "acme/app", &Domain::Trusted, &unit(d), &same)?.hit.ok_or_else(|| anyhow::anyhow!("d's hit"))?;
+            anyhow::ensure!(hit.recorded.verified_by.iter().map(String::as_str).collect::<BTreeSet<_>>() == BTreeSet::from(["r2", "r3"]) && hit.nondeterministic.is_none());
+            // What kiln did on its own, in the audit log.
+            let mut q = c.prepare("SELECT COALESCE(target, ''), detail FROM audit2 WHERE action = 'work.verify' AND result = 'quarantined' ORDER BY id")?;
+            let said = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+            anyhow::ensure!(said.iter().any(|(t, why)| *t == row(a) && why.contains("corrupted") && why.contains(&row(cc))), "{said:?}");
+            anyhow::ensure!(said.iter().any(|(t, why)| *t == row(nd) && why.contains("nondeterministic") && why.contains(&row(e))), "{said:?}");
+            // The mark shows on the nondeterministic unit's other entries.
+            write(c, None, &sc, &unit(nd), &reads(nd, 1), &run_of(nd, "r1", true, &[]))?;
+            let other = lookup_as(c, None, "acme/app", &Domain::Trusted, &unit(nd), &same)?.hit.ok_or_else(|| anyhow::anyhow!("nd's other entry"))?;
+            anyhow::ensure!(other.nondeterministic == Some(vec!["out".to_owned()]), "{other:?}");
             Ok(())
         })
     }

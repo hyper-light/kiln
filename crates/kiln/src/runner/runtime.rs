@@ -4065,6 +4065,15 @@ impl Leg {
                 continue;
             }
             let (kept, at) = (super::cache::kept_at(&self.work_dir, &self.a.repo, &self.a.leg.job_id, dir), at.clone());
+            // A cold run (`kiln rerun --cold`, W24-R23) starts from nothing kept; what it keeps
+            // after is its own.
+            if self.a.cold {
+                match crate::rt::blocking(move || std::fs::create_dir_all(&at)).await? {
+                    Ok(()) => self.note(idx, &format!("`{dir}`: empty: a cold run starts with nothing kept")).await,
+                    Err(e) => self.annotate(idx, "warning", &format!("`{dir}` couldn't be made: {e}")).await,
+                }
+                continue;
+            }
             match crate::rt::blocking(move || super::cache::put_kept(&kept, &at, trusted)).await? {
                 Ok(how) => self.note(idx, &format!("`{dir}`: {how}")).await,
                 Err(e) => self.annotate(idx, "warning", &format!("`{dir}` couldn't be put in place: {e:#}")).await,

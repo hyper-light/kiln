@@ -549,10 +549,12 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respon
     } else {
         None
     };
-    // "Run anyway" (W08-R10): no leg takes an earlier result over.
-    let no_reuse = body.get("no_reuse").and_then(Value::as_bool).unwrap_or(false);
+    // "Run anyway" (W08-R10): no leg takes an earlier result over. Run cold (W24-R23): nor does
+    // any start from kept folders or restore a cache.
+    let cold = body.get("cold").and_then(Value::as_bool).unwrap_or(false);
+    let no_reuse = cold || body.get("no_reuse").and_then(Value::as_bool).unwrap_or(false);
     let (tx, rx) = async_channel::bounded(1);
-    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, by: by.to_owned(), reply: tx });
+    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, cold, by: by.to_owned(), reply: tx });
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
         Ok(Ok(Err(e))) => Err((StatusCode::CONFLICT, e)),

@@ -17,6 +17,7 @@
 //! - [`trust`]: trust domains, lineage, admission and quotas (W24-R21, R22).
 //! - [`seal`]: what runners sign of a result and the server countersigns, and what readers make
 //!   of it (W24-R22).
+//! - [`verify`]: which hits are run again, what that says of an entry, and its lineage (W24-R23).
 
 pub mod eclass;
 pub mod evict;
@@ -30,4 +31,5 @@ pub mod seal;
 pub mod slots;
 pub mod tests;
 pub mod trust;
+pub mod verify;
 pub mod why;

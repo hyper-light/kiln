@@ -97,7 +97,7 @@ pub enum Msg {
     /// it is cancelled. `false` when the run waits for no approval.
     ApproveRun { run: String, by: String, approve: bool, reply: async_channel::Sender<bool> },
     /// A new attempt of a finished run (W05-R17): its number, or why not.
-    Rerun { run: String, mode: RerunMode, debug: bool, keep_failed: Option<u32>, actions: Option<std::collections::BTreeMap<String, wire::ActionRef>>, no_reuse: bool, by: String, reply: async_channel::Sender<Result<u32, String>> },
+    Rerun { run: String, mode: RerunMode, debug: bool, keep_failed: Option<u32>, actions: Option<std::collections::BTreeMap<String, wire::ActionRef>>, no_reuse: bool, cold: bool, by: String, reply: async_channel::Sender<Result<u32, String>> },
     /// A runner's word on a pool's executor it was asked to start (W13-R09).
     Executor { agent: String, json: String },
     /// The stored pools changed: read them again.
@@ -457,6 +457,8 @@ struct RunSt {
     awaiting: Option<Awaiting>,
     /// "Run anyway" (W08-R10): its legs take no earlier result over.
     no_reuse: bool,
+    /// A cold run (`kiln rerun --cold`, W24-R23): no reuse, no kept folders, no cache restored.
+    cold: bool,
 }
 
 /// What an unapproved run is handed to the scheduler with, once it's approved.
@@ -920,8 +922,8 @@ impl Dispatch {
                 let _ = reply.try_send(v);
                 Ok(())
             }
-            Msg::Rerun { run, mode, debug, keep_failed, actions, no_reuse, by, reply } => {
-                let r = self.rerun(&run, &mode, debug, keep_failed, actions, no_reuse, &by).await.map_err(|e| format!("{e:#}"));
+            Msg::Rerun { run, mode, debug, keep_failed, actions, no_reuse, cold, by, reply } => {
+                let r = self.rerun(&run, &mode, debug, keep_failed, actions, no_reuse, cold, &by).await.map_err(|e| format!("{e:#}"));
                 let _ = reply.try_send(r);
                 Ok(())
             }
@@ -1143,7 +1145,7 @@ impl Dispatch {
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let costs = super::insights::costs(&self.hub, &s.repo.id, &s.path).await;
-        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false };
+        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, cold: false };
         self.workflow_run(&st, "requested", None);
         if approval {
             runs::set_approval(&self.hub, &id, "required", None).await?;
@@ -1330,7 +1332,7 @@ impl Dispatch {
     async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event, debug: (bool, Option<u32>), keep: &HashMap<String, (LegReport, String)>, settings: &serde_json::Value) -> anyhow::Result<()> {
         let keep: serde_json::Map<String, serde_json::Value> = keep.iter().map(|(k, (rep, leg))| (k.clone(), serde_json::json!({ "report": report_json(rep), "leg": leg }))).collect();
         let (debug, keep_failed) = debug;
-        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing"), "tree": settings.get("tree"), "no_reuse": settings.get("no_reuse"), "graph": settings.get("graph") }).to_string();
+        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing"), "tree": settings.get("tree"), "no_reuse": settings.get("no_reuse"), "graph": settings.get("graph"), "cold": settings.get("cold") }).to_string();
         let run = run.to_owned();
         self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
@@ -1471,7 +1473,7 @@ impl Dispatch {
     /// planned again from its saved workflow and input. The jobs `mode` selects run again; the
     /// others keep the last attempt's legs and results, which the plan takes as they were.
     #[allow(clippy::too_many_arguments)]
-    async fn rerun(&mut self, run: &str, mode: &RerunMode, debug: bool, keep_failed: Option<u32>, fresh: Option<std::collections::BTreeMap<String, wire::ActionRef>>, no_reuse: bool, by: &str) -> anyhow::Result<u32> {
+    async fn rerun(&mut self, run: &str, mode: &RerunMode, debug: bool, keep_failed: Option<u32>, fresh: Option<std::collections::BTreeMap<String, wire::ActionRef>>, no_reuse: bool, cold: bool, by: &str) -> anyhow::Result<u32> {
         if self.runs.contains_key(run) {
             anyhow::bail!("the run is still in progress; cancel it or wait for it to finish");
         }
@@ -1513,11 +1515,13 @@ impl Dispatch {
         let input = RunInput { github: github.clone(), inputs: v.get("inputs").cloned().unwrap_or_default(), vars: v.get("vars").cloned().unwrap_or_default(), changed: changed.map(Arc::new), trusted: v.get("trusted").and_then(serde_json::Value::as_bool).unwrap_or(false) };
         let actions = fresh.unwrap_or_else(|| v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default());
         let timing = super::results::timing(&self.hub, &repo.id).await;
-        // "Run anyway" (W08-R10): no leg of this attempt takes an earlier result over.
+        // "Run anyway" (W08-R10): no leg of this attempt takes an earlier result over; nor, run
+        // cold (W24-R23), does any start from kept folders or restore a cache.
+        let no_reuse = no_reuse || cold;
         let files = Arc::new(super::reusable::files(&self.hub, &repo, &event.sha, &wf).await);
         let tree = Arc::new(shard_files(&self.hub, &repo, &event.sha, &wf, &files).await);
         let graph = super::graphs::of_run(&self.hub, &repo, &event.sha, &wf, &files).await;
-        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix"), "timing": *timing, "tree": *tree, "no_reuse": no_reuse, "graph": graph.as_deref() });
+        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix"), "timing": *timing, "tree": *tree, "no_reuse": no_reuse, "graph": graph.as_deref(), "cold": cold });
         self.save_input(run, &input, &actions, &event, (debug, keep_failed), &keep, &settings).await?;
         let (plan, acts) = match RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Graphed { source: Source { files: &files, timing: &timing, tree: &tree }, graph }) {
             Ok(x) => x,
@@ -1531,7 +1535,7 @@ impl Dispatch {
         let path = run_path(&github);
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
         // A maintainer reruns it: that is approval enough, as on GitHub.
-        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse };
+        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, cold };
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
         self.hub.ci.runs.lock().insert(run.to_owned());
@@ -2330,6 +2334,7 @@ impl Dispatch {
             trusted: r.trusted,
             // The job's warm workspace (`work: { warm }`, W24-R11), kept by its runner per lane.
             warm: job.and_then(|j| kiln_ci::work::slots::warm(j.kiln.work.as_ref())),
+            cold: r.cold,
         }
     }
 
@@ -2729,7 +2734,7 @@ impl Dispatch {
         } else {
             (None, None)
         };
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false) };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false) };
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
             st.keys.insert(key.clone(), id.clone());
@@ -2997,6 +3002,9 @@ fn cache_access(spec: &kiln_ci::plan::LegSpec, r: &RunSt) -> (kiln_ci::store::ca
         Some(cap) => mode.min(cap),
         None => mode,
     };
+    // A cold run's legs restore nothing (W24-R23); what they save is theirs, and a cache entry,
+    // as a ledger entry, is never overwritten.
+    let mode = if r.cold { mode.min(Mode::WriteOnly) } else { mode };
     let mut access = Vec::new();
     let mut scopes = cache::scopes(&git_ref, r.event.base_ref.as_deref(), &default_branch);
     // An untrusted run saves only to a scope of its own, which no trusted run reads; it restores

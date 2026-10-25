@@ -101,6 +101,10 @@ pub struct AssignmentV2 {
     /// it, so its legs get fresh workspaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm: Option<Warm>,
+    /// The leg is a cold run's (`kiln rerun --cold`, W24-R23): it starts from nothing kept, its
+    /// v1 `cache:` folders empty. An older server never says so; an older runner ignores it.
+    #[serde(default)]
+    pub cold: bool,
 }
 
 /// A leg's warm workspace (W24-R11, R15), from its job's `work: { warm }`: the runner keeps it for
