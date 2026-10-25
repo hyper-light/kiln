@@ -7415,8 +7415,9 @@ its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
 **Requirements: the model**
 
 - **W24-R01 Fingerprints.** `kiln_ci::work::key`, pure: SHA-256 over a canonical encoding
-  prefixed with `kiln/work/v1` and the unit's kind, so granularities never collide and a version
-  bump invalidates everything. Its components:
+  prefixed with `kiln/work/v1` and the unit's kind (`run`, `leg`, `step`, `action`, `test`, and
+  `plan` for a code workflow's plan leg, W25), so granularities never collide and a version bump
+  invalidates everything. Its components:
   - the definition: the job or step after evaluation, secrets by name only;
   - the environment: declared `env:`, `memo.env` and each toolchain's known variables; kiln's
     per-run variables only when the unit's text uses them or they're observed being read;

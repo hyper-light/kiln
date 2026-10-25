@@ -107,6 +107,7 @@ fn kind(k: Kind) -> &'static str {
         Kind::Step => "step",
         Kind::Action => "action",
         Kind::Test => "test",
+        Kind::Plan => "plan",
     }
 }
 
@@ -476,7 +477,7 @@ mod tests {
     }
 
     fn unit() -> impl Strategy<Value = Unit> {
-        let kind = prop_oneof![Just(Kind::Run), Just(Kind::Leg), Just(Kind::Step), Just(Kind::Action), Just(Kind::Test)];
+        let kind = prop_oneof![Just(Kind::Run), Just(Kind::Leg), Just(Kind::Step), Just(Kind::Action), Just(Kind::Test), Just(Kind::Plan)];
         let platform = (text(), text(), text(), text(), proptest::option::of(text()), map()).prop_map(|(os, arch, libc, executor, image, toolchains)| Platform { os, arch, libc, executor, image, toolchains });
         (kind, "[a-z \n]{0,20}", proptest::collection::btree_set("[A-Z_]{1,8}", 0..4), map(), platform, map(), map(), text())
             .prop_map(|(kind, definition, secrets, env, platform, inputs, upstream, trust)| Unit { kind, definition, secrets, env, platform, inputs, upstream, trust })

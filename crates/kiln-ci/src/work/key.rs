@@ -31,6 +31,10 @@ pub enum Kind {
     Step,
     Action,
     Test,
+    /// A code workflow's plan leg (W25): the program's tree as its input, its toolchain in its
+    /// platform, the event's projection as its definition. Its tag keeps its keys apart from
+    /// every other kind's.
+    Plan,
 }
 
 impl Kind {
@@ -41,6 +45,7 @@ impl Kind {
             Kind::Step => "step",
             Kind::Action => "action",
             Kind::Test => "test",
+            Kind::Plan => "plan",
         }
     }
 }
@@ -244,7 +249,7 @@ mod tests {
     }
 
     fn kind() -> impl Strategy<Value = Kind> {
-        prop_oneof![Just(Kind::Run), Just(Kind::Leg), Just(Kind::Step), Just(Kind::Action), Just(Kind::Test)]
+        prop_oneof![Just(Kind::Run), Just(Kind::Leg), Just(Kind::Step), Just(Kind::Action), Just(Kind::Test), Just(Kind::Plan)]
     }
 
     fn unit() -> impl Strategy<Value = Unit> {
@@ -284,7 +289,8 @@ mod tests {
                     Kind::Leg => Kind::Step,
                     Kind::Step => Kind::Action,
                     Kind::Action => Kind::Test,
-                    Kind::Test => Kind::Run,
+                    Kind::Test => Kind::Plan,
+                    Kind::Plan => Kind::Run,
                 }
             }
             1 => u.definition.push(c),
@@ -404,5 +410,24 @@ mod tests {
         // Named in the text, or seen read, a per-run variable counts.
         let named = relevant_env(&all, &declared, &[], "echo $GITHUB_SHA", &BTreeSet::from(["PATH".to_owned()]));
         assert_eq!(named.keys().map(String::as_str).collect::<Vec<_>>(), ["GITHUB_SHA", "MODE", "PATH"]);
+    }
+
+    /// W25 on W24-R01: a code workflow's plan leg is a unit of its own kind: one alike in every
+    /// other part to a leg keys apart from it, weak and strong.
+    #[test]
+    fn w25_a_plan_unit_keys_apart_from_a_leg() {
+        let plan = Unit {
+            kind: Kind::Plan,
+            definition: "{\"event\":\"push\",\"ref\":\"refs/heads/main\"}".into(),
+            secrets: BTreeSet::new(),
+            env: BTreeMap::new(),
+            platform: Platform { toolchains: BTreeMap::from([("node".into(), "sha256:t".into())]), ..Platform::default() },
+            inputs: BTreeMap::from([("program".into(), "tree:1".into())]),
+            upstream: BTreeMap::new(),
+            trust: "trusted".into(),
+        };
+        let leg = Unit { kind: Kind::Leg, ..plan.clone() };
+        assert_ne!(weak(&plan), weak(&leg));
+        assert_eq!(serde_json::to_string(&Kind::Plan).ok().as_deref(), Some("\"plan\""));
     }
 }
