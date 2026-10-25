@@ -4074,7 +4074,8 @@ enforcement points to W18, agent isolation to W20.
   a Firecracker microVM; a rule's `match.nests_containers` sends such legs where it says, as the
   corpus lab's sends them to microVMs, the user's choice (rails' `rails-new-docker`;
   `w13_a_leg_that_runs_podman_leaves_container_executors`). `POST /api/ci/routing/explain` takes
-  `nests_containers` too.
+  `nests_containers` too. Corpus pass 1024b ran `rails-new-docker` on both its events in
+  Firecracker microVMs, and both passed.
 - *Done.* kiln's runner images in Firecracker microVMs, and Podman in them. No registry has
   `kiln/runner-*`, so a microVM leg of one builds it with Docker as the `docker` executor does
   (once per version), saves it (`docker save`, unpacked as it streams), and builds its layers into
@@ -4098,7 +4099,13 @@ enforcement points to W18, agent isolation to W20.
   License Agreement (developer.android.com/studio/terms) that `sdkmanager --licenses` asks for,
   so the administrator who names it accepts it, and the image is labelled so
   (`kiln.android-sdk-license=accepted`). There's no slim one (sdkmanager needs the JDK)
-  (`runner_images_have_a_dockerfile`).
+  (`runner_images_have_a_dockerfile`). Built on adacachy (2026-10-25), the image has NDK 27's
+  LLVM toolchain at `$ANDROID_HOME/ndk/27.3.13750724/toolchains/llvm`
+  (`w13_r04_the_android_image_has_ndk_27s_toolchain`, which runs a leg in it once it's built). uv's
+  Android job (`build-binary-android-aarch64`), routed to it by a rule that names its job, passed
+  with `kiln workflow run`: the NDK's clang linked uv and uvx for `aarch64-linux-android` and the
+  artifact uploaded. The corpus routes its Android jobs (uv's, cpython's, bevy's) to the image
+  (`ANDROID` in `ci/conformance/corpus.py`).
 - *Done.* The leg's machine more as a hosted runner's is (corpus pass 1024b, 2026-10-24):
   - `/tmp` is the machine's own, on the container's file system with its home, as a hosted
     runner's machine has one disk (2026-10-25): a rename from it into the home directory works
@@ -7296,8 +7303,10 @@ and AC02.
   - a Mac, jupiter (Windows) and an arm64 Linux VM on the Mac join the lab, each running the
     corpus's CI code as an unprivileged user of its own;
   - kiln's runner image gets an opt-in Android layer (cmdline-tools and an NDK, where GitHub's
-    image has them), the SDK's licence accepted by the user once (uv's Android job);
-  - jobs that run podman themselves go to microVM legs (rails' `rails-new-docker`);
+    image has them), the SDK's licence accepted by the user once (uv's Android job; done, and
+    the job passes);
+  - jobs that run podman themselves go to microVM legs (rails' `rails-new-docker`; done, and the
+    job passes);
   - AC03 and F-21's `attest-build-provenance` run on a public repository the user owns, with a
     fine-grained token kept as a kiln secret;
   - test tenants are free-tier AWS, Google Cloud and Azure accounts only, each with a $1 budget
