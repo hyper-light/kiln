@@ -1143,7 +1143,14 @@ pub fn record_test(c: &Connection, scope: &str, b: &Binary, cx: &Context, read: 
         domain: cx.trust.clone(),
         ..Recorded::default()
     };
-    let strong = record(c, scope, &test_results::unit(b, cx), read, &result)?;
+    // A pass already kept under its test key stands (W24-R22: entries are never overwritten). This
+    // one differs from it only in its run, leg and time, not in what the binary did, so it isn't
+    // recorded again, which the ledger would take for a conflict and judge (W24-R23); it's its
+    // identity's newest all the same.
+    let strong = match get(c, Family::Result, &format!("{scope}{}", at.hex()))? {
+        Some(_) => at,
+        None => record(c, scope, &test_results::unit(b, cx), read, &result)?,
+    };
     put(c, Family::Test, &last_at(scope, b, cx), &serde_json::to_vec(&(&kept, read))?, now)?;
     Ok(Some(strong))
 }
@@ -1375,6 +1382,31 @@ mod tests {
                 Ok(())
             })
             .await
+        })
+    }
+
+    /// W24-R10 with W24-R22: a binary that passes again under the same test key (another run of
+    /// the same tree) is no conflict: the first pass kept stands, nothing is quarantined, and the
+    /// newest is its identity's.
+    #[test]
+    fn w24_r10_a_pass_again_under_its_test_key_stands() -> anyhow::Result<()> {
+        use kiln_ci::work::tests::Case;
+        in_store(|c| {
+            let sc = scope("acme/app", "trusted");
+            let cx = Context { trust: "trusted".into(), ..Context::default() };
+            let b = Binary { package: "a".into(), name: "lib".into(), args: Vec::new(), digest: Some("a1".into()) };
+            let read = PathSet::from([("crates/a/tests/data.txt".to_owned(), Read::File("a-data".into()))]);
+            let ran = Ran { exit: Some(0), cases: BTreeMap::from([("t1".to_owned(), Case::Passed)]), ms: 1_000 };
+            let at = |run: &str| Provenance { repo: "acme/app".into(), run: run.into(), leg: format!("{run}-test"), runner: run.into(), ..Provenance::default() };
+            let first = record_test(c, &sc, &b, &cx, &read, &ran, &at("r1"))?;
+            let again = record_test(c, &sc, &b, &cx, &read, &Ran { ms: 2_000, ..ran.clone() }, &at("r2"))?;
+            anyhow::ensure!(first.is_some() && again == first, "{first:?} {again:?}");
+            let key = first.ok_or_else(|| anyhow::anyhow!("no key"))?;
+            anyhow::ensure!(quarantined(c, &sc, &key)?.is_none() && scan(c, Family::Verify, &sc)?.is_empty(), "nothing in doubt");
+            let same = |p: &PathSet| p.clone();
+            let found = found_test(c, &sc, &b, &cx, &same)?;
+            anyhow::ensure!(found.by_key.as_ref().is_some_and(|k| k.run == "r1") && found.last.as_ref().is_some_and(|k| k.run == "r2"), "{found:?}");
+            Ok(())
         })
     }
 
