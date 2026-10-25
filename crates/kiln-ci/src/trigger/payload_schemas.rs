@@ -5,7 +5,7 @@
 
 use serde_json::{Value, json};
 
-use super::context::{self, Commit, Person, PullRequest, Repo, RunSummary, Side};
+use super::context::{self, Commit, Counts, Person, PullRequest, Repo, RunSummary, Side};
 use super::event::Event;
 
 const SCHEMA: &str = include_str!("schemas/octokit-webhooks-7.6.1.json");
@@ -199,6 +199,7 @@ fn w03_ac04_payloads_are_githubs() {
         base: Side { branch: "main".into(), sha: format!("{:040x}", 1), repo: repo() },
         created_at: Some("2026-10-19T11:00:00Z".into()),
         updated_at: Some("2026-10-19T12:00:00Z".into()),
+        counts: Counts { commits: 2, additions: 12, deletions: 3, changed_files: 2 },
     };
     for (action, def) in [("opened", "pull_request$opened"), ("synchronize", "pull_request$synchronize"), ("reopened", "pull_request$reopened")] {
         let e = Event { name: "pull_request".into(), action: action.into(), git_ref: "refs/pull/12/merge".into(), sha: format!("{:040x}", 3), before: Some(format!("{:040x}", 1)), actor: "ada".into(), ..Event::default() };

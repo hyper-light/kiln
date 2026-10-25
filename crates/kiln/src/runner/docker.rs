@@ -169,7 +169,57 @@ pub struct Spec {
     /// A test build's full disk (docs/ci.md W22-AC04): the job container's workspace, a volume of
     /// this many bytes in place of the host's directory.
     pub workspace_size: Option<u64>,
+    /// For a `docker` executor's container: `/tmp` a volume of its own, on the engine's disk as a
+    /// hosted runner's `/tmp` is on its machine's, not the container's overlay, which makes no
+    /// file handles (fanotify's watchers fail there: TypeScript's `fswatch` tests, corpus pass
+    /// 1024b). A job's `container:` keeps its own, as on GitHub.
+    pub tmp_volume: bool,
+    /// The memory the leg was given (W05-R03, resource mode), in bytes: the job container's limit,
+    /// swap none beyond it, so what sizes itself by its cgroup fits the leg (CodeQL's analysis
+    /// asked for the whole machine's and was killed, corpus pass 1024b).
+    pub memory: Option<u64>,
+    /// For a `docker` executor's container: its tool cache gets what the image keeps of GitHub's
+    /// ([`SEED_TOOLS`], W13-R04).
+    pub seed_tools: bool,
 }
+
+/// `sysctl` as far as a container goes, its `/proc/sys` read-only: a write of what a setting is
+/// already succeeds, as `sudo sysctl -w` does on a hosted runner's machine, and the rest goes to
+/// the real one, which says why it can't (cpython's and arrow's sanitizer jobs ask for
+/// `vm.mmap_rnd_bits=28`, which the machine may have already). `KILN_SYSCTL`: the real one, for
+/// tests.
+const SYSCTL_SHIM: &str = r#"#!/bin/sh
+# kiln: /proc/sys is read-only in a container. A setting already as asked is left as it is; the rest goes to the real sysctl.
+set -f; real=${KILN_SYSCTL:-/usr/sbin/sysctl}; e=; q=
+while :; do case "$1" in -w|--write) shift ;; -e|--ignore) e=-e; shift ;; -q|--quiet) q=-q; shift ;; *) break ;; esac; done
+[ $# -gt 0 ] || exec "$real" $e $q
+for a; do case "$a" in *=*) have=$("$real" -n "${a%%=*}" 2>/dev/null) && [ "$(printf "%s " $have)" = "$(printf "%s " ${a#*=})" ] || exec "$real" $e $q -w "$@" ;; *) exec "$real" $e $q "$@" ;; esac; done
+[ -n "$q" ] || for a; do echo "${a%%=*} = ${a#*=}"; done
+"#;
+
+/// The image's layer that writes [`SYSCTL_SHIM`] as `/usr/local/sbin/sysctl`, before the real one
+/// on `PATH` and in sudo's `secure_path`.
+fn sysctl_layer() -> String {
+    let lines: Vec<String> = SYSCTL_SHIM.lines().map(|l| format!("'{}'", l.replace('\'', r"'\''"))).collect();
+    format!("RUN printf '%s\\n' {} > /usr/local/sbin/sysctl && chmod 0755 /usr/local/sbin/sysctl\n", lines.join(" \\\n    "))
+}
+
+/// Where kiln's runner images keep the tools GitHub's images have in their tool cache (W13-R04):
+/// set up at `/opt/hostedtoolcache`, as setup-python puts them, then moved aside, since a leg's
+/// tool cache is the host's, mounted there.
+const TOOLS_STASH: &str = "/usr/local/share/kiln/toolcache";
+
+/// Fills a leg's tool cache from its image's [`TOOLS_STASH`]: each version it hasn't, whole
+/// (copied beside it, then renamed in, so one cut short is never taken for set up), and says
+/// what it copied, a line each. What it has stays. `KILN_TOOLS_STASH` and `KILN_TOOL_CACHE`: the
+/// two, for tests.
+const SEED_TOOLS: &str = r#"s=${KILN_TOOLS_STASH:-/usr/local/share/kiln/toolcache} t=${KILN_TOOL_CACHE:-/opt/hostedtoolcache}
+[ -d "$s" ] && [ -w "$t" ] && cd "$s" || exit 0
+for d in */*; do
+  [ -d "$d" ] && [ ! -e "$t/$d" ] || continue
+  mkdir -p "$t/${d%/*}" && rm -rf "$t/$d.kiln" && cp -a "$d" "$t/$d.kiln" && mv "$t/$d.kiln" "$t/$d" && echo "$d" || exit 1
+done
+"#;
 
 /// The group that owns the host's Docker socket.
 #[cfg(unix)]
@@ -203,7 +253,8 @@ pub fn host_user() -> Option<(u32, u32)> {
 /// `setup-*` action: CMake,
 /// Ninja, the autotools and Clang; a JDK with Maven, Ant and sbt (`JAVA_HOME` set); PHP with
 /// Composer; Ruby and Bundler; Leiningen; pipx; Rust (rustup, with rustfmt and clippy); Node.js
-/// 22; the Docker CLI with buildx and compose (for legs given the host's Docker, W13-R04); conda at
+/// 22 with the tools GitHub's images install globally (Yarn 1, TypeScript, Lerna, webpack and the
+/// rest); the Docker CLI with buildx and compose (for legs given the host's Docker, W13-R04); conda at
 /// `$CONDA` (`/usr/share/miniconda`, where GitHub's Miniconda is), from conda-forge's Miniforge,
 /// whose channel needs no Anaconda license. Each comes from Ubuntu's archive or the project's own
 /// release server. apt assumes yes, as GitHub's
@@ -317,6 +368,60 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
         // goes where their containers can run, a microVM or a host, not a container executor's
         // container (kiln_ci::sched::routing::runs_containers).
         d.push_str("RUN apt-get update && apt-get install -y --no-install-recommends podman buildah skopeo fuse-overlayfs uidmap slirp4netns && rm -rf /var/lib/apt/lists/*\n");
+        // The Node.js tools GitHub's images install globally (its toolset's `node_modules`), which
+        // workflows call without setting them up: Yarn 1 above all (react's `yarn install`), as
+        // `yarn` on `PATH` whichever Node setup-node puts first. Last, so the layers before stay.
+        d.push_str("RUN npm install -g grunt gulp n parcel typescript newman webpack webpack-cli lerna yarn && rm -rf /root/.npm\n");
+        // `sysctl` as far as a container goes ([`SYSCTL_SHIM`]).
+        d.push_str(&sysctl_layer());
+        // apt's mirrors as GitHub's images list them, in `/etc/apt/apt-mirrors.txt`, the sources
+        // reading it (`mirror+file:`): workflows read and change it (ruff's and uv's benchmark jobs
+        // `cat` it). The image's own archive (Ubuntu's, or its ports' for arm64), where GitHub's
+        // lists Azure's first.
+        d.push_str(
+            "RUN f=/etc/apt/sources.list.d/ubuntu.sources; [ -f \"$f\" ] || f=/etc/apt/sources.list; \\\n    \
+             u=$(grep -m1 -oE 'https?://[a-z.]*(archive|ports)\\.ubuntu\\.com/ubuntu(-ports)?/?' \"$f\"); \\\n    \
+             if [ -n \"$u\" ]; then printf '%s\\tpriority:1\\n' \"$u\" > /etc/apt/apt-mirrors.txt && sed -i \"s|$u|mirror+file:/etc/apt/apt-mirrors.txt|\" \"$f\"; fi\n",
+        );
+        // The libraries a browser or an Electron app loads (GTK 3, ATK, NSS, ALSA, GBM and the
+        // rest), which GitHub's images have with their Chrome: VS Code's test runner
+        // (rust-analyzer's editor tests, corpus pass 1024b), a Chromium a test downloads.
+        // Ubuntu 24.04's and later carry `t64` names. And what GitHub's machines have from their
+        // apt lists or Ubuntu's server image that kiln's had not: strace (tauri's benchmarks),
+        // GNU time, lsof, psmisc, ICU's headers, NSS's tools, D-Bus, Tk, Noto's emoji. And the
+        // rest of the release's LLVM beside its Clang, as GitHub's images have it: LLVM's tools
+        // (cpython's JIT build calls `llvm-objdump-21`), clang-format, clang-tidy, and the
+        // sanitizers' runtimes and headers (cpython's TSan, UBSan and MSan builds), which 22.04's
+        // Clang has already. And MySQL's and PostgreSQL's client libraries and headers, as GitHub's
+        // images have them with their servers: the `mysql2` and `pg` gems build against them
+        // (rails' `bundle install`).
+        let t = if os == "ubuntu22" { "" } else { "t64" };
+        let rt = if os == "ubuntu22" { "" } else { " libclang-rt-dev" };
+        d.push_str(&format!(
+            "RUN apt-get update && apt-get install -y --no-install-recommends libatk1.0-0{t} libatk-bridge2.0-0{t} libgtk-3-0{t} libasound2{t} libcups2{t} \\\n    \
+             libnss3 libxss1 libgbm1 libxkbfile1 libsecret-1-0 libdrm2 libxcomposite1 libxdamage1 libxrandr2 libxshmfence1 libxtst6 libx11-xcb1 \\\n    \
+             strace time lsof psmisc libicu-dev libnss3-tools dbus tk fonts-noto-color-emoji llvm clang-format clang-tidy{rt} libmysqlclient-dev libpq-dev && rm -rf /var/lib/apt/lists/*\n"
+        ));
+        // The Pythons GitHub's images keep in their tool cache (their toolsets' `toolcache`: the
+        // newest 3.11 to 3.15 built for the release, from actions/python-versions as setup-python
+        // installs them), so setup-python finds there what it finds on GitHub: `3.x` is 3.15. A
+        // cache holding only another leg's 3.11 gave cpython's Emscripten build a Python without
+        // 3.12's `delete_on_close` (corpus pass 1024b). Kept aside ([`TOOLS_STASH`]); a leg's
+        // tool cache gets what it hasn't of them as the leg starts ([`SEED_TOOLS`]).
+        d.push_str(&format!(
+            "RUN rel=$(. /etc/os-release && echo \"$VERSION_ID\") arch=$(dpkg --print-architecture | sed s/amd64/x64/) \\\n    \
+             && curl -fsSL -o /tmp/python-versions.json https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json \\\n    \
+             && for m in 3.11 3.12 3.13 3.14 3.15; do \\\n    \
+             u=$(python3 -c 'import json, sys; m, rel, arch = sys.argv[1:]; print(next((f[\"download_url\"] for v in json.load(open(\"/tmp/python-versions.json\")) if v.get(\"stable\") and v[\"version\"].startswith(m + \".\") for f in v[\"files\"] if (f.get(\"platform\"), f.get(\"platform_version\"), f.get(\"arch\")) == (\"linux\", rel, arch)), \"\"))' \"$m\" \"$rel\" \"$arch\") || exit 1; \\\n    \
+             [ -z \"$u\" ] || {{ mkdir /tmp/python && curl -fsSL \"$u\" | tar -xz -C /tmp/python && (cd /tmp/python && RUNNER_TOOL_CACHE=/opt/hostedtoolcache bash ./setup.sh > /dev/null) && rm -rf /tmp/python; }} || exit 1; \\\n    \
+             done && rm /tmp/python-versions.json && mkdir -p /opt/hostedtoolcache \"$(dirname {TOOLS_STASH})\" && mv /opt/hostedtoolcache {TOOLS_STASH} && mkdir /opt/hostedtoolcache\n"
+        ));
+        // apt's package lists left in place, as GitHub's images leave them (their cleanup runs
+        // `apt-get clean` alone): `apt-get install` and `apt-get remove` know every package
+        // without an `apt-get update` first. deno's sysroot step removes man-db, which kiln's
+        // image hasn't, and stopped on apt's "Unable to locate package" (corpus pass 1024b). The
+        // lists are the image build's, as GitHub's are its week's.
+        d.push_str("RUN apt-get update\n");
     }
     if android {
         // Android's SDK where GitHub's images have it, in an image only a routing rule that names
@@ -339,14 +444,21 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
         );
     }
     if let Some((uid, gid)) = user.filter(|(uid, _)| *uid != 0) {
-        // The base image's own user may hold the uid (Ubuntu's `ubuntu` is 1000).
+        // The base image's own user may hold the uid (Ubuntu's `ubuntu` is 1000). On `PATH`, the
+        // directories of its home that GitHub's has, where tools put themselves without asking:
+        // jetli/wasm-pack-action's `~/.cargo/bin` (ruff's build-wasm, corpus pass 1024b; GitHub's
+        // Rust lives there, kiln's in /usr/local/cargo), Composer's global packages, dotnet's
+        // global tools.
         d.push_str(&format!(
             "RUN u=$(getent passwd {uid} | cut -d: -f1); if [ -n \"$u\" ]; then userdel -r \"$u\" 2>/dev/null || userdel \"$u\"; fi \\\n    \
              && (getent group {gid} >/dev/null || groupadd -g {gid} runner) \\\n    \
              && useradd -m -u {uid} -g {gid} -s /bin/bash runner && install -d -o {uid} -g {gid} /home/runner/work \\\n    \
              && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner && chmod 0440 /etc/sudoers.d/runner\n\
-             ENV PATH=/home/runner/.local/bin:$PATH\n"
+             ENV PATH=/home/runner/.local/bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/home/runner/.dotnet/tools:$PATH\n"
         ));
+        // `/opt` open to all, as GitHub's images leave it (`chmod -R 777 /opt`): steps make their
+        // own directories there without sudo (neovim's old-cmake job, corpus pass 1024b).
+        d.push_str("RUN chmod -R 777 /opt\n");
         if !slim {
             // And the directories setup actions install into without sudo, as GitHub's images
             // let them (setup-dotnet's /usr/share/dotnet; conda's base environment).
@@ -1019,6 +1131,14 @@ impl Containers {
                 if let Some(bytes) = spec.workspace_size {
                     args.extend([s("--mount"), format!("type=tmpfs,destination={workdir},tmpfs-size={bytes},tmpfs-mode=1777")]);
                 }
+                // Anonymous, so it goes with the container (`rm --volumes`), filled from the
+                // image's `/tmp` (its mode, 1777).
+                if spec.tmp_volume {
+                    args.extend([s("--mount"), s("type=volume,destination=/tmp")]);
+                }
+                if let Some(bytes) = spec.memory {
+                    args.extend([s("--memory"), bytes.to_string(), s("--memory-swap"), bytes.to_string()]);
+                }
                 if !shared {
                     for p in &spec.ports {
                         args.extend([s("-p"), p.clone()]);
@@ -1042,6 +1162,19 @@ impl Containers {
                     Err(_) => (false, false),
                 };
                 let musl = c.cli.run(&[s("exec"), id.clone(), s("sh"), s("-c"), s(MUSL_PROBE)], &none, CALL).await.is_ok_and(|o| o.trim() == "musl");
+                // What the image keeps of GitHub's tool cache, into the leg's (W13-R04).
+                if spec.seed_tools {
+                    let mut seed = vec![s("exec")];
+                    if let Some((uid, gid)) = user {
+                        seed.extend([s("--user"), format!("{uid}:{gid}")]);
+                    }
+                    seed.extend([id.clone(), s("sh"), s("-c"), s(SEED_TOOLS)]);
+                    match c.cli.run(&seed, &none, CALL).await {
+                        Ok(o) if !o.trim().is_empty() => say(format!("The tool cache gets the image's {}", o.split_whitespace().collect::<Vec<_>>().join(", "))),
+                        Ok(_) => {}
+                        Err(e) => say(format!("The tool cache didn't get the image's tools: {e:#}")),
+                    }
+                }
                 let (user, home, login) = match user {
                     Some((uid, gid)) => (Some(format!("{uid}:{gid}")), "/home/runner".to_owned(), Some(if uid == 0 { "root" } else { "runner" }.to_owned())),
                     None => (as_runner, "/github/home".to_owned(), None),
@@ -1119,15 +1252,34 @@ impl Containers {
                     say(format!("{key} is healthy"));
                     return Ok(());
                 }
-                "unhealthy" => anyhow::bail!("{key} is unhealthy"),
+                "unhealthy" => {
+                    self.service_log(key, id, say).await;
+                    anyhow::bail!("{key} is unhealthy");
+                }
                 _ => {}
             }
             if start.elapsed() > HEALTHY_WITHIN {
+                self.service_log(key, id, say).await;
                 anyhow::bail!("{key} wasn't healthy within {} minutes", HEALTHY_WITHIN.as_secs() / 60);
             }
             say(format!("{key} is {status}; waiting {} s", wait.as_secs()));
             crate::rt::sleep(wait).await;
             wait = (wait * 2).min(Duration::from_secs(16));
+        }
+    }
+
+    /// A service that failed, as GitHub's runner shows one (W13-R08): "Service container <name>
+    /// failed." and its container's log, both streams (its last 400 lines here), so the leg says
+    /// why (laravel's MySQL said only "mysql is unhealthy", corpus pass 1024b).
+    async fn service_log(&self, key: &str, id: &str, say: &(dyn Fn(String) + Sync)) {
+        say(format!("Service container {key} failed."));
+        match crate::proc::output(self.cli.command(&[s("logs"), s("--tail"), s("400"), id.to_owned()], &BTreeMap::new()), CALL).await {
+            Ok(o) => {
+                for l in String::from_utf8_lossy(&o.stdout).lines().chain(String::from_utf8_lossy(&o.stderr).lines()) {
+                    say(l.to_owned());
+                }
+            }
+            Err(e) => say(format!("Its log couldn't be read: {e:#}")),
         }
     }
 
@@ -1307,6 +1459,138 @@ mod tests {
         Ok(())
     }
 
+    /// W13-R08: an unhealthy service says why, as GitHub's runner shows one: "Service container
+    /// <name> failed." and its container's log, both streams.
+    #[test]
+    fn w13_r08_an_unhealthy_service_shows_its_log() -> anyhow::Result<()> {
+        let Some(bin) = find() else { return Ok(()) };
+        let tmp = tempfile::tempdir()?;
+        let leg = format!("test-unhealthy-{}", std::process::id());
+        let cli = Cli::new(&bin, tmp.path().join("config")).owned_by(tmp.path());
+        let said = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let heard = said.clone();
+        let failed = crate::rt::block_on(async move {
+            let c = Containers::start(cli.clone(), &leg, PathMap::new(Vec::new()), "/", None, Vec::new(), None, &|_| {}).await?;
+            let run = [
+                s("run"),
+                s("-d"),
+                s("--label"),
+                c.label.clone(),
+                s("--health-cmd"),
+                s("false"),
+                s("--health-interval"),
+                s("1s"),
+                s("--health-retries"),
+                s("1"),
+                s("alpine:latest"),
+                s("sh"),
+                s("-c"),
+                s("echo kiln-probe-out; echo kiln-probe-err >&2; exec sleep 120"),
+            ];
+            let id = cli.run(&run, &BTreeMap::new(), CALL).await?;
+            let r = c.healthy("db", &id, &|m: String| heard.lock().push(m)).await;
+            let _ = cli.run(&[s("rm"), s("-f"), id], &BTreeMap::new(), CALL).await;
+            c.stop().await;
+            Ok::<_, anyhow::Error>(r.err().map(|e| format!("{e:#}")))
+        })?;
+        let said = said.lock().clone();
+        assert!(failed.is_some_and(|e| e.contains("db is unhealthy")), "{said:?}");
+        assert!(said.iter().any(|m| m == "Service container db failed."), "{said:?}");
+        assert!(said.iter().any(|m| m.contains("kiln-probe-out")) && said.iter().any(|m| m.contains("kiln-probe-err")), "both streams: {said:?}");
+        Ok(())
+    }
+
+    /// W13-R04: a `docker` executor's container (the leg's machine) has `/tmp` on a disk, as a
+    /// hosted runner's machine has, not on the container's overlay, which makes no file handles
+    /// (fanotify's watchers: TypeScript's `fswatch` tests); open to all (1777), and gone with the
+    /// leg. And W05-R03: the memory the leg was given is its cgroup's limit.
+    #[test]
+    fn w13_r04_the_machines_tmp_and_memory() -> anyhow::Result<()> {
+        let Some(bin) = find() else { return Ok(()) };
+        let tmp = tempfile::tempdir()?;
+        let leg = format!("test-machine-tmp-{}", std::process::id());
+        let cli = Cli::new(&bin, tmp.path().join("config")).owned_by(tmp.path());
+        let job = Spec { image: "alpine:latest".into(), tmp_volume: true, memory: Some(256 << 20), ..Spec::default() };
+        let (fs, mode, volume, after, limit) = crate::rt::block_on(async move {
+            let c = Containers::start(cli.clone(), &leg, PathMap::new(Vec::new()), "/", Some(job), Vec::new(), None, &|_| {}).await?;
+            let id = c.job.as_ref().map(|j| j.id.clone()).unwrap_or_default();
+            let none = BTreeMap::new();
+            let exec = |cmd: &str| [s("exec"), id.clone(), s("sh"), s("-c"), cmd.to_owned()];
+            // The file system `/tmp` is on, from the mount's own line.
+            let fs = cli.run(&exec(r#"awk '$5 == "/tmp" { for (i = 6; i <= NF; i++) if ($i == "-") { print $(i + 1); exit } }' /proc/self/mountinfo"#), &none, CALL).await?;
+            let mode = cli.run(&exec("stat -c %a /tmp"), &none, CALL).await?;
+            let limit = cli.run(&exec("cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes"), &none, CALL).await?;
+            let volume = cli.run(&[s("inspect"), s("-f"), s(r#"{{range .Mounts}}{{if eq .Destination "/tmp"}}{{.Name}}{{end}}{{end}}"#), id.clone()], &none, CALL).await?;
+            c.stop().await;
+            let after = cli.run(&[s("volume"), s("ls"), s("-q"), s("--filter"), format!("name={}", volume.trim())], &none, CALL).await?;
+            Ok::<_, anyhow::Error>((fs, mode, volume, after, limit))
+        })?;
+        assert!(!fs.trim().is_empty() && fs.trim() != "overlay", "/tmp is on a disk: {fs:?}");
+        assert_eq!(mode.trim(), "1777");
+        assert!(!volume.trim().is_empty(), "an anonymous volume at /tmp");
+        assert!(after.trim().is_empty(), "the volume goes with the leg: {after:?}");
+        assert_eq!(limit.trim(), (256u64 << 20).to_string(), "the leg's memory, its cgroup's limit");
+        Ok(())
+    }
+
+    /// W13-R04: the image's `sysctl` does what a container can: a write of what a setting is
+    /// already succeeds as the real one says it (quietly with `-q`), and anything else goes to the
+    /// real one, here one that reads and refuses every write as a container's does.
+    #[cfg(unix)]
+    #[test]
+    fn w13_r04_sysctl_does_what_a_container_can() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (shim, real) = (dir.path().join("sysctl"), dir.path().join("real"));
+        std::fs::write(&shim, SYSCTL_SHIM)?;
+        let fake = "#!/bin/sh\ncase \"$1 $2\" in\n  '-n vm.mmap_rnd_bits') echo 28 ;;\n  '-n net.ipv4.tcp_rmem') printf '4096\\t87380\\t6291456\\n' ;;\n  -n*) echo \"sysctl: cannot stat /proc/sys/$2\" >&2; exit 255 ;;\n  *) echo \"real: $*\"; exit 1 ;;\nesac\n";
+        std::fs::write(&real, fake)?;
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755))?;
+        let run = |args: &[&str]| -> anyhow::Result<(i32, String)> {
+            let o = std::process::Command::new("sh").arg(&shim).args(args).env("KILN_SYSCTL", &real).output()?;
+            Ok((o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).trim().to_owned()))
+        };
+        assert_eq!(run(&["-w", "vm.mmap_rnd_bits=28"])?, (0, "vm.mmap_rnd_bits = 28".to_owned()), "as it is already");
+        assert_eq!(run(&["vm.mmap_rnd_bits=28"])?.0, 0, "without -w too");
+        assert_eq!(run(&["-w", "net.ipv4.tcp_rmem=4096 87380 6291456"])?.0, 0, "values compared as words");
+        assert_eq!(run(&["-q", "-w", "vm.mmap_rnd_bits=28"])?, (0, String::new()), "quiet");
+        assert_eq!(run(&["-w", "vm.mmap_rnd_bits=32"])?, (1, "real: -w vm.mmap_rnd_bits=32".to_owned()), "a change is the real one's");
+        assert_eq!(run(&["-w", "kernel.apparmor_restrict_unprivileged_userns=0"])?.0, 1, "a setting the kernel hasn't");
+        assert_eq!(run(&["-w", "vm.mmap_rnd_bits=28", "vm.overcommit_memory=1"])?.0, 1, "every one as asked, or the real one");
+        assert_eq!(run(&["-a"])?, (1, "real: -a".to_owned()), "reads and the rest are the real one's");
+        Ok(())
+    }
+
+    /// W13-R04: a leg's tool cache gets each version its image keeps that it hasn't, whole, and
+    /// keeps what it has; an image without them leaves it as it is.
+    #[cfg(unix)]
+    #[test]
+    fn w13_r04_a_legs_tool_cache_gets_the_images_tools() -> anyhow::Result<()> {
+        assert!(SEED_TOOLS.contains(TOOLS_STASH));
+        let dir = tempfile::tempdir()?;
+        let (stash, cache) = (dir.path().join("stash"), dir.path().join("cache"));
+        for v in ["3.11.17", "3.15.1"] {
+            std::fs::create_dir_all(stash.join(format!("Python/{v}/x64/bin")))?;
+            std::fs::write(stash.join(format!("Python/{v}/x64/bin/python3")), "the image's")?;
+            std::fs::write(stash.join(format!("Python/{v}/x64.complete")), "")?;
+        }
+        std::fs::create_dir_all(cache.join("Python/3.11.17/x64/bin"))?;
+        std::fs::write(cache.join("Python/3.11.17/x64/bin/python3"), "a leg's")?;
+        let seed = |from: &Path| -> anyhow::Result<String> {
+            let o = std::process::Command::new("sh").arg("-c").arg(SEED_TOOLS).env("KILN_TOOLS_STASH", from).env("KILN_TOOL_CACHE", &cache).output()?;
+            anyhow::ensure!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        };
+        assert_eq!(seed(&stash)?, "Python/3.15.1", "the version it hadn't");
+        assert_eq!(std::fs::read_to_string(cache.join("Python/3.15.1/x64/bin/python3"))?, "the image's");
+        assert!(cache.join("Python/3.15.1/x64.complete").exists(), "set up, as setup-python reads it");
+        assert_eq!(std::fs::read_to_string(cache.join("Python/3.11.17/x64/bin/python3"))?, "a leg's", "what it had stays");
+        assert!(!cache.join("Python/3.15.1.kiln").exists());
+        assert_eq!(seed(&stash)?, "", "nothing twice");
+        assert_eq!(seed(&dir.path().join("none"))?, "", "an image without them");
+        Ok(())
+    }
+
     #[test]
     fn w12_r02_pulls_through_kiln() {
         let cli = Cli::new("docker", PathBuf::from("/tmp/x")).through("kiln.example:7070", vec![("docker.io".into(), "docker.io".into()), ("ghcr.io".into(), "gh".into())]);
@@ -1377,6 +1661,18 @@ mod tests {
             "PATH=/usr/local/go/bin:",
             "break-system-packages",
             "podman buildah skopeo",
+            "npm install -g grunt gulp n parcel typescript newman webpack webpack-cli lerna yarn",
+            "> /usr/local/sbin/sysctl",
+            "> /etc/apt/apt-mirrors.txt",
+            "mirror+file:/etc/apt/apt-mirrors.txt",
+            "libgtk-3-0t64",
+            "libnss3",
+            " strace time lsof psmisc ",
+            " llvm clang-format clang-tidy libclang-rt-dev libmysqlclient-dev libpq-dev && ",
+            "actions/python-versions/main/versions-manifest.json",
+            "for m in 3.11 3.12 3.13 3.14 3.15; do",
+            "mv /opt/hostedtoolcache /usr/local/share/kiln/toolcache && mkdir /opt/hostedtoolcache\n",
+            "RUN apt-get update\n",
         ] {
             assert!(full.contains(tool) && !d.contains(tool), "{tool}");
         }
@@ -1385,6 +1681,8 @@ mod tests {
         assert!(resolute.starts_with("FROM ubuntu:26.04\n") && resolute.contains(" ImageOS=ubuntu26\n") && resolute.contains("libicu78") && resolute.contains("break-system-packages"), "{resolute}");
         let jammy = runner_dockerfile("kiln/runner-ubuntu-22.04", None).unwrap_or_default();
         assert!(jammy.contains(" ImageOS=ubuntu22\n") && jammy.contains("libicu70") && !jammy.contains("break-system-packages"), "{jammy}");
+        assert!(jammy.contains("libgtk-3-0 ") && !jammy.contains("t64"), "Ubuntu 22.04's names: {jammy}");
+        assert!(jammy.contains(" llvm clang-format clang-tidy libmysqlclient-dev libpq-dev && ") && !jammy.contains("libclang-rt-dev"), "22.04's Clang has its sanitizers' runtimes: {jammy}");
         assert!(runner_dockerfile("ubuntu:24.04", None).is_none());
         assert!(runner_dockerfile("kiln/runner-centos", None).is_none());
         // The host's user, with sudo; root stays root.
@@ -1393,6 +1691,10 @@ mod tests {
         // `/home/runner/work`, GitHub's hosted runners' work directory, is the runner's: what a step
         // makes beside its repository's directory there is its own.
         assert!(u.contains("install -d -o 1000 -g 1000 /home/runner/work"), "{u}");
+        // `/opt` as GitHub's images leave it, and the home's directories on `PATH` theirs have.
+        assert!(u.contains("RUN chmod -R 777 /opt\n") && !full.contains("chmod -R 777 /opt"), "{u}");
+        assert!(u.contains("ENV PATH=/home/runner/.local/bin:/home/runner/.cargo/bin:"), "{u}");
+        assert!(runner_dockerfile("kiln/runner-ubuntu-24.04-slim", Some((1000, 1000))).unwrap_or_default().contains("RUN chmod -R 777 /opt\n"));
         assert!(u.trim_end().ends_with("chown -R 1000:1000 /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet /usr/share/miniconda"), "{u}");
         assert_eq!(runner_dockerfile("kiln/runner-ubuntu-24.04", Some((0, 0))), runner_dockerfile("kiln/runner-ubuntu-24.04", None));
         // `-android` (opt-in): the full image, then Android's SDK where GitHub's images have it,

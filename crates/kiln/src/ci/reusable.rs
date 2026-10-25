@@ -65,7 +65,7 @@ fn calls(wf: &Workflow) -> Vec<String> {
 /// repository's at that commit, as on GitHub, not the caller's: they're named so. (A step's `./`
 /// action is the job's workspace's, wherever its workflow came from.)
 async fn remote(hub: &Hub, r: &Remote) -> anyhow::Result<Workflow> {
-    let sha = actions::pin(hub, r).await?;
+    let (sha, full_ref) = actions::pin_ref(hub, r).await?;
     let mirror = r.mirror(hub).to_string_lossy().to_string();
     let src = gitops::run_git(hub, &["-C", &mirror, "show", &format!("{sha}:{}", r.path)], std::time::Duration::from_secs(60)).await?;
     let text = String::from_utf8_lossy(&src).into_owned();
@@ -75,6 +75,8 @@ async fn remote(hub: &Hub, r: &Remote) -> anyhow::Result<Workflow> {
     }
     let mut w = w.ok_or_else(|| anyhow::anyhow!("{} is not a workflow", r.path))?;
     own_calls(&mut w, r, &sha);
+    // Its jobs' `job.workflow_*` (W06-R03): its repository, its ref and the commit pinned.
+    w.origin = Some(kiln_ci::wf::ir::Origin { repository: format!("{}/{}", r.owner, r.repo), git_ref: full_ref, sha });
     Ok(w)
 }
 

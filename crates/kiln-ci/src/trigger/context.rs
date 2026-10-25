@@ -388,11 +388,23 @@ pub struct PullRequest {
     /// RFC 3339 (now, when unknown).
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    /// What it changes over its base (0 each when unknown).
+    pub counts: Counts,
+}
+
+/// A pull request's commits and changes, as GitHub counts them: the commits on its head and not
+/// its base, and the lines and files changed since their merge base.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub commits: u64,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
 }
 
 /// A `pull_request` (or `pull_request_target`) payload, as GitHub's: what kiln knows of the
-/// pull request, with GitHub's links and the counts and states kiln doesn't keep at their empty
-/// values. `synchronize` says the head's move (`before`, `after`).
+/// pull request, with GitHub's links and the comment counts and states kiln doesn't keep at their
+/// empty values. `synchronize` says the head's move (`before`, `after`).
 pub fn pull_request(e: &Event, repo: &Repo, pr: &PullRequest) -> Value {
     let partial = pr.title.is_none() || pr.labels.is_none() || pr.author.is_none();
     let side = |s: &Side| {
@@ -458,10 +470,10 @@ pub fn pull_request(e: &Event, repo: &Repo, pr: &PullRequest) -> Value {
         "comments": 0,
         "review_comments": 0,
         "maintainer_can_modify": false,
-        "commits": 0,
-        "additions": 0,
-        "deletions": 0,
-        "changed_files": 0,
+        "commits": pr.counts.commits,
+        "additions": pr.counts.additions,
+        "deletions": pr.counts.deletions,
+        "changed_files": pr.counts.changed_files,
     });
     if let (Some(m), Value::Object(rest)) = (p.as_object_mut(), rest) {
         m.extend(rest);
@@ -815,5 +827,16 @@ mod tests {
         let p = pull_request(&e, &repo(), &full);
         assert!(p.get("kiln").is_none());
         assert_eq!(at(&p, "/pull_request/labels/0/name"), "bug");
+    }
+
+    /// W03-R07: the counts a workflow sizes its fetch by (`--depth=$(( commits + 1 ))`).
+    #[test]
+    fn w03_r07_a_pull_request_counts_its_commits_and_changes() {
+        let e = Event { name: "pull_request".into(), action: "opened".into(), actor: "mona".into(), ..Event::default() };
+        let pr = PullRequest { number: 3, counts: Counts { commits: 2, additions: 10, deletions: 4, changed_files: 3 }, ..PullRequest::default() };
+        let p = pull_request(&e, &repo(), &pr);
+        assert_eq!([at(&p, "/pull_request/commits"), at(&p, "/pull_request/additions"), at(&p, "/pull_request/deletions"), at(&p, "/pull_request/changed_files")], [2, 10, 4, 3]);
+        let unknown = pull_request(&e, &repo(), &PullRequest { number: 3, ..PullRequest::default() });
+        assert_eq!(at(&unknown, "/pull_request/commits"), 0);
     }
 }
