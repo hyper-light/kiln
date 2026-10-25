@@ -96,6 +96,12 @@ KNOWN = [
     (r"Failed to create check: HttpError: Resource not accessible by integration: the job's token lacks `checks: write`", "it makes a check with the job's token and no `permissions:`, which takes the repository's default: the corpus's copy has GitHub's restricted default, where the upstream's (an older repository's) writes"),
     (r"Preview tarball for commit \w+ was not published within", "it waits for the preview tarball the upstream's Vercel deployment publishes for the pull request's commit, which nothing publishes for the corpus's copy"),
     (r"Missing CI authentication variable: VERCEL_PROJECT_ID", "it pulls a Vercel OIDC token with the repository's Vercel project settings, which the corpus's copy hasn't"),
+    # arrow's ODBC Linux job failed on GitHub at the commit too, in the same step (run 38902346589:
+    # "Execute Docker Build"); here one remote test of its Dremio, the rest passing.
+    (r"`odbc-linux`: Execute Docker Build: .*ubuntu-cpp-odbc` exited with a non-zero exit code", "it failed on GitHub at the commit too, in the same step (arrow's run 38902346589, ODBC Linux's Execute Docker Build)"),
+    # arrow's archery reads past releases' tags and commits (apache-arrow-0.17.0's 771): the
+    # corpus's copy has the upstream's version tags alone, on its empty trunk.
+    (r"No item found with id apache-arrow-|test_release\.py::test_(release_commits|maintenance_patch_selection)", "it reads past releases' tags and commits in the repository's history (apache-arrow-0.17.0's 771), which the corpus's copy hasn't: the upstream's version tags alone, on its empty trunk"),
     # rails' Markdown API check reads the files the pull request adds: the corpus's adds them all.
     (r"Check Markdown APIs in new files", "it checks the files a pull request adds, and the corpus's adds every file to an empty trunk"),
     # TypeScript's tag-vscode-typescript: the pushed commit's parent, the empty trunk too.
@@ -452,7 +458,7 @@ def leg_detail(api, leg):
         except RuntimeError:
             log = ""
         known = known_line([re.sub(r"\x1b\[[0-9;]*m", "", x).strip() for x in log.splitlines()[-200:]], said)
-    if known and not any(re.search(pat, said) for pat, _ in KNOWN):
+    if known and not any(re.search(pat, said) for pat, _ in KNOWN + LEFT):
         said = f"{said[:150]} — {known}"
     # A long line whose known part is past where the note is cut (a digest's 64 characters ahead
     # of Docker Hub's 429) keeps that part.
@@ -464,12 +470,12 @@ def leg_detail(api, leg):
 
 
 def known_line(lines, said):
-    """The first of `lines` a known failure names that `said` hasn't already, cut to what names it
-    when it's long, so the note it joins still matches."""
+    """The first of `lines` a known failure, or one kiln's work has left, names that `said` hasn't
+    already, cut to what names it when it's long, so the note it joins still matches."""
     for x in lines:
         if not x or x in said:
             continue
-        for pat, _ in KNOWN:
+        for pat, _ in KNOWN + LEFT:
             if m := re.search(pat, x):
                 return x if len(x) <= 140 else x[max(0, m.start() - 30) : m.end() + 30]
     return None
@@ -642,14 +648,14 @@ LEFT = [
     # opt-in `-android` one, whose SDK licence the user accepts.
     (r"Could not find any NDK", "it builds for Android with cargo-ndk, which needs Android's NDK: GitHub's image has one, kiln's only in its opt-in `-android` image, whose SDK licence the user accepts (the plan's step 7, left)"),
     # buildx's update-deps: another repository's releases (moby/moby's) through the facade.
-    (r"HttpError: Not Found - https://github\.com/hyper-light/kiln/blob/main/docs/ci\.md#w14", "it reads a repository kiln doesn't have through the facade's REST API (`GITHUB_API_URL`: buildx's update-deps lists moby/moby's releases), which kiln answers Not Found: its git fetches go on to GitHub (W14-R11), its API reads don't; legs' reads of github.com's API wait for W18's egress proxy and a GitHub credential (W22, left)"),
+    (r"(HttpError: |error: )Not Found - https://github\.com/hyper-light/kiln/blob/main/docs/ci\.md#w14", "it reads a repository kiln doesn't have through the facade's REST API (`GITHUB_API_URL`: buildx's update-deps lists moby/moby's releases), which kiln answers Not Found: its git fetches go on to GitHub (W14-R11), its API reads don't; legs' reads of github.com's API wait for W18's egress proxy and a GitHub credential (W22, left)"),
     # Two that passed on GitHub's 4-CPU runner at the same commit, and failed twice here, where a
     # leg sees the machine's 32: ruff's formatter check (tracing-indicatif's progress bars under
     # its threads) and TypeScript's API tests (`node --test` runs a file per CPU, 31 here).
     (r"footer progress bar was hidden despite there being pending progress bars", "a progress-bar library's own check failed under the threads ruff starts for the 32 CPUs a leg here sees, where GitHub's runner has 4 and passed: a leg sees the machine's CPUs, not a hosted runner's few (W05-R03, left), to be run again"),
     (r"panic: EOF \[recovered, repanicked\]", "TypeScript's API server lost its client mid-call, with `node --test` running a test file for each of the 32 CPUs a leg here sees, where GitHub's runner has 4 and passed: a leg sees the machine's CPUs, not a hosted runner's few (W05-R03, left), to be run again"),
     # PyO3/maturin-action reads maturin's releases from api.github.com with the job's token.
-    (r"HttpClientError: Bad credentials|Build wheels: error: Bad credentials", "an action reads another project's releases from api.github.com with the job's token (PyO3/maturin-action: maturin's), which github.com refuses: legs' authenticated reads of github.com wait for W18's egress proxy and a GitHub credential (W22, left)"),
+    (r"HttpClientError: Bad credentials|Build wheels: error: Bad credentials|BadCredentialsException: 401", "an action or tool reads api.github.com with the job's token (PyO3/maturin-action: maturin's releases; arrow's archery: its release changelog), which github.com refuses: legs' authenticated reads of github.com wait for W18's egress proxy and a GitHub credential (W22, left)"),
     # rails' devcontainer smoke test logs in to ghcr.io with the job's token, as GitHub's works there.
     (r'Get "https://ghcr\.io/v2/": denied', "it logs in to GitHub's container registry with the job's token (`docker/login-action`, ghcr.io), which ghcr.io refuses, where GitHub's job token works there: a leg's GHCR login waits for a GitHub credential, through W18's egress proxy or W12-R03's `registries: [ghcr]` (W22, left)"),
     # zizmor's online audits pass GH_TOKEN, the job's, to a container that reads github.com.
