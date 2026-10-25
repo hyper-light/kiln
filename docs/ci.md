@@ -180,7 +180,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC10 (AC08 at 127k assignments/s; AC09 a server killed under a queue, its running legs re-adopted), reruns as attempts; pools' executors scaled with W13 (R27); reservations (R12); the `scaling` and `reservation` reasons; resource mode from runners' facts (R03); AC11 on the live cluster left |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); AC04 (each shell, on Linux, macOS and Windows), AC05 (pre, main and post order, `post-if`, cancellation, timeouts) and AC06 (paths in containers); a `k8s` pool's pods (W13-R07); Firecracker microVMs (W13-R05); shards' left with W13 |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1`, `kiln/auth@v1`, `kiln/upload@v1`, `kiln/download@v1`, `kiln/cache@v1` and `kiln/deploy@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` actions of the owner's own repositories; tarballs in the store; the run page's pins and a rerun with fresh actions; musl Node for Alpine job containers |
-| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06, a rebased diff's); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; the store's chunks in an S3-compatible bucket (R02); BuildKit's `type=gha` and `type=registry` caches (R11, AC03); speed (AC08) measured over HTTP on a 10 GbE link of the bench's own, its release figure from the bench machine |
+| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06, a rebased diff's); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; the store's chunks in an S3-compatible bucket (R02); BuildKit's `type=gha` and `type=registry` caches (R11, AC03); speed (AC08): a 1 GiB restore at 1,181 MiB/s over HTTP on a 10 GbE link of the bench's own, release build, bench machine |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault, Vault, Infisical, Doppler, 1Password), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments' secrets only after approval (AC07); Settings → CI's secrets and variables by scope (W21-R11); Vault, Infisical, Doppler and 1Password as stores (R08); AC02 (every read and read-only tool walked, none with a value); AC06 (declarations end to end, an action's undeclared reads reported); AC08 (W18-AC03's); a repository's, a workflow's and an environment's secrets on their pages |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and people's own passwords; Settings → People and → Tokens; the issuer reached from the internet (its own address, or published to a directory, S3 or Cloud Storage: R12); the cloud ACs left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08); notification channels (W11-R06), OpenTelemetry (R09), and Linear and Jira issue trackers (R07) |
@@ -1973,7 +1973,13 @@ W20.
   cpu, memory, disk }` (1.5, 1 and 1 by default) and `default_request = { cpu, memory, disk, gpu
   }`.
   - A runner offers what its facts say it has (W13-R01): its CPUs' threads, its memory, its work
-    volume's free disk and its GPUs. Until its facts are in, it offers its slots.
+    volume's free disk and its GPUs. Until its facts are in, it offers its slots. Its memory is
+    no more than its cgroups let it use (2026-10-25): the least `memory.max` of its own cgroup
+    and those above it (v1's `memory.limit_in_bytes`), so a runner in a container, a pod or a
+    systemd scope offers that and not the machine's (the corpus lab's, in a 40G scope on a
+    124 GB machine, would have taken seven 16 GiB legs at once). Checked by
+    `w05_r03_a_runners_memory_is_the_least_limit_above_it` and
+    `w05_r03_a_runner_offers_its_cgroups_memory`.
   - A leg takes what its job's `resources:` asks, else the default. CPUs are written as
     Kubernetes writes them (`2`, `0.5`, `500m` for half of one); memory and disk with their units.
     A pool's `resources.cpu` reads `500m` the same way now, where it was 500 minutes.
@@ -1981,13 +1987,34 @@ W20.
     machine's CPUs times 1.5 ran one after the other on a runner with two slots, and a small one
     ran beside one of them. Unit-tested: requests as written (`w05_r03_requests_as_written`).
   - The executor holds a leg to the memory it was given (the assignment's `executor.options`): a
-    container executor's job container has it as its limit (W13-R04, 2026-10-24). CPUs aren't
-    capped: a quota stalls a test's many threads where a hosted runner's machine wouldn't. Tools
-    still see the machine's CPUs and size their work by them (`make -j$(nproc)`, cargo's jobs),
-    so a leg given less memory than that takes runs out of it, where a hosted runner's few CPUs
-    and its memory go together. *Left*: CPUs of the leg's own to count (a cpuset as large as its
-    request), so a leg can be a hosted runner's size; until then the corpus lab stays in slot
-    mode.
+    container executor's job container has it as its limit (W13-R04, 2026-10-24).
+  - And to its CPUs (2026-10-25): a leg runs on CPUs of its own, as many as it asked for (whole
+    ones: half of one is one), a cpuset and not a quota, which stalls a test's many threads
+    where a hosted runner's machine wouldn't. The runner keeps a pool of the CPUs it may run on
+    itself (its `Cpus_allowed_list`: its affinity within its cgroup's cpuset); each leg takes
+    those no other leg holds while there are any, then the least held, and gives them back when
+    it ends. A job container and its services get them as `--cpuset-cpus` (a hosted runner's
+    services share its machine); a pool's executor, started before its leg came (W13-R09), gets
+    them and the leg's memory by `docker update` as the leg takes it; and a host step starts
+    within them through `taskset` (Linux; elsewhere a leg sees the machine's). An engine that
+    can't hold a container to CPUs (a rootless one without the cpuset controller delegated to
+    it) drops them with a warning, as Docker and Podman do, and the leg sees the machine's. So
+    `nproc` says the leg's, and what sizes its work by it (`make -j$(nproc)`, cargo's jobs, a test
+    runner's workers) does as on a hosted runner's machine of that size, its memory going with it:
+    ruff's formatter check and TypeScript's API tests had started a worker per CPU of the lab's 32
+    and failed (corpus pass 1024b); at 4 CPUs a leg both pass (pass 1025c, two legs at once on CPUs
+    0-3 and 4-7, `nproc` 4). Checked by `w05_r03_legs_take_cpus_of_their_own`,
+    `w05_r03_a_host_leg_runs_on_its_cpus` and, with Docker, `w05_r03_a_containers_cpus_are_its_legs`
+    and `w05_r03_a_pools_container_is_held_to_its_legs`. Not in a pod: a one-leg runner there
+    (`kiln agent --ephemeral`, a job's or a `k8s` pool's) has the CPUs its cluster gives it, its
+    node's, which the node's other pods share, so the dispatcher leaves the leg's CPUs out (each
+    pod would take the same first ones); a microVM leg has its microVM's vCPUs. *Left*: the
+    containers a leg's steps start through its Docker socket see the machine's CPUs, where a
+    hosted runner's share its machine's few; two runners on one machine give out the same CPUs,
+    each as if alone.
+  - With Docker inside its container (W13-R04's `docker = "socket"`), a leg keeps the memory and
+    CPUs it was given: the dispatcher had put Docker's option in their place, so such a leg ran
+    free of both (corpus pass 1025b, 2026-10-25; `w05_r03_docker_inside_keeps_the_legs_resources`).
 - *Left.* AC11 on the live cluster.
 - *Done* (2026-10-23), R16's retry where only the runner that lost the leg could take it, which
   waited for good. Of the options put to the user (wait; prefer another runner and take the same
@@ -2911,8 +2938,12 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
     `ACTIONS_CACHE_MODE` and the client restoring and saving as it allows, saying what it skipped;
     a `pull_request_target` run restoring the default branch's entry and unable to save there;
     a called workflow asking for more than its caller allows not starting, and saying why.
+- *Done.* AC08: on the bench machine (adacachy), `.kiln/bench.yaml`'s `ci-bench` job, a release
+  build, restored a 1 GiB entry at 1,181 MiB/s over HTTP on loopback shaped to 10 Gbit/s, 50 µs
+  each way (`cache.restore_10gbe`, the median of its runs; 985262b, 2026-10-25), against 500.
+  The run before (a084bb7) measured 1,128 MiB/s.
 - *Left.*
-  - R12 and AC08 on a real 10 GbE LAN. The store's part is measured by `kiln ci bench`
+  - R12 on a real 10 GbE LAN. The store's part is measured by `kiln ci bench`
     (W22-AC08): a 1 GiB entry restored at 7,962 MiB/s, against 500. R13's insights are done
     (`cache_v1.rs` and the chunked cache record every lookup and save; W19 shows them by key
     prefix, with the time hits saved).
@@ -4043,7 +4074,8 @@ enforcement points to W18, agent isolation to W20.
   a Firecracker microVM; a rule's `match.nests_containers` sends such legs where it says, as the
   corpus lab's sends them to microVMs, the user's choice (rails' `rails-new-docker`;
   `w13_a_leg_that_runs_podman_leaves_container_executors`). `POST /api/ci/routing/explain` takes
-  `nests_containers` too.
+  `nests_containers` too. Corpus pass 1024b ran `rails-new-docker` on both its events in
+  Firecracker microVMs, and both passed.
 - *Done.* kiln's runner images in Firecracker microVMs, and Podman in them. No registry has
   `kiln/runner-*`, so a microVM leg of one builds it with Docker as the `docker` executor does
   (once per version), saves it (`docker save`, unpacked as it streams), and builds its layers into
@@ -4067,12 +4099,22 @@ enforcement points to W18, agent isolation to W20.
   License Agreement (developer.android.com/studio/terms) that `sdkmanager --licenses` asks for,
   so the administrator who names it accepts it, and the image is labelled so
   (`kiln.android-sdk-license=accepted`). There's no slim one (sdkmanager needs the JDK)
-  (`runner_images_have_a_dockerfile`).
+  (`runner_images_have_a_dockerfile`). Built on adacachy (2026-10-25), the image has NDK 27's
+  LLVM toolchain at `$ANDROID_HOME/ndk/27.3.13750724/toolchains/llvm`
+  (`w13_r04_the_android_image_has_ndk_27s_toolchain`, which runs a leg in it once it's built). uv's
+  Android job (`build-binary-android-aarch64`), routed to it by a rule that names its job, passed
+  with `kiln workflow run`: the NDK's clang linked uv and uvx for `aarch64-linux-android` and the
+  artifact uploaded. The corpus routes its Android jobs (uv's, cpython's, bevy's) to the image
+  (`ANDROID` in `ci/conformance/corpus.py`).
 - *Done.* The leg's machine more as a hosted runner's is (corpus pass 1024b, 2026-10-24):
-  - `/tmp` is a volume of its own: anonymous, on the engine's disk, the image's mode (1777), gone
-    with the leg's containers. The container's overlay makes no file handles, so fanotify's
-    watchers failed there (TypeScript's `fswatch` tests, 126 of them). A job's `container:` keeps
-    its own `/tmp`, as on GitHub;
+  - `/tmp` is the machine's own, on the container's file system with its home, as a hosted
+    runner's machine has one disk (2026-10-25): a rename from it into the home directory works
+    (jetli/wasm-pack-action's of wasm-pack into `~/.cargo/bin`). A `/tmp` volume of its own, as
+    kiln gave it on 2026-10-24 for fanotify's watchers, refused that rename across mounts (EXDEV,
+    ruff's `cargo-test-wasm`, corpus pass 1025a): such renames are common in setup steps, file
+    handles rare in tests. *Left*: the container's overlay makes no file handles, so fanotify's
+    watchers fail in it (TypeScript's `fswatch` tests, 126 of them, corpus pass 1024b) where a
+    hosted runner's ext4 has them; a microVM leg (W13-R05) has an ext4 of its own;
   - `/opt` is open to all, as GitHub's images leave it (`chmod -R 777 /opt`): steps make their own
     directories there without sudo (neovim's `old-cmake` job);
   - the runner user's `~/.cargo/bin`, `~/.config/composer/vendor/bin` and `~/.dotnet/tools` are
@@ -4835,6 +4877,14 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
   - workflow runs as GitHub shapes them, from kiln's: `/actions/runs` (with GitHub's filters),
     `/actions/runs/{id}`, `/actions/workflows/{id}` and `/actions/workflows/{id}/runs` (by file
     name or number);
+  - a person's permission on the repository, `GET /collaborators/{username}/permission`, as
+    actions check the run's actor's before they act for it (openai/codex-action: ruff's security
+    review, corpus pass 1025a, 2026-10-25). It's GitHub's legacy base permission (`admin`,
+    `write`, `read`, `none`; maintain is write) and role, from what kiln grants the person there
+    as its git serves them: the server's owner is the repository's admin, then `settings.manage`
+    an admin, `diffs.land` a maintainer, `diffs.submit` a writer, `diffs.read` or `git.read` a
+    reader. No such person: 404 (`w14_r11_runs_and_code_scanning`,
+    `w14_r11_a_collaborators_permission_in_githubs_shape`);
   - code scanning (`crates/kiln/src/ci/rest/scanning.rs`), for W11-R10:
     - `POST /code-scanning/sarifs` (the public API) and `PUT /code-scanning/analysis` (what
       codeql-action uploads with) take SARIF 2.1.0 in base64, gzipped or not, up to 64 MiB
@@ -7187,7 +7237,8 @@ and AC02.
     trip of 0.13 ms). Where the machine can't make one (no `unshare` or `tc`, user namespaces off),
     it says so instead. A debug build, on a machine busy with the corpus lab, restored 1,106 MiB/s
     over the link, 93 % of it (1,740 MiB/s over plain loopback): past the target with room. The
-    release figure is the bench machine's (`.kiln/bench.yaml`). The runs' and logs' network part
+    bench machine's release build (`.kiln/bench.yaml`'s `ci-bench` job on adacachy, 985262b,
+    2026-10-25) restored 1,181 MiB/s over the link and 5,610 MiB/s over plain loopback. The runs' and logs' network part
     (the runner's link, the browser) is the live cluster's to confirm.
 
   It writes `target/ci-bench.json`, and, in a leg, `$KILN_METRICS` with the runs as samples. It
@@ -7208,6 +7259,7 @@ and AC02.
   | Log ingest, 16 legs at once | 2,530 MiB/s | ≥ 200 MiB/s |
   | A live line's way, p99 (the server's part) | 0.18 ms | < 250 ms |
   | A 1 GiB entry restored from the store | 7,962 MiB/s | ≥ 500 MiB/s |
+  | The same over HTTP on a 10 GbE link (the bench machine, `ci-bench`, 2026-10-25) | 1,181 MiB/s | ≥ 500 MiB/s |
 
   Measuring run creation found a git read on every run start, for reusable calls the workflow
   didn't make. It's skipped now, which cut the p99 from 44 ms to 9 ms in a debug build.
@@ -7251,8 +7303,10 @@ and AC02.
   - a Mac, jupiter (Windows) and an arm64 Linux VM on the Mac join the lab, each running the
     corpus's CI code as an unprivileged user of its own;
   - kiln's runner image gets an opt-in Android layer (cmdline-tools and an NDK, where GitHub's
-    image has them), the SDK's licence accepted by the user once (uv's Android job);
-  - jobs that run podman themselves go to microVM legs (rails' `rails-new-docker`);
+    image has them), the SDK's licence accepted by the user once (uv's Android job; done, and
+    the job passes);
+  - jobs that run podman themselves go to microVM legs (rails' `rails-new-docker`; done, and the
+    job passes);
   - AC03 and F-21's `attest-build-provenance` run on a public repository the user owns, with a
     fine-grained token kept as a kiln secret;
   - test tenants are free-tier AWS, Google Cloud and Azure accounts only, each with a $1 budget
@@ -7467,8 +7521,14 @@ credentials, W14's review pages, W19's insights and notifications, and W21.
   host makes a choice possible (KilnCI, and GitHub Actions, GitLab CI/CD or Bitbucket Pipelines),
   each a checkbox, saved together (at least one). Checked in Chromium and WebKit, desktop and
   phone, on a repository on a GitLab (`ci/ui/people_check.mjs`).
-- *Left.* The review pages showing other hosts' pull requests (the agentic work's, against R06's
-  API); AC02 and AC03, which need test repositories on GitHub, GitLab and Bitbucket and their
+- *Done.* The review pages show the hosts' pull requests (R06's API): a repository's open ones at
+  `/review/hosts/:repo` (linked from its panel on the Repositories page), and one at
+  `/review/hosts/:repo/:number` with its checks, conversation, threads on lines and files in
+  kiln's diff view, comments on lines and replies going out at once (a host keeps no drafts), a
+  review (approve, request changes, comment) and a merge by each method the host allows; the inbox
+  lists the ones asking the person's review. Checked in Chromium, desktop and phone, against the
+  mock's GitLab merge requests (`ui/e2e/host-pulls.spec.ts`).
+- *Left.* AC02 and AC03, which need test repositories on GitHub, GitLab and Bitbucket and their
   credentials (user-assisted).
 
 ### W24 Incremental CI: fingerprints, reuse, warm state and shared caches

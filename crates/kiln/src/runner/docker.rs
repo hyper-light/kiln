@@ -169,11 +169,6 @@ pub struct Spec {
     /// A test build's full disk (docs/ci.md W22-AC04): the job container's workspace, a volume of
     /// this many bytes in place of the host's directory.
     pub workspace_size: Option<u64>,
-    /// For a `docker` executor's container: `/tmp` a volume of its own, on the engine's disk as a
-    /// hosted runner's `/tmp` is on its machine's, not the container's overlay, which makes no
-    /// file handles (fanotify's watchers fail there: TypeScript's `fswatch` tests, corpus pass
-    /// 1024b). A job's `container:` keeps its own, as on GitHub.
-    pub tmp_volume: bool,
     /// The memory the leg was given (W05-R03, resource mode), in bytes: the job container's limit,
     /// swap none beyond it, so what sizes itself by its cgroup fits the leg (CodeQL's analysis
     /// asked for the whole machine's and was killed, corpus pass 1024b).
@@ -181,6 +176,9 @@ pub struct Spec {
     /// For a `docker` executor's container: its tool cache gets what the image keeps of GitHub's
     /// ([`SEED_TOOLS`], W13-R04).
     pub seed_tools: bool,
+    /// The CPUs the leg was given (W05-R03, resource mode: [`super::cpus`]), a list (`0-3`): its
+    /// job container and services run on them alone, so `nproc` says the leg's.
+    pub cpuset: Option<String>,
 }
 
 /// `sysctl` as far as a container goes, its `/proc/sys` read-only: a write of what a setting is
@@ -1091,6 +1089,10 @@ impl Containers {
                 for v in &spec.volumes {
                     args.extend([s("-v"), v.clone()]);
                 }
+                // The leg's CPUs, which a hosted runner's services share with its job (W05-R03).
+                if let Some(cpus) = &spec.cpuset {
+                    args.extend([s("--cpuset-cpus"), cpus.clone()]);
+                }
                 args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
                 args.push(image);
                 let id = c.cli.run(&args, &env, CALL).await?;
@@ -1143,13 +1145,11 @@ impl Containers {
                 if let Some(bytes) = spec.workspace_size {
                     args.extend([s("--mount"), format!("type=tmpfs,destination={workdir},tmpfs-size={bytes},tmpfs-mode=1777")]);
                 }
-                // Anonymous, so it goes with the container (`rm --volumes`), filled from the
-                // image's `/tmp` (its mode, 1777).
-                if spec.tmp_volume {
-                    args.extend([s("--mount"), s("type=volume,destination=/tmp")]);
-                }
                 if let Some(bytes) = spec.memory {
                     args.extend([s("--memory"), bytes.to_string(), s("--memory-swap"), bytes.to_string()]);
+                }
+                if let Some(cpus) = &spec.cpuset {
+                    args.extend([s("--cpuset-cpus"), cpus.clone()]);
                 }
                 if !shared {
                     for p in &spec.ports {
@@ -1337,6 +1337,25 @@ impl Containers {
         Ok((out, port))
     }
 
+    /// Holds a job container started before its leg came (a pool's, W13-R09) to the CPUs and
+    /// memory the leg was given (W05-R03), as `--cpuset-cpus` and `--memory` would have at its
+    /// start: `docker update` on it as it runs.
+    pub async fn hold(&self, cpus: Option<&str>, memory: Option<u64>) -> anyhow::Result<()> {
+        let Some(job) = &self.job else { return Ok(()) };
+        let mut args = vec![s("update")];
+        if let Some(c) = cpus {
+            args.extend([s("--cpuset-cpus"), c.to_owned()]);
+        }
+        if let Some(bytes) = memory {
+            args.extend([s("--memory"), bytes.to_string(), s("--memory-swap"), bytes.to_string()]);
+        }
+        if args.len() > 1 {
+            args.push(job.id.clone());
+            self.cli.run(&args, &BTreeMap::new(), CALL).await?;
+        }
+        Ok(())
+    }
+
     /// Removes the leg's containers and networks (the relay's among them, all labelled the leg's)
     /// and what the leg made through its own socket ([`super::docker_sock`]), as the end of a
     /// machine of its own would.
@@ -1469,6 +1488,53 @@ mod tests {
         Ok(())
     }
 
+    /// W05-R03: a job container and its services given CPUs of the leg's own run on them alone:
+    /// `nproc` says the leg's in each.
+    #[test]
+    fn w05_r03_a_containers_cpus_are_its_legs() -> anyhow::Result<()> {
+        let Some(bin) = find() else { return Ok(()) };
+        let tmp = tempfile::tempdir()?;
+        let leg = format!("test-cpuset-{}", std::process::id());
+        let cli = Cli::new(&bin, tmp.path().join("config")).owned_by(tmp.path());
+        let job = Spec { image: "alpine:latest".into(), cpuset: Some("0".into()), ..Spec::default() };
+        // A shell kept up by its open input, as a service stays up.
+        let db = Spec { options: Some("-i".into()), ..job.clone() };
+        let cpus = crate::rt::block_on(async move {
+            let c = Containers::start(cli.clone(), &leg, PathMap::new(Vec::new()), "/", Some(job), vec![("db".into(), db)], None, &|_| {}).await?;
+            let mut n = Vec::new();
+            for id in c.job.iter().map(|j| j.id.clone()).chain(c.services.iter().map(|v| v.id.clone())) {
+                n.push(cli.run(&[s("exec"), id, s("nproc")], &BTreeMap::new(), CALL).await.map(|o| o.trim().to_owned()));
+            }
+            c.stop().await;
+            n.into_iter().collect::<anyhow::Result<Vec<String>>>()
+        })?;
+        assert_eq!(cpus, ["1", "1"], "the job container's, then its service's");
+        Ok(())
+    }
+
+    /// W05-R03, W13-R09: a job container started before its leg came (a pool's) is held to the
+    /// leg's CPUs and memory as it runs.
+    #[test]
+    fn w05_r03_a_pools_container_is_held_to_its_legs() -> anyhow::Result<()> {
+        let Some(bin) = find() else { return Ok(()) };
+        let tmp = tempfile::tempdir()?;
+        let leg = format!("test-hold-{}", std::process::id());
+        let cli = Cli::new(&bin, tmp.path().join("config")).owned_by(tmp.path());
+        let job = Spec { image: "alpine:latest".into(), ..Spec::default() };
+        let (cpus, memory) = crate::rt::block_on(async move {
+            let c = Containers::start(cli.clone(), &leg, PathMap::new(Vec::new()), "/", Some(job), Vec::new(), None, &|_| {}).await?;
+            let id = c.job.as_ref().map(|j| j.id.clone()).unwrap_or_default();
+            let held = c.hold(Some("0"), Some(256 << 20)).await;
+            let cpus = cli.run(&[s("exec"), id.clone(), s("nproc")], &BTreeMap::new(), CALL).await;
+            let memory = cli.run(&[s("exec"), id, s("sh"), s("-c"), s("cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes")], &BTreeMap::new(), CALL).await;
+            c.stop().await;
+            held?;
+            Ok::<_, anyhow::Error>((cpus?, memory?))
+        })?;
+        assert_eq!((cpus.trim(), memory.trim()), ("1", "268435456"));
+        Ok(())
+    }
+
     /// W13-R08: an unhealthy service says why, as GitHub's runner shows one: "Service container
     /// <name> failed." and its container's log, both streams.
     #[test]
@@ -1510,35 +1576,32 @@ mod tests {
         Ok(())
     }
 
-    /// W13-R04: a `docker` executor's container (the leg's machine) has `/tmp` on a disk, as a
-    /// hosted runner's machine has, not on the container's overlay, which makes no file handles
-    /// (fanotify's watchers: TypeScript's `fswatch` tests); open to all (1777), and gone with the
-    /// leg. And W05-R03: the memory the leg was given is its cgroup's limit.
+    /// W13-R04: a `docker` executor's container (the leg's machine) keeps `/tmp` on its own file
+    /// system, with its home, as a hosted runner's machine has one disk: a rename from `/tmp` into
+    /// the home directory works (jetli/wasm-pack-action's into `~/.cargo/bin`, which a `/tmp` of
+    /// its own mount refused with EXDEV, corpus pass 1025a); open to all (1777). And W05-R03: the
+    /// memory the leg was given is its cgroup's limit.
     #[test]
     fn w13_r04_the_machines_tmp_and_memory() -> anyhow::Result<()> {
         let Some(bin) = find() else { return Ok(()) };
         let tmp = tempfile::tempdir()?;
         let leg = format!("test-machine-tmp-{}", std::process::id());
         let cli = Cli::new(&bin, tmp.path().join("config")).owned_by(tmp.path());
-        let job = Spec { image: "alpine:latest".into(), tmp_volume: true, memory: Some(256 << 20), ..Spec::default() };
-        let (fs, mode, volume, after, limit) = crate::rt::block_on(async move {
+        let job = Spec { image: "alpine:latest".into(), memory: Some(256 << 20), ..Spec::default() };
+        let (mounts, mode, limit) = crate::rt::block_on(async move {
             let c = Containers::start(cli.clone(), &leg, PathMap::new(Vec::new()), "/", Some(job), Vec::new(), None, &|_| {}).await?;
             let id = c.job.as_ref().map(|j| j.id.clone()).unwrap_or_default();
             let none = BTreeMap::new();
             let exec = |cmd: &str| [s("exec"), id.clone(), s("sh"), s("-c"), cmd.to_owned()];
-            // The file system `/tmp` is on, from the mount's own line.
-            let fs = cli.run(&exec(r#"awk '$5 == "/tmp" { for (i = 6; i <= NF; i++) if ($i == "-") { print $(i + 1); exit } }' /proc/self/mountinfo"#), &none, CALL).await?;
+            // Mounts at `/tmp` or under it: none, so it's the root file system's, as the home is.
+            let mounts = cli.run(&exec(r#"awk '$5 == "/tmp" || index($5, "/tmp/") == 1 { print $5 }' /proc/self/mountinfo"#), &none, CALL).await?;
             let mode = cli.run(&exec("stat -c %a /tmp"), &none, CALL).await?;
             let limit = cli.run(&exec("cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes"), &none, CALL).await?;
-            let volume = cli.run(&[s("inspect"), s("-f"), s(r#"{{range .Mounts}}{{if eq .Destination "/tmp"}}{{.Name}}{{end}}{{end}}"#), id.clone()], &none, CALL).await?;
             c.stop().await;
-            let after = cli.run(&[s("volume"), s("ls"), s("-q"), s("--filter"), format!("name={}", volume.trim())], &none, CALL).await?;
-            Ok::<_, anyhow::Error>((fs, mode, volume, after, limit))
+            Ok::<_, anyhow::Error>((mounts, mode, limit))
         })?;
-        assert!(!fs.trim().is_empty() && fs.trim() != "overlay", "/tmp is on a disk: {fs:?}");
+        assert_eq!(mounts.trim(), "", "/tmp is the machine's own file system, no mount of its own");
         assert_eq!(mode.trim(), "1777");
-        assert!(!volume.trim().is_empty(), "an anonymous volume at /tmp");
-        assert!(after.trim().is_empty(), "the volume goes with the leg: {after:?}");
         assert_eq!(limit.trim(), (256u64 << 20).to_string(), "the leg's memory, its cgroup's limit");
         Ok(())
     }
