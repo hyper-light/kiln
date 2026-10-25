@@ -164,8 +164,8 @@ function Lacks({ job }: { job: Job }) {
             </div>
           )}
           <p>
-            kiln starts a Claude agent on {pick.runner}, as you, to install only what's missing. A step that needs a person there (a password, an installer's dialog) waits for you in the agent. When it's done, kiln checks the runner's tools and{" "}
-            {failed ? "runs this run's failed jobs again" : "the job goes there once the runner meets it"}.
+            kiln starts a Claude agent on {pick.runner}, as you, to install only what's missing. A step that needs a person there (a password, an installer's dialog) waits for you in the agent. When
+            it's done, kiln checks the runner's tools and {failed ? "runs this run's failed jobs again" : "the job goes there once the runner meets it"}.
           </p>
         </Confirm>
       )}
