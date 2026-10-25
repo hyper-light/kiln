@@ -15,7 +15,7 @@
 //! [`AgentMsg::HarnessHandOver`]: crate::proto::AgentMsg::HarnessHandOver
 //! [`AgentMsg::HarnessAdopted`]: crate::proto::AgentMsg::HarnessAdopted
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::harness::model::Command;
@@ -41,6 +41,10 @@ pub struct Handover {
 #[derive(Debug, Default)]
 pub struct Handovers {
     by_session: HashMap<String, Handover>,
+    /// Hand-overs dropped as their older process went away, by machine: that process may wait for
+    /// a word on them still (its session's inbox fenced). Answered when it says it holds them again
+    /// (`Hub::handovers_dropped`).
+    dropped: HashMap<String, HashSet<String>>,
 }
 
 /// What a piece of a package that came from an older process does.
@@ -105,7 +109,23 @@ impl Handovers {
     /// are returned: their older process goes on with them.
     pub fn lost(&mut self, peer: PeerId) -> Vec<(String, Handover)> {
         let ended: Vec<String> = self.by_session.iter().filter(|(_, h)| h.from == peer || h.to == Some(peer)).map(|(id, _)| id.clone()).collect();
-        ended.into_iter().filter_map(|id| self.by_session.remove(&id).map(|h| (id, h))).filter(|(_, h)| h.from != peer).collect()
+        let ended: Vec<(String, Handover)> = ended.into_iter().filter_map(|id| self.by_session.remove(&id).map(|h| (id, h))).collect();
+        // Those of the process that went: kept, to be answered when it's back.
+        for (id, h) in ended.iter().filter(|(_, h)| h.from == peer) {
+            self.dropped.entry(h.machine.clone()).or_default().insert(id.clone());
+        }
+        ended.into_iter().filter(|(_, h)| h.from != peer).collect()
+    }
+
+    /// Of the sessions a process of `machine` says it holds (`held`), those whose hand-over was
+    /// dropped as a process of it went away: no longer remembered once said.
+    pub fn dropped_in(&mut self, machine: &str, held: &[String]) -> Vec<String> {
+        let Some(d) = self.dropped.get_mut(machine) else { return Vec::new() };
+        let out: Vec<String> = held.iter().filter(|id| d.remove(*id)).cloned().collect();
+        if d.is_empty() {
+            self.dropped.remove(machine);
+        }
+        out
     }
 }
 
@@ -189,7 +209,22 @@ impl Hub {
     /// The newest process took an agent session over, or couldn't (`error`): the older process
     /// that handed it over lets go of it, or goes on with it.
     pub(crate) async fn handover_adopted(&self, agent: &str, peer: PeerId, session: String, error: Option<String>) {
-        let Some(h) = self.handovers.lock().adopted(&session, peer) else { return };
+        let pending = self.handovers.lock().adopted(&session, peer);
+        let Some(h) = pending else {
+            // Taken over by a hand-over the server no longer remembers (it was dropped as the older
+            // process went away, or the server started again): its word still counts, so nothing
+            // later says nobody took it. The older process lets go when it says it holds it (the
+            // newer keeps a session two processes say they hold).
+            if error.is_none() {
+                tracing::info!(%agent, %session, to = peer, "a runner process of this machine took over an agent session whose hand-over the server had lost track of");
+                self.instances.lock().own(Owned::Agent(session.clone()), peer);
+                if let Some(label) = self.instances.lock().get(peer).map(crate::instances::Instance::label) {
+                    self.harness.held_by(&session, &label);
+                }
+                self.handovers.lock().dropped_in(agent, std::slice::from_ref(&session));
+            }
+            return;
+        };
         match &error {
             None => {
                 tracing::info!(%agent, %session, from = h.from, to = peer, "this machine's newest runner process took an agent session over");
@@ -202,6 +237,30 @@ impl Hub {
         }
         self.handed_over(agent, h.from, &session, error).await;
         self.check_retire().await;
+    }
+
+    /// Runner process `peer` of `agent` says it holds agent sessions `held` (its inventory): those
+    /// whose hand-over was dropped as it went away get their word now. With a newer process of the
+    /// machine running, they are asked for again ([`Hub::check_handover`]); with none, nothing took
+    /// them, and the process goes on with them (an inbox fenced while that wasn't known takes
+    /// messages again).
+    pub(crate) async fn handovers_dropped(&self, agent: &str, peer: PeerId, held: &[String]) {
+        let dropped = self.handovers.lock().dropped_in(agent, held);
+        if dropped.is_empty() {
+            return;
+        }
+        let newer = {
+            let inst = self.instances.lock();
+            inst.newest(agent).is_some_and(|n| n != peer && inst.hands_over(n))
+        };
+        if newer {
+            self.check_handover().await;
+            return;
+        }
+        for session in dropped {
+            tracing::info!(%agent, %session, peer, "a hand-over dropped as its runner process went away: no newer process of this machine runs now, so it goes on there");
+            self.handed_over(agent, peer, &session, Some("no newer runner process of this machine runs now".into())).await;
+        }
     }
 
     /// Runner process `peer` went away: hand-overs whose package went to it end, and their older
@@ -275,6 +334,27 @@ mod tests {
         assert!(h.lost(1).is_empty());
         assert_eq!(h.due("box", 1, vec!["s2".into()], t), vec!["s2".to_owned()]);
         assert_eq!(h.adopted("s3", 5).map(|x| x.machine), Some("box".to_owned()));
+    }
+
+    #[test]
+    fn a_hand_over_dropped_with_its_older_process_is_remembered_until_it_says_it_holds_it() {
+        let mut h = Handovers::default();
+        let t = Instant::now();
+        h.due("box", 1, vec!["s1".into(), "s2".into()], t);
+        h.due("mac", 7, vec!["s9".into()], t);
+        assert_eq!(h.piece("s1", 1, Some(2)), Piece::To(2));
+        // The older process goes: nothing to tell it now, but both its hand-overs are kept.
+        assert!(h.lost(1).is_empty());
+        assert!(h.dropped_in("mac", &["s1".into()]).is_empty(), "another machine's aren't these");
+        // Back, it holds s1 (s2 ended meanwhile): s1 is answered, once.
+        assert_eq!(h.dropped_in("box", &["s1".into(), "s3".into()]), vec!["s1".to_owned()]);
+        assert!(h.dropped_in("box", &["s1".into()]).is_empty());
+        assert_eq!(h.dropped_in("box", &["s2".into()]), vec!["s2".to_owned()]);
+        assert!(!h.dropped.contains_key("box"), "nothing left of the machine");
+        // The newer process going: its older one is told at once, and nothing is kept.
+        assert_eq!(h.piece("s9", 7, Some(8)), Piece::To(8));
+        assert_eq!(h.lost(8).len(), 1);
+        assert!(h.dropped_in("mac", &["s9".into()]).is_empty());
     }
 
     #[test]

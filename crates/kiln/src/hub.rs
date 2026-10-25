@@ -1783,8 +1783,11 @@ impl Hub {
                             self.harness.held_by(id, me);
                         }
                     }
+                    let own = inv.sessions.clone();
                     inv.sessions.extend(others);
                     self.harness.inventory(self, &agent, me.as_deref(), &present, inv);
+                    // Hand-overs dropped as it went away get their word now it's back.
+                    self.handovers_dropped(&agent, peer, &own).await;
                     self.check_retire().await;
                 }
                 Err(e) => tracing::debug!(%agent, error = %e, "unreadable agent session inventory"),
