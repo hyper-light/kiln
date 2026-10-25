@@ -90,7 +90,7 @@ pub fn parse(args: &[String], remaps: &[(String, String)]) -> Parsed {
                 inv.extra_filename = x.to_owned();
             }
             inv.keyed.push(format!("-C{}", remap(&v, remaps)));
-        } else if let Some(v) = ["--cfg", "--check-cfg", "--edition", "--target", "--cap-lints", "--error-format", "--json", "--diagnostic-width", "--color", "-W", "-A", "-D", "-F"].iter().find_map(|f| value(f, a, &mut it).map(|v| (f, v))) {
+        } else if let Some(v) = ["--cfg", "--check-cfg", "--edition", "--target", "--cap-lints", "--error-format", "--json", "--diagnostic-width", "--color", "--warn", "--allow", "--deny", "--forbid", "--force-warn", "-W", "-A", "-D", "-F", "-l"].iter().find_map(|f| value(f, a, &mut it).map(|v| (f, v))) {
             inv.keyed.extend([v.0.to_string(), v.1]);
         } else if a == "--test" {
             inv.keyed.push(a.to_owned());
@@ -158,6 +158,7 @@ mod tests {
         let w = weak("rustc 1.98", &one, &digests("d1"), &env);
         assert_ne!(strong(&w, &BTreeMap::from([("/ws/alpha/src/lib.rs".to_owned(), "x".to_owned())]), &BTreeMap::new()), strong(&w, &BTreeMap::from([("/ws/alpha/src/lib.rs".to_owned(), "y".to_owned())]), &BTreeMap::new()));
         assert!(matches!(parse(&args("--crate-name a a.rs --out-dir o -C incremental=/w/inc"), &[]), Parsed::Direct(_)), "a crate under edit");
+        assert!(matches!(parse(&args("--crate-name a a.rs --out-dir o --deny=clippy::unwrap_used --warn=unused -l static=sqlite3"), &[]), Parsed::Cache(_)), "lints and libraries, as cargo passes a workspace's");
         assert!(matches!(parse(&args("-vV"), &[]), Parsed::Direct(_)));
         assert!(matches!(parse(&args("- --crate-name ___ --print=file-names"), &[]), Parsed::Direct(_)));
         assert!(matches!(parse(&args("--crate-name a a.rs --out-dir o -Z unstable-options"), &[]), Parsed::Direct(_)), "what it doesn't understand");

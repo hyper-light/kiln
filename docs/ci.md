@@ -8041,6 +8041,15 @@ and verification (`work::verify`).
      rustc remaps paths and keys on the linker, and R23's sampling checks bins and tests most: a
      linker that still differs marks its units nondeterministic, their lineage quarantined.
   6. Remote mode (R26) ships the toolchain as a tree in the content store.
+  - **Built** (`kiln_ci::work::rustc`, `runner/rustc.rs`): the kiln binary as cargo's
+    `RUSTC_WRAPPER`, its entries in `$KILN_RUSTC_CACHE` (not yet the runner's cache service, R08,
+    nor signed). A miss runs rustc with `--remap-path-prefix` for the workspace, `$CARGO_HOME` and
+    the target folder, so its outputs are the same from any checkout or target; `env-dep` values
+    are keyed remapped; a build script's probes run rustc directly. On kiln's own lib tests from an
+    empty target folder (`CARGO_INCREMENTAL=0`), the second build hits all 468 units, kiln's lib
+    test binary among them, byte for byte the first's, and a change in `crates/kiln` misses only
+    that binary. turso_core's build script writes its build time (`BUILT_TIME_SQLITE`), which is
+    an input: its units hit only with `SOURCE_DATE_EPOCH` set.
 
 **Interfaces.**
 

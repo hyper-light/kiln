@@ -65,10 +65,13 @@ pub fn main(argv: &[OsString]) -> ExitCode {
     if let Some(home) = std::env::var_os("CARGO_HOME").or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo").into_os_string())) {
         remaps.push((home.to_string_lossy().into_owned(), "/cargo".to_owned()));
     }
-    // The build's own folder: `--out-dir`'s parent (`target/debug`), wherever the target is.
-    let out_parent = args.iter().position(|a| a == "--out-dir").and_then(|i| args.get(i + 1)).and_then(|o| Path::new(o).parent().map(|p| p.to_string_lossy().into_owned()));
-    if let Some(p) = out_parent {
-        remaps.insert(0, (p, "/out".to_owned()));
+    // The build's own folder (`target/debug`), wherever the target is: `--out-dir` is its `deps`, or
+    // a build script's `build/<package>`.
+    let base = args.iter().position(|a| a == "--out-dir").and_then(|i| args.get(i + 1)).and_then(|o| {
+        o.rsplit_once("/build/").map(|(b, _)| b.to_owned()).or_else(|| o.strip_suffix("/deps").map(str::to_owned)).or_else(|| Path::new(o).parent().map(|p| p.to_string_lossy().into_owned()))
+    });
+    if let Some(b) = base {
+        remaps.insert(0, (b, "/out".to_owned()));
     }
     let inv = match key::parse(&args, &remaps) {
         Parsed::Cache(inv) => inv,
@@ -77,6 +80,11 @@ pub fn main(argv: &[OsString]) -> ExitCode {
             return direct(rustc, rest);
         }
     };
+    // A build script's probe (`autocfg`'s, `proc-macro2`'s): no unit of cargo's, and nothing kept.
+    if inv.extra_filename.is_empty() && inv.out_dir.contains("/build/") {
+        log(&format!("direct {}: a build script's probe", inv.crate_name));
+        return direct(rustc, rest);
+    }
     match cached(rustc, &args, &inv, &remaps) {
         Ok(c) => c,
         Err(e) => {
@@ -121,7 +129,7 @@ fn cached(rustc: &OsString, args: &[String], inv: &Invocation, remaps: &[(String
     if let Ok(text) = std::fs::read(dir.join("reads.json"))
         && let Ok(reads) = serde_json::from_slice::<Reads>(&text)
     {
-        let env_now: BTreeMap<String, Option<String>> = reads.env.keys().map(|k| (k.clone(), std::env::var(k).ok())).collect();
+        let env_now: BTreeMap<String, Option<String>> = reads.env.keys().map(|k| (k.clone(), std::env::var(k).ok().map(|v| map(&v, remaps)))).collect();
         let strong = key::strong(&weak, &now(&reads.inputs, remaps), &env_now);
         let entry = dir.join(&strong);
         if entry.join("done").is_file() {
@@ -148,8 +156,9 @@ fn cached(rustc: &OsString, args: &[String], inv: &Invocation, remaps: &[(String
             return Ok(ExitCode::SUCCESS);
         }
     }
-    // A miss: rustc runs, its diagnostics passed on as they come and kept.
-    let mut child = Command::new(rustc).args(args).stderr(Stdio::piped()).spawn()?;
+    // A miss: rustc runs, its paths remapped as the key's are so its outputs are the same from any
+    // checkout or target folder, its diagnostics passed on as they come and kept.
+    let mut child = Command::new(rustc).args(args).args(remaps.iter().map(|(from, to)| format!("--remap-path-prefix={from}={to}"))).stderr(Stdio::piped()).spawn()?;
     let mut said = Vec::new();
     if let Some(mut err) = child.stderr.take() {
         let mut buf = [0u8; 8192];
@@ -172,7 +181,9 @@ fn cached(rustc: &OsString, args: &[String], inv: &Invocation, remaps: &[(String
     let Ok(dep) = kiln_ci::work::pathset::dep_info(&d) else { return Ok(ExitCode::SUCCESS) };
     let cwd = std::env::current_dir().unwrap_or_default();
     let inputs: Vec<String> = dep.inputs.iter().map(|p| map(&cwd.join(p).to_string_lossy(), remaps)).collect();
-    let reads = Reads { inputs, env: dep.env.clone() };
+    // A variable's value as keys keep it: a path in it remapped (`OUT_DIR`, `CARGO_MANIFEST_DIR`).
+    let env = dep.env.iter().map(|(k, v)| (k.clone(), v.as_ref().map(|v| map(v, remaps)))).collect();
+    let reads = Reads { inputs, env };
     let strong = key::strong(&weak, &now(&reads.inputs, remaps), &reads.env);
     let entry = dir.join(&strong);
     let files = entry.join("files");
