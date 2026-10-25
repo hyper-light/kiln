@@ -87,6 +87,13 @@ pub struct Spec {
     /// The plan run it does a step of (`plans::agents`): set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_run: Option<String>,
+    /// It's its parent's subagent (`harness::lineage::start_subagent`): kiln started it for one of
+    /// its parent's goals or plan steps, on its parent's machine with its parent's settings, and it
+    /// shows in its parent's chat rather than as an agent of its own. Set by kiln, never from what
+    /// was asked (`POST /api/harness/sessions` drops it). Its machine copies its parent's
+    /// environment and program into it as it opens ([`super::host::Host::open`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subagent: bool,
     /// Where it works when not in its folder itself: a Slates volume of its own laid over the
     /// folder (`crate::workspace`), made on its machine before it starts and kept with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,6 +132,7 @@ impl Default for Spec {
             reach: None,
             parent: None,
             plan_run: None,
+            subagent: false,
             workspace: None,
         }
     }
@@ -316,6 +324,10 @@ pub struct Info {
     /// The plan run it does a step of (as `Spec::plan_run`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_run: Option<String>,
+    /// Its parent's subagent (as `Spec::subagent`): lists show it in its parent's chat and on its
+    /// parent's row, not as an agent of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subagent: bool,
     /// It was started without its harness's skip-every-check mode (`Spec::allow_bypass` off), so
     /// an agent it starts can't have it either.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -958,6 +970,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         max_subagents: core.state.max_subagents,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
+        subagent: spec.subagent,
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
     };
@@ -3900,6 +3913,7 @@ mod tests {
             max_subagents: None,
             parent: None,
             plan_run: None,
+            subagent: false,
             no_bypass: false,
             workspace: None,
         };

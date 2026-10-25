@@ -122,7 +122,11 @@ steps (`only`, `split`) or in another mode, it's refused (409), saying so.
 Each step is held to as a goal (as with **Goals**) by an agent of its own, started for it on the
 machine, harness and folder chosen for the run, or for the step; the run has a page of its own
 (each step with its agent, where it stands, what it waits for and what it changed) and Mission
-Control groups its agents under it.
+Control groups its agents under it. A run an agent runs (`plans_run` from an agent, or a goal's
+plan readied with `then: agents`) gives each step's agent to that agent as its subagent
+(docs/goals.md, "A plan's steps side by side"): in its chat and on its row rather than a row of its
+own, and, where the run says nothing else, on its machine, in its folder and harness, with its
+model, effort, speed, mode and settings.
 
 The run's page draws its steps as their graph, in rounds (each step after the latest step it waits
 for), with a bar of where each stands, the way an agent's

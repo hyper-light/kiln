@@ -10,9 +10,25 @@
 import * as React from "react";
 import "./harness.css";
 import "./console.css";
-import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
+import { Link, Navigate, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ArrowLeft, ChevronRight, RotateCcw, X } from "lucide-react";
-import { lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt, type Command, type FileChange, type HEvent, type Meta, type SessionStore, type Todo } from "@/api/harness";
+import {
+  harnessApi,
+  lastTurnFrom,
+  sessionStore,
+  useSession,
+  useSessionReady,
+  useStopAt,
+  type AgentInfo,
+  type Command,
+  type FileChange,
+  type HEvent,
+  type Meta,
+  type SessionStore,
+  type Todo,
+} from "@/api/harness";
+import { harnessSessionsRes, useRes } from "@/lib/data";
+import { kilnSubagentsOf } from "./tasks";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
@@ -61,9 +77,24 @@ function AgentConsole({ id }: { id: string }) {
   const store = sessionStore(id);
   return (
     <React.Suspense fallback={<AgentLoading id={id} />}>
-      <Agent id={id} store={store} />
+      <InItsAgentsChat id={id}>
+        <Agent id={id} store={store} />
+      </InItsAgentsChat>
     </React.Suspense>
   );
+}
+
+/**
+ * A subagent kiln started for an agent's goal or plan step opens in that agent's chat, its thread
+ * shown there, as its harness's own subagents' are (`?own=1`: its page of its own, for what's only
+ * there). One whose agent has gone is a page of its own.
+ */
+function InItsAgentsChat({ id, children }: { id: string; children: React.ReactNode }) {
+  const [params] = useSearchParams();
+  const all = useRes(harnessSessionsRes).data;
+  const me = all.find((a) => a.id === id);
+  const main = me?.subagent && me.parent && params.get("own") !== "1" ? all.find((a) => a.id === me.parent) : undefined;
+  return main ? <Navigate to={`/agents/${main.id}?task=${encodeURIComponent(id)}`} replace /> : <>{children}</>;
 }
 
 function Agent({ id, store }: { id: string; store: SessionStore }) {
@@ -77,8 +108,13 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const [params, setParams] = useSearchParams();
   const taskId = params.get("task");
   const taskInfo = useSession(store, (s) => (taskId ? s.state?.tasks.find((t) => t.id === taskId || t.tool_id === taskId) : undefined));
+  // The subagents kiln started for its goals or plan steps: its, as its harness's own are.
+  const everyone = useRes(harnessSessionsRes).data;
+  const kiln = React.useMemo(() => kilnSubagentsOf(everyone, id), [everyone, id]);
+  // One of those, its thread shown here: a session of its own.
+  const sub = taskId ? (kiln.find((a) => a.id === taskId) ?? null) : null;
   // Mission Control links by the stable task id; the timeline groups its events by spawn call.
-  const task = taskId ? taskInfo?.tool_id || taskId : null;
+  const task = !sub && taskId ? taskInfo?.tool_id || taskId : null;
   const wide = useMediaQuery("(min-width: 1100px)");
   const [trayCollapsed, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
   // `?tab=plan`: opened on its plans (the way back from one of them, or its research).
@@ -249,7 +285,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
 
   const work = (
     <div className="hx-main">
-      {findOpen && (
+      {findOpen && !sub && (
         <FindBar
           q={findQ}
           onQ={setFindQ}
@@ -261,53 +297,68 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           inputRef={findInput}
         />
       )}
-      {findOpen && dropped > 0 && <EarlierMatches agent={id} q={findQ} before={findEvents[0]?.at} />}
-      {task && (
+      {findOpen && !sub && dropped > 0 && <EarlierMatches agent={id} q={findQ} before={findEvents[0]?.at} />}
+      {(task || sub) && (
         <div className="hx-crumbs">
           <button type="button" className="hx-link" onClick={mainThread}>
             Main thread
           </button>
           <ChevronRight size={12} />
-          <span className="hx-trunc">{taskName ?? "Subagent"}</span>
+          <span className="hx-trunc">{sub ? agentLabel(sub) : (taskName ?? "Subagent")}</span>
+          {/* What's only on its page of its own (its changes, its settings). */}
+          {sub && (
+            <Link to={`/agents/${sub.id}?own=1`} className="hx-link shrink-0">
+              Its page
+            </Link>
+          )}
           <button type="button" className="hx-icon ml-auto" aria-label="Back to the main thread" onClick={mainThread}>
             <X size={13} />
           </button>
         </div>
       )}
-      <PlanSourceContext.Provider value={planSource}>
-        <Timeline
-          key={task ?? "main"}
-          store={store}
-          agent={id}
-          cwd={cwd}
-          parent={task ?? undefined}
-          onOpenTask={openTask}
-          onCommand={send}
-          onReply={setReply}
-          agentLabel={task ? "Subagent" : info?.kind_name}
-          agentName={info?.name}
-          onDecide={send}
-          target={info?.target}
-          kind={info?.kind}
-          accountOpen={account !== null}
-          find={find}
-          footer={footer}
-        />
-      </PlanSourceContext.Provider>
-      <Dock
-        store={store}
-        id={id}
-        attachments={attachments}
-        toMain={task !== null}
-        task={task}
-        onView={openView}
-        onTerminal={openBeside}
-        onOpenTask={openTask}
-        onRemove={() => setConfirmStop(true)}
-        send={send}
-        reply={reply}
-        onClearReply={() => setReply(null)}
-      />
+      {sub ? (
+        <React.Suspense fallback={<LoadingMark />}>
+          <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} />
+        </React.Suspense>
+      ) : (
+        <>
+          <PlanSourceContext.Provider value={planSource}>
+            <Timeline
+              key={task ?? "main"}
+              store={store}
+              agent={id}
+              cwd={cwd}
+              parent={task ?? undefined}
+              onOpenTask={openTask}
+              onCommand={send}
+              onReply={setReply}
+              agentLabel={task ? "Subagent" : info?.kind_name}
+              agentName={info?.name}
+              onDecide={send}
+              target={info?.target}
+              kind={info?.kind}
+              accountOpen={account !== null}
+              find={find}
+              footer={footer}
+            />
+          </PlanSourceContext.Provider>
+          <Dock
+            store={store}
+            id={id}
+            attachments={attachments}
+            toMain={task !== null}
+            task={task}
+            kiln={kiln}
+            onView={openView}
+            onTerminal={openBeside}
+            onOpenTask={openTask}
+            onRemove={() => setConfirmStop(true)}
+            send={send}
+            reply={reply}
+            onClearReply={() => setReply(null)}
+          />
+        </>
+      )}
     </div>
   );
 
@@ -353,7 +404,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           collapsed={trayCollapsed}
           onCollapsed={setTrayCollapsed}
           side={(actions) => (
-            <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} className="hx-side" actions={actions} />
+            <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} kiln={kiln} className="hx-side" actions={actions} />
           )}
         >
           {work}
@@ -373,6 +424,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
               agentId={id}
               harness={info?.kind_name}
               send={send}
+              kiln={kiln}
               hideTabs
               className="hx-side hx-side-phone"
             />
@@ -450,6 +502,65 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
   );
 }
 
+/**
+ * A subagent kiln started for one of the agent's goals or plan steps (a session of its own, on the
+ * agent's machine with its settings), in the agent's chat as its harness's own subagents are: its
+ * thread where the conversation is, what it asks you answered there, and the composer writing to
+ * it. What's only on its page of its own (its settings, its own subagents' threads) opens there.
+ */
+function KilnThread({ id, onTerminal }: { id: string; onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void }) {
+  const store = sessionStore(id);
+  useSessionReady(store);
+  const navigate = useNavigate();
+  const info = useSession(store, (s) => s.info);
+  const cwd = useSession(store, (s) => s.state?.cwd || s.info?.cwd || "");
+  const accepts = useSession(store, (s) => acceptsOf(s.meta));
+  const attachments = useAttachments(accepts);
+  const [reply, setReply] = React.useState<ReplyTarget | null>(null);
+  const send = React.useCallback(
+    (c: Command) => {
+      if (c.type === "approve") markAnswered([c.id]);
+      if (store.send(c)) return;
+      if (c.type === "approve") unmark([c.id]);
+      toast.error("Not connected", "The subagent's machine is reconnecting; try again in a moment.");
+    },
+    [store],
+  );
+  const ownPage = React.useCallback((task?: string) => navigate(`/agents/${id}?own=1${task ? `&task=${encodeURIComponent(task)}` : ""}`), [navigate, id]);
+  const end = () => void harnessApi.end(id, true).catch((e: unknown) => toast.error("Couldn't end it", errorMessage(e)));
+  return (
+    <>
+      <Timeline
+        store={store}
+        agent={id}
+        cwd={cwd}
+        onOpenTask={ownPage}
+        onCommand={send}
+        onReply={setReply}
+        agentLabel="Subagent"
+        agentName={info?.name}
+        onDecide={send}
+        target={info?.target}
+        kind={info?.kind}
+      />
+      <Dock
+        store={store}
+        id={id}
+        attachments={attachments}
+        toMain={false}
+        task={null}
+        onView={() => ownPage()}
+        onTerminal={onTerminal}
+        onOpenTask={ownPage}
+        onRemove={end}
+        send={send}
+        reply={reply}
+        onClearReply={() => setReply(null)}
+      />
+    </>
+  );
+}
+
 /** Under the conversation: what runs besides it, how it ended (when it did), and the composer. */
 function Dock({
   store,
@@ -457,6 +568,7 @@ function Dock({
   attachments,
   toMain,
   task,
+  kiln,
   onView,
   onTerminal,
   onOpenTask,
@@ -471,6 +583,8 @@ function Dock({
   toMain: boolean;
   /** The subagent whose thread is shown: the composer writes to it, as it takes messages. */
   task: string | null;
+  /** The subagents kiln started for its goals or plan steps, beside its harness's own. */
+  kiln?: readonly AgentInfo[];
   onView: (view: string) => void;
   onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void;
   onOpenTask: (toolId: string) => void;
@@ -487,7 +601,7 @@ function Dock({
   const resume = useSession(store, (s) => (s.meta?.features ?? []).includes("resume"));
   return (
     <div className="hx-dock" onPointerDown={keepTyping} onMouseDown={keepTyping}>
-      <ActivityLine store={store} onOpenTask={onOpenTask} />
+      <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} />
       {status === "exited" && exit?.error && empty ? (
         <div className="hx-startfail" role="alert">
           <b>This agent couldn't start.</b> {exit.error}

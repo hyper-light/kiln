@@ -745,6 +745,82 @@ pub async fn hold(hub: &Hub, parent: &Info, ask: &Ask, target: &str, count: usiz
 /// Start agents for `by`: checked against its parent when it's an agent, on the machine picked,
 /// each recorded with whom it acts for and who started it.
 pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refused> {
+    start_as(hub, by, ask, |_| {}).await
+}
+
+/// The machine `parent` runs on, as a target (`local`, `agent:<machine>`).
+fn target_of(parent: &Info) -> String {
+    if parent.target.is_empty() { "local".to_owned() } else { parent.target.clone() }
+}
+
+/// What a subagent of `parent`'s is asked for where its own ask says nothing (`state`: its parent's
+/// live state, as the server last had it): its parent's harness and, in that harness, its model,
+/// effort and mode (a mode kiln can't place is left to the harness, within its parent's); its
+/// parent's machine; one of it. With the speed (in its parent's harness) and the Subagents setting
+/// it starts with, which only its spec takes.
+fn as_its_parent(mut ask: Ask, parent: &Info, state: Option<&super::model::State>) -> (Ask, Option<String>, Option<u32>) {
+    let some = |s: &str| Some(s.trim().to_owned()).filter(|s| !s.is_empty());
+    let unset = |o: &Option<String>| o.as_deref().is_none_or(|s| s.trim().is_empty());
+    if ask.kind.trim().is_empty() {
+        ask.kind.clone_from(&parent.kind);
+    }
+    let same = ask.kind == parent.kind;
+    let mut speed = None;
+    if same {
+        if unset(&ask.model) {
+            ask.model = state.and_then(|s| some(&s.model)).or_else(|| some(&parent.model));
+        }
+        if unset(&ask.effort) {
+            ask.effort = state.and_then(|s| some(&s.effort));
+        }
+        if unset(&ask.mode) {
+            ask.mode = state.and_then(|s| some(&s.mode)).or_else(|| some(&parent.mode)).filter(|m| level(&ask.kind, m).is_some());
+        }
+        // Its speed, standard ("") too: the harness's own default may not be its parent's.
+        speed = state.map(|s| s.speed.clone());
+    }
+    if unset(&ask.on) {
+        ask.on = Some(target_of(parent));
+    }
+    ask.count = Some(1);
+    (ask, speed, parent.max_subagents.or_else(|| state.and_then(|s| s.max_subagents)))
+}
+
+/// Starts a subagent of `by.parent`'s for one of its goals or plan steps (docs/goals.md, "A plan's
+/// steps side by side"): its child, and its subagent besides (`Spec::subagent`), which shows in its
+/// chat and on its row rather than as an agent of its own. It works where and as its parent does:
+/// on its parent's machine (a plan run may place a step elsewhere: `ask.on`), never on one kiln
+/// picks; in its folder there; in its harness and, there, with its model, effort, speed and mode
+/// (at most its own, as every child's) unless `ask` says otherwise; with its Subagents setting, its
+/// pause point and its way of ending a pause; and, opened beside it, with its environment and
+/// program (`super::host::Host::open`), so it has its parent's account and configuration. It
+/// doesn't go on elsewhere at a usage limit by itself: it stays with its parent.
+pub async fn start_subagent(hub: &Hub, by: &Starter, ask: Ask) -> Result<Info, Refused> {
+    let parent = by.parent.clone().ok_or_else(|| bad("a subagent is an agent's: kiln starts one only for an agent"))?;
+    let state = hub.harness.state(&parent.id);
+    let (ask, speed, most) = as_its_parent(ask, &parent, state.as_ref());
+    let infos = start_as(hub, by, ask, |spec| {
+        spec.subagent = true;
+        spec.speed = speed;
+        spec.max_subagents = most;
+    })
+    .await?;
+    let info = infos.into_iter().next().ok_or_else(|| (StatusCode::CONFLICT, "the subagent didn't start".to_owned()))?;
+    // Settings only its live state holds: given to it as a person would, at once (each holds from
+    // its first turn, whether it has started yet or not).
+    if let Some(s) = &state {
+        if s.pause_at.is_some() {
+            let _ = hub.harness.command(hub, &info.id, super::model::Command::PauseAt { percent: s.pause_at }).await;
+        }
+        if s.manual_resume {
+            let _ = hub.harness.command(hub, &info.id, super::model::Command::AutoResume { on: false }).await;
+        }
+    }
+    Ok(info)
+}
+
+/// [`start`], the spec made for the ask then tuned by `tune` before anything starts.
+async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec) + Send) -> Result<Vec<Info>, Refused> {
     let kind = Kind::get(&ask.kind).ok_or_else(|| bad(format!("unknown harness {:?}: claude, codex, devin, gemini, opencode, goose, amp or antigravity", ask.kind)))?;
     if !kind.structured() {
         return Err(bad(format!("{} has no structured mode", kind.name)));
@@ -755,7 +831,7 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
         Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder), not {w:?}"))),
     };
     let count = ask.count.unwrap_or(1).clamp(1, 16);
-    let default_target = by.parent.as_ref().map(|p| if p.target.is_empty() { "local".to_owned() } else { p.target.clone() });
+    let default_target = by.parent.as_ref().map(target_of);
     let target = pick(hub, ask.on.as_deref(), kind.id, default_target.as_deref())?;
     if let Some(asker) = &by.asker {
         may_run_on(asker, &target, "start an agent there")?;
@@ -775,7 +851,7 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
     };
     // Its folder: the one asked for, else its parent's where they share a machine, else home.
     let cwd = ask.cwd.clone().filter(|c| !c.trim().is_empty()).or_else(|| by.parent.as_ref().filter(|p| same_machine(p, &target)).map(|p| p.cwd.clone()).filter(|c| !c.is_empty()));
-    let spec = Spec {
+    let mut spec = Spec {
         kind: kind.id.to_owned(),
         cwd,
         model: ask.model.clone().filter(|m| !m.trim().is_empty()),
@@ -790,6 +866,8 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
         workspace: volume.then(|| crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() }),
         ..Spec::default()
     };
+    tune(&mut spec);
+    let what = if spec.subagent { format!("{} subagent", kind.name) } else { kind.name.to_owned() };
     let infos = hub.harness.open(hub, &target, spec, count).await.map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
     // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
     // person they act for's.
@@ -809,7 +887,7 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
         }
     }
     let parent = by.parent.as_ref().map_or_else(String::new, |p| format!(" for {} ({})", p.name, short(&p.id)));
-    hub.store.audit(by.actor.clone(), "agent.open".into(), format!("{} {} on {target}{parent}", infos.len(), kind.name)).await;
+    hub.store.audit(by.actor.clone(), "agent.open".into(), format!("{} {what} on {target}{parent}", infos.len())).await;
     Ok(infos)
 }
 
@@ -908,6 +986,39 @@ mod tests {
 
     fn info(id: &str, parent: Option<&str>, status: Status) -> Info {
         Info { id: id.into(), parent: parent.map(str::to_owned), status, ..Info::default() }
+    }
+
+    /// A goal's or plan step's subagent goes where and as its agent does (its harness, machine,
+    /// model, effort, speed, mode and Subagents setting), whatever kiln could pick: an agent at max
+    /// effort and fast hands its steps to subagents at max effort and fast, on its own machine. What
+    /// a plan run says for a step stays (another machine, another harness, another model); in
+    /// another harness its parent's model, effort, mode and speed aren't its; a mode kiln can't place
+    /// is left to the harness (within its parent's).
+    #[test]
+    fn a_subagent_goes_where_and_as_its_agent_does() {
+        let parent = Info { kind: "devin".into(), target: "agent:studio".into(), model: "opus-medium".into(), mode: "bypass".into(), max_subagents: Some(3), ..info("main", None, Status::Running) };
+        let state = super::super::model::State { model: "opus-medium".into(), mode: "bypass".into(), effort: "max".into(), speed: "fast".into(), ..Default::default() };
+        let (ask, speed, most) = as_its_parent(Ask { name: Some("Step 2: API".into()), ..Ask::default() }, &parent, Some(&state));
+        assert_eq!((ask.kind.as_str(), ask.on.as_deref(), ask.model.as_deref(), ask.effort.as_deref(), ask.mode.as_deref(), ask.count), ("devin", Some("agent:studio"), Some("opus-medium"), Some("max"), Some("bypass"), Some(1)));
+        assert_eq!((speed.as_deref(), most, ask.name.as_deref()), (Some("fast"), Some(3), Some("Step 2: API")));
+        // Standard speed is its parent's too, and the Subagents setting its live state holds.
+        let standard = super::super::model::State { speed: String::new(), max_subagents: Some(2), ..state.clone() };
+        let (_, speed, most) = as_its_parent(Ask::default(), &Info { max_subagents: None, ..parent.clone() }, Some(&standard));
+        assert_eq!((speed.as_deref(), most), (Some(""), Some(2)));
+        // What the run says for a step stays.
+        let asked = Ask { kind: "devin".into(), on: Some("linux/amd64".into()), model: Some("swe-1".into()), effort: Some("low".into()), mode: Some("ask".into()), ..Ask::default() };
+        let (ask, ..) = as_its_parent(asked, &parent, Some(&state));
+        assert_eq!((ask.on.as_deref(), ask.model.as_deref(), ask.effort.as_deref(), ask.mode.as_deref()), (Some("linux/amd64"), Some("swe-1"), Some("low"), Some("ask")));
+        // Another harness: its parent's machine, nothing of its parent's harness.
+        let (ask, speed, _) = as_its_parent(Ask { kind: "claude".into(), ..Ask::default() }, &parent, Some(&state));
+        assert_eq!((ask.on.as_deref(), ask.model, ask.effort, ask.mode, speed), (Some("agent:studio"), None, None, None, None));
+        // On the server itself; its live state not read yet: its info's model and mode.
+        let (ask, speed, _) = as_its_parent(Ask::default(), &Info { target: String::new(), ..parent.clone() }, None);
+        assert_eq!((ask.on.as_deref(), ask.model.as_deref(), ask.mode.as_deref(), ask.effort, speed), (Some("local"), Some("opus-medium"), Some("bypass"), None, None));
+        // A mode kiln can't place isn't handed on: its harness's default within its parent's.
+        let odd = Info { mode: "turbo".into(), ..parent.clone() };
+        let (ask, ..) = as_its_parent(Ask::default(), &odd, Some(&super::super::model::State { mode: "turbo".into(), ..state }));
+        assert_eq!(ask.mode, None);
     }
 
     #[test]
