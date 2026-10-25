@@ -600,19 +600,15 @@ impl Hub {
         Ok(())
     }
 
-    /// A runner process of `machine` that can hold a learner said so: the newest such process
-    /// holds the machine's (it's told its member and the token its copies are fetched with), and
-    /// every other one lets its go, so one process at a time has the replica's files.
+    /// A runner process of `machine` that can hold a learner said so, or its newest process changed:
+    /// the newest such process holds the machine's (it's told its member and the token its copies
+    /// are fetched with), and every other one lets its go, so one process at a time has the
+    /// replica's files.
     async fn cluster_announced(&self, machine: &str) {
         // The server's own runner, in its process, reads kiln.db as it is.
         let own = self.cfg.local_agent.enabled && machine == crate::pki::sanitize_name(&self.cfg.local_agent_name());
         let group = self.store.group().filter(|_| self.cfg.cluster.learners && !own);
-        let (newest, mut others) = {
-            let inst = self.instances.lock();
-            let newest = inst.newest_with(machine, proto::CAP_CLUSTER);
-            let others: Vec<PeerId> = inst.of(machine).into_iter().filter(|p| Some(*p) != newest && inst.get(*p).is_some_and(|i| i.caps & proto::CAP_CLUSTER != 0)).collect();
-            (newest, others)
-        };
+        let (newest, mut others) = self.instances.lock().holder_of(machine, proto::CAP_CLUSTER);
         // With learners off, the newest lets its replica go too: its front door pipes to the
         // server again rather than wait for a replica that no longer follows.
         if group.is_none() {
@@ -2233,6 +2229,10 @@ impl Hub {
         self.check_handover().await;
         // The front door moves to the process that is newest now.
         crate::frontdoor::control::on_instance_lost(self, name).await;
+        // So does the replica: a blue/green upgrade's new build was told to let it go as it joined
+        // (ranked oldest), and nothing else tells it to hold it now (until 2026-10-25 a machine
+        // upgraded so held no replica until its runner next connected).
+        self.cluster_announced(name).await;
     }
 
     /// A machine's runner processes, while it has more than one, with what each holds.
