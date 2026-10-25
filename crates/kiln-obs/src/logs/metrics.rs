@@ -320,7 +320,7 @@ pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<C
         return Ok(out);
     }
     // Each distinct search's leaves' slots, by node.
-    let leaves: Vec<Vec<u32>> = searches
+    let mut leaves: Vec<Vec<u32>> = searches
         .iter()
         .map(|q| {
             let mut slots = vec![NO_SLOT; q.nodes.len()];
@@ -332,6 +332,41 @@ pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<C
             slots
         })
         .collect();
+    // A key asked once a record (a grouping's values are read once, a duration once) is read
+    // where it is asked: kept, it would cost a lookup in the memo and its value read again.
+    let mut asks = vec![0u32; keys.keys.len()];
+    let mut ask = |slot: u32| {
+        if let Some(n) = asks.get_mut(slot as usize) {
+            *n += 1;
+        }
+    };
+    leaves.iter().flatten().for_each(|&s| ask(s));
+    let mut grouped_once: Vec<usize> = Vec::new();
+    let mut duration_once = false;
+    for a in &live {
+        if !grouped_once.contains(&a.grouping) {
+            grouped_once.push(a.grouping);
+            a.by.iter().for_each(|&s| ask(s));
+        }
+        match metrics.get(a.i).map(|m| &m.compute) {
+            Some(Compute::Duration { .. }) if duration_once => {}
+            Some(Compute::Duration { .. }) => {
+                duration_once = true;
+                ask(a.value);
+            }
+            _ => ask(a.value),
+        }
+    }
+    let once = |slot: &mut u32| {
+        if asks.get(*slot as usize).is_some_and(|&n| n < 2) {
+            *slot = NO_SLOT;
+        }
+    };
+    leaves.iter_mut().flatten().for_each(once);
+    for a in &mut live {
+        a.by.iter_mut().for_each(once);
+        once(&mut a.value);
+    }
     // A grouping's metrics one after another: its values read once a record.
     live.sort_by_key(|a| (a.grouping, a.i));
     let hash = Keyed::new();
