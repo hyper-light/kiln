@@ -1062,7 +1062,6 @@ fn record_delivery(job: &Job, delivered: bool, outcome: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
 
     /// The value at `path` (keys, or indexes into arrays), null where there is none.
     fn at<'a>(v: &'a Value, path: &[&str]) -> &'a Value {
@@ -1476,17 +1475,17 @@ mod tests {
         let basic = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("ops@example.com:T0K3N"));
         let (site, issues) = jira_standin(true, basic)?;
         let (dc, dc_issues) = jira_standin(false, "Bearer P4T".into())?;
-        let cloud = Integration::Jira {
+        // The site's integration: one that closes issues, one that keeps them open, one whose token is wrong.
+        let on_site = |token: &str, close: Option<bool>| Integration::Jira {
             url: format!("{}/", site.url()),
             edition: JiraEdition::Cloud,
             project: "OPS".into(),
             issue_type: None,
             user: Some("ops@example.com".into()),
-            token: "T0K3N".into(),
-            close: None,
+            token: token.into(),
+            close,
         };
-        let open = Integration::Jira { close: Some(false), ..cloud.clone() };
-        let wrong = Integration::Jira { token: "wrong".into(), ..cloud.clone() };
+        let (cloud, open, wrong) = (on_site("T0K3N", None), on_site("T0K3N", Some(false)), on_site("wrong", None));
         let center = Integration::Jira { url: dc.url(), edition: JiraEdition::DataCenter, project: "OPS".into(), issue_type: None, user: None, token: "P4T".into(), close: None };
         let other = Notice { group: vec![("host".into(), "web-2".into())], ..notice("ALERT") };
         let said = crate::rt::block_on(async move {

@@ -1527,7 +1527,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
                 // How long saying what it is takes (its build's probes, its facts), told below: the
                 // server's frames wait meanwhile.
-                let (said_from, mut build_took, mut facts_took) = (Instant::now(), Duration::ZERO, Duration::ZERO);
+                let (said_from, mut build_took) = (Instant::now(), Duration::ZERO);
                 paths.connected(binding, Instant::now());
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
@@ -1567,7 +1567,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // part of the fleet).
                 let started = Instant::now();
                 let facts = (!o.ephemeral && !o.outpost).then(crate::updates::runner_facts);
-                facts_took = started.elapsed();
+                let facts_took = started.elapsed();
                 if let Some(Ok(b)) = facts.as_ref().map(proto::encode) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     // The rest, probed: they take a moment (docs/ci.md W13-R01).
