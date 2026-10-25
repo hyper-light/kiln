@@ -224,6 +224,18 @@ struct Running {
     holds: kiln_ci::sched::state::Incoming,
 }
 
+/// A job holding a share of this runner takes its CPUs (docs/ci.md W05-R03): whole cores of its
+/// own, the other legs' steps moving off them. Where they can't be pinned (no topology: not
+/// Linux), it still holds its room in placement, and the log says so.
+fn hold_cpus(job: &str, holds: kiln_ci::sched::state::Incoming) {
+    let kiln_ci::sched::state::Incoming::Share(q) = holds else { return };
+    let threads = q.cpu.ceil().max(1.0) as usize;
+    match crate::runner::cpus::pins().hold(job, threads) {
+        Some(cpus) => tracing::info!(job, cpus = %crate::runner::cpus::list(&cpus), "it holds these CPUs; the other legs run on the rest"),
+        None => tracing::info!(job, threads, "it holds its share in placement; its cores aren't pinned here"),
+    }
+}
+
 /// Whether this runner takes one more job or leg (docs/ci.md W05-R03), by the rule its dispatchers
 /// use, counting what its jobs and legs from either hold (`jobs`: each one's pooled and holds); a
 /// pool's leg runs in its executor, beside the runner's slots. Why not, when it doesn't.
@@ -2270,6 +2282,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             served_dedicated = true;
                         }
                         let cancel = Shutdown::new();
+                        hold_cpus(&id, holds);
                         jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false, holds });
                         tracing::info!(job = %id, key = %a.spec.key, "running job");
                         let exec = Exec {
@@ -2946,6 +2959,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         let cancel = Shutdown::new();
+                        hold_cpus(&id, holds);
                         jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled, holds });
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
                         // Its pool's executor, when the leg can run in it as it is; else the leg
@@ -3258,6 +3272,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     retire_at = Some(Instant::now() + Duration::from_secs(5)).max(retire_at);
                 }
                 if jobs.remove(&r.job).is_some() {
+                    crate::runner::cpus::pins().release(&r.job);
                     tracing::info!(job = %r.job, status = r.status.as_str(), "job finished");
                     if let Ok(b) = proto::encode(&AgentMsg::JobFinished(r.clone())) {
                         unreceived.insert(r.job.clone(), (Instant::now(), b));
