@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use common::{Fleet, at, caught_up, free_port, now_ms};
+use common::{Fleet, at, free_port, now_ms};
 use serde_json::{Value, json};
 
 /// An HTTP endpoint: `/health` answers `{"status":"ok"}` (or 500 while `down`), `/old` redirects to
@@ -213,7 +213,7 @@ fn synthetic_tests_run_from_each_location_alert_when_enough_fail_and_recover() -
 
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     let (code, _) = f.request("PUT", "/api/observe/v1/integrations/hook", Some(&json!({ "kind": "webhook", "url": format!("http://127.0.0.1:{hook_port}/hook") })))?;
     anyhow::ensure!(code == 204);
     let base = format!("http://127.0.0.1:{}", endpoint.port);

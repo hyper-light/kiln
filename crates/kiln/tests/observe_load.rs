@@ -31,7 +31,7 @@ use kiln_obs::otlp::pb::Writer;
 use serde_json::json;
 
 mod common;
-use common::{Fleet, at, caught_up};
+use common::{Fleet, at};
 
 fn env(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -377,7 +377,7 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
     let compress = env("KOBS_LOAD_GZIP", 1) == 1;
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
     let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
     let server_pid = f.server.as_ref().map_or(0, |p| p.child.id());
@@ -672,7 +672,7 @@ fn an_otlp_log_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyh
     let log_metrics = env("KOBS_LOGS_METRICS", 1) != 0;
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     // Evaluated every ten seconds, the most often a monitor may be.
     let mut monitor_ids = Vec::new();
     for (i, q) in FLOOD_MONITORS.iter().take(monitors).enumerate() {
@@ -992,7 +992,7 @@ fn a_trace_flood_is_taken_or_refused_never_lost_counted_once_and_replicas_agree(
     let traces = env("KOBS_LOAD_TRACES", 170);
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
     let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
     let server_pid = f.server.as_ref().map_or(0, |p| p.child.id());
@@ -1186,7 +1186,7 @@ fn a_runner_whose_server_is_away_refuses_in_time_and_loses_nothing_it_took() -> 
     let series = env("KOBS_LOAD_SERIES", 1000);
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
     let runner_pid = f.runners.get("r1").and_then(Option::as_ref).map_or(0, |p| p.child.id());
     let t0_ms = common::now_ms() - 7_200_000;
@@ -1274,7 +1274,7 @@ fn a_runner_whose_server_is_away_refuses_in_time_and_loses_nothing_it_took() -> 
     let s = f.status()?;
     let dropped = at(&s, &["dropped"]).as_u64().unwrap_or(0) + at(&s, &["machines"]).as_array().into_iter().flatten().map(|m| at(m, &["status", "dropped"]).as_u64().unwrap_or(0)).sum::<u64>();
     anyhow::ensure!(dropped == 0 && have == all.taken, "{} taken, {have} stored, {dropped} dropped\n{}", all.taken, f.logs());
-    f.until(Duration::from_secs(60), "r1 caught up again", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(60), "r1 caught up again", &["r1"])?;
     let (index, digest) = f.verify(2)?;
     eprintln!("\na runner's server away for 10 s, two senders × {series} points a request");
     eprintln!("  first refused {:.2} s after the server went away (the queue's target: {:?} kept for {:?})", first.as_secs_f64(), Duration::from_secs(1), Duration::from_secs(1));
@@ -1549,7 +1549,7 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
     let helpers = std::env::var("KOBS_SOAK_HELPERS").ok().filter(|v| !v.is_empty());
     let mut f = Fleet::with(|_| helpers.as_ref().map_or_else(String::new, |n| format!("query_helpers = {n}")))?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
     let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
     let server_pid = f.server.as_ref().map_or(0, |p| p.child.id());

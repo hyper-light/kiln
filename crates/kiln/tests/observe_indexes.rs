@@ -18,7 +18,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Fleet, at, caught_up, now_ms, raw};
+use common::{Fleet, at, now_ms, raw};
 use serde_json::{Value, json};
 
 const CONFIG: &str = "/api/observe/v1/logs/config";
@@ -121,7 +121,7 @@ fn records_are_kept_by_their_index_excluded_or_over_its_quota_as_datadog_keeps_t
 
     // The runner joins, told the indexes as it connects.
     f.start_runner_with("r1", &[("KILN_OBSERVE_HOST_SECONDS", "2")])?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
 
     // Through the server's API: 400 of web's, 20 debug records, then audit's 150, ten at a time.
     let web: Vec<Value> = (0..400).map(|i| json!({ "message": format!("web request {i}"), "service": "web", "status": "info" })).collect();

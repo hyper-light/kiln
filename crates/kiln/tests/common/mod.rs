@@ -760,6 +760,37 @@ pub fn param(path: &str, name: &str) -> String {
     path.split_once('?').and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('=')))).map(decode).unwrap_or_default()
 }
 
+/// Whether runner `name` is a learner, up, and its last report's digest is the one the leader had
+/// at its index (`seen`: the leader's digest at each index a status of the leader's said).
+fn agrees(s: &Value, name: &str, seen: &BTreeMap<u64, Value>) -> bool {
+    let learners: Vec<u64> = at(s, &["learners"]).as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
+    at(s, &["machines"]).as_array().into_iter().flatten().any(|m| {
+        at(m, &["machine"]) == name
+            && at(m, &["up"]).as_bool() == Some(true)
+            && learners.contains(&at(m, &["member"]).as_u64().unwrap_or(0))
+            && at(m, &["status", "applied"]).as_u64().and_then(|a| seen.get(&a)).is_some_and(|d| d == at(m, &["status", "digest"]))
+    })
+}
+
+impl Fleet {
+    /// Waits for every runner named to be a learner, up, and agreeing with the leader: its last
+    /// report's digest the one the leader had at its index, an index the leader was seen at while
+    /// waiting (or all the leader has now, as [`caught_up`]). Nodes write what they measure every
+    /// few seconds and a runner reports every ten, so a report is some entries behind the leader's
+    /// index now: held to the leader then, not now (on adacachy a runner stayed 5 entries behind
+    /// for 90 s, caught up all along). Indexes seen while waiting come after what was written
+    /// before it, so a runner agreeing at one holds that too.
+    pub fn until_caught_up(&self, within: Duration, what: &str, names: &[&str]) -> anyhow::Result<Value> {
+        let seen = std::cell::RefCell::new(BTreeMap::<u64, Value>::new());
+        self.until(within, what, |s| {
+            if let Some(i) = at(s, &["digest_at"]).as_u64() {
+                seen.borrow_mut().insert(i, at(s, &["digest"]).clone());
+            }
+            caught_up(s, names) || names.iter().all(|n| agrees(s, n, &seen.borrow()))
+        })
+    }
+}
+
 /// Whether every runner named is a learner, up, and has applied all the leader has.
 pub fn caught_up(s: &Value, names: &[&str]) -> bool {
     let applied = at(s, &["applied"]).as_u64().unwrap_or(0);

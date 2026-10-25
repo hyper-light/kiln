@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 mod common;
-use common::{Fleet, Got, Mock, Service, at, caught_up, file_url, now_ms, param, raw};
+use common::{Fleet, Got, Mock, Service, at, file_url, now_ms, param, raw};
 
 #[test]
 #[ignore = "starts a kiln server and two runners as processes"]
@@ -40,7 +40,7 @@ fn the_group_answers_alike_on_every_replica_through_kills_and_an_image() -> anyh
     // Two runners join: each a learner, each catching up from the log.
     f.start_runner("r1")?;
     f.start_runner("r2")?;
-    f.until(Duration::from_secs(60), "both runners caught up", |s| caught_up(s, &["r1", "r2"]))?;
+    f.until_caught_up(Duration::from_secs(60), "both runners caught up", &["r1", "r2"])?;
     // Their own figures came through their own writes (runner → server → group).
     let start = Instant::now();
     loop {
@@ -66,7 +66,7 @@ fn the_group_answers_alike_on_every_replica_through_kills_and_an_image() -> anyh
         anyhow::ensure!(start.elapsed() < Duration::from_secs(10), "the log search answered {found}\n{}", f.logs());
         std::thread::sleep(Duration::from_millis(100));
     }
-    f.until(Duration::from_secs(30), "both runners hold the logs too", |s| caught_up(s, &["r1", "r2"]))?;
+    f.until_caught_up(Duration::from_secs(30), "both runners hold the logs too", &["r1", "r2"])?;
 
     // OTLP: the specification's own JSON example, gzip, to the server with the ingest token.
     let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
@@ -130,7 +130,7 @@ fn the_group_answers_alike_on_every_replica_through_kills_and_an_image() -> anyh
         anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "OTLP through r1 never arrived: {q:?} {found}\n{}", f.logs());
         std::thread::sleep(Duration::from_millis(200));
     }
-    f.until(Duration::from_secs(30), "both runners hold the OTLP points too", |s| caught_up(s, &["r1", "r2"]))?;
+    f.until_caught_up(Duration::from_secs(30), "both runners hold the OTLP points too", &["r1", "r2"])?;
     let (index, digest) = f.verify(3)?;
     eprintln!("three replicas agree at index {index}: {digest:016x}");
 
@@ -143,7 +143,7 @@ fn the_group_answers_alike_on_every_replica_through_kills_and_an_image() -> anyh
     f.call("POST", "/api/observe/v1/compact", Some(&json!({})))?;
     f.until(Duration::from_secs(30), "the leader compacted", |s| at(s, &["durable"]).as_u64().unwrap_or(0) >= before)?;
     f.start_runner("r2")?;
-    f.until(Duration::from_secs(120), "r2 back by an image", |s| caught_up(s, &["r1", "r2"]))?;
+    f.until_caught_up(Duration::from_secs(120), "r2 back by an image", &["r1", "r2"])?;
     let r2_store = f.root.path().join("r2").join("state").join("observe").join("store");
     let blocks = std::fs::read_dir(&r2_store)?.filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().ends_with(".block")).count();
     anyhow::ensure!(blocks > 0, "r2 holds the image's blocks (it never cut on its own)");
@@ -161,7 +161,7 @@ fn the_group_answers_alike_on_every_replica_through_kills_and_an_image() -> anyh
         std::thread::sleep(Duration::from_millis(100));
     }
     f.write("e2e.temp", &["d"], t0, 30, |h, i| f64::from(h.bytes().next().unwrap_or(0)) + i as f64 / 4.0)?;
-    f.until(Duration::from_secs(60), "both runners caught up after the server's restart", |s| caught_up(s, &["r1", "r2"]))?;
+    f.until_caught_up(Duration::from_secs(60), "both runners caught up after the server's restart", &["r1", "r2"])?;
     let (index, digest) = f.verify(3)?;
     eprintln!("after the server's restart: three replicas agree at index {index}: {digest:016x}");
     let members = f.members(&f.status()?);
@@ -201,7 +201,7 @@ fn a_ci_run_is_in_the_metrics_the_events_and_a_trace_a_span_monitor_watches() ->
     let mut f = Fleet::with(|_| format!("[[repos]]\nname = \"e2e\"\nclone_url = \"{url}\"\nbranches = [\"main\"]\npoll_seconds = 2\n"))?;
     f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(60), "r1 caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(60), "r1 caught up", &["r1"])?;
     // CI's failures by resource, watched as Datadog's trace analytics monitors watch spans.
     let m = f.call(
         "POST",
@@ -855,7 +855,7 @@ fn otlp_over_grpc_is_taken_on_the_server_and_a_runner() -> anyhow::Result<()> {
     let mut f = Fleet::new()?;
     let port = common::free_port()?;
     f.start_runner_with("r1", &[("KILN_OTLP_GRPC_ADDR", &format!("127.0.0.1:{port}"))])?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     let now_ns = crate_now() * 1_000_000;
     let metrics = |name: &str, v: f64| -> anyhow::Result<Vec<u8>> {
         let j = json!({ "resourceMetrics": [{ "resource": { "attributes": [{ "key": "service.name", "value": { "stringValue": "grpc-e2e" } }] }, "scopeMetrics": [{ "metrics": [{ "name": name, "gauge": { "dataPoints": [{ "asDouble": v, "timeUnixNano": now_ns.to_string(), "attributes": [{ "key": "host", "value": { "stringValue": "g1" } }] }] } }] }] }] });

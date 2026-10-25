@@ -1424,7 +1424,7 @@ fn a_prometheus_exporter_is_read_where_its_target_says_and_tagged_as_prometheus_
     };
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| common::caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     let url = |path: &str| format!("{}{path}", exporter.url());
     // Tested first: what it would read.
     let tested = f.call("POST", "/api/observe/v1/scrapes/srv/test", Some(&json!({ "url": url("/metrics"), "every_s": 1, "timeout_s": 1 })))?;

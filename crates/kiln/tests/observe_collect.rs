@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use common::{Fleet, at, caught_up, now_ms};
+use common::{Fleet, at, now_ms};
 use serde_json::{Value, json};
 
 /// Line `seq` as an app writes it: JSON, or text one in three (`seq % 3 == 1`: written as its row
@@ -142,7 +142,7 @@ fn writer(path: PathBuf, seqs: std::ops::Range<u64>, per_s: u64, stop: Arc<Atomi
 fn a_runner_s_files_are_stored_once_each_through_rotation_truncation_a_stop_and_a_kill() -> anyhow::Result<()> {
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     let t0 = now_ms() - 60_000;
     let dir = f.root.path().join("applogs");
     std::fs::create_dir_all(&dir)?;
@@ -291,7 +291,7 @@ fn containers_logs_and_the_journal_are_stored_with_what_they_name() -> anyhow::R
     std::fs::write(&entries, [journal_entry(1, 6, "sshd", "Accepted publickey for ops"), journal_entry(2, 3, "sshd", "Failed password for root")].concat())?;
     let env = [("KILN_JOURNALCTL", fake.to_str().unwrap_or("")), ("JOURNAL_ENTRIES", entries.to_str().unwrap_or(""))];
     f.start_runner_with("r1", &env)?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     // A pod's container log, CRI's lines: a long line in parts, then JSON.
     let pod = root.join("k8s/pods/shop_web-1_0f2c/nginx");
     std::fs::create_dir_all(&pod)?;
@@ -360,7 +360,7 @@ fn syslog_is_received_over_udp_and_tcp_with_what_its_messages_name() -> anyhow::
     let t0 = now_ms() - 60_000;
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     let (udp, tcp) = (common::free_port()?, common::free_port()?);
     put_source(&f, "syslog", &json!({ "type": "syslog", "listen": [format!("udp://127.0.0.1:{udp}"), format!("tcp://127.0.0.1:{tcp}")], "rules": [{ "type": "exclude_at_match", "pattern": "noise" }], "tags": ["site:lab"], "on": "r1" }))?;
     // Bound once the runner has the source: a datagram before that is lost, as UDP's would be.
@@ -428,7 +428,7 @@ fn pipelines_parse_logs_where_they_are_taken_on_every_machine() -> anyhow::Resul
     let t0 = now_ms() - 60_000;
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     // A pipeline of yours, for records posted to the server.
     let made = f.call(
         "POST",
@@ -584,7 +584,7 @@ fn windows_event_channels_are_read_once_each_through_a_stop_a_kill_and_a_clear()
     append_events(&system, 1..21)?;
     let env = [("KILN_WEVTUTIL", fake.to_str().unwrap_or("")), ("WEVT_DIR", channels.to_str().unwrap_or(""))];
     f.start_runner_with("r1", &env)?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     put_source(&f, "win", &json!({ "type": "windows_event", "channels": ["System"], "start": "beginning", "tags": ["team:win"], "on": "r1" }))?;
     let c = win_settled(&f, t0, 1..21)?;
     anyhow::ensure!(repeated(&c, 1..21).is_empty(), "{:?}", repeated(&c, 1..21));
@@ -705,7 +705,7 @@ fn windows_events_are_read_through_windows_own_wevtutil_once_each_through_a_stop
     // Events there before the source: read from the channel's start, as it says.
     log_events(&script, &run, 1..21)?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     put_source(&f, "win", &json!({ "type": "windows_event", "channels": ["Application"], "query": "*[System[Provider[@Name='WSH']]]", "start": "beginning", "tags": ["team:win"], "on": "r1" }))?;
     let c = wsh_settled(&f, &run, t0, 1..21)?;
     anyhow::ensure!(repeated(&c, 1..21).is_empty(), "{:?}", repeated(&c, 1..21));

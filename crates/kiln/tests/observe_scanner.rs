@@ -13,7 +13,7 @@ mod common;
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
-use common::{Fleet, caught_up, now_ms, raw};
+use common::{Fleet, now_ms, raw};
 use serde_json::{Value, json};
 
 const CARD: &str = "4111 1111 1111 1111";
@@ -83,7 +83,7 @@ fn sensitive_values_are_replaced_on_every_machine_before_they_are_kept() -> anyh
     anyhow::ensure!(patterns["standard_patterns"].as_array().is_some_and(|p| p.len() >= 30 && p.iter().any(|x| x["id"] == "visa_card" && x["category"] == "credit_card")), "{patterns}");
 
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
 
     // Through the server's API.
     let records = json!([{ "message": format!("paid with {CARD} by {EMAIL}"), "service": "api-path", "attributes": { "login": format!("password={PASSWORD}"), "order": "order-123456" } }]);

@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use common::{Fleet, at, caught_up, free_port, now_ms};
+use common::{Fleet, at, free_port, now_ms};
 use serde_json::{Value, json};
 
 const IMAGE: &str = "prom/prometheus:v3.7.0";
@@ -85,7 +85,7 @@ fn prometheus_s_remote_write_is_stored_sample_for_sample() -> anyhow::Result<()>
     let dir = tempfile::tempdir()?;
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
     let runner = f.otlp.get("r1").copied().unwrap_or(0);
     // What is not a writer's is refused: no token, a body that is not a request, a message of

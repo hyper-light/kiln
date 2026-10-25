@@ -23,7 +23,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use common::{Fleet, at, caught_up, now_ms};
+use common::{Fleet, at, now_ms};
 use serde_json::{Value, json};
 
 fn free_udp_port() -> anyhow::Result<u16> {
@@ -142,7 +142,7 @@ fn dogstatsd_is_taken_as_datadog_s_agent_takes_it_on_every_machine() -> anyhow::
     let dir = tempfile::tempdir()?;
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     let (p_server, p_runner) = (free_udp_port()?, free_udp_port()?);
     let socket = dir.path().join("dsd.socket");
     let mut edge = vec![format!("udp://127.0.0.1:{p_server}")];

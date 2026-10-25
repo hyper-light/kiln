@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
-use common::{Fleet, at, caught_up, now_ms};
+use common::{Fleet, at, now_ms};
 use serde_json::{Value, json};
 
 const WINDOW: i64 = 10_000;
@@ -219,7 +219,7 @@ fn counting(f: &Fleet) -> anyhow::Result<Value> {
 fn metrics_from_logs_count_each_window_once_through_late_records_and_a_restart() -> anyhow::Result<()> {
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
 
     // A metric of Datadog's, as their API takes it; the rest in kiln's shape.
     f.call("POST", "/api/observe/v1/log_metrics", Some(&json!({ "data": { "id": "checkout.errors", "type": "logs_metrics", "attributes": { "compute": { "aggregation_type": "count" }, "filter": { "query": "service:checkout status:error" }, "group_by": [{ "path": "@http.status_code", "tag_name": "status_code" }] } } })))?;

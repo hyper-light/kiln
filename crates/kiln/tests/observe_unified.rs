@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use common::{Fleet, at, caught_up, now_ms};
+use common::{Fleet, at, now_ms};
 use serde_json::{Value, json};
 
 /// Writes lines `seqs` to the unified log, `<tag> n=<seq>`, at about `per_s` a second.
@@ -63,7 +63,7 @@ fn repeated(c: &BTreeMap<u64, u64>, seqs: std::ops::Range<u64>) -> Vec<(u64, u64
 fn the_unified_log_is_read_once_each_through_a_stop_and_a_kill() -> anyhow::Result<()> {
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
-    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
     let t0 = now_ms() - 60_000;
     let tag = format!("kiln-e2e-{}", now_ms());
     let source = json!({ "type": "unified_log", "predicate": format!("eventMessage BEGINSWITH \"{tag}\""), "level": "default", "service": "e2e", "tags": ["team:mac"], "on": "r1" });
