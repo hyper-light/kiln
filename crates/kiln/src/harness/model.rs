@@ -486,6 +486,15 @@ impl Task {
         matches!(self.status.as_str(), "running" | "pending" | "paused")
     }
 
+    /// One of the agent's own subagents, not something it left running. Older machines only report
+    /// the harness's own task kind: the same as the task inspector's classOf fallback.
+    pub fn subagent(&self) -> bool {
+        match self.class.as_deref() {
+            Some(class) => class == "agent",
+            None => !self.kind.starts_with("monitor") && !matches!(self.kind.as_str(), "local_bash" | "local_workflow") && !self.kind.contains("mcp"),
+        }
+    }
+
     /// Something it leaves running on its own: a shell, a monitor, a workflow, a background call
     /// or a subagent sent to the background.
     pub fn left_running(&self) -> bool {

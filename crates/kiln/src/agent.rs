@@ -1960,7 +1960,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     tracing::info!(%instance, %unit, "retired the older runner process: its service is stopped and disabled");
                                 }
                                 Ok(Ok(crate::upgrade::Retired::Busy(n))) => {
-                                    tracing::warn!(%instance, terminals = n, "the older runner process still holds terminals; leaving it running");
+                                    tracing::warn!(%instance, held = n, "the older runner process still holds terminals or agent sessions; leaving it running");
                                 }
                                 Ok(Ok(crate::upgrade::Retired::Nothing)) => {
                                     tracing::info!(%instance, "an older runner process of this machine can be stopped, but not from here (it isn't running here, or it shares this runner's service)");

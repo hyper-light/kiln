@@ -3595,7 +3595,7 @@ mod stack_tests {
             if dispatched {
                 let again = call_ok(crate::ops::call(person.clone(), "goals.plan", serde_json::json!({"agent": id, "id": two})).await)?;
                 assert_eq!(again.get("dispatched").and_then(serde_json::Value::as_bool), Some(false), "{again}");
-                assert!(again.get("why").and_then(serde_json::Value::as_str).is_some_and(|w| w.contains("on it already")), "{again}");
+                assert!(again.get("why").and_then(serde_json::Value::as_str).is_some_and(|w| w.contains("moments ago")), "{again}");
             }
             // The agent planning a goal of its own: as before, nobody sent.
             let mut itself = crate::authz::Caller::owner();

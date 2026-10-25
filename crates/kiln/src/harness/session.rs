@@ -156,16 +156,7 @@ impl SubagentBrief {
     pub(super) fn of(tasks: &[Task]) -> Vec<Self> {
         tasks
             .iter()
-            .filter(|t| match t.class.as_deref() {
-                Some(class) => class == "agent",
-                // Older machines only report the harness's own task kind. Keep this the same
-                // as the task inspector's classOf fallback.
-                None => {
-                    !t.kind.starts_with("monitor")
-                        && !matches!(t.kind.as_str(), "local_bash" | "local_workflow")
-                        && !t.kind.contains("mcp")
-                }
-            })
+            .filter(|t| t.subagent())
             .map(|t| Self {
                 id: t.id.clone(),
                 tool_id: t.tool_id.clone(),

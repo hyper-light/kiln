@@ -43,6 +43,15 @@ const words = (t: string) => t.split(/\s+/).filter(Boolean).join(" ");
 const toGo = (i: GoalItem) => i.status === "pending" || i.status === "active";
 
 const t0 = Date.now() - 3 * 3600_000;
+
+/** A goal's planning, as the server makes it when a person asks for a plan (a subagent of its agent's plans it now). */
+const planningOf = (goal: string, plan: string, research: string, title: string): GoalItem => ({
+  id: `${goal}-planning`,
+  text: `Plan "${title}" (plan ${plan}, research ${research}) is ready: a subagent of yours plans it now (research_add, plans_update, plans_ready), and this is met once it says it's ready`,
+  status: "pending",
+  part_of: goal,
+  part_kind: "planning",
+});
 const stacks = new Map<string, Kept>([
   [
     "fam-orch",
@@ -127,13 +136,26 @@ const stacks = new Map<string, Kept>([
           status: "pending",
           planned_as: "pl_quic",
         },
+        // Being planned now, each by a subagent of Release prep's own (agents.ts), their planning first: a
+        // subagent at "The planner", one asked for "Store and transfer", one that stopped before "Optimize" was ready.
+        planningOf("g-planner", "pl_planner", "rs_planner", "The planner, researched and audited"),
+        {
+          id: "g-planner",
+          text: "The planner, researched and audited (the person's ask, 2026-10-24): newer planning techniques read at their sources, papers and the leading engines' code (DuckDB, DataFusion, Umbra), measured against ours, and the best of them planned as steps of their own",
+          status: "pending",
+          planned_as: "pl_planner",
+        },
+        planningOf("g-store", "pl_store", "rs_store", "Build the data storage/transfer layer"),
         {
           id: "g-store",
+          planned_as: "pl_store",
           text: "Build the data storage/transfer layer and replication using hyper-raft and its crates. We should be transferring data via hyper-quic internally even if our front-end is through the HTTP/1.1 API. Robustly test locally by actually transferring 1k/10k/100k small files and 10k/100k 10GB-100GB files (both streamed single upload and parts). Ensure they replicate correctly given their cells and metadata.",
           status: "pending",
         },
+        planningOf("g-opt", "pl_opt", "rs_opt", "Optimize the QUIC API and s3 HTTP API"),
         {
           id: "g-opt",
+          planned_as: "pl_opt",
           text: "Optimize the QUIC API and s3 HTTP API using the same benchmarking and profiling we have in steps 1-3, minimizing allocs, reallocs, latency, excess memory, and page faults. DO NOT sacrifice ANY ounce of correctness or robustness.",
           status: "pending",
         },

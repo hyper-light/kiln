@@ -80,8 +80,9 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const task = taskId ? taskInfo?.tool_id || taskId : null;
   const wide = useMediaQuery("(min-width: 1100px)");
   const [trayCollapsed, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
-  const [tab, setTab] = React.useState<InspectorTab>("changes");
-  const [phoneTab, setPhoneTab] = React.useState<PhoneTab>("work");
+  // `?tab=plan`: opened on its plans (the way back from one of them, or its research).
+  const [tab, setTab] = React.useState<InspectorTab>(() => (params.get("tab") === "plan" ? "plan" : "changes"));
+  const [phoneTab, setPhoneTab] = React.useState<PhoneTab>(() => (params.get("tab") === "plan" ? "plan" : "work"));
   const [confirmStop, setConfirmStop] = React.useState(false);
   const [settings, setSettings] = React.useState(false);
   /** /login or /logout: the harness's account on its machine, opened in place over the composer. */

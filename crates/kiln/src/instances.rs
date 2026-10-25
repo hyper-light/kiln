@@ -85,6 +85,9 @@ pub struct Instance {
     pub retire_sent: Option<Instant>,
     /// It was told to stop taking jobs (it is not the newest).
     pub drained: bool,
+    /// It said which agent sessions it holds since it connected (its inventory): until then what
+    /// it holds isn't known here, and it is never retired.
+    pub reported: bool,
     /// The build it runs ([`crate::proto::AgentMsg::Build`]); `None` for runners from before.
     pub build: Option<String>,
     /// What it can do ([`crate::proto::CAP_UPGRADE`] ...).
@@ -177,6 +180,7 @@ impl Instances {
                 connected_at: now,
                 retire_sent: None,
                 drained: false,
+                reported: false,
                 build: None,
                 caps: 0,
                 wide: 0,
@@ -343,6 +347,13 @@ impl Instances {
         v
     }
 
+    /// Runner process `peer` said which agent sessions it holds (its inventory).
+    pub fn reported(&mut self, peer: PeerId) {
+        if let Some(i) = self.by_peer.get_mut(&peer) {
+            i.reported = true;
+        }
+    }
+
     /// Of two runner processes of one machine, the newer (the one new work goes to). None when
     /// either is gone, or they are of different machines.
     pub fn newer_of(&self, a: PeerId, b: PeerId) -> Option<PeerId> {
@@ -477,6 +488,19 @@ mod tests {
         assert!(!m.hands_over(4));
         assert_eq!(m.reannounce(4, &ih("green", 200)), Some(vec![2]), "the one drained before stays so");
         assert!(m.hands_over(4), "once it took over, it's a process like the others");
+    }
+
+    #[test]
+    fn a_process_has_said_what_it_holds_only_once_its_inventory_came() {
+        let mut m = Instances::default();
+        m.join(1, "box", hello("a"), 1);
+        assert!(m.get(1).is_some_and(|i| !i.reported), "just connected: not yet");
+        m.reported(1);
+        assert!(m.get(1).is_some_and(|i| i.reported));
+        // The same process on a new connection says it again.
+        m.join(2, "box", hello("a"), 2);
+        assert!(m.get(2).is_some_and(|i| !i.reported));
+        m.reported(9);
     }
 
     #[test]

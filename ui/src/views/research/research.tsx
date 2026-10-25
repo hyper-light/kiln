@@ -8,7 +8,7 @@
  *
  * Where it shows: its plan's page; its agent's Plan tab (the newest in full); its agent's
  * conversation, where the agent records or reads it (in brief, in full on asking); a planned goal
- * on its stack (in a line); the Plans page (all of it, listed); and a page of its own.
+ * on its stack (in a line); and a page of its own, its way back to its agent's plans.
  */
 import * as React from "react";
 import { Fold } from "@/views/harness/fold";
@@ -18,10 +18,11 @@ import { planHref } from "@/api/plans";
 import { INSIDE, SOURCE_WORDS, researchApi, researchHref, type Cite, type CheckState, type Finding, type Research, type ResearchSource } from "@/api/research";
 import { Loadable } from "@/components/ui/loading";
 import { RowsHold } from "@/components/ui/hold";
-import { Crumbs, EmptyState } from "@/components/ui/misc";
+import { EmptyState } from "@/components/ui/misc";
 import { relativeTime } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
 import { Shimmer } from "@/views/harness/signals";
+import { SessionCrumbs } from "@/views/plans/crumbs";
 import "./research.css";
 
 const CHECK_WORDS: Record<CheckState, string> = {
@@ -333,39 +334,9 @@ export function ResearchLine({ id }: { id: string }) {
   const r = res.data;
   return (
     <>
-      <Link to={researchHref(id)}>its research</Link>: {r.summary.findings} finding{r.summary.findings === 1 ? "" : "s"}
+      <Link to={researchHref(id)}>research</Link>: {r.summary.findings} finding{r.summary.findings === 1 ? "" : "s"}
       {gradeWords(r) && ` (${gradeWords(r)})`}
     </>
-  );
-}
-
-/** All research, newest change first, each to open: what was asked and what it comes to. None, nothing. */
-export function ResearchList() {
-  const all = useSuspenseResource("research/all", (s) => researchApi.list({}, s), { pollMs: 15000 }).data.research;
-  if (all.length === 0) return null;
-  return (
-    <section className="plans-research" aria-label="Research">
-      <h2 className="plan-h">Research</h2>
-      <ul className="plans-list">
-        {all.map((r) => (
-          <li key={r.id} className="plans-row">
-            <Link to={researchHref(r.id)} className="plans-row-title">
-              {r.question}
-            </Link>
-            <div className="plans-row-meta">
-              {r.summary.findings} finding{r.summary.findings === 1 ? "" : "s"}
-              {gradeWords(r) && ` (${gradeWords(r)})`} · {r.summary.sources} source{r.summary.sources === 1 ? "" : "s"} · changed {relativeTime(r.updated_at / 1000)}
-              {r.plan && (
-                <>
-                  {" · "}
-                  <Link to={planHref(r.plan)}>its plan</Link>
-                </>
-              )}
-            </div>
-          </li>
-        ))}
-      </ul>
-    </section>
   );
 }
 
@@ -387,32 +358,20 @@ function ResearchOrNone({ id }: { id: string }) {
   if (r === "gone")
     return (
       <>
-        <Crumbs
-          index={6}
-          items={[
-            { label: "Agents", to: "/agents" },
-            { label: "Plans", to: "/agents/plans" },
-          ]}
-        />
+        <SessionCrumbs />
         <EmptyState title="No such research">It may have been made on another server.</EmptyState>
       </>
     );
   return (
     <>
       <title>{`Research: ${r.question.slice(0, 60)} · kiln`}</title>
-      <Crumbs
-        index={6}
-        items={[
-          { label: "Agents", to: "/agents" },
-          { label: "Plans", to: "/agents/plans" },
-        ]}
-      />
+      <SessionCrumbs session={r.agent} />
       <p className="plan-dim plan-meta">
         Research {r.agent ? <>by an agent</> : <>by {r.by}</>} · changed {relativeTime(r.updated_at / 1000)}
         {r.plan && (
           <>
             {" "}
-            · the planning of <Link to={planHref(r.plan)}>its plan</Link>
+            · the planning of <Link to={planHref(r.plan)}>a plan</Link>
           </>
         )}
       </p>

@@ -284,23 +284,13 @@ export default function Mission() {
         compact
         actions={
           phone ? (
-            <>
-              <Button asChild variant="ghost" size="xs">
-                <Link to="/agents/plans">Plans</Link>
-              </Button>
-              <Button size="icon" aria-label="New agents" title="New agents" onClick={() => setSpawn(true)}>
-                <Plus />
-              </Button>
-            </>
+            <Button size="icon" aria-label="New agents" title="New agents" onClick={() => setSpawn(true)}>
+              <Plus />
+            </Button>
           ) : (
-            <>
-              <Button asChild variant="secondary">
-                <Link to="/agents/plans">Plans</Link>
-              </Button>
-              <Button onClick={() => setSpawn(true)}>
-                New agents <Plus />
-              </Button>
-            </>
+            <Button onClick={() => setSpawn(true)}>
+              New agents <Plus />
+            </Button>
           )
         }
       />

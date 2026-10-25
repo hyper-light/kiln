@@ -1770,6 +1770,7 @@ impl Hub {
                         for id in &inv.sessions {
                             inst.own(crate::instances::Owned::Agent(id.clone()), peer);
                         }
+                        inst.reported(peer);
                         let others: Vec<String> = inst
                             .of(&agent)
                             .into_iter()
@@ -1790,6 +1791,7 @@ impl Hub {
                     }
                     inv.sessions.extend(others);
                     self.harness.inventory(self, &agent, me.as_deref(), &present, inv);
+                    self.check_retire().await;
                 }
                 Err(e) => tracing::debug!(%agent, error = %e, "unreadable agent session inventory"),
             },
@@ -2140,7 +2142,9 @@ impl Hub {
                 continue;
             }
             let Some(i) = inst.get_mut(peer) else { continue };
-            if i.retire_sent.is_some_and(|t| t.elapsed() < RETIRE_REPEAT) {
+            // Not before it said what it holds: just connected (the server started again, or it
+            // did), its agent sessions aren't known here yet, and it would look as if it held none.
+            if !i.reported || i.retire_sent.is_some_and(|t| t.elapsed() < RETIRE_REPEAT) {
                 continue;
             }
             i.retire_sent = Some(Instant::now());

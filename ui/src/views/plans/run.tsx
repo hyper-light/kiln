@@ -73,7 +73,7 @@ function RunOrNone({ run }: { run: string }) {
 }
 
 function RunCrumbs({ v }: { v?: PlanRunView }) {
-  return <Crumbs index={6} items={[{ label: "Agents", to: "/agents" }, { label: "Plans", to: "/agents/plans" }, ...(v ? [{ label: v.title, to: planHref(v.plan) }] : [])]} />;
+  return <Crumbs index={6} items={[{ label: "Agents", to: "/agents" }, ...(v ? [{ label: v.title, to: planHref(v.plan) }] : [])]} />;
 }
 
 function Run({ v, onChange }: { v: PlanRunView; onChange: (v: PlanRunView) => void }) {
