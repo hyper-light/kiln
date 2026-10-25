@@ -511,6 +511,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::PUT, ["api", "updates", "policy"]) => boxed(|| set_policies(&hub, req)).await,
         (&Method::PUT, ["api", "updates", "waits"]) => boxed(|| set_waits(&hub, req)).await,
         (&Method::DELETE, ["api", "updates", "waits"]) => boxed(|| reset_waits(&hub)).await,
+        (&Method::GET, ["api", "updates", "skew"]) => Ok(srv::json(StatusCode::OK, &boxed(|| skew_view(&hub)).await)),
+        (&Method::PUT, ["api", "updates", "skew"]) => boxed(|| set_skew(&hub, req)).await,
+        (&Method::DELETE, ["api", "updates", "skew"]) => boxed(|| reset_skew(&hub)).await,
         (&Method::POST, ["api", "updates", "server"]) => boxed(|| upgrade_server(&hub, req)).await,
         (&Method::POST, ["api", "updates", "binaries"]) => boxed(|| upload_binary(&hub, &q, req)).await,
         (&Method::DELETE, ["api", "updates", "binaries", target]) => boxed(|| delete_binary(&hub, target)).await,
@@ -3449,8 +3452,46 @@ async fn updates_overview(hub: &Arc<Hub>, force: bool) -> Response {
                 "config": crate::updates::Waits::of(&hub.cfg.updates),
                 "changed": crate::updates::waits_changed(hub).await,
             },
+            "skew": skew_view(hub).await,
         }),
     )
+}
+
+/// `GET /api/updates/skew`: the version-skew tolerances (`crate::skew`), kiln.toml's beside
+/// them, the commits each takes (the server's first), and where each connected runner stands.
+async fn skew_view(hub: &Hub) -> serde_json::Value {
+    let now = crate::skew::tolerance(hub).await;
+    let runners: Vec<serde_json::Value> =
+        hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral).map(|a| json!({ "name": a.name, "skew": a.skew })).collect();
+    json!({
+        "now": now,
+        "config": crate::skew::Tolerance::of(&hub.cfg.updates),
+        "changed": crate::skew::changed(hub).await,
+        "most": crate::skew::MOST,
+        "server": COMMIT,
+        "commits": crate::skew::window(hub, now).await,
+        "runners": runners,
+    })
+}
+
+/// `PUT /api/updates/skew` `{"full": 100, "upgrade": 1000}`: how many commits behind the server's a
+/// runner may be and do everything, or connect to be upgraded; every connected runner is weighed
+/// again (kiln.toml's `[updates]` says until then).
+async fn set_skew(hub: &Arc<Hub>, req: Request) -> R {
+    let t: crate::skew::Tolerance = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    t.check().map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    crate::skew::set(hub, Some(t)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit("admin".into(), "upgrade.skew".into(), format!("full within {} commits, upgrade within {}", t.full, t.upgrade)).await;
+    hub.emit(&json!({ "type": "updates" }));
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `DELETE /api/updates/skew`: back to what kiln.toml says.
+async fn reset_skew(hub: &Arc<Hub>) -> R {
+    crate::skew::set(hub, None).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit("admin".into(), "upgrade.skew".into(), "as kiln.toml says".to_owned()).await;
+    hub.emit(&json!({ "type": "updates" }));
+    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 /// The pipeline that builds kiln for every platform (`[updates]`), and its latest run.
@@ -3877,6 +3918,10 @@ async fn create_terminal(hub: &Arc<Hub>, req: Request) -> R {
             if !hub.agents.lock().get(machine).is_some_and(|a| a.connected) {
                 return Err(err(StatusCode::CONFLICT, format!("{machine} is not connected")));
             }
+            // Its kiln is to be upgraded: no new terminal (`crate::skew`).
+            if let Some(why) = hub.skew_holds(machine) {
+                return Err(err(StatusCode::CONFLICT, why));
+            }
             hub.store.audit("admin".into(), "terminal.open".into(), t.target.clone()).await;
             crate::termsess::open_agent(hub, machine.to_owned(), t.cmd, cols, rows)
         }
@@ -3977,6 +4022,11 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
             if let Some((job, machine)) = target.strip_prefix("leg:").and_then(|t| t.split_once('@')) {
                 crate::termsess::open_leg(&hub, machine.to_owned(), job, cols, rows)
             } else if let Some(machine) = target.strip_prefix("agent:") {
+                // Its kiln is to be upgraded: no new terminal (`crate::skew`).
+                if let Some(why) = hub.skew_holds(machine) {
+                    tx.send(ws::text(json!({"type": "error", "message": why}).to_string())).await?;
+                    return Ok(());
+                }
                 crate::termsess::open_agent(&hub, machine.to_owned(), cmd, cols, rows)
             } else {
                 match crate::termsess::open_local(&hub, cmd, cols, rows) {

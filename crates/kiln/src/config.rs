@@ -594,6 +594,14 @@ pub struct Updates {
     pub wait_for_jobs_minutes: u64,
     /// Minutes a machine has to build kiln itself, install included.
     pub build_minutes: u64,
+    /// Version skew (`crate::skew`): a runner on the server's commit or one of this many release
+    /// branch commits before it (its first parents) does everything. System → Updates can change
+    /// it, and the one below.
+    pub skew_full: u32,
+    /// Version skew: a runner on one of this many commits before the server's, past `skew_full`,
+    /// connects to be upgraded and takes no new work until it is; further behind, it's refused.
+    /// Never less than `skew_full`.
+    pub skew_upgrade: u32,
 }
 
 impl Default for Updates {
@@ -608,6 +616,9 @@ impl Default for Updates {
             upgrade_minutes: 15,
             wait_for_jobs_minutes: 6 * 60,
             build_minutes: 60,
+            // About three days of main, and about a month: a runner a day behind does everything.
+            skew_full: 100,
+            skew_upgrade: 1000,
         }
     }
 }

@@ -170,6 +170,10 @@ pub struct Updates {
     in_step_wake: crate::rt::Notify,
     /// How long upgrades are waited on, once read (`waits`).
     waits: Mutex<Option<Waits>>,
+    /// The version-skew tolerances, once read (`crate::skew::tolerance`).
+    pub(crate) skew: Mutex<Option<crate::skew::Tolerance>>,
+    /// Where each commit runners said stands under them (`crate::skew::weigh`).
+    pub(crate) skew_seen: Mutex<crate::skew::Seen>,
     /// Every runner on the newest kiln.
     pub fleet: crate::fleet::Fleet,
     /// The binaries kept for other platforms, by target, as kiln's store of bytes holds them

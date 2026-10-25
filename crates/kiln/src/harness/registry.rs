@@ -1528,6 +1528,12 @@ impl Registry {
     pub async fn open(&self, hub: &Hub, target: &str, spec: Spec, count: usize) -> anyhow::Result<Vec<Info>> {
         let count = count.clamp(1, 16);
         let loc = Location::of_target(target);
+        // A machine whose kiln is to be upgraded takes no new agent (`crate::skew`).
+        if let Location::Machine(m) = &loc
+            && let Some(why) = hub.skew_holds(m)
+        {
+            anyhow::bail!("{why}");
+        }
         let mut out = Vec::new();
         for i in 0..count {
             let mut spec = spec.clone();
