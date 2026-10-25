@@ -16,6 +16,7 @@
 //! * [`ops`] — the `agents.*` operations (HTTP, MCP, code mode, the CLI).
 //! * [`wait`] — where agents stand, and waiting for them to settle.
 //! * [`queued`] — what waits in an agent's queue, and the messages kiln keeps there itself.
+//! * [`subagent`] — messages a person writes to one of an agent's own subagents.
 //! * [`transcript`] — Claude Code transcripts as the timeline (history on resume, sessions elsewhere).
 
 pub mod acp;
@@ -32,6 +33,7 @@ pub mod elicit;
 pub mod elsewhere;
 pub mod files;
 pub mod gitstate;
+pub mod goback;
 pub mod handing;
 pub mod handoff;
 pub mod homes;
@@ -51,6 +53,7 @@ pub mod registry;
 pub mod relocate;
 pub mod screen;
 pub mod session;
+pub mod subagent;
 pub mod survivors;
 pub mod told;
 pub mod socket;

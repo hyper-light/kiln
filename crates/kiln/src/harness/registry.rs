@@ -949,7 +949,7 @@ impl Registry {
             // What the server's own terminals and agents ask of kiln (`kiln spawn --on`, `kiln
             // agents wait`) is answered here.
             let forward = Some(crate::harness::ops::forward(Arc::clone(&hub)));
-            match super::socket::serve_with(&hub.harness.local, super::socket::path("server", &hub.harness.dir), forward) {
+            match super::socket::serve_with(&hub.harness.local, super::socket::path("server", &hub.harness.dir), forward, false) {
                 Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
                 Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
             }
@@ -1674,9 +1674,9 @@ impl Registry {
     /// for a machine, every file sent ahead in pieces (the message then refers to them by id).
     async fn route_attachments(&self, hub: &Hub, id: &str, loc: &Location, c: Command) -> Result<Command, Sent> {
         use base64::Engine as _;
-        let Command::Send { id: mid, text, mode, attachments, overrides } = c else { return Ok(c) };
+        let Command::Send { id: mid, text, mode, attachments, overrides, reply_to, task } = c else { return Ok(c) };
         if attachments.is_empty() {
-            return Ok(Command::Send { id: mid, text, mode, attachments, overrides });
+            return Ok(Command::Send { id: mid, text, mode, attachments, overrides, reply_to, task });
         }
         let b64 = base64::engine::general_purpose::STANDARD;
         let mut out = Vec::new();
@@ -1729,7 +1729,7 @@ impl Registry {
             }
             out.push(a);
         }
-        Ok(Command::Send { id: mid, text, mode, attachments: out, overrides })
+        Ok(Command::Send { id: mid, text, mode, attachments: out, overrides, reply_to, task })
     }
 
     /// A harness signed in on a machine (kiln's /login): each of that machine's sessions of it is

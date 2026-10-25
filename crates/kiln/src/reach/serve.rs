@@ -93,6 +93,18 @@ fn ask_login_shell(shell: &str, agent: Vec<(String, String)>) -> Option<Vec<(Str
     // A second early: process start times are whole seconds.
     let since = unix_s().saturating_sub(1);
     let mut child = cmd.spawn().ok()?;
+    // What it writes is read as it comes: its pipe holds 64 KiB at most (a page or two for a user
+    // with many pipes open), and a shell that can't write its environment out never exits.
+    let (tx, said) = std::sync::mpsc::channel();
+    let stdout = child.stdout.take();
+    let _ = std::thread::Builder::new().name("kiln-login-env".into()).spawn(move || {
+        let mut out = String::new();
+        if let Some(mut s) = stdout
+            && std::io::Read::read_to_string(&mut s, &mut out).is_ok()
+        {
+            let _ = tx.send(out);
+        }
+    });
     let started = Instant::now();
     loop {
         match child.try_wait() {
@@ -107,8 +119,7 @@ fn ask_login_shell(shell: &str, agent: Vec<(String, String)>) -> Option<Vec<(Str
             Err(_) => return None,
         }
     }
-    let mut out = String::new();
-    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
+    let out = said.recv_timeout(ENV_TIMEOUT).ok()?;
     let body = out.split_once(&format!("\n{BEGIN}\n"))?.1.split_once(&format!("\n{END}\n"))?.0;
     let env: Vec<(String, String)> = parse_env(body).into_iter().filter(|(k, _)| !SKIP_ENV.contains(&k.as_str())).collect();
     (!env.is_empty()).then(|| without_its_agent(env, since))
@@ -162,6 +173,12 @@ pub async fn login_env() -> Vec<(String, String)> {
     let env = crate::rt::blocking(move || ask_login_shell(&login_shell(), agent)).await.ok().flatten().unwrap_or_else(|| std::env::vars().collect());
     *cell.lock() = Some((Instant::now(), env.clone()));
     env
+}
+
+/// The PATH the login shell said last (however long ago), without asking it: none before
+/// [`login_env`] first answered.
+pub fn login_path() -> Option<String> {
+    LOGIN_ENV.get()?.lock().as_ref()?.1.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone())
 }
 
 /// Where a run starts. `mirror_root`: the synced copy it runs in, when it names one.
@@ -555,6 +572,23 @@ mod tests {
         let shown: Vec<String> = places.iter().map(|p| p.to_string_lossy().replace('/', "\\")).collect();
         assert!(shown.iter().any(|p| p == r"Program Files\Git\bin\bash.exe"), "beside git's cmd folder: {shown:?}");
         assert!(shown.iter().any(|p| p == r"Apps\Git\bin\bash.exe"), "where it installs: {shown:?}");
+    }
+
+    /// A login shell whose environment is more than its pipe holds (64 KiB at most by default; a
+    /// page or two for a user with many pipes open) still says it: what it writes is read as it
+    /// comes, not once it has exited, which it can't while its pipe is full.
+    #[cfg(unix)]
+    #[test]
+    fn a_login_shells_environment_bigger_than_its_pipe_is_read() -> anyhow::Result<()> {
+        // `/bin/sh` itself, handed the variable and a home of its own: a script the test wrote can
+        // be busy for a moment (ETXTBSY) while another test's process starts.
+        let home = tempfile::tempdir()?;
+        let env = vec![("BIG".to_owned(), "x".repeat(100_000)), ("HOME".to_owned(), home.path().to_string_lossy().into_owned())];
+        let started = Instant::now();
+        let env = ask_login_shell("/bin/sh", env).ok_or_else(|| anyhow::anyhow!("no answer"))?;
+        assert!(env.iter().any(|(k, v)| k == "BIG" && v.len() == 100_000), "its 100 kB variable: {:?}", env.iter().map(|(k, v)| (k, v.len())).collect::<Vec<_>>());
+        assert!(started.elapsed() < ENV_TIMEOUT, "answered, not given up on");
+        Ok(())
     }
 
     /// The ssh agent a login shell's startup file starts goes on to the next ask, so the file

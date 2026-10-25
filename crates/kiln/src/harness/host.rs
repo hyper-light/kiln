@@ -862,7 +862,7 @@ fn picks_up(queue: &mut Vec<QueueItem>, also: &str) {
         return;
     }
     let now = super::core::Core::now();
-    queue.insert(0, QueueItem { id: format!("{}restart-{now}", super::core::KEEP_ID), text: format!("{CUT_BY_RESTART}{also}"), at: now, attachments: Vec::new(), overrides: None });
+    queue.insert(0, QueueItem { id: format!("{}restart-{now}", super::core::KEEP_ID), text: format!("{CUT_BY_RESTART}{also}"), at: now, attachments: Vec::new(), overrides: None, reply_to: None });
 }
 
 /// How often what the harnesses run is looked at.

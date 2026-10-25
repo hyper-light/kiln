@@ -392,8 +392,13 @@ impl Turso {
                 }
                 t.rev += 1;
                 let r = t.rev;
-                t.write(&mut w, &c.row, r)?;
-                took.applied += 1;
+                if t.write(&mut w, &c.row, r)? {
+                    took.applied += 1;
+                } else {
+                    // As it is kept here already (sent again, from another of its machine's stores).
+                    t.rev -= 1;
+                    took.same += 1;
+                }
             }
             // Where each session it brought runs: the machine of this feed (a former writer's
             // rows, left out, don't say so). A mirror's feed says it in its rows instead.
@@ -671,8 +676,9 @@ impl Turso {
         })
     }
 
-    /// One row, as write number `rev`.
-    fn write(&self, w: &mut Writes, row: &Row, rev: u64) -> anyhow::Result<()> {
+    /// One row, as write number `rev`: whether it wrote anything. An event or a record line that
+    /// comes again as it is kept writes nothing, and the number goes unused.
+    fn write(&self, w: &mut Writes, row: &Row, rev: u64) -> anyhow::Result<bool> {
         let r = seq(rev);
         let none = |_: &TRow| Ok(());
         // While a copy restores this store, what else writes a session it brought (its own
@@ -693,31 +699,37 @@ impl Turso {
                     self.touch(session);
                 }
             }
-            Row::Event(e) => self.run(
-                &mut w.event,
-                &[
-                    txt(&e.session),
-                    txt(&e.id),
-                    seq(e.seq),
-                    int(e.at),
-                    text(e.parent.as_deref()),
-                    text(e.by.as_deref()),
-                    txt(&e.kind),
-                    text(e.level.as_deref()),
-                    text(e.tool.as_deref()),
-                    text(e.status.as_deref()),
-                    txt(&e.text),
-                    txt(&e.body),
-                    r,
-                ],
-                none,
-            )?,
+            Row::Event(e) => {
+                self.run(
+                    &mut w.event,
+                    &[
+                        txt(&e.session),
+                        txt(&e.id),
+                        seq(e.seq),
+                        int(e.at),
+                        text(e.parent.as_deref()),
+                        text(e.by.as_deref()),
+                        txt(&e.kind),
+                        text(e.level.as_deref()),
+                        text(e.tool.as_deref()),
+                        text(e.status.as_deref()),
+                        txt(&e.text),
+                        txt(&e.body),
+                        r,
+                    ],
+                    none,
+                )?;
+                return Ok(w.event.n_change() > 0);
+            }
             Row::Reset { session, from, at } => {
                 self.run(&mut w.reset, &[txt(session), seq(from.unwrap_or(0))], none)?;
                 self.run(&mut w.dropped, &[r, txt(session), txt("events"), Value::Null, from.map_or(Value::Null, seq), int(*at)], none)?;
             }
             Row::Closed { session, at } => self.run(&mut w.close, &[txt(session), int(*at), r], none)?,
-            Row::Record(rec) => self.run(&mut w.record, &[txt(&rec.session), txt(&rec.source), seq(rec.n), seq(rec.end), record_value(rec)?, r], none)?,
+            Row::Record(rec) => {
+                self.run(&mut w.record, &[txt(&rec.session), txt(&rec.source), seq(rec.n), seq(rec.end), record_value(rec)?, r], none)?;
+                return Ok(w.record.n_change() > 0);
+            }
             Row::RecordReset { session, source, at } => {
                 self.run(&mut w.records_reset, &[txt(session), txt(source)], none)?;
                 self.run(&mut w.dropped, &[r, txt(session), txt("record"), txt(source), Value::Null, int(*at)], none)?;
@@ -728,7 +740,7 @@ impl Turso {
                 self.touch(session);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// The epoch this store has for `session` (0: none yet).
@@ -1093,7 +1105,9 @@ impl Engine for Turso {
             let mut w = t.writes()?;
             for row in rows {
                 t.rev += 1;
-                t.write(&mut w, row, t.rev)?;
+                if !t.write(&mut w, row, t.rev)? {
+                    t.rev -= 1;
+                }
             }
             Ok(())
         })
@@ -1529,6 +1543,40 @@ mod tests {
 
     fn record(n: u64, line: &str) -> Row {
         Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc".into(), n, end: (n + 1) * 1000, line: line.into(), kept: None }))
+    }
+
+    #[test]
+    fn what_comes_again_as_it_is_kept_writes_nothing_and_no_feed_sends_it_again() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut runner = Turso::open(&dir.path().join("r.db"))?;
+        let long = format!("{{\"type\":\"assistant\",\"text\":\"{}\"}}", "the agent read the file and wrote a patch ".repeat(40));
+        let mut rows = super::super::rows::of("s1", &said("m1", 1, "first"), 5);
+        rows.extend(super::super::rows::of("s1", &said("m2", 2, "second"), 5));
+        rows.extend([record(0, "{\"type\":\"summary\"}"), record(1, &long)]);
+        runner.apply(&rows)?;
+        let top = runner.top();
+        // Read again (a restart following the transcript from its top, a timeline written again):
+        // nothing changes, and nothing gets a number for a feed to send.
+        runner.apply(&rows)?;
+        assert_eq!(runner.top(), top);
+        assert!(runner.changes(top, 1 << 20, false)?.rows.is_empty());
+        // What changed is written, and only that.
+        runner.apply(&super::super::rows::of("s1", &said("m2", 2, "second, revised"), 5))?;
+        assert_eq!(runner.top(), top + 1);
+        // The server, sent what it has by a new store of the same machine (a new runner process
+        // that took the sessions over): nothing written, nothing numbered, nothing for a mirror.
+        let mut server = Turso::open(&dir.path().join("s.db"))?;
+        let all = runner.changes(0, 1 << 20, true)?;
+        let first = server.take("box/old", Some("box"), 0, &all)?;
+        assert_eq!((first.applied, first.same), (all.rows.len(), 0));
+        let at = server.top();
+        let again = server.take("box/new", Some("box"), 0, &all)?;
+        assert_eq!((again.applied, again.same, again.gap, again.wrote), (0, all.rows.len(), false, None));
+        assert_eq!(server.top(), at);
+        assert_eq!(server.peer("box/new")?, all.upto);
+        assert_eq!(server.record("s1", "cc", 0, 10)?.into_iter().map(|(_, l)| l).collect::<Vec<_>>(), vec!["{\"type\":\"summary\"}".to_owned(), long]);
+        assert_eq!(server.kept("s1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>()), Some(vec!["first".to_owned(), "second, revised".to_owned()]));
+        Ok(())
     }
 
     #[test]

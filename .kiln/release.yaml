@@ -44,6 +44,10 @@ jobs:
     # Built with the Mac's own toolchain and SDK. Its runners build kiln themselves meanwhile, if
     # this hasn't started (crate::fleet).
     runs-on: [baremetal, macos]
+    # A Mac whose runner finds node: on one whose service's PATH lacks it (node from nvm, kiln
+    # installed before it, as on the Mac Studios) `npm` isn't found and the build fails at once.
+    # The engine routes by `requires`; v1 by the labels alone.
+    requires: ["os == macos", "tools has node"]
     timeout-minutes: 90
     steps:
       # A launchd service's PATH has none of the usual tools in it.

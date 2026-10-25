@@ -127,11 +127,27 @@ pub struct ChangeJob {
     pub baseline: Baseline,
 }
 
+/// A go-back operation done by kiln (`harness::goback`) where a harness lacks it natively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoBackOp {
+    /// Undo the prompt and everything after it: the conversation and the file changes.
+    Rewind,
+    /// Undo the file changes made since the prompt; keep the conversation.
+    RewindFiles,
+    /// A new session with the conversation up to the end of the prompt's turn.
+    Branch,
+    /// A new session with the whole conversation.
+    Fork,
+}
+
 /// Something only the session (which owns the process) can do, asked for by an adapter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     /// Start the harness again, continuing its session from `resume_at` (a rewind).
     Restart { resume_at: Option<String> },
+    /// The go-back (rewind, restore files, branch, fork) that `harness::goback` does where the
+    /// harness has none of its own: `event` is the prompt it goes back to (empty for a fork).
+    GoBack { op: GoBackOp, event: String },
     /// From its next start the harness may skip every permission check: a person chose a mode
     /// that turns checks off, which it was not started able to use.
     AllowBypass,
@@ -894,7 +910,7 @@ mod tests {
     fn a_turn_end_says_what_the_turn_did() {
         let mut core = Core::new();
         core.note_sent("u1");
-        core.upsert("u1", None, Body::User { text: "go".into(), images: 0, client_id: Some("u1".into()), origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("u1", None, Body::User { text: "go".into(), images: 0, client_id: Some("u1".into()), origin: Some("human".into()), attachments: Vec::new(), reply_to: None });
         core.upsert("a1", None, said("Running it."));
         core.upsert("t1", None, tool(ToolStatus::Done));
         core.upsert("t2", None, tool(ToolStatus::Error));
@@ -911,9 +927,9 @@ mod tests {
     #[test]
     fn child_work_cannot_change_the_parent_turns_keep_going_decision() -> anyhow::Result<()> {
         let mut core = Core::new();
-        core.upsert("parent-prompt", None, Body::User { text: "go".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("parent-prompt", None, Body::User { text: "go".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new(), reply_to: None });
         core.upsert("parent-tool", None, tool(ToolStatus::Error));
-        core.upsert("child-prompt", Some("spawn".into()), Body::User { text: "audit".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("child-prompt", Some("spawn".into()), Body::User { text: "audit".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new(), reply_to: None });
         core.upsert("child-tool", Some("spawn".into()), tool(ToolStatus::Done));
         core.upsert("child-answer", Some("spawn".into()), said("Should I try again?"));
         // Distinct times also exercise the fallback to the parent's prompt when no start

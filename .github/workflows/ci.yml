@@ -59,6 +59,10 @@ jobs:
     name: linux (clippy, tests)
     needs: ui
     runs-on: ubuntu-latest
+    env:
+      # Line tables are the debug info a test's backtrace needs, at far less memory: kiln's crate
+      # takes 7 GiB and more to compile (as .kiln/ci.yaml's rust job builds it).
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -74,6 +78,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Clippy
         run: cargo clippy -p kiln --all-targets --locked -- -D warnings
+      # Built apart, the library as its tests first, then the rest: kiln's crate compiled twice at
+      # once (the library, and the library as its tests) ran the runner's 16 GB out, and GitHub shut
+      # the runner down mid-build.
+      - name: Build the library's tests
+        run: cargo test -p kiln --locked --lib --no-run
       - name: Tests
         run: cargo test -p kiln --locked
 
