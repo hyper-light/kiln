@@ -1044,7 +1044,6 @@ function failedJobs(ctx: PagesCtx): UpdateJob[] {
       reached: false,
       log: [
         `upgrading ${mac.name}: it builds ${NEWEST.slice(0, 12)} itself; nothing it runs is stopped`,
-        "kiln checkout: /Users/ada/Projects/kiln (left as it is: the build is of 94f0847a1b2c, from the server)",
         "fetching the source of 94f0847a1b2c from https://kiln.lan",
         "   Compiling kiln-cd v0.2.0 (/Users/ada/.cache/kiln/self-build/src-9d2f61c08b7e4a55/crates/kiln-cd)",
         "   Compiling kiln v0.2.0 (/Users/ada/.cache/kiln/self-build/src-9d2f61c08b7e4a55/crates/kiln)",
@@ -1182,7 +1181,7 @@ function updates(ctx: PagesCtx): UpdatesOverview {
                 ]
               : [
                   { way: "download" as const, ok: true, why: "downloads build 0.1.0+a1b2c3d" },
-                  { way: "build" as const, ok: false, why: "no kiln checkout on it to build from" },
+                  { way: "build" as const, ok: false, why: "it has no cargo or node to build kiln with" },
                 ],
       };
     });
