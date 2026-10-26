@@ -1,4 +1,4 @@
-//! docs/ci.md W26-R30 to R34 and W26-AC30: the conflict graph over kiln's own crates, and 10,000
+//! docs/ci.md W28-R30 to R34 and W28-AC30: the conflict graph over kiln's own crates, and 10,000
 //! random queues over synthetic package graphs.
 
 use std::cell::Cell;
@@ -39,7 +39,7 @@ fn kiln() -> Units {
 }
 
 #[test]
-fn w26_r31_kiln_ci_ui_and_sched() -> Result<(), String> {
+fn w28_r31_kiln_ci_ui_and_sched() -> Result<(), String> {
     let queue = [
         change("A", &["crates/kiln-ci/src/land.rs"], &[]),
         change("B", &["ui/src/routes/index.tsx"], &[]),
@@ -79,7 +79,7 @@ fn w26_r31_kiln_ci_ui_and_sched() -> Result<(), String> {
 }
 
 #[test]
-fn w26_r34_every_decision_names_what_is_shared() -> Result<(), String> {
+fn w28_r34_every_decision_names_what_is_shared() -> Result<(), String> {
     let queue = [
         change("D1", &["docs/ci.md"], &["prod"]),
         change("D2", &["docs/ci.md"], &[]),
@@ -107,7 +107,7 @@ fn w26_r34_every_decision_names_what_is_shared() -> Result<(), String> {
 }
 
 #[test]
-fn w26_r30_a_dependency_a_change_adds_links_it() {
+fn w28_r30_a_dependency_a_change_adds_links_it() {
     let unit = |name: &str, deps: &[&str]| Unit { name: name.into(), ecosystem: "cargo".into(), dir: name.into(), deps: set(deps), ..Unit::default() };
     let queue = [change("X", &["u/Cargo.toml"], &[]), change("Y", &["v/src/lib.rs"], &[])];
     // On the trunk's graph alone u doesn't depend on v, and they'd land side by side.
@@ -120,7 +120,7 @@ fn w26_r30_a_dependency_a_change_adds_links_it() {
 }
 
 #[test]
-fn w26_r34_cycles_the_root_and_long_lists() {
+fn w28_r34_cycles_the_root_and_long_lists() {
     let unit = |name: &str, dir: &str, deps: &[&str]| Unit { name: name.into(), ecosystem: "cargo".into(), dir: dir.into(), deps: set(deps), ..Unit::default() };
     let g = Units::new([unit("p", "p", &["q"]), unit("q", "q", &["p"]), unit("top", "", &[])]);
     let why = |queue: &[Change]| Conflicts::new(&g, queue).verdict("Y").map(Verdict::why);
@@ -131,7 +131,7 @@ fn w26_r34_cycles_the_root_and_long_lists() {
     assert_eq!(why(&[all.clone(), Change { id: "Y".into(), ..all }]), Some(vec!["waits for X: both change README.md; both change a; both change b; and 3 more".to_owned()]));
 }
 
-// -------------------------------------------------------------------- W26-AC30: random queues
+// -------------------------------------------------------------------- W28-AC30: random queues
 
 /// The synthetic repositories' folders: each unit's is one of them.
 const FOLDERS: [&str; 7] = ["", "a", "a/b", "a/b/c", "a/d", "e", "e/f"];
@@ -200,7 +200,7 @@ struct Case {
     queue: Vec<Change>,
     /// Each change's edits: a file's new contents, or none when it's removed.
     edits: Vec<BTreeMap<String, Option<String>>>,
-    /// Each unit's dependencies on the trunk or in any change: the union (W26-R30).
+    /// Each unit's dependencies on the trunk or in any change: the union (W28-R30).
     deps: BTreeMap<String, BTreeSet<String>>,
     /// The graph the conflict graph is given: the trunk's units, then each change's own.
     graph: Units,
@@ -521,12 +521,12 @@ fn check(raw: &Raw, seen: &Seen) -> Result<(), TestCaseError> {
 }
 
 #[test]
-fn w26_ac30_commuting_changes() -> Result<(), String> {
+fn w28_ac30_commuting_changes() -> Result<(), String> {
     let seen = Seen::default();
     let mut runner = TestRunner::new(Config { cases: 10_000, failure_persistence: None, ..Config::default() });
     runner.run(&raw(), |r| check(&r, &seen)).map_err(|e| e.to_string())?;
     let (cases, commuting, whole) = (seen.cases.get(), seen.commuting.get(), seen.whole.get());
-    println!("W26-AC30: {cases} cases; {commuting} sets of two or more commuting changes landed in every order checked; {whole} components landed whole");
+    println!("W28-AC30: {cases} cases; {commuting} sets of two or more commuting changes landed in every order checked; {whole} components landed whole");
     assert!(cases >= 10_000, "{cases} cases run");
     assert!(commuting >= 10_000, "only {commuting} sets of two or more commuting changes");
     assert!(whole >= 1_000, "only {whole} components landed whole");
