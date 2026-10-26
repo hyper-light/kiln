@@ -485,6 +485,10 @@ pause?, exit?, needs?}`. `stand` says where it is, in a word:
 | `offline` | its machine is away; it goes on when it's back |
 | `ended` | it ended, or kiln doesn't list it any more |
 
+An agent that couldn't start keeps the first message it was given until its harness takes it: a
+Restart once the harness is installed, its runner starting again, or a move to a machine that has
+it (docs/reach.md §8) gives it then.
+
 ### Where a child runs
 
 `on` is a machine's name (`local` or `server` for the server, `agent:<name>` too), or what it

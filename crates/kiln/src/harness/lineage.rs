@@ -558,6 +558,24 @@ async fn lacks(hub: &Hub, target: &str, kind: &'static Kind) -> bool {
     !crate::rt::blocking(move || kind.available()).await.unwrap_or(false)
 }
 
+fn harness(id: &str) -> Result<&'static Kind, Refused> {
+    let kind = Kind::get(id).ok_or_else(|| bad(format!("unknown harness {id:?}: claude, codex, devin, gemini, opencode, goose, amp or antigravity")))?;
+    if !kind.structured() {
+        return Err(bad(format!("{} has no structured mode", kind.name)));
+    }
+    Ok(kind)
+}
+
+pub async fn placed(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str) -> Result<String, Refused> {
+    let kind = harness(kind)?;
+    let default_target = parent.map(|p| if p.target.is_empty() { "local".to_owned() } else { p.target.clone() });
+    let target = pick(hub, on, kind.id, default_target.as_deref())?;
+    if lacks(hub, &target, kind).await {
+        return Err(not_installed(hub, &target, kind));
+    }
+    Ok(target)
+}
+
 fn not_installed(hub: &Hub, target: &str, kind: &Kind) -> Refused {
     let machine = target.strip_prefix("agent:").map_or_else(|| "the kiln server (`local`)".to_owned(), str::to_owned);
     let (with, _) = candidates(hub, &crate::reach::directory::Want { harness: Some(kind.id.to_owned()), ..Default::default() });
@@ -767,10 +785,7 @@ pub async fn hold(hub: &Hub, parent: &Info, ask: &Ask, target: &str, count: usiz
 /// Start agents for `by`: checked against its parent when it's an agent, on the machine picked,
 /// each recorded with whom it acts for and who started it.
 pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refused> {
-    let kind = Kind::get(&ask.kind).ok_or_else(|| bad(format!("unknown harness {:?}: claude, codex, devin, gemini, opencode, goose, amp or antigravity", ask.kind)))?;
-    if !kind.structured() {
-        return Err(bad(format!("{} has no structured mode", kind.name)));
-    }
+    let kind = harness(&ask.kind)?;
     let volume = match ask.workspace.as_deref().map(str::trim) {
         None | Some("" | "folder") => false,
         Some("volume") => true,

@@ -238,7 +238,8 @@ server's copy of the conversation instead, its transcript included (`{"from_stor
 [conversations.md](conversations.md), "Resuming on another machine").
 
 An agent that isn't running moves too: one that crashed or couldn't start on its runner goes as
-any other (its runner hands it over), and starts again where it goes. The kiln server keeps the
+any other (its runner hands it over), and starts again where it goes, with the first message it
+was given when its harness never got it. The kiln server keeps the
 agents it runs once they've started; one whose harness never started there (the server hasn't it)
 moves all the same, the server packing it itself, with the first message it was given, and
 handing it to the runner (`{"from_server": true}`). It starts there under the same id, its plan

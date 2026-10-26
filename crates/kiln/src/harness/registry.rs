@@ -2242,7 +2242,6 @@ impl Registry {
         if hub.runner_caps(to) & crate::proto::CAP_CONVO == 0 {
             return Err(format!("{to} runs a kiln too old to take a session from the server; upgrade it first"));
         }
-        let prompt = s.spec.lock().prompt.clone();
         let spec = s.resume_spec();
         let (events, mut state) = {
             let core = s.core.lock();
@@ -2252,8 +2251,7 @@ impl Registry {
         let next = had.max(state.epoch) + 1;
         state.epoch = next - 1;
         let from_cwd = state.cwd.clone();
-        let mut pkg = super::moving::pack(id, spec, cwd, "the kiln server", &from_cwd, super::moving::Carry::Nothing, events, state);
-        pkg.spec.prompt = prompt;
+        let pkg = super::moving::pack(id, spec, cwd, "the kiln server", &from_cwd, super::moving::Carry::Nothing, events, state);
         let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
         send_package(hub, id, to, &bytes).await?;
         self.raise_epoch(id, next);
