@@ -90,12 +90,15 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let join = crate::util::load_or_create_token(&cfg.data("join.token"))?;
 
     let quic_bind: SocketAddr = cfg.server.quic_addr.parse().with_context(|| format!("quic_addr {}", cfg.server.quic_addr))?;
+    // Revoked keys are refused from the first handshake on (W27-R01).
+    let revoked_keys = crate::identities::revoked_keys(&store).await?;
     let (net, net_events) = crate::net::start(crate::net::Spec {
         bind: quic_bind,
         ca_der: pki.ca_der.clone(),
         leaf: leaf.clone(),
         server: true,
         dial_deadline: crate::net::DIAL_DEADLINE,
+        revoked_keys,
     })?;
     // A test build's faults (`KILN_CHAOS`): frames lost, sent twice or sent late below the channel,
     // which it makes up for.

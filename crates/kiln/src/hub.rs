@@ -1225,7 +1225,13 @@ impl Hub {
         true
     }
 
-    pub async fn forget_agent(&self, agent: &str) -> anyhow::Result<()> {
+    pub async fn forget_agent(&self, agent: &str, by: &str) -> anyhow::Result<()> {
+        // Its certificates are revoked for good, recorded so a restart keeps it, and refused at
+        // once (W27-R01); enrolling again under the name brings a new key.
+        let keys = crate::identities::revoke(&self.store, crate::identities::Target::Subject(agent.to_owned()), "runner forgotten", by, crate::util::now_unix()).await?;
+        if !keys.is_empty() {
+            self.net.command(crate::net::Out::RevokeKeys { keys }).await;
+        }
         let mut peers: Vec<PeerId> = self.agents.lock().remove(agent).and_then(|a| a.peer).into_iter().collect();
         peers.extend(self.instances.lock().of(agent));
         peers.sort_unstable();
@@ -3034,7 +3040,7 @@ pub(crate) mod tests {
         );
         let (store, (pki, leaf)) = (store??, keys??);
         let pki = Arc::new(pki);
-        let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
+        let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
         Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
     }

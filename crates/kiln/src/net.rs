@@ -111,6 +111,10 @@ impl Classes for Kiln {
 pub struct ServerBook {
     names: HashMap<PeerId, String>,
     revoked: std::collections::HashSet<String>,
+    /// Each peer's key (its SPKI's SHA-256, hex), and the keys revoked (W27-R01): recorded in the
+    /// store, loaded at start, so a restart keeps them and re-enrolling a name doesn't undo them.
+    keys: HashMap<PeerId, String>,
+    revoked_keys: std::collections::HashSet<String>,
 }
 
 fn cert_name(der: &[u8]) -> Option<String> {
@@ -133,8 +137,14 @@ impl Directory for ServerBook {
         if self.revoked.contains(&name) || crate::pki::reserved(&name) {
             return None;
         }
+        let key = crate::pki::key_sha256(der)?;
+        if self.revoked_keys.contains(&key) {
+            tracing::warn!(agent = %name, key = %key, "refused a revoked certificate");
+            return None;
+        }
         let peer = peer_of(der);
         self.names.insert(peer, name);
+        self.keys.insert(peer, key);
         Some((peer, Role::Agent))
     }
 
@@ -168,6 +178,9 @@ pub enum Out {
     Revoke { name: String },
     /// Accept that agent name again (an admin approved a new machine under it).
     Unrevoke { name: String },
+    /// Refuse certificates for these keys (SPKI SHA-256, hex) from now on, and drop the peers
+    /// connected with them (W27-R01). Never undone: a machine enrolling again has a new key.
+    RevokeKeys { keys: Vec<String> },
     /// Agent side: dial the server.
     Connect { addr: SocketAddr },
     /// Drop the endpoint and build a new one (fresh socket and runtime); an agent re-dials.
@@ -293,6 +306,9 @@ pub struct Spec {
     pub server: bool,
     /// Agent side: a dial with no answer in this long is abandoned and reported `Unreachable`.
     pub dial_deadline: Duration,
+    /// Server side: the keys (SPKI SHA-256, hex) whose certificates are refused from the start
+    /// (W27-R01, `crate::identities::revoked_keys`).
+    pub revoked_keys: Vec<String>,
 }
 
 /// How long an agent's dial may go unanswered (a server that is down, or not routable yet at
@@ -393,7 +409,8 @@ fn build(spec: &Spec) -> anyhow::Result<AnyDriver> {
     let now = Instant::now();
     if spec.server {
         let cfg = Config { tls, role: Role::Server, limits: limits(true), congestion: Default::default() };
-        let ep = Endpoint::<Kiln, _, _>::new(cfg, budget, ServerBook::default(), now)
+        let book = ServerBook { revoked_keys: spec.revoked_keys.iter().cloned().collect(), ..ServerBook::default() };
+        let ep = Endpoint::<Kiln, _, _>::new(cfg, budget, book, now)
             .map_err(|r| anyhow::anyhow!("endpoint: {r}"))?;
         let d = Driver::bind(ep, spec.bind, io).map_err(|e| anyhow::anyhow!("bind {}: {e}", spec.bind))?;
         Ok(AnyDriver::Server(d))
@@ -697,6 +714,17 @@ async fn run_loop(
                                 d.endpoint().directory_mut().revoked.remove(&name);
                             }
                         }
+                        Out::RevokeKeys { keys } => {
+                            if let AnyDriver::Server(d) = &mut driver {
+                                let now = clock!(d);
+                                let book = d.endpoint().directory_mut();
+                                let peers: Vec<PeerId> = book.keys.iter().filter(|(_, k)| keys.contains(k)).map(|(p, _)| *p).collect();
+                                book.revoked_keys.extend(keys);
+                                for p in peers {
+                                    d.endpoint().disconnect(now, p);
+                                }
+                            }
+                        }
                         Out::Connect { addr } => {
                             *last_dial.lock().unwrap_or_else(PoisonError::into_inner) = Some(addr);
                             if let AnyDriver::Agent(d) = &mut driver {
@@ -851,6 +879,56 @@ mod tests {
             .map_err(|_| anyhow::anyhow!("event stream closed"))
     }
 
+    /// The server's next `Connected`, skipping other events; `None` once `within` passes.
+    async fn connected_within(rx: &async_channel::Receiver<NetEvent>, within: Duration) -> Option<PeerId> {
+        let deadline = Instant::now() + within;
+        loop {
+            match next_event(rx, deadline).await {
+                Ok(NetEvent::Connected { peer, .. }) => return Some(peer),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// W27-R01: a revoked key's certificate is dropped at once and refused when it comes back,
+    /// and a server started with it revoked refuses it from the first handshake; another key of
+    /// the same machine name (enrolled again) is welcome.
+    #[test]
+    fn w27_r01_revoked_keys_are_refused_from_the_moment_and_after_a_restart() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open_scratch(dir.path())?;
+            let (old, new) = (pki.issue_local("fedora-2")?, pki.issue_local("fedora-2")?);
+            let old_key = crate::pki::fingerprints(&old.cert_pem)?.key;
+            let addr = |s: std::net::UdpSocket| s.local_addr();
+            let a1 = addr(std::net::UdpSocket::bind("127.0.0.1:0")?)?;
+            let (srv, srv_ev) = start(Spec { bind: a1, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, _agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: old.clone(), server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
+            agent.command(Out::Connect { addr: a1 }).await;
+            let peer = connected_within(&srv_ev, Duration::from_secs(10)).await.ok_or_else(|| anyhow::anyhow!("never connected"))?;
+            srv.command(Out::RevokeKeys { keys: vec![old_key.clone()] }).await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match next_event(&srv_ev, deadline).await? {
+                    NetEvent::Closed { peer: p, .. } if p == peer => break,
+                    _ => {}
+                }
+            }
+            agent.command(Out::Connect { addr: a1 }).await;
+            assert_eq!(connected_within(&srv_ev, Duration::from_secs(3)).await, None, "a revoked key comes back: refused");
+            // A server started with the key revoked (a restart reading the store).
+            let a2 = addr(std::net::UdpSocket::bind("127.0.0.1:0")?)?;
+            let (_srv2, srv2_ev) = start(Spec { bind: a2, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: vec![old_key] })?;
+            agent.command(Out::Connect { addr: a2 }).await;
+            assert_eq!(connected_within(&srv2_ev, Duration::from_secs(3)).await, None, "refused from the first handshake");
+            let (agent2, _ev2) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: new, server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
+            agent2.command(Out::Connect { addr: a2 }).await;
+            assert!(connected_within(&srv2_ev, Duration::from_secs(10)).await.is_some(), "the same name with a new key connects");
+            Ok(())
+        })
+    }
+
     /// A test build's fault sends the frames it picks twice, or late: after the next frame on its
     /// lane, or once `LATE_FOR` passes with none.
     #[test]
@@ -952,8 +1030,8 @@ mod tests {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
             let addr = probe.local_addr()?;
             drop(probe);
-            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE })?;
-            let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local(&name)?, server: false, dial_deadline: DIAL_DEADLINE })?;
+            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local(&name)?, server: false, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
             for f in agent_faults {
                 agent.command(Out::Shed(f)).await;
             }
@@ -1135,7 +1213,7 @@ mod tests {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
             let addr = probe.local_addr()?;
             drop(probe);
-            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: server_leaf, server: true, dial_deadline: DIAL_DEADLINE })?;
+            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: server_leaf, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
             let agent_leaf = pki.issue_local("bench-1")?;
             let (agent, agent_ev) = start(Spec {
                 bind: "127.0.0.1:0".parse()?,
@@ -1143,6 +1221,7 @@ mod tests {
                 leaf: agent_leaf,
                 server: false,
                 dial_deadline: Duration::from_secs(2),
+                revoked_keys: Vec::new(),
             })?;
 
             // A dial into the void (nothing listens there) is abandoned at the deadline and
