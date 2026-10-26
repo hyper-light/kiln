@@ -1998,7 +1998,7 @@ jobs:
 
 /// W08-R08: v1's `artifacts:` on the engine are an artifact of each leg (`artifacts-<key>`), so
 /// every leg of a job list that keeps them uploads its own, as release.yaml's three platforms do
-/// (W26 step 3); one name for all of them refused the second leg's.
+/// (W28 step 3); one name for all of them refused the second leg's.
 #[test]
 fn w08_r08_each_legs_artifacts_are_its_own() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

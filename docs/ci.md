@@ -956,7 +956,7 @@ references, lints and their fixes), `schema.rs` (JSON Schemas from `keys.rs`), `
 returns a broken file with its diagnostics for the run to show. `[ci] kiln_workflows` (off by
 default) lets the engine run `.kiln/` workflows too, v1 standing aside for a commit the engine
 took: the kiln dialect's outputs, exports and implicit checkout run on it end to end. kiln's own
-release pipeline runs there too (W26 step 3):
+release pipeline runs there too (W28 step 3):
   - Each successful leg of it has its `artifacts-<key>` artifact (W08-R08) read, and the
     `kiln-<target>` binaries in it are checked and kept for runners to upgrade to (`[updates]`,
     docs/releases.md), as v1's jobs' tarballs are.
@@ -8055,7 +8055,7 @@ Production's engine is off, so it can't plan them itself.
 
 | File | Kind | Plan for a push to `main` | Legs | Before it can run on the engine |
 |---|---|---|---|---|
-| `ci.yaml` | workflow | runs | 5: `rust`, `ui`, `vendor` on `[k8s]`; `ui-checks` on `[baremetal, linux]`; `release-binary` on `[baremetal, local]` | nothing left (W26 step 3): the `k8s` legs go to a `k8s` pool, in the pods v1 makes for them (W02-R06, W13-R07); `ui-checks`' `linux` matches `Linux` |
+| `ci.yaml` | workflow | runs | 5: `rust`, `ui`, `vendor` on `[k8s]`; `ui-checks` on `[baremetal, linux]`; `release-binary` on `[baremetal, local]` | nothing left (W28 step 3): the `k8s` legs go to a `k8s` pool, in the pods v1 makes for them (W02-R06, W13-R07); `ui-checks`' `linux` matches `Linux` |
 | `bench.yaml` | workflow | runs | 3 on `[baremetal, bench]` | nothing: production has both labels |
 | `e2e.yaml` | workflow | doesn't run (`branches` doesn't match `main`) | 62 when it runs, its `k8s` jobs among them | nothing left: its `k8s` jobs as `ci.yaml`'s |
 | `image.yaml` | workflow | runs | 1 on `[baremetal, local]` | nothing left: it tags `kiln:$KILN_SHA`, which the engine's runner now sets (v1's job variables, W02-R06) |
@@ -8066,7 +8066,7 @@ Production's engine is off, so it can't plan them itself.
 | `deploy.yaml` | KilnCD's policy, not a workflow | not planned (no `jobs:`) | | nothing: CD reads it |
 | `environments.yaml` | KilnCD's environments, not a workflow | not planned (no `jobs:`) | | nothing: CD reads it |
 
-W26 step 3 (branch `ci-w25-engine`) did what the last column asked, and holds it with tests:
+W28 step 3 (branch `ci-w25-engine`) did what the last column asked, and holds it with tests:
 
 - *The `k8s` pool.* A `[[ci.pools]]` of `executor = "k8s"` and `labels = ["k8s"]` takes the
   `[k8s]` legs, and a kiln-dialect leg on it whose job sets `toolchain:`, `image:` or `resources:`
@@ -8080,7 +8080,7 @@ W26 step 3 (branch `ci-w25-engine`) did what the last column asked, and holds it
   production's machines, outside the jobs namespace and its quota.
 - *Labels.* Matching ignores case, in the engine's routing, v1's `carries` and `KCI6007`, as
   GitHub's does: `[baremetal, linux]` fits a runner labelled `Linux`, or one whose only Linux label
-  is the platform's (W05-R21's tests). `w26_kilns_own_workflows_check_plan_and_route` checks every
+  is the platform's (W05-R21's tests). `w28_kilns_own_workflows_check_plan_and_route` checks every
   file above in the kiln dialect, plans it for its own trigger as the server does, and routes each
   leg to the `k8s` pool or one of production's runners (their labels and facts from
   `ci.runners.list`, `tests/fixtures/production-runners.json`).
