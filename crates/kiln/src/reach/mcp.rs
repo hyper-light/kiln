@@ -525,7 +525,7 @@ impl Server {
             cwd: Some(cwd.clone()),
             remote_cwd: if sync { None } else { s("cwd") },
             sync,
-            env,
+            env: super::directory::with_needs(env, s("needs").as_deref().unwrap_or_default()),
             stdin: false,
             timeout_ms: args.get("timeout_s").and_then(Value::as_f64).map(|t| (t.max(0.0) * 1000.0) as u64),
             shell: s("shell"),

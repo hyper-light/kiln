@@ -285,6 +285,20 @@ pub fn target(on: &str, needs: &str) -> Result<String, String> {
     Ok([on.trim(), needs.trim()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(","))
 }
 
+/// Where a command `kiln run --needs` (or MCP's `run` with `needs`) runs finds its needs, as they
+/// were written: `ci/gate.sh` holds itself to them.
+pub const NEEDS_ENV: &str = "KILN_NEEDS";
+
+/// A command's environment `env` with `needs` in [`NEEDS_ENV`] (none asked: as it was).
+pub fn with_needs(mut env: Vec<(String, String)>, needs: &str) -> Vec<(String, String)> {
+    let needs = needs.trim();
+    if !needs.is_empty() {
+        env.retain(|(k, _)| k != NEEDS_ENV);
+        env.push((NEEDS_ENV.to_owned(), needs.to_owned()));
+    }
+    env
+}
+
 pub fn human_bytes(n: u64) -> String {
     let gib = n as f64 / (1024.0 * 1024.0 * 1024.0);
     if gib >= 1.0 { format!("{gib:.0} GB") } else { format!("{:.0} MB", n as f64 / (1024.0 * 1024.0)) }
@@ -526,6 +540,34 @@ mod tests {
         // `--needs` is needs alone: a runner's name there is a mistake, said as such.
         assert_eq!(target("", "adacachy"), Err("adacachy: no such need".to_owned()));
         assert_eq!(target("adacachy", "memm=4g"), Err("memm=4g: no such need".to_owned()));
+    }
+
+    /// The command finds what it was asked for in KILN_NEEDS, `--needs` over a `--env` of the same.
+    #[test]
+    fn kiln_run_gives_the_command_its_needs() {
+        let mine = vec![("A".to_owned(), "1".to_owned()), (NEEDS_ENV.to_owned(), "cpus=1".to_owned())];
+        assert_eq!(with_needs(mine.clone(), " cpus=12,mem=40g,linux/amd64 "), vec![("A".to_owned(), "1".to_owned()), (NEEDS_ENV.to_owned(), "cpus=12,mem=40g,linux/amd64".to_owned())]);
+        assert_eq!(with_needs(mine.clone(), ""), mine);
+    }
+
+    /// The gate asks for what it needs (AGENTS.md, ci/gate.sh) and goes to a runner that has it, by
+    /// no name: the one with 12 cores idle and 40 GiB free.
+    #[test]
+    fn kiln_run_puts_the_gate_on_a_runner_with_room_for_it() -> anyhow::Result<()> {
+        let fleet = [
+            runner("mac", "macos", "aarch64", 24, 0.0, 60),
+            runner("small", "linux", "x86_64", 8, 0.0, 48),
+            runner("busy", "linux", "x86_64", 32, 75.0, 60),
+            runner("tight", "linux", "x86_64", 32, 0.0, 30),
+            runner("roomy", "linux", "x86_64", 32, 10.0, 56),
+        ];
+        let want = Want::parse("cpus=12,mem=40g,linux/amd64")?;
+        let (ok, passed) = rank(&fleet, &want, "small");
+        assert_eq!(ok.iter().map(|c| c.runner.name.as_str()).collect::<Vec<_>>(), ["roomy"], "{passed:?}");
+        for (n, why) in [("mac", "macos is not linux"), ("small", "8 of 8 cores idle, under 12 CPUs"), ("busy", "8 of 32 cores idle, under 12 CPUs"), ("tight", "30 GB free, under 40 GB")] {
+            assert!(passed.iter().any(|(m, w)| m == n && w == why), "{n}: {passed:?}");
+        }
+        Ok(())
     }
 
     #[test]

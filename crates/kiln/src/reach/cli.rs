@@ -35,7 +35,8 @@ pub struct RunArgs {
     /// What the work needs: what the runner must be and have (`linux/amd64`, `macos`, `+gpu`,
     /// `tool:cargo`, `cpus>=16`) and the room it asks for, idle and free there now (`cpus=8`,
     /// `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it). This machine when it has it
-    /// and room to spare, else the idlest runner that has it. Default: the best of all.
+    /// and room to spare, else the idlest runner that has it. Default: the best of all. The command
+    /// finds them in KILN_NEEDS (`ci/gate.sh` holds itself to them).
     #[arg(long, default_value = "")]
     pub needs: String,
     /// A runner by name, for work that has to happen on that machine (it must still meet
@@ -142,7 +143,7 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
         cwd: Some(here.to_string_lossy().into_owned()),
         remote_cwd: a.cwd.clone(),
         sync,
-        env,
+        env: super::directory::with_needs(env, &a.needs),
         stdin: a.stdin,
         timeout_ms: a.timeout.map(|s| s.saturating_mul(1000)),
         shell: a.shell.clone(),
