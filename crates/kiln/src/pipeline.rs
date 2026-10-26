@@ -178,7 +178,7 @@ pub struct StepSpec {
 }
 
 /// A concrete, matrix-expanded unit of work ready to be queued.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PlannedJob {
     /// `test` or `test (profile=release)`.
     pub key: String,
@@ -197,13 +197,57 @@ pub struct PlannedJob {
     pub artifacts: Vec<String>,
     pub cache: Vec<String>,
     pub condition: Option<String>,
-    /// What a runner's facts must meet for the job to go there ([`JobSpec::requires`]). Always
-    /// written, none or some: a planned job goes to runners in postcard (`ServerMsg::Assign`), whose
-    /// fields are read by place, so one skipped when empty had a runner read the steps in its place
-    /// and refuse the job as malformed. `default` reads plans stored before it.
+    /// What a runner's facts must meet for the job to go there ([`JobSpec::requires`]). Written even
+    /// when empty: an assignment carries the job in postcard, which reads each field in turn, so one
+    /// left out puts every field after it out of step and the runner refuses the job as malformed.
+    /// Only a runner from before the CI work goes without it ([`PlannedJob::for_runner`]).
     #[serde(default)]
     pub requires: Vec<String>,
     pub steps: Vec<StepSpec>,
+    /// Written without `requires`, for a runner that reads a job without it; never kept.
+    #[serde(skip)]
+    pub without_requires: bool,
+}
+
+impl PlannedJob {
+    /// The job as a runner with capabilities `caps` reads it. One from before the CI work (no
+    /// [`crate::proto::CAP_CI2`], W22-AC09's mixed fleet) knows no `requires`, and it's sent only
+    /// jobs that require nothing, as it reports no facts to meet a requirement.
+    pub fn for_runner(mut self, caps: u32) -> Self {
+        self.without_requires = caps & crate::proto::CAP_CI2 == 0;
+        self
+    }
+}
+
+// By hand for `requires`, which a runner from before the CI work reads a job without: the fields
+// in their order, as the derived `Deserialize` reads them.
+impl Serialize for PlannedJob {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut j = s.serialize_struct("PlannedJob", 16 + usize::from(!self.without_requires))?;
+        j.serialize_field("key", &self.key)?;
+        j.serialize_field("spec_id", &self.spec_id)?;
+        j.serialize_field("display", &self.display)?;
+        j.serialize_field("needs", &self.needs)?;
+        j.serialize_field("labels", &self.labels)?;
+        j.serialize_field("image", &self.image)?;
+        j.serialize_field("toolchain", &self.toolchain)?;
+        j.serialize_field("env", &self.env)?;
+        j.serialize_field("timeout_minutes", &self.timeout_minutes)?;
+        j.serialize_field("retries", &self.retries)?;
+        j.serialize_field("exclusive", &self.exclusive)?;
+        j.serialize_field("resources", &self.resources)?;
+        j.serialize_field("artifacts", &self.artifacts)?;
+        j.serialize_field("cache", &self.cache)?;
+        j.serialize_field("condition", &self.condition)?;
+        if self.without_requires {
+            j.skip_field("requires")?;
+        } else {
+            j.serialize_field("requires", &self.requires)?;
+        }
+        j.serialize_field("steps", &self.steps)?;
+        j.end()
+    }
 }
 
 pub const MATRIX_LIMIT: usize = 256;
@@ -522,6 +566,7 @@ pub fn plan(p: &Pipeline, base: &Context) -> Result<Vec<PlannedJob>, SpecError> 
                 condition: job.condition.as_ref().map(|c| ctx.interpolate(c)),
                 requires: requirements(job.requires.as_ref()).iter().map(|r| ctx.interpolate(r)).collect(),
                 steps,
+                without_requires: false,
             });
         }
         legs.insert(id.clone(), keys);
