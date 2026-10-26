@@ -8504,6 +8504,83 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
 `kiln_ci::sched::state`, `crates/kiln/src/ci/dispatch.rs`, step 1's replayer and
 `crates/kiln/tests/warm_cancel.rs`.
 
+**Requirements: identical steps shared across pipelines** (step 7's, R70–R79; kiln plan
+`01a1751638db73ba809b8bf4abb6f386`)
+
+- **W28-R70 Portable steps.** A memo step that gives `memo.platform` (a list of the facets its key
+  keeps: `os`, `arch`, `libc`, `executor`, `image`; `any` for none) and its `memo.inputs` is keyed
+  by what it declares and nothing else (`kiln_ci::work::memo::portable_unit`): its definition, the
+  values of its `memo.env` and of the per-run variables its text names, its inputs' git trees, the
+  facets it lists, the toolchains of R71, the earlier memo steps whose `memo.outputs` its inputs
+  name (by their own key, never their place in the job) and its trust. Not its job's `needs`, the
+  job's or workflow's other variables, or the runner's environment. The same step keys alike in
+  every workflow, job, executor and runner, so pipelines can share it. Without `memo.platform`, a
+  step keys as W24-R07 has it.
+- **W28-R71 Toolchains in the key.** `memo.tools: { node: major, rustc: full }`: the runner asks
+  each where the step runs (`rustc -vV`, else `--version`, found on the step's `PATH`, a login
+  shell's or the usual folders) and the key takes the first number of its version (`major`), the
+  first two (`minor`) or a digest of all it said (`full`). A tool that names no version, or a step
+  in a job container, isn't keyed: it runs, saying why.
+- **W28-R72 One execution in flight.** `kiln_ci::work::flight`, pure: a miss is a turn. The first
+  leg to reach a step's key in its trust domain gets its lease and executes it, renewing the lease
+  every 15 s; the others wait. The server keeps the table (`Hub::flight`) and its leases in SQLite
+  (`work_flight`), so a restart rebuilds it. A success is recorded before its lease goes, so a
+  waiter's next lookup is a hit.
+- **W28-R73 Turns.** A lease ends by success, by release (a failure, a cancel: never anyone's
+  result) or by lapsing 60 s after its last renewal (a lost runner). Waiters take turns in the order
+  they asked; one not heard from in 90 s has left.
+- **W28-R74 Domains.** A leg waits on an execution of its own domain or of one it may read
+  (W24-R21: an untrusted or person's leg on a trusted one) and only takes leases in its own.
+  Protected legs share nothing (W24 decision 4, W28-R41).
+- **W28-R75 The runner waits, then materializes.** `/_kiln/work/v1/lookup` with `flight: true`
+  answers 200 (a hit), 201 `{ lease }` or 202 `{ in_flight }`; `wait` holds a waiter up to 20 s at
+  a time, `renew` and `release` keep and let go a lease, and `record` takes the lease it ends. The
+  waiting step says on what (`waiting on step 0 of run #12 (.kiln/release.yaml, on fedora)`), for
+  as long as the job may, then replays the success, naming the run it came from (W24-R28). Its
+  files are put in place from the runner's content store first (W24-R08), else the server's, and
+  kept in the runner's store as they come.
+- **W28-R76 v1 reads it.** v1's step reads `memo:` and ignores it, so `.kiln/` workflows that share
+  steps on the engine still run on v1 until step 3 hands them over.
+- **W28-R77 One UI build per ui/ tree.** ci's `ui`, `ui-checks` and `release-binary` jobs, release's
+  `linux`, `windows` and `macos` jobs and the image job build the UI with the same step: `npm ci`
+  and `KILN_UI_SERVER=off npm run build`, `memo: { inputs: [ui], outputs: [ui/dist], platform:
+  any, tools: { node: major } }`. Packing Bun stays each build's own (`pack-ui-server.mjs`,
+  `ci/release/build.sh`).
+- **W28-R78 One x86_64 musl build per commit.** Release's `linux` job and the image job build
+  `x86_64-unknown-linux-musl` with the same step, after the UI step: `KILN_COMMIT=$KILN_SHA
+  ci/release/build.sh x86_64-unknown-linux-musl`, `platform: [os, arch]`, `tools: { rustc: full }`,
+  its commit named because the binary embeds it. The image takes that binary
+  (`docker build --target prebuilt`) until W24-R29's operations replace BuildKit; a plain
+  `docker build .` still builds from source.
+
+**Acceptance criteria: identical steps shared**
+
+- **W28-AC70 Portable keys.** Over 10⁵ random single-component edits, an undeclared one (executor,
+  image, OS, `needs`, a job's variable) never changes a portable key and a declared one (script,
+  `memo.env`, inputs, a tool's identity, outputs) always does. *Property test* (`cargo test -p
+  kiln-ci work::memo`).
+- **W28-AC72 Single-flight.** Over 10,000 random sequences of asks, renewals, endings, departures,
+  lapses and restarts: one lease per key and domain at a time, an execution only under a lease the
+  table holds for it, waits only on domains the waiter may read, and the same steps give the same
+  answers. *Property test* (`cargo test -p kiln-ci work::flight`).
+- **W28-AC73 A failure is the next turn.** Two pipelines reach a failing portable step together:
+  each runs it, one after waiting; nothing is reused. *E2E* (`cargo test -p kiln --test
+  memo_share`).
+- **W28-AC75 Two pipelines, one execution.** Two workflows differing in name, job and job
+  variables reach the same portable step together: one executes it, the other says what it waits
+  on, then replays it naming the producing run, and the files both show are the same bytes; a push
+  touching nothing it reads reuses it in both. *E2E* (`cargo test -p kiln --test memo_share`).
+- **W28-AC77 One UI build per tree.** Each of the seven jobs' UI steps, keyed as its runner would on
+  its own platform, with its own `needs`, variables and node build: one key. *Test over `.kiln/`*
+  (`cargo test -p kiln --test kiln_workflows_share`).
+- **W28-AC78 One musl build per commit.** Release's and the image's x86_64 steps: one key; another
+  rustc or another UI is another. *Test over `.kiln/`* (the same).
+
+**Progress (step 7).** R70–R78 and AC70–AC78 built (2026-10-26) in `kiln_ci::work::{memo,
+flight}`, `crates/kiln/src/ci/services/memo.rs`, `crates/kiln/src/runner/runtime/memo.rs`, `.kiln/`
+and the `Dockerfile`, on W24's ledger and memo steps (land/w24, through ci-w25-engine) and the
+runner's cache service (ci-w24-m2-cache), merged in. Live counts wait for step 3's switch.
+
 **M2 (built 2026-10-25, awaiting review).**
 
 - **The runner's cache service** (R08, `crates/kiln/src/runner/work`): objects at `<work>/_cas`,
