@@ -148,6 +148,8 @@ fn default_timeout() -> u32 {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "JobResources"))]
 #[serde(deny_unknown_fields)]
 pub struct Resources {
     #[serde(default)]
@@ -157,6 +159,7 @@ pub struct Resources {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct StepSpec {
     #[serde(default)]
@@ -179,6 +182,7 @@ pub struct StepSpec {
 
 /// A concrete, matrix-expanded unit of work ready to be queued.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct PlannedJob {
     /// `test` or `test (profile=release)`.
     pub key: String,

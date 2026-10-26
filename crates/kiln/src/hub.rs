@@ -23,6 +23,7 @@ use crate::net::{Kind, NetEvent, NetHandle};
 use crate::pipeline::Context;
 use crate::proto::{self, AgentMsg, Assignment, Hello, JobResult, LANE_CONTROL, LANE_TERM, ServerMsg};
 use crate::store::{AgentRow, Job, Status, Store};
+use crate::wire::events::ServerEvent;
 
 /// How long a persistent agent may be gone before its jobs are requeued.
 pub(crate) const AGENT_GRACE: Duration = Duration::from_secs(45);
@@ -255,6 +256,7 @@ fn stream_of(msg: &ServerMsg) -> Option<crate::wire::commands::Kind> {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct AgentLive {
     pub name: String,
     #[serde(skip)]
@@ -275,13 +277,21 @@ pub struct AgentLive {
     pub sample: Option<HostSample>,
     /// Its battery, when it has one and its runner says ([`AgentMsg::Power`]).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub battery: Option<crate::os::battery::Battery>,
     /// What its QUIC layer let go before the wire, by lane and reason, as it last said
     /// ([`AgentMsg::NetDrops`]); and what the server's let go of what it had for it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<proto::NetDrop>>", optional))]
     pub dropped: Vec<proto::NetDrop>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<proto::NetDrop>>", optional))]
     pub dropped_toward: Vec<proto::NetDrop>,
+    /// What of its messages the server couldn't read, and of the server's it couldn't
+    /// (`crate::wire::unread`): how many by wire and code, and the newest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub refused: Option<crate::wire::unread::Kept>,
     pub terminal: bool,
     /// An outpost (`kiln outpost`, [`crate::proto::CAP_OUTPOST`]): kiln run where it isn't
     /// installed. It takes no jobs and the server doesn't upgrade it.
@@ -294,13 +304,16 @@ pub struct AgentLive {
     pub lost_at: Option<Instant>,
     /// What the runner's probes found and its administrator declared (docs/ci.md W13-R01, R02).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub facts: Option<Box<kiln_ci::facts::RunnerFacts>>,
     /// The machine's runner processes, while it has more than one (a runner replaced without a
     /// restart: the old one keeps its terminals until they end). See `crate::instances`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<crate::instances::InstanceView>>", optional))]
     pub instances: Vec<crate::instances::InstanceView>,
     /// How its connection reaches the server, while connected (`GET /api/agents`).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub transport: Option<crate::tunnel::Transport>,
     /// How far its (newest process's) kiln is behind the server's (`crate::skew`): to be upgraded,
     /// it takes no new work.
@@ -387,6 +400,9 @@ pub struct Hub {
     /// Time, as the goal driver and what else moves onto it take it: kiln's runtime in production,
     /// a simulated clock in tests (kiln-seams' `Clock`, docs/seams.md).
     pub clock: Arc<dyn kiln_seams::Clock>,
+    /// What the wires couldn't read (`crate::wire::unread`): counted, kept for each runner's and
+    /// agent session's page, audited.
+    pub refusals: Mutex<crate::wire::unread::Refusals>,
     /// Agents that have been sent Cancel for a job, with when (for the timeout escalation).
     cancel_sent: Mutex<HashMap<String, Instant>>,
     /// (job, agent) pairs recently declined: not offered again until DECLINE_BACKOFF passes.
@@ -522,6 +538,7 @@ impl Hub {
             gitops_wanted: Mutex::new(HashSet::new()),
             tool_fixes: Mutex::new(HashMap::new()),
             shutdown,
+            refusals: Mutex::new(crate::wire::unread::Refusals::new(Arc::clone(&clock))),
             clock,
             cancel_sent: Mutex::new(HashMap::new()),
             declined: Mutex::new(HashMap::new()),
@@ -584,7 +601,7 @@ impl Hub {
                 let targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
                 tracing::info!(run = run.number, targets = ?targets, "runners' binaries built by the release pipeline");
                 self.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} run #{} ({}): {}", run.pipeline, run.number, run.sha.get(..12).unwrap_or(&run.sha), targets.join(", "))).await;
-                self.emit(&serde_json::json!({ "type": "updates" }));
+                self.emit(&ServerEvent::Updates);
                 self.updates.fleet.wake();
             }
             Ok(_) => {}
@@ -687,7 +704,7 @@ impl Hub {
         match crate::sync::wire::decode(json) {
             Some(crate::sync::wire::Msg::Repos(r)) => {
                 if self.places.heard(machine, r) {
-                    self.emit(&serde_json::json!({ "type": "places" }));
+                    self.emit(&ServerEvent::Places);
                 }
                 // Said when it connects, and when what it holds changes: what it shares.
                 self.shares.arrange(self);
@@ -730,37 +747,85 @@ impl Hub {
 
     /// Tell every UI that the session list changed.
     pub fn emit_terminals(&self) {
-        self.emit(&serde_json::json!({ "type": "terminals" }));
+        self.emit(&ServerEvent::Terminals);
     }
 
-    pub fn emit(&self, v: &serde_json::Value) {
+    /// Sends `e` down every events socket (`GET /api/events`) and to kiln's own listeners.
+    pub fn emit(&self, e: &ServerEvent) {
         if self.events.receiver_count() > 0 {
-            self.events.send(Arc::from(v.to_string()));
+            self.events.send(Arc::from(e.text()));
         }
     }
 
     pub async fn emit_job(&self, job_id: &str) {
         if let Ok(Some(mut j)) = self.store.job(job_id.to_owned()).await {
             j.spec = None;
-            self.emit(&serde_json::json!({"type": "job", "job": j}));
+            self.emit(&ServerEvent::Job { job: Box::new(j) });
         }
     }
 
     pub async fn emit_run(&self, run_id: &str) {
         if let Ok(Some(r)) = self.store.run(run_id.to_owned()).await {
-            self.emit(&serde_json::json!({"type": "run", "run": r}));
+            self.emit(&ServerEvent::Run { run: Box::new(r) });
         }
     }
 
     pub(crate) fn emit_agent(&self, a: &AgentLive) {
-        self.emit(&serde_json::json!({"type": "agent", "agent": a}));
+        self.emit(&ServerEvent::Agent { agent: Box::new(a.clone()) });
+    }
+
+    /// A message a wire couldn't read (`crate::wire::unread`): counted, kept for its sender's page
+    /// and `on`'s, audited, and each page it changed told. Some: tell its sender now, of how many
+    /// before it it wasn't told; None: not now.
+    pub async fn note_unread(&self, u: crate::wire::unread::Unread, on: Option<crate::wire::unread::Page>) -> Option<u64> {
+        let noted = self.refusals.lock().note(u, on);
+        self.audit_unread(noted.rows).await;
+        for page in &noted.changed {
+            self.emit_refused(page);
+        }
+        noted.tell
+    }
+
+    /// The audit log's rows a minute for what the wires couldn't read, as they come due.
+    pub(crate) async fn tick_unread(&self) {
+        let rows = self.refusals.lock().tick();
+        self.audit_unread(rows).await;
+    }
+
+    async fn audit_unread(&self, rows: Vec<crate::wire::unread::Row>) {
+        for r in rows {
+            let e = crate::audit::Entry {
+                principal: r.principal,
+                action: crate::wire::unread::ACTION.to_owned(),
+                target: Some(r.target.to_owned()),
+                result: r.result.to_owned(),
+                ip: r.address,
+                detail: r.detail,
+                ..Default::default()
+            };
+            crate::audit::write(&self.store, e).await;
+        }
+    }
+
+    /// `page`'s refusals changed: its viewers are told, a runner's in its record, an agent
+    /// session's in its info.
+    fn emit_refused(&self, page: &crate::wire::unread::Page) {
+        let kept = self.refusals.lock().kept(page).cloned();
+        match page {
+            crate::wire::unread::Page::Runner(name) => {
+                let a = self.agents.lock().get(name).cloned();
+                if let Some(mut a) = a {
+                    a.refused = kept;
+                    self.emit_agent(&a);
+                }
+            }
+            crate::wire::unread::Page::Session(id) => self.harness.set_refused(self, id, kept),
+        }
     }
 
     pub fn emit_queue(&self) {
         let m = metrics::global();
-        self.emit(&serde_json::json!({
-            "type": "queue", "queued": m.jobs_queued.get(), "running": m.jobs_running.get()
-        }));
+        self.emit(&ServerEvent::Queue(crate::wire::events::Queue::Counts { queued: m.jobs_queued.get(), running: m.jobs_running.get() }));
     }
 
     pub fn record_sample(&self, agent: &str, s: HostSample) {
@@ -775,7 +840,7 @@ impl Hub {
         if agent != "server" {
             metrics::agent_samples().write().insert(agent.to_owned(), s.clone());
         }
-        self.emit(&serde_json::json!({"type": "sample", "agent": agent, "sample": s}));
+        self.emit(&ServerEvent::Sample { agent: agent.to_owned(), sample: Box::new(s) });
     }
 
     // ------------------------------------------------------------ agent view
@@ -809,6 +874,7 @@ impl Hub {
                     battery: None,
                     dropped: Vec::new(),
                     dropped_toward: Vec::new(),
+                    refused: None,
                     terminal: false,
                     dedicated_job: None,
                     exclusive: false,
@@ -831,6 +897,7 @@ impl Hub {
         for a in &mut out {
             a.transport = a.peer.filter(|_| a.connected).map(|p| self.tunnels.transport(p));
             a.dropped_toward = a.peer.map(|p| metrics::net().toward(p)).unwrap_or_default();
+            a.refused = self.refusals.lock().kept(&crate::wire::unread::Page::Runner(a.name.clone())).cloned();
         }
         out.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
         out
@@ -1191,6 +1258,8 @@ impl Hub {
                 self.send_waited(peer, waited).await;
             }
             self.flush_commands().await;
+            // The audit log's rows a minute for what the wires couldn't read.
+            self.tick_unread().await;
             // What the server has of each runner's streams, said again every few seconds: one lost
             // below the channel mustn't hold a runner's updates up until its next connection.
             if said.elapsed() >= HAVE_AGAIN {
@@ -1396,7 +1465,7 @@ impl Hub {
             let what = format!("{agent} is on battery at {}%{left}: plug it in, or it sleeps and its runner with it", b.percent);
             tracing::warn!(machine = %agent, percent = b.percent, minutes = ?b.minutes, "a machine on battery is low");
             self.store.audit("kiln".into(), "machine.battery_low".into(), what.clone()).await;
-            self.emit(&serde_json::json!({"type": "machine.battery_low", "machine": agent, "battery": b, "text": what}));
+            self.emit(&ServerEvent::MachineBatteryLow { machine: agent.to_owned(), battery: b, text: what });
         }
     }
 
@@ -1454,7 +1523,7 @@ impl Hub {
         // Its agent sessions keep running there too; they are announced again on reconnect.
         self.harness.machine_lost(self, name);
         if self.ai_sessions.lock().remove(name).is_some() {
-            self.emit(&serde_json::json!({ "type": "ai_sessions", "machine": name }));
+            self.emit(&ServerEvent::AiSessions { machine: name.to_owned() });
         }
         self.update_slot_gauges();
         self.emit_agent(&snapshot);
@@ -1638,7 +1707,7 @@ impl Hub {
                 Ok(sessions) => {
                     let old = self.ai_sessions.lock().insert(agent.clone(), sessions.clone());
                     if old.as_ref() != Some(&sessions) {
-                        self.emit(&serde_json::json!({ "type": "ai_sessions", "machine": agent }));
+                        self.emit(&ServerEvent::AiSessions { machine: agent.to_owned() });
                     }
                 }
                 Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable AI session report"),
@@ -1690,7 +1759,7 @@ impl Hub {
                 }
                 self.updates.on_build(self, &agent, &build);
                 self.updates.fleet.wake();
-                self.emit(&serde_json::json!({ "type": "updates" }));
+                self.emit(&ServerEvent::Updates);
                 crate::frontdoor::control::on_build(self, &agent, caps).await;
                 if caps & proto::CAP_SYNC != 0 {
                     self.sync_announced(&agent).await;
@@ -1713,7 +1782,7 @@ impl Hub {
             AgentMsg::UpdatePrefs { accept } => {
                 self.updates.fleet.set_accept(&agent, accept);
                 self.updates.fleet.wake();
-                self.emit(&serde_json::json!({ "type": "updates" }));
+                self.emit(&ServerEvent::Updates);
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
             AgentMsg::Cluster { json, raft } => match (self.store.group(), crate::store::learner::decode(&json)) {
@@ -2131,6 +2200,7 @@ impl Hub {
             battery: None,
             dropped: Vec::new(),
             dropped_toward: Vec::new(),
+            refused: None,
             terminal: h.terminal,
             dedicated_job: h.dedicated_job.clone(),
             exclusive: false,
@@ -2878,6 +2948,56 @@ impl Hub {
 pub(crate) mod tests {
     use super::*;
 
+    fn unread(wire: crate::wire::unread::Wire, from: crate::wire::unread::Sender) -> crate::wire::unread::Unread {
+        crate::wire::unread::Unread { wire, from, what: "variant 51".into(), code: crate::wire::unread::Code::Unknown, why: "AgentMsg has 51 variants".into() }
+    }
+
+    /// A message a runner sent that couldn't be read (typed messages, step 1): its row is in the audit
+    /// log, its runner's record carries it, and the runner's page is told.
+    #[test]
+    fn a_refusal_noted_is_audited_kept_on_its_runner_and_its_page_told() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |_| {}).await?;
+            hub.agents.lock().insert("fedora".into(), live_runner("fedora", "linux", "x86_64"));
+            let mut events = hub.events.subscribe();
+            let fedora = crate::wire::unread::Sender::Runner { name: "fedora".into(), instance: "main".into() };
+            anyhow::ensure!(hub.note_unread(unread(crate::wire::unread::Wire::Runner, fedora), None).await == Some(0), "its sender may be told");
+            let row: (String, Option<String>, String, String) = hub
+                .store
+                .call(|c| Ok(c.query_row("SELECT principal, target, result, detail FROM audit2 WHERE action = 'security.wire_refused'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
+                .await?;
+            anyhow::ensure!(row == ("runner:fedora".into(), Some("runner".into()), "unknown".into(), "variant 51: AgentMsg has 51 variants".into()), "{row:?}");
+            let kept = hub.agent_list().await.into_iter().find(|a| a.name == "fedora").and_then(|a| a.refused);
+            anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(1), "GET /api/agents carries it: {kept:?}");
+            let told: serde_json::Value = serde_json::from_str(&crate::rt::timeout(Duration::from_secs(5), events.recv()).await??)?;
+            anyhow::ensure!(told.pointer("/type") == Some(&serde_json::json!("agent")) && told.pointer("/agent/refused/counts/0/n") == Some(&serde_json::json!(1)), "{told}");
+            Ok(())
+        })
+    }
+
+    /// A runner's update of an agent session that couldn't be read shows on the session's page too:
+    /// its info carries it, its viewers are told, and the runner's next Open of it keeps it.
+    #[test]
+    fn a_refusal_about_a_session_is_kept_in_its_info() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::registry::Location;
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let open = || Update::Open { info: Box::new(crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
+            hub.harness.ingest(&hub, &there, "s1", open());
+            let mut events = hub.events.subscribe();
+            let from = crate::wire::unread::Sender::Runner { name: "box".into(), instance: "main".into() };
+            let _ = hub.note_unread(unread(crate::wire::unread::Wire::RunnerPayload, from), Some(crate::wire::unread::Page::Session("s1".into()))).await;
+            let told: serde_json::Value = serde_json::from_str(&crate::rt::timeout(Duration::from_secs(5), events.recv()).await??)?;
+            anyhow::ensure!(told.pointer("/type") == Some(&serde_json::json!("harness")) && told.pointer("/info/refused/counts/0/wire") == Some(&serde_json::json!("runner_payload")), "{told}");
+            hub.harness.ingest(&hub, &there, "s1", open());
+            let kept = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
+            anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(1), "kept across its runner's Open: {kept:?}");
+            Ok(())
+        })
+    }
+
     /// A job's `requires` route it by the runner's facts (docs/ci.md W05-R22): the release's
     /// macOS job goes to a Mac with cargo and node, never to one with no developer tools (which
     /// failed it at `npm`, 2026-10-24), nor to one that hasn't said what it has.
@@ -2974,6 +3094,7 @@ pub(crate) mod tests {
             battery: None,
             dropped: Vec::new(),
             dropped_toward: Vec::new(),
+            refused: None,
             terminal: true,
             outpost: false,
             dedicated_job: None,

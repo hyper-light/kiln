@@ -186,7 +186,7 @@ async fn refresh(hub: &Arc<Hub>) {
     for r in hub.front_doors.runners() {
         crate::frontdoor::control::push(hub, &r, None, None).await;
     }
-    hub.emit(&json!({ "type": "peers" }));
+    hub.emit(&crate::wire::events::ServerEvent::Peers);
 }
 
 async fn save(hub: &Hub, p: &Peer) -> Result<(), (StatusCode, String)> {
@@ -271,7 +271,7 @@ pub async fn register(hub: &Arc<Hub>, actor: &str, req: Request) -> Answer {
     };
     save(hub, &p).await?;
     hub.store.audit(actor.to_owned(), "peer.register".into(), format!("{} at {}", p.name, p.url)).await;
-    hub.emit(&json!({ "type": "peers" }));
+    hub.emit(&crate::wire::events::ServerEvent::Peers);
     Ok(srv::json(StatusCode::CREATED, &json!({ "peer": p.view(now), "challenge": ch.encode().map_err(internal)? })))
 }
 
@@ -289,7 +289,7 @@ pub async fn rechallenge(hub: &Arc<Hub>, actor: &str, id: &str) -> Answer {
     p.expires_at = ch.x;
     save(hub, &p).await?;
     hub.store.audit(actor.to_owned(), "peer.challenge".into(), p.name.clone()).await;
-    hub.emit(&json!({ "type": "peers" }));
+    hub.emit(&crate::wire::events::ServerEvent::Peers);
     Ok(srv::json(StatusCode::OK, &json!({ "peer": p.view(now), "challenge": ch.encode().map_err(internal)? })))
 }
 
@@ -367,7 +367,7 @@ pub async fn authorize(hub: &Arc<Hub>, actor: &str, req: Request) -> Answer {
     let response = codes::Response::answer(&ch, &our_name(hub), k, role, &hub.pki.ca_der).and_then(|r| r.encode()).map_err(internal)?;
     save(hub, &p).await?;
     hub.store.audit(actor.to_owned(), "peer.authorize".into(), format!("{} ({}) as {role}", p.name, p.public().map(|k| codes::fingerprint(&k)).unwrap_or_default())).await;
-    hub.emit(&json!({ "type": "peers" }));
+    hub.emit(&crate::wire::events::ServerEvent::Peers);
     Ok(srv::json(StatusCode::OK, &json!({ "peer": p.view(now), "response": response })))
 }
 

@@ -202,6 +202,8 @@ fn through_group<R>(conn: &mut Connection, watch: &capture::Watch, group: &group
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "RunStatus"))]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Pending,
@@ -281,6 +283,7 @@ fn upstream() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Run {
     pub id: String,
     pub repo_id: String,
@@ -301,6 +304,7 @@ pub struct Run {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Job {
     pub id: String,
     pub run_id: String,
@@ -320,15 +324,19 @@ pub struct Job {
     pub peak_rss: Option<u64>,
     pub cpu_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub spec: Option<PlannedJob>,
     pub steps: Vec<Step>,
     /// A CI matrix leg's values, by axis: where it sits in its job's grid on the run graph
     /// (docs/ci.md W21-R04).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "Record<string, unknown>"))]
     pub matrix: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "JobStep"))]
 pub struct Step {
     pub idx: u32,
     pub name: String,
@@ -338,6 +346,7 @@ pub struct Step {
     pub exit_code: Option<i32>,
     /// The order it started in among the job's steps (CI legs; docs/ci.md W21).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub seq: Option<i64>,
 }
 

@@ -70,6 +70,8 @@ impl Default for Limits {
 
 /// What a sender is told when the inbox takes its message, the first time and every time after.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "InboxAnswer"))]
 pub struct Answer {
     pub session: String,
     pub message: String,
@@ -88,6 +90,7 @@ pub struct Answer {
 /// Why the inbox didn't take a message. Every one names the session, and an epoch where one
 /// decided it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "refused", rename_all = "snake_case")]
 pub enum Refusal {
     /// Sent for an epoch the session has left: it went on on another machine since. Sent again,
@@ -137,6 +140,7 @@ impl Refusal {
 /// What became of one message sent to a session: its answer, or why it was refused. It goes back to
 /// whoever sent it (`super::core::Update::Inbox`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Said {
     pub message: String,
     pub answer: Result<Answer, Refusal>,

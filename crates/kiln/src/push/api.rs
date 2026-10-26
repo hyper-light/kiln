@@ -94,7 +94,7 @@ pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &Method, rest: &[&st
                 body.get("tags").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).filter(|t| !t.is_empty() && t.len() <= store::MARK_KEY_MAX).take(store::MARK_KEYS).collect();
             let (p, k, h) = (who.clone(), keys.clone(), how.clone());
             hub.store.call(move |c| store::mark(c, &p, &k, &h, at)).await.map_err(store_err)?;
-            hub.emit(&json!({ "type": "notices", "principal": who, "keys": keys, "how": how, "at": at, "tags": tags }));
+            hub.emit(&crate::wire::events::ServerEvent::Notices(crate::wire::events::Notices { principal: who.clone(), keys: keys.clone(), how, at, tags: tags.into_iter().map(str::to_owned).collect() }));
             Ok(srv::json(StatusCode::OK, &json!({ "marked": keys.len(), "at": at })))
         }
         (&Method::POST, ["subscriptions"]) => {
@@ -135,7 +135,7 @@ pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &Method, rest: &[&st
                 .map_err(store_err)?
                 .ok_or_else(|| (StatusCode::CONFLICT, format!("you have {} devices already, the most there may be: remove one first", store::MAX_DEVICES)))?;
             hub.store.audit(caller.name.clone(), "push.device".into(), format!("{label} hears {}", d.hears.join(", "))).await;
-            hub.emit(&json!({ "type": "push" }));
+            hub.emit(&crate::wire::events::ServerEvent::Push);
             Ok(srv::json(StatusCode::CREATED, &d))
         }
         (&Method::DELETE, ["subscriptions", id]) => {
@@ -145,7 +145,7 @@ pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &Method, rest: &[&st
                 return Err((StatusCode::NOT_FOUND, "no such device of yours".into()));
             }
             hub.store.audit(caller.name.clone(), "push.device.remove".into(), String::new()).await;
-            hub.emit(&json!({ "type": "push" }));
+            hub.emit(&crate::wire::events::ServerEvent::Push);
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
         (&Method::POST, ["test"]) => {
@@ -180,7 +180,7 @@ pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &Method, rest: &[&st
             let a = agent.clone();
             hub.store.call(move |c| if on { store::mute(c, &who, &a, crate::util::now_unix()) } else { store::unmute(c, &who, &a) }).await.map_err(store_err)?;
             hub.store.audit(caller.name.clone(), if on { "push.mute".into() } else { "push.unmute".into() }, agent).await;
-            hub.emit(&json!({ "type": "push" }));
+            hub.emit(&crate::wire::events::ServerEvent::Push);
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
         _ => Err((StatusCode::NOT_FOUND, "no such route".into())),

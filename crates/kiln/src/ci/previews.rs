@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use kiln_ci::wire::{PreviewOf, Undeploy, Undeployed};
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension as _, params};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::environments::{EnvDef, Preview, Targets, Template};
 use crate::hub::Hub;
@@ -309,7 +309,7 @@ pub async fn end(hub: &Hub, repo: &Repo, name: &str, why: &str) -> anyhow::Resul
         super::environments::status(hub, d, "inactive", None, Some(format!("The preview went: {why}")), "kiln").await?;
     }
     tracing::info!(repo = %repo.name, environment = %name, kind = kind.as_deref().unwrap_or("none"), why, "a preview went");
-    hub.emit(&json!({ "type": "preview.removed", "repo": repo.name, "environment": name, "why": why }));
+    hub.emit(&crate::wire::events::ServerEvent::PreviewRemoved { repo: repo.name.clone(), environment: name.to_owned(), why: why.to_owned() });
     if matches!(kind.as_deref(), Some("container" | "microvm")) {
         for r in &runners {
             ask(hub, r).await;
@@ -533,6 +533,7 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use super::*;
 
     #[test]

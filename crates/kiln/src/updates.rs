@@ -60,6 +60,8 @@ pub(crate) const FAIL_MARK: &str = "KILN-UPGRADE-FAIL";
 const CHECK_SELECTOR: &str = "kiln.dev/role=image-check";
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "UpdateJobState"))]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     Running,
@@ -69,6 +71,8 @@ pub enum JobState {
 
 /// One upgrade, as the UI follows it.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "UpdateJob"))]
 pub struct Job {
     pub id: String,
     /// "runner" or "server".
@@ -86,10 +90,12 @@ pub struct Job {
     pub to_build: Option<String>,
     /// The commit it brings the machine to, when kiln knows it.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub commit: Option<String>,
     /// A build's: the machine that builds it, when another than the runner's own
     /// (`crate::fleet`); the runner downloads that build.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub on: Option<String>,
     /// The machine reported running `to_build`.
     pub reached: bool,
@@ -97,6 +103,7 @@ pub struct Job {
     pub error: Option<String>,
     /// Kiln stopped waiting for it: which of its [`Waits`] ran out ("upgrade", "jobs" or "build").
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub timed_out: Option<&'static str>,
     /// Its last log line is a progress line (a terminal's carriage return draws it over): the
     /// next line takes its place.
@@ -751,7 +758,7 @@ async fn keep_in_step(hub: &Hub, commit: &str, starts: &mut Starts) -> anyhow::R
         Ok(run) => {
             tracing::info!(run = run.number, commit = short(commit), "building every platform from the server's commit");
             hub.store.audit("kiln".into(), "upgrade.build".into(), format!("{} {} #{} for the server's commit {}", u.release_repo, u.release_pipeline, run.number, short(commit))).await;
-            hub.emit(&serde_json::json!({ "type": "updates" }));
+            hub.emit(&crate::wire::events::ServerEvent::Updates);
             Ok(())
         }
         Err(e) => {
@@ -879,7 +886,7 @@ pub fn release(hub: &Arc<Hub>, force: bool) -> ReleaseInfo {
                 .unwrap_or_else(|e| ReleaseInfo { error: Some(format!("{e:#}")), checked_at: crate::util::now_unix(), ..ReleaseInfo::default() });
             *h.updates.release.lock() = Some((Instant::now(), r));
             h.updates.checking_release.store(false, Ordering::Release);
-            h.emit(&serde_json::json!({ "type": "updates" }));
+            h.emit(&crate::wire::events::ServerEvent::Updates);
         });
     }
     cached.map(|(_, r)| r).unwrap_or_default()
@@ -941,7 +948,7 @@ pub fn image(hub: &Arc<Hub>, force: bool) -> Option<ImageCheck> {
             };
             *h.updates.image.lock() = Some((Instant::now(), c));
             h.updates.checking_image.store(false, Ordering::Release);
-            h.emit(&serde_json::json!({ "type": "updates" }));
+            h.emit(&crate::wire::events::ServerEvent::Updates);
         });
     }
     Some(cached.map(|(_, c)| c).unwrap_or_default())
@@ -1094,7 +1101,7 @@ impl Updates {
             f(j);
             j.clone()
         };
-        hub.emit(&serde_json::json!({ "type": "update_job", "job": snapshot }));
+        hub.emit(&crate::wire::events::ServerEvent::UpdateJob { job: Box::new(snapshot) });
     }
 
     pub(crate) fn say(&self, hub: &Hub, id: &str, line: impl Into<String>) {
@@ -1152,7 +1159,7 @@ impl Updates {
         if let Some(j) = self.job(id) {
             crate::fleet::on_job_end(hub, &j, error.as_deref());
         }
-        hub.emit(&serde_json::json!({ "type": "updates" }));
+        hub.emit(&crate::wire::events::ServerEvent::Updates);
     }
 
     /// Kiln stops waiting for it: its `which` wait ([`Waits`]) ran out.
@@ -1226,7 +1233,7 @@ impl Updates {
         });
         if let Some(j) = through {
             crate::fleet::on_job_end(hub, &j, None);
-            hub.emit(&serde_json::json!({ "type": "updates" }));
+            hub.emit(&crate::wire::events::ServerEvent::Updates);
         }
     }
 }
