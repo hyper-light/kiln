@@ -3,11 +3,13 @@
 //! - [`state`]: the scheduler.
 //! - [`sim`]: a simulator driving it.
 //! - [`groups`]: concurrency groups.
+//! - [`demand`]: demands, the work in flight, and what becomes of work no one wants (W28-R40 to R44).
 //! - [`retry`]: retry policies and failure classes.
 //! - [`routing`]: requirements, rules, eligibility, preferences, explanations.
 //! - [`pools`]: pools of executors kiln starts and stops (W13-R09).
 //! - [`reserve`]: runners and pools kept for some legs in windows (W05-R12).
 
+pub mod demand;
 pub mod groups;
 pub mod pools;
 pub mod reserve;

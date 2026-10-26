@@ -7897,6 +7897,52 @@ before this one call this workstream "W25 step N".
 **Progress.** R30–R34 and AC30 built (2026-10-25) in `kiln_ci::land::conflict`. The land queue
 doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.rs`.
 
+**Requirements: demands and adopt-on-supersede** (step 4's, R40–R49; kiln plan
+`01a17607cd1273c5836771efb9d377d7`)
+
+- **W28-R40 Demands.** `kiln_ci::sched::demand`, pure: each run is a demand, with its lane (the
+  repository, the workflow, and the branch, stack or pull request W05-R08's `when` names), its
+  commit, its intent (gate, waiting, trunk or wip), its actor and its trust domain. A demand that
+  arrives under `supersede: { action: adopt }`, its branch not in `keep`, withdraws every older
+  live demand of its lane, and cancels nothing itself. Older is by the run's creation, so a run
+  approved late (W18-R06) doesn't withdraw a newer one; a rerun's demand is live again and
+  withdraws nothing.
+- **W28-R41 Domains.** A leg adopts only executions its domain may read: its own domain's, and for
+  untrusted and person scopes trusted ones (W24-R21). Protected adopts nothing, as W24 Decision 4
+  lets it take only results two trusted runners produced identically.
+- **W28-R42 Single-flight.** Work in flight is keyed by its key and domain; the key is W08-R10's
+  input hash until W24's strong keys exist. A leg with a key adopts the execution of its key in
+  flight that its domain may adopt (its own domain's first, then a trusted one), or executes it:
+  one key never has two executions at once within a domain. A leg of a withdrawn run only takes
+  what's in flight. An execution's priority is the highest among the live demands waiting on it.
+  After a restart, a queued duplicate of a running execution adopts it. Ledger hits (W24-R06) stay
+  the dispatcher's, before a leg is queued: the table never reads storage.
+- **W28-R43 Work no one wants.** After a withdrawal, or when a waiter leaves, an execution live
+  demands still want is kept, at their highest priority. One no live demand wants is dropped if it
+  hasn't started (or waits for a retry). Running, it runs on while nothing contends for its
+  capacity. Once live work does, it finishes only if its expected remaining time (its cost less its
+  attempt's time so far) is within `finish_within` (300 s by default, from W25 step 1's sweep) and
+  it seeds trusted entries. Otherwise it is cancelled, naming the warm-workspace lane (W24-R11) its
+  workspace goes back to. Nothing is removed from the ledger.
+- **W28-R44 Endings.** Adopters take an execution's result over, reused and naming it, when it
+  succeeded or failed in class `failure`; never for runner-lost, infra, image-pull, oom, disk-full,
+  timeout or a cancel. In those cases the live adopters ask again in the order they adopted: the
+  first executes in its place, and the rest adopt it where their domain may. Withdrawn adopters
+  take what's in flight or are dropped. An adopter of an execution that read observed path sets
+  checks them at its own commit first (W24-R04), and runs itself on a mismatch. Every decision says
+  why.
+
+**Acceptance criteria: demands**
+
+- **W28-AC40 Single-flight within domains.** Over 10,000 random sequences of arrivals, asks,
+  starts, endings in every class, fates, departures, checks and restarts: no key ever has two
+  executions at once within a domain; every adoption is one its domain may make; only a live run's
+  leg executes, and only a withdrawn one's is dropped; every leg ends exactly once; and the same
+  steps give the same table. *Property test* (`cargo test -p kiln-ci sched::demand`).
+
+**Progress (step 4).** R40–R44 and AC40 built (2026-10-25) in `kiln_ci::sched::demand`. The
+scheduler, the dispatcher and step 1's replay don't use it yet: those are the plan's steps 2 to 4.
+
 ## 4. API, events, CLI and MCP reference
 
 All routes come from the one route table (W10-R05, W20-R01) and follow access.md's conventions:
