@@ -1156,6 +1156,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut drops_said: Option<Vec<proto::NetDrop>> = None;
     // The server takes what this runner holds warm (`AgentMsg::WorkState`, docs/ci.md W24-R18),
     // and when it was last told it on this connection, and as of which change.
+    // W24-R31: the reaper of this runner's warm workspaces, on its clock.
+    if !o.outpost && !o.ephemeral {
+        crate::runner::warm::start_reaper(&o.work_dir);
+    }
     let mut server_work = false;
     let mut work_said: Option<(u64, Instant)> = None;
     // The channel's updates go (a server that keeps it welcomed this runner since it started).

@@ -255,6 +255,8 @@ pub struct Metrics {
     /// (`hit`, `miss`, `error`), and the seconds the results taken over had run.
     pub work_lookups: CounterVec,
     pub work_saved_seconds: Counter,
+    /// W24-R31: bytes the reaper freed, by store and reason.
+    pub work_reaped_bytes: CounterVec,
 }
 
 pub fn global() -> &'static Metrics {
@@ -291,6 +293,7 @@ pub fn global() -> &'static Metrics {
         ci_rollup_lag: Gauge::default(),
         work_lookups: CounterVec::new(&["layer", "outcome"]),
         work_saved_seconds: Counter::default(),
+        work_reaped_bytes: CounterVec::new(&["store", "reason"]),
     })
 }
 
@@ -1025,6 +1028,8 @@ pub fn render() -> String {
     help(&mut o, "kiln_work_lookups_total", "counter", "Lookups of recorded work (W24), by layer (leg, ...) and outcome (hit, miss, error).");
     m.work_lookups.render(&mut o, "kiln_work_lookups_total");
     scalar!("kiln_work_saved_seconds_total", "counter", "Seconds of work saved: what the results reuse took over had run.", m.work_saved_seconds.get());
+    help(&mut o, "kiln_work_reaped_bytes_total", "counter", "Bytes the reaper freed (W24-R31), by store (warm, ...) and reason (max_age, target, floor).");
+    m.work_reaped_bytes.render(&mut o, "kiln_work_reaped_bytes_total");
     help(&mut o, "kiln_job_duration_seconds", "histogram", "Job wall time.");
     m.job_duration.render(&mut o, "kiln_job_duration_seconds", "");
     help(&mut o, "kiln_queue_wait_seconds", "histogram", "Time from queued to started.");
