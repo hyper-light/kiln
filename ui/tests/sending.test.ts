@@ -273,3 +273,22 @@ await test("CP-T3.2: Retry sends a message that may have got there (no answer ca
     done();
   }
 });
+
+await test("CP-T3.2: a message its inbox refuses as `reused` got there under its id before (sent again with its upload gone, it read as another): it shows as sent, and Retry never makes it a new message", async () => {
+  const store = new SessionStore("reused");
+  const off = store.subscribe(() => {});
+  try {
+    const ws = attach(store);
+    await tick();
+    send(store, "m20", { text: "look at this", attachments: [{ name: "shot.png", mime: "image/png", file_id: "f9" }] });
+    ws.frame({ t: "nack", id: "m20", code: "reused", why: "message id m20 was already used for another message to session reused", again: false });
+    await tick();
+    assert.deepEqual(shown(store), [["m20", "sent"]], "it got there: sent, until the conversation shows it");
+    const before = ws.sent.length;
+    assert.equal(store.resend("m20"), false, "nothing to send again");
+    await tick();
+    assert.equal(ws.sent.length, before, "and nothing went");
+  } finally {
+    off();
+  }
+});

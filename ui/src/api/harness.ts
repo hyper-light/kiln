@@ -1213,6 +1213,14 @@ export class SessionStore {
       case "nack":
         // Not this time (its machine away, its inbox full ...): it waits, and goes again.
         if (u.id != null && u.again) return this.later(u.id, u.why);
+        // Its id was taken before, its inbox says: this page's own message got there (something of
+        // it changed on the way since, such as a file whose upload left the server). It shows as
+        // sent, never failed, so it's never sent again as a new message: a second prompt (CP-T3.2).
+        if (u.id != null && u.code === "reused" && this.out.has(u.id)) {
+          this.took(u.id);
+          if (this.asked.delete(u.id)) this.patch({ asked: [...this.asked.values()] });
+          return;
+        }
         if (u.id != null && this.asked.has(u.id)) {
           this.refuse(u.id, u.code, u.why);
           this.patch({ asked: [...this.asked.values()], error: u.why });

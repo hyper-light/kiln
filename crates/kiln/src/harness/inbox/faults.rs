@@ -373,6 +373,28 @@ fn a_retry_of_a_message_with_an_uploaded_file_is_answered_as_its_repeat() -> any
     })
 }
 
+/// CP-T3.2 (the twenty-second adversarial check's): a retry of a message carrying an uploaded file
+/// whose upload left the server since its first try (short of room, as here; its 30 minutes up; or
+/// the server started again: uploads are kept in memory) still carries the file's name, so it reads
+/// as the same message and is answered as its repeat. Without its name it read as another message
+/// under its id, refused `reused` for good, and the conversation's Retry sent it as a new message: a
+/// second prompt.
+#[test]
+fn a_retry_of_a_message_whose_upload_left_the_server_is_answered_as_its_repeat() -> anyhow::Result<()> {
+    use crate::harness::registry::Sent;
+    crate::rt::block_on(async {
+        let (hub, id, _dir) = hub_and_session().await?;
+        let file = hub.harness.upload("shot.png".into(), "image/png".into(), bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"))?;
+        let first = hub.harness.command(&hub, &id, with_file(file.clone())).await;
+        anyhow::ensure!(matches!(&first, Sent::Accepted(a) if !a.repeat), "{first:?}");
+        // Short of room (512 MiB in all), the files messages carried already go first.
+        hub.harness.upload("big.bin".into(), "application/octet-stream".into(), bytes::Bytes::from(vec![0u8; (512 << 20) - 4]))?;
+        let again = hub.harness.command(&hub, &id, with_file(file)).await;
+        anyhow::ensure!(matches!(&again, Sent::Accepted(a) if a.repeat), "the same message sent again, its upload gone, was answered {again:?}");
+        Ok(())
+    })
+}
+
 /// The server's one send again for the epoch a `stale_epoch` refusal names (`again_for`) carries
 /// the message's uploaded files: the session takes it with them.
 #[test]

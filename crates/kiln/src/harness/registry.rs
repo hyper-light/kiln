@@ -1916,7 +1916,16 @@ impl Registry {
                 }
                 None => b64.decode(a.data_base64.as_bytes()).ok().map(bytes::Bytes::from),
             };
-            let Some(data) = data.filter(|d| !d.is_empty()) else { continue };
+            let Some(data) = data.filter(|d| !d.is_empty()) else {
+                // Its upload is gone (the server started again, or let it go for room or age): its
+                // name still goes, so the message is the one it was (CP-T3.2, the twenty-second
+                // adversarial check's). Sent again after its first try was taken, it's answered as
+                // its repeat, never refused as another message under its id (whose Retry would be a
+                // second prompt). New, it goes without the file, which its runner leaves out, said.
+                a.data_base64.clear();
+                out.push(a);
+                continue;
+            };
             match loc {
                 Location::Local => {
                     let fid = crate::util::new_id();
