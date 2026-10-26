@@ -715,18 +715,56 @@ pub fn evict(c: &Connection, repo: &str, quotas: &Quotas) -> anyhow::Result<Vec<
     let mut gone = Vec::new();
     for i in trust::evict(&usage, quotas) {
         let Some(k) = keys.get(i) else { continue };
-        delete(c, Family::Result, k)?;
-        for (v, _, _) in scan(c, Family::Verify, &format!("{k}|"))? {
-            delete(c, Family::Verify, &v)?;
-        }
-        // The files it kept go with it: the content store collects those nothing else holds.
-        if let Some((domain, strong)) = k.strip_prefix(&prefix).and_then(|rest| rest.split_once('|')) {
-            let sc = format!("{prefix}{domain}|");
-            c.execute("DELETE FROM work_records WHERE family = ?1 AND substr(key, 1, length(?2)) = ?2 AND value = ?3", rusqlite::params![Family::Object.name(), sc, strong.as_bytes()])?;
-        }
+        remove_entry(c, k)?;
         gone.push(k.clone());
     }
     Ok(gone)
+}
+
+/// An entry (`owner/repo|domain|strong`) deleted with what's beside it: its verifications and hits,
+/// and the files it kept (the content store collects those nothing else holds).
+fn remove_entry(c: &Connection, k: &str) -> anyhow::Result<()> {
+    delete(c, Family::Result, k)?;
+    for (v, _, _) in scan(c, Family::Verify, &format!("{k}|"))? {
+        delete(c, Family::Verify, &v)?;
+    }
+    if let Some((sc, strong)) = k.rsplit_once('|') {
+        let sc = format!("{sc}|");
+        c.execute("DELETE FROM work_records WHERE family = ?1 AND substr(key, 1, length(?2)) = ?2 AND value = ?3", rusqlite::params![Family::Object.name(), sc, strong.as_bytes()])?;
+    }
+    Ok(())
+}
+
+/// W24-R31's reaper over the ledger: each result is an entry of its scope (a repository and trust
+/// domain: `keep_last` keeps each scope's newest), its bytes its row and outputs, its worth the time
+/// it saves on each hit. First each repository with a policy of its own drops what its temporal
+/// rules name (`repos`, resolved for it); then the system's policy, with `free` bytes free on the
+/// data volume, decides what else goes. Each eviction is deleted with what's beside it. What went,
+/// each with why.
+pub fn reap(c: &Connection, system: &kiln_ci::work::reap::Resolved, repos: &BTreeMap<String, kiln_ci::work::reap::Resolved>, free: u64, now: i64) -> anyhow::Result<Vec<kiln_ci::work::reap::Eviction>> {
+    use kiln_ci::work::reap::{Entry, plan};
+    let mut entries: Vec<Entry> = Vec::new();
+    for (k, v, at) in scan(c, Family::Result, "")? {
+        let entry: Recorded = serde_json::from_slice(&v).unwrap_or_default();
+        let group = k.rsplit_once('|').map_or_else(String::new, |(sc, _)| sc.to_owned());
+        let hits = hits_of(c, &k)?;
+        entries.push(Entry { bytes: (v.len() as u64).saturating_add(entry.size), used: at, saved_ms: entry.provenance.ms.saturating_mul(hits.saturating_add(1)), group, id: k });
+    }
+    let held: u64 = entries.iter().map(|e| e.bytes).sum();
+    let mut went = Vec::new();
+    for (repo, policy) in repos {
+        let prefix = format!("{repo}|");
+        let mine: Vec<Entry> = entries.iter().filter(|e| e.id.starts_with(&prefix)).cloned().collect();
+        went.extend(plan(policy, &mine, u64::MAX, 0, now));
+    }
+    let gone: std::collections::BTreeSet<String> = went.iter().map(|e| e.id.clone()).collect();
+    let freed: u64 = went.iter().map(|e| e.bytes).sum();
+    let rest: Vec<Entry> = entries.into_iter().filter(|e| !gone.contains(&e.id)).collect();
+    went.extend(plan(system, &rest, free.saturating_add(freed), held.saturating_sub(freed), now));
+    for e in &went {
+        remove_entry(c, &e.id)?;
+    }
+    Ok(went)
 }
 
 /// One more hit of `scope`'s entry `strong` (W24-R28, AC12): what its worth under quota counts.
@@ -2313,6 +2351,50 @@ mod tests {
             anyhow::ensure!(lookup(c, &sc, &slow, &same)?.is_none() && lookup(c, &sc, &quick, &same)?.is_some());
             let objects: Vec<String> = scan(c, Family::Object, &sc)?.into_iter().map(|(k, _, _)| k).collect();
             anyhow::ensure!(objects == [format!("{sc}o1")], "the evicted entry's file goes with it: {objects:?}");
+            Ok(())
+        })
+    }
+
+    /// W24-R31, the server's reaper: a repository's own max_age drops its stale results; with the
+    /// data volume under its floor, the system's policy evicts the least time saved per byte until
+    /// the target is free, keeping each scope's newest; each eviction says why.
+    #[test]
+    fn w24_r31_the_server_reaps_the_ledger_to_its_target() -> anyhow::Result<()> {
+        use kiln_ci::work::reap::{self as r, Policy, Reason, Scope, Size};
+        in_store(|c| {
+            let now = 1_800_000_000i64;
+            let mut keys = Vec::new();
+            for (i, (repo, age_days, ms)) in [("acme/app", 1i64, 50_000u64), ("acme/app", 2, 1_000), ("acme/app", 3, 2_000), ("acme/web", 1, 40_000), ("acme/web", 50, 3_000)].into_iter().enumerate() {
+                let sc = scope(repo, "trusted");
+                let n = 70 + u64::try_from(i).unwrap_or(0);
+                let rec = Recorded { provenance: Provenance { ms, ..Provenance::default() }, size: 1 << 30, ..made("trusted", "", &[("bin", "sha256:aa")]) };
+                let k = record(c, &sc, &unit(n), &reads(n, 0), &rec)?;
+                let key = format!("{sc}{}", k.hex());
+                c.execute("UPDATE work_records SET at = ?1 WHERE family = 'work.result' AND key = ?2", rusqlite::params![now - age_days * 86_400, key])?;
+                keys.push(key);
+            }
+            let volume = 100u64 << 30;
+            let system = Policy { floor: Some(Size::Bytes(10 << 30)), target: Some(Size::Bytes(12 << 30)), keep_last: Some(1), keep_within: Some(0), max_age: Some(400 * 86_400), ..Policy::default() };
+            let web = Policy { max_age: Some(30 * 86_400), keep_last: Some(0), keep_within: Some(0), ..Policy::default() };
+            let sys = r::resolve(volume, &[(Scope::System, &system)]);
+            let repos: BTreeMap<String, r::Resolved> = [("acme/web".to_owned(), r::resolve(volume, &[(Scope::System, &system), (Scope::Repo, &web)]))].into();
+            // 9 GiB free: under the 10 GiB floor.
+            let went = reap(c, &sys, &repos, 9 << 30, now)?;
+            let by_id = |k: &str| went.iter().find(|e| e.id == k);
+            let stale = keys.get(4).ok_or_else(|| anyhow::anyhow!("five entries"))?;
+            anyhow::ensure!(by_id(stale).is_some_and(|e| e.reason == Reason::MaxAge && e.scope == Some(Scope::Repo)), "acme/web's stale result goes by its max_age: {went:?}");
+            let cheap = keys.get(1).ok_or_else(|| anyhow::anyhow!("five entries"))?;
+            anyhow::ensure!(by_id(cheap).is_some_and(|e| e.reason == Reason::Target && e.rule == "target" && e.scope == Some(Scope::System)), "the least time saved per byte goes for the target: {went:?}");
+            let freed: u64 = went.iter().map(|e| e.bytes).sum();
+            anyhow::ensure!((9u64 << 30) + freed >= 12 << 30, "free space back to the target");
+            for newest in [keys.first(), keys.get(3)].into_iter().flatten() {
+                anyhow::ensure!(by_id(newest).is_none() && get(c, Family::Result, newest)?.is_some(), "each scope's newest stays: {newest}");
+            }
+            for e in &went {
+                anyhow::ensure!(get(c, Family::Result, &e.id)?.is_none(), "{} is gone from the ledger", e.id);
+            }
+            // With room on the volume, nothing more goes.
+            anyhow::ensure!(reap(c, &sys, &BTreeMap::new(), 50 << 30, now)?.is_empty());
             Ok(())
         })
     }

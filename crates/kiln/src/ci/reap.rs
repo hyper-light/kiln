@@ -94,6 +94,23 @@ async fn load(hub: &Hub, wanted: Vec<(Scope, String)>) -> Result<Vec<(Scope, Str
         .map_err(internal)
 }
 
+/// The system's policy and each repository's, as stored (for the server's reaper, W24-R31).
+pub fn stored(c: &rusqlite::Connection) -> rusqlite::Result<(Policy, std::collections::BTreeMap<String, Policy>)> {
+    let mut system = Policy::default();
+    let mut repos = std::collections::BTreeMap::new();
+    let mut st = c.prepare("SELECT scope, target, policy FROM work_reap_policies WHERE scope IN ('system', 'repo')")?;
+    for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+        let (scope, target, text) = row?;
+        let p: Policy = serde_json::from_str(&text).unwrap_or_default();
+        if scope == "system" {
+            system = p;
+        } else {
+            repos.insert(target, p);
+        }
+    }
+    Ok((system, repos))
+}
+
 /// The scopes a request names: the system's always, then a runner's, a repository's and a
 /// session's when given.
 fn chain(q: &HashMap<String, String>) -> Vec<(Scope, String)> {
