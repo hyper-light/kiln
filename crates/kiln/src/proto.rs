@@ -238,6 +238,11 @@ pub enum AgentMsg {
     /// changed, and every 10 minutes, each superseding the last; only to a server announcing
     /// [`CAP_WORK`]. Appended last: postcard encodes variants by index.
     WorkState { json: String },
+    /// An identity asked for (JSON [`IdentityAsk`], docs/ci.md W27-R01): a CSR for a key this
+    /// runner process made and keeps (for itself, an agent session it holds at an epoch, a leg it
+    /// runs); the server answers with [`ServerMsg::Identity`]. Only to a server announcing
+    /// [`CAP_IDENTITY`]. Appended last: postcard encodes variants by index.
+    Identity { json: String },
 }
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
@@ -372,6 +377,37 @@ pub const CAP_HANDOVER: u64 = 1 << 35;
 /// (docs/ci.md W24-R18). A runner that says it tells the server what it holds warm
 /// ([`AgentMsg::WorkState`]); a server that says it takes that.
 pub const CAP_WORK: u64 = 1 << 36;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: identities (docs/ci.md W27-R01). A runner
+/// that says it asks for certificates for keys it makes and keeps ([`AgentMsg::Identity`]); a
+/// server that says it issues them ([`ServerMsg::Identity`]).
+pub const CAP_IDENTITY: u64 = 1 << 37;
+
+/// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct IdentityAsk {
+    /// `runner` (this process), `agent` (a session it holds, at `epoch`) or `leg` (one it runs).
+    pub kind: String,
+    pub csr: String,
+    /// `agent`: the session; `leg`: the leg's id.
+    pub of: Option<String>,
+    /// `agent`: the epoch the key is for.
+    pub epoch: Option<u64>,
+}
+
+/// The answer to an [`IdentityAsk`]: its kind and subject, and the certificate (PEM) or why not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct IdentityGiven {
+    pub kind: String,
+    pub of: Option<String>,
+    pub epoch: Option<u64>,
+    /// The identity's kiln:// URI.
+    pub uri: String,
+    pub cert_pem: Option<String>,
+    pub error: Option<String>,
+}
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -616,6 +652,10 @@ pub enum ServerMsg {
     /// wire's, the cluster group's and the restarts' `Kept` (CP-T3.2 landed after them): postcard
     /// encodes variants by index.
     HarnessSend { session: String, epoch: u64, json: String },
+    /// The certificate for an [`AgentMsg::Identity`], or why there's none (JSON [`IdentityGiven`],
+    /// docs/ci.md W27-R01). Only to runners announcing [`CAP_IDENTITY`]. Appended last: postcard
+    /// encodes variants by index.
+    Identity { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -859,6 +899,20 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&b)?, m);
         // Bit 34 is T3's CAP_INBOX.
         assert!(CAP_WORK.is_power_of_two() && CAP_WORK == 1 << 36 && CAP_WORK & (CAP_WIRE | CAP_NET_DROPS | 1 << 34 | CAP_HANDOVER) == 0);
+        Ok(())
+    }
+
+    /// W27-R01: identities come after every older variant, and their bit is a new one.
+    #[test]
+    fn w27_r01_identities_are_appended_last() -> anyhow::Result<()> {
+        let work = encode(&AgentMsg::WorkState { json: String::new() })?;
+        let send = encode(&ServerMsg::HarnessSend { session: String::new(), epoch: 0, json: String::new() })?;
+        let (a, s) = (AgentMsg::Identity { json: "{}".into() }, ServerMsg::Identity { json: "{}".into() });
+        let (ab, sb) = (encode(&a)?, encode(&s)?);
+        assert_eq!(ab.first().copied(), work.first().map(|i| i + 1), "AgentMsg::Identity comes right after WorkState");
+        assert_eq!(sb.first().copied(), send.first().map(|i| i + 1), "ServerMsg::Identity comes right after HarnessSend");
+        assert_eq!((decode::<AgentMsg>(&ab)?, decode::<ServerMsg>(&sb)?), (a, s));
+        assert!(CAP_IDENTITY.is_power_of_two() && CAP_IDENTITY == 1 << 37 && CAP_IDENTITY & (CAP_WIRE | CAP_NET_DROPS | 1 << 34 | CAP_HANDOVER | CAP_WORK) == 0);
         Ok(())
     }
 

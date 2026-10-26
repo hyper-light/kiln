@@ -55,6 +55,11 @@ pub struct Leaf {
     pub key_pem: String,
 }
 
+/// The DER of a PEM text's first certificate.
+pub fn der_of(pem: &str) -> anyhow::Result<Vec<u8>> {
+    pem_to_der(pem)
+}
+
 fn pem_to_der(pem: &str) -> anyhow::Result<Vec<u8>> {
     use hyper_quic::rustls::pki_types::CertificateDer;
     use hyper_quic::rustls::pki_types::pem::PemObject as _;
@@ -483,6 +488,15 @@ impl Pki {
         }
         let signed = CertificateSigningRequestParams { params: p, public_key: csr.public_key }.signed_by(&self.issuer).context("sign CSR")?;
         Ok(signed.pem())
+    }
+
+    /// The organization kiln's CA certifies for (its certificate's O), the root of every
+    /// identity's chain (W27-R01); `kiln` when it names none.
+    pub fn organization(&self) -> String {
+        x509_parser::parse_x509_certificate(&self.ca_der)
+            .ok()
+            .and_then(|(_, c)| c.subject().iter_organization().next().and_then(|o| o.as_str().ok()).map(str::to_owned))
+            .unwrap_or_else(|| "kiln".to_owned())
     }
 
     /// Whether this CA issued (signed) the DER certificate `der`.

@@ -1967,7 +1967,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if !o.ephemeral && !crate::runner::chaos::get().is_some_and(|c| c.old) {
                     let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | proto::CAP_IDENTITY }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2127,6 +2127,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_kept.extend(sessions.into_iter().map(|k| (k.session.clone(), k)));
                     }
                     ServerMsg::Caps { caps } => {
+                        // An identity of this process's own, for a key it made and keeps, certified
+                        // on each connection (docs/ci.md W27-R01).
+                        if caps & proto::CAP_IDENTITY != 0 && !o.ephemeral {
+                            match crate::runner::identity::ask("runner", None, None) {
+                                Ok(json) => {
+                                    uplink.0.send(Up::Term(AgentMsg::Identity { json })).await.ok();
+                                }
+                                Err(e) => tracing::warn!(error = %format!("{e:#}"), "no identity asked for"),
+                            }
+                        }
                         server_wire = caps & proto::CAP_WIRE != 0;
                         server_drops = caps & proto::CAP_NET_DROPS != 0;
                         server_work = caps & proto::CAP_WORK != 0;
@@ -2523,6 +2533,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 tracing::debug!(error = %e, "unreadable agent session command");
                                 refuse(&mut answer_after, Refusal::Malformed, format!("{e}"));
                             }
+                        }
+                    }
+                    // A certificate for a key this process holds (docs/ci.md W27-R01).
+                    ServerMsg::Identity { json } => {
+                        let label = o.instance.clone().unwrap_or_else(|| crate::upgrade::MAIN.to_owned());
+                        if let Err(e) = crate::runner::identity::given(&json, &o.state_dir, &label) {
+                            tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept");
                         }
                     }
                     // A message for an epoch (CP-T3.2): through its session's inbox, which answers.

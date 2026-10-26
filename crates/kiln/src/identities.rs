@@ -6,10 +6,16 @@
 //! name gets a new key the revocation doesn't touch), and [`revocations`] feeds the chain checker
 //! (`kiln_ci::identity::chain`).
 
-use kiln_ci::identity::chain::Revocation;
+use kiln_ci::identity::chain::{Actor, Identity, Revocation};
 use rusqlite::{OptionalExtension as _, params};
 
+use crate::hub::Hub;
+use crate::instances::PeerId;
+use crate::proto::{IdentityAsk, IdentityGiven, ServerMsg};
 use crate::store::Store;
+
+/// How long a runner process's certificate lasts; it asks again on each connection.
+pub const RUNNER_HOURS: i64 = 7 * 24;
 
 /// What a revocation names.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,21 +26,150 @@ pub enum Target {
     Key(String),
     /// Every certificate recorded for a subject: a machine's name, or a kiln:// URI.
     Subject(String),
+    /// A subject's certificates, by serial only: their key goes on (a runner process given a
+    /// newer certificate for the same key, or gone with its key).
+    Certificates(String),
 }
 
 /// Records a certificate kiln just issued.
 pub async fn record(store: &Store, kind: &str, subject: &str, cert_pem: &str) -> anyhow::Result<()> {
     let f = crate::pki::fingerprints(cert_pem)?;
-    let (kind, subject, now) = (kind.to_owned(), subject.to_owned(), crate::util::now_unix());
+    let (kind, subject, pem, now) = (kind.to_owned(), subject.to_owned(), cert_pem.to_owned(), crate::util::now_unix());
     store
         .call(move |c| {
             c.execute(
-                "INSERT OR IGNORE INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![f.serial, kind, subject, f.key, f.not_before, f.not_after, now],
+                "INSERT OR IGNORE INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at, cert_pem) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![f.serial, kind, subject, f.key, f.not_before, f.not_after, now, pem],
             )?;
             Ok(())
         })
         .await
+}
+
+/// A person's name as an identity's path segment: `user:ada` and `pat:7 of user:ada` are `ada`;
+/// the owner (`admin`) is `admin`; anything else is made safe the way machine names are.
+pub fn person_of(caller: &str) -> String {
+    let name = caller.rsplit_once("user:").map_or(caller, |(_, n)| n);
+    let safe: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' }).collect();
+    let safe = safe.trim_matches('-');
+    if safe.is_empty() || safe == "." || safe == ".." { "admin".to_owned() } else { crate::util::truncate(safe, 128).to_owned() }
+}
+
+/// Records who enrolled `machine` (its last enrollment's).
+pub async fn enrolled(store: &Store, machine: &str, by: &str) -> anyhow::Result<()> {
+    let (machine, by, now) = (machine.to_owned(), person_of(by), crate::util::now_unix());
+    store
+        .call(move |c| {
+            c.execute("INSERT INTO enrollments (machine, enrolled_by, at) VALUES (?1, ?2, ?3) ON CONFLICT (machine) DO UPDATE SET enrolled_by = excluded.enrolled_by, at = excluded.at", params![machine, by, now])?;
+            Ok(())
+        })
+        .await
+}
+
+/// Who enrolled `machine`: `admin` for one enrolled before kiln recorded it.
+pub async fn enrolled_by(store: &Store, machine: &str) -> anyhow::Result<String> {
+    let machine = machine.to_owned();
+    let by: Option<String> = store.call(move |c| Ok(c.query_row("SELECT enrolled_by FROM enrollments WHERE machine = ?1", [machine], |r| r.get(0)).optional()?)).await?;
+    Ok(by.unwrap_or_else(|| "admin".to_owned()))
+}
+
+/// A runner process's identity: its machine and instance, who enrolled the machine, kiln's
+/// organization.
+pub async fn runner_identity(hub: &Hub, machine: &str, instance: &str) -> anyhow::Result<Identity> {
+    let enrolled_by = enrolled_by(&hub.store, machine).await?;
+    Ok(Identity::new(hub.pki.organization(), Actor::Runner { enrolled_by, machine: machine.to_owned(), instance: instance.to_owned() }))
+}
+
+/// A runner process asked for an identity ([`crate::proto::AgentMsg::Identity`]): the certificate,
+/// recorded, or why not, back to it. Its earlier certificates for the same subject are revoked by
+/// serial (the key goes on in the same process).
+pub async fn on_ask(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
+    let ask: IdentityAsk = match serde_json::from_str(json) {
+        Ok(a) => a,
+        Err(e) => return tracing::debug!(agent = %machine, error = %e, "an unreadable identity request"),
+    };
+    let mut given = IdentityGiven { kind: ask.kind.clone(), of: ask.of.clone(), epoch: ask.epoch, ..IdentityGiven::default() };
+    match issue(hub, peer, machine, &ask).await {
+        Ok((uri, pem)) => {
+            given.uri = uri;
+            given.cert_pem = Some(pem);
+        }
+        Err(e) => {
+            tracing::warn!(agent = %machine, kind = %ask.kind, error = %format!("{e:#}"), "no identity issued");
+            given.error = Some(format!("{e:#}"));
+        }
+    }
+    if let Ok(json) = serde_json::to_string(&given) {
+        hub.send_peer(peer, &ServerMsg::Identity { json }).await;
+    }
+}
+
+async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> anyhow::Result<(String, String)> {
+    let (identity, hours) = match ask.kind.as_str() {
+        "runner" => {
+            let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
+            (runner_identity(hub, machine, &instance).await?, RUNNER_HOURS)
+        }
+        other => anyhow::bail!("kiln doesn't issue {other:?} identities"),
+    };
+    let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pem = hub.pki.issue_identity(&ask.csr, &identity, &[], time::Duration::hours(hours))?;
+    revoke(&hub.store, Target::Certificates(uri.clone()), "superseded by a newer certificate", "kiln", crate::util::now_unix()).await?;
+    record(&hub.store, &ask.kind, &uri, &pem).await?;
+    tracing::info!(agent = %machine, identity = %identity, "issued an identity");
+    Ok((uri, pem))
+}
+
+/// A runner process of `machine` went while another goes on (retired after a blue/green
+/// upgrade): its certificates are revoked from now (its key went with it).
+pub async fn runner_retired(hub: &Hub, machine: &str, instance: &str) -> anyhow::Result<()> {
+    let uri = runner_identity(hub, machine, instance).await?.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
+    revoke(&hub.store, Target::Certificates(uri), "runner process retired", "kiln", crate::util::now_unix()).await?;
+    Ok(())
+}
+
+/// One certificate kiln issued, as `GET /api/identities` lists it: checked now, against every
+/// revocation, by `kiln_ci::identity::chain`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Listed {
+    pub serial: String,
+    pub kind: String,
+    pub subject: String,
+    pub key: String,
+    pub not_before: i64,
+    pub not_after: i64,
+    pub issued_at: i64,
+    /// Who it verifies as (`agent matrix, epoch 3, for sam, of hyper-light`), else why it doesn't.
+    pub verified: Option<String>,
+    pub refused: Option<String>,
+}
+
+/// The certificates kiln issued of `kind` (all, when `None`), newest first, each checked now.
+pub async fn list(hub: &Hub, kind: Option<&str>) -> anyhow::Result<Vec<Listed>> {
+    let kind = kind.map(str::to_owned);
+    let rows: Vec<(String, String, String, String, i64, i64, i64, String)> = hub
+        .store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT serial, kind, subject, key_sha256, not_before, not_after, issued_at, cert_pem FROM identities WHERE (?1 IS NULL OR kind = ?1) ORDER BY issued_at DESC, serial")?;
+            let rows = q.query_map([kind], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    let revs = revocations(&hub.store).await?;
+    let now = crate::util::now_unix();
+    Ok(rows
+        .into_iter()
+        .map(|(serial, kind, subject, key, not_before, not_after, issued_at, pem)| {
+            let checked = crate::pki::der_of(&pem).map_err(|e| e.to_string()).and_then(|der| kiln_ci::identity::chain::verify(&[&der], &hub.pki.ca_der, &revs, now).map_err(|e| e.to_string()));
+            let (verified, refused) = match checked {
+                Ok(v) => (Some(v.to_string()), None),
+                // A machine's TLS certificate names no kiln identity: say so only when it's revoked.
+                Err(e) if kind == "machine" && !e.contains("revoked") => (None, None),
+                Err(e) => (None, Some(e)),
+            };
+            Listed { serial, kind, subject, key, not_before, not_after, issued_at, verified, refused }
+        })
+        .collect())
 }
 
 /// Revokes what `target` names from `at` (unix seconds) on; returns the keys it revoked (for the
@@ -47,6 +182,10 @@ pub async fn revoke(store: &Store, target: Target, reason: &str, by: &str, at: i
             let tx = c.savepoint()?;
             // (serial, key, subject) of each row to write.
             let rows: Vec<(Option<String>, Option<String>, String)> = match &target {
+                Target::Certificates(s) => {
+                    let mut q = tx.prepare("SELECT serial FROM identities WHERE subject = ?1 AND serial NOT IN (SELECT serial FROM revocations WHERE serial IS NOT NULL)")?;
+                    q.query_map([s], |r| Ok((Some(r.get::<_, String>(0)?), None, s.clone())))?.collect::<Result<Vec<_>, _>>()?
+                }
                 Target::Subject(s) => {
                     let mut q = tx.prepare("SELECT serial, key_sha256 FROM identities WHERE subject = ?1")?;
                     q.query_map([s], |r| Ok((Some(r.get::<_, String>(0)?), Some(r.get::<_, String>(1)?), s.clone())))?.collect::<Result<Vec<_>, _>>()?
@@ -113,6 +252,16 @@ mod tests {
     fn cert(pki: &crate::pki::Pki, name: &str) -> anyhow::Result<String> {
         let (csr, _key) = crate::pki::make_csr(name)?;
         pki.sign_csr(&csr, name, 30)
+    }
+
+    #[test]
+    fn w27_r01_the_person_an_enrollment_names() {
+        assert_eq!(person_of("user:ada"), "ada");
+        assert_eq!(person_of("pat:7 of user:ada"), "ada");
+        assert_eq!(person_of("admin"), "admin");
+        assert_eq!(person_of("user:sam o'neil"), "sam-o-neil");
+        assert_eq!(person_of("user:"), "admin");
+        assert_eq!(person_of("user:.."), "admin");
     }
 
     #[test]

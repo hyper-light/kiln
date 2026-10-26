@@ -189,6 +189,7 @@ classes! {
         AgentMsg::HarnessHandOver { .. } => Class::Stream,
         AgentMsg::HarnessAdopted { .. } => Class::Answer,
         AgentMsg::WorkState { .. } => Class::State,
+        AgentMsg::Identity { .. } => Class::Ask,
     }
 }
 
@@ -253,6 +254,7 @@ classes! {
         ServerMsg::Cluster { .. } => CLUSTER,
         ServerMsg::Kept { .. } => Class::State,
         ServerMsg::HarnessSend { .. } => PARKED,
+        ServerMsg::Identity { .. } => Class::Answer,
     }
 }
 
