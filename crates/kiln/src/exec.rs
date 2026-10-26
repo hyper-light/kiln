@@ -422,9 +422,11 @@ impl Exec {
         let (prog, args) = self.command_line(shell, script);
         let mut cmd = Command::new(prog);
         cmd.args(args).current_dir(cwd).envs(env);
-        let mut running = crate::proc::spawn_group(cmd)?;
+        // On the CPUs its job may use: its own share, or what no share holds (W05-R03).
+        let mut running = crate::runner::cpus::spawn_on(&self.assign.job_id, move || crate::proc::spawn_group(cmd))?;
         let pgid = running.pgid;
         let _guard = PgidRecord::new(&self.work_dir, &self.assign.job_id, pgid);
+        let _pinned = crate::runner::cpus::Step::new(&self.assign.job_id, pgid);
         let mut pending: Vec<u8> = Vec::with_capacity(LOG_CHUNK);
         let mut flush = Interval::new(Duration::from_millis(100));
         let mut sample = Interval::new(Duration::from_secs(2));

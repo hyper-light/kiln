@@ -1,5 +1,7 @@
-# Benchmarks on real hardware. `exclusive: true` makes the bench job the sole occupant of its
-# agent, so nothing else perturbs the measurement; `noise` is independent work that must wait.
+# Benchmarks on real hardware. `exclusive: true` with `resources:` holds the CPUs and memory a bench
+# asks for, its own alone: whole cores, one L3 domain of adacachy's two for 16 CPUs (docs/ci.md
+# W05-R03). Other work runs beside it on the rest; `noise` is such work. The memory is above each
+# bench's peak (its release build's); what cores can't keep apart is the memory bus and the disk.
 name: bench
 on:
   push: { branches: [main], paths: ["crates/**"] }
@@ -12,10 +14,13 @@ jobs:
   quic-transport:
     name: QUIC transport bench (hardware)
     # Any open Linux machine that builds kiln (its steps read /proc and GNU date): v1 places it on
-    # the runner meeting `requires` with the most room, and `exclusive` keeps that runner its own.
+    # the runner meeting `requires` with the most room, and its share (`exclusive` with
+    # `resources:`) keeps 16 CPUs and 48 GiB of that runner its own, other work on the rest.
     runs-on: [baremetal]
     requires: ["os == linux", "tools has cargo", "tools has python3"]
     exclusive: true
+    # Its peak is about 41 GiB (runs #1218, #1223, #1227).
+    resources: { cpu: "16", memory: 48Gi }
     timeout-minutes: 30
     steps:
       - name: build (release)
@@ -33,11 +38,14 @@ jobs:
     # The CI engine's performance targets (docs/ci.md §1.5, W22-AC08): a miss fails the step; a
     # result more than 10 % worse than its history fails the job (W16's interval rule).
     # Any open Linux or macOS machine that builds kiln; `same-fingerprint` compares a result only
-    # with earlier ones from the same hardware, wherever the bench lands.
+    # with earlier ones from the same hardware, wherever the bench lands. Its share is 8 CPUs, so
+    # it fits every such machine (a Mac Studio has 14; macOS holds the room, its cores unpinned).
     name: CI engine targets (hardware)
     runs-on: [baremetal]
     requires: ["os in [linux, macos]", "tools has cargo"]
     exclusive: true
+    # Its peak is about 13 GiB (runs #1218, #1223, #1227).
+    resources: { cpu: "8", memory: 16Gi }
     timeout-minutes: 60
     bench-gate: { metric: "ci.bench.*", max-regression: 10%, same-fingerprint: true, action: fail }
     steps:
@@ -47,7 +55,8 @@ jobs:
       - name: kiln ci bench
         run: target/release/kiln ci bench --out target/ci-bench.json
   noise:
-    # The `bench`-labelled runner: it waits there whenever an exclusive bench holds that runner.
+    # The `bench`-labelled runner: it runs beside a bench there, on the CPUs the bench's share
+    # doesn't hold, and doesn't wait for it.
     runs-on: [baremetal, bench]
     steps:
-      - run: echo "independent work; must not overlap the exclusive bench"; sleep 5
+      - run: echo "independent work, beside the bench on the rest of its machine"; sleep 5

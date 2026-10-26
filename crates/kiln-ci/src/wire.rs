@@ -108,6 +108,11 @@ pub struct AssignmentV2 {
     /// v1 `cache:` folders empty. An older server never says so; an older runner ignores it.
     #[serde(default)]
     pub cold: bool,
+    /// It has its runner to itself (`exclusive: true`, W05-R03), and what of the runner it holds:
+    /// the CPUs and memory it asked for, the rest free for other legs; none, the whole runner.
+    /// From an older server, neither: a leg like any other.
+    pub exclusive: bool,
+    pub holds: Option<crate::sched::state::Resources>,
 }
 
 /// A leg's warm workspace (W24-R11, R15), from its job's `work: { warm }`: the runner keeps it for
@@ -481,6 +486,22 @@ pub enum JobEventV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What an exclusive leg holds travels with it; from an older server, neither field is there,
+    /// and the leg is like any other; to an older runner, they're keys it doesn't read.
+    #[test]
+    fn an_assignment_says_what_its_leg_holds_and_reads_without_it() -> Result<(), serde_json::Error> {
+        let share = crate::sched::state::Resources { cpu: 16.0, mem: 16 << 30, ..Default::default() };
+        let a = AssignmentV2 { job_id: "bench".into(), exclusive: true, holds: Some(share), ..AssignmentV2::default() };
+        let back: AssignmentV2 = serde_json::from_str(&serde_json::to_string(&a)?)?;
+        assert!(back.exclusive);
+        assert_eq!(back.holds, Some(share));
+        let old: AssignmentV2 = serde_json::from_str(r#"{"job_id":"leg"}"#)?;
+        assert!(!old.exclusive && old.holds.is_none(), "from an older server: a leg like any other");
+        let v: serde_json::Value = serde_json::to_value(&a)?;
+        assert_eq!(v.get("holds").and_then(|h| h.get("cpu")).and_then(serde_json::Value::as_f64), Some(16.0));
+        Ok(())
+    }
 
     #[test]
     fn events_read_as_the_spec_writes_them() -> Result<(), serde_json::Error> {
