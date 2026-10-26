@@ -27,11 +27,84 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::retry::FailureClass;
+use super::state::Supersede;
+use crate::wf::ir::YVal;
 
 /// `finish_within`'s default, in seconds: work no one wants finishes, when live work contends for
 /// its capacity, if it has at most this long left. W25 step 1's sweep (ci/sim/README.md): under 1%
 /// of runner time wasted, within about a point of the most verdicts.
 pub const FINISH_WITHIN: i64 = 300;
+
+/// What a newer run supersedes an older one on (W05-R08's `when`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    Branch,
+    Stack,
+    PullRequest,
+}
+
+/// A workflow's `supersede:` (W05-R08, W28-R46): `{ when: [branch, stack, pull_request], action:
+/// cancel | deprioritize | adopt, keep: [branches], finish-within: 5m }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Supersession {
+    pub when: Vec<When>,
+    pub action: Supersede,
+    /// Branches whose runs are never superseded.
+    pub keep: Vec<String>,
+    /// R43's `finish_within`, in seconds.
+    pub finish_within: i64,
+}
+
+impl Supersession {
+    /// The workflow's `supersede:`; `None` when it has none. What doesn't read is an error that
+    /// says why.
+    pub fn from_yval(v: &YVal) -> Result<Option<Supersession>, String> {
+        let entries = match v {
+            YVal::Null | YVal::Bool(false) => return Ok(None),
+            YVal::Map(entries) => entries,
+            _ => return Err("`supersede` is a map: `{ when, action, keep, finish-within }`".into()),
+        };
+        let list = |k: &str| -> Result<Vec<String>, String> {
+            match v.get(k) {
+                None | Some(YVal::Null) => Ok(Vec::new()),
+                Some(YVal::Seq(items)) => items.iter().map(|i| i.as_str().map(str::to_owned).ok_or_else(|| format!("`supersede.{k}` lists strings"))).collect(),
+                Some(YVal::Str(t)) => Ok(vec![t.src.trim().to_owned()]),
+                Some(_) => Err(format!("`supersede.{k}` is a list")),
+            }
+        };
+        if let Some((k, _)) = entries.iter().find(|(k, _)| !matches!(k.as_str(), "when" | "action" | "keep" | "finish-within")) {
+            return Err(format!("`supersede.{k}` isn't one of when, action, keep and finish-within"));
+        }
+        let mut when = Vec::new();
+        for w in list("when")? {
+            when.push(match w.as_str() {
+                "branch" => When::Branch,
+                "stack" => When::Stack,
+                "pull_request" | "pull-request" => When::PullRequest,
+                other => return Err(format!("`supersede.when` names `{other}`: it takes branch, stack and pull_request")),
+            });
+        }
+        if when.is_empty() {
+            when.push(When::Branch);
+        }
+        let action = match v.get("action").and_then(YVal::as_str).unwrap_or("cancel") {
+            "cancel" => Supersede::Cancel,
+            "deprioritize" => Supersede::Deprioritize,
+            "adopt" => Supersede::Adopt,
+            other => return Err(format!("`supersede.action` is `{other}`: it takes cancel, deprioritize or adopt")),
+        };
+        let finish_within = match v.get("finish-within") {
+            None | Some(YVal::Null) => FINISH_WITHIN,
+            Some(YVal::Num(n)) if *n >= 0.0 => *n as i64,
+            Some(x) => x
+                .as_str()
+                .and_then(crate::plan::reuse::parse_age)
+                .and_then(|s| i64::try_from(s).ok())
+                .ok_or_else(|| "`supersede.finish-within` is a duration: `90s`, `5m`".to_owned())?,
+        };
+        Ok(Some(Supersession { when, action, keep: list("keep")?, finish_within }))
+    }
+}
 
 /// What a run's verdict is wanted for (W28-R40).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

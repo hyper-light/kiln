@@ -1657,9 +1657,11 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `queue: fifo | latest | cancel-in-progress`. GitHub's `queue: single | max` now covers them,
   so kiln uses GitHub's.)
 - **W05-R08 Superseded runs** (opt-in, G-22): `supersede: { when: [branch, stack, pull_request],
-  action: cancel | deprioritize, keep: [main] }` on a workflow cancels or lowers older active runs
-  of the same workflow when a new push arrives for the same branch, a new version of a diff in the
-  same stack, or the same pull request.
+  action: cancel | deprioritize | adopt, keep: [main], finish-within: 5m }` on a workflow cancels or
+  lowers older active runs of the same workflow when a new push arrives for the same branch, a new
+  version of a diff in the same stack, or the same pull request. `adopt` withdraws their demands
+  instead (W28-R40 to R47): their work goes on while a newer run adopts it, and what no one wants
+  gives way to live work unless it's within `finish-within` (300 s by default) of its end.
 - **W05-R09 Priorities.** Default by event: `workflow_dispatch`/manual 100, `land`/`merge_group`
   90, `diff`/`pull_request` 80, `push` 60, `agent` 60, `workflow_run` 50, `schedule` 20; a job's
   `priority: high | normal | low | <0–100>` overrides. Strict between classes, with **aging**:
@@ -1683,7 +1685,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `exclusive`, `approval`, `scaling` (a pool is starting runners; how many and since when),
   `max-parallel`, `capability` (eligible runners' builds lack a capability; which),
   `other-runner` (only the runner its retry avoids could take it: R16's `runner: different`, or a
-  runner that refused it; which). It is stored (`jobs.wait_reason`), sent as an event, and shown
+  runner that refused it; which), `adopted` (it waits for the same work in flight, W28-R42: which
+  leg of which run). It is stored (`jobs.wait_reason`), sent as an event, and shown
   on the leg.
 
 **Requirements: retries** (G-16)
@@ -7943,6 +7946,20 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   `Command::Adopted` (reused from it) or carry on as R44 says. Every decision is a
   `Command::Demand`, said once, with why. After a restart, a running leg announced with work takes
   over a queued duplicate of it.
+- **W28-R46 The dispatcher.** `supersede:` (W05-R08) is read into `when`, `action`, `keep` and
+  `finish-within`; one that doesn't read is logged and supersedes nothing. A new or approved run
+  supersedes on its lane: the repository, the workflow, and the branch, pull request or stack its
+  event names. A rerun's demand is live again and withdraws nothing, and a restart hands the
+  demands over again in creation order. A demand's commit is the event's sha; its intent comes from
+  the event (a land or merge group is a gate, a dispatch someone waits for, a push to the default
+  branch the trunk's, the rest work in progress); its actor is `github.actor`; its domain is the
+  run's trust. In a run that adopts, every leg has work: its W08-R10 input hash as its key (none
+  without `reuse:`, so never adopted), protected when it's bound to an environment. Ledger hits stay
+  the dispatcher's, before a leg is queued. An adopter takes its execution's result over in place,
+  its steps, outputs and artifacts, `reused_from` naming it, and concludes as it did.
+- **W28-R47 Every decision says why.** Each `Command::Demand` is a notice on its leg, which the
+  run page shows, and the leg's `demand` in `ci.legs.routing`. An adopter's wait reads "Adopted
+  `<leg>` of run `<run>`: the same work in flight".
 
 **Acceptance criteria: demands**
 
@@ -7957,10 +7974,19 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   cancelled, saying no live demand wants it and it had 140 s left; B's ui leg adopts A's; B's rust
   leg runs once A's stopped. After a restart that queues B's leg before A's running one is
   announced, the work runs once. *Simulation test* (`cargo test -p kiln-ci sched::tests::w28`).
+- **W28-AC42 Adopting on a server.** Push A, then B touching only `docs/` while A's rust leg runs:
+  B's rust leg adopts A's, with one execution, both runs green, A not cancelled, and B's leg
+  `reused_from` A's. *E2E* (`cargo test -p kiln --test adopt`).
+- **W28-AC43 Freeing what no one wants.** B touches `crates/` while A's rust leg runs and the
+  runner's slots are full: A's rust leg is cancelled as unwanted, saying why; B's ui leg adopts
+  A's; B's rust leg runs. (Starting on A's warm workspace waits for W24-R11: the cancel names the
+  lane.) *E2E.*
+- **W28-AC44 Restart mid-adoption.** The server killed while B's leg adopts A's: after the restart
+  the work in flight is rebuilt from SQLite, and both legs settle (W05-R25). *E2E.*
 
-**Progress (step 4).** R40–R45, AC40 and AC41 built (2026-10-25) in `kiln_ci::sched::demand` and
-`kiln_ci::sched::state`. The dispatcher and step 1's replay don't use them yet: those are the
-plan's steps 3 and 4.
+**Progress (step 4).** R40–R47 and AC40–AC44 built (2026-10-25) in `kiln_ci::sched::demand`,
+`kiln_ci::sched::state` and `crates/kiln/src/ci/dispatch.rs`. Step 1's replay doesn't use the
+demand table yet: that's the plan's step 4.
 
 ## 4. API, events, CLI and MCP reference
 

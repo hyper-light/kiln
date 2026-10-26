@@ -100,6 +100,8 @@ pub struct LegIn {
     /// After a restart: when the attempt its runner still runs started (unix ms), for how long it
     /// has left (W28-R43).
     pub started: Option<i64>,
+    /// Its workflow's `supersede.finish-within` (W28-R43), over the scheduler's.
+    pub finish_within: Option<i64>,
 }
 
 /// A runner that can take legs.
@@ -1011,7 +1013,8 @@ impl Scheduler {
     /// cancelling path.
     fn reconsider(&mut self, exec: &str, contended: bool, now: i64, out: &mut Vec<Command>) -> Option<Fate> {
         let left = self.left(exec, now);
-        let fate = self.demands.fate(exec, left, contended, self.config().finish_within)?;
+        let finish_within = self.legs.get(exec).and_then(|l| l.input.finish_within).unwrap_or(self.config().finish_within);
+        let fate = self.demands.fate(exec, left, contended, finish_within)?;
         self.decide(exec, Decision::Fate(fate.clone()), out);
         match &fate {
             Fate::Kept { priority, .. } => self.rekey(exec, *priority),

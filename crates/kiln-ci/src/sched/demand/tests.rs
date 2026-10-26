@@ -770,3 +770,28 @@ fn w28_ac40_single_flight_within_domains() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[test]
+fn w28_r46_supersede_reads() -> Result<(), String> {
+    use crate::wf::ir::Tpl;
+    let s = |x: &str| YVal::Str(Tpl::new(x, Default::default()));
+    let map = |kv: Vec<(&str, YVal)>| YVal::Map(kv.into_iter().map(|(k, v)| (k.to_owned(), v)).collect());
+    let adopt = map(vec![("when", YVal::Seq(vec![s("branch"), s("pull_request")])), ("action", s("adopt")), ("keep", YVal::Seq(vec![s("release")])), ("finish-within", s("0s"))]);
+    assert_eq!(
+        Supersession::from_yval(&adopt)?,
+        Some(Supersession { when: vec![When::Branch, When::PullRequest], action: Supersede::Adopt, keep: vec!["release".into()], finish_within: 0 })
+    );
+    assert_eq!(Supersession::from_yval(&map(Vec::new()))?, Some(Supersession { when: vec![When::Branch], action: Supersede::Cancel, keep: Vec::new(), finish_within: FINISH_WITHIN }));
+    assert_eq!(Supersession::from_yval(&map(vec![("finish-within", s("5m"))]))?.map(|x| x.finish_within), Some(300));
+    assert_eq!(Supersession::from_yval(&YVal::Null)?, None);
+    for (bad, says) in [
+        (map(vec![("action", s("sometimes"))]), "takes cancel, deprioritize or adopt"),
+        (map(vec![("when", YVal::Seq(vec![s("tag")]))]), "takes branch, stack and pull_request"),
+        (map(vec![("colour", s("red"))]), "isn't one of"),
+        (map(vec![("finish-within", s("soon"))]), "is a duration"),
+        (s("adopt"), "is a map"),
+    ] {
+        assert!(Supersession::from_yval(&bad).is_err_and(|e| e.contains(says)), "{bad:?}");
+    }
+    Ok(())
+}
