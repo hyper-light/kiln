@@ -7921,7 +7921,8 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   can't tell (they stay suspects, saying why).
 - **W28-R53 The replay.** Step 1's replayer decides P3's verdicts with `kiln_ci::verdict`: each job a
   check, a commit affecting the jobs whose input keys it changed, a new failure bisecting only its
-  suspects (ceil(log2 n) runs for n; one is the culprit at once). A commit's verdict counts from
+  suspects, each try where R56's planner says (a suspect's job doing what its draw says; one
+  suspect is the culprit at once). A commit's verdict counts from
   when it was answered for good. ci/sim/README.md reports where the commits answered after an hour
   stood at the hour.
 - **W28-R54 A Cargo workspace's units.** `kiln_ci::verdict::cargo`, pure: from the root manifest's

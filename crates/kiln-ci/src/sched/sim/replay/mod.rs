@@ -244,9 +244,11 @@ pub struct Bisection {
     pub suspects: Vec<usize>,
     /// When its last run finished.
     pub done: Option<i64>,
-    /// The run it names once done: the first suspect whose job would have failed the same way, as
-    /// its draw says, else the failing run.
+    /// The run it names once done: where the planner's tries (each suspect's job doing what its
+    /// draw says) put the culprit (W28-R56).
     pub culprit: Option<usize>,
+    /// It ended with no culprit: the failure was a flake.
+    pub flake: bool,
 }
 
 /// Something the replay decided, and why (as docs/ci.md §0.3 asks of what kiln decides).
@@ -336,7 +338,9 @@ struct RunSt {
 struct BisectSt {
     run: usize,
     job: usize,
-    left: u32,
+    /// The planner (W28-R56), and where its try in flight runs.
+    search: crate::verdict::culprit::Search,
+    at: Option<crate::verdict::culprit::At>,
 }
 
 /// A k8s job's requests when it gives none (the server's default_cpu and default_memory).
@@ -1207,8 +1211,8 @@ impl Engine<'_> {
     }
 
     /// Keeps a job's result for its lane (P3): a new failure starts a bisection over its suspects,
-    /// the commits since its base whose diffs could affect the job (W28-R52), in ceil(log2 n) runs
-    /// for n of them; one suspect is the culprit at once.
+    /// the commits since its base whose diffs could affect the job (W28-R52), each try where
+    /// `kiln_ci::verdict::culprit` says (W28-R56, R57); one suspect is the culprit at once.
     fn record_result(&mut self, r: usize, j: usize, end: End, how: How) {
         if !self.policy.verdicts {
             return;
@@ -1226,49 +1230,75 @@ impl Engine<'_> {
         if suspects.is_empty() {
             return;
         }
-        let n = u32::try_from(suspects.len()).unwrap_or(u32::MAX);
-        let steps = u32::BITS - n.saturating_sub(1).leading_zeros();
         for o in &suspects {
             self.in_bisect.insert((lane.clone(), key.clone(), *o));
         }
         let b = self.bisections.len();
-        self.note(r, format!("job {j} newly failed: bisecting {} commits in {steps} runs", suspects.len()));
-        self.bisections.push(Bisection { lane, key, suspects, done: None, culprit: None });
-        self.bisect_st.push(BisectSt { run: r, job: j, left: steps });
-        if steps == 0 {
-            self.bisected(b);
-        } else {
-            self.new_exec(r, j, format!("bisect{b}"), 1, Some(b));
-        }
+        let search = crate::verdict::culprit::Search::new(suspects.len(), 0.0, false);
+        self.note(r, format!("job {j} newly failed: bisecting {} commits, at most {} tries", suspects.len(), crate::verdict::culprit::bound(suspects.len())));
+        self.bisections.push(Bisection { lane, key, suspects, done: None, culprit: None, flake: false });
+        self.bisect_st.push(BisectSt { run: r, job: j, search, at: None });
+        self.bisect_next(b);
     }
 
-    /// One bisection run finished: the next, or the culprit named.
-    fn bisect_step(&mut self, b: usize) {
-        let Some(st) = self.bisect_st.get_mut(b) else { return };
-        st.left = st.left.saturating_sub(1);
-        let (left, r, j) = (st.left, st.run, st.job);
-        if left == 0 {
-            self.bisected(b);
-        } else {
-            self.new_exec(r, j, format!("bisect{b}"), 1, Some(b));
-        }
-    }
-
-    /// A bisection ends now, naming its culprit: the first suspect whose job would have failed as
-    /// the failing run's did (its draw: what it would have done had it run), else the failing run.
-    fn bisected(&mut self, b: usize) {
+    /// The bisection's next try, where the planner says, or its end: the culprit named, or none.
+    fn bisect_next(&mut self, b: usize) {
+        use crate::verdict::culprit::{At, Next};
         let trace = self.trace;
-        let (Some(st), Some(bi)) = (self.bisect_st.get(b), self.bisections.get(b)) else { return };
-        let (r, j) = (st.run, st.job);
-        let failed = |rr: usize, jj: usize| self.draw(rr, jj).filter(|d| !d.end.passed()).map(|d| d.failed_step.clone());
-        let how = failed(r, j);
-        let first = bi.suspects.iter().copied().find(|&s| trace.runs.get(s).and_then(|run| run.jobs.iter().position(|x| x.key == bi.key)).is_some_and(|js| how.is_some() && failed(s, js) == how));
-        let culprit = first.or_else(|| bi.suspects.contains(&r).then_some(r)).or_else(|| bi.suspects.last().copied());
+        let Some(st) = self.bisect_st.get(b) else { return };
+        let (r, next) = (st.run, st.search.next());
+        let Some(bi) = self.bisections.get(b) else { return };
+        let suspects = bi.suspects.clone();
+        let key = bi.key.clone();
+        let (culprit, flake) = match next {
+            Next::Try { at } => {
+                let tried = match at {
+                    At::Suspect(k) => suspects.get(k).copied(),
+                    At::Failing => Some(r),
+                };
+                let job = tried.and_then(|t| trace.runs.get(t).and_then(|run| run.jobs.iter().position(|x| x.key == key)).map(|js| (t, js)));
+                if let Some((t, js)) = job {
+                    if let Some(st) = self.bisect_st.get_mut(b) {
+                        st.at = Some(at);
+                    }
+                    self.new_exec(t, js, format!("bisect{b}"), 1, Some(b));
+                    return;
+                }
+                (None, false)
+            }
+            Next::Culprit { suspect, .. } => (suspects.get(suspect).copied(), false),
+            Next::NoCulprit { .. } => (None, true),
+            Next::Inconclusive { .. } => (None, false),
+        };
         let now = self.now;
         if let Some(bi) = self.bisections.get_mut(b) {
             bi.done = Some(now);
             bi.culprit = culprit;
+            bi.flake = flake;
         }
+    }
+
+    /// One bisection try finished: its outcome for the check (its job's draw failing the way the
+    /// failing run's did), then the next.
+    fn bisect_step(&mut self, b: usize) {
+        use crate::verdict::culprit::At;
+        let trace = self.trace;
+        let Some(st) = self.bisect_st.get(b) else { return };
+        let (r, j, at) = (st.run, st.job, st.at);
+        let Some(at) = at else { return };
+        let key = self.bisections.get(b).map(|bi| bi.key.clone()).unwrap_or_default();
+        let tried = match at {
+            At::Suspect(k) => self.bisections.get(b).and_then(|bi| bi.suspects.get(k).copied()),
+            At::Failing => Some(r),
+        };
+        let failed_as = |rr: usize, jj: usize| self.draw(rr, jj).filter(|d| !d.end.passed()).map(|d| d.failed_step.clone());
+        let how = failed_as(r, j);
+        let failed = tried.and_then(|t| trace.runs.get(t).and_then(|run| run.jobs.iter().position(|x| x.key == key)).map(|js| (t, js))).is_some_and(|(t, js)| how.is_some() && failed_as(t, js) == how);
+        if let Some(st) = self.bisect_st.get_mut(b) {
+            st.search.observe(at, failed);
+            st.at = None;
+        }
+        self.bisect_next(b);
     }
 
     fn check_concluded(&mut self, r: usize) {

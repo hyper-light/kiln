@@ -151,9 +151,10 @@ pub fn lane_detail(trace: &Trace, out: &Outcome, runs: &[usize], hour: Option<i6
             continue;
         }
         let suspects: Vec<usize> = b.suspects.iter().filter_map(|r| place.get(r).copied()).collect();
-        let finding = match b.culprit.and_then(|c| place.get(&c)) {
-            Some(&commit) => Finding::Culprit { commit },
-            None => Finding::NoCulprit,
+        let finding = match (b.culprit.and_then(|c| place.get(&c)), b.flake) {
+            (Some(&commit), _) => Finding::Culprit { commit },
+            (None, true) => Finding::NoCulprit,
+            (None, false) => Finding::Inconclusive { why: "the bisection couldn't tell".into() },
         };
         events.push((done, 1, events.len(), Event::Found(Found { check: check(run, &b.key), suspects, finding, at: done })));
     }
