@@ -433,6 +433,8 @@ pub struct Hub {
     pub blobs: crate::blobs::Opened,
     /// The bus kiln's events ride: its sessions' live feeds (docs/bus.md).
     pub bus: crate::bus::QuiverBus,
+    /// Memo steps in flight, one execution per key and domain (docs/ci.md W28-R72).
+    pub flight: crate::ci::services::memo::Flights,
 }
 
 impl Hub {
@@ -542,6 +544,7 @@ impl Hub {
             push: crate::push::Service::default(),
             blobs,
             bus,
+            flight: Default::default(),
         }))
     }
 
