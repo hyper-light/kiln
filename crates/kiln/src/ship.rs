@@ -139,19 +139,71 @@ fn part_of(status: &str, conclusion: Option<&str>) -> Part {
     }
 }
 
-/// Reads one commit's records (`sha`: the whole sha, or any unique prefix of seven or more).
-fn load(c: &rusqlite::Connection, repo: &str, sha: &str) -> anyhow::Result<Option<Records>> {
-    let found: Option<(String, String, String, i64)> = c
+const DEPLOY_COLS: &str = "d.environment, (d.production = 1 OR lower(d.environment) = 'production'), d.sha,
+     (SELECT MIN(x.rowid) FROM runs x WHERE x.repo_id = d.repo_id AND x.sha = d.sha),
+     (SELECT s.state FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1),
+     (SELECT s.description FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1),
+     (SELECT s.created_at FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1)";
+
+fn deploy_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeployRec> {
+    Ok(DeployRec {
+        environment: r.get(0)?,
+        production: r.get(1)?,
+        sha: r.get(2)?,
+        first_row: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+        state: r.get(4)?,
+        description: r.get(5)?,
+        at: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+    })
+}
+
+/// What a repository's commits share, read once per refresh rather than once per commit: what each
+/// environment runs now, the newer commit production waits on, and every commit's first run (its
+/// place in time) and branch, newest first.
+#[derive(Debug, Clone, Default)]
+struct RepoCtx {
+    id: String,
+    name: String,
+    current: Vec<DeployRec>,
+    waiting: Option<(String, i64)>,
+    commits: Vec<(String, i64, String)>,
+}
+
+fn repo_ctx(c: &rusqlite::Connection, repo: &str) -> anyhow::Result<Option<RepoCtx>> {
+    let found: Option<(String, String)> = c.query_row("SELECT id, name FROM repos WHERE name = ?1 OR id = ?1", [repo], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let Some((id, name)) = found else { return Ok(None) };
+    let mut st = c.prepare(&format!(
+        "SELECT {DEPLOY_COLS} FROM ci_deployments d WHERE d.repo_id = ?1 AND d.id = (SELECT MAX(e.id) FROM ci_deployments e WHERE e.repo_id = d.repo_id AND e.environment = d.environment
+           AND (SELECT s.state FROM ci_deployment_statuses s WHERE s.deployment_id = e.id ORDER BY s.id DESC LIMIT 1) = 'success')"
+    ))?;
+    let current = st.query_map([&id], deploy_row)?.collect::<Result<_, _>>()?;
+    let waiting = c
         .query_row(
-            "SELECT p.id, p.name, r.sha, MIN(r.rowid) FROM runs r JOIN repos p ON p.id = r.repo_id
-             WHERE (p.name = ?1 OR p.id = ?1) AND (r.sha = ?2 OR (length(?2) >= 7 AND r.sha LIKE ?2 || '%')) GROUP BY p.id, r.sha LIMIT 1",
-            params![repo, sha],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            "SELECT x.sha, MIN(x.rowid) FROM deploy_releases d JOIN runs x ON x.repo_id = ?1 AND x.sha = json_extract(d.spec, '$.version')
+             WHERE d.state = 'waiting' AND lower(d.environment) = 'production' GROUP BY x.sha ORDER BY MIN(x.rowid) DESC LIMIT 1",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((repo_id, repo_name, sha, first_row)) = found else { return Ok(None) };
-    let mut rec = Records { repo: repo_name, sha: sha.clone(), first_row, ..Records::default() };
+    let mut st = c.prepare("SELECT sha, MIN(rowid) AS f, MIN(branch) FROM runs WHERE repo_id = ?1 GROUP BY sha ORDER BY f DESC")?;
+    let commits = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    Ok(Some(RepoCtx { id, name, current, waiting, commits }))
+}
 
+/// Reads one commit's records (`sha`: the whole sha, or any unique prefix of seven or more).
+fn load(c: &rusqlite::Connection, repo: &str, sha: &str) -> anyhow::Result<Option<Records>> {
+    let Some(ctx) = repo_ctx(c, repo)? else { return Ok(None) };
+    let found = ctx.commits.iter().find(|(s, _, _)| s == sha || (sha.len() >= 7 && s.starts_with(sha))).map(|(s, f, _)| (s.clone(), *f));
+    match found {
+        Some((sha, first_row)) => Ok(Some(load_with(c, &ctx, &sha, first_row)?)),
+        None => Ok(None),
+    }
+}
+
+/// One commit's own records; what it shares with its repository comes from `ctx`.
+fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64) -> anyhow::Result<Records> {
+    let (repo_id, sha) = (ctx.id.clone(), sha.to_string());
+    let mut rec = Records { repo: ctx.name.clone(), sha: sha.clone(), first_row, ..Records::default() };
     let mut st = c.prepare("SELECT id, pipeline, branch, message, author, created_at FROM runs WHERE repo_id = ?1 AND sha = ?2 ORDER BY rowid")?;
     rec.runs = st
         .query_map(params![repo_id, sha], |r| Ok(RunRec { id: r.get(0)?, pipeline: r.get(1)?, branch: r.get(2)?, message: r.get(3)?, actor: r.get(4)?, created_at: r.get(5)? }))?
@@ -179,57 +231,24 @@ fn load(c: &rusqlite::Connection, repo: &str, sha: &str) -> anyhow::Result<Optio
         .query_row("SELECT state, reason FROM land_queue WHERE repo_id = ?1 AND candidate = ?2 ORDER BY updated_at DESC LIMIT 1", params![repo_id, sha], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
 
-    // Each environment's deployments: this commit's latest in each, and what each runs now (its
-    // newest deployment that succeeded).
-    let deploy = |r: &rusqlite::Row<'_>| -> rusqlite::Result<DeployRec> {
-        Ok(DeployRec {
-            environment: r.get(0)?,
-            production: r.get(1)?,
-            sha: r.get(2)?,
-            first_row: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
-            state: r.get(4)?,
-            description: r.get(5)?,
-            at: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
-        })
-    };
-    let cols = "d.environment, (d.production = 1 OR lower(d.environment) = 'production'), d.sha,
-         (SELECT MIN(x.rowid) FROM runs x WHERE x.repo_id = d.repo_id AND x.sha = d.sha),
-         (SELECT s.state FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1),
-         (SELECT s.description FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1),
-         (SELECT s.created_at FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1)";
-    let mut st = c.prepare(&format!("SELECT {cols} FROM ci_deployments d WHERE d.repo_id = ?1 AND d.sha = ?2 AND d.id = (SELECT MAX(e.id) FROM ci_deployments e WHERE e.repo_id = d.repo_id AND e.environment = d.environment AND e.sha = d.sha)"))?;
-    rec.own = st.query_map(params![repo_id, sha], deploy)?.collect::<Result<_, _>>()?;
-    let mut st = c.prepare(&format!(
-        "SELECT {cols} FROM ci_deployments d WHERE d.repo_id = ?1 AND d.id = (SELECT MAX(e.id) FROM ci_deployments e WHERE e.repo_id = d.repo_id AND e.environment = d.environment
-           AND (SELECT s.state FROM ci_deployment_statuses s WHERE s.deployment_id = e.id ORDER BY s.id DESC LIMIT 1) = 'success')"
-    ))?;
-    rec.current = st.query_map([&repo_id], deploy)?.collect::<Result<_, _>>()?;
-
+    // This commit's latest deployment in each environment; what each runs now is the repository's.
+    let mut st = c.prepare(&format!("SELECT {DEPLOY_COLS} FROM ci_deployments d WHERE d.repo_id = ?1 AND d.sha = ?2 AND d.id = (SELECT MAX(e.id) FROM ci_deployments e WHERE e.repo_id = d.repo_id AND e.environment = d.environment AND e.sha = d.sha)"))?;
+    rec.own = st.query_map(params![repo_id, sha], deploy_row)?.collect::<Result<_, _>>()?;
+    rec.current = ctx.current.clone();
     // Deploy API releases of this commit (by version), and a newer one production waits on.
     let mut st = c.prepare(
         "SELECT id, state, json_extract(spec, '$.message'), json_extract(spec, '$.rolled_back_by') IS NOT NULL FROM deploy_releases
          WHERE lower(environment) = 'production' AND (json_extract(spec, '$.version') = ?1 OR (length(json_extract(spec, '$.version')) >= 7 AND ?1 LIKE json_extract(spec, '$.version') || '%')) ORDER BY id",
     )?;
     rec.releases = st.query_map([&sha], |r| Ok(ReleaseRec { id: r.get(0)?, state: r.get(1)?, message: r.get(2)?, rolled_back: r.get(3)? }))?.collect::<Result<_, _>>()?;
-    rec.waiting = c
-        .query_row(
-            "SELECT x.sha, MIN(x.rowid) FROM deploy_releases d JOIN runs x ON x.repo_id = ?1 AND (x.sha = json_extract(d.spec, '$.version') OR x.sha LIKE json_extract(d.spec, '$.version') || '%')
-             WHERE d.state = 'waiting' AND lower(d.environment) = 'production' GROUP BY x.sha ORDER BY MIN(x.rowid) DESC LIMIT 1",
-            [&repo_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
+    rec.waiting = ctx.waiting.clone();
     // The commits a production approval would ship: those newer than what production runs, up to this one.
     let prod_row = rec.current.iter().find(|d| d.production).map(|d| d.first_row).unwrap_or(0);
     let branch = rec.runs.first().map(|r| r.branch.clone()).unwrap_or_default();
-    rec.riders = c.query_row(
-        "SELECT COUNT(*) FROM (SELECT MIN(rowid) AS f FROM runs WHERE repo_id = ?1 AND branch = ?2 GROUP BY sha) WHERE f > ?3 AND f <= ?4",
-        params![repo_id, branch, prod_row, first_row],
-        |r| r.get::<_, u32>(0),
-    )?;
+    rec.riders = u32::try_from(ctx.commits.iter().filter(|(_, f, b)| *b == branch && *f > prod_row && *f <= first_row).count()).unwrap_or(u32::MAX);
     let mut st = c.prepare("SELECT tag_name FROM ci_releases WHERE repo_id = ?1 AND target_commitish = ?2 ORDER BY id")?;
     rec.tags = st.query_map(params![repo_id, sha], |r| r.get(0))?.collect::<Result<_, _>>()?;
-    Ok(Some(rec))
+    Ok(rec)
 }
 
 /// A commit's records as `kiln_cd::journey` reads them, `now` in ms.
@@ -467,6 +486,175 @@ pub async fn get_in(store: &crate::store::Store, repo: &str, sha: &str, runners:
     rec.map(|r| detail(&r, &runners, now)).ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))
 }
 
+
+// ---- In memory: a request reads memory only (plan step 5) ---------------------------------------
+
+/// A repository's commits held in memory: each one's records and its list JSON already rendered,
+/// with their order newest first (first run's rowid, sha).
+#[derive(Debug, Default)]
+struct HeldRepo {
+    ctx: RepoCtx,
+    order: Vec<(i64, String)>,
+    rows: HashMap<String, (Records, String)>,
+}
+
+#[derive(Debug, Default)]
+struct Held {
+    seq: i64,
+    built: bool,
+    at_ms: i64,
+    repos: HashMap<String, HeldRepo>,
+}
+
+/// Ship's read model in memory: built once, then kept current from `ship_changes`, which SQLite's
+/// triggers fill as runs, legs, attempts, images, the land queue, deployments, releases and tags
+/// change, so a refresh reloads only the commits that changed. A page is ready JSON joined.
+#[derive(Debug, Default)]
+pub struct ShipCache {
+    held: std::sync::RwLock<Held>,
+}
+
+/// How old the model may be before a request brings it up to date.
+const FRESH_MS: i64 = 250;
+
+fn poisoned() -> Fail {
+    (StatusCode::INTERNAL_SERVER_ERROR, "ship's read model lock was poisoned".to_string())
+}
+
+impl ShipCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the model is older than [`FRESH_MS`] (or not built yet).
+    pub fn stale(&self, now: i64) -> bool {
+        self.held.read().map(|h| !h.built || now - h.at_ms >= FRESH_MS).unwrap_or(true)
+    }
+
+    /// Brings the model up to date: every commit the first time, then only those that changed
+    /// (a repository's environments or releases moving reloads its commits).
+    pub async fn refresh(&self, store: &crate::store::Store, runners: &[RunnerSeen], now: i64) -> Result<(), Fail> {
+        let (built, seq) = {
+            let h = self.held.read().map_err(|_| poisoned())?;
+            (h.built, h.seq)
+        };
+        let (top, loaded) = store
+            .call(move |c| -> anyhow::Result<(i64, Vec<(RepoCtx, Vec<Records>, bool)>)> {
+                let top: i64 = c.query_row("SELECT COALESCE(MAX(seq), 0) FROM ship_changes", [], |r| r.get(0))?;
+                let mut want: HashMap<String, (bool, std::collections::HashSet<String>)> = HashMap::new();
+                if !built {
+                    let mut st = c.prepare("SELECT id FROM repos")?;
+                    for id in st.query_map([], |r| r.get::<_, String>(0))? {
+                        want.insert(id?, (true, Default::default()));
+                    }
+                } else if top > seq {
+                    let mut st = c.prepare("SELECT repo_id, sha FROM ship_changes WHERE seq > ?1")?;
+                    for row in st.query_map([seq], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))? {
+                        let (repo, sha) = row?;
+                        let e = want.entry(repo).or_default();
+                        match sha {
+                            None => e.0 = true,
+                            Some(s) => {
+                                e.1.insert(s);
+                            }
+                        }
+                    }
+                }
+                let mut out = Vec::new();
+                for (repo, (all, shas)) in want {
+                    let Some(ctx) = repo_ctx(c, &repo)? else { continue };
+                    let mut recs = Vec::new();
+                    for (sha, first_row, _) in ctx.commits.iter().filter(|(s, _, _)| all || shas.contains(s)) {
+                        recs.push(load_with(c, &ctx, sha, *first_row)?);
+                    }
+                    out.push((ctx, recs, all));
+                }
+                c.execute("DELETE FROM ship_changes WHERE seq <= ?1", [top])?;
+                Ok((top, out))
+            })
+            .await
+            .map_err(internal)?;
+        let mut h = self.held.write().map_err(|_| poisoned())?;
+        for (ctx, recs, all) in loaded {
+            let held = h.repos.entry(ctx.name.clone()).or_default();
+            if all {
+                held.rows.clear();
+            }
+            for rec in recs {
+                let json = serde_json::to_string(&summary(&rec, runners, now)).unwrap_or_default();
+                held.rows.insert(rec.sha.clone(), (rec, json));
+            }
+            held.order = ctx.commits.iter().filter(|(s, _, _)| held.rows.contains_key(s)).map(|(s, f, _)| (*f, s.clone())).collect();
+            held.ctx = ctx;
+        }
+        // What time and the runners move without a record changing: the guard and the soak run
+        // down, and the commit production runs replants. Those few are drawn again.
+        for held in h.repos.values_mut() {
+            let prod = held.ctx.current.iter().find(|d| d.production).map(|d| d.sha.clone());
+            for (sha, (rec, json)) in held.rows.iter_mut() {
+                if prod.as_deref() == Some(sha.as_str()) || json.contains("\"guard\"") || json.contains("\"soaking\"") {
+                    *json = serde_json::to_string(&summary(rec, runners, now)).unwrap_or_default();
+                }
+            }
+        }
+        h.seq = top;
+        h.built = true;
+        h.at_ms = now;
+        Ok(())
+    }
+
+    /// A page of commits, newest first, from memory: of `repo` (name or id) or every repository,
+    /// of those named in `only`, before `cursor`, at most `limit`.
+    pub fn page(&self, repo: Option<&str>, only: Option<&[String]>, cursor: i64, limit: usize) -> Result<String, Fail> {
+        let h = self.held.read().map_err(|_| poisoned())?;
+        let mut picked: Vec<(i64, &str)> = Vec::new();
+        let repos: Vec<(&String, &HeldRepo)> = h.repos.iter().filter(|(name, r)| repo.is_none_or(|x| x == name.as_str() || x == r.ctx.id) && only.is_none_or(|o| o.iter().any(|n| n == *name))).collect();
+        for (_, r) in &repos {
+            // Newest first already: skip to the cursor, take what a page needs.
+            let from = r.order.partition_point(|(f, _)| *f >= cursor);
+            for (f, sha) in r.order.iter().skip(from).take(limit + 1) {
+                if let Some((_, json)) = r.rows.get(sha) {
+                    picked.push((*f, json.as_str()));
+                }
+            }
+        }
+        if repos.len() > 1 {
+            picked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        }
+        let more = picked.len() > limit;
+        let page = picked.get(..limit.min(picked.len())).unwrap_or_default();
+        let mut out = String::with_capacity(page.iter().map(|(_, j)| j.len() + 1).sum::<usize>() + 48);
+        out.push_str("{\"commits\":[");
+        for (i, (_, json)) in page.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(json);
+        }
+        out.push_str("],\"next_cursor\":");
+        match page.last().filter(|_| more) {
+            Some((f, _)) => out.push_str(&f.to_string()),
+            None => out.push_str("null"),
+        }
+        out.push('}');
+        Ok(out)
+    }
+
+    /// One commit's detail from memory (`sha`: whole, or a prefix of seven or more).
+    pub fn detail(&self, repo: &str, sha: &str, runners: &[RunnerSeen], now: i64) -> Option<Value> {
+        let h = self.held.read().ok()?;
+        let r = h.repos.iter().find(|(name, r)| name.as_str() == repo || r.ctx.id == repo).map(|(_, r)| r)?;
+        let rec = r.rows.get(sha).map(|(rec, _)| rec).or_else(|| if sha.len() >= 7 { r.rows.iter().find(|(s, _)| s.starts_with(sha)).map(|(_, (rec, _))| rec) } else { None })?;
+        Some(detail(rec, runners, now))
+    }
+}
+
+static CACHE: std::sync::OnceLock<ShipCache> = std::sync::OnceLock::new();
+
+fn cache() -> &'static ShipCache {
+    CACHE.get_or_init(ShipCache::new)
+}
+
 /// The runners as the updates know them, for the commit production runs.
 async fn runners_seen(hub: &std::sync::Arc<Hub>) -> Vec<RunnerSeen> {
     let jobs = hub.updates.jobs();
@@ -485,20 +673,37 @@ async fn runners_seen(hub: &std::sync::Arc<Hub>) -> Vec<RunnerSeen> {
         .collect()
 }
 
-/// `GET /api/ship/commits?…`
+/// `GET /api/ship/commits?…`: from memory, brought up to date first when it's older than
+/// [`FRESH_MS`].
 pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller: Option<&crate::authz::Caller>) -> Result<Response, Fail> {
-    let only: Option<String> = match caller {
-        Some(c) => crate::authz::gate::readable(hub, c, "runs.read").await.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())),
+    let only: Option<Vec<String>> = match caller {
+        Some(c) => crate::authz::gate::readable(hub, c, "runs.read").await,
         None => None,
     };
-    let runners = runners_seen(hub).await;
-    Ok(srv::json(StatusCode::OK, &list_in(&hub.store, q, only, runners, crate::util::now_ms()).await?))
+    let now = crate::util::now_ms();
+    let c = cache();
+    if c.stale(now) {
+        let runners = runners_seen(hub).await;
+        c.refresh(&hub.store, &runners, now).await?;
+    }
+    let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(30).clamp(1, 1000);
+    let cursor = q.get("cursor").and_then(|c| c.parse::<i64>().ok()).unwrap_or(i64::MAX);
+    let body = c.page(q.get("repo").map(String::as_str).filter(|r| !r.is_empty()), only.as_deref(), cursor, limit)?;
+    Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
 }
 
-/// `GET /api/ship/commits/:repo/:sha`
+/// `GET /api/ship/commits/:repo/:sha`: from memory, else from the store.
 pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str) -> Result<Response, Fail> {
+    let now = crate::util::now_ms();
+    let c = cache();
     let runners = runners_seen(hub).await;
-    Ok(srv::json(StatusCode::OK, &get_in(&hub.store, repo, sha, runners, crate::util::now_ms()).await?))
+    if c.stale(now) {
+        c.refresh(&hub.store, &runners, now).await?;
+    }
+    match c.detail(repo, sha, &runners, now) {
+        Some(v) => Ok(srv::json(StatusCode::OK, &v)),
+        None => Ok(srv::json(StatusCode::OK, &get_in(&hub.store, repo, sha, runners, now).await?)),
+    }
 }
 
 #[cfg(test)]
@@ -618,6 +823,72 @@ mod tests {
             }
             let missing = get_in(&store, "hyper-light/kiln", "deadbee", runners(), now).await;
             assert!(matches!(missing, Err((StatusCode::NOT_FOUND, _))));
+            Ok(())
+        })
+    }
+
+    /// Plan step 5's measure: 10,000 runs (2,500 commits of 4 runs, 2 legs each), the model built,
+    /// then pages of 1,000 and 100 commits and one commit's detail read from memory. Run in release:
+    /// `cargo test --release -p kiln --lib ship_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn ship_bench_ten_thousand_runs_sub_millisecond() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            store
+                .call(|c| {
+                    let tx = c.unchecked_transaction()?;
+                    tx.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('kiln', 'hyper-light/kiln', 'https://example.invalid/kiln.git', 1)", [])?;
+                    let mut run = tx.prepare("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, attempt) VALUES (?1, 'kiln', ?2, ?3, 'push', 'main', ?4, 'a change', 'ada', 'completed', ?5, 1)")?;
+                    let mut leg = tx.prepare("INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, job_id, run_attempt) VALUES (?1, ?2, ?3, ?3, 'completed', 'success', '[]', '[]', '{}', ?3, 1)")?;
+                    let mut n = 0i64;
+                    for commit in 0..2500i64 {
+                        let sha = format!("{commit:07x}{}", "a".repeat(33));
+                        for pipeline in ["ci", "e2e", "sim", "release"] {
+                            n += 1;
+                            let id = format!("r{n}");
+                            run.execute(params![id, n, pipeline, sha, NOW_S + n])?;
+                            for k in 0..2 {
+                                leg.execute(params![format!("{id}l{k}"), id, format!("{pipeline} leg {k}")])?;
+                            }
+                        }
+                    }
+                    drop((run, leg));
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await?;
+            let cache = ShipCache::new();
+            let now = NOW_S * 1000;
+            let t = std::time::Instant::now();
+            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let build = t.elapsed();
+            let time = |f: &dyn Fn() -> usize| -> (f64, f64, f64, usize) {
+                let mut us: Vec<f64> = Vec::new();
+                let mut bytes = 0;
+                for _ in 0..500 {
+                    let t = std::time::Instant::now();
+                    bytes = f();
+                    us.push(t.elapsed().as_secs_f64() * 1e6);
+                }
+                us.sort_by(|a, b| a.total_cmp(b));
+                let at = |q: f64| us.get(((us.len() as f64 * q) as usize).min(us.len().saturating_sub(1))).copied().unwrap_or(f64::MAX);
+                (at(0.5), at(0.95), at(0.99), bytes)
+            };
+            let p1000 = time(&|| cache.page(Some("hyper-light/kiln"), None, i64::MAX, 1000).map(|s| s.len()).unwrap_or(0));
+            let p100 = time(&|| cache.page(Some("hyper-light/kiln"), None, i64::MAX, 100).map(|s| s.len()).unwrap_or(0));
+            let one = time(&|| cache.detail("hyper-light/kiln", "00004d2", &runners(), now).map(|v| v.to_string().len()).unwrap_or(0));
+            println!("ship bench: built 2,500 commits from 10,000 runs in {build:?}");
+            for (name, (p50, p95, p99, bytes)) in [("limit=1000", p1000), ("limit=100", p100), ("detail", one)] {
+                println!("ship bench: {name}: p50 {p50:.1} µs, p95 {p95:.1} µs, p99 {p99:.1} µs, {bytes} bytes");
+            }
+            assert!(p1000.3 > 0 && p100.3 > 0 && one.3 > 0, "every read answered");
+            if !cfg!(debug_assertions) {
+                assert!(p1000.2 < 1000.0, "limit=1000 p99 {:.1} µs is 1 ms or more", p1000.2);
+                assert!(p100.2 < 200.0, "limit=100 p99 {:.1} µs is 0.2 ms or more", p100.2);
+                assert!(one.2 < 200.0, "detail p99 {:.1} µs is 0.2 ms or more", one.2);
+            }
             Ok(())
         })
     }
