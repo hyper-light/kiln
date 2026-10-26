@@ -7965,6 +7965,11 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   made room for live work is contention. Capacity, durations, draws, warm credit and the ledger of
   finished results stay the replayer's; keys stay the trace's path-set keys; pushes are trusted,
   and `finish_within` is 300 s.
+- **W28-R49 A cancelled build's workspace is as good as a cold one.** A build cut off by the
+  runner's cancel (W05-R18) leaves what finished recorded and fresh, and what it cut off unrecorded,
+  so the next build there rebuilds it: cargo writes a unit's fingerprint only once the unit
+  finished. That is what a cancelled leg's warm workspace going back to its lane (W24-R11) relies
+  on.
 
 **Acceptance criteria: demands**
 
@@ -7993,9 +7998,16 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   (2.2 runner-h, about 0.6%). P0 still reproduces the week within 5 points, and the same seed gives
   the same outcome byte for byte. *Replay* (`cargo test -p kiln-ci sched::sim::replay`; the report
   in ci/sim/README.md).
+- **W28-AC46 A warm build after a mid-build cancel equals a cold one** (W24-AC02 extended). On a
+  fixture workspace (`a` <- `b`, whose build script takes 3 s, <- `c`, a binary), a release build cut
+  off by `kiln::proc::interrupt_group` once `a` finished, then built again in the same target
+  directory at the same path, concludes as a cold build: the same exit status, the same test
+  outcomes, the same binary byte for byte and the same output; `a` is fresh and `b` rebuilt.
+  *Integration test* (`cargo test -p kiln --test warm_cancel`).
 
-**Progress (step 4).** R40–R48 and AC40–AC45 built (2026-10-25) in `kiln_ci::sched::demand`,
-`kiln_ci::sched::state`, `crates/kiln/src/ci/dispatch.rs` and step 1's replayer.
+**Progress (step 4).** R40–R49 and AC40–AC46 built (2026-10-25) in `kiln_ci::sched::demand`,
+`kiln_ci::sched::state`, `crates/kiln/src/ci/dispatch.rs`, step 1's replayer and
+`crates/kiln/tests/warm_cancel.rs`.
 
 ## 4. API, events, CLI and MCP reference
 
