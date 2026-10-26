@@ -8080,10 +8080,9 @@ W25 step 3 (branch `ci-w25-engine`) did what the last column asked, and holds it
   the rest) for kiln-dialect legs, beneath a job's own `env:`.
 - *Release binaries* from the engine's release runs for `[updates]`: adoption, `build_commit`
   and keeping in step read the engine's runs, and a release under way isn't started again.
-- *A v1 fix found on the way:* v1's assignment sent `PlannedJob` with a `skip_serializing_if`
-  field by postcard, so a runner of the server's own build refused every job without `requires`
-  as `Malformed` (from 5e7d27bfb on). It goes in the layout runners have always read
-  (`w05_r22_an_assignments_spec_reads_back_with_or_without_requires`).
+- *A v1 bug the lab ran into:* a runner of the server's own build refused every v1 job without
+  `requires` as `Malformed` (from 5e7d27bfb on: `PlannedJob` went by postcard with that field
+  left out when empty). Main fixed it meanwhile (6c778d1f9, W05-R22), which this branch takes.
 
 Side by side (`ci/conformance/engine_vs_v1.py`): two throwaway servers on fedora, one per engine,
 each with its own bare repository, a minikube of their own and runners with production's labels,
