@@ -619,7 +619,7 @@ impl ShipCache {
             }
         }
         if repos.len() > 1 {
-            picked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            picked.sort_unstable_by_key(|p| std::cmp::Reverse(p.0));
         }
         let more = picked.len() > limit;
         let page = picked.get(..limit.min(picked.len())).unwrap_or_default();
