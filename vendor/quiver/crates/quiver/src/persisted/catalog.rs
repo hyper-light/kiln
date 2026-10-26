@@ -18,7 +18,7 @@ use quiver_api::{Class, Topic};
 const CREATE: u8 = 1;
 const DELETE: u8 = 2;
 const SERVES: u8 = 3;
-const START: u8 = 4;
+const MARK: u8 = 4;
 
 /// Format: a class as a record holds it.
 const fn class_code(class: Class) -> u8 {
@@ -54,9 +54,10 @@ pub(crate) enum Record {
         node: u64,
         port: u16,
     },
-    /// Node `node` started its run `run`: once it has applied this, it has applied every record
-    /// committed before it started.
-    Start { node: u64, run: u64 },
+    /// A mark of node `node`'s, in its run `run`: once it has applied it, it has applied every
+    /// record committed before it (made as the node starts, and as it looks for a topic it
+    /// doesn't hold).
+    Mark { node: u64, run: u64 },
 }
 
 impl Record {
@@ -85,8 +86,8 @@ impl Record {
                 out.extend_from_slice(&node.to_le_bytes());
                 out.extend_from_slice(&port.to_le_bytes());
             }
-            Self::Start { node, run } => {
-                out.push(START);
+            Self::Mark { node, run } => {
+                out.push(MARK);
                 out.extend_from_slice(&node.to_le_bytes());
                 out.extend_from_slice(&run.to_le_bytes());
             }
@@ -132,10 +133,10 @@ impl Record {
                     port,
                 })
             }
-            START => {
+            MARK => {
                 let (node, rest) = take_u64(rest)?;
                 let run = u64::from_le_bytes(rest.try_into().ok()?);
-                Some(Self::Start { node, run })
+                Some(Self::Mark { node, run })
             }
             _ => None,
         }
@@ -188,8 +189,8 @@ pub(crate) enum Applied {
     NoTopic,
     /// A node's port for a topic's part, recorded.
     Served,
-    /// A node's start: nothing changed.
-    Started,
+    /// A node's mark: nothing changed.
+    Marked,
     /// A record no node takes (bytes that are none, or a port for an incarnation not live):
     /// nothing changed, alike at every node.
     Ignored,
@@ -251,7 +252,7 @@ impl Catalog {
                 }
                 None => Applied::Ignored,
             },
-            Some(Record::Start { .. }) => Applied::Started,
+            Some(Record::Mark { .. }) => Applied::Marked,
         }
     }
 
@@ -295,7 +296,7 @@ mod tests {
                 node: 3,
                 port: 40_001,
             },
-            Record::Start { node: 2, run: 9 },
+            Record::Mark { node: 2, run: 9 },
         ];
         let mut out = Vec::new();
         for record in &records {

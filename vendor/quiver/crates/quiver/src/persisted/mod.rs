@@ -34,7 +34,6 @@ mod host;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::task::Waker;
 use std::thread::JoinHandle;
@@ -145,6 +144,10 @@ pub(crate) enum Command {
         at_us: u64,
         reply: oneshot::Sender<Result<Offset, Refusal>>,
     },
+    /// A mark through the catalog: answered once this node applied it.
+    Mark {
+        reply: oneshot::Sender<Result<(), Refusal>>,
+    },
 }
 
 /// What one group of a node did, as its host last looked.
@@ -249,9 +252,6 @@ pub(crate) struct Shared {
     bound: usize,
     views: RwLock<HashMap<String, Arc<Log>>>,
     stats: Mutex<PersistedStats>,
-    /// Whether the node has applied every catalog record committed before it started: until then
-    /// a topic it doesn't hold may be one it hasn't applied yet.
-    settled: AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -287,12 +287,7 @@ impl Shared {
     }
 
     fn settle(&self) {
-        self.settled.store(true, Ordering::Release);
         lock(&self.stats).settled = true;
-    }
-
-    fn settled(&self) -> bool {
-        self.settled.load(Ordering::Acquire)
     }
 
     fn set_figures(&self, run: u64, catalog: GroupFigures, topics: Vec<(String, GroupFigures)>) {
@@ -384,7 +379,6 @@ impl Persisted {
             bound: config.publishes.saturating_add(config.topics),
             views: RwLock::new(HashMap::new()),
             stats: Mutex::new(PersistedStats::default()),
-            settled: AtomicBool::new(false),
         });
         let (opened, open) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
         let for_host = Arc::clone(&shared);
@@ -431,21 +425,26 @@ impl Persisted {
 
     /// The view of the persisted topic `name`; refused [`Refusal::NoTopic`] where the node holds
     /// none, or for no quorum while the node hasn't caught up with its catalog.
-    pub(crate) fn view(&self, name: &str) -> Result<Arc<Log>, Refusal> {
-        let view = self
-            .shared
+    pub(crate) fn view(&self, name: &str) -> Option<Arc<Log>> {
+        self.shared
             .views
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(name)
-            .cloned();
-        match view {
-            Some(view) => Ok(view),
-            None if self.shared.settled() => Err(Refusal::NoTopic(name.to_owned())),
-            None => Err(Refusal::NoQuorum(
-                "this node hasn't caught up with its catalog's group since it started".to_owned(),
-            )),
+            .cloned()
+    }
+
+    /// The view of the persisted topic `name`. A node may not yet have applied a create another
+    /// node answered, so one it doesn't hold it looks for again once it has applied a mark of its
+    /// own through the catalog, everything committed before it: refused [`Refusal::NoTopic`]
+    /// only then, and for no quorum where the catalog has none.
+    pub(crate) async fn lookup(&self, name: &str) -> Result<Arc<Log>, Refusal> {
+        if let Some(view) = self.view(name) {
+            return Ok(view);
         }
+        self.ask(|reply| Command::Mark { reply }).await?;
+        self.view(name)
+            .ok_or_else(|| Refusal::NoTopic(name.to_owned()))
     }
 
     async fn ask<T>(

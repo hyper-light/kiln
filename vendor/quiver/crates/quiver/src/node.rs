@@ -197,12 +197,12 @@ impl Node {
     }
 
     /// The ephemeral topic `name`, else the view of the persisted topic `name`.
-    fn log(&self, name: &str) -> Result<Arc<Log>, Refusal> {
+    async fn log(&self, name: &str) -> Result<Arc<Log>, Refusal> {
         if let Some(log) = self.ephemeral(name) {
             return Ok(log);
         }
         match &self.inner.persisted {
-            Some(persisted) => persisted.view(name),
+            Some(persisted) => persisted.lookup(name).await,
             None => Err(Refusal::NoTopic(name.to_owned())),
         }
     }
@@ -253,7 +253,7 @@ impl Node {
             .persisted
             .as_ref()
             .ok_or_else(|| Refusal::NoTopic(name.to_owned()))?;
-        let view = persisted.view(name)?;
+        let view = persisted.lookup(name).await?;
         quiver_api::check_message(&view.topic, key, payload)?;
         let mut record = Vec::new();
         record_into(&mut record, key, payload);
@@ -270,7 +270,7 @@ impl Node {
             .inner
             .persisted
             .as_ref()
-            .is_some_and(|p| p.view(name).is_ok())
+            .is_some_and(|p| p.view(name).is_some())
         {
             return Err(Refusal::Exists(name.to_owned()));
         }
@@ -312,8 +312,7 @@ impl Node {
         Ok(())
     }
 
-    fn subscribe_now(&self, name: &str, start: Start) -> Result<Box<dyn Subscription>, Refusal> {
-        let log = self.log(name)?;
+    fn subscribe_to(&self, log: &Arc<Log>, start: Start) -> Result<Box<dyn Subscription>, Refusal> {
         let limit = self.inner.config.subscriptions;
         // A place is taken before the subscription is made, given back at once if it's past the
         // bound, and by the subscription as it's dropped: each place taken is given back once.
@@ -363,18 +362,15 @@ impl Topics for Node {
         from: Offset,
         limit: usize,
     ) -> BoxFuture<'a, Result<Batch, Refusal>> {
-        let out = self.log(name).and_then(|log| log.read(from, limit));
-        Box::pin(async move { out })
+        Box::pin(async move { self.log(name).await?.read(from, limit) })
     }
 
     fn wait<'a>(&'a self, name: &'a str, from: Offset) -> BoxFuture<'a, Result<(), Refusal>> {
-        let log = self.log(name);
-        Box::pin(async move { log?.wait(name, from).await })
+        Box::pin(async move { self.log(name).await?.wait(name, from).await })
     }
 
     fn bounds<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(Offset, Offset), Refusal>> {
-        let out = self.log(name).map(|log| log.bounds());
-        Box::pin(async move { out })
+        Box::pin(async move { Ok(self.log(name).await?.bounds()) })
     }
 
     fn subscribe<'a>(
@@ -382,8 +378,7 @@ impl Topics for Node {
         name: &'a str,
         start: Start,
     ) -> BoxFuture<'a, Result<Box<dyn Subscription>, Refusal>> {
-        let out = self.subscribe_now(name, start);
-        Box::pin(async move { out })
+        Box::pin(async move { self.subscribe_to(&self.log(name).await?, start) })
     }
 }
 
@@ -426,7 +421,7 @@ mod tests {
         now(n.create("second", ephemeral(10, 1 << 20))).unwrap();
         now(n.publish("second", Some(b"k"), b"value")).unwrap();
         now(n.publish("second", None, b"bare")).unwrap();
-        let log = n.log("second").unwrap();
+        let log = now(Box::pin(n.log("second"))).unwrap();
         assert_eq!(
             crate::ephemeral::focal_batch_of(&log, 0),
             Some((2, 1, b"\x02kvalue".to_vec()))

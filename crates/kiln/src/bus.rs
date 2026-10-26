@@ -195,11 +195,15 @@ mod tests {
         Ok(())
     }
 
-    struct PersistedFixture(QuiverBus, tempfile::TempDir);
+    /// A persisted bus and the directory its node keeps its data in, gone with it.
+    struct PersistedFixture {
+        bus: QuiverBus,
+        _dir: tempfile::TempDir,
+    }
 
     impl BusFixture for PersistedFixture {
         fn bus(&self) -> &dyn Bus {
-            &self.0
+            &self.bus
         }
 
         fn class(&self) -> Class {
@@ -239,7 +243,7 @@ mod tests {
             let (mut passed, mut failed) = (Vec::new(), Vec::new());
             for case in cases::<PersistedFixture>() {
                 let dir = tempfile::tempdir()?;
-                let fixture = PersistedFixture(persisted(&SimClock::new(), dir.path())?, dir);
+                let fixture = PersistedFixture { bus: persisted(&SimClock::new(), dir.path())?, _dir: dir };
                 match crate::rt::timeout(Duration::from_secs(60), (case.check)(&fixture)).await {
                     Ok(Ok(())) => passed.push(case.id),
                     Ok(Err(why)) => failed.push(format!("{}: {why}", case.id)),

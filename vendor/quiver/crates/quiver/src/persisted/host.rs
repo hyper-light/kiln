@@ -58,6 +58,11 @@ enum Waiter {
     Serves,
     /// The node's record of its start: once applied, the node has caught up with its catalog.
     Start,
+    /// A mark the node made looking for a topic it doesn't hold: once applied, it holds every
+    /// topic created before it.
+    Mark {
+        reply: oneshot::Sender<Result<(), Refusal>>,
+    },
 }
 
 /// A topic's member: bound and waiting for its peers' ports, or open.
@@ -238,7 +243,7 @@ impl Host {
             Publisher::new(client_driver, producer(config.id, run)?, config.id, now);
         catalog_publisher.set_nodes(config.nodes.clone(), now);
         let mut start = Vec::new();
-        Record::Start {
+        Record::Mark {
             node: config.id,
             run,
         }
@@ -485,6 +490,9 @@ impl Host {
             }
             Waiter::Serves => {}
             Waiter::Start => self.shared.settle(),
+            Waiter::Mark { reply } => {
+                let _ = reply.send(outcome.map(|_| ()));
+            }
         }
     }
 
@@ -821,6 +829,17 @@ impl Host {
                     let mut bytes = Vec::new();
                     Record::Delete { name: name.clone() }.encode(&mut bytes);
                     let ticket = self.ticket(Waiter::Delete { name, reply });
+                    let at_us = (self.clock)();
+                    self.catalog_publisher.queue(bytes, at_us, ticket, now);
+                }
+                Command::Mark { reply } => {
+                    let mut bytes = Vec::new();
+                    Record::Mark {
+                        node: self.config.id,
+                        run: self.run,
+                    }
+                    .encode(&mut bytes);
+                    let ticket = self.ticket(Waiter::Mark { reply });
                     let at_us = (self.clock)();
                     self.catalog_publisher.queue(bytes, at_us, ticket, now);
                 }

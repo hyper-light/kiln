@@ -45,10 +45,14 @@ KIP-631).
   as the part is first bound, kept in the part's directory and bound again at every start. Each
   node records its port in the catalog, and a node opens its member once every node's port is
   recorded.
-- **A node's start.** A node back from a restart has applied only what its catalog's log held: a
-  topic created while it was down isn't one it holds yet. It records its start in the catalog,
-  and until it has applied that record it refuses a request for a topic it doesn't hold
-  `NoQuorum` rather than `NoTopic`; its figures say when it has (`PersistedStats::settled`).
+- **A topic a node doesn't hold yet.** A create is answered by the node that asked once it has
+  applied it; another node may not have yet, and a node back from a restart has applied only what
+  its catalog's log held. So a node asked for a topic it doesn't hold makes a mark through the
+  catalog and looks again once it has applied it, everything committed before it: it refuses
+  `NoTopic` only then, and `NoQuorum` where the catalog has no leader. A node makes a mark as it
+  starts too; its figures say when it has applied it (`PersistedStats::settled`). (Without the
+  mark, a publish through the second node right after a create through the first was refused
+  `NoTopic`: the concurrent-publishers test, on fedora.)
 - **A bound.** The catalog's part keeps what its window holds, as any part (Focal's doc 34 P10):
   its records are tens of bytes, so a catalog of the least part memory holds some hundreds of
   thousands of them. A node that finds its catalog let go of records it never applied stops,
