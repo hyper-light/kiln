@@ -175,6 +175,10 @@ pub struct StepSpec {
     /// Allocate a pseudo-terminal so tools emit colour and progress bars.
     #[serde(default)]
     pub tty: bool,
+    /// The CI engine's `memo:` (docs/ci.md W24-R07, W28-R70): read and ignored here, so `.kiln/`
+    /// workflows that share steps on the engine still run on v1 until it takes them over.
+    #[serde(default, skip_serializing)]
+    pub memo: Option<serde_yaml::Value>,
 }
 
 /// A concrete, matrix-expanded unit of work ready to be queued.
@@ -459,6 +463,7 @@ pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
                 timeout_minutes: s.timeout_minutes.as_ref().map(|n| num(n, &format!("{sat}.timeout-minutes"))).transpose()?,
                 continue_on_error: s.continue_on_error.as_ref().and_then(YVal::as_bool).unwrap_or(false),
                 tty: s.kiln.tty,
+                memo: None,
             });
         }
         let spec = JobSpec {
