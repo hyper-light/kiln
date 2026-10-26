@@ -815,8 +815,66 @@ pub async fn start_subagent(hub: &Hub, by: &Starter, ask: Ask) -> Result<Info, R
         if s.manual_resume {
             let _ = hub.harness.command(hub, &info.id, super::model::Command::AutoResume { on: false }).await;
         }
+        // Its harness's other settings (its controls), once its harness lists them ([`settle_settings`]).
+        let controls = settings_of(hub.harness.meta(&parent.id).as_ref(), s);
+        if info.kind == parent.kind && !controls.is_empty() {
+            let pending = json!({"controls": controls, "at": crate::util::now_ms()});
+            let _ = hub.store.kv_set(format!("{LIKE}{}", info.id), pending.to_string()).await;
+        }
     }
     Ok(info)
+}
+
+/// Where kiln keeps the settings a subagent is still to be given, by the subagent (`kv`).
+const LIKE: &str = "agents/like/";
+/// How long a subagent's harness has to list the settings it's to be given.
+const LIKE_FOR_MS: i64 = 10 * 60_000;
+/// Controls that are kiln's own, or another way of saying what a subagent is given already.
+const NOT_SETTINGS: &[&str] = &["rename", "reach", "keep_going", "account", "reload_config"];
+
+/// The settings among an agent's controls (`meta`'s; their values `state`'s): those that hold for
+/// its session (a select, a toggle or words), not actions nor kiln's own, with the value it has now.
+fn settings_of(meta: Option<&Value>, state: &super::model::State) -> serde_json::Map<String, Value> {
+    let listed = meta.and_then(|m| m.get("controls")).and_then(Value::as_array).cloned().unwrap_or_default();
+    let setting = |id: &str| {
+        listed.iter().any(|c| {
+            let is = |k: &str, v: &str| c.get(k).and_then(Value::as_str) == Some(v);
+            is("id", id) && !is("kind", "action") && !is("scope", "turn")
+        })
+    };
+    state.control_values.iter().filter(|(id, v)| !v.is_null() && !NOT_SETTINGS.contains(&id.as_str()) && setting(id)).map(|(id, v)| (id.clone(), v.clone())).collect()
+}
+
+/// Gives each subagent kiln started the settings of its parent's it's still to be given (its
+/// harness's controls), each once its harness lists that control, as a person changing it would;
+/// what isn't listed within [`LIKE_FOR_MS`], or a subagent gone, is let go. Each tick of the goal
+/// driver.
+pub async fn settle_settings(hub: &Hub) {
+    let Ok(pending) = hub.store.kv_prefix(LIKE.to_owned()).await else { return };
+    let now = crate::util::now_ms();
+    for (key, value) in pending {
+        let Some(child) = key.strip_prefix(LIKE) else { continue };
+        let mut v: Value = serde_json::from_str(&value).unwrap_or(Value::Null);
+        let at = v.get("at").and_then(Value::as_i64).unwrap_or(0);
+        let listed: Vec<String> = hub.harness.meta(child).as_ref().and_then(|m| m.get("controls")).and_then(Value::as_array).into_iter().flatten().filter_map(|c| c.get("id").and_then(Value::as_str).map(str::to_owned)).collect();
+        let mut left = serde_json::Map::new();
+        let mut sent = false;
+        if hub.harness.info(child).is_some() {
+            for (id, value) in v.get_mut("controls").and_then(Value::as_object_mut).map(std::mem::take).unwrap_or_default() {
+                if listed.contains(&id) {
+                    let _ = hub.harness.command(hub, child, super::model::Command::Control { id, value: Some(value) }).await;
+                    sent = true;
+                } else {
+                    left.insert(id, value);
+                }
+            }
+        }
+        if left.is_empty() || now.saturating_sub(at) > LIKE_FOR_MS {
+            let _ = hub.store.kv_delete(key).await;
+        } else if sent {
+            let _ = hub.store.kv_set(key, json!({"controls": left, "at": at}).to_string()).await;
+        }
+    }
 }
 
 /// [`start`], the spec made for the ask then tuned by `tune` before anything starts.
@@ -1019,6 +1077,23 @@ mod tests {
         let odd = Info { mode: "turbo".into(), ..parent.clone() };
         let (ask, ..) = as_its_parent(Ask::default(), &odd, Some(&super::super::model::State { mode: "turbo".into(), ..state }));
         assert_eq!(ask.mode, None);
+    }
+
+    /// What a subagent is given of its agent's controls: its session settings (a select, a toggle,
+    /// words) as they are now; not actions, not a prompt's, not kiln's own, not one left unset.
+    #[test]
+    fn a_subagent_is_given_its_agent_s_session_settings_alone() {
+        let meta = json!({"controls": [
+            {"id": "approval_policy", "kind": "select"}, {"id": "web_search", "kind": "toggle"}, {"id": "notes", "kind": "text"},
+            {"id": "compact", "kind": "action"}, {"id": "rewind", "kind": "select", "scope": "turn"}, {"id": "rename", "kind": "text"}, {"id": "unset", "kind": "toggle"},
+        ]});
+        let mut state = super::super::model::State::default();
+        for (id, v) in [("approval_policy", json!("on-request")), ("web_search", json!(true)), ("notes", json!("terse")), ("compact", json!("x")), ("rewind", json!("e1")), ("rename", json!("Main")), ("unset", Value::Null), ("unlisted", json!(1))] {
+            state.control_values.insert(id.to_owned(), v);
+        }
+        let got = settings_of(Some(&meta), &state);
+        assert_eq!(Value::Object(got), json!({"approval_policy": "on-request", "web_search": true, "notes": "terse"}));
+        assert!(settings_of(None, &state).is_empty(), "with no controls listed, nothing");
     }
 
     #[test]

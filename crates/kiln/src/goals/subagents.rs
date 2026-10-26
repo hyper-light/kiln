@@ -833,6 +833,9 @@ mod hub_tests {
                 let g = theirs.items.first().cloned().unwrap_or_default();
                 assert!(g.step.as_ref().is_some_and(|s| s.n == n) && g.text.starts_with(&format!("Step {n} of 5 of the plan \"Fan out\": ")) && theirs.state == "running", "{theirs:?}");
             }
+            // It goes where its agent goes: not moved by itself.
+            let alone = crate::harness::relocate::start(&hub, &two, "elsewhere", false, None, None).await;
+            assert!(alone.as_ref().is_err_and(|e| e.contains("goes where its agent goes")), "{alone:?}");
             // Paused here, they pause; resumed, they go on.
             super::super::control(&hub, main, Action::Pause).await?;
             tick(&hub, &metrics).await;

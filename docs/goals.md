@@ -196,10 +196,13 @@ what it asks you is answered and the composer writes to it) and on the agent's r
 Control, which works through it and carries what it asks you, not as a row of its own. It works
 where and as the agent does: on the agent's own machine, never one kiln picks, in its folder; in
 its harness with its model, effort, speed and mode (at most its own, as every child's); with its
-Subagents setting, its pause point and its way of ending a pause; and, its machine copying them as
-it opens, with the agent's environment and program, so it has the agent's account and
-configuration (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). It doesn't go on elsewhere at a usage limit by
-itself. As many at once as there's room for
+Subagents setting, its pause point and its way of ending a pause; its harness's other session
+settings (its controls: an approval policy, a sandbox, an ACP agent's options), each given once its
+harness lists it; and, its machine copying them as it opens, with the agent's environment and
+program, so it has the agent's account and configuration (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). It
+stays on the agent's machine: it goes along when the agent moves (a move, a usage limit, a machine
+gone), and isn't moved, nor goes on elsewhere at a limit, by itself. Find (Ctrl/⌘F) in its thread
+searches its own conversation. As many at once as there's room for
 among the agent's subagents at work (its **Subagents → At once** setting, one pool whatever each
 does: docs/agents.md, "Agents that run agents"; none set, no limit); the steps there's no room for
 the agent takes itself, in turn, as it would have, so with no room at all its steps go one after

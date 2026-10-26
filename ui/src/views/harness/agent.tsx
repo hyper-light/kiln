@@ -208,10 +208,13 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
 
   // The matches, in the thread shown; a new search starts at the newest, and the one shown stays
   // shown as the conversation grows. (The conversation is read here only while finding.)
-  const findEvents = useSession(store, (s) => (findOpen ? s.events : NO_EVENTS));
-  const dropped = useSession(store, (s) => (findOpen ? (s.state?.dropped ?? 0) : 0));
+  // A subagent kiln started, its thread shown: found in its own session's conversation.
+  const subId = sub?.id;
+  const thread = React.useMemo(() => (subId ? sessionStore(subId) : store), [subId, store]);
+  const findEvents = useSession(thread, (s) => (findOpen ? s.events : NO_EVENTS));
+  const dropped = useSession(thread, (s) => (findOpen ? (s.state?.dropped ?? 0) : 0));
   const q = React.useDeferredValue(findQ);
-  const matches = React.useMemo(() => (findOpen ? findIn(findEvents, task ?? undefined, q) : []), [findOpen, findEvents, task, q]);
+  const matches = React.useMemo(() => (findOpen ? findIn(findEvents, subId ? undefined : (task ?? undefined), q) : []), [findOpen, findEvents, subId, task, q]);
   const [searched, setSearched] = React.useState("");
   if (findOpen && q !== searched) {
     setSearched(q);
@@ -285,7 +288,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
 
   const work = (
     <div className="hx-main">
-      {findOpen && !sub && (
+      {findOpen && (
         <FindBar
           q={findQ}
           onQ={setFindQ}
@@ -297,7 +300,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           inputRef={findInput}
         />
       )}
-      {findOpen && !sub && dropped > 0 && <EarlierMatches agent={id} q={findQ} before={findEvents[0]?.at} />}
+      {findOpen && dropped > 0 && <EarlierMatches agent={subId ?? id} q={findQ} before={findEvents[0]?.at} />}
       {(task || sub) && (
         <div className="hx-crumbs">
           <button type="button" className="hx-link" onClick={mainThread}>
@@ -318,7 +321,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       )}
       {sub ? (
         <React.Suspense fallback={<LoadingMark />}>
-          <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} />
+          <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} find={find} />
         </React.Suspense>
       ) : (
         <>
@@ -508,7 +511,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
  * thread where the conversation is, what it asks you answered there, and the composer writing to
  * it. What's only on its page of its own (its settings, its own subagents' threads) opens there.
  */
-function KilnThread({ id, onTerminal }: { id: string; onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void }) {
+function KilnThread({ id, onTerminal, find }: { id: string; onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void; find?: { q: string; now: FindNow | null } }) {
   const store = sessionStore(id);
   useSessionReady(store);
   const navigate = useNavigate();
@@ -542,6 +545,7 @@ function KilnThread({ id, onTerminal }: { id: string; onTerminal: (o: { what: "s
         onDecide={send}
         target={info?.target}
         kind={info?.kind}
+        find={find}
       />
       <Dock
         store={store}
