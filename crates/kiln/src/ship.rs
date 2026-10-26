@@ -608,7 +608,7 @@ impl ShipCache {
                         want.insert(id?, (true, Default::default()));
                     }
                 } else {
-                    let mut st = tx.prepare("SELECT repo_id, sha FROM ship_changes WHERE seq > ?1 AND seq <= ?2")?;
+                    let mut st = tx.prepare("SELECT repo_id, item FROM ship_changes WHERE seq > ?1 AND seq <= ?2")?;
                     for row in st.query_map(params![seq, top], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
                         let (repo, sha) = row?;
                         let e = want.entry(repo).or_default();
