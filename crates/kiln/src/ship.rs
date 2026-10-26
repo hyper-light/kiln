@@ -601,7 +601,7 @@ impl ShipCache {
         let read = store
             .call(move |c| -> anyhow::Result<Read> {
                 // One snapshot: the seq read and every record loaded agree.
-                let tx = c.unchecked_transaction()?;
+                let tx = c.savepoint()?;
                 let top: i64 = tx.query_row("SELECT n FROM ship_seq", [], |r| r.get(0))?;
                 let mut want: HashMap<String, (bool, std::collections::HashSet<String>)> = HashMap::new();
                 if !built {
@@ -1177,7 +1177,7 @@ mod tests {
         crate::rt::block_on(async move {
             store
                 .call(|c| {
-                    let tx = c.unchecked_transaction()?;
+                    let tx = c.savepoint()?;
                     tx.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('kiln', 'hyper-light/kiln', 'https://example.invalid/kiln.git', 1)", [])?;
                     let mut run = tx.prepare("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, attempt) VALUES (?1, 'kiln', ?2, ?3, 'push', 'main', ?4, 'a change', 'ada', 'completed', ?5, 1)")?;
                     let mut leg = tx.prepare("INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, job_id, run_attempt) VALUES (?1, ?2, ?3, ?3, 'completed', 'success', '[]', '[]', '{}', ?3, 1)")?;
