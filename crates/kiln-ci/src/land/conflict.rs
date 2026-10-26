@@ -1,4 +1,4 @@
-//! The land queue's conflict graph (docs/ci.md W25-R30 to R34), the pure part: which of the
+//! The land queue's conflict graph (docs/ci.md W26-R30 to R34), the pure part: which of the
 //! changes pending in the queue commute, and so land side by side, and which wait for which, each
 //! decision with why. The server gives the changes' files and deploy targets and the repository's
 //! units (W24-R16's package graph), and carries out what this says.
@@ -43,7 +43,7 @@ pub struct Unit {
     pub deps: BTreeSet<String>,
 }
 
-/// The repository's units and what each depends on (W25-R30). A name given more than once is one
+/// The repository's units and what each depends on (W26-R30). A name given more than once is one
 /// unit, holding the files of each folder given, reading every file and depending on every unit
 /// any of them names: the trunk's graph and each pending change's own (W24-R16 read with the change
 /// applied), given together, are their union, so a dependency one change adds links it to the
@@ -132,7 +132,7 @@ impl Units {
     }
 }
 
-/// A change pending in the land queue (W25-R30): a diff, or a change request.
+/// A change pending in the land queue (W26-R30): a diff, or a change request.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Change {
@@ -145,7 +145,7 @@ pub struct Change {
     pub targets: BTreeSet<String>,
 }
 
-/// A change as the conflict graph has it (W25-R30).
+/// A change as the conflict graph has it (W26-R30).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Pending {
     pub id: String,
@@ -159,7 +159,7 @@ pub struct Pending {
     pub component: usize,
 }
 
-/// A connected component of the conflict graph (W25-R31, R32): a queue of its own.
+/// A connected component of the conflict graph (W26-R31, R32): a queue of its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Component {
     /// Its changes, in queue order.
@@ -174,7 +174,7 @@ pub struct Component {
     pub joint: BTreeMap<String, Vec<String>>,
 }
 
-/// What two changes share, so that the later waits for the earlier (W25-R31, R34).
+/// What two changes share, so that the later waits for the earlier (W26-R31, R34).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Conflict {
@@ -197,7 +197,7 @@ impl fmt::Display for Conflict {
     }
 }
 
-/// A change's decision against one change ahead of it in the queue (W25-R34).
+/// A change's decision against one change ahead of it in the queue (W26-R34).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "decision", rename_all = "kebab-case")]
 pub enum Decision {
@@ -217,7 +217,7 @@ impl fmt::Display for Decision {
     }
 }
 
-/// What the queue does with a change (W25-R34): its decision against each change ahead of it.
+/// What the queue does with a change (W26-R34): its decision against each change ahead of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Verdict {
     pub change: String,
@@ -247,13 +247,13 @@ impl Verdict {
     }
 }
 
-/// A landing class (W25-R33): changes no two of which conflict, which land in any order with one
+/// A landing class (W26-R33): changes no two of which conflict, which land in any order with one
 /// tree and one key for every unit. Its canonical form is the sorted set of their ids, so every
 /// order of them is the same class.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Class(pub BTreeSet<String>);
 
-/// The conflict graph of the changes pending in a land queue (W25-R30 to R34).
+/// The conflict graph of the changes pending in a land queue (W26-R30 to R34).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Conflicts {
     /// Each change, in queue order.
@@ -268,7 +268,7 @@ pub struct Conflicts {
 
 impl Conflicts {
     /// The conflict graph of `queue` (in queue order) over `units`, which should be the union of
-    /// the trunk's graph and each change's own (W25-R30).
+    /// the trunk's graph and each change's own (W26-R30).
     pub fn new(units: &Units, queue: &[Change]) -> Conflicts {
         let mut changes: Vec<Pending> = queue
             .iter()
@@ -360,7 +360,7 @@ impl Conflicts {
     }
 
     /// The landing class of `order` (ids, as they would land) when no two of them conflict
-    /// (W25-R33): every order of them gives the same class. Else the first two that conflict, as
+    /// (W26-R33): every order of them gives the same class. Else the first two that conflict, as
     /// the later's decision says it: `D12 waits for D9: both change docs/ci.md`.
     pub fn class(&self, order: &[&str]) -> Result<Class, String> {
         let mut at: BTreeMap<usize, &str> = BTreeMap::new();
@@ -381,7 +381,7 @@ impl Conflicts {
     }
 }
 
-/// What two changes share (W25-R34): the files both change; the units where they meet, those both
+/// What two changes share (W26-R34): the files both change; the units where they meet, those both
 /// affect none of whose dependencies both affect (every unit both affect, when a cycle of
 /// dependencies leaves none); and the deploy targets both change.
 fn shared(units: &Units, a: &Pending, b: &Pending) -> Vec<Conflict> {
