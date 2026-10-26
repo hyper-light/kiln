@@ -271,6 +271,23 @@ pub struct Failure {
     pub suspects: Vec<usize>,
 }
 
+/// What a ledger of results by input key knows (W24-R06's, once it is on main): a check's outcome
+/// for a unit's key. Culprit finding asks it before each try, so a try whose inputs already ran
+/// takes that result instead of running again (W28-R57).
+pub trait Ledger {
+    fn outcome(&self, check: &Check, key: &str) -> Option<Outcome>;
+}
+
+/// No ledger yet: every try runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoLedger;
+
+impl Ledger for NoLedger {
+    fn outcome(&self, _check: &Check, _key: &str) -> Option<Outcome> {
+        None
+    }
+}
+
 /// The verdicts of `lane`'s commits from `seen`, W16's `marks` (a check's flaky or quarantine mark:
 /// its failures don't count) and culprit findings' outcomes (W28-R50 to R52).
 pub fn verdicts(lane: &Lane, seen: &[Seen], marks: &BTreeMap<Check, String>, found: &[Found]) -> Vec<Verdict> {

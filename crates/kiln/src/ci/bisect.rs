@@ -405,7 +405,18 @@ async fn drive(hub: Arc<Hub>, mut b: Bisect, trusted: bool, marked: bool) {
                 return;
             }
         };
-        let t = try_commit(&hub, &repo, &b, &sha, trusted).await;
+        // W24's ledger, once it is on main, answers a try whose inputs already ran (W28-R57).
+        let check = kiln_ci::verdict::Check { workflow: b.workflow.clone(), unit: b.unit.clone().unwrap_or_else(|| b.job.clone()), test: b.test.clone().unwrap_or_default() };
+        let ledger: &dyn kiln_ci::verdict::Ledger = &kiln_ci::verdict::NoLedger;
+        let t = match ledger.outcome(&check, &sha) {
+            Some(o) => Tried {
+                sha: sha.clone(),
+                run: None,
+                conclusion: if matches!(o, kiln_ci::verdict::Outcome::Failed { .. }) { "failure" } else { "success" }.into(),
+                why: Some("its result with these inputs, from the ledger".into()),
+            },
+            None => try_commit(&hub, &repo, &b, &sha, trusted).await,
+        };
         let failed = match t.conclusion.as_str() {
             "success" => Some(false),
             "failure" | "timed_out" => Some(true),
@@ -431,6 +442,9 @@ async fn drive(hub: Arc<Hub>, mut b: Bisect, trusted: bool, marked: bool) {
 /// The job run at `sha`, to its end: its conclusion, or given a test, the test's own result in it.
 async fn try_commit(hub: &Arc<Hub>, repo: &crate::store::Repo, b: &Bisect, sha: &str, trusted: bool) -> Tried {
     let mut vars = BTreeMap::new();
+    // W28-R57: a gate's tries go at once, at gate priority; the rest at low priority.
+    let gate = hub.cfg.ci.culprit_gates.contains(&b.branch);
+    vars.insert("KILN_TRY_PRIORITY".to_owned(), if gate { "90" } else { "20" }.to_owned());
     if let (Some(test), Some(unit)) = (&b.test, &b.unit) {
         vars.insert("KILN_VERDICT_UNITS".to_owned(), unit.clone());
         vars.insert("KILN_VERDICT_TESTS".to_owned(), test.clone());
@@ -487,6 +501,19 @@ async fn try_commit(hub: &Arc<Hub>, repo: &crate::store::Repo, b: &Bisect, sha: 
         }
         crate::rt::sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// Starts culprit finding for a new failure of `check` in `run` (W28-R57), as kiln: a test's over
+/// its unit's commits, a job's over every commit between.
+///
+/// Boxed: a bisection's end works its lane's verdicts out again, which may start another.
+pub fn start_auto<'a>(hub: &'a Arc<Hub>, run: &'a str, check: &'a kiln_ci::verdict::Check) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        let body = if check.test.is_empty() { json!({ "job": check.unit }) } else { json!({ "test": check.test }) };
+        if let Err((_, why)) = start(hub, run, &body, "kiln (W28-R57)").await {
+            tracing::info!(run = %run, check = %check, why = %why, "culprit finding didn't start");
+        }
+    })
 }
 
 /// When the server starts: bisections it was driving stopped with it. Each is said to have, to be

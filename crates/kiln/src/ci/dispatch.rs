@@ -351,7 +351,8 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         admission,
         actor: r.who.actor.as_ref().map(|a| a.id.clone()).unwrap_or_default(),
         lane: format!("{}\0{}\0{}", r.repo.id, r.path, r.event.ref_name()),
-        priority: intent.as_ref().map_or_else(|| priority(&r.event.name), |(i, _)| i.priority()),
+        // A culprit-finding try's own priority, as kiln set it (W28-R57), else by intent or event.
+        priority: r.vars.get("KILN_TRY_PRIORITY").and_then(serde_json::Value::as_str).and_then(|p| p.parse::<u8>().ok()).unwrap_or_else(|| intent.as_ref().map_or_else(|| priority(&r.event.name), |(i, _)| i.priority())),
         intent,
         route,
         exclusive: job.is_some_and(|j| j.kiln.exclusive),

@@ -8175,7 +8175,12 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   result in its run, with `vars.KILN_VERDICT_UNITS` and `vars.KILN_VERDICT_TESTS` set. Every
   bisection's tries come from R56's planner; a try that can't run gives way to its nearest
   testable neighbour. A bisection's end is a culprit finding (R52) for its lane's verdicts: found
-  (`culprit`), `no-culprit` (a flake) or `inconclusive`.
+  (`culprit`), `no-culprit` (a flake) or `inconclusive`. Once declared (`[ci] culprits = true`),
+  culprit finding starts on its own for each new failure with two or more suspects, a test's over
+  its unit's commits; its tries run at low priority (20, below W28-R64's work in progress), or at
+  once at gate priority (90) on a branch in `[ci] culprit_gates`. A ledger of results by input key
+  (`kiln_ci::verdict::Ledger`; none until W24-R06's is on main) answers a try whose inputs already
+  ran, so reuse slots in when it lands.
 - **W28-R58 Waiting for a verdict.** `ci.verdict.wait` (`GET
   /api/ci/repos/:repo/commits/:sha/verdict/wait`) answers once the commit's verdict is final (every
   lane's direct, covered or culprit; `until: final`, the default) or once it changes at all
@@ -8184,8 +8189,9 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   `kiln.ci.verdict()` and `kiln.ci.verdict.wait()` both, whatever the registry's order.
 - **W28-R59 The pushing agent hears.** When a run of a workflow ends, or a bisection, the lane's
   verdicts around it are worked out again. Each commit whose verdict changed since it was last kept
-  gets a `ci_verdict` event (§4.2), and the agent that made it (the session its `Kiln-Agent`
-  trailer names) a `verdict.changed` message, queued after its turn as `fix_checks`' messages are:
+  gets a `ci_verdict` event (§4.2), and the agent that pushed it, as step 6 attributes it
+  (W28-R67: its push's agent token, the agent change request whose last pushed commit it is, or
+  its `Kiln-Agent` line), a `verdict.changed` message, queued after its turn as `fix_checks`' messages are:
   a change of a verdict kept before, or the first answer of a commit the run newly answers.
   Direct and covered say so in a line, covered as optimistic, not passed; suspect says the failing
   check, the commit it failed at, its base and how to find the culprit (`ci.runs.bisect` with the
@@ -8220,11 +8226,9 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
 
 **Progress.** R50–R59, AC50 and AC52–AC54 built (2026-10-25) in `kiln_ci::verdict` (its `cargo`
 reader and `culprit` planner), the replayer, `crates/kiln/src/ci/verdict.rs` (`ci.verdict`,
-`ci.verdict.wait`, `ci_verdict`, `verdict.changed`) and `ci/bisect.rs`. An agent is found by its
-commit's `Kiln-Agent` trailer only: by the agent token that pushed it waits for W25's Decision 3. Bisections start when asked (`ci.runs.bisect`), not on their own for each new
-failure: that is automation kiln adds only once declared, and isn't yet. Their tries run at the
-run's priority: `uploads::Ask` has no priority to give them W05-R09's low class. AC51 is not met: P3
-answers 90.0% (87.8%–90.7%) of ci's commits within the hour, against 75.9% before. About half the
+`ci.verdict.wait`, `ci_verdict`, `verdict.changed`) and `ci/bisect.rs`. AC51 is not met: P3
+answers 90.0% (87.8%–90.7%) of ci's commits within the hour, against 75.9% before; with step 6's
+admission (P4), 85.6% (84.8%–86.3%). About half the
 late ones wait at the hour for a pod of their lane's work that the recorded week's cluster took 30
 min to 2.5 h to start, which no verdict answers sooner.
 

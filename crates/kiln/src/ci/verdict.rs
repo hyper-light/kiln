@@ -378,12 +378,36 @@ pub async fn verdict_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 /// since it was last kept gets a `ci_verdict` event, and the agent that pushed it a
 /// `verdict.changed` message: a change of a verdict kept before, or the first answer of a commit
 /// the run at `sha` newly answers (one after the lane's last run before it).
-pub async fn refresh(hub: &Hub, repo_key: &str, workflow: &str, branch: &str, sha: &str) {
+pub async fn refresh(hub: &Arc<Hub>, repo_key: &str, workflow: &str, branch: &str, sha: &str) {
     let Ok(repos) = hub.store.repos().await else { return };
     let Some(repo) = repos.into_iter().find(|r| r.name == repo_key || r.id == repo_key) else { return };
     let mirror = crate::gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned();
     let Ok(Some(l)) = lane_book(hub, (&repo.id, &repo.name), &mirror, workflow, branch, sha).await else { return };
     let Some(at) = l.shas.iter().position(|s| s == sha) else { return };
+    // W28-R57: culprit finding for each new failure with two or more suspects, once declared.
+    if hub.cfg.ci.culprits {
+        let started = super::bisect::of_lane(hub, &repo.name, workflow, branch).await;
+        for f in l.book.failures().into_iter().filter(|f| f.suspects.len() >= 2) {
+            let Some(bad) = l.shas.get(f.commit).cloned() else { continue };
+            let test = (!f.check.test.is_empty()).then(|| f.check.test.clone());
+            if started.iter().any(|b| b.bad == bad && b.test == test && (test.is_some() || b.job == f.check.unit)) {
+                continue;
+            }
+            let (rid, w, br, s) = (repo.id.clone(), workflow.to_owned(), branch.to_owned(), bad.clone());
+            let run: Option<String> = hub
+                .store
+                .call(move |c| {
+                    use rusqlite::OptionalExtension as _;
+                    Ok(c.query_row("SELECT id FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND branch = ?3 AND sha = ?4 ORDER BY created_at DESC LIMIT 1", rusqlite::params![rid, w, br, s], |r| r.get::<_, String>(0)).optional()?)
+                })
+                .await
+                .ok()
+                .flatten();
+            if let Some(run) = run {
+                super::bisect::start_auto(hub, &run, &f.check).await;
+            }
+        }
+    }
     // The commits the run at `sha` newly answers: after the lane's last run before it.
     let after = l.runs.range(..at).next_back().map_or(0, |p| p + 1);
     for (c, commit) in l.shas.iter().enumerate().skip(at.saturating_sub(RECENT)) {
@@ -403,19 +427,37 @@ pub async fn refresh(hub: &Hub, repo_key: &str, workflow: &str, branch: &str, sh
             Some(_) => true,
             None => (after..=at).contains(&c),
         };
+        // The push that brought it: the lane's first run at or after it.
+        let pushed = l.runs.range(c..).next().and_then(|p| l.shas.get(*p)).map_or(commit.as_str(), String::as_str);
         if news && v.kind != Kind::Pending
-            && let Some(agent) = pusher(hub, &mirror, commit).await
+            && let Some(agent) = pusher(hub, &repo.id, &mirror, commit, pushed).await
         {
             crate::workspace::follow::deliver(hub, &agent, message(&repo.name, workflow, branch, commit, &v, &l.shas)).await;
         }
     }
 }
 
-/// The agent that made a commit: the session its `Kiln-Agent: <name> (<harness>, <id>)` trailer
-/// names (docs/agents.md).
-async fn pusher(hub: &Hub, mirror: &str, sha: &str) -> Option<String> {
-    let body = git(hub, &["-C", mirror, "log", "-1", "--format=%B", sha]).await?;
-    body.lines().rev().find_map(|l| l.trim().strip_prefix("Kiln-Agent:")).and_then(|v| v.trim().rsplit_once(", ")).map(|(_, id)| id.trim_end_matches(')').trim().to_owned()).filter(|id| !id.is_empty())
+/// The agent that pushed a commit, as step 6 attributes it (W28-R67, `kiln_ci::sched::actor`):
+/// the agent token its push came with (the actor of the run of `pushed`, the push that brought
+/// it), the agent change request whose last pushed commit it is, or its `Kiln-Agent` line.
+async fn pusher(hub: &Hub, repo_id: &str, mirror: &str, sha: &str, pushed: &str) -> Option<String> {
+    use kiln_ci::sched::actor;
+    let message = git(hub, &["-C", mirror, "log", "-1", "--format=%B", sha]).await.unwrap_or_default();
+    let (rid, at) = (repo_id.to_owned(), pushed.to_owned());
+    let by: String = hub
+        .store
+        .call(move |c| {
+            use rusqlite::OptionalExtension as _;
+            Ok(c.query_row("SELECT actor FROM runs WHERE repo_id = ?1 AND sha = ?2 ORDER BY created_at LIMIT 1", rusqlite::params![rid, at], |r| r.get::<_, String>(0)).optional()?)
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let changes: Vec<crate::workspace::change::Record> = hub.store.kv_prefix("agents/change/".into()).await.unwrap_or_default().iter().filter_map(|(_, v)| serde_json::from_str(v).ok()).collect();
+    let refs: Vec<actor::Change> = changes.iter().map(|c| actor::Change { agent: &c.agent, sha: &c.sha, change: c.change.as_deref() }).collect();
+    let who = actor::attribute(&actor::Push { sha, pusher: &by, message: &message }, &refs);
+    who.id.strip_prefix("agent:").filter(|id| !id.is_empty()).map(str::to_owned)
 }
 
 /// A `verdict.changed` message (W28-R59): direct and covered in a line; suspect and culprit with
