@@ -209,6 +209,15 @@ impl Bitbucket {
         Ok((status, resp.bytes(limit).await?))
     }
 
+    /// A conditional GET (docs/ci.md W26-R20): its status, its ETag and its JSON; a 304 when `etag`
+    /// still holds.
+    pub async fn get_if(&self, path: &str, etag: Option<&str>) -> anyhow::Result<(u16, Option<String>, Value)> {
+        let client = crate::http::client::github()?;
+        let url = if path.starts_with("http://") || path.starts_with("https://") { path.to_owned() } else { format!("{}{path}", self.api) };
+        let req = client.request(Method::Get, &url).header("Authorization", &self.api_auth()).header("Accept", "application/json");
+        super::mirror::send_if(req, etag).await.with_context(|| format!("Bitbucket: {url}"))
+    }
+
     /// How git reads it.
     pub fn reader(&self, repo: &Repo) -> anyhow::Result<Reader> {
         let name = self.name(repo)?;

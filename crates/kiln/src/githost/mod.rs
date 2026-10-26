@@ -9,6 +9,7 @@ pub mod bitbucket;
 pub mod github;
 pub mod gitlab;
 pub mod hooks;
+pub mod mirror;
 pub mod pulls;
 pub mod statuses;
 pub mod web;

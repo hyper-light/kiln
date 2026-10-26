@@ -6,7 +6,8 @@
 //! into a journey and shapes the JSON. Every field is new, and a client must take any as missing.
 //!
 //! Changes are Ship items by commit (docs/ci.md W26-R01): a commit is an item when it has runs or
-//! is a change's (a diff's version, a change request's commits, where a change landed). A change's
+//! is a change's (a diff's version, a change request's commits, where a change landed; a host's
+//! pull request as `githost::mirror` keeps it: its heads, its commits, where it merged). A change's
 //! tip (its latest version's head, or the commit it landed as) carries its review; its other
 //! commits fold under the tip (`fold_under`), an older version's head standing superseded. Each row
 //! is rendered for those whose turn it is ('yours') and for everyone else, and a request picks by
@@ -172,13 +173,13 @@ impl ChangeRec {
 
 /// Which change a commit (`o.repo_id`, `o.item`) is of: the newest change naming it, its head
 /// before its other commits. The facets' SQL picks the same way ([`facet_sql`]).
-const CHANGE_OF: &str = "FROM ship_commit_changes x JOIN diffs d ON d.id = x.diff_id WHERE x.repo_id = o.repo_id AND x.sha = o.item ORDER BY d.created_at DESC, d.number DESC, x.head DESC, x.n DESC LIMIT 1";
+const CHANGE_OF: &str = "FROM ship_commit_changes x WHERE x.repo_id = o.repo_id AND x.sha = o.item ORDER BY x.created_at DESC, x.number DESC, x.diff_id DESC, x.head DESC, x.n DESC LIMIT 1";
 /// A commit (`o`) is an item when it has runs or is a change's (W26-R01).
 const IS_ITEM: &str = "(EXISTS (SELECT 1 FROM runs r WHERE r.repo_id = o.repo_id AND r.sha = o.item) OR EXISTS (SELECT 1 FROM ship_commit_changes x WHERE x.repo_id = o.repo_id AND x.sha = o.item))";
 
 /// A commit's kind (`diff`, `request`, `commit`) and its change's host, as SQL over `o`.
 fn facet_sql() -> (String, String) {
-    (format!("COALESCE((SELECT CASE d.kind WHEN 'change_request' THEN 'request' ELSE 'diff' END {CHANGE_OF}), 'commit')"), format!("(SELECT x.host {CHANGE_OF})"))
+    (format!("COALESCE((SELECT CASE x.kind WHEN 'change_request' THEN 'request' ELSE 'diff' END {CHANGE_OF}), 'commit')"), format!("(SELECT x.host {CHANGE_OF})"))
 }
 
 fn first_words(s: &str) -> String {
@@ -197,6 +198,9 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
         .query_row(&format!("SELECT x.diff_id, x.n, x.head, x.host {}", CHANGE_OF.replace("o.repo_id", "?1").replace("o.item", "?2")), params![repo_id, sha], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .optional()?;
     let Some((id, n, head, host)) = found else { return Ok(None) };
+    if let Some(number) = id.strip_prefix(&format!("pull:{host}:")).and_then(|n| n.parse::<i64>().ok()) {
+        return load_pull(c, repo_id, &host, number, n.unwrap_or(0), head).map(Some);
+    }
     let mut ch = c.query_row("SELECT number, kind, title, author, author_for, state, landed_commit FROM diffs WHERE id = ?1", [&id], |r| {
         let (number, kind): (i64, String) = (r.get(0)?, r.get(1)?);
         let request = kind == "change_request";
@@ -242,6 +246,72 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
         )
         .optional()?;
     Ok(Some(ch))
+}
+
+/// A host's pull request as a change (W26-R01, R20): from the mirror (`githost::mirror`). Its
+/// review state reads its reviews as kiln's would (changes asked by anyone's latest review, else
+/// approved by one), its asked reviewers join its turn when it's first seen.
+fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n: u32, head: bool) -> anyhow::Result<ChangeRec> {
+    let (title, author, state, reviews, threads, said_by, said, merged, first_seen, requested): (String, String, String, String, i64, String, String, String, i64, String) = c.query_row(
+        "SELECT title, author, state, reviews, threads, said_by, said, merged_sha, first_seen, requested FROM host_pulls WHERE repo_id = ?1 AND host = ?2 AND number = ?3",
+        params![repo_id, host, number],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
+    )?;
+    let reviews: Vec<(String, String, i64, String)> = serde_json::from_str::<Vec<Value>>(&reviews)
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            let action = match s("verdict").as_str() {
+                "approve" => "accept".to_string(),
+                v => v.to_string(),
+            };
+            (s("by"), action, r.get("at").and_then(Value::as_i64).unwrap_or(first_seen), String::new())
+        })
+        .collect();
+    // Each reviewer's latest word decides, as hosts read them.
+    let mut latest: HashMap<&str, &str> = HashMap::new();
+    for (by, action, _, _) in &reviews {
+        if action != "comment" {
+            latest.insert(by.as_str(), action.as_str());
+        }
+    }
+    let review_state = match state.as_str() {
+        "draft" => "draft",
+        "merged" => "landed",
+        "closed" => "abandoned",
+        _ if latest.values().any(|a| *a == "request_changes") => "changes-requested",
+        _ if latest.values().any(|a| *a == "accept") => "accepted",
+        _ => "needs-review",
+    };
+    let mut st = c.prepare("SELECT n, sha, seen_at FROM host_pull_heads WHERE repo_id = ?1 AND host = ?2 AND number = ?3 ORDER BY n")?;
+    let heads: Vec<(u32, String, i64)> = st.query_map(params![repo_id, host, number], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    let (latest_n, latest_sha) = heads.last().map(|(k, s, _)| (*k, s.clone())).unwrap_or_default();
+    let at = heads.iter().find(|(k, _, _)| *k == n).map_or(first_seen, |(_, _, t)| *t);
+    let count = usize::try_from(threads).unwrap_or(0);
+    let threads: Vec<ThreadRec> = (0..count).map(|i| ThreadRec { kind: "question".into(), by: if i + 1 == count { said_by.clone() } else { String::new() }, said: if i + 1 == count { said.clone() } else { String::new() }, ..ThreadRec::default() }).collect();
+    Ok(ChangeRec {
+        name: format!("{}{number}", if host == "gitlab" { "!" } else { "#" }),
+        kind: "request",
+        host: host.to_string(),
+        message: title.clone(),
+        title,
+        author,
+        author_for: None,
+        state: review_state.to_string(),
+        landed: Some(merged).filter(|m| !m.is_empty()),
+        n,
+        head,
+        latest: latest_n,
+        latest_sha,
+        at,
+        reviewers: serde_json::from_str::<Vec<String>>(&requested).unwrap_or_default().into_iter().map(|r| (r, first_seen)).collect(),
+        reviews,
+        pushes: heads.iter().map(|(k, _, t)| (*k, false, *t)).collect(),
+        threads,
+        replies: Vec::new(),
+        queue: None,
+    })
 }
 
 /// A change's review as its tip carries it (W26-R02): whose turn it is folded from its records
@@ -1142,7 +1212,10 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
     }
     let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(30).clamp(1, 1000);
     let cursor = q.get("cursor").and_then(|c| c.parse::<i64>().ok()).unwrap_or(i64::MAX);
-    let viewer = caller.map(principals);
+    let viewer = match caller {
+        Some(c) => Some(principals(hub, c).await),
+        None => None,
+    };
     match c.page(q.get("repo").map(String::as_str).filter(|r| !r.is_empty()), only.as_deref(), &Facets::from_query(q), viewer.as_ref(), cursor, limit)? {
         Some(body) => Ok(srv::response(StatusCode::OK, "application/json", srv::full(body))),
         None => {
@@ -1152,11 +1225,24 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
     }
 }
 
-/// Who a caller is, as a change's turn names principals: itself, and the person an agent acts
-/// for (an agent counts as its person).
-fn principals(c: &crate::authz::Caller) -> HashSet<String> {
+/// Who a caller is, as a change's turn names principals: itself, the person an agent acts for (an
+/// agent counts as its person), and the hosts' accounts its person linked (`github:<login>`).
+async fn principals(hub: &Hub, c: &crate::authz::Caller) -> HashSet<String> {
     let (name, _) = crate::ci::diffs::author_of(&c.name, Some(c.kind));
-    [Some(c.name.clone()), Some(name), crate::ci::diffs::acting_for(&c.name)].into_iter().flatten().filter(|p| !p.is_empty()).collect()
+    let mut out: HashSet<String> = [Some(c.name.clone()), Some(name), crate::ci::diffs::acting_for(&c.name)].into_iter().flatten().filter(|p| !p.is_empty()).collect();
+    if let Some(user) = c.user.clone() {
+        let linked: Vec<String> = hub
+            .store
+            .call(move |db| {
+                let mut q = db.prepare("SELECT provider, login FROM user_identities WHERE user_id = ?1")?;
+                let rows = q.query_map([&user], |r| Ok(format!("{}:{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await
+            .unwrap_or_default();
+        out.extend(linked);
+    }
+    out
 }
 
 /// Whether a commit's JSON is of a repository the caller may read (`only`: the names it may, or
@@ -1180,7 +1266,10 @@ pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str, caller: Optio
     {
         tracing::warn!("ship: the read model kept its last good state: {e}");
     }
-    let viewer = caller.map(principals);
+    let viewer = match caller {
+        Some(c) => Some(principals(hub, c).await),
+        None => None,
+    };
     let v = match c.detail(repo, sha, &runners, now, viewer.as_ref()) {
         Some(v) => v,
         None => get_in(&hub.store, repo, sha, viewer.as_ref(), runners, now).await?,
@@ -1483,7 +1572,29 @@ mod tests {
                 pick(&["queued", "testing", "ejected"])
             ),
             25 => format!("UPDATE diffs SET state = CASE state WHEN 'draft' THEN 'needs-review' ELSE 'draft' END WHERE id = {d} AND state <> 'landed';"),
-            _ => format!("DELETE FROM land_queue WHERE id = (SELECT MIN(id) FROM land_queue); DELETE FROM reviews WHERE id = (SELECT MIN(id) FROM reviews WHERE diff_id = {d});"),
+            26 => format!("DELETE FROM land_queue WHERE id = (SELECT MIN(id) FROM land_queue); DELETE FROM reviews WHERE id = (SELECT MIN(id) FROM reviews WHERE diff_id = {d});"),
+            // A host's pull request, mirrored (W26-R20): opened with a commit besides its head.
+            27 => format!(
+                "INSERT INTO host_pulls (repo_id, host, number, title, author, state, requested, first_seen) VALUES ('kiln', '{}', {n}, 'pull {n}', 'github:ada', 'open', '[\"github:kim\"]', {t});
+                 INSERT INTO host_pull_commits (repo_id, host, number, sha, position) VALUES ('kiln', '{}', {n}, '9999999{n:033}', 0);
+                 INSERT INTO host_pull_heads (repo_id, host, number, n, sha, seen_at) VALUES ('kiln', '{}', {n}, 1, '{sha}', {t});",
+                pick(&["github", "gitlab", "bitbucket"]),
+                pick(&["github", "gitlab", "bitbucket"]),
+                pick(&["github", "gitlab", "bitbucket"])
+            ),
+            28 => format!(
+                "INSERT INTO host_pull_heads (repo_id, host, number, n, sha, seen_at) SELECT p.repo_id, p.host, p.number, (SELECT MAX(h.n) + 1 FROM host_pull_heads h WHERE h.repo_id = p.repo_id AND h.host = p.host AND h.number = p.number), '{sha}', {t}
+                 FROM host_pulls p WHERE p.rowid = (SELECT rowid FROM host_pulls ORDER BY rowid LIMIT 1 OFFSET ({n} % MAX(1, (SELECT COUNT(*) FROM host_pulls)))) AND EXISTS (SELECT 1 FROM host_pull_heads h WHERE h.repo_id = p.repo_id AND h.host = p.host AND h.number = p.number);"
+            ),
+            29 => format!(
+                "UPDATE host_pulls SET reviews = '[{{\"by\": \"github:kim\", \"verdict\": \"{}\", \"at\": {t}}}]', threads = {}, said_by = 'github:kim', said = 'empty matrix meant?', state = '{}', merged_sha = '{}'
+                 WHERE rowid = (SELECT rowid FROM host_pulls ORDER BY rowid LIMIT 1 OFFSET ({n} % MAX(1, (SELECT COUNT(*) FROM host_pulls))));",
+                pick(&["approve", "request_changes", "comment"]),
+                n % 3,
+                pick(&["open", "open", "draft", "merged"]),
+                if n % 4 == 3 { sha } else { "" }
+            ),
+            _ => "DELETE FROM host_pulls WHERE rowid = (SELECT MIN(rowid) FROM host_pulls);".to_string(),
         }
     }
 
@@ -1491,8 +1602,8 @@ mod tests {
     /// viewer in a change's turn, one out of it and none, and through each facet (W26-R02).
     async fn same(store: &crate::store::Store, cache: &ShipCache, now: i64, round: usize) -> anyhow::Result<usize> {
         let mut compared = 0;
-        let (kim, sam): (HashSet<String>, HashSet<String>) = (["user:kim".to_string()].into(), ["user:sam".to_string()].into());
-        let facets: [&[(&str, &str)]; 5] = [&[], &[("kind", "diff")], &[("kind", "request")], &[("kind", "commit")], &[("lens", "review"), ("host", "kiln")]];
+        let (kim, sam): (HashSet<String>, HashSet<String>) = (["user:kim".to_string(), "github:kim".to_string()].into(), ["user:sam".to_string()].into());
+        let facets: [&[(&str, &str)]; 6] = [&[], &[("kind", "diff")], &[("kind", "request")], &[("kind", "commit")], &[("lens", "review"), ("host", "kiln")], &[("host", "github")]];
         for limit in [2usize, 1000] {
             for viewer in [None, Some(&kim), Some(&sam)] {
                 for fq in facets {
@@ -1523,7 +1634,8 @@ mod tests {
     /// What memory serves is what the store says: random inserts, updates and deletes across every
     /// table the model reads (runs, legs, attempts, images, deployments and their statuses, Deploy
     /// API releases, tags; and review's: diffs, versions, a change request's commits, reviewers,
-    /// reviews, threads, comments, the land queue), the list (as three viewers, through each facet)
+    /// reviews, threads, comments, the land queue, the hosts' mirrored pull requests), the list (as
+    /// three viewers, through each facet)
     /// and every commit's detail compared after each refresh; a cap of 3 so pages past memory come
     /// from the store.
     #[test]
@@ -1550,7 +1662,7 @@ mod tests {
                 for _ in 0..4 {
                     n += 1;
                     let sha = shas.get(usize::try_from(next(7)).unwrap_or(0)).copied().unwrap_or(C1);
-                    let sql = ops(n, next(27), sha);
+                    let sql = ops(n, next(31), sha);
                     store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
                 }
                 now += FRESH_MS;
@@ -1580,7 +1692,7 @@ mod tests {
             let mut now = NOW_S * 1000;
             cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             for n in 0..40u64 {
-                let sql = ops(500 + n, n % 27, if n.is_multiple_of(2) { C2 } else { C3 });
+                let sql = ops(500 + n, n % 31, if n.is_multiple_of(2) { C2 } else { C3 });
                 let write = store.call(move |c| Ok(c.execute_batch(&sql)?));
                 now += FRESH_MS;
                 let before = cache.applied();
