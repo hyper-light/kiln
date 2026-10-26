@@ -222,22 +222,39 @@ async fn bundle(repo: &Path, tips: &[String], not: &[String], out: &Path) -> any
     made
 }
 
-/// Runs git in `repo` with `input` on its standard input: what it printed.
+/// Runs git in `repo` with `input` on its standard input: what it printed. Its input is fed while
+/// what it prints is read, never all before: `cat-file --batch-check` answers each line as it
+/// reads it and stops reading once its stdout's pipe is full (8 KiB once its user's pipes pass
+/// `pipe-user-pages-soft`), which held a blocking-pool thread for good, and with every thread of
+/// the pool's share held, the runner's event loop with them.
 async fn with_input(repo: &Path, args: &[&str], input: String) -> anyhow::Result<String> {
     let mut c = super::git::git(Some(repo));
-    c.args(args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-    let what = args.first().copied().unwrap_or("").to_owned();
-    crate::rt::blocking(move || -> anyhow::Result<String> {
-        use std::io::Write as _;
-        let mut child = c.spawn().with_context(|| format!("git {what}"))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(input.as_bytes())?;
+    c.args(args);
+    let what = args.first().copied().unwrap_or("");
+    let d = crate::proc::spawn_duplex(c).with_context(|| format!("git {what}"))?;
+    let stdin = d.stdin.clone();
+    drop(d.stdin);
+    crate::rt::spawn(async move {
+        let _ = stdin.send(input.into_bytes()).await;
+    });
+    let (stdout, stderr, exit) = (d.stdout, d.stderr, d.exit);
+    let read = async move {
+        let err = crate::rt::spawn(async move {
+            let mut err = Vec::new();
+            while let Ok(c) = stderr.recv().await {
+                err.extend_from_slice(&c);
+            }
+            err
+        });
+        let mut out = Vec::new();
+        while let Ok(c) = stdout.recv().await {
+            out.extend_from_slice(&c);
         }
-        let out = child.wait_with_output()?;
-        anyhow::ensure!(out.status.success(), "git {what}: {}", String::from_utf8_lossy(&out.stderr).trim());
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    })
-    .await?
+        (out, err.await.unwrap_or_default(), exit.await.ok().flatten())
+    };
+    let (out, err, code) = crate::rt::timeout(LONG, read).await.map_err(|_| anyhow::anyhow!("git {what} took too long"))?;
+    anyhow::ensure!(code == Some(0), "git {what}: {}", String::from_utf8_lossy(&err).trim());
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// The commits of `ids` the repository holds.
@@ -493,6 +510,27 @@ mod tests {
         assert!(again.0 != prints.0 && again.1 != prints.1, "a commit moves the branch and empties the folder's changes");
         assert_eq!(git(&b, &["rev-parse", "refs/remotes/kiln/a/main"])?, git(&a, &["rev-parse", "main"])?);
         assert_eq!(git(&b, &["for-each-ref", "refs/kiln/wip/"])?, "", "a's work in progress is gone from b");
+        Ok(())
+    }
+
+    #[test]
+    fn many_commits_are_looked_for_without_git_s_pipes_filling() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo = dir.path().to_path_buf();
+        git(&repo, &["init", "-q", "-b", "main"])?;
+        std::fs::write(repo.join("README"), "hello\n")?;
+        git(&repo, &["add", "README"])?;
+        git(&repo, &["commit", "-q", "-m", "first"])?;
+        let commit = git(&repo, &["rev-parse", "main"])?;
+        // ~1 MB of answers each way: far past a pipe's 64 KiB, let alone the 8 KiB a crowded
+        // machine's pipes get.
+        let mut ids: Vec<String> = (0..20_000u32).map(|i| format!("{i:040x}")).collect();
+        ids.push(commit.clone());
+        let have = crate::rt::block_on(async move {
+            let ids: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
+            crate::rt::timeout(std::time::Duration::from_secs(60), held(&repo, &ids)).await.map_err(|_| anyhow::anyhow!("git cat-file never answered"))
+        })?;
+        assert_eq!(have, HashSet::from([commit]));
         Ok(())
     }
 

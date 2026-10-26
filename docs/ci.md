@@ -40,6 +40,8 @@
   - [W22 Conformance, end-to-end and performance testing](#w22-conformance-end-to-end-and-performance-testing)
   - [W23 CI providers](#w23-ci-providers)
   - [W24 Incremental CI](#w24-incremental-ci-fingerprints-reuse-warm-state-and-shared-caches)
+  - [W26 Review in Ship](#w26-review-in-ship-changes-as-ship-items-each-owning-its-review)
+  - [W27 Attested end to end](#w27-attested-end-to-end-identities-signatures-hand-offs-and-the-trail)
 - [4. API, events, CLI and MCP reference](#4-api-events-cli-and-mcp-reference)
 - [5. Milestones and the order of work](#5-milestones-and-the-order-of-work)
 - [Appendix A. GitHub Actions compatibility matrix](#appendix-a-github-actions-compatibility-matrix)
@@ -197,6 +199,8 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 48 of F-21's 50 green, four of them needing accounts and passing in dry configurations against stand-ins (AWS's two, Google's, Codecov's); azure/login waits for a tenant, and attest-build-provenance for GitHub's Sigstore; AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R30, AC01–AC14; milestones M0–M6 and M1e are kiln goals with plans |
+| W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | ready | specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
+| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | ready | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa` |
 
 ---
 
@@ -8188,6 +8192,279 @@ scenario's three. It passes under 60 s for the docs-only change and at most 663 
 cold 2211 s) for the one-file change. Each run's reports say why each step ran, was reused or was
 warm (R28), which tells a miss from a slow hit; the figures go in the baseline's table above, with
 their commits, runner and date.
+
+### W26 Review in Ship: changes as Ship items, each owning its review
+
+**Scope.** Review lives in Ship (the CI/CD Integration agent's page). Ship's unit stays the commit (or tag): a
+stacked diff is one commit, and a branch pull request (kiln's, GitHub's, GitLab's or Bitbucket's)
+is its commits. From the first push to production each is drawn by Ship's own row, glyphs and
+journey, Review the journey's first stage, and its review owned by its dropdown: the diff, threads on lines, kinds that gate approval, conflicts
+resolved where they fall, GitHub-flavoured markdown with suggestions, the conversation, and the
+Review lanes. Around it: kiln's own change identity, replays that keep changes fresh, a ladder for
+conflicts, agents that comment like anyone, and landing through the merge queue. W26 builds on W14
+(hosting, stacked diffs, review, landing) and W23-R06 (every host's pull requests in one shape),
+and every record it makes is signed as W27 says.
+
+**Why.** As of 2026-10-25 (origin/main f599edb2f2), review is a page apart: driven by selects,
+range-diff shown as text, threads marked outdated when their lines move, nothing replaying changes
+as main moves, a conflict ejecting a change as needing a rebase, agents answering threads with new
+versions only, agent reviewers specified and never started, and a land queue testing one batch at
+a time. The design was agreed on a live mock built on Ship's own prototype
+(`~/.cache/kiln-review-design/ship/review-ship.html` on adacachy); the research is kiln research
+`01a174af7d0476b896d3b236098ddded` (46 findings, 65 sources); the plan is kiln plan
+`01a175b7d5e1772f8d3c7cb28e50ab2b`.
+
+**Decisions.** The person's, made on 2026-10-25:
+
+1. **Review is part of Ship.** Changes are Ship items and their review is part of each item; there
+   is no separate review page. Review, the name chosen, is Ship's lens on changes.
+2. **The unit is the commit (or tag).** Both kinds of change are first-class, neither the
+   default: traditional branch pull requests, and stacked diffs in Meta's manner (each diff one
+   commit, reviewed and landed in stack order).
+3. **Fresh changes:** kiln replays open changes in its own copy; branches move only when someone
+   presses Update, unless a repository turns automatic pushes on, with a warning in plain words.
+   An agent sent to resolve a replay's conflicts is a second setting, off by default.
+4. **Conflicts:** agents can resolve on their own. A repository turns automatic resolution on;
+   while it's off, a person confirms an agent's resolution.
+5. **Agents in review:** agents comment, suggest and reply like anyone. A switch on the
+   repository's page in Repos, off by default and applying to every change made to that
+   repository, lets agents fix code from agents' feedback.
+6. **Landing:** through the merge queue the Merge Queues agent is building (W28), with that agent;
+   a host's own queue where a repository has one.
+7. **A change keeps its identity when its commit is rewritten.** kiln writes an ID into the
+   commit message (`Kiln-Change: kc-7f3a9e`); after an amend or a rebase the commit's hash changes
+   but the line doesn't, so D41 stays D41, with its comments, approvals and history. IDs other
+   tools write (jj's and GitButler's `change-id`, Gerrit's `Change-Id`) are recognised too, so
+   their users need no setup; where they disagree with kiln's line, kiln's line decides (R03).
+8. **First:** Review in Ship and each item's review (R01 to R15), built with the CI/CD
+   Integration agent, whose Ship it is.
+
+**Requirements: the model**
+
+- **W26-R01 Changes in Ship, by commit.** Ship's unit stays the commit (or tag). A stacked diff is
+  one commit, its row carrying the diff's review; a branch pull request (kiln's change requests and
+  hosts' pull requests, W23-R06) is its commits, its head commit's row carrying the request's review
+  and its other commits folded under it. A new revision's commit supersedes the one it replaces, as
+  Ship's rows already do, and after it lands the commit carries on. Rows, glyphs, stand words,
+  author lines and paired actions are Ship's, with nothing special-cased; Ship's per-commit read
+  model grows to review: one read model, not two.
+- **W26-R02 Review is the first stage.** Ship's journey strip reads review, land, checks, build,
+  staging, production, replant. Review states (needs you, agent fixing, waiting on others,
+  conflicts, approved) map onto Ship's stands and its needs-you-first order. Ship's facets gain host
+  and kind. An item holds out of the merge queue until its gate (R11) is clear.
+- **W26-R03 A change's identity, kiln's own.** kiln mints a change's identity and keeps it with the
+  change's history (its revisions, its numbers on each host, what it was split from or absorbed).
+  The commit carries it in a trailer kiln names (`Kiln-Change:`), since a message line survives
+  every client's amend and rebase and plain git drops a header it doesn't know. A commit pushed
+  without one is matched to the change it rewrites (range-diff and patch-id against open changes'
+  latest revisions, same author and branch), and kiln asks only when it can't tell. Gerrit's
+  `Change-Id` (which kiln wrote until now) and the `change-id` header jj and GitButler write are
+  read as aliases; a trailer and an alias naming different changes are refused, saying why.
+- **W26-R04 Revisions and their why.** Each revision says why it exists: pushed, rebase only,
+  replayed by kiln, an agent's fix (its thread), a conflict resolved, a suggestion applied. A host
+  pull request's heads are kept at `refs/kiln/…` so its revisions survive a force-push. An interdiff
+  leaves out rebase-only revisions and says so.
+- **W26-R05 Whose turn.** kiln's own rules, pure in `kiln_ci::turn` (the idea is Gerrit's attention
+  set): an added reviewer or agent joins the turn, a reply hands it back, a push hands it to the
+  reviewers, an approval or a land empties it. It orders Ship's needs-you-first and drives nudges.
+
+**Requirements: each item's review**
+
+- **W26-R06 The dropdown's order.** Every item, at every stage, opens to: Files (with the
+  Conversation), the terminal output, Jobs, Lanes.
+- **W26-R07 Files.** The open comments by kind (icons with counts) and Approve, on one row; a search
+  across the change backed by vorpal; per-file diffs that fold like the agent chat's Changes, each
+  with an icon opening the whole file in a full-screen view; a diff over 100 lines folded to its
+  first lines and the lines with comments.
+- **W26-R08 Threads.** Comments sit inline on the lines they're about, flat like the agent chat's
+  turns: a lighter band, top and bottom borders, no inset cards. Each comment's line: who, the
+  signature seal, its kind's icon, when, and ⋯ (edit, delete, copy, quote, change the kind); a long
+  press copies. Reply and Resolve sit aligned under the thread; a reply opens the agent chat's
+  composer (markdown, preview, insert a suggestion, a kind for a new thread) and appends below.
+- **W26-R09 Markdown.** Comments are GitHub-flavoured markdown: emphasis, strikethrough, code,
+  links, mentions, headings, lists, task lists, tables, quotes, rules and fenced code (its language,
+  numbered lines, a copy icon at its top right). Text is escaped before it's shaped: no raw HTML.
+- **W26-R10 Suggestions.** A `suggestion` block shows as a change against the file's own line
+  numbers (the old lines, the new lines), with copy and Apply. Apply commits the change as a
+  revision signed by whoever applies it, and the block then says which revision applied it.
+- **W26-R11 Kinds and the gate.** A thread is a question, a nit, an issue or blocking. Blocking holds
+  approval, merging and any automatic merge until its author resolves it; an open issue warns on
+  approval; an open nit informs. The gate is pure: `kiln_ci::review::gate`.
+- **W26-R12 Conflicts in the diff.** A conflicted replay shows each conflict where it falls, main's
+  side and the change's, resolved by taking main, this, both, an agent's resolution, or an edit;
+  Commit resolution makes a signed revision. Approve waits for every conflict.
+- **W26-R13 The Conversation.** The change's PR-style list of comments, in markdown, with its comment
+  box; line comments appear in it too.
+- **W26-R14 The Review lanes.** Ship's lanes and timeline gain a Review group: pushes, replays,
+  comments, fixes, resolutions and approvals, each with its time and its signer.
+- **W26-R15 Rendering.** An item renders only when it changes (memoized by item and version); a
+  draft lives in local state that live updates never touch; data comes through Suspense and changes
+  through server actions; no effects; an open item holds still while it's used.
+
+**Requirements: keeping changes moving**
+
+- **W26-R16 Fresh.** When main moves, kiln replays each open change onto it in its own copy
+  (`refs/kiln/…`), stack by stack; a clean replay is a rebase-only revision, so approvals stay. The
+  collision radar tells the authors of two open changes that touch the same lines. A branch moves
+  when someone presses Update (GitHub's update-branch, GitLab's rebase, a push with lease
+  elsewhere); a repository can turn on automatic pushes, and turning it on says plainly that every
+  open change's branch is then pushed each time main moves, with heavy API use and many more CI runs
+  on GitHub, GitLab and Bitbucket, and that everyone must pull or rebase before pushing. The planner
+  is pure: `kiln_ci::fresh`.
+- **W26-R17 The conflict ladder.** A conflicted replay is kept as a conflicted revision, so the stack
+  above it still moves, and goes up a ladder, each rung checked by the affected tests: a structural
+  merge, a resolution remembered from the same hunk, the author's agent (or, where a repository turns
+  it on, an agent sent to a runner that has the repository), then the person. A repository can
+  turn on automatic resolution by agents, on its page in Repos: then an agent's resolution that
+  passes the affected tests goes on without a person; while it's off, the default, a person
+  confirms it.
+- **W26-R18 Agents in review.** Agents comment, suggest and reply like anyone, signed as themselves
+  for their person. A switch on the repository's page in Repos, off by default and applying to every change
+  made to that repository, lets agents fix code from agents' feedback. Hand off sends a change's open threads or conflicts to its author's agent, and the item
+  shows it working.
+- **W26-R19 Landing.** A change goes to the merge queue once its gate is clear (no blocking thread,
+  no conflict, the approvals trunk's policy asks for); a host's own queue is used where a repository
+  has one. The queue signs each land into the trail (W27-R07). The queue is the Merge Queues
+  agent's (W28), and W26 is built against it with that agent.
+- **W26-R20 Hosts.** What each host can do (stacks, queues, updating a stale change, batched reviews,
+  merging) is a seam in `crates/kiln-seams`, with a simulator per host and a conformance suite, kept
+  within the hosts' rate limits (webhooks, and polling with ETags).
+
+**Hosts.** Theirs where a host has it, kiln's where it doesn't (R20's seam says which, per
+repository):
+
+| | kiln | GitHub | GitLab | Bitbucket |
+|---|---|---|---|---|
+| Stacks | native: diffs by change identity | native: the Stacks API, merged asynchronously | native: stacked merge requests (one author, 20 at most); kiln beyond | kiln: base-chained, the order held by a status |
+| Landing | the merge queue | its merge queue where a repository has one, else the merge queue | merge trains (Premium), else the merge queue | the merge queue |
+| Out of date | kiln: replayed as main moves | kiln: replayed in kiln's mirror; update-branch or Rebase stack to push | kiln: replayed; its rebase API to push | kiln: replayed; pushed with a lease |
+| Revisions kept | native: every version | kiln: each head kept in the mirror | native versions, mirrored by kiln | kiln: each head kept |
+| Whose turn | kiln | kiln | kiln | kiln |
+| Batched review | native | its pending review | its draft notes | kiln: held, then posted together |
+| Checks | every provider's runs of the commit (KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines), W23's contract | | | |
+
+**Acceptance criteria**
+
+- **W26-AC01 Ship items.** A kiln diff, a change request, and a GitHub, GitLab and Bitbucket pull
+  request from the hosts' simulators each appear as a Ship item with Review its first stage, ordered
+  as Ship orders. *API test and Playwright.*
+- **W26-AC02 The gate.** A blocking thread holds approval, merging and automatic merges until its
+  author resolves it; an issue warns; a nit informs. *Unit tests (`kiln_ci`) and Playwright.*
+- **W26-AC03 Suggestions.** Apply commits a revision signed by whoever applied it, and the diff and
+  the block show it. *Integration test on real git.*
+- **W26-AC04 Conflicts.** A conflict resolves in the diff and commits as a signed revision; Approve
+  waits until then. *Integration test on real git.*
+- **W26-AC05 Markdown.** The GitHub-flavoured cases render as GitHub renders them, and no raw HTML in a
+  comment ever runs. *Unit tests.*
+- **W26-AC06 Responsiveness.** Typing a comment never lags; scrolling an open item with a 10,000-line
+  diff keeps a median frame at or under 16.7 ms (W14-AC06's measurement); nothing moves while an item
+  is open. *Playwright, Chromium and WebKit, desktop and phone widths.*
+- **W26-AC07 Fresh.** A 10-diff stack's replays are recorded within 60 s of main moving (p95 over 20
+  moves); no branch moves unless asked, or unless its repository turned automatic pushes on after the
+  warning. *Integration test on real git.*
+- **W26-AC08 Identity.** A stack amended and rebased with plain git and no hook keeps its changes;
+  commits from jj and GitButler, and kiln's `Change-Id` history, are recognised. *Integration test.*
+- **W26-AC09 Hosts.** The forge seam's conformance suite passes against each host's simulator; an
+  installation with 50 open pull requests makes at most 600 GitHub API requests an hour.
+  *`cargo test -p kiln-seams`.*
+- **W26-AC10 Agents.** With the switch off, agents' feedback starts no fix; on, the author's agent
+  pushes a fix that answers in its thread. *End to end with kiln's fake harness.*
+
+- **W26-AC11 Both kinds.** A branch pull request and a stack of three diffs each go from first
+  push to landed: the stack's commits land in stack order, each reviewed on its own; the branch's
+  commits land together under its review. *Integration test on real git.*
+
+**Sources.** Plan `01a175b7d5e1772f8d3c7cb28e50ab2b`; research `01a174af7d0476b896d3b236098ddded`;
+the mock `~/.cache/kiln-review-design/ship/review-ship.html` (Ship's prototype, from the CI/CD
+Integration agent's `~/.cache/kiln-cicd-design/proto/f-ship.html`).
+
+### W27 Attested end to end: identities, signatures, hand-offs and the trail
+
+**Scope.** Everything that touches kiln signs as itself, under an identity whose chain of whom it
+acts for verifies to kiln's root: people, agents, runners, CI legs, the server and CD. Commits,
+reviews, CI output, artifacts, lands and deploys are signed by whoever made them; every transfer
+and hand-off is signed by both sides; every signed statement goes into one trail; and `kiln verify`
+walks it from a deploy back to the people who wrote and reviewed the code. W27 builds on W10
+(identity, the OIDC issuer) and W18 (provenance and signing), and is shared with Ship's plan: this
+plan builds the base and Review's records, Ship's plan signs CI output, builds, deploys and
+replant.
+
+**Why.** As of 2026-10-25 (origin/main f599edb2f2): kiln's CA issues runners' certificates by CSR
+and runners connect with mutual TLS (`pki.rs`, `docs/access.md`); agents and jobs reach kiln with
+bearer tokens, so what they make isn't signed by them; builds' provenance is signed (W18-R01,
+R02); a landed commit's `Reviewed-by` is unsigned text (`kiln-ci/src/land.rs`); hand-overs are
+signed by neither side. Two failures on 2026-10-25 were of that kind: a blue/green upgrade's new
+build acted on hand-over words meant for the runner it took over from and let go of six agents;
+and a session the server moved off a machine it thought gone kept running there, acting as the same
+agent. The research is kiln research `01a175c54441773fa28bf1488b82e6aa`.
+
+**Decisions.** The person's, made on 2026-10-25: everything signs as itself, end to end, transfers
+and hand-offs included; the work is split with Ship's plan as above; new production environments
+require a verified chain; a key never leaves the place it was made.
+
+**Requirements**
+
+- **W27-R01 Identities.** Every actor gets an identity from kiln's CA naming whom it acts for: a
+  person; each agent session at each epoch (for its person); each runner process (its machine, who
+  enrolled it, the organization); each CI leg (its run, workflow, commit and runner); the server;
+  CD. Each chain walks to an organization and kiln's root; revocations are recorded and checked.
+  Checking a chain is pure: `kiln_ci::identity`, its clock passed in.
+- **W27-R02 Keys stay put.** Keys are made where they're used and only CSRs travel, as runners' do
+  today; a person's key is on their own device, or a short-lived certificate kiln issues after
+  sign-in.
+- **W27-R03 Commits.** A person's commits are signed with their key; an agent's as the agent for its
+  person, never with the person's key; kiln's own (replays, merges, lands) as kiln. A kiln-hosted
+  repository refuses a push whose commits don't verify, as trunk's policy says; for a host's pull
+  request kiln records what the host verified and marks what it couldn't.
+- **W27-R04 Reviews.** Each verdict and comment is signed by whoever gave it; a verdict is signed over
+  its revision (commit and patch-id) and verifies on a rebase-only revision with the same patch-id,
+  never on one that changed the code.
+- **W27-R05 CI output.** A leg's logs, step results, test reports and conclusions are signed as the
+  leg, on its runner; the statuses kiln posts to hosts link to them. *(Ship's plan.)*
+- **W27-R06 Artifacts.** An artifact's provenance (W18-R01) is signed as the leg that built it, naming
+  its runner.
+- **W27-R07 Lands and deploys.** Each land is signed by the merge queue that tested it (the candidate
+  tested is the commit that landed); each deploy, promotion (the same digest), rollback and replant
+  by CD. *(Deploys, promotions, rollbacks and replants: Ship's plan.)*
+- **W27-R08 Hand-offs.** A hand-off is signed by both sides: the holder signs that it hands something
+  on at the next epoch, the receiver that it holds it. From then, what's signed under the old epoch is
+  refused and recorded. It covers a session moving machines or processes (a blue/green upgrade, a
+  take-over), work passed between agents or to a person, a change changing hands, a review request
+  passed on, an approval carried over a rebase-only revision, a promotion and a replant.
+- **W27-R09 The trail.** Every signed statement goes into one append-only log, each entry naming the
+  hash of the one before, checkpointed and signed by kiln, and anchored in a Rekor where one is
+  configured (W18-R02).
+- **W27-R10 `kiln verify`.** `kiln verify <deploy | artifact | commit | change>` walks the chain (deploy,
+  artifact digest, provenance, commit on main, land, reviews, revisions, authors, identities, root)
+  and names the first link that doesn't hold. A change's, a commit's and a deploy's trail export for
+  an auditor, a revision's as a Source VSA (SLSA's source track).
+- **W27-R11 Policy.** An environment can require a verified chain to deploy (W18-R04, grown); new
+  production environments require it.
+- **W27-R12 Seams.** An outside Fulcio, Rekor or identity provider is reached through
+  `crates/kiln-seams`, with simulators and a conformance suite.
+
+**Acceptance criteria**
+
+- **W27-AC01 Chains.** Each kind of actor's signature verifies to kiln's root and names whom it acts
+  for; a revoked identity's signatures are refused from the moment of revocation. *Unit and
+  integration tests.*
+- **W27-AC02 Keys.** No private key crosses the network. *Integration test.*
+- **W27-AC03 Commits.** A person's, an agent's and kiln's commits verify as their makers; an unsigned
+  push to a kiln-hosted repository is refused, saying why. *Integration test.*
+- **W27-AC04 Reviews.** A verdict verifies on its revision and on a rebase-only revision with the same
+  patch-id, and fails on one that changed the code. *Unit test.*
+- **W27-AC05 Hand-offs.** The 14:18 drop and the twin, played again, are refused and recorded; under
+  seeded simulation of moves and take-overs with stale copies still acting, no stale act is ever
+  applied. *Simulation and integration tests.*
+- **W27-AC06 The trail.** An edited, dropped or reordered entry is found. *Unit test.*
+- **W27-AC07 Verify.** `kiln verify` passes a whole chain and names each tampered link; for a deploy of
+  10 commits it answers within 2 s. *Integration test.*
+- **W27-AC08 Policy.** A production environment refuses a deploy whose chain doesn't verify.
+  *Integration test.*
+
+**Sources.** Research `01a175c54441773fa28bf1488b82e6aa` (SLSA v1.2's source track, gittuf's
+reference state log, fencing, and kiln's own `pki.rs`, `docs/access.md`, W18, W19-R05 and
+`kiln-ci/src/land.rs`); plan `01a175b7d5e1772f8d3c7cb28e50ab2b`.
 
 ## 4. API, events, CLI and MCP reference
 

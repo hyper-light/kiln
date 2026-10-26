@@ -192,14 +192,22 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
 
 /// A runner process beside the machine's usual one: the machine's key with this instance's own
 /// certificate, fetched (or renewed) from the server with a current certificate as proof — this
-/// instance's own while it is valid, else the machine's.
+/// instance's own while it is valid, else the machine's. Its own goes once it is for another key
+/// (the machine enrolled again since, with a new one): with it, no TLS configuration is made and
+/// the runner never reaches the server, so an upgrade that starts it never completes.
 async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, Leaf, Option<String>)> {
     let dir = crate::upgrade::instance_dir(&o.state_dir, id);
     let ca = std::fs::read_to_string(o.state_dir.join("ca.pem")).context("this machine is not enrolled (no ca.pem)")?;
     let (machine_cert, key) = crate::upgrade::machine_credentials(&o.state_dir)?;
     let quic = std::fs::read_to_string(o.state_dir.join("quic")).ok().map(|s| s.trim().to_owned());
     let cert_p = dir.join("agent.pem");
-    let own = std::fs::read_to_string(&cert_p).ok();
+    let own = std::fs::read_to_string(&cert_p).ok().filter(|c| {
+        let mine = crate::pki::cert_matches_key(c, &key);
+        if !mine {
+            tracing::warn!(instance = %id, "this runner process's certificate is for a key the machine no longer has (it enrolled again): asking for a new one");
+        }
+        mine
+    });
     if let Some(c) = &own
         && !crate::pki::needs_renewal(c)
     {
