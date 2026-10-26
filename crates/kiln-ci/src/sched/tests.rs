@@ -446,6 +446,46 @@ fn resources_mode_and_cancellation() {
     assert_eq!(c, vec![Command::Cancel { leg: "c0".into(), attempt: 1, reason: "run cancelled".into() }]);
 }
 
+/// W05-R03 with needs (`sched::needs`): a leg runs only where the runner's facts meet its
+/// constraints and its request has room. One asking for more than any runner that could take it
+/// has waits, saying what it asks and what each has; one only out of room for now waits for room.
+#[test]
+fn w05_r03_needs_place_a_leg_and_one_too_big_waits_saying_so() -> Result<(), String> {
+    const GIB: u64 = 1 << 30;
+    let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
+    let runner = |name: &str, os: &str, arch: &str, cpu: f64, mem: u64| RunnerIn {
+        view: RunnerView { facts: RunnerFacts { os: os.into(), arch: arch.into(), ..RunnerFacts::default() }, ..linux(name, 99).view },
+        capacity: Some(Resources { cpu, mem: mem * GIB, disk: 500 * GIB, gpu: 0 }),
+        ..linux(name, 99)
+    };
+    s.handle(Input::RunnerUp(Box::new(runner("small", "linux", "x86_64", 8.0, 16))), 0);
+    s.handle(Input::RunnerUp(Box::new(runner("large", "linux", "x86_64", 16.0, 64))), 0);
+    s.handle(Input::RunnerUp(Box::new(runner("mac", "macos", "aarch64", 24.0, 192))), 0);
+    let asking = |id: &str, spec: &str| -> Result<LegIn, String> {
+        let n = super::needs::parse(spec)?;
+        Ok(LegIn { request: n.request, exclusive: n.exclusive, route: LegRoute { labels: vec!["k8s".into()], requires: n.requires, ..LegRoute::default() }, ..leg(id, "acme/x", 60) })
+    };
+    let to = |c: &[Command], id: &str| {
+        c.iter().find_map(|x| match x {
+            Command::Assign { leg, runner, .. } if leg == id => Some(runner.clone()),
+            _ => None,
+        })
+    };
+    // The Mac has more of everything but isn't linux/amd64, and the small runner hasn't 32 GiB.
+    let c = s.handle(Input::LegQueued(Box::new(asking("fits", "cpus=8,mem=32g,linux/amd64")?)), 1);
+    assert_eq!(to(&c, "fits").as_deref(), Some("large"), "{c:?}");
+    // Without the constraint, 128 GiB goes to the one runner with it.
+    let c = s.handle(Input::LegQueued(Box::new(asking("big", "mem=128g")?)), 2);
+    assert_eq!(to(&c, "big").as_deref(), Some("mac"), "{c:?}");
+    // More than any linux/amd64 runner has even idle: it waits saying so, the Mac not named.
+    s.handle(Input::LegQueued(Box::new(asking("huge", "mem=128g,linux/amd64")?)), 3);
+    assert_eq!(s.reason("huge"), Some(&WaitReason::Oversized { asked: "128 GiB of memory".into(), short: vec!["large has 64 GiB of memory".into(), "small has 16 GiB of memory".into()] }));
+    // 40 GiB fits the large runner idle: it waits for room there, not for a larger runner.
+    s.handle(Input::LegQueued(Box::new(asking("second", "cpus=8,mem=40g,linux/amd64")?)), 4);
+    assert!(matches!(s.reason("second"), Some(WaitReason::Capacity { eligible: 2, busy: 2, draining: 0 })), "{:?}", s.reason("second"));
+    Ok(())
+}
+
 /// W05-AC09's core: after a restart, running legs are adopted (not assigned again) and their
 /// runner's capacity counts them.
 #[test]

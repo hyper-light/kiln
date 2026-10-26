@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::Serialize;
 
 use super::groups::{GroupAction, GroupConfig, Groups};
+use super::needs;
 use super::pools::{self, ExecState, Executor, Pool, PoolView};
 use super::reserve::Reservation;
 use super::retry::{self, Failed, FailureClass, RetryPolicy, RunnerChoice};
@@ -218,6 +219,9 @@ pub enum WaitReason {
     /// where it could start now, until `until` (unix ms) at most: its `warm` or `affinity` term's
     /// patience (W24-R18).
     Warm { runner: String, saves_s: u64, until: i64 },
+    /// It asks for more than any runner that could take it has, even idle (resource mode,
+    /// W05-R03): what it asks, and what each of those runners has of what it's short of.
+    Oversized { asked: String, short: Vec<String> },
 }
 
 /// What to do.
@@ -918,6 +922,40 @@ impl Scheduler {
     /// What holds a heavy leg off a runner by the runner's load, when admission is on (W24-R19).
     fn held_by_load(&self, r: &Runner, l: &Leg) -> Option<super::admit::Held> {
         super::admit::held(self.cfg.admission.as_ref(), &l.input.load, l.input.cost, &r.input.view.name, &r.input.view.facts)
+    }
+
+    /// When not one of the runners that could take `l` (`eligible`) could hold it even idle, in
+    /// resource mode: what each has of what it's short of ("small has 16 GiB of memory"), by name.
+    /// `None` when one could, or one counts slots.
+    fn oversized(&self, eligible: &[&Runner], l: &Leg) -> Option<Vec<String>> {
+        let c = self.config();
+        if !c.resources {
+            return None;
+        }
+        let q = &l.input.request;
+        let mut short = Vec::new();
+        for r in eligible {
+            let cap = r.input.capacity?;
+            let mut has = Vec::new();
+            if q.cpu > cap.cpu * c.overcommit_cpu {
+                has.push(needs::cpus(cap.cpu));
+            }
+            if q.mem as f64 > cap.mem as f64 * c.overcommit_mem {
+                has.push(format!("{} of memory", needs::show_size(cap.mem)));
+            }
+            if q.disk as f64 > cap.disk as f64 * c.overcommit_disk {
+                has.push(format!("{} of disk", needs::show_size(cap.disk)));
+            }
+            if q.gpu > cap.gpu {
+                has.push(needs::gpus(cap.gpu));
+            }
+            if has.is_empty() {
+                return None;
+            }
+            short.push(format!("{} has {}", r.input.view.name, has.join(", ")));
+        }
+        short.sort();
+        Some(short)
     }
 
     /// Gives a runner the best queued legs that fit it, until none does.
@@ -1801,6 +1839,9 @@ impl Scheduler {
             let q = &l.input.request;
             if l.input.exclusive && q.cpu > 0.0 && eligible.iter().all(|r| size(r).is_some_and(|s| q.cpu > s.cpu + 1e-9 || q.mem > s.mem)) {
                 return WaitReason::Unroutable { failing: vec![format!("{} CPUs and {} MiB held for it alone: no runner it could run on is that big", q.cpu, q.mem >> 20)] };
+            }
+            if let Some(short) = self.oversized(&eligible, l) {
+                return WaitReason::Oversized { asked: needs::request_words(&l.input.request).join(", "), short };
             }
             if l.input.exclusive && eligible.iter().all(|r| matches!(claim(&l.input, size(r)), Some(Claim::Whole)) && (!r.running.is_empty() || r.draining)) {
                 return WaitReason::Exclusive;

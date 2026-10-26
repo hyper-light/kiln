@@ -50,11 +50,12 @@ When a step has to happen on another machine (the person's Mac, a server, the bo
 don't hand the person a command to type. When a step needs a person at that machine (a password, a system dialog to \
 allow, something physical), start it yourself and tell them exactly what will appear and what to do. Everything else \
 runs on this machine, with your own tools: use another only when this one can't do the step, because it needs another \
-platform (build and test for Linux x86-64 from a Mac: on: \"linux/amd64\"), a GPU (on: \"+gpu\"), or more memory, disk \
-or cores than this machine has (on: \"mem>=32g\", \"cpus>=16\"). `run` runs one command on one machine. `code_run` runs a \
+platform (build and test for Linux x86-64 from a Mac: needs: \"linux/amd64\"), a GPU (needs: \"+gpu\"), or more memory, \
+disk or cores than this machine has (needs: \"cpus=16,mem=32g\": that many cores idle and that much memory free); `on` \
+names a machine for a step that has to happen on that one. `run` runs one command on one machine. `code_run` runs a \
 JavaScript program against kiln, and only what it returns comes back to you: the same build or test on several machines at \
-once, returning just what failed (`const [mac, linux] = await Promise.all([kiln.machines.run({on: \"macos\", command: \
-\"cargo test\"}), kiln.machines.run({on: \"linux/amd64\", command: \"cargo test\"})])`), or CI runs and deployments \
+once, returning just what failed (`const [mac, linux] = await Promise.all([kiln.machines.run({needs: \"macos\", command: \
+\"cargo test\"}), kiln.machines.run({needs: \"linux/amd64\", command: \"cargo test\"})])`), or CI runs and deployments \
 (`kiln.ci.*`, `kiln.cd.*`; `code_search` lists every operation and its input). The repository you are in is synced to \
 the other machine first (only what changed; git sees the same state there), and the command runs in the matching \
 folder, so you edit here and it builds or tests there; for a command that isn't about this repository, pass sync: false (it runs \
@@ -124,13 +125,24 @@ fn describe(v: &Value) -> String {
     out.join(", ")
 }
 
-const WANT: &str = "What the machine must be (optional): a runner's name, or `linux/amd64`, `macos`, `arm64`, `linux,+gpu`, `cpus>=16`, `mem>=32g`.";
+const WANT: &str = "What the machine must be and have (optional), as `needs` says it: `linux/amd64`, `macos`, `+gpu`, `cpus=8,mem=32g`, `tool:cargo`; or a runner's name.";
+
+/// Where a command of `run` and `kiln.machines.run` goes, as its runner reads it: `on` and `needs`
+/// as one spelling ([`super::directory::target`]), the session's preferred runner when neither is
+/// given.
+fn run_target(args: &Value, prefer: Option<&str>) -> Result<String, String> {
+    let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty());
+    let (on, needs) = (s("on"), s("needs").unwrap_or_default());
+    let on = on.or(if needs.is_empty() { prefer } else { None }).unwrap_or_default();
+    super::directory::target(on, needs).map_err(|e| format!("`needs`: {e}"))
+}
 
 /// A command's input, as `run` and `kiln.machines.run` take it (`run` adds how long to wait).
 fn command_schema(waits: bool) -> Value {
     let mut props = json!({
         "command": {"type": "string", "description": "Shell text, run by bash in the synced copy of this repository."},
-        "on": {"type": "string", "description": "Where: a runner's name or what it must be (`linux/amd64`). Default: the session's preferred runner, else this machine. What it must be picks this machine when it suits and has memory to spare, else the idlest that suits."},
+        "needs": {"type": "string", "description": "What the machine must be and have: `linux/amd64`, `macos`, `+gpu` (a label), `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it. Picks this machine when it has them and room to spare, else the idlest that has them."},
+        "on": {"type": "string", "description": "A runner by name, for a step that has to happen on that machine (it must still meet `needs`). Default: what `needs` picks; with neither, the session's preferred runner, else this machine."},
         "sync": {"type": "boolean", "description": "Copy this repository over first and run in it (default: true inside a git repository)."},
         "cwd": {"type": "string", "description": "With sync: the folder here whose repository is synced and whose counterpart the command runs in (default: the session's folder). Without sync: the folder on the other machine (default: its home)."},
         "timeout_s": {"type": "number", "description": "Stop the command after this many seconds."},
@@ -209,7 +221,7 @@ fn base_tools() -> Value {
     json!([
         {
             "name": "code_run",
-            "description": "Run a JavaScript program against kiln and get back only what it returns. `await kiln.machines.run({on, command})` runs a shell command on one of this kiln's machines (this repository synced over first, as with `run`) and resolves when it ends, with {runner, exit_code, output}; start several and `await Promise.all([...])` to run them side by side. Also `kiln.machines.list({want})`, `kiln.machines.start(...)` (background: {id}), `kiln.machines.output({id, wait_s})`, `kiln.machines.stop({id})`, and kiln's CI and deployments under `kiln.ci.*` and `kiln.cd.*` (`code_search` lists every operation and its input; `kiln.call(name, input)` calls one by name). A refused call throws an Error with `result`. `input` is given as `input`. Bounded: 10 minutes unless timeout_s says otherwise (at most an hour), 16 calls at once, 4 MiB per answer; runs a program ends without are stopped.",
+            "description": "Run a JavaScript program against kiln and get back only what it returns. `await kiln.machines.run({needs, command})` runs a shell command on one of this kiln's machines that has what it needs (or `on`, one by name) (this repository synced over first, as with `run`) and resolves when it ends, with {runner, exit_code, output}; start several and `await Promise.all([...])` to run them side by side. Also `kiln.machines.list({want})`, `kiln.machines.start(...)` (background: {id}), `kiln.machines.output({id, wait_s})`, `kiln.machines.stop({id})`, and kiln's CI and deployments under `kiln.ci.*` and `kiln.cd.*` (`code_search` lists every operation and its input; `kiln.call(name, input)` calls one by name). A refused call throws an Error with `result`. `input` is given as `input`. Bounded: 10 minutes unless timeout_s says otherwise (at most an hour), 16 calls at once, 4 MiB per answer; runs a program ends without are stopped.",
             "inputSchema": {"type": "object", "properties": {
                 "program": {"type": "string", "description": "The body of an async function; `return` its answer."},
                 "input": {"description": "Any JSON, available as `input`."},
@@ -225,13 +237,13 @@ fn base_tools() -> Value {
         },
         {
             "name": "runners",
-            "description": "The machines (kiln runners) commands can run on, best first for `want` (this one first when it suits and has memory to spare): platform, idle cores, free memory, installed agents, and why others don't suit. `want` is a runner's name or what it must be: `linux/amd64`, `macos`, `arm64`, `linux,+gpu`, `cpus>=16`, `mem>=32g`.",
+            "description": "The machines (kiln runners) commands can run on, best first for `want` (this one first when it suits and has memory to spare): platform, idle cores, free memory, installed agents, and why others don't suit. `want` is what it must be and have, as `run`'s `needs` takes it (`linux/amd64`, `+gpu`, `cpus=8,mem=32g`, `tool:cargo`), or a runner's name.",
             "inputSchema": {"type": "object", "properties": {"want": {"type": "string", "description": "What the machine must be (optional)."}}},
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
         {
             "name": "run",
-            "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory, disk or cores than it has, or one that has to happen on that machine (everything else, run here with your own tools). `on` picks it: a runner's name, or what it must be (`linux/amd64`, `macos/arm64`, `+gpu`, `cpus>=16`): this machine when it suits and has memory to spare, else the idlest that suits. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. What the command leaves running when it ends (`nohup … &`, a daemon) ends with it: run a server with background: true, and `stop` it when done. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id for `output` and `stop`.",
+            "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory, disk or cores than it has, or one that has to happen on that machine (everything else, run here with your own tools). `needs` picks it: what it must be and have (`linux/amd64`, `macos/arm64`, `+gpu`, `tool:cargo`, `cpus=8,mem=32g` idle and free): this machine when it suits and has room to spare, else the idlest that suits; `on` names a machine when the step has to happen on that one. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. What the command leaves running when it ends (`nohup … &`, a daemon) ends with it: run a server with background: true, and `stop` it when done. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id for `output` and `stop`.",
             "inputSchema": command_schema(true),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
         },
@@ -508,12 +520,12 @@ impl Server {
         let sync = args.get("sync").and_then(Value::as_bool).unwrap_or(in_repo);
         let env: Vec<(String, String)> = args.get("env").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned()))).collect()).unwrap_or_default();
         let req = RunReq {
-            target: s("on").or_else(|| self.prefer.clone()).unwrap_or_default(),
+            target: run_target(args, self.prefer.as_deref())?,
             command,
             cwd: Some(cwd.clone()),
             remote_cwd: if sync { None } else { s("cwd") },
             sync,
-            env,
+            env: super::directory::with_needs(env, s("needs").as_deref().unwrap_or_default()),
             stdin: false,
             timeout_ms: args.get("timeout_s").and_then(Value::as_f64).map(|t| (t.max(0.0) * 1000.0) as u64),
             shell: s("shell"),
@@ -1130,5 +1142,22 @@ mod tests {
         let names: Vec<&str> = ops.iter().filter_map(|o| o.get("name").and_then(Value::as_str)).collect();
         assert_eq!(names, ["machines.list", "machines.run", "machines.start", "machines.output", "machines.stop"]);
         assert!(ops.iter().all(|o| o.pointer("/input/type") == Some(&json!("object"))));
+    }
+
+    /// `run` and `kiln.machines.run` take `needs` beside `on`: the runner gets both as one spelling,
+    /// the session's preferred runner only when neither is given, and a bad need is refused here.
+    #[test]
+    fn run_takes_needs_beside_on() {
+        let t = |args: Value| run_target(&args, Some("mac"));
+        assert_eq!(t(json!({"command": "make", "needs": "cpus=8,mem=32g,linux/amd64"})).as_deref(), Ok("cpus=8,mem=32g,linux/amd64"));
+        assert_eq!(t(json!({"command": "make", "on": "adacachy", "needs": "mem=32g"})).as_deref(), Ok("adacachy,mem=32g"));
+        assert_eq!(t(json!({"command": "make", "on": "linux/amd64"})).as_deref(), Ok("linux/amd64"));
+        assert_eq!(t(json!({"command": "make", "needs": " "})).as_deref(), Ok("mac"));
+        assert_eq!(run_target(&json!({"command": "make"}), None).as_deref(), Ok(""));
+        assert_eq!(t(json!({"command": "make", "needs": "memm=4g"})), Err("`needs`: memm=4g: no such need".to_owned()));
+        assert_eq!(command_schema(true).pointer("/properties/needs/type"), Some(&json!("string")));
+        let runs: Vec<Value> = machine_ops().into_iter().filter(|o| o.get("name").and_then(Value::as_str).is_some_and(|n| n == "machines.run" || n == "machines.start")).collect();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|o| o.pointer("/input/properties/needs").is_some()), "{runs:?}");
     }
 }

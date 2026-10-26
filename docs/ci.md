@@ -1640,7 +1640,9 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   elsewhere the share holds its room, its cores unpinned). Cores don't keep apart what they share:
   the memory bus and the disks. `exclusive: true` asking for no CPUs takes the whole runner, as
   does one on a runner whose size isn't known. The v1 dispatcher and each runner's own admission
-  hold to the same rule, so neither dispatcher's work lands in the other's share.
+  hold to the same rule, so neither dispatcher's work lands in the other's share. A job's
+  `resources:`, `requires:` and `exclusive:` are its needs, in the one spelling `kiln run --needs`
+  and the MCP tools take too: docs/runners.md.
 - **W05-R04 Data structures.** Requirements are interned into **signatures**; each signature keeps
   its eligible runner set (recomputed when a runner or a rule changes) and a priority queue of its
   legs ordered by (effective priority descending, fair-share virtual time ascending, queue order
@@ -1688,7 +1690,9 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   (`reserve: { for: "workflow == 'bench'", cron: "0 2 * * *", duration: 2h }`); others are not
   assigned there in the window, and legs already running finish.
 - **W05-R13 Wait reasons.** Every waiting leg has exactly one current reason, from: `needs`,
-  `capacity` (with counts: eligible runners, busy, draining), `no-runner` (none eligible is
+  `capacity` (with counts: eligible runners, busy, draining), `oversized` (in resource mode, it
+  asks for more than any eligible runner has even idle: what it asks, and what each of them has of
+  it), `no-runner` (none eligible is
   connected; lists the ones offline), `unroutable` (no runner known to kiln could ever run it; lists
   the failing requirements), `concurrency` (group and holder), `quota`, `reservation`,
   `exclusive`, `approval`, `scaling` (a pool is starting runners; how many and since when),
@@ -5560,7 +5564,7 @@ Firecracker microVMs, R01 in `k8s` pods, and R06. R03 is W06-R13's debug reruns.
     there, the step rerun in place and passing, and the release ending the microVM.
   - The run page's controls in Chromium and WebKit, at desktop and phone widths.
 - *R06* ships as **`kiln workflow run`**: `kiln run` was taken by reach (a command on another runner,
-  `kiln run --on linux/amd64 -- make`), which machines and agents already use. Everything else is
+  `kiln run --needs linux/amd64 -- make`), which machines and agents already use. Everything else is
   as written (`crates/kiln/src/ci/local.rs`, `ci/uploads.rs`):
   - The working tree becomes a commit on `HEAD` (`HEAD` itself when nothing changed), made in a
     copy of the index, so the index and the branches don't move.
@@ -8701,8 +8705,8 @@ in `.github/workflows`. Each key's semantics are in the requirement cited.
 | workflow | `checkout: auto \| false` (default `auto`) | W06-R14 |
 | on | `diff`, `land`, `review`, `comment`, `pipeline`, `agent`, `deploy`, `webhook`; v1 `manual`, `tag`, string `schedule` | W03-R09, W02-R06 |
 | on | `schedule[].{timezone,branch,inputs,jitter,skip-if-unchanged,catch-up}` (O) | W03-R10 |
-| job | `toolchain`, `image`, `exclusive`, `resources: { cpu, memory, disk, gpu }` (O for `resources`) | W02-R06, W05-R03 |
-| job | `requires: [constraints]`, `prefer: [preferences]` (`{ fact, higher }`, `{ label }`, `{ warm }`, `{ affinity: { job } }`, each with `weight`; `patience` with `warm` or `affinity`), `priority` (O) | W05-R22, W05-R23, W24-R18, W05-R09 |
+| job | `toolchain`, `image`, `exclusive`, `resources: { cpu, memory, disk, gpu }` (O for `resources`; what they need, docs/runners.md) | W02-R06, W05-R03 |
+| job | `requires: [constraints]` (docs/runners.md), `prefer: [preferences]` (`{ fact, higher }`, `{ label }`, `{ warm }`, `{ affinity: { job } }`, each with `weight`; `patience` with `warm` or `affinity`), `priority` (O) | W05-R22, W05-R23, W24-R18, W05-R09 |
 | job, step | `retry: { max, on, backoff, runner }` (O) | W05-R14 |
 | workflow, job | `concurrency.limit` (O) | W05-R07 |
 | job | `strategy.matrix.{where,platforms,emulate}`, `strategy.{when,shard,chunk}`, `strategy.max-parallel: {total, per}`, `strategy.fail-fast: {scope, cancel}` (O) | W04-R11 to R16 |
