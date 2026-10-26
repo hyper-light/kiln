@@ -411,3 +411,22 @@ fn w25_s1_readme_holds_the_report() -> Result<(), String> {
     assert!(kept == r, "ci/sim/README.md's report is stale: cargo run -p kiln-ci --example replay -- ci/sim/trace.json --sweeps");
     Ok(())
 }
+
+/// W28-AC45: P2, deciding through `kiln_ci::sched::demand` (W28-R48), wastes at most 5% of the
+/// runner time it uses on the recorded week, the median over seeds 1-8.
+#[test]
+fn w28_ac45_p2_through_the_demand_table_wastes_at_most_5_percent() -> Result<(), String> {
+    let t = week()?;
+    let mut shares: Vec<f64> = SEEDS
+        .iter()
+        .map(|s| {
+            let o = replay(&t, &Policy::p2(), *s);
+            let (used, _) = o.runner_time();
+            if used == 0 { 0.0 } else { o.wasted() as f64 / used as f64 }
+        })
+        .collect();
+    shares.sort_by(f64::total_cmp);
+    let median = shares.get(shares.len() / 2).copied().ok_or("no seeds")?;
+    assert!(median <= 0.05, "P2 wastes {:.2}% of runner time (median over seeds 1-8)", median * 100.0);
+    Ok(())
+}

@@ -43,7 +43,9 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sched::admit::{self, Admit, Demand};
+use crate::sched::demand::{self, Ask, Demands, Domain, End as Ending, Fate, Next, Work};
 use crate::sched::groups::{GroupAction, GroupConfig, Groups};
+use crate::sched::retry::FailureClass;
 
 use draw::Draw;
 pub use trace::{End, Trace};
@@ -371,10 +373,13 @@ struct Engine<'a> {
     exec_st: Vec<ExecSt>,
     /// The executions running now.
     running: BTreeSet<usize>,
-    /// The demands each execution answers.
-    serves: Vec<Vec<(usize, usize)>>,
+    /// Demands and the work in flight (W28-R48): every withdrawal, adoption, drop, finish and
+    /// cancel of P2 and later is `kiln_ci::sched::demand`'s, as the scheduler's is.
+    demands: Demands,
+    /// The execution each executing leg (`run/job`) runs.
+    exec_of: BTreeMap<String, usize>,
+    /// Each lane's runs, in order: what a bisection looks through (P3).
     lanes: BTreeMap<String, Vec<usize>>,
-    inflight: BTreeMap<String, usize>,
     ledger: BTreeMap<String, (End, Option<String>)>,
     warm: BTreeMap<(String, String), (i64, usize)>,
     /// P4's admission: kiln_ci::sched::admit itself, a run of a lane its demand.
@@ -423,9 +428,9 @@ pub fn replay(trace: &Trace, policy: &Policy, seed: u64) -> Outcome {
         execs: Vec::new(),
         exec_st: Vec::new(),
         running: BTreeSet::new(),
-        serves: Vec::new(),
+        demands: Demands::default(),
+        exec_of: BTreeMap::new(),
         lanes: BTreeMap::new(),
-        inflight: BTreeMap::new(),
         ledger: BTreeMap::new(),
         warm: BTreeMap::new(),
         admit: Admit::new(policy.window.unwrap_or_default()),
@@ -552,9 +557,19 @@ impl Engine<'_> {
         let Some(run) = trace.runs.get(r) else { return };
         if self.demand_mode() {
             let lane = self.lane_of(r);
-            let older: Vec<usize> = self.lanes.get(&lane).cloned().unwrap_or_default();
-            for o in older {
-                self.withdraw(o, r);
+            // W28-R48: the newer push withdraws the older demands on its lane, and what answered
+            // them is decided again, as the scheduler does it.
+            let wanted = demand::Demand { run: r.to_string(), lane: lane.clone(), domain: Domain::Trusted, at: self.now, ..demand::Demand::default() };
+            let withdrawn = self.demands.arrive(wanted, true);
+            let olds: Vec<usize> = withdrawn.iter().filter_map(|o| o.parse().ok()).collect();
+            for o in &olds {
+                self.withdraw(*o, r);
+            }
+            for exec in self.demands.affected(&withdrawn) {
+                self.decide(&exec);
+            }
+            for o in olds {
+                self.check_concluded(o);
             }
             self.lanes.entry(lane.clone()).or_default().push(r);
             if run.jobs.is_empty() {
@@ -655,8 +670,8 @@ impl Engine<'_> {
         self.admit_decisions(ds);
     }
 
-    /// A newer push `by` withdraws an older run's demands: what no live demand wants and hasn't
-    /// started is dropped; what runs goes on (it may be cancelled later for live work).
+    /// A newer push `by` withdrew an older run's demands: a run held in its quiet period (P1)
+    /// never asks for its jobs.
     fn withdraw(&mut self, o: usize, by: usize) {
         let Some(rs) = self.runs.get_mut(o) else { return };
         if rs.withdrawn || rs.end != RunEnd::Open {
@@ -667,22 +682,68 @@ impl Engine<'_> {
         self.note(o, format!("demands withdrawn by run {by}"));
         let jobs = self.runs.get(o).map(|rs| rs.jobs.clone()).unwrap_or_default();
         for (j, st) in jobs.into_iter().enumerate() {
-            match st {
-                JobSt::Attached(x) if !self.wanted(x) && matches!(self.exec_st.get(x), Some(ExecSt::Queued | ExecSt::Launching)) => {
-                    self.note(o, format!("execution {x} dropped before it started: no live demand wants it"));
-                    self.stop(x, Stop::Dropped);
-                }
-                JobSt::Waiting if held => self.set_job(o, j, JobSt::Cancelled),
-                _ => {}
+            if held && st == JobSt::Waiting {
+                self.set_job(o, j, JobSt::Cancelled);
             }
         }
-        self.check_concluded(o);
     }
 
-    /// Whether a live demand (one not withdrawn) waits on the execution.
+    /// Whether a live demand waits on the execution, as the demand table has it (a bisection's
+    /// always is).
     fn wanted(&self, x: usize) -> bool {
-        self.serves.get(x).is_some_and(|s| s.iter().any(|(r, j)| self.runs.get(*r).is_some_and(|rs| !rs.withdrawn) && self.job_st(*r, *j) == Some(&JobSt::Attached(x))))
-            || self.execs.get(x).is_some_and(|e| e.bisect.is_some())
+        self.execs.get(x).is_some_and(|e| e.bisect.is_some()) || self.demands.wanted(&self.leg_of(x))
+    }
+
+    /// What becomes of an execution whose demands were withdrawn (W28-R43, R48), as the scheduler
+    /// decides it: dropped if it hasn't started, kept or run on otherwise.
+    fn decide(&mut self, exec: &str) {
+        let Some(x) = self.exec_of.get(exec).copied() else { return };
+        let left = (self.exec_st.get(x) == Some(&ExecSt::Running)).then(|| self.expected_left(x));
+        if let Some(f @ Fate::Drop { .. }) = self.demands.fate(exec, left, false, self.policy.finish_within) {
+            let r = self.execs.get(x).map_or(0, |e| e.run);
+            self.note(r, format!("execution {x}: {}", f.why()));
+            self.stop(x, Stop::Dropped);
+        }
+    }
+
+    /// What the adopters of an execution that ended do (W28-R44, R48), as the scheduler has them:
+    /// take its result over (`end`), run the work themselves, adopt another, or drop.
+    fn follow(&mut self, nexts: Vec<(String, Next)>, end: Option<End>) {
+        let now = self.now;
+        let mut runs = BTreeSet::new();
+        for (leg, next) in nexts {
+            let Some((r, j)) = parse_leg(&leg) else { continue };
+            runs.insert(r);
+            match next {
+                Next::Reuse { .. } => {
+                    if let Some(end) = end {
+                        self.set_job(r, j, JobSt::Done { at: now, end, how: How::Adopted });
+                        self.record_result(r, j, end);
+                    }
+                }
+                Next::Execute => {
+                    let key = self.key_of(r, j);
+                    let y = self.new_exec(r, j, key, 0, None);
+                    self.exec_of.insert(leg, y);
+                    self.set_job(r, j, JobSt::Attached(y));
+                }
+                Next::Adopt { exec, .. } => match self.exec_of.get(&exec).copied() {
+                    Some(y) => {
+                        self.note(r, format!("job {j} adopts execution {y}"));
+                        self.set_job(r, j, JobSt::Attached(y));
+                    }
+                    None => self.set_job(r, j, JobSt::Cancelled),
+                },
+                Next::Drop | Next::Check { .. } => self.set_job(r, j, JobSt::Cancelled),
+            }
+        }
+        for r in runs {
+            if end.is_some() {
+                self.ready(r);
+            } else {
+                self.check_concluded(r);
+            }
+        }
     }
 
     fn start_run(&mut self, r: usize) {
@@ -760,17 +821,17 @@ impl Engine<'_> {
         if let Some(s) = self.exec_st.get_mut(x) {
             *s = ExecSt::Over;
         }
-        let key = self.execs.get(x).map(|e| e.key.clone()).unwrap_or_default();
-        if self.inflight.get(&key) == Some(&x) {
-            self.inflight.remove(&key);
-        }
         self.steps_inflight.retain(|_, (y, _)| *y != x);
-        let served = self.serves.get(x).cloned().unwrap_or_default();
-        for (r, j) in served {
-            if self.job_st(r, j) == Some(&JobSt::Attached(x)) {
-                self.set_job(r, j, JobSt::Cancelled);
-                self.check_concluded(r);
-            }
+        let Some((r, j, bisect)) = self.execs.get(x).map(|e| (e.run, e.job, e.bisect)) else { return };
+        if self.job_st(r, j) == Some(&JobSt::Attached(x)) {
+            self.set_job(r, j, JobSt::Cancelled);
+            self.check_concluded(r);
+        }
+        if bisect.is_none() {
+            let leg = leg_id(r, j);
+            self.exec_of.remove(&leg);
+            let nexts = self.demands.ended(&leg, Ending::Cancelled);
+            self.follow(nexts, None);
         }
     }
 
@@ -845,21 +906,30 @@ impl Engine<'_> {
             self.record_result(r, j, end);
             return;
         }
-        if let Some(x) = self.inflight.get(&key).copied() {
-            self.note(r, format!("job {j} adopts execution {x} ({key})"));
-            if let Some(s) = self.serves.get_mut(x) {
-                s.push((r, j));
+        // W28-R48: adopt the execution in flight, or run, as the scheduler's demand table has it.
+        let leg = leg_id(r, j);
+        let lane = format!("{}/{}", self.lane_of(r), self.job_of(r, j).map_or("", |job| job.key.as_str()));
+        let work = Work { key: Some(key.clone()), domain: Domain::Trusted, lane, observed: false };
+        match self.demands.ask(&leg, &r.to_string(), &work, 0) {
+            Ask::Adopt { exec, .. } => match self.exec_of.get(&exec).copied() {
+                Some(x) => {
+                    self.note(r, format!("job {j} adopts execution {x} ({key})"));
+                    self.set_job(r, j, JobSt::Attached(x));
+                }
+                None => self.set_job(r, j, JobSt::Cancelled),
+            },
+            Ask::Drop => self.set_job(r, j, JobSt::Cancelled),
+            Ask::Execute => {
+                let x = self.new_exec(r, j, key, 0, None);
+                self.exec_of.insert(leg, x);
+                self.set_job(r, j, JobSt::Attached(x));
             }
-            self.set_job(r, j, JobSt::Attached(x));
-            return;
         }
-        if self.runs.get(r).is_some_and(|rs| rs.withdrawn) {
-            self.set_job(r, j, JobSt::Cancelled);
-            return;
-        }
-        let x = self.new_exec(r, j, key.clone(), 0, None);
-        self.inflight.insert(key, x);
-        self.set_job(r, j, JobSt::Attached(x));
+    }
+
+    /// The leg id of the job an execution runs, in the demand table.
+    fn leg_of(&self, x: usize) -> String {
+        self.execs.get(x).map_or_else(String::new, |e| leg_id(e.run, e.job))
     }
 
     fn new_exec(&mut self, r: usize, j: usize, key: String, priority: u8, bisect: Option<usize>) -> usize {
@@ -867,7 +937,6 @@ impl Engine<'_> {
         let runtime = self.draw(r, j).map_or(0, |d| d.duration);
         self.execs.push(Exec { run: r, job: j, key, queued: self.now, started: None, ended: None, end: None, stop: None, pool: None, runtime, credit: 0, salvaged: 0, bisect });
         self.exec_st.push(ExecSt::Queued);
-        self.serves.push(if bisect.is_some() { Vec::new() } else { vec![(r, j)] });
         self.seq += 1;
         self.queue.insert((priority, self.now, self.seq), x);
         x
@@ -1018,11 +1087,15 @@ impl Engine<'_> {
                 continue;
             }
             let running: Vec<usize> = self.running.iter().copied().filter(|y| self.execs.get(*y).is_some_and(|o| o.pool == Some(i))).collect();
+            // W28-R48: contended, what no live demand wants is cancelled or finishes as the
+            // scheduler's demand table decides (work on a cadence, P4, is never cancelled).
             let mut preemptible: Vec<(i64, usize)> = running
                 .iter()
-                .filter(|y| !self.wanted(**y) && self.execs.get(**y).and_then(|o| self.job_of(o.run, o.job)).is_some_and(|oj| !self.on_cadence(oj)))
-                .map(|y| (self.expected_left(*y), *y))
-                .filter(|(left, _)| *left > self.policy.finish_within)
+                .filter(|y| self.execs.get(**y).and_then(|o| self.job_of(o.run, o.job)).is_some_and(|oj| !self.on_cadence(oj)))
+                .filter_map(|y| {
+                    let left = self.expected_left(*y);
+                    matches!(self.demands.fate(&self.leg_of(*y), Some(left), true, self.policy.finish_within), Some(Fate::Cancel { .. })).then_some((left, *y))
+                })
                 .collect();
             preemptible.sort_by(|a, b| b.cmp(a));
             let Some(ps) = self.pools.get(i) else { continue };
@@ -1099,6 +1172,10 @@ impl Engine<'_> {
         let trace = self.trace;
         let Some(e) = self.execs.get(x) else { return };
         let (r, j) = (e.run, e.job);
+        if e.bisect.is_none() {
+            self.demands.started(&leg_id(r, j), now);
+        }
+        let Some(e) = self.execs.get(x) else { return };
         let ephemeral = e.pool.and_then(|p| trace.pools.get(p)).is_some_and(|p| p.slots.is_none());
         let mut runtime = self.draw(r, j).map_or(0, |d| d.duration);
         let mut credit = 0;
@@ -1209,9 +1286,6 @@ impl Engine<'_> {
             self.bisect_step(b);
             return;
         }
-        if self.inflight.get(&key) == Some(&x) {
-            self.inflight.remove(&key);
-        }
         // What it made for other pipelines (P5).
         let done: Vec<(String, String)> = self.steps_inflight.iter().filter(|(_, (y, _))| *y == x).map(|(k, _)| k.clone()).collect();
         for k in done {
@@ -1234,17 +1308,22 @@ impl Engine<'_> {
         if self.demand_mode() && end != End::TimedOut {
             self.ledger.insert(key, (end, draw.and_then(|d| d.failed_step)));
         }
-        let served = self.serves.get(x).cloned().unwrap_or_default();
-        for (sr, sj) in &served {
-            if self.job_st(*sr, *sj) == Some(&JobSt::Attached(x)) {
-                let how = if (*sr, *sj) == (r, j) { How::Ran } else { How::Adopted };
-                self.set_job(*sr, *sj, JobSt::Done { at: now, end, how });
-                self.record_result(*sr, *sj, end);
-            }
+        if self.job_st(r, j) == Some(&JobSt::Attached(x)) {
+            self.set_job(r, j, JobSt::Done { at: now, end, how: How::Ran });
+            self.record_result(r, j, end);
         }
-        for (sr, _) in served {
-            self.ready(sr);
-        }
+        // W28-R48: its adopters take the result over, or carry on without it, as the scheduler
+        // has them: a timeout isn't theirs.
+        let leg = leg_id(r, j);
+        self.exec_of.remove(&leg);
+        let ending = match end {
+            End::Succeeded => Ending::Success,
+            End::Failed => Ending::Failed(FailureClass::Failure),
+            End::TimedOut => Ending::Failed(FailureClass::Timeout),
+        };
+        let nexts = self.demands.ended(&leg, ending);
+        self.ready(r);
+        self.follow(nexts, Some(end));
     }
 
     /// Keeps a job's result for its lane (P3): a new failure starts a bisection over the commits
@@ -1344,6 +1423,7 @@ impl Engine<'_> {
     }
 
     fn conclude(&mut self, r: usize, passed: bool) {
+        self.demands.leave(&r.to_string());
         let now = self.now;
         let Some(rs) = self.runs.get_mut(r) else { return };
         rs.end = if passed { RunEnd::Passed } else { RunEnd::Failed };
@@ -1353,6 +1433,17 @@ impl Engine<'_> {
             self.apply(&g, more);
         }
     }
+}
+
+/// A job's leg id in the demand table (W28-R48): `run/job`.
+fn leg_id(r: usize, j: usize) -> String {
+    format!("{r}/{j}")
+}
+
+/// The run and job a leg id names.
+fn parse_leg(leg: &str) -> Option<(usize, usize)> {
+    let (r, j) = leg.split_once('/')?;
+    Some((r.parse().ok()?, j.parse().ok()?))
 }
 
 /// Whether a pool carries every label a job asks for.
