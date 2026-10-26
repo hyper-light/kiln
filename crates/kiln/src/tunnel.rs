@@ -1011,6 +1011,7 @@ mod tests {
                 leaf,
                 server,
                 dial_deadline: Duration::from_secs(10),
+                revoked_keys: Vec::new(),
             };
             let (_server, server_ev) = crate::net::start(spec(quic, pki.server_leaf(&[])?, true))?;
             let (http, registry) = tunnel_server(quic)?;
@@ -1069,6 +1070,7 @@ mod tests {
                 leaf: pki.server_leaf(&[])?,
                 server: true,
                 dial_deadline: crate::net::DIAL_DEADLINE,
+                revoked_keys: Vec::new(),
             })?;
             assert!(udp_answers(&addr.to_string(), Duration::from_secs(5)).await, "no Version Negotiation from {addr}");
             // Nothing listens there: no answer.

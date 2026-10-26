@@ -247,6 +247,47 @@ pub fn verify_issued(ca_der: &[u8], der: &[u8]) -> bool {
     cert.verify_signature(Some(ca.public_key())).is_ok()
 }
 
+/// A certificate as kiln records it (W27-R01): its serial (hex of its bytes), the SHA-256 (hex)
+/// of its SubjectPublicKeyInfo, and its validity (unix seconds). The same spellings
+/// `kiln_ci::identity::chain` checks revocations by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fingerprints {
+    pub serial: String,
+    pub key: String,
+    pub not_before: i64,
+    pub not_after: i64,
+}
+
+/// The first certificate of a PEM text, fingerprinted.
+pub fn fingerprints(pem: &str) -> anyhow::Result<Fingerprints> {
+    fingerprints_der(&pem_to_der(pem)?)
+}
+
+/// A DER certificate, fingerprinted.
+pub fn fingerprints_der(der: &[u8]) -> anyhow::Result<Fingerprints> {
+    let (_, cert) = x509_parser::parse_x509_certificate(der).map_err(|e| anyhow::anyhow!("not a certificate: {e}"))?;
+    Ok(Fingerprints {
+        serial: cert.raw_serial().iter().map(|b| format!("{b:02x}")).collect(),
+        key: crate::util::sha256_hex(cert.public_key().raw),
+        not_before: cert.validity().not_before.timestamp(),
+        not_after: cert.validity().not_after.timestamp(),
+    })
+}
+
+/// The SHA-256 (hex) of a DER certificate's key: what the TLS directory checks revocations by.
+pub fn key_sha256(der: &[u8]) -> Option<String> {
+    fingerprints_der(der).ok().map(|f| f.key)
+}
+
+/// A random positive serial number, the same length every time.
+fn random_serial() -> SerialNumber {
+    let mut serial: [u8; 16] = rand::random();
+    if let Some(b) = serial.first_mut() {
+        *b = (*b & 0x7f) | 0x40;
+    }
+    SerialNumber::from_slice(&serial)
+}
+
 /// Make an agent name safe to use as a DNS SAN.
 pub fn sanitize_name(name: &str) -> String {
     let s: String = name
@@ -410,6 +451,36 @@ impl Pki {
             p.distinguished_name.push(DnType::CommonName, n.clone());
         }
         p.distinguished_name.push(DnType::OrganizationName, "kiln front door");
+        let signed = CertificateSigningRequestParams { params: p, public_key: csr.public_key }.signed_by(&self.issuer).context("sign CSR")?;
+        Ok(signed.pem())
+    }
+
+    /// An actor's certificate (W27-R01) for the key of `csr_pem`, which never leaves where it was
+    /// made: the identity's URI (its one URI SAN) and `facts` (Fulcio's extensions, by member,
+    /// as DER UTF8Strings) are the server's, whatever the CSR asked. For digital signatures only,
+    /// not a CA, a random serial, valid from five minutes ago for `lifetime`.
+    pub fn issue_identity(&self, csr_pem: &str, identity: &kiln_ci::identity::chain::Identity, facts: &[(u64, &str)], lifetime: Duration) -> anyhow::Result<String> {
+        use kiln_ci::identity::chain::{der_utf8_string, fulcio};
+        let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Parsing checks the CSR's own signature (possession of its private key).
+        let csr = CertificateSigningRequestParams::from_pem(csr_pem).context("parse CSR")?;
+        let mut p = CertificateParams::new(Vec::<String>::new()).context("certificate params")?;
+        p.subject_alt_names = vec![rcgen::SanType::URI(uri.as_str().try_into().context("the identity's URI")?)];
+        p.distinguished_name = DistinguishedName::new();
+        p.distinguished_name.push(DnType::OrganizationName, identity.org.clone());
+        let now = OffsetDateTime::now_utc();
+        p.not_before = now - Duration::minutes(5);
+        p.not_after = now + lifetime;
+        p.is_ca = IsCa::ExplicitNoCa;
+        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        p.use_authority_key_identifier_extension = true;
+        p.serial_number = Some(random_serial());
+        for (member, value) in facts {
+            let mut oid = fulcio::ARC.to_vec();
+            oid.push(*member);
+            let content = der_utf8_string(value).ok_or_else(|| anyhow::anyhow!("a fact is longer than 65535 bytes"))?;
+            p.custom_extensions.push(rcgen::CustomExtension::from_oid_content(&oid, content));
+        }
         let signed = CertificateSigningRequestParams { params: p, public_key: csr.public_key }.signed_by(&self.issuer).context("sign CSR")?;
         Ok(signed.pem())
     }
@@ -615,6 +686,39 @@ mod tests {
         let server = pki.server_leaf(&[])?;
         let server_csr = make_csr_with_key(SERVER_NAME, &server.key_pem)?;
         assert!(pki.sign_instance(&server.cert_pem, &server_csr).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn w27_r01_identities_issued_by_csr_verify_to_the_root() -> anyhow::Result<()> {
+        use kiln_ci::identity::chain::{self, Actor, Identity, fulcio};
+        let dir = tempfile::tempdir()?;
+        let pki = Pki::open_scratch(dir.path())?;
+        // The CSR asks for another name; the certificate names what the server says.
+        let (csr, key_pem) = make_csr("someone-else")?;
+        let agent = Identity::new("hyper-light", Actor::Agent { person: "sam".into(), agent: "matrix".into(), epoch: 3 });
+        let pem = pki.issue_identity(&csr, &agent, &[], Duration::hours(12))?;
+        let der = pem_to_der(&pem)?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let v = chain::verify(&[&der], &pki.ca_der, &[], now).map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(v.to_string(), "agent matrix, epoch 3, for sam, of hyper-light");
+        assert!(v.not_after - v.not_before <= 12 * 3600 + 300);
+        assert!(cert_matches_key(&pem, &key_pem), "certified for the CSR's key, made by the requester");
+        let f = fingerprints(&pem)?;
+        assert_eq!((f.serial.clone(), f.key.clone()), (v.serial.clone(), v.key.clone()));
+        // A leg's facts ride in Fulcio's extensions.
+        let (csr, _key) = make_csr("leg")?;
+        let leg = Identity::new(
+            "hyper-light",
+            Actor::Leg { enrolled_by: "ada".into(), machine: "fedora-2".into(), instance: "01a174ed".into(), run: 812, attempt: 1, leg: "e2e".into() },
+        );
+        let pem = pki.issue_identity(&csr, &leg, &[(fulcio::SOURCE_REPOSITORY_DIGEST, "4c1e2a90")], Duration::hours(6))?;
+        let v = chain::verify(&[&pem_to_der(&pem)?], &pki.ca_der, &[], now).map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(v.facts.commit.as_deref(), Some("4c1e2a90"));
+        // A tampered CSR (another key's signature) is refused.
+        let (_, other_key) = make_csr("x")?;
+        let forged = make_csr_with_key("x", &other_key)?.replace("BEGIN CERTIFICATE REQUEST-----\n", "BEGIN CERTIFICATE REQUEST-----\nAAAA");
+        assert!(pki.issue_identity(&forged, &agent, &[], Duration::hours(1)).is_err());
         Ok(())
     }
 }

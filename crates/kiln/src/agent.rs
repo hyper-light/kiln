@@ -1030,7 +1030,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     });
     // What the server last heard of it on this connection.
     let mut front_door_sent: Option<String> = None;
-    let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
+    let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
     // A test build's faults: frames lost, sent twice or sent late below the channel, which it
     // makes up for.
     if let Some(c) = crate::runner::chaos::get() {
