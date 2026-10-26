@@ -4,9 +4,10 @@ kiln's events ride a bus: Quiver, the topic store (github.com/hyper-light/quiver
 `vendor/quiver`, its node in the server's process. kiln reaches it only through kiln-seams' `Bus`
 (docs/seams.md, "Bus"; `crate::bus`). Quiver keeps each topic's messages in memory, the ephemeral
 class of Focal's doc 33, each message a Focal batch charged to one memory budget, and a reader
-behind what a topic keeps is refused `Behind`, never skipped silently. It carries one thing so far,
-the live feed of every agent session (the critical path's CP-T2.1); kiln's CI and deploy events
-come next, on the persisted class (CP-T2.2).
+behind what a topic keeps is refused `Behind`, never skipped silently. It carries the live feed of
+every agent session (the critical path's CP-T2.1) on the ephemeral class, and kiln's CI and deploy
+events on the persisted class (CP-T2.2): a topic's messages on the server's disk before a publish
+is answered.
 
 ## The live feed
 
@@ -50,6 +51,57 @@ on any device (`crate::harness::live`):
   server closes its socket. The topic goes with the last of them (at once if none
   watches); a viewer that finds it gone is told `closed` too.
 
+## The persisted class
+
+The server opens its bus as the one node of a cluster of one (`QuiverBus::open_server`): each
+persisted topic a part of Focal's replicated by a Raft group of one, durable on the server's disk,
+a publish answered once the group's log flushed it (Quiver's `docs/design/persisted.md`). Its data
+is in `[bus] data`, else the data directory's `bus`: `node/` (the catalog's and each topic's log,
+part and port), `identities/` and `identities.key` (the identities its node and publishers speak
+as, made the first time). Its node listens on loopback at ports the system picks, since no peer
+dials it.
+
+- **What a topic holds.** Reads come from the node's view of what its group committed, under the
+  topic's retention (`[bus] persisted_bytes`); after a restart the view holds what the part's
+  window kept (`[bus] part_memory`), so the defaults keep the two alike: a restart holds what the
+  topic held.
+- **When it can't open** (its directory damaged, unreadable or not a directory), the server starts
+  with the ephemeral class alone and says why (an error on target `kiln.bus`, event
+  `persisted_refused`): the live feeds go on, and what would ride a persisted topic waits where it
+  was made.
+
+## kiln's events
+
+kiln's CI and deploy events, and everything else its outgoing webhooks (docs/ci.md W19-R07) and
+notification rules (W19-R06) take, go one way (`crate::events`, CP-T2.2 step 8): recorded with the
+state they report, published to the persisted topic `kiln.events` in the order they were recorded,
+and delivered from it in that order, at least once, so a kill -9 of the server loses none.
+
+- **Recorded with the change (the outbox).** An event is a row of `event_outbox`, written in the
+  SQLite transaction that changes what it reports, so the change and its event commit together or
+  not at all (the transactional outbox). A run's or a job's change of status or conclusion is
+  written by triggers on `runs` and `jobs`, whatever code made it; a run's end (`run.*`, `leg.flaky`),
+  a deployment's end (`deploy.*`), a run waiting for its reviewers (`approval.waiting`) and a land
+  queue's ejection (`land.ejected`) by the code that makes the change, in its transaction. What
+  isn't a change of kiln.db (KilnCD's apps, a runner's comings and goings, an agent's turn) is
+  recorded as it's said. The cluster group's replay writes a write's rows as they were, its
+  triggers off, so a replica holds the same events, not twice them.
+- **Relayed in order.** One relay publishes the outbox to `kiln.events` oldest first, each row's
+  events with the row's number in them, and then records how far it got and lets the rows go; a
+  restart goes on from the first row not recorded, so a row published but not recorded is published
+  again, with the same number.
+- **Delivered from the topic.** Each kind of delivery reads `kiln.events` from a position of its
+  own, kept in kiln.db: for each event it logs the deliveries the event makes (each subscription
+  that takes it; each channel a rule sends it to), each with its body and a delivery id that is the
+  same however often it's made (`X-Kiln-Delivery`), and moves its position past the event, in one
+  transaction. An event it meets again, with a number it has passed, it skips. A worker for each
+  target sends that target's logged deliveries one at a time, in order, retrying with exponential
+  backoff for a day before it gives one up as failed (logged, counted, sent again on asking), so a
+  target that's down holds up only itself, and its backlog waits in kiln.db, not on the topic.
+- **Behind.** A position the topic has let go (`Refusal::Behind`, a reader stopped longer than the
+  topic keeps) moves to the topic's oldest, saying how many events were missed (a warning on target
+  `kiln.events`, counted): never skipped silently.
+
 ## Settings
 
 `[bus]` in kiln.toml:
@@ -58,14 +110,18 @@ on any device (`crate::harness::live`):
 |---|---|---|
 | `memory` | `memory = 268435456` (256 MiB) | The bytes the bus's messages may take, their framing included, until every reader has let them go (outside it: each segment's own slots, about 25 KB, and what a viewer's read copies on its way out). Past it a topic lets its oldest go to take a new message; one it can't make room for is refused, typed, and its viewers start over from snapshots. At least 2,166,784 bytes, two of Quiver's largest messages with their framing (a topic keeping its largest, held by a reader, can still take another): less, and the server doesn't start. |
 | `topic_bytes` | `topic_bytes = 16777216` (16 MiB) | The bytes one topic keeps at most (its keys and payloads), beside the messages it retains. |
+| `data` | `data = ""` | Where the persisted class keeps its logs, parts and identities. Empty: the data directory's `bus`. |
+| `part_memory` | `part_memory = 67108864` (64 MiB) | Each persisted part's memory: what its window keeps of its messages, and so what its topic holds again after a restart; its log on disk is about twice it. At least 25,165,824 (24 MiB), the least a part of Focal's takes. |
+| `persisted_bytes` | `persisted_bytes = 67108864` (64 MiB) | The bytes a persisted topic keeps for its readers (its keys and payloads): for kiln's events, what a delivery target away the longest may still read. Its messages are charged to `memory` with the live feeds'. |
 
 The bus holds 65,536 topics and 65,536 subscriptions at once; a session's feed keeps 2048 frames.
 
 ## Classes
 
-Quiver serves the ephemeral class today. A topic of the replicated, persisted or windowed class is
-refused (`Unavailable`, naming the class) until its goal lands (CP-T2.2, CP-T2.4), never kept as
-another class.
+Quiver serves the ephemeral class, and on the server the persisted class (above). A topic of the
+replicated or windowed class is refused (`Unavailable`, naming the class) until its goal lands
+(the windowed class's is CP-T2.4), and so is a persisted one on a bus whose persisted class didn't
+open: never kept as another class.
 
 ## Metrics
 

@@ -302,7 +302,7 @@ async fn fail_run(hub: &Hub, repo: &Repo, e: &Event, l: &load::Loaded, message: 
         input: String::new(),
     };
     super::runs::create(hub, repo, n).await?;
-    super::runs::finish_run(hub, &id, Status::Failed, "startup_failure", Some(error)).await?;
+    super::runs::finish_run(hub, &id, Status::Failed, "startup_failure", Some(error), false).await?;
     hub.emit_run(&id).await;
     Ok(id)
 }

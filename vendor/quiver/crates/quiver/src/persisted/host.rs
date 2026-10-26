@@ -288,6 +288,9 @@ impl Host {
         #[cfg(not(feature = "sim"))]
         let seed = || None;
         let member_driver = bind(&ids, config.id, own, true, seed())?;
+        // Where the member listens: `own`, or the port the system picked for a cluster of one's
+        // port 0, which its own publisher dials (`PersistedConfig::nodes`).
+        let listens = SocketAddr::new(own.ip(), local_port(&member_driver)?);
         let any = SocketAddr::new(own.ip(), 0);
         let client_driver = bind(&ids, config.id, any, false, seed())?;
         let plan = Plan {
@@ -306,7 +309,12 @@ impl Host {
         let catalog_seat = Seat::open(member_driver, plan, now)?;
         let mut catalog_publisher =
             Publisher::new(client_driver, producer(config.id, run)?, config.id, now);
-        catalog_publisher.set_nodes(config.nodes.clone(), now);
+        let nodes = config
+            .nodes
+            .iter()
+            .map(|&(id, address)| (id, if id == config.id { listens } else { address }))
+            .collect();
+        catalog_publisher.set_nodes(nodes, now);
         let mut start = Vec::new();
         Record::Mark {
             node: config.id,

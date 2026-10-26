@@ -982,10 +982,12 @@ fn unwiden(conn: &Connection) -> anyhow::Result<()> {
 }
 
 impl Machine {
-    /// Opens kiln.db at `db` to apply entries: foreign keys off (an entry's rows hold its cascades
-    /// already), and where it stands read from [`STATE`] (made, at 0, on the first start).
+    /// Opens kiln.db at `db` to apply entries: foreign keys and triggers off (an entry's rows hold
+    /// its cascades already, and what its triggers wrote: the events of crate::events), and where it
+    /// stands read from [`STATE`] (made, at 0, on the first start).
     fn open(db: &Path, fetch: Option<Fetch>) -> anyhow::Result<Machine> {
         let conn = Connection::open(db).with_context(|| format!("opening {} for the cluster group", db.display()))?;
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
         conn.execute_batch(&format!(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = OFF; PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS {STATE} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL, term INTEGER NOT NULL, seq INTEGER NOT NULL);
@@ -1309,6 +1311,55 @@ mod tests {
         // Writes go on from there.
         set(&store, "k5", "v5")?;
         assert_eq!(state(&db)?.0, 6);
+        Ok(())
+    }
+
+    /// The events a write's triggers record (crate::events, CP-T2.2 step 8) are among its rows: do
+    /// make runs through the group, lose them and their events from kiln.db, and start again, expect
+    /// the replay to bring back each event once, as the write made it, not again from the triggers.
+    #[test]
+    fn cp_t2_2_a_replayed_write_brings_back_its_events_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (db, log) = (dir.path().join("kiln.db"), dir.path().join("cluster"));
+        let outbox = |db: &Path| -> anyhow::Result<Vec<(i64, String, String)>> {
+            let c = Connection::open(db)?;
+            let mut st = c.prepare("SELECT id, kind, fact FROM event_outbox ORDER BY id")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        };
+        {
+            let store = Store::open_grouped(&db, &log)?;
+            crate::rt::block_on({
+                let store = store.clone();
+                async move {
+                    store
+                        .call(|c| {
+                            c.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/app', '', 0)", [])?;
+                            for n in 1..=3 {
+                                c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES (?1, 'r', ?2, 'ci', 'push', 'main', 'abc', 'queued', 0)", rusqlite::params![format!("run{n}"), n])?;
+                            }
+                            Ok(())
+                        })
+                        .await
+                }
+            })?;
+            crate::rt::block_on({
+                let store = store.clone();
+                async move { store.call(|c| Ok(c.execute("UPDATE runs SET status = 'running' WHERE id = 'run3'", []).map(|_| ())?)).await }
+            })?;
+            store.flush_group()?;
+        }
+        let made = outbox(&db)?;
+        assert_eq!(made.len(), 4, "three runs made and one changed: {made:?}");
+        // kiln.db loses its last write (the run's change and its event), and where it stood goes
+        // back with it: undone as the disk lost it, by no trigger.
+        {
+            let c = Connection::open(&db)?;
+            c.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
+            c.execute_batch(&format!("UPDATE runs SET status = 'queued' WHERE id = 'run3'; DELETE FROM event_outbox WHERE id = 4; UPDATE {STATE} SET seq = seq - 1, applied = 0"))?;
+        }
+        drop(Store::open_grouped(&db, &log)?);
+        assert_eq!(outbox(&db)?, made, "each event once, as the write made it");
         Ok(())
     }
 

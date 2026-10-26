@@ -4,20 +4,30 @@
 //! wants ([`EVENTS`], or `*`), from what its scope holds (the server, an organization's
 //! repositories, one repository's). Each event goes as the JSON kiln's own clients get, with
 //! `X-Kiln-Event`, `X-Kiln-Delivery` and `X-Kiln-Signature-256` (HMAC-SHA256 of the body with
-//! the integration's secret), in order for each subscriber and retried with backoff. Every
-//! delivery is logged with its body before it is sent, so a restart resumes what was waiting and
-//! any of them can be sent again (`POST /api/ci/webhooks/deliveries/:id/redeliver`).
+//! the integration's secret).
+//!
+//! **Delivered from kiln.events** (docs/bus.md, "kiln's events"; CP-T2.2 step 8): the events are
+//! read from the bus's persisted topic in the order they were recorded, from a position kept in
+//! kiln.db; each event's deliveries (one for each subscription that takes it) are logged with
+//! their bodies, pending, in the transaction that moves the position past it, each with an id that
+//! is the same however often the event is read (`X-Kiln-Delivery`, for a receiver to know one it
+//! had). A sender for each subscription POSTs its deliveries one at a time, oldest first, retrying
+//! with exponential backoff for a day ([`crate::events::RETRY_FOR`]): in order, at least once, and
+//! a kill -9 of the server loses none. Any delivery can be sent again
+//! (`POST /api/ci/webhooks/deliveries/:id/redeliver`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
 use http::StatusCode;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::Fail;
 use super::integrations::{self, Integration};
+use crate::events::{Due, Event, Log, Logged, Reader, Senders, Tried};
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
 
@@ -61,11 +71,9 @@ const BUSY: &[&str] = &["queue"];
 /// How long a list of subscriptions is used before it is read again.
 const FRESH: Duration = Duration::from_secs(5);
 
-/// Events waiting for one subscriber, beyond which they are logged as dropped (to send again).
-const QUEUE: usize = 1000;
-
-/// Seconds to wait before each attempt.
-const ATTEMPTS: &[u64] = &[0, 2, 15, 60];
+/// Deliveries waiting for one subscriber, beyond which its next are logged as dropped (to send
+/// again): a day of kiln's busiest events with room.
+const BACKLOG: i64 = 100_000;
 
 /// How long deliveries are logged.
 const KEEP: i64 = 14 * 86_400;
@@ -106,191 +114,256 @@ fn in_scope(i: &Integration, repo: Option<&(String, String)>) -> bool {
     }
 }
 
-/// One event for one subscriber: its logged delivery.
-struct Out {
-    row: i64,
-    delivery: String,
-    i: Integration,
-    kind: String,
-    body: Arc<str>,
-}
-
-/// Follows the hub's events for as long as the server runs, a worker for each subscriber.
+/// Reads kiln.events for the subscriptions, and sends what it logs, for as long as the server runs.
 pub fn spawn(hub: Arc<Hub>) {
+    let reader = Arc::new(Webhooks { senders: Senders::new(Deliveries), subs: parking_lot::Mutex::new((Vec::new(), None)), runs: parking_lot::Mutex::new(HashMap::new()) });
+    let (resumed, senders) = (Arc::clone(&hub), Arc::clone(&reader.senders));
     crate::rt::spawn(async move {
-        let mut rx = hub.events.subscribe();
-        let mut runs: HashMap<String, (String, String)> = HashMap::new();
-        let (mut subs, mut read_at): (Vec<Integration>, Option<Instant>) = (Vec::new(), None);
-        let mut queues: HashMap<String, async_channel::Sender<Out>> = HashMap::new();
-        // What a restart interrupted, first.
-        resume(&hub, &mut queues).await;
-        let mut pruned = Instant::now();
+        // What a restart left waiting, first.
+        if let Err(e) = senders.resume(&resumed).await {
+            tracing::warn!(error = %format!("{e:#}"), "the webhook deliveries a restart left couldn't be read");
+        }
+    });
+    crate::events::read(&hub, reader);
+    let weak = Arc::downgrade(&hub);
+    crate::rt::spawn(async move {
         loop {
-            let text = match rx.recv().await {
-                Ok(t) => t,
-                Err(async_broadcast::RecvError::Overflowed(n)) => {
-                    tracing::warn!(missed = n, "outgoing webhooks fell behind; some events weren't sent");
-                    continue;
-                }
-                Err(async_broadcast::RecvError::Closed) => return,
-            };
-            let Ok(event) = serde_json::from_str::<Value>(&text) else { continue };
-            let Some(kind) = event.get("type").and_then(Value::as_str).filter(|k| EVENTS.iter().any(|(e, _)| e == k)) else { continue };
-            if read_at.is_none_or(|t| t.elapsed() > FRESH) {
-                if let Ok(all) = integrations::list(&hub).await {
-                    subs = all.into_iter().filter(|i| i.kind == "webhook" && !wanted(&i.config).is_empty()).collect();
-                    // A subscription that's gone: its worker finds so, and ends.
-                    queues.retain(|id, _| subs.iter().any(|i| &i.id == id));
-                }
-                read_at = Some(Instant::now());
+            let Some(hub) = weak.upgrade() else { return };
+            let before = hub.clock.unix_s() - KEEP;
+            let _ = hub.store.call(move |c| Ok(c.execute("DELETE FROM webhook_deliveries WHERE ts < ?1 AND status != 'pending'", [before]).map(|_| ())?)).await;
+            let clock = Arc::clone(&hub.clock);
+            drop(hub);
+            clock.sleep(Duration::from_secs(3600)).await;
+        }
+    });
+}
+
+/// The reader of kiln.events for the subscriptions.
+struct Webhooks {
+    senders: Arc<Senders<Deliveries>>,
+    /// The subscriptions, and when they were read.
+    subs: parking_lot::Mutex<(Vec<Integration>, Option<Instant>)>,
+    /// Runs' repositories, as jobs' events need them.
+    runs: parking_lot::Mutex<HashMap<String, (String, String)>>,
+}
+
+impl Webhooks {
+    async fn subscriptions(&self, hub: &Hub) -> Vec<Integration> {
+        {
+            let subs = self.subs.lock();
+            if subs.1.is_some_and(|t| t.elapsed() <= FRESH) {
+                return subs.0.clone();
             }
-            if pruned.elapsed() > Duration::from_secs(3600) {
-                let before = crate::util::now_unix() - KEEP;
-                let _ = hub.store.call(move |c| Ok(c.execute("DELETE FROM webhook_deliveries WHERE ts < ?1 AND status != 'pending'", [before]).map(|_| ())?)).await;
-                pruned = Instant::now();
+        }
+        match integrations::list(hub).await {
+            Ok(all) => {
+                let subs: Vec<Integration> = all.into_iter().filter(|i| i.kind == "webhook" && !wanted(&i.config).is_empty()).collect();
+                *self.subs.lock() = (subs.clone(), Some(Instant::now()));
+                subs
             }
-            let takers: Vec<&Integration> = subs.iter().filter(|i| takes(&wanted(&i.config), kind)).collect();
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the webhook subscriptions couldn't be read");
+                self.subs.lock().0.clone()
+            }
+        }
+    }
+}
+
+impl Reader for Webhooks {
+    fn name(&self) -> &'static str {
+        "webhooks"
+    }
+
+    fn plan<'a>(&'a self, hub: &'a Arc<Hub>, e: &'a Event) -> BoxFuture<'a, anyhow::Result<Logged>> {
+        Box::pin(async move {
+            if !EVENTS.iter().any(|(k, _)| *k == e.kind) {
+                return Ok(Logged::none());
+            }
+            let subs = self.subscriptions(hub).await;
+            let takers: Vec<Integration> = subs.into_iter().filter(|i| takes(&wanted(&i.config), &e.kind)).collect();
             if takers.is_empty() {
-                continue;
+                return Ok(Logged::none());
             }
-            let repo = repo_of(&hub, &event, &mut runs).await;
-            for i in takers.into_iter().filter(|i| in_scope(i, repo.as_ref())) {
-                let delivery = crate::util::new_id();
-                let Some(row) = begin(&hub, &i.name, kind, &delivery, &text).await else { continue };
-                enqueue(&hub, &mut queues, Out { row, delivery, i: i.clone(), kind: kind.to_owned(), body: Arc::clone(&text) }).await;
+            // A run or a job gone since its event leaves nothing to send.
+            let Some(body) = body(hub, e).await? else { return Ok(Logged::none()) };
+            let repo = repo_of(hub, &body, &self.runs).await;
+            let takers: Vec<Integration> = takers.into_iter().filter(|i| in_scope(i, repo.as_ref())).collect();
+            if takers.is_empty() {
+                return Ok(Logged::none());
             }
-        }
-    });
-}
-
-/// Hands `out` to its subscriber's worker; when that one is too far behind, the delivery stays
-/// logged as dropped, to send again.
-async fn enqueue(hub: &Arc<Hub>, queues: &mut HashMap<String, async_channel::Sender<Out>>, out: Out) {
-    let tx = queues.entry(out.i.id.clone()).or_insert_with(|| worker(Arc::clone(hub)));
-    if let Err(async_channel::TrySendError::Full(out) | async_channel::TrySendError::Closed(out)) = tx.try_send(out) {
-        tracing::warn!(integration = %out.i.name, "a webhook subscriber is too far behind; an event was logged, not sent");
-        finish(hub, out.row, "dropped", None, 0, Some(format!("not sent: {QUEUE} events were waiting"))).await;
-    }
-}
-
-/// Deliveries a restart interrupted (logged, never finished), sent now, in order.
-async fn resume(hub: &Arc<Hub>, queues: &mut HashMap<String, async_channel::Sender<Out>>) {
-    let rows: Vec<(i64, String, String, String, String)> = hub
-        .store
-        .call(|c| {
-            let mut st = c.prepare("SELECT id, integration, event, delivery, body FROM webhook_deliveries WHERE status = 'pending' ORDER BY id")?;
-            let rows = st.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?)))?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            let (now, kind, text) = (hub.clock.unix_s(), e.kind.clone(), body.to_string());
+            let rows: Vec<(String, String)> = takers.iter().map(|i| (i.name.clone(), delivery_id(e, &i.id))).collect();
+            let targets = takers.into_iter().map(|i| i.name).collect();
+            crate::metrics::events().logged.add(&["webhook"], u64::try_from(rows.len()).unwrap_or(0));
+            Ok(Logged {
+                write: Box::new(move |c: &Connection| {
+                    for (name, delivery) in rows {
+                        let waiting: i64 = c.query_row("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'pending' AND integration = ?1", [&name], |r| r.get(0))?;
+                        let (status, error) = if waiting >= BACKLOG { ("dropped", Some(format!("not sent: {BACKLOG} deliveries were waiting"))) } else { ("pending", None) };
+                        c.execute(
+                            "INSERT INTO webhook_deliveries (ts, integration, event, delivery, status, attempts, error, body, first_at, next_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?1, ?1)",
+                            params![now, name, kind, delivery, status, error, text],
+                        )?;
+                    }
+                    Ok(())
+                }),
+                targets,
+            })
         })
-        .await
-        .unwrap_or_default();
-    if !rows.is_empty() {
-        tracing::info!(deliveries = rows.len(), "sending the webhook deliveries a restart interrupted");
     }
-    for (row, name, kind, delivery, body) in rows {
-        match integrations::get(hub, &name).await.ok().flatten() {
-            Some(i) => enqueue(hub, queues, Out { row, delivery, i, kind, body: Arc::from(body) }).await,
-            None => finish(hub, row, "failed", None, 0, Some(format!("the integration {name} is gone"))).await,
+
+    fn wake(&self, hub: &Arc<Hub>, targets: Vec<String>) {
+        for t in targets {
+            self.senders.wake(hub, &t);
         }
     }
 }
 
-/// A subscriber's worker: its events, one at a time, in order, each with the subscription as it
-/// is by then.
-fn worker(hub: Arc<Hub>) -> async_channel::Sender<Out> {
-    let (tx, rx) = async_channel::bounded::<Out>(QUEUE);
-    crate::rt::spawn(async move {
-        while let Ok(mut out) = rx.recv().await {
-            match integrations::get(&hub, &out.i.name).await {
-                Ok(Some(i)) if i.id == out.i.id => out.i = i,
-                Ok(_) => {
-                    finish(&hub, out.row, "failed", None, 0, Some("the integration is gone".into())).await;
-                    continue;
-                }
-                Err(_) => {}
+/// A delivery's id: the same for an event and a subscription however often the event is read
+/// (`X-Kiln-Delivery`), 32 hex digits as kiln's ids are.
+fn delivery_id(e: &Event, integration: &str) -> String {
+    let mut id = crate::util::sha256_hex(format!("kiln.events/{}/{integration}", e.n).as_bytes());
+    id.truncate(32);
+    id
+}
+
+/// What a subscriber is sent for `e`: the JSON kiln's own clients get. A run's or a job's change
+/// is the run or job as it is now, at the status and conclusion the change gave it; `None` once
+/// it's gone.
+async fn body(hub: &Hub, e: &Event) -> anyhow::Result<Option<Value>> {
+    let text = |key: &str| e.about.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let changed = |v: &mut Value| {
+        for key in ["status", "conclusion"] {
+            if let (Some(o), Some(at)) = (v.as_object_mut(), e.about.get(key)) {
+                o.insert(key.to_owned(), at.clone());
             }
-            let (status, code, attempts, error) = send(&hub, &out, ATTEMPTS).await;
-            finish(&hub, out.row, status, code, attempts, error).await;
         }
-    });
-    tx
+    };
+    Ok(match e.kind.as_str() {
+        "run" => hub.store.run(text("run")).await?.map(|r| {
+            let mut run = serde_json::to_value(r).unwrap_or(Value::Null);
+            changed(&mut run);
+            json!({ "type": "run", "run": run })
+        }),
+        "job" => hub.store.job(text("job")).await?.map(|mut j| {
+            j.spec = None;
+            let mut job = serde_json::to_value(j).unwrap_or(Value::Null);
+            changed(&mut job);
+            json!({ "type": "job", "job": job })
+        }),
+        _ => Some(match super::notify::shown(e) {
+            Some(shown) => shown,
+            None => {
+                let mut v = Value::Object(e.about.clone());
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("type".into(), json!(e.kind));
+                }
+                v
+            }
+        }),
+    })
 }
 
-/// The repository an event is about: its own, a run's, or a job's run's.
-async fn repo_of(hub: &Hub, event: &Value, runs: &mut HashMap<String, (String, String)>) -> Option<(String, String)> {
+/// The subscriptions' deliveries, as their senders use them.
+struct Deliveries;
+
+impl Log for Deliveries {
+    fn name(&self) -> &'static str {
+        "webhook"
+    }
+
+    fn due(&self, c: &Connection, target: &str) -> rusqlite::Result<Option<Due>> {
+        c.query_row(
+            "SELECT id, COALESCE(first_at, ts), COALESCE(next_at, 0), attempts FROM webhook_deliveries WHERE status = 'pending' AND integration = ?1 ORDER BY id LIMIT 1",
+            [target],
+            |r| Ok(Due { row: r.get(0)?, first_at: r.get(1)?, next_at: r.get(2)?, tries: r.get(3)? }),
+        )
+        .optional()
+    }
+
+    fn send<'a>(&'a self, hub: &'a Arc<Hub>, row: i64) -> BoxFuture<'a, Tried> {
+        Box::pin(async move {
+            let found: anyhow::Result<Option<(String, String, String, String)>> =
+                hub.store.call(move |c| Ok(c.query_row("SELECT integration, event, delivery, body FROM webhook_deliveries WHERE id = ?1", [row], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?))).optional()?)).await;
+            let (name, kind, delivery, body) = match found {
+                Ok(Some(found)) => found,
+                Ok(None) => return Tried::Done { status: "failed", code: None, error: Some("the delivery is gone".into()) },
+                Err(e) => return Tried::Failed { code: None, error: format!("{e:#}") },
+            };
+            let i = match integrations::get(hub, &name).await {
+                Ok(Some(i)) => i,
+                Ok(None) => return Tried::Done { status: "failed", code: None, error: Some(format!("the integration {name} is gone")) },
+                Err(e) => return Tried::Failed { code: None, error: format!("{e:#}") },
+            };
+            post(hub, &i, &kind, &delivery, &body).await
+        })
+    }
+
+    fn tried(&self, c: &Connection, row: i64, a: &crate::events::After<'_>) -> rusqlite::Result<()> {
+        c.execute("UPDATE webhook_deliveries SET ts = ?2, status = ?3, code = ?4, attempts = attempts + 1, error = ?5, next_at = ?6 WHERE id = ?1", params![row, a.now, a.status, a.code, a.error, a.next_at])?;
+        Ok(())
+    }
+
+    fn pending(&self, c: &Connection) -> rusqlite::Result<Vec<String>> {
+        let mut st = c.prepare("SELECT DISTINCT integration FROM webhook_deliveries WHERE status = 'pending'")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        rows.collect()
+    }
+}
+
+/// The repository an event's body is about: its own, a run's, or a job's run's (`runs`: those
+/// known, by run).
+async fn repo_of(hub: &Hub, event: &Value, runs: &parking_lot::Mutex<HashMap<String, (String, String)>>) -> Option<(String, String)> {
+    let keep = |run: String, repo: (String, String)| {
+        let mut runs = runs.lock();
+        if runs.len() > 10_000 {
+            runs.clear();
+        }
+        runs.insert(run, repo);
+    };
     if let (Some(id), Some(name)) = (event.pointer("/repo/id").and_then(Value::as_str), event.pointer("/repo/name").and_then(Value::as_str)) {
         return Some((id.to_owned(), name.to_owned()));
     }
     if let Some(r) = event.get("run") {
         let (id, name) = (r.get("repo_id").and_then(Value::as_str)?, r.get("repo_name").and_then(Value::as_str)?);
         if let Some(run) = r.get("id").and_then(Value::as_str) {
-            runs.insert(run.to_owned(), (id.to_owned(), name.to_owned()));
+            keep(run.to_owned(), (id.to_owned(), name.to_owned()));
         }
         return Some((id.to_owned(), name.to_owned()));
     }
     let run = event.pointer("/job/run_id").and_then(Value::as_str)?.to_owned();
-    if let Some(r) = runs.get(&run) {
-        return Some(r.clone());
+    let known = runs.lock().get(&run).cloned();
+    if known.is_some() {
+        return known;
     }
     let found = hub.store.run(run.clone()).await.ok().flatten().map(|r| (r.repo_id, r.repo_name))?;
-    if runs.len() > 10_000 {
-        runs.clear();
-    }
-    runs.insert(run, found.clone());
+    keep(run, found.clone());
     Some(found)
 }
 
-/// POSTs one event, waiting `waits` seconds before each attempt until one is answered 2xx:
-/// how it went, in how many attempts.
-async fn send(hub: &Hub, out: &Out, waits: &[u64]) -> (&'static str, Option<u16>, i64, Option<String>) {
-    let Some(url) = out.i.config.get("url").and_then(Value::as_str).filter(|u| !u.trim().is_empty()) else { return ("failed", None, 0, Some("the integration has no `url`".into())) };
-    let key = match integrations::token(hub, &out.i).await {
+/// POSTs one delivery once: how it went.
+async fn post(hub: &Hub, i: &Integration, kind: &str, delivery: &str, body: &str) -> Tried {
+    let Some(url) = i.config.get("url").and_then(Value::as_str).filter(|u| !u.trim().is_empty()) else { return Tried::Done { status: "failed", code: None, error: Some("the integration has no `url`".into()) } };
+    let key = match integrations::token(hub, i).await {
         Ok(k) => k,
-        Err(e) => return ("failed", None, 0, Some(format!("its signing key: {e:#}"))),
+        Err(e) => return Tried::Failed { code: None, error: format!("its signing key: {e:#}") },
     };
     let client = match crate::http::client::Client::public() {
         Ok(c) => c,
-        Err(e) => return ("failed", None, 0, Some(format!("{e:#}"))),
+        Err(e) => return Tried::Failed { code: None, error: format!("{e:#}") },
     };
-    let body = out.body.as_bytes().to_vec();
+    let body = body.as_bytes().to_vec();
     let sig = key.map(|k| format!("sha256={}", crate::util::hmac_hex(k.as_bytes(), &body)));
-    let (mut code, mut error, mut attempts) = (None, None, 0);
-    for wait in waits {
-        if *wait > 0 {
-            crate::rt::sleep(Duration::from_secs(*wait)).await;
-        }
-        attempts += 1;
-        // A URL someone gave kiln: never this machine or a private network unless allowed (W22-AC07).
-        let mut req = client.post(url).reaching(&hub.cfg.ci.reach()).header("content-type", "application/json").header("user-agent", "kiln-webhooks").header("x-kiln-event", &out.kind).header("x-kiln-delivery", &out.delivery).body(body.clone()).timeout(Duration::from_secs(20));
-        if let Some(s) = &sig {
-            req = req.header("x-kiln-signature-256", s);
-        }
-        match req.send().await {
-            Ok(r) if r.is_success() => return ("sent", Some(r.status()), attempts, None),
-            Ok(r) => (code, error) = (Some(r.status()), Some(format!("HTTP {}", r.status()))),
-            Err(e) => (code, error) = (None, Some(format!("{e:#}"))),
-        }
+    // A URL someone gave kiln: never this machine or a private network unless allowed (W22-AC07).
+    let mut req = client.post(url).reaching(&hub.cfg.ci.reach()).header("content-type", "application/json").header("user-agent", "kiln-webhooks").header("x-kiln-event", kind).header("x-kiln-delivery", delivery).body(body).timeout(Duration::from_secs(20));
+    if let Some(s) = &sig {
+        req = req.header("x-kiln-signature-256", s);
     }
-    tracing::warn!(integration = %out.i.name, event = %out.kind, error = ?error, "a webhook wasn't delivered");
-    ("failed", code, attempts, error)
-}
-
-/// Logs a delivery about to be queued: its row.
-async fn begin(hub: &Hub, name: &str, kind: &str, delivery: &str, body: &str) -> Option<i64> {
-    let (name, kind, delivery, body, now) = (name.to_owned(), kind.to_owned(), delivery.to_owned(), body.to_owned(), crate::util::now_unix());
-    hub.store
-        .call(move |c| {
-            c.execute("INSERT INTO webhook_deliveries (ts, integration, event, delivery, status, attempts, body) VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5)", params![now, name, kind, delivery, body])?;
-            Ok(c.last_insert_rowid())
-        })
-        .await
-        .ok()
-}
-
-/// Logs how a delivery went (attempts add to what it had).
-async fn finish(hub: &Hub, row: i64, status: &'static str, code: Option<u16>, attempts: i64, error: Option<String>) {
-    let now = crate::util::now_unix();
-    let _ = hub.store.call(move |c| Ok(c.execute("UPDATE webhook_deliveries SET ts = ?2, status = ?3, code = ?4, attempts = attempts + ?5, error = ?6 WHERE id = ?1", params![row, now, status, code, attempts, error]).map(|_| ())?)).await;
+    match req.send().await {
+        Ok(r) if r.is_success() => Tried::Sent { code: Some(r.status()) },
+        Ok(r) => Tried::Failed { code: Some(r.status()), error: format!("HTTP {}", r.status()) },
+        Err(e) => Tried::Failed { code: None, error: format!("{e:#}") },
+    }
 }
 
 /// `GET /api/ci/webhooks/deliveries?integration=&status=&limit=`: newest first, without bodies;
@@ -331,18 +404,148 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &HashMap<
             let found: Option<(String, String, String, String)> = hub.store.call(move |c| Ok(c.query_row("SELECT integration, event, delivery, body FROM webhook_deliveries WHERE id = ?1", [id], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?))).optional()?)).await.map_err(fail)?;
             let (name, kind, delivery, body) = found.ok_or_else(|| (StatusCode::NOT_FOUND, "no such delivery".to_owned()))?;
             let i = integrations::get(hub, &name).await.map_err(fail)?.ok_or_else(|| (StatusCode::GONE, format!("the integration {name} is gone")))?;
-            let out = Out { row: id, delivery, i, kind, body: Arc::from(body) };
-            let (status, code, attempts, error) = send(hub, &out, &[0]).await;
-            finish(hub, id, status, code, attempts, error.clone()).await;
-            Ok(srv::json(StatusCode::OK, &json!({ "id": id, "delivery": out.delivery, "status": status, "code": code, "error": error })))
+            let (status, code, error) = match post(hub, &i, &kind, &delivery, &body).await {
+                Tried::Sent { code } => ("sent", code, None),
+                Tried::Failed { code, error } => ("failed", code, Some(error)),
+                Tried::Done { status, code, error } => (status, code, error),
+            };
+            // One still waiting on its sender stays its sender's, unless this one went.
+            let (now, recorded_error) = (hub.clock.unix_s(), error.clone());
+            hub.store
+                .call(move |c| Ok(c.execute("UPDATE webhook_deliveries SET ts = ?2, status = CASE WHEN status = 'pending' AND ?3 != 'sent' THEN status ELSE ?3 END, code = ?4, attempts = attempts + 1, error = ?5 WHERE id = ?1", params![id, now, status, code, recorded_error]).map(|_| ())?))
+                .await
+                .map_err(fail)?;
+            Ok(srv::json(StatusCode::OK, &json!({ "id": id, "delivery": delivery, "status": status, "code": code, "error": error })))
         }
         _ => Err((StatusCode::NOT_FOUND, "no such route".into())),
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use kiln_seams::clock::SimClock;
+
     use super::*;
+
+    /// A local endpoint: down (answering 503) while `down` is set; up, it answers 200 and keeps
+    /// each request's delivery id and body, in the order they came.
+    pub(crate) struct Endpoint {
+        pub port: u16,
+        pub down: Arc<AtomicBool>,
+        pub got: Arc<parking_lot::Mutex<Vec<(String, Value)>>>,
+        pub refused: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    pub(crate) fn endpoint() -> anyhow::Result<Endpoint> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let (down, got, refused) = (Arc::new(AtomicBool::new(false)), Arc::new(parking_lot::Mutex::new(Vec::new())), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let (d, g, r) = (Arc::clone(&down), Arc::clone(&got), Arc::clone(&refused));
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let (mut length, mut delivery) = (0usize, String::new());
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                    if let Some(v) = lower.strip_prefix("x-kiln-delivery:") {
+                        delivery = v.trim().to_owned();
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let up = !d.load(Ordering::SeqCst);
+                if up {
+                    g.lock().push((delivery, serde_json::from_slice(&body).unwrap_or(Value::Null)));
+                } else {
+                    r.fetch_add(1, Ordering::SeqCst);
+                }
+                let answer = if up { "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n" } else { "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n" };
+                let _ = reader.get_mut().write_all(answer.as_bytes());
+            }
+        });
+        Ok(Endpoint { port, down, got, refused })
+    }
+
+    /// Lets `d` pass on `clock`, a second at a time, the hub's tasks running between.
+    pub(crate) async fn pass(clock: &SimClock, d: Duration) {
+        for _ in 0..d.as_secs() {
+            clock.advance(Duration::from_secs(1));
+            crate::rt::sleep(Duration::from_millis(3)).await;
+        }
+    }
+
+    /// T-T2.2.1 (CP-T2.2 step 8, AC-T2.2.1): do subscribe a webhook to runs' changes, take its
+    /// endpoint down for 10 minutes while runs are made and moved, then bring it back; expect
+    /// every change delivered once it's back, in the order made, at least once (a delivery seen
+    /// twice with the same id), having been retried with backoff while it was down.
+    #[test]
+    fn t_t2_2_1_a_webhook_endpoint_down_for_10_minutes_gets_every_event_in_order() -> anyhow::Result<()> {
+        let clock = SimClock::new();
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub_on(Arc::new(clock.clone()), |cfg| cfg.ci.allow_private_targets = vec!["127.0.0.1".into()]).await?;
+            let ep = endpoint()?;
+            ep.down.store(true, Ordering::SeqCst);
+            let url = format!("http://127.0.0.1:{}/hook", ep.port);
+            integrations::create(&hub, "webhook", "audit", json!({ "url": url, "events": ["run"] }), integrations::Secrets { secret: Some("s3cret"), signing: None }, None, "test").await.map_err(anyhow::Error::msg)?;
+            crate::events::spawn(&hub);
+            spawn(Arc::clone(&hub));
+            // The reader takes the topic from where it is once it's made: wait for it to stand.
+            for _ in 0..2000 {
+                if hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_positions WHERE reader = 'webhooks'", [], |r| r.get::<_, i64>(0))?)).await? == 1 {
+                    break;
+                }
+                pass(&clock, Duration::from_secs(1)).await;
+            }
+            hub.store.call(|c| Ok(c.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r1', 'acme/app', '', 0)", []).map(|_| ())?)).await?;
+            // Ten minutes down: a run made, and 15 s later started, every 30 s.
+            let mut made: Vec<(String, String)> = Vec::new();
+            for n in 1..=20 {
+                let id = format!("run{n:02}");
+                let run = id.clone();
+                hub.store.call(move |c| Ok(c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES (?1, 'r1', ?2, 'ci', 'push', 'main', 'abc', 'queued', 0)", params![run, n]).map(|_| ())?)).await?;
+                made.push((id.clone(), "queued".into()));
+                pass(&clock, Duration::from_secs(15)).await;
+                let run = id.clone();
+                hub.store.call(move |c| Ok(c.execute("UPDATE runs SET status = 'running' WHERE id = ?1", [run]).map(|_| ())?)).await?;
+                made.push((id, "running".into()));
+                pass(&clock, Duration::from_secs(15)).await;
+            }
+            let refused = ep.refused.load(Ordering::SeqCst);
+            assert!(ep.got.lock().is_empty(), "nothing went while it was down");
+            assert!(refused >= 8, "tried again and again with backoff over 10 minutes: {refused} tries");
+            ep.down.store(false, Ordering::SeqCst);
+            // Back: everything goes within the longest wait between tries, and then some.
+            let mut waited = 0;
+            while ep.got.lock().iter().map(|(d, _)| d.clone()).collect::<std::collections::HashSet<_>>().len() < made.len() && waited < 900 {
+                pass(&clock, Duration::from_secs(5)).await;
+                waited += 5;
+            }
+            let got = ep.got.lock().clone();
+            let mut seen = std::collections::HashMap::new();
+            let mut order = Vec::new();
+            for (delivery, body) in &got {
+                let at = (body.pointer("/run/id").and_then(Value::as_str).unwrap_or_default().to_owned(), body.pointer("/run/status").and_then(Value::as_str).unwrap_or_default().to_owned());
+                if let Some(before) = seen.insert(delivery.clone(), at.clone()) {
+                    assert_eq!(before, at, "a delivery sent twice is the same event");
+                    continue;
+                }
+                order.push(at);
+            }
+            assert_eq!(order, made, "every change, in the order made, after {waited} s back");
+            Ok::<(), anyhow::Error>(())
+        })
+    }
 
     fn sub(scope: &str, events: Value) -> Integration {
         Integration { id: "i1".into(), kind: "webhook".into(), name: "audit".into(), config: json!({ "url": "http://x", "events": events }), has_secret: true, has_signing_secret: false, scope: scope.into(), created_by: "admin".into(), created_at: 0, updated_at: 0, verified_at: None, last_error: None, last_used_at: None }

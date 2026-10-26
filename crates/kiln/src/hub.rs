@@ -345,8 +345,11 @@ pub struct Hub {
     /// Where kiln keeps its bytes (`crate::blobs`, docs/blobs.md): the server's data directory, or
     /// any S3.
     pub blobs: crate::blobs::Opened,
-    /// The bus kiln's events ride: its sessions' live feeds (docs/bus.md).
+    /// The bus kiln's events ride: its sessions' live feeds, and its CI and deploy events on the
+    /// persisted class (docs/bus.md).
     pub bus: crate::bus::QuiverBus,
+    /// What wakes the relay of kiln's events from their outbox to the bus (`crate::events`).
+    pub relay: crate::events::Relay,
 }
 
 impl Hub {
@@ -382,8 +385,9 @@ impl Hub {
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
-        // The bus every session's live feed rides (docs/bus.md): Quiver's node, in this process.
-        let bus = crate::bus::QuiverBus::open(&cfg.bus, Arc::clone(&clock))?;
+        // The bus every session's live feed rides, and kiln's CI and deploy events (docs/bus.md):
+        // Quiver's node, in this process, the one node of a cluster of one for the persisted class.
+        let bus = crate::bus::QuiverBus::open_server(&cfg.bus, &cfg.bus.data_in(&cfg.server.data_dir), Arc::clone(&clock))?;
         let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock), Arc::new(bus.clone()));
         let contents = crate::sync::contents::Contents::start(&blobs, cfg.data("sync").join("blobs"));
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
@@ -452,6 +456,7 @@ impl Hub {
             push: crate::push::Service::default(),
             blobs,
             bus,
+            relay: crate::events::Relay::default(),
         }))
     }
 
@@ -629,6 +634,10 @@ impl Hub {
         if self.events.receiver_count() > 0 {
             self.events.send(Arc::from(v.to_string()));
         }
+        // What the viewers hear of mostly follows a change whose event its trigger recorded; and
+        // what outgoing webhooks take of it besides is recorded (crate::events).
+        self.relay.heard(v);
+        self.relay.kick();
     }
 
     pub async fn emit_job(&self, job_id: &str) {
@@ -2684,6 +2693,17 @@ pub(crate) mod tests {
 
     /// A scratch hub whose time is `clock`'s (a `kiln_seams::clock::SimClock`, mostly).
     pub(crate) async fn scratch_hub_on(clock: Arc<dyn kiln_seams::Clock>, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
+        scratch_hub_in(clock, None, f).await
+    }
+
+    /// A scratch hub whose kiln.db is the file `db` and whose bus keeps its data in `bus`: a
+    /// second one on them takes up where the first stopped (a restart).
+    pub(crate) async fn restartable_hub(clock: Arc<dyn kiln_seams::Clock>, db: &std::path::Path, bus: &std::path::Path) -> anyhow::Result<Arc<Hub>> {
+        let bus = bus.to_string_lossy().into_owned();
+        scratch_hub_in(clock, Some(db.to_path_buf()), move |cfg| cfg.bus.data = bus).await
+    }
+
+    async fn scratch_hub_in(clock: Arc<dyn kiln_seams::Clock>, db: Option<std::path::PathBuf>, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
         let dir = tempfile::tempdir()?.keep();
         let mut cfg = Config::default();
         cfg.server.data_dir = dir.clone();
@@ -2695,7 +2715,10 @@ pub(crate) mod tests {
         // keys are throwaway: written without waiting for the disk.
         let pki_dir = dir.join("pki");
         let (store, keys) = futures::join!(
-            crate::rt::blocking(Store::in_memory),
+            crate::rt::blocking(move || match db {
+                Some(db) => Store::open(&db),
+                None => Store::in_memory(),
+            }),
             crate::rt::blocking(move || -> anyhow::Result<_> {
                 let pki = crate::pki::Pki::open_scratch(&pki_dir)?;
                 let leaf = pki.server_leaf(&[])?;

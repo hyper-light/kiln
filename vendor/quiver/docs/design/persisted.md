@@ -44,7 +44,10 @@ KIP-631).
 - **Ports.** A topic's member listens on the node's host at a port the operating system picks
   as the part is first bound, kept in the part's directory and bound again at every start. Each
   node records its port in the catalog, and a node opens its member once every node's port is
-  recorded.
+  recorded. A cluster of one may name port 0 for its node: its catalog's member listens where the
+  system picks at each start, and its own publisher dials it there, since no peer does (kiln's
+  server on one machine, beside the many servers its tests start at once); a cluster of more is
+  refused it, its peers dialing every node where the configuration says.
 - **A topic a node doesn't hold yet.** A create is answered by the node that asked once it has
   applied it; another node may not have yet, and a node back from a restart has applied only what
   its catalog's log held. So a node asked for a topic it doesn't hold makes a mark through the

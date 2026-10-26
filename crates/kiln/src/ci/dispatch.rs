@@ -1067,7 +1067,7 @@ impl Dispatch {
         }
         // A kiln workflow that declares its secrets needs every required one (W09-R06).
         if let Some(why) = self.missing_secrets(&s).await {
-            runs::finish_run(&self.hub, &id, Status::Failed, "startup_failure", Some(why)).await?;
+            runs::finish_run(&self.hub, &id, Status::Failed, "startup_failure", Some(why), false).await?;
             self.hub.emit_run(&id).await;
             return Ok(());
         }
@@ -1098,7 +1098,7 @@ impl Dispatch {
         let (plan, actions) = match started {
             Ok(x) => x,
             Err(e) => {
-                runs::finish_run(&self.hub, &id, Status::Failed, "failure", Some(format!("The run could not start: {e}"))).await?;
+                runs::finish_run(&self.hub, &id, Status::Failed, "failure", Some(format!("The run could not start: {e}")), false).await?;
                 self.hub.emit_run(&id).await;
                 return Ok(());
             }
@@ -1109,12 +1109,12 @@ impl Dispatch {
         let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false };
         self.workflow_run(&st, "requested", None);
         if approval {
+            // W19-R06's `approval.waiting`, recorded with it (crate::events).
             runs::set_approval(&self.hub, &id, "required", None).await?;
             st.awaiting = Some(Awaiting { group });
             self.runs.insert(id.clone(), st);
             self.hub.ci.runs.lock().insert(id.clone());
             self.hub.emit_run(&id).await;
-            crate::rt::spawn(super::notify::approval_waiting(Arc::clone(&self.hub), id, Vec::new()));
             return Ok(());
         }
         self.runs.insert(id.clone(), st);
@@ -1336,7 +1336,7 @@ impl Dispatch {
                     let existing = self.runs.get(run).and_then(|r| r.keys.get(&leg.key).cloned());
                     match existing {
                         Some(id) => {
-                            runs::finish_leg(&self.hub, &id, status_of(conclusion), conclusion.as_str(), None, Some(reason)).await?;
+                            runs::finish_leg(&self.hub, &id, status_of(conclusion), conclusion.as_str(), None, Some(reason), None).await?;
                             self.hub.emit_job(&id).await;
                         }
                         None => {
@@ -1378,9 +1378,9 @@ impl Dispatch {
                 }
                 PlanAction::Finish(c) => {
                     self.save_removed(run).await?;
-                    runs::finish_run(&self.hub, run, status_of(c), c.result(), None).await?;
-                    // W19-R06: who wants to hear of it; R02: its trace.
-                    crate::rt::spawn(super::notify::run_finished(Arc::clone(&self.hub), run.to_owned()));
+                    // W19-R06: who wants to hear of it, recorded with the end (crate::events); R02:
+                    // its trace.
+                    runs::finish_run(&self.hub, run, status_of(c), c.result(), None, true).await?;
                     crate::rt::spawn(super::otel::run_finished(Arc::clone(&self.hub), run.to_owned()));
                     let cmds = self.sched.handle(Input::RunFinished { run: run.to_owned() }, now_ms());
                     if let Some(r) = self.runs.remove(run) {
@@ -1483,7 +1483,7 @@ impl Dispatch {
         let (plan, acts) = match RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Source { files: &files, timing: &timing, tree: &tree }) {
             Ok(x) => x,
             Err(e) => {
-                runs::finish_run(&self.hub, run, Status::Failed, "failure", Some(format!("The run could not start: {e}"))).await?;
+                runs::finish_run(&self.hub, run, Status::Failed, "failure", Some(format!("The run could not start: {e}")), false).await?;
                 self.hub.emit_run(run).await;
                 return Ok(attempt);
             }
@@ -1552,12 +1552,12 @@ impl Dispatch {
                 if let Some(limit) = def.concurrency
                     && self.deploying(&repo.id, &def.name, id) >= usize::try_from(limit).unwrap_or(usize::MAX)
                 {
-                    runs::wait_reason(&self.hub, id, &serde_json::json!({ "reason": "concurrency", "environment": def.name, "limit": limit })).await?;
+                    runs::wait_reason(&self.hub, id, &serde_json::json!({ "reason": "concurrency", "environment": def.name, "limit": limit }), None).await?;
                     self.hub.emit_job(id).await;
                     return Ok(());
                 }
                 let Some(mut h) = self.held.remove(id) else { return Ok(()) };
-                runs::wait_reason(&self.hub, id, &serde_json::Value::Null).await?;
+                runs::wait_reason(&self.hub, id, &serde_json::Value::Null, None).await?;
                 self.hub.emit_job(id).await;
                 // A host, container or microVM environment's jobs run on its runners (W15-R02).
                 for q in super::environments::routing(&def) {
@@ -1587,20 +1587,19 @@ impl Dispatch {
                     (true, None, None, Some(_)) => "gate",
                     (true, None, None, None) => "wait-timer",
                 };
-                runs::wait_reason(&self.hub, id, &serde_json::json!({ "reason": reason, "environment": def.name, "reviewers": reviewers, "until": until, "window": window, "promotion": promotion, "gate": gate })).await?;
+                // W19-R06: the first time it waits for a reviewer, who wants to hear of it, recorded
+                // with the wait (crate::events).
+                let announce = !reviewers.is_empty() && self.held.get(id).is_some_and(|h| !h.announced);
+                let waiting = announce.then_some((run.as_str(), def.name.as_str()));
+                runs::wait_reason(&self.hub, id, &serde_json::json!({ "reason": reason, "environment": def.name, "reviewers": reviewers, "until": until, "window": window, "promotion": promotion, "gate": gate }), waiting).await?;
+                if announce && let Some(h) = self.held.get_mut(id) {
+                    h.announced = true;
+                }
                 // Promotion and custom gates move as other runs do: it's looked at again shortly.
                 if promotion.is_some() || gate.is_some() {
                     self.timers.insert((now + GATE_AGAIN_SECS) * 1000);
                 }
                 self.hub.emit_job(id).await;
-                // W19-R06: the first time it waits for a reviewer, who wants to hear of it.
-                if !reviewers.is_empty()
-                    && let Some(h) = self.held.get_mut(id)
-                    && !h.announced
-                {
-                    h.announced = true;
-                    crate::rt::spawn(super::notify::approval_waiting(Arc::clone(&self.hub), run.clone(), vec![def.name.clone()]));
-                }
                 if let Some(t) = until {
                     self.timers.insert(t * 1000);
                 }
@@ -1811,7 +1810,7 @@ impl Dispatch {
                     r
                 }
                 Command::Wait { leg, reason } => {
-                    let r = runs::wait_reason(&self.hub, &leg, &serde_json::to_value(&reason).unwrap_or_default()).await;
+                    let r = runs::wait_reason(&self.hub, &leg, &serde_json::to_value(&reason).unwrap_or_default(), None).await;
                     self.hub.emit_job(&leg).await;
                     r
                 }
@@ -2493,15 +2492,15 @@ impl Dispatch {
             if let Err(e) = super::environments::status(&self.hub, d, state, l.env_url.clone(), None, "github-actions[bot]").await {
                 tracing::warn!(leg = %leg, error = %format!("{e:#}"), "a deployment's status could not be recorded");
             }
-            // W19-R06: `deploy.succeeded` or `deploy.failed`.
-            if matches!(c, PlanC::Success | PlanC::Failure | PlanC::TimedOut)
-                && let Some(env) = l.spec.environment.as_ref().map(|e| e.name.clone())
-            {
-                crate::rt::spawn(super::notify::deployed(Arc::clone(&self.hub), l.run.clone(), env, c == PlanC::Success));
-            }
         }
+        // W19-R06: `deploy.succeeded` or `deploy.failed`, recorded with the leg's end (crate::events).
+        let deployed = l
+            .deployment
+            .filter(|_| matches!(c, PlanC::Success | PlanC::Failure | PlanC::TimedOut))
+            .and(l.spec.environment.as_ref())
+            .map(|e| runs::Deployed { run: l.run.clone(), environment: e.name.clone(), succeeded: c == PlanC::Success });
         // A timeout stays `timed_out` on the leg (W06-R12); its dependants see a failure.
-        runs::finish_leg(&self.hub, leg, status_of(c), c.as_str(), outputs, reason).await?;
+        runs::finish_leg(&self.hub, leg, status_of(c), c.as_str(), outputs, reason, deployed).await?;
         self.hub.emit_job(leg).await;
         let report = LegReport { conclusion: Some(c), ..l.report };
         // W08-R10: a success of a job that opted in is kept for the legs with its inputs.
@@ -2552,7 +2551,7 @@ impl Dispatch {
             let r = self.replay(&run, &model, &input).await;
             if let Err(e) = r {
                 tracing::warn!(run, error = %format!("{e:#}"), "a CI run could not be rebuilt; it fails");
-                runs::finish_run(&self.hub, &run, Status::Failed, "failure", Some(format!("The run could not be rebuilt after a restart: {e:#}"))).await?;
+                runs::finish_run(&self.hub, &run, Status::Failed, "failure", Some(format!("The run could not be rebuilt after a restart: {e:#}")), false).await?;
             }
         }
         Ok(())

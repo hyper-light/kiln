@@ -107,6 +107,11 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
     // Where kiln keeps its bytes (docs/blobs.md): what was kept before taken in, what's kept read.
     crate::blobs::start(&hub).await;
+    // kiln's events, from their outbox to the bus's persisted topic, and the notification rules'
+    // deliveries made from it (docs/bus.md, "kiln's events"); the outgoing webhooks' start with
+    // the CI engine.
+    crate::events::spawn(&hub);
+    crate::ci::notify::spawn(&hub);
     // The CI engine (docs/ci.md), when turned on.
     crate::ci::dispatch::spawn(hub.clone());
     // Terminal sessions' names, kept across restarts.

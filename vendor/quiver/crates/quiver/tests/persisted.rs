@@ -133,3 +133,41 @@ fn cp_t2_2_each_nodes_publishes_are_answered_at_their_own_offsets() {
         assert_eq!(read, answered, "node {id}'s log");
     }
 }
+
+/// A cluster of one may name port 0 (kiln's server on one machine, beside the many servers its
+/// tests start at once): do start one so, publish, restart it (at another port the system picks)
+/// and publish again, expect each publish answered at its offset and both read back; and a cluster
+/// of three naming a port 0 refused, typed, since its peers dial every node where it says.
+#[test]
+fn cp_t2_2_a_cluster_of_one_listens_where_the_system_picks() {
+    let mut c = Cluster::start_at(vec![(1, std::net::SocketAddr::from(([127, 0, 0, 1], 0)))]);
+    let topic = quiver_api::Topic {
+        class: Class::Persisted,
+        retain_messages: 100,
+        retain_bytes: 1 << 20,
+    };
+    futures::executor::block_on(c.node(1).create("events", topic)).unwrap();
+    let first = futures::executor::block_on(c.node(1).publish("events", None, b"a")).unwrap();
+    c.kill(1);
+    c.restart(1);
+    let second = futures::executor::block_on(c.node(1).publish("events", None, b"b")).unwrap();
+    assert_eq!((first, second), (0, 1));
+    let read = futures::executor::block_on(c.node(1).read("events", 0, 10)).unwrap();
+    let held: Vec<(u64, Vec<u8>)> = read
+        .messages
+        .into_iter()
+        .map(|m| (m.offset, m.payload))
+        .collect();
+    assert_eq!(held, vec![(0, b"a".to_vec()), (1, b"b".to_vec())]);
+
+    let mut three = c.config(1);
+    three.nodes = (1..=3)
+        .map(|i| (i, std::net::SocketAddr::from(([127, 0, 0, 1], 0))))
+        .collect();
+    three.data = c.dir.join("three");
+    let refused = quiver::Node::with_persisted(cluster::NODE, three).err();
+    assert!(
+        matches!(&refused, Some(quiver_api::Refusal::Invalid { why, .. }) if why.contains("port is 0")),
+        "{refused:?}"
+    );
+}

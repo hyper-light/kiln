@@ -172,13 +172,21 @@ async fn queue_event(hub: &Hub, ids: &[String], action: &str, reason: Option<&st
 /// Takes an entry out of the queue, saying why (`code`: GitHub's reason, for `dequeued`); its
 /// diffs go back to their review state.
 async fn eject(hub: &Arc<Hub>, e: &Entry, reason: &str, code: &str) -> anyhow::Result<()> {
-    let (id, why) = (e.id.clone(), reason.to_owned());
-    hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'ejected', reason = ?2, updated_at = ?3 WHERE id = ?1", params![id, why, crate::util::now_unix()]).map(|_| ())?)).await?;
+    let (id, why, diffs) = (e.id.clone(), reason.to_owned(), e.diffs.clone());
+    // W19-R06's `land.ejected`, recorded with the ejection (crate::events).
+    hub.store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            tx.execute("UPDATE land_queue SET state = 'ejected', reason = ?2, updated_at = ?3 WHERE id = ?1", params![id, why, crate::util::now_unix()])?;
+            crate::events::record(&tx, "land.ejected", &serde_json::json!({ "diffs": diffs, "reason": why }))?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
     set_diff_state(hub, &e.diffs, State::Accepted).await?;
     hub.store.audit("kiln".into(), "queue.eject".into(), format!("{}: {reason}", e.id)).await;
     tell(hub, e, "ejected", Some(reason)).await;
     queue_event(hub, &e.diffs, "dequeued", Some(code), "kiln").await;
-    crate::rt::spawn(super::notify::land_ejected(Arc::clone(hub), e.diffs.clone(), reason.to_owned()));
     tracing::info!(entry = %e.id, %reason, "ejected from the land queue");
     Ok(())
 }

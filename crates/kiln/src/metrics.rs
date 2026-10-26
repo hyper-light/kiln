@@ -608,6 +608,65 @@ fn render_bus(o: &mut String) {
     let _ = writeln!(o, "kiln_bus_memory_limit_bytes {}", g.memory_limit_bytes.get());
 }
 
+/// kiln's events (`crate::events`, CP-T2.2 step 8): relayed from the outbox to the bus's persisted
+/// topic `kiln.events`, and delivered from it.
+pub struct EventsMetrics {
+    /// Outbox rows the relay published and let go.
+    pub relayed: Counter,
+    /// Events published to `kiln.events`.
+    pub published: Counter,
+    /// Events said that couldn't be recorded, so won't be delivered.
+    pub unrecorded: Counter,
+    /// Outbox rows of a kind this build doesn't know (a later build's, after a rollback).
+    pub unknown: Counter,
+    /// Outbox rows waiting to be relayed, as the relay last saw.
+    pub outbox: Gauge,
+    /// Deliveries the topic's readers logged, by kind (webhook, notify).
+    pub logged: CounterVec,
+    /// Tries of deliveries, by kind and result (sent, retry, failed, skipped).
+    pub attempts: CounterVec,
+    /// Events a reader never took, the topic having let them go first, by reader.
+    pub missed: CounterVec,
+}
+
+pub fn events() -> &'static EventsMetrics {
+    static M: OnceLock<EventsMetrics> = OnceLock::new();
+    M.get_or_init(|| EventsMetrics {
+        relayed: Counter::default(),
+        published: Counter::default(),
+        unrecorded: Counter::default(),
+        unknown: Counter::default(),
+        outbox: Gauge::default(),
+        logged: CounterVec::new(&["kind"]),
+        attempts: CounterVec::new(&["kind", "result"]),
+        missed: CounterVec::new(&["reader"]),
+    })
+}
+
+/// The `kiln_events_*` families, in the exposition.
+fn render_events(o: &mut String) {
+    let m = events();
+    let help = |o: &mut String, name: &str, kind: &str, h: &str| {
+        let _ = writeln!(o, "# HELP {name} {h}\n# TYPE {name} {kind}");
+    };
+    help(o, "kiln_events_relayed_total", "counter", "Outbox rows the relay published to kiln.events and let go.");
+    let _ = writeln!(o, "kiln_events_relayed_total {}", m.relayed.get());
+    help(o, "kiln_events_published_total", "counter", "Events published to the persisted topic kiln.events.");
+    let _ = writeln!(o, "kiln_events_published_total {}", m.published.get());
+    help(o, "kiln_events_unrecorded_total", "counter", "Events said that couldn't be recorded, so won't be delivered.");
+    let _ = writeln!(o, "kiln_events_unrecorded_total {}", m.unrecorded.get());
+    help(o, "kiln_events_unknown_total", "counter", "Outbox rows of a kind this build doesn't know (a later build's, after a rollback): they make no event.");
+    let _ = writeln!(o, "kiln_events_unknown_total {}", m.unknown.get());
+    help(o, "kiln_events_outbox", "gauge", "Outbox rows waiting to be relayed to kiln.events, as the relay last saw.");
+    let _ = writeln!(o, "kiln_events_outbox {}", m.outbox.get());
+    help(o, "kiln_events_deliveries_logged_total", "counter", "Deliveries the readers of kiln.events logged, by kind (webhook, notify).");
+    m.logged.render(o, "kiln_events_deliveries_logged_total");
+    help(o, "kiln_events_delivery_attempts_total", "counter", "Tries of deliveries made from kiln.events, by kind and result (sent, retry, failed, skipped).");
+    m.attempts.render(o, "kiln_events_delivery_attempts_total");
+    help(o, "kiln_events_missed_total", "counter", "Events a reader of kiln.events never took, the topic having let them go first, by reader.");
+    m.missed.render(o, "kiln_events_missed_total");
+}
+
 /// The `kiln_blobs_*` families, in the exposition.
 fn render_blobs(o: &mut String) {
     let m = blobs();
@@ -931,6 +990,7 @@ pub fn render() -> String {
     render_agents(agents(), &mut o);
     render_blobs(&mut o);
     render_bus(&mut o);
+    render_events(&mut o);
     render_net(&mut o);
 
     let samples = agent_samples().read();

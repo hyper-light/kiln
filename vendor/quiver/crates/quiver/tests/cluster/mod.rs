@@ -57,15 +57,22 @@ pub const NODE: NodeConfig = NodeConfig {
 impl Cluster {
     /// `n` nodes, each started.
     pub fn start(n: u64) -> Self {
+        Self::start_at(
+            (1..=n)
+                .map(|i| (i, SocketAddr::from(([127, 0, 0, 1], free_port()))))
+                .collect(),
+        )
+    }
+
+    /// The nodes `addresses` names, each started.
+    pub fn start_at(addresses: Vec<(u64, SocketAddr)>) -> Self {
         let id = next();
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join("persisted")
             .join(format!("{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let addresses: Vec<(u64, SocketAddr)> = (1..=n)
-            .map(|i| (i, SocketAddr::from(([127, 0, 0, 1], free_port()))))
-            .collect();
+        let n = u64::try_from(addresses.len()).unwrap();
         let mut cluster = Self {
             dir,
             addresses,

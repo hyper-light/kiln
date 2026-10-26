@@ -55,7 +55,9 @@ pub struct PersistedConfig {
     /// This node, among `nodes`.
     pub id: u64,
     /// Every node of the cluster, numbered 1, 2, 3… in order, and the address its catalog's
-    /// member listens on; each topic's member listens on the same host at a port of its own.
+    /// member listens on; each topic's member listens on the same host at a port of its own. A
+    /// cluster of one may give port 0: its member listens where the system picks, at each start,
+    /// since no peer dials it (kiln's server on one machine, beside other servers' tests).
     pub nodes: Vec<(u64, SocketAddr)>,
     /// The directory the node keeps its logs, its parts' images and its run in.
     pub data: PathBuf,
@@ -115,6 +117,12 @@ impl PersistedConfig {
         }
         if self.address(self.id).is_none() {
             return Err(invalid(format!("node {} isn't among its nodes", self.id)));
+        }
+        if self.nodes.len() > 1 && self.nodes.iter().any(|(_, a)| a.port() == 0) {
+            return Err(invalid(
+                "a node's port is 0 only in a cluster of one: its peers dial every other there"
+                    .to_owned(),
+            ));
         }
         if self.part_memory < Self::PART_MEMORY_MIN {
             return Err(invalid(format!(
