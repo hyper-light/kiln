@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""kiln's own workflows on v1 and on the CI engine, side by side (docs/ci.md W24 M0 step 4, W26).
+"""kiln's own workflows on v1 and on the CI engine, side by side (docs/ci.md W24 M0 step 4, W28).
 
 Two throwaway servers each poll a bare repository of their own: one runs `.kiln/` on v1
 (`[ci] kiln_workflows` off), the other on the engine (on, with a `k8s` pool). This moves `main`
