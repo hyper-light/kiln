@@ -7894,8 +7894,58 @@ before this one call this workstream "W25 step N".
   same tree and every unit the key it has with its own change alone; and every decision names
   only what its two changes share. *Property test* (`cargo test -p kiln-ci land::conflict`).
 
-**Progress.** R30–R34 and AC30 built (2026-10-25) in `kiln_ci::land::conflict`. The land queue
-doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.rs`.
+**Requirements: order and admission within components**
+
+- **W28-R35 Order, side by side.** `kiln_ci::land::order`, pure: every component's work waits in
+  one pooled queue over every runner that can do it, so no component waits on another. The queue
+  ranks a unit by its score: 30 points on its component's critical path (the head's check's
+  critical path, which every landing behind the head waits for), up to 30 for the shortest
+  expected service (the median of the job's runs, falling linearly to none at 30 min), and
+  W05-R09's aging, `aging_per_minute` (default 1) a minute waited; ties go to the longer wait. The
+  aging bound is the score's range aged away, 60 min by default: once a unit has waited it, nothing
+  that arrives after passes it, and a unit past it keeps the runners it waits for from anything
+  ranked below it.
+- **W28-R36 The speculation window.** Each component tests the first changes of its queue at once,
+  each on its expected stack (the changes ahead of it in its component, then itself), as many as
+  its AIMD window allows: the window starts at its cap (`window_cap`, default 8), opens by one on a
+  pass and halves on a failure, as Zuul's does, never past its cap nor below one; a change past it
+  is suspended. A job's result is keyed by the job and the tree its unit has on the stack, the set
+  of the trunk's and the stack's changes of that unit (R32, R33), so a result the trunk or another
+  candidate has answers it and one in flight is shared. A failure is the change's own once every
+  change ahead of it has passed. It ejects the change, and the candidates behind it re-key: what
+  still keys keeps its result, and what its leaving changed runs again.
+- **W28-R37 Admission.** A component's head always starts its candidate. Another change in the
+  window starts its only while the bottleneck its check needs is below `util_cap` (default 0.8)
+  committed, the shortest expected service first (aged): the bottleneck is, of each of its jobs'
+  pools, the least committed, and of those the most, counting what holds a pool and what waits for
+  it. One deferred for the aging bound starts regardless. Each deferral says why: `deferred:
+  speculative, and the bottleneck its check needs is at 89% of its capacity, at or past the 80%
+  cap`.
+
+**Acceptance criteria: order and admission**
+
+- **W28-AC31 A burst of agent changes.** Twenty small changes at once, fifteen in components of
+  their own and five sharing kiln-ci, whose checks share two runners: the fifteen land without
+  waiting for each other, each as its own check ends; the five start the critical path first (their
+  head), then the shortest expected service first. *Replay test* (`cargo test -p kiln-ci
+  w28_ac31`).
+- **W28-AC32 Aging under a stream.** Long changes behind a constant stream of short ones on one
+  runner: each long change starts within the aging bound, and without aging none starts while the
+  stream lasts. *Replay test* (`cargo test -p kiln-ci w28_ac32`).
+- **W28-AC33 The recorded week.** The Oct 18-25 trace replayed through the land queue
+  (`kiln_ci::sched::sim::replay::land`, seeds 1-8) against today's serial batch-and-bisect at
+  kiln's own `queue.batch` (1): the mean time from enqueue to landed falls by at least 50%,
+  runner-hours per landed change fall by at least 50%, no job waits for a runner past the aging
+  bound, and no window passes its cap. *Replay* (`cargo test -p kiln-ci w28_ac33`);
+  ci/sim/README.md keeps the report.
+
+**Progress.** R30–R34 and AC30 built (2026-10-25) in `kiln_ci::land::conflict`; R35–R37, AC31
+and AC32 (2026-10-25) in `kiln_ci::land::order` and the replay's `land`. AC33 is met in part: on
+the recorded week the mean time from enqueue to landed falls 78% (4.3 h to 55 min), no job waits
+past the 60 min bound (53 min at most) and no window opens past 8, but runner-hours per landed
+change fall only 7% (0.683 to 0.635). The trace keys work by eight input classes, and the classes a
+change touches are 84% of its pipeline's expected work (ci/sim/README.md). The land queue uses
+none of this yet: that is step 9's third step, in `crates/kiln/src/ci/land.rs`.
 
 ## 4. API, events, CLI and MCP reference
 

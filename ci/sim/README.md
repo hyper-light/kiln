@@ -280,3 +280,104 @@ image_compile_share on P5 (assumed: the trace can't split the image's build):
 | image_compile_share 0 | 1.2 (0.9–1.3) | 74.1% (71.9%–75.9%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.20 |
 | image_compile_share 0.3 | 1.2 (0.9–1.3) | 74.1% (71.9%–75.9%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.20 |
 | image_compile_share 0.6 | 1.2 (0.9–1.3) | 74.1% (71.9%–75.9%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.20 |
+
+## The land queue
+
+W28 step 9.2 (docs/ci.md W28-R35 to R37, AC31 to AC33): the week's 270 ci pushes to main replayed
+as changes that want to land, through today's land queue and step 9's, by
+`kiln_ci::sched::sim::replay::land` with the order and admission of `kiln_ci::land::order`.
+`cargo run -p kiln-ci --example land -- ci/sim/trace.json --sweeps` prints the report and the
+sweeps below. `cargo test -p kiln-ci sched::sim::replay::land` checks the synthetic queues
+(AC31, AC32), the week's criteria (AC33) and that this report is current.
+
+- **The changes.** Each ci push to main enqueues as its run was created. It affects the input
+  classes whose keys its commit changed from the previous push's, and its check is its recorded
+  run's jobs, each taking and ending as recorded, or as drawn for one that didn't finish (the
+  replay's draws, seeds 1-8). The same job on the same tree ends the same way, whoever runs it: a
+  tree is the set of changes of its class on the trunk and on the candidate's stack.
+- **Serial, batch 1** is today's queue as kiln runs it (`crates/kiln/src/ci/land.rs`; `.kiln/`
+  sets no `queue.batch`): one candidate at a time, the change on the trunk, its whole pipeline run
+  again; a failure ejects it.
+- **Components** is step 9's. `kiln_ci::land::conflict`'s graph over the pending changes, each
+  class standing for a unit, splits them into components that never wait for each other. Each
+  component tests the first changes of its queue at once, each on its expected stack, as many as
+  its AIMD window allows (it starts at its cap of 8, halves on a failure, opens by one on a pass).
+  A job's result is keyed by the job and its class's tree, so what the trunk or another candidate
+  already has answers it, and one in flight is shared. A speculative candidate starts only while
+  the bottleneck its check needs is below 80% committed, the shortest expected service first. All
+  the work waits in one pooled queue: the critical path first (a component's head's), then the
+  shortest expected service, aged a point a minute, so the aging bound is 60 min. A failure is a
+  change's own once every change ahead of it has passed, as in Zuul; the candidates behind an
+  ejection re-key, keeping what still keys.
+
+<!-- land report -->
+Seeds 1-8; the week's 270 ci pushes to main are the changes that want to land.
+
+| Policy | Seed | Landed | Ejected | Mean enqueue to landed | Runner-h per landed change | Longest wait for a runner | Widest window |
+|---|---|---|---|---|---|---|---|
+| serial, batch 1 | 1 | 120 | 138 | 4.3 h | 0.684 | 0 min | – |
+| serial, batch 1 | 2 | 124 | 134 | 4.5 h | 0.681 | 0 min | – |
+| serial, batch 1 | 3 | 126 | 132 | 4.0 h | 0.679 | 0 min | – |
+| serial, batch 1 | 4 | 119 | 139 | 4.5 h | 0.708 | 0 min | – |
+| serial, batch 1 | 5 | 121 | 137 | 4.4 h | 0.693 | 0 min | – |
+| serial, batch 1 | 6 | 123 | 135 | 3.8 h | 0.676 | 0 min | – |
+| serial, batch 1 | 7 | 124 | 134 | 4.7 h | 0.681 | 0 min | – |
+| serial, batch 1 | 8 | 126 | 133 | 3.9 h | 0.666 | 0 min | – |
+| components | 1 | 123 | 140 | 56 min | 0.634 | 53 min | 8 (cap 8) |
+| components | 2 | 126 | 137 | 53 min | 0.615 | 46 min | 8 (cap 8) |
+| components | 3 | 128 | 135 | 54 min | 0.644 | 49 min | 8 (cap 8) |
+| components | 4 | 117 | 146 | 59 min | 0.676 | 46 min | 8 (cap 8) |
+| components | 5 | 123 | 146 | 1.1 h | 0.674 | 53 min | 8 (cap 8) |
+| components | 6 | 126 | 137 | 43 min | 0.618 | 53 min | 8 (cap 8) |
+| components | 7 | 124 | 139 | 1.1 h | 0.633 | 49 min | 8 (cap 8) |
+| components | 8 | 136 | 134 | 43 min | 0.582 | 49 min | 8 (cap 8) |
+
+| Mean over seeds 1-8 | serial, batch 1 | components | Change |
+|---|---|---|---|
+| Mean enqueue to landed | 4.3 h | 55 min | -78% |
+| Runner-h per landed change | 0.683 | 0.635 | -7% |
+| Changes landed | 122.9 | 125.4 | +2% |
+| Longest wait for a runner | 0 min | 50 min | – |
+<!-- /land report -->
+
+### What the land queue's numbers say
+
+- **Time to land falls 78%**, 4.3 h to 55 min over seeds 1-8, and by more than half on every
+  seed (AC33's test checks each). Serial tests one change at a time, while the k8s quota can run
+  two rust jobs: components run their head and a speculative candidate beside it, every component
+  beside the others, and reuse what a change didn't touch.
+- **No wait passes the aging bound, and no window its cap.** The longest any job waited for a
+  runner is 53 min, under the bound of 60, and no window opened past 8.
+- **Runner-hours per landed change fall 7%** (0.683 to 0.635), short of AC33's 50%.
+  - The trace keys work by eight input classes, and nearly every push changes the costly ones:
+    229 of the 270 change `rust`'s inputs, 245 the release binary's and `ui-checks`'s. A
+    candidate runs again the jobs of the classes its change touches, 84% of a pipeline's
+    expected work, so reuse can save about a sixth at most.
+  - Speculation spends part of that back: a candidate tested on a stack that a failure then
+    breaks runs again, and 2.3 runner-h a week is stopped unused. With no speculation (a window
+    of 1), runner-hours per landed change fall 16% and time to land 61%.
+  - Finer keys than the trace has could save more: per package (W24-R16, R17), a change to one
+    crate runs again only that crate and what depends on it. Measuring it would take each push's
+    changed files in the trace.
+
+### The order's defaults
+
+From the sweeps below; each knob varied with the others at their defaults (means over seeds 1-8).
+
+| Parameter | Default | Why |
+|---|---|---|
+| `window_cap` | 8 | Time to land flattens past 4 (56 min at 4, 55 at 8 and at 12) while the longest wait for a runner climbs toward the aging bound (16, 53 and 59 min). 8 keeps it inside and orders a burst of conflicting agent changes as one (AC31); 4 would keep waits a third as long, at 2 points more runner-hours saved. |
+| `util_cap` | 0.8 | The plan's. From 0.6 to 1.0 time to land and runner-hours don't move: one rust job holds 44% of the k8s quota's memory, so the head's and one more fit, and the cap only decides whether a third candidate waits in the pooled queue (1.0) or before it. |
+| `aging_per_minute` | 1 | W05-R09's: the bound is 30 points for the critical path plus 30 for the shortest service, 60 min. |
+
+| Policy | Mean enqueue to landed | Runner-h per landed change | Changes landed | Longest wait for a runner | Runner-h stopped unused |
+|---|---|---|---|---|---|
+| serial, batch 1 | 4.3 h | 0.683 | 122.9 | 0 min | 0.0 |
+| components, window cap 1 | 1.7 h | 0.573 | 124.9 | 0 min | 0.0 |
+| components, window cap 2 | 59 min | 0.599 | 125.1 | 2 min | 1.2 |
+| components, window cap 4 | 56 min | 0.619 | 125.4 | 16 min | 1.5 |
+| components, window cap 8 | 55 min | 0.635 | 125.4 | 53 min | 2.3 |
+| components, window cap 12 | 55 min | 0.638 | 125.4 | 59 min | 2.4 |
+| components, admission cap 0.6 | 55 min | 0.635 | 125.4 | 53 min | 2.3 |
+| components, admission cap 0.8 | 55 min | 0.635 | 125.4 | 53 min | 2.3 |
+| components, admission cap 1 | 55 min | 0.635 | 125.6 | 56 min | 2.3 |
