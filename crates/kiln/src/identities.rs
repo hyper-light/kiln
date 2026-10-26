@@ -18,6 +18,40 @@ use crate::store::Store;
 pub const RUNNER_HOURS: i64 = 7 * 24;
 /// How long an agent session's certificate lasts, for one epoch; asked again on each connection.
 pub const AGENT_HOURS: i64 = 7 * 24;
+/// How long the server's and CD's signing certificates last; renewed at start once less than 30
+/// days are left.
+pub const SERVER_DAYS: i64 = 90;
+
+/// The server's and CD's own signing identities (W27-R01): keys made here, in `<data>/pki`
+/// (0600, never sent), apart from the server's TLS leaf; certified by kiln's CA, recorded, and
+/// renewed when missing, expiring or not for their key.
+pub async fn own_identities(store: &Store, pki: &crate::pki::Pki) -> anyhow::Result<()> {
+    for (kind, actor) in [("server", Actor::Server), ("cd", Actor::Cd)] {
+        let identity = Identity::new(pki.organization(), actor);
+        let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (key_path, cert_path) = (pki.dir().join(format!("{kind}-signing.key")), pki.dir().join(format!("{kind}-signing.pem")));
+        let key = match std::fs::read_to_string(&key_path) {
+            Ok(k) => k,
+            Err(_) => {
+                let k = crate::pki::new_key_pem()?;
+                crate::util::write_secret(&key_path, k.as_bytes(), 0o600)?;
+                k
+            }
+        };
+        let current = std::fs::read_to_string(&cert_path).ok().filter(|c| !crate::pki::needs_renewal(c) && crate::pki::cert_matches_key(c, &key));
+        if current.is_some() {
+            continue;
+        }
+        let csr = crate::pki::make_csr_with_key("kiln-identity", &key)?;
+        let pem = pki.issue_identity(&csr, &identity, &[], time::Duration::days(SERVER_DAYS))?;
+        crate::util::write_secret(&cert_path, pem.as_bytes(), 0o644)?;
+        revoke(store, Target::Certificates(uri.clone()), "superseded by a newer certificate", "kiln", crate::util::now_unix()).await?;
+        record(store, kind, &uri, &pem).await?;
+        tracing::info!(identity = %identity, "issued an identity");
+    }
+    Ok(())
+}
+
 /// How long a CI leg's certificate lasts: the leg's attempt, with room.
 pub const LEG_HOURS: i64 = 24;
 /// How long a person's certificate lasts after they sign in: hours, never past a day.
