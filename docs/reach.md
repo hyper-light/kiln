@@ -144,12 +144,16 @@ repository, `--no-sync` to skip):
   the worktree's HEAD, index and logs, and none of the other worktrees;
 - any other folder: everything but the usual build output.
 
-The copy lives at `~/.kiln/reach/<asking runner>/<tree>-<hash>` and is kept (until rules let it
-go, §5.1), so the next sync sends only what changed: the asker sends the list (path, size, time,
-mode), the doer asks for the files that differ, the asker sends them (256 KiB pieces, at most 4 MiB
-unacknowledged), and on commit the copy is made to match exactly. The command then runs in the
-copy's folder matching where the asker was. Paths are checked (relative, plain, never through a
-symlink) so a list can't write outside the copy.
+The copy lives at `~/.kiln/reach/<asking runner>/<tree>-<hash>` and is kept, so the next sync
+sends only what changed: the asker sends the list (path, size, time, mode), the doer asks for the
+files that differ, the asker sends them (256 KiB pieces, at most 4 MiB unacknowledged), and on
+commit the copy is made to match the list: what was sent before and is no longer listed goes,
+while what was never sent (untracked and ignored build output such as `target/`, `ui/dist` and
+`node_modules`) stays, so builds over there stay incremental (docs/ci.md W24-R24). The list last
+applied is kept beside the copy (`<copy>.kiln-sent`), never in it; a copy without one is made to
+match exactly, once. The command then runs in the copy's folder matching
+where the asker was. Paths are checked (relative, plain, never through a symlink) so a list can't
+write outside the copy.
 
 Measured on this repository (8,100 files, 36 MB, through the relay): first sync 2.5 s, an
 unchanged tree 0.5 s.
@@ -221,6 +225,30 @@ with. Changes to the rules are audited (`reach.keep`, `reach.keep.now`).
 `from`, the runner whose tree it is), `kiln_reach_copies_let_go_total` and
 `kiln_reach_copies_let_go_bytes_total` (by `trigger`). Logs on target `kiln.reach`, event
 `let_go` with the copy, the trigger, its bytes and why.
+
+### 5.2 Reuse
+
+`kiln run --reuse` (the `run` tool's `reuse`) gives back the result of an identical run instead
+of running again (docs/ci.md W24-R24): the same command, in the same folder of the tree, with the
+same `-e` variables, on the same machine, over an identical tree (what sync sends, by content,
+`.git` aside). The asking runner keys the run on the work ledger (`reach/reuse.rs`, a unit of kind
+`run` whose tree is an input) and looks it up before it syncs; a hit replays the recorded output
+and exits 0, saying `[kiln] reused: …`, and nothing is synced or run. Only a success is recorded,
+with its output (up to 16 MiB) in the runner's content store (`<work>/_cas`); a failure always runs
+again. Results are the machine user's own (`person:<user>`), never trusted ones. A run that reads
+input (`-i`), runs in a named shell, is detached, or has no tree (`--no-sync` elsewhere, outside a
+git repository) isn't keyed: it runs, saying why. The runner's cache service opens the first time
+it's asked to reuse.
+
+### 5.3 Objects from peers
+
+An object a runner's cache lacks (docs/ci.md W24-R27) is asked of runners that hold it before the
+server: the server's directory says which (`reach/directory.rs`, from what each runner said it
+holds, by repository, as `holds` and `holders` questions), and the object comes over the reach
+link (`Ask::Object`, `Say::ObjectData`, `Say::ObjectMissing`), a window at a time from the offset
+asked, in pieces of 1 MiB. The holder serves only an object held for the repository asked about,
+from a local file of it beside its cache, put together once. The asker hashes what came before it
+keeps it: a copy that isn't what its digest says is refused, never kept, and the next holder asked.
 
 ## 6. Local socket
 

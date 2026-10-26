@@ -163,6 +163,10 @@ enum Cmd {
     /// The egress relay in a leg's container (docs/ci.md W18-R08); the runner starts it.
     #[command(hide = true)]
     EgressRelay,
+    /// Go's cache on this runner's cache service (docs/ci.md W24-R08): the go command's
+    /// `GOCACHEPROG` helper (`GOCACHEPROG="kiln gocacheprog"`, with `KILN_CACHE_URL` and
+    /// `KILN_CACHE_TOKEN`).
+    Gocacheprog(kiln::runner::work::gocacheprog::Args),
     /// The CI engine's runs: a list, or one with its legs.
     Runs(kiln::ci::cli::RunsArgs),
     /// Any of kiln's operations, as agents have them: `kiln op` lists them, `kiln op <name> …` runs one.
@@ -459,6 +463,17 @@ fn main() -> ExitCode {
         };
     }
     let cli = Cli::parse();
+    // `kiln gocacheprog` answers the go command on stdout (W24-R08): nothing else may write there,
+    // logs included, and it needs no runtime.
+    if let Cmd::Gocacheprog(a) = &cli.cmd {
+        return match kiln::runner::work::gocacheprog::main(a.clone()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("kiln gocacheprog: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // `kiln workflow run` runs a server of its own in this process: its logs are the runs', and
     // the server says only what goes wrong unless asked for more.
     let quiet = matches!(cli.cmd, Cmd::Workflow(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
@@ -876,6 +891,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Runner(a) => boxed(|| kiln::runner::setup::cli(a)).await,
         Cmd::EgressRelay => kiln::runner::egress::relay_main(),
+        Cmd::Gocacheprog(a) => kiln::runner::work::gocacheprog::main(a),
         Cmd::Workflow(a) => {
             // A signal stops the runs; the server and runner this process runs for them stop after.
             let stop = Shutdown::new();

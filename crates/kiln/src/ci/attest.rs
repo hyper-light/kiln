@@ -44,8 +44,9 @@ pub struct Signer {
 }
 
 impl Signer {
-    /// Loads the key under `dir`, or makes it (once, readable by this user alone).
-    fn open(dir: &Path) -> anyhow::Result<Signer> {
+    /// Loads the key under `dir`, or makes it (once, readable by this user alone). The work
+    /// ledger's countersignatures are made with it too (W24-R22).
+    pub(crate) fn open(dir: &Path) -> anyhow::Result<Signer> {
         let path = dir.join("attest-signing.p8");
         let pkcs8 = match std::fs::read(&path) {
             Ok(b) => b,

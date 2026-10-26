@@ -199,6 +199,10 @@ Updates (`t`): `open {info}` (a snapshot follows), `state {state}`, `meta {meta}
 `changes {files}` (the whole changeset), `reply {client, value}` (the answer to one client's
 request), `reset` (the timeline starts over), `synced` (the snapshot is complete), `closed`.
 
+A command on the socket is audited as its caller (`agent.command`), its row written beside the
+socket by a writer of its own, in order: the command goes on to the session without waiting for
+kiln's store, which a busy disk can hold for seconds (a message then showed seconds late).
+
 On a slow link most of what a long conversation sends is its snapshot, and during a turn its
 state changes all the time while most of it (skills, plugins, MCP servers) stays the same. A
 viewer can ask for less of both, in the socket's query:
@@ -1108,6 +1112,18 @@ working: what you send is kept in your browser ("Kept here", editable and remova
 reloads) and goes to the agent in order once it can take it, ahead of anything sent after.
 Files attached go along when they were uploaded; ones that couldn't be (no server) stay with the
 page until it reloads.
+
+### What you sent, at once
+
+A message shows at the end of the conversation the moment it goes, marked *sending…*, then *sent*
+once its machine has it (the socket's `ack`), until the agent's session shows it (its prompt, or
+its place in a queue, the agent's or a subagent's), which then takes its place (`SessionStore`'s
+`outgoing`, `ui/src/api/harness.ts`). While it waits (its machine away, its inbox slow to answer)
+it goes again under its id by itself, as every command does (docs/wire.md, "The UI's sockets"),
+and the line above the composer says why. One refused for good (the socket's `nack`, or no answer
+at all) or whose agent ended before it got there says *failed to send* and why, with Retry and
+Remove. Retry sends its words, files and reply again as a new message: its id's answer stays the
+refusal. These are kept in the page only; CP-T3.4's outbox keeps them across reloads and tabs.
 
 ### A machine on battery
 
