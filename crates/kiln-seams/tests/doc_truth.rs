@@ -220,6 +220,14 @@ fn seams() -> Vec<Seam> {
                 format!("GitHub {} requests an hour, GitLab {}, Bitbucket {}", forge::GITHUB_HOURLY, forge::GITLAB_HOURLY, forge::BITBUCKET_HOURLY),
             ],
         },
+        Seam {
+            title: "Sigstore",
+            file: "sigstore.rs",
+            tr: "Sigstore",
+            more: &[],
+            cases: said(&sigstore::cases::<sigstore::SimSigstoreFixture>()),
+            bounds: vec![format!("{} entries", count(sigstore::SIM_ENTRIES as u64))],
+        },
     ]
 }
 

@@ -535,3 +535,27 @@ Methods: `abilities`, `open`, `change`, `changes`, `update`, `stack`, `stack_add
 - **FORGE-17** a merged change refuses updates, merges, queueing, stacking and drafts: Closed
 - **FORGE-18** bad requests are refused Invalid and change nothing: a branch that isn't there, a change into itself or from a branch with one open, a blank title, a blank or long comment, an empty stack
 - **FORGE-19** unstacking takes a stack's unmerged changes out of it, leaving those queued in place, and dissolves it once none are left; a host that can't refuses Unsupported
+
+## Sigstore
+
+An outside Fulcio and Rekor (docs/ci.md W18-R02, W27-R12). Fulcio certifies a key for whoever an
+identity token names, the key's holder proving it has it by signing the token's subject; Rekor logs
+entries, numbered in the order they come, and gives each back by its number.
+
+- **Implementations:** kiln's client of the Fulcio and Rekor `[ci.attest]` names
+  (`kiln::ci::signing::Remote`: Fulcio's `/api/v2/signingCert`, Rekor's `/api/v1/log/entries`);
+  `kiln_seams::sigstore::SimSigstore`, whose chain is its own (no Sigstore verifier trusts it) and
+  whose log is in memory, 100,000 entries (past it, refused `Full`), each taken a second after the
+  last from the start it's given.
+- **Used by:** kiln's keyless signing (`[ci.attest] signing = "keyless"`, `ci/signing.rs`).
+- **Passed by:** the simulator, every clause. kiln's client hasn't been run against the suite yet:
+  that needs a Fulcio and Rekor of its own to point at (one deployed in kiln's cluster, W18-R02).
+
+Methods: `certify`, `log`, `entry`.
+
+- **SIGSTORE-1** a key with a token it takes is certified: a chain of PEM certificates, the key's first, then what issued it
+- **SIGSTORE-2** a missing token, a key that isn't one or a missing proof is refused Invalid, naming which
+- **SIGSTORE-3** an entry logged is found again at its index, with the same uuid, body and time
+- **SIGSTORE-4** entries are numbered in the order they're logged, and their times never go back
+- **SIGSTORE-5** the same entry logged twice is refused Conflict, naming where it is
+- **SIGSTORE-6** an index never logged is refused NotFound
