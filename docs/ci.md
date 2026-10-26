@@ -7953,6 +7953,20 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   bisection's tries come from R56's planner; a try that can't run gives way to its nearest
   testable neighbour. A bisection's end is a culprit finding (R52) for its lane's verdicts: found
   (`culprit`), `no-culprit` (a flake) or `inconclusive`.
+- **W28-R58 Waiting for a verdict.** `ci.verdict.wait` (`GET
+  /api/ci/repos/:repo/commits/:sha/verdict/wait`) answers once the commit's verdict is final (every
+  lane's direct, covered or culprit; `until: final`, the default) or once it changes at all
+  (`until: any`), or when `timeout_s` (600 at most) runs out: the verdict then, whether it is
+  final, and whether the time ran out, as `deploy.releases.wait` does. Code mode has
+  `kiln.ci.verdict()` and `kiln.ci.verdict.wait()` both, whatever the registry's order.
+- **W28-R59 The pushing agent hears.** When a run of a workflow ends, or a bisection, the lane's
+  verdicts around it are worked out again. Each commit whose verdict changed since it was last kept
+  gets a `ci_verdict` event (§4.2), and the agent that made it (the session its `Kiln-Agent`
+  trailer names) a `verdict.changed` message, queued after its turn as `fix_checks`' messages are:
+  a change of a verdict kept before, or the first answer of a commit the run newly answers.
+  Direct and covered say so in a line, covered as optimistic, not passed; suspect says the failing
+  check, the commit it failed at, its base and how to find the culprit (`ci.runs.bisect` with the
+  test); culprit says why.
 
 **Acceptance criteria**
 
@@ -7974,10 +7988,17 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   End to end, a bisection of one test tries only the commits that change its crate, names the
   culprit, and the culprit's verdict is culprit. *Unit, property and integration tests* (`cargo
   test -p kiln-ci culprit`, `cargo test -p kiln --test verdicts`).
+- **W28-AC54 Agents hear and wait.** End to end, an agent's commit (its `Kiln-Agent` trailer)
+  covered by a later run's pass gets the agent a `verdict.changed` message saying it is covered,
+  and no other commit's; `ci.verdict.wait` answers at once for a final verdict and says the time
+  ran out when nothing changes. `ci.verdict` and `ci.verdict.wait` are §4.1 routes and operations on
+  every surface (`w20_r01_each_operation_is_a_route`). *Integration and unit tests* (`cargo test -p
+  kiln --test verdicts`, `cargo test -p kiln w28_r58`).
 
-**Progress.** R50–R57, AC50, AC52 and AC53 built (2026-10-25) in `kiln_ci::verdict` (its `cargo`
-reader and `culprit` planner), the replayer, `crates/kiln/src/ci/verdict.rs` (`ci.verdict`) and
-`ci/bisect.rs`. Bisections start when asked (`ci.runs.bisect`), not on their own for each new
+**Progress.** R50–R59, AC50 and AC52–AC54 built (2026-10-25) in `kiln_ci::verdict` (its `cargo`
+reader and `culprit` planner), the replayer, `crates/kiln/src/ci/verdict.rs` (`ci.verdict`,
+`ci.verdict.wait`, `ci_verdict`, `verdict.changed`) and `ci/bisect.rs`. An agent is found by its
+commit's `Kiln-Agent` trailer only: by the agent token that pushed it waits for W25's Decision 3. Bisections start when asked (`ci.runs.bisect`), not on their own for each new
 failure: that is automation kiln adds only once declared, and isn't yet. Their tries run at the
 run's priority: `uploads::Ask` has no priority to give them W05-R09's low class. AC51 is not met: P3
 answers 79.3% (77.4%–81.9%) of ci's commits within the hour, against 75.9% before. The late ones
@@ -8090,6 +8111,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/repos/:repo/providers/workflows` | `ci.providers.workflows` (each provider's CI files, checked) | runs.read | W23 |
 | GET | `/api/ci/repos/:repo/commits/:sha/checks` | `ci.providers.checks` (every provider's runs of a commit) | runs.read | W23 |
 | GET | `/api/ci/repos/:repo/commits/:sha/verdict?workflow=` | `ci.verdict` (a commit's verdict per unit and test on each lane: direct, covered, suspect, culprit) | runs.read | W28 |
+| GET | `/api/ci/repos/:repo/commits/:sha/verdict/wait?until=&timeout_s=&workflow=` | `ci.verdict.wait` (until the verdict is final, or changes with `until: any`; `timeout_s` at most 600) | runs.read | W28 |
 | GET | `/api/ci/runs/:id/pending` | `ci.runs.pending` (whichever provider's run) | runs.read | W23 |
 | GET · POST | `/api/ci/repos/:repo/pulls[/:n]` · `/:n/{comments,reviews,merge}` | `host.pulls.list`, `.get`, `.comment`, `.review`, `.merge` (GitHub's, GitLab's and Bitbucket's; as the person when they signed in with that host) | diffs.read · diffs.review · diffs.land | W23 |
 | POST | `/api/hooks/gitlab` · `/api/hooks/bitbucket` | GitLab's and Bitbucket's webhooks | open, their secret | W23 |
@@ -8108,8 +8130,9 @@ token model.
 read and coalesced per object at most every 250 ms: `ci_run`, `ci_leg` (status, wait reason,
 progress), `ci_step`, `ci_annotation`, `ci_artifact`, `ci_runner` (facts, health), `ci_pool`,
 `ci_routing` (rules changed), `diff`, `diff_version`, `review`, `comment`, `queue`, `deployment`,
-`environment`, `incident`, `experiment`, `notification`. Today's `run`, `job`, `agent`, `sample`,
-`queue` messages stay.
+`environment`, `incident`, `experiment`, `notification`, `ci_verdict` (a commit's verdict on a lane
+changed: `repo`, `workflow`, `branch`, `sha`, `kind`, `why`, the verdict; W28-R59). Today's `run`,
+`job`, `agent`, `sample`, `queue` messages stay.
 
 ### 4.3 CLI
 

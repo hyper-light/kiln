@@ -860,6 +860,13 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"repo": {"type": "string", "description": REPO}, "sha": {"type": "string"}, "workflow": {"type": "string", "description": "Only this workflow's lane."}}), &["repo", "sha"]),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "commits", &text(v, "sha")?, "verdict"]), query(v, &["workflow"]))),
                 run: |cx: Cx, v: Value| async move { super::verdict::of_commit(&cx.hub, &text(&v, "repo")?, &text(&v, "sha")?, &query(&v, &["workflow"])).await }),
+            op!("ci.verdict.wait", "Wait for a commit's verdict to be final (`until: final`, the default: every lane direct, covered or culprit) or to change at all (`until: any`), for at most `timeout_s` seconds (600 at most): the verdict then (as ci.verdict gives it), whether it is final, and whether the time ran out (W28-R58).", ro: true, destructive: false,
+                input: || schema(json!({
+                    "repo": {"type": "string", "description": REPO}, "sha": {"type": "string"}, "workflow": {"type": "string", "description": "Only this workflow's lane."},
+                    "until": {"type": "string", "enum": ["final", "any"]}, "timeout_s": {"type": "integer", "minimum": 1, "maximum": 600}
+                }), &["repo", "sha"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "commits", &text(v, "sha")?, "verdict", "wait"]), query(v, &["workflow", "until", "timeout_s"]))),
+                run: |cx: Cx, v: Value| async move { super::verdict::wait(&cx.hub, &text(&v, "repo")?, &text(&v, "sha")?, &query(&v, &["workflow", "until", "timeout_s"])).await }),
             op!("host.pulls.list", "A repository's open pull requests (merge requests) on its host, GitHub, GitLab or Bitbucket: as you, when you signed in with that host.", ro: true, destructive: false,
                 input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "pulls"]), HashMap::new())),

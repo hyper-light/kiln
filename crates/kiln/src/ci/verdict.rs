@@ -5,10 +5,12 @@
 //! quarantine as failures that don't count. `kiln_ci::verdict` decides; this only reads.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use http::StatusCode;
 use kiln_ci::land::conflict::Units;
-use kiln_ci::verdict::{Affects, Book, Check, Commit, Finding, Found, How, Outcome, Seen};
+use kiln_ci::verdict::{Affects, Book, Check, Commit, Finding, Found, How, Kind, Outcome, Seen, Verdict};
 use serde_json::{Value, json};
 
 use super::Fail;
@@ -60,7 +62,32 @@ pub async fn of_commit(hub: &Hub, repo_key: &str, sha: &str, q: &HashMap<String,
 }
 
 /// The commit's verdict on one lane, if the lane's first parents hold it.
-async fn lane(hub: &Hub, (repo_id, repo): (&str, &str), mirror: &str, workflow: &str, branch: &str, sha: &str) -> Result<Option<Value>, Fail> {
+async fn lane(hub: &Hub, repo: (&str, &str), mirror: &str, workflow: &str, branch: &str, sha: &str) -> Result<Option<Value>, Fail> {
+    let Some(l) = lane_book(hub, repo, mirror, workflow, branch, sha).await? else { return Ok(None) };
+    let Some(p) = l.shas.iter().position(|s| s == sha) else { return Ok(None) };
+    Ok(l.book.verdict(p).map(|v| l.named(&v)))
+}
+
+/// A lane as `kiln_ci::verdict` keeps it: its commits by SHA, the places of those with runs, and
+/// its book.
+struct LaneBook {
+    shas: Vec<String>,
+    runs: BTreeSet<usize>,
+    book: Book,
+}
+
+impl LaneBook {
+    /// A verdict as JSON, its commits by SHA.
+    fn named(&self, v: &kiln_ci::verdict::Verdict) -> Value {
+        let mut j = serde_json::to_value(v).unwrap_or(Value::Null);
+        named(&mut j, &self.shas);
+        j
+    }
+}
+
+/// The lane of `workflow` on `branch`, from its tip back to `sha` and BACK more, if its first
+/// parents hold `sha`.
+async fn lane_book(hub: &Hub, (repo_id, repo): (&str, &str), mirror: &str, workflow: &str, branch: &str, sha: &str) -> Result<Option<LaneBook>, Fail> {
     // The lane's commits: first parents up to the branch's tip, back to the commit and BACK more.
     let (r, w, b) = (repo_id.to_owned(), workflow.to_owned(), branch.to_owned());
     let runs: Vec<RunRow> = hub
@@ -116,12 +143,8 @@ async fn lane(hub: &Hub, (repo_id, repo): (&str, &str), mirror: &str, workflow: 
         };
         book.found(Found { check, suspects, finding, at: b.updated_at });
     }
-    let Some(&p) = place.get(sha) else { return Ok(None) };
-    let mut v = book.verdict(p).and_then(|v| serde_json::to_value(v).ok());
-    if let Some(v) = v.as_mut() {
-        named(v, &shas);
-    }
-    Ok(v)
+    let with_runs: BTreeSet<usize> = runs.iter().filter_map(|r| place.get(r.sha.as_str()).copied()).collect();
+    Ok(Some(LaneBook { shas, runs: with_runs, book }))
 }
 
 /// A verdict as an agent reads it: each commit by its SHA, not its place in the lane.
@@ -246,4 +269,170 @@ async fn marks(hub: &Hub, run: &str, workflow: &str, units: &Units) -> Vec<(Chec
     out.sort();
     out.dedup_by(|a, b| a.0 == b.0);
     out
+}
+
+/// The longest `ci.verdict.wait` waits (W28-R58), as `deploy.releases.wait` does.
+const WAIT_MAX_SECS: u64 = 600;
+/// How many commits before a run's a refresh looks at again for a change (W28-R59).
+const RECENT: usize = 50;
+
+/// Whether every lane's verdict of a `ci.verdict` answer is final: answered (direct, covered or
+/// culprit), not pending or suspect.
+fn is_final(v: &Value) -> bool {
+    let lanes = v.get("lanes").and_then(Value::as_array).cloned().unwrap_or_default();
+    !lanes.is_empty() && lanes.iter().all(|l| matches!(l.pointer("/verdict/kind").and_then(Value::as_str), Some("direct" | "covered" | "culprit")))
+}
+
+/// `GET /api/ci/repos/:repo/commits/:sha/verdict/wait?until=&timeout_s=&workflow=`
+/// (`ci.verdict.wait`, W28-R58): the commit's verdict once it is final (`until: final`, the
+/// default) or once it changes at all (`until: any`), or when `timeout_s` (600 at most) runs out:
+/// the verdict then, whether it is final, and whether the time ran out.
+pub async fn wait(hub: &Hub, repo_key: &str, sha: &str, q: &HashMap<String, String>) -> Result<Value, Fail> {
+    use futures::FutureExt as _;
+    let any = q.get("until").map(String::as_str) == Some("any");
+    let secs = q.get("timeout_s").and_then(|t| t.parse::<u64>().ok()).unwrap_or(WAIT_MAX_SECS).clamp(1, WAIT_MAX_SECS);
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut rx = hub.events.subscribe();
+    let first = of_commit(hub, repo_key, sha, q).await?;
+    let full = first.get("sha").and_then(Value::as_str).unwrap_or(sha).to_owned();
+    let answer = |v: Value, timed_out: bool| json!({ "final": is_final(&v), "timed_out": timed_out, "verdict": v });
+    if !any && is_final(&first) {
+        return Ok(answer(first, false));
+    }
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            let now = of_commit(hub, repo_key, sha, q).await?;
+            return Ok(answer(now, true));
+        }
+        // A verdict of this commit changed, a run ended, or 30 s went by: look again.
+        let nap = left.min(Duration::from_secs(30));
+        let mut heard = false;
+        while !heard {
+            futures::select_biased! {
+                () = hub.shutdown.cancelled().fuse() => return Ok(answer(first, true)),
+                () = crate::rt::sleep(nap).fuse() => break,
+                m = rx.recv().fuse() => match m {
+                    Ok(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                        heard = match v.get("type").and_then(Value::as_str) {
+                            Some("ci_verdict") => v.get("sha").and_then(Value::as_str) == Some(full.as_str()),
+                            Some("run") => ended(&v),
+                            _ => false,
+                        };
+                    }
+                    Err(async_broadcast::RecvError::Overflowed(_)) => heard = true,
+                    Err(async_broadcast::RecvError::Closed) => break,
+                },
+            }
+        }
+        let now = of_commit(hub, repo_key, sha, q).await?;
+        if (any && now != first) || (!any && is_final(&now)) {
+            return Ok(answer(now, false));
+        }
+    }
+}
+
+/// Whether a `run` event says the run ended.
+fn ended(v: &Value) -> bool {
+    matches!(v.pointer("/run/status").and_then(Value::as_str), Some("succeeded" | "failed" | "cancelled" | "skipped" | "timed_out"))
+}
+
+/// Follows CI's runs for as long as the server runs: when one ends, its lane's recent verdicts
+/// are worked out again (W28-R59).
+pub async fn verdict_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
+    let mut rx = hub.events.subscribe();
+    loop {
+        futures::select_biased! {
+            () = hub.shutdown.cancelled().fuse() => return Ok(()),
+            m = rx.recv().fuse() => match m {
+                Ok(text) => {
+                    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    if v.get("type").and_then(Value::as_str) != Some("run") {
+                        continue;
+                    }
+                    let (Some(id), true) = (v.pointer("/run/id").and_then(Value::as_str).map(str::to_owned), ended(&v)) else { continue };
+                    // A workflow's run (v2) that ended: its lane.
+                    let lane: Option<(String, String, String, String)> = hub
+                        .store
+                        .call(move |c| {
+                            use rusqlite::OptionalExtension as _;
+                            Ok(c.query_row("SELECT repo_id, workflow_id, branch, sha FROM runs WHERE id = ?1 AND COALESCE(workflow_id, '') != ''", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?)
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                    if let Some((repo, workflow, branch, sha)) = lane {
+                        refresh(&hub, &repo, &workflow, &branch, &sha).await;
+                    }
+                }
+                Err(async_broadcast::RecvError::Overflowed(_)) => {}
+                Err(async_broadcast::RecvError::Closed) => return Ok(()),
+            },
+        }
+    }
+}
+
+/// Works out the lane's verdicts again around `sha` (W28-R59): each commit whose verdict changed
+/// since it was last kept gets a `ci_verdict` event, and the agent that pushed it a
+/// `verdict.changed` message: a change of a verdict kept before, or the first answer of a commit
+/// the run at `sha` newly answers (one after the lane's last run before it).
+pub async fn refresh(hub: &Hub, repo_key: &str, workflow: &str, branch: &str, sha: &str) {
+    let Ok(repos) = hub.store.repos().await else { return };
+    let Some(repo) = repos.into_iter().find(|r| r.name == repo_key || r.id == repo_key) else { return };
+    let mirror = crate::gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned();
+    let Ok(Some(l)) = lane_book(hub, (&repo.id, &repo.name), &mirror, workflow, branch, sha).await else { return };
+    let Some(at) = l.shas.iter().position(|s| s == sha) else { return };
+    // The commits the run at `sha` newly answers: after the lane's last run before it.
+    let after = l.runs.range(..at).next_back().map_or(0, |p| p + 1);
+    for (c, commit) in l.shas.iter().enumerate().skip(at.saturating_sub(RECENT)) {
+        let Some(v) = l.book.verdict(c) else { continue };
+        let key = format!("ci/verdict/{}/{workflow}/{branch}/{commit}", repo.name);
+        let kept = format!("{:?}: {}", v.kind, v.why);
+        let before = hub.store.kv_get(key.clone()).await.ok().flatten();
+        if before.as_deref() == Some(kept.as_str()) {
+            continue;
+        }
+        if hub.store.kv_set(key, kept).await.is_err() {
+            continue;
+        }
+        let j = l.named(&v);
+        hub.emit(&json!({ "type": "ci_verdict", "repo": repo.name, "workflow": workflow, "branch": branch, "sha": commit, "kind": v.kind, "why": v.why, "verdict": j }));
+        let news = match &before {
+            Some(_) => true,
+            None => (after..=at).contains(&c),
+        };
+        if news && v.kind != Kind::Pending
+            && let Some(agent) = pusher(hub, &mirror, commit).await
+        {
+            crate::workspace::follow::deliver(hub, &agent, message(&repo.name, workflow, branch, commit, &v, &l.shas)).await;
+        }
+    }
+}
+
+/// The agent that made a commit: the session its `Kiln-Agent: <name> (<harness>, <id>)` trailer
+/// names (docs/agents.md).
+async fn pusher(hub: &Hub, mirror: &str, sha: &str) -> Option<String> {
+    let body = git(hub, &["-C", mirror, "log", "-1", "--format=%B", sha]).await?;
+    body.lines().rev().find_map(|l| l.trim().strip_prefix("Kiln-Agent:")).and_then(|v| v.trim().rsplit_once(", ")).map(|(_, id)| id.trim_end_matches(')').trim().to_owned()).filter(|id| !id.is_empty())
+}
+
+/// A `verdict.changed` message (W28-R59): direct and covered in a line; suspect and culprit with
+/// the failing check, its base, the commit that failed and how to look.
+fn message(repo: &str, workflow: &str, branch: &str, sha: &str, v: &Verdict, shas: &[String]) -> String {
+    let short = |s: &str| s.get(..12).unwrap_or(s).to_owned();
+    let at = |p: Option<usize>| p.and_then(|p| shas.get(p)).map_or_else(String::new, |s| short(s));
+    let look = format!("ci.verdict {{\"repo\": \"{repo}\", \"sha\": \"{sha}\"}} shows each check.");
+    let head = format!("verdict.changed: your commit {} on {branch} ({workflow})", short(sha));
+    let bad = v.checks.iter().find(|c| matches!(c.status, kiln_ci::verdict::Status::Suspect | kiln_ci::verdict::Status::Culprit));
+    match (v.kind, bad) {
+        (Kind::Suspect, Some(c)) => format!(
+            "{head} is a suspect: {} newly failed at {} (it passed at {}), and your diff could affect {}. A culprit finding clears or names it: ci.runs.bisect {{\"run\": <that run>, \"test\": \"{}\"}}. {look}",
+            c.check, at(c.by), at(c.base), c.check.unit, c.check.test
+        ),
+        (Kind::Culprit, Some(c)) => format!("{head} is the culprit: {}. Fix it and push again. {look}", c.why),
+        (Kind::Covered, _) => format!("{head} is covered (optimistic, not passed): {}. {look}", v.why),
+        _ => format!("{head} is {}: {}. {look}", serde_json::to_value(v.kind).ok().and_then(|k| k.as_str().map(str::to_owned)).unwrap_or_default(), v.why),
+    }
 }

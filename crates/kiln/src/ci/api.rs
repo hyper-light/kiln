@@ -190,6 +190,7 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::GET, ["repos", repo, "commits", sha, "checks"]) => Ok(ok(&super::providers::checks(hub, repo, sha).await?)),
         // W28-R55: a commit's verdict on each lane it is on, per unit and test.
         (&Method::GET, ["repos", repo, "commits", sha, "verdict"]) => Ok(ok(&super::verdict::of_commit(hub, repo, sha, q).await?)),
+        (&Method::GET, ["repos", repo, "commits", sha, "verdict", "wait"]) => Ok(ok(&super::verdict::wait(hub, repo, sha, q).await?)),
         // W23-R06: the host's pull requests (merge requests).
         (_, ["repos", repo, "pulls", tail @ ..]) => crate::githost::pulls::route(hub, method, repo, tail, body, caller).await,
         // W03-R11: dispatches (another provider's, W23-R01).

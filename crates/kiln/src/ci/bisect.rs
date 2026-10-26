@@ -347,7 +347,12 @@ pub async fn start(hub: &Arc<Hub>, run: &str, body: &Value, by: &str) -> Result<
     hub.store.audit(by.to_owned(), "ci.runs.bisect".into(), format!("{} run #{}: {} between {} and {} ({} commits)", f.repo, f.number, b.job, b.good, b.bad, b.commits.len())).await;
     let answer = b.clone();
     let hub = Arc::clone(hub);
-    crate::rt::spawn(async move { drive(hub, b, f.trusted, marked).await });
+    let (repo, workflow, branch, bad) = (b.repo.clone(), b.workflow.clone(), b.branch.clone(), b.bad.clone());
+    crate::rt::spawn(async move {
+        drive(Arc::clone(&hub), b, f.trusted, marked).await;
+        // W28-R59: its end is a culprit finding: the lane's verdicts again, and the news.
+        super::verdict::refresh(&hub, &repo, &workflow, &branch, &bad).await;
+    });
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "bisect": answer })))
 }
 

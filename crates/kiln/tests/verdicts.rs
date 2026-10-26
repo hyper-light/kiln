@@ -287,3 +287,80 @@ fn w28_r57_a_test_bisection_tries_only_its_units_commits() -> anyhow::Result<()>
     }
     Ok(())
 }
+
+/// W28-R58, R59: the agent that made a commit (its `Kiln-Agent` trailer names it) hears its
+/// commit's verdict when it comes, without watching main; `ci.verdict.wait` answers at once for a
+/// final verdict, and says the time ran out when nothing changes.
+#[test]
+fn w28_r59_the_pushing_agent_hears_its_commits_verdict() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let (_runner, log) = common::agents::runner(dir.path(), s.port, "box", None, common::agents::Talk { lines: 1, every_ms: 10 })?;
+    common::agents::connected(s.port, &s.admin, "box", &log, Duration::from_secs(120))?;
+    let desk = dir.path().join("desk");
+    std::fs::create_dir_all(&desk)?;
+    let heard = desk.join(".fake-claude-messages");
+    std::fs::write(desk.join(".fake-claude-controls"), "")?;
+    std::fs::write(&heard, "")?;
+    let agent = common::agents::open_session(s.port, &s.admin, "box", &desk, Duration::from_secs(90))?;
+
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));
+    std::fs::create_dir_all(&home)?;
+    for d in [".kiln", "crates/p/src", "crates/q/src"] {
+        std::fs::create_dir_all(work.join(d))?;
+    }
+    let commit = |files: &[(&str, &str)], message: &str| -> anyhow::Result<String> {
+        for (f, t) in files {
+            std::fs::write(work.join(f), t)?;
+        }
+        git(&home, &work, &["add", "."])?;
+        git(&home, &work, &["commit", "-qm", message])?;
+        Ok(git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned())
+    };
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    commit(&[("README.md", "app\n")], "first")?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    commit(
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("crates/p/Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\n"),
+            ("crates/p/src/lib.rs", "pub fn p() {}\n"),
+            ("crates/q/Cargo.toml", "[package]\nname = \"q\"\nversion = \"0.1.0\"\n[dependencies]\np = { path = \"../p\" }\n"),
+            ("crates/q/src/lib.rs", "pub fn q() {}\n"),
+            (".kiln/ci.yaml", CI),
+        ],
+        "the workspace",
+    )?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    ended(&s, 1)?;
+
+    // The agent's commit, and one after it whose run covers it.
+    let mine = commit(&[("crates/p/src/a.rs", "mine\n")], &format!("p: a\n\nKiln-Agent: tester (claude, {agent})"))?;
+    let next = commit(&[("README.md", "next\n")], "next")?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    ended(&s, 2)?;
+    let short = mine.get(..12).unwrap_or_default().to_owned();
+    until(&s, 120, "the agent's verdict.changed", || {
+        let got = std::fs::read_to_string(&heard).unwrap_or_default();
+        Ok((!(got.contains("verdict.changed") && got.contains(&short) && got.contains("covered (optimistic, not passed)"))).then_some(got))
+    })?;
+    // Only its own commit is news to it.
+    let got = std::fs::read_to_string(&heard).unwrap_or_default();
+    assert!(!got.contains(next.get(..12).unwrap_or_default()), "{got}");
+
+    // ci.verdict.wait: its commit's verdict is final at once; the next one's, waited on for any
+    // change for a second, doesn't change.
+    let (st, w) = op(&s, "ci.verdict.wait", json!({ "repo": "acme/app", "sha": mine }))?;
+    assert!(st == 200 && w.get("final") == Some(&json!(true)) && w.get("timed_out") == Some(&json!(false)), "{st} {w}");
+    assert_eq!(w.pointer("/verdict/lanes/0/verdict/kind"), Some(&json!("covered")), "{w}");
+    let (st, w) = op(&s, "ci.verdict.wait", json!({ "repo": "acme/app", "sha": next, "until": "any", "timeout_s": 1 }))?;
+    assert!(st == 200 && w.get("timed_out") == Some(&json!(true)), "{st} {w}");
+    Ok(())
+}
