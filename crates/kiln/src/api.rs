@@ -4971,11 +4971,35 @@ async fn send_snapshot(tx: &mut ws::Sender, frames: Vec<String>, packed: bool) -
     Ok(())
 }
 
+/// A socket's audit rows waiting for the store, at most: past that, its next command waits for room
+/// (a row is never dropped).
+const AUDITS_WAITING: usize = 256;
+
+/// Writes an agent session socket's audit rows of its commands (docs/ci.md W19-R05) in the order
+/// they came, beside the socket: a command never waits for the store, whose one connection a busy
+/// disk's checkpoint or another caller's long write holds for seconds. A message once waited so
+/// before it went, and showed seconds late. What's waiting when the socket closes is still written.
+fn audits(store: &crate::store::Store, who: String) -> async_channel::Sender<String> {
+    let (tx, rx) = async_channel::bounded::<String>(AUDITS_WAITING);
+    let store = store.clone();
+    crate::rt::spawn(async move {
+        while let Ok(detail) = rx.recv().await {
+            store.audit(who.clone(), "agent.command".into(), detail).await;
+        }
+    });
+    tx
+}
+
 /// A socket command's row of its own (the socket's request is a GET), as its caller: which command,
-/// not what it says.
-async fn audit_command(hub: &Hub, who: &str, id: &str, c: &crate::harness::model::Command) {
+/// not what it says. It goes to the socket's writer of rows (`audits`, made at its first command),
+/// so the command goes on without waiting for the store; should that writer be gone, it's written
+/// here.
+async fn audit_command(hub: &Hub, audit: &mut Option<async_channel::Sender<String>>, who: &str, id: &str, c: &crate::harness::model::Command) {
     let kind = serde_json::to_value(c).ok().and_then(|v| v.get("type").and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_default();
-    hub.store.audit(who.to_owned(), "agent.command".into(), format!("{id}: {kind}")).await;
+    let writer = audit.get_or_insert_with(|| audits(&hub.store, who.to_owned()));
+    if let Err(async_channel::SendError(row)) = writer.send(format!("{id}: {kind}")).await {
+        hub.store.audit(who.to_owned(), "agent.command".into(), row).await;
+    }
 }
 
 /// What a viewer sent on its socket: a command under the id its client made (`{"t": "cmd", "id",
@@ -5082,6 +5106,8 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     // "Revisions").
     let mut have = att.rev;
     let closed = || ws::text(json!({"t": "closed"}).to_string());
+    // The writer of its commands' audit rows (`audits`), from its first command.
+    let mut audit: Option<async_channel::Sender<String>> = None;
     loop {
         let live = {
             let (bus, topic, from) = (&hub.bus, &topic, at);
@@ -5192,7 +5218,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         let kind = hub.harness.kind_of(&hub, &id, &c);
                         match hub.harness.asked.take(&id, &scope, &cmd, kind, Instant::now()) {
                             (kind, Taken::New(rx)) => {
-                                audit_command(&hub, &who, &id, &c).await;
+                                audit_command(&hub, &mut audit, &who, &id, &c).await;
                                 hub.harness.send_asked(&hub, &id, &scope, &cmd, c).await;
                                 answers.push(answer_of(cmd, rx, kind));
                             }
@@ -5203,7 +5229,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     // As clients from before ids send them: refusals said as errors, nothing for
                     // the rest.
                     Ok(FromViewer::Bare(c)) => {
-                        audit_command(&hub, &who, &id, &c).await;
+                        audit_command(&hub, &mut audit, &who, &id, &c).await;
                         let pending = hub.harness.dispatch(&hub, &id, c.clone()).await;
                         let (h, session) = (Arc::clone(&hub), id.clone());
                         answers.push(async move { refusal_frame(h.harness.resolve(&h, &session, c, pending).await) }.boxed());
@@ -5359,6 +5385,69 @@ mod tests {
         want.push(SYNCED);
         assert_eq!(lines, want);
         Ok(())
+    }
+
+    /// A command on a session's socket doesn't wait for the store: with the store's one connection
+    /// held (a checkpoint on a busy disk, another caller's long write), each one's audit row is
+    /// taken at once and the command goes on, where it once waited for the row to be written first
+    /// and a message showed seconds late; and the rows are all written, in order, once the store is
+    /// free, the socket having let go of its writer meanwhile.
+    #[test]
+    fn a_command_on_the_socket_goes_without_waiting_for_the_store() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use std::time::{Duration, Instant};
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let (held, holding) = async_channel::bounded::<()>(1);
+            let busy = hub.store.clone();
+            let hold = crate::rt::spawn(async move {
+                busy.call(move |_| {
+                    let _ = held.send_blocking(());
+                    std::thread::sleep(Duration::from_millis(1500));
+                    Ok(())
+                })
+                .await
+            });
+            holding.recv().await?;
+            // A row written in line, beside the commands: it waits for the store.
+            let store = hub.store.clone();
+            let in_line = crate::rt::spawn(async move {
+                let at = Instant::now();
+                store.audit("user:dev1".into(), "probe".into(), "in line".into()).await;
+                at.elapsed()
+            });
+            let mut audit = None;
+            let going = Instant::now();
+            for n in 1..=3 {
+                let send: crate::harness::model::Command = serde_json::from_value(json!({"type": "send", "id": format!("m{n}"), "text": "go"}))?;
+                audit_command(&hub, &mut audit, "user:dev1", &format!("gone-{n}"), &send).await;
+            }
+            let went = going.elapsed();
+            drop(audit);
+            let waited = in_line.await.map_err(|_| anyhow::anyhow!("the row in line was never written"))?;
+            anyhow::ensure!(waited >= Duration::from_millis(500), "the store wasn't busy: a row in line waited {waited:?}");
+            anyhow::ensure!(went * 4 < waited, "the commands waited for the store: {went:?} for three, {waited:?} for a row in line");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let rows = loop {
+                let all = crate::audit::list(&hub.store, &HashMap::new()).await?;
+                let mut rows: Vec<(String, String)> = all
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|r| r.get("action").and_then(serde_json::Value::as_str) == Some("agent.command"))
+                    .map(|r| (r.get("principal").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), r.get("detail").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned()))
+                    .collect();
+                // Newest first: in the order they were written.
+                rows.reverse();
+                if rows.len() >= 3 || Instant::now() > deadline {
+                    break rows;
+                }
+                crate::rt::sleep(Duration::from_millis(50)).await;
+            };
+            let want: Vec<(String, String)> = (1..=3).map(|n| ("user:dev1".to_owned(), format!("gone-{n}: send"))).collect();
+            anyhow::ensure!(rows == want, "{rows:?}");
+            let _ = hold.await;
+            Ok(())
+        })
     }
 
     #[test]
