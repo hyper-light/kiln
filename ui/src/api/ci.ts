@@ -943,6 +943,8 @@ export function waitSentence(w: unknown): string | null {
     reservation?: string;
     avoided?: string;
     refused?: boolean;
+    leg?: string;
+    run?: string;
     lane?: string;
     deadline?: number;
     next?: number;
@@ -979,6 +981,8 @@ export function waitSentence(w: unknown): string | null {
       return `Its runners are reserved${o.reservation ? ` (${o.reservation})` : ""} until ${o.until ? new Date(o.until).toLocaleTimeString() : "the reservation ends"}.`;
     case "retry":
       return `Retrying at ${o.at ? new Date(o.at * 1000).toLocaleTimeString() : "a moment"}.`;
+    case "adopted":
+      return `Adopted ${o.leg ?? "an execution"}${o.run ? ` of run ${o.run}` : ""}: the same work in flight, which it finishes reused from.`;
     case "approval":
       return `Waiting for a review to deploy to ${o.environment ?? "its environment"}${o.reviewers?.length ? ` (${o.reviewers.join(", ")})` : ""}${o.until ? `, and until ${new Date(o.until * 1000).toLocaleTimeString()}` : ""}.`;
     case "wait-timer":
