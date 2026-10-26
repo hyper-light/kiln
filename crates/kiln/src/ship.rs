@@ -827,6 +827,37 @@ mod tests {
         })
     }
 
+    /// A change shows within 250 ms: the model is fresh for FRESH_MS, and the first read after
+    /// brings in just what the triggers noted.
+    #[test]
+    fn ship_a_change_shows_within_250ms() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let cache = ShipCache::new();
+            let now = NOW_S * 1000;
+            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let stand = |cache: &ShipCache| -> Option<String> {
+                let page: Value = serde_json::from_str(&cache.page(None, None, i64::MAX, 10).ok()?).ok()?;
+                page.get("commits")?.as_array()?.iter().find(|c| c.get("short").and_then(Value::as_str) == Some("2222222"))?.get("stand")?.as_str().map(str::to_string)
+            };
+            assert_eq!(stand(&cache).as_deref(), Some("needs_you"));
+            // A person approves 2222222's production release.
+            store.call(|c| Ok(c.execute("UPDATE deploy_releases SET state = 'committing' WHERE id = 1", []).map(|_| ())?)).await?;
+            assert!(!cache.stale(now + FRESH_MS - 1));
+            assert!(cache.stale(now + FRESH_MS));
+            let t = std::time::Instant::now();
+            cache.refresh(&store, &runners(), now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let took = t.elapsed();
+            println!("ship: a change brought in in {took:?}");
+            assert_eq!(stand(&cache).as_deref(), Some("in_staging"));
+            assert!(took.as_millis() < 250, "bringing a change in took {took:?}");
+            Ok(())
+        })
+    }
+
     /// Plan step 5's measure: 10,000 runs (2,500 commits of 4 runs, 2 legs each), the model built,
     /// then pages of 1,000 and 100 commits and one commit's detail read from memory. Run in release:
     /// `cargo test --release -p kiln --lib ship_bench -- --ignored --nocapture`.
