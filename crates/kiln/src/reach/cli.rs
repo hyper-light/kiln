@@ -125,11 +125,19 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
     let path = super::local::find_socket()?;
     let here = std::env::current_dir()?;
     let sync = if a.no_sync { false } else { a.sync || in_git_repo(&here) };
-    let env = a
+    let mut env = a
         .env
         .iter()
         .map(|kv| kv.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())).ok_or_else(|| anyhow::anyhow!("--env takes KEY=VALUE, not {kv:?}")))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    // Run by an agent kiln started (its processes carry `KILN_AGENT`): the copy of the tree over
+    // there is that agent's, for the rules that keep copies (docs/reach.md §5.1).
+    if sync
+        && !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV)
+        && let Some(agent) = std::env::var("KILN_AGENT").ok().filter(|a| !a.trim().is_empty())
+    {
+        env.push((super::keeper::AGENT_ENV.to_owned(), agent));
+    }
     let req = RunReq {
         target: a.on.clone(),
         command: a.command.join(" "),

@@ -558,6 +558,17 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let want = srv::query(&req).get("want").cloned();
             reach_runners(&hub, want.as_deref())
         }
+        // The copies of runners' trees other runners keep (docs/reach.md §5.1): the rules for them,
+        // what each runner holds and let go, and asking runners to let go now.
+        (&Method::GET, ["api", "reach", "keep"]) => Ok(srv::json(StatusCode::OK, &boxed(|| hub.copies.view(&hub)).await)),
+        (m @ (&Method::PUT | &Method::DELETE), ["api", "reach", "keep", "rules"]) => boxed(|| keep_rules(&hub, &caller, crate::reach::copies::Whose::System, *m == Method::PUT, req)).await,
+        (m @ (&Method::PUT | &Method::DELETE), ["api", "reach", "keep", "runners", name]) => boxed(|| keep_rules(&hub, &caller, crate::reach::copies::Whose::Runner(name), *m == Method::PUT, req)).await,
+        (m @ (&Method::PUT | &Method::DELETE), ["api", "reach", "keep", "repos", key @ ..]) if !key.is_empty() => {
+            let key = key.join("/");
+            boxed(|| keep_rules(&hub, &caller, crate::reach::copies::Whose::Repo(&key), *m == Method::PUT, req)).await
+        }
+        (&Method::POST, ["api", "reach", "keep", "now"]) => boxed(|| keep_now(&hub, &caller, None)).await,
+        (&Method::POST, ["api", "reach", "keep", "runners", name, "now"]) => boxed(|| keep_now(&hub, &caller, Some(name))).await,
         (&Method::GET, ["api", "agents", "join"]) => Ok(join_info(&hub)),
         (&Method::POST, ["api", "outposts", "invite"]) => Ok(outpost_invite(&hub)),
         (&Method::GET, ["api", "discovery"]) => Ok(boxed(|| discovery(&hub)).await),
@@ -830,6 +841,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let id = (*id).to_owned();
             if boxed(|| hub.harness.close(&hub, &id)).await {
                 let _ = boxed(|| crate::goals::forget(&hub, &id)).await;
+                boxed(|| hub.copies.forget_agent(&hub, &id)).await;
                 boxed(|| hub.store.audit("admin".into(), "agent.close".into(), id)).await;
                 Ok(srv::status(StatusCode::NO_CONTENT))
             } else {
@@ -855,6 +867,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let id = (*id).to_owned();
             boxed(|| harness_command(&hub, &id, req)).await
         }
+        // Its copies on other runners, and its own rules for them (docs/reach.md §5.1).
+        (&Method::GET, ["api", "harness", "sessions", id, "keep"]) => Ok(srv::json(StatusCode::OK, &boxed(|| hub.copies.agent(&hub, id)).await)),
+        (m @ (&Method::PUT | &Method::DELETE), ["api", "harness", "sessions", id, "keep"]) => boxed(|| keep_rules(&hub, &caller, crate::reach::copies::Whose::Agent(id), *m == Method::PUT, req)).await,
         (&Method::POST, ["api", "harness", "command"]) => boxed(|| harness_command_many(&hub, req)).await,
         (&Method::POST, ["api", "harness", "files"]) => boxed(|| harness_upload(&hub, &q, req)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
@@ -3589,6 +3604,35 @@ async fn upgrade_runner(hub: &Arc<Hub>, name: &str, req: Request) -> R {
         Ok(job) => Ok(srv::json(StatusCode::ACCEPTED, &job)),
         Err(e) => Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
     }
+}
+
+/// `PUT` (the body's rules) or `DELETE` (none: the scope above's apply) the rules for the copies of
+/// runners' trees other runners keep, `whose` (docs/reach.md §5.1). Runners have them within
+/// 20 seconds.
+async fn keep_rules(hub: &Arc<Hub>, caller: &crate::authz::Caller, whose: crate::reach::copies::Whose<'_>, put: bool, req: Request) -> R {
+    let rules = if put {
+        let bytes = srv::body_bytes(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        Some(crate::reach::copies::rules_of(&bytes).map_err(|e| err(StatusCode::BAD_REQUEST, e))?)
+    } else {
+        None
+    };
+    let said = rules.as_ref().filter(|r| !r.is_empty()).map_or_else(|| "as the scope above says".to_owned(), |r| serde_json::to_string(r).unwrap_or_default());
+    hub.copies.set(hub, whose, rules).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit(caller.name.clone(), "reach.keep".into(), format!("{}: {said}", whose.said())).await;
+    hub.emit(&json!({ "type": "keep" }));
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `POST /api/reach/keep/now`, `POST /api/reach/keep/runners/{name}/now`: that runner (or every
+/// one) lets go now of what its rules don't keep, within 20 seconds.
+async fn keep_now(hub: &Arc<Hub>, caller: &crate::authz::Caller, runner: Option<&str>) -> R {
+    let asked = hub.copies.ask(hub, runner);
+    if asked.is_empty() {
+        return Err(err(StatusCode::NOT_FOUND, runner.map_or_else(|| "no runner to ask".to_owned(), |r| format!("no runner {r}"))));
+    }
+    hub.store.audit(caller.name.clone(), "reach.keep.now".into(), format!("let go now of what the rules don't keep on {}", asked.join(", "))).await;
+    hub.emit(&json!({ "type": "keep" }));
+    Ok(srv::json(StatusCode::ACCEPTED, &json!({ "asked": asked })))
 }
 
 #[derive(Deserialize)]

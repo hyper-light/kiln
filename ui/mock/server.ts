@@ -25,6 +25,7 @@ import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
+import { handleKeep } from "./keep.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
@@ -1438,6 +1439,8 @@ const server = http.createServer(async (req, res) => {
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body })) return;
+    // ---- copies runners keep of other runners' trees (docs/reach.md §5.1) ----
+    if (await handleKeep(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 

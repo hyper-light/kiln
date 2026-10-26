@@ -184,6 +184,7 @@ counted.
 | WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands go on it too, each under an id and answered `ack` or `nack` (docs/wire.md, "The UI's sockets") |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
+| GET / PUT / DELETE | `/api/harness/sessions/:id/keep` | its copies on other runners (each with what the rules say of it) and its own rules for them (docs/reach.md §5.1); DELETE: its repository's and runner's apply |
 | POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear,restore}` | run, pause, skip the goal under way, empty its goal stack, or bring back the goals cleared last |
 | POST | `/api/harness/sessions/:id/terminals` | `{what: "shell" \| "screen", command?, cols?, rows?}`: open one beside it → 201 `{terminal, what, command?, to_type?}`; see below |
 | GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Devin, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it), `takeover`, `fork` (a copy can be continued) and `managed_by?` (the agent session already continuing that conversation) |
