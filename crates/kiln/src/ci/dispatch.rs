@@ -267,6 +267,46 @@ fn keep_minutes(debug: Option<&kiln_ci::wf::ir::YVal>) -> Option<u32> {
     Some(u32::try_from(minutes.min(u64::from(crate::runner::kept::MAX_KEEP_MINUTES))).unwrap_or(crate::runner::kept::MAX_KEEP_MINUTES))
 }
 
+/// What a run is for and whose it is (W28-R64, R67): its intent class and its actor, each with why.
+#[derive(Debug, Clone, Default)]
+struct Who {
+    intent: Option<(kiln_ci::sched::intent::Intent, String)>,
+    actor: Option<kiln_ci::sched::actor::Actor>,
+}
+
+/// What a run is for and whose it is, from its event and kiln's records (W28-R64, R67): read only
+/// when the scheduler orders by intent or shares by actor.
+async fn who_of(hub: &Hub, st: &RunSt) -> Who {
+    use kiln_ci::sched::{actor, intent};
+    let s = &hub.cfg.ci.scheduler;
+    if !s.by_intent() && !s.fair_levels().contains(&kiln_ci::sched::FairBy::Actor) {
+        return Who::default();
+    }
+    // Agents' change requests (crate::workspace::change): who pushed which commit last, and who
+    // waits on its checks.
+    let changes: Vec<crate::workspace::change::Record> =
+        hub.store.kv_prefix("agents/change/".into()).await.unwrap_or_default().iter().filter_map(|(_, v)| serde_json::from_str(v).ok()).collect();
+    let sha = st.event.sha.as_str();
+    let mine = |c: &&crate::workspace::change::Record| !sha.is_empty() && c.sha.eq_ignore_ascii_case(sha);
+    let waiting = changes.iter().filter(mine).find(|c| c.fix_checks || c.stack.is_some()).map(|c| {
+        let name = c.change.clone().unwrap_or_else(|| "its change request".into());
+        if c.stack.is_some() { format!("a plan run's step waits on it ({name})") } else { format!("agent {} waits on its verdict to fix its checks ({name})", c.agent) }
+    });
+    let default_branch = st.repo.default_branch.clone().unwrap_or_else(|| "main".into());
+    let server = crate::api::COMMIT;
+    let facts = intent::Facts {
+        event: &st.event.name,
+        branch: st.event.ref_name(),
+        default_branch: &default_branch,
+        deploys: false,
+        server_commit: !server.is_empty() && !sha.is_empty() && sha.eq_ignore_ascii_case(server),
+        waiting: waiting.as_deref(),
+    };
+    let message = st.event.payload.pointer("/head_commit/message").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let refs: Vec<actor::Change> = changes.iter().map(|c| actor::Change { agent: &c.agent, sha: &c.sha, change: c.change.as_deref() }).collect();
+    Who { intent: Some(intent::classify(&facts)), actor: Some(actor::attribute(&actor::Push { sha, pusher: &st.event.actor, message }, &refs)) }
+}
+
 /// What the scheduler gets of a leg: its route, priority, concurrency group and retries.
 fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::ci::Ci) -> LegIn {
     let job = spec.def();
@@ -284,12 +324,34 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
     }
     let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
     let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
+    // The workflow's `coalesce:` and `cadence:` (W28-R60): its lane is the repository's workflow on
+    // this branch, the leg's unit its job and matrix, its place the run's number.
+    let admission = r.plan.admission.any().then(|| {
+        let a = r.plan.admission.millis();
+        kiln_ci::sched::admit::Demand {
+            lane: format!("{}\0{}\0{}", r.repo.id, r.path, r.event.ref_name()),
+            unit: spec.key.clone(),
+            order: r.github.get("run_number").and_then(serde_json::Value::as_u64).unwrap_or_else(|| u64::try_from(r.created).unwrap_or_default()),
+            coalesce: a.coalesce,
+            cadence: a.cadence,
+            speculative: false,
+        }
+    });
+    // Priority by intent (W28-R64), opt-in: a job that deploys is a gate; the rest as its run is.
+    let intent = cfg.scheduler.by_intent().then(|| match spec.environment.as_ref().filter(|e| !e.name.is_empty()) {
+        Some(e) => (kiln_ci::sched::intent::Intent::Gate, format!("it deploys to {}", e.name)),
+        None => r.who.intent.clone().unwrap_or((kiln_ci::sched::intent::Intent::Trunk, "its run wasn't classified".into())),
+    });
     LegIn {
         id: id.to_owned(),
         run: run.to_owned(),
         repo: r.repo.name.clone(),
+        admission,
+        actor: r.who.actor.as_ref().map(|a| a.id.clone()).unwrap_or_default(),
+        lane: format!("{}\0{}\0{}", r.repo.id, r.path, r.event.ref_name()),
+        priority: intent.as_ref().map_or_else(|| priority(&r.event.name), |(i, _)| i.priority()),
+        intent,
         route,
-        priority: priority(&r.event.name),
         exclusive: job.is_some_and(|j| j.kiln.exclusive),
         group,
         retry,
@@ -314,6 +376,7 @@ fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config 
         overcommit_cpu: s.overcommit.cpu,
         overcommit_mem: s.overcommit.memory,
         overcommit_disk: s.overcommit.disk,
+        fair_by: s.fair_levels(),
         ..Config::default()
     }
 }
@@ -481,6 +544,8 @@ struct RunSt {
     /// An outside contributor's run waiting for a maintainer (W18-R06): the concurrency group
     /// it joins once approved.
     awaiting: Option<Awaiting>,
+    /// What it's for and whose it is (W28-R64, R67), when the scheduler orders by them.
+    who: Who,
     /// "Run anyway" (W08-R10): its legs take no earlier result over.
     no_reuse: bool,
 }
@@ -856,7 +921,7 @@ impl Dispatch {
                 r.map(|_| ())
             }
             Msg::Explain { leg, reply } => {
-                let v = serde_json::json!({ "leg": leg, "known": self.legs.contains_key(&leg), "wait_reason": self.sched.reason(&leg), "runners": self.sched.explain(&leg) });
+                let v = serde_json::json!({ "leg": leg, "known": self.legs.contains_key(&leg), "wait_reason": self.sched.reason(&leg), "standing": self.sched.standing(&leg), "runners": self.sched.explain(&leg) });
                 let _ = reply.try_send(v);
                 Ok(())
             }
@@ -1136,7 +1201,8 @@ impl Dispatch {
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let costs = super::insights::costs(&self.hub, &s.repo.id, &s.path).await;
-        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false };
+        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, who: Who::default() };
+        st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         if approval {
             runs::set_approval(&self.hub, &id, "required", None).await?;
@@ -1522,7 +1588,8 @@ impl Dispatch {
         let path = run_path(&github);
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
         // A maintainer reruns it: that is approval enough, as on GitHub.
-        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse };
+        let mut st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, who: Who::default() };
+        st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
         self.hub.ci.runs.lock().insert(run.to_owned());
@@ -2695,7 +2762,8 @@ impl Dispatch {
         } else {
             (None, None)
         };
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false) };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default() };
+        st.who = who_of(&self.hub, &st).await;
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
             st.keys.insert(key.clone(), id.clone());
