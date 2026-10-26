@@ -200,7 +200,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R30, AC01–AC14; milestones M0–M6 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | ready | specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
-| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | ready | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa` |
+| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756` |
 
 ---
 
@@ -8481,6 +8481,38 @@ require a verified chain; a key never leaves the place it was made.
 **Sources.** Research `01a175c54441773fa28bf1488b82e6aa` (SLSA v1.2's source track, gittuf's
 reference state log, fencing, and kiln's own `pki.rs`, `docs/access.md`, W18, W19-R05 and
 `kiln-ci/src/land.rs`); plan `01a175b7d5e1772f8d3c7cb28e50ab2b`.
+
+**Built: identities (R01, R02, R12; AC01, AC02).** Plan `01a17856b1b0712babf8dfd37ce48756`,
+research `01a17947fdad71e5a4f15866e3541c41`.
+
+- *Identities.* A leaf names its actor in one URI subject alternative name whose path is whom it
+  acts for: `kiln://<org>/person/<name>`; `…/person/<name>/agent/<session>/epoch/<n>`;
+  `…/person/<enrolled by>/machine/<machine>/instance/<instance>`; a leg, its runner's then
+  `/run/<number>/attempt/<n>/leg/<key>`, its workflow, repository, commit and run in Fulcio's
+  extensions (1.3.6.1.4.1.57264.1.9, .12, .13, .21); `kiln://<org>/server`; `…/server/cd`. The
+  organization is the CA's. kiln adds no OID of its own.
+- *Checking* is `kiln_ci::identity::chain::verify` (and `verify_signed`): RFC 5280 path validation
+  at the time the caller gives, against the revocations it gives. An agent verifies as the agent
+  for its person, never as the person.
+- *Keys stay put.* Every kind is issued from a CSR only (`Pki::issue_identity`). A runner process
+  makes keys in its own memory for itself, for each agent session it holds at each epoch, and for
+  each leg it runs, and asks for their certificates over its channel (`AgentMsg::Identity`,
+  `ServerMsg::Identity`, `CAP_IDENTITY`; docs/wire.md). A person's key is made by
+  `kiln login --certificate` in their config and certified for 12 hours (`POST /api/me/identity`,
+  a person signed in only). The server's and CD's keys are in `<data>/pki` (0600).
+- *Revocations* are rows with when, why and by whom (migration `w27_identities`):
+  forgetting a runner, a runner process retiring, a session moving to a new epoch (the epochs it
+  left), a session ending, a person disabled, or `POST /api/identities/revoke`. The TLS directory
+  refuses revoked keys from the first handshake after a restart, and re-enrolling a name brings a
+  new key the revocation doesn't touch. `GET /api/identities` lists what kiln issued, each checked
+  now; enrollment records who enrolled each machine.
+- *Seams.* An outside Fulcio and Rekor is reached through `kiln_seams::Sigstore` (docs/seams.md),
+  its simulator passing the suite; `ci/signing.rs`'s client is the real one.
+- *Tests.* `kiln-ci` `w27_r01_*` (each kind; expired, revoked, wrongly issued);
+  `crates/kiln/tests/identities.rs`: `w27_ac01_chains`, `w27_ac02_keys` and one per kind.
+- *Not yet.* An agent's certificate doesn't name the runner instance holding it; kiln's Sigstore
+  client hasn't run the suite against a real Fulcio and Rekor; nothing signs with these identities
+  yet (commits, reviews, CI output, lands and deploys: R03 to R11).
 
 ## 4. API, events, CLI and MCP reference
 

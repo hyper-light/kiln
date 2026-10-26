@@ -352,14 +352,15 @@ fn git(home: &Path, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(out)
 }
 
-/// The leg's steps look for a key in what they can reach (its environment), and find none.
+/// The leg's steps look for a key in what they can reach (its environment), and find none. The
+/// words are split so the workflow's own text (kept in the store) never holds them.
 const LEG: &str = r#"on: push
 jobs:
   e2e:
     runs-on: local
     steps:
       - run: |
-          if env | grep -q "PRIVATE KEY"; then echo "a private key in the environment"; exit 1; fi
+          if env | grep -q "PRIVATE"" KEY"; then echo "a private key in the environment"; exit 1; fi
           sleep 1
           echo "no key here"
 "#;
@@ -440,3 +441,109 @@ fn w27_r01_the_server_and_cd_their_own_identities() -> anyhow::Result<()> {
     assert_eq!(identities(&s, "cd")?.len(), 1);
     Ok(())
 }
+
+/// Every kind of actor on one server: the server and CD, its own runner (which runs a leg), a
+/// runner beside it holding an agent session, and the owner certified from the CLI. The leg's
+/// workflow is pushed to a repository of the server's own.
+fn everything(dir: &Path) -> anyhow::Result<(Server, Vec<agents::Runner>)> {
+    let s = start(dir, &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+    let (runner, log) = agents::runner(dir, s.port, "box-a", None, TALK)?;
+    agents::connected(s.port, &s.admin, "box-a", &log, Duration::from_secs(60))?;
+    let cwd = dir.join("work-here");
+    std::fs::create_dir_all(&cwd)?;
+    agents::open_session(s.port, &s.admin, "box-a", &cwd, Duration::from_secs(60))?;
+    let out = common::kiln()
+        .args(["login", "--certificate", "--url", &format!("http://127.0.0.1:{}", s.port), "--token", &s.admin])
+        .env("XDG_CONFIG_HOME", dir.join("owner-config"))
+        .env("HOME", dir.join("home"))
+        .output()?;
+    anyhow::ensure!(out.status.success(), "kiln login --certificate: {}", String::from_utf8_lossy(&out.stderr));
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.join("githome"), dir.join("tree"));
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    std::fs::write(work.join("README.md"), "an app\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while http(s.port, "GET", "/api/repos", &s.admin, None)?.1.contains("\"last_polled_at\":null") {
+        anyhow::ensure!(Instant::now() < deadline, "never polled");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::fs::write(work.join(".kiln/e2e.yaml"), LEG)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "the workflow"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    for kind in ["server", "cd", "runner", "agent", "person", "leg"] {
+        until_identities(&s, kind, Duration::from_secs(120), |l| l.iter().any(|i| !field(i, "verified").is_empty()))?;
+    }
+    Ok((s, vec![runner]))
+}
+
+/// W27-AC01: each kind of actor's certificate verifies to kiln's root and names whom it acts for;
+/// a revoked identity's certificate is refused from the moment of revocation, saying so.
+#[test]
+fn w27_ac01_chains() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (s, _runners) = everything(dir.path())?;
+    let want = [
+        ("server", "kiln server of hyper-light"),
+        ("cd", "CD, for the kiln server of hyper-light"),
+        ("runner", ", enrolled by admin, of hyper-light"),
+        ("agent", ", for admin, of hyper-light"),
+        ("person", "admin of hyper-light"),
+        ("leg", ", enrolled by admin, of hyper-light"),
+    ];
+    for (kind, says) in want {
+        let list = identities(&s, kind)?;
+        let one = list.iter().find(|i| !field(i, "verified").is_empty()).cloned().unwrap_or_default();
+        assert!(field(&one, "verified").ends_with(says) || field(&one, "verified") == says, "{kind}: {one}");
+        // Revoked: refused from then, saying when, why and by whom.
+        let (st, body) = http(s.port, "POST", "/api/identities/revoke", &s.admin, Some(&serde_json::json!({ "serial": field(&one, "serial"), "reason": format!("{kind} key lost") })))?;
+        anyhow::ensure!(st == 200, "{kind}: {st} {body}");
+        let after = identities(&s, kind)?;
+        let gone = after.iter().find(|i| field(i, "serial") == field(&one, "serial")).cloned().unwrap_or_default();
+        assert!(field(&gone, "refused").contains(&format!("{kind} key lost, by admin")), "{kind}: {gone}");
+    }
+    Ok(())
+}
+
+/// W27-AC02: no private key crosses the network. Every private key on disk is where it was made
+/// and belongs: the CA's and the server's own in its data, each machine's in its state, the
+/// person's in their config; none in the store, a log, or beside any identity's certificate.
+#[test]
+fn w27_ac02_keys() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (s, runners) = everything(dir.path())?;
+    drop(runners);
+    drop(s);
+    let made_there = |p: &str| {
+        p.ends_with("/data/pki/ca.key")
+            || p.ends_with("/data/pki/server.key")
+            || p.ends_with("-signing.key")
+            || p.ends_with("/agent.key")
+            || p.ends_with("/reach/identity.key")
+            || p.ends_with("/owner-config/kiln/identity.key")
+            || p.contains("/data/keys/")
+    };
+    let mut keys = Vec::new();
+    for f in walk(dir.path())? {
+        let name = f.to_string_lossy().into_owned();
+        if name.contains("/githome/") || name.contains("/tree/") || name.contains("/work") {
+            continue;
+        }
+        let bytes = std::fs::read(&f).unwrap_or_default();
+        if String::from_utf8_lossy(&bytes).contains("PRIVATE KEY") {
+            keys.push(name);
+        }
+    }
+    let stray: Vec<&String> = keys.iter().filter(|k| !made_there(k)).collect();
+    assert!(stray.is_empty(), "private keys away from where they were made: {stray:?} (all: {keys:?})");
+    assert!(keys.iter().any(|k| k.ends_with("/owner-config/kiln/identity.key")), "the person's key is on their side: {keys:?}");
+    Ok(())
+}
+
