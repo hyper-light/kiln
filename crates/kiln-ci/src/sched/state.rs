@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::Serialize;
 
+use super::demand::{self, Ask, Demand, Demands, End, Fate, Next, Running, Work};
 use super::groups::{GroupAction, GroupConfig, Groups};
 use super::pools::{self, ExecState, Executor, Pool, PoolView};
 use super::reserve::Reservation;
@@ -49,6 +50,9 @@ pub struct Config {
     pub pools: Vec<Pool>,
     /// Runners and pools kept for matching legs in windows (W05-R12).
     pub reservations: Vec<Reservation>,
+    /// Seconds of work left within which work no live demand wants finishes when live work
+    /// contends for its capacity, if it seeds trusted entries (W28-R43).
+    pub finish_within: i64,
 }
 
 impl Default for Config {
@@ -65,6 +69,7 @@ impl Default for Config {
             quotas: HashMap::new(),
             pools: Vec::new(),
             reservations: Vec::new(),
+            finish_within: demand::FINISH_WITHIN,
         }
     }
 }
@@ -89,6 +94,12 @@ pub struct LegIn {
     /// It has a `container:` or `services:`: on a hosted pool (`k8s`), it runs in an executor
     /// made for it (a pod of that container, those services beside it, W13-R07).
     pub own_executor: bool,
+    /// Its work (W28-R42): the key it adopts or executes by, its domain and its warm lane. A leg
+    /// without stays out of demands.
+    pub work: Option<Work>,
+    /// After a restart: when the attempt its runner still runs started (unix ms), for how long it
+    /// has left (W28-R43).
+    pub started: Option<i64>,
 }
 
 /// A runner that can take legs.
@@ -118,6 +129,8 @@ pub enum Outcome {
 pub enum Supersede {
     Cancel,
     Deprioritize,
+    /// Withdraws their demands instead: their work goes on while a live demand wants it (W28-R40).
+    Adopt,
 }
 
 /// Something that happened.
@@ -127,6 +140,11 @@ pub enum Input {
     /// older runs with the same key (workflow and branch, stack or pull request).
     RunQueued { run: String, group: Option<(String, String, GroupConfig)>, supersede: Option<(String, Supersede)> },
     RunFinished { run: String },
+    /// A run's demand (W28-R40), before its `RunQueued`: that withdraws older demands on its lane
+    /// when its `supersede` adopts. On its own (a rerun's), it is live again and withdraws nothing.
+    Demand(Box<Demand>),
+    /// W24-R04's check of what an ended execution read came back, at an adopter's own commit.
+    Checked { leg: String, matched: bool },
     LegQueued(Box<LegIn>),
     /// After a restart: a leg the runner still runs (W05-R25).
     LegRunning { leg: Box<LegIn>, runner: String, attempt: u32 },
@@ -179,6 +197,31 @@ pub enum WaitReason {
     /// Only `avoided` could take it, and it waits for another: as its retry policy asks
     /// (`runner: different`), or as that one refused it (W05-R16).
     OtherRunner { avoided: String, refused: bool },
+    /// It adopted `leg` of `run`, the same work in flight, and waits for it to end (W28-R42).
+    Adopted { leg: String, run: String },
+}
+
+/// A decision about a leg's work in demands (W28-R45), for its routing and its run's page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Decision {
+    /// What its ask got: it executes, adopts, or (its run withdrawn) is dropped (W28-R42).
+    Asked(Ask),
+    /// What becomes of its execution: kept, dropped, run on, finished or cancelled (W28-R43).
+    Fate(Fate),
+    /// What it does once the execution it adopted ended, or its check came back (W28-R44).
+    Next(Next),
+}
+
+impl Decision {
+    /// Why, in words.
+    pub fn why(&self) -> String {
+        match self {
+            Decision::Asked(a) => a.why(),
+            Decision::Fate(f) => f.why(),
+            Decision::Next(n) => n.why(),
+        }
+    }
 }
 
 /// What to do.
@@ -210,6 +253,10 @@ pub enum Command {
     /// The leg is done for good: the plan hears of it now.
     Settled { leg: String, outcome: Outcome, reason: Option<String> },
     Timer { at: i64 },
+    /// What became of a leg's work in demands, and why (W28-R45).
+    Demand { leg: String, decision: Decision },
+    /// An adopter's execution ended: it's done, reused from `from`, as `from` ended (W28-R44).
+    Adopted { leg: String, from: String, outcome: Outcome },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -219,6 +266,10 @@ enum State {
     Queued,
     Retrying { at: i64 },
     Assigned { runner: String },
+    /// It adopted `exec` (W28-R42): it waits for it, holding no runner, slot or quota.
+    Adopted { exec: String },
+    /// `from` ended as `outcome`, and it checks what `from` read first (W24-R04).
+    Checking { from: String, outcome: Outcome },
     Done,
 }
 
@@ -252,6 +303,8 @@ struct Leg {
     cancelling: Option<String>,
     /// Gone with its repository while it ran: its attempt's end frees its runner, nothing else.
     gone: bool,
+    /// When its attempt started (unix ms), while one runs: how long it has left (W28-R43).
+    started: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +349,10 @@ pub struct Scheduler {
     /// The reservations' windows open now (index, end), and when they're next looked at (W05-R12).
     windows: Vec<(usize, i64)>,
     windows_at: Option<i64>,
+    /// Demands and the work in flight (W28-R40 to R45).
+    demands: Demands,
+    /// Each leg's last decision in demands, said once.
+    decided: HashMap<String, Decision>,
 }
 
 impl Scheduler {
@@ -325,14 +382,30 @@ impl Scheduler {
                         self.group_action(a, now, &mut out);
                     }
                 }
+                self.demands.leave(&run);
+            }
+            Input::Demand(d) => {
+                let _ = self.demands.arrive(*d, false);
+            }
+            Input::Checked { leg, matched } => {
+                let outcome = match self.legs.get(&leg).map(|l| &l.state) {
+                    Some(State::Checking { outcome, .. }) => Some(outcome.clone()),
+                    _ => None,
+                };
+                if let Some(outcome) = outcome
+                    && let Some(next) = self.demands.checked(&leg, matched)
+                {
+                    self.next_for(&leg, next, Some(&outcome), now, &mut out);
+                }
             }
             Input::LegQueued(leg) => self.leg_queued(*leg, now, &mut out),
-            Input::LegRunning { leg, runner, attempt } => self.adopt(*leg, runner, attempt),
+            Input::LegRunning { leg, runner, attempt } => self.adopt(*leg, runner, attempt, now, &mut out),
             Input::LegCancelled { leg, reason } => self.cancel(&leg, reason, now, &mut out),
             Input::LegGone { leg } => self.gone(&leg, now, &mut out),
             Input::AttemptFinished { leg, attempt, outcome } => self.finished(&leg, attempt, outcome, now, &mut out),
             Input::Rejected { leg } => {
                 if let Some(runner) = self.release(&leg) {
+                    self.stopped(&leg);
                     self.discard_used(&leg, &mut out);
                     if let Some(l) = self.legs.get_mut(&leg) {
                         l.avoid = Some((runner.clone(), Off::Refused));
@@ -374,13 +447,18 @@ impl Scheduler {
 
     fn run_queued(&mut self, run: String, group: Option<(String, String, GroupConfig)>, supersede: Option<(String, Supersede)>, now: i64, out: &mut Vec<Command>) {
         if let Some((key, action)) = supersede {
-            let older = self.superseding.entry(key).or_default();
-            let olds: Vec<String> = std::mem::take(older);
-            older.push(run.clone());
-            for o in olds {
-                match action {
-                    Supersede::Cancel => out.push(Command::CancelRun { run: o, reason: "superseded by a newer run".into() }),
-                    Supersede::Deprioritize => self.deprioritize(&o),
+            if action == Supersede::Adopt {
+                self.withdraw(&run, key, now, out);
+            } else {
+                let older = self.superseding.entry(key).or_default();
+                let olds: Vec<String> = std::mem::take(older);
+                older.push(run.clone());
+                for o in olds {
+                    if action == Supersede::Cancel {
+                        out.push(Command::CancelRun { run: o, reason: "superseded by a newer run".into() });
+                    } else {
+                        self.deprioritize(&o);
+                    }
                 }
             }
         }
@@ -488,7 +566,7 @@ impl Scheduler {
         let group = input.group.clone();
         self.legs.insert(
             id.clone(),
-            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, key: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false },
+            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, key: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None },
         );
         match group {
             Some((key, name, cfg)) => {
@@ -506,7 +584,7 @@ impl Scheduler {
         }
     }
 
-    fn adopt(&mut self, input: LegIn, runner: String, attempt: u32) {
+    fn adopt(&mut self, input: LegIn, runner: String, attempt: u32, now: i64, out: &mut Vec<Command>) {
         let id = input.id.clone();
         let req = self.requirement(&input);
         let sig = req.signature();
@@ -516,6 +594,7 @@ impl Scheduler {
         }
         *self.in_progress.entry(input.repo.clone()).or_default() += 1;
         let request = input.request;
+        let (work, run, priority, started) = (input.work.clone(), input.run.clone(), input.priority, input.started);
         self.legs.insert(
             id.clone(),
             Leg {
@@ -532,12 +611,24 @@ impl Scheduler {
                 last_runner: Some(runner.clone()),
                 cancelling: None,
                 gone: false,
+                started,
             },
         );
         // The runner may not have reconnected yet: keep what it runs until it does.
         let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, exclusive: false });
-        r.running.push(id);
+        r.running.push(id.clone());
         add(&mut r.used, &request);
+        // W28-R42: what its runner still runs is the execution of its work. A queued duplicate
+        // asked for before this was announced adopts it instead, with its adopters.
+        let Some(work) = work else { return };
+        if let Running::Took { .. } = self.demands.running(&id, &run, &work, priority, started.unwrap_or(now)) {
+            for a in self.demands.adopters(&id).into_iter().map(str::to_owned).collect::<Vec<_>>() {
+                if self.legs.get(&a).is_some_and(|l| l.state != State::Adopted { exec: id.clone() }) {
+                    self.decide(&a, Decision::Asked(Ask::Adopt { exec: id.clone(), run: run.clone() }), out);
+                    self.adopted(&a, id.clone(), run.clone(), now, out);
+                }
+            }
+        }
     }
 
     fn ensure_sig(&mut self, sig: &str, req: &Requirement) {
@@ -552,12 +643,35 @@ impl Scheduler {
         self.config().weights.get(repo).copied().filter(|w| *w > 0.0).unwrap_or(1.0)
     }
 
-    /// Puts a leg in its signature's queue and tries the runners that could take it.
+    /// Puts a leg in its signature's queue and tries the runners that could take it. A leg with
+    /// work first adopts the execution of its key in flight, if there's one its domain may adopt
+    /// (W28-R42); live work that can't be placed then contends for the capacity of work no one
+    /// wants (W28-R43).
     fn enqueue(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
         let Some(leg) = self.legs.get(id) else { return };
         if leg.state == State::Done {
             return;
         }
+        if let Some(work) = leg.input.work.clone()
+            && !self.demands.is_execution(id)
+        {
+            let (run, priority) = (leg.input.run.clone(), leg.input.priority);
+            let ask = self.demands.ask(id, &run, &work, priority);
+            self.decide(id, Decision::Asked(ask.clone()), out);
+            match ask {
+                Ask::Adopt { exec, run } => return self.adopted(id, exec, run, now, out),
+                Ask::Drop => return self.settle(id, Outcome::Cancelled, Some(Ask::Drop.why()), now, out),
+                Ask::Execute => {}
+            }
+        }
+        self.queue(id, now, out);
+        if self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
+            self.contend(id, now, out);
+        }
+    }
+
+    fn queue(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(leg) = self.legs.get(id) else { return };
         let (repo, cost) = (leg.input.repo.clone(), leg.input.cost.unwrap_or(self.config().default_cost));
         // Start-time fair queuing across repositories (W05-R10).
         let start = self.vtime.max(self.finish.get(&repo).copied().unwrap_or(0.0));
@@ -725,6 +839,9 @@ impl Scheduler {
         l.state = State::Assigned { runner: runner.to_owned() };
         l.reason = None;
         l.last_runner = Some(runner.to_owned());
+        l.started = Some(now);
+        self.demands.started(id, now);
+        let Some(l) = self.legs.get_mut(id) else { return };
         let (attempt, request, exclusive, repo, fair) = (l.attempt, l.input.request, l.input.exclusive, l.input.repo.clone(), l.key.map_or(0, |k| k.1));
         let req = l.req.clone();
         let (image, docker) = (req.image.clone(), req.docker.clone());
@@ -786,6 +903,7 @@ impl Scheduler {
             return;
         }
         let runner = self.release(id);
+        self.stopped(id);
         self.discard_used(id, out);
         // Cancelled while it ran: a failure now (killed, its runner gone) is the cancel's doing.
         if let Some(why) = self.legs.get(id).and_then(|l| l.cancelling.clone()) {
@@ -840,10 +958,191 @@ impl Scheduler {
         // An executor made for it goes with it (a pod still starting for a cancelled leg).
         self.discard_used(id, out);
         let group = self.legs.remove(id).and_then(|l| l.input.group);
-        out.push(Command::Settled { leg: id.to_owned(), outcome, reason });
+        self.decided.remove(id);
+        out.push(Command::Settled { leg: id.to_owned(), outcome: outcome.clone(), reason });
         if let Some((key, _, _)) = group {
             for a in self.groups.leave(&key, &format!("leg:{id}")) {
                 self.group_action(a, now, out);
+            }
+        }
+        self.answer(id, &outcome, now, out);
+    }
+
+    // ------------------------------------------------------------------ demands (W28-R40 to R45)
+
+    /// Its attempt ended: until the next starts, it has no time left to count (W28-R43).
+    fn stopped(&mut self, id: &str) {
+        if let Some(l) = self.legs.get_mut(id) {
+            l.started = None;
+        }
+        self.demands.stopped(id);
+    }
+
+    /// Says a leg's decision in demands, once (W28-R45).
+    fn decide(&mut self, leg: &str, d: Decision, out: &mut Vec<Command>) {
+        if self.decided.get(leg) != Some(&d) {
+            self.decided.insert(leg.to_owned(), d.clone());
+            out.push(Command::Demand { leg: leg.to_owned(), decision: d });
+        }
+    }
+
+    /// `run`'s demand arrives on `lane` and withdraws the older ones there (W28-R40); what answered
+    /// them is decided again (W28-R43).
+    fn withdraw(&mut self, run: &str, lane: String, now: i64, out: &mut Vec<Command>) {
+        let mut d = self.demands.demand(run).cloned().unwrap_or_else(|| Demand { run: run.to_owned(), at: now, ..Demand::default() });
+        d.lane = lane;
+        let withdrawn = self.demands.arrive(d, true);
+        for exec in self.demands.affected(&withdrawn) {
+            self.reconsider(&exec, false, now, out);
+        }
+    }
+
+    /// The seconds an execution is expected to take still: its cost (history, W19) less its
+    /// attempt's time so far; `None` while no attempt of it runs.
+    fn left(&self, id: &str, now: i64) -> Option<i64> {
+        let l = self.legs.get(id)?;
+        let started = l.started?;
+        let cost = l.input.cost.unwrap_or(self.config().default_cost);
+        Some((cost - (now - started) as f64 / 1000.0).round() as i64)
+    }
+
+    /// Decides what becomes of an execution (W28-R43), and carries it out: kept at the highest
+    /// priority its live demands give, dropped, run on, finished, or cancelled through the
+    /// cancelling path.
+    fn reconsider(&mut self, exec: &str, contended: bool, now: i64, out: &mut Vec<Command>) -> Option<Fate> {
+        let left = self.left(exec, now);
+        let fate = self.demands.fate(exec, left, contended, self.config().finish_within)?;
+        self.decide(exec, Decision::Fate(fate.clone()), out);
+        match &fate {
+            Fate::Kept { priority, .. } => self.rekey(exec, *priority),
+            Fate::Drop { .. } => self.cancel(exec, fate.why(), now, out),
+            Fate::Cancel { .. } => {
+                // What's being cancelled is over as far as its work goes: no one adopts it now.
+                for (leg, next) in self.demands.ended(exec, End::Cancelled) {
+                    self.next_for(&leg, next, None, now, out);
+                }
+                self.cancel(exec, fate.why(), now, out);
+            }
+            Fate::Run { .. } | Fate::Finish { .. } => {}
+        }
+        Some(fate)
+    }
+
+    /// A queued execution takes `priority`, the highest its live demands give (W28-R42, R43).
+    fn rekey(&mut self, exec: &str, priority: u8) {
+        if !self.legs.get(exec).is_some_and(|l| l.state == State::Queued && l.input.priority != priority) {
+            return;
+        }
+        self.unqueue(exec);
+        let fair = self.legs.get_mut(exec).map_or(0, |l| {
+            l.input.priority = priority;
+            l.key.map_or(0, |k| k.1)
+        });
+        self.set_key(exec, fair);
+        self.insert_queue(exec);
+    }
+
+    /// `id` adopted `exec` of `run` (W28-R42): it waits for it, holding no runner, slot or quota,
+    /// and `exec` takes its priority if that's higher. Wanted again, `exec` says so.
+    fn adopted(&mut self, id: &str, exec: String, run: String, now: i64, out: &mut Vec<Command>) {
+        self.unqueue(id);
+        if let Some(l) = self.legs.get_mut(id) {
+            l.state = State::Adopted { exec: exec.clone() };
+            l.key = None;
+        }
+        self.set_reason(id, WaitReason::Adopted { leg: exec.clone(), run }, out);
+        if matches!(self.decided.get(&exec), Some(Decision::Fate(Fate::Run { .. } | Fate::Finish { .. }))) {
+            self.reconsider(&exec, false, now, out);
+        } else if let Some(p) = self.demands.priority(&exec) {
+            self.rekey(&exec, p);
+        }
+    }
+
+    /// A leg left (settled, gone): if it executed work, its adopters take its result over or carry
+    /// on without it (W28-R44); if it adopted, its execution may be wanted no more (W28-R43).
+    fn answer(&mut self, id: &str, outcome: &Outcome, now: i64, out: &mut Vec<Command>) {
+        if self.demands.is_execution(id) {
+            let end = match outcome {
+                Outcome::Success => End::Success,
+                Outcome::Failed(f) => End::Failed(f.class),
+                Outcome::Cancelled => End::Cancelled,
+            };
+            for (leg, next) in self.demands.ended(id, end) {
+                self.next_for(&leg, next, Some(outcome), now, out);
+            }
+        } else if let Some(exec) = self.demands.forget(id) {
+            self.reconsider(&exec, false, now, out);
+        }
+    }
+
+    /// What an adopter does once its execution ended (as `outcome`), or its check came back
+    /// (W28-R44).
+    fn next_for(&mut self, leg: &str, next: Next, outcome: Option<&Outcome>, now: i64, out: &mut Vec<Command>) {
+        if !self.legs.contains_key(leg) {
+            return;
+        }
+        self.decide(leg, Decision::Next(next.clone()), out);
+        match next {
+            Next::Reuse { from } => self.reused(leg, from, outcome.cloned().unwrap_or(Outcome::Cancelled), now, out),
+            Next::Check { from } => {
+                if let Some(l) = self.legs.get_mut(leg) {
+                    l.state = State::Checking { from, outcome: outcome.cloned().unwrap_or(Outcome::Cancelled) };
+                }
+            }
+            Next::Execute => {
+                if let Some(l) = self.legs.get_mut(leg) {
+                    l.state = State::Pending;
+                }
+                self.enqueue(leg, now, out);
+            }
+            Next::Adopt { exec, run } => self.adopted(leg, exec, run, now, out),
+            Next::Drop => self.settle(leg, Outcome::Cancelled, Some(Next::Drop.why()), now, out),
+        }
+    }
+
+    /// An adopter takes its execution's result over: it's done, reused from `from`, as `from`
+    /// ended (W28-R44).
+    fn reused(&mut self, id: &str, from: String, outcome: Outcome, now: i64, out: &mut Vec<Command>) {
+        self.discard_used(id, out);
+        let group = self.legs.remove(id).and_then(|l| l.input.group);
+        self.decided.remove(id);
+        out.push(Command::Adopted { leg: id.to_owned(), from, outcome });
+        if let Some((key, _, _)) = group {
+            for a in self.groups.leave(&key, &format!("leg:{id}")) {
+                self.group_action(a, now, out);
+            }
+        }
+    }
+
+    /// Live work that can't be placed contends for the capacity of running work no live demand
+    /// wants (W28-R43): of that on a runner it could use, or in its pool, the one with the most
+    /// time left is cancelled, unless it finishes within finish_within, seeding trusted entries.
+    fn contend(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(l) = self.legs.get(id) else { return };
+        if !self.demands.live(&l.input.run) {
+            return;
+        }
+        let pool = l.req.pool.clone();
+        let eligible = self.sigs.get(&l.sig).map(|s| s.eligible.clone()).unwrap_or_default();
+        let mut unwanted: Vec<(i64, String)> = self
+            .demands
+            .unwanted_running()
+            .into_iter()
+            .filter_map(|x| {
+                let u = self.legs.get(&x)?;
+                let State::Assigned { runner } = &u.state else { return None };
+                let could = match (&pool, &u.req.pool) {
+                    (Some(p), Some(q)) => p == q,
+                    (None, None) => eligible.contains(runner),
+                    _ => false,
+                };
+                (could && u.cancelling.is_none()).then(|| (self.left(&x, now).unwrap_or(i64::MAX), x))
+            })
+            .collect();
+        unwanted.sort_by(|a, b| b.cmp(a));
+        for (_, x) in unwanted {
+            if matches!(self.reconsider(&x, true, now, out), Some(Fate::Cancel { .. })) {
+                return;
             }
         }
     }
@@ -861,15 +1160,18 @@ impl Scheduler {
     }
 
     /// A leg gone with its repository, off its runner and out of the scheduler: nothing settled.
+    /// Its adopters, in other runs, carry on without it (W28-R44).
     fn drop_gone(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
         let runner = self.release(id);
         self.discard_used(id, out);
         let group = self.legs.remove(id).and_then(|l| l.input.group);
+        self.decided.remove(id);
         if let Some((key, _, _)) = group {
             for a in self.groups.leave(&key, &format!("leg:{id}")) {
                 self.group_action(a, now, out);
             }
         }
+        self.answer(id, &Outcome::Cancelled, now, out);
         if let Some(r) = runner {
             self.try_runner(&r, now, out);
         }
@@ -888,7 +1190,8 @@ impl Scheduler {
                 self.unqueue(id);
                 self.settle(id, Outcome::Cancelled, Some(reason), now, out);
             }
-            State::Pending | State::Retrying { .. } => self.settle(id, Outcome::Cancelled, Some(reason), now, out),
+            // An adopter stops waiting: what it adopted may be wanted no more (W28-R43).
+            State::Pending | State::Retrying { .. } | State::Adopted { .. } | State::Checking { .. } => self.settle(id, Outcome::Cancelled, Some(reason), now, out),
             State::Done => {}
         }
     }

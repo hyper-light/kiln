@@ -708,3 +708,216 @@ fn w05_r03_requests_as_written() -> Result<(), String> {
     assert_eq!((pool.request.cpu, pool.request.mem), (0.1, 64 << 20), "a pool's executor asks a tenth of a CPU");
     Ok(())
 }
+
+// ------------------------------------------------------------------ demands (W28-R45, W28-AC41)
+
+use super::demand::{Ask, Demand, Domain, Fate, Next, Work};
+use super::retry::Failed;
+use super::state::Decision;
+
+const LANE: &str = "acme/ci@refs/heads/main";
+
+/// A push's run arrives: its demand, then its `RunQueued`, which withdraws older demands on its
+/// lane (`supersede: { action: adopt }`).
+fn push(s: &mut Scheduler, run: &str, at: i64) -> Vec<Command> {
+    let demand = Demand { run: run.into(), lane: LANE.into(), commit: format!("c-{run}"), domain: Domain::Trusted, at, ..Demand::default() };
+    let mut c = s.handle(Input::Demand(Box::new(demand)), at);
+    c.extend(s.handle(Input::RunQueued { run: run.into(), group: None, supersede: Some((LANE.into(), Supersede::Adopt)) }, at));
+    c
+}
+
+/// `run`'s leg of job `job`, its work's key `key`, expected to take `cost` seconds.
+fn job(run: &str, job: &str, key: &str, cost: f64) -> LegIn {
+    LegIn {
+        id: format!("{run}/{job}"),
+        run: run.into(),
+        repo: "acme/x".into(),
+        route: LegRoute { labels: vec!["k8s".into()], ..LegRoute::default() },
+        priority: 60,
+        cost: Some(cost),
+        work: Some(Work { key: Some(key.into()), domain: Domain::Trusted, lane: format!("acme/x/{job}"), observed: false }),
+        ..LegIn::default()
+    }
+}
+
+fn assigns(c: &[Command]) -> Vec<(String, String)> {
+    c.iter().filter_map(|x| if let Command::Assign { leg, runner, .. } = x { Some((leg.clone(), runner.clone())) } else { None }).collect()
+}
+
+/// A leg's last decision in demands among `c`.
+fn decision(c: &[Command], leg: &str) -> Option<Decision> {
+    c.iter().rev().find_map(|x| match x {
+        Command::Demand { leg: l, decision } if l == leg => Some(decision.clone()),
+        _ => None,
+    })
+}
+
+fn endings(c: &[Command]) -> Vec<Command> {
+    c.iter().filter(|x| matches!(x, Command::Settled { .. } | Command::Adopted { .. })).cloned().collect()
+}
+
+fn adopted(leg: &str, exec: &str, run: &str) -> Command {
+    Command::Wait { leg: leg.into(), reason: WaitReason::Adopted { leg: exec.into(), run: run.into() } }
+}
+
+/// W28-AC41: push A, then push B touching only docs/ while A's rust leg runs. B's rust leg has
+/// A's key and adopts A's execution: one execution, both legs green, A never cancelled.
+#[test]
+fn w28_ac41_a_docs_only_push_adopts_the_rust_leg() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 0);
+    let mut all = push(&mut s, "A", 0);
+    let c = s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 0);
+    assert_eq!(assigns(&c), [("A/rust".to_owned(), "a".to_owned())]);
+    assert_eq!(decision(&c, "A/rust"), Some(Decision::Asked(Ask::Execute)));
+    all.extend(c);
+    // B arrives while it runs: A's demand is withdrawn, and its work runs on.
+    let c = push(&mut s, "B", 60_000);
+    assert_eq!(decision(&c, "A/rust"), Some(Decision::Fate(Fate::Run { by: vec!["B".into()] })));
+    all.extend(c);
+    let c = s.handle(Input::LegQueued(Box::new(job("B", "rust", "K1", 200.0))), 60_000);
+    assert!(c.contains(&adopted("B/rust", "A/rust", "A")), "{c:?}");
+    assert_eq!(decision(&c, "B/rust"), Some(Decision::Asked(Ask::Adopt { exec: "A/rust".into(), run: "A".into() })));
+    assert_eq!(decision(&c, "A/rust"), Some(Decision::Fate(Fate::Kept { priority: 60, by: vec!["B".into()] })), "wanted again");
+    all.extend(c);
+    let c = s.handle(Input::AttemptFinished { leg: "A/rust".into(), attempt: 1, outcome: Outcome::Success }, 200_000);
+    assert_eq!(
+        endings(&c),
+        [Command::Settled { leg: "A/rust".into(), outcome: Outcome::Success, reason: None }, Command::Adopted { leg: "B/rust".into(), from: "A/rust".into(), outcome: Outcome::Success }]
+    );
+    all.extend(c);
+    assert_eq!(assigns(&all).len(), 1, "one execution: {all:?}");
+    assert!(!all.iter().any(|x| matches!(x, Command::Cancel { .. } | Command::CancelRun { .. })), "A is never cancelled");
+}
+
+/// W28-AC41: push B touching crates/ while A's rust leg is 30% done and both slots are busy. B's
+/// ui leg adopts A's (the same key). B's rust leg contends for a slot: A's rust leg, which no live
+/// demand wants, is cancelled for it, saying how long it had left, and B's runs once it stopped.
+#[test]
+fn w28_ac41_a_crates_push_takes_the_unwanted_rust_legs_slot() {
+    let mut s = Scheduler::new(Config { finish_within: 60, ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 0);
+    push(&mut s, "A", 0);
+    let mut c = s.handle(Input::LegQueued(Box::new(job("A", "ui", "U1", 300.0))), 0);
+    c.extend(s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 0));
+    assert_eq!(assigns(&c).len(), 2, "both slots busy");
+    // 60 s into A's rust leg's 200, B arrives.
+    let c = push(&mut s, "B", 60_000);
+    assert_eq!(decision(&c, "A/rust"), Some(Decision::Fate(Fate::Run { by: vec!["B".into()] })));
+    assert_eq!(decision(&c, "A/ui"), Some(Decision::Fate(Fate::Run { by: vec!["B".into()] })));
+    let c = s.handle(Input::LegQueued(Box::new(job("B", "ui", "U1", 300.0))), 60_000);
+    assert!(c.contains(&adopted("B/ui", "A/ui", "A")), "{c:?}");
+    assert_eq!(decision(&c, "A/ui"), Some(Decision::Fate(Fate::Kept { priority: 60, by: vec!["B".into()] })));
+    let c = s.handle(Input::LegQueued(Box::new(job("B", "rust", "K2", 200.0))), 60_000);
+    let cancelled = Fate::Cancel { by: vec!["B".into()], left: Some(140), finish_within: 60, seeds: true, lane: "acme/x/rust".into() };
+    assert_eq!(decision(&c, "A/rust"), Some(Decision::Fate(cancelled.clone())));
+    assert!(c.contains(&Command::Cancel { leg: "A/rust".into(), attempt: 1, reason: cancelled.why() }), "{c:?}");
+    assert!(cancelled.why().contains("no live demand wants it") && cancelled.why().contains("about 140 s left"), "{}", cancelled.why());
+    assert!(assigns(&c).is_empty(), "B's rust leg waits for A's to stop");
+    let c = s.handle(Input::AttemptFinished { leg: "A/rust".into(), attempt: 1, outcome: Outcome::Cancelled }, 61_000);
+    assert_eq!(endings(&c), [Command::Settled { leg: "A/rust".into(), outcome: Outcome::Cancelled, reason: None }]);
+    assert_eq!(assigns(&c), [("B/rust".to_owned(), "a".to_owned())]);
+    let c = s.handle(Input::AttemptFinished { leg: "A/ui".into(), attempt: 1, outcome: Outcome::Success }, 300_000);
+    assert_eq!(endings(&c), [Command::Settled { leg: "A/ui".into(), outcome: Outcome::Success, reason: None }, Command::Adopted { leg: "B/ui".into(), from: "A/ui".into(), outcome: Outcome::Success }]);
+}
+
+/// W28-AC41: contended, work no one wants that is within finish_within of its end and seeds
+/// trusted entries finishes; live work waits for it.
+#[test]
+fn w28_r45_contended_work_near_its_end_finishes() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    push(&mut s, "A", 0);
+    s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 0);
+    push(&mut s, "B", 60_000);
+    let c = s.handle(Input::LegQueued(Box::new(job("B", "rust", "K2", 200.0))), 60_000);
+    assert_eq!(decision(&c, "A/rust"), Some(Decision::Fate(Fate::Finish { by: vec!["B".into()], left: 140, finish_within: 300 })));
+    assert!(!c.iter().any(|x| matches!(x, Command::Cancel { .. })), "{c:?}");
+    let c = s.handle(Input::AttemptFinished { leg: "A/rust".into(), attempt: 1, outcome: Outcome::Success }, 200_000);
+    assert_eq!(assigns(&c), [("B/rust".to_owned(), "a".to_owned())]);
+}
+
+/// W28-AC41: after a restart, B's leg, queued with A's key, is asked for before A's running leg is
+/// announced. It becomes A's adopter, and the work runs once.
+#[test]
+fn w28_ac41_a_restart_ends_with_one_execution() {
+    let mut s = Scheduler::new(Config::default());
+    let c = s.handle(Input::LegQueued(Box::new(job("B", "rust", "K1", 200.0))), 0);
+    assert_eq!(decision(&c, "B/rust"), Some(Decision::Asked(Ask::Execute)));
+    let running = LegIn { started: Some(-30_000), ..job("A", "rust", "K1", 200.0) };
+    let c = s.handle(Input::LegRunning { leg: Box::new(running), runner: "a".into(), attempt: 1 }, 0);
+    assert!(c.contains(&adopted("B/rust", "A/rust", "A")), "{c:?}");
+    let c = s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 1);
+    assert!(assigns(&c).is_empty(), "nothing runs twice: {c:?}");
+    let c = s.handle(Input::AttemptFinished { leg: "A/rust".into(), attempt: 1, outcome: Outcome::Success }, 170_000);
+    assert_eq!(endings(&c), [Command::Settled { leg: "A/rust".into(), outcome: Outcome::Success, reason: None }, Command::Adopted { leg: "B/rust".into(), from: "A/rust".into(), outcome: Outcome::Success }]);
+}
+
+/// W28-R44 through the scheduler: an execution that fails in class `failure` fails its adopter too.
+/// One whose runner is lost twice (its retry too) leaves its adopter to run the work itself.
+#[test]
+fn w28_r45_failures_and_lost_runners() {
+    let failed = |class| Outcome::Failed(Failed { class, exit_code: Some(1), log_hits: Vec::new() });
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 0);
+    s.handle(Input::LegQueued(Box::new(job("B", "rust", "K1", 200.0))), 1);
+    let c = s.handle(Input::AttemptFinished { leg: "A/rust".into(), attempt: 1, outcome: failed(FailureClass::Failure) }, 100_000);
+    assert!(c.contains(&Command::Adopted { leg: "B/rust".into(), from: "A/rust".into(), outcome: failed(FailureClass::Failure) }), "{c:?}");
+
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    assert_eq!(assigns(&s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 0)), [("A/rust".to_owned(), "a".to_owned())]);
+    assert!(s.handle(Input::LegQueued(Box::new(job("B", "rust", "K1", 200.0))), 1).contains(&adopted("B/rust", "A/rust", "A")));
+    // A's runner is lost: its retry runs elsewhere, and B still waits for it.
+    let c = s.handle(Input::RunnerLost { runner: "a".into() }, 10_000);
+    assert!(c.iter().any(|x| matches!(x, Command::Retry { leg, attempt: 2, .. } if leg == "A/rust")), "{c:?}");
+    assert_eq!(assigns(&c), [("A/rust".to_owned(), "b".to_owned())]);
+    assert!(endings(&c).is_empty());
+    // Lost again, A has failed for good, in a way B may not take over: B executes the work.
+    let c = s.handle(Input::RunnerLost { runner: "b".into() }, 20_000);
+    assert!(endings(&c).iter().all(|x| matches!(x, Command::Settled { leg, .. } if leg == "A/rust")) && !endings(&c).is_empty(), "{c:?}");
+    assert_eq!(decision(&c, "B/rust"), Some(Decision::Next(Next::Execute)));
+    let c = s.handle(Input::RunnerUp(Box::new(linux("c", 1))), 30_000);
+    assert_eq!(assigns(&c), [("B/rust".to_owned(), "c".to_owned())]);
+}
+
+/// W28-R45: B's push withdraws A. A's queued rust leg, which no live demand wants, settles
+/// cancelled, saying why; its test leg, which D wants, is kept at the highest priority left (D's 50,
+/// not A's 90), so X's leg at 70 goes first.
+#[test]
+fn w28_r45_withdrawn_queued_work_is_dropped_or_kept_at_the_highest_priority_left() {
+    let mut s = Scheduler::new(Config::default());
+    push(&mut s, "A", 0);
+    s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { priority: 90, ..job("A", "test", "T1", 100.0) })), 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { priority: 70, ..job("X", "lint", "L1", 100.0) })), 0);
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { priority: 50, ..job("D", "test", "T1", 100.0) })), 0);
+    assert!(c.contains(&adopted("D/test", "A/test", "A")), "{c:?}");
+    let c = push(&mut s, "B", 1_000);
+    let dropped = Fate::Drop { by: vec!["B".into()] };
+    assert!(c.contains(&Command::Settled { leg: "A/rust".into(), outcome: Outcome::Cancelled, reason: Some(dropped.why()) }), "{c:?}");
+    assert_eq!(decision(&c, "A/test"), Some(Decision::Fate(Fate::Kept { priority: 50, by: vec!["D".into()] })));
+    let c = s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 2_000);
+    assert_eq!(assigns(&c), [("X/lint".to_owned(), "a".to_owned())]);
+}
+
+/// W28-R45: a withdrawn run's leg queued later only takes what's in flight: with nothing there, it
+/// settles cancelled, saying why. An adopter cancelled with its run stops waiting, and the
+/// execution it adopted is decided again: its own run still wants it, so it's kept.
+#[test]
+fn w28_r45_withdrawn_runs_take_only_what_is_in_flight() {
+    let mut s = Scheduler::new(Config::default());
+    push(&mut s, "A", 0);
+    push(&mut s, "B", 1_000);
+    let c = s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 2_000);
+    assert!(c.contains(&Command::Settled { leg: "A/rust".into(), outcome: Outcome::Cancelled, reason: Some(Ask::Drop.why()) }), "{c:?}");
+    // C's leg (no demand: its workflow doesn't adopt) executes K2, queued; B's leg adopts it. B
+    // cancelled, C's work is still C's own, so it stays.
+    s.handle(Input::LegQueued(Box::new(job("C", "rust", "K2", 200.0))), 3_000);
+    assert!(s.handle(Input::LegQueued(Box::new(job("B", "rust", "K2", 200.0))), 3_000).contains(&adopted("B/rust", "C/rust", "C")));
+    let c = s.handle(Input::LegCancelled { leg: "B/rust".into(), reason: "run cancelled".into() }, 4_000);
+    assert_eq!(endings(&c), [Command::Settled { leg: "B/rust".into(), outcome: Outcome::Cancelled, reason: Some("run cancelled".into()) }]);
+    assert_eq!(decision(&c, "C/rust"), Some(Decision::Fate(Fate::Kept { priority: 60, by: vec!["C".into()] })));
+}

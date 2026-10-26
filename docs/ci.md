@@ -7931,6 +7931,18 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   take what's in flight or are dropped. An adopter of an execution that read observed path sets
   checks them at its own commit first (W24-R04), and runs itself on a mismatch. Every decision says
   why.
+- **W28-R45 The scheduler.** `kiln_ci::sched::state` owns the demand table. A run's demand
+  (`Input::Demand`) comes before its `RunQueued`, whose `Supersede::Adopt` withdraws older demands
+  on its lane. A leg with work (`LegIn.work`) asks the table as it would be queued. Adopting, it
+  holds no runner, slot or quota, and waits (`WaitReason::Adopted`, naming the leg and run).
+  Executing, it's queued as ever, at the highest priority its live demands give. A withdrawn
+  execution still queued is dropped, settled cancelled with why. Running, it goes on until live
+  work that can't be placed contends for a runner or pool it could use. Then, of those, the one with
+  the most time left is cancelled through the cancelling path, unless it finishes within
+  `finish_within` seeding trusted entries. When an execution settles, its adopters end as
+  `Command::Adopted` (reused from it) or carry on as R44 says. Every decision is a
+  `Command::Demand`, said once, with why. After a restart, a running leg announced with work takes
+  over a queued duplicate of it.
 
 **Acceptance criteria: demands**
 
@@ -7939,9 +7951,16 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   executions at once within a domain; every adoption is one its domain may make; only a live run's
   leg executes, and only a withdrawn one's is dropped; every leg ends exactly once; and the same
   steps give the same table. *Property test* (`cargo test -p kiln-ci sched::demand`).
+- **W28-AC41 Two pushes through the scheduler.** Push A, then B touching only docs/ while A's rust
+  leg runs: B's rust leg adopts A's, with one assignment, both settling green, A never cancelled.
+  B touching crates/ while A's rust leg is 30% done and both slots are busy: A's rust leg is
+  cancelled, saying no live demand wants it and it had 140 s left; B's ui leg adopts A's; B's rust
+  leg runs once A's stopped. After a restart that queues B's leg before A's running one is
+  announced, the work runs once. *Simulation test* (`cargo test -p kiln-ci sched::tests::w28`).
 
-**Progress (step 4).** R40–R44 and AC40 built (2026-10-25) in `kiln_ci::sched::demand`. The
-scheduler, the dispatcher and step 1's replay don't use it yet: those are the plan's steps 2 to 4.
+**Progress (step 4).** R40–R45, AC40 and AC41 built (2026-10-25) in `kiln_ci::sched::demand` and
+`kiln_ci::sched::state`. The dispatcher and step 1's replay don't use them yet: those are the
+plan's steps 3 and 4.
 
 ## 4. API, events, CLI and MCP reference
 

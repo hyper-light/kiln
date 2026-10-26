@@ -43,6 +43,10 @@ pub struct Sim {
     pub settled: Vec<(i64, String, Outcome)>,
     pub waits: Vec<(i64, String, WaitReason)>,
     pub runs: Vec<(i64, Command)>,
+    /// Adopters done, reused from their execution: (time, leg, execution, outcome) (W28-R44).
+    pub adopted: Vec<(i64, String, String, Outcome)>,
+    /// Demand decisions, each said once: (time, leg, why) (W28-R45).
+    pub decisions: Vec<(i64, String, String)>,
     /// Slot-time: (repo, start, end).
     pub busy: Vec<(String, i64, i64)>,
     /// How long a host takes to start a pool's executor (W13-R09).
@@ -70,6 +74,8 @@ impl Sim {
             settled: Vec::new(),
             waits: Vec::new(),
             runs: Vec::new(),
+            adopted: Vec::new(),
+            decisions: Vec::new(),
             busy: Vec::new(),
             executor_start_ms: 500,
             failing_hosts: HashSet::new(),
@@ -181,6 +187,8 @@ impl Sim {
                 Command::Wait { leg, reason } => self.waits.push((self.now, leg, reason)),
                 c @ (Command::StartRun { .. } | Command::CancelRun { .. }) => self.runs.push((self.now, c)),
                 Command::Retry { .. } => {}
+                Command::Adopted { leg, from, outcome } => self.adopted.push((self.now, leg, from, outcome)),
+                Command::Demand { leg, decision } => self.decisions.push((self.now, leg, decision.why())),
             }
         }
     }

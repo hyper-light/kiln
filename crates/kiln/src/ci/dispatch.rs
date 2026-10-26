@@ -1850,6 +1850,13 @@ impl Dispatch {
                     self.timers.insert(at);
                     Ok(())
                 }
+                // W28-R45: only legs with work get these, and none has work until the dispatcher
+                // wires demands through (W28-R46). An adopter settles as its execution ended.
+                Command::Demand { leg, decision } => {
+                    tracing::debug!(leg = %leg, why = %decision.why(), "demand decision");
+                    Ok(())
+                }
+                Command::Adopted { leg, from, outcome } => self.settled(&leg, outcome, Some(format!("reused from {from}"))).await,
             };
             if let Err(e) = r {
                 tracing::warn!(error = %format!("{e:#}"), "CI dispatcher command");
