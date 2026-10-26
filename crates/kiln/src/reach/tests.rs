@@ -31,6 +31,8 @@ struct Lab {
     ctl: async_channel::Sender<Ctl>,
     _dirs: Vec<tempfile::TempDir>,
     mirrors: std::path::PathBuf,
+    /// What linux's node notes of the copies it holds.
+    using: Arc<super::keeper::Using>,
 }
 
 fn info(name: &str, fp: &str) -> RunnerInfo {
@@ -55,7 +57,15 @@ async fn lab() -> anyhow::Result<Lab> {
     let dirs = vec![tempfile::tempdir()?, tempfile::tempdir()?, tempfile::tempdir()?];
     let mirrors = dirs.get(2).map(|d| d.path().to_path_buf()).unwrap_or_default();
     let (adopt_tx, adoptions) = async_channel::unbounded();
-    let cfg = |name: &str, d: &tempfile::TempDir, adopt: Option<async_channel::Sender<node::Adoption>>| Config { name: name.into(), dir: d.path().join("reach"), accept: true, mirrors: mirrors.clone(), adopt };
+    let using = Arc::new(super::keeper::Using::default());
+    let cfg = |name: &str, d: &tempfile::TempDir, adopt: Option<async_channel::Sender<node::Adoption>>| Config {
+        name: name.into(),
+        dir: d.path().join("reach"),
+        accept: true,
+        mirrors: mirrors.clone(),
+        using: if name == "linux" { Arc::clone(&using) } else { Arc::default() },
+        adopt,
+    };
     let (mac, mac_out) = node::start(cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None))?;
     let (linux, linux_out) = node::start(cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)))?;
     let directory = Arc::new(Mutex::new(vec![info("mac", mac.fingerprint()), info("linux", linux.fingerprint())]));
@@ -123,7 +133,7 @@ async fn lab() -> anyhow::Result<Lab> {
     });
     mac.feed(In::Server(true)).await;
     linux.feed(In::Server(true)).await;
-    Ok(Lab { mac, linux, adoptions, ctl: ctl_tx, _dirs: dirs, mirrors })
+    Ok(Lab { mac, linux, adoptions, ctl: ctl_tx, _dirs: dirs, mirrors, using })
 }
 
 async fn deliver(peers: &Mutex<HashMap<&'static str, u64>>, handle_of: &impl Fn(&str) -> Handle, to: u64, sm: ServerMsg) {
@@ -289,6 +299,60 @@ fn a_tree_syncs_over_and_the_command_runs_in_the_copy() -> anyhow::Result<()> {
         assert!(evs.iter().any(|e| matches!(e, Ev::Synced { sent: 0 | 1, .. })), "{evs:?}");
         let evs = run_from_mac(&lab, RunReq { command: "true".into(), ..req }, |_| None).await?;
         assert!(evs.iter().any(|e| matches!(e, Ev::Synced { sent: 1, .. })), "{evs:?}");
+        Ok(())
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn a_copy_is_in_use_while_its_sync_and_run_are_at_it_and_noted_as_the_agents_that_asked() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let repo = tempfile::tempdir()?;
+        let r = repo.path();
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(r).args(args).env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").output();
+        git(&["init", "-q"])?;
+        git(&["remote", "add", "origin", "https://github.com/hyper-light/kiln.git"])?;
+        std::fs::write(r.join("a.txt"), "a\n")?;
+        git(&["add", "."])?;
+        git(&["commit", "-qm", "init"])?;
+        // While the command runs, the copy is in use; it says which agent asked (docs/reach.md §5.1).
+        let req = RunReq {
+            target: "linux".into(),
+            command: "sleep 0.6; echo $KILN_REACH_AGENT".into(),
+            cwd: Some(r.to_string_lossy().into_owned()),
+            sync: true,
+            env: vec![(super::keeper::AGENT_ENV.to_owned(), "agent-7".to_owned())],
+            ..RunReq::default()
+        };
+        let key = super::sync::mirror_key("mac", &std::fs::canonicalize(r)?);
+        let using = Arc::clone(&lab.using);
+        let k = ("mac".to_owned(), key.clone());
+        let seen_busy = crate::rt::spawn(async move {
+            for _ in 0..200 {
+                if using.snapshot().get(&k).is_some_and(|u| u.busy > 0) {
+                    return true;
+                }
+                crate::rt::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        });
+        let evs = run_from_mac(&lab, req, |_| None).await?;
+        assert_eq!(output(&evs, false), "agent-7\n");
+        assert!(matches!(seen_busy.await, Ok(true)), "in use while it ran");
+        // Done with, it's no longer in use: the last use and the agent stay noted.
+        let mut done = None;
+        for _ in 0..100 {
+            done = lab.using.snapshot().get(&("mac".to_owned(), key.clone())).cloned().filter(|u| u.busy == 0);
+            if done.is_some() {
+                break;
+            }
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        let done = done.ok_or_else(|| anyhow::anyhow!("still in use: {:?}", lab.using.snapshot()))?;
+        assert_eq!(done.agent.as_deref(), Some("agent-7"));
+        assert!(done.used > 0);
+        assert!(lab.mirrors.join("mac").join(&key).join("a.txt").is_file());
         Ok(())
     })
 }

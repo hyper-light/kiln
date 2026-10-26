@@ -415,6 +415,9 @@ pub struct Hub {
     pub sync: crate::sync::server::Sync,
     /// Reach: the links between runners this server relays, and their identities (`crate::reach`).
     pub reach: Mutex<crate::reach::relay::Relay>,
+    /// The copies of runners' trees other runners keep: the rules for them, and what each runner
+    /// said it holds and let go (`crate::reach::copies`, docs/reach.md §5.1).
+    pub copies: crate::reach::copies::Copies,
     /// The git repositories each machine holds, as it last said (`crate::sync::places`).
     pub places: crate::sync::places::Places,
     /// Clones, syncs and moves of repositories between machines (`crate::sync::tasks`).
@@ -472,6 +475,7 @@ impl Hub {
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
         let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
+        let copies = crate::reach::copies::Copies::open(cfg.data("reach").join("copies.json"));
         let records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::StoreRecords::open(store.clone())?);
         Ok(Arc::new(Self {
             cfg,
@@ -530,6 +534,7 @@ impl Hub {
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
             sync,
             reach: Mutex::new(crate::reach::relay::Relay::default()),
+            copies,
             places,
             tasks,
             shares: crate::sync::share::Shares::default(),
@@ -600,19 +605,15 @@ impl Hub {
         Ok(())
     }
 
-    /// A runner process of `machine` that can hold a learner said so: the newest such process
-    /// holds the machine's (it's told its member and the token its copies are fetched with), and
-    /// every other one lets its go, so one process at a time has the replica's files.
+    /// A runner process of `machine` that can hold a learner said so, or its newest process changed:
+    /// the newest such process holds the machine's (it's told its member and the token its copies
+    /// are fetched with), and every other one lets its go, so one process at a time has the
+    /// replica's files.
     async fn cluster_announced(&self, machine: &str) {
         // The server's own runner, in its process, reads kiln.db as it is.
         let own = self.cfg.local_agent.enabled && machine == crate::pki::sanitize_name(&self.cfg.local_agent_name());
         let group = self.store.group().filter(|_| self.cfg.cluster.learners && !own);
-        let (newest, mut others) = {
-            let inst = self.instances.lock();
-            let newest = inst.newest_with(machine, proto::CAP_CLUSTER);
-            let others: Vec<PeerId> = inst.of(machine).into_iter().filter(|p| Some(*p) != newest && inst.get(*p).is_some_and(|i| i.caps & proto::CAP_CLUSTER != 0)).collect();
-            (newest, others)
-        };
+        let (newest, mut others) = self.instances.lock().holder_of(machine, proto::CAP_CLUSTER);
         // With learners off, the newest lets its replica go too: its front door pipes to the
         // server again rather than wait for a replica that no longer follows.
         if group.is_none() {
@@ -1817,6 +1818,15 @@ impl Hub {
                         let answer = serde_json::json!({ "runners": self.reach_directory() });
                         self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                     }
+                    // What the runner holds of other runners' trees and let go: kept, and answered
+                    // with the rules it weighs them with (docs/reach.md §5.1).
+                    Some("keep") => {
+                        let (hub, runner) = (Arc::clone(self), agent.clone());
+                        crate::rt::spawn(async move {
+                            let answer = hub.copies.heard(&hub, &runner, ask.get("report")).await;
+                            hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                        });
+                    }
                     // An agent's MCP server on the runner asks for kiln's operations: answered on
                     // their own, so a slow one holds up nothing else the runner says.
                     Some("registry" | "call" | "page" | "stream") => {
@@ -2233,6 +2243,10 @@ impl Hub {
         self.check_handover().await;
         // The front door moves to the process that is newest now.
         crate::frontdoor::control::on_instance_lost(self, name).await;
+        // So does the replica: a blue/green upgrade's new build was told to let it go as it joined
+        // (ranked oldest), and nothing else tells it to hold it now (until 2026-10-25 a machine
+        // upgraded so held no replica until its runner next connected).
+        self.cluster_announced(name).await;
     }
 
     /// A machine's runner processes, while it has more than one, with what each holds.

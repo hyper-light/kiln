@@ -921,3 +921,209 @@ fn w28_r45_withdrawn_runs_take_only_what_is_in_flight() {
     assert_eq!(endings(&c), [Command::Settled { leg: "B/rust".into(), outcome: Outcome::Cancelled, reason: Some("run cancelled".into()) }]);
     assert_eq!(decision(&c, "C/rust"), Some(Decision::Fate(Fate::Kept { priority: 60, by: vec!["C".into()] })));
 }
+
+// ---------------------------------------------------------------------- admission (W28-R60 to R63)
+
+const SEC: i64 = 1_000;
+
+fn lane_leg(id: &str, order: u64, coalesce: Option<super::admit::Coalesce>, cadence: Option<super::admit::Cadence>) -> LegIn {
+    let admission = super::admit::Demand { lane: "acme/x\0ci\0main".into(), unit: "test".into(), order, coalesce, cadence, speculative: false };
+    LegIn { admission: Some(admission), ..leg(id, "acme/x", 60) }
+}
+
+/// W28-R61, W28-AC60: pushes every 30 s from 10 s, quiet 45 s, max_wait 5 min, the one runner busy
+/// with another workflow's leg until 290 s: each push skips the one held (coalesced, never
+/// started), and the newest is let go as the runner frees, before 300 s.
+#[test]
+fn w28_ac60_coalescing_runs_the_newest_once_the_runner_frees() {
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("a", 1));
+    sim.leg(0, leg("blocker", "acme/y", 60), 290 * SEC);
+    let busy = super::admit::Coalesce { quiet: 45 * SEC, max_wait: 300 * SEC, always: false };
+    for i in 0..10 {
+        sim.leg(10 * SEC + i * 30 * SEC, lane_leg(&format!("p{i}"), i as u64, Some(busy), None), 60 * SEC);
+    }
+    sim.run(400 * SEC);
+    let ran: Vec<&str> = sim.assigned.iter().map(|a| a.leg.as_str()).filter(|l| l.starts_with('p')).collect();
+    assert_eq!(ran, vec!["p9"], "only the newest ran");
+    assert_eq!(sim.started("p9"), Some(290 * SEC), "as the runner freed");
+    let coalesced = sim.settled.iter().filter(|(_, l, o)| l.starts_with('p') && *o == Outcome::Cancelled).count();
+    assert_eq!(coalesced, 9);
+    assert!(sim.waits.iter().any(|(_, l, r)| l == "p0" && matches!(r, WaitReason::Coalescing { until, deadline, .. } if *until == 55 * SEC && *deadline == 310 * SEC)));
+}
+
+/// W28-R61: on an idle system a push starts at once: admission delay 0 s.
+#[test]
+fn w28_r61_an_idle_system_starts_a_push_at_once() {
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("a", 1));
+    let busy = super::admit::Coalesce { quiet: 45 * SEC, max_wait: 300 * SEC, always: false };
+    sim.leg(5 * SEC, lane_leg("p0", 0, Some(busy), None), 60 * SEC);
+    sim.run(10 * SEC);
+    assert_eq!(sim.started("p0"), Some(5 * SEC));
+}
+
+/// W28-R61: under a stream that keeps the runner busy past max_wait, the burst's newest is let go at
+/// max_wait (it then waits for capacity like any leg), and later pushes start a burst of their own.
+#[test]
+fn w28_r61_max_wait_bounds_a_burst() {
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("a", 1));
+    sim.leg(0, leg("blocker", "acme/y", 60), 2_000 * SEC);
+    let busy = super::admit::Coalesce { quiet: 45 * SEC, max_wait: 300 * SEC, always: false };
+    for i in 0..20 {
+        sim.leg(10 * SEC + i * 30 * SEC, lane_leg(&format!("p{i}"), i as u64, Some(busy), None), 60 * SEC);
+    }
+    sim.run(700 * SEC);
+    // Let go at 310 s (10 s + max_wait): p10, the newest then (it arrived at the deadline), waits
+    // for the runner; the next burst's newest, p19, is let go at its own quiet's end.
+    for id in ["p10", "p19"] {
+        assert!(matches!(sim.last_wait(id), Some(WaitReason::Capacity { .. })), "{id}: {:?}", sim.last_wait(id));
+        assert!(!sim.settled.iter().any(|(_, l, _)| l == id), "{id} never skipped once let go");
+    }
+    assert_eq!(sim.settled.iter().filter(|(_, l, o)| l.starts_with('p') && *o == Outcome::Cancelled).count(), 18);
+}
+
+/// W28-R62: on a cadence an exclusive leg's runner takes no new work while it waits, so it starts
+/// once the work there ends; without, later work keeps filling the runner.
+#[test]
+fn w28_r62_cadence_drains_for_an_exclusive_leg() {
+    for (cadence, want) in [(Some(super::admit::Cadence::Free), vec![Some(0), Some(100 * SEC), Some(110 * SEC)]), (None, vec![Some(0), Some(120 * SEC), Some(20 * SEC)])] {
+        let mut sim = Sim::new(Config::default());
+        sim.runner(0, linux("bench", 2));
+        sim.leg(0, leg("a", "acme/x", 60), 100 * SEC);
+        let mut b = lane_leg("b", 1, None, cadence);
+        b.exclusive = true;
+        sim.leg(10 * SEC, b, 10 * SEC);
+        sim.leg(20 * SEC, leg("c", "acme/x", 60), 100 * SEC);
+        sim.run(500 * SEC);
+        assert_eq!(vec![sim.started("a"), sim.started("b"), sim.started("c")], want, "cadence {cadence:?}");
+    }
+}
+
+/// W28-R62: a newer leg on the cadence takes the place of the one waiting to start.
+#[test]
+fn w28_r62_cadence_runs_the_newest() {
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("bench", 1));
+    sim.leg(0, leg("busy", "acme/y", 60), 100 * SEC);
+    for i in 0..3 {
+        sim.leg(10 * SEC + i * 10 * SEC, lane_leg(&format!("b{i}"), i as u64, None, Some(super::admit::Cadence::Free)), 10 * SEC);
+    }
+    sim.run(500 * SEC);
+    assert_eq!(sim.started("b2"), Some(100 * SEC));
+    assert_eq!(sim.started("b0"), None);
+    assert!(sim.settled.iter().any(|(_, l, o)| l == "b1" && *o == Outcome::Cancelled));
+}
+
+/// W28-R68: a lane's speculative legs beyond its window wait, saying so, until one passes.
+#[test]
+fn w28_r68_speculation_window_holds_and_lets_go() {
+    let cfg = Config { window: super::admit::Window { initial: 2, floor: 1, cap: 4 }, ..Config::default() };
+    let mut sim = Sim::new(cfg);
+    sim.runner(0, linux("a", 4));
+    for i in 0..3 {
+        let mut l = lane_leg(&format!("s{i}"), i as u64, None, None);
+        if let Some(a) = l.admission.as_mut() {
+            a.speculative = true;
+            a.unit = format!("bisect{i}");
+        }
+        sim.leg(0, l, 30 * SEC);
+    }
+    sim.run(SEC);
+    assert!(matches!(sim.last_wait("s2"), Some(WaitReason::Speculation { size: 2, in_flight: 2, .. })));
+    assert_eq!(sim.started("s2"), None);
+    sim.run(40 * SEC);
+    assert_eq!(sim.started("s2"), Some(30 * SEC), "the first pass widened the window");
+}
+
+// ---------------------------------------------------------------------- priority by intent (W28-R64, R65)
+
+/// W28-R64, W28-AC62: one saturated runner; gate, waiting, trunk and WIP legs queued together
+/// start in that order.
+#[test]
+fn w28_ac62_intent_classes_go_in_order() {
+    use super::intent::Intent;
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("a", 1));
+    sim.leg(0, leg("busy", "acme/x", 60), MIN);
+    for (id, i) in [("wip", Intent::Wip), ("trunk", Intent::Trunk), ("gate", Intent::Gate), ("waiting", Intent::Waiting)] {
+        sim.leg(1, leg(id, "acme/x", i.priority()), MIN);
+    }
+    sim.run(10 * MIN);
+    let order: Vec<&str> = sim.assigned.iter().map(|a| a.leg.as_str()).filter(|l| *l != "busy").collect();
+    assert_eq!(order, vec!["gate", "waiting", "trunk", "wip"]);
+}
+
+/// W28-R65: W05-R09's aging bounds every class's wait: a WIP leg behind a steady stream of gate
+/// legs (one a minute, each a minute long) starts within (90 − 40) / 1 minutes, and one leg's time.
+#[test]
+fn w28_r65_aging_bounds_a_wip_legs_wait_behind_gate() {
+    use super::intent::Intent;
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("a", 1));
+    sim.leg(0, leg("gate-busy", "acme/x", Intent::Gate.priority()), MIN);
+    sim.leg(1, leg("wip", "acme/y", Intent::Wip.priority()), MIN);
+    for i in 0..120 {
+        sim.leg(i * MIN + 2, leg(&format!("gate{i}"), "acme/x", Intent::Gate.priority()), MIN);
+    }
+    sim.run(150 * MIN);
+    let start = sim.started("wip").unwrap_or(i64::MAX);
+    assert!(start <= 51 * MIN + 1, "the WIP leg started at {} min", start / MIN);
+    assert!(start >= 49 * MIN, "and not before aging lifted it: {} min", start / MIN);
+}
+
+// ---------------------------------------------------------------------- fair share by actor and lane (W28-R66)
+
+fn by_actor(id: &str, actor: &str, lane: &str) -> LegIn {
+    LegIn { actor: actor.into(), lane: lane.into(), ..leg(id, "acme/x", 60) }
+}
+
+/// W28-R66, W28-AC63: agent A pushes ten times a minute, agent B once, in one repository, each push
+/// a 40-second leg on one slot: with fair_by = [repo, actor] each gets half the capacity within 10
+/// points over every 10-minute window, where by repository alone B gets its arrival share.
+#[test]
+fn w28_ac63_two_agents_at_ten_to_one_share_alike() {
+    use super::state::FairBy;
+    for (fair_by, fair) in [(vec![FairBy::Repo, FairBy::Actor], true), (vec![FairBy::Repo], false)] {
+        let mut sim = Sim::new(Config { fair_by, default_cost: 40.0, ..Config::default() });
+        sim.runner(0, linux("a", 1));
+        for m in 0..80 {
+            for k in 0..10 {
+                sim.leg(m * MIN + k * 6 * SEC, by_actor(&format!("a{m}-{k}"), "agent:A", "acme/x\0ci\0agents/a"), 40 * SEC);
+            }
+            sim.leg(m * MIN + 3 * SEC, by_actor(&format!("b{m}"), "agent:B", "acme/x\0ci\0agents/b"), 40 * SEC);
+        }
+        sim.run(80 * MIN);
+        let mut w = 10;
+        while w + 10 <= 70 {
+            let share = sim.shares_by(w * MIN, (w + 10) * MIN, |l| l.get(..1).unwrap_or_default().to_owned()).get("b").copied().unwrap_or(0.0);
+            if fair {
+                assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: B got {share:.2}", w + 10);
+            } else {
+                assert!(share < 0.25, "by repository alone, window {w}–{}: B got {share:.2}", w + 10);
+            }
+            w += 10;
+        }
+    }
+}
+
+/// W28-R66: fair_by = [repo, actor, lane]: actor A's two lanes get about a quarter each, actor B's
+/// one lane about half.
+#[test]
+fn w28_r66_nested_levels_split_their_parents_share() {
+    use super::state::FairBy;
+    let mut sim = Sim::new(Config { fair_by: vec![FairBy::Repo, FairBy::Actor, FairBy::Lane], default_cost: 60.0, ..Config::default() });
+    sim.runner(0, linux("a", 2));
+    for i in 0..200 {
+        sim.leg(1, by_actor(&format!("x{i}"), "agent:A", "x"), MIN);
+        sim.leg(1, by_actor(&format!("y{i}"), "agent:A", "y"), MIN);
+        sim.leg(1, by_actor(&format!("z{i}"), "agent:B", "z"), MIN);
+    }
+    sim.run(100 * MIN);
+    let shares = sim.shares_by(0, 60 * MIN, |l| l.get(..1).unwrap_or_default().to_owned());
+    for (lane, want) in [("x", 0.25), ("y", 0.25), ("z", 0.5)] {
+        let got = shares.get(lane).copied().unwrap_or(0.0);
+        assert!((got - want).abs() <= 0.10, "lane {lane}: {got:.2}, want {want}");
+    }
+}

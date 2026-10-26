@@ -391,6 +391,12 @@ pub struct Scheduler {
     pub mode: String,
     pub overcommit: Overcommit,
     pub default_request: kiln_ci::sched::pools::ResourceSpec,
+    /// `event` (W05-R09's defaults by event) or `intent` (W28-R64): gate 90, someone waiting 80,
+    /// trunk 60, work in progress 40, a job's own `priority:` still first.
+    pub priority: String,
+    /// What fair share is between, outermost first (W05-R10, W28-R66): `repo`, then `actor` (the
+    /// agent or person a commit is attributed to), then `lane` (a workflow on a branch).
+    pub fair_by: Vec<String>,
 }
 
 impl Scheduler {
@@ -398,12 +404,42 @@ impl Scheduler {
     pub fn resources(&self) -> bool {
         self.mode.trim().eq_ignore_ascii_case("resources")
     }
+
+    /// Priority by intent (W28-R64).
+    pub fn by_intent(&self) -> bool {
+        self.priority.trim().eq_ignore_ascii_case("intent")
+    }
+
+    /// `fair_by` as the scheduler takes it: always the repository first; unknown names left out.
+    pub fn fair_levels(&self) -> Vec<kiln_ci::sched::FairBy> {
+        use kiln_ci::sched::FairBy;
+        let mut out = vec![FairBy::Repo];
+        for l in &self.fair_by {
+            let level = match l.trim().to_ascii_lowercase().as_str() {
+                "actor" => FairBy::Actor,
+                "lane" => FairBy::Lane,
+                _ => continue,
+            };
+            if !out.contains(&level) {
+                out.push(level);
+            }
+        }
+        out
+    }
 }
 
 impl Default for Scheduler {
     fn default() -> Self {
         let d = kiln_ci::sched::state::Config::default();
-        Scheduler { aging_per_minute: d.aging_per_minute, default_cost_seconds: d.default_cost, mode: "slots".into(), overcommit: Overcommit::default(), default_request: Default::default() }
+        Scheduler {
+            aging_per_minute: d.aging_per_minute,
+            default_cost_seconds: d.default_cost,
+            mode: "slots".into(),
+            overcommit: Overcommit::default(),
+            default_request: Default::default(),
+            priority: "event".into(),
+            fair_by: vec!["repo".into()],
+        }
     }
 }
 

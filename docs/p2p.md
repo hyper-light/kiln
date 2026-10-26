@@ -297,7 +297,10 @@ reads from it (`crates/kiln/src/store/learner.rs`, `crates/kiln/src/frontdoor/re
   from its machine's name) and the token its copies are fetched with. Other processes of the
   machine let go of theirs, so one process at a time holds the replica's files. A newest process
   whose older one holds them yet (finishing its last jobs before it retires) tries again until it
-  lets go: 15 s apart at first, then each minute, with the server's newest word to join.
+  lets go: 15 s apart at first, then each minute, with the server's newest word to join. A
+  blue/green upgrade's new build joins ranked oldest, so it lets go until it takes over; as it's
+  promoted, the server says again who holds the replica, and the new build joins while the runner
+  it took over from lets go.
 - **A copy, then the log.** A learner starts from a copy of kiln.db, `GET /api/cluster/copy`, made
   with `VACUUM INTO` at the group's last applied entry. The server's own log index stays behind. Any
   copy made later stands in for that point: an entry its `seq` holds already is skipped, as a restart

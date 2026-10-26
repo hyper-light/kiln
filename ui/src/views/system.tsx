@@ -14,6 +14,7 @@ import { fileStamp, saveFile, toCsv } from "@/lib/download";
 import { absoluteTime, formatUptime } from "@/lib/format";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useLocation } from "@/lib/router";
+import { KeepSection } from "./keep/section";
 import { childStatus, RelTime } from "./shared";
 import { StoresHold, StoresSection } from "./stores/section";
 import { BuildsSection, UpdatesSection } from "./updates/section";
@@ -96,6 +97,7 @@ export default function System() {
               invalidate("system");
               invalidate("updates");
               invalidate("conversations");
+              invalidate("reach/keep");
               invalidate("audit");
             }}
           >
@@ -208,7 +210,7 @@ function auditTakes(a: AuditEntry, chosen: Chosen, q: string, skip?: string) {
 function AuditSection() {
   const [win, setWin] = React.useState<AuditWindow>("7");
   return (
-    <FoldSection id="system.audit" index="07" label="Audit" title="Audit log" aside={<Segmented label="Window" value={win} onChange={setWin} options={AUDIT_WINDOWS} />}>
+    <FoldSection id="system.audit" index="08" label="Audit" title="Audit log" aside={<Segmented label="Window" value={win} onChange={setWin} options={AUDIT_WINDOWS} />}>
       <Loadable label="the audit log" fallback={<TableHold head={<AuditHead />} rows={8} rowHeight={39} />}>
         <AuditTable win={win} />
       </Loadable>
@@ -384,6 +386,8 @@ function SystemBody() {
 
       <StoresSection index="06" />
 
+      <KeepSection index="07" />
+
       <AuditSection />
     </>
   );
@@ -410,7 +414,8 @@ function SystemHold() {
       <FoldSection id="system.stores" index="06" label="Conversations" title="Conversation stores">
         <StoresHold />
       </FoldSection>
-      <FoldSection id="system.audit" index="07" label="Audit" title="Audit log">
+      <KeepSection index="07" hold />
+      <FoldSection id="system.audit" index="08" label="Audit" title="Audit log">
         <TableHold head={<AuditHead />} rows={8} rowHeight={39} />
       </FoldSection>
     </>

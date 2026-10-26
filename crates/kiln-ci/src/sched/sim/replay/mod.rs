@@ -41,7 +41,8 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::sched::demand::{Ask, Demand, Demands, Domain, End as Ending, Fate, Next, Work};
+use crate::sched::admit::{self, Admit, Demand};
+use crate::sched::demand::{self, Ask, Demands, Domain, End as Ending, Fate, Next, Work};
 use crate::sched::groups::{GroupAction, GroupConfig, Groups};
 use crate::sched::retry::FailureClass;
 
@@ -83,6 +84,8 @@ pub struct Policy {
     pub cadence: bool,
     /// P5: shared steps; the share of the image's build its compile is (taken from release's).
     pub share: Option<f64>,
+    /// P4: bisection runs are speculative demands of their lane, under its AIMD window (W28-R68).
+    pub window: Option<admit::Window>,
 }
 
 /// The defaults W25's later steps take, from the sweeps in ci/sim/README.md: finish work no one
@@ -97,7 +100,7 @@ pub const MAX_WAIT: i64 = 600;
 
 impl Policy {
     fn demands(name: &str) -> Policy {
-        Policy { name: name.into(), groups: None, finish_within: FINISH_WITHIN, warm_credit: WARM_CREDIT, verdicts: false, coalesce: None, cadence: false, share: None }
+        Policy { name: name.into(), groups: None, finish_within: FINISH_WITHIN, warm_credit: WARM_CREDIT, verdicts: false, coalesce: None, cadence: false, share: None, window: None }
     }
 
     /// P0: today, as recorded (cancel-in-progress where the workflows said so).
@@ -122,7 +125,7 @@ impl Policy {
 
     /// P4: P3 plus coalescing and cadence.
     pub fn p4() -> Policy {
-        Policy { verdicts: true, coalesce: Some(Coalesce { quiet: QUIET, max_wait: MAX_WAIT }), cadence: true, ..Policy::demands("P4") }
+        Policy { verdicts: true, coalesce: Some(Coalesce { quiet: QUIET, max_wait: MAX_WAIT }), cadence: true, window: Some(admit::Window::default()), ..Policy::demands("P4") }
     }
 
     /// P5: P4 plus sharing across pipelines (the image's compile not shared: see ci/sim/README.md).
@@ -292,7 +295,8 @@ enum ExecSt {
 enum Ev {
     Finish(usize),
     Launched(usize),
-    Release(usize),
+    /// Admission's timer (P4): what it held may go.
+    Review,
     Arrive(usize),
 }
 
@@ -301,7 +305,7 @@ impl Ev {
         match self {
             Ev::Finish(_) => 0,
             Ev::Launched(_) => 1,
-            Ev::Release(_) => 2,
+            Ev::Review => 2,
             Ev::Arrive(_) => 3,
         }
     }
@@ -377,7 +381,10 @@ struct Engine<'a> {
     lanes: BTreeMap<String, Vec<usize>>,
     ledger: BTreeMap<String, (End, Option<String>)>,
     warm: BTreeMap<(String, String), (i64, usize)>,
-    held: BTreeMap<String, (usize, i64)>,
+    /// P4's admission: kiln_ci::sched::admit itself, a run of a lane its demand.
+    admit: Admit,
+    /// P4: each bisection's step in flight, as admission knows it.
+    bisect_admit: BTreeMap<usize, String>,
     steps_done: BTreeMap<(String, String), i64>,
     steps_inflight: BTreeMap<(String, String), (usize, i64)>,
     results: BTreeMap<(String, String), Vec<(usize, End, Option<String>)>>,
@@ -425,7 +432,8 @@ pub fn replay(trace: &Trace, policy: &Policy, seed: u64) -> Outcome {
         lanes: BTreeMap::new(),
         ledger: BTreeMap::new(),
         warm: BTreeMap::new(),
-        held: BTreeMap::new(),
+        admit: Admit::new(policy.window.unwrap_or_default()),
+        bisect_admit: BTreeMap::new(),
         steps_done: BTreeMap::new(),
         steps_inflight: BTreeMap::new(),
         results: BTreeMap::new(),
@@ -489,9 +497,13 @@ impl Engine<'_> {
             self.now = t;
             match ev {
                 Ev::Arrive(r) => self.arrive(r),
-                Ev::Release(r) => self.release_held(r),
+                Ev::Review => self.review_admit(),
                 Ev::Launched(x) => self.launched(x),
-                Ev::Finish(x) => self.finish(x),
+                Ev::Finish(x) => {
+                    self.finish(x);
+                    // Capacity freed: a burst held only while its pools were saturated may go.
+                    self.review_admit();
+                }
             }
             self.dispatch();
         }
@@ -546,8 +558,8 @@ impl Engine<'_> {
             let lane = self.lane_of(r);
             // W28-R48: the newer push withdraws the older demands on its lane, and what answered
             // them is decided again, as the scheduler does it.
-            let demand = Demand { run: r.to_string(), lane: lane.clone(), domain: Domain::Trusted, at: self.now, ..Demand::default() };
-            let withdrawn = self.demands.arrive(demand, true);
+            let wanted = demand::Demand { run: r.to_string(), lane: lane.clone(), domain: Domain::Trusted, at: self.now, ..demand::Demand::default() };
+            let withdrawn = self.demands.arrive(wanted, true);
             let olds: Vec<usize> = withdrawn.iter().filter_map(|o| o.parse().ok()).collect();
             for o in &olds {
                 self.withdraw(*o, r);
@@ -565,20 +577,15 @@ impl Engine<'_> {
             }
             self.start_run(r);
             if let Some(c) = self.policy.coalesce {
-                let burst = self.held.remove(&lane).map(|(_, start)| start);
-                if self.saturated(r) {
-                    let start = burst.unwrap_or(self.now);
-                    let until = (self.now + c.quiet).min(start + c.max_wait);
-                    if until > self.now {
-                        if let Some(rs) = self.runs.get_mut(r) {
-                            rs.held = true;
-                        }
-                        self.held.insert(lane, (r, start));
-                        self.note(r, format!("held until {until}: its pools are saturated (quiet {}, max_wait {})", c.quiet, c.max_wait));
-                        self.at(until, Ev::Release(r));
-                        return;
-                    }
-                }
+                // A run of a lane is one demand of it (the unit is the whole run): admission holds it
+                // while its pools are saturated, a newer push of the lane skipping it (P2 has
+                // withdrawn it already), and lets it go at its quiet's end, at max_wait, or as its
+                // pools free (W28-R61, R63).
+                let d = Demand { lane, unit: String::new(), order: r as u64, coalesce: Some(admit::Coalesce { quiet: c.quiet, max_wait: c.max_wait, always: false }), cadence: None, speculative: false };
+                let saturated = self.saturated(r);
+                let ds = self.admit.arrive(&r.to_string(), d, saturated, self.now);
+                self.admit_decisions(ds);
+                return;
             }
             self.ready(r);
             return;
@@ -609,12 +616,57 @@ impl Engine<'_> {
             return;
         }
         rs.held = false;
-        let lane = self.lane_of(r);
-        if self.held.get(&lane).is_some_and(|(h, _)| *h == r) {
-            self.held.remove(&lane);
-        }
         self.note(r, "released from its quiet period".into());
         self.ready(r);
+    }
+
+    /// Carries out admission's decisions (P4).
+    fn admit_decisions(&mut self, ds: Vec<admit::Decision>) {
+        for d in ds {
+            match d {
+                admit::Decision::Admit { id } => {
+                    if let Some(b) = id.strip_prefix("bisect").and_then(|rest| rest.split('.').next()).and_then(|b| b.parse::<usize>().ok()) {
+                        if let Some((r, j)) = self.bisect_st.get(b).map(|st| (st.run, st.job)) {
+                            self.new_exec(r, j, format!("bisect{b}"), 1, Some(b));
+                        }
+                        continue;
+                    }
+                    let Ok(r) = id.parse::<usize>() else { continue };
+                    if self.runs.get(r).is_some_and(|rs| rs.held) {
+                        self.release_held(r);
+                    } else if self.runs.get(r).is_some_and(|rs| !rs.withdrawn && rs.end == RunEnd::Open) {
+                        self.ready(r);
+                    }
+                }
+                admit::Decision::Hold { id, held: admit::Held::Coalescing { until, .. } } => {
+                    let Ok(r) = id.parse::<usize>() else { continue };
+                    if let Some(rs) = self.runs.get_mut(r) {
+                        rs.held = true;
+                    }
+                    let (quiet, max_wait) = self.policy.coalesce.map_or((0, 0), |c| (c.quiet, c.max_wait));
+                    self.note(r, format!("held until {until}: its pools are saturated (quiet {quiet}, max_wait {max_wait})"));
+                }
+                admit::Decision::Hold { id, held: admit::Held::Speculation { size, in_flight, .. } } => {
+                    let run = id.strip_prefix("bisect").and_then(|rest| rest.split('.').next()).and_then(|b| b.parse::<usize>().ok()).and_then(|b| self.bisect_st.get(b)).map(|st| st.run);
+                    if let Some(r) = run {
+                        self.note(r, format!("{id} held: its lane's speculation window is full ({in_flight} of {size})"));
+                    }
+                }
+                // P2 withdrew the older run as the newer arrived; nothing else holds here.
+                admit::Decision::Skip { .. } | admit::Decision::Hold { .. } => {}
+                admit::Decision::Timer { at } => self.at(at, Ev::Review),
+            }
+        }
+    }
+
+    /// What admission held that may go now: its time came, or its pools aren't saturated now.
+    fn review_admit(&mut self) {
+        if self.admit.idle() {
+            return;
+        }
+        let free: BTreeSet<String> = self.admit.coalescing().filter(|id| id.parse::<usize>().is_ok_and(|r| !self.saturated(r))).map(str::to_owned).collect();
+        let ds = self.admit.review(self.now, &|id| free.contains(id));
+        self.admit_decisions(ds);
     }
 
     /// A newer push `by` withdrew an older run's demands: a run held in its quiet period (P1)
@@ -1224,6 +1276,12 @@ impl Engine<'_> {
             *s = ExecSt::Over;
         }
         if let Some(b) = bisect {
+            // Its lane's window learns from it, and lets go what it held (W28-R68).
+            if let Some(id) = self.bisect_admit.remove(&b) {
+                let passed = self.execs.get(x).and_then(|e| e.end).map(|e| e == End::Succeeded);
+                let ds = self.admit.ended(&id, passed, self.now);
+                self.admit_decisions(ds);
+            }
             self.bisect_step(b);
             return;
         }
@@ -1313,22 +1371,36 @@ impl Engine<'_> {
         self.note(r, format!("job {j} newly failed: bisecting {} commits in {steps} runs", suspects.len()));
         self.bisections.push(Bisection { lane, key, suspects, done: None });
         self.bisect_st.push(BisectSt { run: r, job: j, left: steps });
-        let k = format!("bisect{b}");
-        self.new_exec(r, j, k, 1, Some(b));
+        self.bisect_run(b);
+    }
+
+    /// A bisection's next run: at once, or under its lane's speculation window (P4, W28-R68).
+    fn bisect_run(&mut self, b: usize) {
+        let Some(st) = self.bisect_st.get(b) else { return };
+        let (r, j, left) = (st.run, st.job, st.left);
+        if self.policy.window.is_none() {
+            self.new_exec(r, j, format!("bisect{b}"), 1, Some(b));
+            return;
+        }
+        let lane = self.bisections.get(b).map_or_else(String::new, |bi| bi.lane.clone());
+        let id = format!("bisect{b}.{left}");
+        self.bisect_admit.insert(b, id.clone());
+        let d = Demand { lane, unit: format!("bisect{b}"), order: b as u64, coalesce: None, cadence: None, speculative: true };
+        let ds = self.admit.arrive(&id, d, false, self.now);
+        self.admit_decisions(ds);
     }
 
     /// One bisection run finished: the next, or the culprit named.
     fn bisect_step(&mut self, b: usize) {
         let Some(st) = self.bisect_st.get_mut(b) else { return };
         st.left = st.left.saturating_sub(1);
-        let (left, r, j) = (st.left, st.run, st.job);
-        if left == 0 {
+        if st.left == 0 {
             let now = self.now;
             if let Some(bi) = self.bisections.get_mut(b) {
                 bi.done = Some(now);
             }
         } else {
-            self.new_exec(r, j, format!("bisect{b}"), 1, Some(b));
+            self.bisect_run(b);
         }
     }
 

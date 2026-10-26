@@ -63,6 +63,9 @@ pub struct Config {
     /// Who takes over what another runner hands this one (an agent session moving here); None:
     /// hand-overs are refused.
     pub adopt: Option<async_channel::Sender<Adoption>>,
+    /// The copies' uses, for their keeper (`super::keeper`, docs/reach.md §5.1): each sync and run
+    /// holds its copy in use while it's at it.
+    pub using: Arc<super::keeper::Using>,
 }
 
 /// Something another runner hands this one to take over, whole: `reply` says whether it was.
@@ -125,7 +128,7 @@ const ADOPT_PIECE: usize = 1 << 20;
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default() }
     }
 }
 
@@ -1231,10 +1234,14 @@ impl Node {
         let room = Arc::new(event_listener::Event::new());
         let (ev_tx, ev_rx) = async_channel::bounded::<serve::Event>(16);
         let extra = vec![("KILN_REACH_FROM".to_owned(), key.0.clone())];
+        // A run in a copy holds it in use until the run's last event, noted as the agent's that
+        // asked for it (docs/reach.md §5.1).
+        let busy = spec.mirror.as_deref().map(|m| self.cfg.using.busy(&key.0, m, super::keeper::agent_of(&spec.env)));
         let stdin = serve::start(spec.clone(), cwd, shell, extra, ev_tx);
         // Forward the run's events into the node, waiting while its asker has too much unread.
         let (tx, k, h, r) = (self.tx.clone(), key.clone(), Arc::clone(&held), Arc::clone(&room));
         crate::rt::spawn(async move {
+            let _busy = busy;
             while let Ok(ev) = ev_rx.recv().await {
                 if let serve::Event::Output { data, .. } = &ev {
                     while h.load(Ordering::Relaxed) >= BUFFER {
@@ -1405,7 +1412,9 @@ impl Node {
                     return;
                 }
             };
-            s.syncs.insert(sync_key.clone(), sync_worker(root, sync_key.clone(), key.clone(), self.tx.clone()));
+            // The copy is in use while its sync's worker is at it (docs/reach.md §5.1).
+            let busy = self.cfg.using.busy(&key.0, &sync_key, None);
+            s.syncs.insert(sync_key.clone(), sync_worker(root, sync_key.clone(), key.clone(), self.tx.clone(), busy));
         }
         if let Some(w) = s.syncs.get(&sync_key)
             && w.send(a).await.is_err()
@@ -1666,10 +1675,11 @@ enum Msg {
 
 /// A sync done for another runner: its own task, the file system work on blocking threads. What it
 /// says goes back through the node.
-fn sync_worker(root: PathBuf, key: String, session: (String, String), node: async_channel::Sender<In>) -> async_channel::Sender<SyncAsk> {
+fn sync_worker(root: PathBuf, key: String, session: (String, String), node: async_channel::Sender<In>, busy: super::keeper::Busy) -> async_channel::Sender<SyncAsk> {
     // Unbounded: the node never waits on a sync; the asker's window bounds what is in flight.
     let (tx, rx) = async_channel::unbounded::<SyncAsk>();
     crate::rt::spawn(async move {
+        let _busy = busy;
         let say = |s: SyncSay| {
             let node = node.clone();
             let session = session.clone();
