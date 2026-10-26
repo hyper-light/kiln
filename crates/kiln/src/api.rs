@@ -578,6 +578,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         // Identities kiln's CA issued: their revocations, and revoking one (W27-R01).
         (&Method::GET, ["api", "identities", "revocations"]) => boxed(|| identity_revocations(&hub)).await,
+        // A person's short-lived certificate for a key made on their device (W27-R02).
+        (&Method::POST, ["api", "me", "identity"]) => {
+            let caller = caller_of(&hub, req.headers()).await.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "sign in first"))?;
+            boxed(|| me_identity(&hub, caller, req)).await
+        }
         (&Method::GET, ["api", "identities"]) => {
             let kind = srv::query(&req).remove("kind");
             boxed(|| async {
@@ -2845,6 +2850,17 @@ async fn forget_agent(hub: &Hub, name: &str, by: &str) -> R {
     hub.forget_agent(name, by).await?;
     hub.store.audit(by.to_owned(), "agent.forget".into(), name.to_owned()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `POST /api/me/identity` `{csr}`: the caller's certificate as a person, for the CSR's key.
+async fn me_identity(hub: &Hub, caller: crate::authz::Caller, req: Request) -> R {
+    let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let csr = b.get("csr").and_then(serde_json::Value::as_str).ok_or_else(|| err(StatusCode::BAD_REQUEST, "send a csr"))?;
+    let (uri, pem) = crate::identities::issue_person(hub, &caller, csr).await.map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let f = crate::pki::fingerprints(&pem).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let identity = kiln_ci::identity::chain::Identity::parse(&uri).map(|i| i.to_string()).unwrap_or_default();
+    hub.store.audit(caller.name.clone(), "identity.person".into(), uri.clone()).await;
+    Ok(srv::json(StatusCode::OK, &json!({ "uri": uri, "identity": identity, "cert_pem": pem, "not_after": f.not_after })))
 }
 
 /// `GET /api/identities/revocations`: every revocation, oldest first (W27-R01).

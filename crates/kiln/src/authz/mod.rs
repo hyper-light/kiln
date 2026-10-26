@@ -335,6 +335,7 @@ pub static ROUTES: &[Rule] = &[
     // W10: one's own passkeys and password.
     r("GET", "/api/me/passkeys", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys", SIGNED_IN, At::Server),
+    r("POST", "/api/me/identity", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys/options", SIGNED_IN, At::Server),
     r("DELETE", "/api/me/passkeys/*", SIGNED_IN, At::Server),
     r("GET", "/api/me/password", SIGNED_IN, At::Server),

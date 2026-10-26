@@ -18,6 +18,55 @@ use crate::store::Store;
 pub const RUNNER_HOURS: i64 = 7 * 24;
 /// How long an agent session's certificate lasts, for one epoch; asked again on each connection.
 pub const AGENT_HOURS: i64 = 7 * 24;
+/// How long a person's certificate lasts after they sign in: hours, never past a day.
+pub const PERSON_HOURS: i64 = 12;
+
+/// A person's identity for a key made on their own device (W27-R02): issued to a person signed
+/// in (the owner, a user, a user's personal access token), never to an agent, a job or a peer.
+/// Returns the identity's URI and its certificate.
+pub async fn issue_person(hub: &Hub, caller: &crate::authz::Caller, csr: &str) -> anyhow::Result<(String, String)> {
+    use crate::authz::gate::Kind;
+    anyhow::ensure!(caller.agent.is_none() && matches!(caller.kind, Kind::Owner | Kind::User | Kind::Pat), "a person's certificate is for a person signed in, never an agent, a job or a peer");
+    let identity = Identity::new(hub.pki.organization(), Actor::Person { name: person_of(&caller.name) });
+    let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pem = hub.pki.issue_identity(csr, &identity, &[], time::Duration::hours(PERSON_HOURS))?;
+    record(&hub.store, "person", &uri, &pem).await?;
+    Ok((uri, pem))
+}
+
+/// Person `name` was disabled: their certificates are refused from now (W27-R01).
+pub async fn person_disabled(hub: &Hub, name: &str, by: &str) -> anyhow::Result<()> {
+    let uri = Identity::new(hub.pki.organization(), Actor::Person { name: person_of(name) }).uri().map_err(|e| anyhow::anyhow!("{e}"))?;
+    revoke(&hub.store, Target::Subject(uri), "person disabled", by, crate::util::now_unix()).await?;
+    Ok(())
+}
+
+/// `kiln login --certificate`: a key made here, on this device (`<config>/kiln/identity.key`,
+/// 0600, never sent), and the short-lived certificate the server issues for it to whoever
+/// `target`'s token signs in as (`identity.pem` beside it). Returns who it names and where.
+pub async fn login_certificate(target: &crate::access::Target) -> anyhow::Result<String> {
+    let dir = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).map_or_else(|| crate::os::home_dir().join(".config"), std::path::PathBuf::from).join("kiln");
+    std::fs::create_dir_all(&dir)?;
+    let key_path = dir.join("identity.key");
+    let key = match std::fs::read_to_string(&key_path) {
+        Ok(k) => k,
+        Err(_) => {
+            let k = crate::pki::new_key_pem()?;
+            crate::util::write_secret(&key_path, k.as_bytes(), 0o600)?;
+            k
+        }
+    };
+    let csr = crate::pki::make_csr_with_key("kiln-identity", &key)?;
+    let client = crate::http::client::Client::public()?;
+    let resp = client.post(&format!("{}/api/me/identity", target.url.trim_end_matches('/'))).bearer(&target.token).json(&serde_json::json!({ "csr": csr })).send().await?;
+    let ok = resp.is_success();
+    let v: serde_json::Value = resp.json(1 << 20).await.unwrap_or_default();
+    anyhow::ensure!(ok, "no certificate: {}", v.get("error").and_then(serde_json::Value::as_str).unwrap_or("refused"));
+    let pem = v.get("cert_pem").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("the server sent no certificate"))?;
+    let cert_path = dir.join("identity.pem");
+    crate::util::write_secret(&cert_path, pem.as_bytes(), 0o644)?;
+    Ok(format!("{} until {} ({})", v.get("identity").and_then(serde_json::Value::as_str).unwrap_or_default(), v.get("not_after").and_then(serde_json::Value::as_i64).unwrap_or_default(), cert_path.display()))
+}
 
 /// What a revocation names.
 #[derive(Clone, Debug, PartialEq, Eq)]
