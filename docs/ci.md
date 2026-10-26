@@ -8063,9 +8063,11 @@ Production's engine is off, so it can't plan them itself.
 W25 step 3 (branch `ci-w25-engine`) did what the last column asked, and holds it with tests:
 
 - *The `k8s` pool.* A `[[ci.pools]]` of `executor = "k8s"` and `labels = ["k8s"]` takes the
-  `[k8s]` legs, and a kiln-dialect leg on it gets a pod made for it as v1's job pod: the image of
-  its `image:` (else its `toolchain:`'s preset), its own `resources:` CPU and memory (memory its
-  limit too), v1's toolchain caches under the cache claim and v1's deadline
+  `[k8s]` legs, and a kiln-dialect leg on it whose job sets `toolchain:`, `image:` or `resources:`
+  (as each of kiln's own `[k8s]` jobs does) gets a pod made for it as v1's job pod, the pool's
+  other legs keeping its pods: the image of its `image:` (else its `toolchain:`'s preset), its own
+  `resources:` CPU and memory (memory its limit too), v1's toolchain caches under the cache claim
+  and v1's deadline
   (`w02_r06_kilns_k8s_jobs_get_v1s_pods_on_a_k8s_pool` holds every `[k8s]` job of `.kiln` to
   v1's pod, field by field; `w02_r06_a_kiln_dialect_leg_on_a_k8s_pool_gets_v1s_pod`, against
   the Kubernetes stand-in). Routing them to bare metal instead would have put the test suite on
