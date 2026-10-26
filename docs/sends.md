@@ -148,9 +148,10 @@ the session again.
 (30 minutes; short of room, those messages carried already go first): a message sent again
 carries it too, and reads as the same message, its repeat; and the server's sending once more for
 the epoch named carries it. Uploads live in the server's memory: once one is gone (expired, let go
-for room, or the server started again), a message sent again still carries the file's name, so it
-reads as the same message and is answered as its repeat if its first try was taken; new, it goes
-without the file, which its runner leaves out, said. The conversation counts a `reused` refusal of
+for room, or the server started again), a message sent again (by the conversation, Mission
+Control's message box under its key, or the API) still carries the file's name, so it reads as the
+same message and is answered as its repeat if its first try was taken; new, it goes without the
+file, which its runner leaves out, said. The conversation counts a `reused` refusal of
 its own message as taken (it shows as sent), so its Retry never sends it as a new message.
 
 **Bounds.** A session's inbox keeps the ids of its last 4,096 messages; past 4,096 and 256 more, its

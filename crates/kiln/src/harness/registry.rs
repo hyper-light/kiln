@@ -1869,7 +1869,10 @@ impl Registry {
     }
 
     /// Attachments that refer to uploads, with the uploads' bytes in them instead: what one
-    /// message to many agents carries to each. One whose upload is gone (expired) is left out.
+    /// message to many agents carries to each. One whose upload is gone (expired, let go for room,
+    /// or the server started again) keeps its name without its bytes, as [`Registry::route_attachments`]
+    /// does: the message is the one it was, so sent again under its key it's answered as its repeat
+    /// where it was taken (CP-T3.2, the twenty-second adversarial check's).
     pub fn inline_uploads(&self, attachments: Vec<super::model::Attachment>) -> Vec<super::model::Attachment> {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -1878,7 +1881,10 @@ impl Registry {
             .filter_map(|mut a| {
                 a.path = None;
                 let Some(fid) = a.file_id.take() else { return (!a.data_base64.is_empty()).then_some(a) };
-                let (name, mime, data) = self.upload_of(&fid)?;
+                let Some((name, mime, data)) = self.upload_of(&fid) else {
+                    a.data_base64.clear();
+                    return (!a.name.is_empty()).then_some(a);
+                };
                 if a.name.is_empty() {
                     a.name = name;
                 }
