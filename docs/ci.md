@@ -7922,7 +7922,10 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
 - **W28-R53 The replay.** Step 1's replayer decides P3's verdicts with `kiln_ci::verdict`: each job a
   check, a commit affecting the jobs whose input keys it changed, a new failure bisecting only its
   suspects, each try where R56's planner says (a suspect's job doing what its draw says; one
-  suspect is the culprit at once). A commit's verdict counts from
+  suspect is the culprit at once), and keeping what is under way: a run whose own work has begun
+  runs its jobs as they come ready though newer pushes withdrew it, and the newest execution of
+  each job of a lane (launching or running) stays until a live demand of the same job needs its
+  room. A commit's verdict counts from
   when it was answered for good. ci/sim/README.md reports where the commits answered after an hour
   stood at the hour.
 - **W28-R54 A Cargo workspace's units.** `kiln_ci::verdict::cargo`, pure: from the root manifest's
@@ -8001,9 +8004,9 @@ reader and `culprit` planner), the replayer, `crates/kiln/src/ci/verdict.rs` (`c
 commit's `Kiln-Agent` trailer only: by the agent token that pushed it waits for W25's Decision 3. Bisections start when asked (`ci.runs.bisect`), not on their own for each new
 failure: that is automation kiln adds only once declared, and isn't yet. Their tries run at the
 run's priority: `uploads::Ask` has no priority to give them W05-R09's low class. AC51 is not met: P3
-answers 79.3% (77.4%–81.9%) of ci's commits within the hour, against 75.9% before. The late ones
-wait mostly for capacity (ci's rust jobs held out of the k8s quota through bursts of pushes),
-which steps 6 and 8 (admission, spreading load) reach, not verdicts.
+answers 90.0% (87.8%–90.7%) of ci's commits within the hour, against 75.9% before. About half the
+late ones wait at the hour for a pod of their lane's work that the recorded week's cluster took 30
+min to 2.5 h to start, which no verdict answers sooner.
 
 ## 4. API, events, CLI and MCP reference
 

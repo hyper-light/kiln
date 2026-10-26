@@ -648,10 +648,53 @@ impl Engine<'_> {
         self.check_concluded(o);
     }
 
-    /// Whether a live demand (one not withdrawn) waits on the execution.
+    /// Whether a live demand (one not withdrawn) waits on the execution, or (P3 and later) it is
+    /// what answers its lane's older commits.
     fn wanted(&self, x: usize) -> bool {
+        self.live(x) || (self.policy.verdicts && self.answers(x))
+    }
+
+    /// Whether a live demand (one not withdrawn) waits on the execution, or a bisection runs it.
+    fn live(&self, x: usize) -> bool {
         self.serves.get(x).is_some_and(|s| s.iter().any(|(r, j)| self.runs.get(*r).is_some_and(|rs| !rs.withdrawn) && self.job_st(*r, *j) == Some(&JobSt::Attached(x))))
             || self.execs.get(x).is_some_and(|e| e.bisect.is_some())
+    }
+
+    /// Whether `y`, kept only as what answers its lane's older commits, gives way to `x`: a live
+    /// demand of the same job on the same lane, whose result answers them too (P3).
+    fn gives_way(&self, y: usize, x: usize) -> bool {
+        let (Some(a), Some(b)) = (self.execs.get(y), self.execs.get(x)) else { return false };
+        !self.live(y) && self.lane_of(a.run) == self.lane_of(b.run) && self.job_of(a.run, a.job).map(|j| &j.key) == self.job_of(b.run, b.job).map(|j| &j.key)
+    }
+
+    /// P3 (W28-R53): a covered verdict needs a later commit's result, so the newest execution of
+    /// each job of a lane under way (its pod launching, or running) is kept when newer pushes
+    /// withdraw its demand: it answers the lane's commits before it. Dropped, a burst of pushes
+    /// each faster than a pod's start would leave every commit of the burst waiting for the next
+    /// quiet spell.
+    fn answers(&self, x: usize) -> bool {
+        let trace = self.trace;
+        let under_way = |y: usize| matches!(self.exec_st.get(y), Some(ExecSt::Launching | ExecSt::Running));
+        let Some(e) = self.execs.get(x) else { return false };
+        if e.bisect.is_some() || !under_way(x) {
+            return false;
+        }
+        let (lane, key) = (self.lane_of(e.run), self.job_of(e.run, e.job).map(|j| j.key.clone()));
+        let order = |r: usize| (trace.runs.get(r).map_or(0, |x| x.at), r);
+        !self.execs.iter().enumerate().any(|(y, o)| y != x && under_way(y) && o.bisect.is_none() && order(o.run) > order(e.run) && self.lane_of(o.run) == lane && self.job_of(o.run, o.job).map(|j| j.key.clone()) == key)
+    }
+
+    /// P3 (W28-R53): whether run `r`'s own work has begun: an execution of its own launched or
+    /// running, or a job it ran done (not a result reused or adopted). Withdrawn, such a run still
+    /// runs its jobs as they come ready, which answer its commit and cover the lane's before it.
+    fn begun(&self, r: usize) -> bool {
+        self.runs.get(r).is_some_and(|rs| {
+            rs.jobs.iter().any(|st| match st {
+                JobSt::Done { how: How::Ran, .. } => true,
+                JobSt::Attached(x) => self.execs.get(*x).is_some_and(|e| e.run == r) && matches!(self.exec_st.get(*x), Some(ExecSt::Launching | ExecSt::Running)),
+                _ => false,
+            })
+        })
     }
 
     fn start_run(&mut self, r: usize) {
@@ -822,7 +865,7 @@ impl Engine<'_> {
             self.set_job(r, j, JobSt::Attached(x));
             return;
         }
-        if self.runs.get(r).is_some_and(|rs| rs.withdrawn) {
+        if self.runs.get(r).is_some_and(|rs| rs.withdrawn) && !(self.policy.verdicts && self.begun(r)) {
             self.set_job(r, j, JobSt::Cancelled);
             return;
         }
@@ -989,7 +1032,7 @@ impl Engine<'_> {
             let running: Vec<usize> = self.running.iter().copied().filter(|y| self.execs.get(*y).is_some_and(|o| o.pool == Some(i))).collect();
             let mut preemptible: Vec<(i64, usize)> = running
                 .iter()
-                .filter(|y| !self.wanted(**y) && self.execs.get(**y).and_then(|o| self.job_of(o.run, o.job)).is_some_and(|oj| !self.on_cadence(oj)))
+                .filter(|y| (!self.wanted(**y) || self.gives_way(**y, x)) && self.execs.get(**y).and_then(|o| self.job_of(o.run, o.job)).is_some_and(|oj| !self.on_cadence(oj)))
                 .map(|y| (self.expected_left(*y), *y))
                 .filter(|(left, _)| *left > self.policy.finish_within)
                 .collect();
