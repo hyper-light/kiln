@@ -188,6 +188,7 @@ classes! {
         AgentMsg::NetDrops { .. } => Class::Telemetry,
         AgentMsg::HarnessHandOver { .. } => Class::Stream,
         AgentMsg::HarnessAdopted { .. } => Class::Answer,
+        AgentMsg::WorkState { .. } => Class::State,
     }
 }
 

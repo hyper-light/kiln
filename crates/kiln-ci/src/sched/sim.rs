@@ -32,6 +32,8 @@ pub struct Sim {
     events: HashMap<u64, Ev>,
     seq: u64,
     durations: HashMap<String, i64>,
+    /// A leg's duration on one runner, where it differs (a warm runner's, W24-R18): (leg, runner).
+    pub durations_on: HashMap<(String, String), i64>,
     failures: HashMap<String, Vec<FailureClass>>,
     repos: HashMap<String, String>,
     running: HashMap<String, (String, i64)>,
@@ -59,6 +61,7 @@ impl Sim {
             events: HashMap::new(),
             seq: 0,
             durations: HashMap::new(),
+            durations_on: HashMap::new(),
             failures: HashMap::new(),
             repos: HashMap::new(),
             running: HashMap::new(),
@@ -135,8 +138,8 @@ impl Sim {
             match c {
                 Command::Assign { leg, runner, attempt, .. } => {
                     self.assigned.push(Assigned { at: self.now, leg: leg.clone(), runner: runner.clone(), attempt });
+                    let d = self.durations_on.get(&(leg.clone(), runner.clone())).or_else(|| self.durations.get(&leg)).copied().unwrap_or(60_000);
                     self.running.insert(leg.clone(), (runner, self.now));
-                    let d = self.durations.get(&leg).copied().unwrap_or(60_000);
                     self.at(self.now + d, Ev::Finish { leg, attempt });
                 }
                 Command::Cancel { leg, attempt, .. } => {

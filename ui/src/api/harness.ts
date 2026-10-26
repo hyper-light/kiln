@@ -1181,6 +1181,37 @@ export interface Snapshot {
   ranFrom: number | null;
   /** The commands this page sent that haven't been answered, and those refused a moment ago. */
   asked: Asked[];
+  /** Messages sent from this page that the session doesn't show yet, in the order they went. */
+  outgoing: Outgoing[];
+}
+
+/**
+ * A message sent from this page, shown in the conversation at once until its session shows it
+ * there or in a queue: on its way (`sending`, sent again under its id until it's answered:
+ * `Snapshot.asked`), taken by its machine (`sent`), or refused for good (`failed`, `why`). Part of
+ * CP-T3.4: nothing sent is out of sight while it goes.
+ */
+export interface Outgoing {
+  id: string;
+  text: string;
+  /** Its files, by name. */
+  attachments: string[];
+  reply_to?: string;
+  /** The subagent it's for (its task's id). */
+  task?: string;
+  mode?: SendMode;
+  /** When it was sent (ms). */
+  at: number;
+  state: "sending" | "sent" | "failed";
+  why?: string;
+}
+
+const ENDED = "the agent ended before it got there";
+
+/** A message on its way from here, and what was sent (a retry sends it again, as a new message). */
+interface Going {
+  o: Outgoing;
+  c: Extract<Command, { type: "send" }>;
 }
 
 /**
@@ -1207,7 +1238,21 @@ export function lastTurnFrom(s: Snapshot): number | null {
 /** A promise React reads as settled without waiting (its `status`, as React marks the ones it tracks). */
 const READY: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
 
-const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, files: [], error: null, ready: false, stopAsked: null, ranFrom: null, asked: [] };
+const EMPTY: Snapshot = {
+  conn: "connecting",
+  info: null,
+  meta: null,
+  state: null,
+  events: [],
+  changes: null,
+  files: [],
+  error: null,
+  ready: false,
+  stopAsked: null,
+  ranFrom: null,
+  asked: [],
+  outgoing: [],
+};
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /**
  * The snapshot sent as the socket opens ends with the server's "synced"; one sent later (a machine
@@ -1364,6 +1409,8 @@ export class SessionStore {
   /** Packed messages being unpacked, and the chain they (and what came after them) are taken in. */
   private unpacking = 0;
   private inbox: Promise<void> = Promise.resolve();
+  /** Messages sent from here that the session doesn't show yet, in the order they went (`Snapshot.outgoing`). */
+  private out = new Map<string, Going>();
 
   constructor(readonly id: string) {}
 
@@ -1405,7 +1452,8 @@ export class SessionStore {
   /**
    * Send a command; false when the session isn't connected. It goes under an id ({@link commandId}),
    * taken once however often it's sent: kept until its answer comes, it's sent again on each socket
-   * after this one, and shown as waiting meanwhile, or refused once it is (`Snapshot.asked`).
+   * after this one, and shown as waiting meanwhile, or refused once it is (`Snapshot.asked`). A
+   * message also shows in the conversation until the session has it (`Snapshot.outgoing`).
    */
   send = (c: Command): boolean => {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
@@ -1413,7 +1461,25 @@ export class SessionStore {
     this.asked.set(id, { id, command: c, at: Date.now(), state: "pending" });
     this.ws.send(JSON.stringify({ t: "cmd", id, c }));
     this.patch({ asked: [...this.asked.values()] });
+    if (c.type === "send") this.track(c);
     return true;
+  };
+
+  /**
+   * Sends a message refused for good again, as a new message with its words, files and reply (its
+   * id's answer stays the refusal): false while the session isn't connected.
+   */
+  resend = (id: string): boolean => {
+    const m = this.out.get(id);
+    if (m?.o.state !== "failed" || !this.send({ ...m.c, id: clientId() })) return false;
+    this.out.delete(id);
+    this.outChanged();
+    return true;
+  };
+
+  /** Lets go of a message that didn't get there: it isn't sent again. */
+  discard = (id: string) => {
+    if (this.out.delete(id)) this.outChanged();
   };
 
   /** The socket's open: what was sent and not answered goes again under its id; what waited too long for any answer is said to have had none. */
@@ -1446,11 +1512,12 @@ export class SessionStore {
     }, AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1]);
   }
 
-  /** Command `id` was refused: shown so a moment, then let go of. */
+  /** Command `id` was refused: shown so a moment, then let go of. A message refused so says so where it shows in the conversation, until it's sent again or let go of. */
   private refuse(id: string, code: string, why: string) {
     const a = this.asked.get(id);
     if (!a) return;
     this.asked.set(id, { ...a, state: "refused", code, why });
+    this.fail([id], why);
     window.setTimeout(() => {
       if (this.asked.get(id)?.state !== "refused") return;
       this.asked.delete(id);
@@ -1669,6 +1736,8 @@ export class SessionStore {
         if (u.outcome === "parked") return this.later(u.id, "its machine is away, and it goes once that's back");
         // A message its inbox hasn't answered yet: asked again, its inbox answers a repeat if it took it.
         if (u.outcome === "pending") return this.later(u.id, "its inbox hasn't said it took it yet");
+        // Its machine has it: a message shows as sent until the conversation shows it.
+        this.took(u.id);
         if (this.asked.delete(u.id)) this.patch({ asked: [...this.asked.values()] });
         return;
       case "nack":
@@ -1701,6 +1770,7 @@ export class SessionStore {
         this.commit();
         this.ended = true;
         this.patch({ conn: "gone", ready: true });
+        this.fail(this.sending(), ENDED);
         this.settle();
         return;
     }
@@ -1797,6 +1867,7 @@ export class SessionStore {
     // Ready only with its events in order, so the first render has them all.
     this.snap = { ...this.snap, events: this.ordered() };
     this.known = true;
+    this.arrived(this.byId.values());
     this.settle();
     this.schedule();
   }
@@ -1816,6 +1887,7 @@ export class SessionStore {
     // Taken as ended; still looked for now and then.
     this.ended = true;
     this.patch({ conn: "gone", ready: true });
+    this.fail(this.sending(), ENDED);
     this.settle();
   }
 
@@ -1867,6 +1939,74 @@ export class SessionStore {
         this.begin(this.snap.info, false);
         break;
     }
+    if (u.t === "events") this.arrived(u.events);
+    else if (u.t === "state" || u.t === "state_patch") this.arrived([]);
+  }
+
+  /* -------------------------------------------------------------- what's on its way from here */
+
+  /** A message that went: shown as sending until the session has it (sent again, the same one, in its place and with its time). */
+  private track(c: Extract<Command, { type: "send" }>) {
+    if (this.shows(c.id)) return;
+    const at = this.out.get(c.id)?.o.at ?? Date.now();
+    const o: Outgoing = { id: c.id, text: c.text, attachments: (c.attachments ?? []).map((a) => a.name), reply_to: c.reply_to, task: c.task, mode: c.mode, at, state: "sending" };
+    this.out.set(c.id, { o, c });
+    this.outChanged();
+  }
+
+  /** Whether the session shows message `id`: in its conversation, or waiting in its queue or a subagent's. */
+  private shows(id: string): boolean {
+    const s = this.snap.state;
+    if (s?.queue?.some((q) => q.id === id) || s?.tasks?.some((t) => t.queue?.some((q) => q.id === id))) return true;
+    if (this.byId.get(id)?.kind === "user") return true;
+    for (const e of this.byId.values()) if (e.kind === "user" && e.client_id === id) return true;
+    return false;
+  }
+
+  /** Lets go of the messages sent from here that the session shows now: among `events` (those that came; all of them, after a snapshot), or in its queues. */
+  private arrived(events: Iterable<HEvent>) {
+    if (this.out.size === 0) return;
+    const before = this.out.size;
+    for (const e of events) {
+      if (e.kind !== "user") continue;
+      this.out.delete(e.id);
+      if (e.client_id) this.out.delete(e.client_id);
+    }
+    const s = this.snap.state;
+    for (const q of s?.queue ?? []) this.out.delete(q.id);
+    for (const t of s?.tasks ?? []) for (const q of t.queue ?? []) this.out.delete(q.id);
+    if (this.out.size !== before) this.outChanged();
+  }
+
+  /** The messages still on their way: not taken by their machine yet. */
+  private sending(): string[] {
+    return [...this.out.values()].filter((m) => m.o.state === "sending").map((m) => m.o.id);
+  }
+
+  /** Message `id`'s machine has it (its inbox took it, or its runner did): it shows as sent until the conversation shows it. */
+  private took(id: string) {
+    const m = this.out.get(id);
+    if (m?.o.state !== "sending") return;
+    this.out.set(id, { ...m, o: { ...m.o, state: "sent" } });
+    this.outChanged();
+  }
+
+  /** Messages `ids` didn't get there, `why` (one its machine took did, whatever's said after). */
+  private fail(ids: string[], why: string) {
+    let changed = false;
+    for (const id of ids) {
+      const m = this.out.get(id);
+      if (!m || m.o.state === "sent") continue;
+      this.out.set(id, { ...m, o: { ...m.o, state: "failed", why } });
+      changed = true;
+    }
+    if (changed) this.outChanged();
+  }
+
+  /** What's shown of the messages on their way changed. */
+  private outChanged() {
+    this.snap = { ...this.snap, outgoing: Array.from(this.out.values(), (m) => m.o) };
+    this.schedule();
   }
 
   private settle() {

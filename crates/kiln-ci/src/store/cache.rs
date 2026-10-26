@@ -186,8 +186,9 @@ pub fn evict(entries: &[Entry], now: i64, max_idle_secs: i64, quota: u64) -> Vec
 }
 
 /// The kiln dialect's `cache:` on a job (W08-R09): each entry `{ key, restore-keys, paths, scope,
-/// policy, local }` a `kiln/cache@v1` step the job starts with. Lists of directories (v1's kept
-/// directories) aren't caches of this kind, and give none.
+/// policy, local }` a `kiln/cache@v1` step the job starts with. v1's directories (a string each)
+/// aren't caches of this kind: together they're one `kiln/keep@v1` step, folders the runner keeps
+/// per repository and job for trusted legs (W02-R06, W24-R11).
 pub fn job_steps(entries: &[crate::wf::ir::YVal]) -> Vec<crate::wf::ir::Step> {
     use crate::wf::ir::{Step, Tpl, YVal};
     let text = |v: &YVal| -> Option<YVal> {
@@ -200,7 +201,8 @@ pub fn job_steps(entries: &[crate::wf::ir::YVal]) -> Vec<crate::wf::ir::Step> {
             other => Some(other.clone()),
         }
     };
-    entries
+    let dirs: Vec<String> = entries.iter().filter_map(|e| e.as_str().map(str::to_owned)).collect();
+    let mut steps: Vec<Step> = entries
         .iter()
         .filter(|e| matches!(e, YVal::Map(_)))
         .map(|e| {
@@ -214,7 +216,12 @@ pub fn job_steps(entries: &[crate::wf::ir::YVal]) -> Vec<crate::wf::ir::Step> {
             }
             Step { name: Some(Tpl::new("Cache".to_owned(), Default::default())), uses: Some("kiln/cache@v1".into()), with, ..Step::default() }
         })
-        .collect()
+        .collect();
+    if !dirs.is_empty() {
+        let with = vec![("path".to_owned(), YVal::Str(Tpl::new(dirs.join("\n"), Default::default())))];
+        steps.push(Step { name: Some(Tpl::new("Keep v1 cache directories".to_owned(), Default::default())), uses: Some("kiln/keep@v1".into()), with, ..Step::default() });
+    }
+    steps
 }
 
 #[cfg(test)]
@@ -335,7 +342,9 @@ mod tests {
         assert_eq!(with.get("path").map(String::as_str), Some("target\n~/.cargo/registry"));
         assert_eq!(with.get("restore-keys").map(String::as_str), Some("cargo-"));
         assert!(with.get("key").is_some_and(|k| k.contains("hashFiles")));
-        // v1's kept directories aren't caches of this kind.
-        assert!(job_steps(&[crate::wf::ir::YVal::Str(crate::wf::ir::Tpl::new("target", Default::default()))]).is_empty());
+        // v1's kept directories are one kiln/keep@v1 step (W02-R06, W24-R11).
+        let kept = job_steps(&[crate::wf::ir::YVal::Str(crate::wf::ir::Tpl::new("target", Default::default()))]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept.first().and_then(|s| s.uses.as_deref()), Some("kiln/keep@v1"));
     }
 }

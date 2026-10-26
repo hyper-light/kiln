@@ -402,25 +402,76 @@ impl Mirror {
         Ok(())
     }
 
-    /// Make the copy match the list: folders and symlinks as listed, and whatever is not listed
-    /// removed. Returns how many entries were removed.
+    /// Where the list the copy was last made to match is kept: beside the copy, never in it.
+    fn sent_path(&self) -> Option<PathBuf> {
+        let name = self.root.file_name()?.to_str()?;
+        Some(self.root.with_file_name(format!("{name}.kiln-sent")))
+    }
+
+    /// What the last commit was sent, path by path; `None` for a copy with no record of it.
+    fn sent_before(&self) -> Option<HashMap<String, EntryKind>> {
+        let bytes = std::fs::read(self.sent_path()?).ok()?;
+        serde_json::from_slice::<Vec<(String, EntryKind)>>(&bytes).ok().map(|l| l.into_iter().collect())
+    }
+
+    fn record_sent(&self) -> anyhow::Result<()> {
+        let Some(path) = self.sent_path() else { return Ok(()) };
+        let list: Vec<(&str, EntryKind)> = self.plan.iter().map(|e| (e.path.as_str(), e.kind)).collect();
+        let tmp = path.with_extension("kiln-sent-part");
+        std::fs::write(&tmp, serde_json::to_vec(&list)?).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("place {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Make the copy match the list: folders and symlinks as listed, and what was sent before but
+    /// is no longer listed removed. What was never sent (untracked and ignored output: `target/`,
+    /// `ui/dist`, `node_modules`) stays between syncs, so builds there stay incremental (W24-R24).
+    /// A copy with no record of what it was sent is made to match exactly, once. Returns how many
+    /// entries were removed.
     pub fn commit(&mut self) -> anyhow::Result<u32> {
         for (_, (_, tmp, _)) in self.open.drain() {
             let _ = std::fs::remove_file(tmp);
         }
         let listed: HashSet<&str> = self.plan.iter().map(|e| e.path.as_str()).collect();
-        // What is not listed goes first, deepest first, never following a symlink.
+        let sent = self.sent_before();
+        // The folders holding something listed or sent before; any other folder was never sent,
+        // and isn't even looked into.
+        let known: Option<HashSet<String>> = sent.as_ref().map(|s| {
+            let mut known = HashSet::new();
+            for p in listed.iter().copied().chain(s.keys().map(String::as_str)) {
+                known.insert(p.to_owned());
+                let mut at = p;
+                while let Some((parent, _)) = at.rsplit_once('/') {
+                    if !known.insert(parent.to_owned()) {
+                        break;
+                    }
+                    at = parent;
+                }
+            }
+            known
+        });
+        let skip = |p: &str| known.as_ref().is_some_and(|k| !k.contains(p));
+        // What goes, goes first, deepest first, never following a symlink.
         let mut found = Vec::new();
-        walk(&self.root, Path::new(""), &|_| false, &mut found)?;
+        walk(&self.root, Path::new(""), &skip, &mut found)?;
         found.sort_by(|a, b| b.path.len().cmp(&a.path.len()).then_with(|| b.path.cmp(&a.path)));
         let mut removed = 0;
         for f in found {
-            let keep = listed.contains(f.path.as_str()) && self.plan.iter().any(|e| e.path == f.path && e.kind == f.kind);
-            if keep {
+            if self.plan.iter().any(|e| e.path == f.path && e.kind == f.kind) {
+                continue;
+            }
+            let relisted = listed.contains(f.path.as_str());
+            let goes = match &sent {
+                None => true,
+                Some(s) => relisted || s.contains_key(&f.path) || f.path.ends_with(".kiln-part"),
+            };
+            if !goes {
                 continue;
             }
             let full = self.root.join(&f.path);
             let gone = match f.kind {
+                // A folder that was sent goes once nothing is left in it: what a build made there stays.
+                EntryKind::Dir if sent.is_some() && !relisted => std::fs::remove_dir(&full),
                 EntryKind::Dir => std::fs::remove_dir_all(&full),
                 _ => std::fs::remove_file(&full),
             };
@@ -450,6 +501,7 @@ impl Mirror {
             #[cfg(unix)]
             std::os::unix::fs::symlink(&target, &full).with_context(|| format!("link {}", full.display()))?;
         }
+        self.record_sent()?;
         Ok(removed)
     }
 }
@@ -576,6 +628,51 @@ mod tests {
         assert_eq!(run(&["log", "--format=%s", "-1"])?, "feature work");
         assert_eq!(run(&["status", "--porcelain"])?, "M a.txt");
         assert!(!d.join(".git/worktrees").exists(), "the other worktrees stay home");
+        Ok(())
+    }
+
+    #[test]
+    fn w24_r24_build_output_survives_a_sync_and_deleted_files_go() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let src = dir.path().join("src");
+        let dst = dir.path().join("copy");
+        std::fs::create_dir_all(src.join("crates"))?;
+        std::fs::write(src.join("crates/a.rs"), "a")?;
+        std::fs::write(src.join("crates/b.rs"), "b")?;
+        sync(&src, &dst)?;
+        // The build over there writes output the asker never sends.
+        std::fs::create_dir_all(dst.join("target/debug"))?;
+        std::fs::write(dst.join("target/debug/x"), "built")?;
+        std::fs::write(dst.join("crates/generated.rs"), "made there")?;
+        sync(&src, &dst)?;
+        assert!(dst.join("target/debug/x").exists());
+        assert!(dst.join("crates/generated.rs").exists());
+        // A file deleted on the asking machine goes over there; the build output still stays.
+        std::fs::remove_file(src.join("crates/b.rs"))?;
+        let (_, _, removed) = sync(&src, &dst)?;
+        assert_eq!(removed, 1);
+        assert!(!dst.join("crates/b.rs").exists());
+        assert!(dst.join("crates/a.rs").exists());
+        assert!(dst.join("target/debug/x").exists());
+        // The record of what was sent sits beside the copy, never in it.
+        assert!(dir.path().join("copy.kiln-sent").exists());
+        assert!(!dst.join("copy.kiln-sent").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn w24_r24_a_copy_without_a_record_is_matched_exactly_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let src = dir.path().join("src");
+        let dst = dir.path().join("copy");
+        std::fs::create_dir_all(&src)?;
+        std::fs::write(src.join("a.rs"), "a")?;
+        // A copy made before records were kept, holding a file the asker no longer has.
+        std::fs::create_dir_all(&dst)?;
+        std::fs::write(dst.join("stale.rs"), "old")?;
+        sync(&src, &dst)?;
+        assert!(!dst.join("stale.rs").exists());
+        assert!(dst.join("a.rs").exists());
         Ok(())
     }
 

@@ -147,7 +147,11 @@ repository, `--no-sync` to skip):
 The copy lives at `~/.kiln/reach/<asking runner>/<tree>-<hash>` and is kept, so the next sync
 sends only what changed: the asker sends the list (path, size, time, mode), the doer asks for the
 files that differ, the asker sends them (256 KiB pieces, at most 4 MiB unacknowledged), and on
-commit the copy is made to match exactly. The command then runs in the copy's folder matching
+commit the copy is made to match the list: what was sent before and is no longer listed goes,
+while what was never sent (untracked and ignored build output such as `target/`, `ui/dist` and
+`node_modules`) stays, so builds over there stay incremental (docs/ci.md W24-R24). The list last
+applied is kept beside the copy (`<copy>.kiln-sent`), never in it; a copy without one is made to
+match exactly, once. The command then runs in the copy's folder matching
 where the asker was. Paths are checked (relative, plain, never through a symlink) so a list can't
 write outside the copy.
 

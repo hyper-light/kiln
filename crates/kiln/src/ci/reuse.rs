@@ -118,10 +118,65 @@ pub async fn inputs(hub: &Hub, repo: &Repo, sha: &str, leg: &LegSpec, reuse: &Sp
 
 /// A leg that succeeded under `hash` within `max_age` seconds, whose artifacts are all still
 /// there: it and the report it gave.
-pub async fn lookup(hub: &Hub, hash: &str, max_age: u64) -> anyhow::Result<Option<(String, String)>> {
+/// The trust domain a leg's results are kept in (W24-R21): untrusted ones never meet trusted ones.
+pub fn domain(trusted: bool) -> &'static str {
+    if trusted { "trusted" } else { "untrusted" }
+}
+
+/// Whether a run's work is trusted (W24-R20, R21): a trusted run's, except a change's own as it's
+/// reviewed (a diff, a pull request), which writes untrusted work and reads trusted. The land queue,
+/// trusted, never takes a diff's own results: its candidate runs what the diffs touched itself.
+pub fn work_trusted(trusted: bool, event: &str) -> bool {
+    trusted && !matches!(event, "diff" | "pull_request" | "pull_request_target")
+}
+
+/// A leg's work unit (docs/ci.md W24-R06): a leg whose definition is its input hash, which covers
+/// its definition, pins, images, platform, listed variables and listed paths' trees. The work
+/// ledger keys it, on the one path its records and lookups share (W24-R30).
+pub fn work_unit(hash: &str, trusted: bool) -> kiln_ci::work::key::Unit {
+    use kiln_ci::work::key::{Kind, Platform, Unit};
+    Unit {
+        kind: Kind::Leg,
+        definition: format!("w08-r10 {hash}"),
+        secrets: Default::default(),
+        env: Default::default(),
+        platform: Platform::default(),
+        inputs: Default::default(),
+        upstream: Default::default(),
+        trust: domain(trusted).to_owned(),
+    }
+}
+
+/// Whether a succeeded leg can still be taken over: it's there, succeeded, and its artifacts all are.
+fn stands(c: &rusqlite::Connection, leg: &str, now: i64) -> rusqlite::Result<bool> {
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.id = ?1 AND j.status = 'succeeded'
+           AND NOT EXISTS (SELECT 1 FROM ci_artifacts a WHERE a.leg_id = j.id AND (a.finalized = 0 OR (a.expires_at IS NOT NULL AND a.expires_at <= ?2))))",
+        params![leg, now],
+        |r| r.get(0),
+    )
+}
+
+/// The newest succeeded leg for `hash` within `max_age` whose artifacts are all still there, with
+/// its report: from the work ledger first (W24-R06), then from W08-R10's own table, which holds
+/// the results kept before the ledger.
+pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u64) -> anyhow::Result<Option<(String, String)>> {
     let (hash, since) = (hash.to_owned(), crate::util::now_unix().saturating_sub(i64::try_from(max_age).unwrap_or(i64::MAX)));
-    hub.store
+    let (scope, unit) = (crate::ci::work::scope(repo, domain(trusted)), work_unit(&hash, trusted));
+    let found = hub
+        .store
         .call(move |c| {
+            let now = crate::util::now_unix();
+            let same = |p: &kiln_ci::work::key::PathSet| p.clone();
+            if let Some(hit) = crate::ci::work::lookup(c, &scope, &unit, &same)?
+                && hit.recorded.provenance.finished_at >= since
+                && stands(c, &hit.recorded.provenance.leg, now)?
+            {
+                if let Some(by) = &hit.class {
+                    tracing::info!(leg = %hit.recorded.provenance.leg, class = ?by.class, why = ?by.why, "a leg's result is reused by its class (W24-R30)");
+                }
+                return Ok(Some((hit.recorded.provenance.leg.clone(), hit.recorded.outputs.get("report").cloned().unwrap_or_default())));
+            }
             Ok(c.query_row(
                 "SELECT r.leg_id, r.report FROM ci_reuse r JOIN jobs j ON j.id = r.leg_id
                  WHERE r.input_hash = ?1 AND r.created_at >= ?2 AND j.status = 'succeeded'
@@ -132,15 +187,33 @@ pub async fn lookup(hub: &Hub, hash: &str, max_age: u64) -> anyhow::Result<Optio
             )
             .optional()?)
         })
-        .await
+        .await;
+    // Every lookup counted, by layer and outcome (W24-R28).
+    let outcome = match &found {
+        Ok(Some(_)) => "hit",
+        Ok(None) => "miss",
+        Err(_) => "error",
+    };
+    crate::metrics::global().work_lookups.inc(&["leg", outcome]);
+    found
 }
 
-/// A leg that succeeded under `hash`: kept for those that come after.
-pub async fn remember(hub: &Hub, leg: &str, run: &str, hash: &str, report: &str) -> anyhow::Result<()> {
-    let (leg, run, hash, report) = (leg.to_owned(), run.to_owned(), hash.to_owned(), report.to_owned());
+/// A leg that succeeded under `hash`: kept for those that come after, in the work ledger as its
+/// work unit's (W24-R06) and in W08-R10's own table.
+pub async fn remember(hub: &Hub, repo: &str, trusted: bool, leg: &str, run: &str, hash: &str, report: &str) -> anyhow::Result<()> {
+    let (repo, leg, run, hash, report) = (repo.to_owned(), leg.to_owned(), run.to_owned(), hash.to_owned(), report.to_owned());
     hub.store
         .call(move |c| {
-            c.execute("INSERT OR REPLACE INTO ci_reuse (input_hash, leg_id, run_id, report, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![hash, leg, run, report, crate::util::now_unix()])?;
+            let now = crate::util::now_unix();
+            c.execute("INSERT OR REPLACE INTO ci_reuse (input_hash, leg_id, run_id, report, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![hash, leg, run, report, now])?;
+            let result = crate::ci::work::Recorded {
+                outcome: "success".into(),
+                outputs: BTreeMap::from([("report".to_owned(), report)]),
+                provenance: crate::ci::work::Provenance { repo: repo.clone(), run, leg, finished_at: now, ..Default::default() },
+                domain: domain(trusted).to_owned(),
+                ..Default::default()
+            };
+            crate::ci::work::record(c, &crate::ci::work::scope(&repo, domain(trusted)), &work_unit(&hash, trusted), &kiln_ci::work::key::PathSet::new(), &result)?;
             Ok(())
         })
         .await
@@ -173,7 +246,12 @@ pub async fn take_over(hub: &Hub, run: &str, source: &str, id: &str, hash: &str)
                  SELECT ?1, ?2, name, object, size, digest, mime_type, created_at, expires_at, finalized FROM ci_artifacts WHERE leg_id = ?3",
                 params![run, id, source],
             )?;
+            // The time it saved: what its source ran (W24-R28).
+            let ran: Option<i64> = tx.query_row("SELECT finished_at - started_at FROM jobs WHERE id = ?1", [&id], |r| r.get(0)).optional()?.flatten();
             tx.commit()?;
+            if let Some(s) = ran.and_then(|s| u64::try_from(s).ok()) {
+                crate::metrics::global().work_saved_seconds.add(s);
+            }
             Ok(())
         })
         .await
@@ -203,5 +281,53 @@ mod tests {
         assert_eq!(matching(listing, "README.md"), "100644 blob c1\tREADME.md");
         assert_eq!(matching(listing, "**/*.rs"), "100644 blob b1\tlib/x/b.rs");
         assert_eq!(matching(listing, "nothing"), "");
+    }
+
+    /// W24-R06: a leg that took an earlier result over, as one the change can't affect does, is a
+    /// passing required check: the land policy sees it green, and its row names its source.
+    #[test]
+    fn w24_r06_a_reused_leg_is_a_passing_required_check() -> anyhow::Result<()> {
+        use crate::ci::runs;
+        use crate::store::Status;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let repo = Repo { id: "r1".into(), name: "acme/app".into(), clone_url: String::new(), branches: Vec::new(), poll_seconds: 0, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "native".into(), default_branch: None, mirror: None };
+            let repo = hub.store.upsert_repo(repo).await?;
+            let (wf, _) = kiln_ci::wf::parse_workflow(".kiln/ci.yaml", "on: push\njobs:\n  a:\n    work: { memo: true }\n    steps: [{run: t}]\n", kiln_ci::expr::Dialect::Kiln);
+            let wf = std::sync::Arc::new(wf.ok_or_else(|| anyhow::anyhow!("no workflow"))?);
+            let input = kiln_ci::plan::RunInput { trusted: true, ..Default::default() };
+            let (_, acts) = kiln_ci::plan::RunPlan::start(wf, input, kiln_ci::plan::Settings::default(), &kiln_ci::plan::NoSource).map_err(|e| anyhow::anyhow!(e))?;
+            let spec = acts.into_iter().find_map(|a| if let kiln_ci::plan::PlanAction::Queue(s) = a { Some(*s) } else { None }).ok_or_else(|| anyhow::anyhow!("no leg"))?;
+            let new = |id: &str, sha: &str| runs::NewRun {
+                id: id.into(),
+                workflow: ".kiln/ci.yaml".into(),
+                name: "ci".into(),
+                event: "push".into(),
+                branch: "main".into(),
+                sha: sha.into(),
+                message: String::new(),
+                author: String::new(),
+                actor: "ada".into(),
+                trigger: Value::Null,
+                trusted: true,
+                priority: 60,
+                payload: Value::Null,
+                model: String::new(),
+                input: String::new(),
+            };
+            runs::create(&hub, &repo, new("run1", "s1")).await?;
+            runs::create(&hub, &repo, new("run2", "s2")).await?;
+            runs::insert_leg(&hub, "run1", "leg1", &spec, Status::Queued, None).await?;
+            runs::finish_leg(&hub, "leg1", Status::Succeeded, "success", None, None).await?;
+            take_over(&hub, "run2", "leg1", "leg2", "h1").await?;
+            let checks = crate::ci::review::checks_on(&hub, "acme/app", "s2").await?;
+            anyhow::ensure!(checks.get("ci/a") == Some(&Some("success".to_owned())), "{checks:?}");
+            let land = kiln_ci::land::Land { checks: vec!["ci/a".into()], approvals: 0, owners: false, resolve_threads: false, ..Default::default() };
+            let blockers = kiln_ci::land::blockers(&land, &[], &kiln_ci::land::Facts { checks, ..Default::default() });
+            anyhow::ensure!(blockers.is_empty(), "{blockers:?}");
+            let from: Option<String> = hub.store.call(|c| Ok(c.query_row("SELECT reused_from FROM jobs WHERE id = 'leg2'", [], |r| r.get(0))?)).await?;
+            anyhow::ensure!(from.as_deref() == Some("leg1"), "{from:?}");
+            Ok(())
+        })
     }
 }

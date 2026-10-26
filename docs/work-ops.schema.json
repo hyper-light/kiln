@@ -1,0 +1,1211 @@
+{
+  "$defs": {
+    "command": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "argv": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "argv"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "shell": {
+              "additionalProperties": false,
+              "properties": {
+                "script": {
+                  "type": "string"
+                },
+                "shell": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "shell",
+                "script"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "shell"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "config": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "env"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "label": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "label"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "workdir": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workdir"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "user": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "user"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "entrypoint": {
+              "additionalProperties": false,
+              "properties": {
+                "args": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "keep_cmd": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "args",
+                "keep_cmd"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "entrypoint"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cmd": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "cmd"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "expose": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "expose"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "volume": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "volume"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "stop_signal": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "stop_signal"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "healthcheck": {
+              "$ref": "#/$defs/healthcheck"
+            }
+          },
+          "required": [
+            "healthcheck"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "shell": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "shell"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "maintainer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "maintainer"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "onbuild": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "onbuild"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "copy": {
+      "additionalProperties": false,
+      "properties": {
+        "chmod": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "chown": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dest": {
+          "type": "string"
+        },
+        "exclude": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/copy_source"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "dest",
+        "sources",
+        "chown",
+        "chmod",
+        "exclude"
+      ],
+      "type": "object"
+    },
+    "copy_source": {
+      "additionalProperties": false,
+      "properties": {
+        "contents_only": {
+          "type": "boolean"
+        },
+        "follow_symlinks": {
+          "type": "boolean"
+        },
+        "include": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path": {
+          "type": "string"
+        },
+        "required": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "unpack": {
+          "type": "boolean"
+        },
+        "wildcard": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "follow_symlinks",
+        "contents_only",
+        "wildcard",
+        "unpack",
+        "include",
+        "required"
+      ],
+      "type": "object"
+    },
+    "exec": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/command"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "mounts": {
+          "items": {
+            "$ref": "#/$defs/mount"
+          },
+          "type": "array"
+        },
+        "network": {
+          "$ref": "#/$defs/network"
+        },
+        "platform": {
+          "$ref": "#/$defs/platform"
+        },
+        "proxy": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "security": {
+          "$ref": "#/$defs/security"
+        },
+        "user": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "env",
+        "cwd",
+        "user",
+        "mounts",
+        "network",
+        "security",
+        "platform",
+        "proxy"
+      ],
+      "type": "object"
+    },
+    "export": {
+      "additionalProperties": false,
+      "properties": {
+        "epoch": {
+          "oneOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "platform": {
+          "$ref": "#/$defs/platform"
+        }
+      },
+      "required": [
+        "platform",
+        "epoch"
+      ],
+      "type": "object"
+    },
+    "git": {
+      "additionalProperties": false,
+      "properties": {
+        "checksum": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "keep_git_dir": {
+          "type": "boolean"
+        },
+        "reference": {
+          "type": "string"
+        },
+        "subdir": {
+          "type": "string"
+        },
+        "submodules": {
+          "type": "boolean"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "reference",
+        "subdir",
+        "checksum",
+        "keep_git_dir",
+        "submodules"
+      ],
+      "type": "object"
+    },
+    "healthcheck": {
+      "additionalProperties": false,
+      "properties": {
+        "interval": {
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retries": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_interval": {
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_period": {
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "test": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "timeout": {
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "test",
+        "interval",
+        "timeout",
+        "start_period",
+        "start_interval",
+        "retries"
+      ],
+      "type": "object"
+    },
+    "http": {
+      "additionalProperties": false,
+      "properties": {
+        "checksum": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "filename": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "checksum",
+        "filename"
+      ],
+      "type": "object"
+    },
+    "image": {
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "platform": {
+          "$ref": "#/$defs/platform"
+        },
+        "reference": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reference",
+        "digest",
+        "platform"
+      ],
+      "type": "object"
+    },
+    "local": {
+      "additionalProperties": false,
+      "properties": {
+        "exclude": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "include": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "include",
+        "exclude"
+      ],
+      "type": "object"
+    },
+    "mkdir": {
+      "additionalProperties": false,
+      "properties": {
+        "created": {
+          "oneOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "owner": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parents": {
+          "type": "boolean"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "mode",
+        "parents",
+        "owner",
+        "created"
+      ],
+      "type": "object"
+    },
+    "mkfile": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "mode": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "owner": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "mode",
+        "data",
+        "owner"
+      ],
+      "type": "object"
+    },
+    "mount": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/mount_kind"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "mount_kind": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "bind": {
+              "additionalProperties": false,
+              "properties": {
+                "readonly": {
+                  "type": "boolean"
+                },
+                "source": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source",
+                "readonly"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "bind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cache": {
+              "additionalProperties": false,
+              "properties": {
+                "gid": {
+                  "oneOf": [
+                    {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "id": {
+                  "type": "string"
+                },
+                "mode": {
+                  "oneOf": [
+                    {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "readonly": {
+                  "type": "boolean"
+                },
+                "sharing": {
+                  "$ref": "#/$defs/sharing"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "uid": {
+                  "oneOf": [
+                    {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "sharing",
+                "source",
+                "readonly",
+                "mode",
+                "uid",
+                "gid"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "cache"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "tmpfs": {
+              "additionalProperties": false,
+              "properties": {
+                "size": {
+                  "oneOf": [
+                    {
+                      "maximum": 18446744073709551615,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "size"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "tmpfs"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "secret": {
+              "additionalProperties": false,
+              "properties": {
+                "env": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "gid": {
+                  "oneOf": [
+                    {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "id": {
+                  "type": "string"
+                },
+                "mode": {
+                  "oneOf": [
+                    {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "required": {
+                  "type": "boolean"
+                },
+                "uid": {
+                  "oneOf": [
+                    {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "env",
+                "required",
+                "mode",
+                "uid",
+                "gid"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "secret"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ssh": {
+              "additionalProperties": false,
+              "properties": {
+                "gid": {
+                  "oneOf": [
+                    {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "id": {
+                  "type": "string"
+                },
+                "mode": {
+                  "oneOf": [
+                    {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "required": {
+                  "type": "boolean"
+                },
+                "uid": {
+                  "oneOf": [
+                    {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "required",
+                "mode",
+                "uid",
+                "gid"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ssh"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "network": {
+      "enum": [
+        "default",
+        "none",
+        "host"
+      ]
+    },
+    "op": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "image": {
+              "$ref": "#/$defs/image"
+            }
+          },
+          "required": [
+            "image"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "git": {
+              "$ref": "#/$defs/git"
+            }
+          },
+          "required": [
+            "git"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "http": {
+              "$ref": "#/$defs/http"
+            }
+          },
+          "required": [
+            "http"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "local": {
+              "$ref": "#/$defs/local"
+            }
+          },
+          "required": [
+            "local"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "exec": {
+              "$ref": "#/$defs/exec"
+            }
+          },
+          "required": [
+            "exec"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "copy": {
+              "$ref": "#/$defs/copy"
+            }
+          },
+          "required": [
+            "copy"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "mkdir": {
+              "$ref": "#/$defs/mkdir"
+            }
+          },
+          "required": [
+            "mkdir"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "mkfile": {
+              "$ref": "#/$defs/mkfile"
+            }
+          },
+          "required": [
+            "mkfile"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "remove": {
+              "$ref": "#/$defs/remove"
+            }
+          },
+          "required": [
+            "remove"
+          ],
+          "type": "object"
+        },
+        {
+          "const": "merge"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "config": {
+              "$ref": "#/$defs/config"
+            }
+          },
+          "required": [
+            "config"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "export": {
+              "$ref": "#/$defs/export"
+            }
+          },
+          "required": [
+            "export"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "service": {
+              "$ref": "#/$defs/service"
+            }
+          },
+          "required": [
+            "service"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "platform": {
+      "additionalProperties": false,
+      "properties": {
+        "arch": {
+          "type": "string"
+        },
+        "os": {
+          "type": "string"
+        },
+        "variant": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "os",
+        "arch"
+      ],
+      "type": "object"
+    },
+    "port": {
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "protocol": {
+          "enum": [
+            "tcp",
+            "udp"
+          ]
+        }
+      },
+      "required": [
+        "port",
+        "protocol"
+      ],
+      "type": "object"
+    },
+    "remove": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_not_found": {
+          "type": "boolean"
+        },
+        "path": {
+          "type": "string"
+        },
+        "wildcard": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "allow_not_found",
+        "wildcard"
+      ],
+      "type": "object"
+    },
+    "security": {
+      "enum": [
+        "sandbox",
+        "insecure"
+      ]
+    },
+    "service": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/command"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "platform": {
+          "$ref": "#/$defs/platform"
+        },
+        "ports": {
+          "items": {
+            "$ref": "#/$defs/port"
+          },
+          "type": "array"
+        },
+        "user": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "env",
+        "cwd",
+        "user",
+        "ports",
+        "platform"
+      ],
+      "type": "object"
+    },
+    "sharing": {
+      "enum": [
+        "shared",
+        "private",
+        "locked"
+      ]
+    }
+  },
+  "$id": "https://kiln.dev/schemas/work-ops.json",
+  "$ref": "#/$defs/op",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "kiln work::ops operation"
+}

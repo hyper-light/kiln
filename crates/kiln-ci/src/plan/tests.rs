@@ -20,6 +20,7 @@ struct Source {
     workflows: HashMap<String, Arc<Workflow>>,
     durations: HashMap<String, f64>,
     files: Vec<String>,
+    graph: Option<Arc<Graph>>,
 }
 
 impl PlanSource for Source {
@@ -32,6 +33,9 @@ impl PlanSource for Source {
     fn files(&self, pattern: &str) -> Vec<String> {
         let p = Patterns::new(&[pattern]).unwrap_or_default();
         self.files.iter().filter(|f| p.matches(f)).cloned().collect()
+    }
+    fn graph(&self) -> Option<Arc<Graph>> {
+        self.graph.clone()
     }
 }
 
@@ -136,6 +140,7 @@ fn empty_plan() -> RunPlan {
         output_bytes: 0,
         run_env: Vec::new(),
         removed: BTreeMap::new(),
+        graph: None,
     }
 }
 
@@ -166,6 +171,7 @@ fn dead_spec() -> LegSpec {
         emulated: false,
         reads: Vec::new(),
         cache_cap: None,
+        unaffected: None,
         defined_in: DefinedIn::default(),
         workflow: Arc::new(Workflow::default()),
         job_index: 0,
@@ -712,4 +718,104 @@ fn preview_lists_the_combinations_exclude_removed() -> Result<(), String> {
     assert_eq!(p.legs.len(), 3);
     assert_eq!(p.removed.get("t").cloned().unwrap_or_default(), vec![(serde_json::json!({"os": "mac", "node": 20}), "removed by exclude entry 2".to_owned())]);
     Ok(())
+}
+
+// ------------------------------------------------------------------ affected() (W24-R17)
+
+/// A Cargo workspace of three crates, where `cli` depends on `core`.
+fn crates() -> Arc<Graph> {
+    let files: HashMap<&str, &str> = HashMap::from([
+        ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+        ("crates/core/Cargo.toml", "[package]\nname = \"core\"\n"),
+        ("crates/cli/Cargo.toml", "[package]\nname = \"cli\"\n\n[dependencies]\ncore = { path = \"../core\" }\n"),
+        ("crates/docs/Cargo.toml", "[package]\nname = \"docs\"\n"),
+    ]);
+    let paths: Vec<String> = files.keys().map(|p| (*p).to_owned()).collect();
+    Arc::new(graph::read(&|p| files.get(p).map(|t| (*t).to_owned()), &paths))
+}
+
+/// A push that changed `files`.
+fn changed(files: &[&str]) -> RunInput {
+    RunInput { trusted: true, changed: Some(Arc::new(files.iter().map(|f| (*f).to_owned()).collect())), ..RunInput::default() }
+}
+
+/// W24-R17: `affected()` in a dynamic matrix and in a condition, from the run's changed files and
+/// the commit's package graph.
+#[test]
+fn w24_r17_affected_in_matrices_and_conditions() {
+    let wf = "name: k\non: push\njobs:\n  test:\n    strategy:\n      matrix:\n        crate: ${{ affected('cargo') }}\n    steps: [{run: t}]\n  docs:\n    if: contains(affected('cargo'), 'docs')\n    steps: [{run: d}]\n";
+    let r = Run::with(wf, Dialect::Kiln, changed(&["crates/core/src/lib.rs", "README.md"]), Source { graph: Some(crates()), ..Source::default() });
+    assert_eq!(r.queued, ["test (cli)", "test (core)"], "core, and cli, which depends on it: {:?}", r.log);
+    assert!(r.logged("docs skipped"), "{:?}", r.log);
+    let r = Run::with(wf, Dialect::Kiln, changed(&["crates/docs/book.md"]), Source { graph: Some(crates()), ..Source::default() });
+    let mut queued = r.queued.clone();
+    queued.sort();
+    assert_eq!(queued, ["docs", "test (docs)"]);
+}
+
+/// What `affected()` can't know is an error that says why, never an empty list.
+#[test]
+fn w24_r17_affected_says_what_it_lacks() {
+    let wf = |eco: &str| format!("name: k\non: push\njobs:\n  test:\n    strategy:\n      matrix:\n        crate: ${{{{ affected('{eco}') }}}}\n    steps: [{{run: t}}]\n");
+    let failed = |r: &Run, why: &str| r.logged(&format!("test failure: strategy.matrix.crate: {why}"));
+    let r = Run::with(&wf("cargo"), Dialect::Kiln, changed(&["x"]), Source::default());
+    assert!(failed(&r, "affected() needs the repository's package graph"), "{:?}", r.log);
+    let r = Run::with(&wf("cargo"), Dialect::Kiln, RunInput { trusted: true, ..RunInput::default() }, Source { graph: Some(crates()), ..Source::default() });
+    assert!(failed(&r, "affected() needs the event's changed files"), "{:?}", r.log);
+    let r = Run::with(&wf("maven"), Dialect::Kiln, changed(&["x"]), Source { graph: Some(crates()), ..Source::default() });
+    assert!(failed(&r, "affected(): `maven` is not an ecosystem"), "{:?}", r.log);
+    let broken = Arc::new(graph::read(&|_| Some("[workspace\n".to_owned()), &["Cargo.toml".to_owned()]));
+    let r = Run::with(&wf("cargo"), Dialect::Kiln, changed(&["x"]), Source { graph: Some(broken), ..Source::default() });
+    assert!(failed(&r, "affected('cargo'): the cargo package graph couldn't be read: Cargo.toml: isn't valid TOML"), "{:?}", r.log);
+}
+
+// ------------------------------------------------------------------ unaffected legs (W24-R06)
+
+/// W24-R06: a job that opts in to reuse, whose `if:` is false only for what the change didn't
+/// touch, is queued to finish reused (`unaffected` saying why it would have been skipped); one whose
+/// `if:` is false for another reason, or that doesn't opt in, is skipped as before; one the change
+/// affects runs.
+#[test]
+fn w24_r06_legs_the_change_cannot_affect_are_queued_to_be_reused() {
+    let wf = "name: k\non: push\njobs:\n  core:\n    if: contains(affected('cargo'), 'core')\n    work: { memo: { paths: [crates/core] } }\n    steps: [{run: t}]\n  plain:\n    if: contains(affected('cargo'), 'core')\n    steps: [{run: t}]\n  prs:\n    if: github.event_name == 'pull_request' && contains(affected('cargo'), 'core')\n    work: { memo: true }\n    steps: [{run: t}]\n  docs:\n    if: changed('docs/**')\n    reuse: true\n    steps: [{run: d}]\n  cli:\n    if: contains(affected('cargo'), 'cli')\n    reuse: true\n    steps: [{run: c}]\n";
+    let r = Run::with(wf, Dialect::Kiln, changed(&["crates/cli/src/main.rs"]), Source { graph: Some(crates()), ..Source::default() });
+    let mut queued = r.queued.clone();
+    queued.sort();
+    assert_eq!(queued, ["cli", "core", "docs"], "{:?}", r.log);
+    assert_eq!(r.spec("core").unaffected.as_deref(), Some("skipped: `if: contains(affected('cargo'), 'core')` was false"));
+    assert_eq!(r.spec("docs").unaffected.as_deref(), Some("skipped: `if: changed('docs/**')` was false"));
+    assert_eq!(r.spec("cli").unaffected, None, "the change affects it: it runs");
+    assert!(r.logged("plain skipped") && r.logged("prs skipped"), "no reuse, or false whatever changed: {:?}", r.log);
+    // Not part of what the leg is: its reuse key is the same either way.
+    let json = serde_json::to_value(r.spec("core")).unwrap_or_default();
+    assert!(json.get("unaffected").is_none(), "{json}");
+}
+
+/// W24-R06 with `when:`: a matrix's legs the change can't affect are queued to be reused, the
+/// others run.
+#[test]
+fn w24_r06_when_over_affected() {
+    let wf = "name: k\non: push\njobs:\n  test:\n    strategy:\n      matrix:\n        crate: [core, cli, docs]\n      when: contains(affected('cargo'), matrix.crate)\n    work: { memo: true }\n    steps: [{run: t}]\n";
+    let r = Run::with(wf, Dialect::Kiln, changed(&["crates/cli/src/main.rs"]), Source { graph: Some(crates()), ..Source::default() });
+    assert_eq!(r.queued, ["test (core)", "test (cli)", "test (docs)"], "{:?}", r.log);
+    assert_eq!(r.spec("test (cli)").unaffected, None);
+    assert_eq!(r.spec("test (core)").unaffected.as_deref(), Some("skipped by when"));
+    assert_eq!(r.spec("test (docs)").unaffected.as_deref(), Some("skipped by when"));
+}
+
+/// W24-R06: what the dispatcher makes of an unaffected leg is what follows it: reused, its
+/// dependents run on its outputs; skipped (nothing to reuse), they're skipped as they'd have been.
+#[test]
+fn w24_r06_an_unaffected_legs_end_is_its_dependents_need() {
+    let wf = "name: k\non: push\njobs:\n  core:\n    if: contains(affected('cargo'), 'core')\n    reuse: true\n    steps: [{run: t}]\n  after:\n    needs: core\n    steps: [{run: a}]\n";
+    let input = || changed(&["crates/cli/src/main.rs"]);
+    let mut r = Run::with(wf, Dialect::Kiln, input(), Source { graph: Some(crates()), ..Source::default() });
+    assert_eq!(r.queued, ["core"]);
+    r.outputs("core", &[("v", "1")]);
+    assert_eq!(r.queued, ["core", "after"], "reused: {:?}", r.log);
+    assert_eq!(at(&r.spec("after").needs, "/core/outputs/v"), serde_json::json!("1"));
+    let mut r = Run::with(wf, Dialect::Kiln, input(), Source { graph: Some(crates()), ..Source::default() });
+    r.finish("core", Conclusion::Skipped);
+    assert!(r.logged("after skipped"), "{:?}", r.log);
+    assert_eq!(r.finished, Some(Conclusion::Success));
 }

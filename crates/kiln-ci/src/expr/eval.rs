@@ -290,6 +290,7 @@ impl Evaluator<'_> {
                 let y = serde_yaml::to_string(&arg(0).to_json()).map_err(|e| eval_err(format!("toYAML(): {e}")))?;
                 Value::String(y.into())
             }
+            Func::Affected => Value::array(self.cx.affected(&arg(0).coerce_string())?.iter().map(|name| Value::str(name)).collect()),
         })
     }
 }
