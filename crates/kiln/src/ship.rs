@@ -798,8 +798,19 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
     }
 }
 
-/// `GET /api/ship/commits/:repo/:sha`: from memory, else from the store.
-pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str) -> Result<Response, Fail> {
+/// Whether a commit's JSON is of a repository the caller may read (`only`: the names it may, or
+/// None for every one): one it may not is as missing as one that isn't there.
+fn visible(v: &Value, only: Option<&[String]>) -> bool {
+    only.is_none_or(|names| v.get("repo").and_then(Value::as_str).is_some_and(|repo| names.iter().any(|n| n == repo)))
+}
+
+/// `GET /api/ship/commits/:repo/:sha`: from memory, else from the store; of a repository the
+/// caller may read, else not found.
+pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str, caller: Option<&crate::authz::Caller>) -> Result<Response, Fail> {
+    let only: Option<Vec<String>> = match caller {
+        Some(c) => crate::authz::gate::readable(hub, c, "runs.read").await,
+        None => None,
+    };
     let now = crate::util::now_ms();
     let c = cache();
     let runners = runners_seen(hub).await;
@@ -808,10 +819,14 @@ pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str) -> Result<Res
     {
         tracing::warn!("ship: the read model kept its last good state: {e}");
     }
-    match c.detail(repo, sha, &runners, now) {
-        Some(v) => Ok(srv::json(StatusCode::OK, &v)),
-        None => Ok(srv::json(StatusCode::OK, &get_in(&hub.store, repo, sha, runners, now).await?)),
+    let v = match c.detail(repo, sha, &runners, now) {
+        Some(v) => v,
+        None => get_in(&hub.store, repo, sha, runners, now).await?,
+    };
+    if !visible(&v, only.as_deref()) {
+        return Err((StatusCode::NOT_FOUND, "no such commit".to_string()));
     }
+    Ok(srv::json(StatusCode::OK, &v))
 }
 
 #[cfg(test)]
@@ -1087,6 +1102,33 @@ mod tests {
             store.call(|c| Ok(c.execute_batch("ALTER TABLE ship_changes_away RENAME TO ship_changes")?)).await?;
             cache.refresh(&store, &runners(), now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             same(&store, &cache, now + FRESH_MS, 0).await?;
+            Ok(())
+        })
+    }
+
+    /// Callers see only the repositories they may read: memory's pages hold only theirs, and a
+    /// commit of another is as missing as one that isn't there.
+    #[test]
+    fn ship_callers_see_only_the_repositories_they_may_read() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let cache = ShipCache::new();
+            let now = NOW_S * 1000;
+            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let count = |page: Option<String>| -> usize { page.and_then(|p| serde_json::from_str::<Value>(&p).ok()).and_then(|v| v.get("commits").and_then(Value::as_array).map(Vec::len)).unwrap_or(usize::MAX) };
+            let other = ["someone/else".to_string()];
+            let mine = ["hyper-light/kiln".to_string()];
+            assert_eq!(count(cache.page(None, Some(&other), i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 0);
+            assert_eq!(count(cache.page(Some("hyper-light/kiln"), Some(&other), i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 0);
+            assert_eq!(count(cache.page(None, Some(&mine), i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 3);
+            let one = get_in(&store, "hyper-light/kiln", C1, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert!(visible(&one, None));
+            assert!(visible(&one, Some(&mine)));
+            assert!(!visible(&one, Some(&other)));
+            assert!(!visible(&one, Some(&[])));
             Ok(())
         })
     }
