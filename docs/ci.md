@@ -1688,7 +1688,9 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   (`reserve: { for: "workflow == 'bench'", cron: "0 2 * * *", duration: 2h }`); others are not
   assigned there in the window, and legs already running finish.
 - **W05-R13 Wait reasons.** Every waiting leg has exactly one current reason, from: `needs`,
-  `capacity` (with counts: eligible runners, busy, draining), `no-runner` (none eligible is
+  `capacity` (with counts: eligible runners, busy, draining), `oversized` (in resource mode, it
+  asks for more than any eligible runner has even idle: what it asks, and what each of them has of
+  it), `no-runner` (none eligible is
   connected; lists the ones offline), `unroutable` (no runner known to kiln could ever run it; lists
   the failing requirements), `concurrency` (group and holder), `quota`, `reservation`,
   `exclusive`, `approval`, `scaling` (a pool is starting runners; how many and since when),

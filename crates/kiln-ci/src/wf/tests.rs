@@ -224,6 +224,21 @@ fn w02_ac05_overlays() {
     assert!(d.iter().any(|x| x.code == "KCI1010"), "overlays can't change GitHub keys: {d:?}");
 }
 
+/// W05-R03: a GitHub workflow's job says what it needs through its overlay (kiln's own keys, in
+/// `.kiln/overlays/`), and the scheduler reads it as it reads the kiln dialect's (`sched::needs`).
+#[test]
+fn w05_r03_a_github_jobs_needs_come_from_its_overlay() {
+    let (wf, d) = gha("on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let mut wf = wf.unwrap_or_default();
+    let (ov, d) = parse_overlay("jobs:\n  build:\n    exclusive: true\n    resources: { cpu: 8, memory: 32Gi }\n    requires: [\"os == linux\", \"arch == x86_64\"]\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let d = apply_overlay(&mut wf, &ov.unwrap_or_default());
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let j = wf.job("build").cloned().unwrap_or_default();
+    assert_eq!(crate::sched::needs::of_job(&j.kiln), crate::sched::needs::parse("cpus=8,mem=32g,linux/amd64,exclusive"));
+}
+
 #[test]
 fn file_kinds_and_precedence() {
     assert_eq!(file_kind(".github/workflows/ci.yml"), Some(FileKind::GhaWorkflow));

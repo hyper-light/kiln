@@ -76,20 +76,7 @@ impl Needs {
 
     /// In words, for placement's messages: "8 CPUs, 32 GiB of memory, os == linux, the runner whole".
     pub fn describe(&self) -> String {
-        let r = &self.request;
-        let mut parts = Vec::new();
-        if r.cpu > 0.0 {
-            parts.push(format!("{} CPU{}", expr::js_number_to_string(r.cpu), if (r.cpu - 1.0).abs() < f64::EPSILON { "" } else { "s" }));
-        }
-        if r.mem > 0 {
-            parts.push(format!("{} of memory", show_size(r.mem)));
-        }
-        if r.disk > 0 {
-            parts.push(format!("{} of disk", show_size(r.disk)));
-        }
-        if r.gpu > 0 {
-            parts.push(format!("{} GPU{}", r.gpu, if r.gpu == 1 { "" } else { "s" }));
-        }
+        let mut parts = request_words(&self.request);
         parts.extend(self.requires.iter().cloned());
         if self.exclusive {
             parts.push("the runner whole".into());
@@ -210,8 +197,41 @@ pub fn size(s: &str) -> Option<u64> {
     (v.is_finite() && v >= 0.0).then_some(v as u64)
 }
 
+/// What a request reserves, in words, leaving out what it doesn't ask for: `8 CPUs`, `32 GiB of
+/// memory`, `50 GiB of disk`, `1 GPU`.
+pub fn request_words(r: &Resources) -> Vec<String> {
+    let mut parts = Vec::new();
+    if r.cpu > 0.0 {
+        parts.push(cpus(r.cpu));
+    }
+    if r.mem > 0 {
+        parts.push(format!("{} of memory", show_size(r.mem)));
+    }
+    if r.disk > 0 {
+        parts.push(format!("{} of disk", show_size(r.disk)));
+    }
+    if r.gpu > 0 {
+        parts.push(gpus(r.gpu));
+    }
+    parts
+}
+
+/// `8 CPUs`, `1 CPU`, `0.5 CPUs`.
+pub fn cpus(n: f64) -> String {
+    format!("{} CPU{}", expr::js_number_to_string(n), if (n - 1.0).abs() < f64::EPSILON { "" } else { "s" })
+}
+
+/// `1 GPU`, `2 GPUs`, `no GPU`.
+pub fn gpus(n: u32) -> String {
+    match n {
+        0 => "no GPU".into(),
+        1 => "1 GPU".into(),
+        n => format!("{n} GPUs"),
+    }
+}
+
 /// `32 GiB`, `512 MiB`, `1.5 TiB`.
-fn show_size(n: u64) -> String {
+pub fn show_size(n: u64) -> String {
     let units = [(1u64 << 40, "TiB"), (1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")];
     units
         .iter()
