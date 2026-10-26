@@ -1,0 +1,219 @@
+Subject: a simulated loss burst ends in time on a quiet flow
+Why: Quiver's simulation of its persisted class (kiln's CP-T2.2 step 6, AC-T2.2.5): stepped per datagram alone, a flow that sent rarely stayed in a loss burst for as long as it sent little, and a restarted publisher's QUIC handshake to its leader met one burst for 30 s (seeds 6302 and 7452); offered upstream on cp/t2.2-told (5b13b2b)
+
+diff --git a/crates/hyper-rt/src/sim.rs b/crates/hyper-rt/src/sim.rs
+index 6274974b24c4ef7110eca202a7bdd21438ce1488..f23c20562f71584e19a809f90a1875db8bca6227 100644
+--- a/crates/hyper-rt/src/sim.rs
++++ b/crates/hyper-rt/src/sim.rs
+@@ -66,7 +66,8 @@ const BITS_PER_BYTE: u128 = 8;
+ /// 1960; Elliott, BSTJ 1963], the standard model of both independent loss (one state) and bursty loss
+ /// (a "bad" state entered and left with the given per-datagram probabilities). Every probability is in
+ /// parts per million ([`PPM`]); the state is kept per directed flow and drawn from the fabric's seeded
+-/// generator, so a scenario replays exactly from its seed.
++/// generator, so a scenario replays exactly from its seed. The chain steps once per datagram, and, for
++/// a process stepped in time ([`SimLoss::in_time`]), once more for each slot a flow stays quiet.
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+ pub struct SimLoss {
+     /// Per-datagram probability of moving from the good state to the bad one.
+@@ -77,6 +78,8 @@ pub struct SimLoss {
+     good_loss_ppm: u32,
+     /// Loss probability of a datagram sent in the bad state.
+     bad_loss_ppm: u32,
++    /// The time one step of the chain stands for, beside each datagram's own; zero for none.
++    slot_ns: u64,
+ }
+ 
+ impl SimLoss {
+@@ -86,6 +89,7 @@ impl SimLoss {
+         bad_to_good_ppm: PPM,
+         good_loss_ppm: 0,
+         bad_loss_ppm: 0,
++        slot_ns: 0,
+     };
+ 
+     /// Independent (Bernoulli) loss of `loss_ppm` per datagram.
+@@ -95,6 +99,7 @@ impl SimLoss {
+             bad_to_good_ppm: PPM,
+             good_loss_ppm: loss_ppm,
+             bad_loss_ppm: loss_ppm,
++            slot_ns: 0,
+         }
+     }
+ 
+@@ -107,15 +112,40 @@ impl SimLoss {
+             bad_to_good_ppm: leave_ppm,
+             good_loss_ppm: 0,
+             bad_loss_ppm: burst_loss_ppm,
++            slot_ns: 0,
+         }
+     }
+ 
++    /// This process with its chain stepped in time as well: a flow quiet for longer than `slot_ns`
++    /// steps once for each slot after the first (its datagram stands for that one), up to
++    /// [`QUIET_STEPS_MOST`]. A burst then ends in time, as a real path's does, whether the flow sends
++    /// or not; stepped per datagram alone, a flow that sends rarely stays in a burst for as long as it
++    /// sends little: a QUIC handshake's probes, backing off, met one burst for 30 s (Quiver CP-T2.2
++    /// step 6, seeds 6302 and 7452). A flow that sends once a slot or more often steps as before.
++    #[must_use]
++    pub const fn in_time(self, slot_ns: u64) -> SimLoss {
++        SimLoss { slot_ns, ..self }
++    }
++
+     /// Whether this process ever loses anything (so a loss-free path draws nothing from the generator).
+     const fn is_lossless(&self) -> bool {
+         self.good_loss_ppm == 0 && self.bad_loss_ppm == 0
+     }
+ }
+ 
++/// Format: the most steps a quiet flow's loss chain takes at once ([`SimLoss::in_time`]): a chain that
++/// leaves a burst with one percent a step has left it after 1,024 with probability above 0.99996.
++pub const QUIET_STEPS_MOST: u64 = 1024;
++
++/// One step of a Gilbert–Elliott chain from `bad`: whether it is in the bad state after.
++fn step(rng: &mut Xorshift, bad: bool, loss: SimLoss) -> bool {
++    if bad {
++        !chance(rng, loss.bad_to_good_ppm)
++    } else {
++        chance(rng, loss.good_to_bad_ppm)
++    }
++}
++
+ /// A draw that succeeds with probability `ppm` parts per million.
+ fn chance(rng: &mut Xorshift, ppm: u32) -> bool {
+     let bound = usize::try_from(PPM).unwrap_or(usize::MAX);
+@@ -374,6 +404,8 @@ pub struct SimFabric {
+     pair_paths: BTreeMap<(u16, u16), SimPath>,
+     links: BTreeMap<SimLinkId, LinkState>,
+     loss_state: BTreeMap<(u16, u16), bool>,
++    /// When each flow's loss chain last stepped, for a process stepped in time ([`SimLoss::in_time`]).
++    loss_at: BTreeMap<(u16, u16), u64>,
+     nats: BTreeMap<u16, NatState>,
+     external: BTreeMap<u16, u16>,
+     /// Every external port a NAT has allocated, live or expired, so a datagram to an expired mapping is
+@@ -398,6 +430,7 @@ impl SimFabric {
+             pair_paths: BTreeMap::new(),
+             links: BTreeMap::new(),
+             loss_state: BTreeMap::new(),
++            loss_at: BTreeMap::new(),
+             nats: BTreeMap::new(),
+             external: BTreeMap::new(),
+             nat_ports: std::collections::BTreeSet::new(),
+@@ -460,17 +493,27 @@ impl SimFabric {
+             .unwrap_or(self.default_path)
+     }
+ 
+-    /// Whether the flow's loss process drops the next datagram, advancing its Gilbert–Elliott state.
+-    fn lose(&mut self, flow: (u16, u16), loss: SimLoss) -> bool {
++    /// Whether the flow's loss process drops the datagram it sends at `now`, advancing its
++    /// Gilbert–Elliott state: once for the datagram, and first once for each slot the flow was quiet
++    /// past the first, for a process stepped in time ([`SimLoss::in_time`]).
++    fn lose(&mut self, now: u64, flow: (u16, u16), loss: SimLoss) -> bool {
+         if loss.is_lossless() {
+             return false;
+         }
+-        let bad = self.loss_state.get(&flow).copied().unwrap_or(false);
+-        let next = if bad {
+-            !chance(&mut self.rng, loss.bad_to_good_ppm)
+-        } else {
+-            chance(&mut self.rng, loss.good_to_bad_ppm)
+-        };
++        let mut bad = self.loss_state.get(&flow).copied().unwrap_or(false);
++        if loss.slot_ns > 0 {
++            let quiet = self.loss_at.insert(flow, now).map_or(0, |last| {
++                now.saturating_sub(last)
++                    .checked_div(loss.slot_ns)
++                    .unwrap_or(0)
++                    .saturating_sub(1)
++                    .min(QUIET_STEPS_MOST)
++            });
++            for _ in 0..quiet {
++                bad = step(&mut self.rng, bad, loss);
++            }
++        }
++        let next = step(&mut self.rng, bad, loss);
+         self.loss_state.insert(flow, next);
+         chance(
+             &mut self.rng,
+@@ -509,7 +552,7 @@ impl SimFabric {
+                 .saturating_add(link.serialization_ns(bytes.len()));
+             link.busy_until_ns = departure;
+         }
+-        if self.lose((from, path_dest), path.loss) {
++        if self.lose(now, (from, path_dest), path.loss) {
+             self.stats.dropped_loss = self.stats.dropped_loss.saturating_add(1);
+             return None;
+         }
+diff --git a/crates/hyper-rt/tests/sim_path.rs b/crates/hyper-rt/tests/sim_path.rs
+index 77306f3baa67a717b780128c1af2dcb46f5ba5a7..3115331c5056ab817d2f584c5e39be62d0f2f3ab 100644
+--- a/crates/hyper-rt/tests/sim_path.rs
++++ b/crates/hyper-rt/tests/sim_path.rs
+@@ -256,6 +256,16 @@ fn two_flows_through_one_link_share_its_capacity() {
+ /// Sends `count` small datagrams through `loss` (no bottleneck) and returns which sequence numbers were
+ /// lost, in order, with the counters.
+ fn lost_sequences(seed: u64, loss: SimLoss, count: usize) -> (Vec<u64>, SimFabricStats) {
++    lost_sequences_every(seed, loss, count, MS)
++}
++
++/// [`lost_sequences`], the datagrams sent `every` nanoseconds apart.
++fn lost_sequences_every(
++    seed: u64,
++    loss: SimLoss,
++    count: usize,
++    every: u64,
++) -> (Vec<u64>, SimFabricStats) {
+     let mut sim = SimRuntime::new(&config(), seed).unwrap();
+     let (ports, arrivals) = spawn_receiver(&mut sim, true);
+     let receiver = port(&mut sim, &ports);
+@@ -263,7 +273,7 @@ fn lost_sequences(seed: u64, loss: SimLoss, count: usize) -> (Vec<u64>, SimFabri
+         sim_udp_set_pair_path(from, to, SimPath::in_order(MS, 0).with_loss(loss));
+     };
+     // Spaced so the receiver drains between sends and its buffer never drops anything.
+-    let schedule: Vec<(u64, usize)> = (0..count).map(|k| (k as u64 * MS, 16)).collect();
++    let schedule: Vec<(u64, usize)> = (0..count).map(|k| (k as u64 * every, 16)).collect();
+     spawn_sender(&mut sim, receiver, setup, schedule, 0);
+     let (seen, stats) = finish(&mut sim, &arrivals);
+     let delivered: std::collections::BTreeSet<u64> = seen.iter().map(|a| a.sequence).collect();
+@@ -322,6 +332,43 @@ fn burst_loss_loses_in_runs() {
+     );
+ }
+ 
++/// AC (Quiver CP-T2.2 step 6, a burst ends in time): stepped per datagram alone, the burst process above
++/// loses the same datagrams sent 100 ms apart as 1 ms apart, in the same runs of about four, so a burst
++/// lasts 400 ms on the quiet flow. Stepped in time as well, once per millisecond slot the flow is quiet,
++/// it loses those 100 ms apart one at a time, each datagram's state all but independent of the last
++/// one's after 99 steps; and those a slot apart exactly as per datagram alone.
++#[test]
++fn a_quiet_flow_leaves_a_burst_in_time() {
++    let burst = SimLoss::bursty(PPM / 400, PPM / 4, PPM);
++    let (dense, _) = lost_sequences(3, burst, LOSS_SAMPLE);
++    let (quiet, _) = lost_sequences_every(3, burst, LOSS_SAMPLE, 100 * MS);
++    assert_eq!(
++        quiet, dense,
++        "per datagram alone, the spacing changes nothing"
++    );
++    let run = mean_run(&quiet);
++    assert!(
++        (2.5..=6.0).contains(&run),
++        "per datagram alone, a quiet flow's bursts run about four long (mean run {run})"
++    );
++    let (in_time, _) = lost_sequences_every(3, burst.in_time(MS), LOSS_SAMPLE, 100 * MS);
++    assert!(
++        in_time.len() > 20,
++        "bursts happened ({} lost)",
++        in_time.len()
++    );
++    assert!(
++        mean_run(&in_time) < 1.5,
++        "stepped in time, a quiet flow's losses are scattered (mean run {})",
++        mean_run(&in_time)
++    );
++    let (in_time_dense, _) = lost_sequences(3, burst.in_time(MS), LOSS_SAMPLE);
++    assert_eq!(
++        in_time_dense, dense,
++        "a flow that sends once a slot steps as it did per datagram"
++    );
++}
++
+ /// AC (RFC 8899's black hole): a path with an MTU delivers a datagram at or below it and silently drops
+ /// one above it, counted.
+ #[test]

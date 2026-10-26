@@ -84,10 +84,12 @@ them.
 
 ## Vendoring
 
-kiln vendors Quiver (`vendor/quiver`), Focal's bus (`vendor/focal-bus`, branch `bus-replicated` at
-`f8052a5`) and hyper-raft (`vendor/hyper-raft`, at `25cf889`, its `main` and the revision Focal's bus
-takes) at the revisions Quiver takes them, with Quiver's recorded changes (vendor/MANIFEST.toml,
-docs/vendoring.md). kiln's own transport, runtime and
-replicated stores (sync, CD) moved with it from hyper-raft `767627f` to `25cf889`, so kiln links one
-revision of each, the one Mantle takes too. In kiln's copy, hyper-durable's
-`RamStore` is compiled only for tests: kiln's sync tests ask for it through a dev-dependency.
+kiln vendors Quiver (`vendor/quiver`, at `44bae34`, whose simulation of the persisted class ran
+10,000 seeds alike in two passes and lost no acknowledged publish), Focal's bus (`vendor/focal-bus`,
+branch `bus-replicated` at `b6cf8e3`) and hyper-raft (`vendor/hyper-raft`, at `c6baec2`, its `main`
+and the revision Focal's bus takes) at the revisions Quiver takes them, with Quiver's recorded
+changes: the bus's five and hyper-raft's six (vendor/MANIFEST.toml, docs/vendoring.md, each copy's
+`UPSTREAM.md`). kiln's own transport, runtime and replicated stores (sync, CD) moved with it, from
+hyper-raft `767627f` to `25cf889` (CP-T2.1) and on to `c6baec2` (CP-T2.2), so kiln links one
+revision of each. In kiln's copy, hyper-durable's `RamStore` is compiled only for tests: kiln's sync
+tests ask for it through a dev-dependency.

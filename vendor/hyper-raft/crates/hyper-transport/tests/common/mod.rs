@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
 use hyper_transport::{
     AdmissionLimits, Authenticated, Budget, Classes, Config, Directory, Endpoint, Event, Fixed,
-    Limits, PeerId, Refusal, Transmit,
+    Limits, PeerId, Refusal, RestartKey, Transmit,
 };
 
 /// The deployment's authority, issuing one certificate per node.
@@ -785,6 +785,41 @@ impl Pair {
         let mut node =
             Endpoint::new_seeded(config, Fixed::new(budget, 64), book, now, seed_of(which))
                 .unwrap();
+        node.set_default_path_ceiling(u16::try_from(LINK_PAYLOAD).unwrap());
+        node
+    }
+}
+
+impl Pair {
+    /// [`Pair::node`], keyed by `restart`, the key the node keeps across its restarts
+    /// (`Endpoint::new_restartable`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn restartable<C: Classes<Role = Role>>(
+        &self,
+        which: PeerId,
+        role: Role,
+        book: Book,
+        limits: Limits,
+        budget: u64,
+        now: Instant,
+        restart: &RestartKey,
+    ) -> Node<C> {
+        let (certificate, key) = if which == 1 { &self.one } else { &self.two };
+        let config = Config {
+            tls: Tls::mutual(&credentials(&self.pki.root, certificate, key), true).unwrap(),
+            role,
+            limits,
+            congestion: Default::default(),
+        };
+        let mut node = Endpoint::new_restartable(
+            config,
+            Fixed::new(budget, 64),
+            book,
+            now,
+            restart,
+            Some(seed_of(which)),
+        )
+        .unwrap();
         node.set_default_path_ceiling(u16::try_from(LINK_PAYLOAD).unwrap());
         node
     }

@@ -105,6 +105,36 @@ The comparison needs Docker, and librdkafka's build needs `make` and a C and a C
 there's no `c++` on the PATH, zig's serves (`zig c++`, as Quiver's gate installs zig). Kafka's
 profile needs a JDK's `jcmd` on the host.
 
+## The persisted class under simulation (kiln's CP-T2.2 step 6)
+
+AC-T2.2.5: no acknowledged publish lost under kill -9 of any node, over 10,000 seeds of the persisted
+class's deterministic simulation (`crates/quiver/tests/sim.rs`, `docs/design/persisted-sim.md`).
+
+```sh
+bench/sim-sweep.sh OUT        # seeds 1 to 10,000 twice, then bench/sim-collect.py OUT
+```
+
+- **What a seed is.** A run of three nodes on virtual time: 6 s of publishes and faults (kill -9 at a
+  host's await or a disk's cut, the devices' crash states, partitions, loss alone or in bursts,
+  reordering, duplicated datagrams, disk stalls), then everything mended and every node caught up,
+  checked every 100 ms while it runs and at its end. Its line says its publishes, those acknowledged
+  and those lost (an acknowledged publish some node's view lacks at its offset at the end), its kills
+  by where they fell and whether they took the leader, the crash states, partitions and stalls, the
+  resends and the leaders' recognitions, the views checked, its paths, the datagrams the fabric
+  duplicated and lost, its digest, and whether it broke a check.
+- **Twice.** Every seed runs in two partitions of the seeds over processes (pass A: eight of 1,250;
+  pass B: nine, shifted by 625), so each runs after other seeds in another process, and its digest
+  must be alike in both: a run is its seed's, whatever ran before it.
+- **Its own directory.** The runs and the cluster's identities are under `OUT/root`
+  (`QUIVER_SIM_ROOT`), the identities made there once, by one process, before the passes start, as
+  Ed25519: never a directory an older binary made, whose ECDSA signatures change a handshake's size
+  from run to run.
+- **What it writes.** `OUT/seeds-A.tsv` and `OUT/seeds-B.tsv`, a seed a line; the totals, the seeds
+  that broke and the digests that differ, printed. A failing seed's trace is kept under the test's
+  directory and the seed runs again in its process (`run again: digest the same`).
+- **Where.** Each process is single-threaded, at nice 10. Not on adacachy, which runs kiln's
+  production.
+
 ## The profile
 
 Every run carries a profile of its measured window (`profile/`): what its threads and its broker

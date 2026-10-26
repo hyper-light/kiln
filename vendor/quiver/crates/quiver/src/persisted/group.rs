@@ -37,7 +37,7 @@ use focal_bus::wire::{Ack, Bus, Durability, Role};
 use focal_memory::MemoryBudget;
 use hyper_rt_transport::Driver;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
-use hyper_transport::{Config, Endpoint, Event, Refusal as WireRefusal};
+use hyper_transport::{Config, Endpoint, Event, Refusal as WireRefusal, RestartKey};
 
 /// A node's endpoint, driven on its host's shard.
 pub(crate) type Drv = Driver<Bus, BusBudget, BusDirectory>;
@@ -96,10 +96,36 @@ fn said(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+/// An endpoint made now on the shard's clock (`hyper_rt_transport::shard_instant`, the host's off
+/// a simulated shard), its QUIC layer seeded with `seed` where one is given, keyed by `restart`, the
+/// key it keeps across its restarts at its address, where one is given.
+fn made(
+    config: Config<Role>,
+    budget: BusBudget,
+    directory: BusDirectory,
+    seed: Option<[u8; 32]>,
+    restart: Option<&RestartKey>,
+) -> Result<Endpoint<Bus, BusBudget, BusDirectory>, String> {
+    let now = hyper_rt_transport::shard_instant();
+    match (restart, seed) {
+        (Some(key), seed) => Endpoint::new_restartable(config, budget, directory, now, key, seed),
+        (None, Some(seed)) => Endpoint::new_seeded(config, budget, directory, now, seed),
+        (None, None) => Endpoint::new(config, budget, directory, now),
+    }
+    .map_err(|e| format!("{e:?}"))
+}
+
 impl Identities {
-    /// The identities of a cluster of `nodes`, kept in `dir` (made there the first time).
-    pub(crate) fn load(dir: &std::path::Path, nodes: usize) -> Result<Self, String> {
-        let local = pki::load_or_make(dir, nodes, nodes).map_err(said)?;
+    /// The identities of a cluster of `nodes`, kept in `dir` (made there the first time, with
+    /// `kind`'s keys), sealed under `key_file`, or under the per-user root key file named for the
+    /// directory's root key where it names none, as Focal's node keeps its own (focal-bus `serve`).
+    pub(crate) fn load(
+        dir: &std::path::Path,
+        key_file: Option<&std::path::Path>,
+        nodes: usize,
+        kind: pki::KeyKind,
+    ) -> Result<Self, String> {
+        let local = pki::load_or_make_with(dir, key_file, nodes, nodes, kind).map_err(said)?;
         Ok(Self { local, nodes })
     }
 
@@ -111,10 +137,15 @@ impl Identities {
         (1..=u64::try_from(self.nodes).unwrap_or(0)).take(self.nodes)
     }
 
-    /// Node `id`'s endpoint for a member: it knows the other nodes and every node's publisher.
+    /// Node `id`'s endpoint for a member: it knows the other nodes and every node's publisher. Its
+    /// QUIC layer is seeded with `seed` where one is given (the simulation's), from the system
+    /// otherwise, and it is keyed by the key it keeps across its restarts at `bound`, the address its
+    /// socket holds.
     pub(crate) fn member_endpoint(
         &self,
         id: u64,
+        seed: Option<[u8; 32]>,
+        bound: SocketAddr,
     ) -> Result<Endpoint<Bus, BusBudget, BusDirectory>, String> {
         let peers = self.nodes.saturating_sub(1);
         let mut directory = BusDirectory::new(self.nodes.saturating_add(peers));
@@ -138,25 +169,28 @@ impl Identities {
         }
         let own = self.local.node(id).ok_or("no identity for this node")?;
         let limits = focal_bus::limits::node(self.nodes, peers).map_err(said)?;
-        Endpoint::new(
-            Config {
-                tls: Tls::mutual(&credentials(&self.local, own), true)
-                    .map_err(|e| format!("{e:?}"))?,
-                role: Role::Node,
-                limits,
-                congestion: Default::default(),
-            },
-            BusBudget::new(MemoryBudget::new(TRANSPORT_MEMORY, 0).map_err(said)?),
-            directory,
-            Instant::now(),
-        )
-        .map_err(|e| format!("{e:?}"))
+        let config = Config {
+            tls: Tls::mutual(&credentials(&self.local, own), true).map_err(|e| format!("{e:?}"))?,
+            role: Role::Node,
+            limits,
+            congestion: Default::default(),
+        };
+        let budget = BusBudget::new(MemoryBudget::new(TRANSPORT_MEMORY, 0).map_err(said)?);
+        // Keyed as Focal's node keys its endpoint (`serve::restart_key`): a peer that sends on a
+        // connection the node's last run held at `bound` is answered with a reset and dials again,
+        // where it held the dead run's connection until its idle timeout and refused the new run's
+        // dials as Busy (hyper-raft docs/transport.md §4ah; Quiver's simulation, seed 3763).
+        let restart = focal_bus::serve::restart_key(&own.key, bound).map_err(said)?;
+        made(config, budget, directory, seed, Some(&restart))
     }
 
-    /// Node `id`'s endpoint for a publisher: it knows every node.
+    /// Node `id`'s endpoint for a publisher: it knows every node. Seeded as a member's is; never
+    /// keyed for restarts, as its port is the system's choice at each start, where no peer reaches
+    /// its last run.
     pub(crate) fn client_endpoint(
         &self,
         id: u64,
+        seed: Option<[u8; 32]>,
     ) -> Result<Endpoint<Bus, BusBudget, BusDirectory>, String> {
         let mut directory = BusDirectory::new(self.nodes);
         for node in self.node_ids() {
@@ -173,19 +207,25 @@ impl Identities {
         let own = Self::client_index(id)
             .and_then(|index| self.local.clients.get(index))
             .ok_or("no client identity for this node")?;
-        Endpoint::new(
-            Config {
-                tls: Tls::mutual(&credentials(&self.local, own), false)
-                    .map_err(|e| format!("{e:?}"))?,
-                role: Role::Client,
-                limits: focal_bus::limits::client_of(self.nodes).map_err(said)?,
-                congestion: Default::default(),
-            },
-            BusBudget::new(MemoryBudget::new(TRANSPORT_MEMORY, 0).map_err(said)?),
-            directory,
-            Instant::now(),
-        )
-        .map_err(|e| format!("{e:?}"))
+        let config = Config {
+            tls: Tls::mutual(&credentials(&self.local, own), false)
+                .map_err(|e| format!("{e:?}"))?,
+            role: Role::Client,
+            limits: focal_bus::limits::client_of(self.nodes).map_err(said)?,
+            congestion: Default::default(),
+        };
+        let budget = BusBudget::new(MemoryBudget::new(TRANSPORT_MEMORY, 0).map_err(said)?);
+        made(config, budget, directory, seed, None)
+    }
+
+    /// Each node, and the peer its publisher is to every member (`pki::Local::client_peer`).
+    pub(crate) fn publishers(&self) -> Vec<(u64, u64)> {
+        self.node_ids()
+            .filter_map(|node| {
+                let index = usize::try_from(node.checked_sub(1)?).ok()?;
+                Some((node, self.local.client_peer(index)?))
+            })
+            .collect()
     }
 
     /// The lane window a member's acknowledgements are bounded by (`Member::open`).
@@ -234,6 +274,16 @@ impl Redial {
         self.due.values().map(|(at, _)| *at).min()
     }
 
+    /// Under the simulation, the peers due to be dialed at `now`, with when each fell due.
+    #[cfg(feature = "sim")]
+    fn due_now(&self, now: Instant) -> Vec<(u64, Instant)> {
+        self.due
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(peer, (at, _))| (*peer, *at))
+            .collect()
+    }
+
     /// Dials each peer of `peers` that is due; a dial that fails is due again, later.
     fn dial(
         &mut self,
@@ -271,6 +321,11 @@ pub(crate) struct Plan {
     pub(crate) members: Vec<u64>,
     pub(crate) clients: usize,
     pub(crate) lane_window: usize,
+    /// Each node, and the peer its publisher is to this member (`Identities::publishers`).
+    pub(crate) publishers: Vec<(u64, u64)>,
+    /// Under the simulation, the node's simulated machine its log's device is on.
+    #[cfg(feature = "sim")]
+    pub(crate) machine: Option<std::sync::Arc<super::sim::Machine>>,
 }
 
 impl Plan {
@@ -287,30 +342,44 @@ impl Plan {
             budget.clone(),
         )
         .map_err(said)?;
-        let member = Member::open(
-            MemberSettings {
-                id: self.id,
-                peers: self.peers.clone(),
-                data: self.data.clone(),
-                key_file: self.key_file.clone(),
-                memory_bytes: self.memory,
-                // No fates: the group commits on a majority's disks, the persisted class.
-                fates: Vec::new(),
-                spanning: 0,
-            },
-            node,
-            self.members.clone(),
-            self.clients,
-            self.lane_window,
-            budget,
-            now,
-        )
-        .map_err(said)?;
-        if member.class() != Durability::Persisted {
-            return Err("the part's group would not acknowledge on a majority's disks".to_owned());
+        let settings = MemberSettings {
+            id: self.id,
+            peers: self.peers.clone(),
+            data: self.data.clone(),
+            key_file: self.key_file.clone(),
+            memory_bytes: self.memory,
+            // No fates: the group commits on a majority's disks, the persisted class.
+            fates: Vec::new(),
+            spanning: 0,
+        };
+        let (members, clients, window) = (self.members.clone(), self.clients, self.lane_window);
+        #[cfg(feature = "sim")]
+        if let Some(machine) = &self.machine {
+            let simulated = focal_bus::member::Simulated {
+                device: machine.handle(&self.data)?,
+                settings,
+            };
+            #[cfg_attr(not(feature = "plant-own-log-commit"), allow(unused_mut))]
+            let mut member =
+                Member::open_simulated(simulated, node, members, clients, window, budget, now)
+                    .map_err(said)?;
+            // The planted bug's build: a commit on the leader's own log alone.
+            #[cfg(feature = "plant-own-log-commit")]
+            member.plant(Some(hyper_raft::Mutant::OwnLogCommit));
+            return persisted(member);
         }
-        Ok(member)
+        let member =
+            Member::open(settings, node, members, clients, window, budget, now).map_err(said)?;
+        persisted(member)
     }
+}
+
+/// `member`, if it acknowledges on a majority's disks: the persisted class.
+fn persisted(member: Member) -> Result<Member, String> {
+    if member.class() != Durability::Persisted {
+        return Err("the part's group would not acknowledge on a majority's disks".to_owned());
+    }
+    Ok(member)
 }
 
 /// This node's member of a part's group, on its endpoint.
@@ -319,6 +388,10 @@ pub(crate) struct Seat {
     pub(crate) member: Member,
     plan: Plan,
     redial: Redial,
+    /// Under the simulation, the member's last connection events and dials, with when (the shard's
+    /// clock, ms), for its diagnosis.
+    #[cfg(feature = "sim")]
+    heard: VecDeque<String>,
 }
 
 impl Seat {
@@ -330,15 +403,35 @@ impl Seat {
         for (peer, address) in &plan.peers {
             let _ = driver.endpoint().connect(now, *peer, *address);
         }
-        Ok(Self {
+        #[cfg_attr(not(feature = "sim"), allow(unused_mut))]
+        let mut seat = Self {
             driver,
             member,
             plan,
             redial: Redial::default(),
-        })
+            #[cfg(feature = "sim")]
+            heard: VecDeque::new(),
+        };
+        #[cfg(feature = "sim")]
+        seat.hear(format!("opens, dials {:?}", seat.plan.peers));
+        Ok(seat)
+    }
+
+    /// Under the simulation, a connection event or a dial noted for the diagnosis.
+    #[cfg(feature = "sim")]
+    fn hear(&mut self, what: String) {
+        if self.heard.len() >= 64 {
+            self.heard.pop_front();
+        }
+        let ms = hyper_rt::futures::now_ns() / 1_000_000;
+        self.heard.push_back(format!("{ms} ms: {what}"));
     }
 
     pub(crate) fn on_event(&mut self, event: Event<Bus>, now: Instant) {
+        #[cfg(feature = "sim")]
+        if let Some((peer, up)) = peer_change(&event) {
+            self.hear(format!("peer {peer} {}", if up { "up" } else { "down" }));
+        }
         if let Some((peer, up)) = peer_change(&event)
             && self.plan.peers.iter().any(|(id, _)| *id == peer)
         {
@@ -358,23 +451,63 @@ impl Seat {
     /// without this, a peer back from a kill was refused every connection it dialed
     /// (`Refusal::Busy`) and never caught up (CP-T2.2's kill drills, 2026-10-25).
     pub(crate) fn turn(&mut self, waker: &Waker, now: Instant) -> Result<(), String> {
+        #[cfg(feature = "sim")]
+        for (peer, at) in self.redial.due_now(now) {
+            self.hear(format!("dials {peer}, due since {at:?}"));
+        }
         self.redial
             .dial(self.driver.endpoint(), &self.plan.peers, now);
         let mut suspected = Vec::new();
-        self.member
-            .turn(self.driver.endpoint(), waker, now, &mut |event| {
+        let mut restarted = Vec::new();
+        self.member.turn(
+            self.driver.endpoint(),
+            waker,
+            now,
+            &mut |event| match event {
                 // A peer it heard from before: one never heard from (its member not yet open) holds
                 // no connection that ended with its process, and closing what it holds only delays it.
-                if let GroupEvent::Suspected(suspicion) = event
-                    && suspicion.last.is_some()
-                {
+                GroupEvent::Suspected(suspicion) if suspicion.last.is_some() => {
                     suspected.push(suspicion.peer);
                 }
-            });
+                GroupEvent::Restarted { peer } => restarted.push(*peer),
+                _ => {}
+            },
+        );
+        // A node back from a kill within its peers' detection bound is never suspected: they hear
+        // only that it restarted, its stream's later run. Its dead run's publisher connections held
+        // both of its client identity's places, and every member refused the new run's publisher
+        // Busy until they had carried nothing for two minutes (the sweep at d4ad260, seeds 1293
+        // and 2608: 3,718 connections lost, no acknowledgement). Its member's own connections need
+        // nothing: the new run answers the dead run's with a reset (its restart key).
+        for peer in restarted {
+            let publisher = self
+                .plan
+                .publishers
+                .iter()
+                .find(|(node, _)| *node == peer)
+                .map(|(_, client)| *client);
+            if self.plan.peers.iter().any(|(id, _)| *id == peer)
+                && let Some(client) = publisher
+            {
+                #[cfg(feature = "sim")]
+                self.hear(format!("{peer} restarted: disconnects its publisher"));
+                self.driver.endpoint().disconnect(now, client);
+            }
+        }
         for peer in suspected {
             if self.plan.peers.iter().any(|(id, _)| *id == peer) {
+                #[cfg(feature = "sim")]
+                self.hear(format!("suspects {peer}: disconnects it and its publisher"));
                 self.driver.endpoint().disconnect(now, peer);
                 self.redial.note(peer, false, now);
+                // Its node's publisher too: a node back from a kill dials with the same client
+                // identity, and the dead process's connections held both of its places, so every
+                // member refused its publisher Busy until they had carried nothing for two minutes
+                // (CP-T2.2 step 6's simulation, seed 8). The publisher dials again, as it does.
+                let publisher = self.plan.publishers.iter().find(|(node, _)| *node == peer);
+                if let Some((_, client)) = publisher {
+                    self.driver.endpoint().disconnect(now, *client);
+                }
             }
         }
         if self.member.fenced() {
@@ -383,8 +516,12 @@ impl Seat {
         Ok(())
     }
 
-    /// Takes `everyone`'s addresses for its peers; whether one changed.
-    pub(crate) fn peers_changed(&mut self, everyone: &[(u64, SocketAddr)]) -> bool {
+    /// Takes `everyone`'s addresses for its peers; whether one changed. A peer that moved (its
+    /// member bound another port as it started again, the one it kept taken) has what this node
+    /// holds or is dialing at its old address closed, and is dialed at its new one: a dial in
+    /// flight to the old address held off every new one until its handshake timed out, two
+    /// minutes, the pair apart all that time (CP-T2.2 step 6's simulation, seed 3).
+    pub(crate) fn peers_changed(&mut self, everyone: &[(u64, SocketAddr)], now: Instant) -> bool {
         let peers: Vec<(u64, SocketAddr)> = everyone
             .iter()
             .filter(|(id, _)| *id != self.plan.id)
@@ -392,6 +529,21 @@ impl Seat {
             .collect();
         if peers == self.plan.peers {
             return false;
+        }
+        for (peer, address) in &peers {
+            let moved = self
+                .plan
+                .peers
+                .iter()
+                .any(|(id, before)| id == peer && before != address);
+            if moved {
+                #[cfg(feature = "sim")]
+                self.hear(format!(
+                    "peer {peer} moved to {address}: closes and dials it there"
+                ));
+                self.driver.endpoint().disconnect(now, *peer);
+                self.redial.note(*peer, false, now);
+            }
         }
         self.plan.peers = peers;
         true
@@ -406,6 +558,53 @@ impl Seat {
 
     pub(crate) fn part(&self) -> &Part {
         self.member.node().part()
+    }
+
+    /// Under the simulation, everything the member and its endpoint say of themselves.
+    #[cfg(feature = "sim")]
+    pub(crate) fn diagnosis(&mut self) -> String {
+        let leader = self.member.leader();
+        let mut established = Vec::new();
+        self.driver.endpoint().established(&mut established);
+        let paths: Vec<String> = established
+            .iter()
+            .map(|(peer, at)| {
+                let quic = self.driver.endpoint().connection_stats(*peer);
+                format!("{peer}@{at}: {quic:?}")
+            })
+            .collect();
+        format!(
+            "member of node {} at {}: leads {}, leader {:?} in term {}, in flight {:?}, fenced {}\n  core {}\n  {:?}\n  endpoint {:?}\n  dials {:?}\n  established {paths:?}\n  heard {:?}\n  redial {:?}",
+            self.plan.id,
+            self.plan.data.display(),
+            self.member.is_leader(),
+            leader.node,
+            leader.term,
+            self.member.in_flight(),
+            self.member.fenced(),
+            self.member.core_state(),
+            self.member.stats(),
+            self.driver.endpoint().stats(),
+            self.plan.peers,
+            self.heard,
+            self.redial,
+        )
+    }
+
+    /// Under the simulation, what a wait of `what` that never answered finds of the member: its
+    /// work in flight and its log's frames, flushes and the flush on its device, if one is.
+    #[cfg(feature = "sim")]
+    pub(crate) fn stuck(&self, what: &str) -> String {
+        let (writes, reads) = self.member.in_flight();
+        let stats = self.member.stats();
+        format!(
+            "the simulation's {what} of node {}'s member at {} never answered: {writes} writes and \
+             {reads} reads in flight, its log's frames {}, flushes {}",
+            self.plan.id,
+            self.plan.data.display(),
+            stats.log.frames,
+            stats.log.flushes,
+        )
     }
 }
 
@@ -484,6 +683,12 @@ pub(crate) struct Publisher {
     /// When the node it sends to last answered, or it began sending there.
     answered_at: Instant,
     pub(crate) stats: PublisherStats,
+    /// Under the simulation, what it chose and what its connections did, the latest 64, and its
+    /// sends by node and the redirects it took by sender and leader, for the diagnosis.
+    #[cfg(feature = "sim")]
+    pub(crate) heard: VecDeque<String>,
+    #[cfg(feature = "sim")]
+    pub(crate) counts: BTreeMap<String, u64>,
 }
 
 impl Publisher {
@@ -505,6 +710,10 @@ impl Publisher {
             resend_at: None,
             retry_at: None,
             dial_at: None,
+            #[cfg(feature = "sim")]
+            heard: VecDeque::new(),
+            #[cfg(feature = "sim")]
+            counts: BTreeMap::new(),
             led_at: now,
             answered_at: now,
             stats: PublisherStats::default(),
@@ -518,8 +727,19 @@ impl Publisher {
         self.choose(None, now);
     }
 
-    /// Takes `nodes`' addresses for the group's members, going on as it was.
-    pub(crate) fn set_addresses(&mut self, nodes: &[(u64, SocketAddr)]) {
+    /// Takes `nodes`' addresses for the group's members, going on as it was. A member that moved
+    /// has what the publisher holds or is dialing at its old address closed: a dial in flight
+    /// there held off a new one for two minutes, as the member's own did (`Seat::peers_changed`).
+    pub(crate) fn set_addresses(&mut self, nodes: &[(u64, SocketAddr)], now: Instant) {
+        for (node, address) in nodes {
+            let moved = self
+                .nodes
+                .iter()
+                .any(|(id, before)| id == node && before != address);
+            if moved {
+                self.driver.endpoint().disconnect(now, *node);
+            }
+        }
         nodes.clone_into(&mut self.nodes);
     }
 
@@ -534,6 +754,23 @@ impl Publisher {
             asked: now,
             ticket,
         });
+    }
+
+    /// Under the simulation, a choice or a connection's change noted for the diagnosis.
+    #[cfg(feature = "sim")]
+    fn hear(&mut self, what: String) {
+        if self.heard.len() >= 64 {
+            self.heard.pop_front();
+        }
+        let ms = hyper_rt::futures::now_ns() / 1_000_000;
+        self.heard.push_back(format!("{ms} ms: {what}"));
+    }
+
+    /// Under the simulation, one more of what the diagnosis counts.
+    #[cfg(feature = "sim")]
+    fn count(&mut self, what: String) {
+        let count = self.counts.entry(what).or_default();
+        *count = count.saturating_add(1);
     }
 
     /// Sends to `node` from now (or, for none, the next node after the one it sent to), and
@@ -554,6 +791,8 @@ impl Publisher {
             }
         });
         if next != self.target {
+            #[cfg(feature = "sim")]
+            self.count(format!("chooses {next:?}, was {:?}", self.target));
             self.leads = false;
             self.answered_at = now;
         }
@@ -568,15 +807,41 @@ impl Publisher {
     /// after [`RETRY`] if it doesn't connect.
     fn dial(&mut self, node: u64, now: Instant) {
         self.dial_at = now.checked_add(RETRY);
-        if let Some((_, address)) = self.nodes.iter().find(|(id, _)| *id == node)
-            && self.driver.endpoint().connect(now, node, *address).is_err()
-        {
-            self.stats.dials_refused = self.stats.dials_refused.saturating_add(1);
+        if let Some((_, address)) = self.nodes.iter().find(|(id, _)| *id == node).copied() {
+            let dialed = self.driver.endpoint().connect(now, node, address);
+            #[cfg(feature = "sim")]
+            self.count(format!("dials {node} at {address}: {dialed:?}"));
+            if dialed.is_err() {
+                self.stats.dials_refused = self.stats.dials_refused.saturating_add(1);
+            }
         }
+    }
+
+    /// Under the simulation, what the publisher's endpoint holds: its figures, and the paths it has
+    /// established.
+    #[cfg(feature = "sim")]
+    pub(crate) fn endpoint_state(&mut self) -> String {
+        let mut established = Vec::new();
+        self.driver.endpoint().established(&mut established);
+        format!(
+            "endpoint {:?} established {established:?} nodes {:?} connected {:?}",
+            self.driver.endpoint().stats(),
+            self.nodes,
+            self.connected
+        )
     }
 
     /// Acts on one of its endpoint's events; what it settled.
     pub(crate) fn on_event(&mut self, event: Event<Bus>, now: Instant) -> Vec<Settled> {
+        #[cfg(feature = "sim")]
+        if let Some((peer, up)) = peer_change(&event) {
+            self.hear(format!("peer {peer} {}", if up { "up" } else { "down" }));
+        }
+        #[cfg(feature = "sim")]
+        let sender = match &event {
+            Event::Frame { peer, .. } => Some(*peer),
+            _ => None,
+        };
         if let Some((peer, up)) = peer_change(&event) {
             if up {
                 self.stats.connects = self.stats.connects.saturating_add(1);
@@ -604,31 +869,43 @@ impl Publisher {
         let mut out_of_order = false;
         let mut acked_by = None;
         let from = self.target.unwrap_or(0);
-        Client::new(from).on_event(self.driver.endpoint(), event, |delivery| match delivery {
-            Delivery::Acked(ack) if ack.producer == producer && ack.stream == STREAM => {
-                stats.acks = stats.acks.saturating_add(1);
-                if ack.class == Ack::OUT_OF_ORDER {
-                    out_of_order = true;
-                } else if ack.class == Ack::REFUSED {
-                    if let Some(gone) = owed.remove(&ack.sequence) {
-                        settled.push(Settled::Refused(gone.ticket));
-                    }
-                } else {
-                    acked_by = Some(from);
-                    if let Some(entry) = owed.get_mut(&ack.sequence) {
-                        entry.batch = None;
-                        if ack.count > 0 {
-                            entry.base = Some(ack.base);
+        Client::new(from).on_event(
+            self.driver.endpoint(),
+            event,
+            now,
+            |delivery| match delivery {
+                Delivery::Acked(ack) if ack.producer == producer && ack.stream == STREAM => {
+                    stats.acks = stats.acks.saturating_add(1);
+                    if ack.class == Ack::OUT_OF_ORDER {
+                        out_of_order = true;
+                    } else if ack.class == Ack::REFUSED {
+                        if let Some(gone) = owed.remove(&ack.sequence) {
+                            settled.push(Settled::Refused(gone.ticket));
+                        }
+                    } else {
+                        acked_by = Some(from);
+                        if let Some(entry) = owed.get_mut(&ack.sequence) {
+                            entry.batch = None;
+                            if ack.count > 0 {
+                                entry.base = Some(ack.base);
+                            }
                         }
                     }
                 }
-            }
-            Delivery::Redirected(redirect) if redirect.producer == producer => {
-                stats.redirects = stats.redirects.saturating_add(1);
-                redirects.push(redirect.leader);
-            }
-            _ => {}
-        });
+                Delivery::Redirected(redirect) if redirect.producer == producer => {
+                    stats.redirects = stats.redirects.saturating_add(1);
+                    redirects.push(redirect.leader);
+                }
+                _ => {}
+            },
+        );
+        #[cfg(feature = "sim")]
+        for leader in &redirects {
+            self.count(format!(
+                "redirect from {sender:?} to {:?} in term {}",
+                leader.node, leader.term
+            ));
+        }
         if acked_by.is_some() {
             self.leads = true;
             self.led_at = now;
@@ -715,7 +992,17 @@ impl Publisher {
                     continue;
                 };
                 match client.publish(self.driver.endpoint(), batch) {
-                    Ok(()) => self.stats.resent = self.stats.resent.saturating_add(1),
+                    Ok(()) => {
+                        self.stats.resent = self.stats.resent.saturating_add(1);
+                        #[cfg(feature = "sim")]
+                        {
+                            let count = self
+                                .counts
+                                .entry(format!("resent to {target}"))
+                                .or_default();
+                            *count = count.saturating_add(1);
+                        }
+                    }
                     Err(_) => {
                         all_sent = false;
                         break;
@@ -832,6 +1119,13 @@ impl Publisher {
     }
 
     /// The node it sends to, and the batches it owes and holds unsent.
+    /// Under the simulation: the node it sends to, whether it knows that node leads, and the
+    /// term it knows.
+    #[cfg(feature = "sim")]
+    pub(crate) const fn known(&self) -> (Option<u64>, bool, u64) {
+        (self.target, self.leads, self.term)
+    }
+
     pub(crate) fn state(&self) -> (Option<u64>, usize, usize) {
         (self.target, self.owed.len(), self.queued.len())
     }

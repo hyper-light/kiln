@@ -1,0 +1,1229 @@
+Subject: the simulation's seams: a told log, one clock on simulated shards, binds by port, a planted commit
+Why: Quiver's persisted class runs in a deterministic simulation (kiln's CP-T2.2 step 6, docs/design/persisted-sim.md). A told log (Waits::Told) writes only when its caller cuts (Log::cut) and reads a waking fetch only when served (Log::serve). Its restore at open, and any caller that waits on its write or fetch, tell it by waiting. Every driver on a simulated shard reads one clock (hyper_rt::sim::anchor, shard_instant). A simulated bind takes the port asked for in its shard. Mutant::OwnLogCommit is the planted bug, through Replica::plant. Offered upstream as hyper-raft's cp/t2.2-told.
+
+diff --git a/crates/hyper-durable/Cargo.toml b/crates/hyper-durable/Cargo.toml
+index 70816c64b84374a2e5b2e6abba7eaa5b9f9f1686..75495a4ee909eadcccca2cff6ba9779f00501be7 100644
+--- a/crates/hyper-durable/Cargo.toml
++++ b/crates/hyper-durable/Cargo.toml
+@@ -20,6 +20,9 @@ thiserror.workspace = true
+ # asks for it (this crate's own tests, below). Quiver's and kiln's copies make it so, as the
+ # write-ahead log is mandatory there (Quiver's docs/design/focal-bus.md, "GroupStore mandated").
+ test-store = []
++# A defect planted in the replica's core (`Replica::plant`, `hyper_raft::Mutant`), for a test build
++# that shows its checks catch it; no consumer enables it.
++mutants = ["hyper-raft/mutants"]
+ 
+ [dev-dependencies]
+ hyper-durable = { path = ".", features = ["test-store"] }
+diff --git a/crates/hyper-durable/src/replica.rs b/crates/hyper-durable/src/replica.rs
+index baf27cf2834947235203bdea0b0fa133a53e1aab..e2a3405031f1a0deff644985a43d2bcc72d658b6 100644
+--- a/crates/hyper-durable/src/replica.rs
++++ b/crates/hyper-durable/src/replica.rs
+@@ -496,6 +496,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
+         Ok(replica)
+     }
+ 
++    /// Plants `mutant` in the replica's core, or takes the one planted out: a defect a test build
++    /// shows its checks catch (`hyper_raft::Mutant`; the `mutants` feature, which no consumer
++    /// enables).
++    #[cfg(feature = "mutants")]
++    pub fn plant(&mut self, mutant: Option<hyper_raft::Mutant>) {
++        self.node.plant(mutant);
++    }
++
+     /// This member.
+     pub fn id(&self) -> u64 {
+         self.node.raft.id()
+diff --git a/crates/hyper-log/src/device.rs b/crates/hyper-log/src/device.rs
+index 5b3951a6c8c85d52ec206b898984df88f36e5ccf..c66d2455e3918bb4003e8f8662d918a28fcc3297 100644
+--- a/crates/hyper-log/src/device.rs
++++ b/crates/hyper-log/src/device.rs
+@@ -476,6 +476,9 @@ pub(crate) struct Device<F> {
+     mac: Option<hyper_seal::log::FrameMac>,
+     /// What making a record durable has cost this file each way ([`Device::confirm`]).
+     costs: Costs,
++    /// A confirmation is made durable the first way alone, whatever the costs measured: under
++    /// `Waits::Told`, whose caller decides every operation the device makes.
++    steady: bool,
+ }
+ 
+ /// A running mean of nanoseconds, of every sample since the log opened: no constant weighs them.
+@@ -534,9 +537,17 @@ impl<F: BlockFile> Device<F> {
+             more,
+             mac: None,
+             costs: Costs::default(),
++            steady: false,
+         }
+     }
+ 
++    /// The device of a log under `Waits::Told`, whose confirmations are made durable one way,
++    /// never by what it measured, so its operations follow from its frames alone.
++    pub(crate) fn steady(mut self, steady: bool) -> Self {
++        self.steady = steady;
++        self
++    }
++
+     /// The device of a sealed log, which checks every frame it reads against `mac`.
+     pub(crate) fn sealed(mut self, mac: Option<hyper_seal::log::FrameMac>) -> Self {
+         self.mac = mac;
+@@ -741,7 +752,7 @@ impl<F: BlockFile> Device<F> {
+     /// own. Each mean is of every sample since the log opened, so no constant weighs them; a way
+     /// not taken keeps the mean it had, and is taken again once the other's mean passes it.
+     fn confirm(&mut self, buf: &mut AlignedBuf, at: u64) -> (Result<(), LogError>, Timing) {
+-        if self.costs.flushing_is_cheaper() {
++        if !self.steady && self.costs.flushing_is_cheaper() {
+             let (result, timing) = self.write_flushed(buf, at);
+             if result.is_ok() {
+                 self.costs.flushed.add(timing.took_ns);
+diff --git a/crates/hyper-log/src/group.rs b/crates/hyper-log/src/group.rs
+index f7edc474afdcaeb8c0d4ff3467c451b2842b0895..5cb46ae4b352999ef5d6c49a2941972c06e36634 100644
+--- a/crates/hyper-log/src/group.rs
++++ b/crates/hyper-log/src/group.rs
+@@ -690,6 +690,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
+             high,
+             page,
+             into,
++            waits: true,
+         };
+         match self.ask(query)? {
+             Answer::Entries(f) => Ok(f),
+diff --git a/crates/hyper-log/src/lib.rs b/crates/hyper-log/src/lib.rs
+index 2312c5f325662cd7b2c139b3e0f3540297d235a0..53b17f2f117b5a85eba7d80855249eaeeaca26a2 100644
+--- a/crates/hyper-log/src/lib.rs
++++ b/crates/hyper-log/src/lib.rs
+@@ -103,6 +103,17 @@ pub enum Waits {
+     /// submitters never return within a wait, as the replica simulation's, which drives each
+     /// member's submissions one at a time.
+     Never,
++    /// Writes nothing until told: a batch is what was held and queued when the caller cuts
++    /// ([`Log::cut`]), and a submission admitted meanwhile waits for the next cut. It reads entries
++    /// from the device for a fetch only when told too ([`Log::serve`]), or when the fetch's caller
++    /// waits on it (`Log::fetch`, a group's `fetch`). For a
++    /// simulation that decides when each write reaches the device: what one frame holds and when
++    /// it is answered are then the caller's, not the log's threads'. A frame is confirmed on its
++    /// own unless a cut already asks for the next, its confirmation made durable one way rather
++    /// than the way the device measured cheaper, and nothing is filled ahead. The restore of a
++    /// frame lost at open is the log's own, written as the log opens, which waits for it; and a
++    /// caller that waits on its write as it sends it (`write`) tells the writer by waiting.
++    Told,
+ }
+ 
+ /// Entries to write from `first` on, replacing any the group holds at or after it.
+@@ -930,6 +941,7 @@ impl<F: BlockFile + 'static> Log<F> {
+         p.fills = crate::unwind::contained(|| file.fills_new_space()).unwrap_or(false);
+         let (more, told) = sync_channel(device::MORE);
+         let device = device::Device::new(file, pool, config.segment_bytes, told)
++            .steady(config.waits == Waits::Told)
+             .sealed(sealer.as_ref().map(seal::Sealer::frame_mac));
+         let wiring = owner::Wiring {
+             device,
+@@ -1043,6 +1055,34 @@ impl<F: BlockFile + 'static> Log<F> {
+         )
+     }
+ 
++    /// Under [`Waits::Told`], tells the writer to write what it holds: every submission it has
++    /// admitted, and any held for room, in frames from the next on. The returned handle is
++    /// answered once each of them is answered, durable or refused: `Ok` once the last frame that
++    /// took them is durable and confirmed, or at once when there were none; `Fenced` where the log
++    /// fenced. Under the other waits the writer writes without being told, and the handle is
++    /// answered at once.
++    pub fn cut(&self) -> Result<Pending, LogError> {
++        let (ticket, waiting) = ticket::call(None);
++        self.lines
++            .inbox
++            .send(Message::Cut(ticket))
++            .map_err(|_| LogError::Closed)?;
++        Ok(Pending(waiting))
++    }
++
++    /// Under [`Waits::Told`], tells the owner to read from the device the entries it was asked
++    /// for and holds (`Log::fetch_waking` and a group's fetches), which it reads only when told: the
++    /// returned handle is answered once every fetch held is answered, at once when none is. Under
++    /// the other waits the owner reads as it is asked, and the handle is answered at once.
++    pub fn serve(&self) -> Result<Pending, LogError> {
++        let (ticket, waiting) = ticket::call(None);
++        self.lines
++            .inbox
++            .send(Message::Serve(ticket))
++            .map_err(|_| LogError::Closed)?;
++        Ok(Pending(waiting))
++    }
++
+     /// Asks the owner and waits for its answer.
+     fn ask(&self, query: Query) -> Result<Answer, LogError> {
+         ask(&self.lines.inbox, query)
+@@ -1183,7 +1223,7 @@ impl<F: BlockFile + 'static> Log<F> {
+         page: Page,
+         into: Fetched,
+     ) -> Result<Fetched, LogError> {
+-        self.fetch_waking(group, low, high, page, into, None)?
++        self.send_fetch(group, low, high, page, into, (None, true))?
+             .wait()
+     }
+ 
+@@ -1197,6 +1237,19 @@ impl<F: BlockFile + 'static> Log<F> {
+         page: Page,
+         into: Fetched,
+         waker: Option<Waker>,
++    ) -> Result<Fetching, LogError> {
++        self.send_fetch(group, low, high, page, into, (waker, false))
++    }
++
++    /// Sends the owner a fetch: whether its caller waits on it as it asks (`Query::Entries`).
++    fn send_fetch(
++        &self,
++        group: u128,
++        low: u64,
++        high: u64,
++        page: Page,
++        into: Fetched,
++        (waker, waits): (Option<Waker>, bool),
+     ) -> Result<Fetching, LogError> {
+         let (ticket, waiting) = ticket::call(waker);
+         let query = Query::Entries {
+@@ -1205,6 +1258,7 @@ impl<F: BlockFile + 'static> Log<F> {
+             high,
+             page,
+             into,
++            waits,
+         };
+         self.lines
+             .inbox
+diff --git a/crates/hyper-log/src/owner/mod.rs b/crates/hyper-log/src/owner/mod.rs
+index 9af435fa6cef90e3a8ccdb0fd9f2127be599234f..d17dcfeceef656f806f6ecef7659359f09a2f6c1 100644
+--- a/crates/hyper-log/src/owner/mod.rs
++++ b/crates/hyper-log/src/owner/mod.rs
+@@ -51,7 +51,7 @@ use crate::state::State;
+ use crate::stats::{self, Tally};
+ use crate::ticket::{Answer, Reply, Ticket};
+ use crate::writer::{Key, Placement, Submission};
+-use crate::{LogError, Params};
++use crate::{LogError, Params, Waits};
+ 
+ use read::Fetch;
+ pub(crate) use read::Query;
+@@ -79,6 +79,12 @@ pub(crate) enum Message<F> {
+     Release(u128),
+     /// The log is closing: the owner answers what it holds and ends.
+     Close,
++    /// Under `Waits::Told`, the caller's word to write what the owner holds (`Log::cut`),
++    /// answered through its ticket once all of it is.
++    Cut(Ticket),
++    /// Under `Waits::Told`, the caller's word to read the fetches the owner holds (`Log::serve`),
++    /// answered through its ticket once none is left.
++    Serve(Ticket),
+ }
+ 
+ /// What the owner hears, in the order it hears it: a message from its inbox, or what came back
+@@ -288,6 +294,14 @@ pub(crate) struct Owner<F> {
+     /// The bytes the last frame wrote: a fill's piece is no larger, so a frame that waits behind
+     /// one waits no longer than behind another frame.
+     frame_bytes: u64,
++    /// Under `Waits::Told`: the cuts told and not yet taken into a batch, and those the batch on
++    /// the device took, answered with the last frame that holds what they took (`Owner::cut`).
++    cuts: Vec<Ticket>,
++    cutting: Vec<Ticket>,
++    /// Under `Waits::Told`: the serves told and not yet answered (`Owner::serve`); and whether
++    /// the first fetch is on the device.
++    serving: Vec<Ticket>,
++    reading: bool,
+ }
+ 
+ impl<F: BlockFile + 'static> Owner<F> {
+@@ -359,6 +373,10 @@ impl<F: BlockFile + 'static> Owner<F> {
+             filled: None,
+             unfilled: None,
+             frame_bytes: 0,
++            cuts: Vec::new(),
++            cutting: Vec::new(),
++            serving: Vec::new(),
++            reading: false,
+         }
+     }
+ 
+@@ -553,11 +571,82 @@ impl<F: BlockFile + 'static> Owner<F> {
+             }
+             Message::Claim(group, ticket) => self.claim(group, ticket),
+             Message::Release(group) => self.release(group),
+-            Message::Close => self.closing = true,
++            Message::Close => {
++                self.closing = true;
++                // Under `Waits::Told` a close writes what the owner holds, as a cut does, and
++                // reads what it was asked, as a serve does.
++                if !self.untold() {
++                    self.parked = false;
++                    self.agenda.step = true;
++                    self.read_if_served();
++                }
++            }
++            Message::Cut(ticket) => self.cut(ticket),
++            Message::Serve(ticket) => self.serve(ticket),
+         }
+         None
+     }
+ 
++    /// Whether the writer writes without being told (every waits but `Waits::Told`).
++    fn untold(&self) -> bool {
++        self.p.config.waits != Waits::Told
++    }
++
++    /// Under `Waits::Told`, whether the writer has been told to write what it holds: a cut not
++    /// yet answered, the log closing, which writes what it holds as a cut would, or a caller that
++    /// waits on its write from the moment it sent it (a blocking write, as a replica's open makes),
++    /// which can cut nothing until it is answered, so its waiting tells the writer.
++    pub(super) fn told(&self) -> bool {
++        !self.cuts.is_empty()
++            || !self.cutting.is_empty()
++            || self.closing
++            || self
++                .intake
++                .iter()
++                .chain(&self.schedule.held)
++                .any(|s| s.doer.is_some())
++    }
++
++    /// Whether the first fetch may go to the device: as it comes, but under `Waits::Told` only
++    /// while a serve or a close asks for it, or a caller waits on a fetch held.
++    pub(super) fn serves(&self) -> bool {
++        self.untold()
++            || !self.serving.is_empty()
++            || self.closing
++            || self.fetches.iter().any(|f| f.waits)
++    }
++
++    /// A serve: under `Waits::Told`, the fetches the owner holds are read from the device and the
++    /// serve is answered once none is left; under the other waits, or with none held, at once.
++    fn serve(&mut self, mut ticket: Ticket) {
++        if self.untold() || self.fetches.is_empty() {
++            ticket.answer(Ok(Answer::Durable(Vec::new())));
++            return;
++        }
++        self.serving.push(ticket);
++        self.read_if_served();
++    }
++
++    /// A cut: under `Waits::Told`, the next batch takes what the owner holds and the cut is
++    /// answered once all of it is; under the other waits, at once. A frame on the device that a
++    /// next one now follows leaves its confirmation to that frame's record.
++    fn cut(&mut self, mut ticket: Ticket) {
++        if self.untold() {
++            ticket.answer(Ok(Answer::Durable(Vec::new())));
++            return;
++        }
++        if self.fenced {
++            ticket.answer(Err(LogError::Fenced));
++            return;
++        }
++        self.cuts.push(ticket);
++        if !self.intake.is_empty() || !self.schedule.held.is_empty() {
++            self.tell_more();
++        }
++        self.parked = false;
++        self.agenda.step = true;
++    }
++
+     /// A job and the device back from the thread that did it: the device is the owner's again,
+     /// and the job's completion is acted on.
+     fn back(&mut self, mut back: Box<Carrier<F>>) {
+@@ -613,7 +702,7 @@ impl<F: BlockFile + 'static> Owner<F> {
+                 // them, comes after the word.
+                 let admit = s.admit;
+                 self.intake.push_back(s);
+-                self.tell_more();
++                self.tell_admitted();
+                 if admit && let Some(s) = self.intake.back() {
+                     s.ticket.admit();
+                 }
+@@ -636,7 +725,7 @@ impl<F: BlockFile + 'static> Owner<F> {
+             if let Some(s) = self.waiting.remove(&seq) {
+                 let admit = s.admit;
+                 self.intake.push_back(s);
+-                self.tell_more();
++                self.tell_admitted();
+                 if admit && let Some(s) = self.intake.back() {
+                     s.ticket.admit();
+                 }
+@@ -845,6 +934,14 @@ impl<F: BlockFile + 'static> Owner<F> {
+         self.looking = true;
+     }
+ 
++    /// A submission admitted: another frame follows the one on the device, unless under
++    /// `Waits::Told` no cut asks for one yet.
++    fn tell_admitted(&mut self) {
++        if self.untold() || self.told() {
++            self.tell_more();
++        }
++    }
++
+     /// A submission was admitted while a frame is on the device: another frame follows it, so
+     /// the device leaves the frame's confirmation to the next one's record, as the writer did
+     /// when it found submissions queued (mantle docs/design/raft-log.md §3).
+diff --git a/crates/hyper-log/src/owner/read.rs b/crates/hyper-log/src/owner/read.rs
+index d43c5384991588e1a6d660866abfbea1f704ae59..5fd94da6a08dd01ba46bb1827271e35b366ba692 100644
+--- a/crates/hyper-log/src/owner/read.rs
++++ b/crates/hyper-log/src/owner/read.rs
+@@ -24,6 +24,9 @@ pub(crate) enum Query {
+         high: u64,
+         page: Page,
+         into: Fetched,
++        /// Its caller waits on its answer as it asks (`Log::fetch`, a group's `fetch`): under
++        /// `Waits::Told` it could serve nothing until answered, so it is read as it is asked.
++        waits: bool,
+     },
+     Flushed,
+     Fenced,
+@@ -37,6 +40,8 @@ pub(super) struct Fetch {
+     ticket: Ticket,
+     /// Reads made of entries that missed, which a second miss ends.
+     retries: u32,
++    /// Its caller waits on its answer (`Query::Entries`).
++    pub(super) waits: bool,
+ }
+ 
+ /// Reads an entry that missed its place is given before it is called damaged: mantle-log looks
+@@ -55,8 +60,9 @@ impl<F: BlockFile + 'static> Owner<F> {
+                 high,
+                 page,
+                 into,
++                waits,
+             } => {
+-                self.fetch(group, (low, high, page), into, ticket);
++                self.fetch(group, (low, high, page), into, (ticket, waits));
+                 return;
+             }
+             Query::Flushed => Ok(Answer::Flushed(self.schedule.frames, self.schedule.updates)),
+@@ -144,7 +150,7 @@ impl<F: BlockFile + 'static> Owner<F> {
+         group: u128,
+         range: (u64, u64, Page),
+         mut into: Fetched,
+-        mut ticket: Ticket,
++        (mut ticket, waits): (Ticket, bool),
+     ) {
+         into.clear();
+         let mut reads = std::mem::replace(&mut self.spare_reads, Reads::none());
+@@ -175,8 +181,15 @@ impl<F: BlockFile + 'static> Owner<F> {
+             reads,
+             ticket,
+             retries: 0,
++            waits,
+         });
+-        if self.fetches.len() == 1 {
++        self.read_if_served();
++    }
++
++    /// Hands the device the first fetch's reads, unless they are there already or, under
++    /// `Waits::Told`, no serve asks for them yet (`Owner::serves`).
++    pub(super) fn read_if_served(&mut self) {
++        if !self.reading && self.serves() {
+             self.read_next();
+         }
+     }
+@@ -221,12 +234,14 @@ impl<F: BlockFile + 'static> Owner<F> {
+             return;
+         };
+         let reads = std::mem::replace(&mut fetch.reads, Reads::none());
++        self.reading = true;
+         self.io.push_back((Job::Read(reads), None));
+     }
+ 
+     /// A fetch's reads are back: entries that missed their place are looked up again, once, as
+     /// one moved by a sweep since its place was taken; the fetch is answered when none is left.
+     pub(super) fn read(&mut self, mut reads: Reads) {
++        self.reading = false;
+         let Some(mut fetch) = self.fetches.pop_front() else {
+             return;
+         };
+@@ -252,7 +267,13 @@ impl<F: BlockFile + 'static> Owner<F> {
+             }
+             Err(e) => fetch.ticket.answer(Err(e)),
+         }
+-        self.read_next();
++        // The serves are answered once no fetch is left.
++        if self.fetches.is_empty() {
++            for mut ticket in self.serving.drain(..) {
++                ticket.answer(Ok(Answer::Durable(Vec::new())));
++            }
++        }
++        self.read_if_served();
+     }
+ 
+     /// A sealed log's entries read back as stored, opened: each under the session of its segment
+diff --git a/crates/hyper-log/src/owner/write.rs b/crates/hyper-log/src/owner/write.rs
+index c9ba21a922bf3f9486327e0c468fd44b9255ad98..f420974ea7aaa185ae6228ab95a1e81c53e5b39d 100644
+--- a/crates/hyper-log/src/owner/write.rs
++++ b/crates/hyper-log/src/owner/write.rs
+@@ -121,6 +121,15 @@ impl<F: BlockFile + 'static> Owner<F> {
+         if self.intake.is_empty() {
+             return;
+         }
++        // Under `Waits::Told` a batch starts at a cut, which runs the loop (`Owner::cut`), or as a
++        // caller waits on its write (`Owner::told`), which this submission may be.
++        if self.p.config.waits == Waits::Told {
++            if self.parked && self.told() {
++                self.parked = false;
++                self.agenda.step = true;
++            }
++            return;
++        }
+         if self.parked {
+             self.parked = false;
+             let mut batch = std::mem::take(&mut self.buffers.batch);
+@@ -159,6 +168,19 @@ impl<F: BlockFile + 'static> Owner<F> {
+                 return;
+             }
+             self.drain();
++            let told = self.p.config.waits == Waits::Told;
++            // A restore of a lost frame at open is the log's own, written as it opens (the open
++            // waits for it), before any caller could cut.
++            if told && !self.told() && !self.schedule.restoring {
++                // Nothing is written until told: what is held and queued waits for a cut.
++                if !self.idle() {
++                    return;
++                }
++                continue;
++            }
++            // The batch takes the cuts told so far: they are answered with what it takes.
++            let cuts = std::mem::take(&mut self.cuts);
++            self.cutting.extend(cuts);
+             let mut batch = std::mem::take(&mut self.schedule.held);
+             let held = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+             self.schedule.held = std::mem::take(&mut self.buffers.batch);
+@@ -169,12 +191,25 @@ impl<F: BlockFile + 'static> Owner<F> {
+                 return;
+             }
+             self.buffers.batch = batch;
++            // A cut that found nothing to write.
++            self.answer_cuts(None);
+             if !self.idle() {
+                 return;
+             }
+         }
+     }
+ 
++    /// Answers the cuts the batch on the device took (`Owner::cut`): `Ok` once every submission
++    /// they took is answered, or refused as the batch was.
++    pub(super) fn answer_cuts(&mut self, refused: Option<fn() -> LogError>) {
++        for mut ticket in self.cutting.drain(..) {
++            ticket.answer(match refused {
++                None => Ok(Answer::Durable(Vec::new())),
++                Some(refusal) => Err(refusal()),
++            });
++        }
++    }
++
+     /// Nothing is queued: the last frame is confirmed on its own, at once, since no frame would
+     /// carry the confirmation; or, with none to confirm, the next slot's zeros are written ahead
+     /// a piece at a time, and with none of those either the owner parks. Whether the loop goes
+@@ -366,7 +401,7 @@ impl<F: BlockFile + 'static> Owner<F> {
+         reason = "hyper-log's owner times its own writes (CLAUDE.md §1, sans-io's one exception)"
+     )]
+     fn gather_then_commit(&mut self, batch: VecDeque<Submission<F>>, answered: u64, before: u64) {
+-        if answered == 0 || self.p.config.waits == Waits::Never {
++        if answered == 0 || self.p.config.waits != Waits::Measured {
+             self.commit_unless_fenced(batch);
+             return;
+         }
+@@ -417,6 +452,7 @@ impl<F: BlockFile + 'static> Owner<F> {
+                 self.answer(s, Err(LogError::Fenced));
+             }
+             self.buffers.batch = batch;
++            self.answer_cuts(Some(|| LogError::Fenced));
+             self.agenda.step = true;
+             return;
+         }
+@@ -787,13 +823,24 @@ impl<F: BlockFile + 'static> Owner<F> {
+                     let tell = s.ticket.port()?;
+                     Some(Doer { slot, tell })
+                 });
+-                let these = self.answers_of(&mut taken);
++                let mut these = self.answers_of(&mut taken);
++                // The cuts the batch took are answered with the frame that takes the last of
++                // it: this one, unless updates are held over for the next.
++                if self.schedule.held.is_empty() {
++                    let cuts = self.cutting.drain(..).map(|ticket| Answering {
++                        ticket,
++                        entries: Vec::new(),
++                    });
++                    these.extend(cuts);
++                }
+                 let before = self
+                     .unconfirmed
+                     .as_mut()
+                     .map(|u| std::mem::take(&mut u.answering))
+                     .unwrap_or_default();
+-                let more = !self.intake.is_empty() || !self.schedule.held.is_empty();
++                let waiting = !self.intake.is_empty() || !self.schedule.held.is_empty();
++                // Under `Waits::Told` what waits is written next only if told to.
++                let more = waiting && (self.p.config.waits != Waits::Told || self.told());
+                 self.more_told = more;
+                 self.phase = Phase::Writing(Writing {
+                     taken,
+@@ -1162,6 +1209,10 @@ impl<F: BlockFile + 'static> Owner<F> {
+     /// No frame was written, so none confirms the last: a confirmation does, so that no answer
+     /// waits on traffic that may only ever be refused.
+     fn no_frame(&mut self) {
++        // What the cuts took is answered, refused, unless some is held over for the next frame.
++        if self.schedule.held.is_empty() {
++            self.answer_cuts(None);
++        }
+         if self.confirm(true) {
+             return;
+         }
+@@ -1210,6 +1261,7 @@ impl<F: BlockFile + 'static> Owner<F> {
+         for s in taken.into_iter().map(|(s, _)| s).chain(batch).chain(held) {
+             self.answer(s, Err(LogError::Fenced));
+         }
++        self.answer_cuts(Some(|| LogError::Fenced));
+         if let Some(before) = self.unconfirmed.take() {
+             self.settle(before, Err(()), None);
+         }
+diff --git a/crates/hyper-log/tests/log.rs b/crates/hyper-log/tests/log.rs
+index 532e9e1dca0a3db87e04195bc1ca79b5b7007947..2b199709e98d1472cb45a6d208e54b2779503f5f 100644
+--- a/crates/hyper-log/tests/log.rs
++++ b/crates/hyper-log/tests/log.rs
+@@ -1083,6 +1083,39 @@ fn a_frame_confirmed_by_a_durable_write_is_restored_and_marked_after_a_power_cut
+     drop(closed(log));
+ }
+ 
++/// A log under `Waits::Told` opens after its last acknowledged frame is damaged at rest: the
++/// restore the open writes and waits for is the log's own, never held for a cut no caller could make
++/// before the open returns. The frames are written under `Measured`, the damage as the test below
++/// makes it, and the log opened again under `Told`.
++#[test]
++fn a_told_log_opens_and_restores_a_damaged_last_frame() {
++    let file = sim(29);
++    let cfg = config(16, 8);
++    let log = Log::create(file, cfg, ID).unwrap();
++    for i in 1..=4u64 {
++        let update = Update {
++            entries: Some(entries(i, &[1])),
++            ..Update::default()
++        };
++        log.write(1, update).unwrap();
++    }
++    let file = closed(log);
++    file.inject(Fault::BitFlip {
++        offset: AREA + 5 * BLOCK as u64 + 8,
++        bit: 2,
++        stored: true,
++    })
++    .unwrap();
++    let told = Config {
++        waits: Waits::Told,
++        ..cfg
++    };
++    let (log, recovery) = Log::open(file, told, ID).unwrap();
++    assert_eq!(recovery.restored, vec![1]);
++    assert_eq!(log.view(1).unwrap().unwrap().last, 3);
++    drop(closed(log));
++}
++
+ #[test]
+ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
+     for field in [0u64, 8, 40, 64, 70, 120] {
+diff --git a/crates/hyper-log/tests/told.rs b/crates/hyper-log/tests/told.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d747a71969ffe59b952de726e85f74f69114b2b6
+--- /dev/null
++++ b/crates/hyper-log/tests/told.rs
+@@ -0,0 +1,272 @@
++//! `Waits::Told`: the writer writes nothing until its caller cuts (`Log::cut`), so what one frame
++//! holds and when it is answered are the caller's. A simulation decides with it when each write
++//! reaches its device (Quiver's `docs/design/persisted-sim.md`).
++#![allow(
++    clippy::unwrap_used,
++    clippy::expect_used,
++    clippy::panic,
++    clippy::indexing_slicing,
++    clippy::arithmetic_side_effects,
++    clippy::disallowed_macros,
++    clippy::disallowed_methods,
++    clippy::cast_possible_truncation,
++    clippy::cognitive_complexity
++)]
++
++use std::time::Duration;
++
++use hyper_block::buf::Alignment;
++use hyper_block::sim::{Crash, Fault, SimFile};
++use hyper_log::{Config, Entries, Entry, Fetched, Log, LogError, Page, Pending, Update, Waits};
++
++const ID: u128 = 0x746f_6c64;
++const BLOCK: usize = 4096;
++
++fn config(waits: Waits) -> Config {
++    Config {
++        segment_bytes: 16 * BLOCK as u64,
++        max_segments: 16,
++        max_groups: 8,
++        group_entries: 1 << 10,
++        group_bytes: 1 << 20,
++        group_cache: 1 << 16,
++        queue_submissions: 64,
++        waits,
++    }
++}
++
++fn sim(seed: u64) -> SimFile {
++    SimFile::new(
++        Alignment::new(BLOCK).unwrap(),
++        Alignment::new(512).unwrap(),
++        seed,
++    )
++    .unwrap()
++}
++
++/// Entry `index` of a group, of `len` bytes tagged with it.
++fn append(index: u64, len: usize) -> Update {
++    Update {
++        entries: Some(Entries {
++            first: index,
++            entries: vec![Entry {
++                term: 1,
++                bytes: (0..len).map(|b| (index as usize + b) as u8).collect(),
++            }],
++        }),
++        ..Update::default()
++    }
++}
++
++/// The device's writes and flushes so far.
++fn ops(log: &Log<SimFile>) -> (u64, u64) {
++    let stats = log.with_file(|f| f.stats().unwrap()).unwrap();
++    (stats.writes, stats.syncs)
++}
++
++/// Long enough for the log's threads to have written anything they were going to.
++const SETTLE: Duration = Duration::from_millis(50);
++
++#[test]
++fn under_told_nothing_is_written_until_the_cut_then_one_frame_holds_it_all() {
++    let log = Log::create(sim(1), config(Waits::Told), ID).unwrap();
++    let before = ops(&log);
++    let pending: Vec<Pending> = (1..=4)
++        .map(|group| log.submit(group, append(1, 100)).unwrap())
++        .collect();
++    std::thread::sleep(SETTLE);
++    assert_eq!(
++        ops(&log),
++        before,
++        "nothing reaches the device before the cut"
++    );
++    assert!(
++        pending.iter().all(|p| p.poll().is_none()),
++        "nothing is answered before the cut"
++    );
++    let frames = log.stats(None).unwrap().frames;
++
++    log.cut().unwrap().wait().unwrap();
++    // The cut is answered once every update it took is: each is answered already.
++    for p in &pending {
++        assert!(matches!(p.poll(), Some(Ok(()))));
++    }
++    let stats = log.stats(None).unwrap();
++    assert_eq!(stats.frames, frames + 1, "one frame holds the four updates");
++    assert_eq!(stats.updates, 4);
++    for group in 1..=4 {
++        assert_eq!(log.view(group).unwrap().unwrap().last, 1);
++    }
++    // Written and confirmed on its own: nothing more follows until the next cut.
++    let after = ops(&log);
++    std::thread::sleep(SETTLE);
++    assert_eq!(ops(&log), after);
++}
++
++#[test]
++fn a_cut_that_finds_nothing_held_is_answered_at_once() {
++    let log = Log::create(sim(2), config(Waits::Told), ID).unwrap();
++    let before = ops(&log);
++    log.cut().unwrap().wait().unwrap();
++    assert_eq!(ops(&log), before);
++}
++
++#[test]
++fn each_cut_takes_only_what_came_before_it() {
++    let log = Log::create(sim(3), config(Waits::Told), ID).unwrap();
++    let first = log.submit(1, append(1, 10)).unwrap();
++    log.cut().unwrap().wait().unwrap();
++    assert!(matches!(first.poll(), Some(Ok(()))));
++    let second = log.submit(1, append(2, 10)).unwrap();
++    std::thread::sleep(SETTLE);
++    assert!(
++        second.poll().is_none(),
++        "the next update waits for the next cut"
++    );
++    assert_eq!(log.view(1).unwrap().unwrap().last, 1);
++    log.cut().unwrap().wait().unwrap();
++    assert!(matches!(second.poll(), Some(Ok(()))));
++    assert_eq!(log.view(1).unwrap().unwrap().last, 2);
++}
++
++#[test]
++fn under_the_other_waits_a_cut_is_answered_at_once() {
++    for waits in [Waits::Never, Waits::Measured] {
++        let log = Log::create(sim(4), config(waits), ID).unwrap();
++        log.submit(1, append(1, 10)).unwrap().wait().unwrap();
++        let before = ops(&log);
++        log.cut().unwrap().wait().unwrap();
++        // Under `Measured` the log may write zeros ahead while it idles; under `Never` nothing.
++        if waits == Waits::Never {
++            assert_eq!(ops(&log), before);
++        }
++    }
++}
++
++/// The same updates and cuts from the same seed, with power cut at the same operation, give the
++/// same answers, the same operations and, after the crash, the same log: what a frame holds is
++/// fixed by the cuts, not by when the log's threads ran. (The bytes differ: each segment's nonce
++/// comes from the operating system, `docs/raft-log.md` §2.)
++#[test]
++fn the_same_updates_and_cuts_leave_the_same_log_after_a_crash() {
++    let run = |cut_after: u64| {
++        let log = Log::create(sim(5), config(Waits::Told), ID).unwrap();
++        let mut answers = Vec::new();
++        for round in 0..20_u64 {
++            if round == 12 {
++                log.with_file(move |f| f.inject(Fault::PowerCut { ops: cut_after }).unwrap())
++                    .unwrap();
++            }
++            // Refused at once once the log has fenced.
++            let groups = 1..=1 + u128::from(round % 4);
++            let pending: Vec<Option<Pending>> = groups
++                .map(|group| {
++                    log.submit(group, append(round / 4 + 1, 64 * round as usize))
++                        .ok()
++                })
++                .collect();
++            if round % 3 == 2 {
++                // Submitted and not cut: the next cut takes these too.
++                continue;
++            }
++            answers.push(log.cut().unwrap().wait().is_ok());
++            let durable =
++                |p: &Option<Pending>| p.as_ref().is_some_and(|p| matches!(p.poll(), Some(Ok(()))));
++            answers.extend(pending.iter().map(durable));
++        }
++        let ops = ops(&log);
++        let file = log.close().unwrap();
++        file.crash(Crash::Random).unwrap();
++        file.clear_faults().unwrap();
++        let (log, recovery) = Log::open(file, config(Waits::Told), ID).unwrap();
++        let views: Vec<Option<(u64, u64)>> = (1..=4)
++            .map(|group| log.view(group).unwrap().map(|v| (v.start.index, v.last)))
++            .collect();
++        (
++            answers,
++            ops,
++            recovery.frames,
++            recovery.damaged,
++            recovery.restored,
++            views,
++        )
++    };
++    for cut_after in [0, 1, 2, 3, 5, 8, 13] {
++        assert_eq!(
++            run(cut_after),
++            run(cut_after),
++            "power cut after {cut_after} operations"
++        );
++    }
++}
++
++#[test]
++fn a_power_cut_in_the_cut_s_frame_fences_the_cut_and_its_updates() {
++    let log = Log::create(sim(6), config(Waits::Told), ID).unwrap();
++    let pending = log.submit(1, append(1, 10)).unwrap();
++    log.with_file(|f| f.inject(Fault::PowerCut { ops: 0 }).unwrap())
++        .unwrap();
++    assert!(matches!(log.cut().unwrap().wait(), Err(LogError::Fenced)));
++    assert!(matches!(pending.poll(), Some(Err(LogError::Fenced))));
++    // A fenced log answers a later cut at once.
++    assert!(matches!(log.cut().unwrap().wait(), Err(LogError::Fenced)));
++}
++
++#[test]
++fn a_close_writes_what_was_held_as_a_cut_would() {
++    let log = Log::create(sim(7), config(Waits::Told), ID).unwrap();
++    let pending = log.submit(1, append(1, 10)).unwrap();
++    let file = log.close().unwrap();
++    assert!(matches!(pending.poll(), Some(Ok(()))));
++    let (log, _) = Log::open(file, config(Waits::Told), ID).unwrap();
++    assert_eq!(log.view(1).unwrap().unwrap().last, 1);
++}
++
++/// Under `Waits::Told` a fetch of entries the log no longer holds in memory waits for a serve
++/// (`Log::serve`), which is answered once the fetch is; a serve with nothing held, and any serve
++/// under the other waits, is answered at once.
++#[test]
++fn under_told_a_fetch_from_the_device_waits_for_a_serve() {
++    let log = Log::create(sim(8), config(Waits::Told), ID).unwrap();
++    // Past the group's cache (64 KiB): the first entries are read back from the device.
++    for index in 1..=24 {
++        log.submit(1, append(index, 8 << 10)).unwrap();
++        log.cut().unwrap().wait().unwrap();
++    }
++    let page = Page::payload(u64::MAX);
++    let fetching = log
++        .fetch_waking(1, 1, 2, page, Fetched::default(), None)
++        .unwrap();
++    std::thread::sleep(SETTLE);
++    assert!(
++        fetching.poll().is_none(),
++        "a read from the device waits for the serve"
++    );
++    log.serve().unwrap().wait().unwrap();
++    let fetched = fetching.poll().unwrap().unwrap();
++    assert_eq!(fetched.iter().count(), 1);
++    log.serve().unwrap().wait().unwrap();
++    // A caller that waits on its fetch as it asks could serve nothing until answered: read as asked.
++    let fetched = log.fetch(1, 1, 2, page, Fetched::default()).unwrap();
++    assert_eq!(fetched.iter().count(), 1);
++    let group = log.group(1).unwrap();
++    assert_eq!(group.entries(1, 2, u64::MAX).unwrap().len(), 1);
++
++    let log = Log::create(sim(9), config(Waits::Never), ID).unwrap();
++    log.serve().unwrap().wait().unwrap();
++}
++
++/// Under `Waits::Told` a caller that waits on its write from the moment it sends it (`Log::write`,
++/// a group's `write`, as a replica's open makes) is answered without a cut: it could make none
++/// until answered, so its waiting tells the writer. What was queued before it goes in its frame.
++#[test]
++fn under_told_a_blocking_write_tells_the_writer_by_waiting() {
++    let log = Log::create(sim(11), config(Waits::Told), ID).unwrap();
++    let queued = log.submit(2, append(1, 10)).unwrap();
++    log.write(1, append(1, 10)).unwrap();
++    assert!(matches!(queued.poll(), Some(Ok(()))));
++    assert_eq!(log.view(1).unwrap().unwrap().last, 1);
++    let mut group = log.group(3).unwrap();
++    group.write(append(1, 10)).unwrap();
++    assert_eq!(log.view(3).unwrap().unwrap().last, 1);
++}
+diff --git a/crates/hyper-raft/src/mutant.rs b/crates/hyper-raft/src/mutant.rs
+index d1dca0cc1dbf022c1c907a3de2888023546f7188..a761120cd4ba4e32b040f1571c6798ec1d636efd 100644
+--- a/crates/hyper-raft/src/mutant.rs
++++ b/crates/hyper-raft/src/mutant.rs
+@@ -21,4 +21,7 @@ pub enum Mutant {
+     /// The fast track counts a fast quorum of the configuration in force alone, not of every one a
+     /// member of the term may count by (the second rule, seed 54104).
+     FastAnyConfiguration,
++    /// A leader commits what its own durable log holds, before a quorum's logs hold it: a
++    /// persisted acknowledgement before a quorum's flush (Quiver's simulation, CP-T2.2 step 6).
++    OwnLogCommit,
+ }
+diff --git a/crates/hyper-raft/src/raft.rs b/crates/hyper-raft/src/raft.rs
+index d81a5bbbc5a6c9294c261d2f7529f91385b414c3..d666bc66fefa77b7d47650d94d6b8531788d8f4c 100644
+--- a/crates/hyper-raft/src/raft.rs
++++ b/crates/hyper-raft/src/raft.rs
+@@ -2026,7 +2026,12 @@ impl<S: Storage> Raft<S> {
+     }
+     /// Commits what the quorum holds, if it is of this term: whether the commit moved.
+     fn commit(&mut self) -> Result<bool> {
+-        let index = self.tracker.quorum_index();
++        let mut index = self.tracker.quorum_index();
++        if self.planted(crate::Mutant::OwnLogCommit)
++            && let Some(own) = self.tracker.get(self.id)
++        {
++            index = index.max(own.matched);
++        }
+         let term = if self.planted(crate::Mutant::OlderTermCommit) {
+             self.log.term(index).unwrap_or(self.term)
+         } else {
+diff --git a/crates/hyper-raft/tests/check.rs b/crates/hyper-raft/tests/check.rs
+index 62d069b8417774a48f7caf1481cd7d02372a3dde..57bd65a4f51297fac085bdab8a057f6bf5e2fbd2 100644
+--- a/crates/hyper-raft/tests/check.rs
++++ b/crates/hyper-raft/tests/check.rs
+@@ -408,6 +408,33 @@ fn a_vote_sent_before_it_is_durable_is_caught() {
+     );
+ }
+ 
++/// A commit on the leader's own durable log alone, before a quorum's logs hold the entry
++/// (`Mutant::OwnLogCommit`): a persisted acknowledgement before a quorum's flush, the defect Quiver's
++/// simulation plants (CP-T2.2 step 6). The oracles catch it here too.
++#[test]
++fn a_commit_on_the_leaders_own_log_alone_is_caught() {
++    let mix = Mix {
++        leader_leaves: true,
++        bursts: true,
++        windows: true,
++        lag: 35,
++        ..Mix::everything()
++    };
++    let settings = judged_settings(Settings {
++        depth: 2,
++        in_place: true,
++        ..Settings::focal()
++    });
++    let make = |seed| {
++        let mut group: Cluster<Lagged> = Cluster::new(5, &[1, 2, 3], settings, seed);
++        group.stop_who_left = true;
++        group
++    };
++    let (seed, violation) = caught(make, 0, 24, 2_000, &mix, Mutant::OwnLogCommit)
++        .expect("no schedule caught a commit on the leader's own log alone");
++    println!("own log commit: seed {seed}: {violation}");
++}
++
+ /// The fast track without its first rule (`docs/raft.md` §3): a member holding the entry beside its
+ /// log counted before its log holds an entry of the leader's term. Its original seed, 9843, no
+ /// longer reaches the defect on today's core (the reads' rounds and R17 moved its schedule); a
+diff --git a/crates/hyper-rt-transport/src/driver.rs b/crates/hyper-rt-transport/src/driver.rs
+index 7b4a448785254601d1a245c25366d3e54f72792f..e93362f20d214627af84c099a7ba592b88cbca78 100644
+--- a/crates/hyper-rt-transport/src/driver.rs
++++ b/crates/hyper-rt-transport/src/driver.rs
+@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
+ use hyper_rt::RtError;
+ use hyper_rt::futures::{Sleep, sleep};
+ use hyper_rt::readiness::{Member, Ready, ReadyGroup};
++use hyper_rt::shard::ShardContext;
+ use hyper_rt::udp::{
+     Batched, Io, IoStats, MAX_BATCH, QueueCharge, Queued, RECEIVE_BYTES, Ring, UdpSocket,
+ };
+@@ -62,6 +63,29 @@ fn shard_now() -> Result<u64, RtError> {
+     hyper_rt::registry::with_current(|context| context.now_ns()).ok_or(RtError::NotOnShardThread)
+ }
+ 
++/// Now, as the `Instant` an endpoint made on this thread's shard is to be given (`Endpoint::new`'s
++/// `now`): on a simulated shard the virtual clock's reading from the process's anchor, the clock every
++/// driver there reads (`hyper_rt::sim::anchor`); on any other thread the host's clock, as before.
++#[allow(
++    clippy::disallowed_methods,
++    reason = "the runtime adapter's clock: the host's off a simulated shard, as the driver's anchor is"
++)]
++pub fn shard_instant() -> Instant {
++    let simulated = hyper_rt::registry::with_current(|context| {
++        context.driver_is_sim().then(|| context.now_ns())
++    })
++    .flatten();
++    match simulated {
++        Some(ns) => {
++            let anchor = hyper_rt::sim::anchor();
++            anchor
++                .checked_add(Duration::from_nanos(ns))
++                .unwrap_or(anchor)
++        }
++        None => Instant::now(),
++    }
++}
++
+ /// Bound: the datagrams one turn takes from the endpoint and sends before the turn's other work:
+ /// one system call's most ([`MAX_BATCH`]).
+ const DATAGRAMS_A_TURN: usize = MAX_BATCH;
+@@ -295,7 +319,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
+             .set_recv_buffer_bytes(usize::try_from(ask).unwrap_or(usize::MAX))?;
+         let unmeasured = endpoint.unmeasured_room();
+         endpoint.set_receive_capacity(unmeasured, 0);
+-        let anchor = (shard_now()?, Instant::now());
++        // On a simulated shard every driver anchors to the process's one instant for the virtual
++        // clock's zero, so all of a simulation's endpoints read one clock (`hyper_rt::sim::anchor`).
++        let simulated =
++            hyper_rt::registry::with_current(ShardContext::driver_is_sim).unwrap_or(false);
++        let anchor = if simulated {
++            (0, hyper_rt::sim::anchor())
++        } else {
++            (shard_now()?, Instant::now())
++        };
+         let resolution = Duration::from_nanos(hyper_rt::machine::clock::resolution_ns());
+         Ok(Self {
+             endpoint,
+diff --git a/crates/hyper-rt-transport/src/lib.rs b/crates/hyper-rt-transport/src/lib.rs
+index 6257460f2bf4bf7e1fff7202fc1b58b8d1cb7350..8d2ff4198a30dbfc679e9ea3c28255802aa42e51 100644
+--- a/crates/hyper-rt-transport/src/lib.rs
++++ b/crates/hyper-rt-transport/src/lib.rs
+@@ -33,6 +33,6 @@
+ mod driver;
+ mod plane;
+ 
+-pub use driver::{Driver, RingStats, Rooms, TURNS, least_bytes};
++pub use driver::{Driver, RingStats, Rooms, TURNS, least_bytes, shard_instant};
+ pub use hyper_rt::udp::{Arrival, Io, IoStats, MAX_BATCH, RECEIVE_BYTES};
+ pub use plane::PlaneSocket;
+diff --git a/crates/hyper-rt-transport/tests/simulation.rs b/crates/hyper-rt-transport/tests/simulation.rs
+index f0c776d0b5ce6331efa07a8385e5724a5543211c..37ad79d4f64c0ceececa519447409f7f7cdd4b25 100644
+--- a/crates/hyper-rt-transport/tests/simulation.rs
++++ b/crates/hyper-rt-transport/tests/simulation.rs
+@@ -526,3 +526,36 @@ fn nodes_on_simulated_shards_exchange_requests_frames_and_sealed_datagrams_alike
+     }
+     eprintln!("ended at {} ns; {:?}", first.ended_ns, first.fabric);
+ }
++
++/// Two drivers made on one simulated shard with real time between their making read one clock, and
++/// `shard_instant`, an endpoint's `now` on that shard, reads it too: each anchors to the process's one
++/// instant for the virtual clock's zero (`hyper_rt::sim::anchor`), not to the host's clock when made.
++/// Anchored when made, the second read the first's clock plus the real time between them.
++#[test]
++fn drivers_made_apart_in_real_time_read_one_clock_on_a_simulated_shard() {
++    const AT_NS: u64 = 5_000_000;
++    let issued = Issued::new(3);
++    let mut sim = SimRuntime::new(&config(), SEED).unwrap();
++    let shards = sim.shard_ids();
++    let (first, second) = (endpoint(&issued, 1), endpoint(&issued, 2));
++    let (tell, told) = channel();
++    sim.spawn_on(shards[0], async move {
++        hyper_rt::futures::sleep(AT_NS).await.unwrap();
++        let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
++        let a: Drv = Driver::bind(first, any, IO).unwrap();
++        std::thread::sleep(Duration::from_millis(20));
++        let b: Drv = Driver::bind(second, any, IO).unwrap();
++        let readings = (
++            a.clock().unwrap(),
++            b.clock().unwrap(),
++            hyper_rt_transport::shard_instant(),
++        );
++        tell.send(readings).unwrap();
++    })
++    .unwrap();
++    sim.run_until(2 * AT_NS);
++    let (a, b, now) = told.recv().unwrap();
++    assert_eq!(a, b);
++    assert_eq!(a, now);
++    assert_eq!(a, hyper_rt::sim::anchor() + Duration::from_nanos(AT_NS));
++}
+diff --git a/crates/hyper-rt/src/sim.rs b/crates/hyper-rt/src/sim.rs
+index 5b31bfd4ae8f39d40488e4ab7028262e7996dcee..f8791ba60591f4829ce394b096390634f866003d 100644
+--- a/crates/hyper-rt/src/sim.rs
++++ b/crates/hyper-rt/src/sim.rs
+@@ -34,6 +34,20 @@ use crate::task::SpawnRequest;
+ /// Format: the "no deadline requested" sentinel.
+ const NO_DEADLINE: u64 = u64::MAX;
+ 
++/// The instant every simulated shard's clock reads zero at: one for the process, taken the first time
++/// it is asked for. An adapter that speaks `std::time::Instant` anchors to it on a simulated shard
++/// (hyper-rt-transport's `Driver`), so every endpoint of a simulation reads one clock however much real
++/// time passed between their making; an endpoint anchored when it was made would read the virtual clock
++/// offset by the real time before it, a different offset for each.
++#[allow(
++    clippy::disallowed_methods,
++    reason = "a simulation's Instant anchor, its one read of the host's clock (docs/sim.md §3.2)"
++)]
++pub fn anchor() -> std::time::Instant {
++    static ANCHOR: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++    *ANCHOR.get_or_init(std::time::Instant::now)
++}
++
+ use std::collections::{BTreeMap, VecDeque};
+ 
+ use crate::mem::Encoded;
+@@ -692,6 +706,24 @@ impl SimSockets {
+         self.port_base.saturating_add(index)
+     }
+ 
++    /// Takes socket `index` from the free list, the others left in their order; `None` if it is not
++    /// there.
++    fn take_free(&self, index: u16) -> Option<u16> {
++        let mut above = Vec::new();
++        let mut found = false;
++        while let Some(free) = self.free.pop() {
++            if free == index {
++                found = true;
++                break;
++            }
++            above.push(free);
++        }
++        for free in above.into_iter().rev() {
++            let _ = self.free.push(free);
++        }
++        found.then_some(index)
++    }
++
+     /// The bytes every socket's receive buffer holds at once: the send queue's bound.
+     fn outbound_bound(&self) -> usize {
+         self.sockets.len().saturating_mul(SIM_RECV_BUFFER_BYTES)
+@@ -740,13 +772,26 @@ fn with_sockets<R>(f: impl FnOnce(&ShardContext, &SimSockets) -> R) -> Option<R>
+         .flatten()
+ }
+ 
+-/// Binds a simulated socket on the current shard: its index and port.
+-pub(crate) fn sim_bind() -> Result<(u16, u16), RtError> {
++/// Binds a simulated socket on the current shard: its index and port. A port of the shard's own
++/// range asked for by number is taken if free and refused if bound, as an OS binds one, so a node
++/// started again on its shard listens where its peers dial it; any other (port 0, or another shard's)
++/// is the next free port.
++pub(crate) fn sim_bind(requested: u16) -> Result<(u16, u16), RtError> {
+     with_sockets(|_, sockets| {
+-        let index = sockets.free.pop().ok_or(RtError::Capacity {
++        let full = || RtError::Capacity {
+             what: "simulated sockets",
+             bound: sockets.sockets.len(),
+-        })?;
++        };
++        let index = match sockets.index_of(requested).filter(|_| requested != 0) {
++            Some(index) if sockets.socket(index).is_some_and(|s| s.bound.get()) => {
++                return Err(RtError::DriverRefused {
++                    call: "bind a simulated port already bound",
++                    code: None,
++                });
++            }
++            Some(index) => sockets.take_free(index).ok_or_else(full)?,
++            None => sockets.free.pop().ok_or_else(full)?,
++        };
+         if let Some(socket) = sockets.socket(index) {
+             socket.bound.set(true);
+             socket.held.set(0);
+diff --git a/crates/hyper-rt/src/udp/mod.rs b/crates/hyper-rt/src/udp/mod.rs
+index daa13246b642a0f9279bcafe277ff119d1bde90f..2ad1fd332e1506df1e4b3cc33b6ad5d8e9dad4a9 100644
+--- a/crates/hyper-rt/src/udp/mod.rs
++++ b/crates/hyper-rt/src/udp/mod.rs
+@@ -137,12 +137,13 @@ fn on_sim() -> bool {
+ 
+ impl UdpSocket {
+     /// Binds a non-blocking UDP socket to `addr` (use port 0 for an OS-assigned port, then
+-    /// [`UdpSocket::local_addr`]). On the simulation runtime the requested address is ignored and a
+-    /// fabric port is assigned.
++    /// [`UdpSocket::local_addr`]). On the simulation runtime a port of the shard's own range asked for
++    /// by number is taken if free (refused if bound), and any other request is given the next free
++    /// fabric port.
+     pub fn bind(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
+         let addr = addr.into();
+         if on_sim() {
+-            let (index, port) = crate::sim::sim_bind()?;
++            let (index, port) = crate::sim::sim_bind(addr.port())?;
+             return Ok(UdpSocket::of(Inner::Sim { index, port }));
+         }
+         let socket = netsys::dgram_socket(Family::of(addr))?;
+diff --git a/crates/hyper-rt/tests/udp.rs b/crates/hyper-rt/tests/udp.rs
+index 729c64f26e14414aa36e8a8a335bbbf0cd745752..0adcb076178255bdfd8e744c87d1d6726af07c2e 100644
+--- a/crates/hyper-rt/tests/udp.rs
++++ b/crates/hyper-rt/tests/udp.rs
+@@ -435,6 +435,41 @@ fn a_simulated_udp_datagram_is_received() {
+     }
+ }
+ 
++/// On the simulation fabric a port of the shard's own range asked for by number is the port bound, a
++/// second bind of it is refused while the first holds it, and it is bound again once the first has
++/// closed, as a node started again on its shard binds where its peers dial it; port 0 takes the next
++/// free port, the one asked for passed over.
++#[test]
++fn a_simulated_bind_takes_the_port_asked_for_in_its_shard() {
++    use hyper_rt::sim::SimRuntime;
++
++    let mut sim = SimRuntime::new(&config(), 1).unwrap();
++    let id = sim.shard_ids()[0];
++    let (tx, rx) = channel();
++    sim.spawn_on(id, async move {
++        let at = |port| SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
++        let port_of = |socket: &UdpSocket| socket.local_addr().unwrap().port();
++        let any = UdpSocket::bind(at(0)).unwrap();
++        let first = port_of(&any);
++        let asked = first + 5;
++        let held = UdpSocket::bind(at(asked)).unwrap();
++        let bound = port_of(&held);
++        let refused = UdpSocket::bind(at(asked)).is_err();
++        drop(held);
++        let again = UdpSocket::bind(at(asked)).unwrap();
++        let rebound = port_of(&again);
++        let next = port_of(&UdpSocket::bind(at(0)).unwrap());
++        let _ = tx.send((first, asked, bound, refused, rebound, next));
++    })
++    .unwrap();
++    sim.run_until_idle();
++    let (first, asked, bound, refused, rebound, next) = rx.try_recv().unwrap();
++    assert_eq!(bound, asked);
++    assert!(refused, "a bound port is refused");
++    assert_eq!(rebound, asked);
++    assert_eq!(next, first + 1);
++}
++
+ // ── The fabric's latency model (§4.8 A-9: "independently delayed … messages") ────────────────────────
+ 
+ /// Shape: the one-way delay of the modelled inter-region path — 80 ms, half the 162 ms P50 round trip

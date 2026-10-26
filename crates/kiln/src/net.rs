@@ -770,6 +770,9 @@ fn on_event<B, D>(
         // A lane that found a frame too full has room again: the loop flushes the outbox after
         // every event it handles.
         Event::BodyReady { .. } | Event::Writable { .. } | Event::LaneRoom { .. } => {}
+        // A dialed peer's path going quiet and answering again (hyper-raft c6baec2): kiln's own
+        // liveness judges its peers, so nothing changes here.
+        Event::Degrading { .. } | Event::Progressing { .. } => {}
     }
 }
 

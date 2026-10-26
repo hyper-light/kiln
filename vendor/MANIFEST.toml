@@ -76,7 +76,7 @@ files = { "ld-musl-aarch64.so.1" = "/lib/ld-musl-aarch64.so.1", "libstdc++.so.6"
 [projects.quiver]
 kind = "git"
 repository = "https://github.com/hyper-light/quiver"
-commit = "72359f55c5afb8c151fc3010c9518c07dc419895"
+commit = "44bae3465a3f04c4ee833c93cc8f28af59cb28b9"
 path = "vendor/quiver"
 exclude = ["vendor", "bench/records"]
 
@@ -85,7 +85,7 @@ exclude = ["vendor", "bench/records"]
 [projects.focal-bus]
 kind = "git"
 repository = "https://github.com/hyper-light/focal"
-commit = "f8052a5eaf21f81709129583e535331c2e9722f3"
+commit = "b6cf8e33b5119b5beef8fe9723455caacb30ade5"
 path = "vendor/focal-bus"
 take = [
   "Cargo.toml",
@@ -103,7 +103,7 @@ own = ["UPSTREAM.md"]
 [projects.hyper-raft]
 kind = "git"
 repository = "https://github.com/hyper-light/hyper-raft"
-commit = "25cf88924895ee55976caa061a48789355fb3354"
+commit = "c6baec2de3d0520fc422c6b8f112480c2de817e8"
 path = "vendor/hyper-raft"
 take = [
   "Cargo.toml",

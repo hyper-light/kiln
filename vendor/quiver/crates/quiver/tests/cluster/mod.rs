@@ -99,6 +99,7 @@ impl Cluster {
             nodes: self.addresses.clone(),
             data: self.dir.join(format!("node-{id}")),
             identities: self.dir.join("identities"),
+            identities_key: Some(self.dir.join("identities.key")),
             part_memory: PersistedConfig::PART_MEMORY_MIN,
             topics: 16,
             publishes: 4096,

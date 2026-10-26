@@ -30,9 +30,17 @@ if ! command -v c++ >/dev/null; then
   export PATH="$cxx_home:$PATH"
 fi
 gate cargo clippy --workspace --all-targets --locked -- -D warnings
+# The persisted class's simulation and its planted bug's build (docs/design/persisted-sim.md), which
+# the workspace's default features leave out.
+gate cargo clippy -p quiver --all-targets --locked --features sim -- -D warnings
+gate cargo clippy -p quiver --all-targets --locked --features sim,plant-own-log-commit -- -D warnings
 # The same lints for macOS and Windows (rust-toolchain.toml installs their targets).
 gate cargo-zigbuild clippy --workspace --all-targets --locked --target aarch64-apple-darwin -- -D warnings
 gate cargo-zigbuild clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
 gate bash scripts/check-production.sh
 gate cargo test --workspace --locked
+# The simulation: a few seeds of faults, one seed run twice alike, and the planted bug found and
+# replayed (kiln's CP-T2.2 step 6, AC-T2.2.5; the 10,000 seeds are a run of their own, bench/records/).
+gate cargo test -p quiver --locked --features sim --test sim
+gate cargo test -p quiver --locked --features sim,plant-own-log-commit --test sim
 gate python3 scripts/vendor.py check

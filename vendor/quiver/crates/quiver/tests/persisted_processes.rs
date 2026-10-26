@@ -133,7 +133,13 @@ impl Lab {
             .join(",");
         // The cluster's identities, made once before its nodes start, as an operator makes them
         // and gives each node the same directory: three nodes making them at once race.
-        focal_bus::pki::load_or_make(&dir.join("identities"), 3, 3).unwrap();
+        focal_bus::pki::load_or_make(
+            &dir.join("identities"),
+            Some(&dir.join("identities.key")),
+            3,
+            3,
+        )
+        .unwrap();
         let mut lab = Self {
             dir,
             nodes,
@@ -161,6 +167,8 @@ impl Lab {
             .arg(self.dir.join(format!("node-{id}")))
             .arg("--identities")
             .arg(self.dir.join("identities"))
+            .arg("--identities-key")
+            .arg(self.dir.join("identities.key"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

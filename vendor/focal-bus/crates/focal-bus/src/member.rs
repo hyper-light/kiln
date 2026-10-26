@@ -32,6 +32,16 @@
 //! core's own bound on the messages it holds for one member, and a message past it is dropped, as
 //! a network may drop it: Raft sends it again.
 //!
+//! **One connection a pair, kept by the lesser node** (doc 34 P8). The node of the lesser id dials
+//! the other as it starts, and again whenever the pair has no connection, told by its endpoint
+//! (`Event::Closed`, `Event::Unreachable`): at once after a connection that lasted, and after a dial
+//! that gave none lasting, a back-off from the last dial's start ([`crate::limits::REDIAL_FIRST`]
+//! doubled to [`crate::limits::REDIAL_MOST`]), so a peer that refuses is not dialed in a loop. A
+//! restarted node is found by its peers at their next send to it: its endpoint keeps the key it
+//! resets the connections of its last run with (`serve::restart_key`), as a restarted host's TCP
+//! answers with an RST, and the lesser dials it again. A node that never redialed lost each pair whose
+//! connection closed, and a group of three restarted one node at a time had no leader left.
+//!
 //! **Elections by suspicion** (doc 33 §4.1): the node-pair liveness stream judges each other node
 //! for every group the pair shares, its heartbeats on a lane of their own (`wire::LIVENESS_LANE`),
 //! and the replica takes its word (`suspect`, `trust`, `restarted`), as hyper-durable-e2e's members
@@ -46,6 +56,8 @@ use std::task::Waker;
 use std::time::{Duration, Instant};
 
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
+use hyper_block::DiskError;
+use hyper_block::block::{BlockFile, Durable};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_durable::{
@@ -62,6 +74,7 @@ use hyper_transport::{Budget, Classes, Directory, Endpoint, Event, LaneId, PeerI
 use crate::BusError;
 use crate::batch::{Batch, MIN_BATCH};
 use crate::group::{Applied, Outcome, PartMachine};
+use crate::limits;
 use crate::node::Node;
 use crate::producer::Verdict;
 use crate::wire::{self, Ack, Bus, Durability, Kind, LANE, LIVENESS_LANE, Leader, Redirect, Reply};
@@ -85,6 +98,11 @@ const IMAGE_FILE: &str = "part.image";
 /// Format: the node's run, in the node's data directory: a count it raises at every start, before
 /// the stream's first heartbeat (`hyper_liveness::Settings::run`).
 const RUN_FILE: &str = "run";
+/// Format: the mark a node's data directory holds once its run and its part's image are sealed
+/// (29 §12.9): from then on either in the clear is refused, never read.
+const SEALED_FILE: &str = "SEALED";
+/// Bytes of a run in the clear, as an earlier binary kept it: a little-endian count.
+const RUN_BYTES: usize = 8;
 /// Format: the log's identity: the bus's part log.
 const LOG_ID: u128 = u128::from_le_bytes(*b"focal-bus-part-1");
 
@@ -195,6 +213,8 @@ pub struct MemberStats {
     pub dropped_records: u64,
     /// Raft messages dropped for a full outbox: Raft sends them again.
     pub dropped_messages: u64,
+    /// Raft messages that waited in their member's outbox for its lane to make room.
+    pub outboxed: u64,
     /// Heartbeats the stream refused (stale, unknown peer).
     pub refused_heartbeats: u64,
     /// Drives of the replica.
@@ -445,7 +465,7 @@ impl ReplicaBudget for MemberBudget {
     }
 }
 
-type PartReplica = Replica<GroupStore<DeviceFile>, PartMachine, MemberBudget>;
+type PartReplica = Replica<GroupStore<NodeFile>, PartMachine, MemberBudget>;
 
 /// What the liveness stream asked during a call into it.
 #[derive(Debug, Default)]
@@ -602,12 +622,63 @@ impl Answer {
 /// The key an acknowledgement is owed under: a batch's stream, producer and sequence.
 type Owed = (u64, u64, u32);
 
+/// This node's connection to another node of its group, as its endpoint tells it (module docs).
+#[derive(Clone, Copy, Debug)]
+struct Link {
+    /// Whether this node dials the peer: the pair's lesser node does.
+    dials: bool,
+    /// When the connection up now came up; none while none is.
+    up: Option<Instant>,
+    /// When this node's last dial to the peer began.
+    dialed: Option<Instant>,
+    /// When this node dials the peer next: set while the pair has no connection and no dial of this
+    /// node's is under way.
+    next: Option<Instant>,
+    /// What the next dial waits after the last began, when that one gave no connection lasting as
+    /// long: [`limits::REDIAL_FIRST`], doubled after each such dial to [`limits::REDIAL_MOST`].
+    backoff: Duration,
+}
+
+impl Link {
+    fn new(dials: bool) -> Self {
+        Self {
+            dials,
+            up: None,
+            dialed: None,
+            next: None,
+            backoff: limits::REDIAL_FIRST,
+        }
+    }
+
+    /// The pair has no connection, at `now`: a node that dials the peer dials it again, at once
+    /// after a connection that lasted its back-off, and otherwise once its back-off, doubled, has
+    /// passed since its last dial began.
+    fn down(&mut self, now: Instant) {
+        let lasted = self
+            .up
+            .take()
+            .is_some_and(|up| now.saturating_duration_since(up) >= self.backoff);
+        if !self.dials {
+            return;
+        }
+        self.backoff = if lasted {
+            limits::REDIAL_FIRST
+        } else {
+            self.backoff.saturating_mul(2).min(limits::REDIAL_MOST)
+        };
+        let from = self.dialed.unwrap_or(now);
+        self.next = Some(from.checked_add(self.backoff).unwrap_or(now).max(now));
+    }
+}
+
 /// A node of a part's group (module docs).
 pub struct Member {
     id: u64,
     peers: Vec<(u64, SocketAddr)>,
+    /// This node's connection to each of `peers`, in their order.
+    links: Vec<Link>,
     replica: PartReplica,
-    log: Log<DeviceFile>,
+    log: Log<NodeFile>,
     /// Whether the log's file is written in place, as its file system said when it was opened.
     written_in_place: Option<bool>,
     liveness: Liveness,
@@ -648,6 +719,11 @@ pub struct Member {
     compact_wanted: bool,
     /// When the node's last wait ended: its busy period runs from here to its turn's end.
     woke: Option<Instant>,
+    /// Under a simulation, the Raft messages the node sent, queued or dropped for each peer, and
+    /// took from each, by kind and what the replica said; the heartbeats its stream refused, why;
+    /// its waits as its stream judged them: for its diagnosis (`Member::core_state`).
+    #[cfg(feature = "sim")]
+    traffic: std::collections::BTreeMap<String, u64>,
     /// Whether the node led at its last turn: a node that stops leading redirects what it owed.
     leading: bool,
     /// The drives one turn makes at most: the store's depth and one.
@@ -672,19 +748,41 @@ impl std::fmt::Debug for Member {
     }
 }
 
-/// The node's run: the count kept at `path`, raised and made durable before it is used, so each
-/// start's is greater than every earlier start's.
-fn raise_run(path: &Path) -> Result<u64, BusError> {
+/// The node's run: the count kept at `path`, raised by one and made durable before it is used, so
+/// each start's is greater than every earlier start's, sealed whole under the data directory's group
+/// key (29 §12.9), the key unwrapped for it and dropped after. A run in the clear, as an earlier
+/// binary kept it (its eight bytes alone, where a sealed file is its header and more), is taken
+/// while `clear`, until the node is marked sealed; a sealed run that does not open under its
+/// directory's keys is refused.
+fn raise_run(path: &Path, keys: &focal_seal::DataKeys, clear: bool) -> Result<u64, BusError> {
     use focal_platform::fs::{FileMedium, Medium};
     let medium = FileMedium;
     let previous = if medium
         .exists(path)
         .map_err(|_| BusError::Configuration("the node's run could not be looked for"))?
     {
+        let most = focal_seal::file::sealed_bound(RUN_BYTES)
+            .ok_or(BusError::Configuration("the node's run"))?;
         let bytes = medium
-            .read(path, 8)
+            .read(path, most)
             .map_err(|_| BusError::Configuration("the node's run could not be read"))?;
-        let bytes: [u8; 8] = bytes
+        let plain = if bytes.len() == RUN_BYTES {
+            if !clear {
+                return Err(BusError::Configuration(
+                    "the node's run lies in the clear after the node was sealed",
+                ));
+            }
+            bytes
+        } else {
+            let key = keys
+                .key(focal_seal::Store::Group)
+                .map_err(|_| BusError::Configuration("the node's group key could not be opened"))?;
+            let mut opened = focal_seal::file::open(&key, bytes, RUN_BYTES).map_err(|_| {
+                BusError::Configuration("the node's run does not open under its node's keys")
+            })?;
+            std::mem::take(&mut *opened)
+        };
+        let bytes: [u8; RUN_BYTES] = plain
             .as_slice()
             .try_into()
             .map_err(|_| BusError::Configuration("the node's run is damaged"))?;
@@ -695,10 +793,47 @@ fn raise_run(path: &Path) -> Result<u64, BusError> {
     let run = previous
         .checked_add(1)
         .ok_or(BusError::Capacity("the node's runs"))?;
+    let key = keys
+        .key(focal_seal::Store::Group)
+        .map_err(|_| BusError::Configuration("the node's group key could not be opened"))?;
+    let sealed = focal_seal::file::seal(&key, &run.to_le_bytes())
+        .map_err(|_| BusError::Configuration("the node's run could not be sealed"))?;
+    drop(key);
     let mut medium = FileMedium;
-    focal_platform::fs::install(&mut medium, path, &run.to_le_bytes())
+    focal_platform::fs::install(&mut medium, path, &sealed)
         .map_err(|_| BusError::Configuration("the node's run could not be made durable"))?;
     Ok(run)
+}
+
+/// Whether the node's data directory `data` is marked sealed: its run and its image are, and one in
+/// the clear is refused.
+fn sealed_mark(data: &Path) -> Result<bool, BusError> {
+    data.join(SEALED_FILE)
+        .try_exists()
+        .map_err(|_| BusError::Configuration("the node's seal mark could not be looked for"))
+}
+
+/// The temporary `focal_platform::fs::install` writes `path` through, removed where a cut install
+/// left it (29 §12.9): an earlier binary's held what it installed in the clear, and with no image to
+/// convert, nothing else would replace it until the node's next image. The mark's directory sync
+/// makes the removal durable.
+fn discard_temporary(path: &Path) -> Result<(), BusError> {
+    match std::fs::remove_file(path.with_extension("part")) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(BusError::Configuration(
+            "a temporary of the node's part could not be removed",
+        )),
+    }
+}
+
+/// The node's data directory `data` marked sealed, durably: written once its run and its image are
+/// sealed and durable, so a cut before it leaves each whole in one form or the other and the next
+/// open finishes (29 §12.9).
+fn mark_sealed(data: &Path) -> Result<(), BusError> {
+    let mut medium = focal_platform::fs::FileMedium;
+    focal_platform::fs::install(&mut medium, &data.join(SEALED_FILE), &[])
+        .map_err(|_| BusError::Configuration("the node's seal mark could not be made durable"))
 }
 
 /// The node log's configuration, from what the bus states (hyper-log's `Config::derive`; no field
@@ -738,13 +873,130 @@ fn log_config(align: Alignment, memory_bytes: u64) -> Result<hyper_log::Config, 
     .map_err(|_| BusError::Configuration("the node's log facts give no configuration"))
 }
 
+/// The file a node's log is on: the file in its data directory, or, for a simulation, hyper-sim's
+/// block device (`Member::open_simulated`), whose crash states and power cuts the simulation decides.
+#[derive(Debug)]
+pub enum NodeFile {
+    /// The node's own file (`LOG_FILE` in its data directory).
+    Device(DeviceFile),
+    /// A handle onto a simulated device.
+    #[cfg(feature = "sim")]
+    Sim(hyper_block::sim::SimHandle),
+}
+
+impl BlockFile for NodeFile {
+    fn alignment(&self) -> Alignment {
+        match self {
+            Self::Device(f) => f.alignment(),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => f.alignment(),
+        }
+    }
+
+    fn layout_block(&self) -> Alignment {
+        match self {
+            Self::Device(f) => f.layout_block(),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => f.layout_block(),
+        }
+    }
+
+    fn len(&self) -> Result<u64, DiskError> {
+        match self {
+            Self::Device(f) => BlockFile::len(f),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => BlockFile::len(f),
+        }
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
+        match self {
+            Self::Device(f) => f.read_exact_at(buf, offset),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => f.read_exact_at(buf, offset),
+        }
+    }
+
+    fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
+        match self {
+            Self::Device(f) => f.read_resident_at(buf, offset),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => f.read_resident_at(buf, offset),
+        }
+    }
+
+    fn reads_resident(&self) -> bool {
+        match self {
+            Self::Device(f) => f.reads_resident(),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => f.reads_resident(),
+        }
+    }
+
+    fn residency(&self) -> hyper_block::Residency {
+        match self {
+            Self::Device(f) => f.residency(),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => f.residency(),
+        }
+    }
+
+    fn set_residency_shadow(&mut self, on: bool) {
+        match self {
+            Self::Device(f) => f.set_residency_shadow(on),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => f.set_residency_shadow(on),
+        }
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
+        match self {
+            Self::Device(f) => f.write_all_at(buf, offset),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => f.write_all_at(buf, offset),
+        }
+    }
+
+    fn sync_data(&self) -> Result<(), DiskError> {
+        match self {
+            Self::Device(f) => f.sync_data(),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => f.sync_data(),
+        }
+    }
+
+    fn fills_new_space(&self) -> bool {
+        match self {
+            Self::Device(f) => f.fills_new_space(),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => f.fills_new_space(),
+        }
+    }
+
+    fn write_durable_at(&self, buf: &[u8], offset: u64) -> Result<Durable, DiskError> {
+        match self {
+            Self::Device(f) => f.write_durable_at(buf, offset),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => f.write_durable_at(buf, offset),
+        }
+    }
+
+    fn try_clone(&self) -> Result<Self, DiskError> {
+        match self {
+            Self::Device(f) => f.try_clone().map(Self::Device),
+            #[cfg(feature = "sim")]
+            Self::Sim(f) => f.try_clone().map(Self::Sim),
+        }
+    }
+}
+
 /// Opens the node's log in `data`, sealed under the keys `key_file` keeps, or makes it; with
 /// whether its file is written in place (`DeviceFile::written_in_place`).
 fn open_log(
     data: &Path,
     key_file: &Path,
     memory_bytes: u64,
-) -> Result<(Log<DeviceFile>, Option<bool>), BusError> {
+) -> Result<(Log<NodeFile>, Option<bool>), BusError> {
     let path = data.join(LOG_FILE);
     let exists = path
         .try_exists()
@@ -768,6 +1020,7 @@ fn open_log(
     let file = DeviceFile::open(&path, false, CachingRequest::PreferDirect, align)
         .map_err(|_| BusError::Configuration("the node's log could not be opened"))?;
     let written_in_place = file.written_in_place();
+    let file = NodeFile::Device(file);
     let ((parent, auth), _keys) = focal_seal::open_or_create(data, key_file)
         .map_err(|_| BusError::Configuration("the node's keys could not be opened"))?
         .split();
@@ -786,6 +1039,90 @@ fn open_log(
     Ok((log, written_in_place))
 }
 
+/// A member to open on a simulated device ([`Member::open_simulated`]): its settings, and the
+/// handle its log writes through.
+#[cfg(feature = "sim")]
+#[derive(Debug)]
+pub struct Simulated {
+    /// What the member is opened from, as for [`Member::open`]; its log is on `device`, not in
+    /// `data`, where its image, its run and its keys stay.
+    pub settings: MemberSettings,
+    /// The device its log is on.
+    pub device: hyper_block::sim::SimHandle,
+}
+
+/// What a member's log was opened with: the node's run, its directory's keys and whether it was in
+/// the clear, the log, and whether its file is written in place.
+struct Placed {
+    run: u64,
+    /// The directory's keys, and whether it was in the clear before this open ([`prepare`]).
+    keys: focal_seal::DataKeys,
+    clear: bool,
+    log: Log<NodeFile>,
+    written_in_place: Option<bool>,
+}
+
+/// What a member serves its part with beside its log ([`Member::open`]).
+struct Parts {
+    node: Node,
+    members: Vec<u64>,
+    clients: usize,
+    lane_window: usize,
+    budget: MemoryBudget,
+    now: Instant,
+}
+
+/// The node's data directory made, owner-only, each directory durable in its parent, its keys
+/// opened, and its run raised: the run this start is, the keys, and whether the directory was in
+/// the clear before (what [`Member::open`] and `open_simulated` share).
+fn prepare(data: &Path, key_file: &Path) -> Result<(u64, focal_seal::DataKeys, bool), BusError> {
+    focal_platform::fs::create_dir_all_durable(data, focal_platform::fs::create_dir_private)
+        .map_err(|_| BusError::Configuration("the node's data directory could not be made"))?;
+    // The directory's keys before any file of it is read (29 §12.9): made with the root key file
+    // where it has none, as the log's are.
+    let keys = focal_seal::DataKeys::new(data, key_file);
+    keys.ensure()
+        .map_err(|_| BusError::Configuration("the node's keys could not be opened"))?;
+    let clear = !sealed_mark(data)?;
+    let run = raise_run(&data.join(RUN_FILE), &keys, clear)?;
+    Ok((run, keys, clear))
+}
+
+/// Opens the node's log on a simulated device, sealed under the keys `key_file` keeps as
+/// [`open_log`] seals it, under `hyper_log::Waits::Told`: made if the device holds nothing, opened
+/// from what it holds otherwise.
+#[cfg(feature = "sim")]
+fn open_simulated_log(
+    data: &Path,
+    key_file: &Path,
+    memory_bytes: u64,
+    device: hyper_block::sim::SimHandle,
+) -> Result<Log<NodeFile>, BusError> {
+    let empty = device
+        .is_empty()
+        .map_err(|_| BusError::Configuration("the simulated device could not be read"))?;
+    let config = hyper_log::Config {
+        waits: hyper_log::Waits::Told,
+        ..log_config(device.alignment(), memory_bytes)?
+    };
+    let ((parent, auth), _keys) = focal_seal::open_or_create(data, key_file)
+        .map_err(|_| BusError::Configuration("the node's keys could not be opened"))?
+        .split();
+    let with = hyper_log::With {
+        sealing: Some(hyper_log::Sealing { parent, auth }),
+        growth: None,
+    };
+    let file = NodeFile::Sim(device);
+    if empty {
+        hyper_log::Log::create_with(file, config, LOG_ID, with)
+            .map_err(|_| BusError::Configuration("the node's log could not be made"))
+    } else {
+        hyper_log::Log::open_with(file, config, LOG_ID, with)
+            .map(|(log, _)| log)
+            .map_err(|_| BusError::Configuration("the node's log could not be opened"))
+    }
+}
+
 impl Member {
     /// The node `settings` names, opened on its log and its part's image, serving the part through
     /// `node`; `members` are the group's voters, this node among them, its founding configuration.
@@ -799,15 +1136,81 @@ impl Member {
         budget: MemoryBudget,
         now: Instant,
     ) -> Result<Self, BusError> {
-        // The data directory, owner-only, each directory made durable in its parent.
-        focal_platform::fs::create_dir_all_durable(
-            &settings.data,
-            focal_platform::fs::create_dir_private,
-        )
-        .map_err(|_| BusError::Configuration("the node's data directory could not be made"))?;
-        let run = raise_run(&settings.data.join(RUN_FILE))?;
+        let (run, keys, clear) = prepare(&settings.data, &settings.key_file)?;
         let (log, written_in_place) =
             open_log(&settings.data, &settings.key_file, settings.memory_bytes)?;
+        let placed = Placed {
+            run,
+            keys,
+            clear,
+            log,
+            written_in_place,
+        };
+        let parts = Parts {
+            node,
+            members,
+            clients,
+            lane_window,
+            budget,
+            now,
+        };
+        Self::on_log(settings, placed, parts)
+    }
+
+    /// The node `simulated` names, as [`Member::open`] opens it, but with its log on a simulated
+    /// device rather than the file in its data directory: made there if the device holds nothing,
+    /// opened from what it holds otherwise, and run under `hyper_log::Waits::Told`, so it writes
+    /// only when its owner cuts ([`Member::cut`]). For a simulation that decides when each write
+    /// reaches the device and what a crash leaves of it (Quiver's `docs/design/persisted-sim.md`).
+    #[cfg(feature = "sim")]
+    pub fn open_simulated(
+        simulated: Simulated,
+        node: Node,
+        members: Vec<u64>,
+        clients: usize,
+        lane_window: usize,
+        budget: MemoryBudget,
+        now: Instant,
+    ) -> Result<Self, BusError> {
+        let Simulated { settings, device } = simulated;
+        let (run, keys, clear) = prepare(&settings.data, &settings.key_file)?;
+        let log = open_simulated_log(&settings.data, &settings.key_file, settings.memory_bytes, device)?;
+        let placed = Placed {
+            run,
+            keys,
+            clear,
+            log,
+            written_in_place: None,
+        };
+        let parts = Parts {
+            node,
+            members,
+            clients,
+            lane_window,
+            budget,
+            now,
+        };
+        Self::on_log(settings, placed, parts)
+    }
+
+    /// The member opened on its log: its part's group claimed, its image opened, its replica and
+    /// its liveness stream made.
+    fn on_log(settings: MemberSettings, placed: Placed, parts: Parts) -> Result<Self, BusError> {
+        let Placed {
+            run,
+            keys,
+            clear,
+            log,
+            written_in_place,
+        } = placed;
+        let Parts {
+            node,
+            members,
+            clients,
+            lane_window,
+            budget,
+            now,
+        } = parts;
         let store = GroupStore::claim(&log, PART_GROUP)
             .map_err(|_| BusError::Configuration("the part's group could not be claimed"))?;
         let drives = hyper_durable::LogStore::depth(&store).saturating_add(1);
@@ -817,10 +1220,17 @@ impl Member {
         };
         let machine = PartMachine::open(
             node,
-            settings.data.join(IMAGE_FILE),
+            crate::group::ImageFile::new(settings.data.join(IMAGE_FILE), keys, clear),
             founding,
             members.len(),
         )?;
+        // The run and the image sealed and durable: the node is marked so, and from here either in
+        // the clear is refused. What an earlier binary's cut install of its image left goes first:
+        // nothing is installing now (the part's writer settled any image it was handed).
+        if clear {
+            discard_temporary(&settings.data.join(IMAGE_FILE))?;
+            mark_sealed(&settings.data)?;
+        }
         let memory = usize::try_from(settings.memory_bytes)
             .map_err(|_| BusError::Configuration("the node's memory"))?;
         let message = usize::try_from(wire::RAFT_BOUND)
@@ -876,9 +1286,15 @@ impl Member {
             resolution: Duration::from_nanos(hyper_rt::machine::clock::resolution_ns()),
         })
         .map_err(|_| BusError::Configuration("the liveness stream"))?;
+        let links = settings
+            .peers
+            .iter()
+            .map(|(peer, _)| Link::new(*peer > settings.id))
+            .collect();
         Ok(Self {
             id: settings.id,
             peers: settings.peers,
+            links,
             replica,
             log,
             written_in_place,
@@ -901,6 +1317,8 @@ impl Member {
             emptied_seen: 0,
             compact_wanted: false,
             woke: None,
+            #[cfg(feature = "sim")]
+            traffic: std::collections::BTreeMap::new(),
             leading: false,
             drives,
             due: false,
@@ -915,6 +1333,91 @@ impl Member {
     /// durable, and its owner ends it.
     pub const fn fenced(&self) -> bool {
         self.fenced
+    }
+
+    /// Tells the node's log to write what it holds (`hyper_log::Log::cut`): under
+    /// `hyper_log::Waits::Told` ([`Member::open_simulated`]) the log writes nothing until told,
+    /// and the handle is answered once all it held is; under the other waits, at once.
+    pub fn cut(&self) -> Result<Pending, BusError> {
+        self.log
+            .cut()
+            .map_err(|_| BusError::Configuration("the node's log has closed"))
+    }
+
+    /// Plants `mutant` in the node's replica, or takes the one planted out: a defect a test build
+    /// shows its checks catch (`hyper_raft::Mutant`; the `mutants` feature, which no consumer
+    /// enables). A member opened again holds none.
+    #[cfg(feature = "mutants")]
+    pub fn plant(&mut self, mutant: Option<hyper_raft::Mutant>) {
+        self.replica.plant(mutant);
+    }
+
+    /// Tells the node's log to read the entries its replica asked for and the log holds
+    /// (`hyper_log::Log::serve`): under `hyper_log::Waits::Told` it reads nothing from its device
+    /// until told, and the handle is answered once every such read is; under the other waits, at
+    /// once.
+    pub fn serve(&self) -> Result<Pending, BusError> {
+        self.log
+            .serve()
+            .map_err(|_| BusError::Configuration("the node's log has closed"))
+    }
+
+    /// The node's writes to its log not yet taken back by its replica and its liveness stream,
+    /// and the reads of entries it asked of the log not yet taken back: what a simulation waits
+    /// on before its world moves on, so each answer reaches the node at an instant it chose.
+    pub fn in_flight(&self) -> (usize, usize) {
+        let liveness = usize::from(self.liveness_write.is_some());
+        (
+            self.replica.in_flight().saturating_add(liveness),
+            self.replica.reads_held(),
+        )
+    }
+
+    /// The replica's core as a simulation's diagnosis tells it (`sim` feature): its role, term and
+    /// leader, its log's commit, applied and last index, whether a write of its waits for room,
+    /// the members its detectors suspect, its configuration's members and the peers its stream is
+    /// attached to, and, leading, each member's progress; then its outbox, its traffic, and its
+    /// liveness stream: the flush it measured, its timer's granularity, its wake, each pair.
+    #[cfg(feature = "sim")]
+    #[must_use]
+    pub fn core_state(&self) -> String {
+        use std::fmt::Write as _;
+        let raft = &self.replica.core().raft;
+        let log = raft.log();
+        let mut said = format!(
+            "{:?} in term {}, leader {}, commit {}, applied {}, last {:?}, stalled {}, suspects {:?}, members {:?}, attached {:?}",
+            raft.state(),
+            raft.term(),
+            raft.leader_id(),
+            log.committed(),
+            log.applied(),
+            log.last_index().ok(),
+            self.replica.is_stalled(),
+            raft.suspected(),
+            raft.configuration().members().collect::<Vec<_>>(),
+            self.attached
+        );
+        if raft.state() == hyper_raft::StateRole::Leader {
+            for (member, progress) in raft.tracker().iter() {
+                let _ = write!(said, "; {member}: {progress:?}");
+            }
+        }
+        let _ = write!(
+            said,
+            "\n  liveness flush {:?} granularity {:?} wake {:?} failed {} writing {}",
+            self.liveness.flush_mean(),
+            self.liveness.granularity(),
+            self.liveness.wake(),
+            self.liveness_failed,
+            self.liveness_write.is_some()
+        );
+        for peer in &self.attached {
+            let _ = write!(said, "; {peer}: {:?}", self.liveness.report(*peer));
+        }
+        let waiting: Vec<(PeerId, usize)> =
+            self.outbox.iter().map(|(peer, w)| (*peer, w.len())).collect();
+        let _ = write!(said, "\n  outbox {waiting:?} traffic {:?}", self.traffic);
+        said
     }
 
     /// The node's id.
@@ -1002,16 +1505,54 @@ impl Member {
     }
 
     /// Dials every other node of a greater id: one connection a pair, made by the lesser.
-    pub fn connect<B, D>(&self, endpoint: &mut Endpoint<Bus, B, D>, now: Instant)
+    pub fn connect<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, now: Instant)
     where
         B: Budget<<Bus as Classes>::Class>,
         D: Directory<Role = <Bus as Classes>::Role>,
     {
-        for (peer, address) in &self.peers {
-            if *peer > self.id {
-                let _ = endpoint.connect(now, *peer, *address);
+        for (link, (peer, address)) in self.links.iter_mut().zip(&self.peers) {
+            if link.dials {
+                Self::dial(endpoint, link, *peer, *address, now);
             }
         }
+    }
+
+    /// Dials each peer whose next dial is due by `now` (module docs).
+    fn redial<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, now: Instant)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        for (link, (peer, address)) in self.links.iter_mut().zip(&self.peers) {
+            if link.next.is_some_and(|next| next <= now) {
+                Self::dial(endpoint, link, *peer, *address, now);
+            }
+        }
+    }
+
+    /// One dial of `peer`, whose end the endpoint tells (`Endpoint::connect`): a dial it refuses
+    /// at once is a dial that gave no connection.
+    fn dial<B, D>(
+        endpoint: &mut Endpoint<Bus, B, D>,
+        link: &mut Link,
+        peer: u64,
+        address: SocketAddr,
+        now: Instant,
+    ) where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        link.dialed = Some(now);
+        link.next = None;
+        if endpoint.connect(now, peer, address).is_err() {
+            link.down(now);
+        }
+    }
+
+    /// The link to `peer`, if it is another node of the group.
+    fn link_mut(&mut self, peer: PeerId) -> Option<&mut Link> {
+        let at = self.peers.iter().position(|(id, _)| *id == peer)?;
+        self.links.get_mut(at)
     }
 
     /// Whether `peer` is another node of the group.
@@ -1046,11 +1587,12 @@ impl Member {
                 ..
             } => {
                 let arrival = self.now_ns(now);
-                if self
-                    .liveness
-                    .on_heartbeat(peer, frame.bytes(), arrival, &mut self.asked)
-                    .is_err()
+                if let Err(_refusal) =
+                    self.liveness
+                        .on_heartbeat(peer, frame.bytes(), arrival, &mut self.asked)
                 {
+                    #[cfg(feature = "sim")]
+                    self.note(format!("from {peer} heartbeat refused, {_refusal:?}"));
                     self.stats.refused_heartbeats = self.stats.refused_heartbeats.saturating_add(1);
                 }
                 endpoint.release(frame);
@@ -1080,10 +1622,28 @@ impl Member {
                 self.flush_answers(endpoint, peer);
                 self.node_mut().on_event(endpoint, room);
             }
+            Event::Connected { peer, .. } if self.is_node(peer) => {
+                if let Some(link) = self.link_mut(peer) {
+                    link.up = Some(now);
+                    link.next = None;
+                }
+                // A connection that took another's place takes what waited for the old one's lane:
+                // no lane of the new one was full, so no room it makes would flush the outbox, and
+                // every later frame would queue behind what waited.
+                self.flush_outbox(endpoint, peer);
+            }
             Event::Closed { peer, .. } if self.is_node(peer) => {
                 // What waited for the lane goes with the connection; Raft sends it again.
                 if let Some(waiting) = self.outbox.get_mut(&peer) {
                     waiting.clear();
+                }
+                if let Some(link) = self.link_mut(peer) {
+                    link.down(now);
+                }
+            }
+            Event::Unreachable { peer, .. } if self.is_node(peer) => {
+                if let Some(link) = self.link_mut(peer) {
+                    link.down(now);
                 }
             }
             closed @ Event::Closed { peer, .. } => {
@@ -1107,7 +1667,15 @@ impl Member {
                 // could not hold is stepped again once the window gave memory back
                 // ([`Member::relieve_window`]): refused for good, a follower whose window had
                 // filled its memory took no append again, and fell behind for good.
-                if let Err(ReplicaError::Budget(_)) = self.replica.step(message)
+                #[cfg(feature = "sim")]
+                let kind = message.msg_type;
+                let stepped = self.replica.step(message);
+                #[cfg(feature = "sim")]
+                self.note(match &stepped {
+                    Ok(()) => format!("from {peer} {kind:?} stepped"),
+                    Err(refused) => format!("from {peer} {kind:?} refused, {refused:?}"),
+                });
+                if let Err(ReplicaError::Budget(_)) = stepped
                     && self.relieve_window()
                     && let Ok(again) = Message::decode(bytes)
                 {
@@ -1408,10 +1976,16 @@ impl Member {
         let waiting = self.outbox.get(&to).is_some_and(|w| !w.is_empty());
         if !waiting {
             match endpoint.send_frame(to, LANE, Kind::Raft, &self.encoded) {
-                Ok(()) => return,
+                Ok(()) => {
+                    #[cfg(feature = "sim")]
+                    self.note(format!("to {to} {:?} sent", message.msg_type));
+                    return;
+                }
                 Err(Refusal::LaneFull) => {}
                 // No connection yet, or the member is gone.
-                Err(_) => {
+                Err(_refusal) => {
+                    #[cfg(feature = "sim")]
+                    self.note(format!("to {to} {:?} dropped, {_refusal:?}", message.msg_type));
                     self.stats.dropped_messages = self.stats.dropped_messages.saturating_add(1);
                     let _ = self.replica.report_unreachable(to);
                     return;
@@ -1421,11 +1995,23 @@ impl Member {
         let bound = self.outbox_bound;
         let queue = self.outbox.entry(to).or_default();
         if queue.len() >= bound {
+            #[cfg(feature = "sim")]
+            self.note(format!("to {to} {:?} dropped, outbox full", message.msg_type));
             self.stats.dropped_messages = self.stats.dropped_messages.saturating_add(1);
             let _ = self.replica.report_unreachable(to);
             return;
         }
         queue.push_back(self.encoded.clone());
+        self.stats.outboxed = self.stats.outboxed.saturating_add(1);
+        #[cfg(feature = "sim")]
+        self.note(format!("to {to} {:?} queued", message.msg_type));
+    }
+
+    /// Under a simulation, one more of what the node's traffic counts.
+    #[cfg(feature = "sim")]
+    fn note(&mut self, what: String) {
+        let count = self.traffic.entry(what).or_default();
+        *count = count.saturating_add(1);
     }
 
     /// Sends what waited in `peer`'s outbox while its lane has room.
@@ -1442,6 +2028,11 @@ impl Member {
             match endpoint.send_frame(peer, LANE, Kind::Raft, front) {
                 Ok(()) => {
                     queue.pop_front();
+                    #[cfg(feature = "sim")]
+                    {
+                        let count = self.traffic.entry(format!("to {peer} flushed")).or_default();
+                        *count = count.saturating_add(1);
+                    }
                 }
                 Err(Refusal::LaneFull) => return,
                 Err(_) => {
@@ -1584,6 +2175,12 @@ impl Member {
                 }
                 Change::Restarted { .. } => {
                     tell(&GroupEvent::Restarted { peer });
+                    // What waited for the lane of the process that stopped is moot, and the replica
+                    // probes the new one from what it holds: kept, the probe and every frame after
+                    // it would queue behind it for a room no event of the old connection brings.
+                    if let Some(waiting) = self.outbox.get_mut(&peer) {
+                        waiting.clear();
+                    }
                     self.replica.restarted(peer)
                 }
             };
@@ -1606,6 +2203,7 @@ impl Member {
         B: Budget<<Bus as Classes>::Class>,
         D: Directory<Role = <Bus as Classes>::Role>,
     {
+        self.redial(endpoint, now);
         self.written(now);
         self.pairs();
         self.measure();
@@ -1787,7 +2385,9 @@ impl Member {
     }
 
     /// A node that stopped leading redirects every publisher it owed: the group may or may not have
-    /// committed their batches, and the part recognises those it took when they come again.
+    /// committed their batches, and the part recognises those it took when they come again. It
+    /// ends every subscription it held, naming the leader it knows (doc 34 P7): a follower applies
+    /// what its group commits and cannot hold a publisher for a subscriber that takes no more.
     fn settle_leadership<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>)
     where
         B: Budget<<Bus as Classes>::Class>,
@@ -1795,10 +2395,15 @@ impl Member {
     {
         let leading = self.replica.is_leader();
         if self.leading && !leading {
-            let owed: Vec<(PeerId, Owed)> = self.owed.drain().map(|(owed, _)| owed).collect();
+            let mut owed: Vec<(PeerId, Owed)> =
+                self.owed.drain().map(|(owed, _)| owed).collect();
+            // In order, not the map's: the redirects go out the same way every run.
+            owed.sort_unstable();
             for (peer, key) in owed {
                 self.redirect(endpoint, peer, key);
             }
+            let leader = self.leader();
+            self.node_mut().stop_delivering(endpoint, leader);
         }
         self.leading = leading;
     }
@@ -1812,16 +2417,30 @@ impl Member {
     pub fn waited(&mut self, began: Instant, woke: Instant) {
         self.woke = Some(woke);
         let Some(at) = self.liveness.wake() else {
+            #[cfg(feature = "sim")]
+            self.note("waited, no wake asked".to_owned());
             return;
         };
         let (began, woke) = (self.now_ns(began), self.now_ns(woke));
+        #[cfg(feature = "sim")]
+        self.note(
+            if began < at && woke >= at {
+                "waited past the wake"
+            } else if woke < at {
+                "waited, woke before the wake"
+            } else {
+                "waited, began past the wake"
+            }
+            .to_owned(),
+        );
         if began < at && woke >= at {
             self.liveness.on_wait(at, woke);
         }
     }
 
     /// When the node next has work though nothing arrives: at once where a turn left its replica
-    /// more to do, and otherwise the replica's deadline or the stream's wake, the sooner.
+    /// more to do, and otherwise the soonest of the replica's deadline, the stream's wake and a
+    /// peer's next dial.
     pub fn deadline(&self) -> Option<Instant> {
         if self.due {
             return Some(self.origin);
@@ -1829,16 +2448,113 @@ impl Member {
         let at = |ns: u64| self.origin.checked_add(Duration::from_nanos(ns));
         let replica = self.replica.deadline().and_then(at);
         let stream = self.liveness.wake().and_then(at);
-        match (replica, stream) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let dial = self.links.iter().filter_map(|link| link.next).min();
+        [replica, stream, dial].into_iter().flatten().min()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pair's dialer dials again at once after a connection that lasted its back-off, and after
+    /// dials that gave none lasting, one back-off from the last dial's start, doubling from
+    /// `REDIAL_FIRST` to `REDIAL_MOST`; the other node of the pair never dials (module docs).
+    #[test]
+    fn a_dialer_dials_again_at_once_after_a_lasting_connection_and_backs_off_after_failed_dials() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut link = Link::new(true);
+        link.dialed = Some(at(0));
+        link.up = Some(at(10));
+        // Up an hour: the next dial is due at once.
+        link.down(at(3_600_000));
+        assert_eq!(link.next, Some(at(3_600_000)));
+        assert_eq!(link.backoff, limits::REDIAL_FIRST);
+        // Dials refused as they begin: each one back-off, doubled, after the last began, to the most.
+        let mut now = 3_600_000;
+        for wait in [2_000, 3_000, 3_000] {
+            link.dialed = Some(at(now));
+            link.next = None;
+            link.down(at(now + 5));
+            assert_eq!(link.next, Some(at(now + wait)), "after the dial at {now}");
+            now += wait;
+        }
+        // A connection up and closed within its back-off backs off as a refused dial does.
+        link.dialed = Some(at(now));
+        link.up = Some(at(now + 5));
+        link.down(at(now + 10));
+        assert_eq!(link.next, Some(at(now + 3_000)));
+        // A connection up through its back-off starts the back-off over.
+        link.dialed = Some(at(now));
+        link.up = Some(at(now + 5));
+        link.down(at(now + 3_005));
+        assert_eq!(link.backoff, limits::REDIAL_FIRST);
+        assert_eq!(link.next, Some(at(now + 3_005)));
+
+        let mut listener = Link::new(false);
+        listener.up = Some(at(0));
+        listener.down(at(10));
+        assert_eq!(listener.next, None);
+        assert_eq!(listener.up, None);
+    }
+
+    /// A node's run is kept sealed under its directory's group key and raised at each start; one in
+    /// the clear, as an earlier binary kept it, is taken and sealed until the node is marked sealed
+    /// and refused after; a changed byte and another node's run are refused (29 §12.9).
+    #[test]
+    fn a_nodes_run_is_raised_sealed_and_one_in_the_clear_taken_only_before_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RUN_FILE);
+        let keys = focal_seal::test_keys(dir.path()).unwrap();
+        let refusal = |clear: bool| match raise_run(&path, &keys, clear) {
+            Err(BusError::Configuration(why)) => why,
+            other => panic!("not refused: {other:?}"),
+        };
+        assert_eq!(raise_run(&path, &keys, false).unwrap(), 1);
+        assert_eq!(raise_run(&path, &keys, false).unwrap(), 2);
+        let sealed = std::fs::read(&path).unwrap();
+        assert_ne!(sealed.len(), RUN_BYTES, "the run lies in the clear");
+        let group = keys.key(focal_seal::Store::Group).unwrap();
+        assert_eq!(
+            *focal_seal::file::open(&group, sealed.clone(), RUN_BYTES).unwrap(),
+            2u64.to_le_bytes()
+        );
+
+        std::fs::write(&path, 41u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            refusal(false),
+            "the node's run lies in the clear after the node was sealed"
+        );
+        assert_eq!(raise_run(&path, &keys, true).unwrap(), 42);
+        assert_ne!(std::fs::read(&path).unwrap().len(), RUN_BYTES);
+        // A cut after the run was sealed and before the node's mark: the next start raises the
+        // sealed run.
+        assert_eq!(raise_run(&path, &keys, true).unwrap(), 43);
+
+        let mut flipped = std::fs::read(&path).unwrap();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 1;
+        std::fs::write(&path, &flipped).unwrap();
+        assert_eq!(
+            refusal(false),
+            "the node's run does not open under its node's keys"
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let theirs = other.path().join(RUN_FILE);
+        raise_run(
+            &theirs,
+            &focal_seal::test_keys(other.path()).unwrap(),
+            false,
+        )
+        .unwrap();
+        std::fs::copy(&theirs, &path).unwrap();
+        assert_eq!(
+            refusal(false),
+            "the node's run does not open under its node's keys"
+        );
+    }
 
     fn marks(issued: u64, persisted: u64, committed: u64) -> Reached {
         Reached {

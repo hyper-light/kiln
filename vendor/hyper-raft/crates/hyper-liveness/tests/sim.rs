@@ -314,6 +314,8 @@ struct Node {
     log: Vec<(u64, PeerId, Heartbeat)>,
     /// Every durable completion: when.
     durable: Vec<u64>,
+    /// The liveness writes the node's stream asked for (`Output::flush`).
+    liveness_writes: u64,
     suspicions: Vec<Suspicion>,
     /// What the node fed its stream and what the stream told it, in order (`record`): every
     /// suspicion in it is traced to the detector's rule, and every count the stream reports is
@@ -403,6 +405,7 @@ impl Sim {
                     disk_busy_until: 0,
                     log: Vec::new(),
                     durable: Vec::new(),
+                    liveness_writes: 0,
                     suspicions: Vec::new(),
                     record: {
                         let mut record = Record::default();
@@ -587,6 +590,7 @@ impl Sim {
                 .unwrap();
         }
         if std::mem::take(&mut self.nodes[node].owner.flush) {
+            self.nodes[node].liveness_writes += 1;
             self.submit(node, Write::Liveness);
         }
         self.arm(node);
@@ -1974,6 +1978,218 @@ fn a_node_that_hears_no_peer_keeps_its_streams_on_schedule() {
                 },
                 Some(until),
             );
+        }
+    }
+}
+
+/// RFC 8085 §3.1.3 (BCP 145): an application that "cannot maintain an RTT estimate for a
+/// destination, because the destination does not send return traffic", "SHOULD NOT send more than
+/// one UDP datagram every 3 seconds". A stream to a peer from which nothing had come stayed at its
+/// sender's floor, `E[flush] + G`, and asked a flush for each heartbeat for as long as the peer said
+/// nothing: a founder of mantle's three-node cell started alone flushed its log 10,000 times a
+/// second on an idle NVMe, its floor 80 to 115 µs. Do: one node of three, its peers never alive,
+/// for a minute of its clock, in the four worlds. Expect: to each peer, once a heartbeat states an
+/// interval of 3 s every later one does, none states more (every floor here is shorter), and the
+/// heartbeats are no more than the doublings from the shortest interval stated to 3 s and one each
+/// 3 s of the minute; the liveness writes the node asked are no more than the heartbeats they
+/// proved and its first.
+#[test]
+fn a_node_whose_peers_never_answer_backs_off_to_a_heartbeat_every_three_seconds() {
+    // Format: RFC 8085 §3.1.3, the second case's bound.
+    const BOUND: u64 = 3_000 * MS;
+    // Shape: the run, twenty bounds.
+    const SPAN: u64 = 60_000 * MS;
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(20, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            sim.nodes[1].alive = false;
+            sim.nodes[2].alive = false;
+            sim.run_while(|_| true, Some(SPAN));
+            let node = &sim.nodes[0];
+            let mut sent = 0u64;
+            for peer in [2u64, 3] {
+                let beats: Vec<&Heartbeat> = node
+                    .log
+                    .iter()
+                    .filter(|(_, to, _)| *to == peer)
+                    .map(|(_, _, beat)| beat)
+                    .collect();
+                assert!(!beats.is_empty(), "{name} seed {seed}: nothing sent {peer}");
+                assert!(
+                    beats.iter().all(|beat| beat.floor_ns < BOUND),
+                    "{name} seed {seed}: a floor past the bound, which the stream keeps"
+                );
+                let stated: Vec<u64> = beats.iter().map(|beat| beat.interval_ns).collect();
+                assert!(
+                    stated.iter().all(|interval| *interval <= BOUND),
+                    "{name} seed {seed}: to {peer} an interval past 3 s: {stated:?}"
+                );
+                if let Some(first) = stated.iter().position(|interval| *interval == BOUND) {
+                    assert!(
+                        stated[first..].iter().all(|interval| *interval == BOUND),
+                        "{name} seed {seed}: to {peer} the bound left: {stated:?}"
+                    );
+                }
+                let shortest = stated.iter().copied().min().unwrap().max(1);
+                let doublings = u64::from((BOUND / shortest).max(1).ilog2()) + 1;
+                let most = doublings + SPAN / BOUND + 1;
+                assert!(
+                    beats.len() as u64 <= most,
+                    "{name} seed {seed}: {} heartbeats to {peer} in {} s, past {most}: the \
+                     doublings from {} µs to 3 s and one every 3 s",
+                    beats.len(),
+                    SPAN / 1_000 / MS,
+                    shortest / US
+                );
+                sent += beats.len() as u64;
+            }
+            assert!(
+                node.liveness_writes <= sent + 1,
+                "{name} seed {seed}: {} liveness writes for {sent} heartbeats",
+                node.liveness_writes
+            );
+        }
+    }
+}
+
+/// A stream backed off while its peer said nothing answers the peer's first heartbeat at once and
+/// leaves the back-off: the peer judges the node from its own start, and a backed-off slot would
+/// keep it waiting up to 3 s. Do: one node of two alone for twenty seconds, its stream to the
+/// other backed off to 3 s, then the other started. Expect: the alone node's first heartbeat after
+/// it took the other's first is sent within a poll's and a flush's lateness of taking it (the
+/// bound `a_node_that_hears_no_peer_keeps_its_streams_on_schedule` holds a stream on schedule to),
+/// every later one states an interval under 3 s, and both pairs configure.
+#[test]
+fn a_peer_heard_at_last_is_answered_at_once_and_its_stream_backs_off_no_more() {
+    // Format: RFC 8085 §3.1.3, the second case's bound.
+    const BOUND: u64 = 3_000 * MS;
+    // Shape: the time alone, long enough for the stream to reach the bound from any floor here.
+    const ALONE: u64 = 20_000 * MS;
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(21, 8) {
+            let mut sim = Sim::new(2, world, seed);
+            sim.nodes[1].alive = false;
+            sim.run_while(|_| true, Some(ALONE));
+            assert_eq!(
+                sim.nodes[0]
+                    .liveness
+                    .report(2)
+                    .and_then(|report| report.sending),
+                Some(Duration::from_nanos(BOUND)),
+                "{name} seed {seed}: the stream alone reached the bound"
+            );
+            let mut liveness = Liveness::new(Settings {
+                local: 2,
+                run: 1,
+                max_peers: 2,
+                history: Exposure::new(),
+                resolution: RESOLUTION,
+            })
+            .unwrap();
+            liveness.attach(1).unwrap();
+            sim.restart(1, liveness);
+            sim.poll(1);
+            let taken = |sim: &Sim| sim.nodes[0].liveness.report(2).map_or(0, |r| r.taken);
+            sim.run_while(|sim| taken(sim) == 0, None);
+            let heard = sim.now;
+            let sent_before = sim.nodes[0].log.len();
+            sim.run_while(|sim| sim.nodes[0].log.len() == sent_before, None);
+            let (answered, to, _) = sim.nodes[0].log[sent_before];
+            assert_eq!(to, 2);
+            let behind = sim.latest_late + sim.longest_freeze + sim.longest_write;
+            assert!(
+                answered - heard <= behind,
+                "{name} seed {seed}: answered {} ms after the first heartbeat, past the {} ms a \
+                 poll and a flush may take",
+                (answered - heard) / MS,
+                behind / MS
+            );
+            sim.run_until_configured();
+            let later: Vec<u64> = sim.nodes[0].log[sent_before + 1..]
+                .iter()
+                .map(|(_, _, beat)| beat.interval_ns)
+                .collect();
+            assert!(
+                !later.is_empty(),
+                "{name} seed {seed}: nothing sent after the answer"
+            );
+            assert!(
+                later.iter().all(|interval| *interval < BOUND),
+                "{name} seed {seed}: backed off after the peer was heard: {later:?}"
+            );
+        }
+    }
+}
+
+/// A node restarted where it hears no peer backs its streams off, and its peers, which hear it,
+/// expect each doubling: no suspicion of it is of a heartbeat its sender had not yet due (mantle's
+/// roll test restarts a founder so: at a new port, which its peers send to at its old one until
+/// they are told). Its streams state each gap and double it (`Pair::backed_off`), and a heartbeat
+/// that echoes nothing tells the peer to expect that (`unanswered_next`). Doubled from the floor, unforeseen, each doubling came a whole
+/// gap past the peers' freshness point: 49 to 91 suspicions of the live node a world, in 8 seeds of
+/// 8 over its 10 s deaf, where the node sending at its floor drew 0 to 2, each a late heartbeat of
+/// its own.
+#[test]
+fn a_restarted_node_that_hears_no_peer_is_not_suspected_for_its_back_off() {
+    // Shape: long enough for its streams to back off to the bound from any floor here.
+    const DEAF: u64 = 10_000 * MS;
+    // Format: RFC 8085 §3.1.3, the second case's bound.
+    const BOUND: u64 = 3_000 * MS;
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(22, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            settled(&mut sim);
+            let before: Vec<usize> = (0..2)
+                .map(|node| sim.nodes[node].suspicions.len())
+                .collect();
+            let mut liveness = Liveness::new(Settings {
+                local: 3,
+                run: 2,
+                max_peers: 2,
+                history: Exposure::new(),
+                resolution: RESOLUTION,
+            })
+            .unwrap();
+            liveness.attach(1).unwrap();
+            liveness.attach(2).unwrap();
+            sim.restart(2, liveness);
+            sim.nodes[2].deaf = true;
+            let start = sim.now;
+            let logged = sim.nodes[2].log.len();
+            sim.poll(2);
+            sim.run_while(|_| true, Some(start + DEAF));
+            let sent = &sim.nodes[2].log[logged..];
+            assert!(
+                sent.iter().any(|(_, _, beat)| beat.interval_ns == BOUND),
+                "{name} seed {seed}: the restarted node never backed off to the bound"
+            );
+            for (node, taken_before) in before.iter().enumerate() {
+                let peer = node as u64 + 1;
+                for suspicion in sim.nodes[node].suspicions[*taken_before..]
+                    .iter()
+                    .filter(|suspicion| suspicion.peer == 3)
+                {
+                    let last = suspicion.last.expect("the run's heartbeats were taken").seq;
+                    // The slot after the last taken, by its sender's schedule: the next heartbeat
+                    // it sent, less the slots it skipped to it at its interval.
+                    let due = sent
+                        .iter()
+                        .find(|(_, to, beat)| *to == peer && beat.seq > last)
+                        .map(|(_, _, beat)| {
+                            beat.sent_ns - beat.late_ns - (beat.seq - last - 1) * beat.interval_ns
+                        });
+                    assert!(
+                        due.is_some_and(|due| due <= suspicion.at_ns),
+                        "{name} seed {seed}: node {peer} suspected the restarted node at {} ms, \
+                         its next heartbeat due at {:?} ms",
+                        (suspicion.at_ns - start) / MS,
+                        due.map(|due| (due - start) / MS)
+                    );
+                }
+            }
         }
     }
 }

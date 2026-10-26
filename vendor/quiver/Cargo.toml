@@ -50,6 +50,7 @@ exit = "deny"
 focal-bus = { path = "vendor/focal-bus/crates/focal-bus" }
 focal-memory = { path = "vendor/focal-bus/crates/focal-memory" }
 focal-platform = { path = "vendor/focal-bus/crates/focal-platform" }
+focal-seal = { path = "vendor/focal-bus/crates/focal-seal" }
 hyper-block = { path = "vendor/hyper-raft/crates/hyper-block" }
 hyper-durable = { path = "vendor/hyper-raft/crates/hyper-durable" }
 hyper-liveness = { path = "vendor/hyper-raft/crates/hyper-liveness" }

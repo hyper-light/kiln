@@ -30,6 +30,8 @@
 mod catalog;
 mod group;
 mod host;
+#[cfg(feature = "sim")]
+pub mod sim;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -60,6 +62,10 @@ pub struct PersistedConfig {
     /// The cluster's identities (`focal_bus::pki`): a node's and a publisher's for each node, made
     /// there the first time, the same directory at every node.
     pub identities: PathBuf,
+    /// The key file the identities' directory keeps its keys under (Focal's sealing at rest, its
+    /// doc 29 §12.9), the same file at every node that shares the directory; `None`, the per-user
+    /// root key file named for the directory's root key, as Focal's own node keeps its identities.
+    pub identities_key: Option<PathBuf>,
     /// Each part's memory, the catalog's and each topic's: what its window keeps of its batches
     /// and what its log holds (about twice it, `hyper_log::Config::derive`).
     pub part_memory: u64,
@@ -167,6 +173,9 @@ pub struct GroupFigures {
     pub frames: u64,
     /// The offset after the last its part applied.
     pub applied: u64,
+    /// Publishes this node's member, leading, recognised as sent again (one in flight or applied):
+    /// answered, never proposed twice.
+    pub duplicates: u64,
     /// What this node's publisher to the group did.
     pub sent: u64,
     pub resent: u64,
@@ -194,6 +203,7 @@ impl GroupFigures {
             leader: leader.node,
             frames: stats.log.frames,
             applied: seat.part().bounds(group::STREAM).map_or(0, |(_, end)| end),
+            duplicates: stats.duplicates,
             sent: publisher.stats.sent,
             resent: publisher.stats.resent,
             redirects: publisher.stats.redirects,
@@ -252,6 +262,10 @@ pub(crate) struct Shared {
     bound: usize,
     views: RwLock<HashMap<String, Arc<Log>>>,
     stats: Mutex<PersistedStats>,
+    /// Under the simulation, what its members were at the host's last turn, once asked for
+    /// (`sim::World::diagnose`): `Some` while asked, the host filling it.
+    #[cfg(feature = "sim")]
+    diagnosis: Mutex<Option<String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -259,6 +273,33 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Shared {
+    fn new(config: &PersistedConfig) -> Self {
+        Self {
+            inbox: Mutex::new(Inbox {
+                commands: VecDeque::new(),
+                waker: None,
+                stop: false,
+            }),
+            bound: config.publishes.saturating_add(config.topics),
+            views: RwLock::new(HashMap::new()),
+            stats: Mutex::new(PersistedStats::default()),
+            #[cfg(feature = "sim")]
+            diagnosis: Mutex::new(None),
+        }
+    }
+
+    /// The host ended, `why` said, and every command waiting refused.
+    fn end(&self, why: String) {
+        lock(&self.stats).ended = Some(why);
+        self.stop();
+    }
+
+    /// Whether the host ended.
+    #[cfg(feature = "sim")]
+    fn ended(&self) -> bool {
+        lock(&self.stats).ended.is_some()
+    }
+
     fn stopping(&self) -> bool {
         lock(&self.inbox).stop
     }
@@ -320,6 +361,15 @@ impl Shared {
         Ok(())
     }
 
+    /// Wakes the host, for a turn.
+    #[cfg(feature = "sim")]
+    fn wake(&self) {
+        let waker = lock(&self.inbox).waker.clone();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
     /// Tells the host to stop: it ends at its next wake, holding nothing it answers.
     fn stop(&self) {
         let waker = {
@@ -370,24 +420,14 @@ impl Persisted {
         clock: Clock,
     ) -> Result<Self, Refusal> {
         config.check()?;
-        let shared = Arc::new(Shared {
-            inbox: Mutex::new(Inbox {
-                commands: VecDeque::new(),
-                waker: None,
-                stop: false,
-            }),
-            bound: config.publishes.saturating_add(config.topics),
-            views: RwLock::new(HashMap::new()),
-            stats: Mutex::new(PersistedStats::default()),
-        });
+        let shared = Arc::new(Shared::new(&config));
         let (opened, open) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
         let for_host = Arc::clone(&shared);
         let host = std::thread::Builder::new()
             .name(format!("quiver-persisted-{}", config.id))
             .spawn(move || {
                 let ended = run_host(config, &for_host, &opened, clock, budget);
-                lock(&for_host.stats).ended = Some(ended.unwrap_or_else(|why| why));
-                for_host.stop();
+                for_host.end(ended.unwrap_or_else(|why| why));
             })
             .map_err(|e| Refusal::Unavailable(format!("the persisted host's thread: {e}")))?;
         match open.recv() {
@@ -514,22 +554,36 @@ fn run_host(
     };
     let shared = Arc::clone(shared);
     let opened = opened.clone();
+    let told = move |open: Result<(), String>| {
+        let _ = opened.send(open);
+    };
     shard
-        .block_on(async move {
-            let waker =
-                std::future::poll_fn(|context| std::task::Poll::Ready(context.waker().clone()))
-                    .await;
-            shared.set_waker(waker.clone());
-            let mut host = match host::Host::open(config, Arc::clone(&shared), waker, clock, budget)
-            {
-                Ok(host) => host,
-                Err(why) => {
-                    let _ = opened.send(Err(why.clone()));
-                    return Err(why);
-                }
-            };
-            let _ = opened.send(Ok(()));
-            host.run().await.map(|()| "it was stopped".to_owned())
-        })
+        .block_on(
+            async move { host_body(config, &shared, told, clock, budget, host::real()).await },
+        )
         .map_err(|e| format!("its shard: {e:?}"))?
+}
+
+/// The host on the shard it's polled on: opened (said through `opened`), run until it's stopped or
+/// faults; why it ended. Under the simulation `sim` is what the world gave this start.
+async fn host_body(
+    config: PersistedConfig,
+    shared: &Arc<Shared>,
+    opened: impl FnOnce(Result<(), String>),
+    clock: Clock,
+    budget: MemoryBudget,
+    sim: host::Sim,
+) -> Result<String, String> {
+    let waker =
+        std::future::poll_fn(|context| std::task::Poll::Ready(context.waker().clone())).await;
+    shared.set_waker(waker.clone());
+    let mut host = match host::Host::open(config, Arc::clone(shared), waker, clock, budget, sim) {
+        Ok(host) => host,
+        Err(why) => {
+            opened(Err(why.clone()));
+            return Err(why);
+        }
+    };
+    opened(Ok(()));
+    host.run().await.map(|()| "it was stopped".to_owned())
 }

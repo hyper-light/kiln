@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use hyper_transport::{
-    Event, ExchangeId, LEAST_PROGRESS, Limits, Progress, Refusal, Unprompted, probes_within,
+    Event, ExchangeId, LEAST_PROGRESS, Limits, Progress, Refusal, RestartKey, Unprompted,
+    probes_within,
 };
 
 const PERIOD: Duration = Duration::from_secs(2);
@@ -2658,17 +2659,21 @@ fn a_dial_failing_as_the_last_one_did_is_told_all_the_same() {
     let pair = Pair::new();
     let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
     let address = net.b_address;
-    // The path is cut: node 2 hears nothing more, and the connection idles out.
+    // The path is cut: node 2 hears nothing more, node 1's keep-alive goes unacknowledged and its
+    // path is degrading (§4ai), and the connection idles out.
     net.b_dead = true;
     let told = told_until_a_holds(&mut net, 0);
     assert!(
         matches!(
             told[..],
-            [Event::Closed {
-                peer: 2,
-                epoch: 1,
-                refusal: None
-            }]
+            [
+                Event::Degrading { peer: 2, epoch: 1 },
+                Event::Closed {
+                    peer: 2,
+                    epoch: 1,
+                    refusal: None
+                }
+            ]
         ),
         "{told:?}"
     );
@@ -2721,6 +2726,195 @@ fn a_dial_failing_as_the_last_one_did_is_told_all_the_same() {
         ),
         "{told:?}"
     );
+}
+
+/// A dialer is told its peer's path is degrading once nothing it sent has been acknowledged for four
+/// probe timeouts (hyper-quic's `PathDegrading`, quiche's rule; docs/transport.md §4ai), long before
+/// its idle timeout ends the connection, and progressing once the peer answers again; a path event
+/// the owner has not polled is taken away by the connection's close, which says more. Before it, an
+/// owner heard nothing of a peer that went until the idle timeout: focal's bus client kept sending
+/// to a leader killed with kill -9 for two minutes, while the group had elected another in a second
+/// (found by focal).
+#[test]
+fn a_dialer_is_told_its_peers_path_degrading_long_before_its_idle_timeout() {
+    let pair = Pair::new();
+    let limits = limits();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits, 256 << 20);
+    let mut server = Server::new();
+    events(&mut net.a);
+    // Node 2 goes, saying nothing, as a killed process does; node 1 sends it a frame.
+    net.b_dead = true;
+    let gone = net.now;
+    net.a.send_frame(2, 0, Kind::Append, b"one").unwrap();
+    let mut told = Vec::new();
+    net.until(TURNS, |net| {
+        told.extend(events(&mut net.a));
+        !told.is_empty()
+    });
+    assert!(
+        matches!(told[..], [Event::Degrading { peer: 2, epoch: 1 }]),
+        "{told:?}"
+    );
+    let took = net.now - gone;
+    assert!(
+        took < limits.keep_alive.unwrap(),
+        "told {took:?} after the peer went"
+    );
+    assert_eq!(net.a.stats().connections, 1, "the connection stays open");
+    // Node 2 answers again: node 1 is told its path makes progress, and the frame arrives.
+    net.b_dead = false;
+    let mut told = Vec::new();
+    net.until(TURNS, |net| {
+        server.serve(&mut net.b);
+        told.extend(events(&mut net.a));
+        !told.is_empty() && server.frames.len() == 1
+    });
+    assert!(
+        matches!(told[..], [Event::Progressing { peer: 2, epoch: 1 }]),
+        "{told:?}"
+    );
+    // Node 2 goes again, and node 1 polls nothing until the connection idles out: the path event
+    // that waited is taken away by the close.
+    net.b_dead = true;
+    net.a.send_frame(2, 0, Kind::Append, b"two").unwrap();
+    net.until(TURNS, |net| net.a.stats().connections == 0);
+    let told = events(&mut net.a);
+    assert!(
+        matches!(
+            told[..],
+            [Event::Closed {
+                peer: 2,
+                epoch: 1,
+                refusal: None
+            }]
+        ),
+        "{told:?}"
+    );
+}
+
+/// An endpoint restarted at its address with the key it keeps across restarts resets each connection
+/// its last run held as a packet on it arrives (RFC 9000 §10.3), as a restarted host's TCP answers
+/// with an RST: node 1, connected to node 2 and sending it only keep-alives, is told the connection
+/// closed within a keep-alive of node 2's restart, and its next dial connects. Restarted with a key
+/// of its own, as an endpoint without one is at every start, node 2 drops what comes on the old
+/// connection, its ID one the new key does not know, and node 1 is told only as the connection idles
+/// out (docs/transport.md §4ah).
+#[test]
+fn a_restarted_endpoint_resets_what_its_last_run_held() {
+    let pair = Pair::new();
+    let kept = RestartKey::from_secret(&[1; 32]).unwrap();
+    let fresh = RestartKey::from_secret(&[2; 32]).unwrap();
+    let limits = limits();
+    let keep_alive = limits.keep_alive.unwrap();
+    for (restarted_with, reset) in [(&kept, true), (&fresh, false)] {
+        let now = hyper_sim::Anchor::new().instant(0).unwrap();
+        let node_2 = |restart: &RestartKey, now| {
+            pair.restartable::<Mantle>(
+                2,
+                Role::Node,
+                pair.book(Role::Node, Role::Node),
+                limits,
+                256 << 20,
+                now,
+                restart,
+            )
+        };
+        let node_1 = pair.node::<Mantle>(
+            1,
+            Role::Node,
+            pair.book(Role::Node, Role::Node),
+            limits,
+            256 << 20,
+            now,
+        );
+        let mut net = Net::new(now, node_1, node_2(&kept, now));
+        let address = net.b_address;
+        net.a.connect(now, 2, address).unwrap();
+        net.until(TURNS, |net| {
+            events(&mut net.b);
+            events(&mut net.a).iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Connected {
+                        peer: 2,
+                        epoch: 1,
+                        ..
+                    }
+                )
+            })
+        });
+        // Node 2's run ends with nothing said, as a process's does when it stops, and the next
+        // starts at its address.
+        net.b = node_2(restarted_with, net.now);
+        let restarted = net.now;
+        let mut told = Vec::new();
+        let mut degraded = None;
+        net.until(TURNS, |net| {
+            for event in events(&mut net.a) {
+                if matches!(event, Event::Degrading { .. }) {
+                    degraded = Some(net.now);
+                }
+                told.push(event);
+            }
+            told.iter()
+                .any(|event| matches!(event, Event::Closed { .. }))
+        });
+        let took = net.now - restarted;
+        if reset {
+            assert!(
+                matches!(
+                    told[..],
+                    [Event::Closed {
+                        peer: 2,
+                        epoch: 1,
+                        ..
+                    }]
+                ),
+                "{told:?}"
+            );
+            assert!(took <= keep_alive, "reset {took:?} after the restart");
+        } else {
+            // Its keep-alive unacknowledged, node 1 is told its path is degrading (§4ai) within a
+            // keep-alive and the zero path's four probe timeouts, long before the close.
+            assert!(
+                matches!(
+                    told[..],
+                    [
+                        Event::Degrading { peer: 2, epoch: 1 },
+                        Event::Closed {
+                            peer: 2,
+                            epoch: 1,
+                            ..
+                        }
+                    ]
+                ),
+                "{told:?}"
+            );
+            let degraded = degraded.unwrap() - restarted;
+            assert!(
+                degraded <= keep_alive * 2,
+                "degrading told {degraded:?} after the restart"
+            );
+            assert!(
+                took >= limits.idle_timeout - keep_alive,
+                "closed {took:?} after a restart that could not reset it"
+            );
+        }
+        net.a.connect(net.now, 2, address).unwrap();
+        net.until(TURNS, |net| {
+            events(&mut net.b);
+            events(&mut net.a).iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Connected {
+                        peer: 2,
+                        epoch: 2,
+                        ..
+                    }
+                )
+            })
+        });
+    }
 }
 
 /// A dial that ends after its peer connected in, and went, while the owner polled nothing is told:

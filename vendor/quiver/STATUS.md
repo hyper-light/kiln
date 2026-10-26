@@ -62,6 +62,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Open
 
+- **Focal's newer bus** (`bus-replicated` at `425dcdac`, 2026-10-26, with hyper-raft `c6baec2`): its
+  client fails over by itself (`Client::group`: the next node, newer-term leaders, KIP-580
+  back-off) and a member's restart flushes its outbox on a new connection. Re-vendored
+  deliberately (with Focal's agent), they may replace the persisted class's own leader-following
+  publisher and its disconnect of a suspected peer (`docs/design/persisted.md`).
+
 - **The catalog's snapshot**: the persisted class's catalog keeps what its part's window holds (some
   hundreds of thousands of its records at the least part memory); a node that finds records it
   never applied let go stops, saying so. Snapshotting it, or the catalog proper in Amphora, is

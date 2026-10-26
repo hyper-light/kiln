@@ -37,6 +37,10 @@ windows-sys = { workspace = true, features = [
 [dev-dependencies]
 hyper-measure = { path = "../hyper-measure" }
 
+# tests/console_close.rs: the pipes of the pseudoconsole a console close is delivered through.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Pipes"] }
+
 # loom builds only under `RUSTFLAGS="--cfg loom"`, for the park and kick protocol's interleavings.
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"

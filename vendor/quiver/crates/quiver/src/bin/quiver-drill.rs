@@ -3,7 +3,8 @@
 //! CP-T2.2, `tests/persisted_processes.rs`), each killed with SIGKILL at a persistence point and
 //! started again on what its directory holds.
 //!
-//! `quiver-drill --id N --nodes 1=ADDRESS,2=ADDRESS,… --data DIR --identities DIR`
+//! `quiver-drill --id N --nodes 1=ADDRESS,2=ADDRESS,… --data DIR --identities DIR
+//! [--identities-key FILE]`
 //!
 //! It says `ready RUN` once it has caught up with its catalog's group. Each line it reads is answered by one line:
 //! `create NAME` by `ok` or `refused WHY`; `publish NAME PAYLOAD` by `acked OFFSET` or
@@ -55,6 +56,7 @@ fn config(args: &[String]) -> Result<PersistedConfig, String> {
     let mut nodes = Vec::new();
     let mut data = None;
     let mut identities = None;
+    let mut identities_key = None;
     let mut at = args.iter();
     while let Some(flag) = at.next() {
         let value = at.next().ok_or_else(|| format!("{flag} takes a value"))?;
@@ -72,6 +74,7 @@ fn config(args: &[String]) -> Result<PersistedConfig, String> {
             }
             "--data" => data = Some(PathBuf::from(value)),
             "--identities" => identities = Some(PathBuf::from(value)),
+            "--identities-key" => identities_key = Some(PathBuf::from(value)),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -80,6 +83,7 @@ fn config(args: &[String]) -> Result<PersistedConfig, String> {
         nodes,
         data: data.ok_or("--data is needed")?,
         identities: identities.ok_or("--identities is needed")?,
+        identities_key,
         part_memory: PersistedConfig::PART_MEMORY_MIN,
         topics: 16,
         publishes: 4096,

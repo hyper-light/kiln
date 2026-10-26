@@ -1083,6 +1083,39 @@ fn a_frame_confirmed_by_a_durable_write_is_restored_and_marked_after_a_power_cut
     drop(closed(log));
 }
 
+/// A log under `Waits::Told` opens after its last acknowledged frame is damaged at rest: the
+/// restore the open writes and waits for is the log's own, never held for a cut no caller could make
+/// before the open returns. The frames are written under `Measured`, the damage as the test below
+/// makes it, and the log opened again under `Told`.
+#[test]
+fn a_told_log_opens_and_restores_a_damaged_last_frame() {
+    let file = sim(29);
+    let cfg = config(16, 8);
+    let log = Log::create(file, cfg, ID).unwrap();
+    for i in 1..=4u64 {
+        let update = Update {
+            entries: Some(entries(i, &[1])),
+            ..Update::default()
+        };
+        log.write(1, update).unwrap();
+    }
+    let file = closed(log);
+    file.inject(Fault::BitFlip {
+        offset: AREA + 5 * BLOCK as u64 + 8,
+        bit: 2,
+        stored: true,
+    })
+    .unwrap();
+    let told = Config {
+        waits: Waits::Told,
+        ..cfg
+    };
+    let (log, recovery) = Log::open(file, told, ID).unwrap();
+    assert_eq!(recovery.restored, vec![1]);
+    assert_eq!(log.view(1).unwrap().unwrap().last, 3);
+    drop(closed(log));
+}
+
 #[test]
 fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
     for field in [0u64, 8, 40, 64, 70, 120] {

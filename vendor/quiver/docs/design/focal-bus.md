@@ -23,6 +23,13 @@ sources, its evidence and what would falsify it.
   docs/vendoring.md): it vendors Focal's bus and hyper-raft at these same commits, beside Quiver,
   and moves its own hyper-raft from `767627f` to `25cf889`.
 
+- **Since, 2026-10-26:** the bus at `bus-replicated`'s `b6cf8e3` (2026-10-25) and hyper-raft at
+  `c6baec2` (`main`), the revision it takes, for kiln's CP-T2.2 step 6: the persisted class's
+  simulation found followers that never caught up again, which that bus's `425dcda` and that
+  hyper-raft's `3e54e50` fix (`docs/design/persisted-sim.md`). A node's identities and data
+  directories are now sealed at rest, the identities under the key file `PersistedConfig::identities_key` names, or Focal's
+  per-user root key file. kiln moves its copies with Quiver's.
+
 ## The ephemeral class, in process
 
 Focal's doc 33 (§4.2) defines the class: in memory, lost with its node, gaps announced. Doc 32's

@@ -1,0 +1,191 @@
+Subject: a simulated path may duplicate datagrams
+Why: Quiver's simulation of its persisted class (kiln's CP-T2.2 step 6, AC-T2.2.5) needs duplicated messages on the fabric; offered upstream on cp/t2.2-told (d59ae5f)
+
+diff --git a/crates/hyper-rt/src/sim.rs b/crates/hyper-rt/src/sim.rs
+index f8791ba60591f4829ce394b096390634f866003d..6274974b24c4ef7110eca202a7bdd21438ce1488 100644
+--- a/crates/hyper-rt/src/sim.rs
++++ b/crates/hyper-rt/src/sim.rs
+@@ -184,6 +184,9 @@ pub struct SimPath {
+     reorders: bool,
+     /// The loss process.
+     loss: SimLoss,
++    /// How often a datagram is delivered twice, in parts per million: the copy after a delay of its
++    /// own, kept in the flow's order where the path keeps it.
++    duplicate_ppm: u32,
+     /// The largest datagram the path carries; a larger one is dropped. `None` — no limit.
+     mtu: Option<usize>,
+     /// The bottleneck the path's datagrams are serialized through, if any.
+@@ -203,6 +206,7 @@ impl SimPath {
+         jitter_ns: 0,
+         reorders: false,
+         loss: SimLoss::NONE,
++        duplicate_ppm: 0,
+         mtu: None,
+         link: None,
+     };
+@@ -214,6 +218,7 @@ impl SimPath {
+             jitter_ns,
+             reorders: false,
+             loss: SimLoss::NONE,
++            duplicate_ppm: 0,
+             mtu: None,
+             link: None,
+         }
+@@ -226,6 +231,7 @@ impl SimPath {
+             jitter_ns,
+             reorders: true,
+             loss: SimLoss::NONE,
++            duplicate_ppm: 0,
+             mtu: None,
+             link: None,
+         }
+@@ -236,6 +242,15 @@ impl SimPath {
+         SimPath { loss, ..self }
+     }
+ 
++    /// This path, delivering `duplicate_ppm` datagrams in a million twice (a link's resend, a route
++    /// taken twice), the copy after a delay of its own. At 0 it draws nothing from the generator.
++    pub const fn with_duplicates(self, duplicate_ppm: u32) -> SimPath {
++        SimPath {
++            duplicate_ppm,
++            ..self
++        }
++    }
++
+     /// This path, dropping every datagram longer than `mtu` bytes.
+     pub const fn with_mtu(self, mtu: usize) -> SimPath {
+         SimPath {
+@@ -317,6 +332,8 @@ pub struct SimFabricStats {
+     pub dropped_unbound: u64,
+     /// The largest backlog any link's queue held, in bytes.
+     pub peak_queue_bytes: u64,
++    /// Datagrams a path's duplication sent a second time.
++    pub duplicated: u64,
+ }
+ 
+ /// A datagram the fabric holds until its arrival time.
+@@ -503,6 +520,24 @@ impl SimFabric {
+             arrival = arrival.max(*previous);
+         }
+         self.last_arrival.insert((from, path_dest), arrival);
++        if path.duplicate_ppm > 0 && chance(&mut self.rng, path.duplicate_ppm) {
++            let mut again = departure.saturating_add(path.draw(&mut self.rng));
++            if !path.reorders {
++                again = again.max(arrival);
++                self.last_arrival.insert((from, path_dest), again);
++            }
++            self.stats.duplicated = self.stats.duplicated.saturating_add(1);
++            let sequence = self.next_sequence;
++            self.next_sequence = self.next_sequence.saturating_add(1);
++            self.in_flight.insert(
++                (again, sequence),
++                InFlight {
++                    dest,
++                    bytes: bytes.clone(),
++                    from: wire_from,
++                },
++            );
++        }
+         if arrival <= now {
+             return self.arrive(dest, bytes, wire_from, now);
+         }
+diff --git a/crates/hyper-rt/tests/udp.rs b/crates/hyper-rt/tests/udp.rs
+index 0adcb076178255bdfd8e744c87d1d6726af07c2e..e3f1a934c2c3d0fcab8ce4c733b9c7016046d4c8 100644
+--- a/crates/hyper-rt/tests/udp.rs
++++ b/crates/hyper-rt/tests/udp.rs
+@@ -582,6 +582,95 @@ fn a_reordering_path_overtakes_within_one_flow() {
+     );
+ }
+ 
++/// Sends `FLOW_LENGTH` datagrams `SEND_GAP_NS` apart over `path`, each stamped with its virtual send
++/// time, and returns every datagram the receiver saw by a virtual second after the last send (arrival,
++/// stamp), in arrival order, with the fabric's counts.
++fn run_counted_flow(
++    seed: u64,
++    path: hyper_rt::sim::SimPath,
++) -> (Vec<(u64, u64)>, hyper_rt::sim::SimFabricStats) {
++    use hyper_rt::sim::SimRuntime;
++
++    let mut sim = SimRuntime::new(&config(), seed).unwrap();
++    sim.set_path(path);
++    let id = sim.shard_ids()[0];
++    let (port_tx, port_rx) = channel();
++    let (seen, arrivals) = channel();
++
++    sim.spawn_on(id, async move {
++        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
++        let _ = port_tx.send(socket.local_addr().unwrap().port());
++        let mut buf = [0u8; 8];
++        loop {
++            let (n, _) = socket.recv_from(&mut buf).await.unwrap();
++            assert_eq!(n, 8, "a whole stamp arrived");
++            let stamp = u64::from_le_bytes(buf);
++            let _ = seen.send((hyper_rt::futures::now_ns(), stamp));
++        }
++    })
++    .unwrap();
++
++    sim.spawn_on(id, async move {
++        let port = loop {
++            if let Ok(p) = port_rx.try_recv() {
++                break p;
++            }
++            hyper_rt::futures::sleep(1_000).await.unwrap();
++        };
++        let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
++        let dest = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
++        for _ in 0..FLOW_LENGTH {
++            let stamp = hyper_rt::futures::now_ns();
++            let _ = sender.send_to(&stamp.to_le_bytes(), dest);
++            hyper_rt::futures::sleep(SEND_GAP_NS).await.unwrap();
++        }
++    })
++    .unwrap();
++
++    sim.run_until(SEND_GAP_NS * FLOW_LENGTH as u64 + 1_000_000_000);
++    (arrivals.try_iter().collect(), sim.stats())
++}
++
++/// AC (§4.8 A-9 "duplicated messages"; Quiver's CP-T2.2 step 6): a path told to duplicate delivers that
++/// many datagrams in a million twice, each copy after a delay of its own, kept in the flow's order where
++/// the path keeps it, and counted (`SimFabricStats::duplicated`); a path told nothing duplicates nothing.
++#[test]
++fn a_duplicating_path_delivers_datagrams_twice() {
++    use hyper_rt::sim::SimPath;
++
++    let path = SimPath::in_order(ONE_WAY_NS, JITTER_NS);
++    let (always, fabric) = run_counted_flow(7, path.with_duplicates(1_000_000));
++    assert_eq!(fabric.duplicated, FLOW_LENGTH as u64, "{fabric:?}");
++    assert_eq!(
++        always.len(),
++        2 * FLOW_LENGTH,
++        "every datagram arrived twice"
++    );
++    let mut stamps: Vec<u64> = always.iter().map(|(_, stamp)| *stamp).collect();
++    assert!(
++        stamps.windows(2).all(|pair| pair[0] <= pair[1]),
++        "the copies kept the flow in order"
++    );
++    stamps.dedup();
++    assert_eq!(stamps.len(), FLOW_LENGTH, "each datagram twice, none more");
++
++    let reordering = SimPath::reordering(ONE_WAY_NS, JITTER_NS).with_duplicates(300_000);
++    let (some, fabric) = run_counted_flow(7, reordering);
++    assert!(
++        fabric.duplicated > 0 && fabric.duplicated < FLOW_LENGTH as u64,
++        "{fabric:?}"
++    );
++    assert_eq!(some.len(), FLOW_LENGTH + fabric.duplicated as usize);
++
++    let (none, fabric) = run_counted_flow(7, path);
++    assert_eq!(fabric.duplicated, 0);
++    assert_eq!(
++        none.len(),
++        FLOW_LENGTH,
++        "a plain path delivers each datagram once"
++    );
++}
++
+ /// AC (D-20, deterministic simulation): the jitter is drawn from the simulation's seeded generator, so two
+ /// runs with one seed produce the same arrival times to the nanosecond, and a different seed draws a
+ /// different sequence — a failure history replays exactly.

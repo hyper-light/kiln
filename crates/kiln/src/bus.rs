@@ -220,6 +220,7 @@ mod tests {
             nodes: vec![(1, std::net::SocketAddr::from(([127, 0, 0, 1], port)))],
             data: dir.join("bus"),
             identities: dir.join("identities"),
+            identities_key: Some(dir.join("identities.key")),
             part_memory: quiver::PersistedConfig::PART_MEMORY_MIN,
             topics: 16,
             publishes: 1024,
