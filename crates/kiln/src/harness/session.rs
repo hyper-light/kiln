@@ -1657,7 +1657,7 @@ fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<S
     core.state.switching = Some(super::model::Switching { kind: target.id.to_owned(), model: model.clone(), mode, effort, modes, efforts });
     core.touch_state();
     if !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited) {
-        let text = format!("Switching to {} ({}) when this turn ends — the conversation carries over", model_label(target, &model), target.name);
+        let text = format!("Switching to {} when this turn ends — the conversation carries over", in_harness(target, &model));
         core.upsert("switch-pending", None, super::model::Body::Notice { level: Level::Info, text });
     }
     Some(Switch { to: target, model })
@@ -1666,6 +1666,12 @@ fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<S
 /// A model's name as its harness lists it, else its id.
 fn model_label(kind: &Kind, model: &str) -> String {
     super::kinds::models_of(kind.id).into_iter().find(|m| m.id == model && !m.label.is_empty()).map_or_else(|| model.to_owned(), |m| m.label)
+}
+
+/// A model in its harness, in words: "GPT-6.1-Sol (Codex)"; none chosen, "Gemini CLI (its
+/// default model)".
+fn in_harness(kind: &Kind, model: &str) -> String {
+    if model.is_empty() { format!("{} (its default model)", kind.name) } else { format!("{} ({})", model_label(kind, model), kind.name) }
 }
 
 /// Most of a conversation carried to another harness (bytes, about): what fits a smaller model's
@@ -1679,6 +1685,9 @@ enum Record {
     Claude { session: String, records: Vec<serde_json::Value> },
     /// Codex: a new thread's history.
     Codex(Vec<serde_json::Value>),
+    /// An ACP agent or Antigravity: the conversation in words, which its new session is given
+    /// with the first message it gets (`handoff::as_words`).
+    Words(String),
     /// Nothing to carry: it never said anything (or a harness that takes nothing).
     Nothing,
 }
@@ -1696,17 +1705,21 @@ struct Carried {
 }
 
 /// The conversation so far, carried from harness `from` to `to`: read from `from`'s own record of
-/// session `session` (never kiln's timeline), fitted, and put the way `to` keeps its own, with a
-/// note telling the model so (and `more`, after it); its permission mode and effort carried over.
-/// `cwd`: where it goes on (a Claude Code transcript names it); `model`: the one it goes on with
-/// (empty: the harness's default). Err: `from`'s record couldn't be read.
+/// session `session` where kiln reads one (Claude Code's, Codex's), else `timeline` (kiln's, for
+/// an ACP agent or Antigravity: [`timeline_of`]), fitted, and put the way `to` keeps its own (in
+/// words, for one whose own record kiln doesn't write), with a note telling the model so (and
+/// `more`, after it); its permission mode and effort carried over. `cwd`: where it goes on (a
+/// Claude Code transcript names it); `model`: the one it goes on with (empty: the harness's
+/// default). Err: `from`'s record couldn't be read.
 #[allow(clippy::too_many_arguments)]
-async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)], session: Option<String>, cwd: &str, old_model: &str, mode: &str, effort: &str, allow_bypass: bool, model: &str, more: Option<&str>) -> Result<Carried, String> {
+async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)], session: Option<String>, timeline: Option<super::handoff::Conversation>, cwd: &str, old_model: &str, mode: &str, effort: &str, allow_bypass: bool, model: &str, more: Option<&str>) -> Result<Carried, String> {
     use super::handoff;
-    // What the model saw, from the harness's own record (no session yet: nothing to carry).
-    let read = match session {
-        None => Some(handoff::Conversation::default()),
-        Some(id) => {
+    // What the model saw: from the harness's own record (no session yet: nothing to carry), or
+    // for one whose record kiln doesn't read, kiln's timeline.
+    let read = match (from.own_record(), session) {
+        (false, _) => Some(timeline.unwrap_or_default()),
+        (true, None) => Some(handoff::Conversation::default()),
+        (true, Some(id)) => {
             let env = env.to_vec();
             crate::rt::blocking(move || match from.protocol {
                 Protocol::ClaudeStreamJson => handoff::read_claude(&env, &id),
@@ -1719,10 +1732,12 @@ async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)
         }
     };
     let Some(mut conv) = read else { return Err(format!("kiln could not read {}'s record of this conversation", from.name)) };
-    let dropped = handoff::fit(&mut conv, CARRY_MAX);
+    // In words it all goes with one message: less of it.
+    let words = !to.own_record();
+    let dropped = handoff::fit(&mut conv, if words { handoff::WORDS_BUDGET } else { CARRY_MAX });
     let empty = conv.entries.is_empty() && conv.summary.is_none();
     let (mode, effort) = carried_settings(from, to, mode, effort, allow_bypass, model);
-    let mut note = handoff::note(from.name, old_model, to.name, &conv.todos, dropped);
+    let mut note = handoff::note(from.name, old_model, to.name, &conv.todos, dropped, words);
     if let Some(more) = more {
         note.push(' ');
         note.push_str(more);
@@ -1735,9 +1750,22 @@ async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)
             Record::Claude { session: id, records }
         }
         Protocol::CodexAppServer => Record::Codex(handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>")))),
-        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => Record::Nothing,
+        // Fitted already (fitting it again would count what it left out anew).
+        Protocol::Acp(_) | Protocol::AgyStreamJson => Record::Words(handoff::as_words(conv, &note, usize::MAX)),
+        Protocol::Terminal => Record::Nothing,
     };
     Ok(Carried { record, mode, effort, dropped, empty })
+}
+
+/// The conversation as kiln's timeline keeps it, with the plan as it stands: what is carried out
+/// of a harness whose own record kiln doesn't read (`carried`). None for one whose record it does.
+fn timeline_of<'a>(from: &Kind, events: impl IntoIterator<Item = &'a super::model::Event>, todos: &[super::model::Todo]) -> Option<super::handoff::Conversation> {
+    if from.own_record() {
+        return None;
+    }
+    let mut c = super::handoff::from_events(events);
+    c.todos = todos.to_vec();
+    Some(c)
 }
 
 /// The permission mode and effort a session goes on with in harness `to`, carried from `from`: the
@@ -1750,7 +1778,12 @@ fn carried_settings(from: &Kind, to: &Kind, mode: &str, effort: &str, allow_bypa
 
 fn carried_choices(from: &Kind, to: &Kind, mode: &str, effort: &str, allow_bypass: bool, model: &str) -> (Option<String>, Option<String>, Vec<super::model::ModeOption>, Vec<super::model::ControlOption>) {
     use super::handoff;
-    let modes: Vec<super::model::ModeOption> = to.modes().0.into_iter().filter(|m| !m.dangerous || allow_bypass).collect();
+    // An ACP agent that says its modes only once started: kiln's own, which every one takes.
+    let named = match to.modes().0 {
+        m if m.is_empty() && matches!(to.protocol, Protocol::Acp(_)) => super::acp::kiln_modes(),
+        m => m,
+    };
+    let modes: Vec<super::model::ModeOption> = named.into_iter().filter(|m| !m.dangerous || allow_bypass).collect();
     let offered: Vec<String> = modes.iter().map(|m| m.id.clone()).collect();
     let mode = handoff::mode_for(from.id, mode, to.id, &offered);
     let efforts: Vec<super::model::ControlOption> = super::kinds::models_of(to.id)
@@ -1804,10 +1837,12 @@ fn picks_up_there(st: &mut super::model::State) -> bool {
 }
 
 /// Go on in harness `sw.to` (the one the session ran in, `from`, has ended): the conversation so
-/// far read from `from`'s own record and written the way `sw.to` keeps its own, the permission
-/// mode and effort carried over. The session's id, timeline, changeset and queue stay. Returns
-/// the harness to start and, for one that takes it once started (Codex), the conversation; None:
-/// it couldn't be carried (said in the timeline), and the session stays in `from`.
+/// far read from `from`'s own record (or kiln's timeline, for a harness whose record kiln doesn't
+/// read) and written the way `sw.to` keeps its own (in words, for one that takes it so), the
+/// permission mode and effort carried over. The session's id, timeline, changeset and queue
+/// stay. Returns the harness to start and, for one that takes it once started (Codex, and in
+/// words an ACP agent or Antigravity), the conversation; None: it couldn't be carried (said in
+/// the timeline), and the session stays in `from`.
 async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usize, sink: &Sink) -> Option<(&'static Kind, Option<Vec<serde_json::Value>>)> {
     use super::handoff;
     let to = sw.to;
@@ -1815,10 +1850,10 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         let sp = s.spec.lock();
         (sp.env.clone(), sp.allow_bypass)
     };
-    let (cwd, session, old_model, mode, effort) = {
+    let (cwd, session, old_model, mode, effort, timeline) = {
         let core = s.core.lock();
         let st = &core.state;
-        (st.cwd.clone(), st.harness_session.clone(), st.model.clone(), st.mode.clone(), st.effort.clone())
+        (st.cwd.clone(), st.harness_session.clone(), st.model.clone(), st.mode.clone(), st.effort.clone(), timeline_of(from, core.events(), &st.todos))
     };
     let fail = |s: &Arc<Session>, text: String| {
         let mut core = s.core.lock();
@@ -1830,7 +1865,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
             e.body = super::model::Body::Notice { level: Level::Info, text: "Switch cancelled".to_owned() };
         }
     };
-    let c = match carried(from, to, &env, session, &cwd, &old_model, &mode, &effort, allow_bypass, &sw.model, None).await {
+    let c = match carried(from, to, &env, session, timeline, &cwd, &old_model, &mode, &effort, allow_bypass, &sw.model, None).await {
         Ok(c) => c,
         Err(e) => {
             fail(s, format!("{e}, so it goes on in {}.", from.name));
@@ -1850,12 +1885,15 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
             }
         }
         Record::Codex(items) => (None, Some(items)),
+        // Given with the first message it gets, as a move carries it (`moving::CONTEXT`).
+        Record::Words(text) => (None, Some(vec![serde_json::json!({"type": super::moving::CONTEXT, "text": text})])),
         Record::Nothing => (None, None),
     };
     {
         let mut sp = s.spec.lock();
         sp.kind = to.id.to_owned();
-        sp.model = Some(sw.model.clone());
+        // None chosen: the harness's own default.
+        sp.model = Some(sw.model.clone()).filter(|m| !m.is_empty());
         sp.mode.clone_from(&mode);
         sp.effort.clone_from(&effort);
         sp.speed = None;
@@ -1882,9 +1920,9 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         if unpaused.as_ref().is_some_and(|p| p.cut.is_some()) {
             core.state.queue.insert(0, super::model::QueueItem { id: format!("{}{}", super::pause::KILN_ID, crate::util::new_id()), text: super::pause::CONTINUE_ELSEWHERE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
         }
-        let mut text = format!("Now {} ({})", model_label(to, &sw.model), to.name);
+        let mut text = format!("Now {}", in_harness(to, &sw.model));
         if !empty {
-            text.push_str(" — the conversation carried over");
+            text.push_str(if to.own_record() { " — the conversation carried over" } else { " — the conversation carried over, in words with the next message" });
         }
         if unpaused.is_some() {
             text.push_str(&format!("; the pause for {}'s usage limit ended", from.name));
@@ -2427,7 +2465,7 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
         if !(kind.switchable() && to.switchable()) {
             return Err(format!("a conversation can't be carried from {} to {}", kind.name, to.name));
         }
-        let model = mv.model.as_deref().map_or_else(|| "its default model".to_owned(), |m| model_label(to, m));
+        let model = mv.model.as_deref().filter(|m| !m.is_empty()).map_or_else(|| "its default model".to_owned(), |m| model_label(to, m));
         let text = format!("Going on in {} ({model}) on {} — the conversation carries over", to.name, mv.to);
         s.core.lock().upsert(&format!("harness-switch:move-{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
     }
@@ -2455,17 +2493,20 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
             .await
             .map_err(|e| format!("{e:#}"))??
         }
-        // The other harness's own record of it, as a switch writes one (`carried`).
+        // The other harness's own record of it (or the conversation in words), as a switch
+        // writes one (`carried`).
         Some(to) => {
             let model = mv.model.clone().unwrap_or_default();
-            let c = carried(kind, to, &spec.env, session, &mv.cwd, &state.model, &state.mode, &state.effort, spec.allow_bypass, &model, Some(&note)).await?;
+            let timeline = timeline_of(kind, &events, &state.todos);
+            let c = carried(kind, to, &spec.env, session, timeline, &mv.cwd, &state.model, &state.mode, &state.effort, spec.allow_bypass, &model, Some(&note)).await?;
             let (carry, there) = match c.record {
                 Record::Claude { session, records } => (Carry::ClaudeLines { session: session.clone(), lines: records.iter().map(serde_json::Value::to_string).collect() }, Some(session)),
                 Record::Codex(items) => (Carry::Seed { items }, None),
+                Record::Words(text) => (Carry::Words { text }, None),
                 Record::Nothing => (Carry::Nothing, None),
             };
             to.id.clone_into(&mut spec.kind);
-            spec.model.clone_from(&mv.model);
+            spec.model = mv.model.clone().filter(|m| !m.is_empty());
             spec.mode.clone_from(&c.mode);
             spec.effort.clone_from(&c.effort);
             spec.speed = None;
@@ -3232,6 +3273,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                 }
                 *s.pid.lock() = None;
+                // A conversation carried in that it took is in its own session now, which it
+                // starts again on (Antigravity starts again for a new mode, model or effort); one
+                // it hasn't taken yet is given to it again.
+                if adapter.seeded() {
+                    seed = None;
+                }
                 if rewind_to.is_some() {
                     first = false;
                     continue;
@@ -3240,9 +3287,6 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     {
                         let mut core = s.core.lock();
                         adapter.exited(&mut core, None, None);
-                    }
-                    if adapter.seeded() {
-                        seed = None;
                     }
                     first = false;
                     continue;
@@ -3613,6 +3657,112 @@ mod tests {
         let top = ["max", "xhigh", "high"].into_iter().find(|l| efforts.iter().any(|e| e.id == *l));
         assert_eq!(effort.as_deref(), top, "{efforts:?}");
         Ok(())
+    }
+
+    /// Into Devin, Antigravity or another ACP agent too: named by its own modes (kiln's Ask and
+    /// Bypass for an agent that says its own only once started), at the same latitude.
+    #[test]
+    fn a_switch_into_any_harness_is_named_by_its_modes_at_the_same_latitude() -> anyhow::Result<()> {
+        use super::{Kind, carried_choices};
+        let kind = |id: &str| Kind::get(id).ok_or_else(|| anyhow::anyhow!("no {id}"));
+        let (claude, devin, agy, gemini) = (kind("claude")?, kind("devin")?, kind("antigravity")?, kind("gemini")?);
+        let (mode, _, modes, _) = carried_choices(claude, devin, "auto", "", true, "");
+        assert_eq!(mode.as_deref(), Some("smart"));
+        assert!(modes.iter().any(|m| m.id == "bypass" && m.dangerous), "{modes:?}");
+        let (mode, effort, modes, _) = carried_choices(devin, agy, "smart", "high", false, "");
+        assert_eq!((mode.as_deref(), effort.as_deref()), (Some("accept-edits"), Some("high")));
+        assert!(modes.iter().all(|m| !m.dangerous), "no bypass without leave to: {modes:?}");
+        let (mode, effort, modes, efforts) = carried_choices(claude, gemini, "bypassPermissions", "high", true, "");
+        assert_eq!(modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), [super::super::acp::KILN_ASK, super::super::acp::KILN_BYPASS]);
+        assert_eq!((mode.as_deref(), effort), (Some(super::super::acp::KILN_BYPASS), None), "{efforts:?}");
+        // Without leave to skip every check: kiln asks.
+        assert_eq!(carried_choices(claude, gemini, "bypassPermissions", "", false, "").0.as_deref(), Some(super::super::acp::KILN_ASK));
+        // A mode that only reads: nothing that low there, so its own default (kiln asks).
+        assert_eq!(carried_choices(claude, gemini, "plan", "", true, "").0, None);
+        // And out of one: Devin's plan stays plan in Claude Code.
+        assert_eq!(carried_choices(devin, claude, "plan", "", true, "opus").0.as_deref(), Some("plan"));
+        Ok(())
+    }
+
+    /// A conversation goes from any harness into any other: out of Devin's (kiln's timeline, with
+    /// the plan as it stands) into Claude Code's transcript and Codex's thread, each command as
+    /// their own call; out of Claude Code's own record into Devin's, and out of Devin's into
+    /// Antigravity's, in words with the first message; the permission mode at the same latitude.
+    #[test]
+    fn a_conversation_goes_from_any_harness_into_any_other() -> anyhow::Result<()> {
+        use super::super::handoff;
+        use super::super::model::{Body, Event, Todo, ToolCall};
+        let kind = |id: &str| Kind::get(id).ok_or_else(|| anyhow::anyhow!("no {id}"));
+        let (claude, codex, devin, agy, gemini) = (kind("claude")?, kind("codex")?, kind("devin")?, kind("antigravity")?, kind("gemini")?);
+        let ev = |id: &str, body: Body| Event { id: id.into(), seq: 0, at: 0, parent: None, by: None, body };
+        let said = |text: &str| Body::User { text: text.into(), images: 0, client_id: None, origin: Some("human".into()), attachments: vec![], reply_to: None };
+        let tool: ToolCall = serde_json::from_value(serde_json::json!({"tool_id": "t1", "name": "run_shell_command", "tool": "shell", "title": "date -u", "input": {"command": "date -u"}, "status": "done", "output": "Sun Oct 25 12:00:00 UTC 2026", "exit_code": 0, "started": 0}))?;
+        let events = vec![
+            ev("u1", said("what time is it?")),
+            ev("a1", Body::Assistant { text: "Reading the clock.".into(), streaming: false }),
+            ev("t1", Body::Tool(Box::new(tool))),
+            ev("a2", Body::Assistant { text: "It's noon, UTC.".into(), streaming: false }),
+        ];
+        let todos = vec![Todo { text: "read the clock once".into(), status: "in_progress".into() }];
+        let nothing: Vec<Event> = Vec::new();
+        crate::rt::block_on(async move {
+            // Out of Devin into Claude Code: a transcript it resumes, the command its own Bash call.
+            let c = carried(devin, claude, &[], None, timeline_of(devin, &events, &todos), "/w", "", "smart", "high", true, "opus", None).await.map_err(anyhow::Error::msg)?;
+            let Record::Claude { session, records } = &c.record else { anyhow::bail!("not a transcript") };
+            let lines: Vec<String> = records.iter().map(serde_json::Value::to_string).collect();
+            anyhow::ensure!(!session.is_empty() && lines.iter().any(|l| l.contains("what time is it?")) && lines.iter().any(|l| l.contains("\"Bash\"") && l.contains("date -u")), "{lines:?}");
+            anyhow::ensure!(lines.iter().any(|l| l.contains("began in Devin") && l.contains("- [~] read the clock once")), "the note, with the plan: {lines:?}");
+            assert_eq!((c.mode.as_deref(), c.effort.as_deref(), c.dropped, c.empty), (Some("auto"), Some("high"), 0, false));
+            // Into Codex: its new thread's history (from kiln's timeline, its own session's id
+            // notwithstanding).
+            let c = carried(devin, codex, &[], Some("devin-session".into()), timeline_of(devin, &events, &todos), "/w", "", "ask", "", true, "gpt-6.1-sol", None).await.map_err(anyhow::Error::msg)?;
+            let Record::Codex(items) = &c.record else { anyhow::bail!("not a thread's history") };
+            let all = serde_json::to_string(items)?;
+            anyhow::ensure!(all.contains("<kiln_handoff>") && all.contains("began in Devin and now continues here in Codex") && all.contains("what time is it?") && all.contains("exec_command") && all.contains("date -u") && all.contains("noon"), "{all}");
+            assert_eq!(c.mode.as_deref(), Some("untrusted"));
+            // Out of Gemini CLI (an ACP agent's own mode, placed by its words) into Claude Code.
+            let c = carried(gemini, claude, &[], None, timeline_of(gemini, &events, &todos), "/w", "gemini-3-pro", "autoEdit", "", true, "opus", None).await.map_err(anyhow::Error::msg)?;
+            let Record::Claude { records, .. } = &c.record else { anyhow::bail!("not a transcript") };
+            let all = serde_json::to_string(records)?;
+            anyhow::ensure!(all.contains("began in Gemini CLI (model gemini-3-pro)") && all.contains("It's noon, UTC."), "{all}");
+            assert_eq!(c.mode.as_deref(), Some("acceptEdits"));
+            // Out of Claude Code: from its own record (never kiln's timeline) into Devin, in words.
+            let dir = tempfile::tempdir()?;
+            let env = vec![("CLAUDE_CONFIG_DIR".to_owned(), dir.path().to_string_lossy().into_owned())];
+            let recs = handoff::to_claude(&handoff::from_events(&events), None, "S1", "/w", "claude-opus-5-5");
+            handoff::write_claude(&env, "/w", "S1", &recs)?;
+            anyhow::ensure!(timeline_of(claude, &events, &todos).is_none() && timeline_of(codex, &events, &todos).is_none(), "Claude Code's and Codex's own records are read, not kiln's timeline");
+            let c = carried(claude, devin, &env, Some("S1".into()), None, "/w", "claude-opus-5-5", "acceptEdits", "max", true, "", None).await.map_err(anyhow::Error::msg)?;
+            let Record::Words(text) = &c.record else { anyhow::bail!("not in words") };
+            anyhow::ensure!(text.starts_with("<kiln_handoff>\nThis conversation began in Claude Code (model claude-opus-5-5) and now continues here in Devin") && text.contains("each described in words"), "{text}");
+            anyhow::ensure!(text.contains("The person said:\nwhat time is it?") && text.contains("You ran `date -u` (exit code 0); it returned:\nSun Oct 25") && text.ends_with("</kiln_handoff>"), "{text}");
+            assert_eq!(c.mode.as_deref(), Some("accept-edits"));
+            // Its record unreadable: it says so (and the session stays where it is).
+            let e = carried(claude, devin, &env, Some("missing".into()), None, "/w", "", "", "", true, "", None).await.err().unwrap_or_default();
+            anyhow::ensure!(e.contains("could not read Claude Code's record"), "{e}");
+            // Out of Devin into Antigravity: in words too, a move's note after the switch's.
+            let c = carried(devin, agy, &[], None, timeline_of(devin, &events, &todos), "/w", "", "plan", "", true, "", Some("It moved to mac.")).await.map_err(anyhow::Error::msg)?;
+            let Record::Words(text) = &c.record else { anyhow::bail!("not in words") };
+            anyhow::ensure!(text.contains("continues here in Antigravity CLI") && text.contains("It moved to mac.") && text.contains("- [~] read the clock once"), "{text}");
+            assert_eq!(c.mode.as_deref(), Some("plan"));
+            // Nothing said yet: nothing to carry.
+            let c = carried(gemini, devin, &[], None, timeline_of(gemini, &nothing, &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(c.empty && matches!(c.record, Record::Nothing));
+            // A long one goes in words in less room than a harness's own record takes.
+            let mut long = vec![ev("u0", said("the goal"))];
+            long.extend((0..400).map(|i| ev(&format!("a{i}"), Body::Assistant { text: format!("{i} {}", "x".repeat(1000)), streaming: false })));
+            let c = carried(gemini, devin, &[], None, timeline_of(gemini, &long, &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
+            let Record::Words(text) = &c.record else { anyhow::bail!("not in words") };
+            anyhow::ensure!(
+                c.dropped > 0 && text.len() < handoff::WORDS_BUDGET + 16 * 1024 && text.contains("the goal") && text.contains(&format!("{} older messages were left out", c.dropped)) && text.contains(&format!("[{} earlier message(s)", c.dropped)),
+                "{} bytes, {} left out",
+                text.len(),
+                c.dropped
+            );
+            let c = carried(gemini, claude, &[], None, timeline_of(gemini, &long, &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(c.dropped == 0, "{} left out of Claude Code's", c.dropped);
+            Ok(())
+        })
     }
 
     #[test]

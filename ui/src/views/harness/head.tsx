@@ -15,7 +15,7 @@ import { RoundButton } from "./figure/figure";
 import { AtLimit } from "./elsewhere";
 import { LimitBadge, topLimit, UsagePanel } from "./limits";
 import { machineName } from "./parts";
-import { RunSettings, type RunSettingsProps } from "./run-settings";
+import { modelIn, RunSettings, type RunSettingsProps } from "./run-settings";
 import { NameField, type useAgentActions } from "./actions";
 import { formatThought } from "./signals";
 import { subagentsAtWork, subagentTasksAtWork, workingThrough } from "./tasks";
@@ -44,7 +44,9 @@ function TurnControl({ tone, label, action, onClick, restart = false }: { tone: 
       <RoundButton className="ag-turn-control" data-state={tone} label={action ? `${label} · ${action}` : label} disabled={!onClick} onClick={onClick}>
         {restart ? <RotateCcw size={15} aria-hidden="true" /> : <Pause size={15} aria-hidden="true" />}
       </RoundButton>
-      <span className="sr-only" role="status">{label}</span>
+      <span className="sr-only" role="status">
+        {label}
+      </span>
     </>
   );
 }
@@ -59,7 +61,11 @@ function StoppingControl({ stopAt, onForce, unavailable }: { stopAt: number; onF
  *  turn runs, and keeps room for hours. */
 function TurnTime({ started }: { started: number }) {
   const now = useClock(1000);
-  return <span className="ag-turn-time" title="Time in this turn" aria-label={`Time in this turn: ${formatThought((now - started) / 1000)}`}>{formatThought((now - started) / 1000)}</span>;
+  return (
+    <span className="ag-turn-time" title="Time in this turn" aria-label={`Time in this turn: ${formatThought((now - started) / 1000)}`}>
+      {formatThought((now - started) / 1000)}
+    </span>
+  );
 }
 
 /** Between turns the clock stops where the last one ended. */
@@ -122,7 +128,11 @@ export function AgentHeader({
   const left = state?.left_behind ?? info?.left_behind ?? 0;
   const openShell = info?.shell ? () => navigate(`/terminal?session=${encodeURIComponent(info.shell ?? "")}`) : null;
   // Settings always: kiln's own (usage limits) are there whatever the harness offers.
-  const extra = [...(left > 0 && onBackground ? [{ label: `${left} left running…`, onSelect: onBackground }] : []), ...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), { label: "Settings…", onSelect: onSettings }];
+  const extra = [
+    ...(left > 0 && onBackground ? [{ label: `${left} left running…`, onSelect: onBackground }] : []),
+    ...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []),
+    { label: "Settings…", onSelect: onSettings },
+  ];
   // Newer Codex adapters can interrupt and continue a turn to apply its permissions immediately.
   const permissionsLive = features.includes("permissions_live");
   const nextTurn = info?.kind === "codex" ? { mode: !permissionsLive, model: true, effort: true } : undefined;
@@ -137,8 +147,12 @@ export function AgentHeader({
     onMode: !switching && features.includes("set_mode") ? (m) => send({ type: "set_mode", mode: m }) : undefined,
     modeCanReapply: permissionsLive && running,
     models: meta?.models ?? [],
-    model: switching?.model ?? state?.model ?? info?.model ?? "",
-    onModel: features.includes("set_model") ? (m, kind) => send(kind && kind !== info?.kind ? { type: "set_model", model: m, kind } : { type: "set_model", model: m }) : undefined,
+    // A switch waiting shows as that harness's model (its own default, for none).
+    model: switching ? modelIn(switching.kind, switching.model) : (state?.model ?? info?.model ?? ""),
+    onModel:
+      features.includes("set_model") || features.includes("switch_harness")
+        ? (m, kind) => send(kind && kind !== info?.kind ? { type: "set_model", model: m, kind } : { type: "set_model", model: m })
+        : undefined,
     harness: switching?.kind ?? info?.kind,
     modelLabel,
     efforts: switching ? (switching.efforts ?? []) : (meta?.efforts ?? []),
@@ -207,8 +221,15 @@ export function AgentHeader({
           )}
         </div>
         <div className="ag-actions">
-          {canStop && stopAt != null ? <StoppingControl stopAt={stopAt} onForce={onForceStop} unavailable={unavailable} /> : (
-            <TurnControl {...signal} action={canStop ? "Stop the current turn" : canRestart ? "Restart" : undefined} onClick={canStop ? onStop : canRestart ? () => send({ type: "restart" }) : undefined} restart={canRestart} />
+          {canStop && stopAt != null ? (
+            <StoppingControl stopAt={stopAt} onForce={onForceStop} unavailable={unavailable} />
+          ) : (
+            <TurnControl
+              {...signal}
+              action={canStop ? "Stop the current turn" : canRestart ? "Restart" : undefined}
+              onClick={canStop ? onStop : canRestart ? () => send({ type: "restart" }) : undefined}
+              restart={canRestart}
+            />
           )}
           {onFind && (
             <RoundButton label="Find in the conversation (Ctrl F)" onClick={onFind}>
@@ -232,15 +253,11 @@ export function AgentHeader({
         </div>
       </div>
       <div className="ag-clock-row">
-        {running && state?.turn_started != null ? (
-          <TurnTime started={state.turn_started} />
-        ) : state?.last_turn && lastTurnFrom != null ? (
-          <TurnTook ms={state.last_turn.at - lastTurnFrom} />
-        ) : null}
+        {running && state?.turn_started != null ? <TurnTime started={state.turn_started} /> : state?.last_turn && lastTurnFrom != null ? <TurnTook ms={state.last_turn.at - lastTurnFrom} /> : null}
       </div>
       {switchTarget ? (
         <React.Suspense fallback={<RunSettings {...line} />}>
-          <RunSettingsElsewhere {...line} target={switchTarget} />
+          <RunSettingsElsewhere {...line} target={switchTarget} own={info?.kind} />
         </React.Suspense>
       ) : (
         <RunSettings {...line} />
@@ -266,9 +283,9 @@ export function AgentHeader({
   );
 }
 
-/** The line with the models of the other harnesses on the agent's machine it can go on in (its conversation carried over). */
-function RunSettingsElsewhere({ target, ...line }: RunSettingsProps & { target: string }) {
+/** The line with the models of the other harnesses on the agent's machine it can go on in (its conversation carried over), the one a switch waits for among them; `own`: the harness it runs in. */
+function RunSettingsElsewhere({ target, own, ...line }: RunSettingsProps & { target: string; own?: string }) {
   const kinds = useSuspenseResource(`harness-kinds/${target}`, () => harnessApi.kinds(target).catch((): KindInfo[] => []), { pollMs: 120_000 });
-  const elsewhere = kinds.data.filter((k) => k.switch && k.available && k.id !== line.harness).map((k) => ({ kind: k.id, name: k.name, models: k.models ?? [] }));
+  const elsewhere = kinds.data.filter((k) => k.switch && k.available && k.id !== own).map((k) => ({ kind: k.id, name: k.name, models: k.models ?? [] }));
   return <RunSettings {...line} elsewhere={elsewhere} />;
 }

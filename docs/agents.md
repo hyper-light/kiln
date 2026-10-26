@@ -76,6 +76,18 @@ again on the same conversation. A new model, effort or mode is a flag, so it sta
 between turns. Files you attach go to it as their paths on its machine; its models come from
 `agy models`.
 
+An agent goes on in any other of these harnesses, its conversation carried over: picking another
+harness's model in the head's line (`set_model` with `kind`; a harness that lists no models yet
+offers its own default) switches it once the turn under way ends. The conversation is read from
+Claude Code's transcript or Codex's rollout where it ran there, else from kiln's timeline with the
+plan as it stands, and only what the model still sees goes (`harness/handoff.rs`). Claude Code
+takes it as a transcript it resumes and Codex as its new thread's history, each call as its own
+where it has one; Devin, the other ACP agents and Antigravity take it in words, given once with the
+first message they get (a restart before that gives it then), in less room. The permission mode
+goes at the same latitude, never wider (an ACP agent that names its modes only once started gets
+kiln's Ask, or Bypass from a mode that skipped every check), and the effort as near as the model
+takes. The timeline marks the line between the two.
+
 ## Where a harness is found
 
 A machine offers a harness (`/api/harness/kinds`, the machines the new-agent dialog lists) when its
@@ -1046,7 +1058,8 @@ turn (`harness/pause.rs`):
   harness chosen are the only ones it goes to; otherwise kiln picks one that is
   connected, takes sessions over (reach), and has the same harness signed in to another account,
   one kiln doesn't know to be as full. Failing that, another harness its conversation can be
-  carried into (Claude Code ⇄ Codex), signed in with room, with the first model it lists there.
+  carried into (any other), signed in with room, with the first model it lists there (its own
+  default, when it lists none).
   Its own harness comes first, then a machine with a copy of its repository, then the emptiest
   account; a repository not there yet is copied over and kept in step. It moves as a move you ask
   for does (`docs/reach.md` §8), and goes on there unpaused, the cut-off turn first. With nowhere
@@ -1055,7 +1068,7 @@ turn (`harness/pause.rs`):
   seconds, with the way to upgrade it; one from before a machine could be chosen offers only
   "wherever has room".
 - **Go on now.** The paused line above the composer: resume now, resume at the reset or not, or
-  go on now: here in another harness (Claude Code ⇄ Codex), or on another machine that takes
+  go on now: here in another harness (any other on its machine), or on another machine that takes
   agents over, in its own harness or one its conversation can be carried into, with the model
   chosen; the turn the limit cut off goes on there. What you do there that its runner doesn't do
   (an older kiln: it stops again at its stop point as it resumes, or leaves a command it doesn't

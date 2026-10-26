@@ -483,7 +483,8 @@ impl Adapter {
     }
 
     /// Start with a conversation carried over from another harness, in the harness's own form
-    /// (Codex: Responses items for its new thread; Claude Code reads its own from a transcript).
+    /// (Codex: Responses items for its new thread; Claude Code reads its own from a transcript;
+    /// an ACP agent and Antigravity take it in words, with the first message they get).
     pub fn seed(&mut self, items: Vec<serde_json::Value>) {
         // The conversation in words (`moving::Carry::Words`), for a harness that takes it only with
         // its first message.
@@ -496,11 +497,14 @@ impl Adapter {
         }
     }
 
-    /// That conversation is in (or there was none).
+    /// That conversation is in (or there was none): an ACP agent and Antigravity have it once
+    /// they were given it with a message, so one started again before that is given it then.
     pub fn seeded(&self) -> bool {
         match self {
             Self::Codex(a) => a.seeded(),
-            Self::Claude(_) | Self::Acp(_) | Self::Agy(_) => true,
+            Self::Acp(a) => a.seeded(),
+            Self::Agy(a) => a.seeded(),
+            Self::Claude(_) => true,
         }
     }
 }
@@ -574,9 +578,17 @@ impl Kind {
         }
     }
 
-    /// A conversation can be carried into it from another harness (and out of it): kiln reads
-    /// and writes its own record of one.
+    /// A conversation can be carried into it from another harness (and out of it): every harness
+    /// kiln runs as a structured session. One with its [`own_record`](Self::own_record) is read
+    /// and written as it keeps it; any other is read from kiln's timeline and given the
+    /// conversation in words, with the first message it gets.
     pub fn switchable(&self) -> bool {
+        self.structured()
+    }
+
+    /// kiln reads and writes its own record of a conversation (Claude Code's transcript, Codex's
+    /// thread), so a conversation carried into it or out of it goes as that record.
+    pub fn own_record(&self) -> bool {
         matches!(self.protocol, Protocol::ClaudeStreamJson | Protocol::CodexAppServer)
     }
 

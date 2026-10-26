@@ -99,6 +99,11 @@ function modeWords(modes: ModeOption[], current: string): Word[] {
   });
 }
 
+/** Another harness's model as its word's id, its own (two harnesses may list the same model); `model` "": its own default, for one that lists none yet. */
+export const modelIn = (kind: string, model: string) => `kiln-in:${kind}:${model}`;
+/** The model a word stands for ("" another harness's own default). */
+const modelOfWord = (id: string) => /^kiln-in:[^:]*:([\s\S]*)$/.exec(id)?.[1] ?? id;
+
 /** A model reads as `modelLabel` makes it ("Opus 5.5") when that knows the id, else as the harness names it. */
 function modelWord(m: { id: string; label?: string; description?: string }, pretty: (id: string) => string): Word {
   const p = pretty(m.id);
@@ -107,8 +112,9 @@ function modelWord(m: { id: string; label?: string; description?: string }, pret
 
 function modelWords(models: ModelOption[], current: string, pretty: (id: string) => string): Word[] {
   const list = models.map((m) => modelWord(m, pretty));
-  // The agent's own model, when the harness doesn't list it, goes last: the families keep the harness's order.
-  return current && !list.some((w) => w.id === current) ? [...list, modelWord({ id: current }, pretty)] : list;
+  // The agent's own model, when the harness doesn't list it, goes last: the families keep the harness's order. Another
+  // harness's (a switch waiting) reads as its model, or "Default".
+  return current && !list.some((w) => w.id === current) ? [...list, { ...modelWord({ id: modelOfWord(current) || "default" }, pretty), id: current }] : list;
 }
 
 function effortWords(efforts: ControlOption[], current: string): Word[] {
@@ -138,10 +144,7 @@ function versionText(w: Word, family: string): string {
 
 /** "5.5 (1M)" → [5, 5]. */
 function versionNumbers(text: string): number[] {
-  return (text.match(/\d+(?:\.\d+)*/)?.[0] ?? "")
-    .split(".")
-    .filter(Boolean)
-    .map(Number);
+  return (text.match(/\d+(?:\.\d+)*/)?.[0] ?? "").split(".").filter(Boolean).map(Number);
 }
 
 /** Newest first; the plain version before its variants ("5.5" before "5.5 (1M)"). */
@@ -395,9 +398,7 @@ function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; o
           </button>
         )}
       </p>
-      {versions && current && own.length > 1 && (
-        <WordRow label={`${current.name} versions`} words={own.map((v) => ({ ...v, text: versionText(v, current.name) }))} value={value} onPick={onPick} />
-      )}
+      {versions && current && own.length > 1 && <WordRow label={`${current.name} versions`} words={own.map((v) => ({ ...v, text: versionText(v, current.name) }))} value={value} onPick={onPick} />}
     </div>
   );
 }
@@ -460,6 +461,7 @@ function SpeedBolt({ line, onPick }: { line: SpeedLine; onPick?: () => void }) {
 export interface Elsewhere {
   kind: string;
   name: string;
+  /** As its sessions there last listed them; none listed yet, it's chosen with its own default. */
   models: ModelOption[];
 }
 
@@ -564,8 +566,16 @@ export function RunSettings({
   // Codex's Custom label describes separate controls; it isn't a preset that can be selected.
   const isPreset = (id: string) => modes.some((m) => m.id === id) && !(harness === "codex" && id === "custom");
   const availableModes = modes.filter((m) => isPreset(m.id) || m.id === shown("mode"));
-  // The other harnesses' models, by harness (they switch the agent there).
-  const groups = onModel ? elsewhere.filter((h) => h.models.length > 0).map((h) => ({ ...h, words: h.models.map((m) => ({ ...modelWord(m, modelLabel), kind: h.kind })) })) : [];
+  // The other harnesses' models, by harness (they switch the agent there); one that lists none yet, its own default.
+  const groups = onModel
+    ? elsewhere.map((h) => ({
+        ...h,
+        words:
+          h.models.length > 0
+            ? h.models.map((m) => ({ ...modelWord(m, modelLabel), id: modelIn(h.kind, m.id), kind: h.kind }))
+            : [{ id: modelIn(h.kind, ""), text: "Default", full: "Its default model", kind: h.kind }],
+      }))
+    : [];
   const others = groups.flatMap((g) => g.words);
   // The agent's own models (its current one among them, unless that is another harness's: a switch waiting).
   const own = modelWords(models, others.some((w) => w.id === shown("model")) ? "" : shown("model"), modelLabel);
@@ -574,7 +584,8 @@ export function RunSettings({
     model: { words: [...own, ...others], count: models.length + others.length, pick: onModel },
     effort: { words: effortWords(efforts, shown("effort")), count: efforts.length, pick: onEffort },
   };
-  const kindOf = (id: string) => others.find((w) => w.id === id)?.kind ?? harness;
+  // Another harness's model goes there; the agent's own stays (or comes back from a switch waiting).
+  const kindOf = (id: string) => others.find((w) => w.id === id)?.kind;
   const nameOf = (k: Kind, id: string) => sets[k].words.find((w) => w.id === id)?.full ?? id;
   const editable = (k: Kind) => Boolean(sets[k].pick && sets[k].count > 0);
   const nextTurn = (k: Kind) => Boolean(running && appliesNextTurn?.[k]);
@@ -641,13 +652,15 @@ export function RunSettings({
     const reapply = k === "mode" && modeCanReapply && isPreset(to) && to === prev;
     if (!pick || (to === prev && !reapply) || (k === "mode" && !isPreset(to))) return;
     const [prevKind, toKind] = k === "model" ? [kindOf(prev), kindOf(to)] : [undefined, undefined];
-    if (k === "model" && onModel) onModel(to, toKind);
+    if (k === "model" && onModel) onModel(modelOfWord(to), toKind);
     else pick(to);
     setChange({ kind: k, base: actual[k], prev, to, undoable: Boolean(prev) && !reapply && (k !== "mode" || isPreset(prev)), prevKind, toKind });
     setArmed(null);
     setTick((t) => t + 1);
     const there = groups.find((g) => g.kind === toKind)?.name;
-    setSaid(`${KEY[k]}: ${nameOf(k, to)}${there ? `, in ${there}: the conversation carries over${running ? " at the end of this turn" : ""}` : nextTurn(k) ? ", from the next turn" : reapply ? ", applying now" : ""}`);
+    setSaid(
+      `${KEY[k]}: ${nameOf(k, to)}${there ? `, in ${there}: the conversation carries over${running ? " at the end of this turn" : ""}` : nextTurn(k) ? ", from the next turn" : reapply ? ", applying now" : ""}`,
+    );
   };
 
   const choose = (k: Kind, w: Word, reapply = false) => {
@@ -667,7 +680,7 @@ export function RunSettings({
     if (!change?.undoable) return;
     const { kind: k, prev, to, prevKind, toKind } = change;
     // A switch undone goes back to the harness the agent was in (or doesn't happen).
-    if (k === "model" && onModel) onModel(prev, prevKind);
+    if (k === "model" && onModel) onModel(modelOfWord(prev), prevKind);
     else sets[k].pick?.(prev);
     setChange({ kind: k, base: actual[k], prev: to, to: prev, undoable: false, prevKind: toKind, toKind: prevKind });
     setArmed(null);
@@ -688,7 +701,7 @@ export function RunSettings({
   // Every setting keeps its column, even when a harness has no value for it yet.
   const parts = KINDS.map((k) => ({
     k,
-    text: shown(k) ? sets[k].words.find((w) => w.id === shown(k))?.text ?? shown(k) : editable(k) ? KEY[k] : "—",
+    text: shown(k) ? (sets[k].words.find((w) => w.id === shown(k))?.text ?? shown(k)) : editable(k) ? KEY[k] : "—",
     empty: !shown(k),
   }));
 
@@ -700,7 +713,7 @@ export function RunSettings({
     if (k === "model") {
       return (
         <>
-          <ModelChoice words={own} value={shown(k)} onPick={pick} />
+          {own.length > 0 && <ModelChoice words={own} value={shown(k)} onPick={pick} />}
           {after}
           {groups.map((g) => (
             <div key={g.kind} className="rs-elsewhere" role="group" aria-label={`${g.name} models`}>
@@ -774,10 +787,16 @@ export function RunSettings({
           <span className="rs-values">
             {parts.map((p, i) => (
               <React.Fragment key={p.k}>
-                {i > 0 && <span className="rs-sep" aria-hidden="true">·</span>}
+                {i > 0 && (
+                  <span className="rs-sep" aria-hidden="true">
+                    ·
+                  </span>
+                )}
                 {editable(p.k) ? (
                   <button
-                    ref={(el) => { values.current[p.k] = el; }}
+                    ref={(el) => {
+                      values.current[p.k] = el;
+                    }}
                     type="button"
                     className="rs-v"
                     data-kind={p.k}
@@ -801,7 +820,14 @@ export function RunSettings({
           {speeds.length > 0 && <SpeedBolt line={speedLine} onPick={onSpeed ? pickSpeed : undefined} />}
         </p>
         <div className="rs-extra">
-          {trailing && <><span className="rs-divider" aria-hidden="true">|</span>{trailing}</>}
+          {trailing && (
+            <>
+              <span className="rs-divider" aria-hidden="true">
+                |
+              </span>
+              {trailing}
+            </>
+          )}
         </div>
         {undoable && (
           <span className="rs-after">
