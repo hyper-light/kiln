@@ -55,7 +55,8 @@ jobs:
       - name: ui
         run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
         memo: { inputs: [ui], outputs: [ui/dist], platform: any, tools: { node: major } }
-      - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui typecheck && npm run --prefix ui lint
+      # Against the wire types made from Rust (ui/src/api/wire, held to the Rust by `wire::ts`).
+      - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui typecheck && npm run --prefix ui lint && npm --prefix ui test
 
   ui-checks:
     name: ui checks (Chromium and WebKit, desktop and phone)

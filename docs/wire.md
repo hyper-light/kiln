@@ -646,6 +646,15 @@ A command over the API under an `Idempotency-Key` is taken once the same way; th
 for each. A message there is its inbox's to take once (CP-T3.2). A server that restarts lets go of
 its ids, so a command sent again to it goes on again. A message's inbox still takes it once.
 
+Each socket's frames are a Rust type each way, and the server builds what it sends from them:
+`crate::wire::ui` for the session, terminal, stream and log sockets (`SessionDown` and `SessionUp`
+for a session's, its `ack` and `nack` among them), `crate::wire::events::ServerEvent` for
+`/api/events`. The UI reads them, and the `Command`s, `Update`s and runner records they carry, as
+TypeScript made from those types with ts-rs, checked in under `ui/src/api/wire/`; it writes no copy
+of its own. `cargo test -p kiln wire::ts` fails, naming the file and its first difference, when a
+type changes without its file, and `KILN_WRITE_TS=1 cargo test -p kiln wire::ts` writes them. Both
+CIs typecheck the UI against them.
+
 | Socket | Way | Message | Class | Why | Today |
 |---|---|---|---|---|---|
 | `/api/harness/sessions/:id/ws` | up | `cmd` | command, as its `Command` says | A command under the id its client made. | Taken once per id, answered `ack` or `nack`, and sent again by the client on its next socket until then (plan step 7). |

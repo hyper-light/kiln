@@ -39,6 +39,7 @@ pub const ACTION: &str = "security.wire_refused";
 
 /// A wire, and which way along it: what reads it and what sent it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Wire {
     /// A runner's frames, as the server reads them.
@@ -145,6 +146,8 @@ impl Wire {
 
 /// Why a message couldn't be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "UnreadCode"))]
 #[serde(rename_all = "snake_case")]
 pub enum Code {
     /// A kind of message this build doesn't know: a newer peer's.
@@ -176,6 +179,8 @@ impl Code {
 
 /// Where a message that couldn't be read came from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "UnreadSender"))]
 #[serde(rename_all = "snake_case")]
 pub enum Sender {
     /// A runner, by its name, and which of its processes (its instance).
@@ -231,6 +236,7 @@ pub enum Page {
 
 /// A message a wire couldn't read: never what it said, only what kind it was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Unread {
     pub wire: Wire,
     pub from: Sender,
@@ -262,6 +268,8 @@ fn cut(s: &mut String, most: usize) {
 
 /// How many refusals of one wire and code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "RefusedCount"))]
 pub struct Count {
     pub wire: Wire,
     pub code: Code,
@@ -270,6 +278,8 @@ pub struct Count {
 
 /// A refusal kept for a page, and when it was noted (milliseconds since the Unix epoch).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "RefusedMessage"))]
 pub struct Refused {
     pub at: i64,
     pub unread: Unread,
@@ -277,10 +287,13 @@ pub struct Refused {
 
 /// What's kept of a runner's or an agent session's refusals, for its page.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "RefusedMessages"))]
 pub struct Kept {
     /// How many, by wire and code, in the order each first came.
     pub counts: Vec<Count>,
     /// The newest, the newest last.
+    #[cfg_attr(test, ts(as = "Vec<Refused>"))]
     pub newest: VecDeque<Refused>,
 }
 

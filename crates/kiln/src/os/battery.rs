@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// A machine's battery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Battery {
     /// How full, 0–100.
     pub percent: u8,
@@ -19,6 +20,7 @@ pub struct Battery {
     pub charging: bool,
     /// Minutes left on battery, when the machine says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub minutes: Option<u32>,
 }
 

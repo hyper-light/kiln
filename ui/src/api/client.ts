@@ -1,5 +1,5 @@
 import { apiPath } from "@/lib/peer-base";
-import type { Agent, AgentKeep, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JobTools, ToolFix, JoinInfo, JoinRequest, KeepRules, KeepView, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncMode, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
+import type { Agent, AgentKeep, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JobTools, ToolFix, JoinInfo, JoinRequest, KeepRules, KeepView, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunRow, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncMode, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -238,7 +238,7 @@ export const api = {
 
   /** Newest first, older pages `before` a time; or by `sort` (`oldest`, `longest`, `shortest`), later pages from `offset`. */
   runs: (params: { repo?: string; limit?: number; before?: string | number; sort?: string; offset?: number }, signal?: AbortSignal) =>
-    get<Run[]>(`/api/runs${qs({ repo: params.repo, limit: params.limit ?? 50, before: params.before, sort: params.sort, offset: params.offset })}`, signal),
+    get<RunRow[]>(`/api/runs${qs({ repo: params.repo, limit: params.limit ?? 50, before: params.before, sort: params.sort, offset: params.offset })}`, signal),
   run: (id: string, signal?: AbortSignal, attempt?: number) => get<RunDetail>(`/api/runs/${enc(id)}${attempt ? `?attempt=${attempt}` : ""}`, signal),
   cancelRun: (id: string) => post<void>(`/api/runs/${enc(id)}/cancel`),
   retryRun: (id: string, onlyFailed: boolean) => post<void>(`/api/runs/${enc(id)}/retry`, { only_failed: onlyFailed }),

@@ -23,6 +23,7 @@ use crate::net::{Kind, NetEvent, NetHandle};
 use crate::pipeline::Context;
 use crate::proto::{self, AgentMsg, Assignment, Hello, JobResult, LANE_CONTROL, LANE_TERM, ServerMsg};
 use crate::store::{AgentRow, Job, Status, Store};
+use crate::wire::events::ServerEvent;
 
 /// How long a persistent agent may be gone before its jobs are requeued.
 pub(crate) const AGENT_GRACE: Duration = Duration::from_secs(45);
@@ -255,6 +256,7 @@ fn stream_of(msg: &ServerMsg) -> Option<crate::wire::commands::Kind> {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct AgentLive {
     pub name: String,
     #[serde(skip)]
@@ -275,16 +277,20 @@ pub struct AgentLive {
     pub sample: Option<HostSample>,
     /// Its battery, when it has one and its runner says ([`AgentMsg::Power`]).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub battery: Option<crate::os::battery::Battery>,
     /// What its QUIC layer let go before the wire, by lane and reason, as it last said
     /// ([`AgentMsg::NetDrops`]); and what the server's let go of what it had for it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<proto::NetDrop>>", optional))]
     pub dropped: Vec<proto::NetDrop>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<proto::NetDrop>>", optional))]
     pub dropped_toward: Vec<proto::NetDrop>,
     /// What of its messages the server couldn't read, and of the server's it couldn't
     /// (`crate::wire::unread`): how many by wire and code, and the newest.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub refused: Option<crate::wire::unread::Kept>,
     pub terminal: bool,
     /// An outpost (`kiln outpost`, [`crate::proto::CAP_OUTPOST`]): kiln run where it isn't
@@ -298,13 +304,16 @@ pub struct AgentLive {
     pub lost_at: Option<Instant>,
     /// What the runner's probes found and its administrator declared (docs/ci.md W13-R01, R02).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub facts: Option<Box<kiln_ci::facts::RunnerFacts>>,
     /// The machine's runner processes, while it has more than one (a runner replaced without a
     /// restart: the old one keeps its terminals until they end). See `crate::instances`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<crate::instances::InstanceView>>", optional))]
     pub instances: Vec<crate::instances::InstanceView>,
     /// How its connection reaches the server, while connected (`GET /api/agents`).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub transport: Option<crate::tunnel::Transport>,
     /// How far its (newest process's) kiln is behind the server's (`crate::skew`): to be upgraded,
     /// it takes no new work.
@@ -592,7 +601,7 @@ impl Hub {
                 let targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
                 tracing::info!(run = run.number, targets = ?targets, "runners' binaries built by the release pipeline");
                 self.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} run #{} ({}): {}", run.pipeline, run.number, run.sha.get(..12).unwrap_or(&run.sha), targets.join(", "))).await;
-                self.emit(&serde_json::json!({ "type": "updates" }));
+                self.emit(&ServerEvent::Updates);
                 self.updates.fleet.wake();
             }
             Ok(_) => {}
@@ -695,7 +704,7 @@ impl Hub {
         match crate::sync::wire::decode(json) {
             Some(crate::sync::wire::Msg::Repos(r)) => {
                 if self.places.heard(machine, r) {
-                    self.emit(&serde_json::json!({ "type": "places" }));
+                    self.emit(&ServerEvent::Places);
                 }
                 // Said when it connects, and when what it holds changes: what it shares.
                 self.shares.arrange(self);
@@ -738,30 +747,31 @@ impl Hub {
 
     /// Tell every UI that the session list changed.
     pub fn emit_terminals(&self) {
-        self.emit(&serde_json::json!({ "type": "terminals" }));
+        self.emit(&ServerEvent::Terminals);
     }
 
-    pub fn emit(&self, v: &serde_json::Value) {
+    /// Sends `e` down every events socket (`GET /api/events`) and to kiln's own listeners.
+    pub fn emit(&self, e: &ServerEvent) {
         if self.events.receiver_count() > 0 {
-            self.events.send(Arc::from(v.to_string()));
+            self.events.send(Arc::from(e.text()));
         }
     }
 
     pub async fn emit_job(&self, job_id: &str) {
         if let Ok(Some(mut j)) = self.store.job(job_id.to_owned()).await {
             j.spec = None;
-            self.emit(&serde_json::json!({"type": "job", "job": j}));
+            self.emit(&ServerEvent::Job { job: Box::new(j) });
         }
     }
 
     pub async fn emit_run(&self, run_id: &str) {
         if let Ok(Some(r)) = self.store.run(run_id.to_owned()).await {
-            self.emit(&serde_json::json!({"type": "run", "run": r}));
+            self.emit(&ServerEvent::Run { run: Box::new(r) });
         }
     }
 
     pub(crate) fn emit_agent(&self, a: &AgentLive) {
-        self.emit(&serde_json::json!({"type": "agent", "agent": a}));
+        self.emit(&ServerEvent::Agent { agent: Box::new(a.clone()) });
     }
 
     /// A message a wire couldn't read (`crate::wire::unread`): counted, kept for its sender's page
@@ -815,9 +825,7 @@ impl Hub {
 
     pub fn emit_queue(&self) {
         let m = metrics::global();
-        self.emit(&serde_json::json!({
-            "type": "queue", "queued": m.jobs_queued.get(), "running": m.jobs_running.get()
-        }));
+        self.emit(&ServerEvent::Queue(crate::wire::events::Queue::Counts { queued: m.jobs_queued.get(), running: m.jobs_running.get() }));
     }
 
     pub fn record_sample(&self, agent: &str, s: HostSample) {
@@ -832,7 +840,7 @@ impl Hub {
         if agent != "server" {
             metrics::agent_samples().write().insert(agent.to_owned(), s.clone());
         }
-        self.emit(&serde_json::json!({"type": "sample", "agent": agent, "sample": s}));
+        self.emit(&ServerEvent::Sample { agent: agent.to_owned(), sample: Box::new(s) });
     }
 
     // ------------------------------------------------------------ agent view
@@ -1457,7 +1465,7 @@ impl Hub {
             let what = format!("{agent} is on battery at {}%{left}: plug it in, or it sleeps and its runner with it", b.percent);
             tracing::warn!(machine = %agent, percent = b.percent, minutes = ?b.minutes, "a machine on battery is low");
             self.store.audit("kiln".into(), "machine.battery_low".into(), what.clone()).await;
-            self.emit(&serde_json::json!({"type": "machine.battery_low", "machine": agent, "battery": b, "text": what}));
+            self.emit(&ServerEvent::MachineBatteryLow { machine: agent.to_owned(), battery: b, text: what });
         }
     }
 
@@ -1515,7 +1523,7 @@ impl Hub {
         // Its agent sessions keep running there too; they are announced again on reconnect.
         self.harness.machine_lost(self, name);
         if self.ai_sessions.lock().remove(name).is_some() {
-            self.emit(&serde_json::json!({ "type": "ai_sessions", "machine": name }));
+            self.emit(&ServerEvent::AiSessions { machine: name.to_owned() });
         }
         self.update_slot_gauges();
         self.emit_agent(&snapshot);
@@ -1699,7 +1707,7 @@ impl Hub {
                 Ok(sessions) => {
                     let old = self.ai_sessions.lock().insert(agent.clone(), sessions.clone());
                     if old.as_ref() != Some(&sessions) {
-                        self.emit(&serde_json::json!({ "type": "ai_sessions", "machine": agent }));
+                        self.emit(&ServerEvent::AiSessions { machine: agent.to_owned() });
                     }
                 }
                 Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable AI session report"),
@@ -1751,7 +1759,7 @@ impl Hub {
                 }
                 self.updates.on_build(self, &agent, &build);
                 self.updates.fleet.wake();
-                self.emit(&serde_json::json!({ "type": "updates" }));
+                self.emit(&ServerEvent::Updates);
                 crate::frontdoor::control::on_build(self, &agent, caps).await;
                 if caps & proto::CAP_SYNC != 0 {
                     self.sync_announced(&agent).await;
@@ -1774,7 +1782,7 @@ impl Hub {
             AgentMsg::UpdatePrefs { accept } => {
                 self.updates.fleet.set_accept(&agent, accept);
                 self.updates.fleet.wake();
-                self.emit(&serde_json::json!({ "type": "updates" }));
+                self.emit(&ServerEvent::Updates);
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
             AgentMsg::Cluster { json, raft } => match (self.store.group(), crate::store::learner::decode(&json)) {

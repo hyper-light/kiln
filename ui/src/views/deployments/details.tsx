@@ -9,7 +9,7 @@ import { X } from "lucide-react";
 
 import { cdApi, resourceKey, type CdLogQuery } from "@/api/cd";
 import { wsUrl } from "@/api/client";
-import type { CdLogLine, CdLogs, CdNode, CdResourceDetail, CdResourceKey } from "@/api/types";
+import type { CdLogDown, CdLogLine, CdLogs, CdNode, CdResourceDetail, CdResourceKey } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -387,12 +387,12 @@ function FollowedLog({ appId, node, q, o, set }: { appId: string; node: CdNode; 
       ws.onopen = () => setState("live");
       ws.onmessage = (m) => {
         if (typeof m.data !== "string") return;
-        const msg = JSON.parse(m.data) as { type: string; lines?: CdLogLine[]; pod?: string; message?: string };
-        if (msg.type === "lines" && msg.lines) {
+        const msg = JSON.parse(m.data) as CdLogDown;
+        if (msg.type === "lines") {
           pending.push(...msg.lines);
           if (!frame) frame = requestAnimationFrame(flush);
         } else if (msg.type === "error") {
-          setErrors((e) => [...e, msg.pod ? `${msg.pod}: ${msg.message ?? ""}` : (msg.message ?? "")]);
+          setErrors((e) => [...e, msg.pod ? `${msg.pod}: ${msg.message}` : msg.message]);
         } else if (msg.type === "end") {
           setState("ended");
         }

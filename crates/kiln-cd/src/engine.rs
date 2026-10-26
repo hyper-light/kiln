@@ -89,7 +89,9 @@ impl Default for Config {
 }
 
 /// Why a sync started; also its priority (lower first).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, serde::Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "kebab-case")]
 pub enum Trigger {
     /// A person (or an agent acting for one).
     Manual = 0,
@@ -361,7 +363,8 @@ pub struct Summary {
 }
 
 /// Where a sync stands.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum OpPhase {
     /// Validating every apply first.
     DryRun,

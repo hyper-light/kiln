@@ -132,6 +132,7 @@ impl Default for Spec {
 
 /// A pending approval, as lists show it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ApprovalBrief {
     pub id: String,
     pub tool: ToolKind,
@@ -143,16 +144,20 @@ pub struct ApprovalBrief {
 /// A native subagent as lists show it. Its work still belongs to its harness's task, not a
 /// separate kiln session, so this is tracking only and carries no execution settings or output.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct SubagentBrief {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub tool_id: Option<String>,
     pub description: String,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub parent_task: Option<String>,
     pub started: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub ended: Option<i64>,
 }
 
@@ -176,11 +181,14 @@ impl SubagentBrief {
 
 /// Goals an agent paused for a person, until someone resumes them (`Info::held`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "HeldGoals"))]
 pub struct Held {
     /// Why, as the stack says it ("Paused by the agent: …").
     pub why: String,
     /// The plan it waits for you to look at first, when that's why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub plan: Option<String>,
     /// Unix ms it paused.
     pub since: i64,
@@ -188,6 +196,8 @@ pub struct Held {
 
 /// A session as lists show it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentInfo"))]
 pub struct Info {
     pub id: String,
     pub kind: String,
@@ -197,11 +207,13 @@ pub struct Info {
     pub target: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub shell: Option<String>,
     pub cwd: String,
     /// The working tree its work is in (`State::tree`): what's asked of git about its work is
     /// asked there ([`Info::work_dir`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub tree: Option<String>,
     pub created_at: i64,
     pub status: Status,
@@ -212,6 +224,7 @@ pub struct Info {
     #[serde(default)]
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub harness_session: Option<String>,
     #[serde(default)]
     pub approvals: Vec<ApprovalBrief>,
@@ -235,21 +248,25 @@ pub struct Info {
     #[serde(default)]
     pub cost_usd: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub activity: Option<String>,
     pub last_activity: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub exit: Option<ExitInfo>,
     /// What the person first asked for.
     #[serde(default)]
     pub goal: String,
     /// The goal the harness itself pursues, and how it stands (see `State::objective`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub objective: Option<super::model::Objective>,
     /// The agent's latest words, shortened.
     #[serde(default)]
     pub summary: String,
     /// What it is doing right now, in plain words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub doing: Option<String>,
     /// Its writer's epoch ([`State::epoch`]): a machine that announces a copy from before the
     /// session went on elsewhere lets go of it.
@@ -267,29 +284,36 @@ pub struct Info {
     pub lines_removed: u32,
     /// How full the context window is, 0–100, when the harness says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub context_pct: Option<u8>,
     /// Unix ms the current turn started (None when idle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub turn_started: Option<i64>,
     /// The plan limits of the account it runs on (as `State::limits`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limits: Vec<super::model::Limit>,
     /// That account, as `State::account` (never an address).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub account: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub plan: Option<String>,
     /// Tasks it left running with no turn under way (as `State::left_behind`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub left_behind: u32,
     /// Where its commands may run besides its machine (as `State::reach`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub reach: Option<String>,
     /// It waits for a usage limit to reset (as `State::pause`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub pause: Option<super::model::Pause>,
     /// How its last turn ended (as `State::last_turn`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub last_turn: Option<super::model::TurnEnd>,
     /// Kiln doesn't keep it going when it stops part-way (`goals::keep`; set on the server).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -297,9 +321,11 @@ pub struct Info {
     /// Its goals wait on a person: it paused them for you, until you resume them (`goals::held_stacks`;
     /// set on the server).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub held: Option<Held>,
     /// What of its messages couldn't be read (`crate::wire::unread`; set on the server).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub refused: Option<crate::wire::unread::Kept>,
     /// At a usage limit it goes on on another machine with room (as `State::move_on_limit`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -309,15 +335,19 @@ pub struct Info {
     pub move_plan: super::model::MovePlan,
     /// Where it pauses as its limits fill (as `State::pause_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub pause_at: Option<u8>,
     /// The most subagents it runs at once (as `State::max_subagents`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub max_subagents: Option<u32>,
     /// The agent that started it (as `Spec::parent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub parent: Option<String>,
     /// The plan run it does a step of (as `Spec::plan_run`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub plan_run: Option<String>,
     /// It was started without its harness's skip-every-check mode (`Spec::allow_bypass` off), so
     /// an agent it starts can't have it either.
@@ -325,6 +355,7 @@ pub struct Info {
     pub no_bypass: bool,
     /// Its workspace of its own, when it has one (as `Spec::workspace`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub workspace: Option<crate::workspace::Workspace>,
 }
 

@@ -10,9 +10,13 @@
 
 pub mod channel;
 pub mod commands;
+pub mod events;
 pub mod keep;
 pub mod link;
 pub mod sums;
+#[cfg(test)]
+pub mod ts;
+pub mod ui;
 pub mod unread;
 pub mod uplink;
 

@@ -401,7 +401,7 @@ pub async fn refresh(hub: &Arc<Hub>) -> Option<Target> {
         tracing::info!(commit = short(&t.commit), from = %t.from, "the newest kiln: every runner follows it");
         hub.store.audit("kiln".into(), "upgrade.target".into(), format!("{} runs {}, the newest kiln: every runner follows it", t.from, short(&t.commit))).await;
         hub.updates.wake_in_step();
-        hub.emit(&serde_json::json!({ "type": "updates" }));
+        hub.emit(&crate::wire::events::ServerEvent::Updates);
     }
     hub.updates.fleet.target()
 }
@@ -944,7 +944,7 @@ pub async fn on_built(hub: &Arc<Hub>, job: &str, sha256: &str, bytes: Option<Vec
     anyhow::ensure!(got == sha256, "the binary's SHA-256 is {got}, not {sha256}");
     let kept = crate::updates::keep_built(hub, &b.target, bytes, &b.machine, &b.commit).await?;
     hub.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} ({}): {} for {}", b.machine, short(&b.commit), kept.build, b.target)).await;
-    hub.emit(&serde_json::json!({ "type": "updates" }));
+    hub.emit(&crate::wire::events::ServerEvent::Updates);
     hub.updates.fleet.wake();
     Ok(())
 }

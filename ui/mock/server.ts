@@ -17,6 +17,7 @@ import os from "node:os";
 import { WebSocketServer, WebSocket } from "ws";
 import type { Agent, AuditEntry, Child, HostSample, Job, JobTools, PlannedJob, Repo, Run, ServerEvent, Status, Step } from "../src/api/types.ts";
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
+import { defaultRunner } from "./defaults.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
@@ -206,8 +207,8 @@ function pushSample(name: string, s: HostSample) {
 const serverHost = newHost(16, 64, 1800);
 prefillHistory("server", serverHost, 0.25);
 
-function addAgent(a: Omit<Agent, "running" | "busy" | "sample" | "draining"> & { draining?: boolean }, host: HostState, prefill = true) {
-  const agent: Agent = { ...a, draining: a.draining ?? false, running: [], busy: 0, sample: null };
+function addAgent(a: Omit<Agent, keyof ReturnType<typeof defaultRunner>> & Partial<ReturnType<typeof defaultRunner>>, host: HostState, prefill = true) {
+  const agent: Agent = { ...defaultRunner(), ...a };
   agents.set(a.name, agent);
   agentState.set(a.name, host);
   if (prefill) {
@@ -263,7 +264,8 @@ function plannedFor(tpl: JobTpl): PlannedJob {
     artifacts: tpl.key === "bench" ? ["target/criterion/**"] : [],
     cache: tpl.toolchain === "rust" ? ["~/.cargo/registry", "target"] : [],
     condition: null,
-    steps: tpl.steps.map((s) => ({ name: s.name, run: s.run, tty: true })),
+    requires: [],
+    steps: tpl.steps.map((s) => ({ name: s.name, run: s.run, shell: null, env: {}, "working-directory": null, "timeout-minutes": null, "continue-on-error": false, tty: true })),
   };
 }
 

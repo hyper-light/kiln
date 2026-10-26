@@ -132,7 +132,7 @@ impl Mirror {
             self.sent = Value::Null;
             return None;
         }
-        let text = json!({"t": "state", "state": self.state}).to_string();
+        let text = crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::State { state: self.state.clone() }).text();
         let patch = state_patch(&self.sent, &self.state);
         self.sent.clone_from(&self.state);
         Some(Frame { text: Arc::from(text), patch: patch.map(Arc::from), rev: self.rev })
@@ -310,32 +310,34 @@ impl Parts {
     /// The frames that bring a viewer to the state the parts were taken at; `files`, what's kept of
     /// the files its messages mention (`Keeper::frame`), goes ahead of the events.
     fn frames(self, files: Option<String>) -> Vec<String> {
-        let head = if self.resumed { "resumed" } else { "open" };
-        let mut out = vec![json!({"t": head, "info": self.info, "rev": self.rev, "born": born()}).to_string()];
+        use crate::wire::ui::{SessionDown, SessionFrame};
+        let (info, born) = (self.info, Some(born()));
+        let head = if self.resumed { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born } };
+        let mut out = vec![SessionDown { frame: head, rev: Some(self.rev) }.text()];
+        let text = |f: SessionFrame| SessionDown::from(f).text();
         if !self.meta.is_null() {
-            out.push(json!({"t": "meta", "meta": self.meta}).to_string());
+            out.push(text(SessionFrame::Meta { meta: self.meta }));
         }
         if !self.state.is_null() {
-            out.push(json!({"t": "state", "state": self.state}).to_string());
+            out.push(text(SessionFrame::State { state: self.state }));
         }
         if !self.changes.is_null() {
-            out.push(json!({"t": "changes", "files": self.changes}).to_string());
+            out.push(text(SessionFrame::Changes { files: self.changes }));
         }
         out.extend(files);
-        let mut batch: Vec<&Value> = Vec::new();
+        let mut batch: Vec<Value> = Vec::new();
         let mut size = 0usize;
         for e in &self.events {
             let n = e.to_string().len();
             if size + n > 256 * 1024 && !batch.is_empty() {
-                out.push(json!({"t": "events", "events": batch}).to_string());
-                batch = Vec::new();
+                out.push(text(SessionFrame::Events { events: std::mem::take(&mut batch) }));
                 size = 0;
             }
             size += n;
-            batch.push(e);
+            batch.push(Value::clone(e));
         }
         if !batch.is_empty() {
-            out.push(json!({"t": "events", "events": batch}).to_string());
+            out.push(text(SessionFrame::Events { events: batch }));
         }
         out
     }
@@ -499,7 +501,8 @@ fn state_patch(was: &Value, now: &Value) -> Option<String> {
     let (Value::Object(was), Value::Object(now)) = (was, now) else { return None };
     let set: serde_json::Map<String, Value> = now.iter().filter(|(k, v)| was.get(*k) != Some(*v)).map(|(k, v)| (k.clone(), v.clone())).collect();
     let gone: Vec<&String> = was.keys().filter(|k| !now.contains_key(*k)).collect();
-    Some(if gone.is_empty() { json!({"t": "state_patch", "set": set}) } else { json!({"t": "state_patch", "set": set, "gone": gone}) }.to_string())
+    let gone = gone.into_iter().cloned().collect();
+    Some(crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::StatePatch { set, gone }).text())
 }
 
 /// A file uploaded for a message, kept briefly until the message is sent.
@@ -876,7 +879,7 @@ impl Registry {
             m.info.keep_off = !on;
             m.info.clone()
         };
-        hub.emit(&json!({"type": "harness", "info": info}));
+        hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
     }
 
     /// The plans sessions proposed (plan mode) since the last look, by session, each its latest.
@@ -899,7 +902,7 @@ impl Registry {
             }
         }
         for info in changed {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
 
@@ -917,7 +920,7 @@ impl Registry {
             }
         };
         if let Some(info) = info {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
 
@@ -946,7 +949,7 @@ impl Registry {
             }
             m.info.clone()
         };
-        hub.emit(&json!({"type": "harness", "info": info}));
+        hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
     }
 
     /// Environment for one of the server's own terminals, so `kiln spawn` there works.
@@ -1014,7 +1017,7 @@ impl Registry {
             tracing::info!(sessions = infos.len(), "agent sessions on machines that are away, from the conversation store");
         }
         for info in infos {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
 
@@ -1465,9 +1468,9 @@ impl Registry {
             self.opened.forget(id);
             self.asked.forget(id);
             super::archive::closed(hub, id);
-            hub.emit(&json!({"type": "harness_closed", "id": id}));
+            hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         } else if let Some(info) = changed {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
 
@@ -1540,7 +1543,7 @@ impl Registry {
         self.forget_holders(&gone);
         for id in gone {
             super::archive::closed(hub, &id);
-            hub.emit(&json!({"type": "harness_closed", "id": id}));
+            hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
     }
 
@@ -1602,7 +1605,7 @@ impl Registry {
         }
         self.kinds.lock().remove(&format!("agent:{machine}"));
         for info in infos {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
 
@@ -1625,7 +1628,7 @@ impl Registry {
             }
         }
         for info in infos {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
 
@@ -1678,7 +1681,7 @@ impl Registry {
         if let Some(m) = self.mirrors.lock().get_mut(id) {
             // A revision of its own, past what its viewers have: else they'd take it as had.
             m.rev = m.rev.saturating_add(1);
-            m.send(Frame::of(json!({"t": "files", "files": added}).to_string()));
+            m.send(Frame::of(crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::Files { files: added.to_vec() }).text()));
         }
     }
 
@@ -1818,7 +1821,7 @@ impl Registry {
             }
         }
         for info in &out {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info.clone()) });
         }
         Ok(out)
     }
@@ -2240,7 +2243,7 @@ impl Registry {
             })
         };
         if let Some(info) = info {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info.clone()) });
         }
         tracing::info!(session = %id, from = %from_name, %to, bytes = bytes.len(), "agent session goes on on another machine, from the server's store");
         send_package(hub, id, to, &bytes).await
@@ -2290,7 +2293,7 @@ impl Registry {
             })
         };
         if let Some(info) = info {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
         self.local.let_go(id);
         tracing::info!(session = %id, %to, bytes = bytes.len(), "an agent whose harness never started on the server goes on on a runner");
@@ -2324,7 +2327,7 @@ impl Registry {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }
             super::archive::closed(hub, id);
-            hub.emit(&json!({"type": "harness_closed", "id": id}));
+            hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
         ok || loc.is_some()
     }

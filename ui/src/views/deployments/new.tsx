@@ -73,7 +73,7 @@ export function toYaml(v: unknown, indent = 0): string {
 
 /* ---------------------------- the draft ---------------------------- */
 
-interface Artifact {
+interface DraftArtifact {
   name: string;
   kind: "image" | "published";
   /** The image (`docker.io/acme/api`), or the published image's name. */
@@ -89,7 +89,7 @@ interface Draft {
   name: string;
   /** Each setting as typed: text, or JSON for object settings. */
   settings: Record<string, string>;
-  artifacts: Artifact[];
+  artifacts: DraftArtifact[];
   auto: boolean;
   selfHeal: boolean;
   prune: boolean;
@@ -393,7 +393,7 @@ function Builder() {
                 <SelectField
                   label="From"
                   value={a.kind}
-                  onChange={(v) => set("artifacts", d.artifacts.map((x, j) => (j === i ? { ...x, kind: v as Artifact["kind"] } : x)))}
+                  onChange={(v) => set("artifacts", d.artifacts.map((x, j) => (j === i ? { ...x, kind: v as DraftArtifact["kind"] } : x)))}
                   options={[
                     { value: "image", label: "A registry, tagged by commit" },
                     { value: "published", label: "An image kiln publishes" },

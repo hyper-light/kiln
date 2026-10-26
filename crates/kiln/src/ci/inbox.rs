@@ -50,7 +50,7 @@ pub async fn put(hub: &Hub, people: &[String], event: &str, title: &str, line: &
         })
         .await?;
     for p in &told {
-        hub.emit(&json!({ "type": "inbox", "person": p }));
+        hub.emit(&crate::wire::events::ServerEvent::Inbox { person: p.clone() });
     }
     Ok(n)
 }
@@ -112,6 +112,6 @@ pub async fn read(hub: &Arc<Hub>, caller: &Caller, body: &Value) -> Result<Value
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    hub.emit(&json!({ "type": "inbox", "person": who }));
+    hub.emit(&crate::wire::events::ServerEvent::Inbox { person: who.to_string() });
     Ok(json!({ "read": n }))
 }

@@ -943,6 +943,7 @@ mod tests {
 
 /// Live per-agent host samples, reported by agents and rendered with an `agent` label.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct HostSample {
     pub ts_ms: i64,
     pub cpu_pct: f32,
