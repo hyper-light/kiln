@@ -177,6 +177,12 @@ pub struct Acp {
     /// the model in use has a `speed` option.
     #[serde(default)]
     speed_start: Option<String>,
+    /// A `/compact` it was sent: its turn is a compaction (Devin says nothing else of one).
+    #[serde(default)]
+    compact_prompt: Option<String>,
+    /// The compaction it says is under way (`compaction_update`), by its id.
+    #[serde(default)]
+    compaction: Option<String>,
 }
 
 fn ready() -> bool {
@@ -239,6 +245,8 @@ impl Acp {
             refresh: false,
             empty,
             speed_start: None,
+            compact_prompt: None,
+            compaction: None,
         }
     }
 
@@ -330,7 +338,7 @@ impl Acp {
             "initialize",
             json!({
                 "protocolVersion": 1,
-                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "session": {"configOptions": {"boolean": {}}}},
+                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "session": {"configOptions": {"boolean": {}}, "compaction": {}}},
                 "clientInfo": {"name": "kiln", "version": env!("CARGO_PKG_VERSION")},
             }),
         );
@@ -360,6 +368,8 @@ impl Acp {
         self.prompt_result = None;
         self.pending.clear();
         self.asks.clear();
+        self.compact_prompt = None;
+        self.compaction = None;
         core.state.approvals.clear();
         core.state.exit = Some(ExitInfo::now(code, error));
         core.state.doing = None;
@@ -877,6 +887,12 @@ impl Acp {
             core.state.turn_started = Some(Core::now());
             core.state.doing = Some("Thinking".to_owned());
         }
+        // Its own `/compact`: the prompt's turn is the compaction, which it may say nothing else of.
+        let t = m.text.trim();
+        if (t == "/compact" || t.starts_with("/compact ")) && core.meta.commands.iter().any(|c| c.name == "compact") {
+            self.compact_prompt = Some(m.id.clone());
+            core.compacting(None);
+        }
         self.show(core, &m, Delivery::Started);
         self.settle(core);
     }
@@ -996,6 +1012,13 @@ impl Acp {
             let cancelled = v.get("error").is_some() || v.pointer("/result/stopReason").and_then(Value::as_str) == Some("cancelled");
             core.state.delivery.insert(client.clone(), if cancelled { Delivery::Cancelled } else { Delivery::Completed });
             core.touch_state();
+            // Its `/compact` is over: its words say how it went (one it reports ends as it says).
+            if self.compact_prompt.as_deref() == Some(client.as_str()) {
+                self.compact_prompt = None;
+                if self.compaction.is_none() {
+                    core.compacting_over(None);
+                }
+            }
             if self.prompting.as_deref() == Some(client.as_str()) {
                 self.prompt_result = Some(v.clone());
             } else if let Some(err) = v.get("error") {
@@ -1338,7 +1361,10 @@ impl Acp {
     }
 
     fn update(&mut self, core: &mut Core, u: &Value) {
-        let history = matches!(u.get("sessionUpdate").and_then(Value::as_str), Some("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update"));
+        let history = matches!(
+            u.get("sessionUpdate").and_then(Value::as_str),
+            Some("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update" | "compaction_update" | "compaction_summary_chunk")
+        );
         if history {
             self.empty = false;
         }
@@ -1468,6 +1494,40 @@ impl Acp {
                 }
                 core.touch_state();
             }
+            "compaction_update" => self.compaction_update(core, u),
+            // A compaction's summary (`compaction_summary_chunk`) isn't shown.
+            _ => {}
+        }
+    }
+
+    /// A compaction it reports (ACP's `session.compaction`, which kiln offers): one by its id,
+    /// under way until it says how it ended, with what claude-agent-acp adds of it
+    /// (`_meta.contextCompaction`).
+    fn compaction_update(&mut self, core: &mut Core, u: &Value) {
+        let Some(id) = u.get("compactionId").and_then(Value::as_str) else { return };
+        let key = format!("{}-{id}", self.run);
+        let meta = u.pointer("/_meta/contextCompaction");
+        let n = |k: &str| meta.and_then(|m| m.get(k)).and_then(Value::as_u64);
+        match u.get("status").and_then(Value::as_str) {
+            Some("in_progress") => {
+                self.compaction = Some(id.to_owned());
+                core.compacting(None);
+            }
+            Some(status @ ("completed" | "failed" | "cancelled")) => {
+                self.compaction = None;
+                let c = core.compacting_of(None).cloned();
+                let ms = n("durationMs").and_then(|d| i64::try_from(d).ok()).or_else(|| c.as_ref().map(|c| Core::now() - c.since));
+                match status {
+                    "completed" => core.compacted(&key, None, Level::Info, super::core::compacted_words(n("preTokens").or(c.and_then(|c| c.tokens)), n("postTokens"), ms)),
+                    "failed" => {
+                        let why = u.get("error").or_else(|| meta.and_then(|m| m.get("error"))).and_then(Value::as_str);
+                        core.compacted(&key, None, Level::Warn, super::core::compaction_failed_words(why));
+                    }
+                    _ if c.is_some() => core.compaction_stopped(None),
+                    _ => core.compacted(&key, None, Level::Warn, "Compaction stopped".to_owned()),
+                }
+            }
+            // Statuses ACP adds later: nothing is read into them.
             _ => {}
         }
     }
@@ -1643,6 +1703,49 @@ mod tests {
         for m in msgs {
             a.line(core, &m.to_string());
         }
+    }
+
+    /// kiln offers ACP's session compaction: a compaction the agent reports is under way until it
+    /// says how it ended (claude-agent-acp's `_meta.contextCompaction` saying more); Devin's own
+    /// `/compact`, which it says nothing else of, for its turn.
+    #[test]
+    fn compactions_it_reports_and_its_own_compact() {
+        let mut core = Core::new();
+        core.state.cwd = "/w".into();
+        let mut a = Acp::new(None);
+        a.start(&mut core);
+        let w = written(&mut core);
+        assert_eq!(w.first().and_then(|v| v.pointer("/params/clientCapabilities/session/compaction")), Some(&json!({})));
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}})]);
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}})]);
+        let update = |u: Value| json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": u}});
+        let marker = |core: &Core, id: &str| {
+            core.events().find(|e| e.id.starts_with(super::super::core::COMPACTION) && e.id.ends_with(id)).and_then(|e| match &e.body {
+                Body::Notice { level, text } => Some((*level, text.clone())),
+                _ => None,
+            })
+        };
+        feed(&mut a, &mut core, &[update(json!({"sessionUpdate": "compaction_update", "compactionId": "cmp_1", "status": "in_progress"}))]);
+        assert!(core.state.compacting.is_some());
+        feed(
+            &mut a,
+            &mut core,
+            &[
+                update(json!({"sessionUpdate": "compaction_summary_chunk", "compactionId": "cmp_1", "content": {"type": "text", "text": "## Retained"}})),
+                update(json!({"sessionUpdate": "compaction_update", "compactionId": "cmp_1", "status": "completed", "_meta": {"contextCompaction": {"version": 1, "trigger": "automatic", "preTokens": 180_000, "postTokens": 22_000, "durationMs": 41_000}}})),
+            ],
+        );
+        assert!(core.state.compacting.is_none());
+        assert_eq!(marker(&core, "cmp_1"), Some((Level::Info, "Compacted · 180k → 22k tokens · 41s".to_owned())));
+        feed(&mut a, &mut core, &[update(json!({"sessionUpdate": "compaction_update", "compactionId": "cmp_2", "status": "failed", "error": "No model"}))]);
+        assert_eq!(marker(&core, "cmp_2"), Some((Level::Warn, "Couldn't compact: No model".to_owned())));
+        feed(&mut a, &mut core, &[update(json!({"sessionUpdate": "available_commands_update", "availableCommands": [{"name": "compact", "description": "Force conversation compaction"}]}))]);
+        a.command(&mut core, Command::Send { id: "m1".into(), text: "/compact".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+        assert_eq!(core.state.doing.as_deref(), Some(super::super::core::COMPACTING));
+        let pid = written(&mut core).iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).and_then(|p| p.get("id").cloned()).unwrap_or_default();
+        feed(&mut a, &mut core, &[update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Context compacted"}})), json!({"jsonrpc": "2.0", "id": pid, "result": {"stopReason": "end_turn"}})]);
+        assert!(core.state.compacting.is_none());
+        assert_eq!(core.state.doing, None);
     }
 
     #[test]

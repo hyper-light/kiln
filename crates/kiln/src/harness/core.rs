@@ -6,10 +6,59 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{Approval, Body, Event, Meta, State, Status, Task, ToolStatus, TurnEnd, clip_middle};
+use super::model::{Approval, Body, Compacting, Event, Level, Meta, State, Status, Task, ToolStatus, TurnEnd, clip_middle};
 
 /// The ids of the messages kiln sends to keep an agent going (`goals::keep`); they show as kiln's.
 pub const KEEP_ID: &str = "kiln-keep-";
+
+/// What every compaction's marker's id starts with: a notice, which the UI draws as the boundary
+/// it is (above it, the agent works from a summary).
+pub const COMPACTION: &str = "compaction:";
+/// What an agent is doing while its harness compacts its conversation (`State::doing`).
+pub const COMPACTING: &str = "Compacting the conversation";
+
+/// A count of tokens, short: "850", "967k", "1.2M".
+pub fn tokens_short(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// How long something took, short: "42s", "1m 38s", "1h 02m" (as the UI's clocks say it).
+fn took(ms: i64) -> String {
+    let s = ms.max(0) / 1_000;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3_600 => format!("{}m {:02}s", s / 60, s % 60),
+        _ => format!("{}h {:02}m", s / 3_600, s % 3_600 / 60),
+    }
+}
+
+/// A compaction's marker, with what's known of it: "Compacted · 967k → 48k tokens · 1m 38s".
+pub fn compacted_words(before: Option<u64>, after: Option<u64>, ms: Option<i64>) -> String {
+    let mut words = vec!["Compacted".to_owned()];
+    match (before, after) {
+        (Some(b), Some(a)) => words.push(format!("{} → {} tokens", tokens_short(b), tokens_short(a))),
+        (Some(b), None) => words.push(format!("was {} tokens", tokens_short(b))),
+        _ => {}
+    }
+    if let Some(ms) = ms.filter(|ms| *ms >= 1_000) {
+        words.push(took(ms));
+    }
+    words.join(" · ")
+}
+
+/// The marker of a compaction that didn't happen, and why, as its harness said.
+pub fn compaction_failed_words(why: Option<&str>) -> String {
+    match why.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(why) => format!("Couldn't compact: {}", clip_middle(why, 300).0),
+        None => "Couldn't compact the conversation".to_owned(),
+    }
+}
 
 /// Tasks a session's state keeps: beyond these the oldest finished go. The state goes to viewers
 /// whole, in one frame, and a long Codex session runs hundreds of terminals.
@@ -435,6 +484,7 @@ impl Core {
         self.state.tasks.clear();
         self.state.exit = None;
         self.state.activity = None;
+        self.state.compacting = None;
         self.state.doing = None;
         self.state.switching = None;
         self.changed.clear();
@@ -600,6 +650,53 @@ impl Core {
         self.touch_state();
     }
 
+    /// Its harness began compacting the conversation of `parent` (a subagent's, by its call's id;
+    /// None: the main thread's), or says again that it goes on: when it began stays as it was.
+    pub fn compacting(&mut self, parent: Option<String>) {
+        if self.state.compacting.as_ref().is_some_and(|c| c.parent == parent || c.parent.is_none()) {
+            return;
+        }
+        let main = parent.is_none();
+        self.state.compacting = Some(Compacting { since: Self::now(), tokens: if main { self.state.usage.context_tokens } else { None }, parent });
+        if main {
+            self.state.doing = Some(COMPACTING.to_owned());
+        }
+        self.touch_state();
+    }
+
+    /// The compaction of `parent`'s conversation under way, if there is one.
+    pub fn compacting_of(&self, parent: Option<&str>) -> Option<&Compacting> {
+        self.state.compacting.as_ref().filter(|c| c.parent.as_deref() == parent)
+    }
+
+    /// The compaction of `parent`'s conversation under way is over, however it went: what it was.
+    pub fn compacting_over(&mut self, parent: Option<&str>) -> Option<Compacting> {
+        self.compacting_of(parent)?;
+        let c = self.state.compacting.take();
+        if parent.is_none() && self.state.doing.as_deref() == Some(COMPACTING) {
+            self.state.doing = (self.state.status == Status::Running).then(|| "Thinking".to_owned());
+        }
+        self.touch_state();
+        c
+    }
+
+    /// `parent`'s conversation was compacted, or wasn't (`level` Warn), as `text` says: its marker
+    /// goes where the conversation is now, as `compaction:<key>` (said again with the same key, the
+    /// same marker, where it was).
+    pub fn compacted(&mut self, key: &str, parent: Option<String>, level: Level, text: String) {
+        self.compacting_over(parent.as_deref());
+        self.upsert(&format!("{COMPACTION}{key}"), parent, Body::Notice { level, text });
+    }
+
+    /// A compaction of `parent`'s conversation still under way ended without its harness saying
+    /// how (its turn or its process ended first): its marker says it stopped, after how long.
+    pub fn compaction_stopped(&mut self, parent: Option<&str>) {
+        let Some(c) = self.compacting_over(parent) else { return };
+        let ms = Self::now() - c.since;
+        let text = if ms >= 1_000 { format!("Compaction stopped after {}", took(ms)) } else { "Compaction stopped".to_owned() };
+        self.upsert(&format!("{COMPACTION}stopped-{}", self.next_seq), c.parent, Body::Notice { level: Level::Warn, text });
+    }
+
     pub fn events(&self) -> impl DoubleEndedIterator<Item = &Event> {
         self.events.iter()
     }
@@ -731,6 +828,9 @@ impl Core {
     /// whatever its adapter knew. Its tasks still live end stopped, its calls still running or
     /// waiting end cancelled, text it was writing stops; all of it stays to read.
     pub fn end_harness_work(&mut self) {
+        if let Some(parent) = self.state.compacting.as_ref().map(|c| c.parent.clone()) {
+            self.compaction_stopped(parent.as_deref());
+        }
         let now = Self::now();
         for t in self.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT)) {
             t.status = "stopped".into();
@@ -912,6 +1012,54 @@ mod tests {
 
     fn said(text: &str) -> Body {
         Body::Assistant { text: text.into(), streaming: false }
+    }
+
+    /// A compaction under way: what the agent does says so, its harness saying so again keeps when
+    /// it began, and its marker (a `compaction:` notice) goes where the conversation is at its end.
+    #[test]
+    fn a_compaction_goes_on_until_its_marker() {
+        let mut core = Core::new();
+        core.set_status(Status::Running);
+        core.state.usage.context_tokens = Some(967_000);
+        core.compacting(None);
+        let since = core.state.compacting.as_ref().map(|c| c.since);
+        assert_eq!(core.state.compacting.as_ref().and_then(|c| c.tokens), Some(967_000));
+        assert_eq!(core.state.doing.as_deref(), Some(COMPACTING));
+        core.compacting(None);
+        assert_eq!(core.state.compacting.as_ref().map(|c| c.since), since);
+        // A subagent's waits behind the main thread's.
+        core.compacting(Some("toolu_9".into()));
+        assert_eq!(core.state.compacting.as_ref().and_then(|c| c.parent.clone()), None);
+        core.compacted("k1", None, Level::Info, compacted_words(Some(967_000), Some(48_400), Some(98_000)));
+        assert!(core.state.compacting.is_none());
+        assert_eq!(core.state.doing.as_deref(), Some("Thinking"));
+        assert!(matches!(core.get("compaction:k1").map(|e| &e.body), Some(Body::Notice { level: Level::Info, text }) if text == "Compacted · 967k → 48k tokens · 1m 38s"));
+    }
+
+    /// One its harness's process ended during says it stopped, in its thread; one taken up again
+    /// elsewhere isn't under way there.
+    #[test]
+    fn a_compaction_its_process_ended_during_stopped() {
+        let mut core = Core::new();
+        core.compacting(Some("toolu_9".into()));
+        core.end_harness_work();
+        assert!(core.state.compacting.is_none());
+        let stopped = core.events().find(|e| e.id.starts_with(COMPACTION));
+        assert!(matches!(stopped.map(|e| (&e.body, e.parent.as_deref())), Some((Body::Notice { level: Level::Warn, text }, Some("toolu_9"))) if text.starts_with("Compaction stopped")));
+        core.compacting(None);
+        let state = core.state.clone();
+        core.restore(Vec::new(), state);
+        assert!(core.state.compacting.is_none());
+    }
+
+    #[test]
+    fn compaction_words() {
+        assert_eq!(compacted_words(Some(967_000), Some(48_400), Some(98_000)), "Compacted · 967k → 48k tokens · 1m 38s");
+        assert_eq!(compacted_words(Some(1_240_000), None, Some(42_400)), "Compacted · was 1.2M tokens · 42s");
+        assert_eq!(compacted_words(None, None, Some(400)), "Compacted");
+        assert_eq!(compacted_words(None, None, Some(3_725_000)), "Compacted · 1h 02m");
+        assert_eq!(compaction_failed_words(Some(" prompt too long ")), "Couldn't compact: prompt too long");
+        assert_eq!(compaction_failed_words(None), "Couldn't compact the conversation");
     }
 
     /// CP-T3.2 (the fourteenth adversarial check's): kiln's own message handed to the harness is

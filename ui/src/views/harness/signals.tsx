@@ -6,12 +6,13 @@ import { cn } from "@/lib/utils";
 import { useNow } from "@/lib/hooks";
 import { thinkingWords } from "./thinking";
 
-export type OpticState = "idle" | "thinking" | "tool" | "waiting" | "done" | "ended";
+export type OpticState = "idle" | "thinking" | "tool" | "compacting" | "waiting" | "done" | "ended";
 
 const OPTIC_LABELS: Record<OpticState, string> = {
   idle: "Idle",
   thinking: "Thinking",
   tool: "Using a tool",
+  compacting: "Compacting",
   waiting: "Waiting for you",
   done: "Done",
   ended: "Ended",
@@ -226,6 +227,21 @@ export function LoadingMark({ className }: { className?: string }) {
       <path className="sg-load-light" d={LOOP} pathLength={100} stroke={`url(#${gradient})`} />
       <path className="sg-load-tail" d={TAIL} />
     </svg>
+  );
+}
+
+/**
+ * A compaction's rule: the conversation's length as a hairline, the summary as the site's 30 px
+ * prism bar. While it compacts (`live`) the whole spectrum is drawn in from the far end into the
+ * bar, which the GPU does (only a transform and opacity move); after, the bar holds still as the
+ * boundary it is, broken in the warning's tone where it didn't compact (`warn`).
+ */
+export function Condense({ live = false, warn = false, className }: { live?: boolean; warn?: boolean; className?: string }) {
+  return (
+    <span className={cn("sg-condense", className)} data-live={live ? "true" : "false"} data-tone={warn ? "warn" : undefined} aria-hidden="true">
+      {live && <span className="sg-condense-light" />}
+      <span className="sg-condense-bar" />
+    </span>
   );
 }
 

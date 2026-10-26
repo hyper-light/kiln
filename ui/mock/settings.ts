@@ -153,6 +153,14 @@ export async function handleSettings(req: http.IncomingMessage, res: http.Server
     images.images[decodeURIComponent(mm[1]!)] = await ctx.body<ImageHome>(req);
     return (ctx.json(res, 200, images), true);
   }
+  // kiln's GitHub App (docs/ci.md W14-R10): none until GitHub's manifest flow makes one.
+  if (p === "/api/ci/github/app" && m === "GET") return (ctx.json(res, 200, { configured: false, web_url: "https://github.com" }), true);
+  if (p === "/api/ci/github/app/manifest" && m === "POST") {
+    const b = await ctx.body<{ org?: string }>(req);
+    const action = b.org ? `https://github.com/organizations/${encodeURIComponent(b.org)}/settings/apps/new?state=mock` : "https://github.com/settings/apps/new?state=mock";
+    const base = `http://${req.headers.host ?? "127.0.0.1"}`;
+    return (ctx.json(res, 200, { action, manifest: JSON.stringify({ name: `kiln (${req.headers.host ?? ""})`, url: base, redirect_url: `${base}/api/ci/github/app/callback`, public: false }) }), true);
+  }
   if (p === "/api/ci/integrations" && m === "GET") return (ctx.json(res, 200, { kinds, integrations } satisfies Integrations), true);
   if (p === "/api/ci/integrations" && m === "POST") {
     const b = await ctx.body<{

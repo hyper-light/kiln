@@ -19,6 +19,9 @@
  *                    a session keeps)
  *   MOCK_LIVE_STEPS=n   the turn still going has taken n steps already (a long turn of an agent
  *                       working on its own: a note and a command each)
+ *   MOCK_COMPACT=1   its context is full: the turn still going compacts as the page first opens,
+ *                    for MOCK_COMPACT_MS (20 s), then goes on; it compacted once before in this
+ *                    turn, and once in the turn before, which an older kiln marked in words
  */
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -32,6 +35,8 @@ const ID = "demo-long";
 const T0 = Date.UTC(2026, 9, 17, 9, 0, 0);
 const TURNS = Number(process.env.MOCK_TURNS ?? 40);
 const LIVE_STEPS = Number(process.env.MOCK_LIVE_STEPS ?? 0);
+const COMPACT = process.env.MOCK_COMPACT === "1";
+const COMPACT_MS = Number(process.env.MOCK_COMPACT_MS ?? 20_000);
 
 const FILES = ["crates/kiln/src/http/client.rs", "crates/kiln/src/http/retry.rs", "crates/kiln/src/rt/timer.rs", "crates/kiln/tests/retry.rs", "ui/src/api/client.ts"];
 const ASKS = [
@@ -170,6 +175,8 @@ for (let i = 1; i <= TURNS; i++) {
       started: at + 19_500,
       ended: at + 20_800,
     });
+  // A compaction an older kiln marked in words alone.
+  if (COMPACT && i === TURNS) add({ id: `L-n-compacted${i}`, at: at + 20_900, kind: "notice", level: "info", text: "Conversation compacted (was 912k tokens)" });
   add({ id: `L-a${i}`, at: at + 21_000, kind: "assistant", text: answer(i) });
 }
 
@@ -370,6 +377,7 @@ export function handleShownPages(path: string, res: ServerResponse): boolean {
 }
 
 add({ id: "L-u-live", at: LIVE_AT, kind: "user", text: "Now do the same for the websocket reconnects, and keep going until the suite is green." });
+if (COMPACT) add({ id: "compaction:mock-1", at: LIVE_AT + 900, kind: "notice", level: "info", text: "Compacted · 967k → 48k tokens · 1m 38s" });
 // A long turn already under way: what it said and ran, step after step.
 for (let k = 1; k <= LIVE_STEPS; k++) {
   const at = LIVE_AT + 1_000 + k * 20;
@@ -532,8 +540,12 @@ let running = !PAUSED;
 let doing = "Thinking";
 let turnStarted = Date.now() - Number(process.env.MOCK_TURN_AGE_MS ?? 134_000);
 let lastTurn: State["last_turn"];
+/** MOCK_COMPACT: when the compaction under way began, and how many it has done since. */
+let compactingSince: number | undefined;
+let compactions = 0;
 const state = (): State => ({
   status: offline() ? "disconnected" : running ? "running" : "idle",
+  compacting: compactingSince === undefined ? undefined : { since: compactingSince, tokens: 967_000 },
   pause_at: pauseAt,
   max_subagents: maxSubagents,
   ...(OLD_RUNNER ? {} : { move_on_limit: moveOn, move_plan: { ...movePlan } }),
@@ -598,6 +610,26 @@ let thinkingUntil = 0;
 function tick() {
   if (viewers.size === 0 || PAUSED) {
     timer = null;
+    return;
+  }
+  // Compacting: nothing else moves until it's done, then its marker is where it ran.
+  if (compactingSince !== undefined) {
+    if (Date.now() - compactingSince >= COMPACT_MS) {
+      compactions += 1;
+      const marker = add({
+        id: `compaction:mock-live-${compactions}`,
+        at: Date.now(),
+        kind: "notice",
+        level: "info",
+        text: `Compacted · 967k → 51k tokens · ${Math.round((Date.now() - compactingSince) / 1000)}s`,
+      });
+      compactingSince = undefined;
+      doing = "Thinking";
+      thinkingUntil = Date.now() + 3_000;
+      broadcast({ t: "events", events: [marker] });
+      broadcast({ t: "state", state: state() });
+    }
+    timer = setTimeout(tick, 140);
     return;
   }
   if (Date.now() < thinkingUntil) {
@@ -704,6 +736,12 @@ export function handleLongSession(ws: WebSocket, id: string, packed = false, pat
     return true;
   }
   const slow = Number(process.env.MOCK_SLOW_SNAPSHOT ?? 0);
+  // Its context full: it compacts as the page first opens, between one reply and the next.
+  if (COMPACT && compactions === 0 && compactingSince === undefined && running) {
+    compactingSince = Date.now();
+    doing = "Compacting the conversation";
+    live.streaming = false;
+  }
   const first = state();
   const frames: unknown[] = [
     { t: "open", info },

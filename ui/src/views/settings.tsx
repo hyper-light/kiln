@@ -27,6 +27,7 @@ import { MyPasswordGroup, MyPasswordHold, PasskeysGroup, PasskeysHold, myPasswor
 import { PeopleGroup, PeopleHold, RolesGroup, RolesHold, peopleRes, rolesRes } from "@/views/settings-people";
 import { TokensGroup, TokensHold, tokensRes } from "@/views/settings-tokens";
 import { CiSecretsGroups, CiSecretsHold } from "@/views/settings-ci";
+import { GithubGroup, GithubHold } from "@/views/settings-github";
 import { RoutingGroups, RoutingHold } from "@/views/settings-routing";
 import { OidcGroups, OidcHold } from "@/views/settings-oidc";
 import { ActionsGroup, ActionsHold } from "@/views/settings-actions";
@@ -145,7 +146,7 @@ export default function Settings() {
             index={next()}
             title="CI"
             about="The secrets and variables runs read, where legs run, the actions they may use, and the identity jobs prove"
-            words="ci secrets variables routing actions oidc"
+            words="ci secrets variables routing github actions oidc"
           >
             {(may("secrets.manage", false) || may("variables.manage", false)) && (
               <Loadable label="the scopes" fallback={<CiSecretsHold />}>
@@ -159,6 +160,9 @@ export default function Settings() {
             )}
             {may("settings.manage") && (
               <>
+                <Loadable label="the GitHub App" fallback={<GithubHold />}>
+                  <GithubGroup />
+                </Loadable>
                 <Loadable label="the actions policy" fallback={<ActionsHold />}>
                   <ActionsGroup />
                 </Loadable>

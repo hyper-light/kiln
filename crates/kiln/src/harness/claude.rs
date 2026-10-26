@@ -268,6 +268,10 @@ pub struct Claude {
     /// until they've taken that one.
     #[serde(default)]
     waking: BTreeSet<String>,
+    /// The compaction under way or just over (its boundary says more of it after its status said
+    /// it ended): its conversation's parent, and its marker's key, one marker for both.
+    #[serde(default)]
+    compaction: Option<(Option<String>, String)>,
 }
 
 impl Claude {
@@ -316,6 +320,7 @@ impl Claude {
             relays: HashMap::new(),
             relay_calls: HashMap::new(),
             waking: BTreeSet::new(),
+            compaction: None,
         }
     }
 
@@ -641,6 +646,19 @@ impl Claude {
     fn notice(&mut self, core: &mut Core, level: Level, text: impl Into<String>, parent: Option<String>) {
         self.notice_seq += 1;
         core.upsert(&format!("notice-{}-{}", self.run, self.notice_seq), parent, Body::Notice { level, text: text.into() });
+    }
+
+    /// The key of the marker of `parent`'s compaction under way or just over, else a new one.
+    fn compaction_key(&mut self, parent: Option<&str>) -> String {
+        if let Some((p, key)) = &self.compaction
+            && p.as_deref() == parent
+        {
+            return key.clone();
+        }
+        self.notice_seq += 1;
+        let key = format!("{}-{}", self.run, self.notice_seq);
+        self.compaction = Some((parent.map(str::to_owned), key.clone()));
+        key
     }
 
     /// Something is being worked on: note when the turn began.
@@ -2264,6 +2282,28 @@ impl Claude {
                 if activity.as_deref() == Some("requesting") && parent.is_none() {
                     self.begin(core);
                 }
+                // Compacting is said again every 30 s while it goes on; its end says how it went
+                // (older CLIs say nothing of it: their boundary ends it).
+                if activity.as_deref() == Some("compacting") {
+                    // A new one has a marker of its own.
+                    if core.compacting_of(parent.as_deref()).is_none() {
+                        self.compaction = None;
+                    }
+                    core.compacting(parent.clone());
+                } else if let Some(result) = str_of(v, "compact_result") {
+                    let key = self.compaction_key(parent.as_deref());
+                    let (level, text) = if result == "failed" {
+                        (Level::Warn, super::core::compaction_failed_words(str_of(v, "compact_error")))
+                    } else {
+                        let c = core.compacting_of(parent.as_deref());
+                        (Level::Info, super::core::compacted_words(c.and_then(|c| c.tokens), None, c.map(|c| Core::now() - c.since)))
+                    };
+                    core.compacted(&key, parent.clone(), level, text);
+                    // Its boundary follows one that compacted.
+                    if result == "failed" {
+                        self.compaction = None;
+                    }
+                }
                 core.state.activity = activity;
                 core.touch_state();
                 self.settle(core);
@@ -2291,12 +2331,12 @@ impl Claude {
             }
             "compact_boundary" => {
                 let meta = v.get("compact_metadata").or_else(|| v.get("compactMetadata"));
-                let pre = meta.and_then(|m| m.get("pre_tokens").or_else(|| m.get("preTokens"))).and_then(Value::as_u64);
-                let text = match pre {
-                    Some(p) => format!("Conversation compacted (was {} tokens)", fmt_tokens(p)),
-                    None => "Conversation compacted".to_owned(),
-                };
-                self.notice(core, Level::Info, text, parent);
+                let n = |snake: &str, camel: &str| meta.and_then(|m| m.get(snake).or_else(|| m.get(camel))).and_then(Value::as_u64);
+                let key = self.compaction_key(parent.as_deref());
+                let ms = n("duration_ms", "durationMs").and_then(|d| i64::try_from(d).ok()).or_else(|| core.compacting_of(parent.as_deref()).map(|c| Core::now() - c.since));
+                let text = super::core::compacted_words(n("pre_tokens", "preTokens"), n("post_tokens", "postTokens"), ms);
+                core.compacted(&key, parent, Level::Info, text);
+                self.compaction = None;
             }
             "api_retry" => {
                 let attempt = v.get("attempt").and_then(Value::as_u64).unwrap_or(0);
@@ -2929,6 +2969,9 @@ impl Claude {
     fn result(&mut self, core: &mut Core, v: &Value) {
         self.turn = false;
         self.agents_allowed.clear();
+        // A compaction its turn ended before (an interrupt): it didn't finish.
+        core.compaction_stopped(None);
+        self.compaction = None;
         let started = core.state.turn_started;
         core.state.turn_started = None;
         core.state.doing = None;
@@ -3750,16 +3793,6 @@ fn fast_blocked(reason: &str) -> Option<String> {
     Some(said.to_owned())
 }
 
-fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.0}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
 /// `path` relative to `cwd` when inside it.
 pub fn rel(path: &str, cwd: &str) -> String {
     if !cwd.is_empty()
@@ -4119,6 +4152,54 @@ mod tests {
         for l in lines {
             c.line(core, l);
         }
+    }
+
+    /// The compactions' markers, newest last: (level, words, thread).
+    fn compactions(core: &Core) -> Vec<(Level, String, Option<String>)> {
+        core.events()
+            .filter(|e| e.id.starts_with(super::super::core::COMPACTION))
+            .filter_map(|e| match &e.body {
+                Body::Notice { level, text } => Some((*level, text.clone(), e.parent.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Claude Code 2.1.296 compacting: `status: "compacting"` (said again every 30 s, with what
+    /// it has written so far), its end (`compact_result`), then its boundary (`compact_metadata`):
+    /// one marker. A subagent's is its own, one that fails says why, and one its turn ended before
+    /// stopped.
+    #[test]
+    fn a_compaction_shows_while_it_goes_on_and_its_boundary_after() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        core.state.usage.context_tokens = Some(967_000);
+        feed(&mut c, &mut core, &[
+            r#"{"type":"system","subtype":"status","status":"requesting","session_id":"s","uuid":"u1"}"#,
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s","uuid":"u2"}"#,
+        ]);
+        let since = core.state.compacting.as_ref().map(|c| c.since);
+        assert!(since.is_some());
+        assert_eq!(core.state.doing.as_deref(), Some(super::super::core::COMPACTING));
+        feed(&mut c, &mut core, &[r#"{"type":"system","subtype":"status","status":"compacting","compact_output_chars":5120,"session_id":"s","uuid":"u3"}"#]);
+        assert_eq!(core.state.compacting.as_ref().map(|c| c.since), since);
+        feed(&mut c, &mut core, &[
+            r#"{"type":"system","subtype":"status","status":null,"compact_result":"success","session_id":"s","uuid":"u4"}"#,
+            r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":967000,"post_tokens":48000,"duration_ms":98000},"session_id":"s","uuid":"b1"}"#,
+        ]);
+        assert!(core.state.compacting.is_none());
+        assert_eq!(core.state.doing.as_deref(), Some("Thinking"));
+        assert_eq!(compactions(&core), [(Level::Info, "Compacted · 967k → 48k tokens · 1m 38s".to_owned(), None)]);
+        feed(&mut c, &mut core, &[r#"{"type":"system","subtype":"status","status":"compacting","parent_tool_use_id":"toolu_5"}"#]);
+        assert_eq!(core.state.compacting.as_ref().and_then(|c| c.parent.as_deref()), Some("toolu_5"));
+        feed(&mut c, &mut core, &[r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"Conversation too long","parent_tool_use_id":"toolu_5"}"#]);
+        assert_eq!(compactions(&core).last(), Some(&(Level::Warn, "Couldn't compact: Conversation too long".to_owned(), Some("toolu_5".to_owned()))));
+        feed(&mut c, &mut core, &[
+            r#"{"type":"system","subtype":"status","status":"compacting"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"","terminal_reason":"aborted_streaming","session_id":"s"}"#,
+        ]);
+        assert!(core.state.compacting.is_none());
+        assert!(compactions(&core).last().is_some_and(|(level, text, _)| *level == Level::Warn && text.starts_with("Compaction stopped")));
     }
 
     fn tool<'a>(core: &'a Core, id: &str) -> Option<&'a ToolCall> {

@@ -5,6 +5,7 @@
 .sg-shimmer,
 .sg-think,
 .sg-trace,
+.sg-condense,
 .sg-caret {
   /* --prism, horizontal (rules, text) and as a seamless vertical loop (the thinking rule, the caret). */
   --sg-prism: linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
@@ -53,6 +54,12 @@
   animation: sg-optic-sway 2.4s ease-in-out infinite;
   animation-delay: calc(var(--i) * -0.1s);
 }
+/* Compacting: the rings draw in toward the centre, outermost first, and let go, in the beat of the
+   rule beside them (the shape only). */
+.sg-optic[data-state="compacting"] > span {
+  animation: sg-optic-gather 2.8s cubic-bezier(0.45, 0, 0.25, 1) infinite;
+  animation-delay: calc(var(--i) * 0.1s);
+}
 /* Waiting on you: held still in amber, the outer ring lit. */
 .sg-optic[data-state="waiting"] {
   filter: drop-shadow(0 0 2px rgb(216 187 149 / 45%));
@@ -87,6 +94,16 @@
   }
   50% {
     transform: rotate(-32deg) scaleX(0.6) rotate(calc(var(--i) * 5deg + 2deg));
+  }
+}
+/* The outer rings shrink most: at the gather they nearly meet the inner ones. */
+@keyframes sg-optic-gather {
+  0%,
+  100% {
+    transform: rotate(-35deg) scaleX(0.55) rotate(calc(var(--i) * 5deg));
+  }
+  55% {
+    transform: rotate(-35deg) scaleX(0.55) rotate(calc(var(--i) * 5deg + 10deg)) scale(calc(0.52 + var(--i) * 0.13));
   }
 }
 
@@ -452,6 +469,85 @@
   }
 }
 
+/* ------------------------------------------------------------ condense (a compaction) */
+
+/* The conversation's length as the timeline's hairline; the summary as the site's 30 px prism bar
+   at its start. While it compacts, the whole spectrum, as wide as the conversation, is squeezed
+   from the far end into the bar, which brightens as it takes it: scaled, not resized, so only a
+   transform and opacity move and the GPU does it. */
+.sg-condense {
+  position: relative;
+  display: block;
+  height: 2px;
+}
+.sg-condense::before {
+  position: absolute;
+  top: 0.5px;
+  right: 0;
+  left: 0;
+  height: 1px;
+  background: #1d1f24;
+  content: "";
+}
+.sg-condense-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 30px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--sg-prism);
+  opacity: 0.9;
+}
+.sg-condense-light {
+  position: absolute;
+  inset: 0;
+  border-radius: 1px;
+  background: var(--sg-prism);
+  transform-origin: 0 50%;
+  opacity: 0;
+  animation: sg-condense 2.8s cubic-bezier(0.62, 0, 0.82, 0.38) infinite;
+}
+.sg-condense[data-live="true"] .sg-condense-bar {
+  animation: sg-condense-take 2.8s ease-in-out infinite;
+}
+/* One that didn't compact: the bar broken, in the warning's tone (as an error leaves a call's loop). */
+.sg-condense[data-tone="warn"] .sg-condense-bar {
+  background: repeating-linear-gradient(90deg, #cbb69a 0 7px, transparent 7px 11px);
+  opacity: 0.85;
+}
+@keyframes sg-condense {
+  0% {
+    transform: scaleX(1);
+    opacity: 0;
+  }
+  16% {
+    transform: scaleX(1);
+    opacity: 0.42;
+  }
+  80% {
+    transform: scaleX(0.035);
+    opacity: 0.95;
+  }
+  88%,
+  100% {
+    transform: scaleX(0.035);
+    opacity: 0;
+  }
+}
+@keyframes sg-condense-take {
+  0%,
+  72% {
+    opacity: 0.5;
+  }
+  86% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.5;
+  }
+}
+
 /* ------------------------------------------------------------ caret */
 
 .sg-caret {
@@ -484,6 +580,8 @@
 :root[data-motion="paused"] .sg-beam,
 :root[data-motion="paused"] .sg-trace-glow > span,
 :root[data-motion="paused"] .sg-load path,
+:root[data-motion="paused"] .sg-condense-light,
+:root[data-motion="paused"] .sg-condense-bar,
 :root[data-motion="paused"] .sg-caret {
   animation-play-state: paused;
 }
@@ -499,6 +597,8 @@
   .sg-beam,
   .sg-trace-glow > span,
   .sg-load path,
+  .sg-condense-light,
+  .sg-condense-bar,
   .sg-caret,
   .sg-chev {
     animation: none !important;
@@ -510,6 +610,10 @@
   }
   .sg-load-light {
     stroke-dasharray: none;
+  }
+  /* Compacting says so in words, over the bar held still. */
+  .sg-condense-light {
+    display: none;
   }
 }
 
@@ -530,7 +634,12 @@
   .sg-load path {
     stroke: CanvasText;
   }
-  .sg-trace-glow {
+  .sg-trace-glow,
+  .sg-condense-light {
     display: none;
+  }
+  .sg-condense::before,
+  .sg-condense-bar {
+    background: CanvasText;
   }
 }
