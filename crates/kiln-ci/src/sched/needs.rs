@@ -357,6 +357,49 @@ mod tests {
         Ok(())
     }
 
+    /// docs/runners.md holds to the parser: each row of its spelling table reads as the table says,
+    /// each spelling it shows (its `needs` blocks, each `kiln run --needs`) parses, and its workflow
+    /// example makes the needs it says it does.
+    #[test]
+    fn docs_runners_md_spells_needs_as_the_parser_reads_them() -> Result<(), String> {
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/runners.md")).map_err(|e| e.to_string())?;
+        let section = |title: &str| doc.split(title).nth(1).and_then(|s| s.split("\n## ").next()).unwrap_or_default().to_owned();
+        let code = |cell: &str| cell.trim().strip_prefix('`').and_then(|c| c.strip_suffix('`')).map(str::to_owned);
+        let mut rows = 0;
+        for line in section("## 2. The spelling").lines().filter(|l| l.starts_with("| `")) {
+            let cells: Vec<&str> = line.split('|').collect();
+            let (Some(spelling), Some(reads)) = (cells.get(1).and_then(|c| code(c)), cells.get(2).and_then(|c| code(c))) else { return Err(format!("a row without a spelling and its reading: {line}")) };
+            assert_eq!(parse(&spelling)?.describe(), reads, "docs/runners.md says {spelling} reads as {reads}");
+            rows += 1;
+        }
+        assert!(rows >= 15, "the spelling table: {rows} rows");
+        let mut shown: Vec<String> = Vec::new();
+        let mut block = false;
+        for line in doc.lines().map(str::trim) {
+            match line {
+                "```needs" => block = true,
+                "```" => block = false,
+                l if block && !l.is_empty() => shown.push(l.to_owned()),
+                _ => {}
+            }
+        }
+        let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        shown.extend(flat.split("kiln run --needs ").skip(1).filter_map(|r| r.split_whitespace().next()).map(|s| s.trim_end_matches('`').to_owned()));
+        assert!(shown.len() >= 10, "{shown:?}");
+        for s in &shown {
+            parse(s).map_err(|why| format!("docs/runners.md shows {s}: {why}"))?.constraints()?;
+        }
+        // §3: the job's keys make the needs the text gives them.
+        let workflow = section("## 3. In a workflow");
+        let said = workflow.split("This job needs `").nth(1).and_then(|s| s.split('`').next()).ok_or("§3 says no job's needs")?;
+        let yaml = workflow.split("```yaml\n").nth(1).and_then(|s| s.split("```").next()).ok_or("§3 has no workflow")?;
+        let src = format!("on: push\n{yaml}    steps:\n      - run: make\n");
+        let (wf, diags) = parse_workflow(".kiln/ci.yaml", &src, Dialect::Kiln);
+        let job = wf.as_ref().and_then(|w| w.job("build")).ok_or_else(|| format!("§3's workflow: {diags:?}"))?;
+        assert_eq!(of_job(&job.kiln)?, parse(said)?, "§3's job against {said}");
+        Ok(())
+    }
+
     #[test]
     fn sizes_are_binary_in_any_case() {
         for (s, want) in [("32g", Some(32 * GIB)), ("32G", Some(32 * GIB)), ("32GB", Some(32 * GIB)), ("32Gi", Some(32 * GIB)), ("512m", Some(512 << 20)), ("1.5t", Some(3 << 39)), ("1024", Some(1024)), ("4h", None), ("lots", None), ("-1g", None)] {
