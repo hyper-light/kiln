@@ -133,6 +133,8 @@ pub struct Keyed {
     pub why: String,
     pub scope: String,
     pub weak: Key,
+    /// The unit the ledger keys and looks up (W24-R30).
+    pub unit: Unit,
 }
 
 /// `req` keyed, or why it can't be.
@@ -151,15 +153,15 @@ async fn key_for(handle: &Handle, me: &str, req: &RunReq) -> anyhow::Result<Resu
     let digest = crate::rt::blocking(move || tree(&root)).await??;
     let person = person();
     let u = unit(req, &rel.to_string_lossy(), &digest, &choice.runner, &person);
-    Ok(Ok(Keyed { runner: choice.runner, why: choice.why, scope: crate::ci::work::scope(REPO, &person), weak: key::weak(&u) }))
+    Ok(Ok(Keyed { runner: choice.runner, why: choice.why, scope: crate::ci::work::scope(REPO, &person), weak: key::weak(&u), unit: u }))
 }
 
 /// The result recorded for `weak` in `scope`, with its output; `None` without one, or when its
 /// output is no longer kept.
-pub async fn lookup(svc: &Service, scope: &str, weak: Key) -> anyhow::Result<Option<(Recorded, Vec<(bool, Vec<u8>)>)>> {
+pub async fn lookup(svc: &Service, scope: &str, unit: Unit) -> anyhow::Result<Option<(Recorded, Vec<(bool, Vec<u8>)>)>> {
     let sc = scope.to_owned();
-    let found = svc.store().ledger().call(move |c| crate::ci::work::lookup(c, &sc, &weak, &|p: &PathSet| p.clone())).await?;
-    let Some((_, recorded)) = found else { return Ok(None) };
+    let found = svc.store().ledger().call(move |c| crate::ci::work::lookup(c, &sc, &unit, &|p: &PathSet| p.clone())).await?;
+    let Some(crate::ci::work::Hit { recorded, .. }) = found else { return Ok(None) };
     let Some(log) = recorded.logs.clone() else { return Ok(None) };
     let store = std::sync::Arc::clone(svc.store());
     let bytes = crate::rt::blocking(move || store.read(&log)).await??;
@@ -181,8 +183,8 @@ pub async fn record(svc: &Service, k: &Keyed, pieces: &[(bool, Vec<u8>)], ms: u6
         domain: person,
         ..Recorded::default()
     };
-    let (scope, weak) = (k.scope.clone(), k.weak);
-    svc.store().ledger().call(move |c| crate::ci::work::record(c, &scope, &weak, &PathSet::new(), &result).map(|_| ())).await
+    let (scope, unit) = (k.scope.clone(), k.unit.clone());
+    svc.store().ledger().call(move |c| crate::ci::work::record(c, &scope, &unit, &PathSet::new(), &result).map(|_| ())).await
 }
 
 fn ago(secs: i64) -> String {
@@ -237,7 +239,7 @@ pub async fn run_with(svc: Option<&std::sync::Arc<Service>>, handle: &Handle, me
             return;
         }
     };
-    match lookup(svc, &keyed.scope, keyed.weak).await {
+    match lookup(svc, &keyed.scope, keyed.unit.clone()).await {
         Ok(Some((found, pieces))) => {
             let _ = ev.send(Ev::Picked { runner: keyed.runner.name.clone(), why: keyed.why.clone() }).await;
             let took = found.provenance.ms as f64 / 1000.0;

@@ -387,6 +387,7 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         container: spec.container.clone(),
         workflow_file: r.path.clone(),
         prefer,
+        ..LegIn::default()
     }
 }
 

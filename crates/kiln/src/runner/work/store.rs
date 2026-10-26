@@ -113,7 +113,13 @@ impl Index {
 /// A tool's name for an object as a unit of work (W24-R30: every key on the ledger's one path):
 /// an action whose definition is the tool's own key in its namespace, in the scope's domain.
 pub fn entry_key(ns: &str, name: &str, domain: &str) -> Key {
-    key::weak(&Unit {
+    key::weak(&entry_unit(ns, name, domain))
+}
+
+/// The unit of `ns`/`name` in `domain` that [`entry_key`] keys: what the ledger looks up and
+/// records (W24-R30).
+pub fn entry_unit(ns: &str, name: &str, domain: &str) -> Unit {
+    Unit {
         kind: Kind::Action,
         definition: format!("kiln/cas {ns}\n{name}"),
         secrets: Default::default(),
@@ -122,7 +128,7 @@ pub fn entry_key(ns: &str, name: &str, domain: &str) -> Key {
         inputs: Default::default(),
         upstream: Default::default(),
         trust: domain.to_owned(),
-    })
+    }
 }
 
 /// An entry as the ledger records it: its object and size among the outputs, what the tool sent
@@ -152,7 +158,7 @@ fn entry_of(r: &Recorded) -> Option<Entry> {
 /// nothing.
 fn ledger_entry(c: &rusqlite::Connection, scope: &Scope, ns: &str, name: &str) -> anyhow::Result<Option<Option<Entry>>> {
     let same = |p: &PathSet| p.clone();
-    Ok(crate::ci::work::lookup(c, &scope.key(), &entry_key(ns, name, &scope.domain), &same)?.map(|(_, r)| entry_of(&r)))
+    Ok(crate::ci::work::lookup(c, &scope.key(), &entry_unit(ns, name, &scope.domain), &same)?.map(|h| entry_of(&h.recorded)))
 }
 
 /// The store.
@@ -445,7 +451,7 @@ impl Store {
                 {
                     return Ok(false);
                 }
-                crate::ci::work::record(c, &s.key(), &entry_key(&ns, &name, &s.domain), &PathSet::new(), &recorded(Some(&entry), &s.domain, entry.at))?;
+                crate::ci::work::record(c, &s.key(), &entry_unit(&ns, &name, &s.domain), &PathSet::new(), &recorded(Some(&entry), &s.domain, entry.at))?;
                 Ok(true)
             })
             .await
@@ -460,7 +466,7 @@ impl Store {
                 if !matches!(ledger_entry(c, &s, &ns, &name)?, Some(Some(_))) {
                     return Ok(false);
                 }
-                crate::ci::work::record(c, &s.key(), &entry_key(&ns, &name, &s.domain), &PathSet::new(), &recorded(None, &s.domain, crate::util::now_unix()))?;
+                crate::ci::work::record(c, &s.key(), &entry_unit(&ns, &name, &s.domain), &PathSet::new(), &recorded(None, &s.domain, crate::util::now_unix()))?;
                 Ok(true)
             })
             .await
@@ -584,7 +590,7 @@ mod tests {
                 anyhow::ensure!(store.entry(&[a.clone(), t.clone()], "sccache", "gone").await?.map(|(s, e)| (s, e.digest)) == Some((t.clone(), td)));
                 // On the ledger: a unit whose definition is the tool's key.
                 let same = |p: &PathSet| p.clone();
-                let (sk, wk) = (a.key(), entry_key("sccache", "k1", "untrusted"));
+                let (sk, wk) = (a.key(), entry_unit("sccache", "k1", "untrusted"));
                 anyhow::ensure!(store.ledger().call(move |c| crate::ci::work::lookup(c, &sk, &wk, &same)).await?.is_some(), "recorded on the ledger");
                 d
             };

@@ -1133,9 +1133,9 @@ fn w28_r66_nested_levels_split_their_parents_share() {
 mod warm_placement {
 use super::*;
 
-use super::routing::Affinity;
-use super::sim::Assigned;
-use super::warm::{self, Held, Wants, Workspace};
+use crate::sched::routing::Affinity;
+use crate::sched::sim::Assigned;
+use crate::sched::warm::{self, Held, Wants, Workspace};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
@@ -1256,7 +1256,7 @@ fn w24_r18_affinity_goes_after_that_jobs_workspaces() {
 /// the one with Docker, though the other comes first by name, and the explanation says why.
 #[test]
 fn w24_r18_a_lanes_workspace_counts_where_the_leg_runs_with_its_toolchain() -> Result<(), String> {
-    use super::routing::{Rule, RuleMatch};
+    use crate::sched::routing::{Rule, RuleMatch};
     let rule = Rule { matches: RuleMatch { labels: vec!["k8s".into()], ..RuleMatch::default() }, executor: vec!["docker".into(), "host".into()], image: Some("kiln/runner-ubuntu-24.04".into()), ..Rule::default() };
     let mut s = Scheduler::new(Config { rules: vec![rule.clone()], ..Config::default() });
     let mut docker = linux("w", 1);
@@ -1557,7 +1557,7 @@ proptest! {
                 l.route.job = format!("job{}", j % 3);
                 l.route.workflow = "ci".into();
                 if terms {
-                    l.lane = Some(format!("lane{}", j % 3));
+                    l.warm_lane = Some(format!("lane{}", j % 3));
                     l.prefer = vec![if j % 2 == 0 { Preference { warm: true, patience: Some(share), ..Preference::default() } } else { Preference { affinity: Some(Affinity { job: "job0".into() }), weight: Some(3.0), ..Preference::default() } }];
                 }
                 sim.leg(*at, l, *took);

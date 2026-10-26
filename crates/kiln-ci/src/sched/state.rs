@@ -25,7 +25,7 @@ use super::pools::{self, ExecState, Executor, Pool, PoolView};
 use super::reserve::Reservation;
 use super::retry::{self, Failed, FailureClass, RetryPolicy, RunnerChoice};
 use super::routing::{self, Check, LegRoute, Preference, Requirement, Rule, RunnerView};
-use super::warm::{self, Held, Wants};
+use super::warm::{self, Held as WarmHeld, Wants};
 
 /// What a leg asks for and a runner offers, in resource mode (W05-R03).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
@@ -238,7 +238,7 @@ pub enum Input {
     /// What a runner holds warm (W24-R18), in place of what it held before: its workspaces, how
     /// far each is behind and what warm runs took there, and its bandwidth. From the runners'
     /// reports of their workspaces and the ledger's history.
-    Warm { runner: String, held: Held },
+    Warm { runner: String, held: WarmHeld },
 }
 
 /// Why a leg waits (W05-R13): exactly one, the current one.
@@ -483,7 +483,7 @@ pub struct Scheduler {
     /// actors, `repo\0actor` → lanes.
     members: HashMap<String, HashMap<String, usize>>,
     /// What each runner holds warm, by runner (W24-R18).
-    warm: HashMap<String, Held>,
+    warm: HashMap<String, WarmHeld>,
     /// The time of the last input: explanations reckon waits from it.
     now: i64,
 }
@@ -1772,7 +1772,7 @@ impl Scheduler {
     // ------------------------------------------------------------------ warm placement (W24-R18)
 
     /// What a runner holds warm now. Legs already placed stay; the next decisions use it.
-    fn warm_changed(&mut self, runner: String, held: Held) {
+    fn warm_changed(&mut self, runner: String, held: WarmHeld) {
         if held.workspaces.is_empty() && held.bandwidth.is_none() {
             self.warm.remove(&runner);
         } else {
@@ -1975,7 +1975,7 @@ impl Scheduler {
     /// Ends the waits for warm runners that can't take their legs any more: lost, draining, or no
     /// longer eligible. In queue order, so the first in line goes first.
     fn release_holds(&mut self, now: i64, out: &mut Vec<Command>) {
-        let mut ended: Vec<((i64, u64, u64), String)> = self
+        let mut ended: Vec<(_, String)> = self
             .legs
             .iter()
             .filter(|(_, l)| l.hold.as_ref().is_some_and(|h| !self.sigs.get(&l.sig).is_some_and(|s| s.eligible.contains(&h.runner)) || !self.runners.get(&h.runner).is_some_and(|r| self.admits(r, l))))
