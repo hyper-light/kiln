@@ -1367,7 +1367,7 @@ impl Leg {
                 .get("cpus")
                 .and_then(serde_json::Value::as_u64)
                 .filter(|_| matches!(a.executor.kind.as_str(), "" | "host" | "docker"))
-                .and_then(|n| super::cpus::take(usize::try_from(n).unwrap_or(0)))
+                .and_then(|n| super::cpus::take(&a.job_id, usize::try_from(n).unwrap_or(0)))
                 .map(std::sync::Arc::new),
             matchers: matchers::Job::default(),
             stop: None,
@@ -2263,7 +2263,7 @@ impl Leg {
             workspace_size: None,
             memory: None,
             seed_tools: false,
-            cpuset: st.cpus.as_ref().map(|l| l.list()),
+            cpuset: super::cpus::pins().allowed(&self.a.job_id).map(|c| super::cpus::list(&c)),
         })
     }
 
@@ -2460,8 +2460,9 @@ impl Leg {
         let job = job.map(|j| super::docker::Spec { workspace_size: super::chaos::for_leg(a.attempt).and_then(|c| c.disk_mib).map(|mib| u64::from(mib) << 20), ..j });
         // The memory the leg was given in resource mode (W05-R03), its job container's limit.
         let job = job.map(|j| super::docker::Spec { memory: a.executor.options.get("memory").and_then(serde_json::Value::as_u64), ..j });
-        // And the CPUs it was given, its job container's own (`--cpuset-cpus`).
-        let job = job.map(|j| super::docker::Spec { cpuset: st.cpus.as_ref().map(|l| l.list()), ..j });
+        // And the CPUs it may use, its job container's own (`--cpuset-cpus`): those it was lent,
+        // its share, or what no share holds.
+        let job = job.map(|j| super::docker::Spec { cpuset: super::cpus::pins().allowed(&a.job_id).map(|c| super::cpus::list(&c)), ..j });
         // W18-R08: a job in a container is contained, its one way out the relay to the runner's
         // proxy. A runner without a static kiln for the relay can't contain it: an untrusted leg
         // stops here; a trusted one runs as it would without its policy, and says so.
@@ -2716,20 +2717,16 @@ impl Leg {
             }
             cli.exec_command(&j.id, j.user.as_deref(), &j.map.translate(&wd.to_string_lossy()), &inner, &j.map.translate(&prog), &args)
         } else {
-            // On the host, within the CPUs the leg was given (W05-R03), as `taskset` starts it.
-            let mut c = match (&st.cpus, super::cpus::taskset()) {
-                (Some(l), Some(t)) => {
-                    let mut c = Command::new(t);
-                    c.arg("-c").arg(l.list()).arg(&prog).args(&args);
-                    c
-                }
-                _ => shell_program(&prog, &args, shell),
-            };
+            let mut c = shell_program(&prog, &args, shell);
             c.current_dir(wd).envs(&env);
             c
         };
-        let mut running = crate::proc::spawn_group(cmd)?;
+        // On the CPUs its leg may use (W05-R03): its share, the CPUs it was lent, or what no share
+        // holds, from its first instruction; and moved as a share is taken or let go.
+        let job = self.a.job_id.clone();
+        let mut running = super::cpus::spawn_on(&job, move || crate::proc::spawn_group(cmd))?;
         st.groups.push(running.pgid);
+        let _pinned = super::cpus::Step::new(&self.a.job_id, running.pgid);
         let mut oom_at = oom_after.map(|d| Instant::now() + d);
         let mut r = Reading { proc: Processor::new(st.allow_unsecure), line: Vec::new(), set_output: BTreeMap::new(), matchers: st.matchers.step(), failed: false, enospc: false };
         let mut flush = Interval::new(Duration::from_millis(100));
@@ -5351,13 +5348,10 @@ runs:
     }
 
     /// W05-R03: a leg in resource mode runs on CPUs of its own, as many as it asked for: on the
-    /// host its steps start within them (`taskset`), so `nproc` says the leg's (Linux).
+    /// host its steps start on them, so `nproc` says the leg's (Linux).
     #[cfg(target_os = "linux")]
     #[test]
     fn w05_r03_a_host_leg_runs_on_its_cpus() -> anyhow::Result<()> {
-        if super::super::cpus::taskset().is_none() {
-            return Ok(());
-        }
         let wf = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: echo \"cpus $(nproc)\"\n";
         let (r, logs, _) = run_leg_with(wf, &[], Dialect::Gha, &|_| Ok(()), &|a: &mut AssignmentV2| a.executor.options = serde_json::json!({ "cpus": 1 }))?;
         assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");

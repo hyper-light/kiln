@@ -1630,7 +1630,17 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   resources and `[ci.scheduler] mode = "resources"`, CPU, memory, disk and GPUs. A leg requests
   `resources` (default from its pool or `[ci.scheduler] default_request`). In resource mode a leg
   fits when every requested resource fits within capacity × `overcommit` (default 1.0 for memory
-  and disk, 1.5 for CPU). `exclusive: true` takes the whole runner.
+  and disk, 1.5 for CPU). `exclusive: true` with `resources:` asking for CPUs **holds** them and
+  the memory it asks, for the leg alone: it starts where that much is neither held nor taken by
+  the ordinary legs there (a slot's share each in slots mode), never overcommitted, and other legs
+  run beside it in the rest: in slots mode in the slots the unheld share keeps (32 CPUs with 16
+  held: half the slots), in resource mode in what's unheld × `overcommit`. Its runner gives it
+  whole cores of its own, a whole L3 domain when the share covers one, and every other leg's
+  steps (and containers, `--cpuset-cpus`) run on the rest, moved as shares come and go (Linux;
+  elsewhere the share holds its room, its cores unpinned). Cores don't keep apart what they share:
+  the memory bus and the disks. `exclusive: true` asking for no CPUs takes the whole runner, as
+  does one on a runner whose size isn't known. The v1 dispatcher and each runner's own admission
+  hold to the same rule, so neither dispatcher's work lands in the other's share.
 - **W05-R04 Data structures.** Requirements are interned into **signatures**; each signature keeps
   its eligible runner set (recomputed when a runner or a rule changes) and a priority queue of its
   legs ordered by (effective priority descending, fair-share virtual time ascending, queue order
@@ -1993,12 +2003,15 @@ W20.
   - And to its CPUs (2026-10-25): a leg runs on CPUs of its own, as many as it asked for (whole
     ones: half of one is one), a cpuset and not a quota, which stalls a test's many threads
     where a hosted runner's machine wouldn't. The runner keeps a pool of the CPUs it may run on
-    itself (its `Cpus_allowed_list`: its affinity within its cgroup's cpuset); each leg takes
-    those no other leg holds while there are any, then the least held, and gives them back when
-    it ends. A job container and its services get them as `--cpuset-cpus` (a hosted runner's
+    itself (its `Cpus_allowed_list`: its affinity within its cgroup's cpuset), in one ledger with
+    the shares exclusive legs hold (W05-R03); each leg takes, of those no share holds, the ones
+    no other leg holds while there are any, then the least held, and gives them back when it
+    ends. A share taken later keeps off leased CPUs while there are enough others; when it
+    can't, a leased leg keeps what of its lease the share doesn't hold. A job container and its services get them as `--cpuset-cpus` (a hosted runner's
     services share its machine); a pool's executor, started before its leg came (W13-R09), gets
     them and the leg's memory by `docker update` as the leg takes it; and a host step starts
-    within them through `taskset` (Linux; elsewhere a leg sees the machine's). An engine that
+    on them from its first instruction, the thread starting it lending it its CPUs, and moves
+    as shares come and go (Linux; elsewhere a leg sees the machine's). An engine that
     can't hold a container to CPUs (a rootless one without the cpuset controller delegated to
     it) drops them with a warning, as Docker and Podman do, and the leg sees the machine's. So
     `nproc` says the leg's, and what sizes its work by it (`make -j$(nproc)`, cargo's jobs, a test
@@ -5354,7 +5367,7 @@ opt-in quarantine, timing data for shards, regression tracking and opt-in gates 
 - **W16-AC04 Benchmarks.** A synthetic 10 % slowdown with low noise is flagged; a 2 % slowdown with
   high noise is "no clear difference"; a gate at 5 % fails the first and passes the second.
   *Unit test with seeded data.*
-- **W16-AC05 End to end.** kiln's own `bench.yaml` on an exclusive runner records criterion
+- **W16-AC05 End to end.** kiln's own `bench.yaml` on cores it holds (W05-R03) records criterion
   metrics and shows trends per fingerprint. *E2E.*
 
 **Progress.** In progress: R01 (formats and `test-results:`), R02, R03 (the run page and

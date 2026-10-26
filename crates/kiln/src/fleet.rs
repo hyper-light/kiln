@@ -1459,6 +1459,7 @@ mod tests {
             outpost: false,
             dedicated_job: None,
             exclusive: false,
+            held: Vec::new(),
             lost_at: None,
             facts: Some(Box::new(kiln_ci::facts::RunnerFacts {
                 os: os.into(),
