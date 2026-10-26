@@ -1326,6 +1326,7 @@ const MIME: Record<string, string> = {
   ".svg": "image/svg+xml",
   ".woff2": "font/woff2",
   ".woff": "font/woff",
+  ".wasm": "application/wasm",
   ".png": "image/png",
   ".json": "application/json",
   ".webmanifest": "application/manifest+json",

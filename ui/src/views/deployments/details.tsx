@@ -19,6 +19,7 @@ import { useSuspenseResource } from "@/lib/resource";
 import { FileDiffView } from "@/views/harness/diff";
 import { age, compareText } from "./model";
 import { HealthPair, KindBadge, StatePair, SyncPair, appKey, objectLabel } from "./parts";
+import { Highlighted } from "@/components/code/highlighted";
 
 export type Show = "summary" | "live" | "desired" | "diff" | "events" | "logs";
 
@@ -257,7 +258,9 @@ function Manifest({ text, empty, name }: { text: string | null; empty: string; n
         <span className="cd-meta">{name}</span>
         <CopyButton text={text} className="cd-copy" />
       </div>
-      <pre className="cd-yaml">{text}</pre>
+      <pre className="cd-yaml">
+        <Highlighted text={text} lang="yaml" />
+      </pre>
     </div>
   );
 }
@@ -268,7 +271,7 @@ function Diff({ d }: { d: CdResourceDetail }) {
   return (
     <div className="cd-diffs">
       <p className="cd-meta">What a sync changes: − is what runs, + what it becomes. Fields the cluster fills in itself are left out.</p>
-      <FileDiffView diff={{ path: objectLabel(d.key), hunks: d.diff.hunks }} label={objectLabel(d.key)} />
+      <FileDiffView diff={{ path: objectLabel(d.key), hunks: d.diff.hunks }} label={objectLabel(d.key)} language="yaml" />
     </div>
   );
 }

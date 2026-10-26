@@ -3,15 +3,18 @@
  * change) stays in view while you scroll through the file. Hunks are unified on narrow containers
  * and side by side on wide ones where the caller allows it; long lines soft-wrap under a hanging
  * indent instead of scrolling sideways; the words that changed in an edited line are picked out;
- * long unchanged runs fold away behind a control that opens them in place. Which layout applies is
- * the diff's own width's call (container queries in diff.css), not the viewport's.
+ * long unchanged runs fold away behind a control that opens them in place; the code is in its
+ * language's colours (lib/syntax), once its grammar is here. Which layout applies is the diff's own
+ * width's call (container queries in diff.css), not the viewport's.
  */
 import * as React from "react";
 import { flushSync } from "react-dom";
 import { ChevronRight, ChevronsUpDown, FileDiff as FileDiffIcon, FilePlus2 } from "lucide-react";
 import type { FileDiff, Hunk } from "@/api/harness";
+import { resolveLanguage, useHighlighter, type Highlight, type Tok } from "@/lib/syntax/browser";
 import { cn } from "@/lib/utils";
 import { diffStats } from "./derive";
+import "@/components/code/syntax.css";
 import "./diff.css";
 
 /* ------------------------------------------------------------------ model */
@@ -134,11 +137,10 @@ function compare(a: Toks, b: Toks): Likeness {
   const w = m + 1;
   const lcs = new Uint16Array((n + 1) * w);
   const run = (i: number, j: number) => lcs[i * w + j] ?? 0;
-  for (let i = n - 1; i >= 0; i--)
-    for (let j = m - 1; j >= 0; j--) lcs[i * w + j] = a.s[i] === b.s[j] ? run(i + 1, j + 1) + 1 : Math.max(run(i + 1, j), run(i, j + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) lcs[i * w + j] = a.s[i] === b.s[j] ? run(i + 1, j + 1) + 1 : Math.max(run(i + 1, j), run(i, j + 1));
   const ka = new Uint8Array(n);
   const kb = new Uint8Array(m);
-  for (let i = 0, j = 0; i < n && j < m; ) {
+  for (let i = 0, j = 0; i < n && j < m;) {
     if (a.s[i] === b.s[j]) {
       ka[i++] = 1;
       kb[j++] = 1;
@@ -206,7 +208,7 @@ function pair(dels: Line[], adds: Line[]): Pair[] {
       best[i * w + j] = Math.max(most(i + 1, j), most(i, j + 1), k ? k.sim + most(i + 1, j + 1) : 0);
     }
   const matches: [number, number][] = [];
-  for (let i = 0, j = 0; i < d && j < a; ) {
+  for (let i = 0, j = 0; i < d && j < a;) {
     const k = kAt(i, j);
     if (k && most(i, j) === k.sim + most(i + 1, j + 1)) {
       take(i, j, k);
@@ -255,7 +257,7 @@ export function hunkOf(h: Hunk): HunkModel {
   let o = h.old_start;
   let n = h.new_start;
   const ls = h.lines;
-  for (let i = 0; i < ls.length; ) {
+  for (let i = 0; i < ls.length;) {
     const tag = (ls[i] ?? "").charAt(0);
     if (tag === "-" || tag === "+") {
       // A block runs to the next unchanged line; its deletions and additions keep their own order.
@@ -322,10 +324,41 @@ function seamsOf(text: string, from: number): { at: number; glue: boolean }[] {
 }
 
 /**
- * A line's text: its changed words marked, its seams in place, and its indentation kept from
- * wrapping (white-space: pre), or a long first word would wrap whole and leave its first row empty.
+ * Each line's tokens: a hunk's old side (its unchanged and deleted lines) and its new side (its
+ * unchanged and added ones) each read as one piece of code, so a string or a comment over several
+ * lines reads right. An unchanged line takes the new side's.
  */
-function Words({ text, marks }: { text: string; marks?: Span[] }) {
+export function tokensOf(hunks: HunkModel[], hl: Highlight): Map<Line, Tok[]> {
+  const out = new Map<Line, Tok[]>();
+  for (const h of hunks) {
+    const old: Line[] = [];
+    const neu: Line[] = [];
+    for (const seg of h.segs) {
+      if (seg.t === "ctx") {
+        old.push(...seg.lines);
+        neu.push(...seg.lines);
+      } else {
+        old.push(...seg.dels);
+        neu.push(...seg.adds);
+      }
+    }
+    const side = (lines: Line[], keep: (l: Line) => boolean) => {
+      if (!lines.length) return;
+      const toks = hl(lines.map((l) => l.text).join("\n"));
+      if (toks) lines.forEach((l, i) => keep(l) && out.set(l, toks[i] ?? []));
+    };
+    side(old, (l) => l.kind === "del");
+    side(neu, (l) => l.kind !== "del");
+  }
+  return out;
+}
+
+/**
+ * A line's text: in its tokens' colours, its changed words marked, its seams in place, and its
+ * indentation kept from wrapping (white-space: pre), or a long first word would wrap whole and
+ * leave its first row empty.
+ */
+function Words({ text, marks, toks }: { text: string; marks?: Span[]; toks?: readonly Tok[] }) {
   const ind = text.length - text.trimStart().length;
   const seams = seamsOf(text, ind);
   const runs: { s: number; e: number; mark: boolean }[] = [];
@@ -337,6 +370,32 @@ function Words({ text, marks }: { text: string; marks?: Span[] }) {
   }
   if (from < text.length) runs.push({ s: from, e: text.length, mark: false });
   let k = 0;
+  // The text from s to e in its tokens' colours (tokens are in order, as the line is walked).
+  let t = 0;
+  const coloured = (s: number, e: number): React.ReactNode[] => {
+    const out: React.ReactNode[] = [];
+    for (let at = s; at < e;) {
+      while (toks && t < toks.length && (toks[t]?.[1] ?? 0) <= at) t++;
+      const tok = toks?.[t];
+      if (!tok || tok[0] >= e) {
+        out.push(text.slice(at, e));
+        break;
+      }
+      if (tok[0] > at) {
+        out.push(text.slice(at, tok[0]));
+        at = tok[0];
+        continue;
+      }
+      const end = Math.min(tok[1], e);
+      out.push(
+        <span key={at} className={tok[2]}>
+          {text.slice(at, end)}
+        </span>,
+      );
+      at = end;
+    }
+    return out;
+  };
   return (
     <>
       {runs.map((r, i) => {
@@ -351,28 +410,21 @@ function Words({ text, marks }: { text: string; marks?: Span[] }) {
           );
         }
         for (let p = seams[k]; p !== undefined && p.at < r.e; p = seams[++k]) {
-          if (p.at > at) parts.push(text.slice(at, p.at));
+          if (p.at > at) parts.push(<React.Fragment key={`${at}t`}>{coloured(at, p.at)}</React.Fragment>);
           parts.push(p.glue ? <span key={p.at} className="hx-glue" /> : <wbr key={p.at} />);
           at = p.at;
         }
-        if (at < r.e) parts.push(text.slice(at, r.e));
+        if (at < r.e) parts.push(<React.Fragment key={`${at}t`}>{coloured(at, r.e)}</React.Fragment>);
         return r.mark ? <mark key={i}>{parts}</mark> : <React.Fragment key={i}>{parts}</React.Fragment>;
       })}
     </>
   );
 }
 
-const Row = React.memo(function Row({ line, sr, split, unfolded, first }: { line: Line; sr: number; split: boolean; unfolded?: boolean; first?: string }) {
+const Row = React.memo(function Row({ line, toks, sr, split, unfolded, first }: { line: Line; toks?: readonly Tok[]; sr: number; split: boolean; unfolded?: boolean; first?: string }) {
   const hang: Vars | undefined = line.hang === 2 ? undefined : { "--hang": line.hang };
   return (
-    <div
-      className="hx-row"
-      data-kind={line.kind}
-      data-unfolded={unfolded || undefined}
-      data-fold-start={first}
-      tabIndex={first ? -1 : undefined}
-      style={split ? at(sr) : undefined}
-    >
+    <div className="hx-row" data-kind={line.kind} data-unfolded={unfolded || undefined} data-fold-start={first} tabIndex={first ? -1 : undefined} style={split ? at(sr) : undefined}>
       <span className="hx-no" data-side="o" aria-hidden="true">
         {line.o ?? ""}
       </span>
@@ -381,19 +433,33 @@ const Row = React.memo(function Row({ line, sr, split, unfolded, first }: { line
       </span>
       <span className="hx-mk">{SIGN[line.kind]}</span>
       <code className="hx-code" style={hang}>
-        <Words text={line.text} marks={line.marks} />
+        <Words text={line.text} marks={line.marks} toks={toks} />
       </code>
       {split && line.kind === "ctx" && (
         // Side by side, an unchanged line shows on both sides.
         <code className="hx-code hx-dup" style={hang} aria-hidden="true">
-          <Words text={line.text} />
+          <Words text={line.text} toks={toks} />
         </code>
       )}
     </div>
   );
 });
 
-function HunkRows({ h, hi, split, unfolded, onUnfold }: { h: HunkModel; hi: number; split: boolean; unfolded: ReadonlySet<string>; onUnfold: (id: string) => void }) {
+function HunkRows({
+  h,
+  hi,
+  toks,
+  split,
+  unfolded,
+  onUnfold,
+}: {
+  h: HunkModel;
+  hi: number;
+  toks: Map<Line, Tok[]> | null;
+  split: boolean;
+  unfolded: ReadonlySet<string>;
+  onUnfold: (id: string) => void;
+}) {
   const out: React.ReactNode[] = [];
   let sr = 1;
   h.segs.forEach((seg, si) => {
@@ -417,7 +483,7 @@ function HunkRows({ h, hi, split, unfolded, onUnfold }: { h: HunkModel; hi: numb
           }
           return;
         }
-        out.push(<Row key={`${si}.${k}`} line={l} sr={sr++} split={split} unfolded={folded} first={folded && k === fold?.head ? id : undefined} />);
+        out.push(<Row key={`${si}.${k}`} line={l} toks={toks?.get(l)} sr={sr++} split={split} unfolded={folded} first={folded && k === fold?.head ? id : undefined} />);
       });
       return;
     }
@@ -432,8 +498,8 @@ function HunkRows({ h, hi, split, unfolded, onUnfold }: { h: HunkModel; hi: numb
       if (a !== null) rowA[a] = top + k;
       else if (split) fills.push(<span key={`${si}r${k}`} className="hx-fill" data-side="r" style={at(top + k)} />);
     });
-    seg.dels.forEach((l, k) => out.push(<Row key={`${si}d${k}`} line={l} sr={rowD[k] ?? top} split={split} />));
-    seg.adds.forEach((l, k) => out.push(<Row key={`${si}a${k}`} line={l} sr={rowA[k] ?? top} split={split} />));
+    seg.dels.forEach((l, k) => out.push(<Row key={`${si}d${k}`} line={l} toks={toks?.get(l)} sr={rowD[k] ?? top} split={split} />));
+    seg.adds.forEach((l, k) => out.push(<Row key={`${si}a${k}`} line={l} toks={toks?.get(l)} sr={rowA[k] ?? top} split={split} />));
     out.push(...fills);
     sr += seg.pairs.length;
   });
@@ -456,6 +522,7 @@ export function FileDiffView({
   defaultOpen = true,
   layout = "auto",
   reveal = 0,
+  language,
 }: {
   /** Find shows a match in it: it opens (a new number each time one is shown). */
   reveal?: number;
@@ -468,6 +535,8 @@ export function FileDiffView({
    * unified: never side by side. Narrower than 640px, every diff is unified.
    */
   layout?: "auto" | "unified" | "split";
+  /** What its code is, when its path doesn't say (a Kubernetes object's YAML): a language's name (lib/syntax). */
+  language?: string;
 }) {
   const [open, setOpen] = React.useState(defaultOpen);
   const [revealed, setRevealed] = React.useState(0);
@@ -485,6 +554,10 @@ export function FileDiffView({
     const only = stats.del > 0 && stats.add === 0 ? "del" : stats.add > 0 && stats.del === 0 ? "add" : undefined;
     return { hunks: open ? hunks.map(hunkOf) : [], digits: Math.max(2, String(last).length), only, stats };
   }, [hunks, open]);
+  // Its language by what the caller says, else its path, else a `#!` the file starts with.
+  const top = hunks[0]?.new_start === 1 ? (hunks[0].lines.find((l) => l.startsWith("+") || l.startsWith(" "))?.slice(1) ?? "") : "";
+  const hl = useHighlighter(resolveLanguage(language, diff.path, top));
+  const toks = React.useMemo(() => (hl && model.hunks.length ? tokensOf(model.hunks, hl) : null), [hl, model.hunks]);
   // Side by side only helps when lines changed on both sides (not in a new file or a pure deletion,
   // whose other column of numbers goes, too).
   const split = layout !== "unified" && !model.only ? (layout === "split" ? "on" : "auto") : undefined;
@@ -525,7 +598,7 @@ export function FileDiffView({
                     <span className="hx-sep-label">{h.where}</span>
                   </div>
                 )}
-                <HunkRows h={h} hi={hi} split={split !== undefined} unfolded={unfolded} onUnfold={unfold} />
+                <HunkRows h={h} hi={hi} toks={toks} split={split !== undefined} unfolded={unfolded} onUnfold={unfold} />
               </React.Fragment>
             ))
           )}

@@ -27,6 +27,7 @@ import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Link, useNavigate } from "@/lib/router";
 import "./deployments.css";
+import { Highlighted } from "@/components/code/highlighted";
 
 const providersRes: Res<{ providers: CdProvider[] }> = { key: "cd/providers", fetch: (s) => cdApi.providers(s) };
 const reposRes: Res<Awaited<ReturnType<typeof api.repos>>> = { key: "repos", fetch: (s) => api.repos(s) };
@@ -443,7 +444,9 @@ function Builder() {
                 <code>.kiln/deploy.yaml</code>
                 <CopyBlock text={deploy} />
               </div>
-              <pre>{deploy}</pre>
+              <pre>
+                <Highlighted text={deploy} lang="yaml" />
+              </pre>
             </div>
             {environments && (
               <div className="cd-new-yaml">
@@ -451,7 +454,9 @@ function Builder() {
                   <code>.kiln/environments.yaml</code>
                   <CopyBlock text={environments} />
                 </div>
-                <pre>{environments}</pre>
+                <pre>
+                  <Highlighted text={environments} lang="yaml" />
+                </pre>
               </div>
             )}
             {errors.length > 0 && (
@@ -508,7 +513,9 @@ function Checked({ result, stale }: { result: CdValidation; stale: boolean }) {
                       <summary>
                         {String(o.kind ?? "")} <code>{[meta.namespace, meta.name].filter(Boolean).join("/")}</code>
                       </summary>
-                      <pre>{toYaml(o.spec ?? {})}</pre>
+                      <pre>
+                        <Highlighted text={toYaml(o.spec ?? {})} lang="yaml" />
+                      </pre>
                     </details>
                   </li>
                 );
