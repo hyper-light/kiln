@@ -13,7 +13,7 @@ import * as React from "react";
 import { ExternalLink, RotateCw } from "lucide-react";
 import type { ToolCall } from "@/api/harness";
 import { useAuth } from "@/lib/auth";
-import { enginesOf, heightAt, heightsFor, ownEngine, pageOf, type ShownPage } from "./page-of";
+import { enginesOf, heightAt, heightsFor, ownEngine, pageOf, shownTitle, type ShownPage } from "./page-of";
 import { FilesContext } from "./files";
 import { Beam, PrismLabel } from "./signals";
 import { useDrafts } from "./state";
@@ -311,7 +311,7 @@ export function PageView({ call }: { call: ToolCall & { id: string } }) {
       <div className="pg-head">
         <Beam status={running ? "running" : "error"} className="pg-beam" />
         <PrismLabel live={running} className="pg-title">
-          {call.title || "A page"}
+          {shownTitle(call, "A page")}
         </PrismLabel>
         <span className="pg-said">{running ? "Keeping it and its files" : ""}</span>
       </div>

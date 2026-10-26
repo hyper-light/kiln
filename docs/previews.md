@@ -82,7 +82,10 @@ Links to the web open in a new tab.
   page's console, height, layout shift, long tasks and frame rate. A phone by default (390×844, 2×,
   dark). `measure: true` also gives the height at each width.
 - `show_page`: show a page in the conversation. The answer has the page's id and heights, and what
-  kiln's browser saw of it.
+  kiln's browser saw of it. The conversation draws the page whichever harness called it (and
+  `show_live`'s stream the same way): it knows the call by the harness's name for it (Claude
+  Code's and Codex's `mcp__kiln__show_page`, Devin's "Called show_page from kiln") or, from an ACP
+  agent that words it otherwise, by kiln's answer in its output (`ui/src/views/harness/page-of.ts`).
 
 The browser is Chrome for Testing at a version kiln pins (its download checked against a SHA-256
 kiln knows). It's downloaded the first time a machine needs it, about 200 MB, into kiln's state
