@@ -236,6 +236,11 @@ pub enum AgentMsg {
     /// or why it couldn't (`error`): the older one lets go of it, or goes on with it. Only to a
     /// server announcing [`CAP_HANDOVER`]. Appended last: postcard encodes variants by index.
     HarnessAdopted { session: String, error: Option<String> },
+    /// CI: what this runner holds warm (JSON `kiln_ci::work::slots::WorkState`, docs/ci.md W24-R11,
+    /// R18): each lane's workspaces and how long its legs took here, for placement. Sent once it
+    /// changed, and every 10 minutes, each superseding the last; only to a server announcing
+    /// [`CAP_WORK`]. Appended last: postcard encodes variants by index.
+    WorkState { json: String },
     /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): `json` a [`crate::observe::wire::Msg`],
     /// `bytes` what it carries (a raft message's, or a write's entry; empty when none). Only from
     /// runners announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard
@@ -373,6 +378,11 @@ pub const CAP_INBOX: u64 = 1 << 34;
 /// the server passes the session on and says how it went (`Command::HandedOver`, in a
 /// [`ServerMsg::HarnessCmd`]). Bit 34 is T3's `CAP_INBOX` (docs/wire.md).
 pub const CAP_HANDOVER: u64 = 1 << 35;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: warm workspaces, for placement
+/// (docs/ci.md W24-R18). A runner that says it tells the server what it holds warm
+/// ([`AgentMsg::WorkState`]); a server that says it takes that.
+pub const CAP_WORK: u64 = 1 << 36;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -816,6 +826,19 @@ mod tests {
         Ok(())
     }
 
+    /// W24-R18: a runner's warm state comes after every older variant, and its bit is a new one.
+    #[test]
+    fn work_state_is_appended_after_the_hand_overs() -> anyhow::Result<()> {
+        let adopted = encode(&AgentMsg::HarnessAdopted { session: "s".into(), error: None })?;
+        let m = AgentMsg::WorkState { json: r#"{"lanes":[]}"#.into() };
+        let b = encode(&m)?;
+        assert_eq!(b.first().copied(), adopted.first().map(|i| i + 1), "AgentMsg::WorkState comes right after HarnessAdopted");
+        assert_eq!(decode::<AgentMsg>(&b)?, m);
+        // Bit 34 is T3's CAP_INBOX.
+        assert!(CAP_WORK.is_power_of_two() && CAP_WORK == 1 << 36 && CAP_WORK & (CAP_WIRE | CAP_NET_DROPS | 1 << 34 | CAP_HANDOVER) == 0);
+        Ok(())
+    }
+
     #[test]
     fn the_cluster_group_is_appended_after_the_channel() -> anyhow::Result<()> {
         // After `Wire` in both (AgentMsg 46, ServerMsg 54), so a peer from before P2 skips it.
@@ -1130,17 +1153,17 @@ mod tests {
 
     #[test]
     fn observe_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
-        // Right after main's last (deployed first): a session inbox's sends (CP-T3.2), and its
-        // sessions' hand-overs.
+        // Right after main's last (deployed first): a session inbox's sends (CP-T3.2), and what a
+        // runner holds warm (W24).
         let last_server = encode(&ServerMsg::HarnessSend { session: "s".into(), epoch: 1, json: "{}".into() })?;
         let s = ServerMsg::Observe { json: "{}".into(), bytes: vec![1, 2] };
         let b = encode(&s)?;
         assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after HarnessSend");
         assert_eq!(decode::<ServerMsg>(&b)?, s);
-        let last_agent = encode(&AgentMsg::HarnessAdopted { session: "s".into(), error: None })?;
+        let last_agent = encode(&AgentMsg::WorkState { json: "{}".into() })?;
         let a = AgentMsg::Observe { json: "{}".into(), bytes: vec![3] };
         let b = encode(&a)?;
-        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Observe comes right after HarnessAdopted");
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Observe comes right after WorkState");
         assert_eq!(decode::<AgentMsg>(&b)?, a);
         let every = [
             CAP_UPGRADE,

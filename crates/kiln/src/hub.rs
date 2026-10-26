@@ -1849,6 +1849,12 @@ impl Hub {
             // Hand-overs between a machine's runner processes (`crate::handovers`).
             AgentMsg::HarnessHandOver { session, offset, data, done } => self.handover_piece(&agent, peer, session, offset, data, done).await,
             AgentMsg::HarnessAdopted { session, error } => self.handover_adopted(&agent, peer, session, error).await,
+            // What it holds warm, for placement (docs/ci.md W24-R18); a job's pod holds nothing.
+            AgentMsg::WorkState { json } => match serde_json::from_str::<kiln_ci::work::slots::WorkState>(&json) {
+                Ok(state) if !self.agents.lock().get(&agent).is_none_or(|a| a.ephemeral) => self.ci.send(crate::ci::dispatch::Msg::WorkState { agent: agent.clone(), state: Box::new(state) }),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(agent = %agent, error = %e, "an unreadable report of warm workspaces"),
+            },
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -2142,7 +2148,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {

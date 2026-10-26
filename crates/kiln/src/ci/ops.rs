@@ -209,7 +209,8 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({
                     "run": {"type": "string", "description": RUN}, "mode": {"type": "string", "enum": ["all", "failed", "job"]},
                     "job": {"type": "string", "description": "With mode `job`."}, "debug": {"type": "boolean"},
-                    "keep_failed": {"type": "integer", "description": "Minutes a failed leg is kept to look into (W17-R02)."}
+                    "keep_failed": {"type": "integer", "description": "Minutes a failed leg is kept to look into (W17-R02)."},
+                    "cold": {"type": "boolean", "description": "Run cold (W24-R23): no reuse, no kept folders, no cache restored."}
                 }), &["run"]),
                 route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "rerun"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &v, &cx.caller.name).await).await }),

@@ -153,6 +153,49 @@ fn w08_ac06_a_leg_takes_a_result_for_the_same_inputs() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W24-R06: `work: { memo }` is what `reuse:` is shorthand for, kept in the work ledger: a
+/// README-only push reuses the build and names its source.
+#[test]
+fn w24_r06_work_memo_reuses_through_the_ledger() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/reuse", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join("src"))?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/reuse.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    std::fs::write(work.join("README.md"), "memo\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    let commit = |message: &str| -> anyhow::Result<()> {
+        git(&home, &work, &["add", "."])?;
+        git(&home, &work, &["commit", "-qm", message])?;
+        git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+        Ok(())
+    };
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/build.yaml"), BUILD.replace("reuse: { paths: [src] }", "work: { memo: { paths: [src] } }"))?;
+    std::fs::write(work.join("src/version"), "1\n")?;
+    commit("build")?;
+    let (first, first_log) = finished(&s, 1)?;
+    assert_eq!(first.pointer("/leg/conclusion"), Some(&json!("success")), "{first}\n{first_log}\n{}", s.log());
+    let line = built(&first_log);
+    std::fs::write(work.join("README.md"), "memo, again\n")?;
+    commit("readme")?;
+    let (second, second_log) = finished(&s, 2)?;
+    assert!(second.pointer("/leg/reused_from").is_some_and(|r| !r.is_null()), "it reused the build: {second}");
+    assert_eq!(second.pointer("/leg/reused_run"), first.get("run"), "it names the run it came from: {second}");
+    assert_eq!(built(&second_log), line, "its log is its source's");
+    Ok(())
+}
+
 const PULL: &str = r#"on: pull_request
 jobs:
   build:

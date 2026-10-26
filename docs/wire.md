@@ -314,8 +314,9 @@ takes a new bit, never one that means something already, even in the other direc
 | 33 | `CAP_NET_DROPS` | `ServerMsg::Caps` | the server takes what a runner's QUIC layer dropped (`NetDrops`) |
 | 34 | `CAP_INBOX` | `AgentMsg::Caps` | the runner's inbox takes `HarnessSend` (T3, CP-T3.2) |
 | 35 | `CAP_HANDOVER` | `AgentMsg::Caps`, `ServerMsg::Caps` | hand-overs between a machine's runner processes: an older one hands its sessions to the newest (`HarnessHandOver`, `HarnessAdopted`, `HandedOver`; releases.md, "One runner a machine") |
+| 36 | `CAP_WORK` | `AgentMsg::Caps`, `ServerMsg::Caps` | warm workspaces for placement: the runner says what it holds warm, the server takes it (`WorkState`; ci.md W24-R18) |
 
-Bits from 36 are free. Take the next one, and add its row here in the same change.
+Bits from 37 are free. Take the next one, and add its row here in the same change.
 
 ## The lab
 
@@ -414,6 +415,7 @@ Four edges are left, and the lab steers clear of each:
 | `NetDrops` | telemetry | What the runner's QUIC layer let go before it reached the wire, by lane and reason, counted from its start: each supersedes the last ("Loss below the channel"). | Sent with its samples once it changed, to a server announcing `CAP_NET_DROPS`. |
 | `HarnessHandOver` | stream | An agent session packed for the machine's newest runner process, in pieces: the server passes it on as `HarnessPackage`. | New: to a server announcing `CAP_HANDOVER`, on the conversation lane. |
 | `HarnessAdopted` | answer | Whether the runner took over a session an older process of its machine handed it: that process lets go of it, or goes on with it. | New: to a server announcing `CAP_HANDOVER`. |
+| `WorkState` | state | What the runner holds warm: each lane's workspaces and how long its legs took there, for placement (ci.md W24-R18). Each supersedes the last. | New: with its samples once it changed, and every 10 minutes, to a server announcing `CAP_WORK`. |
 | `Observe` | carried (observe's group) | The runner's replica of observe's group (docs/observe.md §5): hyper-raft's messages, which it acknowledges and resends, and the writes it takes, offered to the leader until they commit. | Only from a runner announcing `CAP_OBSERVE`, on lane 5. |
 
 ## Server to runner: `ServerMsg`
