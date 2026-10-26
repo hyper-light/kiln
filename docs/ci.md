@@ -40,6 +40,7 @@
   - [W22 Conformance, end-to-end and performance testing](#w22-conformance-end-to-end-and-performance-testing)
   - [W23 CI providers](#w23-ci-providers)
   - [W24 Incremental CI](#w24-incremental-ci-fingerprints-reuse-warm-state-and-shared-caches)
+  - [W28 Demand-driven CI](#w28-demand-driven-ci-adopt-cover-stagger-land-by-conflict-graph)
 - [4. API, events, CLI and MCP reference](#4-api-events-cli-and-mcp-reference)
 - [5. Milestones and the order of work](#5-milestones-and-the-order-of-work)
 - [Appendix A. GitHub Actions compatibility matrix](#appendix-a-github-actions-compatibility-matrix)
@@ -7847,6 +7848,54 @@ plan:
 | M3 | Graphs, `affected()`, tests, the land queue, admission | R10, R16, R17, R19, R20 |
 | M4 | Observation, `kiln rustc`, trust, verification | R04, R05, R09, R21–R23 |
 | M5 | Warm microVMs and k8s, remote execution, the seams | R13, R14, R26 |
+
+### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
+
+**Scope.** The land queue, builds and deploys of a trunk many agents change at once (kiln plan
+`01a17502affc74b3af5a30092f8418bc`). This section holds step 9's requirements, R30–R39 (kiln plan
+`01a1751638e773b98b5092662fc06bf5`); the other steps take their ranges as they come. Commits
+before this one call this workstream "W25 step N".
+
+**Requirements: the conflict graph**
+
+- **W28-R30 Pending changes.** `kiln_ci::land::conflict`, pure: a change pending in the land queue
+  is the files it changes, the units those files affect and the deploy targets it changes. A file
+  is an input of the unit whose folder holds it most closely, one per ecosystem, and of every unit
+  that reads it (a workspace's root manifest and lockfile). A change affects those units and every
+  unit that depends on one of them, transitively (W24-R17). The graph is the union of the trunk's
+  and each pending change's own (W24-R16 read with the change applied), so a dependency one change
+  adds links it to the changes of what it then depends on.
+- **W28-R31 Components.** Two changes conflict when they share a changed file, an affected unit or
+  a deploy target. The conflict graph's connected components come from a union-find over the
+  queue's changes, so two changes are in one component exactly when a chain of conflicts links
+  them. Each component is a queue of its own, and a change that conflicts with nothing ahead of it
+  lands at once. W24-R30's e-graph is a union-find over result keys within a trust domain;
+  changes aren't keys, so the conflict graph keeps a union-find of its own.
+- **W28-R32 Interaction and joint units.** A component's interaction units are those whose inputs
+  take files from two or more of its changes: where its changes meet. Its joint units are those
+  that two or more of its changes affect: the interaction units, what depends on them, and what
+  depends on units that different changes affect. Only joint units get keys that no change gives
+  alone, so only they are built and tested together. Every other unit keeps the key it has with
+  its own change alone, or the trunk's.
+- **W28-R33 Landing classes.** Changes no two of which conflict commute: every order of them gives
+  the same tree, and every unit the key it has with its own change alone. They land as one class,
+  whose canonical form is the sorted set of their ids, so every order of them is the same class.
+- **W28-R34 Every decision says why.** Each change is decided against each change ahead of it in
+  the queue. `waits for D9: both affect crates/kiln-ci (unit kiln-ci)` names what the two share:
+  files first, then the units where they meet (those none of whose dependencies both affect), then
+  deploy targets. `lands beside D12: no shared unit, file or target` says they share nothing.
+
+**Acceptance criteria**
+
+- **W28-AC30 Commuting changes.** Over 10,000 random queues on synthetic package graphs: two
+  changes share a component exactly when a chain of shared files, affected units or deploy targets
+  links them; interaction units are exactly those whose inputs take files from two or more of a
+  component's changes; for every set of changes no two of which conflict, every order gives the
+  same tree and every unit the key it has with its own change alone; and every decision names
+  only what its two changes share. *Property test* (`cargo test -p kiln-ci land::conflict`).
+
+**Progress.** R30–R34 and AC30 built (2026-10-25) in `kiln_ci::land::conflict`. The land queue
+doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.rs`.
 
 ## 4. API, events, CLI and MCP reference
 

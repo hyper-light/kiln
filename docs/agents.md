@@ -485,6 +485,10 @@ pause?, exit?, needs?}`. `stand` says where it is, in a word:
 | `offline` | its machine is away; it goes on when it's back |
 | `ended` | it ended, or kiln doesn't list it any more |
 
+An agent that couldn't start keeps the first message it was given until its harness takes it: a
+Restart once the harness is installed, its runner starting again, or a move to a machine that has
+it (docs/reach.md §8) gives it then.
+
 ### Where a child runs
 
 `on` is a machine's name (`local` or `server` for the server, `agent:<name>` too), or what it
@@ -493,7 +497,10 @@ the machines that suit and have the harness installed, the idlest (most idle cor
 memory) gets it; outposts and job pods never do. Without `on`, an agent's child runs on the
 agent's own machine, in its folder unless `cwd` says otherwise; a person's runs on the server
 when it runs agents, else on the best runner with the harness. A child on another machine starts
-in that machine's home unless `cwd` names a folder there.
+in that machine's home unless `cwd` names a folder there. A machine named, or the agent's own,
+that kiln knows hasn't the harness (its list of harnesses says so; the server's own asked again
+with its user's login shell) is refused, naming the machines that have it, rather than given an
+agent that can't start there.
 
 ### Sending again
 

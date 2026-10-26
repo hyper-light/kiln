@@ -1,5 +1,9 @@
 //! A simulator (docs/ci.md W05 design): runners, legs, durations and failures on a virtual clock,
 //! driving the real [`Scheduler`]. Tests and `kiln ci bench --scheduler` use it.
+//!
+//! [`replay`] replays a recorded week of v1 runs under supersession policies (W25 step 1).
+
+pub mod replay;
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
