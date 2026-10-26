@@ -2048,7 +2048,7 @@ impl Leg {
         };
         // W24-R07: a `memo:` step is looked up before it runs, a hit replayed instead; what earlier
         // hits left is put in place before anything runs.
-        let keyed = match self.memo_prepare(st, idx, step, nested, &env, &wd, shell.as_deref(), script.as_deref(), &with).await {
+        let keyed = match self.memo_prepare(st, idx, step, nested, &env, &wd, shell.as_deref(), script.as_deref(), &with, job_deadline).await {
             memo::Prepared::Hit(hit) => {
                 let outputs = self.memo_replay(st, idx, *hit).await;
                 self.finish(st, idx, id, Conclusion::Success, Conclusion::Success, Some(0), outputs, nested).await;
