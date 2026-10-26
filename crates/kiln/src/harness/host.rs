@@ -3378,6 +3378,23 @@ while True:
             let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
             let s = older.open(Some("h".into()), spec)?;
             until_it("the stand-in harness's start", 30, || s.pid.lock().is_some() && !s.core.lock().meta.features.is_empty()).await?;
+            // The stand-in harnesses that read a line (their first, kiln's initialize), in the order they
+            // did. Each is waited for to be reading before what's timed after it: a loaded Mac can hold
+            // a fresh script at its exec for minutes (its policy's checks), and the turns below are timed
+            // from here (the twenty-second adversarial check's: these tests timed out with their stand-in
+            // never run, not with kiln slow).
+            let readers = || -> Vec<u64> {
+                let mut out = Vec::new();
+                for l in std::fs::read_to_string(&heard).unwrap_or_default().lines() {
+                    if let Some(pid) = serde_json::from_str::<serde_json::Value>(l).ok().and_then(|w| w.get("pid").and_then(serde_json::Value::as_u64))
+                        && !out.contains(&pid)
+                    {
+                        out.push(pid);
+                    }
+                }
+                out
+            };
+            until_it("the stand-in harness reading", 300, || !readers().is_empty()).await?;
             assert!(older.command("h", message("m1", "build it")));
             until_it("m1's turn", 30, || s.core.lock().state.status == Status::Running).await?;
             assert!(older.command("h", message("m2", "then test it")));
@@ -3413,6 +3430,7 @@ while True:
                 pkg.get("inbox")
             );
             newer.adopt("an older kiln runner of this machine", &bytes).map_err(anyhow::Error::msg)?;
+            until_it("the newer process's stand-in reading", 300, || readers().len() >= 2).await?;
             if went_away {
                 // The newer process's link drops before its word that it took it reaches the
                 // server, which tells the older one it went away (`Hub::handovers_lost`).
