@@ -144,12 +144,16 @@ repository, `--no-sync` to skip):
   the worktree's HEAD, index and logs, and none of the other worktrees;
 - any other folder: everything but the usual build output.
 
-The copy lives at `~/.kiln/reach/<asking runner>/<tree>-<hash>` and is kept (until rules let it
-go, §5.1), so the next sync sends only what changed: the asker sends the list (path, size, time,
-mode), the doer asks for the files that differ, the asker sends them (256 KiB pieces, at most 4 MiB
-unacknowledged), and on commit the copy is made to match exactly. The command then runs in the
-copy's folder matching where the asker was. Paths are checked (relative, plain, never through a
-symlink) so a list can't write outside the copy.
+The copy lives at `~/.kiln/reach/<asking runner>/<tree>-<hash>` and is kept, so the next sync
+sends only what changed: the asker sends the list (path, size, time, mode), the doer asks for the
+files that differ, the asker sends them (256 KiB pieces, at most 4 MiB unacknowledged), and on
+commit the copy is made to match the list: what was sent before and is no longer listed goes,
+while what was never sent (untracked and ignored build output such as `target/`, `ui/dist` and
+`node_modules`) stays, so builds over there stay incremental (docs/ci.md W24-R24). The list last
+applied is kept beside the copy (`<copy>.kiln-sent`), never in it; a copy without one is made to
+match exactly, once. The command then runs in the copy's folder matching
+where the asker was. Paths are checked (relative, plain, never through a symlink) so a list can't
+write outside the copy.
 
 Measured on this repository (8,100 files, 36 MB, through the relay): first sync 2.5 s, an
 unchanged tree 0.5 s.

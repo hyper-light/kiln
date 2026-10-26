@@ -1157,6 +1157,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // was last told of it on this connection.
     let mut server_drops = false;
     let mut drops_said: Option<Vec<proto::NetDrop>> = None;
+    // The server takes what this runner holds warm (`AgentMsg::WorkState`, docs/ci.md W24-R18),
+    // and when it was last told it on this connection, and as of which change.
+    let mut server_work = false;
+    let mut work_said: Option<(u64, Instant)> = None;
     // The channel's updates go (a server that keeps it welcomed this runner since it started).
     let mut updates_on = false;
     // The server's commands on the channel (`crate::wire::commands`): what this runner has of
@@ -1904,11 +1908,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
-                // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md). A test
-                // build's `old` says nothing, as a runner from before the channel.
+                // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md), and an
+                // outpost aside, it says what it holds warm (docs/ci.md W24-R18). A test build's
+                // `old` says nothing, as a runner from before the channel.
                 if !o.ephemeral && !crate::runner::chaos::get().is_some_and(|c| c.old) {
                     let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX }) {
+                    let work = if o.outpost { 0 } else { proto::CAP_WORK };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -1981,6 +1987,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 server_wire = false;
                 server_drops = false;
                 drops_said = None;
+                server_work = false;
+                work_said = None;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -2068,6 +2076,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Caps { caps } => {
                         server_wire = caps & proto::CAP_WIRE != 0;
                         server_drops = caps & proto::CAP_NET_DROPS != 0;
+                        server_work = caps & proto::CAP_WORK != 0;
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                         }
@@ -3264,6 +3273,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if server_drops && welcomed && drops_said.as_ref() != Some(&dropped) {
                         uplink.msg(AgentMsg::NetDrops { dropped: dropped.clone() }).await;
                         drops_said = Some(dropped);
+                    }
+                    // What it holds warm, for placement (docs/ci.md W24-R18): once it changed here,
+                    // and every 10 minutes for what the machine's other runner processes changed.
+                    let now_changes = crate::runner::warm::changes();
+                    if server_work && welcomed && !o.ephemeral && !o.outpost && work_said.is_none_or(|(at, when)| at != now_changes || when.elapsed() >= Duration::from_secs(600)) {
+                        let dir = o.work_dir.clone();
+                        if let Ok(state) = crate::rt::blocking(move || crate::runner::warm::state(&dir)).await
+                            && let Ok(json) = serde_json::to_string(&state)
+                        {
+                            uplink.msg(AgentMsg::WorkState { json }).await;
+                        }
+                        work_said = Some((now_changes, Instant::now()));
                     }
                     // What its conversation stores are doing, for the server's board (a server from
                     // before takes it for nothing). Never waits: a full link skips one.

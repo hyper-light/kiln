@@ -330,6 +330,8 @@ pub enum Func {
     Trim,
     FromYaml,
     ToYaml,
+    // kiln dialect (W24-R17)
+    Affected,
 }
 
 impl Func {
@@ -358,6 +360,7 @@ impl Func {
             "trim" => Self::Trim,
             "fromyaml" => Self::FromYaml,
             "toyaml" => Self::ToYaml,
+            "affected" => Self::Affected,
             _ => return None,
         })
     }
@@ -388,6 +391,7 @@ impl Func {
             Self::Trim => "trim",
             Self::FromYaml => "fromYAML",
             Self::ToYaml => "toYAML",
+            Self::Affected => "affected",
         }
     }
 
@@ -397,7 +401,7 @@ impl Func {
             Self::Contains | Self::StartsWith | Self::EndsWith | Self::Matches | Self::Split => (2, 2),
             Self::Format | Self::HashFiles | Self::Changed => (1, 255),
             Self::Join => (1, 2),
-            Self::ToJson | Self::FromJson | Self::Lower | Self::Upper | Self::Trim | Self::FromYaml | Self::ToYaml => (1, 1),
+            Self::ToJson | Self::FromJson | Self::Lower | Self::Upper | Self::Trim | Self::FromYaml | Self::ToYaml | Self::Affected => (1, 1),
             Self::Case => (3, usize::MAX),
             Self::Success | Self::Always | Self::Cancelled | Self::Failure => (0, 0),
             Self::Coalesce => (2, 255),
@@ -411,7 +415,7 @@ impl Func {
 
     /// Only in the kiln dialect.
     pub fn is_kiln(self) -> bool {
-        matches!(self, Self::Changed | Self::Matches | Self::Coalesce | Self::Split | Self::Replace | Self::Lower | Self::Upper | Self::Trim | Self::FromYaml | Self::ToYaml)
+        matches!(self, Self::Changed | Self::Matches | Self::Coalesce | Self::Split | Self::Replace | Self::Lower | Self::Upper | Self::Trim | Self::FromYaml | Self::ToYaml | Self::Affected)
     }
 
     /// Built into GitHub's expression language itself (not added by the workflow schema).

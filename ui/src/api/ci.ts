@@ -950,6 +950,8 @@ export function waitSentence(w: unknown): string | null {
     next?: number;
     size?: number;
     in_flight?: number;
+    runner?: string;
+    saves_s?: number;
   };
   const list = (xs?: string[]) => (xs && xs.length ? `: ${xs.join(", ")}` : "");
   // A lane is a repository's workflow on a branch (W28-R60): its workflow and branch.
@@ -979,6 +981,8 @@ export function waitSentence(w: unknown): string | null {
       return `Pool ${o.pool ?? ""} is starting ${o.starting ?? 0} executor${o.starting === 1 ? "" : "s"}${o.since ? ` since ${new Date(o.since).toLocaleTimeString()}` : ""}.`;
     case "reservation":
       return `Its runners are reserved${o.reservation ? ` (${o.reservation})` : ""} until ${o.until ? new Date(o.until).toLocaleTimeString() : "the reservation ends"}.`;
+    case "warm":
+      return `Waiting for ${o.runner ?? "a busy runner"}, where it runs warm: about ${o.saves_s ?? 0} s sooner${o.until ? `, until ${new Date(o.until).toLocaleTimeString()} at most` : ""}.`;
     case "retry":
       return `Retrying at ${o.at ? new Date(o.at * 1000).toLocaleTimeString() : "a moment"}.`;
     case "adopted":

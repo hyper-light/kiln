@@ -21,6 +21,7 @@ pub mod environments;
 pub mod events;
 pub mod experiments;
 pub mod facade;
+pub mod graphs;
 pub mod hooks;
 pub mod hosting;
 pub mod imap;
@@ -38,6 +39,8 @@ pub mod notify;
 pub mod oidc;
 pub mod ops;
 pub mod otel;
+#[cfg(test)]
+mod own_workflows;
 pub mod preview;
 pub mod previews;
 pub mod providers;
@@ -63,7 +66,9 @@ pub mod services;
 pub mod token;
 pub mod trackers;
 pub mod uploads;
+pub mod warm;
 pub mod webhooks;
+pub mod work;
 pub mod workflows;
 
 /// A failure: an HTTP status and why (as `cd::ops::Fail`).

@@ -178,7 +178,7 @@ pub struct StepSpec {
 }
 
 /// A concrete, matrix-expanded unit of work ready to be queued.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PlannedJob {
     /// `test` or `test (profile=release)`.
     pub key: String,
@@ -197,10 +197,57 @@ pub struct PlannedJob {
     pub artifacts: Vec<String>,
     pub cache: Vec<String>,
     pub condition: Option<String>,
-    /// What a runner's facts must meet for the job to go there ([`JobSpec::requires`]).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// What a runner's facts must meet for the job to go there ([`JobSpec::requires`]). Written even
+    /// when empty: an assignment carries the job in postcard, which reads each field in turn, so one
+    /// left out puts every field after it out of step and the runner refuses the job as malformed.
+    /// Only a runner from before the CI work goes without it ([`PlannedJob::for_runner`]).
+    #[serde(default)]
     pub requires: Vec<String>,
     pub steps: Vec<StepSpec>,
+    /// Written without `requires`, for a runner that reads a job without it; never kept.
+    #[serde(skip)]
+    pub without_requires: bool,
+}
+
+impl PlannedJob {
+    /// The job as a runner with capabilities `caps` reads it. One from before the CI work (no
+    /// [`crate::proto::CAP_CI2`], W22-AC09's mixed fleet) knows no `requires`, and it's sent only
+    /// jobs that require nothing, as it reports no facts to meet a requirement.
+    pub fn for_runner(mut self, caps: u32) -> Self {
+        self.without_requires = caps & crate::proto::CAP_CI2 == 0;
+        self
+    }
+}
+
+// By hand for `requires`, which a runner from before the CI work reads a job without: the fields
+// in their order, as the derived `Deserialize` reads them.
+impl Serialize for PlannedJob {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut j = s.serialize_struct("PlannedJob", 16 + usize::from(!self.without_requires))?;
+        j.serialize_field("key", &self.key)?;
+        j.serialize_field("spec_id", &self.spec_id)?;
+        j.serialize_field("display", &self.display)?;
+        j.serialize_field("needs", &self.needs)?;
+        j.serialize_field("labels", &self.labels)?;
+        j.serialize_field("image", &self.image)?;
+        j.serialize_field("toolchain", &self.toolchain)?;
+        j.serialize_field("env", &self.env)?;
+        j.serialize_field("timeout_minutes", &self.timeout_minutes)?;
+        j.serialize_field("retries", &self.retries)?;
+        j.serialize_field("exclusive", &self.exclusive)?;
+        j.serialize_field("resources", &self.resources)?;
+        j.serialize_field("artifacts", &self.artifacts)?;
+        j.serialize_field("cache", &self.cache)?;
+        j.serialize_field("condition", &self.condition)?;
+        if self.without_requires {
+            j.skip_field("requires")?;
+        } else {
+            j.serialize_field("requires", &self.requires)?;
+        }
+        j.serialize_field("steps", &self.steps)?;
+        j.end()
+    }
 }
 
 pub const MATRIX_LIMIT: usize = 256;
@@ -392,11 +439,7 @@ pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
             None => {}
         }
         let resources = match &j.kiln.resources {
-            Some(YVal::Map(m)) => {
-                let get = |k: &str| m.iter().find(|(x, _)| x == k).map(|(_, v)| yaml_scalar(&yaml_value(v)));
-                Resources { cpu: get("cpu"), memory: get("memory") }
-            }
-            Some(_) => return Err(format!("{} is not a mapping", at("resources"))),
+            Some(r) => resources_of(r).ok_or_else(|| format!("{} is not a mapping", at("resources")))?,
             None => Resources::default(),
         };
         let retries = match j.kiln.retry.as_ref().and_then(|r| r.get("max")) {
@@ -444,6 +487,15 @@ pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
     let p = Pipeline { name: wf.name.clone().unwrap_or_default(), on, env: map(&wf.env), concurrency, jobs };
     validate(&p).map_err(|e| e.to_string())?;
     Ok(p)
+}
+
+/// A kiln-dialect job's `resources:` as v1 reads them: its `cpu` and `memory`, as YAML wrote them
+/// (`2`, `"500m"`, `16Gi`). `None` when it isn't a mapping. A `k8s` pool's pod for the job reads
+/// them so too (docs/ci.md W02-R06, W13-R07).
+pub fn resources_of(r: &kiln_ci::wf::ir::YVal) -> Option<Resources> {
+    let kiln_ci::wf::ir::YVal::Map(m) = r else { return None };
+    let get = |k: &str| m.iter().find(|(x, _)| x == k).map(|(_, v)| yaml_scalar(&yaml_value(v)));
+    Some(Resources { cpu: get("cpu"), memory: get("memory") })
 }
 
 /// A value of the new model as v1 read it: whole numbers are integers, as YAML wrote them.
@@ -519,6 +571,7 @@ pub fn plan(p: &Pipeline, base: &Context) -> Result<Vec<PlannedJob>, SpecError> 
                 condition: job.condition.as_ref().map(|c| ctx.interpolate(c)),
                 requires: requirements(job.requires.as_ref()).iter().map(|r| ctx.interpolate(r)).collect(),
                 steps,
+                without_requires: false,
             });
         }
         legs.insert(id.clone(), keys);
