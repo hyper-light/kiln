@@ -3,6 +3,7 @@
 //! - [`state`]: the scheduler.
 //! - [`sim`]: a simulator driving it.
 //! - [`groups`]: concurrency groups.
+//! - [`needs`]: what work needs of a runner, in one grammar (docs/runners.md).
 //! - [`retry`]: retry policies and failure classes.
 //! - [`routing`]: requirements, rules, eligibility, preferences, explanations.
 //! - [`pools`]: pools of executors kiln starts and stops (W13-R09).
@@ -12,6 +13,7 @@
 
 pub mod admit;
 pub mod groups;
+pub mod needs;
 pub mod pools;
 pub mod reserve;
 pub mod retry;

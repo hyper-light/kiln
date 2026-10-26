@@ -1250,7 +1250,8 @@ impl Hub {
     // ------------------------------------------------------------ reach
 
     /// Reach's directory (`crate::reach::directory`): every runner that is not a job pod — what it
-    /// is, how busy it is, its harnesses, its reach identity and whether it takes links.
+    /// is, how busy it is, its harnesses, its reach identity and whether it takes links, and the
+    /// facts it reported (what `kiln run --needs` checks).
     pub fn reach_directory(&self) -> Vec<crate::reach::directory::RunnerInfo> {
         let kinds = self.harness.kinds();
         let relay = self.reach.lock();
@@ -1280,6 +1281,7 @@ impl Hub {
                     draining: a.draining,
                     harnesses: kinds.get(&format!("agent:{}", a.name)).map(|ks| ks.iter().filter(|k| k.available).map(|k| k.id.clone()).collect()).unwrap_or_default(),
                     via: a.transport.map(|t| t.to_string()).unwrap_or_default(),
+                    facts: a.facts.clone(),
                 }
             })
             .collect();

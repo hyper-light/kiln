@@ -90,6 +90,18 @@ pub fn fact(f: &RunnerFacts, name: &str) -> Fact {
     }
 }
 
+/// Whether [`fact`] knows a fact by this name: its own, `tools.<tool>`, `executors.<executor>` or
+/// `custom.<name>`. A constraint reads any other name as a custom fact (false when the runner has
+/// none); the needs spelling refuses it, as a typo.
+pub fn known_fact(name: &str) -> bool {
+    const OWN: &[&str] = &[
+        "os", "os.version", "os.distro", "kernel", "arch", "arch_variant", "arch.variant", "cpu.cores", "cpu.threads", "cpu.model", "cpu.flags", "mem.total", "mem.free", "disk.total",
+        "disk.free", "gpu.count", "gpu.model", "gpu.vendor", "gpu.memory", "virt.kvm", "virt.hvf", "virt.nested", "executors", "binfmt", "tools", "net.egress",
+    ];
+    let n = name.to_ascii_lowercase();
+    OWN.contains(&n.as_str()) || ["tools.", "executors.", "custom."].iter().any(|p| n.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))
+}
+
 /// A literal in a constraint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Lit {
@@ -98,7 +110,7 @@ pub enum Lit {
 }
 
 impl Lit {
-    fn show(&self) -> String {
+    pub fn show(&self) -> String {
         match self {
             Lit::Str(s) => s.clone(),
             Lit::Num(n) => expr::js_number_to_string(*n),

@@ -159,6 +159,53 @@ impl Fe<'_> {
         }
     }
 
+    /// A job's `resources:` (W05-R03): `cpu`, `memory`, `disk` and `gpu`, each a quantity placement
+    /// can reserve, or a KCI1011 at the one that isn't. A templated one is read once it's known.
+    fn job_resources(&mut self, n: &Node, path: &str) -> YVal {
+        match n.as_map() {
+            Some(map) => {
+                for (k, v) in map {
+                    let Some(name) = k.text() else { continue };
+                    let at = format!("{path}.{name}");
+                    let text = v.text().unwrap_or_default().trim().to_owned();
+                    if text.contains("${{") {
+                        continue;
+                    }
+                    let (ok, form) = match name.as_str() {
+                        "cpu" => (crate::sched::pools::cpus(&text).is_some(), "a number of CPUs (`2`, `0.5`, `500m`)"),
+                        // `number` reads a lowercase `m` as minutes: `512m` of memory is 512 minutes.
+                        "memory" | "disk" => (!text.ends_with(['s', 'm', 'h', 'd']) && crate::sched::routing::number(&text).is_some_and(|b| b >= 0.0), "a size (`512Mi`, `32Gi`, `2G`)"),
+                        "gpu" => (text.parse::<u32>().is_ok(), "a number of GPUs"),
+                        _ => {
+                            self.err("KCI1010", format!("unknown key `{name}` in `resources` (cpu, memory, disk, gpu)"), k.range, &at);
+                            continue;
+                        }
+                    };
+                    if !ok {
+                        self.err("KCI1011", format!("`{at}` isn't {form}: `{text}`"), v.range, &at);
+                    }
+                }
+            }
+            None if n.is_null() => {}
+            None => self.err("KCI1011", format!("`{path}` must be a mapping of `cpu`, `memory`, `disk` and `gpu`"), n.range, path),
+        }
+        self.yval(n)
+    }
+
+    /// A job's `requires:` (W05-R22): each a constraint routing can read, or a KCI1011 at the one it
+    /// can't. A templated one is read once it's known.
+    fn job_requires(&mut self, n: &Node, path: &str) -> Vec<Tpl> {
+        let list = self.tpl_list(n, path);
+        for (i, t) in list.iter().enumerate() {
+            if !t.src.contains("${{")
+                && let Err(why) = crate::sched::routing::Constraint::parse(&t.src)
+            {
+                self.err("KCI1011", why, t.range, &format!("{path}[{i}]"));
+            }
+        }
+        list
+    }
+
     pub fn yval(&mut self, n: &Node) -> YVal {
         match &n.kind {
             Kind::Scalar(Scalar::Null, _) => YVal::Null,
@@ -724,8 +771,8 @@ impl Fe<'_> {
                 "toolchain" => kiln.toolchain = self.str(v, &at),
                 "image" => kiln.image = self.tpl(v, &at),
                 "exclusive" => kiln.exclusive = self.bool(v, &at).unwrap_or(false),
-                "resources" => kiln.resources = Some(self.yval(v)),
-                "requires" => kiln.requires = self.tpl_list(v, &at),
+                "resources" => kiln.resources = Some(self.job_resources(v, &at)),
+                "requires" => kiln.requires = self.job_requires(v, &at),
                 // W05-R23, W24-R18: an item routing can't read counts for nothing, and says why.
                 "prefer" => {
                     kiln.prefer = v.as_seq().map(|s| s.iter().map(|x| self.yval(x)).collect()).unwrap_or_default();
