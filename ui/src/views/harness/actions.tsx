@@ -11,7 +11,7 @@ import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { copyText } from "@/views/terminal/clipboard";
-import { MoveDialog } from "./move";
+import { MoveDialog, movable } from "./move";
 import { useEndWithChildren } from "./family";
 
 const ReachDialog = React.lazy(() => import("./reach").then((m) => ({ default: m.ReachDialog })));
@@ -59,8 +59,8 @@ export function useAgentActions(
     { label: "Stop the current turn", onSelect: () => void command({ type: "interrupt" }, "interrupt it"), hidden: a.status !== "running" && a.status !== "waiting" },
     { label: "Restart", onSelect: () => void command({ type: "restart" }, "restart it"), hidden: live },
     { label: "Duplicate…", onSelect: () => setAct("duplicate") },
-    // Agents the kiln server itself runs stay there.
-    { label: "Move to…", onSelect: () => setAct("move"), hidden: !live || !a.target.startsWith("agent:") },
+    // Agents the kiln server itself runs stay there once they've started.
+    { label: "Move to…", onSelect: () => setAct("move"), hidden: !movable(a) },
     { label: "Where commands run…", onSelect: () => setAct("reach"), hidden: !a.target.startsWith("agent:") },
     { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
     { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : void end()), danger: true },

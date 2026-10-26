@@ -208,6 +208,15 @@ fn given_to(hub: &Hub, cfg: &Config, i: usize) -> R<Option<String>> {
     }
 }
 
+fn either(own: &Option<String>, run: &Option<String>) -> Option<String> {
+    own.clone().filter(|s| !s.trim().is_empty()).or_else(|| run.clone().filter(|s| !s.trim().is_empty()))
+}
+
+async fn ran(hub: &Hub, run: &str) -> R<bool> {
+    let run = run.to_owned();
+    Ok(hub.store.call(move |c| Ok(c.query_row("SELECT 1 FROM plan_runs WHERE id = ?1", params![run], |_| Ok(())).optional()?.is_some())).await?)
+}
+
 /// Steps as words: "step 2", "steps 2 and 3", "steps 2, 3 and 4" (each `i` from 0).
 fn steps_words(i: &[usize]) -> String {
     let n: Vec<String> = i.iter().map(|i| (i + 1).to_string()).collect();
@@ -261,6 +270,16 @@ pub async fn start(hub: &Arc<Hub>, p: &Plan, cfg: Config, key: Option<&str>) -> 
     if blank(&cfg.place.kind) && picked.iter().any(|&i| given.get(i).is_some_and(Option::is_none) && cfg.steps.get(i).is_none_or(|s| blank(&s.kind))) {
         return Err(Error::Bad("say which harness runs its steps: `new.kind` (or each step's `kind`)".into()));
     }
+    // The same id as `plans::run` makes under the key: one key, one request, whatever its mode.
+    let run = key.map_or_else(crate::util::new_id, |k| crate::util::derive_id(&["plans.run", &p.id, k]));
+    if key.is_none() || !ran(hub, &run).await? {
+        let parent = cfg.parent.as_deref().and_then(|a| hub.harness.info(a));
+        for &i in picked.iter().filter(|&&i| given.get(i).is_some_and(Option::is_none)) {
+            let own = cfg.steps.get(i).cloned().unwrap_or_default();
+            let kind = either(&own.kind, &cfg.place.kind).unwrap_or_default();
+            crate::harness::lineage::placed(hub, parent.as_ref(), either(&own.on, &cfg.place.on).as_deref(), &kind).await.map_err(|(c, m)| Error::Refused(c, format!("step {}: {m}", i + 1)))?;
+        }
+    }
     // The steps it takes wait only for each other: those outside the run are taken as done.
     let all = super::waits(&p.items, n, cfg.parallel);
     let needs: Vec<Vec<usize>> = all.iter().enumerate().map(|(i, d)| if picked.contains(&i) { d.iter().copied().filter(|j| picked.contains(j)).collect() } else { d.clone() }).collect();
@@ -280,8 +299,6 @@ pub async fn start(hub: &Arc<Hub>, p: &Plan, cfg: Config, key: Option<&str>) -> 
         .map(|&i| (i, title_of(p, i), goal_of(p, i, n), serde_json::to_string(needs.get(i).map_or(&[][..], Vec::as_slice)).unwrap_or_else(|_| "[]".into()), given.get(i).cloned().flatten()))
         .collect();
     let taken = steps.len();
-    // The same id as `plans::run` makes under the key: one key, one request, whatever its mode.
-    let run = key.map_or_else(crate::util::new_id, |k| crate::util::derive_id(&["plans.run", &p.id, k]));
     let (now, version, plan_id, by) = (crate::util::now_unix(), p.version, p.id.clone(), cfg.actor.clone());
     let config = serde_json::to_string(&cfg).map_err(anyhow::Error::from)?;
     let (run_c, note_c) = (run.clone(), note.clone());
@@ -576,7 +593,6 @@ async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
     }
     let own = head.config.steps.get(at).cloned().unwrap_or_default();
     let base = &head.config.place;
-    let pick = |a: &Option<String>, b: &Option<String>| a.clone().filter(|s| !s.trim().is_empty()).or_else(|| b.clone().filter(|s| !s.trim().is_empty()));
     let parent = match head.config.parent.as_deref() {
         Some(p) => Some(hub.harness.info(p).ok_or_else(|| Error::Bad("the agent that ran this plan has ended, so its steps can't be held to it: run the plan again".into()))?),
         None => None,
@@ -590,12 +606,12 @@ async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
     let starter = Starter { parent, opener: head.config.opener.clone(), actor: head.config.actor.clone(), plan_run: Some(run.to_owned()), asker };
     let name: String = format!("Step {}: {}", at + 1, row.title).chars().take(80).collect();
     let ask = Ask {
-        kind: pick(&own.kind, &base.kind).unwrap_or_default(),
-        on: pick(&own.on, &base.on),
-        cwd: pick(&own.cwd, &base.cwd),
-        model: pick(&own.model, &base.model),
-        effort: pick(&own.effort, &base.effort),
-        mode: pick(&own.mode, &base.mode),
+        kind: either(&own.kind, &base.kind).unwrap_or_default(),
+        on: either(&own.on, &base.on),
+        cwd: either(&own.cwd, &base.cwd),
+        model: either(&own.model, &base.model),
+        effort: either(&own.effort, &base.effort),
+        mode: either(&own.mode, &base.mode),
         name: Some(name),
         count: Some(1),
         ..Ask::default()
@@ -911,6 +927,7 @@ mod tests {
                 crate::rt::spawn(async move {
                     let _ = crate::harness::registry::Registry::run_local(h).await;
                 });
+                hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
                 let items = ["Write the engine", "Wire it", "Screenshot it"].iter().map(|t| Item { title: (*t).to_owned(), ..Item::default() }).collect();
                 let p = super::super::create(&hub, super::super::New { title: "Ship sync".into(), items, ..Default::default() }, "admin").await?;
                 let cfg = Config {
@@ -964,6 +981,56 @@ mod tests {
                 // Listed, with how many of its steps are met.
                 let all = list(&hub, false).await?;
                 anyhow::ensure!(all.first().is_some_and(|b| b.id == run && b.met == 3 && b.total == 3 && b.title == "Ship sync"));
+                Ok(())
+            });
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!("the run hung"),
+        }
+    }
+
+    #[test]
+    fn a_run_whose_steps_cant_start_where_theyre_placed_is_refused_before_it_starts() -> anyhow::Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = crate::rt::block_on(async {
+                let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+                let offering = |ids: &[&str]| {
+                    crate::harness::kinds::offered()
+                        .into_iter()
+                        .map(|mut k| {
+                            k.available = ids.contains(&k.id.as_str());
+                            k
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for (name, os) in [("box", "linux"), ("studio", "macos")] {
+                    hub.agents.lock().insert(name.into(), crate::hub::tests::live_runner(name, os, "aarch64"));
+                }
+                hub.harness.set_kinds("local", offering(&["claude"]));
+                hub.harness.set_kinds("agent:box", offering(&["claude", "devin"]));
+                hub.harness.set_kinds("agent:studio", offering(&["claude"]));
+                let items = ["Schema", "API"].iter().map(|t| Item { title: (*t).to_owned(), ..Item::default() }).collect();
+                let p = super::super::create(&hub, super::super::New { title: "Placed".into(), items, ..Default::default() }, "admin").await?;
+                let place = |on: &str| Place { on: Some(on.into()), kind: Some("devin".into()), cwd: Some("/nonexistent/kiln-plan-placed".into()), ..Place::default() };
+                let cfg = |place: Place, steps: Vec<Place>| Config { place, steps, opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
+                let refused = |r: R<Started>| match r {
+                    Err(Error::Refused(code, why)) => Some((code, why)),
+                    _ => None,
+                };
+                let (code, why) = refused(start(&hub, &p, cfg(place("studio"), Vec::new()), None).await).ok_or_else(|| anyhow::anyhow!("a run whose machine hasn't its harness started"))?;
+                anyhow::ensure!(code == http::StatusCode::CONFLICT && why == "step 1: Devin isn't installed on studio: pick a machine that has it with `on`: box", "{why}");
+                let own = vec![Place::default(), Place { on: Some("studio".into()), ..Place::default() }];
+                let why = refused(start(&hub, &p, cfg(place("box"), own), None).await).map(|(_, why)| why).unwrap_or_default();
+                anyhow::ensure!(why == "step 2: Devin isn't installed on studio: pick a machine that has it with `on`: box", "{why}");
+                anyhow::ensure!(list(&hub, false).await?.is_empty(), "no run was made");
+                hub.harness.set_kinds("local", offering(&["devin"]));
+                let first = start(&hub, &p, cfg(place("local"), Vec::new()), Some("k")).await?;
+                hub.harness.set_kinds("local", offering(&["claude"]));
+                let again = start(&hub, &p, cfg(place("local"), Vec::new()), Some("k")).await?;
+                anyhow::ensure!(again.run == first.run, "asked again under its key, it's the run it started then");
                 Ok(())
             });
             let _ = tx.send(r);

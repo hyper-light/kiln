@@ -237,6 +237,16 @@ When the agent's machine is away, it can't hand the agent over. The move then go
 server's copy of the conversation instead, its transcript included (`{"from_store": true}`; see
 [conversations.md](conversations.md), "Resuming on another machine").
 
+An agent that isn't running moves too: one that crashed or couldn't start on its runner goes as
+any other (its runner hands it over), and starts again where it goes, with the first message it
+was given when its harness never got it. The kiln server keeps the
+agents it runs once they've started; one whose harness never started there (the server hasn't it)
+moves all the same, the server packing it itself, with the first message it was given, and
+handing it to the runner (`{"from_server": true}`). It starts there under the same id, its plan
+step, goals and parent kept, in the same folder where that runner has it (under the server's home,
+the same place under the runner's), else in its home. The page of an agent that couldn't start
+offers **Move to…** beside **Start a new one**.
+
 1. **The folder** (`harness/relocate.rs`, on the server). An agent working in a git repository goes
    on in that repository's copy on the other machine, kept in step by sync (*Repositories on
    machines*, [sync.md](sync.md)): a copy there already, or one a sync task makes now — the source's
