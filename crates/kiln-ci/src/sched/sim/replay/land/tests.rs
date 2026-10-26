@@ -199,3 +199,42 @@ fn w28_ac33_readme_holds_the_land_report() -> Result<(), String> {
     assert!(kept == r, "ci/sim/README.md's land report is stale: cargo run -p kiln-ci --example land -- ci/sim/trace.json");
     Ok(())
 }
+
+/// W28-R36, batches: the burst's five kiln-ci changes tested as one batch, the union of their
+/// checks on the stack of all five. Their jobs start critical path first, then the shortest, as
+/// the two runners free; the batch's pass lands all five at once. The fifteen others are batches
+/// of one and land as their own checks end.
+#[test]
+fn w28_r36_batches_land_a_window_as_one() {
+    let mut pushes: Vec<Push> = (1..=15).map(|k| push(1, &format!("crate-{k}"), "check", "small", 120 + 10 * k, "succeeded")).collect();
+    for (k, secs) in [400, 100, 300, 50, 200].into_iter().enumerate() {
+        pushes.push(push(1, "kiln-ci", &format!("kiln-ci-{k}"), "ci", secs, "succeeded"));
+    }
+    let t = queue(vec![machine("small", 15), machine("ci", 2)], &pushes);
+    let o = replay(&t, &LandPolicy::components(Order { batch: true, ..Order::default() }), 1);
+    for k in 1..=15 {
+        let i = usize::try_from(k).unwrap_or(0);
+        assert_eq!((started(&o, i), landed(&o, i)), (Some(1), Some(1 + 120 + 10 * k)));
+    }
+    assert!(o.decisions.iter().any(|d| d.contains("#20's batch of 5 passed")));
+    // The batch's check holds each change's own job: they start critical path first, then the
+    // shortest.
+    let mut by_start: Vec<(Option<i64>, usize)> = o.execs.iter().filter(|e| e.key.starts_with("kiln-ci-")).map(|e| (e.started, e.item)).collect();
+    by_start.sort_unstable();
+    assert_eq!(by_start, vec![(Some(1), 16), (Some(1), 19), (Some(51), 17), (Some(151), 20), (Some(351), 18)], "critical path first, then shortest first");
+    let lands: Vec<Option<i64>> = (16..=20).map(|i| landed(&o, i)).collect();
+    assert_eq!(lands, vec![Some(651); 5], "one batch, landed at once");
+}
+
+/// W28-R36, batches: a batch that doesn't fill its window holds for more changes, never past
+/// the aging bound from its oldest change's enqueue; both changes then run as one check.
+#[test]
+fn w28_r36_a_batch_holds_never_past_the_aging_bound() {
+    let pushes = vec![push(1, "x", "x", "r", 100, "succeeded"), push(600, "x", "x", "r", 100, "succeeded")];
+    let t = queue(vec![machine("r", 1)], &pushes);
+    for hold in [3600, 7200] {
+        let o = replay(&t, &LandPolicy::components(Order { batch: true, hold_s: hold, ..Order::default() }), 1);
+        assert_eq!(o.execs.iter().map(|e| e.started).collect::<Vec<_>>(), vec![Some(3600)], "hold {hold}: one check, at the bound");
+        assert_eq!((landed(&o, 1), landed(&o, 2)), (Some(3700), Some(3700)));
+    }
+}

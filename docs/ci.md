@@ -7919,7 +7919,10 @@ before this one call this workstream "W25 step N". Step 6's, admission, are R60â
   unit (R32, R33), so a result the trunk or another candidate has answers it and one in flight is
   shared. A failure is the change's own once every change ahead of it has passed. It ejects the
   change, and the candidates behind it re-key: what still keys keeps its result, and what its
-  leaving changed runs again.
+  leaving changed runs again. A component can instead test its window as one batch (`Order::batch`,
+  off by default): the union of its changes' checks on the stack of them all, whose pass lands
+  every change; a batch that doesn't fill its window holds for more (`hold_s`), never past the
+  aging bound, and a failure narrows the suspects to the batch's changes of what failed.
 - **W28-R37 Admission.** A component's head always starts its candidate. Another change in the
   window starts its only while the bottleneck its check needs is below `util_cap` (default 0.8)
   committed, the shortest expected service first (aged): the bottleneck is, of each of its jobs'
@@ -8056,7 +8059,8 @@ before this one call this workstream "W25 step N". Step 6's, admission, are R60â
 week the mean time from enqueue to landed falls 78% (4.3 h to 55 min), no job waits past the 60 min
 bound (53 min at most) and no window opens past 8, but runner-hours per landed change fall only 7%
 (0.683 to 0.635). The trace keys work by eight input classes, and the classes a change touches are
-84% of its pipeline's expected work (ci/sim/README.md). The land queue uses none of this yet: that
+84% of its pipeline's expected work (ci/sim/README.md). Batches come to 0.354 (-48%) and 1.9 h to land at a window of 8, an
+80 min bound and an 80 min hold. The land queue uses none of this yet: that
 is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built (2026-10-25): `kiln_cd::deploys` decides, and the release worker in `crates/kiln/src/deploy` carries it out for every release in flight, the objects two apps share read from KilnCD's engine (`Engine::shared_objects`). One target coalescing applies with an environment's `concurrency: queue`; with `reject`, the default, a second release is refused as before.
 
 **Requirements: demands and adopt-on-supersede** (step 4's, R40â€“R49; kiln plan

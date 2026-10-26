@@ -371,6 +371,14 @@ Seeds 1-8; the week's 270 ci pushes to main are the changes that want to land.
   - Finer keys than the trace has could save more: per package (W24-R16, R17), a change to one
     crate runs again only that crate and what depends on it. Measuring it would take each push's
     changed files in the trace.
+- **Batches come closest on runner-hours** (`Order { batch: true, .. }`, off by default): each
+  component tests its window as one batch, the union of its changes' checks on the stack of them
+  all, and its pass lands every change. A batch that doesn't fill its window holds for more,
+  never past the aging bound; a failure stops it, narrows the suspects to its changes of what
+  failed, ejects a sole suspect at once and else bisects over them. At a window of 8, aging 0.75
+  a minute (an 80 min bound) and an 80 min hold: 0.354 runner-h per landed change (-48%), 1.9 h
+  to land (-56%), no wait for a runner, 149 changes landed. Failed jobs cost about 22 runner-h
+  a week under every policy, and only the hold grows batches, so it stops short of half.
 
 ### The order's defaults
 
@@ -382,14 +390,18 @@ From the sweeps below; each knob varied with the others at their defaults (means
 | `util_cap` | 0.8 | The plan's. From 0.6 to 1.0 time to land and runner-hours don't move: one rust job holds 44% of the k8s quota's memory, so the head's and one more fit, and the cap only decides whether a third candidate waits in the pooled queue (1.0) or before it. |
 | `aging_per_minute` | 1 | W05-R09's: the bound is 30 points for the critical path plus 30 for the shortest service, 60 min. |
 
-| Policy | Mean enqueue to landed | Runner-h per landed change | Changes landed | Longest wait for a runner | Runner-h stopped unused |
-|---|---|---|---|---|---|
-| serial, batch 1 | 4.3 h | 0.683 | 122.9 | 0 min | 0.0 |
-| components, window cap 1 | 1.7 h | 0.573 | 124.9 | 0 min | 0.0 |
-| components, window cap 2 | 59 min | 0.599 | 125.1 | 2 min | 1.2 |
-| components, window cap 4 | 56 min | 0.619 | 125.4 | 16 min | 1.5 |
-| components, window cap 8 | 55 min | 0.635 | 125.4 | 53 min | 2.3 |
-| components, window cap 12 | 55 min | 0.638 | 125.4 | 59 min | 2.4 |
-| components, admission cap 0.6 | 55 min | 0.635 | 125.4 | 53 min | 2.3 |
-| components, admission cap 0.8 | 55 min | 0.635 | 125.4 | 53 min | 2.3 |
-| components, admission cap 1 | 55 min | 0.635 | 125.6 | 56 min | 2.3 |
+| Policy | Mean enqueue to landed | Runner-h per landed change | Changes landed | Longest wait for a runner | Runner-h stopped unused | Runner-h of failed jobs | Runner-h |
+|---|---|---|---|---|---|---|---|
+| serial, batch 1 | 4.3 h | 0.683 | 122.9 | 0 min | 0.0 | 23.4 | 83.9 |
+| components, window cap 1 | 1.7 h | 0.573 | 124.9 | 0 min | 0.0 | 21.4 | 71.4 |
+| components, window cap 2 | 59 min | 0.599 | 125.1 | 2 min | 1.2 | 22.3 | 74.8 |
+| components, window cap 4 | 56 min | 0.619 | 125.4 | 16 min | 1.5 | 23.0 | 77.4 |
+| components, window cap 8 | 55 min | 0.635 | 125.4 | 53 min | 2.3 | 23.3 | 79.4 |
+| components, window cap 12 | 55 min | 0.638 | 125.4 | 59 min | 2.4 | 23.4 | 79.9 |
+| components, batches, window cap 8, aging 1, hold 0 min | 54 min | 0.499 | 130.1 | 0 min | 0.7 | 21.9 | 64.8 |
+| components, batches, window cap 8, aging 1, hold 60 min | 1.9 h | 0.392 | 142.6 | 0 min | 0.9 | 24.2 | 55.9 |
+| components, batches, window cap 4, aging 0.75, hold 80 min | 1.7 h | 0.380 | 142.1 | 0 min | 0.6 | 23.0 | 54.0 |
+| components, batches, window cap 8, aging 0.75, hold 80 min | 1.9 h | 0.354 | 149.1 | 0 min | 0.7 | 22.6 | 52.8 |
+| components, admission cap 0.6 | 55 min | 0.635 | 125.4 | 53 min | 2.3 | 23.3 | 79.4 |
+| components, admission cap 0.8 | 55 min | 0.635 | 125.4 | 53 min | 2.3 | 23.3 | 79.4 |
+| components, admission cap 1 | 55 min | 0.635 | 125.6 | 56 min | 2.3 | 23.3 | 79.7 |

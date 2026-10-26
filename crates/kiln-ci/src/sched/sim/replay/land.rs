@@ -84,6 +84,8 @@ struct Spec {
     typical: i64,
     /// Whether it lies on its check's critical path, by expected service.
     critical: bool,
+    /// The change and the place in its run it comes from: its draw and its labels.
+    src: (usize, usize),
 }
 
 /// A change in the queue.
@@ -123,6 +125,9 @@ struct Cand {
     /// Each job's work key, as it resolved.
     keys: Vec<Option<String>>,
     decided: bool,
+    /// Its check: its change's jobs, or a batch's every change's (the newest's where two share a
+    /// job), its critical path recomputed over them.
+    specs: Vec<Spec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +258,8 @@ enum Ev {
     Finish(usize),
     Launched(usize),
     Arrive(usize),
+    /// A held batch's time to start.
+    Wake,
 }
 
 impl Ev {
@@ -261,6 +268,7 @@ impl Ev {
             Ev::Finish(_) => 0,
             Ev::Launched(_) => 1,
             Ev::Arrive(_) => 2,
+            Ev::Wake => 3,
         }
     }
 }
@@ -311,15 +319,18 @@ fn items(trace: &Trace, typical: &BTreeMap<(String, String), i64>) -> Vec<Item> 
         let nodes: Vec<Node> = run.jobs.iter().map(|j| Node { id: j.key.clone(), needs: j.needs.clone(), duration: typ(j) as f64 }).collect();
         let path: BTreeSet<String> = critical_path(&nodes).into_iter().collect();
         let service = run.jobs.iter().filter(|j| path.contains(&j.key)).map(typ).sum();
+        let idx = out.len();
         let check = run
             .jobs
             .iter()
-            .map(|j| Spec {
+            .enumerate()
+            .map(|(n, j)| Spec {
                 key: j.key.clone(),
                 class: j.class.clone().unwrap_or_else(|| run.workflow.clone()),
                 needs: j.needs.iter().filter_map(|n| run.jobs.iter().position(|o| &o.key == n)).collect(),
                 typical: typ(j),
                 critical: path.contains(&j.key),
+                src: (idx, n),
             })
             .collect();
         out.push(Item { run: r, at: run.at, aff, check, service });
@@ -370,6 +381,8 @@ pub fn replay(trace: &Trace, policy: &LandPolicy, seed: u64) -> LandOut {
         windows: BTreeMap::new(),
         trunk: BTreeMap::new(),
         told: BTreeSet::new(),
+        limit: BTreeMap::new(),
+        wakes: BTreeSet::new(),
         active: None,
         failures: 0,
         window_max: 0,
@@ -440,6 +453,11 @@ struct Engine<'a> {
     trunk: BTreeMap<String, (usize, u64)>,
     /// Changes whose verdict the decisions have.
     told: BTreeSet<usize>,
+    /// Batches: how many changes a component's next batch may hold, by its head, after a failure
+    /// narrowed the suspects.
+    limit: BTreeMap<usize, usize>,
+    /// The times a held batch wakes the queue.
+    wakes: BTreeSet<i64>,
     /// Serial: the candidate under test, and failures since the last land.
     active: Option<usize>,
     failures: u32,
@@ -469,6 +487,7 @@ impl Engine<'_> {
                 }
                 match entry.remove() {
                     Ev::Arrive(i) => self.pending.push(i),
+                    Ev::Wake => {}
                     Ev::Launched(x) => self.launched(x),
                     Ev::Finish(x) => self.finish(x),
                 }
@@ -497,9 +516,40 @@ impl Engine<'_> {
     }
 
     fn new_cand(&mut self, item: usize, batch: Vec<usize>) -> usize {
-        let n = self.items.get(item).map_or(0, |it| it.check.len());
-        self.cands.push(Cand { item, batch, jobs: vec![JobSt::Queued; n], keys: vec![None; n], decided: false });
+        let specs = if self.order.batch && self.serial.is_none() { self.union(&batch) } else { self.items.get(item).map(|it| it.check.clone()).unwrap_or_default() };
+        let n = specs.len();
+        self.cands.push(Cand { item, batch, jobs: vec![JobSt::Queued; n], keys: vec![None; n], decided: false, specs });
         self.cands.len() - 1
+    }
+
+    /// A batch's check (W28-R36): every job of every change in it, the newest change's where two
+    /// have the same, so each change's own checks run on the batch's stack; its critical path is
+    /// the longest chain among them.
+    fn union(&self, batch: &[usize]) -> Vec<Spec> {
+        let mut picked: Vec<(Spec, Vec<String>)> = Vec::new();
+        for &m in batch.iter().rev() {
+            let Some(it) = self.items.get(m) else { continue };
+            for sp in &it.check {
+                if picked.iter().all(|(o, _)| o.key != sp.key) {
+                    let needs = sp.needs.iter().filter_map(|n| it.check.get(*n).map(|d| d.key.clone())).collect();
+                    picked.push((sp.clone(), needs));
+                }
+            }
+        }
+        let keys: Vec<String> = picked.iter().map(|(sp, _)| sp.key.clone()).collect();
+        let mut out: Vec<Spec> = picked
+            .into_iter()
+            .map(|(mut sp, needs)| {
+                sp.needs = needs.iter().filter_map(|k| keys.iter().position(|o| o == k)).collect();
+                sp
+            })
+            .collect();
+        let nodes: Vec<Node> = out.iter().map(|sp| Node { id: sp.key.clone(), needs: sp.needs.iter().filter_map(|n| out.get(*n).map(|d| d.key.clone())).collect(), duration: sp.typical as f64 }).collect();
+        let path: BTreeSet<String> = critical_path(&nodes).into_iter().collect();
+        for sp in &mut out {
+            sp.critical = path.contains(&sp.key);
+        }
+        out
     }
 
     /// The tree class `class` has on `stack` (the changes over the trunk, in queue order): the
@@ -655,7 +705,7 @@ impl Engine<'_> {
         let live: Vec<(usize, usize)> = self.cand_of.iter().map(|(&i, &c)| (i, c)).collect();
         for (i, c) in live {
             let stack = self.stack(i);
-            let specs: Vec<(String, String)> = self.items.get(i).map(|it| it.check.iter().map(|s| (s.key.clone(), s.class.clone())).collect()).unwrap_or_default();
+            let specs: Vec<(String, String)> = self.cands.get(c).map(|cd| cd.specs.iter().map(|s| (s.key.clone(), s.class.clone())).collect()).unwrap_or_default();
             let mut moved = false;
             for (j, (key, class)) in specs.iter().enumerate() {
                 let Some(Some(was)) = self.cands.get(c).and_then(|cd| cd.keys.get(j)).cloned() else { continue };
@@ -687,6 +737,12 @@ impl Engine<'_> {
     /// weighed so what it queues counts; a change past the window is suspended, letting go of what
     /// runs only for it.
     fn admit(&mut self) {
+        if self.order.batch {
+            for comp in self.comps.clone() {
+                self.admit_batch(&comp);
+            }
+            return;
+        }
         for comp in self.comps.clone() {
             let open = comp.first().and_then(|h| self.windows.get(h)).map_or(1, Speculation::open);
             let open = usize::try_from(open).unwrap_or(1);
@@ -723,6 +779,38 @@ impl Engine<'_> {
         }
     }
 
+    /// A component tested as one batch (W28-R36): with no candidate in flight, the window's top
+    /// change gets one on the stack of every change ahead of it in the window, and its pass lands
+    /// them all; the window's critical path is that candidate's.
+    fn admit_batch(&mut self, comp: &[usize]) {
+        if comp.iter().any(|i| self.cand_of.contains_key(i)) {
+            return;
+        }
+        let open = comp.first().and_then(|h| self.windows.get(h)).map_or(1, Speculation::open);
+        let narrowed = comp.first().and_then(|h| self.limit.get(h).copied());
+        let open = usize::try_from(open).unwrap_or(1);
+        // A batch that doesn't fill the window waits for more changes, never past its oldest
+        // change's hold (bounded by the aging bound).
+        let hold = self.order.hold_s.min(self.order.aging_bound());
+        let ready = comp.first().and_then(|h| self.items.get(*h)).map_or(self.now, |it| it.at.saturating_add(hold));
+        if narrowed.is_none() && comp.len() < open && self.now < ready {
+            if self.wakes.insert(ready) {
+                self.at(ready, Ev::Wake);
+            }
+            return;
+        }
+        if let Some(h) = comp.first() {
+            self.limit.remove(h);
+        }
+        let n = open.min(comp.len()).min(narrowed.unwrap_or(usize::MAX).max(1));
+        let batch: Vec<usize> = comp.iter().take(n).copied().collect();
+        let Some(&top) = batch.last() else { return };
+        let c = self.new_cand(top, batch.clone());
+        self.cand_of.insert(top, c);
+        self.note(format!("#{top}: candidate {c}, the window's top, for {} change(s)", batch.len()));
+        self.drive(c);
+    }
+
     /// Start change `i`'s candidate and answer what it can at once, so what it queues counts
     /// against the next one weighed.
     fn start(&mut self, i: usize, what: String) {
@@ -741,6 +829,9 @@ impl Engine<'_> {
     /// re-key before anything lands; a pass opens the window by one; each component's passed
     /// prefix lands.
     fn decide(&mut self) -> bool {
+        if self.order.batch {
+            return self.decide_batch();
+        }
         let mut passes = Vec::new();
         let mut failures = Vec::new();
         for comp in &self.comps {
@@ -757,7 +848,7 @@ impl Engine<'_> {
                         continue;
                     }
                     Some((c, cd)) if clear => {
-                        let failed: Vec<String> = cd.jobs.iter().zip(self.items.get(i).map(|it| it.check.as_slice()).unwrap_or_default()).filter(|(s, _)| matches!(s, JobSt::Done(e) if !e.passed())).map(|(_, sp)| sp.key.clone()).collect();
+                        let failed: Vec<String> = cd.jobs.iter().zip(cd.specs.iter()).filter(|(s, _)| matches!(s, JobSt::Done(e) if !e.passed())).map(|(_, sp)| sp.key.clone()).collect();
                         failures.push((i, c, failed));
                     }
                     _ => {}
@@ -785,6 +876,84 @@ impl Engine<'_> {
             let w = self.window_op(i, Speculation::pass);
             self.note(format!("#{i} passed on its stack; its component's window opens to {w}"));
             changed = true;
+        }
+        for comp in self.comps.clone() {
+            for i in comp {
+                if self.out.get(i).is_some_and(|o| o.landed.is_some() || o.ejected) {
+                    continue;
+                }
+                if !self.passed.contains(&i) {
+                    break;
+                }
+                self.land(i);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Decide each component's batch (W28-R36): a pass lands every change it holds and opens the
+    /// window by one; a failure of one change alone ejects it; a failure of more halves the window,
+    /// so the next batch is half as big, as today's bisection, but per component.
+    fn decide_batch(&mut self) -> bool {
+        let live: Vec<(usize, usize)> = self.cand_of.iter().map(|(&i, &c)| (i, c)).collect();
+        let mut changed = false;
+        for (i, c) in live {
+            let Some(cd) = self.cands.get(c) else { continue };
+            // A batch fails as soon as one of its jobs does: what else runs for it stops.
+            let failed = cd.jobs.iter().any(|s| matches!(s, JobSt::Done(e) if !e.passed()));
+            if cd.decided || !(failed || cd.jobs.iter().all(|s| matches!(s, JobSt::Done(_) | JobSt::Skipped))) {
+                continue;
+            }
+            let ok = !failed && cd.jobs.iter().all(|s| matches!(s, JobSt::Done(e) if e.passed()));
+            let batch = cd.batch.clone();
+            if let Some(cd) = self.cands.get_mut(c) {
+                cd.decided = true;
+            }
+            changed = true;
+            if ok {
+                self.passed.extend(batch.iter().copied());
+                // The window opens by one for each change the batch lands.
+                let mut w = 0;
+                for _ in &batch {
+                    w = self.window_op(i, Speculation::pass);
+                }
+                self.note(format!("#{i}'s batch of {} passed; its component's window opens to {w}", batch.len()));
+            } else if batch.len() <= 1 {
+                let w = self.window_op(i, Speculation::fail);
+                self.note(format!("#{i} ejected: its candidate failed alone; its component's window is {w}"));
+                self.eject(i);
+            } else {
+                // The failing jobs' classes narrow the suspects to the batch's changes of them
+                // (W28-R32: a change can only break the units it affects): the next batch is the
+                // changes ahead of the first suspect, or that suspect alone.
+                let failed: BTreeSet<String> = self
+                    .cands
+                    .get(c)
+                    .map(|cd| cd.jobs.iter().zip(cd.specs.iter()).filter(|(s, _)| matches!(s, JobSt::Done(e) if !e.passed())).map(|(_, sp)| sp.class.clone()).collect())
+                    .unwrap_or_default();
+                let suspects: Vec<usize> = batch.iter().copied().filter(|m| self.items.get(*m).is_some_and(|it| it.aff.iter().any(|a| failed.contains(a)))).collect();
+                let first = batch.iter().position(|m| suspects.first() == Some(m));
+                let w = self.window_op(i, Speculation::fail);
+                self.cand_of.remove(&i);
+                self.drop_jobs(c);
+                if let [only] = suspects.as_slice() {
+                    // The only change in the batch to what failed: the failing trees are the ones
+                    // it has alone, so it fails alone too; out, and the rest goes on without it.
+                    let only = *only;
+                    self.note(format!("#{only} ejected: the only change in #{i}'s batch of {} to what failed; its component's window halves to {w}", batch.len()));
+                    self.eject(only);
+                    continue;
+                }
+                // Bisect over the suspects: the next batch ends at the middle one.
+                let mid = suspects.get(suspects.len().saturating_sub(1) / 2).and_then(|m| batch.iter().position(|x| x == m));
+                let cut = mid.map(|p| p + 1);
+                if let (Some(p), Some(&head)) = (cut, batch.first()) {
+                    self.limit.insert(head, p);
+                }
+                let next = first.map_or(w as usize, |p| p.max(1).min(w as usize));
+                self.note(format!("#{i}'s batch of {} failed: its component's window halves to {w}, and the next batch holds {next}", batch.len()));
+            }
         }
         for comp in self.comps.clone() {
             for i in comp {
@@ -849,8 +1018,7 @@ impl Engine<'_> {
     /// Answer what a candidate's jobs can be asked: a job whose needs all passed resolves; one with
     /// a need that failed or was skipped is skipped.
     fn drive(&mut self, c: usize) {
-        let Some(i) = self.cands.get(c).map(|cd| cd.item) else { return };
-        let needs: Vec<Vec<usize>> = self.items.get(i).map(|it| it.check.iter().map(|s| s.needs.clone()).collect()).unwrap_or_default();
+        let needs: Vec<Vec<usize>> = self.cands.get(c).map(|cd| cd.specs.iter().map(|s| s.needs.clone()).collect()).unwrap_or_default();
         loop {
             let mut moved = false;
             for (j, ns) in needs.iter().enumerate() {
@@ -879,7 +1047,7 @@ impl Engine<'_> {
     /// has, the execution in flight, or a new execution; under serial always a new one.
     fn resolve(&mut self, c: usize, j: usize) {
         let Some((i, batch)) = self.cands.get(c).map(|cd| (cd.item, cd.batch.clone())) else { return };
-        let Some((key, class, critical)) = self.items.get(i).and_then(|it| it.check.get(j)).map(|s| (s.key.clone(), s.class.clone(), s.critical)) else {
+        let Some((key, class, critical, src)) = self.cands.get(c).and_then(|cd| cd.specs.get(j)).map(|s| (s.key.clone(), s.class.clone(), s.critical, s.src)) else {
             self.set(c, j, JobSt::Skipped);
             return;
         };
@@ -899,8 +1067,8 @@ impl Engine<'_> {
                 return;
             }
         }
-        let critical = !serial && critical && self.is_head(i);
-        let x = self.new_exec(i, j, key.clone(), critical);
+        let critical = !serial && critical && (self.order.batch || self.is_head(i));
+        let x = self.new_exec(src.0, src.1, key.clone(), critical);
         if !serial {
             self.inflight.insert(key, x);
         }
@@ -1263,19 +1431,24 @@ pub fn sweeps(trace: &Trace, seeds: &[u64]) -> String {
     for cap in [1, 2, 4, 8, 12] {
         policies.push(LandPolicy { name: format!("components, window cap {cap}"), mode: Mode::Components(Order { window: admit::Window { initial: cap, floor: 1, cap }, ..Order::default() }) });
     }
+    for (cap, aging, hold) in [(8, 1.0, 0), (8, 1.0, 3600), (4, 0.75, 4800), (8, 0.75, 4800)] {
+        policies.push(LandPolicy { name: format!("components, batches, window cap {cap}, aging {aging}, hold {} min", hold / 60), mode: Mode::Components(Order { aging_per_minute: aging, window: admit::Window { initial: cap, floor: 1, cap }, batch: true, hold_s: hold, ..Order::default() }) });
+    }
     for util in [0.6, 0.8, 1.0] {
         policies.push(LandPolicy { name: format!("components, admission cap {util}"), mode: Mode::Components(Order { util_cap: util, ..Order::default() }) });
     }
     let mut s = String::new();
-    let _ = writeln!(s, "| Policy | Mean enqueue to landed | Runner-h per landed change | Changes landed | Longest wait for a runner | Runner-h stopped unused |");
-    let _ = writeln!(s, "|---|---|---|---|---|---|");
+    let _ = writeln!(s, "| Policy | Mean enqueue to landed | Runner-h per landed change | Changes landed | Longest wait for a runner | Runner-h stopped unused | Runner-h of failed jobs | Runner-h |");
+    let _ = writeln!(s, "|---|---|---|---|---|---|---|---|");
     for p in &policies {
         let outs: Vec<LandOut> = seeds.iter().map(|&seed| replay(trace, p, seed)).collect();
         let stopped = mean(outs.iter().map(|o| o.execs.iter().filter(|e| e.stale).map(Exec::used).sum::<i64>() as f64 / 3600.0));
         let longest = outs.iter().map(LandOut::max_wait).max().unwrap_or(0);
+        let failed = mean(outs.iter().map(|o| o.execs.iter().filter(|e| e.end.is_some_and(|x| !x.passed())).map(Exec::used).sum::<i64>() as f64 / 3600.0));
+        let total = mean(outs.iter().map(|o| o.used() as f64 / 3600.0));
         let _ = writeln!(
             s,
-            "| {} | {} | {:.3} | {:.1} | {} | {stopped:.1} |",
+            "| {} | {} | {:.3} | {:.1} | {} | {stopped:.1} | {failed:.1} | {total:.1} |",
             p.name,
             dur(mean(outs.iter().map(LandOut::mean_to_land))),
             mean(outs.iter().map(LandOut::runner_hours_per_landed)),

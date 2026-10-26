@@ -40,6 +40,12 @@ pub struct Order {
     /// The share of the bottleneck's capacity committed at which speculative candidates defer
     /// (default 0.8).
     pub util_cap: f64,
+    /// Whether a component tests its window as one batch: the window's top candidate, on the
+    /// stack of every change in it, lands them all when it passes (W28-R36).
+    pub batch: bool,
+    /// Batches: how long a batch that doesn't fill its window waits for more changes, from its
+    /// oldest change's enqueue (seconds; at most the aging bound).
+    pub hold_s: i64,
 }
 
 /// The land queue's window: it starts at its cap, as Zuul's starts at its size (W28-R36).
@@ -55,7 +61,7 @@ pub const SJF_SPAN: i64 = 1800;
 
 impl Default for Order {
     fn default() -> Order {
-        Order { aging_per_minute: 1.0, window: WINDOW, util_cap: 0.8 }
+        Order { aging_per_minute: 1.0, window: WINDOW, util_cap: 0.8, batch: false, hold_s: 0 }
     }
 }
 
