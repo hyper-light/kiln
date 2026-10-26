@@ -141,6 +141,11 @@ waits for instead (**after 2, 3**).
   once; an agent that runs a plan also has at most as many subagents at work at once as its
   Subagents setting says (one pool, whatever each does; none set, no limit), and further steps
   wait for room.
+- **Where each step runs.** Before the run starts, each step's machine is found as its agent's
+  will be (its own `on`, else the run's, else the machine of the agent that ran the plan): a step
+  whose machine can't take it (none by that name or none that suits, or one kiln knows hasn't
+  its harness) refuses the whole run, naming the step, and the machines that have the harness.
+  Asked for again under its key, a run started then is the run it started, as it stands.
 - **One folder.** Steps side by side in one folder share it, and the run says so: brief each
   step to keep to its own files, or give steps folders or machines of their own (`steps`). Until
   agents have workspaces of their own (docs/agentic.md, W: held with Slates), nothing keeps them

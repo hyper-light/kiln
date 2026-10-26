@@ -1016,12 +1016,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Agent sessions other runners hand this one (a session moving here) are taken over by its
     // session host, once there is one (below).
     let (adopt_tx, adopt_rx) = async_channel::bounded::<crate::reach::node::Adoption>(4);
-    let reach = o.reach.filter(|_| !o.ephemeral).and_then(|accept| match crate::reach::node::start(crate::reach::node::Config {
-        adopt: Some(adopt_tx.clone()),
-        ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept)
-    }) {
+    let reach = o.reach.filter(|_| !o.ephemeral).map(|accept| {
+        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
+        (Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start(cfg))
+    });
+    let reach = reach.and_then(|(using, mirrors, started)| match started {
         Ok((handle, said)) => {
             crate::reach::node::set_global(handle.clone());
+            // What other runners' trees left here, kept as people's rules say (docs/reach.md §5.1).
+            crate::reach::keeper::start(handle.clone(), using, mirrors);
             let up = up_tx.clone();
             crate::rt::spawn(async move {
                 while let Ok(m) = said.recv().await {
@@ -1616,6 +1619,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 retire_span = Some(tracing::info_span!(target: "kiln::upgrade", parent: &mv.root, "upgrade.retire", jobs = left, result = empty, error = empty));
                                 tracing::info!(%job, sessions, terminals, jobs = left, "handed over to the new build; this runner retires once its jobs end");
                                 retiring = true;
+                                // The new build keeps the copies of other runners' trees from now on.
+                                crate::reach::keeper::retire();
                                 // No new jobs here: this runner finishes its own, then retires.
                                 draining = true;
                                 retire_at = Some(Instant::now() + RETIRE_QUIET);

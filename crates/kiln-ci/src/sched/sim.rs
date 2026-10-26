@@ -45,6 +45,8 @@ pub struct Sim {
     pub runs: Vec<(i64, Command)>,
     /// Slot-time: (repo, start, end).
     pub busy: Vec<(String, i64, i64)>,
+    /// Slot-time by leg: (leg, start, end).
+    pub busy_legs: Vec<(String, i64, i64)>,
     /// How long a host takes to start a pool's executor (W13-R09).
     pub executor_start_ms: i64,
     /// Hosts whose executors fail to start.
@@ -71,6 +73,7 @@ impl Sim {
             waits: Vec::new(),
             runs: Vec::new(),
             busy: Vec::new(),
+            busy_legs: Vec::new(),
             executor_start_ms: 500,
             failing_hosts: HashSet::new(),
             executors_started: Vec::new(),
@@ -122,6 +125,7 @@ impl Sim {
                     if let Some(repo) = self.repos.get(&leg) {
                         self.busy.push((repo.clone(), start, t));
                     }
+                    self.busy_legs.push((leg.clone(), start, t));
                     let outcome = match self.failures.get_mut(&leg).filter(|f| !f.is_empty()) {
                         Some(f) => Outcome::Failed(Failed { class: f.remove(0), exit_code: None, log_hits: Vec::new() }),
                         None => Outcome::Success,
@@ -191,6 +195,23 @@ impl Sim {
         for (repo, s, e) in &self.busy {
             let overlap = (e.min(&to) - s.max(&from)).max(0);
             *by.entry(repo.clone()).or_default() += overlap as f64;
+        }
+        let total: f64 = by.values().sum();
+        if total > 0.0 {
+            for v in by.values_mut() {
+                *v /= total;
+            }
+        }
+        by
+    }
+
+    /// Each group's share of the slot-time in `[from, to)`, legs grouped by `key` (their actor, their
+    /// lane).
+    pub fn shares_by(&self, from: i64, to: i64, key: impl Fn(&str) -> String) -> HashMap<String, f64> {
+        let mut by: HashMap<String, f64> = HashMap::new();
+        for (leg, s, e) in &self.busy_legs {
+            let overlap = (e.min(&to) - s.max(&from)).max(0);
+            *by.entry(key(leg)).or_default() += overlap as f64;
         }
         let total: f64 = by.values().sum();
         if total > 0.0 {

@@ -594,7 +594,9 @@ export type ServerEvent =
   /** Someone marked notices (`principal`: whose; `tags`: agents whose shown notifications go): notices.ts. */
   | { type: "notices"; principal: string; keys: string[]; how: "away" | "done" | "seen"; at: number; tags?: string[] }
   /** An agent's change request opened or moved on (`agents.change`, review, CI): refetch GET /api/harness/changes. */
-  | { type: "agent_change"; agent: string };
+  | { type: "agent_change"; agent: string }
+  /** The rules for the copies runners keep of other runners' trees, or what a runner holds of them, changed: refetch GET /api/reach/keep. */
+  | { type: "keep" };
 
 /* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
 
@@ -2033,6 +2035,108 @@ export interface ReachRunner {
   mem_total: number;
   mem_used: number;
   harnesses: string[];
+}
+
+/* ---------------------------- copies runners keep of other runners' trees (docs/reach.md §5.1) ---------------------------- */
+
+/**
+ * One scope's rules for the copies: every runner's, a runner's, a repository's or an agent's. Each
+ * one unset is the scope above's; 0, "" or false says there is none here.
+ */
+export interface KeepRules {
+  /** Keep the newest this many copies, among the scope's own. */
+  newest?: number;
+  /** Keep the copies used within this many hours. */
+  hours?: number;
+  /** With both rules, a copy stays only when both keep it (else either). */
+  both?: boolean;
+  /** When what the rules don't keep goes: a five-field cron schedule. */
+  schedule?: string;
+  /** The schedule's time zone (IANA); UTC without one. */
+  timezone?: string;
+  /** What the rules don't keep goes while the disk has less than this share of it free... */
+  free_percent?: number;
+  /** ... or less than this many GiB. */
+  free_gib?: number;
+  /** With too little room still, the copies the rules keep go too, least recently used first. */
+  beyond?: boolean;
+}
+
+export interface KeepDisk {
+  total: number;
+  free: number;
+}
+
+/** A copy of another runner's tree, with what the rules say of it now. */
+export interface KeepCopy {
+  /** The runner whose tree it is. */
+  from: string;
+  /** Its folder there. */
+  key: string;
+  repo?: string;
+  /** The agents whose commands ran in it, the latest last. */
+  agents?: string[];
+  created: number;
+  used: number;
+  bytes?: number;
+  busy?: boolean;
+  kept: boolean;
+  why: string;
+  /** The runner it's on (an agent's copies). */
+  runner?: string;
+}
+
+export type KeepTrigger = "schedule" | "room" | "asked";
+
+/** A copy a runner let go, and why. */
+export interface KeepGone {
+  from: string;
+  key: string;
+  repo?: string;
+  agent?: string;
+  bytes?: number;
+  at: number;
+  trigger: KeepTrigger;
+  why: string;
+  /** Moved aside, but not all deleted yet. */
+  error?: string;
+}
+
+export interface KeepRunner {
+  name: string;
+  connected: boolean;
+  /** Its own rules ({} when it has none). */
+  rules: KeepRules;
+  /** When the server last heard what it holds; null: never. */
+  heard: number | null;
+  base: string | null;
+  disk: KeepDisk | null;
+  copies: KeepCopy[];
+  gone: KeepGone[];
+  /** When a schedule next comes round for it. */
+  next: number | null;
+  /** The last ask to let go now, and the last it carried out. */
+  asked: number;
+  done: number;
+  /** What letting go now would let go. */
+  now: { copies: number; bytes: number };
+  error: string | null;
+}
+
+/** `GET /api/reach/keep`. */
+export interface KeepView {
+  now: number;
+  /** Every runner's rules. */
+  rules: KeepRules;
+  /** Each repository's that has any, by key. */
+  repos: Record<string, KeepRules>;
+  runners: KeepRunner[];
+}
+
+/** `GET /api/harness/sessions/:id/keep`: its own rules, and its copies on every runner. */
+export interface AgentKeep {
+  rules: KeepRules;
+  copies: KeepCopy[];
 }
 
 /* ---------------------------- providers (docs/cd-targets.md) ---------------------------- */

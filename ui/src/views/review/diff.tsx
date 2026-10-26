@@ -1,6 +1,6 @@
 /**
  * One file of a diff under review (W14-R06): its header (where it is, how it changed, viewed), and
- * its hunks, unified or side by side, syntax-highlighted with the editor's grammars, the words that
+ * its hunks, unified or side by side, syntax-highlighted (tree-sitter, lib/syntax), the words that
  * changed in an edited line picked out, blocks that moved marked with where they went, unchanged
  * runs folded, and threads in place under the lines they're about. A line's number is where a
  * comment starts: click it, shift-click another to take a range.
@@ -10,14 +10,14 @@
  */
 import * as React from "react";
 import { ChevronRight, MessageSquarePlus } from "lucide-react";
-import type { Parser } from "@lezer/common";
 import type { Hunk } from "@/api/harness";
 import { reviewApi, whoSaid, type ChangedFile, type Thread } from "@/api/review";
 import { Button } from "@/components/ui/button";
 import { relativeTime } from "@/lib/format";
+import { resolveLanguage, useHighlighter, type Highlight, type Tok } from "@/lib/syntax/browser";
 import { hunkOf, type Line, type Seg, type Span } from "@/views/harness/diff";
-import { highlightLines, parserFor, type Tok } from "./highlight";
-import { ignoringWhitespace, isImage, languageOf, placeOf, type MovedTo, type PatchFile, type Place } from "./patch";
+import { ignoringWhitespace, isImage, placeOf, type MovedTo, type PatchFile, type Place } from "./patch";
+import "@/components/code/syntax.css";
 
 /** Unchanged lines kept beside a change when a run folds; fewer hidden than MIN_FOLD aren't worth a control. */
 const KEEP = 3;
@@ -111,11 +111,11 @@ function Code({ text, toks, marks }: { text: string; toks?: Tok[]; marks?: Span[
   );
 }
 
-/** Each side's tokens by line number, for one hunk. */
-function tokensOf(parser: Parser | null, h: Hunk): { old: Map<number, Tok[]>; neu: Map<number, Tok[]> } {
+/** Each side's tokens by line number, for one hunk: each side read as one piece of code, so strings and comments over lines read right. */
+function tokensOf(hl: Highlight | null, h: Hunk): { old: Map<number, Tok[]>; neu: Map<number, Tok[]> } {
   const old = new Map<number, Tok[]>();
   const neu = new Map<number, Tok[]>();
-  if (!parser) return { old, neu };
+  if (!hl) return { old, neu };
   const oldLines: string[] = [];
   const oldNums: number[] = [];
   const newLines: string[] = [];
@@ -135,8 +135,8 @@ function tokensOf(parser: Parser | null, h: Hunk): { old: Map<number, Tok[]>; ne
       newNums.push(n++);
     }
   }
-  highlightLines(parser, oldLines).forEach((toks, i) => old.set(oldNums[i] ?? -1, toks));
-  highlightLines(parser, newLines).forEach((toks, i) => neu.set(newNums[i] ?? -1, toks));
+  if (oldLines.length) hl(oldLines.join("\n"))?.forEach((toks, i) => old.set(oldNums[i] ?? -1, toks));
+  if (newLines.length) hl(newLines.join("\n"))?.forEach((toks, i) => neu.set(newNums[i] ?? -1, toks));
   return { old, neu };
 }
 
@@ -157,7 +157,6 @@ export function FileDiff(p: FileProps) {
   const { file, meta } = p;
   const [open, setOpen] = React.useState(!(meta?.generated ?? false) && !(meta?.viewed ?? false));
   const viewed = meta?.viewed ?? false;
-  const lang = languageOf(file.path);
   const added = meta?.added ?? file.hunks.reduce((a, h) => a + h.lines.filter((l) => l.startsWith("+")).length, 0);
   const deleted = meta?.deleted ?? file.hunks.reduce((a, h) => a + h.lines.filter((l) => l.startsWith("-")).length, 0);
   const outdated = p.threads.filter((t) => t.start_line != null && !anchorOf(t, p.version));
@@ -222,22 +221,13 @@ export function FileDiff(p: FileProps) {
             <BinaryBody p={p} />
           ) : file.hunks.length === 0 ? (
             <p className="rv-sub rv-pad">{file.modeChange ? "Only its mode changed." : file.status === "renamed" ? "Moved as it was." : "No line changes."}</p>
-          ) : lang ? (
-            <React.Suspense fallback={<Hunks p={p} parser={null} />}>
-              <Highlighted lang={lang} p={p} />
-            </React.Suspense>
           ) : (
-            <Hunks p={p} parser={null} />
+            <Hunks p={p} />
           )}
         </div>
       )}
     </section>
   );
-}
-
-function Highlighted({ lang, p }: { lang: string; p: FileProps }) {
-  const parser = React.use(parserFor(lang));
-  return <Hunks p={p} parser={parser} />;
 }
 
 function BinaryBody({ p }: { p: FileProps }) {
@@ -262,12 +252,13 @@ function BinaryBody({ p }: { p: FileProps }) {
   );
 }
 
-/** The file's hunks, with the lines picked for a comment and the threads under their lines. */
-function Hunks({ p, parser }: { p: FileProps; parser: Parser | null }) {
+/** The file's hunks, in their language's colours (once its grammar is here), with the lines picked for a comment and the threads under their lines. */
+function Hunks({ p }: { p: FileProps }) {
   const [pick, setPick] = React.useState<Pick | null>(null);
   const [unfolded, setUnfolded] = React.useState<ReadonlySet<string>>(new Set());
+  const hl = useHighlighter(resolveLanguage(null, p.file.path));
   const hunks = React.useMemo(() => p.file.hunks.map((h) => (p.whitespace ? ignoringWhitespace(h) : h)), [p.file.hunks, p.whitespace]);
-  const models = React.useMemo(() => hunks.map((h) => ({ m: hunkOf(h), tok: tokensOf(parser, h) })), [hunks, parser]);
+  const models = React.useMemo(() => hunks.map((h) => ({ m: hunkOf(h), tok: tokensOf(hl, h) })), [hunks, hl]);
   // Threads by where they end: `old:12`, `new:40`.
   const byEnd = React.useMemo(() => {
     const m = new Map<string, Thread[]>();

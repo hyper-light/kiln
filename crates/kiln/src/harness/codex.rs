@@ -325,6 +325,10 @@ pub struct Codex {
     /// Notifications can finish a turn before its turn/start RPC reply arrives.
     #[serde(default)]
     completed_turn: Option<String>,
+    /// It says its compactions as items (`contextCompaction`): its older word for one,
+    /// `thread/compacted`, says nothing more.
+    #[serde(default)]
+    compaction_items: bool,
     /// Subagents kiln stopped for working under other permissions than the session's, until
     /// their parent is told.
     #[serde(default)]
@@ -448,6 +452,7 @@ impl Codex {
             permissions_changing: false,
             turn_permissions: None,
             completed_turn: None,
+            compaction_items: false,
             stopped: Vec::new(),
             withheld: HashMap::new(),
             applied: None,
@@ -3122,6 +3127,7 @@ impl Codex {
                 child.runtime = None;
                 child.turn = None;
                 child.done_turn = p.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned);
+                core.compaction_stopped(Some(parent.as_str()));
                 // What it asked goes with its turn (Codex withdraws it).
                 let ended = p.pointer("/turn/id").and_then(Value::as_str);
                 let gone: Vec<String> = core.state.approvals.iter().chain(self.withheld.values())
@@ -3272,6 +3278,8 @@ impl Codex {
                     _ => "cut",
                 };
                 core.end_turn(core.state.turn_started, how, Some(status));
+                // A compaction its turn ended before (an interrupt): it didn't finish.
+                core.compaction_stopped(None);
                 core.state.turn_started = None;
                 core.state.doing = None;
                 core.state.usage.turns += 1;
@@ -3456,7 +3464,11 @@ impl Codex {
                 let msg = p.get("message").or_else(|| p.get("summary")).and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| method.to_owned());
                 self.notice(core, Level::Warn, msg);
             }
-            "thread/compacted" => self.notice(core, Level::Info, "Conversation compacted"),
+            "thread/compacted" if !self.compaction_items => {
+                let turn = p.get("turnId").and_then(Value::as_str).unwrap_or("");
+                core.compacted(&format!("{}-turn-{turn}", self.run), None, Level::Info, super::core::compacted_words(None, None, None));
+            }
+            "thread/compacted" => {}
             "account/rateLimits/updated" => {
                 // Sparse: what a rolling update leaves out (or sends as null) stays as it was.
                 let Some(snap) = p.get("rateLimits").and_then(Value::as_object) else { return };
@@ -3979,7 +3991,17 @@ impl Codex {
                 };
                 core.upsert(&id, parent.clone(), Body::Tool(Box::new(call)));
             }
-            "contextCompaction" if thread.is_none() && done => self.notice(core, Level::Info, "Conversation compacted"),
+            // A compaction: under way from its start (`State::compacting`), its marker at its end.
+            "contextCompaction" => {
+                self.compaction_items = true;
+                if done {
+                    let c = core.compacting_of(parent.as_deref());
+                    let text = super::core::compacted_words(c.and_then(|c| c.tokens), None, c.map(|c| Core::now() - c.since));
+                    core.compacted(&id, parent.clone(), Level::Info, text);
+                } else {
+                    core.compacting(parent.clone());
+                }
+            }
             "enteredReviewMode" if thread.is_none() && done => self.notice(core, Level::Info, "Reviewing"),
             "exitedReviewMode" if thread.is_none() && done => self.notice(core, Level::Info, "Review finished"),
             _ => {}
@@ -4838,6 +4860,43 @@ mod tests {
         let mut all = w;
         all.extend(written(&mut core));
         (c, core, all)
+    }
+
+    /// The compactions' markers' words, oldest first, and whether each says it compacted.
+    fn compactions(core: &Core) -> Vec<(bool, String)> {
+        core.events()
+            .filter(|e| e.id.starts_with(super::super::core::COMPACTION))
+            .filter_map(|e| match &e.body {
+                Body::Notice { level, text } => Some((*level == Level::Info, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Codex says a compaction as an item: under way from its start, its marker at its end; its
+    /// older `thread/compacted` says nothing more of it; one its turn ended before stopped.
+    #[test]
+    fn a_compaction_item_shows_while_it_goes_on() {
+        let (mut c, mut core, _) = opened();
+        core.state.usage.context_tokens = Some(950_000);
+        let item = |method: &str, id: &str| json!({"method": method, "params": {"threadId": "th1", "turnId": "t1", "item": {"type": "contextCompaction", "id": id}}});
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "inProgress", "items": []}}}), item("item/started", "cc1")]);
+        assert_eq!(core.state.compacting.as_ref().and_then(|c| c.tokens), Some(950_000));
+        assert_eq!(core.state.doing.as_deref(), Some(super::super::core::COMPACTING));
+        feed(&mut c, &mut core, &[item("item/completed", "cc1"), json!({"method": "thread/compacted", "params": {"threadId": "th1", "turnId": "t1"}})]);
+        assert!(core.state.compacting.is_none());
+        assert_eq!(compactions(&core), [(true, "Compacted · was 950k tokens".to_owned())]);
+        feed(&mut c, &mut core, &[item("item/started", "cc2"), json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted", "items": []}}})]);
+        assert!(core.state.compacting.is_none());
+        assert!(compactions(&core).last().is_some_and(|(compacted, text)| !compacted && text.starts_with("Compaction stopped")));
+    }
+
+    /// An older Codex says only `thread/compacted`.
+    #[test]
+    fn an_older_codex_says_only_that_it_compacted() {
+        let (mut c, mut core, _) = opened();
+        feed(&mut c, &mut core, &[json!({"method": "thread/compacted", "params": {"threadId": "th1", "turnId": "t1"}})]);
+        assert_eq!(compactions(&core), [(true, "Compacted".to_owned())]);
     }
 
     #[test]

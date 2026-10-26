@@ -506,7 +506,12 @@ impl Server {
         let cwd = s("cwd").unwrap_or_else(|| self.cwd.clone());
         let in_repo = std::process::Command::new("git").arg("-C").arg(&cwd).args(["rev-parse", "--is-inside-work-tree"]).output().is_ok_and(|o| o.status.success());
         let sync = args.get("sync").and_then(Value::as_bool).unwrap_or(in_repo);
-        let env: Vec<(String, String)> = args.get("env").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned()))).collect()).unwrap_or_default();
+        let mut env: Vec<(String, String)> = args.get("env").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned()))).collect()).unwrap_or_default();
+        // The copy of its tree over there is this agent's, for the rules that keep copies
+        // (docs/reach.md §5.1).
+        if sync && !self.session.is_empty() && !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV) {
+            env.push((super::keeper::AGENT_ENV.to_owned(), self.session.clone()));
+        }
         let req = RunReq {
             target: s("on").or_else(|| self.prefer.clone()).unwrap_or_default(),
             command,

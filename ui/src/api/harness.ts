@@ -313,6 +313,15 @@ export interface FileChange {
   at: number;
 }
 
+/** A compaction under way (`State.compacting`): the main thread's, or a subagent's (`parent`, its spawning call). */
+export interface Compacting {
+  /** Unix ms it began. */
+  since: number;
+  /** The context it compacts, in tokens, as its harness last said (the main thread's). */
+  tokens?: number;
+  parent?: string;
+}
+
 export interface State {
   status: Status;
   goal?: string;
@@ -337,6 +346,8 @@ export interface State {
   todos: Todo[];
   usage: Usage;
   activity?: string;
+  /** Its harness is compacting a conversation now; its marker (a `compaction:` notice) says how it went. */
+  compacting?: Compacting;
   exit?: ExitInfo;
   dropped: number;
   effort?: string;
