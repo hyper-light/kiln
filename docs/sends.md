@@ -384,6 +384,17 @@ host's.
   starting Codex or ACP harness's adapter holds: that word still reaches the agent, once, and the
   goal, brought back, is said again, as one put back always is (the twenty-first adversarial
   check's).
+- **A message changed on the way between its tries.** A message sent again reads as another under
+  its id when something of it changed on the server's side since its first try other than a
+  named file's bytes: a file attached with no name whose upload left the server (the first try
+  took the upload's name, which the server no longer has), or a broadcast's slash command routed
+  otherwise (a skill one try, words the next) as the agent's catalog changed. Its inbox refuses
+  it `reused`. The conversation counts that as taken (it shows as sent); a broadcast reports it
+  failed, and sent again under a new key it's a second prompt. The composer and Mission Control
+  name every file (the twenty-second adversarial check's).
+- **A slow Retry after an unchecked message.** A message sent in a runner's first moment, before
+  it says its inbox, goes unchecked; ended `unanswered`, that answer is kept under its id for 10
+  minutes, and the conversation's Retry under the id gets it again until then. Slow, not doubled.
 - **Goals given as a harness's own control.** A harness whose goal is a control of its own (Codex's
   `thread/goal/set`) is given it as a command, with no message id: started again after a server
   restart between giving it and noting it, the same goal is set again.
