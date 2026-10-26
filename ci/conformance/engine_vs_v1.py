@@ -50,6 +50,12 @@ class Server:
         with open(token_file) as f:
             self.token = f.read().strip()
 
+    def post(self, path, body=None):
+        data = json.dumps(body or {}).encode()
+        req = urllib.request.Request(self.url + path, data=data, method="POST", headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status
+
     def get(self, path, raw=False):
         req = urllib.request.Request(self.url + path, headers={"Authorization": "Bearer " + self.token})
         for attempt in range(5):
@@ -97,6 +103,9 @@ def failing_tests(log):
 class V1:
     side = "v1"
 
+    def rerun(self, run):
+        return self.s.post(f"/api/runs/{run['id']}/retry")
+
     def __init__(self, server, name):
         self.s = server
         repos = self.s.get("/api/repos") or []
@@ -127,6 +136,9 @@ class V1:
 
 class Engine:
     side = "engine"
+
+    def rerun(self, run):
+        return self.s.post(f"/api/ci/runs/{run['id']}/rerun")
 
     def __init__(self, server, name):
         self.s = server
@@ -185,6 +197,9 @@ def record(sides, sha, runs, timed_out):
         flows = {}
         for r in runs[s.side]:
             name, jobs = s.jobs(r)
+            if name in flows:
+                # Newest first: an older run of the workflow (before a rerun) doesn't count.
+                continue
             flow = flows.setdefault(name, {"runs": [], "jobs": collections.defaultdict(list), "tests": {}})
             flow["runs"].append(r["id"])
             for j in jobs:
@@ -272,6 +287,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=4 * 3600)
     ap.add_argument("--prod", help="production's failing tests by commit: {sha: {failed: [...]}}")
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--rerun", help="run a recorded commit's runs again on both sides (a commit the lab disturbed) and record it anew")
     a = ap.parse_args()
     with open(a.commits) as f:
         order = [l.split()[0] for l in f if l.strip() and not l.startswith("#")]
@@ -287,6 +303,21 @@ def main():
         waves = [([sides[0]], a.v1_repo), ([sides[1]], a.engine_repo)]
     else:
         sys.exit("--repo, or --v1-repo and --engine-repo")
+    if a.rerun:
+        sha = a.rerun
+        for s in sides:
+            for r in s.runs(sha):
+                print(f"  {s.side} rerun {r['id']}: {s.rerun(r)}", flush=True)
+        time.sleep(30)
+        runs, timed_out = wait_for(sides, sha, a.timeout)
+        rec = record(sides, sha, runs, timed_out)
+        rec.update({"subject": git(waves[0][1], "log", "-1", "--format=%s", sha), "rerun": True})
+        path = os.path.join(a.out, f"{sha}.json")
+        with open(path + ".part", "w") as f:
+            json.dump(rec, f, indent=1)
+        os.replace(path + ".part", path)
+        print(f"  rerun of {sha[:10]}: {compare(rec, prod)}", flush=True)
+        return
     for sha in order:
         path = os.path.join(a.out, f"{sha}.json")
         current = git(waves[0][1], "rev-parse", "refs/heads/main")
