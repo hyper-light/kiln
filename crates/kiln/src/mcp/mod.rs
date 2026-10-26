@@ -751,7 +751,7 @@ fn tools_of(ops: Vec<crate::ops::Info>) -> Vec<Value> {
             "name": tool_name(o.name),
             "title": o.name,
             "description": o.summary,
-            "inputSchema": (o.input)(),
+            "inputSchema": o.input.schema(),
             "annotations": {"readOnlyHint": o.read_only, "destructiveHint": o.destructive, "openWorldHint": false},
         }));
     }
@@ -938,32 +938,58 @@ mod tests {
         if types.contains(&"string") { Some(json!(1)) } else { Some(json!("x")) }
     }
 
-    /// Each of kiln's own operations publishes its input type's schema (as an MCP tool, and in
-    /// code mode's registry), and reads each input as that type: a field it doesn't take is
-    /// refused (its schema says `additionalProperties: false`), and so is one of the wrong type,
-    /// each saying where.
+    /// Every operation (kiln's own, CI's, releases' and deployments', with deployments on)
+    /// publishes its input type's schema, as an MCP tool and in code mode's registry, and a call's
+    /// input is read as that type. Called through `/api/mcp`, each refuses an argument it doesn't
+    /// take (its schema says `additionalProperties: false`) and one of the wrong type, as a tool
+    /// error saying which (`unknown_field`, `invalid_type`) and where. One that takes nothing, or
+    /// only what may be of several kinds, is given arguments that aren't an object: -32602 there,
+    /// and refused by its type too (`crate::ops::misfit`, as code mode reads a call).
     #[test]
-    fn every_own_operation_publishes_its_input_type_and_reads_by_it() {
-        let tools = tools_of(crate::ops::listed(false));
-        let registry = code::registry_of(&crate::ops::listed(false));
-        let mut differ = Vec::new();
-        for op in crate::ops::own() {
-            let schema = op.input.schema();
-            let tool = tools.iter().find(|t| t.get("name").and_then(Value::as_str) == Some(tool_name(op.name).as_str()));
-            let listed = registry.as_array().and_then(|r| r.iter().find(|o| o.get("name").and_then(Value::as_str) == Some(op.name)));
-            if tool.and_then(|t| t.get("inputSchema")) != Some(&schema) || listed.and_then(|o| o.get("input")) != Some(&schema) {
-                differ.push(op.name);
+    fn every_operation_is_typed() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.cd.enabled = true).await?;
+            let ops = crate::ops::all(&hub);
+            let tools = tools_of(crate::ops::all(&hub));
+            let registry = code::registry_of(&ops);
+            anyhow::ensure!(ops.len() > 300, "{} operations", ops.len());
+            let caller = Caller::owner();
+            let call = |tool: &str, arguments: Value| {
+                let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}).to_string();
+                let (hub, caller) = (&hub, caller.clone());
+                async move { answer(hub, caller, body.as_bytes()).await }
+            };
+            // A tool error saying `code` at `path`.
+            let refused = |a: &Option<Value>, code: &str, path: &str| {
+                let at = |p: &str| a.as_ref().and_then(|a| a.pointer(p)).cloned();
+                at("/result/isError") == Some(json!(true)) && at("/result/structuredContent/code") == Some(json!(code)) && at("/result/structuredContent/path") == Some(json!(path))
+            };
+            let mut differ = Vec::new();
+            for op in &ops {
+                let schema = op.input.schema();
+                let name = tool_name(op.name);
+                let tool = tools.iter().find(|t| t.get("name").and_then(Value::as_str) == Some(name.as_str()));
+                let listed = registry.as_array().and_then(|r| r.iter().find(|o| o.get("name").and_then(Value::as_str) == Some(op.name)));
+                if tool.and_then(|t| t.get("inputSchema")) != Some(&schema) || listed.and_then(|o| o.get("input")) != Some(&schema) {
+                    differ.push(op.name);
+                }
+                anyhow::ensure!(schema.get("additionalProperties") == Some(&json!(false)), "{}", op.name);
+                let a = call(&name, json!({"zz_not_a_field": 1})).await;
+                anyhow::ensure!(refused(&a, "unknown_field", "/zz_not_a_field"), "{}: {a:?}", op.name);
+                let wrong = schema.get("properties").and_then(Value::as_object).and_then(|p| p.iter().find_map(|(k, v)| wrong_for(v).map(|w| (k.clone(), w))));
+                if let Some((field, w)) = wrong {
+                    let a = call(&name, json!({ field.clone(): w })).await;
+                    anyhow::ensure!(refused(&a, "invalid_type", &format!("/{field}")), "{}: {a:?}", op.name);
+                } else {
+                    let a = call(&name, json!("x")).await;
+                    anyhow::ensure!(a.as_ref().and_then(|a| a.pointer("/error/code")) == Some(&json!(rpc::INVALID_PARAMS)), "{}: {a:?}", op.name);
+                    let m = crate::ops::misfit(&caller, op.name, &json!("x"));
+                    anyhow::ensure!(m.as_ref().is_some_and(|m| m.path.is_empty() && m.code() == "invalid_type"), "{}: {m:?}", op.name);
+                }
             }
-            assert_eq!(schema.get("additionalProperties"), Some(&json!(false)), "{}", op.name);
-            let m = op.input.fits(&json!({"zz_not_a_field": 1}));
-            assert!(m.as_ref().is_err_and(|m| m.path == "/zz_not_a_field" && m.code() == "unknown_field"), "{}: {m:?}", op.name);
-            let wrong = schema.get("properties").and_then(Value::as_object).and_then(|p| p.iter().find_map(|(k, v)| wrong_for(v).map(|w| (k.clone(), w))));
-            if let Some((field, w)) = wrong {
-                let m = op.input.fits(&json!({ field.clone(): w }));
-                assert!(m.as_ref().is_err_and(|m| m.path == format!("/{field}") && m.code() == "invalid_type"), "{}: {m:?}", op.name);
-            }
-        }
-        assert!(differ.is_empty(), "published schemas that aren't their input type's: {differ:?}");
+            anyhow::ensure!(differ.is_empty(), "published schemas that aren't their input type's: {differ:?}");
+            Ok(())
+        })
     }
 
     /// `/api/mcp` answers each message it can't read as JSON-RPC 2.0 and MCP say, and notes it

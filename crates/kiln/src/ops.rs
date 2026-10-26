@@ -38,7 +38,7 @@ pub struct Info {
     pub summary: &'static str,
     pub read_only: bool,
     pub destructive: bool,
-    pub input: fn() -> Value,
+    pub input: Input,
 }
 
 /// One of kiln's own operations (agents, plans, goal stacks): what it is, the HTTP route it is
@@ -74,11 +74,6 @@ impl Input {
     /// Its JSON Schema.
     pub fn schema(&self) -> Value {
         (self.schema)()
-    }
-
-    /// What makes its JSON Schema, for a list of operations ([`Info`]).
-    pub fn schema_fn(&self) -> fn() -> Value {
-        self.schema
     }
 
     /// Whether `input` fits it: where and why not.
@@ -246,23 +241,34 @@ impl Misfit {
     }
 }
 
+/// What operation `name` takes, whichever's it is: kiln's own, CI's, releases' or deployments'.
+pub fn input_of(name: &str) -> Option<Input> {
+    own()
+        .iter()
+        .find(|o| o.name == name)
+        .map(|o| o.input)
+        .or_else(|| crate::ci::ops::ops().iter().find(|o| o.name == name).map(|o| o.input))
+        .or_else(|| crate::deploy::ops::ops().iter().find(|o| o.name == name).map(|o| o.input))
+        .or_else(|| crate::cd::ops::ops().iter().find(|o| o.name == name).map(|o| o.input))
+}
+
 /// Why `input` doesn't fit operation `name` as `caller` gives it (an agent's own id where it left
-/// `agent` out, [`YOURS`]): kiln's own operations' inputs are read as their types; none for
-/// another's (CI's, deployments').
+/// `agent` out, [`YOURS`]): each operation's input is read as its type.
 pub fn misfit(caller: &Caller, name: &str, input: &Value) -> Option<Misfit> {
-    let op = own().iter().find(|o| o.name == name)?;
+    let wants = input_of(name)?;
     let input = yours(caller, name, if input.is_null() { json!({}) } else { input.clone() });
-    op.input.fits(&input).err()
+    wants.fits(&input).err()
+}
+
+/// A field that must be given, null among what it may be (`"on": null` clears): serde would take a
+/// missing `Option` for null.
+pub fn present<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    <Option<T> as serde::Deserialize>::deserialize(d)
 }
 
 /// A string field of an input, required.
 pub fn text(v: &Value, k: &str) -> Result<String, Fail> {
     v.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).ok_or_else(|| (StatusCode::BAD_REQUEST, format!("`{k}` is required")))
-}
-
-/// An input's JSON Schema: an object with these properties.
-pub fn schema(props: Value, required: &[&str]) -> Value {
-    json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
 }
 
 /// A route's path, as segments.
@@ -296,7 +302,7 @@ pub fn all(hub: &Hub) -> Vec<Info> {
 /// The operations as `GET /api/ops` lists them (W20-R01): each one's name, summary, whether it
 /// changes anything, and its input's JSON Schema.
 pub fn catalog(hub: &Hub) -> Value {
-    let ops: Vec<Value> = all(hub).iter().map(|o| json!({ "name": o.name, "summary": o.summary, "read_only": o.read_only, "destructive": o.destructive, "input": (o.input)() })).collect();
+    let ops: Vec<Value> = all(hub).iter().map(|o| json!({ "name": o.name, "summary": o.summary, "read_only": o.read_only, "destructive": o.destructive, "input": o.input.schema() })).collect();
     json!({ "operations": ops })
 }
 
@@ -308,7 +314,7 @@ pub fn listed(cd: bool) -> Vec<Info> {
         out.extend(crate::deploy::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
     }
     out.extend(crate::ci::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
-    out.extend(own().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input.schema_fn() }));
+    out.extend(own().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
     out
 }
 
@@ -364,6 +370,7 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let method = if op.read_only { Method::GET } else { Method::POST };
     let run = async {
         crate::authz::gate::check(&cx.hub, &cx.caller, &method, &["api", "cd", "ops", name], &Default::default()).await?;
+        op.input.fits(&input).map_err(|m| (StatusCode::BAD_REQUEST, m.said(name)))?;
         let cd = crate::cd::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "deployments aren't on here, or are starting ([cd] enabled)".to_owned()))?;
         crate::cd::ops::call(crate::cd::ops::Cx { hub: Arc::clone(&cx.hub), cd, actor: cx.caller.name.clone() }, name, input).await
     };

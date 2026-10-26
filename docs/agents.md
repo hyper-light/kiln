@@ -574,10 +574,10 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.workspace` | `GET /api/harness/agents/:id/workspace` | → `{workspace: {kind, over, sub, volume, mount} \| null, drift: [path]}` ("Workspaces of their own", below) |
 | `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}`; `{manifest}` (that plan's; a person only) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more |
 
-Each takes an input type of its own (`crate::ops::Input`), as each of kiln's own operations does
-(agents', plans', goal stacks', programs', research's, runners', attachments' and access's): its
-JSON Schema (the MCP tool's `inputSchema`, `GET /api/ops`' `input`) is generated from it, and a
-call's input is read as it before the call runs. A field it doesn't take is refused, as its schema
+Each takes an input type of its own (`crate::ops::Input`), as every operation of the registry
+does (kiln's own, CI's, releases' and deployments'): its JSON Schema (the MCP tool's
+`inputSchema`, `GET /api/ops`' `input`) is generated from it, and a call's input is read as it
+before the call runs. A field it doesn't take is refused, as its schema
 says (`additionalProperties: false`), and so is one of the wrong type. Over MCP that's a tool error
 (`isError`) whose structured content says what's wrong (`code`: `unknown_field`, `missing_field`,
 `invalid_type` or `invalid_value`), where (`path`, a JSON Pointer) and why, so the agent can

@@ -6515,6 +6515,10 @@ R04, R05's skills, and R06's rights.
   once as that route's would be), in the OpenAPI document (`/api/ops/{name}`, each with its
   summary and schema), and as `kiln op` (the list, `--schema`, and a run with a JSON object or
   `key=value` pairs). Checked end to end (`w20_r01_operations_over_http_and_the_cli`).
+- *R01's* input schemas are generated (docs/agents.md, "Operations"): each operation takes a Rust
+  input type (`crate::ops::Input`), whose JSON Schema is what every surface publishes, and a call's
+  input is read as it once its caller may run it. An argument it doesn't take, or one of the wrong
+  type, is refused saying where and why (`mcp::tests::every_operation_is_typed`).
 - *AC05* (`tests/skills.rs`): the skills' programs run as written. The test takes each program
   from its `SKILL.md` and calls `code_run` with it over MCP, against a server with a repository,
   a failing run, a leg no runner can take, a diff and a secret:

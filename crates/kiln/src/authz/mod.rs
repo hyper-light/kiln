@@ -722,7 +722,7 @@ pub fn openapi(version: &str, ops: &[crate::ops::Info]) -> serde_json::Value {
                 "summary": o.summary,
                 "x-kiln-read-only": o.read_only,
                 "x-kiln-destructive": o.destructive,
-                "requestBody": { "required": false, "content": { "application/json": { "schema": (o.input)() } } },
+                "requestBody": { "required": false, "content": { "application/json": { "schema": o.input.schema() } } },
                 "security": [{ "bearer": [] }, { "session": [] }],
                 "responses": { "200": { "description": "its answer" }, "400": { "description": "the input isn't right" }, "403": { "description": "its route's capability is missing in that scope" }, "404": { "description": "no such operation, or what it names" } },
             } }),

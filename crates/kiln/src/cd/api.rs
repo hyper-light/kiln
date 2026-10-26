@@ -149,7 +149,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["ops"]) => {
             let list: Vec<Value> = ops::ops()
                 .iter()
-                .map(|o| json!({"name": o.name, "summary": o.summary, "read_only": o.read_only, "destructive": o.destructive, "input": (o.input)()}))
+                .map(|o| json!({"name": o.name, "summary": o.summary, "read_only": o.read_only, "destructive": o.destructive, "input": o.input.schema()}))
                 .collect();
             return Ok(srv::json(StatusCode::OK, &json!({"ops": list})));
         }

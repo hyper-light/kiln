@@ -381,9 +381,9 @@ Agents use deployments the way people do, through the same API and the same rule
   tools (`await kiln.cd.apps.list({ health: "Degraded" })`) in a bounded sandbox inside kiln. Only
   what the program returns enters the agent's context, so "every degraded app in production with
   its failing pods' last events" is one call, whether there are 10 apps or 100,000. Lists are
-  async iterators that page on the server. Bulk operations (`kiln.cd.apps.sync({ selector })`)
-  are single, idempotent operations. The same tools are offered one by one for clients without
-  code mode.
+  async iterators that page on the server. Bulk operations
+  (`kiln.cd.apps.sync_many({ health: "Degraded" })`) are single, idempotent operations. The same
+  tools are offered one by one for clients without code mode.
 - **Skills.** kiln ships skills for deploying a change, diagnosing a degraded app, rolling back,
   writing app definitions, running fleets and moving from Argo CD. They are served over MCP (the
   skills extension) and installed into every agent kiln starts.

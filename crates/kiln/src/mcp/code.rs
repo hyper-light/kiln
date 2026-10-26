@@ -188,7 +188,7 @@ pub fn registry_of(ops: &[ops::Info]) -> Value {
             .map(|o| {
                 json!({
                     "name": o.name, "call": format!("kiln.{}", o.name), "tool": super::tool_name(o.name),
-                    "summary": o.summary, "read_only": o.read_only, "destructive": o.destructive, "input": (o.input)(),
+                    "summary": o.summary, "read_only": o.read_only, "destructive": o.destructive, "input": o.input.schema(),
                 })
             })
             .collect(),
