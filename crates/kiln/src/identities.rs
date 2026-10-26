@@ -18,6 +18,8 @@ use crate::store::Store;
 pub const RUNNER_HOURS: i64 = 7 * 24;
 /// How long an agent session's certificate lasts, for one epoch; asked again on each connection.
 pub const AGENT_HOURS: i64 = 7 * 24;
+/// How long a CI leg's certificate lasts: the leg's attempt, with room.
+pub const LEG_HOURS: i64 = 24;
 /// How long a person's certificate lasts after they sign in: hours, never past a day.
 pub const PERSON_HOURS: i64 = 12;
 
@@ -156,6 +158,7 @@ pub async fn on_ask(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
 }
 
 async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> anyhow::Result<(String, String)> {
+    let mut facts: Vec<(u64, String)> = Vec::new();
     let (identity, hours) = match ask.kind.as_str() {
         "runner" => {
             let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
@@ -166,10 +169,18 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
             let epoch = ask.epoch.ok_or_else(|| anyhow::anyhow!("an agent's identity names its epoch"))?;
             (agent_identity(hub, machine, session, epoch).await?, AGENT_HOURS)
         }
+        "leg" => {
+            let leg = ask.of.as_deref().ok_or_else(|| anyhow::anyhow!("a leg's identity names its leg"))?;
+            let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
+            let (identity, f) = leg_identity(hub, machine, &instance, leg).await?;
+            facts = f;
+            (identity, LEG_HOURS)
+        }
         other => anyhow::bail!("kiln doesn't issue {other:?} identities"),
     };
     let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let pem = hub.pki.issue_identity(&ask.csr, &identity, &[], time::Duration::hours(hours))?;
+    let facts: Vec<(u64, &str)> = facts.iter().map(|(m, v)| (*m, v.as_str())).collect();
+    let pem = hub.pki.issue_identity(&ask.csr, &identity, &facts, time::Duration::hours(hours))?;
     let now = crate::util::now_unix();
     revoke(&hub.store, Target::Certificates(uri.clone()), "superseded by a newer certificate", "kiln", now).await?;
     if let Actor::Agent { epoch, .. } = &identity.actor
@@ -199,6 +210,50 @@ async fn agent_identity(hub: &Hub, machine: &str, session: &str, epoch: u64) -> 
         None => anyhow::bail!("kiln can't say whom agent session {session} acts for"),
     };
     Ok(Identity::new(hub.pki.organization(), Actor::Agent { person, agent: session.to_owned(), epoch }))
+}
+
+/// A CI leg's identity, for the runner process of `machine` it was given to: its run's number,
+/// its attempt and key, on that runner (and through it who enrolled the machine), and as facts in
+/// Fulcio's extensions its workflow, repository, commit and run.
+async fn leg_identity(hub: &Hub, machine: &str, instance: &str, leg: &str) -> anyhow::Result<(Identity, Vec<(u64, String)>)> {
+    use kiln_ci::identity::chain::fulcio;
+    let id = leg.to_owned();
+    type Row = (i64, i64, String, Option<String>, String, String, String, String);
+    let row: Option<Row> = hub
+        .store
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT r.number, j.attempt, j.key, j.agent, r.sha, COALESCE(r.workflow_id, ''), p.name, r.id FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id WHERE j.id = ?1",
+                [&id],
+                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?, x.get(5)?, x.get(6)?, x.get(7)?)),
+            )
+            .optional()?)
+        })
+        .await?;
+    let (number, attempt, key, agent, sha, workflow, repo, run) = row.ok_or_else(|| anyhow::anyhow!("kiln knows no leg {leg}"))?;
+    anyhow::ensure!(agent.as_deref() == Some(machine), "leg {leg} was given to {}, not {machine}", agent.unwrap_or_else(|| "no runner".into()));
+    let enrolled_by = enrolled_by(&hub.store, machine).await?;
+    let safe: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' }).collect();
+    let safe = crate::util::truncate(safe.trim_matches('-'), 128).to_owned();
+    let identity = Identity::new(
+        hub.pki.organization(),
+        Actor::Leg {
+            enrolled_by,
+            machine: machine.to_owned(),
+            instance: instance.to_owned(),
+            run: u64::try_from(number).unwrap_or_default(),
+            attempt: u32::try_from(attempt.max(1)).unwrap_or(1),
+            leg: if safe.is_empty() { "leg".to_owned() } else { safe },
+        },
+    );
+    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    let facts = vec![
+        (fulcio::BUILD_SIGNER_URI, format!("{base}/{repo}/{workflow}")),
+        (fulcio::SOURCE_REPOSITORY_URI, format!("{base}/{repo}")),
+        (fulcio::SOURCE_REPOSITORY_DIGEST, sha),
+        (fulcio::RUN_INVOCATION_URI, format!("{base}/runs/{run}/attempts/{}", attempt.max(1))),
+    ];
+    Ok((identity, facts))
 }
 
 /// Every subject an agent session's certificates were issued for, with its epoch.

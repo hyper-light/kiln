@@ -2965,6 +2965,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if o.ephemeral {
                             served_dedicated = true;
                         }
+                        // The leg's own identity: a key made here, outside anything its steps can
+                        // reach (docs/ci.md W27-R01).
+                        if server_identity {
+                            match crate::runner::identity::ask("leg", Some(&id), None) {
+                                Ok(json) => uplink.msg(AgentMsg::Identity { json }).await,
+                                Err(e) => tracing::warn!(job = %id, error = %format!("{e:#}"), "no identity asked for"),
+                            }
+                        }
                         // A new attempt: its events count from one.
                         journal.remove(&id);
                         unreceived.remove(&id);
@@ -3328,6 +3336,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 if jobs.remove(&r.job).is_some() {
                     crate::runner::cpus::pins().release(&r.job);
+                    // The leg's key goes with it (docs/ci.md W27-R01).
+                    crate::runner::identity::forget(&crate::runner::identity::slot("leg", Some(&r.job), None));
                     tracing::info!(job = %r.job, status = r.status.as_str(), "job finished");
                     if let Ok(b) = proto::encode(&AgentMsg::JobFinished(r.clone())) {
                         unreceived.insert(r.job.clone(), (Instant::now(), b));

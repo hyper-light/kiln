@@ -337,3 +337,85 @@ fn w27_r01_people_certified_after_sign_in() -> anyhow::Result<()> {
     assert!(!String::from_utf8_lossy(&db).contains("PRIVATE KEY"));
     Ok(())
 }
+
+fn git(home: &Path, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let o = std::process::Command::new("git")
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "init.defaultBranch=main", "-c", "credential.helper="])
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()?;
+    let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    anyhow::ensure!(o.status.success(), "git {args:?}: {out}");
+    Ok(out)
+}
+
+/// The leg's steps look for a key in what they can reach (its environment), and find none.
+const LEG: &str = r#"on: push
+jobs:
+  e2e:
+    runs-on: local
+    steps:
+      - run: |
+          if env | grep -q "PRIVATE KEY"; then echo "a private key in the environment"; exit 1; fi
+          sleep 1
+          echo "no key here"
+"#;
+
+/// W27-R01, R02: a CI leg has a certificate of its own, for a key its runner made outside the
+/// steps' reach, naming its run, attempt and leg, its runner (and who enrolled it) and, in
+/// Fulcio's extensions, its commit.
+#[test]
+fn w27_r01_a_ci_leg_its_own_certificate() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    std::fs::write(work.join("README.md"), "an app\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    // Once the server has polled its trunk, the workflow comes as a push.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        if !body.contains("\"last_polled_at\":null") {
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "never polled: {body}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::fs::write(work.join(".kiln/e2e.yaml"), LEG)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "the workflow"])?;
+    let sha = git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+
+    // The run finishes, its leg successful (it found no key).
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=10", &s.admin, None)?;
+        let runs: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        if let Some(r) = runs.iter().find(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            assert_eq!(r.get("conclusion").and_then(Value::as_str), Some("success"), "{r}\n{}", s.log());
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no finished run: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let legs = until_identities(&s, "leg", Duration::from_secs(30), |l| l.iter().any(|i| !field(i, "verified").is_empty()))?;
+    let leg = legs.iter().find(|i| !field(i, "verified").is_empty()).cloned().unwrap_or_default();
+    let said = field(&leg, "verified");
+    let short = sha.get(..7).unwrap_or_default();
+    assert!(said.starts_with(&format!("leg e2e of run 1 (attempt 1) at {short}, on runner ")), "{said}");
+    assert!(said.ends_with(", enrolled by admin, of hyper-light"), "{said}");
+    assert!(field(&leg, "subject").contains("/run/1/attempt/1/leg/e2e"), "{leg}");
+    Ok(())
+}
