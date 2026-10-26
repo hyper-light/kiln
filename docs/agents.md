@@ -493,7 +493,10 @@ the machines that suit and have the harness installed, the idlest (most idle cor
 memory) gets it; outposts and job pods never do. Without `on`, an agent's child runs on the
 agent's own machine, in its folder unless `cwd` says otherwise; a person's runs on the server
 when it runs agents, else on the best runner with the harness. A child on another machine starts
-in that machine's home unless `cwd` names a folder there.
+in that machine's home unless `cwd` names a folder there. A machine named, or the agent's own,
+that kiln knows hasn't the harness (its list of harnesses says so; the server's own asked again
+with its user's login shell) is refused, naming the machines that have it, rather than given an
+agent that can't start there.
 
 ### Sending again
 

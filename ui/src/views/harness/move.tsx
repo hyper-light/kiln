@@ -31,6 +31,8 @@ export const askPlaces = (signal: AbortSignal): Promise<Places> =>
 
 type Agent = Pick<AgentInfo, "id" | "name" | "kind" | "kind_name" | "target" | "status">;
 
+export const movable = (a: Pick<AgentInfo, "target" | "status" | "harness_session">) => a.target.startsWith("agent:") || (a.status === "exited" && !a.harness_session);
+
 /** Names in words: "a", "a and b", "a, b and c". */
 const inWords = (ns: string[]) => (ns.length < 2 ? ns.join("") : `${ns.slice(0, -1).join(", ")} and ${ns[ns.length - 1]}`);
 
@@ -95,7 +97,9 @@ export function MoveDialog({ agent, onClose }: { agent: Agent; onClose: () => vo
         description={
           agent.status === "disconnected"
             ? "Its machine is away, so it goes on from the kiln server's copy: its conversation, timeline and queue. Its files stay on that machine, unless its repository is kept in step where it goes."
-            : "Its conversation, timeline and queue go along. A git repository it works in goes too, kept in step between both machines; other folders stay where they are."
+            : agent.target === "local"
+              ? "It never started on the kiln server, so it starts on the machine you pick instead, with what it was asked to do: in the same folder where that machine has it, else in its home folder."
+              : "Its conversation, timeline and queue go along. A git repository it works in goes too, kept in step between both machines; other folders stay where they are."
         }
       >
         <Loadable label="Loading your machines" fallback={<p className="mv-none">Looking at your machines…</p>}>

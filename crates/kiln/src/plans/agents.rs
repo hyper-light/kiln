@@ -911,6 +911,7 @@ mod tests {
                 crate::rt::spawn(async move {
                     let _ = crate::harness::registry::Registry::run_local(h).await;
                 });
+                hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
                 let items = ["Write the engine", "Wire it", "Screenshot it"].iter().map(|t| Item { title: (*t).to_owned(), ..Item::default() }).collect();
                 let p = super::super::create(&hub, super::super::New { title: "Ship sync".into(), items, ..Default::default() }, "admin").await?;
                 let cfg = Config {

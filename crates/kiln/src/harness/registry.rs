@@ -637,6 +637,26 @@ fn naming<'a>(reported: &'a str, last: &str, kind_name: &str, kept: bool) -> Nam
     }
 }
 
+async fn send_package(hub: &Hub, id: &str, to: &str, bytes: &[u8]) -> Result<(), String> {
+    // In pieces that fit a command's frame, each answered before the next goes (docs/wire.md,
+    // "Commands"): a move whose machine went away mid-way says so.
+    const PIECE: usize = 768 << 10;
+    let pieces: Vec<&[u8]> = bytes.chunks(PIECE).collect();
+    let mut offset = 0u64;
+    for (n, piece) in pieces.iter().enumerate() {
+        use crate::wire::commands::Answer;
+        let msg = ServerMsg::HarnessPackage { session: id.to_owned(), offset, data: piece.to_vec(), done: n + 1 == pieces.len() };
+        match hub.command(to, &msg, crate::hub::COMMAND_WITHIN).await {
+            Answer::Taken | Answer::Sent => {}
+            Answer::Refused { why, .. } => return Err(format!("{to} couldn't take the session: {why}")),
+            Answer::Unreachable { .. } | Answer::Parked => return Err(format!("{to} went away while the session was on its way")),
+            Answer::Unanswered { why } => return Err(format!("{to} didn't answer while the session was on its way: {why}")),
+        }
+        offset += piece.len() as u64;
+    }
+    Ok(())
+}
+
 impl Registry {
     /// A registry of tests: its store in `dir`, its feeds on the bus's simulator.
     #[cfg(test)]
@@ -1095,6 +1115,19 @@ impl Registry {
             }
         }
         all
+    }
+
+    pub fn lacks(&self, target: &str, kind: &str) -> bool {
+        #[cfg(test)]
+        if self.test_program.lock().is_some() {
+            return false;
+        }
+        self.kinds.lock().get(target).is_some_and(|ks| !ks.iter().any(|k| k.id == kind && k.available))
+    }
+
+    #[cfg(test)]
+    pub fn set_kinds(&self, target: &str, kinds: Vec<KindInfo>) {
+        self.kinds.lock().insert(target.to_owned(), kinds);
     }
 
     /// A session's meta as last reported (its harness's catalog: slash commands, models, modes).
@@ -2189,22 +2222,59 @@ impl Registry {
             hub.emit(&json!({"type": "harness", "info": info}));
         }
         tracing::info!(session = %id, from = %from_name, %to, bytes = bytes.len(), "agent session goes on on another machine, from the server's store");
-        // In pieces that fit a command's frame, each answered before the next goes (docs/wire.md,
-        // "Commands"): a move whose machine went away mid-way says so.
-        const PIECE: usize = 768 << 10;
-        let pieces: Vec<&[u8]> = bytes.chunks(PIECE).collect();
-        let mut offset = 0u64;
-        for (n, piece) in pieces.iter().enumerate() {
-            use crate::wire::commands::Answer;
-            let msg = ServerMsg::HarnessPackage { session: id.to_owned(), offset, data: piece.to_vec(), done: n + 1 == pieces.len() };
-            match hub.command(to, &msg, crate::hub::COMMAND_WITHIN).await {
-                Answer::Taken | Answer::Sent => {}
-                Answer::Refused { why, .. } => return Err(format!("{to} couldn't take the session: {why}")),
-                Answer::Unreachable { .. } | Answer::Parked => return Err(format!("{to} went away while the session was on its way")),
-                Answer::Unanswered { why } => return Err(format!("{to} didn't answer while the session was on its way: {why}")),
-            }
-            offset += piece.len() as u64;
+        send_package(hub, id, to, &bytes).await
+    }
+
+    pub fn never_started(&self, id: &str) -> bool {
+        let Some(s) = self.local.get(id) else { return false };
+        if s.pid.lock().is_some() {
+            return false;
         }
+        let core = s.core.lock();
+        core.state.status == Status::Exited && core.state.harness_session.is_none() && !core.events().any(|e| matches!(e.body, super::model::Body::User { .. } | super::model::Body::Assistant { .. }))
+    }
+
+    pub async fn move_local(&self, hub: &Hub, id: &str, to: &str, cwd: &str) -> Result<(), String> {
+        let s = self.local.get(id).filter(|_| self.never_started(id)).ok_or_else(|| "only an agent whose harness never started on the kiln server moves from it".to_owned())?;
+        if !hub.agents.lock().get(to).is_some_and(|a| a.connected) {
+            return Err(format!("{to} isn't connected"));
+        }
+        if hub.runner_caps(to) & crate::proto::CAP_CONVO == 0 {
+            return Err(format!("{to} runs a kiln too old to take a session from the server; upgrade it first"));
+        }
+        let prompt = s.spec.lock().prompt.clone();
+        let spec = s.resume_spec();
+        let (events, mut state) = {
+            let core = s.core.lock();
+            (core.events().cloned().collect::<Vec<_>>(), core.state.clone())
+        };
+        let had = self.mirrors.lock().get(id).and_then(|m| m.state.get("epoch").and_then(Value::as_u64)).unwrap_or(0);
+        let next = had.max(state.epoch) + 1;
+        state.epoch = next - 1;
+        let from_cwd = state.cwd.clone();
+        let mut pkg = super::moving::pack(id, spec, cwd, "the kiln server", &from_cwd, super::moving::Carry::Nothing, events, state);
+        pkg.spec.prompt = prompt;
+        let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
+        send_package(hub, id, to, &bytes).await?;
+        self.raise_epoch(id, next);
+        if let Some(store) = &self.convo {
+            store.put(vec![crate::convo::rows::Row::Session { session: id.to_owned(), info: None, meta: None, state: None, changes: None, epoch: Some(next), open: false, at: crate::util::now_ms() }]);
+        }
+        let info = {
+            let mut g = self.mirrors.lock();
+            g.get_mut(id).filter(|m| m.location == Location::Local).map(|m| {
+                m.location = Location::Machine(to.to_owned());
+                m.info.target = m.location.target();
+                m.info.status = Status::Starting;
+                m.opened_at = Some(std::time::Instant::now());
+                m.info.clone()
+            })
+        };
+        if let Some(info) = info {
+            hub.emit(&json!({"type": "harness", "info": info}));
+        }
+        self.local.let_go(id);
+        tracing::info!(session = %id, %to, bytes = bytes.len(), "an agent whose harness never started on the server goes on on a runner");
         Ok(())
     }
 
