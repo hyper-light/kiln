@@ -7931,12 +7931,27 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   `Cargo.lock`. A file no unit takes affects every unit.
 - **W28-R55 Verdicts on the server.** `ci.verdict` (`GET /api/ci/repos/:repo/commits/:sha/verdict`)
   gives the commit's verdict on each lane whose first parents hold it, its commits named by SHA.
-  The server reads the lane from the mirror (the branch's first parents up to its newest run, 200
-  back from the commit), each commit's changed files over the units the newest commit's manifests
+  The server reads the lane from the mirror (the branch's first parents up to its tip, 200 back
+  from the commit), each commit's changed files over the units the newest commit's manifests
   give, and each run's latest attempt: every test W16 recorded as a check (its unit from its file,
   else its suite's crate, else its job), every job without a report as a check of its own (its
   conclusion as the failure's signature). A test W16 found flaky in a run (W16-R04's first rule)
   or quarantined (W16-R05) is marked: its failures don't count. `kiln_ci::verdict` decides.
+- **W28-R56 Flake-aware culprit finding.** `kiln_ci::verdict::culprit`, pure, after Google's Flake
+  Aware Culprit Finding: a posterior over "suspect i broke it" and "no culprit, a flake", from a
+  prior (the check's flake rate; at least 0.1 for a test W16 marks flaky) and every try's outcome,
+  a broken check failing every time and an unbroken one at the flake rate. It names a culprit, or
+  no culprit, at a posterior of 0.99; a flaky check's first try runs the failing commit again;
+  each other try is the first suspect whose cumulative posterior reaches one half (the one before
+  it when that one already failed); past ceil(log2 n) + 1 + 3 tries it stops inconclusive. With
+  no flakiness it is a binary search: at most ceil(log2 n) + 1 tries for n suspects.
+- **W28-R57 Bisecting a test.** `ci.runs.bisect` takes a `test` (W16's `suite name`): the job is
+  the one that reported it, `good` the last run of the lane it passed in, and only the commits
+  whose diffs could affect its unit are tried (`suspects`), each try judged by the test's own
+  result in its run, with `vars.KILN_VERDICT_UNITS` and `vars.KILN_VERDICT_TESTS` set. Every
+  bisection's tries come from R56's planner; a try that can't run gives way to its nearest
+  testable neighbour. A bisection's end is a culprit finding (R52) for its lane's verdicts: found
+  (`culprit`), `no-culprit` (a flake) or `inconclusive`.
 
 **Acceptance criteria**
 
@@ -7952,9 +7967,18 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   failure in crate p names exactly the commits whose diffs affect p; a quarantined test's failure
   makes none, and its verdict says so; covered checks carry no outcome. *Integration test*
   (`cargo test -p kiln --test verdicts`).
+- **W28-AC53 Culprits.** Without flakiness the planner names the culprit within ceil(log2 n) + 1
+  tries for every culprit position (up to 64 suspects); over 10,000 random searches with flake
+  rates up to 0.3, every search ends within its cap and the same outcomes give the same tries.
+  End to end, a bisection of one test tries only the commits that change its crate, names the
+  culprit, and the culprit's verdict is culprit. *Unit, property and integration tests* (`cargo
+  test -p kiln-ci culprit`, `cargo test -p kiln --test verdicts`).
 
-**Progress.** R50–R55, AC50 and AC52 built (2026-10-25) in `kiln_ci::verdict` and its `cargo`
-reader, the replayer, and `crates/kiln/src/ci/verdict.rs` (`ci.verdict`). AC51 is not met: P3
+**Progress.** R50–R57, AC50, AC52 and AC53 built (2026-10-25) in `kiln_ci::verdict` (its `cargo`
+reader and `culprit` planner), the replayer, `crates/kiln/src/ci/verdict.rs` (`ci.verdict`) and
+`ci/bisect.rs`. Bisections start when asked (`ci.runs.bisect`), not on their own for each new
+failure: that is automation kiln adds only once declared, and isn't yet. Their tries run at the
+run's priority: `uploads::Ask` has no priority to give them W05-R09's low class. AC51 is not met: P3
 answers 79.3% (77.4%–81.9%) of ci's commits within the hour, against 75.9% before. The late ones
 wait mostly for capacity (ci's rust jobs held out of the k8s quota through bursts of pushes),
 which steps 6 and 8 (admission, spreading load) reach, not verdicts.

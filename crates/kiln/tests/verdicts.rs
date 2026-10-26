@@ -202,3 +202,88 @@ fn w28_r55_verdicts_per_unit_and_test() -> anyhow::Result<()> {
     assert!(test(&e1, "q_works").and_then(|x| x.get("why")).and_then(Value::as_str).is_some_and(|w| w.contains("quarantined")), "{e1}");
     Ok(())
 }
+
+/// W28-R56, R57: a bisection of one test tries only the commits whose diffs could affect its
+/// unit, judged by the test's own result: of f1..f4, f2 breaks p and f4 changes p, f1 and f3 only
+/// q. It tries f2 alone (failing) and names it; f2's verdict is then culprit, and f4, failing
+/// because of it, isn't suspect.
+#[test]
+fn w28_r57_a_test_bisection_tries_only_its_units_commits() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));
+    std::fs::create_dir_all(&home)?;
+    for d in [".kiln", "crates/p/src", "crates/q/src"] {
+        std::fs::create_dir_all(work.join(d))?;
+    }
+    let commit = |files: &[(&str, &str)], message: &str| -> anyhow::Result<String> {
+        for (f, t) in files {
+            std::fs::write(work.join(f), t)?;
+        }
+        git(&home, &work, &["add", "."])?;
+        git(&home, &work, &["commit", "-qm", message])?;
+        Ok(git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned())
+    };
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    commit(&[("README.md", "app\n")], "first")?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    commit(
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("crates/p/Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\n"),
+            ("crates/p/src/lib.rs", "pub fn p() {}\n"),
+            ("crates/q/Cargo.toml", "[package]\nname = \"q\"\nversion = \"0.1.0\"\n[dependencies]\np = { path = \"../p\" }\n"),
+            ("crates/q/src/lib.rs", "pub fn q() {}\n"),
+            (".kiln/ci.yaml", CI),
+        ],
+        "the workspace",
+    )?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    ended(&s, 1)?;
+    let f: Vec<String> = [("crates/q/src/f1.rs", "f1"), ("crates/p/bug", "f2"), ("crates/q/src/f3.rs", "f3"), ("crates/p/src/f4.rs", "f4")]
+        .iter()
+        .map(|(file, m)| commit(&[(file, &format!("{m}\n"))], m))
+        .collect::<anyhow::Result<_>>()?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    ended(&s, 2)?;
+    let (_, runs) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=10", &s.admin, None)?;
+    let runs: Value = serde_json::from_str(&runs)?;
+    let red = runs.get("runs").and_then(Value::as_array).and_then(|r| r.iter().find(|r| r.get("number") == Some(&json!(2)))).and_then(|r| r.get("id")).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let (f1, f2, f3, f4) = (f.first().cloned().unwrap_or_default(), f.get(1).cloned().unwrap_or_default(), f.get(2).cloned().unwrap_or_default(), f.get(3).cloned().unwrap_or_default());
+
+    let (st, started) = op(&s, "ci.runs.bisect", json!({ "run": red, "test": "p_works" }))?;
+    anyhow::ensure!((200..300).contains(&st), "{st} {started}");
+    assert_eq!(started.pointer("/bisect/suspects"), Some(&json!([f2, f4])), "only the commits that change p: {started}");
+    assert_eq!(started.pointer("/bisect/unit"), Some(&json!("p")), "{started}");
+    let id = started.pointer("/bisect/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut done = Value::Null;
+    until(&s, 300, "the bisection", || {
+        let (_, v) = op(&s, "ci.runs.bisects", json!({ "run": red, "bisect": id }))?;
+        done = v.get("bisect").cloned().unwrap_or_default();
+        Ok((done.get("state").and_then(Value::as_str) == Some("running")).then(|| done.to_string()))
+    })?;
+    assert_eq!(done.get("state"), Some(&json!("found")), "{done}");
+    assert_eq!(done.pointer("/culprit/sha"), Some(&json!(f2)), "{done}");
+    assert_eq!(done.get("tried").and_then(Value::as_array).map(Vec::len), Some(1), "one try for two suspects: {done}");
+    assert_eq!(done.pointer("/tried/0/sha"), Some(&json!(f2)), "{done}");
+    assert!(done.pointer("/tried/0/why").and_then(Value::as_str).is_some_and(|w| w.contains("p_works failed")), "judged by the test's own result: {done}");
+
+    let v2 = verdict(&s, &f2)?;
+    assert_eq!(kind(&v2), "culprit", "{v2}");
+    let v4 = verdict(&s, &f4)?;
+    assert_eq!(status(&v4, "p_works"), "direct", "{v4}");
+    assert_ne!(kind(&v4), "suspect", "{v4}");
+    for sha in [&f1, &f3] {
+        let v = verdict(&s, sha)?;
+        assert_eq!(status(&v, "p_works"), "unaffected", "{v}");
+        assert_eq!(kind(&v), "covered", "{v}");
+    }
+    Ok(())
+}

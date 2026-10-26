@@ -1,10 +1,15 @@
 //! Bisecting a failure (docs/ci.md §4.1's `ci.runs.bisect`, W20-R09's `diagnose`;
 //! docs/ci-agents.md): a failed run's job, run again on the commits between the last one it passed
-//! on and the run's own, the range halved each time, until the first commit it fails on is found.
-//! Each try is an ordinary run of that job (and the jobs it needs) at that commit, on the run's
-//! branch, trusted as the failed run was: the commits are its own history. A try that can't run
-//! (it didn't start, it was cancelled) ends the bisection inconclusive, saying which and why.
+//! on and the run's own, until the first commit it fails on is found. `kiln_ci::verdict::culprit`
+//! picks each try (W28-R56: a binary search when the check isn't flaky). Each try is an ordinary
+//! run of that job (and the jobs it needs) at that commit, on the run's branch, trusted as the
+//! failed run was: the commits are its own history. Given a test (W28-R57), only the commits whose
+//! diffs could affect its unit are tried, each try judged by the test's own result, with
+//! `vars.KILN_VERDICT_UNITS` and `vars.KILN_VERDICT_TESTS` set so a workflow can run just those. A
+//! try that can't run (it didn't start, it was cancelled) is skipped for its nearest neighbour; the
+//! bisection ends inconclusive when none is left, saying why.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +17,8 @@ use http::StatusCode;
 use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use kiln_ci::verdict::culprit::{At, Next, Search};
 
 use super::Fail;
 use crate::http::server::{self as srv, Response};
@@ -56,8 +63,17 @@ pub struct Bisect {
     pub good: String,
     pub bad: String,
     pub commits: Vec<String>,
+    /// The test bisected (W16's `suite name`) and its unit (W28-R57): tried only at `suspects`, the
+    /// commits whose diffs could affect the unit, each try judged by the test's own result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suspects: Vec<String>,
     pub tried: Vec<Tried>,
-    /// `running`, `found` (`culprit`), `inconclusive` or `failed` (`why`).
+    /// `running`, `found` (`culprit`), `no-culprit` (the failure didn't come back: a flake),
+    /// `inconclusive` or `failed` (`why`).
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub culprit: Option<Culprit>,
@@ -75,6 +91,25 @@ const TRY: Duration = Duration::from_secs(3 * 3600);
 
 fn key(id: &str) -> String {
     format!("ci/bisect/{id}")
+}
+
+impl Bisect {
+    /// The commits it searches: its suspects, or for a job every commit between.
+    pub fn suspects(&self) -> &[String] {
+        if self.suspects.is_empty() { &self.commits } else { &self.suspects }
+    }
+}
+
+/// A lane's bisections: its repository's, workflow's and branch's (W28-R57).
+pub async fn of_lane(hub: &Hub, repo: &str, workflow: &str, branch: &str) -> Vec<Bisect> {
+    hub.store
+        .kv_prefix("ci/bisect/".to_owned())
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(_, t)| serde_json::from_str::<Bisect>(&t).ok())
+        .filter(|b| b.repo == repo && b.workflow == workflow && b.branch == branch)
+        .collect()
 }
 
 fn internal(e: anyhow::Error) -> Fail {
@@ -173,14 +208,53 @@ pub async fn start(hub: &Arc<Hub>, run: &str, body: &Value, by: &str) -> Result<
         .into_iter()
         .map(|j| j.split('/').next().unwrap_or(&j).to_owned())
         .collect();
-    let job = match (asked, failed.as_slice()) {
-        (Some(j), _) => j,
-        (None, [one]) => one.clone(),
-        (None, []) => return Err(conflict("none of the run's jobs failed: say which to bisect (`job`)")),
-        (None, many) => return Err(conflict(format!("{} failed: say which to bisect (`job`)", many.join(", ")))),
+    // W28-R57: given a test, the job that reported it in this run, when none is asked for.
+    let test = text("test");
+    let reported: Option<String> = match (&test, &asked) {
+        (Some(t), None) => {
+            let (rid, want) = (run.to_owned(), t.clone());
+            hub.store
+                .call(move |c| {
+                    Ok(c.query_row(
+                        "SELECT t.leg_key FROM test_results t JOIN test_cases k ON k.repo_id = t.repo_id AND k.id = t.case_id WHERE t.run_id = ?1 AND (TRIM(k.suite || ' ' || k.name) = ?2 OR k.name = ?2 OR k.id = ?2) ORDER BY t.attempt DESC LIMIT 1",
+                        rusqlite::params![rid, want],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?)
+                })
+                .await
+                .map_err(internal)?
+                .map(|leg| leg.split('/').next().unwrap_or(&leg).to_owned())
+        }
+        _ => None,
+    };
+    let job = match (asked, reported, failed.as_slice()) {
+        (Some(j), _, _) => j,
+        (None, Some(j), _) => j,
+        (None, None, [one]) => one.clone(),
+        (None, None, []) => return Err(conflict("none of the run's jobs failed: say which to bisect (`job`)")),
+        (None, None, many) => return Err(conflict(format!("{} failed: say which to bisect (`job`)", many.join(", ")))),
     };
     let bad = text("bad").unwrap_or_else(|| f.sha.clone());
-    let good = match text("good") {
+    // Given a test, the last run of the lane it passed in (W28-R57); else the last green run.
+    let passed_at: Option<String> = match &test {
+        Some(t) => {
+            let (repo_id, wf, branch, at, this, want) = (f.repo_id.clone(), f.workflow.clone(), f.branch.clone(), f.created_at, run.to_owned(), t.clone());
+            hub.store
+                .call(move |c| {
+                    Ok(c.query_row(
+                        "SELECT r.sha FROM runs r JOIN test_results t ON t.run_id = r.id JOIN test_cases k ON k.repo_id = t.repo_id AND k.id = t.case_id WHERE r.repo_id = ?1 AND r.workflow_id = ?2 AND r.branch = ?3 AND r.id != ?5 AND r.created_at <= ?4 AND t.outcome = 'passed' AND (TRIM(k.suite || ' ' || k.name) = ?6 OR k.name = ?6 OR k.id = ?6) ORDER BY r.created_at DESC LIMIT 1",
+                        rusqlite::params![repo_id, wf, branch, at, this, want],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?)
+                })
+                .await
+                .map_err(internal)?
+        }
+        None => None,
+    };
+    let good = match text("good").or(passed_at) {
         Some(g) => g,
         None => {
             let (repo_id, wf, branch, at, this) = (f.repo_id.clone(), f.workflow.clone(), f.branch.clone(), f.created_at, run.to_owned());
@@ -212,13 +286,43 @@ pub async fn start(hub: &Arc<Hub>, run: &str, body: &Value, by: &str) -> Result<
     if git(vec!["-C".into(), mirror.clone(), "merge-base".into(), "--is-ancestor".into(), good.clone(), bad.clone()]).await.is_err() {
         return Err(conflict(format!("{} isn't an ancestor of {} here", good.get(..12).unwrap_or(&good), bad.get(..12).unwrap_or(&bad))));
     }
-    let out = git(vec!["-C".into(), mirror, "rev-list".into(), "--reverse".into(), "--first-parent".into(), "--ancestry-path".into(), format!("{good}..{bad}")]).await.map_err(internal)?;
+    let out = git(vec!["-C".into(), mirror.clone(), "rev-list".into(), "--reverse".into(), "--first-parent".into(), "--ancestry-path".into(), format!("{good}..{bad}")]).await.map_err(internal)?;
     let commits: Vec<String> = String::from_utf8_lossy(&out).lines().map(str::trim).filter(|l| is_sha(l)).map(str::to_owned).collect();
     if commits.is_empty() {
         return Err(conflict("there's nothing between them to bisect"));
     }
     if commits.len() > MOST {
         return Err(conflict(format!("{} commits are more than a bisection takes on ({MOST}): say a later `good`", commits.len())));
+    }
+    // W28-R57: a test, tried only where its unit could have changed, judged by its own result.
+    let (mut unit, mut suspects, mut marked) = (None, Vec::new(), false);
+    if let Some(t) = &test {
+        let (rid, want) = (f.repo_id.clone(), t.clone());
+        let case: Option<(String, Option<String>)> = hub
+            .store
+            .call(move |c| {
+                Ok(c.query_row(
+                    "SELECT suite, file FROM test_cases WHERE repo_id = ?1 AND (TRIM(suite || ' ' || name) = ?2 OR name = ?2 OR id = ?2) ORDER BY first_seen DESC LIMIT 1",
+                    rusqlite::params![rid, want],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?)
+            })
+            .await
+            .map_err(internal)?;
+        let Some((suite, file)) = case else { return Err(conflict(format!("no test `{t}` has results in {}", f.repo))) };
+        let units = super::verdict::units_at(hub, &mirror, &bad).await;
+        let u = super::verdict::unit_of(&units, file.as_deref(), &suite, &job);
+        for sha in &commits {
+            if super::verdict::affects(hub, &mirror, &units, sha).await.unit(&u) {
+                suspects.push(sha.clone());
+            }
+        }
+        if suspects.is_empty() {
+            return Err(conflict(format!("none of the {} commits between could affect {u}, `{t}`'s unit", commits.len())));
+        }
+        marked = super::results::flaky_in_run(hub, run).await.unwrap_or_default().iter().any(|n| n == t);
+        unit = Some(u);
     }
     let now = crate::util::now_unix();
     let mut b = Bisect {
@@ -231,6 +335,9 @@ pub async fn start(hub: &Arc<Hub>, run: &str, body: &Value, by: &str) -> Result<
         good,
         bad,
         commits,
+        test,
+        unit,
+        suspects,
         state: "running".into(),
         by: by.to_owned(),
         created_at: now,
@@ -240,50 +347,98 @@ pub async fn start(hub: &Arc<Hub>, run: &str, body: &Value, by: &str) -> Result<
     hub.store.audit(by.to_owned(), "ci.runs.bisect".into(), format!("{} run #{}: {} between {} and {} ({} commits)", f.repo, f.number, b.job, b.good, b.bad, b.commits.len())).await;
     let answer = b.clone();
     let hub = Arc::clone(hub);
-    crate::rt::spawn(async move { drive(hub, b, f.trusted).await });
+    crate::rt::spawn(async move { drive(hub, b, f.trusted, marked).await });
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "bisect": answer })))
 }
 
-/// Halves `b`'s range until one commit is left: the first the job fails on.
-async fn drive(hub: Arc<Hub>, mut b: Bisect, trusted: bool) {
+/// Searches `b`'s suspects (W28-R56) until the planner names the first commit the check fails on,
+/// or no culprit (a flake), or can't tell.
+async fn drive(hub: Arc<Hub>, mut b: Bisect, trusted: bool, marked: bool) {
     let Some(repo) = hub.store.repos().await.ok().and_then(|r| r.into_iter().find(|r| r.name == b.repo)) else {
         b.state = "failed".into();
         b.why = Some(format!("{} is gone", b.repo));
         save(&hub, &mut b).await;
         return;
     };
-    // The first failing commit is in commits[lo..=hi]; the last one fails (it's the run's).
-    let (mut lo, mut hi) = (0usize, b.commits.len().saturating_sub(1));
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let Some(sha) = b.commits.get(mid).cloned() else { break };
+    let suspects: Vec<String> = b.suspects().to_vec();
+    let mut search = Search::new(suspects.len(), 0.0, marked);
+    let mut untestable: BTreeSet<usize> = BTreeSet::new();
+    loop {
+        let (at, sha) = match search.next() {
+            Next::Try { at: At::Failing } => (At::Failing, b.bad.clone()),
+            Next::Try { at: At::Suspect(k) } => {
+                // An untestable suspect gives way to its nearest testable neighbour.
+                let near = std::iter::once(Some(k)).chain((1..suspects.len()).flat_map(|d| [k.checked_sub(d), k.checked_add(d)])).flatten().find(|j| *j < suspects.len() && !untestable.contains(j));
+                match near.and_then(|j| suspects.get(j).map(|s| (j, s.clone()))) {
+                    Some((j, s)) => (At::Suspect(j), s),
+                    None => {
+                        b.state = "inconclusive".into();
+                        b.why = Some("no suspect could be tested".into());
+                        save(&hub, &mut b).await;
+                        return;
+                    }
+                }
+            }
+            Next::Culprit { suspect, .. } => {
+                let sha = suspects.get(suspect).cloned().unwrap_or_else(|| b.bad.clone());
+                let (message, author) = crate::gitops::commit_info(&hub, &repo, &sha).await;
+                b.culprit = Some(Culprit { sha, message, author });
+                b.state = "found".into();
+                save(&hub, &mut b).await;
+                return;
+            }
+            Next::NoCulprit { .. } => {
+                b.state = "no-culprit".into();
+                b.why = Some("the failure didn't come back when tried again: a flake".into());
+                save(&hub, &mut b).await;
+                return;
+            }
+            Next::Inconclusive { why } => {
+                b.state = "inconclusive".into();
+                b.why = Some(why);
+                save(&hub, &mut b).await;
+                return;
+            }
+        };
         let t = try_commit(&hub, &repo, &b, &sha, trusted).await;
-        let passed = t.conclusion == "success";
-        let failed = matches!(t.conclusion.as_str(), "failure" | "timed_out");
+        let failed = match t.conclusion.as_str() {
+            "success" => Some(false),
+            "failure" | "timed_out" => Some(true),
+            _ => None,
+        };
         b.tried.push(t.clone());
-        if passed {
-            lo = mid + 1;
-        } else if failed {
-            hi = mid;
-        } else {
-            b.state = "inconclusive".into();
-            b.why = Some(format!("{} couldn't be tested: {}", sha.get(..12).unwrap_or(&sha), t.why.unwrap_or_else(|| t.conclusion.clone())));
-            save(&hub, &mut b).await;
-            return;
+        match (failed, at) {
+            (Some(f), _) => search.observe(at, f),
+            (None, At::Suspect(k)) => {
+                untestable.insert(k);
+            }
+            (None, At::Failing) => {
+                b.state = "inconclusive".into();
+                b.why = Some(format!("the failing commit couldn't be tried again: {}", t.why.unwrap_or_else(|| t.conclusion.clone())));
+                save(&hub, &mut b).await;
+                return;
+            }
         }
         save(&hub, &mut b).await;
     }
-    let sha = b.commits.get(lo).cloned().unwrap_or_else(|| b.bad.clone());
-    let (message, author) = crate::gitops::commit_info(&hub, &repo, &sha).await;
-    b.culprit = Some(Culprit { sha, message, author });
-    b.state = "found".into();
-    save(&hub, &mut b).await;
 }
 
-/// The job run at `sha`, to its end.
+/// The job run at `sha`, to its end: its conclusion, or given a test, the test's own result in it.
 async fn try_commit(hub: &Arc<Hub>, repo: &crate::store::Repo, b: &Bisect, sha: &str, trusted: bool) -> Tried {
-    let ask =
-        super::uploads::Ask { sha: sha.to_owned(), git_ref: b.branch.clone(), event: "push".into(), workflows: vec![b.workflow.clone()], job: Some(b.job.clone()), ..super::uploads::Ask::default() };
+    let mut vars = BTreeMap::new();
+    if let (Some(test), Some(unit)) = (&b.test, &b.unit) {
+        vars.insert("KILN_VERDICT_UNITS".to_owned(), unit.clone());
+        vars.insert("KILN_VERDICT_TESTS".to_owned(), test.clone());
+    }
+    let ask = super::uploads::Ask {
+        sha: sha.to_owned(),
+        git_ref: b.branch.clone(),
+        event: "push".into(),
+        workflows: vec![b.workflow.clone()],
+        job: Some(b.job.clone()),
+        vars,
+        ..super::uploads::Ask::default()
+    };
     let untestable = |why: String| Tried { sha: sha.to_owned(), run: None, conclusion: "untestable".into(), why: Some(why) };
     let started = match super::uploads::start_runs(hub, repo, &ask, trusted, &b.by, false).await {
         Ok((runs, skipped)) => match runs.first().and_then(|r| r.get("id")).and_then(Value::as_str) {
@@ -298,7 +453,29 @@ async fn try_commit(hub: &Arc<Hub>, repo: &crate::store::Repo, b: &Bisect, sha: 
         let conclusion: Option<String> =
             hub.store.call(move |c| Ok(c.query_row("SELECT conclusion FROM runs WHERE id = ?1", [&id], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await.unwrap_or(None);
         if let Some(c) = conclusion {
-            return Tried { sha: sha.to_owned(), run: Some(started), conclusion: c, why: None };
+            let Some(test) = b.test.clone() else { return Tried { sha: sha.to_owned(), run: Some(started), conclusion: c, why: None } };
+            // The test's own result in the try's latest attempt (W28-R57).
+            let id = started.clone();
+            let want = test.clone();
+            let outcome: Option<String> = hub
+                .store
+                .call(move |c| {
+                    Ok(c.query_row(
+                        "SELECT t.outcome FROM test_results t JOIN test_cases k ON k.repo_id = t.repo_id AND k.id = t.case_id WHERE t.run_id = ?1 AND (TRIM(k.suite || ' ' || k.name) = ?2 OR k.name = ?2 OR k.id = ?2) ORDER BY t.attempt DESC LIMIT 1",
+                        rusqlite::params![id, want],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?)
+                })
+                .await
+                .unwrap_or(None);
+            let (conclusion, why) = match outcome.as_deref() {
+                Some("passed") => ("success", format!("{test} passed in its run")),
+                Some("failed" | "error") => ("failure", format!("{test} failed in its run")),
+                Some(o) => ("untestable", format!("{test} was {o} in its run")),
+                None => ("untestable", format!("its run ({c}) didn't report {test}")),
+            };
+            return Tried { sha: sha.to_owned(), run: Some(started), conclusion: conclusion.into(), why: Some(why) };
         }
         if std::time::Instant::now() >= deadline {
             return Tried { sha: sha.to_owned(), run: Some(started), conclusion: "untestable".into(), why: Some("its run took longer than three hours".into()) };
