@@ -386,6 +386,65 @@ pub fn follow(hunks: &[Hunk], start: u32, end: u32) -> Option<(u32, u32)> {
     Some((u32::try_from(s + delta).ok()?, u32::try_from(e + delta).ok()?))
 }
 
+/// Open threads on a change, by kind (W26-R11).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Open {
+    pub question: u32,
+    pub nit: u32,
+    pub issue: u32,
+    pub blocking: u32,
+}
+
+/// What a change's review state is read from (W26-R02).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Facts {
+    pub draft: bool,
+    /// A reviewer asked for changes on the latest revision and hasn't approved since.
+    pub changes_asked: bool,
+    pub open: Open,
+    /// Conflicts unresolved in its latest replay onto trunk.
+    pub conflicts: u32,
+    /// An agent is at work on its threads or conflicts.
+    pub fixing: bool,
+    /// The approvals trunk's policy asks for are given.
+    pub policy_met: bool,
+}
+
+/// Where a change's review stands, as Ship draws it (`kiln_cd::journey::ReviewState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Standing {
+    Draft,
+    Requested,
+    Changes,
+    Blocked,
+    Fixing,
+    Conflict,
+    Approved,
+}
+
+/// A change's review state (W26-R02): a draft is a draft; an agent at work shows as that; then a
+/// conflict, a blocking thread and changes asked, each the author's to answer; approved once its gate
+/// is clear (no blocking thread, no conflict, no changes asked, the policy's approvals given); else
+/// waiting on its reviewers.
+pub fn state(f: &Facts) -> Standing {
+    if f.draft {
+        Standing::Draft
+    } else if f.fixing {
+        Standing::Fixing
+    } else if f.conflicts > 0 {
+        Standing::Conflict
+    } else if f.open.blocking > 0 {
+        Standing::Blocked
+    } else if f.changes_asked {
+        Standing::Changes
+    } else if f.policy_met {
+        Standing::Approved
+    } else {
+        Standing::Requested
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +558,19 @@ mod tests {
         assert!(plan(&[Commit { sha: "4".repeat(40), ..d1.clone() }], &gone, "t").is_err_and(|e| e.contains("reclaim")));
         assert!(plan(&[], &k, "t").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn w26_r02_a_review_stands_as_its_records_say() {
+        let open = |blocking, question| Open { blocking, question, ..Open::default() };
+        let approved = Facts { policy_met: true, ..Facts::default() };
+        assert_eq!(state(&Facts::default()), Standing::Requested, "waiting on its reviewers");
+        assert_eq!(state(&approved), Standing::Approved);
+        assert_eq!(state(&Facts { open: open(0, 2), ..approved }), Standing::Approved, "questions don't hold the gate");
+        assert_eq!(state(&Facts { open: open(1, 0), ..approved }), Standing::Blocked, "a blocking thread holds an approval");
+        assert_eq!(state(&Facts { changes_asked: true, ..approved }), Standing::Changes);
+        assert_eq!(state(&Facts { conflicts: 2, open: open(1, 0), ..approved }), Standing::Conflict, "a conflict comes before a thread");
+        assert_eq!(state(&Facts { fixing: true, conflicts: 2, ..approved }), Standing::Fixing, "an agent at work shows as that");
+        assert_eq!(state(&Facts { draft: true, fixing: true, ..approved }), Standing::Draft);
     }
 }
