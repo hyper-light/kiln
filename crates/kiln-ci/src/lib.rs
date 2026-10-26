@@ -22,6 +22,7 @@
 //! - [`stats`]: bootstrap intervals for benchmarks and experiments (W16, W20).
 //! - [`facts`]: what runners report about themselves (W13).
 //! - [`graphql`]: GraphQL documents, for the facade's GraphQL (W14).
+//! - [`identity`]: a change's identity across rewrites: kiln's trailer, aliases, matching (W26).
 //! - [`wire`]: the JSON payloads between the server and CI runners (§2.5).
 //! - [`work`]: fingerprints for doing the least work a change needs (W24).
 
@@ -33,6 +34,7 @@ pub mod experiments;
 pub mod expr;
 pub mod facts;
 pub mod graphql;
+pub mod identity;
 pub mod insights;
 pub mod land;
 pub mod oidc;

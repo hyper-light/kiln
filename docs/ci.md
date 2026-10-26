@@ -4515,7 +4515,8 @@ adapts [review.md](review.md), which it replaces.
 
 - **W14-R03 Stacked diffs**, as review.md specifies: a **diff** is one commit under review,
   numbered (`D123`), whose identity survives amends and rebases through a `Change-Id: I<40 hex>`
-  trailer (Gerrit's format; kiln's commit-msg hook and `kiln submit` add it); each push of a
+  trailer (Gerrit's format; kiln's commit-msg hook and `kiln submit` add it; since W26-R03 the
+  identity is kiln's own `Kiln-Change`, a Change-Id an alias, and no hook is needed); each push of a
   changed commit adds a **version** (`D123 v3`), marked **rebase-only** when its patch is
   unchanged; a **stack** is a chain of diffs; an **interdiff** compares any two versions with
   rebase noise removed (`git range-diff` semantics); every version is kept at
@@ -8257,6 +8258,24 @@ a time. The design was agreed on a live mock built on Ship's own prototype
   latest revisions, same author and branch), and kiln asks only when it can't tell. Gerrit's
   `Change-Id` (which kiln wrote until now) and the `change-id` header jj and GitButler write are
   read as aliases; a trailer and an alias naming different changes are refused, saying why.
+  - *Built* (plan `01a17858021a74259cf8d76f17031d00`). The pure part is `kiln_ci::identity`:
+    - the trailer is `Kiln-Change: kc-<16 hex>`; every one of a squash's trailer paragraphs is
+      read;
+    - the aliases are `Change-Id`, `change-id` and GitButler's older `gitbutler-change-id`,
+      read from `git log --format=raw`;
+    - an alias kiln has never seen says the commit is new;
+    - a commit with neither is matched among the pusher's open diffs on the trunk: by patch-id,
+      else by likeness of changed lines and title (50% with a 15-point margin over the next;
+      30–50%, or a tie, asks), else by its lines lying inside one change;
+    - a split keeps the change for the half most like it; a squash (changes side by side in one
+      commit) keeps the most alike and absorbs the rest;
+    - an answer is `-o change=<commit>:<D12|new>`.
+
+    Records live in migration `20261026-1000_w26_change_identity` (`changes`, `change_aliases`,
+    `change_numbers`, `diffs.kiln_change`), which backfills every diff, its Change-Id as an
+    alias. Lands, restacks, submissions without git, agents' stacks and the optional hook write
+    the trailer; `kiln submit` rewrites nothing. Tests: `w26_r03_*` (kiln-ci, store), and real
+    git without a hook in `crates/kiln/tests/identity.rs` (`w26_ac08_*`).
 - **W26-R04 Revisions and their why.** Each revision says why it exists: pushed, rebase only,
   replayed by kiln, an agent's fix (its thread), a conflict resolved, a suggestion applied. A host
   pull request's heads are kept at `refs/kiln/…` so its revisions survive a force-push. An interdiff

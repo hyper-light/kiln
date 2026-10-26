@@ -1,6 +1,7 @@
 //! Diffs from a working copy (docs/ci.md W14-R03, §4.3): `kiln clone` (with git's credential
-//! helper and the commit-msg hook that gives each commit a `Change-Id`), `kiln submit` (adding the
-//! Change-Ids commits lack, then `git push <remote> HEAD:refs/for/<trunk>`), `kiln sync` (the
+//! helper and the commit-msg hook that gives each commit a `Kiln-Change`, W26-R03), `kiln
+//! submit` (`git push <remote> HEAD:refs/for/<trunk>`, the commits as they are: kiln matches a
+//! commit without a trailer to the change it rewrites, so no hook is needed), `kiln sync` (the
 //! trunk fetched, landed diffs dropped, the rest rebased), `kiln diffs`, and `kiln checkout
 //! D12[@v2]`. git does the work; kiln only says what to run.
 
@@ -14,17 +15,21 @@ use super::cli::Conn;
 use crate::config::Config;
 use crate::http::client::Method;
 
-/// The commit-msg hook: a `Change-Id` for every commit that lacks one (Gerrit's trailer, so
-/// existing tools read it). Plain sh, as git runs hooks on every platform.
+/// The commit-msg hook: a `Kiln-Change` for every new commit that doesn't say which change it is
+/// (W26-R03); a message with a Change-Id (kiln's before W26, an alias) is left as it is, so the
+/// two never name different changes. Optional: kiln matches commits without one. Plain sh, as
+/// git runs hooks on every platform.
 pub const COMMIT_MSG_HOOK: &str = r#"#!/bin/sh
-# kiln: every commit gets a Change-Id, so its diff keeps its identity across amends and rebases
-# (docs/ci.md W14-R03). Installed by `kiln clone` or `kiln hook install`.
+# kiln: every commit gets a Kiln-Change, its change's identity across amends and rebases
+# (docs/ci.md W26-R03). Optional: kiln matches a commit without one to the change it rewrites.
+# Installed by `kiln clone` or `kiln hook install`.
 msg="$1"
+grep -qi '^Kiln-Change: kc-[0-9a-f]\{6,32\}[[:space:]]*$' "$msg" && exit 0
 grep -qi '^Change-Id: I[0-9a-f]\{40\}[[:space:]]*$' "$msg" && exit 0
 # An empty message aborts the commit by itself.
 grep -qv '^[[:space:]]*\(#.*\)\{0,1\}$' "$msg" || exit 0
-id=$( { git var GIT_COMMITTER_IDENT; git var GIT_AUTHOR_IDENT; cat "$msg"; date; } | git hash-object --stdin | cut -c1-40)
-git interpret-trailers --in-place --if-exists doNothing --trailer "Change-Id: I$id" "$msg"
+id=$( { git var GIT_COMMITTER_IDENT; git var GIT_AUTHOR_IDENT; cat "$msg"; date; } | git hash-object --stdin | cut -c1-16)
+git interpret-trailers --in-place --if-exists doNothing --trailer "Kiln-Change: kc-$id" "$msg"
 "#;
 
 fn git() -> Command {
@@ -91,8 +96,9 @@ fn install_hook(dir: Option<&str>) -> Result<std::path::PathBuf> {
     };
     std::fs::create_dir_all(&hooks)?;
     let path = hooks.join("commit-msg");
-    if path.exists() && !std::fs::read_to_string(&path).unwrap_or_default().contains("kiln: every commit gets a Change-Id") {
-        bail!("{} is another hook: add kiln's Change-Id step to it (see `kiln hook print`)", path.display());
+    // kiln's own hook, this one or the one that wrote Change-Ids before W26, is replaced.
+    if path.exists() && !std::fs::read_to_string(&path).unwrap_or_default().contains("kiln: every commit gets a") {
+        bail!("{} is another hook: add kiln's Kiln-Change step to it (see `kiln hook print`), or go without: kiln matches commits that have none", path.display());
     }
     std::fs::write(&path, COMMIT_MSG_HOOK)?;
     #[cfg(unix)]
@@ -123,7 +129,7 @@ pub async fn clone(args: CloneArgs, cfg: &Config) -> Result<()> {
     let dir = args.dir.clone().unwrap_or_else(|| args.repo.rsplit('/').next().unwrap_or("repo").trim_end_matches(".git").to_owned());
     run(&["clone", "-c", &helper, &url, &dir])?;
     let hook = install_hook(Some(&dir))?;
-    eprintln!("[kiln] {dir}: commits get a Change-Id ({}); `kiln submit` sends them for review", hook.display());
+    eprintln!("[kiln] {dir}: commits get a Kiln-Change ({}); `kiln submit` sends them for review", hook.display());
     Ok(())
 }
 
@@ -194,89 +200,16 @@ pub struct SubmitArgs {
     topic: Option<String>,
 }
 
-/// The commits between `base` and HEAD, bottom first: (sha, parents, message).
-fn stack(base: &str) -> Result<Vec<(String, Vec<String>, String)>> {
-    let log = out(&["log", "--reverse", "--topo-order", "--format=%H%x1f%P%x1f%B%x1e", &format!("{base}..HEAD")])?;
-    Ok(log
-        .split('\x1e')
-        .filter_map(|rec| {
-            let mut f = rec.trim_start_matches('\n').splitn(3, '\x1f');
-            let (sha, parents, message) = (f.next()?.trim().to_owned(), f.next()?.split_whitespace().map(str::to_owned).collect(), f.next().unwrap_or_default().to_owned());
-            (!sha.is_empty()).then_some((sha, parents, message))
-        })
-        .collect())
-}
-
-/// A new Change-Id: `I` and 40 hex digits no other commit has.
-fn new_change_id(seed: &str) -> String {
-    let h = crate::util::sha256_hex(format!("{seed}{}", crate::util::random_token()).as_bytes());
-    format!("I{}", h.get(..40).unwrap_or(&h))
-}
-
-/// Gives every commit of the stack that lacks one a Change-Id: the commits from the first such
-/// one up are rewritten (their trees, authors and dates kept), and HEAD moves to the new tip.
-/// How many were given one.
-fn add_change_ids(list: &[(String, Vec<String>, String)]) -> Result<usize> {
-    let Some(first) = list.iter().position(|(_, _, m)| kiln_ci::review::change_id(m).is_none()) else { return Ok(0) };
-    let Some(mut parent) = list.get(first).and_then(|(_, p, _)| p.first().cloned()) else { bail!("the first commit without a Change-Id has no parent") };
-    let mut given = 0;
-    for (sha, parents, message) in list.iter().skip(first) {
-        if parents.len() != 1 {
-            bail!("{} is a merge: a diff is one commit on another", sha.get(..12).unwrap_or(sha));
-        }
-        let msg = match kiln_ci::review::change_id(message) {
-            Some(_) => message.clone(),
-            None => {
-                given += 1;
-                kiln_ci::review::with_change_id(message, &new_change_id(sha))
-            }
-        };
-        let who = out(&["log", "-1", "--format=%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd", "--date=raw", sha])?;
-        let f: Vec<&str> = who.split('\0').collect();
-        let get = |i: usize| f.get(i).copied().unwrap_or_default();
-        let tree = out(&["rev-parse", &format!("{sha}^{{tree}}")])?;
-        let mut cmd = git();
-        cmd.args(["commit-tree", &tree, "-p", &parent, "-F", "-"])
-            .env("GIT_AUTHOR_NAME", get(0))
-            .env("GIT_AUTHOR_EMAIL", get(1))
-            .env("GIT_AUTHOR_DATE", get(2))
-            .env("GIT_COMMITTER_NAME", get(3))
-            .env("GIT_COMMITTER_EMAIL", get(4))
-            .env("GIT_COMMITTER_DATE", get(5))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped());
-        let mut child = cmd.spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(msg.as_bytes())?;
-        }
-        let o = child.wait_with_output()?;
-        if !o.status.success() {
-            bail!("git commit-tree: {}", String::from_utf8_lossy(&o.stderr).trim());
-        }
-        parent = String::from_utf8_lossy(&o.stdout).trim().to_owned();
-    }
-    let old = out(&["rev-parse", "HEAD"])?;
-    match out(&["symbolic-ref", "-q", "HEAD"]) {
-        Ok(branch) if !branch.is_empty() => run(&["update-ref", "-m", "kiln submit: Change-Ids", &branch, &parent, &old])?,
-        _ => run(&["update-ref", "--no-deref", "-m", "kiln submit: Change-Ids", "HEAD", &parent, &old])?,
-    }
-    Ok(given)
-}
-
 /// `kiln submit`: every commit between the trunk and HEAD as a diff (or a new version of its
-/// diff), through `git push <remote> HEAD:refs/for/<trunk>`.
+/// diff), through `git push <remote> HEAD:refs/for/<trunk>`, the commits as they are: kiln finds
+/// each one's change by its trailer, an alias, or the change it rewrites (W26-R03).
 pub fn submit(args: SubmitArgs) -> Result<()> {
     let remote = remote_of(args.remote.as_deref())?;
     let trunk = trunk_of(&remote, args.trunk.as_deref());
     run(&["fetch", "--quiet", &remote, &trunk])?;
     let base = out(&["merge-base", "FETCH_HEAD", "HEAD"])?;
-    let list = stack(&base)?;
-    if list.is_empty() {
+    if out(&["rev-list", "--count", &format!("{base}..HEAD")])?.trim() == "0" {
         bail!("nothing to submit: HEAD is on {remote}/{trunk}");
-    }
-    let given = add_change_ids(&list)?;
-    if given > 0 {
-        eprintln!("[kiln] gave {given} commit{} a Change-Id", if given == 1 { "" } else { "s" });
     }
     let mut push: Vec<String> = vec!["push".into(), remote.clone(), format!("HEAD:refs/for/{trunk}")];
     let mut opt = |o: String| push.extend(["-o".to_owned(), o]);
@@ -961,14 +894,8 @@ pub async fn review(args: ReviewArgs, cfg: &Config) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn w14_r03_change_ids() {
-        let id = new_change_id("abc");
-        assert!(kiln_ci::review::is_change_id(&id), "{id}");
-        assert_ne!(id, new_change_id("abc"));
-    }
-
-    /// The hook gives a commit a Change-Id once, and leaves one that has it alone.
+    /// The hook gives a commit a Kiln-Change once (W26-R03), and leaves one that has it, or a
+    /// Change-Id, alone.
     #[cfg(unix)]
     #[test]
     fn w14_r03_commit_msg_hook() -> Result<()> {
@@ -985,10 +912,15 @@ mod tests {
         g(&["add", "a"])?;
         g(&["commit", "-qm", "one: a"])?;
         let m = g(&["log", "-1", "--format=%B"])?;
-        let id = kiln_ci::review::change_id(&m);
-        assert!(id.is_some(), "{m}");
+        let id = kiln_ci::identity::kiln_changes(&m);
+        assert!(id.len() == 1 && id.iter().all(|k| kiln_ci::identity::is_kiln_change(k)), "{m}");
         g(&["commit", "-q", "--amend", "--no-edit"])?;
-        assert_eq!(kiln_ci::review::change_id(&g(&["log", "-1", "--format=%B"])?), id, "an amend keeps it");
+        assert_eq!(kiln_ci::identity::kiln_changes(&g(&["log", "-1", "--format=%B"])?), id, "an amend keeps it");
+        // A commit with a Change-Id (kiln's before W26) gets no second identity.
+        std::fs::write(dir.path().join("a"), "2")?;
+        g(&["commit", "-qam", "two: a\n\nChange-Id: I1111111111111111111111111111111111111111"])?;
+        let m = g(&["log", "-1", "--format=%B"])?;
+        assert!(kiln_ci::identity::kiln_changes(&m).is_empty() && kiln_ci::identity::change_ids(&m).len() == 1, "{m}");
         Ok(())
     }
 
