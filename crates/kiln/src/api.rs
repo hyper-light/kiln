@@ -568,7 +568,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "join-requests"]) => Ok(srv::json(StatusCode::OK, &hub.joins.list(Instant::now(), &hub.pki.ca_der))),
         (&Method::POST, ["api", "join-requests", id, "approve"]) => {
             let id = (*id).to_owned();
-            boxed(|| approve_join(&hub, &id, req)).await
+            let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
+            boxed(|| approve_join(&hub, &id, req, &by)).await
         }
         (&Method::POST, ["api", "join-requests", id, "deny"]) => boxed(|| deny_join(&hub, id)).await,
         (&Method::DELETE, ["api", "agents", name]) => {
@@ -577,6 +578,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         // Identities kiln's CA issued: their revocations, and revoking one (W27-R01).
         (&Method::GET, ["api", "identities", "revocations"]) => boxed(|| identity_revocations(&hub)).await,
+        (&Method::GET, ["api", "identities"]) => {
+            let kind = srv::query(&req).remove("kind");
+            boxed(|| async {
+                let list = crate::identities::list(&hub, kind.as_deref()).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                Ok(srv::json(StatusCode::OK, &json!({ "identities": list })))
+            })
+            .await
+        }
         (&Method::POST, ["api", "identities", "revoke"]) => {
             let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
             boxed(|| identity_revoke(&hub, req, &by)).await
@@ -3001,6 +3010,10 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     };
     let cert = hub.pki.sign_csr(&r.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     crate::identities::record(&hub.store, "machine", &name, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // Who enrolled it (W27-R01): the owner, whose join token or invite it brought; kiln for its
+    // own pods.
+    let by = if ephemeral { "kiln" } else { "admin" };
+    crate::identities::enrolled(&hub.store, &name, by).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let quic = if ephemeral {
         hub.cfg.kubernetes.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone())
     } else {
@@ -3379,7 +3392,7 @@ async fn free_agent_name(hub: &Hub, wanted: &str, hostname: &str) -> String {
 }
 
 /// `POST /api/join-requests/:id/approve`: sign the machine's CSR exactly as enrollment does.
-async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
+async fn approve_join(hub: &Hub, id: &str, req: Request, by: &str) -> R {
     let decision: crate::join::Decision = srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or_default();
     let c = match hub.joins.candidate(id, Instant::now()) {
         Ok(c) => c,
@@ -3398,6 +3411,7 @@ async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
     let days = if outpost { crate::pki::OUTPOST_DAYS } else { 365 };
     let cert = hub.pki.sign_csr(&c.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     crate::identities::record(&hub.store, "machine", &name, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    crate::identities::enrolled(&hub.store, &name, by).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let quic = hub.cfg.server.quic_advertise.clone();
     let quic_port = hub.discovery.advert.lock().quic;
     let approval = crate::join::Approval {

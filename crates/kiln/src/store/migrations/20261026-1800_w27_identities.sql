@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS identities (
     key_sha256 TEXT NOT NULL,
     not_before INTEGER NOT NULL,
     not_after INTEGER NOT NULL,
-    issued_at INTEGER NOT NULL
+    issued_at INTEGER NOT NULL,
+    cert_pem TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS identities_subject ON identities (subject);
 
@@ -25,3 +26,11 @@ CREATE TABLE IF NOT EXISTS revocations (
     CHECK (serial IS NOT NULL OR key_sha256 IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS revocations_key ON revocations (key_sha256);
+
+-- Who enrolled each machine: the person who approved its join, else the owner whose join token it
+-- brought (`admin`). A runner process's certificate names them.
+CREATE TABLE IF NOT EXISTS enrollments (
+    machine TEXT PRIMARY KEY,
+    enrolled_by TEXT NOT NULL,
+    at INTEGER NOT NULL
+);
