@@ -79,6 +79,7 @@ struct DeployRec {
 
 #[derive(Debug, Clone, Default)]
 struct ReleaseRec {
+    id: i64,
     state: String,
     message: Option<String>,
     rolled_back: bool,
@@ -206,10 +207,10 @@ fn load(c: &rusqlite::Connection, repo: &str, sha: &str) -> anyhow::Result<Optio
 
     // Deploy API releases of this commit (by version), and a newer one production waits on.
     let mut st = c.prepare(
-        "SELECT state, json_extract(spec, '$.message'), json_extract(spec, '$.rolled_back_by') IS NOT NULL FROM deploy_releases
+        "SELECT id, state, json_extract(spec, '$.message'), json_extract(spec, '$.rolled_back_by') IS NOT NULL FROM deploy_releases
          WHERE lower(environment) = 'production' AND (json_extract(spec, '$.version') = ?1 OR (length(json_extract(spec, '$.version')) >= 7 AND ?1 LIKE json_extract(spec, '$.version') || '%')) ORDER BY id",
     )?;
-    rec.releases = st.query_map([&sha], |r| Ok(ReleaseRec { state: r.get(0)?, message: r.get(1)?, rolled_back: r.get(2)? }))?.collect::<Result<_, _>>()?;
+    rec.releases = st.query_map([&sha], |r| Ok(ReleaseRec { id: r.get(0)?, state: r.get(1)?, message: r.get(2)?, rolled_back: r.get(3)? }))?.collect::<Result<_, _>>()?;
     rec.waiting = c
         .query_row(
             "SELECT x.sha, MIN(x.rowid) FROM deploy_releases d JOIN runs x ON x.repo_id = ?1 AND (x.sha = json_extract(d.spec, '$.version') OR x.sha LIKE json_extract(d.spec, '$.version') || '%')
@@ -352,6 +353,31 @@ fn empty() -> Journey {
     }
 }
 
+/// What a person can do about a commit from its row, each through the endpoint kiln has for it
+/// (nothing new decides): approve or hold the production release waiting on them (the Deploy
+/// API's approval); retry a failed check (the run's rerun, its failed legs only) or hand it to an
+/// agent (an attachment: an agent looking after the run); retry a runner that didn't replant (its
+/// upgrade, again).
+fn actions(rec: &Records, j: &Journey) -> Vec<Value> {
+    let act = |name: &str, method: &str, path: String, body: Value| json!({ "name": name, "method": method, "path": path, "body": body });
+    let mut out = Vec::new();
+    if let Some(r) = rec.releases.iter().find(|r| r.state == "waiting") {
+        out.push(act("approve", "POST", format!("/api/deploy/releases/{}/approve", r.id), json!({})));
+        out.push(act("hold", "POST", format!("/api/deploy/releases/{}/reject", r.id), json!({})));
+    }
+    let failed = rec.legs.iter().find(|l| matches!(attempt_of(&l.status, l.conclusion.as_deref(), None), Attempt::Failed) && !is_release(rec.runs.iter().find(|r| r.id == l.run_id).map(|r| r.pipeline.as_str()).unwrap_or_default()));
+    if let Some(leg) = failed {
+        out.push(act("retry", "POST", format!("/api/ci/runs/{}/rerun", leg.run_id), json!({ "mode": "failed" })));
+        out.push(act("hand_off", "POST", "/api/attachments".to_string(), json!({ "repo": rec.repo, "run": leg.run_id })));
+    }
+    if let (true, Some(r)) = (j.in_production, j.replant.as_ref()) {
+        for x in r.runners.iter().filter(|x| x.state == Runner::Failed) {
+            out.push(act("retry_runner", "POST", format!("/api/updates/runners/{}", x.name), Value::Null));
+        }
+    }
+    out
+}
+
 /// A commit as the list shows it.
 fn summary(rec: &Records, runners: &[RunnerSeen], now: i64) -> Value {
     let j = journey_of(rec, runners, now);
@@ -368,6 +394,7 @@ fn summary(rec: &Records, runners: &[RunnerSeen], now: i64) -> Value {
         "environments": envs, "tags": rec.tags,
         "runs": rec.runs.iter().map(|r| json!({ "id": r.id, "pipeline": r.pipeline })).collect::<Vec<_>>(),
         "cursor": rec.first_row,
+        "actions": actions(rec, &j),
     })
 }
 
@@ -564,6 +591,31 @@ mod tests {
 
             let shipped = get_in(&store, "hyper-light/kiln", C1, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert_eq!(field(&shipped, &["replant"]).and_then(Value::as_array).map(Vec::len), Some(2));
+            // Every action names an endpoint kiln has: a route in its table, not the unnamed default.
+            let mut failed = runners();
+            if let Some(r) = failed.get_mut(1) {
+                r.failed = Some("upgrade timed out: no report within 15 minutes".into());
+            }
+            let with_failed = list_in(&store, &HashMap::new(), None, failed, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let acts: Vec<(String, String, String)> = with_failed
+                .get("commits")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .flat_map(|c| c.get("actions").and_then(Value::as_array).cloned().unwrap_or_default())
+                .map(|a| (a.get("name").and_then(Value::as_str).unwrap_or_default().to_string(), a.get("method").and_then(Value::as_str).unwrap_or_default().to_string(), a.get("path").and_then(Value::as_str).unwrap_or_default().to_string()))
+                .collect();
+            let names: Vec<&str> = acts.iter().map(|(n, _, _)| n.as_str()).collect();
+            assert_eq!(names, vec!["retry", "hand_off", "approve", "hold", "retry_runner"]);
+            let named = |method: &str, path: &str| -> anyhow::Result<bool> {
+                let m = http::Method::from_bytes(method.as_bytes())?;
+                let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+                Ok(crate::authz::rule(&m, &segs).pattern != crate::authz::UNNAMED.pattern)
+            };
+            assert!(!named("POST", "/api/ship/no/such/route")?, "the check tells a route kiln lacks");
+            for (name, method, path) in &acts {
+                assert!(named(method, path)?, "{name}: {method} {path} is no route kiln has");
+            }
             let missing = get_in(&store, "hyper-light/kiln", "deadbee", runners(), now).await;
             assert!(matches!(missing, Err((StatusCode::NOT_FOUND, _))));
             Ok(())
