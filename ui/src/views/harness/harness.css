@@ -2574,25 +2574,6 @@ textarea.hx-input {
   /* A path or an address in it breaks rather than widening the tab. */
   overflow-wrap: anywhere;
 }
-.hx-skill-search {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  height: 36px;
-  padding: 0 10px;
-  border: 1px solid #262930;
-  border-radius: 10px;
-  color: var(--color-subtle);
-}
-.hx-skill-search input {
-  flex: 1;
-  min-width: 0;
-  border: 0;
-  background: transparent;
-  color: var(--color-foreground);
-  font-size: 13px;
-  outline: none;
-}
 .hx-skill-view {
   max-height: 60dvh;
   overflow-y: auto;
