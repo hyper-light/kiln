@@ -16,6 +16,8 @@ use crate::store::Store;
 
 /// How long a runner process's certificate lasts; it asks again on each connection.
 pub const RUNNER_HOURS: i64 = 7 * 24;
+/// How long an agent session's certificate lasts, for one epoch; asked again on each connection.
+pub const AGENT_HOURS: i64 = 7 * 24;
 
 /// What a revocation names.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,14 +112,72 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
             let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
             (runner_identity(hub, machine, &instance).await?, RUNNER_HOURS)
         }
+        "agent" => {
+            let session = ask.of.as_deref().ok_or_else(|| anyhow::anyhow!("an agent's identity names its session"))?;
+            let epoch = ask.epoch.ok_or_else(|| anyhow::anyhow!("an agent's identity names its epoch"))?;
+            (agent_identity(hub, machine, session, epoch).await?, AGENT_HOURS)
+        }
         other => anyhow::bail!("kiln doesn't issue {other:?} identities"),
     };
     let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
     let pem = hub.pki.issue_identity(&ask.csr, &identity, &[], time::Duration::hours(hours))?;
-    revoke(&hub.store, Target::Certificates(uri.clone()), "superseded by a newer certificate", "kiln", crate::util::now_unix()).await?;
+    let now = crate::util::now_unix();
+    revoke(&hub.store, Target::Certificates(uri.clone()), "superseded by a newer certificate", "kiln", now).await?;
+    if let Actor::Agent { epoch, .. } = &identity.actor
+        && let Some(session) = ask.of.as_deref()
+    {
+        // What the session signed at an epoch it has left is refused from the hand-over on.
+        for old in epochs_of(&hub.store, session).await?.into_iter().filter(|(_, e)| e < epoch) {
+            revoke(&hub.store, Target::Subject(old.0), &format!("moved on to epoch {epoch}"), "kiln", now).await?;
+        }
+    }
     record(&hub.store, &ask.kind, &uri, &pem).await?;
     tracing::info!(agent = %machine, identity = %identity, "issued an identity");
     Ok((uri, pem))
+}
+
+/// An agent session's identity at `epoch`, for the runner process of `machine` holding it: the
+/// session must run there, at that epoch or a later one than kiln last heard (a copy left behind
+/// at an older one gets none), and kiln must know whom it acts for.
+async fn agent_identity(hub: &Hub, machine: &str, session: &str, epoch: u64) -> anyhow::Result<Identity> {
+    let info = hub.harness.info(session).ok_or_else(|| anyhow::anyhow!("kiln knows no agent session {session} yet"))?;
+    anyhow::ensure!(info.target == format!("agent:{machine}"), "agent session {session} runs on {}, not {machine}", info.target);
+    let known = hub.harness.epoch_of(session);
+    anyhow::ensure!(epoch >= known, "agent session {session} is at epoch {known}; epoch {epoch} is a copy left behind");
+    let person = match crate::mcp::whose(hub, session).await {
+        Some(p) if p == "owner" => "admin".to_owned(),
+        Some(p) => person_of(&p),
+        None => anyhow::bail!("kiln can't say whom agent session {session} acts for"),
+    };
+    Ok(Identity::new(hub.pki.organization(), Actor::Agent { person, agent: session.to_owned(), epoch }))
+}
+
+/// Every subject an agent session's certificates were issued for, with its epoch.
+async fn epochs_of(store: &Store, session: &str) -> anyhow::Result<Vec<(String, u64)>> {
+    let pattern = format!("%/agent/{session}/epoch/%");
+    let subjects: Vec<String> = store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT DISTINCT subject FROM identities WHERE kind = 'agent' AND subject LIKE ?1")?;
+            let rows = q.query_map([pattern], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    Ok(subjects
+        .into_iter()
+        .filter_map(|s| match Identity::parse(&s).ok()?.actor {
+            Actor::Agent { agent, epoch, .. } if agent == session => Some((s, epoch)),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Agent session `session` ended: every certificate of every epoch it had is revoked from now.
+pub async fn agent_ended(store: &Store, session: &str) -> anyhow::Result<()> {
+    let now = crate::util::now_unix();
+    for (subject, _) in epochs_of(store, session).await? {
+        revoke(store, Target::Subject(subject), "agent ended", "kiln", now).await?;
+    }
+    Ok(())
 }
 
 /// A runner process of `machine` went while another goes on (retired after a blue/green
