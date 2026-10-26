@@ -244,6 +244,9 @@ over seeds 1-8).
   started 149 min after their push). 5 waited for a job's needs, 4 for a run going and 4 for a push
   made after the hour, and 1 had no answer in the window. With pods starting as they did that
   week, 95% is out of reach for verdicts: the pods alone leave 13 commits a week late.
+  Replayed with every pool's capacity unlimited (runner slots, the k8s quota's CPU, memory and pods),
+  P3 reaches 93.3% (89.6%–95.9%) and P4 89.6%: 8 commits a week still wait at the hour on pods the
+  recorded week started late, so no scheduling or verdict policy reaches 95% on this trace.
 - **P4** brings the bench's wait to 7 min (W25's step 6 asks at most 15) and waste to 0.3 runner-h,
   at 85.6% of ci's verdicts within 60 min.
 - **P5** saves about 6 runner-h a week of release builds and 3 of ci (0.20 runner-h per ci verdict,
