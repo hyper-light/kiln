@@ -179,6 +179,45 @@ pub async fn take_over(hub: &Hub, run: &str, source: &str, id: &str, hash: &str)
         .await
 }
 
+/// An adopter of `source`'s execution takes its result over in place (W28-R44): its row's runner,
+/// times, exit code and outputs, its steps and its artifacts, `reused_from` naming `source`.
+/// Returns the report `source` gave its plan, when it logged one.
+pub async fn adopt_into(hub: &Hub, leg: &str, source: &str) -> anyhow::Result<Option<String>> {
+    let (leg, source) = (leg.to_owned(), source.to_owned());
+    hub.store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            tx.execute(
+                "UPDATE jobs SET (agent, executor, started_at, finished_at, exit_code, error, outputs, reused_from) =
+                   (SELECT agent, executor, started_at, finished_at, exit_code, error, outputs, COALESCE(reused_from, id) FROM jobs WHERE id = ?2)
+                 WHERE id = ?1",
+                params![leg, source],
+            )?;
+            tx.execute("DELETE FROM steps WHERE job_id = ?1", [&leg])?;
+            tx.execute(
+                "INSERT INTO steps (job_id, idx, name, status, started_at, finished_at, exit_code, kind, step_id, action, outcome, conclusion, outputs, attempt)
+                 SELECT ?1, idx, name, status, started_at, finished_at, exit_code, kind, step_id, action, outcome, conclusion, outputs, attempt FROM steps WHERE job_id = ?2",
+                params![leg, source],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO ci_artifacts (run_id, leg_id, name, object, size, digest, mime_type, created_at, expires_at, finalized)
+                 SELECT (SELECT run_id FROM jobs WHERE id = ?1), ?1, name, object, size, digest, mime_type, created_at, expires_at, finalized FROM ci_artifacts WHERE leg_id = ?2",
+                params![leg, source],
+            )?;
+            let report: Option<String> = tx
+                .query_row(
+                    "SELECT l.report FROM ci_plan_log l JOIN jobs j ON j.id = ?1 WHERE l.run_id = j.run_id AND l.leg = j.key AND l.kind = 'leg' ORDER BY l.seq DESC LIMIT 1",
+                    [&source],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            tx.commit()?;
+            Ok(report)
+        })
+        .await
+}
+
 /// The input hash a leg was queued with, if it opted in.
 pub async fn hash_of(hub: &Hub, leg: &str) -> anyhow::Result<Option<String>> {
     let leg = leg.to_owned();

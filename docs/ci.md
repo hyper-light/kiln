@@ -1657,9 +1657,11 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `queue: fifo | latest | cancel-in-progress`. GitHub's `queue: single | max` now covers them,
   so kiln uses GitHub's.)
 - **W05-R08 Superseded runs** (opt-in, G-22): `supersede: { when: [branch, stack, pull_request],
-  action: cancel | deprioritize, keep: [main] }` on a workflow cancels or lowers older active runs
-  of the same workflow when a new push arrives for the same branch, a new version of a diff in the
-  same stack, or the same pull request.
+  action: cancel | deprioritize | adopt, keep: [main], finish-within: 5m }` on a workflow cancels or
+  lowers older active runs of the same workflow when a new push arrives for the same branch, a new
+  version of a diff in the same stack, or the same pull request. `adopt` withdraws their demands
+  instead (W28-R40 to R47): their work goes on while a newer run adopts it, and what no one wants
+  gives way to live work unless it's within `finish-within` (300 s by default) of its end.
 - **W05-R09 Priorities.** Default by event: `workflow_dispatch`/manual 100, `land`/`merge_group`
   90, `diff`/`pull_request` 80, `push` 60, `agent` 60, `workflow_run` 50, `schedule` 20; a job's
   `priority: high | normal | low | <0–100>` overrides. Strict between classes, with **aging**:
@@ -1683,7 +1685,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `exclusive`, `approval`, `scaling` (a pool is starting runners; how many and since when),
   `max-parallel`, `capability` (eligible runners' builds lack a capability; which),
   `other-runner` (only the runner its retry avoids could take it: R16's `runner: different`, or a
-  runner that refused it; which). It is stored (`jobs.wait_reason`), sent as an event, and shown
+  runner that refused it; which), `adopted` (it waits for the same work in flight, W28-R42: which
+  leg of which run), and admission's (W28-R60): `coalescing` (its lane, until when, at the latest
+  when), `cadence` (its lane, its next start) and `speculation` (its lane, the window, how many are
+  in flight). It is stored (`jobs.wait_reason`), sent as an event, and shown
   on the leg.
 
 **Requirements: retries** (G-16)
@@ -7855,7 +7860,7 @@ plan:
 `01a17502affc74b3af5a30092f8418bc`). This section holds step 9's requirements, R30–R39 (kiln plan
 `01a1751638e773b98b5092662fc06bf5`), and step 5's, R50–R59 (kiln plan
 `01a17604e26a73e187efb3a2859aaacb`); the other steps take their ranges as they come. Commits
-before this one call this workstream "W25 step N".
+before this one call this workstream "W25 step N". Step 6's, admission, are R60–R69 (kiln plan `01a17603d7cd701bb0a238c056af91ae`).
 
 **Requirements: the conflict graph**
 
@@ -7895,8 +7900,223 @@ before this one call this workstream "W25 step N".
   same tree and every unit the key it has with its own change alone; and every decision names
   only what its two changes share. *Property test* (`cargo test -p kiln-ci land::conflict`).
 
-**Progress.** R30–R34 and AC30 built (2026-10-25) in `kiln_ci::land::conflict`. The land queue
-doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.rs`.
+**Requirements: deploys by what they share**
+
+- **W28-R38 Deploys of independent targets run at once.** `kiln_cd::deploys`, pure: a deploy's
+  target is an app at its destination; besides it, a deploy holds its place (the target's cluster
+  and namespace), its app, and each object it deploys that another app deploys too. Deploys that
+  share none of these run at once. Deploys of different targets that share one take turns, oldest
+  first: one under way holds what it shares whatever its age, one ready to go holds it for those
+  behind it, and one its own gates hold (an approval, a soak, a window) holds nothing. Deploys of
+  one target coalesce to the newest revision, as rollouts supersede (docs/cd-targets.md §5): a
+  newer deploy takes an older one's place once its gates let it go, and a rolling one's once its
+  own write is done; a write is never cut short, its successor waiting for it so the newer
+  revision lands on top. The release worker (`crates/kiln/src/deploy`) carries the decisions out:
+  a superseded release ends cancelled, naming the release that took its place.
+- **W28-R39 Every wait names its resource.** Each deploy is decided against each deploy ahead of
+  it, and each under way behind it, and a wait says what the two share: `waits for release 5:
+  both deploy to prod's shop-web namespace`. The other decisions say why too: `deploys beside
+  release 4: nothing shared`, `goes before release 6, which its gates hold: both deploy app web`,
+  `supersedes release 3: the newest revision of web in staging rolls out`.
+
+**Acceptance criteria: deploys**
+
+- **W28-AC38 Deploys by what they share.** Three deploys, app a in namespace x, app b in namespace
+  y and app a again: a and b roll out together, and the second a supersedes the first, which rolls
+  on until the second's write is done. Over 10,000 random queues run to the end as the release
+  worker runs them: no two deploys under way of different targets share a resource; a target's
+  writes start oldest first, one at a time, none cut short; each target's newest deploy rolls out
+  and every other ends once, finished or superseded by a newer one that rolled out; a deploy that
+  shares nothing starts at once; and every wait names exactly what its two deploys share. *Unit
+  and property tests* (`cargo test -p kiln-cd deploys`, `cargo test -p kiln w28_r38`).
+
+**Requirements: admission** (`kiln_ci::sched::admit`, `intent`, `actor`, and the scheduler)
+
+- **W28-R60 Admission.** Pure: time comes in, decisions and timers go out. A demand is a leg with
+  its lane (a repository's workflow on a branch), its unit (its job and matrix values) and its
+  run's place in the lane (the run's number: the newest is the highest). Admission admits it into
+  its queue, holds it saying why (W05-R13's `coalescing`, `cadence`, `speculation`), or skips it for
+  a newer demand of its lane and unit, naming that one's run. A held leg counts its wait from its
+  arrival. Off until a workflow declares `coalesce:` or `cadence:` (§0.3).
+- **W28-R61 Coalescing.** `coalesce: { quiet, max-wait, when }` (or `true`: a quiet `60s`,
+  `max-wait: 10m`, `when: busy`). A demand whose leg would wait for capacity now is held for
+  `quiet`; each newer demand of its lane and unit skips the one held (cancelled, never started:
+  `coalesced into run N`) and restarts the quiet period, never past `max-wait` from the burst's
+  start; the held one goes as soon as the runners it needs have room. `when: always` holds it
+  whether or not they do. One let go is never skipped, so a steady stream still runs a commit at
+  least every `max-wait`, the newest then.
+- **W28-R62 Cadence.** `cadence: { on: free }` (or `true`) or `{ every: <duration> }`, for
+  exclusive or expensive work (the bench, the macOS release, e2e). At most one demand of a lane and
+  unit waits to start: the newest, which takes the older one's place in the queue (`skipped by its
+  workflow's cadence for run N`). An exclusive one keeps the least busy runner that could take it
+  from other work until it's free, so it starts when its resource frees. `every` starts at most
+  one per interval. The commits it skips get verdicts from coverage (W25 step 5), and a regression
+  is bisected over them.
+- **W28-R63 Measured on the week.** The replay's P4 (`kiln_ci::sched::sim::replay`) runs its
+  coalescing through `kiln_ci::sched::admit`, so what it measures is the implementation; the
+  defaults come from its sweeps (`ci/sim/README.md`): a quiet minute while busy, ten minutes at
+  most, a cadence for exclusive jobs and the macOS release.
+- **W28-R64 Priority by intent.** `[ci.scheduler] priority = "intent"` (the default `event` keeps
+  W05-R09): gate 90 (`land`, `merge_group`, `deploy`, a job that deploys to an environment, and the
+  commit a server runs), waiting 80 (a person's manual run, the `agent` event, a commit an agent's
+  change request with `fix_checks` waits on, a plan run's stack step, `ci.verdict.wait`'s once W25
+  step 5 adds it), trunk 60 (the default branch), WIP 40 (other branches and diffs). Each leg's
+  routing explanation (`ci.legs.routing`'s `standing`) names its class and why.
+- **W28-R65 Aging between classes, fair share within.** A signature keeps a queue per priority,
+  each ordered by fair-share start, then arrival; the next leg comes from the priority whose next
+  leg has the highest `priority + aging_per_minute × minutes waited`. Classes stay strict, a class
+  behind a saturated stream of gate work starts within `(90 − p) / aging` minutes and a leg's time,
+  and fair share holds inside a class however long its legs wait.
+- **W28-R66 Fair share by actor and lane.** `[ci.scheduler] fair_by = ["repo", "actor", "lane"]`
+  (`["repo"]` by default, W05-R10 as it was): inside a repository its active actors share its
+  share equally, and inside an actor its active lanes, as far as the list goes (Buildbarn's nested
+  invocations). Two agents pushing at 10:1 each get half of what they saturate.
+- **W28-R67 Whose a commit is.** Agents push with their machine's git identity, so kiln's records
+  say: the agent token a push came with (`agent:<id>`), else the agent change request whose last
+  pushed commit it is (`agents/change/<agent>`), else a `Kiln-Agent: <name> (<harness>, <id>)`
+  line in its message, else the event's actor, a person. The explanation names which.
+- **W28-R68 Speculation window.** A lane's speculative demands (not its newest: bisection steps,
+  intermediate commits kept for direct verdicts, land candidates past the head) go only while fewer
+  than its window are in flight; a pass widens it by one, a failure halves it, between a floor and
+  a cap (Zuul's window). A lane's newest demand and gate demands are never held by it. The land
+  queue's per-component window (step 9) is the same type.
+- **W28-R69 Defaults from the week.** Every default is the replay's: `quiet` 60 s, `max-wait`
+  600 s, cadence on for exclusive jobs and the macOS release (W25 step 1's sweeps, kept with P4 on
+  admit), and a window of 4 between 1 and 20 (its sweep over P4's bisection runs), all in
+  `ci/sim/README.md` with their numbers.
+
+**Acceptance criteria: admission**
+
+- **W28-AC60 Coalescing.** Idle: a push starts at once. Saturated: pushes every 30 s for 10 min,
+  `quiet: 45s`, `max-wait: 5m`: every older one held is skipped, the newest starts as the runners
+  free or is let go by `max-wait`. *Unit and scheduler simulation tests* (`cargo test -p kiln-ci
+  sched::admit`, `w28_ac60_*`).
+- **W28-AC61 The bench on the week.** The replay's P4 on admit: the bench's queue wait p50 at most
+  900 s (4,601 s measured), each bench run on the newest crates/** commit, the commits it skipped
+  covered and a regression bisected. *Replay test* (`w25_s1_p4_*`).
+- **W28-AC62 Intent.** Gate, waiting, trunk and WIP legs queued together start in that order; a
+  WIP leg behind a steady stream of gate legs starts within 50 minutes and a leg's time.
+  *Scheduler simulation tests.*
+- **W28-AC63 Fair share by actor.** Two agents at 10 and 1 pushes a minute, one repository,
+  `fair_by = ["repo", "actor"]`: each 50 % ± 10 % of slot-time over every 10-minute window.
+  *Scheduler simulation test.*
+- **W28-AC64 Window.** Three speculative demands, a window of 2: the third waits saying
+  `speculation`; a pass admits it; a failure halves the window, never below its floor. *Unit and
+  scheduler tests.*
+- **W28-AC65 Explained.** Every hold and skip names its reason; every attribution its source.
+  *Unit tests* (`w28_r67_attribution`, the reasons in `w28_*`).
+
+**Progress.** R60–R69 and AC60–AC65 built (2026-10-25) in `kiln_ci::sched::{admit, intent, actor}`, the scheduler, the dialect (`coalesce:`, `cadence:`), `[ci.scheduler] priority` and `fair_by`, and the dispatcher; the replay's P4 runs on admit. R30–R34 and AC30 built (2026-10-25) in `kiln_ci::land::conflict`. The land queue
+doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built (2026-10-25): `kiln_cd::deploys` decides, and the release worker in `crates/kiln/src/deploy` carries it out for every release in flight, the objects two apps share read from KilnCD's engine (`Engine::shared_objects`). One target coalescing applies with an environment's `concurrency: queue`; with `reject`, the default, a second release is refused as before.
+
+**Requirements: demands and adopt-on-supersede** (step 4's, R40–R49; kiln plan
+`01a17607cd1273c5836771efb9d377d7`)
+
+- **W28-R40 Demands.** `kiln_ci::sched::demand`, pure: each run is a demand, with its lane (the
+  repository, the workflow, and the branch, stack or pull request W05-R08's `when` names), its
+  commit, its intent (gate, waiting, trunk or wip), its actor and its trust domain. A demand that
+  arrives under `supersede: { action: adopt }`, its branch not in `keep`, withdraws every older
+  live demand of its lane, and cancels nothing itself. Older is by the run's creation, so a run
+  approved late (W18-R06) doesn't withdraw a newer one; a rerun's demand is live again and
+  withdraws nothing.
+- **W28-R41 Domains.** A leg adopts only executions its domain may read: its own domain's, and for
+  untrusted and person scopes trusted ones (W24-R21). Protected adopts nothing, as W24 Decision 4
+  lets it take only results two trusted runners produced identically.
+- **W28-R42 Single-flight.** Work in flight is keyed by its key and domain; the key is W08-R10's
+  input hash until W24's strong keys exist. A leg with a key adopts the execution of its key in
+  flight that its domain may adopt (its own domain's first, then a trusted one), or executes it:
+  one key never has two executions at once within a domain. A leg of a withdrawn run only takes
+  what's in flight. An execution's priority is the highest among the live demands waiting on it.
+  After a restart, a queued duplicate of a running execution adopts it. Ledger hits (W24-R06) stay
+  the dispatcher's, before a leg is queued: the table never reads storage.
+- **W28-R43 Work no one wants.** After a withdrawal, or when a waiter leaves, an execution live
+  demands still want is kept, at their highest priority. One no live demand wants is dropped if it
+  hasn't started (or waits for a retry). Running, it runs on while nothing contends for its
+  capacity. Once live work does, it finishes only if its expected remaining time (its cost less its
+  attempt's time so far) is within `finish_within` (300 s by default, from W25 step 1's sweep) and
+  it seeds trusted entries. Otherwise it is cancelled, naming the warm-workspace lane (W24-R11) its
+  workspace goes back to. Nothing is removed from the ledger.
+- **W28-R44 Endings.** Adopters take an execution's result over, reused and naming it, when it
+  succeeded or failed in class `failure`; never for runner-lost, infra, image-pull, oom, disk-full,
+  timeout or a cancel. In those cases the live adopters ask again in the order they adopted: the
+  first executes in its place, and the rest adopt it where their domain may. Withdrawn adopters
+  take what's in flight or are dropped. An adopter of an execution that read observed path sets
+  checks them at its own commit first (W24-R04), and runs itself on a mismatch. Every decision says
+  why.
+- **W28-R45 The scheduler.** `kiln_ci::sched::state` owns the demand table. A run's demand
+  (`Input::Demand`) comes before its `RunQueued`, whose `Supersede::Adopt` withdraws older demands
+  on its lane. A leg with work (`LegIn.work`) asks the table as it would be queued. Adopting, it
+  holds no runner, slot or quota, and waits (`WaitReason::Adopted`, naming the leg and run).
+  Executing, it's queued as ever, at the highest priority its live demands give. A withdrawn
+  execution still queued is dropped, settled cancelled with why. Running, it goes on until live
+  work that can't be placed contends for a runner or pool it could use. Then, of those, the one with
+  the most time left is cancelled through the cancelling path, unless it finishes within
+  `finish_within` seeding trusted entries. When an execution settles, its adopters end as
+  `Command::Adopted` (reused from it) or carry on as R44 says. Every decision is a
+  `Command::Demand`, said once, with why. After a restart, a running leg announced with work takes
+  over a queued duplicate of it.
+- **W28-R46 The dispatcher.** `supersede:` (W05-R08) is read into `when`, `action`, `keep` and
+  `finish-within`; one that doesn't read is logged and supersedes nothing. A new or approved run
+  supersedes on its lane: the repository, the workflow, and the branch, pull request or stack its
+  event names. A rerun's demand is live again and withdraws nothing, and a restart hands the
+  demands over again in creation order. A demand's commit is the event's sha; its intent comes from
+  the event (a land or merge group is a gate, a dispatch someone waits for, a push to the default
+  branch the trunk's, the rest work in progress); its actor is `github.actor`; its domain is the
+  run's trust. In a run that adopts, every leg has work: its W08-R10 input hash as its key (none
+  without `reuse:`, so never adopted), protected when it's bound to an environment. Ledger hits stay
+  the dispatcher's, before a leg is queued. An adopter takes its execution's result over in place,
+  its steps, outputs and artifacts, `reused_from` naming it, and concludes as it did.
+- **W28-R47 Every decision says why.** Each `Command::Demand` is a notice on its leg, which the
+  run page shows, and the leg's `demand` in `ci.legs.routing`. An adopter's wait reads "Adopted
+  `<leg>` of run `<run>`: the same work in flight".
+- **W28-R48 The replay decides as the scheduler does.** In W25 step 1's replayer, P2 and later ask
+  `kiln_ci::sched::demand` for every withdrawal, adoption, drop, finish and cancel; the moment it
+  made room for live work is contention. Capacity, durations, draws, warm credit and the ledger of
+  finished results stay the replayer's; keys stay the trace's path-set keys; pushes are trusted,
+  and `finish_within` is 300 s.
+- **W28-R49 A cancelled build's workspace is as good as a cold one.** A build cut off by the
+  runner's cancel (W05-R18) leaves what finished recorded and fresh, and what it cut off unrecorded,
+  so the next build there rebuilds it: cargo writes a unit's fingerprint only once the unit
+  finished. That is what a cancelled leg's warm workspace going back to its lane (W24-R11) relies
+  on.
+
+**Acceptance criteria: demands**
+
+- **W28-AC40 Single-flight within domains.** Over 10,000 random sequences of arrivals, asks,
+  starts, endings in every class, fates, departures, checks and restarts: no key ever has two
+  executions at once within a domain; every adoption is one its domain may make; only a live run's
+  leg executes, and only a withdrawn one's is dropped; every leg ends exactly once; and the same
+  steps give the same table. *Property test* (`cargo test -p kiln-ci sched::demand`).
+- **W28-AC41 Two pushes through the scheduler.** Push A, then B touching only docs/ while A's rust
+  leg runs: B's rust leg adopts A's, with one assignment, both settling green, A never cancelled.
+  B touching crates/ while A's rust leg is 30% done and both slots are busy: A's rust leg is
+  cancelled, saying no live demand wants it and it had 140 s left; B's ui leg adopts A's; B's rust
+  leg runs once A's stopped. After a restart that queues B's leg before A's running one is
+  announced, the work runs once. *Simulation test* (`cargo test -p kiln-ci sched::tests::w28`).
+- **W28-AC42 Adopting on a server.** Push A, then B touching only `docs/` while A's rust leg runs:
+  B's rust leg adopts A's, with one execution, both runs green, A not cancelled, and B's leg
+  `reused_from` A's. *E2E* (`cargo test -p kiln --test adopt`).
+- **W28-AC43 Freeing what no one wants.** B touches `crates/` while A's rust leg runs and the
+  runner's slots are full: A's rust leg is cancelled as unwanted, saying why; B's ui leg adopts
+  A's; B's rust leg runs. (Starting on A's warm workspace waits for W24-R11: the cancel names the
+  lane.) *E2E.*
+- **W28-AC44 Restart mid-adoption.** The server killed while B's leg adopts A's: after the restart
+  the work in flight is rebuilt from SQLite, and both legs settle (W05-R25). *E2E.*
+- **W28-AC45 Superseded work, replayed.** Runner time on superseded work no demand used, under P2
+  deciding through `kiln_ci::sched::demand`, median over seeds 1-8 on the recorded week: at most 5%
+  (2.2 runner-h, about 0.6%). P0 still reproduces the week within 5 points, and the same seed gives
+  the same outcome byte for byte. *Replay* (`cargo test -p kiln-ci sched::sim::replay`; the report
+  in ci/sim/README.md).
+- **W28-AC46 A warm build after a mid-build cancel equals a cold one** (W24-AC02 extended). On a
+  fixture workspace (`a` <- `b`, whose build script takes 3 s, <- `c`, a binary), a release build cut
+  off by `kiln::proc::interrupt_group` once `a` finished, then built again in the same target
+  directory at the same path, concludes as a cold build: the same exit status, the same test
+  outcomes, the same binary byte for byte and the same output; `a` is fresh and `b` rebuilt.
+  *Integration test* (`cargo test -p kiln --test warm_cancel`).
+
+**Progress (step 4).** R40–R49 and AC40–AC46 built (2026-10-25) in `kiln_ci::sched::demand`,
+`kiln_ci::sched::state`, `crates/kiln/src/ci/dispatch.rs`, step 1's replayer and
+`crates/kiln/tests/warm_cancel.rs`.
 
 **Requirements: verdicts**
 
@@ -8524,6 +8744,7 @@ in `.github/workflows`. Each key's semantics are in the requirement cited.
 | --- | --- | --- |
 | workflow | `secrets: { NAME: { required } }` | W09-R06 |
 | workflow | `supersede: { when, action, keep }` (O) | W05-R08 |
+| workflow | `coalesce: { quiet, max-wait, when }`, `cadence: { on: free } \| { every }` (O) | W28-R61, W28-R62 |
 | workflow | `routing: { infer: true }` (O) | W05-R19 |
 | workflow | `run-env: true` | W04-R21 |
 | workflow | `kiln: { honour-skip-ci }` (O) | W03-R06 |

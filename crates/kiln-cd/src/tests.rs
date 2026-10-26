@@ -557,6 +557,29 @@ fn a_namespace_another_app_deploys_is_not_shared_with_one_that_makes_it() {
     assert!(h.run_until(30_000, |h| web_namespace(h).is_none()), "{:?}", h.engine.resources("namespaces"));
 }
 
+/// docs/ci.md W28-R38: the config two apps' deploys share is each object both deploy; an app's
+/// own objects, and the namespace it makes, are nobody else's.
+#[test]
+fn w28_r38_shared_objects_are_those_another_app_deploys_too() {
+    let (mut h, git) = harness(fast());
+    let mut a = auto("a");
+    a.create_namespace = Some((Vec::new(), Vec::new()));
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "a", "a1", vec![config_map("settings", "1", json!({})), config_map("a-own", "1", json!({}))]);
+    h.input(Input::UpsertApp(AppConfig::new("b", "dev", "web")));
+    deploy(&mut h, &git, "b", "b1", vec![config_map("settings", "1", json!({})), service("b")]);
+    let mut c = auto("c");
+    c.create_namespace = Some((Vec::new(), Vec::new()));
+    h.input(Input::UpsertApp(c));
+    deploy(&mut h, &git, "c", "c1", vec![config_map("c-own", "1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "a") && settled(h, "c")), "{:?} {:?}", status(&h, "a"), status(&h, "c"));
+    let settings = vec![ResKey::new("", "ConfigMap", "web", "settings")];
+    assert_eq!(h.engine.shared_objects("a"), settings);
+    assert_eq!(h.engine.shared_objects("b"), settings);
+    assert!(h.engine.shared_objects("c").is_empty(), "{:?}", h.engine.shared_objects("c"));
+    assert!(h.engine.shared_objects("nobody").is_empty());
+}
+
 #[test]
 fn shadow_mode_compares_and_never_writes() {
     let (mut h, git) = harness(fast());

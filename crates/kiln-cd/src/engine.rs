@@ -2003,6 +2003,23 @@ impl Engine {
         self.app_by_id.keys()
     }
 
+    /// The objects an app deploys that another app deploys too, in key order: config two apps'
+    /// deploys share (docs/ci.md W28-R38).
+    pub fn shared_objects(&self, id: &str) -> Vec<ResKey> {
+        let Some(&a) = self.app_by_id.get(id) else { return Vec::new() };
+        let Some(app) = self.app(a) else { return Vec::new() };
+        let deploys = |r: &Res| r.desired.is_some() && !r.made;
+        let mut out: Vec<ResKey> = app
+            .resources
+            .iter()
+            .filter_map(|ix| self.res(app.cluster, *ix))
+            .filter(|r| deploys(r) && self.slots(app.cluster, &r.key).iter().filter_map(|s| self.res(app.cluster, s)).any(|s| s.app != r.app && deploys(s)))
+            .map(|r| r.key.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
     /// An app's resources.
     pub fn resources(&self, id: &str) -> Vec<ResourceView> {
         let Some(&a) = self.app_by_id.get(id) else { return Vec::new() };

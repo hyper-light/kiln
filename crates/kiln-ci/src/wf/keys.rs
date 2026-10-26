@@ -356,6 +356,8 @@ pub const WORKFLOW: &[Key] = &[
     gha("cache-mode", Ty::Str, "Cache access for every job: `read`, `write`, `write-only` or `none` (low-trust events default to `read`)."),
     kiln_only("secrets", Ty::Any, "kiln: the secrets this workflow uses (W09-R06)."),
     kiln("supersede", Ty::Any, "kiln: cancel or deprioritize older runs (W05-R08)."),
+    kiln_only("coalesce", Ty::Any, "kiln: `{ quiet, max-wait, when }`: a burst of pushes runs its newest commit while the runners it needs are busy (W28-R61)."),
+    kiln_only("cadence", Ty::Any, "kiln: `{ on: free }` or `{ every }`: the newest commit runs when its runner frees, or once per interval (W28-R62)."),
     kiln("routing", Ty::Any, "kiln: `{ infer: true }` (W05-R19)."),
     kiln_only("run-env", Ty::Bool, "kiln: collect `$KILN_RUN_ENV` into `run.env` (W04-R21)."),
     kiln("kiln", Ty::Any, "kiln: `{ honour-skip-ci, chain-depth }` (W03-R06, R13)."),

@@ -14,7 +14,9 @@ use kiln_ci::plan::{self, Conclusion as PlanC, LegReport, LegSpec, PlanAction, P
 use kiln_ci::sched::groups::GroupConfig;
 use kiln_ci::sched::retry::{Failed, FailureClass, RetryOn, RetryPolicy};
 use kiln_ci::sched::routing::{LegRoute, RunnerView};
-use kiln_ci::sched::{Command, Config, Input, LegIn, Outcome, RunnerIn, Scheduler};
+use kiln_ci::sched::demand::{Demand, Domain, Intent, Supersession, When, Work};
+use kiln_ci::sched::state::Decision;
+use kiln_ci::sched::{Command, Config, Input, LegIn, Outcome, RunnerIn, Scheduler, Supersede};
 use kiln_ci::trigger::Event;
 use kiln_ci::wf::Workflow;
 use kiln_ci::wire::{self, AssignmentV2, JobEventV2};
@@ -267,6 +269,46 @@ fn keep_minutes(debug: Option<&kiln_ci::wf::ir::YVal>) -> Option<u32> {
     Some(u32::try_from(minutes.min(u64::from(crate::runner::kept::MAX_KEEP_MINUTES))).unwrap_or(crate::runner::kept::MAX_KEEP_MINUTES))
 }
 
+/// What a run is for and whose it is (W28-R64, R67): its intent class and its actor, each with why.
+#[derive(Debug, Clone, Default)]
+struct Who {
+    intent: Option<(kiln_ci::sched::intent::Intent, String)>,
+    actor: Option<kiln_ci::sched::actor::Actor>,
+}
+
+/// What a run is for and whose it is, from its event and kiln's records (W28-R64, R67): read only
+/// when the scheduler orders by intent or shares by actor.
+async fn who_of(hub: &Hub, st: &RunSt) -> Who {
+    use kiln_ci::sched::{actor, intent};
+    let s = &hub.cfg.ci.scheduler;
+    if !s.by_intent() && !s.fair_levels().contains(&kiln_ci::sched::FairBy::Actor) {
+        return Who::default();
+    }
+    // Agents' change requests (crate::workspace::change): who pushed which commit last, and who
+    // waits on its checks.
+    let changes: Vec<crate::workspace::change::Record> =
+        hub.store.kv_prefix("agents/change/".into()).await.unwrap_or_default().iter().filter_map(|(_, v)| serde_json::from_str(v).ok()).collect();
+    let sha = st.event.sha.as_str();
+    let mine = |c: &&crate::workspace::change::Record| !sha.is_empty() && c.sha.eq_ignore_ascii_case(sha);
+    let waiting = changes.iter().filter(mine).find(|c| c.fix_checks || c.stack.is_some()).map(|c| {
+        let name = c.change.clone().unwrap_or_else(|| "its change request".into());
+        if c.stack.is_some() { format!("a plan run's step waits on it ({name})") } else { format!("agent {} waits on its verdict to fix its checks ({name})", c.agent) }
+    });
+    let default_branch = st.repo.default_branch.clone().unwrap_or_else(|| "main".into());
+    let server = crate::api::COMMIT;
+    let facts = intent::Facts {
+        event: &st.event.name,
+        branch: st.event.ref_name(),
+        default_branch: &default_branch,
+        deploys: false,
+        server_commit: !server.is_empty() && !sha.is_empty() && sha.eq_ignore_ascii_case(server),
+        waiting: waiting.as_deref(),
+    };
+    let message = st.event.payload.pointer("/head_commit/message").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let refs: Vec<actor::Change> = changes.iter().map(|c| actor::Change { agent: &c.agent, sha: &c.sha, change: c.change.as_deref() }).collect();
+    Who { intent: Some(intent::classify(&facts)), actor: Some(actor::attribute(&actor::Push { sha, pusher: &st.event.actor, message }, &refs)) }
+}
+
 /// What the scheduler gets of a leg: its route, priority, concurrency group and retries.
 fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::ci::Ci) -> LegIn {
     let job = spec.def();
@@ -284,12 +326,34 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
     }
     let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
     let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
+    // The workflow's `coalesce:` and `cadence:` (W28-R60): its lane is the repository's workflow on
+    // this branch, the leg's unit its job and matrix, its place the run's number.
+    let admission = r.plan.admission.any().then(|| {
+        let a = r.plan.admission.millis();
+        kiln_ci::sched::admit::Demand {
+            lane: format!("{}\0{}\0{}", r.repo.id, r.path, r.event.ref_name()),
+            unit: spec.key.clone(),
+            order: r.github.get("run_number").and_then(serde_json::Value::as_u64).unwrap_or_else(|| u64::try_from(r.created).unwrap_or_default()),
+            coalesce: a.coalesce,
+            cadence: a.cadence,
+            speculative: false,
+        }
+    });
+    // Priority by intent (W28-R64), opt-in: a job that deploys is a gate; the rest as its run is.
+    let intent = cfg.scheduler.by_intent().then(|| match spec.environment.as_ref().filter(|e| !e.name.is_empty()) {
+        Some(e) => (kiln_ci::sched::intent::Intent::Gate, format!("it deploys to {}", e.name)),
+        None => r.who.intent.clone().unwrap_or((kiln_ci::sched::intent::Intent::Trunk, "its run wasn't classified".into())),
+    });
     LegIn {
         id: id.to_owned(),
         run: run.to_owned(),
         repo: r.repo.name.clone(),
+        admission,
+        actor: r.who.actor.as_ref().map(|a| a.id.clone()).unwrap_or_default(),
+        lane: format!("{}\0{}\0{}", r.repo.id, r.path, r.event.ref_name()),
+        priority: intent.as_ref().map_or_else(|| priority(&r.event.name), |(i, _)| i.priority()),
+        intent,
         route,
-        priority: priority(&r.event.name),
         exclusive: job.is_some_and(|j| j.kiln.exclusive),
         group,
         retry,
@@ -314,6 +378,7 @@ fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config 
         overcommit_cpu: s.overcommit.cpu,
         overcommit_mem: s.overcommit.memory,
         overcommit_disk: s.overcommit.disk,
+        fair_by: s.fair_levels(),
         ..Config::default()
     }
 }
@@ -481,8 +546,12 @@ struct RunSt {
     /// An outside contributor's run waiting for a maintainer (W18-R06): the concurrency group
     /// it joins once approved.
     awaiting: Option<Awaiting>,
+    /// What it's for and whose it is (W28-R64, R67), when the scheduler orders by them.
+    who: Who,
     /// "Run anyway" (W08-R10): its legs take no earlier result over.
     no_reuse: bool,
+    /// Its workflow's `supersede:`, for its event (W05-R08, W28-R46).
+    sup: Option<Sup>,
 }
 
 /// What an unapproved run is handed to the scheduler with, once it's approved.
@@ -709,10 +778,83 @@ struct Dispatch {
     /// When the runners of legs the rebuild after a restart found running have had their grace to
     /// say hello (ms): a leg whose runner hasn't by then was lost with it ([`Dispatch::absent`]).
     absent_after: Option<i64>,
+    /// Each leg's last decision in demands, for its routing (W28-R47).
+    decisions: HashMap<String, Decision>,
 }
 
 fn now_ms() -> i64 {
     crate::util::now_unix() * 1000
+}
+
+/// A run's `supersede:` (W05-R08, W28-R46): what it does to older runs, the lane it supersedes on,
+/// whether it withdraws there (its branch not in `keep`), and its `finish-within`.
+#[derive(Debug, Clone)]
+struct Sup {
+    lane: String,
+    action: Supersede,
+    withdraws: bool,
+    finish_within: i64,
+}
+
+/// How a run reaches the scheduler: new (or approved), rerun (its demand live again, withdrawing
+/// nothing), or rebuilt after a restart (withdrawals worked out again, in creation order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arrival {
+    New,
+    Rerun,
+    Restore,
+}
+
+/// The run's supersession, when its workflow declares one and its event is one `when` names: on
+/// the repository, the workflow, and the branch or pull request (or W14 stack).
+fn sup_of(wf: &Workflow, repo: &Repo, path: &str, event: &str, github: &serde_json::Value) -> Option<Sup> {
+    let s = match Supersession::from_yval(wf.supersede.as_ref()?) {
+        Ok(s) => s?,
+        Err(e) => {
+            tracing::warn!(workflow = %path, error = %e, "the workflow's supersede doesn't read; nothing is superseded");
+            return None;
+        }
+    };
+    let text = |p: &str| github.pointer(p).map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned));
+    let scope = s.when.iter().find_map(|w| match w {
+        When::Branch if event == "push" => text("/ref").filter(|r| r.starts_with("refs/heads/")).map(|r| format!("branch:{r}")),
+        When::PullRequest if event.starts_with("pull_request") => text("/event/pull_request/number").or_else(|| text("/event/number")).map(|n| format!("pr:{n}")),
+        When::Stack if event == "diff" => text("/event/stack").map(|n| format!("stack:{n}")),
+        _ => None,
+    })?;
+    let branch = text("/ref_name").unwrap_or_default();
+    Some(Sup { lane: format!("{}\0{path}\0{scope}", repo.id), action: s.action, withdraws: !s.keep.contains(&branch), finish_within: s.finish_within })
+}
+
+/// A run's demand (W28-R40, R46): its commit, its intent by event (a land or merge group is a
+/// gate, a dispatch someone waits for, a push to the default branch the trunk's, the rest work in
+/// progress), the actor that pushed it, and its trust.
+fn demand_of(run: &str, r: &RunSt, sup: &Sup) -> Demand {
+    let text = |p: &str| r.github.pointer(p).and_then(serde_json::Value::as_str);
+    let default = text("/event/repository/default_branch").unwrap_or("main");
+    let intent = match r.event.name.as_str() {
+        "land" | "merge_group" => Intent::Gate,
+        "workflow_dispatch" => Intent::Waiting,
+        "push" if text("/ref_name") == Some(default) => Intent::Trunk,
+        _ => Intent::Wip,
+    };
+    let domain = if r.trusted { Domain::Trusted } else { Domain::Untrusted };
+    Demand { run: run.to_owned(), lane: sup.lane.clone(), commit: r.event.sha.clone(), intent, actor: text("/actor").map(str::to_owned), domain, at: r.created.saturating_mul(1000) }
+}
+
+/// A leg's work (W28-R42, R46), in a run whose workflow adopts: its W08-R10 input hash as its key
+/// (a leg without `reuse:` has none, and is never adopted); its run's trust as its domain, or
+/// protected when it's bound to an environment; its job as its warm lane.
+fn work_of(r: &RunSt, spec: &LegSpec, key: Option<String>) -> Option<Work> {
+    if !r.sup.as_ref().is_some_and(|s| s.action == Supersede::Adopt) {
+        return None;
+    }
+    let domain = match (spec.environment.as_ref().is_some_and(|e| !e.name.is_empty()), r.trusted) {
+        (true, _) => Domain::Protected,
+        (false, true) => Domain::Trusted,
+        (false, false) => Domain::Untrusted,
+    };
+    Some(Work { key, domain, lane: format!("{}/{}/{}", r.repo.name, r.path, spec.job), observed: false })
 }
 
 /// Default priority by event (W05-R09).
@@ -775,6 +917,7 @@ pub fn spawn(hub: Arc<Hub>) {
             in_commands: false,
             pods: std::collections::HashSet::new(),
             absent_after: None,
+            decisions: HashMap::new(),
         };
         // A test build's fault: the rebuild late, so the runners say hello first (W22-AC04).
         if let Some(late) = crate::runner::chaos::get().and_then(|c| c.rebuild_after) {
@@ -856,7 +999,8 @@ impl Dispatch {
                 r.map(|_| ())
             }
             Msg::Explain { leg, reply } => {
-                let v = serde_json::json!({ "leg": leg, "known": self.legs.contains_key(&leg), "wait_reason": self.sched.reason(&leg), "runners": self.sched.explain(&leg) });
+                let demand = self.decisions.get(&leg).map(|d| serde_json::json!({ "decision": d, "why": d.why() }));
+                let v = serde_json::json!({ "leg": leg, "known": self.legs.contains_key(&leg), "wait_reason": self.sched.reason(&leg), "standing": self.sched.standing(&leg), "runners": self.sched.explain(&leg), "demand": demand });
                 let _ = reply.try_send(v);
                 Ok(())
             }
@@ -1136,7 +1280,9 @@ impl Dispatch {
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let costs = super::insights::costs(&self.hub, &s.repo.id, &s.path).await;
-        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false };
+        let sup = sup_of(&s.workflow, &s.repo, &s.path, &s.event.name, &github);
+        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, who: Who::default(), sup };
+        st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         if approval {
             runs::set_approval(&self.hub, &id, "required", None).await?;
@@ -1150,9 +1296,40 @@ impl Dispatch {
         self.runs.insert(id.clone(), st);
         self.hub.ci.runs.lock().insert(id.clone());
         self.hub.emit_run(&id).await;
-        let cmds = self.sched.handle(Input::RunQueued { run: id, group, supersede: None }, now_ms());
+        let cmds = self.run_queued(&id, group, Arrival::New);
         self.commands(cmds).await;
         Ok(())
+    }
+
+    /// Hands a run to the scheduler (W05-R06, W05-R08, W28-R40, R46): its demand first when its
+    /// workflow adopts, then its `RunQueued`, superseding older runs on its lane as its arrival
+    /// lets it.
+    fn run_queued(&mut self, run: &str, group: Option<(String, String, GroupConfig)>, arrival: Arrival) -> Vec<Command> {
+        let mut cmds = Vec::new();
+        let mut supersede = None;
+        if let Some((s, d)) = self.runs.get(run).and_then(|r| r.sup.as_ref().map(|s| (s.clone(), demand_of(run, r, s)))) {
+            if s.action == Supersede::Adopt {
+                cmds.extend(self.sched.handle(Input::Demand(Box::new(d)), now_ms()));
+            }
+            supersede = match arrival {
+                Arrival::New if s.withdraws => Some((s.lane, s.action)),
+                Arrival::Restore if s.withdraws && s.action == Supersede::Adopt => Some((s.lane, s.action)),
+                _ => None,
+            };
+        }
+        cmds.extend(self.sched.handle(Input::RunQueued { run: run.to_owned(), group, supersede }, now_ms()));
+        cmds
+    }
+
+    /// An adopter's execution ended (W28-R44): it takes `from`'s result over in place, its row
+    /// `reused_from` naming it, and concludes as `from` did.
+    async fn adopted(&mut self, leg: &str, from: &str, outcome: Outcome) -> anyhow::Result<()> {
+        if let Some(report) = super::reuse::adopt_into(&self.hub, leg, from).await?
+            && let Some(l) = self.legs.get_mut(leg)
+        {
+            l.report = report_from_json(&report);
+        }
+        self.settled(leg, outcome, Some(format!("reused from {from}, the same work it adopted"))).await
     }
 
     /// A maintainer's decision on an outside contributor's run (W18-R06).
@@ -1161,7 +1338,7 @@ impl Dispatch {
         runs::set_approval(&self.hub, run, if approve { "approved" } else { "rejected" }, Some(by)).await?;
         if approve {
             self.hub.emit_run(run).await;
-            let cmds = self.sched.handle(Input::RunQueued { run: run.to_owned(), group: waiting.group, supersede: None }, now_ms());
+            let cmds = self.run_queued(run, waiting.group, Arrival::New);
             self.commands(cmds).await;
         } else {
             self.cancel_run(run, &format!("{by} didn't approve it")).await?;
@@ -1522,12 +1699,14 @@ impl Dispatch {
         let path = run_path(&github);
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
         // A maintainer reruns it: that is approval enough, as on GitHub.
-        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse };
+        let sup = sup_of(&wf, &repo, &path, &event.name, &github);
+        let mut st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, who: Who::default(), sup };
+        st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
         self.hub.ci.runs.lock().insert(run.to_owned());
         self.hub.emit_run(run).await;
-        let cmds = self.sched.handle(Input::RunQueued { run: run.to_owned(), group, supersede: None }, now_ms());
+        let cmds = self.run_queued(run, group, Arrival::Rerun);
         self.commands(cmds).await;
         Ok(attempt)
     }
@@ -1700,7 +1879,10 @@ impl Dispatch {
         let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
-        let leg = leg_in(r, run, &id, &spec, &self.hub.cfg.ci);
+        let mut leg = leg_in(r, run, &id, &spec, &self.hub.cfg.ci);
+        // W28-R46: a run that adopts gives its legs work, keyed by W08-R10's input hash.
+        leg.work = work_of(r, &spec, reuse.as_ref().map(|(h, _)| h.clone()));
+        leg.finish_within = r.sup.as_ref().map(|s| s.finish_within);
         let dockerless = dockerless_pod(&self.sched, r, &spec, &leg.route);
         self.legs.insert(
             id.clone(),
@@ -1850,6 +2032,15 @@ impl Dispatch {
                     self.timers.insert(at);
                     Ok(())
                 }
+                // W28-R47: every decision in demands says why, on the leg's page (a notice) and in
+                // its routing (`demand`).
+                Command::Demand { leg, decision } => {
+                    let r = runs::annotation(&self.hub, &leg, None, "notice", Some("demand".into()), &decision.why(), None, None, None, None, None).await;
+                    self.decisions.insert(leg.clone(), decision);
+                    self.hub.emit_job(&leg).await;
+                    r
+                }
+                Command::Adopted { leg, from, outcome } => self.adopted(&leg, &from, outcome).await,
             };
             if let Err(e) = r {
                 tracing::warn!(error = %format!("{e:#}"), "CI dispatcher command");
@@ -2512,6 +2703,7 @@ impl Dispatch {
     /// preview, W15-R07): its deployment's last status, its row, and the plan told.
     async fn concluded(&mut self, leg: &str, c: PlanC, reason: Option<String>) -> anyhow::Result<()> {
         let Some(l) = self.legs.remove(leg) else { return Ok(()) };
+        self.decisions.remove(leg);
         // A deployment ends here: the next its environment holds may go (W15-R01).
         if let Some((env, repo)) = l.spec.environment.as_ref().map(|e| e.name.clone()).zip(self.runs.get(&l.run).map(|r| r.repo.id.clone())) {
             Box::pin(self.next_deployments(&repo, &env)).await?;
@@ -2695,7 +2887,9 @@ impl Dispatch {
         } else {
             (None, None)
         };
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false) };
+        let sup = sup_of(&wf, &repo, &path, &event.name, &input.github);
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup };
+        st.who = who_of(&self.hub, &st).await;
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
             st.keys.insert(key.clone(), id.clone());
@@ -2729,7 +2923,10 @@ impl Dispatch {
                     gone: false,
                 },
             );
-            let li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci);
+            let mut li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci);
+            // Its work again, from the input hash it was queued with (W28-R46, W05-R25).
+            li.work = work_of(&st, &spec, super::reuse::hash_of(&self.hub, &id).await.ok().flatten());
+            li.finish_within = st.sup.as_ref().map(|s| s.finish_within);
             match (s, agent) {
                 // Running on `a` as the store has it; `a` says whether it still is. A runner that
                 // said hello while this rebuilt said what it runs (what it left out it lost:
@@ -2749,7 +2946,10 @@ impl Dispatch {
             // Still waiting for a maintainer: nothing goes to the scheduler until then.
             return Ok(());
         }
-        let _ = self.sched.handle(Input::RunQueued { run: run.to_owned(), group: None, supersede: None }, now_ms());
+        // Its demand again, so withdrawals are worked out afresh in creation order (W28-R46). It has
+        // started already.
+        let cmds: Vec<Command> = self.run_queued(run, None, Arrival::Restore).into_iter().filter(|c| !matches!(c, Command::StartRun { .. })).collect();
+        self.commands(cmds).await;
         for li in queued {
             // Held for its environment before the restart: held again, its wait counted from then.
             if let Some(env) = self.legs.get(&li.id).and_then(|l| l.spec.environment.as_ref()).map(|e| e.name.clone()).filter(|n| !n.is_empty()) {

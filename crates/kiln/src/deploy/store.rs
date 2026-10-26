@@ -416,7 +416,7 @@ pub async fn releases(store: Recs<'_>, q: ReleaseQuery) -> anyhow::Result<Vec<Re
 }
 
 /// The releases in flight for a registration, oldest first.
-async fn flying(store: Recs<'_>, app: &str, env: &str) -> anyhow::Result<Vec<Release>> {
+pub async fn flying(store: Recs<'_>, app: &str, env: &str) -> anyhow::Result<Vec<Release>> {
     let mut out = Vec::new();
     for row in rows(store, IN_FLIGHT, &under(&[app, env]), LISTED).await? {
         let Some(id) = number(&row.key, false) else { continue };
@@ -436,6 +436,20 @@ pub async fn newest_in_flight(store: Recs<'_>, app: &str, env: &str) -> anyhow::
 /// A registration's release in flight, if any: the oldest, when several wait their turn.
 pub async fn in_flight(store: Recs<'_>, app: &str, env: &str) -> anyhow::Result<Option<Release>> {
     Ok(flying(store, app, env).await?.into_iter().next())
+}
+
+/// Every release in flight, of every registration, oldest first: the deploy queue (docs/ci.md
+/// W28-R38).
+pub async fn in_flight_all(store: Recs<'_>) -> anyhow::Result<Vec<Release>> {
+    let mut out = Vec::new();
+    for row in rows(store, IN_FLIGHT, &[], LISTED).await? {
+        let Some(id) = number(&row.key, false) else { continue };
+        if let Some(r) = release(store, id).await?.filter(|r| r.state.in_flight()) {
+            out.push(r);
+        }
+    }
+    out.sort_by_key(|r| r.id);
+    Ok(out)
 }
 
 // ------------------------------------------------------------------ the work queue

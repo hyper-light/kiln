@@ -46,7 +46,8 @@ pub struct Environment {
     pub sync: SyncSettings,
     #[serde(default)]
     pub watch: WatchSettings,
-    /// A release asked for while another is in flight: refused (`reject`) or kept waiting (`queue`).
+    /// A release asked for while another of its registration is in flight: refused (`reject`), or
+    /// taking its place (`queue`), the newest revision rolling out (docs/ci.md W28-R38).
     #[serde(default)]
     pub concurrency: Concurrency,
     /// What agents may do here (docs/cd-targets.md D6). Nothing, by default: a person releases.
