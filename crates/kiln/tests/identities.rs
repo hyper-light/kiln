@@ -153,9 +153,14 @@ fn w27_r01_each_runner_process_its_own_identity() -> anyhow::Result<()> {
     let mine = first.iter().find(|i| field(i, "subject") == main_uri).cloned().unwrap_or_default();
     assert_eq!(field(&mine, "verified"), "runner fedora-2 (instance main), enrolled by admin, of hyper-light", "{mine}");
     // Its certificate is on the machine; its key isn't anywhere on disk.
+    // The runner writes its certificate once it has it, a moment after the server records it.
     let ids = dir.path().join("fedora-2-state/identities");
-    let files: Vec<String> = std::fs::read_dir(&ids)?.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-    assert!(files.iter().any(|f| f.starts_with("main-runner")), "{files:?}");
+    let names = || -> Vec<String> { std::fs::read_dir(&ids).map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default() };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !names().iter().any(|f| f.starts_with("main-runner")) {
+        anyhow::ensure!(Instant::now() < deadline, "the runner never wrote its certificate: {:?}", names());
+        std::thread::sleep(Duration::from_millis(100));
+    }
     for f in walk(dir.path())? {
         let text = std::fs::read_to_string(&f).unwrap_or_default();
         assert!(!(text.contains("PRIVATE KEY") && f.starts_with(&ids)), "a key written beside the identities: {}", f.display());
@@ -185,7 +190,9 @@ fn walk(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
     let mut out = Vec::new();
     let mut todo = vec![dir.to_path_buf()];
     while let Some(d) = todo.pop() {
-        for e in std::fs::read_dir(&d)?.filter_map(|e| e.ok()) {
+        // A folder gone since it was listed (a runner's temporary files) is skipped.
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.filter_map(|e| e.ok()) {
             let p = e.path();
             if p.is_dir() {
                 todo.push(p);
