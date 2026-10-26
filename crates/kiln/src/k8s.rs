@@ -572,6 +572,7 @@ mod tests {
             spec: Some(planned),
             steps: Vec::new(),
             matrix: None,
+            placement: None,
         }
     }
 

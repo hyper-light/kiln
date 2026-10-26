@@ -52,6 +52,7 @@ pub mod smtp;
 pub mod repo_config;
 pub mod results;
 pub mod rest;
+pub mod retry;
 pub mod reusable;
 pub mod review;
 pub mod review_cli;

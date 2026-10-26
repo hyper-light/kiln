@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::demand::{self, Ask, Demand, Demands, End, Fate, Next, Running, Work};
 use super::admit::{self, Admit, Held, Skipped};
@@ -159,6 +159,31 @@ pub struct LegIn {
     /// Its workflow's file (`.kiln/ci.yaml`), as runners' lanes name its jobs: what `affinity: {
     /// job }` and a `warm` term without a lane go by (W24-R18).
     pub workflow_file: String,
+    /// Where a person's retry asked it to run (W05-R28).
+    pub placement: Placement,
+}
+
+/// Where a person's retry asked a leg to run (W05-R28): only on `runner`, or on any runner but
+/// `avoid` (the one it ran on). It narrows what the leg's requirements allow, never widens it, and
+/// holds through the attempt's own retries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Placement {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avoid: Option<String>,
+}
+
+impl Placement {
+    pub fn is_empty(&self) -> bool {
+        self.runner.is_none() && self.avoid.is_none()
+    }
+
+    /// Whether it lets the leg run on `runner`.
+    pub fn allows(&self, runner: &str) -> bool {
+        self.runner.as_deref().is_none_or(|r| r == runner) && self.avoid.as_deref() != Some(runner)
+    }
 }
 
 /// A runner that can take legs.
@@ -258,8 +283,17 @@ pub enum WaitReason {
     /// The runners or pool that could take it are kept for other legs until `until` (W05-R12).
     Reservation { reservation: String, until: i64 },
     /// Only `avoided` could take it, and it waits for another: as its retry policy asks
-    /// (`runner: different`), or as that one refused it (W05-R16).
-    OtherRunner { avoided: String, refused: bool },
+    /// (`runner: different`), as that one refused it (W05-R16), or as a person's retry asked
+    /// (`asked`, W05-R28).
+    OtherRunner {
+        avoided: String,
+        refused: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        asked: bool,
+    },
+    /// Only `runner` may run it, as a person's retry asked (W05-R28), and that runner can't take
+    /// it now.
+    Pinned { runner: String, state: PinnedState },
     /// It adopted `leg` of `run`, the same work in flight, and waits for it to end (W28-R42).
     Adopted { leg: String, run: String },
     /// Held to coalesce a burst of its lane while the runners it needs are busy (W28-R61): until
@@ -276,6 +310,18 @@ pub enum WaitReason {
     /// where it could start now, until `until` (unix ms) at most: its `warm` or `affinity` term's
     /// patience (W24-R18).
     Warm { runner: String, saves_s: u64, until: i64 },
+}
+
+/// Why the runner a retry asked for can't take its leg now (W05-R28).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PinnedState {
+    /// Every slot taken (or its room held by a reservation or another's exclusive leg).
+    Busy,
+    Draining,
+    Offline,
+    /// It no longer meets the leg's requirements.
+    Unable,
 }
 
 impl From<Held> for WaitReason {
@@ -361,6 +407,9 @@ enum State {
     Checking { from: String, outcome: Outcome },
     Done,
 }
+
+/// How long a leg a person's retry placed on a runner waits when that runner refuses it (W05-R28).
+pub const REFUSED_AGAIN_MS: i64 = 15_000;
 
 /// Why a leg stays off a runner (W05-R16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,10 +591,23 @@ impl Scheduler {
                 if let Some(runner) = self.release(&leg) {
                     self.stopped(&leg);
                     self.discard_used(&leg, &mut out);
-                    if let Some(l) = self.legs.get_mut(&leg) {
-                        l.avoid = Some((runner.clone(), Off::Refused));
+                    // Refused by the runner a person's retry asked for (W05-R28): only it may run
+                    // the leg, so it's asked again in a while, as v1 offers a declined job again.
+                    if self.legs.get(&leg).is_some_and(|l| l.input.placement.runner.as_deref() == Some(runner.as_str())) {
+                        let at = now + REFUSED_AGAIN_MS;
+                        if let Some(l) = self.legs.get_mut(&leg) {
+                            l.state = State::Retrying { at };
+                        }
+                        self.timers.entry(at).or_default().push(leg.clone());
+                        out.push(Command::Timer { at });
+                        let name = self.runners.get(&runner).map_or_else(|| runner.clone(), |r| r.input.view.name.clone());
+                        self.set_reason(&leg, WaitReason::Pinned { runner: name, state: PinnedState::Busy }, &mut out);
+                    } else {
+                        if let Some(l) = self.legs.get_mut(&leg) {
+                            l.avoid = Some((runner.clone(), Off::Refused));
+                        }
+                        self.enqueue(&leg, now, &mut out);
                     }
-                    self.enqueue(&leg, now, &mut out);
                     self.try_runner(&runner, now, &mut out);
                 }
             }
@@ -1084,10 +1146,10 @@ impl Scheduler {
         order.into_iter().map(|(_, r)| r.input.id.clone()).collect()
     }
 
-    /// Whether a runner other than `avoided` could take a leg: one connected, eligible for it and
-    /// not draining, with room now or not.
+    /// Whether a runner other than `avoided` could take a leg: one connected, eligible for it, not
+    /// draining and allowed by its placement, with room now or not.
     fn another_could(&self, l: &Leg, avoided: &str) -> bool {
-        self.sigs.get(&l.sig).is_some_and(|s| s.eligible.iter().any(|id| id != avoided && self.runners.get(id).is_some_and(|r| !r.draining)))
+        self.sigs.get(&l.sig).is_some_and(|s| s.eligible.iter().any(|id| id != avoided && l.input.placement.allows(id) && self.runners.get(id).is_some_and(|r| !r.draining)))
     }
 
     /// Tries again the runners that queued legs stay off only while another could take them
@@ -1131,11 +1193,16 @@ impl Scheduler {
         }
         if let Some((a, off)) = &l.avoid
             && *a == r.input.id
+            // The runner a person's retry asked for (W05-R28): the leg waits for it, not another.
+            && l.input.placement.runner.as_deref() != Some(a.as_str())
             && (*off != Off::Lost || self.another_could(l, a))
         {
             return false;
         }
         if l.pin.as_deref().is_some_and(|p| p != r.input.id) {
+            return false;
+        }
+        if !l.input.placement.allows(&r.input.id) {
             return false;
         }
         if let Some(q) = self.config().quotas.get(&l.input.repo)
@@ -1679,12 +1746,14 @@ impl Scheduler {
         }
     }
 
-    /// Whether a runner may take legs of `req`: a hosted executor's own runner only its pool's
-    /// (W13-R07), and no other runner those; the rest as routing decides.
+    /// Whether a runner may take legs of `req`: connected, and [`Scheduler::routable`].
     fn eligible_for(&self, req: &Requirement, r: &Runner) -> bool {
-        if !r.connected {
-            return false;
-        }
+        r.connected && self.routable(req, r)
+    }
+
+    /// Whether a runner, connected or not, could take legs of `req`: a hosted executor's own
+    /// runner only its pool's (W13-R07), and no other runner those; the rest as routing decides.
+    fn routable(&self, req: &Requirement, r: &Runner) -> bool {
         let hosted = req.pool.as_deref().and_then(|p| self.pool(p)).is_some_and(|p| p.hosted);
         match r.input.executor.as_deref() {
             Some(e) => hosted && self.executors.get(e).is_some_and(|x| Some(x.pool.as_str()) == req.pool.as_deref()),
@@ -2276,12 +2345,31 @@ impl Scheduler {
         if let Some(h) = &l.hold {
             return WaitReason::Warm { runner: h.name.clone(), saves_s: h.saves_s, until: h.until };
         }
-        let eligible: Vec<&Runner> = self.sigs.get(&l.sig).map(|s| s.eligible.iter().filter_map(|r| self.runners.get(r)).collect()).unwrap_or_default();
+        let routed: Vec<&Runner> = self.sigs.get(&l.sig).map(|s| s.eligible.iter().filter_map(|r| self.runners.get(r)).collect()).unwrap_or_default();
+        // Of those, the ones a person's retry lets it run on (W05-R28).
+        let eligible: Vec<&Runner> = routed.iter().copied().filter(|r| l.input.placement.allows(&r.input.id)).collect();
         // Every runner that could take it is kept for other legs: until the first window ends.
         if !eligible.is_empty()
             && let Some((name, until)) = eligible.iter().map(|r| self.reserved_against(r, l)).collect::<Option<Vec<_>>>().and_then(|all| all.into_iter().min_by_key(|(_, u)| *u))
         {
             return WaitReason::Reservation { reservation: name, until };
+        }
+        let name = |id: &str| self.runners.get(id).map_or_else(|| id.to_owned(), |r| r.input.view.name.clone());
+        if let Some(p) = &l.input.placement.runner {
+            let state = match self.runners.get(p) {
+                Some(r) if !r.connected => PinnedState::Offline,
+                Some(r) if !self.routable(&l.req, r) => PinnedState::Unable,
+                Some(r) if r.draining => PinnedState::Draining,
+                Some(_) => PinnedState::Busy,
+                None => PinnedState::Offline,
+            };
+            return WaitReason::Pinned { runner: name(p), state };
+        }
+        if let Some(a) = &l.input.placement.avoid
+            && eligible.is_empty()
+            && !routed.is_empty()
+        {
+            return WaitReason::OtherRunner { avoided: name(a), refused: false, asked: true };
         }
         if let (Some(pool), false) = (&l.req.pool, eligible.is_empty()) {
             let mine: Vec<&Executor> = self.executors.values().filter(|e| e.pool == *pool).collect();
@@ -2298,8 +2386,7 @@ impl Scheduler {
             && !eligible.is_empty()
             && eligible.iter().all(|r| r.input.id == *a)
         {
-            let avoided = self.runners.get(a).map_or_else(|| a.clone(), |r| r.input.view.name.clone());
-            return WaitReason::OtherRunner { avoided, refused: *off == Off::Refused };
+            return WaitReason::OtherRunner { avoided: name(a), refused: *off == Off::Refused, asked: false };
         }
         // Heavy, and held off by their load the runners that could take it (W24-R19).
         let held: Vec<super::load::Held> = eligible.iter().filter(|r| r.connected && !r.draining).filter_map(|r| self.held_by_load(r, l)).collect();
@@ -2348,7 +2435,8 @@ impl Scheduler {
             .values()
             .enumerate()
             .map(|(i, r)| {
-                let checks = routing::checks(&l.req, &r.input.view);
+                let mut checks = routing::checks(&l.req, &r.input.view);
+                checks.extend(placement_check(&l.input.placement, r));
                 Explained {
                     runner: r.input.id.clone(),
                     name: r.input.view.name.clone(),
@@ -2447,6 +2535,16 @@ pub struct Warmth {
 /// Seconds as whole milliseconds.
 fn ms(s: f64) -> i64 {
     (s * 1000.0).round() as i64
+}
+
+/// A person's retry's placement as one more check of a runner, for explanations (W05-R28).
+fn placement_check(p: &Placement, r: &Runner) -> Option<Check> {
+    let (requirement, pass) = match (&p.runner, &p.avoid) {
+        (Some(x), _) => (format!("runner == {x} (asked by its retry)"), r.input.id == *x),
+        (None, Some(x)) => (format!("runner != {x} (asked by its retry)"), r.input.id != *x),
+        (None, None) => return None,
+    };
+    Some(Check { requirement, value: format!("runner = {}", r.input.view.name), pass })
 }
 
 fn add(a: &mut Resources, b: &Resources) {
