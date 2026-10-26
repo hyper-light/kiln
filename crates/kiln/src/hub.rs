@@ -250,14 +250,19 @@ impl Pending {
 
 /// Which of a runner process's command streams `msg` rides (docs/wire.md, "Commands"): live for
 /// a command refused while its runner is away, parked for one that waits for it. A `HarnessCmd`
-/// rides as the command it carries says. None: not a command.
+/// rides as the command it carries says, but for a message with an id, which rides live (CP-T3.2):
+/// it goes this way only to a process whose inbox isn't known (one from before inboxes, or one just
+/// connected that hasn't said yet), with no epoch, and parked it would go once that process was
+/// back, though its session went on elsewhere meanwhile and took it there, sent again under its id
+/// (the twenty-second adversarial check's). Live, a link that drops before it's answered ends it,
+/// and its sender sends it again under its id, wherever its session runs then. None: not a command.
 fn stream_of(msg: &ServerMsg) -> Option<crate::wire::commands::Kind> {
     use crate::wire::commands::Kind as Stream;
     use crate::wire::{Away, Class};
     let class = match (crate::wire::server_class(msg), msg) {
-        (Class::Command(Away::AsItsCommand), ServerMsg::HarnessCmd { json, .. }) => {
-            serde_json::from_str::<crate::harness::model::Command>(json).map_or(Class::Command(Away::Park), |c| crate::wire::command_class(&c))
-        }
+        (Class::Command(Away::AsItsCommand), ServerMsg::HarnessCmd { json, .. }) => serde_json::from_str::<crate::harness::model::Command>(json).map_or(Class::Command(Away::Park), |c| {
+            if crate::harness::registry::message_id(&c).is_some() { Class::Command(Away::Refuse) } else { crate::wire::command_class(&c) }
+        }),
         (c, _) => c,
     };
     match class {
@@ -3066,6 +3071,23 @@ pub(crate) mod tests {
             anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(1), "kept across its runner's Open: {kept:?}");
             Ok(())
         })
+    }
+
+    /// CP-T3.2 (the twenty-second adversarial check's): a message with an id that rides a
+    /// `HarnessCmd` (to a process whose inbox isn't known) rides the live stream, so it's never kept
+    /// for a runner that's away and sent there once it's back; one without an id still parks,
+    /// unchecked, and so does a change to the queue.
+    #[test]
+    fn a_message_with_an_id_rides_the_live_stream_and_one_without_parks() {
+        use crate::harness::model::{Command, SendMode};
+        use crate::wire::commands::Kind as Stream;
+        let cmd = |c: Command| ServerMsg::HarnessCmd { session: "s".into(), json: serde_json::to_string(&c).unwrap_or_default() };
+        let send = |id: &str| Command::Send { id: id.into(), text: "hi".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+        assert_eq!(stream_of(&cmd(send("m1"))), Some(Stream::Live), "a message with an id");
+        assert_eq!(stream_of(&cmd(Command::SkillRun { name: "review".into(), args: None, id: Some("k1".into()), mode: Default::default() })), Some(Stream::Live), "a skill run with an id");
+        assert_eq!(stream_of(&cmd(send(""))), Some(Stream::Parked), "a message without one");
+        assert_eq!(stream_of(&cmd(Command::SkillRun { name: "review".into(), args: None, id: None, mode: Default::default() })), Some(Stream::Parked), "a skill run without one");
+        assert_eq!(stream_of(&cmd(Command::QueueRemove { id: "m1".into() })), Some(Stream::Parked), "a change to the queue");
     }
 
     /// A job's `requires` route it by the runner's facts (docs/ci.md W05-R22): the release's
