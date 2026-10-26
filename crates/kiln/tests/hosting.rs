@@ -3456,10 +3456,9 @@ fn w26_r02_a_blocking_thread_holds_a_diff_out_of_the_queue() -> anyhow::Result<(
     let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "native repository: {st} {body}");
-    // Ship's list asks `runs.read` of the server (its own rule): dev and lead are viewers there too.
-    let dev = person(&s, "dev", &["developer@repo:acme/app", "viewer"])?;
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
     let rev = person(&s, "rev", &["developer@repo:acme/app"])?;
-    let lead = person(&s, "lead", &["maintainer@repo:acme/app", "viewer"])?;
+    let lead = person(&s, "lead", &["maintainer@repo:acme/app"])?;
     must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(work.join(".kiln"))?;
