@@ -199,7 +199,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 48 of F-21's 50 green, four of them needing accounts and passing in dry configurations against stand-ins (AWS's two, Google's, Codecov's); azure/login waits for a tenant, and attest-build-provenance for GitHub's Sigstore; AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R30, AC01–AC14; milestones M0–M6 and M1e are kiln goals with plans |
-| W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | ready | specified (2026-10-25): R01–R20, AC01–AC10; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
+| W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | ready | specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | ready | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa` |
 
 ---
@@ -8192,10 +8192,10 @@ their commits, runner and date.
 
 ### W26 Review in Ship: changes as Ship items, each owning its review
 
-**Scope.** Review lives in Ship (the CI/CD Integration agent's page). A change (a kiln diff or
-change request, or a GitHub, GitLab or Bitbucket pull request) is a Ship item from its first push
-to production: drawn by Ship's own row, glyphs and journey, Review the journey's first stage, and
-its review owned by its dropdown: the diff, threads on lines, kinds that gate approval, conflicts
+**Scope.** Review lives in Ship (the CI/CD Integration agent's page). Ship's unit stays the commit (or tag): a
+stacked diff is one commit, and a branch pull request (kiln's, GitHub's, GitLab's or Bitbucket's)
+is its commits. From the first push to production each is drawn by Ship's own row, glyphs and
+journey, Review the journey's first stage, and its review owned by its dropdown: the diff, threads on lines, kinds that gate approval, conflicts
 resolved where they fall, GitHub-flavoured markdown with suggestions, the conversation, and the
 Review lanes. Around it: kiln's own change identity, replays that keep changes fresh, a ladder for
 conflicts, agents that comment like anyone, and landing through the merge queue. W26 builds on W14
@@ -8215,25 +8215,36 @@ a time. The design was agreed on a live mock built on Ship's own prototype
 
 1. **Review is part of Ship.** Changes are Ship items and their review is part of each item; there
    is no separate review page. Review, the name chosen, is Ship's lens on changes.
-2. **The default unit** for kiln-hosted repositories: agents stack, people choose a stack or a
-   branch change request.
+2. **The unit is the commit (or tag).** Both kinds of change are first-class, neither the
+   default: traditional branch pull requests, and stacked diffs in Meta's manner (each diff one
+   commit, reviewed and landed in stack order).
 3. **Fresh changes:** kiln replays open changes in its own copy; branches move only when someone
    presses Update, unless a repository turns automatic pushes on, with a warning in plain words.
    An agent sent to resolve a replay's conflicts is a second setting, off by default.
-4. **Conflicts:** a person always confirms an agent's resolution.
-5. **Agents in review:** agents comment, suggest and reply like anyone. A per-repository switch,
-   off by default, lets agents fix code from agents' feedback.
-6. **Landing:** through the merge queue another agent is building; a host's own queue where a
-   repository has one.
-7. **Identity:** kiln's own (R03); others' identifiers are read, never relied on.
-8. **First:** Review in Ship and each item's review (R01 to R15).
+4. **Conflicts:** agents can resolve on their own. A repository turns automatic resolution on;
+   while it's off, a person confirms an agent's resolution.
+5. **Agents in review:** agents comment, suggest and reply like anyone. A switch on the
+   repository's page in Repos, off by default and applying to every change made to that
+   repository, lets agents fix code from agents' feedback.
+6. **Landing:** through the merge queue the Merge Queues agent is building (W28), with that agent;
+   a host's own queue where a repository has one.
+7. **A change keeps its identity when its commit is rewritten.** kiln writes an ID into the
+   commit message (`Kiln-Change: kc-7f3a9e`); after an amend or a rebase the commit's hash changes
+   but the line doesn't, so D41 stays D41, with its comments, approvals and history. IDs other
+   tools write (jj's and GitButler's `change-id`, Gerrit's `Change-Id`) are recognised too, so
+   their users need no setup; where they disagree with kiln's line, kiln's line decides (R03).
+8. **First:** Review in Ship and each item's review (R01 to R15), built with the CI/CD
+   Integration agent, whose Ship it is.
 
 **Requirements: the model**
 
-- **W26-R01 Changes are Ship items.** A kiln diff, a change request or a host's pull request
-  (W23-R06) is a Ship item from its first push, drawn by Ship's row, glyphs, stand words, author
-  line and paired actions, with nothing special-cased; after it lands it carries on as the same
-  item. Ship's per-commit read model grows to changes: one read model, not two.
+- **W26-R01 Changes in Ship, by commit.** Ship's unit stays the commit (or tag). A stacked diff is
+  one commit, its row carrying the diff's review; a branch pull request (kiln's change requests and
+  hosts' pull requests, W23-R06) is its commits, its head commit's row carrying the request's review
+  and its other commits folded under it. A new revision's commit supersedes the one it replaces, as
+  Ship's rows already do, and after it lands the commit carries on. Rows, glyphs, stand words,
+  author lines and paired actions are Ship's, with nothing special-cased; Ship's per-commit read
+  model grows to review: one read model, not two.
 - **W26-R02 Review is the first stage.** Ship's journey strip reads review, land, checks, build,
   staging, production, replant. Review states (needs you, agent fixing, waiting on others,
   conflicts, approved) map onto Ship's stands and its needs-you-first order. Ship's facets gain host
@@ -8300,15 +8311,18 @@ a time. The design was agreed on a live mock built on Ship's own prototype
 - **W26-R17 The conflict ladder.** A conflicted replay is kept as a conflicted revision, so the stack
   above it still moves, and goes up a ladder, each rung checked by the affected tests: a structural
   merge, a resolution remembered from the same hunk, the author's agent (or, where a repository turns
-  it on, an agent sent to a runner that has the repository), then the person, who confirms any
-  agent's resolution.
+  it on, an agent sent to a runner that has the repository), then the person. A repository can
+  turn on automatic resolution by agents, on its page in Repos: then an agent's resolution that
+  passes the affected tests goes on without a person; while it's off, the default, a person
+  confirms it.
 - **W26-R18 Agents in review.** Agents comment, suggest and reply like anyone, signed as themselves
-  for their person. A per-repository switch, off by default, lets agents fix code from agents'
-  feedback. Hand off sends a change's open threads or conflicts to its author's agent, and the item
+  for their person. A switch on the repository's page in Repos, off by default and applying to every change
+  made to that repository, lets agents fix code from agents' feedback. Hand off sends a change's open threads or conflicts to its author's agent, and the item
   shows it working.
 - **W26-R19 Landing.** A change goes to the merge queue once its gate is clear (no blocking thread,
   no conflict, the approvals trunk's policy asks for); a host's own queue is used where a repository
-  has one. The queue signs each land into the trail (W27-R07).
+  has one. The queue signs each land into the trail (W27-R07). The queue is the Merge Queues
+  agent's (W28), and W26 is built against it with that agent.
 - **W26-R20 Hosts.** What each host can do (stacks, queues, updating a stale change, batched reviews,
   merging) is a seam in `crates/kiln-seams`, with a simulator per host and a conformance suite, kept
   within the hosts' rate limits (webhooks, and polling with ETags).
@@ -8352,6 +8366,10 @@ repository):
   *`cargo test -p kiln-seams`.*
 - **W26-AC10 Agents.** With the switch off, agents' feedback starts no fix; on, the author's agent
   pushes a fix that answers in its thread. *End to end with kiln's fake harness.*
+
+- **W26-AC11 Both kinds.** A branch pull request and a stack of three diffs each go from first
+  push to landed: the stack's commits land in stack order, each reviewed on its own; the branch's
+  commits land together under its review. *Integration test on real git.*
 
 **Sources.** Plan `01a175b7d5e1772f8d3c7cb28e50ab2b`; research `01a174af7d0476b896d3b236098ddded`;
 the mock `~/.cache/kiln-review-design/ship/review-ship.html` (Ship's prototype, from the CI/CD
