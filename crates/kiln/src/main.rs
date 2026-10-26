@@ -183,7 +183,7 @@ enum Cmd {
     /// Repositories: list them; create one kiln hosts, or import one from upstream.
     Repo(kiln::ci::cli::RepoArgs),
     /// Clone a repository kiln hosts, with kiln's credentials and the commit-msg hook that gives
-    /// each commit a Change-Id.
+    /// each commit a Kiln-Change (optional: kiln matches commits without one).
     Clone(kiln::ci::review_cli::CloneArgs),
     /// Send the commits between the trunk and HEAD for review: each a diff, or a new version of
     /// its diff (`git push kiln HEAD:refs/for/<trunk>`).

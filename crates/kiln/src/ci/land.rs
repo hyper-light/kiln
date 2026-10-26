@@ -581,7 +581,7 @@ async fn apply_change_request(hub: &Hub, path: &str, tip: &str, strategy: Strate
         Strategy::Merge => {
             let tree = merge_tree(hub, path, tip, &head).await?;
             let who = author(hub, path, &head).await.map_err(other)?;
-            let msg = land::landed_message(&format!("Merge {}: {}\n\n{}", d.name, d.title, d.summary), &d.name, reviewers);
+            let msg = land::landed_message(&format!("Merge {}: {}\n\n{}", d.name, d.title, d.summary), &d.name, reviewers, &changes_of(&[d]));
             let c = commit_tree(hub, path, &tree, &[tip, &head], &who, &msg).await.map_err(other)?;
             commits.insert(d.id.clone(), c.clone());
             Ok(Applied { tip: c, commits })
@@ -594,7 +594,7 @@ async fn apply_change_request(hub: &Hub, path: &str, tip: &str, strategy: Strate
                 let tree = pick_tree(hub, path, &at, c, &parent).await?;
                 let who = author(hub, path, c).await.map_err(other)?;
                 let msg = gitops::run_git(hub, &["-C", path, "log", "-1", "--format=%B", c], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
-                at = commit_tree(hub, path, &tree, &[&at], &who, &land::landed_message(&msg, &d.name, reviewers)).await.map_err(other)?;
+                at = commit_tree(hub, path, &tree, &[&at], &who, &land::landed_message(&msg, &d.name, reviewers, &changes_of(&[d]))).await.map_err(other)?;
             }
             commits.insert(d.id.clone(), at.clone());
             Ok(Applied { tip: at, commits })
@@ -603,11 +603,16 @@ async fn apply_change_request(hub: &Hub, path: &str, tip: &str, strategy: Strate
         _ => {
             let tree = merge_tree(hub, path, tip, &head).await?;
             let who = author(hub, path, &head).await.map_err(other)?;
-            let c = commit_tree(hub, path, &tree, &[tip], &who, &land::landed_message(&message, &d.name, reviewers)).await.map_err(other)?;
+            let c = commit_tree(hub, path, &tree, &[tip], &who, &land::landed_message(&message, &d.name, reviewers, &changes_of(&[d]))).await.map_err(other)?;
             commits.insert(d.id.clone(), c.clone());
             Ok(Applied { tip: c, commits })
         }
     }
+}
+
+/// The changes' identities `diffs` land, for their commits' `Kiln-Change` lines (W26-R03).
+fn changes_of(diffs: &[&Diff]) -> Vec<String> {
+    diffs.iter().filter_map(|d| d.change.clone()).collect()
 }
 
 /// The author of `commit`: name, email, date (raw).
@@ -701,7 +706,7 @@ async fn apply(hub: &Hub, path: &str, tip: &str, e: &Entry) -> Result<Applied, R
             reviewers.sort();
             reviewers.dedup();
             let revisions: Vec<String> = chain.iter().map(|(d, _, _)| d.name.clone()).collect();
-            let mut message = land::landed_message(&message, &revisions.join(", "), &reviewers);
+            let mut message = land::landed_message(&message, &revisions.join(", "), &reviewers, &changes_of(&chain.iter().map(|(d, _, _)| d).collect::<Vec<_>>()));
             if revisions.len() > 1 {
                 message = message.replace(&format!("Differential-Revision: {}", revisions.join(", ")), &revisions.iter().map(|r| format!("Differential-Revision: {r}")).collect::<Vec<_>>().join("\n"));
             }
@@ -718,7 +723,7 @@ async fn apply(hub: &Hub, path: &str, tip: &str, e: &Entry) -> Result<Applied, R
             for (d, v, reviewers) in &chain {
                 let tree = pick_tree(hub, path, &at, &v.commit, &v.parent).await?;
                 let who = author(hub, path, &v.commit).await.map_err(|x| Refusal::Other(format!("{x:#}")))?;
-                let message = land::landed_message(&msg_of(&v.commit).await, &d.name, reviewers);
+                let message = land::landed_message(&msg_of(&v.commit).await, &d.name, reviewers, &changes_of(&[d]));
                 at = commit_tree(hub, path, &tree, &[&at], &who, &message).await.map_err(|x| Refusal::Other(format!("{x:#}")))?;
                 commits.insert(d.id.clone(), at.clone());
             }
@@ -1062,6 +1067,8 @@ async fn restack(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, landed: &
         };
         let Ok(who) = author(hub, path, &v.commit).await else { continue };
         let message = gitops::run_git(hub, &["-C", path, "log", "-1", "--format=%B", &v.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
+        // The commit kiln makes carries its change's `Kiln-Change` (W26-R03).
+        let message = kiln_ci::identity::with_kiln_changes(&message, &changes_of(&[&d]));
         let Ok(c) = commit_tree(hub, path, &tree, &[&onto], &who, &message).await else { continue };
         let patch = diffs::git_run(hub, &["-C", path, "show", "--no-color", &c], &[], Vec::new()).await.ok().map(|r| r.out).unwrap_or_default();
         let patch_id = diffs::git_with_input(hub, &["-C", path, "patch-id", "--stable"], patch).await.ok().and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned)).unwrap_or_default();
