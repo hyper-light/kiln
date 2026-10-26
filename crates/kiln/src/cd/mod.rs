@@ -391,9 +391,22 @@ impl Cd {
             let ids: BTreeSet<String> = defs.iter().map(AppDef::id).collect();
             for def in defs {
                 let changed = self.apps.read().get(&def.id()).is_none_or(|e| e.def != def);
+                // A copy of the app kept in kiln (`cd.apps.keep`, taken over) loads at each start,
+                // before this file is read, and stays while it doesn't read: kiln-production once
+                // came back so as it was a week before, and a sync deployed that (2026-10-26). The
+                // file's is the app now, so it's the copy kept.
+                let kept = self.store.read(|d| d.apps.get(&def.id()).is_some_and(|k| *k != def));
                 if changed {
                     tracing::info!(app = %def.id(), repo = %repo.name, commit = %short(&commit), "deployments: an app from a deploy file");
-                    self.register(def);
+                    self.register(def.clone());
+                }
+                if kept {
+                    tracing::info!(app = %def.id(), repo = %repo.name, commit = %short(&commit), "deployments: the copy kept in kiln follows the deploy file");
+                    match self.store.submit(Command::PutApp(Box::new(def))).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(repo = %repo.name, error = %e, "deployments: can't keep a deploy file's app"),
+                        Err(_) => tracing::warn!(repo = %repo.name, "deployments: the store stopped"),
+                    }
                 }
             }
             let gone: Vec<String> = self
@@ -725,7 +738,7 @@ impl Cd {
                 (Some(_), Some(s)) => s,
                 (Some(p), None) => {
                     let pipeline = given.pipeline.as_deref().unwrap_or("image");
-                    self.published_locally(def, pipeline, revision).await.with_context(|| format!("artifact {name}"))?;
+                    self.published_locally(def, p, pipeline, revision).await.with_context(|| format!("artifact {name}"))?;
                     refs.push(ArtifactRef { name: name.clone(), reference: format!("{p}:{revision}"), repository: p.clone(), tag: Some(revision.to_owned()), digest: String::new() });
                     continue;
                 }
