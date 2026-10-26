@@ -1683,7 +1683,9 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `exclusive`, `approval`, `scaling` (a pool is starting runners; how many and since when),
   `max-parallel`, `capability` (eligible runners' builds lack a capability; which),
   `other-runner` (only the runner its retry avoids could take it: R16's `runner: different`, or a
-  runner that refused it; which). It is stored (`jobs.wait_reason`), sent as an event, and shown
+  runner that refused it; which), and admission's (W28-R60): `coalescing` (its lane, until when,
+  at the latest when), `cadence` (its lane, its next start) and `speculation` (its lane, the
+  window, how many are in flight). It is stored (`jobs.wait_reason`), sent as an event, and shown
   on the leg.
 
 **Requirements: retries** (G-16)
@@ -7854,7 +7856,7 @@ plan:
 **Scope.** The land queue, builds and deploys of a trunk many agents change at once (kiln plan
 `01a17502affc74b3af5a30092f8418bc`). This section holds step 9's requirements, R30–R39 (kiln plan
 `01a1751638e773b98b5092662fc06bf5`); the other steps take their ranges as they come. Commits
-before this one call this workstream "W25 step N".
+before this one call this workstream "W25 step N". Step 6's, admission, are R60–R69 (kiln plan `01a17603d7cd701bb0a238c056af91ae`).
 
 **Requirements: the conflict graph**
 
@@ -7894,7 +7896,83 @@ before this one call this workstream "W25 step N".
   same tree and every unit the key it has with its own change alone; and every decision names
   only what its two changes share. *Property test* (`cargo test -p kiln-ci land::conflict`).
 
-**Progress.** R30–R34 and AC30 built (2026-10-25) in `kiln_ci::land::conflict`. The land queue
+**Requirements: admission** (`kiln_ci::sched::admit`, `intent`, `actor`, and the scheduler)
+
+- **W28-R60 Admission.** Pure: time comes in, decisions and timers go out. A demand is a leg with
+  its lane (a repository's workflow on a branch), its unit (its job and matrix values) and its
+  run's place in the lane (the run's number: the newest is the highest). Admission admits it into
+  its queue, holds it saying why (W05-R13's `coalescing`, `cadence`, `speculation`), or skips it for
+  a newer demand of its lane and unit, naming that one's run. A held leg counts its wait from its
+  arrival. Off until a workflow declares `coalesce:` or `cadence:` (§0.3).
+- **W28-R61 Coalescing.** `coalesce: { quiet, max-wait, when }` (or `true`: a quiet `60s`,
+  `max-wait: 10m`, `when: busy`). A demand whose leg would wait for capacity now is held for
+  `quiet`; each newer demand of its lane and unit skips the one held (cancelled, never started:
+  `coalesced into run N`) and restarts the quiet period, never past `max-wait` from the burst's
+  start; the held one goes as soon as the runners it needs have room. `when: always` holds it
+  whether or not they do. One let go is never skipped, so a steady stream still runs a commit at
+  least every `max-wait`, the newest then.
+- **W28-R62 Cadence.** `cadence: { on: free }` (or `true`) or `{ every: <duration> }`, for
+  exclusive or expensive work (the bench, the macOS release, e2e). At most one demand of a lane and
+  unit waits to start: the newest, which takes the older one's place in the queue (`skipped by its
+  workflow's cadence for run N`). An exclusive one keeps the least busy runner that could take it
+  from other work until it's free, so it starts when its resource frees. `every` starts at most
+  one per interval. The commits it skips get verdicts from coverage (W25 step 5), and a regression
+  is bisected over them.
+- **W28-R63 Measured on the week.** The replay's P4 (`kiln_ci::sched::sim::replay`) runs its
+  coalescing through `kiln_ci::sched::admit`, so what it measures is the implementation; the
+  defaults come from its sweeps (`ci/sim/README.md`): a quiet minute while busy, ten minutes at
+  most, a cadence for exclusive jobs and the macOS release.
+- **W28-R64 Priority by intent.** `[ci.scheduler] priority = "intent"` (the default `event` keeps
+  W05-R09): gate 90 (`land`, `merge_group`, `deploy`, a job that deploys to an environment, and the
+  commit a server runs), waiting 80 (a person's manual run, the `agent` event, a commit an agent's
+  change request with `fix_checks` waits on, a plan run's stack step, `ci.verdict.wait`'s once W25
+  step 5 adds it), trunk 60 (the default branch), WIP 40 (other branches and diffs). Each leg's
+  routing explanation (`ci.legs.routing`'s `standing`) names its class and why.
+- **W28-R65 Aging between classes, fair share within.** A signature keeps a queue per priority,
+  each ordered by fair-share start, then arrival; the next leg comes from the priority whose next
+  leg has the highest `priority + aging_per_minute × minutes waited`. Classes stay strict, a class
+  behind a saturated stream of gate work starts within `(90 − p) / aging` minutes and a leg's time,
+  and fair share holds inside a class however long its legs wait.
+- **W28-R66 Fair share by actor and lane.** `[ci.scheduler] fair_by = ["repo", "actor", "lane"]`
+  (`["repo"]` by default, W05-R10 as it was): inside a repository its active actors share its
+  share equally, and inside an actor its active lanes, as far as the list goes (Buildbarn's nested
+  invocations). Two agents pushing at 10:1 each get half of what they saturate.
+- **W28-R67 Whose a commit is.** Agents push with their machine's git identity, so kiln's records
+  say: the agent token a push came with (`agent:<id>`), else the agent change request whose last
+  pushed commit it is (`agents/change/<agent>`), else a `Kiln-Agent: <name> (<harness>, <id>)`
+  line in its message, else the event's actor, a person. The explanation names which.
+- **W28-R68 Speculation window.** A lane's speculative demands (not its newest: bisection steps,
+  intermediate commits kept for direct verdicts, land candidates past the head) go only while fewer
+  than its window are in flight; a pass widens it by one, a failure halves it, between a floor and
+  a cap (Zuul's window). A lane's newest demand and gate demands are never held by it. The land
+  queue's per-component window (step 9) is the same type.
+- **W28-R69 Defaults from the week.** Every default is the replay's: `quiet` 60 s, `max-wait`
+  600 s, cadence on for exclusive jobs and the macOS release (W25 step 1's sweeps, kept with P4 on
+  admit), and a window of 4 between 1 and 20 (its sweep over P4's bisection runs), all in
+  `ci/sim/README.md` with their numbers.
+
+**Acceptance criteria: admission**
+
+- **W28-AC60 Coalescing.** Idle: a push starts at once. Saturated: pushes every 30 s for 10 min,
+  `quiet: 45s`, `max-wait: 5m`: every older one held is skipped, the newest starts as the runners
+  free or is let go by `max-wait`. *Unit and scheduler simulation tests* (`cargo test -p kiln-ci
+  sched::admit`, `w28_ac60_*`).
+- **W28-AC61 The bench on the week.** The replay's P4 on admit: the bench's queue wait p50 at most
+  900 s (4,601 s measured), each bench run on the newest crates/** commit, the commits it skipped
+  covered and a regression bisected. *Replay test* (`w25_s1_p4_*`).
+- **W28-AC62 Intent.** Gate, waiting, trunk and WIP legs queued together start in that order; a
+  WIP leg behind a steady stream of gate legs starts within 50 minutes and a leg's time.
+  *Scheduler simulation tests.*
+- **W28-AC63 Fair share by actor.** Two agents at 10 and 1 pushes a minute, one repository,
+  `fair_by = ["repo", "actor"]`: each 50 % ± 10 % of slot-time over every 10-minute window.
+  *Scheduler simulation test.*
+- **W28-AC64 Window.** Three speculative demands, a window of 2: the third waits saying
+  `speculation`; a pass admits it; a failure halves the window, never below its floor. *Unit and
+  scheduler tests.*
+- **W28-AC65 Explained.** Every hold and skip names its reason; every attribution its source.
+  *Unit tests* (`w28_r67_attribution`, the reasons in `w28_*`).
+
+**Progress.** R60–R69 and AC60–AC65 built (2026-10-25) in `kiln_ci::sched::{admit, intent, actor}`, the scheduler, the dialect (`coalesce:`, `cadence:`), `[ci.scheduler] priority` and `fair_by`, and the dispatcher; the replay's P4 runs on admit. R30–R34 and AC30 built (2026-10-25) in `kiln_ci::land::conflict`. The land queue
 doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.rs`.
 
 ## 4. API, events, CLI and MCP reference
@@ -8410,6 +8488,7 @@ in `.github/workflows`. Each key's semantics are in the requirement cited.
 | --- | --- | --- |
 | workflow | `secrets: { NAME: { required } }` | W09-R06 |
 | workflow | `supersede: { when, action, keep }` (O) | W05-R08 |
+| workflow | `coalesce: { quiet, max-wait, when }`, `cadence: { on: free } \| { every }` (O) | W28-R61, W28-R62 |
 | workflow | `routing: { infer: true }` (O) | W05-R19 |
 | workflow | `run-env: true` | W04-R21 |
 | workflow | `kiln: { honour-skip-ci }` (O) | W03-R06 |
