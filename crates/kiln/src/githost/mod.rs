@@ -6,6 +6,9 @@
 //! from a template.
 
 pub mod bitbucket;
+pub mod forge;
+#[cfg(test)]
+mod forge_fake;
 pub mod github;
 pub mod gitlab;
 pub mod hooks;

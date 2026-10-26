@@ -13,6 +13,7 @@
 //! | [`Sandbox`](sandbox::Sandbox) | a harness launched in a boundary | `host`, then Shards (CP-T4.1), then Hex |
 //! | [`Placement`](placement::Placement) | where work runs, by resources | Hex (CP-T7.1) |
 //! | [`HarnessPort`](harness::HarnessPort) | kiln's agents: who they are, and commands to them | kiln's harness registry |
+//! | [`Forge`](forge::Forge) | what a git host does with changes: stacks, its queue, updates, batched reviews, merges | githost: kiln's GitHub App, GitLab, Bitbucket (W26-R20) |
 //!
 //! Each module holds the trait, its simulator (`Sim*`: deterministic, in memory, bounded) and its
 //! conformance suite (`conformance::cases`, run with [`conformance::run`] against a fixture that
@@ -30,6 +31,7 @@ pub mod blobs;
 pub mod bus;
 pub mod clock;
 pub mod conformance;
+pub mod forge;
 pub mod harness;
 pub mod placement;
 pub mod records;
@@ -41,6 +43,7 @@ pub use artifacts::Artifacts;
 pub use blobs::Blobs;
 pub use bus::Bus;
 pub use clock::Clock;
+pub use forge::Forge;
 pub use harness::HarnessPort;
 pub use placement::Placement;
 pub use records::Records;
