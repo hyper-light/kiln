@@ -288,7 +288,7 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
     let image = if !rec.images.is_empty() || !release_running { Part::Passed } else { Part::Running };
     let build = Build { platforms, image };
 
-    let checks_ok = !matches!(journey::pips(&Journey { checks: checks.clone(), ..empty() }, now).get(1).map(|p| p.state), Some(journey::Glyph::Failed));
+    let checks_ok = !matches!(journey::pips(&Journey { checks: checks.clone(), ..empty() }, now).into_iter().find(|p| p.stage == journey::Stage::Checks).map(|p| p.state), Some(journey::Glyph::Failed));
     let newer = |d: &DeployRec| d.first_row > rec.first_row;
     let own = |prod: bool| rec.own.iter().find(|d| d.production == prod && (prod || lower_is(&d.environment, "staging") || !rec.own.iter().any(|x| !x.production && lower_is(&x.environment, "staging"))));
     let current = |prod: bool| rec.current.iter().find(|d| d.production == prod && (prod || lower_is(&d.environment, "staging") || !rec.current.iter().any(|x| !x.production && lower_is(&x.environment, "staging"))));
@@ -351,7 +351,7 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
             .collect(),
     });
 
-    Journey { author, land, checks, build, staging, production, replant, in_production, handled_by: None, fixed_by: None }
+    Journey { author, land, checks, build, staging, production, replant, in_production, handled_by: None, fixed_by: None, review: None }
 }
 
 fn lower_is(s: &str, want: &str) -> bool {
@@ -370,6 +370,7 @@ fn empty() -> Journey {
         in_production: false,
         handled_by: None,
         fixed_by: None,
+        review: None,
     }
 }
 
