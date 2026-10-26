@@ -292,7 +292,7 @@ pub const STEP: &[Key] = &[
     kiln("test-results", Ty::Any, "kiln: test reports this step writes (W16-R01)."),
     kiln("integrations", Ty::StrList, "kiln: integrations this step authenticates to (W11-R03)."),
     kiln_only("tty", Ty::Bool, "kiln v1: run under a pseudo-terminal."),
-    kiln("memo", Ty::StrOrMap(MEMO), "kiln: reuse the step's earlier success while its inputs are unchanged: `check` (nothing to restore), or `{ inputs, outputs, env, max-age }` (W24-R07)."),
+    kiln("memo", Ty::StrOrMap(MEMO), "kiln: reuse the step's earlier success while its inputs are unchanged: `check` (nothing to restore), or `{ inputs, outputs, env, max-age, platform, tools }` (W24-R07, W28-R70)."),
     kiln("tests", Ty::Any, "kiln: run a build's test binaries, those whose binary or what they read changed, and replay the others' recorded passes: `{ cargo: [args] }` (W24-R10)."),
 ];
 
@@ -303,6 +303,8 @@ pub const MEMO: &[Key] = &[
     kiln("env", Ty::StrList, "Variables the step depends on besides those the workflow declares."),
     kiln("max-age", Ty::Str, "How long a result stays reusable (`14d` by default)."),
     kiln("secrets", Ty::Str, "`hmac`: a step that receives secrets keyed by their HMAC (W24-R05)."),
+    kiln("platform", Ty::Any, "The platform facets the key keeps (`[os, arch]`; `any` for none): the step keys by what it declares only, so pipelines share it (W28-R70)."),
+    kiln("tools", Ty::Any, "Toolchains whose identity the key keeps, each at a precision: `{ node: major, rustc: full }` (W28-R71)."),
 ];
 
 pub const JOB: &[Key] = &[
