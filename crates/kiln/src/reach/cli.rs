@@ -3,9 +3,10 @@
 //! reach's trust.
 //!
 //! ```text
-//! kiln run --on linux/amd64 -- cargo test      # the idlest Linux x86-64 runner, this repo synced over
-//! kiln run --on adacachy --no-sync -- uptime   # a runner by name, in its home folder
-//! kiln runners linux                           # the Linux runners, best first
+//! kiln run --needs linux/amd64 -- cargo test           # the idlest Linux x86-64 runner, this repo synced over
+//! kiln run --needs cpus=8,mem=32g,linux/amd64 -- make  # one with 8 cores idle and 32 GiB free
+//! kiln run --on adacachy --no-sync -- uptime           # a runner by name, in its home folder
+//! kiln runners linux                                   # the Linux runners, best first
 //! ```
 
 #[cfg(unix)]
@@ -31,9 +32,15 @@ impl std::error::Error for ExitWith {}
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct RunArgs {
-    /// Where: a runner's name, or what it must be — `linux/amd64`, `macos`, `arm64`, `linux,+gpu`,
-    /// `cpus>=16`, `mem>=32g`. The idlest runner that suits is picked. Default: the best of all
-    /// (this machine itself when it is).
+    /// What the work needs: what the runner must be and have (`linux/amd64`, `macos`, `+gpu`,
+    /// `tool:cargo`, `cpus>=16`) and the room it asks for, idle and free there now (`cpus=8`,
+    /// `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it). This machine when it has it
+    /// and room to spare, else the idlest runner that has it. Default: the best of all. The command
+    /// finds them in KILN_NEEDS (`ci/gate.sh` holds itself to them).
+    #[arg(long, default_value = "")]
+    pub needs: String,
+    /// A runner by name, for work that has to happen on that machine (it must still meet
+    /// --needs). What it must be, as --needs says it, works here too.
     #[arg(long, short = 'o', default_value = "")]
     pub on: String,
     /// Copy this folder's tree (its git repository, as git sees it) over first, and run in the
@@ -71,10 +78,13 @@ pub struct RunArgs {
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct RunnersArgs {
-    /// Rank them for this (`linux/amd64`, `macos`, a name ...).
+    /// Rank them for this, as `kiln run --needs` takes it (`linux/amd64`, `cpus=8,mem=32g`, a name ...).
     pub want: Option<String>,
     #[arg(long)]
     pub json: bool,
+    /// A runner's facts instead (docs/ci.md W13-R01).
+    #[command(subcommand)]
+    pub facts: Option<crate::ci::cli::RunnerFacts>,
 }
 
 #[derive(clap::Args, Clone, Debug)]
@@ -128,12 +138,12 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
         .map(|kv| kv.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())).ok_or_else(|| anyhow::anyhow!("--env takes KEY=VALUE, not {kv:?}")))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let req = RunReq {
-        target: a.on.clone(),
+        target: super::directory::target(&a.on, &a.needs).map_err(|e| anyhow::anyhow!("--needs: {e}"))?,
         command: a.command.join(" "),
         cwd: Some(here.to_string_lossy().into_owned()),
         remote_cwd: a.cwd.clone(),
         sync,
-        env,
+        env: super::directory::with_needs(env, &a.needs),
         stdin: a.stdin,
         timeout_ms: a.timeout.map(|s| s.saturating_mul(1000)),
         shell: a.shell.clone(),
@@ -328,5 +338,38 @@ pub fn reach(a: ReachArgs) -> anyhow::Result<()> {
             }
             other => anyhow::bail!("unexpected answer {other:?}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::RunArgs;
+    use crate::reach::directory::target;
+
+    #[derive(clap::Parser)]
+    struct Kiln {
+        #[command(flatten)]
+        run: RunArgs,
+    }
+
+    /// `kiln run` takes what the work needs, and a runner by name for work that has to happen on
+    /// one machine: both go to the runner as one spelling, and a bad need is refused before anything
+    /// is asked of it.
+    #[test]
+    fn kiln_run_takes_needs_and_a_runner_by_name() -> anyhow::Result<()> {
+        let a = Kiln::try_parse_from(["kiln", "--needs", "cpus=8,mem=32g,linux/amd64", "--", "cargo", "test"])?.run;
+        assert_eq!((a.needs.as_str(), a.on.as_str(), a.command.join(" ").as_str()), ("cpus=8,mem=32g,linux/amd64", "", "cargo test"));
+        assert_eq!(target(&a.on, &a.needs).as_deref(), Ok("cpus=8,mem=32g,linux/amd64"));
+        let a = Kiln::try_parse_from(["kiln", "-o", "adacachy", "--needs", "mem=32g", "--no-sync", "--", "uptime"])?.run;
+        assert!(a.no_sync);
+        assert_eq!(target(&a.on, &a.needs).as_deref(), Ok("adacachy,mem=32g"));
+        // As before needs: what it must be, given to --on.
+        let a = Kiln::try_parse_from(["kiln", "--on", "linux/amd64", "--", "make"])?.run;
+        assert_eq!(target(&a.on, &a.needs).as_deref(), Ok("linux/amd64"));
+        let a = Kiln::try_parse_from(["kiln", "--needs", "memm=4g", "--", "true"])?.run;
+        assert_eq!(target(&a.on, &a.needs), Err("memm=4g: no such need".to_owned()));
+        Ok(())
     }
 }

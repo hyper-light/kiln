@@ -399,13 +399,12 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .cp-mirror[data-off] {
   opacity: 0.5;
 }
-/* iOS sets a field's text in from where a box's is: there it stays plain. */
+/* iOS breaks a field's lines as its own stylesheet says (WebKit's html.css: spaces end a line, a
+   no-break space is a space); the copy under it does the same, so both break in the same places. */
 @supports (-webkit-touch-callout: none) {
   .cp .hx-compose-input.cp-mirror {
-    display: none;
-  }
-  .cp .cp-input {
-    color: var(--color-foreground);
+    -webkit-nbsp-mode: space;
+    line-break: after-white-space;
   }
 }
 .cp-mirror .md-m {
@@ -729,11 +728,15 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 }
 .in-sec-toggle {
   display: flex;
+  flex: 1 1 auto;
   align-items: center;
   gap: 8px;
-  width: 100%;
+  min-width: 0;
   min-height: 44px;
+  /* The heading's own lettering (a button's would be its own). */
+  letter-spacing: inherit;
   text-align: left;
+  text-transform: inherit;
 }
 .in-sec-toggle:hover {
   color: var(--color-bright);
@@ -811,6 +814,31 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .hx-thought,
 .hx-live-tail {
   padding: 10px 0 2px;
+}
+/* A compaction: under way where the turn's live line is (what it does, the context it compacts,
+   its clock, the rule condensing); done, the same row held still, its bar the boundary. The two
+   are the same height, so settling moves nothing. */
+.hx-compaction {
+  padding: 10px 0 4px;
+}
+.hx-compaction-line {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+.hx-compaction-facts {
+  color: #7b7e88;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.hx-compaction .sg-condense {
+  margin-top: 7px;
+}
+.hx-compaction[data-tone="warn"] .sg-label {
+  color: var(--color-warn);
+}
+.hx-compaction[data-tone="warn"] .sg-optic > span {
+  border-color: #d8bb95;
+  opacity: 0.55;
 }
 .hx-turn .hx-note,
 .hx-turn .hx-outcome {
@@ -1518,8 +1546,86 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .al-item .bg-out {
   padding: 0 4px 10px;
 }
+/* A subagent running: its mark and words take the prism's sweep (signals.css). */
+.al-mark,
+.al-glyph {
+  display: inline-flex;
+  align-items: center;
+}
+.al-mark {
+  gap: 6px;
+}
+.al-row > .al-glyph {
+  grid-area: glyph;
+}
+/* A row and its stop side by side; what either opens goes under both. */
+.al-head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+.al-head > .al-row {
+  flex: 1;
+  min-width: 0;
+  padding-right: 8px;
+}
+/* A row whose output opens under it says so. */
+.al-row[aria-expanded] {
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-areas: "glyph what time open";
+}
+.al-open {
+  grid-area: open;
+  color: #6d7078;
+  transition: transform 0.15s;
+}
+.al-stop {
+  flex: none;
+  min-height: 28px;
+  margin-right: max(12px, env(safe-area-inset-right));
+  padding: 0 8px;
+  border-radius: 5px;
+  color: #a1a4ad;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.al-stop:hover,
+.al-stop[aria-expanded="true"] {
+  background: rgb(255 255 255 / 4%);
+  color: #ecc9cc;
+}
+.al-stop[data-off] {
+  color: #6d7078;
+}
+.al-stop[data-off]:hover,
+.al-stop[data-off][aria-expanded="true"] {
+  color: #a1a4ad;
+}
+.al-stop[data-busy] {
+  display: inline-flex;
+  align-items: center;
+  background: none;
+  color: #8f929b;
+}
+.al-note {
+  margin: 0 max(16px, env(safe-area-inset-right)) 10px 28px;
+  color: #8f929b;
+  font-size: 12px;
+}
+.al-confirm {
+  margin: 0 max(16px, env(safe-area-inset-right)) 10px 28px;
+}
+@media (pointer: coarse) {
+  .al-stop {
+    min-height: 36px;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
-  .al-chev {
+  .al-chev,
+  .al-open {
     transition: none;
   }
 }

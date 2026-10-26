@@ -1,11 +1,155 @@
 /**
  * What the goal stack panel (goals.tsx) works out, kept apart to be tested: the goals its edit box
- * covers and how the box's lines go back to them, and which reads of a stack came back too late to
- * show.
+ * covers and how the box's lines go back to them, which reads of a stack came back too late to
+ * show, which goals can become plans, and where a planned goal's steps stand.
  */
-import type { GoalItem, GoalStack } from "@/api/harness";
+import type { GoalItem, GoalStack, HEvent, QueueItem, Task, ToolCall } from "@/api/harness";
+import type { Stand } from "@/views/plans/status";
+import { taskLive, type ToolEvent } from "./derive";
+import { isSubagent } from "./tasks";
+
+/** How long kiln's ask to plan a goal now stands, its subagent not started yet (the server's `DISPATCH_AGAIN_MS`). */
+const ASK_STANDS_MS = 30 * 60_000;
+/** kiln's ask to plan a goal now: a steer, its id so (harness/pause.rs `KILN_ID`, goals/ops.rs `dispatch`). */
+const PLAN_ASK = "kiln-plan-";
+
+/**
+ * A goal's planning, as its agent's session shows it (Make a plan, Plan it now): kiln asked the
+ * agent to send a subagent (`asked`, none started yet), a subagent of its is at it (`planning`, its
+ * latest calls; `wrote`: it has written the plan's steps), or one was and ended with the plan not
+ * ready (`ended`).
+ */
+export type Planner = { kind: "asked"; at: number } | { kind: "planning" | "ended"; task: Task; calls: ToolEvent[]; wrote: boolean };
+
+/**
+ * Who's planning plan `plan` in its agent's session: its subagent (the one its brief, which names the
+ * plan, went to; the latest), with its last `shown` calls and whether it has written the steps; else kiln's ask, while it stands, said
+ * or still in the agent's queue. A subagent that ended having said the plan is ready: none (the
+ * stack shows its steps next).
+ */
+export function plannerOf(plan: string, tasks: readonly Task[], events: readonly HEvent[], queue: readonly QueueItem[], now: number, shown = 1): Planner | null {
+  let task: Task | undefined;
+  for (const t of tasks) if (isSubagent(t) && t.prompt?.includes(plan) && (!task || t.started > task.started)) task = t;
+  if (task) {
+    const live = taskLive(task);
+    const calls: ToolEvent[] = [];
+    let wrote = false;
+    let ready = false;
+    for (let i = events.length - 1; i >= 0 && !(calls.length >= shown && wrote && (live || ready)); i--) {
+      const e = events[i];
+      if (e?.kind !== "tool" || e.parent === undefined || e.parent !== task.tool_id) continue;
+      if (calls.length < shown) calls.unshift(e);
+      if (e.server === "kiln" && e.status === "done" && e.tool_short === "plans_update") wrote = true;
+      if (e.server === "kiln" && e.status === "done" && e.tool_short === "plans_ready") ready = true;
+    }
+    if (!live && ready) return null;
+    return { kind: live ? "planning" : "ended", task, calls, wrote };
+  }
+  const asked = (id: string | undefined, text: string) => !!id?.startsWith(PLAN_ASK) && text.includes(plan);
+  for (const q of queue) if (asked(q.id, q.text) && q.at >= now - ASK_STANDS_MS) return { kind: "asked", at: q.at };
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (!e || e.at < now - ASK_STANDS_MS) break;
+    if (e.kind === "user" && asked(e.client_id, e.text)) return { kind: "asked", at: e.at };
+  }
+  return null;
+}
+
+/** kiln's own tools, as a planner's call says what it did (`going`: it's at it now). */
+const KILN_SAYS: Record<string, (input: Record<string, unknown>, going: boolean) => string> = {
+  research_add: (input, going) => {
+    const found = Array.isArray(input.findings) ? (input.findings as { claim?: unknown }[]) : [];
+    const first = typeof found[0]?.claim === "string" ? `: ${found[0].claim}` : "";
+    return `${going ? "Adding" : "Added"} ${found.length === 1 ? "a finding" : `${found.length || "its"} findings`}${first}`;
+  },
+  research_get: () => "Read its research",
+  research_start: (_, going) => (going ? "Starting its research" : "Started its research"),
+  plans_get: () => "Read the plan",
+  plans_update: (input, going) => {
+    const steps = Array.isArray(input.items) ? (input.items as { title?: unknown }[]) : [];
+    const titles = steps.map((s) => (typeof s.title === "string" ? s.title : "")).filter(Boolean);
+    return steps.length
+      ? `${going ? "Writing" : "Wrote"} ${steps.length === 1 ? "a step" : `${steps.length} steps`}${titles.length ? `: ${titles.join(" · ")}` : ""}`
+      : going
+        ? "Changing the plan"
+        : "Changed the plan";
+  },
+  plans_ready: (_, going) => (going ? "Saying the plan is ready" : "Said the plan is ready"),
+};
+
+/** A call, in a line of plain words ("Reading crates/x.rs", "Added a finding: …"): what a planner's last calls say. */
+export function callWords(c: Pick<ToolCall, "tool" | "name" | "title" | "status" | "server" | "tool_short" | "input">): string {
+  const going = c.status === "running" || c.status === "pending";
+  const kiln = c.server === "kiln" ? KILN_SAYS[c.tool_short ?? ""] : undefined;
+  if (kiln) return kiln(c.input && typeof c.input === "object" ? (c.input as Record<string, unknown>) : {}, going);
+  const t = c.title;
+  switch (c.tool) {
+    case "read":
+      return `${going ? "Reading" : "Read"} ${t}`;
+    case "search":
+      return `${going ? "Searching" : "Searched"} for ${t}`;
+    case "web":
+      return c.name === "WebSearch" ? `${going ? "Searching" : "Searched"} the web for “${t}”` : `${going ? "Reading" : "Read"} ${t}`;
+    case "shell":
+      return `${going ? "Running" : "Ran"} ${t}`;
+    case "edit":
+      return `${going ? "Editing" : "Edited"} ${t}`;
+    case "agent":
+      return `${going ? "Handing" : "Handed"} on: ${t}`;
+    default:
+      return t ? `${c.tool_short ?? c.name}: ${t}` : (c.tool_short ?? c.name);
+  }
+}
 
 /** The goal that stopped a paused stack with none under way (the last to end, not met or skipped), to try again first. */
+/** One of its own goals still to go, not a part, a plan's step, planned already or out on a subagent: it can become a plan (Make a plan). */
+export function canPlan(g: GoalItem): boolean {
+  return (g.status === "pending" || g.status === "active") && !g.part_of && !g.planned_as && !g.step && !g.waits_on && !outOn(g);
+}
+
+/** A goal still to go that's being planned, its planning waiting its turn: a subagent of its agent can plan it now (Plan it now). */
+export function canPlanNow(g: GoalItem, items: readonly GoalItem[]): boolean {
+  return g.status === "pending" && !!g.planned_as && items.some((i) => i.part_of === g.id && i.part_kind === "planning" && i.status === "pending");
+}
+
+const PART_STAND = { pending: "waiting", active: "working", met: "met", unmet: "unmet", skipped: "skipped" } as const;
+
+/**
+ * Where step `n` of the plan `goal` became stands, as its part on the stack says: under way while it
+ * is, while one of its own parts (its criteria and tests) is, or while a subagent has it (side by side
+ * with the plan's other steps); none when it isn't on the stack.
+ */
+export function stepStand(goal: GoalItem, items: readonly GoalItem[], n: number, paused: boolean): Stand | undefined {
+  const part = items.find((i) => i.part_of === goal.id && i.part_kind === "plan" && i.step?.n === n);
+  if (!part) return undefined;
+  const busy = part.status === "active" || (part.status === "pending" && (!!part.subagent || items.some((i) => i.part_of === part.id && i.status === "active")));
+  if (busy) return paused ? "paused" : "working";
+  return PART_STAND[part.status];
+}
+
+/** A goal still to go that a subagent has: a plan's step, side by side with the plan's others (its subagent's id). */
+export function outOn(g: GoalItem): string | undefined {
+  return g.status === "pending" ? g.subagent : undefined;
+}
+
+/**
+ * A goal's line as it stands, `parts` its parts at any depth: under way (`active`) while it is, while
+ * a subagent has it, or while any of its parts is (its plan's steps on the agent or on subagents, its
+ * run's agents); `away`, the agent it's under way on when that's another (its subagent, or a
+ * program's worker it was handed to); `busy`, its light turning: always while subagents or a run
+ * are at it, whatever else is under way beside them, and while the agent works on it itself
+ * (`working`: the agent is at work now).
+ */
+export function lineOf(g: GoalItem, parts: readonly GoalItem[], working: boolean): { status: GoalItem["status"]; away?: string; busy: boolean } {
+  const sub = outOn(g);
+  if (sub) return { status: "active", away: sub, busy: true };
+  const pending = g.status === "pending";
+  const own = pending && parts.some((p) => p.status === "active" && !p.waits_on);
+  const others = pending && parts.some((p) => !!outOn(p) || (p.status === "active" && !!p.waits_on));
+  const status = own || others ? "active" : g.status;
+  return { status, away: pending && !own && !others ? g.on : undefined, busy: others || (status === "active" && working && !g.waits_on) };
+}
+
 export function stoppedBy(stack: GoalStack | null): GoalItem | undefined {
   if (stack?.state !== "paused" || stack.items.some((i) => i.status === "active")) return undefined;
   const last = stack.items.filter((i) => i.status !== "pending").at(-1);

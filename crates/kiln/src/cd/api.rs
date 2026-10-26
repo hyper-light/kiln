@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use http::{Method, StatusCode};
-use hyper::body::Incoming;
+use kiln_http::Incoming;
 use kiln_cd::obj::ResKey;
 use serde_json::{Value, json};
 
@@ -189,7 +189,12 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             }
             ("cd.apps.rollback".into(), b)
         }
+        (&Method::GET, ["apps", p, n, "rollback-targets"]) => ("cd.apps.rollback_targets".into(), app(p, n)),
         (&Method::POST, ["apps", p, n, "follow"]) => ("cd.apps.follow".into(), app(p, n)),
+        (&Method::GET, ["apps", p, n, "auto-rollback"]) => ("cd.apps.auto_rollback".into(), app(p, n)),
+        (&Method::PUT, ["apps", p, n, "auto-rollback"]) => ("cd.apps.set_auto_rollback".into(), with(json_body(body).await?, "app", json!(format!("{p}/{n}")))),
+        (&Method::GET, ["repos", "auto-rollback"]) => ("cd.repos.auto_rollback".into(), json!({})),
+        (&Method::PUT, ["repos", "auto-rollback"]) => ("cd.repos.set_auto_rollback".into(), json_body(body).await?),
         (&Method::GET, ["apps", p, n, "rollout"]) => ("cd.apps.rollout".into(), app(p, n)),
         (&Method::POST, ["apps", p, n, "rollout", action]) => {
             let b = json_body(body).await?;

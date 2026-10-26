@@ -18,6 +18,9 @@ pub struct Declared {
     pub facts: BTreeMap<String, String>,
     /// Commands whose output is read as a version (`cuda = "nvcc --version"`).
     pub probes: BTreeMap<String, String>,
+    /// The most `kiln/cache@v1`'s local tier keeps in `<work>/_cache` (`cache_max = "20G"`; 10G
+    /// when unset, docs/ci.md W08-R09).
+    pub cache_max: Option<String>,
 }
 
 impl Declared {
@@ -55,33 +58,45 @@ async fn output(program: &str, args: &[&str]) -> Option<String> {
     o.status.success().then(|| format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
 }
 
+/// The tools a runner's facts report when they're on `PATH`: each as its fact names it, the program
+/// and the arguments that print its version.
+pub const TOOLS: &[(&str, &str, &[&str])] = &[
+    ("git", "git", &["--version"]),
+    ("node", "node", &["--version"]),
+    ("python3", "python3", &["--version"]),
+    ("cargo", "cargo", &["--version"]),
+    ("go", "go", &["version"]),
+    ("java", "java", &["-version"]),
+    ("dotnet", "dotnet", &["--version"]),
+    ("docker", "docker", &["--version"]),
+    ("docker buildx", "docker", &["buildx", "version"]),
+    ("podman", "podman", &["--version"]),
+    ("shards", "shards", &["--version"]),
+    ("firecracker", "firecracker", &["--version"]),
+    ("kubectl", "kubectl", &["version", "--client"]),
+];
+
 /// Tools found on `PATH`, with the version each reports.
 async fn tools() -> BTreeMap<String, String> {
-    let list: &[(&str, &str, &[&str])] = &[
-        ("git", "git", &["--version"]),
-        ("node", "node", &["--version"]),
-        ("python3", "python3", &["--version"]),
-        ("cargo", "cargo", &["--version"]),
-        ("go", "go", &["version"]),
-        ("java", "java", &["-version"]),
-        ("dotnet", "dotnet", &["--version"]),
-        ("docker", "docker", &["--version"]),
-        ("docker buildx", "docker", &["buildx", "version"]),
-        ("podman", "podman", &["--version"]),
-        ("shards", "shards", &["--version"]),
-        ("firecracker", "firecracker", &["--version"]),
-        ("kubectl", "kubectl", &["version", "--client"]),
-    ];
-    let found = futures::future::join_all(list.iter().map(|(name, program, args)| async move { output(program, args).await.as_deref().and_then(version_in).map(|v| ((*name).to_owned(), v)) })).await;
+    let found = futures::future::join_all(TOOLS.iter().map(|(name, program, args)| async move { output(program, args).await.as_deref().and_then(version_in).map(|v| ((*name).to_owned(), v)) })).await;
     found.into_iter().flatten().collect()
 }
 
-/// The executors this runner can run legs on right now, each probed: the host always; Docker (or
-/// Podman) when its engine answers, with its version and whether it runs rootless. Firecracker and
-/// shards are reported as tools until this runner can run legs on them.
+/// The executors this runner can run legs on right now, each probed: the host always; Firecracker
+/// when its microVMs can run here (KVM, Firecracker, its guest kernel and e2fsprogs: W13-R05), with
+/// its version and kernel; Docker (or Podman) when its engine answers, with its version and whether
+/// it runs rootless. shards is reported as a tool until this runner can run legs on it.
 async fn executors() -> BTreeMap<String, Executor> {
     let mut out = BTreeMap::new();
     out.insert("host".to_owned(), Executor::default());
+    #[cfg(target_os = "linux")]
+    if let Ok(Some(m)) = crate::rt::blocking(super::firecracker::Machine::find).await {
+        let kernel = m.kernel.to_string_lossy().into_owned();
+        // How its VMMs are confined (W13-R05): a jail of namespaces each, or none here.
+        let jail = if m.jail { "namespaces" } else { "none" }.to_owned();
+        let version = crate::rt::blocking(move || m.version()).await.ok().flatten();
+        out.insert("firecracker".to_owned(), Executor { version, details: [("kernel".to_owned(), kernel), ("jail".to_owned(), jail)].into() });
+    }
     let Ok(Some(bin)) = crate::rt::blocking(super::docker::find).await else { return out };
     let engine = if bin.ends_with("podman") { "podman" } else { "docker" };
     let mut version = None;
@@ -204,6 +219,32 @@ pub(crate) fn volume(dir: &Path) -> Option<Disk> {
     Some(Disk { total, free })
 }
 
+/// The machine's I/O pressure (docs/ci.md W24-R19): Linux's pressure stall information, the `full`
+/// line's `avg10` of `/proc/pressure/io` (the share of the last 10 s in which all non-idle tasks
+/// were stalled on I/O at once), in percent. `None` where the kernel doesn't report it.
+fn io_pressure() -> Option<f64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    std::fs::read_to_string("/proc/pressure/io").ok().as_deref().and_then(io_full)
+}
+
+/// `full avg10` of a PSI file (`some avg10=0.00 avg60=0.00 avg300=0.00 total=0`, then the same
+/// for `full`).
+fn io_full(text: &str) -> Option<f64> {
+    let line = text.lines().find(|l| l.split_whitespace().next() == Some("full"))?;
+    line.split_whitespace().find_map(|w| w.strip_prefix("avg10=")).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// This machine's size, as its facts give it: its CPUs (threads) and memory. What a runner's own
+/// admission counts what exclusive legs hold against (docs/ci.md W05-R03).
+pub(crate) fn size() -> Option<kiln_ci::sched::state::Resources> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    (threads > 0 && sys.total_memory() > 0).then(|| kiln_ci::sched::state::Resources { cpu: threads as f64, mem: sys.total_memory(), ..Default::default() })
+}
+
 /// The machine: its OS, CPU, memory, the work directory's volume, virtualization and emulation.
 fn machine(work_dir: &Path) -> RunnerFacts {
     use sysinfo::{Disks, System};
@@ -232,18 +273,34 @@ fn machine(work_dir: &Path) -> RunnerFacts {
         },
         arch,
         cpu: Cpu { model, cores, threads, flags: cpu_flags() },
-        mem: Mem { total: sys.total_memory(), free: sys.available_memory() },
+        mem: mem(sys.total_memory(), sys.available_memory(), crate::os::cgroup::memory_limit()),
         disk,
         virt: Virt { kvm, hvf: false, nested },
         binfmt: binfmt(),
+        // Its load, for admission (W24-R19).
+        work: Some(kiln_ci::facts::WorkFacts { io_full: io_pressure() }),
         ..RunnerFacts::default()
     }
+}
+
+/// The memory this runner may use (W13-R01): the machine's, no more than its cgroups' limit (a
+/// systemd scope's or slice's, a container's, a pod's), which the scheduler gives legs out of
+/// in resource mode (W05-R03).
+fn mem(total: u64, free: u64, limit: Option<u64>) -> Mem {
+    let total = limit.map_or(total, |l| l.min(total));
+    Mem { total, free: free.min(total) }
 }
 
 /// Every fact of this runner, its probes run now.
 pub async fn gather(work_dir: &Path, declared: &Declared) -> RunnerFacts {
     let dir = work_dir.to_path_buf();
     let mut f = crate::rt::blocking(move || machine(&dir)).await.unwrap_or_default();
+    // A test build posing as a runner of another platform (`--chaos platform=`, docs/ci.md
+    // W04-AC07): that platform's OS and architecture, and so the labels they give.
+    if let Some(p) = super::chaos::get().and_then(|c| c.platform.as_deref()).and_then(|p| kiln_ci::plan::matrix::Platform::parse(p).ok()) {
+        f.arch_variant = p.variant.clone().or_else(|| (p.fact_arch == "aarch64").then(|| "v8".to_owned()));
+        (f.os, f.arch) = (p.fact_os.to_owned(), p.fact_arch.to_owned());
+    }
     // Hypervisor.framework on a Mac: the kernel says whether it's supported.
     if cfg!(target_os = "macos") {
         f.virt.hvf = output("sysctl", &["-n", "kern.hv_support"]).await.is_some_and(|v| v.trim() == "1");
@@ -270,6 +327,16 @@ pub async fn gather(work_dir: &Path, declared: &Declared) -> RunnerFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W05-R03: a runner in a cgroup offers what the cgroup lets it use, not the machine's.
+    #[test]
+    fn w05_r03_a_runner_offers_its_cgroups_memory() {
+        let g = 1u64 << 30;
+        assert_eq!(mem(124 * g, 49 * g, Some(40 * g)), Mem { total: 40 * g, free: 40 * g }, "a 40G scope on a 124G machine");
+        assert_eq!(mem(124 * g, 30 * g, Some(40 * g)), Mem { total: 40 * g, free: 30 * g });
+        assert_eq!(mem(16 * g, 8 * g, Some(40 * g)), Mem { total: 16 * g, free: 8 * g }, "a limit over the machine's");
+        assert_eq!(mem(124 * g, 49 * g, None), Mem { total: 124 * g, free: 49 * g }, "no limit");
+    }
 
     #[test]
     fn w13_r01_versions() {
@@ -298,5 +365,18 @@ mod tests {
         assert_eq!((d.facts.get("location").map(String::as_str), d.probes.get("cuda").map(String::as_str)), (Some("rack-2"), Some("nvcc --version")));
         assert_eq!(Declared::from_file(&dir.path().join("none.toml")), Declared::default());
         Ok(())
+    }
+
+    /// W24-R19: the I/O pressure a runner reports is PSI's `full avg10`.
+    #[test]
+    fn w24_r19_io_pressure() {
+        let psi = "some avg10=12.50 avg60=8.00 avg300=2.10 total=123456\nfull avg10=7.25 avg60=3.00 avg300=1.00 total=65432\n";
+        assert_eq!(io_full(psi), Some(7.25));
+        assert_eq!(io_full("some avg10=1.00 avg60=0.00 avg300=0.00 total=1\n"), None, "a kernel without `full`");
+        assert_eq!(io_full("full avg10=nan avg60=0.00\n"), None);
+        assert_eq!(io_full(""), None);
+        if cfg!(target_os = "linux") && std::path::Path::new("/proc/pressure/io").exists() {
+            assert!(io_pressure().is_some_and(|p| (0.0..=100.0).contains(&p)), "{:?}", io_pressure());
+        }
     }
 }

@@ -21,7 +21,8 @@
 //! | `GET`, `POST /releases`; `GET /releases/{id}` | releases (filters: `app`, `environment`, `state`, `limit`) |
 //! | `POST /releases/{id}/cancel`, `/releases/{id}/rollback` | |
 //! | `POST /releases/{id}/approve`, `/releases/{id}/reject` | a person's answer to a release waiting for approval (`{note}`) |
-//! | `POST /fleets`, `GET /fleets/{id}` | a fleet change: one version, or values set, across many apps of an environment |
+//! | `POST /fleets`, `GET /fleets/{id}` | a fleet change: one version, or values set, across many apps of an environment; or (`source`) a kiln-base version or values set in each app's source repository, one pull request per repository |
+//! | `POST /fleets/{id}/merge` (`{repo}`), `DELETE /fleets/{id}` | a source change's proposals on kiln's own git server merged; its open proposals withdrawn |
 //! | `GET /apps/{app}/environments/{env}/secrets`; `PUT`, `DELETE …/secrets/{name}` (`?release=false`) | an app's secrets there (§3.5): names and versions; a value is set (`{value}` or `{base64}`), never read back; a change is released |
 //! | `GET …/secrets/{name}/versions`, `GET …/secret-uses?limit` | a secret's versions; each read of the secrets for a delivery |
 //! | `POST /secret-keys/rotate` | every app's secrets re-sealed under a new data key |
@@ -35,7 +36,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use http::{Method, StatusCode};
-use hyper::body::Incoming;
+use kiln_http::Incoming;
 use serde_json::{Value, json};
 
 use super::flow::{self, Ask, Fail, RollbackAsk, Who};
@@ -77,11 +78,19 @@ struct Note {
     note: Option<String>,
 }
 
+/// Which of a fleet change's proposals on kiln's own git server to merge (none named: each open).
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MergeAsk {
+    #[serde(default)]
+    repo: Option<String>,
+}
+
 /// An app and an environment it's registered in.
 async fn registered(d: &Deploy, app: &str, env: &str) -> Result<(App, Environment), Fail> {
-    let a = store::app(&d.hub.store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
-    let environment = store::environment(&d.hub.store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
-    store::registration(&d.hub.store, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
+    let a = store::app(&*d.records, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    let environment = store::environment(&*d.records, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+    store::registration(&*d.records, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
     Ok((a, environment))
 }
 
@@ -103,14 +112,14 @@ pub fn route<'a>(hub: &'a Arc<Hub>, rest: &'a [&'a str], q: &'a HashMap<String, 
 }
 
 async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
-    let d = super::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "deploying by API isn't running here (it runs with [cd] enabled)".to_owned()))?;
-    let who = req.extensions().get::<crate::authz::Caller>().map_or_else(|| Who { name: "admin".to_owned(), agent: false }, Who::of);
+    let d = super::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, super::not_running()))?;
+    let who = req.extensions().get::<crate::authz::Caller>().map_or_else(|| Who::kiln("admin"), Who::of);
     let actor = who.name.clone();
     // A template that makes repositories is put by someone who may add them.
     let adds_repos = req.extensions().get::<crate::authz::Caller>().is_none_or(|c| c.can("settings.manage", &crate::authz::Scope::Server));
     let key = req.headers().get("idempotency-key").and_then(|v| v.to_str().ok()).map(str::to_owned);
     let method = req.method().clone();
-    let store = &d.hub.store;
+    let store = &*d.records;
     match (&method, rest) {
         (&Method::GET, ["environments"]) => ok(&json!({ "environments": store::environments(store).await.map_err(internal)? })),
         (&Method::POST, ["environments"]) => {
@@ -175,11 +184,11 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
         (&Method::GET, ["apps"]) => ok(&json!({ "apps": store::apps(store).await.map_err(internal)? })),
         (&Method::POST, ["apps"]) => {
             let ask: flow::AppAsk = body(req.into_body()).await?;
-            created(&boxed(|| flow::create_app(&d, &actor, ask)).await?)
+            created(&boxed(|| flow::create_app(&d, &who, ask)).await?)
         }
         (&Method::PATCH, ["apps", name]) => {
             let patch: flow::AppPatch = body(req.into_body()).await?;
-            ok(&boxed(|| flow::patch_app(&d, &actor, name, patch)).await?)
+            ok(&boxed(|| flow::patch_app(&d, &who, name, patch)).await?)
         }
         (&Method::GET, ["apps", name, "catalog-info.yaml"]) => {
             let a = store::app(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {name}")))?;
@@ -191,7 +200,7 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
             if a.name != *name {
                 return Err(bad(format!("the body is app {}, the path {name}", a.name)));
             }
-            ok(&boxed(|| flow::put_app(&d, &actor, a)).await?)
+            ok(&boxed(|| flow::put_app(&d, &who, a)).await?)
         }
         (&Method::DELETE, ["apps", name]) => {
             let yes = |k: &str| q.get(k).is_some_and(|v| v == "true" || v == "1");
@@ -242,6 +251,7 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
         (&Method::POST, ["apps", app, "environments", env, "actions"]) => {
             let ask: actions::Ask = body(req.into_body()).await?;
             let (a, environment) = registered(&d, app, env).await?;
+            boxed(|| flow::may_release(&d, &who, &a, &environment, "act on what runs of")).await?;
             ok(&boxed(|| actions::run(&d, &who, &a, &environment, &ask)).await?)
         }
         (&Method::GET, ["apps", app, "environments", env, "versions"]) => ok(&json!({ "versions": boxed(|| versions(&d, app, env)).await? })),
@@ -256,10 +266,7 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
             ok(&boxed(|| secret_delete(&d, &who, app, env, name, how)).await?)
         }
         (&Method::GET, ["apps", app, "environments", env, "secrets", name, "versions"]) => ok(&boxed(|| secret_versions(&d, &who, app, env, name)).await?),
-        (&Method::POST, ["secret-keys", "rotate"]) => {
-            let n = secrets::of(&d.hub).rotate(&caller(&who)).await.map_err(refused)?;
-            ok(&json!({ "resealed": n }))
-        }
+        (&Method::POST, ["secret-keys", "rotate"]) => ok(&boxed(|| rotate_keys(&d, &who)).await?),
         (&Method::GET, ["apps", app, "environments", env, "secret-uses"]) => {
             let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
             ok(&boxed(|| secret_uses(&d, &who, app, env, limit)).await?)
@@ -268,13 +275,10 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
         // For linked servers (§11): where this one is and what it signs with, and what runs of an
         // app in one of its environments, signed for the server asking (`audience`, its issuer).
         (&Method::GET, ["link"]) => ok(&link::about(&d.hub)),
-        (&Method::GET, ["apps", app, "environments", env, "statement"]) => {
-            let audience = q.get("audience").map(|a| a.trim()).filter(|a| !a.is_empty() && a.len() <= 512).ok_or_else(|| bad("`audience`: the issuer of the server asking"))?;
-            match boxed(|| link::statement(&d, app, env, audience)).await.map_err(internal)? {
-                Some(statement) => ok(&json!({ "statement": statement })),
-                None => Err((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}"))),
-            }
-        }
+        // Where release repositories may be (§7): kiln's own git server, GitHub through kiln's App,
+        // each GitLab with the groups its token covers, Bitbucket with its workspaces.
+        (&Method::GET, ["git-hosts"]) => ok(&json!({ "hosts": boxed(|| git_hosts(&d.hub)).await })),
+        (&Method::GET, ["apps", app, "environments", env, "statement"]) => ok(&boxed(|| statement(&d, app, env, q.get("audience").map(String::as_str))).await?),
 
         (&Method::GET, ["releases"]) => {
             let state = match q.get("state") {
@@ -301,6 +305,11 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
             created(&boxed(|| flow::fleet(&d, &who, f)).await?)
         }
         (&Method::GET, ["fleets", id]) => ok(&boxed(|| flow::fleet_status(&d, id)).await?),
+        (&Method::POST, ["fleets", id, "merge"]) => {
+            let ask: MergeAsk = body(req.into_body()).await?;
+            ok(&boxed(|| super::sources::merge(&d, &who, id, ask.repo.as_deref())).await?)
+        }
+        (&Method::DELETE, ["fleets", id]) => ok(&boxed(|| super::sources::withdraw(&d, &who, id)).await?),
         (&Method::GET, ["releases", id]) => ok(&store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?),
         (&Method::POST, ["releases", id, verdict @ ("approve" | "reject")]) => {
             let (id, note) = (release_id(id)?, body::<Note>(req.into_body()).await?.note);
@@ -320,10 +329,42 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
     }
 }
 
+/// What runs of `app` in `env` and what's on its way, signed for the linked server whose issuer is
+/// `audience` (§11).
+pub(super) async fn statement(d: &Deploy, app: &str, env: &str, audience: Option<&str>) -> Result<Value, Fail> {
+    let audience = audience.map(str::trim).filter(|a| !a.is_empty() && a.len() <= 512).ok_or_else(|| bad("`audience`: the issuer of the server asking"))?;
+    match link::statement(d, app, env, audience).await.map_err(internal)? {
+        Some(statement) => Ok(json!({ "statement": statement })),
+        None => Err((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}"))),
+    }
+}
+
+/// Every app's secrets sealed again under a new data key (§3.5): how many were.
+pub(super) async fn rotate_keys(d: &Deploy, who: &Who) -> Result<Value, Fail> {
+    let n = secrets::of(&d.hub).rotate(&caller(who)).await.map_err(refused)?;
+    Ok(json!({ "resealed": n }))
+}
+
+/// The git hosts release repositories may be on (docs/deploy-api.md §7).
+pub(super) async fn git_hosts(hub: &Hub) -> Vec<Value> {
+    use super::model::{BITBUCKET_HOST, GITHUB_HOST, GITLAB_HOST, KILN_HOST};
+    let mut out = vec![json!({ "host": KILN_HOST, "name": "kiln's own git server" })];
+    if let Some(app) = crate::githost::github::app(hub).await {
+        out.push(json!({ "host": GITHUB_HOST, "name": "GitHub", "web": app.web }));
+    }
+    for g in crate::githost::gitlab::hosts(hub).await {
+        out.push(json!({ "host": GITLAB_HOST, "name": "GitLab", "web": g.web, "groups": g.groups() }));
+    }
+    if let Some(b) = crate::githost::bitbucket::host(hub).await {
+        out.push(json!({ "host": BITBUCKET_HOST, "name": "Bitbucket", "web": b.web, "groups": b.workspaces() }));
+    }
+    out
+}
+
 /// Every registration with what runs and what's in flight, and what waits for people: the
 /// environments board, in one answer.
-async fn board(d: &Deploy) -> Result<Value, Fail> {
-    let st = &d.hub.store;
+pub(super) async fn board(d: &Deploy) -> Result<Value, Fail> {
+    let st = &*d.records;
     let environments = store::environments(st).await.map_err(internal)?;
     let apps = store::apps(st).await.map_err(internal)?;
     let mut cells = Vec::new();
@@ -342,7 +383,7 @@ async fn board(d: &Deploy) -> Result<Value, Fail> {
 /// The versions a registration has run, newest first: when each first and last landed, how often,
 /// and whether it runs now.
 pub(super) async fn versions(d: &Deploy, app: &str, env: &str) -> Result<Vec<Value>, Fail> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let reg = store::registration(st, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
     let list = store::releases(st, store::ReleaseQuery { app: Some(app.into()), environment: Some(env.into()), limit: 1000, ..store::ReleaseQuery::default() }).await.map_err(internal)?;
     let running = reg.running.and_then(|id| list.iter().find(|r| r.id == id)).and_then(|r| r.version.clone());
@@ -372,12 +413,12 @@ pub(super) async fn versions(d: &Deploy, app: &str, env: &str) -> Result<Vec<Val
 
 /// An app, with each environment it's registered in and what runs there.
 pub(super) async fn app_json(d: &Deploy, name: &str) -> Result<Value, Fail> {
-    let a = store::app(&d.hub.store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {name}")))?;
-    let regs = store::registrations(&d.hub.store, Some(name), None).await.map_err(internal)?;
+    let a = store::app(&*d.records, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {name}")))?;
+    let regs = store::registrations(&*d.records, Some(name), None).await.map_err(internal)?;
     let mut envs = Vec::new();
     for reg in regs {
         let running = match reg.running {
-            Some(id) => store::release(&d.hub.store, id).await.map_err(internal)?,
+            Some(id) => store::release(&*d.records, id).await.map_err(internal)?,
             None => None,
         };
         envs.push(json!({ "registration": reg, "running": running }));
@@ -387,10 +428,10 @@ pub(super) async fn app_json(d: &Deploy, name: &str) -> Result<Value, Fail> {
 
 /// A registration: what runs, what's in flight, the latest releases, and what its provider says now.
 pub(super) async fn registration_json(d: &Deploy, app: &str, env: &str) -> Result<Value, Fail> {
-    let a = store::app(&d.hub.store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
-    let environment = store::environment(&d.hub.store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
-    let reg = store::registration(&d.hub.store, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
-    let recent = store::releases(&d.hub.store, store::ReleaseQuery { app: Some(app.into()), environment: Some(env.into()), state: None, version: None, limit: 20 }).await.map_err(internal)?;
+    let a = store::app(&*d.records, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    let environment = store::environment(&*d.records, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+    let reg = store::registration(&*d.records, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
+    let recent = store::releases(&*d.records, store::ReleaseQuery { app: Some(app.into()), environment: Some(env.into()), state: None, version: None, limit: 20 }).await.map_err(internal)?;
     let in_flight = recent.iter().find(|r| r.state.in_flight()).cloned();
     let running = recent.iter().find(|r| Some(r.id) == reg.running).cloned();
     let provider = match environment.provider.strip_prefix("argocd/") {
@@ -417,8 +458,8 @@ pub(super) async fn registration_json(d: &Deploy, app: &str, env: &str) -> Resul
 
 /// An app's secrets in an environment (§3.5) belong to an app and an environment that are there.
 async fn secret_scope(d: &Deploy, app: &str, env: &str) -> Result<Scope, Fail> {
-    store::app(&d.hub.store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
-    store::environment(&d.hub.store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+    store::app(&*d.records, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    store::environment(&*d.records, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
     Ok(Scope::of(app, env))
 }
 
@@ -448,7 +489,13 @@ async fn secret_value(body: Incoming) -> Result<secrets::Value, Fail> {
     }
     let bytes = srv::body_bytes(body, LIMIT).await.map_err(|e| bad(format!("{e:#}")))?;
     let put: Put = serde_json::from_slice(&bytes).map_err(|_| bad("a secret is set with `{\"value\": \"…\"}`, or `{\"base64\": \"…\"}` for bytes"))?;
-    match (put.value, put.base64) {
+    secret_value_of(put.value, put.base64)
+}
+
+/// A secret's value from its text (`value`) or its bytes (`base64`): one of them. What doesn't
+/// read is refused without saying what it was.
+pub(super) fn secret_value_of(value: Option<String>, base64: Option<String>) -> Result<secrets::Value, Fail> {
+    match (value, base64) {
         (Some(v), None) => Ok(secrets::Value::new(v.into_bytes())),
         (None, Some(b)) => {
             use base64::Engine as _;
@@ -469,7 +516,7 @@ pub(super) async fn secrets_list(d: &Deploy, who: &Who, app: &str, env: &str) ->
 
 /// Sets a secret's next version, and releases it unless `release` is false: the version, and the
 /// release that delivers it (made, or joined) with what happens next.
-async fn secret_put(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, value: secrets::Value, how: Change) -> Result<Value, Fail> {
+pub(super) async fn secret_put(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, value: secrets::Value, how: Change) -> Result<Value, Fail> {
     let at = secret_scope(d, app, env).await?;
     let meta = secrets::of(&d.hub).put(&at, name, value, &caller(who)).await.map_err(refused)?;
     let (release, next) = released(d, who, app, env, format!("{name} v{}", meta.version), how).await;
@@ -481,7 +528,7 @@ async fn secret_put(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, val
     Ok(v)
 }
 
-async fn secret_delete(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, how: Change) -> Result<Value, Fail> {
+pub(super) async fn secret_delete(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, how: Change) -> Result<Value, Fail> {
     let at = secret_scope(d, app, env).await?;
     secrets::of(&d.hub).delete(&at, name, &caller(who)).await.map_err(refused)?;
     let (release, next) = released(d, who, app, env, format!("{name} deleted"), how).await;
@@ -495,9 +542,9 @@ async fn secret_delete(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, 
 /// asks that the release delivering it isn't reverted if it fails (a rotation after a leak: a
 /// revert would deliver the old value again).
 #[derive(Debug, Clone, Copy)]
-struct Change {
-    release: bool,
-    revert: bool,
+pub(super) struct Change {
+    pub(super) release: bool,
+    pub(super) revert: bool,
 }
 
 impl Change {
@@ -508,15 +555,13 @@ impl Change {
 }
 
 async fn released(d: &Deploy, who: &Who, app: &str, env: &str, what: String, how: Change) -> (Option<Release>, String) {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let later = format!("release it with `kiln deploy {app} --to {env} --secrets`");
     if !how.release {
         return (None, format!("not released: {later}"));
     }
-    match store::environment(st, env).await {
-        Ok(Some(e)) if e.provider.starts_with("argocd/") => return (None, "kept: Argo CD can't take secrets from kiln yet".to_owned()),
-        Ok(_) => {}
-        Err(e) => return (None, format!("not released ({e:#}): {later}")),
+    if let Err(e) = store::environment(st, env).await {
+        return (None, format!("not released ({e:#}): {later}"));
     }
     match store::registration(st, app, env).await {
         Ok(Some(reg)) if reg.running.is_some() => {}
@@ -546,13 +591,13 @@ async fn released(d: &Deploy, who: &Who, app: &str, env: &str, what: String, how
     }
 }
 
-async fn secret_versions(d: &Deploy, who: &Who, app: &str, env: &str, name: &str) -> Result<Value, Fail> {
+pub(super) async fn secret_versions(d: &Deploy, who: &Who, app: &str, env: &str, name: &str) -> Result<Value, Fail> {
     let at = secret_scope(d, app, env).await?;
     let versions = secrets::of(&d.hub).versions(&at, name, &caller(who)).await.map_err(refused)?;
     Ok(json!({ "name": name, "versions": versions }))
 }
 
-async fn secret_uses(d: &Deploy, who: &Who, app: &str, env: &str, limit: usize) -> Result<Value, Fail> {
+pub(super) async fn secret_uses(d: &Deploy, who: &Who, app: &str, env: &str, limit: usize) -> Result<Value, Fail> {
     let at = secret_scope(d, app, env).await?;
     let reads = secrets::of(&d.hub).reads(&at, limit, &caller(who)).await.map_err(refused)?;
     Ok(json!({ "reads": reads }))
@@ -575,12 +620,13 @@ mod tests {
             concurrency: Default::default(),
             agents: AgentPolicy::default(),
             argocd: Default::default(),
+            owners: Default::default(),
         }
     }
 
     /// Sets a secret as a person would over the API: what the answer says.
     async fn set(d: &Deploy, env: &str, name: &str, release: bool) -> anyhow::Result<Value> {
-        let ada = Who { name: "ada".into(), agent: false };
+        let ada = Who::kiln("ada");
         secret_put(d, &ada, "web", env, name, secrets::Value::new(b"value".to_vec()), Change { release, revert: true }).await.map_err(|(code, m)| anyhow::anyhow!("{code}: {m}"))
     }
 
@@ -593,8 +639,8 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let root = tempfile::tempdir()?;
-            let d = Deploy { hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), github: Default::default(), hub: Arc::clone(&hub) };
-            let st = &hub.store;
+            let d = Deploy { records: Arc::clone(&hub.records), stand_in: None, hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), remote: Default::default(), hub: Arc::clone(&hub) };
+            let st = &*d.records;
             store::put_environment(st, &env("staging", KILNCD)).await?;
             store::put_environment(st, &env("argo", "argocd/prod")).await?;
             let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
@@ -609,6 +655,7 @@ mod tests {
                 contacts: Contacts::default(),
                 source: None,
                 archived: false,
+                registries: None,
             };
             store::put_app(st, &web).await?;
 
@@ -633,9 +680,10 @@ mod tests {
             let v = set(&d, "staging", "API_KEY", true).await?;
             anyhow::ensure!(v.pointer("/release/id") == Some(&json!(r.id)) && v.pointer("/release/secrets") == Some(&json!("DB_PASSWORD v2, API_KEY v2")), "{v}");
 
-            // Kept without releasing, when asked; and where Argo CD deploys, which can't take them yet.
+            // Kept without releasing, when asked; and where Argo CD deploys as anywhere: kept for its first release.
             anyhow::ensure!(next(&set(&d, "staging", "OTHER", false).await?).starts_with("not released"));
-            anyhow::ensure!(next(&set(&d, "argo", "DB_PASSWORD", true).await?).contains("Argo CD"));
+            let v = set(&d, "argo", "DB_PASSWORD", true).await?;
+            anyhow::ensure!(v.get("release") == Some(&Value::Null) && next(&v).contains("first release"), "{v}");
             Ok(())
         })
     }

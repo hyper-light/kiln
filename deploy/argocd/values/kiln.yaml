@@ -28,6 +28,13 @@ config:
   kubernetes:
     max_pods: 64
 
+# Production's memory limit (Ada, 2026-10-24). kiln:61b07ceb's start peaked at the chart's 2Gi,
+# which tripped the guard's memory check (share over 0.8) and rolled it back into a crash loop. The
+# chart's default stays 2Gi; the requests stay the chart's.
+resources:
+  limits:
+    memory: 16Gi
+
 # kiln's own repository is on GitHub: its CI follows it there, like every hyper-light repository's
 # (Argo CD still deploys from the in-cluster git server). Registered here because the repository
 # was first added pointing at the in-cluster server, and discovery leaves names it already has.
@@ -35,6 +42,29 @@ extraConfig: |
   [[repos]]
   name = "hyper-light/kiln"
   clone_url = "https://github.com/hyper-light/kiln.git"
+
+  # W23-AC02/AC03's test repositories (docs/ci.md W23): gitlab.com through a project access token,
+  # Bitbucket Cloud through a repository access token, each from the Secret `kiln-w23-hosts`
+  # (keys gitlab.token, bitbucket.token). A token missing or not mounted yet is only warned about,
+  # and the files are read again each minute.
+  [[ci.gitlab]]
+  url = "https://gitlab.com"
+  token_file = "/etc/kiln/hosts/gitlab.token"
+
+  [ci.bitbucket]
+  token_file = "/etc/kiln/hosts/bitbucket.token"
+
+# The hosts' tokens above. Optional: kiln starts without it.
+extraVolumes:
+  - name: hosts
+    secret:
+      secretName: kiln-w23-hosts
+      defaultMode: 0400
+      optional: true
+extraVolumeMounts:
+  - name: hosts
+    mountPath: /etc/kiln/hosts
+    readOnly: true
 
 # Bare-metal agents outside the cluster: <minikube node IP>:30070/TCP and :30071/UDP
 # (deploy/cluster/expose-lan.sh forwards host ports 7070/7071 to these for LAN machines).

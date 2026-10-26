@@ -65,8 +65,8 @@ export interface ToolCall {
 }
 
 export type Body =
-  | { kind: "user"; text: string; images?: number; attachments?: string[]; client_id?: string; origin?: string }
-  | { kind: "assistant"; text: string; streaming?: boolean }
+  | { kind: "user"; text: string; images?: number; attachments?: string[]; client_id?: string; origin?: string; reply_to?: string }
+  | { kind: "assistant"; text: string; streaming?: boolean; reply_to?: string }
   | { kind: "thinking"; text: string; streaming?: boolean; redacted?: boolean }
   | ({ kind: "tool" } & ToolCall)
   | { kind: "notice"; level: Level; text: string };
@@ -132,6 +132,9 @@ export interface QueueItem {
   id: string;
   text: string;
   at: number;
+  attachments?: Attachment[];
+  overrides?: { model?: string; effort?: string };
+  reply_to?: string;
 }
 
 export interface Task {
@@ -167,6 +170,12 @@ export interface Task {
   wakes?: string;
   /** Whether a stop can work. */
   stoppable?: boolean;
+  /** Subagents: how a person's message reaches it now (a `send` with its `task`); none: it takes none, and the composer writes to the agent. */
+  takes?: SendMode[];
+  /** "parent": a message to it goes by way of the agent that started it (its harness takes none from kiln itself). */
+  via?: string;
+  /** Messages waiting for it to finish what it's doing. */
+  queue?: QueueItem[];
 }
 
 /** A harness's own subagent, tracked within its parent's session without another executor. */
@@ -255,6 +264,8 @@ export interface StatusItem {
 export interface ExitInfo {
   code: number | null;
   error?: string;
+  /** Unix ms it ended: what a stop is known by (its card's key). */
+  at?: number;
 }
 
 /** One file's change since the agent first touched it (the server keeps it cumulative). */
@@ -289,7 +300,10 @@ function withFiles(was: KeptFile[], added: KeptFile[]): KeptFile[] {
 }
 
 export interface FileChange {
+  /** Relative to its working tree's top (`tree`) when it's in one, else to the agent's folder. */
   path: string;
+  /** The top of the git working tree it's in: its folder's repository's own, or a worktree of it. */
+  tree?: string;
   created?: boolean;
   deleted?: boolean;
   added: number;
@@ -297,6 +311,15 @@ export interface FileChange {
   hunks: Hunk[];
   truncated?: boolean;
   at: number;
+}
+
+/** A compaction under way (`State.compacting`): the main thread's, or a subagent's (`parent`, its spawning call). */
+export interface Compacting {
+  /** Unix ms it began. */
+  since: number;
+  /** The context it compacts, in tokens, as its harness last said (the main thread's). */
+  tokens?: number;
+  parent?: string;
 }
 
 export interface State {
@@ -323,9 +346,17 @@ export interface State {
   todos: Todo[];
   usage: Usage;
   activity?: string;
+  /** Its harness is compacting a conversation now; its marker (a `compaction:` notice) says how it went. */
+  compacting?: Compacting;
   exit?: ExitInfo;
   dropped: number;
   effort?: string;
+  /** The speed it runs at: absent or "" standard, else one of `Meta.speeds`. */
+  speed?: string;
+  /** Why its faster speeds can't serve it now (its account doesn't allow them), as its harness said. */
+  speed_blocked?: string;
+  /** Fast, but at standard speed for now: fast mode's own rate limit is cooling down (Claude Code). */
+  speed_cooldown?: boolean;
   /** Live values of Meta.controls, by id. */
   control_values?: Record<string, unknown>;
   limits?: Limit[];
@@ -350,6 +381,8 @@ export interface State {
   pause?: Pause;
   /** It pauses once a limit is this full (percent): between turns, or at the next step of one under way; absent: only when one is reached. */
   pause_at?: number;
+  /** The most subagents it runs at once: its harness's own, and the agents it starts through kiln (absent: no limit of its own). */
+  max_subagents?: number;
   /** How its last turn ended (what kiln's keep-going reads). */
   last_turn?: TurnEnd;
   /** Turns in a row kiln started to keep it going, since a person last said something. */
@@ -416,6 +449,7 @@ export interface ModelOption {
   id: string;
   label: string;
   description?: string;
+  default?: boolean;
   /** The effort levels it takes, lowest first (when the harness says). */
   efforts?: string[];
 }
@@ -457,6 +491,16 @@ export interface GoalItem {
   part_of?: string;
   /** The plan step it was made from (`n` from 1). */
   step?: { plan: string; version: number; n: number; run?: string };
+  /** The agent it's under way on, handed to it (a program's coordinator's goal, its track's worker's: docs/programs.md). */
+  on?: string;
+  /** Who made it a part: the agent (`own`: its goal comes back for its own check), or kiln (`checks`, `plan`, `planning`, `run`: its goal is met once they all are). */
+  part_kind?: "own" | "checks" | "plan" | "planning" | "run";
+  /** The plan it became. */
+  planned_as?: string;
+  /** The plan run it waits for. */
+  waits_on?: string;
+  /** The subagent a plan's step was handed to, side by side with the plan's other steps (docs/goals.md, "A plan's steps side by side"): under way there while it's still to go here; once met, who met it. */
+  subagent?: string;
 }
 
 /** An agent's goals, one after another: each goes once the one before is met. */
@@ -470,6 +514,8 @@ export interface GoalStack {
   cleared?: number;
   /** Paused for a while: when it resumes by itself (unix ms). */
   resume_at?: number;
+  /** Its big goals planned first (docs/goals.md, "Big goals, planned first"): on unless turned off. */
+  plan_big?: boolean;
 }
 
 /** A terminal beside an agent, in its folder on its machine: its shell, or its harness's own screen. */
@@ -499,6 +545,8 @@ export interface BroadcastBody {
   mode?: SendMode;
   command?: Command;
   approvals?: "allow" | "deny";
+  /** An idempotency key: sent again with it, each agent's message is the same one, delivered once. */
+  key?: string;
 }
 
 export interface BroadcastOutcome {
@@ -581,11 +629,13 @@ export interface Meta {
   hooks?: HookInfo[];
   /** Reasoning effort levels, when the harness has them. */
   efforts?: ControlOption[];
+  /** The speeds faster than standard the model in use runs at, slowest first (absent: none). */
+  speeds?: ControlOption[];
   modes: ModeOption[];
   models: ModelOption[];
   commands: SlashCommand[];
   agents: string[];
-  /** "steer", "send_now", "queue_cancel", "interrupt", "set_mode", "set_model", "stop_task", "file_suggestions", "resume", "switch_harness" */
+  /** "steer", "send_now", "queue_cancel", "interrupt", "set_mode", "set_model", "set_speed", "stop_task", "file_suggestions", "resume", "switch_harness" */
   features: string[];
 }
 
@@ -613,6 +663,16 @@ export interface TurnEnd {
   kept?: number;
 }
 
+/** Goals an agent paused for you, until you resume them (`AgentInfo.held`). */
+export interface Held {
+  /** Why, as its goal stack says it ("Paused by the agent: …"). */
+  why: string;
+  /** The plan it waits for you to look at first, when that's why. */
+  plan?: string;
+  /** Unix ms it paused. */
+  since: number;
+}
+
 export interface AgentInfo {
   id: string;
   kind: string;
@@ -622,6 +682,8 @@ export interface AgentInfo {
   name: string;
   shell?: string;
   cwd: string;
+  /** The working tree its work is in (its latest change's): git's questions about its work go there. */
+  tree?: string;
   created_at: number;
   status: Status;
   title: string;
@@ -641,12 +703,16 @@ export interface AgentInfo {
   pause?: Pause;
   /** Kiln doesn't keep it going when it stops part-way (the "keep_going" control). */
   keep_off?: boolean;
+  /** Its goals wait on you: it paused them for you, until you resume them (set on the server). */
+  held?: Held;
   /** At a limit it goes on on another machine with room (as `State.move_on_limit`). */
   move_on_limit?: boolean;
   /** Where it goes on then (as `State.move_plan`). */
   move_plan?: MovePlan;
   /** Where it pauses as its limits fill (as `State.pause_at`). */
   pause_at?: number;
+  /** The most subagents it runs at once (as `State.max_subagents`). */
+  max_subagents?: number;
   cost_usd: number;
   activity?: string;
   last_activity: number;
@@ -753,7 +819,7 @@ export interface Spec {
 export type WorkspacesAvailable = Record<string, { available: boolean; why_not?: string }>;
 
 export type Command =
-  | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string } }
+  | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string }; reply_to?: string; task?: string }
   | { type: "control"; id: string; value?: unknown }
   | { type: "mcp_enable"; name: string; enabled: boolean }
   | { type: "mcp_reconnect"; name: string }
@@ -761,9 +827,11 @@ export type Command =
   | { type: "mcp_add"; scope: string; name: string; transport: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> }
   | { type: "mcp_remove"; scope: string; name: string }
   | { type: "skill_view"; name: string; client: string }
-  | { type: "skill_run"; name: string; args?: string }
+  /** `id`: the message's id, made once (a skill run is delivered like a message: once). */
+  | { type: "skill_run"; name: string; args?: string; id?: string }
   | { type: "set_effort"; effort: string }
-  | { type: "queue_edit"; id: string; text: string }
+  | { type: "set_speed"; speed: string }
+  | { type: "queue_edit"; id: string; text: string; attachments?: Attachment[] }
   | { type: "queue_remove"; id: string }
   | { type: "queue_move"; id: string; index: number }
   | { type: "queue_send_now"; id: string }
@@ -797,15 +865,24 @@ export type Command =
   | { type: "auto_resume"; on: boolean }
   /** Pause once a limit is this full (null: only when one is reached). */
   | { type: "pause_at"; percent: number | null }
+  /** The most subagents it runs at once (null: no limit of its own). */
+  | { type: "max_subagents"; count: number | null }
   /** Whether at a limit it goes on on another machine with room, and where (`MovePlan`). */
   | ({ type: "move_on_limit"; on: boolean } & MovePlan);
 
 export type Update =
-  | { t: "open"; info: AgentInfo }
+  /** The session whole follows; `rev` is the server's copy's revision, `born` its process's incarnation (docs/wire.md, "Revisions"). */
+  | { t: "open"; info: AgentInfo; rev?: number; born?: number }
+  /** Only what changed since the revision asked for follows (`?after=`), then "synced". */
+  | { t: "resumed"; info: AgentInfo; rev?: number; born?: number }
   | { t: "changes"; files: FileChange[] }
   /** Files finished messages mention, kept by the server (ahead of the events in a snapshot). */
   | { t: "files"; files: KeptFile[] }
   | { t: "error"; error: string }
+  /** A command sent under `id` was taken: applied, parked for its runner, accepted by its inbox (`accepted`), or sent to a runner that can't say more (docs/wire.md, "The UI's sockets"). */
+  | { t: "ack"; id: string; outcome: "taken" | "parked" | "accepted" | "unchecked" | "pending"; accepted?: unknown }
+  /** A command sent under `id` wasn't: its kind (`code`) and why; `again` when it may go again under its id (it didn't get through this time); `id` null for what couldn't be read. */
+  | { t: "nack"; id: string | null; code: string; why: string; again?: boolean; refused?: unknown }
   | { t: "closed" }
   | { t: "state"; state: State }
   /** What changed in the state since the last one (asked for with `?patch=state`): the fields set, and those gone. */
@@ -820,11 +897,11 @@ export type Update =
 
 /* ------------------------------------------------------------------ REST */
 
-async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>): Promise<T> {
   const res = await fetch(path, {
     method,
     credentials: "same-origin",
-    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    headers: body === undefined ? headers : { "content-type": "application/json", ...headers },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   });
@@ -926,8 +1003,10 @@ export const harnessApi = {
   /** Its live pages. */
   streams: (id: string) => call<StreamView[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/streams`),
   /** Open a live page: an address, or (`start`) the project's app; in a profile. */
-  openStream: (id: string, body: { url?: string; start?: boolean; profile?: string; engine?: string; device?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string }) =>
-    call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
+  openStream: (
+    id: string,
+    body: { url?: string; start?: boolean; profile?: string; engine?: string; device?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string },
+  ) => call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
   closeStream: (id: string, stream: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}/streams/${stream}`),
   /** Open the app on a port of its machine on this person's own device: a link to follow there. */
   openOnDevice: (id: string, body: { port: number; path?: string }) => call<Opened>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/opened`, body),
@@ -952,9 +1031,19 @@ export const harnessApi = {
   /** Its goals still to go, as they should be (existing ones by id; the one under way among them puts it back or rewords it). */
   setGoals: (id: string, goals: { id?: string; text: string }[]) => call<GoalStack>("PUT", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals }),
   /** Goals after its others; `start` runs the stack. */
-  addGoals: (id: string, goals: string[], start = false) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals, start }),
+  /** `key` (CP-T3.2): asked again under it, its goals are added once. */
+  addGoals: (id: string, goals: string[], start = false, key?: string) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals, start, key }),
   /** Start (or resume), pause, skip the goal under way, clear, or bring back the goals cleared last. */
-  goalAction: (id: string, action: "start" | "pause" | "skip" | "clear" | "restore") => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`),
+  /** `goal`: for a skip, the goal under way it's for (asked again once it's skipped, nothing more is: CP-T3.2). */
+  /** `key` (CP-T3.2): asked again under it (its answer lost), it does nothing more, whatever changed since. */
+  goalAction: (id: string, action: "start" | "pause" | "skip" | "clear" | "restore", goal: string | undefined, key: string) =>
+    call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`, goal ? { id: goal, key } : { key }),
+  /** One of its goals turned into a plan: planning it (research, its steps, ready) goes first, then its steps (`goals_plan`). */
+  /** Whether its stack plans its big goals first (a person's setting, not the agent's). */
+  goalSettings: (id: string, settings: { plan_big: boolean }) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/settings`, settings),
+  /** `dispatched`: a subagent of its agent plans it now (else `why` not: its planning waits its turn). */
+  planGoal: (id: string, goal: string) =>
+    call<{ plan: string; research: string; goal: string; part: string; dispatched?: boolean; why?: string | null }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/plan`, { id: goal }),
   /** The terminals beside an agent (its shell, its harness's own screen), live ones first. */
   terminals: (id: string) => call<BesideTerminal[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/terminals`),
   /** Open one beside it: its shell (the one already open, with `command` run in it), or its harness's own screen on `command`. */
@@ -985,8 +1074,13 @@ export const harnessApi = {
   /** Every agent of `machine`, which is gone, goes on elsewhere from the server's copy of its conversation: each on the machine that suits it, or all on `to`. */
   recover: (machine: string, to?: string) =>
     call<{ moved: { id: string; name: string; to?: string; error?: string }[] }>("POST", `/api/harness/machines/${encodeURIComponent(machine)}/recover`, to ? { to } : {}),
-  /** A command without opening the session's socket (inbox answers). */
-  command: (id: string, c: Command) => call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c),
+  /**
+   * A command without opening the session's socket (inbox answers). It goes under an id, as on the
+   * socket: a message's own (its id is its key), else `key`, one made now unless given, taken once
+   * however often it's sent under it (docs/wire.md, "The UI's sockets").
+   */
+  command: (id: string, c: Command, key: string = clientId()) =>
+    call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, c.type === "send" || c.type === "skill_run" ? undefined : { "idempotency-key": key }),
   /** Events whose words hold every word of `q`, across conversations (one agent's with `agent`; those before `until`, unix ms), newest first, from the server's conversation store. */
   said: (p: { q: string; agent?: string; until?: number; limit?: number }) => {
     const qs = new URLSearchParams({ q: p.q });
@@ -1016,13 +1110,56 @@ export const harnessApi = {
   broadcastPreview: (to: BroadcastTo) => call<BroadcastPreview>("POST", "/api/harness/broadcast/preview", { to }),
 };
 
-let seq = 0;
-/** A client-made id for a message or request (delivery state is reported under it). */
-export const clientId = () => `c${Date.now().toString(36)}${(++seq).toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+/**
+ * A client-made id for a message or request (delivery state is reported under it): a UUIDv7, 48
+ * bits of the time and 74 random, as 32 hex digits. A message's id is made once and every retry
+ * carries it, and the agent's inbox takes each id once (CP-T3.2), so it mustn't meet another's.
+ */
+export const clientId = (): string => {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  const ms = Date.now();
+  b[0] = Math.floor(ms / 2 ** 40) & 0xff;
+  b[1] = Math.floor(ms / 2 ** 32) & 0xff;
+  b[2] = (ms >>> 24) & 0xff;
+  b[3] = (ms >>> 16) & 0xff;
+  b[4] = (ms >>> 8) & 0xff;
+  b[5] = ms & 0xff;
+  b[6] = ((b[6] ?? 0) & 0x0f) | 0x70;
+  b[8] = ((b[8] ?? 0) & 0x3f) | 0x80;
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+};
 
 /* ------------------------------------------------------------------ live session */
 
 export type Conn = "connecting" | "open" | "reconnecting" | "gone";
+
+/** A command this page sent under an id it made (docs/wire.md, "The UI's sockets"): waiting for its answer (sent again on the next socket until it comes), or refused, saying how and why. */
+export interface Asked {
+  id: string;
+  command: Command;
+  /** When it was first sent (ms). */
+  at: number;
+  state: "pending" | "refused";
+  code?: string;
+  why?: string;
+  /** How many times it was answered for now (parked, or to send again), and sent again for it. */
+  tries?: number;
+}
+
+/** How long a command waits for an answer, sent again on each socket meanwhile: past it, it's said to have had none. One answered for now (parked, or to send again) has had one, and goes on. */
+export const ASKED_FOR_MS = 10 * 60_000;
+/** How long a refused command stays shown. */
+export const REFUSED_FOR_MS = 15_000;
+/** How long a command answered for now (parked, or a nack the server says to send `again`) waits before it goes again under its id: doubling from the first, to the last at most. */
+export const AGAIN_AFTER_MS = [10_000, 20_000, 40_000, 60_000];
+
+/** The id a command goes under: a message's own (its inbox takes it once under it), else one made now. */
+export function commandId(c: Command): string {
+  if (c.type === "send" && c.id) return c.id;
+  if (c.type === "skill_run" && c.id) return c.id;
+  return clientId();
+}
 
 export interface Snapshot {
   conn: Conn;
@@ -1042,6 +1179,39 @@ export interface Snapshot {
   stopAsked: { turn: number | undefined; at: number } | null;
   /** When the turn under way began, kept once it ends: between turns the clock holds the last one's length. */
   ranFrom: number | null;
+  /** The commands this page sent that haven't been answered, and those refused a moment ago. */
+  asked: Asked[];
+  /** Messages sent from this page that the session doesn't show yet, in the order they went. */
+  outgoing: Outgoing[];
+}
+
+/**
+ * A message sent from this page, shown in the conversation at once until its session shows it
+ * there or in a queue: on its way (`sending`, sent again under its id until it's answered:
+ * `Snapshot.asked`), taken by its machine (`sent`), or refused for good (`failed`, `why`). Part of
+ * CP-T3.4: nothing sent is out of sight while it goes.
+ */
+export interface Outgoing {
+  id: string;
+  text: string;
+  /** Its files, by name. */
+  attachments: string[];
+  reply_to?: string;
+  /** The subagent it's for (its task's id). */
+  task?: string;
+  mode?: SendMode;
+  /** When it was sent (ms). */
+  at: number;
+  state: "sending" | "sent" | "failed";
+  why?: string;
+}
+
+const ENDED = "the agent ended before it got there";
+
+/** A message on its way from here, and what was sent (a retry sends it again, as a new message). */
+interface Going {
+  o: Outgoing;
+  c: Extract<Command, { type: "send" }>;
 }
 
 /**
@@ -1068,7 +1238,21 @@ export function lastTurnFrom(s: Snapshot): number | null {
 /** A promise React reads as settled without waiting (its `status`, as React marks the ones it tracks). */
 const READY: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
 
-const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, files: [], error: null, ready: false, stopAsked: null, ranFrom: null };
+const EMPTY: Snapshot = {
+  conn: "connecting",
+  info: null,
+  meta: null,
+  state: null,
+  events: [],
+  changes: null,
+  files: [],
+  error: null,
+  ready: false,
+  stopAsked: null,
+  ranFrom: null,
+  asked: [],
+  outgoing: [],
+};
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /**
  * The snapshot sent as the socket opens ends with the server's "synced"; one sent later (a machine
@@ -1192,6 +1376,12 @@ export class SessionStore {
   private wsAt = 0;
   /** Frames on this connection so far. */
   private frames = 0;
+  /** How far what's shown goes in the server's copy (docs/wire.md, "Revisions"): its process's
+   * incarnation and the copy's revision. A reconnect asks for only what came after. */
+  private born = 0;
+  private rev = 0;
+  /** What an "open" or "resumed" said, taken once what follows it is in. */
+  private pending: { born: number; rev: number } | null = null;
   /** Something shows it (or will in a moment): the socket stays up. */
   private wanted = false;
   private unhook: (() => void)[] = [];
@@ -1213,10 +1403,14 @@ export class SessionStore {
   /** When nothing showed it any more. */
   idleSince = 0;
   private replies = new Map<string, (v: unknown) => void>();
+  /** The commands sent and not answered yet, and those refused a moment ago, by id. */
+  private asked = new Map<string, Asked>();
   private waiting: { promise: Promise<void>; resolve: () => void } | null = null;
   /** Packed messages being unpacked, and the chain they (and what came after them) are taken in. */
   private unpacking = 0;
   private inbox: Promise<void> = Promise.resolve();
+  /** Messages sent from here that the session doesn't show yet, in the order they went (`Snapshot.outgoing`). */
+  private out = new Map<string, Going>();
 
   constructor(readonly id: string) {}
 
@@ -1255,12 +1449,81 @@ export class SessionStore {
   /** Connect now rather than at the next try (the tab is shown again, the network is back). */
   wake = () => this.kick(false);
 
-  /** Send a command; false when the session isn't connected. */
+  /**
+   * Send a command; false when the session isn't connected. It goes under an id ({@link commandId}),
+   * taken once however often it's sent: kept until its answer comes, it's sent again on each socket
+   * after this one, and shown as waiting meanwhile, or refused once it is (`Snapshot.asked`). A
+   * message also shows in the conversation until the session has it (`Snapshot.outgoing`).
+   */
   send = (c: Command): boolean => {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
-    this.ws.send(JSON.stringify(c));
+    const id = commandId(c);
+    this.asked.set(id, { id, command: c, at: Date.now(), state: "pending" });
+    this.ws.send(JSON.stringify({ t: "cmd", id, c }));
+    this.patch({ asked: [...this.asked.values()] });
+    if (c.type === "send") this.track(c);
     return true;
   };
+
+  /**
+   * Sends a message refused for good again, as a new message with its words, files and reply (its
+   * id's answer stays the refusal): false while the session isn't connected.
+   */
+  resend = (id: string): boolean => {
+    const m = this.out.get(id);
+    if (m?.o.state !== "failed" || !this.send({ ...m.c, id: clientId() })) return false;
+    this.out.delete(id);
+    this.outChanged();
+    return true;
+  };
+
+  /** Lets go of a message that didn't get there: it isn't sent again. */
+  discard = (id: string) => {
+    if (this.out.delete(id)) this.outChanged();
+  };
+
+  /** The socket's open: what was sent and not answered goes again under its id; what waited too long for any answer is said to have had none. */
+  private sendAgain(ws: WebSocket) {
+    const now = Date.now();
+    let changed = false;
+    for (const a of this.asked.values()) {
+      if (a.state !== "pending") continue;
+      if (!a.tries && now - a.at > ASKED_FOR_MS) {
+        this.refuse(a.id, "unanswered", "no answer came");
+        changed = true;
+        continue;
+      }
+      ws.send(JSON.stringify({ t: "cmd", id: a.id, c: a.command }));
+    }
+    if (changed) this.patch({ asked: [...this.asked.values()] });
+  }
+
+  /** Command `id` was answered for now: it waits, and goes again under its id in a while, on this socket if it's still open (or on the next as any waiting one does). */
+  private later(id: string, why?: string) {
+    const a = this.asked.get(id);
+    if (!a || a.state !== "pending") return;
+    const tries = (a.tries ?? 0) + 1;
+    this.asked.set(id, { ...a, tries, why });
+    this.patch({ asked: [...this.asked.values()] });
+    const ws = this.ws;
+    window.setTimeout(() => {
+      const now = this.asked.get(id);
+      if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && now.tries === tries) ws.send(JSON.stringify({ t: "cmd", id, c: now.command }));
+    }, AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1]);
+  }
+
+  /** Command `id` was refused: shown so a moment, then let go of. A message refused so says so where it shows in the conversation, until it's sent again or let go of. */
+  private refuse(id: string, code: string, why: string) {
+    const a = this.asked.get(id);
+    if (!a) return;
+    this.asked.set(id, { ...a, state: "refused", code, why });
+    this.fail([id], why);
+    window.setTimeout(() => {
+      if (this.asked.get(id)?.state !== "refused") return;
+      this.asked.delete(id);
+      this.patch({ asked: [...this.asked.values()] });
+    }, REFUSED_FOR_MS);
+  }
 
   /**
    * Stop the turn under way; `force` when asking didn't take (the harness starts again, the
@@ -1347,7 +1610,9 @@ export class SessionStore {
     this.incoming = null;
     let ws: WebSocket;
     try {
-      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws${TAKES}`));
+      // What's shown already: only what came after it, when the server's copy can say.
+      const after = this.born && this.rev ? `&after=${this.born}.${this.rev}` : "";
+      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws${TAKES}${after}`));
     } catch {
       this.retry();
       return;
@@ -1356,6 +1621,9 @@ export class SessionStore {
     this.ws = ws;
     this.wsAt = Date.now();
     this.unpacking = 0;
+    ws.onopen = () => {
+      if (this.ws === ws) this.sendAgain(ws);
+    };
     ws.onmessage = (ev) => {
       if (this.ws !== ws) return;
       if (typeof ev.data === "string") {
@@ -1404,6 +1672,19 @@ export class SessionStore {
     }
     this.frames += 1;
     this.apply(u);
+    this.mark(u);
+  }
+
+  /** Where a frame says the server's copy is: an "open" or "resumed" once what follows it is in, a
+   * live frame at once. */
+  private mark(u: Update) {
+    const rev = (u as { rev?: unknown }).rev;
+    if (u.t === "open" || u.t === "resumed") {
+      const born = (u as { born?: unknown }).born;
+      this.pending = typeof born === "number" && typeof rev === "number" ? { born, rev } : null;
+      return;
+    }
+    if (!this.incoming && typeof rev === "number" && rev > this.rev) this.rev = rev;
   }
 
   /** The socket closed: try again (rarely once it has ended, in case it was only away). */
@@ -1411,7 +1692,9 @@ export class SessionStore {
     if (!this.wanted) return;
     window.clearTimeout(this.quiet);
     window.clearTimeout(this.hold);
+    // A snapshot or resume cut off isn't what's shown: a reconnect asks from what was before it.
     this.incoming = null;
+    this.pending = null;
     if (this.ended) {
       this.retry(ENDED_RETRY_MS);
       return;
@@ -1448,13 +1731,32 @@ export class SessionStore {
       case "error":
         this.patch({ error: u.error });
         return;
+      case "ack":
+        // Parked for its machine, which is away: it waits, asked again in a while.
+        if (u.outcome === "parked") return this.later(u.id, "its machine is away, and it goes once that's back");
+        // A message its inbox hasn't answered yet: asked again, its inbox answers a repeat if it took it.
+        if (u.outcome === "pending") return this.later(u.id, "its inbox hasn't said it took it yet");
+        // Its machine has it: a message shows as sent until the conversation shows it.
+        this.took(u.id);
+        if (this.asked.delete(u.id)) this.patch({ asked: [...this.asked.values()] });
+        return;
+      case "nack":
+        // Not this time (its machine away, its inbox full ...): it waits, and goes again.
+        if (u.id != null && u.again) return this.later(u.id, u.why);
+        if (u.id != null && this.asked.has(u.id)) {
+          this.refuse(u.id, u.code, u.why);
+          this.patch({ asked: [...this.asked.values()], error: u.why });
+        } else this.patch({ error: u.why });
+        return;
       case "open":
+      case "resumed":
         this.opened = true;
         this.ended = false;
         this.misses = 0;
         this.attempt = 0;
-        // Sent as the socket opens: the server's own snapshot, which it ends with "synced".
-        this.begin(u.info, this.frames === 1);
+        // Sent as the socket opens: the server's own snapshot, which it ends with "synced"; or
+        // only what came after what's shown (resumed), taken in with it.
+        this.begin(u.info, this.frames === 1, u.t === "resumed");
         if (this.snap.ready && this.snap.conn !== "open") this.patch({ conn: "open" });
         return;
       case "synced":
@@ -1468,6 +1770,7 @@ export class SessionStore {
         this.commit();
         this.ended = true;
         this.patch({ conn: "gone", ready: true });
+        this.fail(this.sending(), ENDED);
         this.settle();
         return;
     }
@@ -1484,9 +1787,11 @@ export class SessionStore {
     this.schedule();
   }
 
-  private begin(info: AgentInfo | null, told: boolean) {
+  private begin(info: AgentInfo | null, told: boolean, resumed = false) {
     window.clearTimeout(this.hold);
-    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: null, files: null, byId: new Map(), events: false, told };
+    // A resume adds to what's shown; a snapshot replaces it.
+    const byId = resumed ? new Map(this.byId) : new Map<string, HEvent>();
+    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: resumed ? this.snap.changes : null, files: null, byId, events: false, told };
     this.hold = window.setTimeout(() => this.commit(), HOLD_MS);
     this.wait();
   }
@@ -1540,6 +1845,12 @@ export class SessionStore {
     }
     this.byId = byId;
     this.reorder = true;
+    // What's shown goes as far as the open or resume said.
+    if (this.pending) {
+      this.born = this.pending.born;
+      this.rev = this.pending.rev;
+      this.pending = null;
+    }
     const s = this.snap;
     this.snap = {
       ...s,
@@ -1556,6 +1867,7 @@ export class SessionStore {
     // Ready only with its events in order, so the first render has them all.
     this.snap = { ...this.snap, events: this.ordered() };
     this.known = true;
+    this.arrived(this.byId.values());
     this.settle();
     this.schedule();
   }
@@ -1575,6 +1887,7 @@ export class SessionStore {
     // Taken as ended; still looked for now and then.
     this.ended = true;
     this.patch({ conn: "gone", ready: true });
+    this.fail(this.sending(), ENDED);
     this.settle();
   }
 
@@ -1626,6 +1939,74 @@ export class SessionStore {
         this.begin(this.snap.info, false);
         break;
     }
+    if (u.t === "events") this.arrived(u.events);
+    else if (u.t === "state" || u.t === "state_patch") this.arrived([]);
+  }
+
+  /* -------------------------------------------------------------- what's on its way from here */
+
+  /** A message that went: shown as sending until the session has it (sent again, the same one, in its place and with its time). */
+  private track(c: Extract<Command, { type: "send" }>) {
+    if (this.shows(c.id)) return;
+    const at = this.out.get(c.id)?.o.at ?? Date.now();
+    const o: Outgoing = { id: c.id, text: c.text, attachments: (c.attachments ?? []).map((a) => a.name), reply_to: c.reply_to, task: c.task, mode: c.mode, at, state: "sending" };
+    this.out.set(c.id, { o, c });
+    this.outChanged();
+  }
+
+  /** Whether the session shows message `id`: in its conversation, or waiting in its queue or a subagent's. */
+  private shows(id: string): boolean {
+    const s = this.snap.state;
+    if (s?.queue?.some((q) => q.id === id) || s?.tasks?.some((t) => t.queue?.some((q) => q.id === id))) return true;
+    if (this.byId.get(id)?.kind === "user") return true;
+    for (const e of this.byId.values()) if (e.kind === "user" && e.client_id === id) return true;
+    return false;
+  }
+
+  /** Lets go of the messages sent from here that the session shows now: among `events` (those that came; all of them, after a snapshot), or in its queues. */
+  private arrived(events: Iterable<HEvent>) {
+    if (this.out.size === 0) return;
+    const before = this.out.size;
+    for (const e of events) {
+      if (e.kind !== "user") continue;
+      this.out.delete(e.id);
+      if (e.client_id) this.out.delete(e.client_id);
+    }
+    const s = this.snap.state;
+    for (const q of s?.queue ?? []) this.out.delete(q.id);
+    for (const t of s?.tasks ?? []) for (const q of t.queue ?? []) this.out.delete(q.id);
+    if (this.out.size !== before) this.outChanged();
+  }
+
+  /** The messages still on their way: not taken by their machine yet. */
+  private sending(): string[] {
+    return [...this.out.values()].filter((m) => m.o.state === "sending").map((m) => m.o.id);
+  }
+
+  /** Message `id`'s machine has it (its inbox took it, or its runner did): it shows as sent until the conversation shows it. */
+  private took(id: string) {
+    const m = this.out.get(id);
+    if (m?.o.state !== "sending") return;
+    this.out.set(id, { ...m, o: { ...m.o, state: "sent" } });
+    this.outChanged();
+  }
+
+  /** Messages `ids` didn't get there, `why` (one its machine took did, whatever's said after). */
+  private fail(ids: string[], why: string) {
+    let changed = false;
+    for (const id of ids) {
+      const m = this.out.get(id);
+      if (!m || m.o.state === "sent") continue;
+      this.out.set(id, { ...m, o: { ...m.o, state: "failed", why } });
+      changed = true;
+    }
+    if (changed) this.outChanged();
+  }
+
+  /** What's shown of the messages on their way changed. */
+  private outChanged() {
+    this.snap = { ...this.snap, outgoing: Array.from(this.out.values(), (m) => m.o) };
+    this.schedule();
   }
 
   private settle() {

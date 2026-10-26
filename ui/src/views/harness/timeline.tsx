@@ -5,15 +5,39 @@
  * the files it read, the subagent it started.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUpRight, Check, ChevronRight, CircleAlert, Copy, CornerDownRight, Info, TriangleAlert } from "lucide-react";
-import { useSession, type Approval, type Command, type Delivery, type HEvent, type Meta, type SessionStore, type Task } from "@/api/harness";
+import { ArrowDown, ArrowUpRight, ChevronRight, CircleAlert, Copy, CornerDownRight, Download, FileDown, GitBranch, GitFork, Info, Pencil, Reply, SquarePlus, TriangleAlert, Undo2, X } from "lucide-react";
+import { useSession, type Approval, type Command, type Compacting, type Delivery, type HEvent, type Meta, type Outgoing, type QueueItem, type SessionStore, type Task } from "@/api/harness";
+import { useNavigate } from "@/lib/router";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { AccountCard, saysSignedOut } from "./account-card";
-import { changesetOf, diffStats, duration, relPath, shareTurns, stepStatus, stepSummary, taskDot, taskDuration, taskLive, taskOfCall, turnsFrom, type Item, type Step, type ToolEvent, type Turn, type TurnsMemo } from "./derive";
+import {
+  changesetOf,
+  diffStats,
+  duration,
+  relPath,
+  shareTurns,
+  stepStatus,
+  stepSummary,
+  taskDot,
+  taskDuration,
+  taskLive,
+  taskOfCall,
+  tokens,
+  turnsFrom,
+  type Item,
+  type Step,
+  type ToolEvent,
+  type Turn,
+  type TurnsMemo,
+} from "./derive";
 import { ApprovalCard, type Decide } from "./approval";
 import { DiffStat, FileDiffView } from "./diff";
-import { TurnMenu } from "./controls";
+import { MsgMenu, type MenuGroup, type MenuRow } from "./msgmenu";
+import { SpawnDialog } from "./spawn";
+import { fileUrl, keptFor, kindOf, resolvePath } from "./files";
+import { toast } from "@/components/ui/toast";
+import { Button } from "@/components/ui/button";
 import { bringIntoView, elementOf, FindNowContext, mark, useRevealed, type FindNow } from "./find";
 import { Output, Prose, ToolIcon } from "./parts";
 import { FilesContext, type ConversationFiles } from "./files";
@@ -22,15 +46,21 @@ import { pageOf } from "./page-of";
 import { LiveView } from "./live";
 import { liveOf } from "./live-of";
 import { SavePlan, todosAsPlan } from "@/views/plans/save";
+import { researchCall } from "@/api/research";
+import { ResearchCard } from "@/views/research/research";
 import { copyText } from "@/views/terminal/clipboard";
-import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
+import { Beam, Condense, formatThought, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
 import { latestThought, thinkingStarted, thoughtIsLive, thoughtShown, type ThoughtItem } from "./thinking";
 import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
 import { useHeld, useRecent } from "./dom";
+import { unsending } from "./unsend";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
+
+/** The calls that last touched each piece of research in the conversation: their steps open on it, as the agent reports it. */
+const Researched = React.createContext<ReadonlySet<string>>(new Set());
 
 /** The notice saying the harness isn't signed in (the latest, unless it has worked since), and where to sign it in. */
 const SignIn = React.createContext<{ notice: string; target: string; kind: string } | null>(null);
@@ -42,6 +72,7 @@ const Tasks = React.createContext<Task[]>(NO_TASKS);
 
 function Contexts({
   asking,
+  researched,
   signIn,
   findNow,
   tasks,
@@ -49,6 +80,7 @@ function Contexts({
   children,
 }: {
   asking: ReadonlySet<string>;
+  researched: ReadonlySet<string>;
   signIn: React.ContextType<typeof SignIn>;
   findNow: FindNow | null;
   tasks: Task[];
@@ -58,13 +90,15 @@ function Contexts({
 }) {
   return (
     <Asking.Provider value={asking}>
-      <SignIn.Provider value={signIn}>
-        <Tasks.Provider value={tasks}>
-          <FilesContext.Provider value={files}>
-            <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
-          </FilesContext.Provider>
-        </Tasks.Provider>
-      </SignIn.Provider>
+      <Researched.Provider value={researched}>
+        <SignIn.Provider value={signIn}>
+          <Tasks.Provider value={tasks}>
+            <FilesContext.Provider value={files}>
+              <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
+            </FilesContext.Provider>
+          </Tasks.Provider>
+        </SignIn.Provider>
+      </Researched.Provider>
     </Asking.Provider>
   );
 }
@@ -262,9 +296,13 @@ function AskBody({ calls }: { calls: ToolEvent[] }) {
 }
 
 function ToolBody({ calls }: { calls: ToolEvent[] }) {
+  // Research the agent records or reads shows as the research, as it stands, once in the step: where it last touched it.
+  const research = calls.map((c) => (c.status === "error" ? null : researchCall(c)));
+  const lastOf = new Map(research.flatMap((r, i) => (r?.id ? [[r.id, i] as const] : [])));
   return (
     <div className="hx-stack">
-      {calls.map((c) => {
+      {calls.map((c, i) => {
+        const r = research[i];
         const input = c.input && typeof c.input === "object" && Object.keys(c.input as object).length ? JSON.stringify(c.input, null, 2) : null;
         return (
           <div key={c.id} className="hx-generic" data-ev={c.id}>
@@ -282,8 +320,14 @@ function ToolBody({ calls }: { calls: ToolEvent[] }) {
               )}
               <span className="hx-dim hx-trunc">{c.title}</span>
             </div>
-            {input && (c.server || c.tool === "other" || c.tool === "mcp") && <pre className="hx-pre hx-tool-input">{input}</pre>}
-            {c.output && <Output text={c.output} truncated={c.truncated} error={c.status === "error"} />}
+            {r?.id ? (
+              lastOf.get(r.id) === i && <ResearchCard id={r.id} />
+            ) : (
+              <>
+                {input && (c.server || c.tool === "other" || c.tool === "mcp") && <pre className="hx-pre hx-tool-input">{input}</pre>}
+                {c.output && <Output text={c.output} truncated={c.truncated} error={c.status === "error"} />}
+              </>
+            )}
           </div>
         );
       })}
@@ -340,6 +384,7 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
   const failures = step.calls.filter((c) => c.status === "error" || (c.tool === "shell" && c.exit_code !== undefined && c.exit_code !== 0)).length;
   const asking = React.useContext(Asking);
   const asked = step.calls.some((c) => asking.has(c.tool_id));
+  const researched = React.useContext(Researched);
   // Open by default: what needs attention, and what is happening right now (once it has gone on a moment).
   const [open, setOpen] = React.useState<boolean | null>(null);
   // A match found in it opens it.
@@ -353,7 +398,14 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
   // of a second or so) and pulls everything after it up the page. Folding it is the person's.
   const [opened] = React.useState(() => ({ yes: false }));
   if (runs) opened.yes = true;
-  const isOpen = open ?? (opened.yes || failures > 0 || step.group === "agent" || step.group === "ask" || (step.group === "plan" && step.calls.some((c) => c.tool === "plan")));
+  const isOpen =
+    open ??
+    (opened.yes ||
+      failures > 0 ||
+      step.group === "agent" ||
+      step.group === "ask" ||
+      (step.group === "plan" && step.calls.some((c) => c.tool === "plan")) ||
+      step.calls.some((c) => researched.has(c.id)));
   const stats = step.group === "edit" ? diffStats(step.calls.filter((c) => c.status !== "denied").flatMap((c) => c.diffs ?? [])) : null;
   const first = step.calls[0];
   const last = step.calls.at(-1);
@@ -466,56 +518,516 @@ const DELIVERY: Record<Delivery, string> = {
   cancelled: "dropped",
 };
 
-/** Copy what was said (your message, the agent's words), as it was written: a quiet icon that says when it took. */
-function CopyMsg({ text, label, className }: { text: string; label: string; className?: string }) {
-  const [done, setDone] = React.useState(false);
-  return (
-    <button
-      type="button"
-      className={cn("hx-icon hx-msg-copy", className)}
-      aria-label={done ? "Copied" : label}
-      title={done ? "Copied" : label}
-      onClick={() =>
-        void copyText(text).then((ok) => {
-          if (!ok) return;
-          setDone(true);
-          window.setTimeout(() => setDone(false), 1400);
-        })
-      }
-    >
-      {done ? <Check size={13} /> : <Copy size={13} />}
-    </button>
-  );
-}
-
 /** When something was said, "14:05": one formatter for every message (making one for each, as each renders, is slow). */
 const SAID_AT = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" });
 
-/** What was asked: it renders only when it changes, not as the turn under it streams. */
-const Prompt = React.memo(function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "user" }>; delivery?: Delivery; meta?: Meta | null; onCommand?: (c: Command) => void }) {
-  const system = e.origin && e.origin !== "human";
+/* ------------------------------------------------------------------ messages: menus, replies, gestures */
+
+/** What "Reply to" hands the composer: the event it answers, who wrote it, its words. */
+export interface ReplyTarget {
+  id: string;
+  who: string;
+  text: string;
+}
+
+const HOLD_MS = 480;
+const HOLD_PX = 9;
+
+/**
+ * Hold a message ~half a second to copy it as Markdown (the source its `text` already is, code
+ * fenced): a faint ring while it counts, a toast once it has. Letting go or moving far cancels.
+ */
+function useHoldCopy(md: () => string | undefined) {
+  const p = React.useRef<{ x: number; y: number; t: number } | null>(null);
+  const [held, setHeld] = React.useState(false);
+  const end = () => {
+    if (p.current) window.clearTimeout(p.current.t);
+    p.current = null;
+  };
+  return {
+    held,
+    props: {
+      onPointerDown: (e: React.PointerEvent) => {
+        if (e.pointerType === "mouse" && e.button !== 0) return;
+        if (e.target instanceof Element && e.target.closest("button, a, input, textarea, select, [contenteditable='true'], .hx-msg-menu")) return;
+        const x = e.clientX;
+        const y = e.clientY;
+        p.current = {
+          x,
+          y,
+          t: window.setTimeout(() => {
+            p.current = null;
+            const s = md();
+            if (!s) return;
+            void copyText(s).then((ok) => {
+              if (!ok) return;
+              setHeld(true);
+              toast.success("Copied as Markdown");
+              window.setTimeout(() => setHeld(false), 900);
+            });
+          }, HOLD_MS),
+        };
+      },
+      onPointerMove: (e: React.PointerEvent) => {
+        if (p.current && (Math.abs(e.clientX - p.current.x) > HOLD_PX || Math.abs(e.clientY - p.current.y) > HOLD_PX)) end();
+      },
+      onPointerUp: end,
+      onPointerCancel: end,
+    },
+  };
+}
+
+/** The text a click copies: what's rendered (its element's own words, by event id), else its source. */
+const renderedText = (id: string, fallback: string) => document.querySelector<HTMLElement>(`[data-ev~="${CSS.escape(id)}"] .hx-prose`)?.innerText ?? fallback;
+
+/** A file a message mentions or attaches, where the server kept it (for good) or its machine has it. */
+function downloadNamed(ctx: { session: string; cwd: string; files: { path: string; seq: number; sha?: string }[] }, name: string, seq: number | undefined) {
+  const full = resolvePath(name, ctx.cwd) ?? name;
+  const kept = keptFor(ctx.files, full, seq) ?? ctx.files.find((f) => f.path.endsWith(`/${name}`) && (seq === undefined || f.seq <= seq));
+  window.open(fileUrl(ctx.session, kept?.path ?? name, kept), "_blank", "noopener");
+}
+
+/** The message a reply quotes: a clamped line or two of it; the whole of it a tap away. */
+function Quote({ id, who, lookup }: { id: string; who?: string; lookup: (id: string) => HEvent | undefined }) {
+  const [full, setFull] = React.useState(false);
+  const src = lookup(id);
+  if (!src) return null;
+  const text = (src.kind === "user" || src.kind === "assistant" || src.kind === "thinking" ? src.text : "").trim();
+  if (!text) return null;
+  const said = who ?? (src.kind === "user" ? (src.origin && src.origin !== "human" ? src.origin : "You") : "Agent");
+  const long = text.length > 140 || text.split("\n").length > 3;
+  const open = () => {
+    if (long) setFull(true);
+  };
   return (
-    <div className="hx-prompt" data-origin={e.origin ?? "human"} data-ev={e.id}>
-      <div className="hx-prompt-meta">
-        <span className="hx-eyebrow">{system ? e.origin : "You"}</span>
-        <span className="hx-dim">{SAID_AT.format(e.at)}</span>
-        {delivery && <span className="hx-dim">· {DELIVERY[delivery]}</span>}
-        {e.attachments?.length ? (
-          <span className="hx-dim hx-trunc" title={e.attachments.join(", ")}>
-            · {e.attachments.join(", ")}
-          </span>
-        ) : e.images ? (
-          <span className="hx-dim">
-            · {e.images} image{e.images === 1 ? "" : "s"}
-          </span>
-        ) : null}
-        {e.text && <CopyMsg text={e.text} label={system ? "Copy the message" : "Copy your message"} className="hx-prompt-copy" />}
-        {!system && onCommand && <TurnMenu meta={meta ?? null} eventId={e.id} send={onCommand} />}
+    <>
+      {/* A div, not a button: the quote's words render as markdown, and a button can't hold blocks. */}
+      <div
+        className="hx-quote"
+        role={long ? "button" : undefined}
+        tabIndex={long ? 0 : undefined}
+        onClick={open}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            open();
+          }
+        }}
+      >
+        <span className="hx-quote-who">
+          <CornerDownRight size={11} aria-hidden="true" />
+          {said}
+        </span>
+        <div className={cn("hx-quote-text", long && "hx-quote-clamp")}>
+          <Prose text={text} />
+        </div>
+        {long && <span className="hx-quote-more">the whole message ↗</span>}
       </div>
-      <div className="hx-prompt-text">{e.text}</div>
+      {full && <QuoteDialog src={src} who={said} text={text} onClose={() => setFull(false)} />}
+    </>
+  );
+}
+
+/** The whole of a quoted message, on the conversation's surface: its markdown and the files it
+ *  mentions drawn as the message drew them (`seq`), its attachments after. */
+function QuoteDialog({ src, who, text, onClose }: { src: HEvent; who: string; text: string; onClose: () => void }) {
+  const files = React.useContext(FilesContext);
+  const atts = src.kind === "user" ? (src.attachments ?? []) : [];
+  return (
+    <DialogLike onClose={onClose}>
+      <div className="hx-quote-full">
+        <div className="hx-cover-head">
+          <span className="hx-cover-who">
+            <CornerDownRight size={12} aria-hidden="true" /> {who}
+          </span>
+          <button type="button" className="hx-icon hx-cover-x" aria-label="Close" onClick={onClose}>
+            <X size={15} />
+          </button>
+        </div>
+        <Prose text={text} seq={src.seq} />
+        {atts.length > 0 && (
+          <div className="hx-quote-files">
+            {atts.map((name) => {
+              const full = (files && resolvePath(name, files.cwd)) || name;
+              const kept = files && (keptFor(files.files, full, src.seq) ?? files.files.find((f) => f.path === full || f.path.endsWith(`/${name}`)));
+              const url = files ? fileUrl(files.session, full, kept || undefined) : undefined;
+              return kindOf(full, kept?.meta?.mime) === "image" && url ? (
+                <a key={name} href={url} target="_blank" rel="noopener noreferrer">
+                  <img src={url} alt={name} className="hx-quote-img" />
+                </a>
+              ) : (
+                <a key={name} className="hx-quote-file" href={url} target="_blank" rel="noopener noreferrer">
+                  <Download size={11} aria-hidden="true" /> {name}
+                </a>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </DialogLike>
+  );
+}
+
+/** An in-surface card over the conversation (the same shape the full-size viewer uses): tap away,
+ *  ✕, or Esc to close. */
+function DialogLike({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
+  return (
+    <div className="hx-cover" role="dialog" aria-modal="true" onClick={onClose} onKeyDown={(e) => e.key === "Escape" && onClose()}>
+      <div className="hx-cover-card" ref={(el) => el?.focus({ preventScroll: true })} tabIndex={-1} onClick={(e) => e.stopPropagation()}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/** A message kept off the conversation until it goes: swipe it right to unsend it. */
+function useUnsendSwipe(can: boolean, onUnsend: () => void) {
+  const drag = React.useRef<{ x: number; y: number; dx: number } | null>(null);
+  const [dx, setDx] = React.useState(0);
+  const reset = () => {
+    drag.current = null;
+    setDx(0);
+  };
+  return {
+    dx,
+    props: {
+      onPointerDown: (e: React.PointerEvent) => {
+        if (!can || (e.pointerType === "mouse" && e.button !== 0)) return;
+        if (e.target instanceof Element && e.target.closest("button, a, input, textarea, select")) return;
+        drag.current = { x: e.clientX, y: e.clientY, dx: 0 };
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+      },
+      onPointerMove: (e: React.PointerEvent) => {
+        const d = drag.current;
+        if (!d) return;
+        const x = e.clientX - d.x;
+        const y = e.clientY - d.y;
+        if (Math.abs(y) > Math.abs(x) && d.dx === 0) {
+          drag.current = null;
+          return;
+        }
+        d.dx = Math.max(0, x);
+        setDx(d.dx);
+      },
+      onPointerUp: () => {
+        const gone = (drag.current?.dx ?? 0) > 72;
+        reset();
+        if (gone) onUnsend();
+      },
+      onPointerCancel: reset,
+    },
+  };
+}
+
+/** Where a message can go from one of yours, on a harness that says it can (its turn-scope controls). */
+function goBackRows(e: Extract<HEvent, { kind: "user" }>, meta: Meta | null | undefined, send: (c: Command) => void, kindName: string | undefined): MenuRow[] {
+  const controls = meta?.controls ?? [];
+  const named = (id: string) => controls.find((c) => c.id === id);
+  const act = (id: string, icon: React.ReactNode, label: string, danger?: boolean): MenuRow => {
+    const c = named(id);
+    if (!c) return { icon, label, disabled: `not on ${kindName ?? "this harness"}` };
+    return {
+      icon,
+      label: c.label,
+      danger: danger || c.dangerous,
+      confirm: c.dangerous ? { title: `${c.label}?`, body: c.description ?? "This can't be undone from kiln." } : undefined,
+      onSelect: () => send({ type: "control", id: c.id, value: { event: e.id } }),
+    };
+  };
+  const fork = named("fork");
+  return [
+    act("rewind_files", <Download size={13} />, "Restore files to here"),
+    act("rewind", <Undo2 size={13} />, "Rewind conversation to here", true),
+    act("branch", <GitBranch size={13} />, "Branch from here"),
+    fork
+      ? {
+          icon: <GitFork size={13} />,
+          label: fork.label || "Fork whole conversation",
+          danger: fork.dangerous,
+          confirm: fork.dangerous ? { title: `${fork.label}?`, body: fork.description ?? "" } : undefined,
+          onSelect: () => send({ type: "control", id: "fork", value: { event: e.id } }),
+        }
+      : { icon: <GitFork size={13} />, label: "Fork whole conversation", disabled: `not on ${kindName ?? "this harness"}` },
+  ];
+}
+
+/** One thing you said: its menu (reply, copy, edit/unsend while it waits, where to go from it), and swipe-right to unsend. */
+const Prompt = React.memo(function Prompt({
+  e,
+  delivery,
+  meta,
+  queueItem,
+  onCommand,
+  onReply,
+  lookup,
+  spawn,
+  kindName,
+}: {
+  e: Extract<HEvent, { kind: "user" }>;
+  delivery?: Delivery;
+  meta?: Meta | null;
+  /** Its kiln-queue entry while it waits (unsend restores its attachments from it). */
+  queueItem?: QueueItem;
+  onCommand?: (c: Command) => void;
+  onReply?: (t: ReplyTarget) => void;
+  lookup?: (id: string) => HEvent | undefined;
+  /** What a "new agent" starts with (its target, folder, harness). */
+  spawn?: { target?: string; cwd?: string; kind?: string };
+  kindName?: string;
+}) {
+  const system = e.origin && e.origin !== "human";
+  const files = React.useContext(FilesContext);
+  const [editing, setEditing] = React.useState(false);
+  const [draft, setDraft] = React.useState(e.text);
+  const [unsent, setUnsent] = React.useState(false);
+  const [spawning, setSpawning] = React.useState(false);
+  const queued = delivery === "queued" && Boolean(queueItem || e.client_id);
+  const navigate = useNavigate();
+  const why = delivery ? DELIVERY[delivery] : "sent";
+  const unsend = () => {
+    const { unsend: remove } = unsending(queueItem?.id ?? e.client_id);
+    if (!onCommand || !remove) return;
+    onCommand(remove);
+    setUnsent(true);
+  };
+  // What it unsent still goes (unsend.ts): Undo shows it again, sending nothing.
+  const undo = () => {
+    unsending(queueItem?.id ?? e.client_id).undo.forEach((c) => onCommand?.(c));
+    setUnsent(false);
+  };
+  const swipe = useUnsendSwipe(queued && !editing && !unsent, unsend);
+  const hold = useHoldCopy(() => e.text);
+  if (unsent) {
+    return (
+      <div className="hx-unsent" data-ev={e.id}>
+        You unsent this message
+        <button type="button" className="hx-link" onClick={undo}>
+          Undo
+        </button>
+      </div>
+    );
+  }
+  const filesGroup: MenuGroup = {
+    label: "Files",
+    rows: [
+      {
+        icon: <FileDown size={13} />,
+        label: `Download attachment${(e.attachments?.length ?? 0) === 1 ? "" : "s"}`,
+        disabled: e.attachments?.length ? (files ? undefined : "files unknown") : "none attached",
+        onSelect: () => files && e.attachments?.forEach((a) => downloadNamed(files, a, e.seq)),
+      },
+    ],
+  };
+  const groups: MenuGroup[] = system
+    ? // A message kiln put there isn't yours to edit or go back from: reply, copy, files.
+      [
+        {
+          rows: [
+            { icon: <Reply size={13} />, label: "Reply to", onSelect: () => onReply?.({ id: e.id, who: String(e.origin), text: e.text }) },
+            { icon: <Copy size={13} />, label: "Copy", onSelect: () => void copyText(e.text) },
+          ],
+        },
+        filesGroup,
+      ]
+    : [
+        {
+          rows: [
+            { icon: <Reply size={13} />, label: "Reply to", onSelect: () => onReply?.({ id: e.id, who: "You", text: e.text }) },
+            { icon: <Copy size={13} />, label: "Copy", onSelect: () => void copyText(e.text) },
+            {
+              icon: <Pencil size={13} />,
+              label: "Edit",
+              disabled: queued ? undefined : why,
+              onSelect: () => {
+                setDraft(e.text);
+                setEditing(true);
+              },
+            },
+            { icon: <Undo2 size={13} />, label: "Unsend", disabled: queued ? undefined : why, onSelect: unsend },
+          ],
+        },
+        ...(!onCommand ? [] : [{ label: "Go back", rows: goBackRows(e, meta, onCommand, kindName) }]),
+        filesGroup,
+        { rows: [{ icon: <SquarePlus size={13} />, label: "Start new agent on this", onSelect: () => setSpawning(true) }] },
+      ];
+  return (
+    // The swipe's pointer capture retargets moves to the wrap: the hold-to-copy shares these
+    // handlers so moving to swipe still cancels it.
+    <div
+      className="hx-prompt-wrap"
+      data-dragging={swipe.dx > 0 || undefined}
+      onPointerDown={(e) => {
+        swipe.props.onPointerDown(e);
+        hold.props.onPointerDown(e);
+      }}
+      onPointerMove={(e) => {
+        swipe.props.onPointerMove(e);
+        hold.props.onPointerMove(e);
+      }}
+      onPointerUp={() => {
+        swipe.props.onPointerUp();
+        hold.props.onPointerUp();
+      }}
+      onPointerCancel={() => {
+        swipe.props.onPointerCancel();
+        hold.props.onPointerCancel();
+      }}
+    >
+      {queued && (
+        <div className="hx-unsend-strip" style={{ opacity: Math.min(1, swipe.dx / 72) }}>
+          <Undo2 size={14} /> Unsend
+        </div>
+      )}
+      <div className="hx-prompt" data-origin={e.origin ?? "human"} data-ev={e.id} data-held={hold.held || undefined} style={swipe.dx ? { transform: `translateX(${swipe.dx}px)` } : undefined}>
+        <div className="hx-prompt-meta">
+          <span className="hx-eyebrow">{system ? e.origin : "You"}</span>
+          <span className="hx-dim">{SAID_AT.format(e.at)}</span>
+          {delivery && (
+            <span className="hx-dim">
+              ·{" "}
+              <span className="hx-delivery" data-delivery={delivery}>
+                {DELIVERY[delivery]}
+              </span>
+            </span>
+          )}
+          {e.attachments?.length ? (
+            <span className="hx-dim hx-trunc" title={e.attachments.join(", ")}>
+              · {e.attachments.join(", ")}
+            </span>
+          ) : e.images ? (
+            <span className="hx-dim">
+              · {e.images} image{e.images === 1 ? "" : "s"}
+            </span>
+          ) : null}
+          <MsgMenu groups={groups} label={system ? "Actions on this message" : "Actions on your message"} className="hx-prompt-menu" />
+        </div>
+        {e.reply_to && lookup && <Quote id={e.reply_to} lookup={lookup} />}
+        {editing ? (
+          <textarea
+            className="hx-prompt-edit"
+            value={draft}
+            autoFocus
+            onChange={(ev) => setDraft(ev.target.value)}
+            onBlur={() => {
+              setEditing(false);
+              if (draft.trim() && draft !== e.text && onCommand) onCommand({ type: "queue_edit", id: queueItem?.id ?? e.client_id ?? "", text: draft });
+            }}
+            onKeyDown={(ev) => {
+              if (ev.key === "Escape") {
+                setDraft(e.text);
+                setEditing(false);
+              }
+            }}
+          />
+        ) : (
+          <div className="hx-prompt-text">{e.text}</div>
+        )}
+      </div>
+      {spawning && (
+        <SpawnDialog open={spawning} onOpenChange={setSpawning} defaults={{ ...spawn, prompt: e.text }} onStarted={(started) => navigate(started[0] ? `/agents/${started[0].id}` : "/agents")} />
+      )}
     </div>
   );
 });
+
+/**
+ * Something you sent that the conversation doesn't show yet, where it will show: at once, as it
+ * goes, and as sent once its machine says it has it, until the agent's session shows it (its own
+ * prompt then takes its place). One refused for good says why, and goes again as a new message
+ * (its id's answer stays the refusal) or is let go.
+ */
+const Sending = React.memo(function Sending({
+  m,
+  live,
+  lookup,
+  onResend,
+  onDiscard,
+}: {
+  m: Outgoing;
+  /** Connected: it can go again now. */
+  live: boolean;
+  lookup?: (id: string) => HEvent | undefined;
+  onResend: (id: string) => void;
+  onDiscard: (id: string) => void;
+}) {
+  const failed = m.state === "failed";
+  const why = m.why ? `${m.why.charAt(0).toUpperCase()}${m.why.slice(1)}.` : "It didn't get there.";
+  return (
+    <section className="hx-turn hx-sending" data-state={m.state}>
+      <div className="hx-prompt-wrap">
+        <div className="hx-prompt" data-origin="human">
+          <div className="hx-prompt-meta">
+            <span className="hx-eyebrow">You</span>
+            <span className="hx-dim">{SAID_AT.format(m.at)}</span>
+            <span className="hx-dim">
+              ·{" "}
+              <span className="hx-delivery" data-delivery={m.state}>
+                {failed ? "failed to send" : m.state === "sent" ? "sent" : "sending…"}
+              </span>
+            </span>
+            {m.attachments.length > 0 && (
+              <span className="hx-dim hx-trunc" title={m.attachments.join(", ")}>
+                · {m.attachments.join(", ")}
+              </span>
+            )}
+          </div>
+          {m.reply_to && lookup && <Quote id={m.reply_to} lookup={lookup} />}
+          <div className="hx-prompt-text">{m.text}</div>
+          {failed && (
+            <div className="hx-send-failed" role="alert">
+              <span>{why}</span>
+              <span className="hx-prompt-acts">
+                <Button size="xs" variant="secondary" disabled={!live} title={live ? undefined : "Not connected: it can go again once the page is"} onClick={() => onResend(m.id)}>
+                  Retry
+                </Button>
+                <Button size="xs" variant="ghost" onClick={() => onDiscard(m.id)}>
+                  Remove
+                </Button>
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+});
+
+/** What the agent said (a note along the way, or the answer): reply, copy, export, start an agent on it. */
+function saidGroups(e: { id: string; text: string }, who: string, onReply?: (t: ReplyTarget) => void, onSpawn?: () => void): MenuGroup[] {
+  return [
+    {
+      rows: [
+        { icon: <Reply size={13} />, label: "Reply to", onSelect: () => onReply?.({ id: e.id, who, text: e.text }) },
+        { icon: <Copy size={13} />, label: "Copy", onSelect: () => void copyText(renderedText(e.id, e.text)) },
+        {
+          icon: <Copy size={13} />,
+          label: "Copy as Markdown",
+          onSelect: () =>
+            void copyText(e.text).then((ok) => {
+              if (ok) toast.success("Copied as Markdown");
+            }),
+        },
+      ],
+    },
+    {
+      rows: [
+        {
+          icon: <FileDown size={13} />,
+          label: "Export excerpt",
+          hint: ".md",
+          onSelect: () => {
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(new Blob([e.text], { type: "text/markdown" }));
+            a.download = `excerpt-${e.id}.md`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+          },
+        },
+        { icon: <SquarePlus size={13} />, label: "Start new agent on this", onSelect: () => onSpawn?.() },
+      ],
+    },
+  ];
+}
 
 /** A step that started a subagent: it shows the subagent's task as it goes. */
 function AgentStep({ step, cwd, onOpenTask }: { step: Step; cwd: string; onOpenTask?: (t: string) => void }) {
@@ -523,23 +1035,70 @@ function AgentStep({ step, cwd, onOpenTask }: { step: Step; cwd: string; onOpenT
   return <StepRow step={step} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />;
 }
 
+/** Something the agent said along the way (a note): hold it to copy it as Markdown; its ⋯ is always there. */
+function Said({
+  item,
+  who,
+  onReply,
+  lookup,
+  spawn,
+}: {
+  item: Extract<Item, { type: "note" }>;
+  who?: string;
+  onReply?: (t: ReplyTarget) => void;
+  lookup?: (id: string) => HEvent | undefined;
+  spawn?: { target?: string; cwd?: string; kind?: string };
+}) {
+  const navigate = useNavigate();
+  const [spawning, setSpawning] = React.useState(false);
+  const hold = useHoldCopy(() => item.event.text);
+  const replyTo = (item.event as { reply_to?: string }).reply_to;
+  return (
+    <div className="hx-said" data-ev={item.event.id} data-held={hold.held || undefined} tabIndex={-1} {...hold.props}>
+      {/* The menu floats right: it has to come first, the quote's and the text's lines wrap around it. */}
+      {!item.event.streaming && item.event.text && (
+        <MsgMenu groups={saidGroups(item.event, who ?? "Agent", onReply, () => setSpawning(true))} label="Actions on this message" className="hx-said-menu" />
+      )}
+      {replyTo && lookup && <Quote id={replyTo} lookup={lookup} />}
+      <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} streaming={item.event.streaming} />
+      {spawning && <SpawnDialog open={spawning} onOpenChange={setSpawning} defaults={{ ...spawn, prompt: item.event.text }} onStarted={(s) => navigate(s[0] ? `/agents/${s[0].id}` : "/agents")} />}
+    </div>
+  );
+}
+
 /** One thing in a turn: it renders again only when it changes (or starts or stops being the live one), not as the rest of the turn streams. */
-const ItemView = React.memo(function ItemView({ item, cwd, onOpenTask, active, since }: { item: Item; cwd: string; onOpenTask?: (t: string) => void; active: boolean; since: number }) {
+const ItemView = React.memo(function ItemView({
+  item,
+  cwd,
+  onOpenTask,
+  active,
+  since,
+  who,
+  onReply,
+  lookup,
+  spawn,
+}: {
+  item: Item;
+  cwd: string;
+  onOpenTask?: (t: string) => void;
+  active: boolean;
+  since: number;
+  who?: string;
+  onReply?: (t: ReplyTarget) => void;
+  lookup?: (id: string) => HEvent | undefined;
+  spawn?: { target?: string; cwd?: string; kind?: string };
+}) {
   switch (item.type) {
     case "step":
       return item.group === "agent" ? <AgentStep step={item} cwd={cwd} onOpenTask={onOpenTask} /> : <StepRow step={item} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />;
     case "note":
-      // A tap (or a pointer resting on it) shows its copy icon.
-      return (
-        <div className="hx-said" data-ev={item.event.id} tabIndex={-1}>
-          <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} streaming={item.event.streaming} />
-          {!item.event.streaming && item.event.text && <CopyMsg text={item.event.text} label="Copy what it said" className="hx-said-copy" />}
-        </div>
-      );
+      return <Said item={item} who={who} onReply={onReply} lookup={lookup} spawn={spawn} />;
     case "thought":
       return <Thought item={item} live={active && Boolean(latestThought(item).streaming)} since={since} />;
     case "notice":
       return <Notice e={item.event} repeats={item.repeats} />;
+    case "compaction":
+      return <CompactionMark e={item.event} />;
     case "page":
       // The page, or where it'll be while it's being kept; a call that failed says why, as a step.
       return pageOf(item.event) || item.event.status === "running" || item.event.status === "pending" ? (
@@ -558,7 +1117,7 @@ const ItemView = React.memo(function ItemView({ item, cwd, onOpenTask, active, s
 
 /** Whether the end of a live turn shows it at work: a reply or a thought streaming, a call running. */
 function moving(items: Item[], turnStarted?: number): boolean {
-  const last = items.findLast((item) => item.type !== "notice");
+  const last = items.findLast((item) => item.type !== "notice" && item.type !== "compaction");
   if (!last) return false;
   if (last.type === "note") return Boolean(last.event.streaming);
   if (last.type === "thought") return thoughtIsLive(last, true, turnStarted) && thoughtShown(last);
@@ -584,18 +1143,109 @@ function LiveTail({ doing, since }: { doing?: string; since?: number }) {
   );
 }
 
+/** How long it has gone on, ticking (kept out of what's announced). */
+function Since({ since }: { since: number }) {
+  const now = useNow();
+  return (
+    <span className="sg-num" aria-hidden="true">
+      {formatThought(Math.max(0, (now - since) / 1000))}
+    </span>
+  );
+}
+
+/** A compaction under way, where the turn's live line is: what it does, the context it compacts
+ *  and for how long; the optic draws in, and the conversation's spectrum is condensed into the bar
+ *  its marker keeps, in the same place, once it's done. */
+function CompactingRow({ c }: { c: Compacting }) {
+  return (
+    <div className="hx-compaction" data-state="live" role="status">
+      <span className="sg-thinking-line hx-compaction-line">
+        <span className="sg-think-glyph" aria-hidden="true">
+          <Optic state="compacting" />
+        </span>
+        <PrismLabel live sweep>
+          Compacting the conversation
+        </PrismLabel>
+        <span className="hx-compaction-facts">
+          {c.tokens ? `${tokens(c.tokens)} tokens · ` : ""}
+          <Since since={c.since} />
+        </span>
+      </span>
+      <Condense live />
+    </div>
+  );
+}
+
+/** A compaction's marker: the row the live one settles into, in the words its harness's adapter
+ *  wrote, its bar held still as the boundary it is (above it, the agent works from a summary);
+ *  one that didn't compact in the warning's tone. */
+function CompactionMark({ e }: { e: Extract<HEvent, { kind: "notice" }> }) {
+  const warn = e.level !== "info";
+  return (
+    <div
+      className="hx-compaction"
+      data-state="done"
+      data-tone={warn ? "warn" : undefined}
+      data-ev={e.id}
+      title={warn ? undefined : "The conversation was summarized to free context: from here on the agent works from that summary"}
+    >
+      <span className="sg-thinking-line hx-compaction-line">
+        <span className="sg-think-glyph" aria-hidden="true">
+          <Optic state="done" />
+        </span>
+        <PrismLabel>{e.text}</PrismLabel>
+      </span>
+      <Condense warn={warn} />
+    </div>
+  );
+}
+
+/** The turn's answer: hold it to copy it as Markdown; its ⋯ is always there. */
+function OutcomeBody({
+  outcome,
+  who,
+  onReply,
+  lookup,
+  spawn,
+}: {
+  outcome: { id: string; seq: number; text: string; reply_to?: string };
+  who?: string;
+  onReply?: (t: ReplyTarget) => void;
+  lookup?: (id: string) => HEvent | undefined;
+  spawn?: { target?: string; cwd?: string; kind?: string };
+}) {
+  const navigate = useNavigate();
+  const [spawning, setSpawning] = React.useState(false);
+  const hold = useHoldCopy(() => outcome.text);
+  return (
+    <div className="hx-outcome-body" data-ev={outcome.id} data-held={hold.held || undefined} {...hold.props}>
+      {/* The menu floats right: it has to come first, the quote's and the text's lines wrap around it. */}
+      {outcome.text && <MsgMenu groups={saidGroups(outcome, who ?? "Agent", onReply, () => setSpawning(true))} label="Actions on the answer" className="hx-outcome-menu" />}
+      {outcome.reply_to && lookup && <Quote id={outcome.reply_to} lookup={lookup} />}
+      <Prose text={outcome.text} seq={outcome.seq} />
+      {spawning && <SpawnDialog open={spawning} onOpenChange={setSpawning} defaults={{ ...spawn, prompt: outcome.text }} onStarted={(s) => navigate(s[0] ? `/agents/${s[0].id}` : "/agents")} />}
+    </div>
+  );
+}
+
 const TurnView = React.memo(function TurnView({
   turn,
   cwd,
   delivery,
   live,
   doing,
+  compacting,
   turnStarted,
   onOpenTask,
   meta,
   onCommand,
   agentLabel,
   reading,
+  queueItem,
+  onReply,
+  lookup,
+  spawn,
+  kindName,
 }: {
   /** Who answers (the harness's name), over the agent's side of the turn. */
   agentLabel?: string;
@@ -605,12 +1255,19 @@ const TurnView = React.memo(function TurnView({
   live: boolean;
   /** What the agent says it's doing, while the turn is live. */
   doing?: string;
+  /** A compaction of this thread's conversation under way (the last turn's, at its end). */
+  compacting?: Compacting;
   turnStarted?: number;
   onOpenTask?: (t: string) => void;
   meta?: Meta | null;
   onCommand?: (c: Command) => void;
   /** The part being read stays in the window while the turn grows. */
   reading: string | null;
+  queueItem?: QueueItem;
+  onReply?: (t: ReplyTarget) => void;
+  lookup?: (id: string) => HEvent | undefined;
+  spawn?: { target?: string; cwd?: string; kind?: string };
+  kindName?: string;
 }) {
   const edits = React.useMemo(() => (turn.outcome ? changesetOf(turn.items.flatMap((i) => (i.type === "step" ? i.calls : []))) : []), [turn]);
   const add = edits.reduce((n, f) => n + f.add, 0);
@@ -624,7 +1281,7 @@ const TurnView = React.memo(function TurnView({
   const end = allSteps ? turn.items.length : hidden + STEPS_WINDOW;
   const sought = findNow !== null && turn.items.some((it, i) => (i < hidden || i >= end) && itemHolds(it, findNow.id));
   const items = sought ? turn.items : turn.items.slice(hidden, end);
-  const currentItem = turn.items.findLast((item) => item.type !== "notice");
+  const currentItem = turn.items.findLast((item) => item.type !== "notice" && item.type !== "compaction");
   const since = thinkingStarted(turn, turnStarted);
   // At work with nothing moving at its end: said once the end has held still a moment (from the
   // start, before anything has moved, at once).
@@ -641,7 +1298,7 @@ const TurnView = React.memo(function TurnView({
   const label = turn.by ?? agentLabel;
   return (
     <section className="hx-turn">
-      {turn.prompt && <Prompt e={turn.prompt} delivery={delivery} meta={meta} onCommand={onCommand} />}
+      {turn.prompt && <Prompt e={turn.prompt} delivery={delivery} meta={meta} queueItem={queueItem} onCommand={onCommand} onReply={onReply} lookup={lookup} spawn={spawn} kindName={kindName} />}
       <div className="hx-work">
         {label && (turn.items.length > 0 || turn.outcome || live) && <div className="hx-agent-label">{label}</div>}
         {hidden > 0 && !sought && (
@@ -650,13 +1307,24 @@ const TurnView = React.memo(function TurnView({
           </button>
         )}
         {items.map((it) => (
-          <ItemView key={it.key} since={since} item={it} cwd={cwd} onOpenTask={onOpenTask} active={live && it === currentItem && (it.type !== "thought" || thoughtIsLive(it, true, turnStarted))} />
+          <ItemView
+            key={it.key}
+            since={since}
+            item={it}
+            cwd={cwd}
+            onOpenTask={onOpenTask}
+            active={live && it === currentItem && (it.type !== "thought" || thoughtIsLive(it, true, turnStarted))}
+            who={label ?? agentLabel}
+            onReply={onReply}
+            lookup={lookup}
+            spawn={spawn}
+          />
         ))}
-        {live && !turn.outcome && !movedLately && <LiveTail doing={doing} since={since} />}
+        {compacting ? <CompactingRow c={compacting} /> : live && !turn.outcome && !movedLately && <LiveTail doing={doing} since={since} />}
       </div>
       {turn.outcome && (
         <div className="hx-outcome" data-ev={turn.outcome.id}>
-          <Prose text={turn.outcome.text} seq={turn.outcome.seq} />
+          <OutcomeBody outcome={turn.outcome} who={label ?? agentLabel} onReply={onReply} lookup={lookup} spawn={spawn} />
           <div className="hx-outcome-foot">
             {edits.length > 0 && (
               <span>
@@ -664,7 +1332,6 @@ const TurnView = React.memo(function TurnView({
               </span>
             )}
             {turn.ended && <span className="hx-meta-num">{duration(turn.ended - turn.started)}</span>}
-            {turn.outcome.text && <CopyMsg text={turn.outcome.text} label="Copy the answer" className="hx-outcome-copy" />}
           </div>
         </div>
       )}
@@ -893,6 +1560,7 @@ export const Timeline = React.memo(function Timeline({
   kind,
   accountOpen,
   find,
+  onReply,
 }: {
   store: SessionStore;
   /** The agent's id: where your place in it is kept. */
@@ -914,12 +1582,18 @@ export const Timeline = React.memo(function Timeline({
   onOpenTask?: (t: string) => void;
   /** Turn actions (rewind, branch) go out through this. */
   onCommand?: (c: Command) => void;
+  /** "Reply to" on any message hands the composer what it answers. */
+  onReply?: (t: ReplyTarget) => void;
   footer?: React.ReactNode;
 }) {
   const events = useSession(store, (s) => s.events);
   const state = useSession(store, (s) => s.state);
   const meta = useSession(store, (s) => s.meta);
   const done = useAnswered();
+  // What a reply quotes, by the event it answers.
+  const byId = React.useMemo(() => new Map(events.map((e) => [e.id, e] as const)), [events]);
+  const lookup = React.useCallback((id: string) => byId.get(id), [byId]);
+  const spawn = React.useMemo(() => ({ target, cwd, kind }), [target, cwd, kind]);
   // The files its messages mention, as the server kept them: shown where they're mentioned.
   const keptFiles = useSession(store, (s) => s.files);
   const conversationFiles = React.useMemo(() => ({ session: agent, cwd, files: keptFiles }), [agent, cwd, keptFiles]);
@@ -932,6 +1606,16 @@ export const Timeline = React.memo(function Timeline({
     const call = events.find((e) => e.id === parent);
     return call?.kind === "tool" ? call.task : undefined;
   }, [parent, task, events]);
+  // What you sent to this thread (the main one, or this subagent) that it doesn't show yet: at its end.
+  const outgoing = useSession(store, (s) => s.outgoing);
+  const live = useSession(store, (s) => s.conn === "open");
+  const mine = React.useMemo(() => outgoing.filter((m) => (thread ? m.task === thread : !m.task)), [outgoing, thread]);
+  const resend = React.useCallback(
+    (id: string) => {
+      if (!store.resend(id)) toast.error("Not connected", "The page is reconnecting to the agent; try again in a moment.");
+    },
+    [store],
+  );
   const going = parent ? Boolean(task && taskLive(task)) : state?.status === "running" || state?.status === "waiting" || state?.status === "starting";
   // Turns that didn't change stay the same objects, so only what changed renders again; and only
   // the turns from the first change on are worked out again (derive.ts), not the whole history.
@@ -1064,11 +1748,23 @@ export const Timeline = React.memo(function Timeline({
     [findQ, findNow, grows, holds, from, to, read, restore],
   );
   const running = parent ? task?.status === "running" : state?.status === "running";
+  // A compaction of this thread's conversation under way, while its harness can still be heard.
+  const compacting = state?.compacting && (state.compacting.parent ?? undefined) === parent && state.status !== "exited" && state.status !== "disconnected" ? state.compacting : undefined;
   const tasks = state?.tasks ?? NO_TASKS;
   // What you answered here goes from sight at once (answered.ts).
   const approvals = stillAsked(state?.approvals ?? NO_APPROVALS, done);
   const askingKey = approvals.map((a) => a.tool_id ?? "").join(" ");
   const asking = React.useMemo(() => new Set(askingKey.split(" ").filter(Boolean)), [askingKey]);
+  // The calls that last touched each piece of research: their steps open on it. A key, so the set only changes when they do.
+  const researchedKey = React.useMemo(() => {
+    const last = new Map<string, string>();
+    for (const e of events) {
+      const r = e.kind === "tool" && e.status !== "error" ? researchCall(e) : null;
+      if (r?.id) last.set(r.id, e.id);
+    }
+    return [...last.values()].join(" ");
+  }, [events]);
+  const researched = React.useMemo(() => new Set(researchedKey.split(" ").filter(Boolean)), [researchedKey]);
   // What waits on you sits where it was asked: the latest thing the agent did, the conversation's
   // end. Scrolled away from it, a pill floating over the bottom edge says so (nothing moves).
   const pending = onDecide ? approvals : NO_APPROVALS;
@@ -1102,7 +1798,7 @@ export const Timeline = React.memo(function Timeline({
   }, [events, parent, kind, accountOpen]);
   const signIn = React.useMemo(() => (signedOut && target && kind ? { notice: signedOut, target, kind } : null), [signedOut, target, kind]);
   return (
-    <Contexts asking={asking} signIn={signIn} findNow={findNow} tasks={tasks} files={conversationFiles}>
+    <Contexts asking={asking} researched={researched} signIn={signIn} findNow={findNow} tasks={tasks} files={conversationFiles}>
       {/* Named for the router's scroll memory, so another page's never lands here or this one's there. */}
       <div
         ref={keeper.ref}
@@ -1132,7 +1828,7 @@ export const Timeline = React.memo(function Timeline({
                 {task?.summary ? <Prose text={task.summary} className="hx-sub-result" /> : <p className="hx-dim text-[12px]">No work has been reported in this thread yet.</p>}
               </div>
             ) : (
-              <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
+              mine.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
             ))}
           {turns.slice(from, to).map((t, j) => (
             <TurnView
@@ -1142,20 +1838,27 @@ export const Timeline = React.memo(function Timeline({
               delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
               live={running && from + j === turns.length - 1}
               doing={running && from + j === turns.length - 1 ? state?.doing : undefined}
-              turnStarted={running && from + j === turns.length - 1 ? parent ? task?.started : state?.turn_started ?? undefined : undefined}
+              compacting={from + j === turns.length - 1 ? compacting : undefined}
+              turnStarted={running && from + j === turns.length - 1 ? (parent ? task?.started : (state?.turn_started ?? undefined)) : undefined}
               onOpenTask={onOpenTask}
               meta={meta}
               onCommand={onCommand}
               agentLabel={agentLabel}
               reading={reading.current}
+              queueItem={t.prompt?.client_id ? state?.queue.find((q) => q.id === t.prompt?.client_id) : undefined}
+              onReply={onReply}
+              lookup={lookup}
+              spawn={spawn}
+              kindName={agentLabel ?? kind}
             />
           ))}
           {/* A window further back: what came after joins as you scroll down to it. */}
           {!tail && <div key={`to-${to}`} ref={later} className="hx-earlier" aria-hidden="true" />}
+          {tail && mine.map((m) => <Sending key={m.id} m={m} live={live} lookup={lookup} onResend={resend} onDiscard={store.discard} />)}
           {tail && hasAsks && onDecide && (
             <div ref={asksRef} className="hx-asks">
               {pending.map((a) => (
-                <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} />
+                <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} />
               ))}
             </div>
           )}

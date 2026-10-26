@@ -4,8 +4,9 @@
 //! It is a JWT signed by the server (HS256), so it is checked without any state. Its `scp`
 //! claim has the scopes GitHub's toolkit parses for its backend ids:
 //! `Actions.Results:<run>:<leg>`. Its `ac` claim lists the cache scopes the leg may read and
-//! write, in lookup order, as GitHub's does (W08-R06, W08-R14). W10's job tokens, with
-//! permissions and principals, replace it.
+//! write, in lookup order, as GitHub's does (W08-R06, W08-R14): a string holding their JSON, which
+//! is how BuildKit's cache client reads it (W08-R11). W10's job tokens, with permissions and
+//! principals, replace it.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -39,7 +40,7 @@ pub struct Claims {
     pub repo: String,
     pub scp: String,
     /// Cache scopes in lookup order (W08-R06).
-    #[serde(default)]
+    #[serde(default, with = "ac_claim")]
     pub ac: Vec<Access>,
     /// The leg's cache mode (W08-R14).
     #[serde(default)]
@@ -47,6 +48,32 @@ pub struct Claims {
     pub iat: i64,
     pub nbf: i64,
     pub exp: i64,
+}
+
+/// `ac` as GitHub writes it, a string holding the scopes' JSON: BuildKit's cache client
+/// (`go-actions-cache`) refuses anything else. One minted as a list before is still read.
+mod ac_claim {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::Access;
+
+    pub fn serialize<S: Serializer>(ac: &[Access], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&serde_json::to_string(ac).map_err(serde::ser::Error::custom)?)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Access>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Text(String),
+            List(Vec<Access>),
+        }
+        match Option::<Either>::deserialize(d)? {
+            Some(Either::Text(t)) => serde_json::from_str(&t).map_err(serde::de::Error::custom),
+            Some(Either::List(l)) => Ok(l),
+            None => Ok(Vec::new()),
+        }
+    }
 }
 
 impl Claims {
@@ -275,6 +302,22 @@ mod tests {
         assert_eq!(results, Some(3));
         assert_eq!(c.read_scopes(), vec!["refs/pull/7/merge", "refs/heads/main"]);
         assert_eq!(c.write_scope().as_deref(), Some("refs/pull/7/merge"));
+        // `ac` as GitHub writes it (W08-R11): a string of the scopes' JSON, as BuildKit reads it.
+        let payload = |t: &str| -> Result<serde_json::Value, String> {
+            let body = t.split('.').nth(1).ok_or("three parts")?;
+            serde_json::from_slice(&B64.decode(body.as_bytes()).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        };
+        let ac = payload(&t)?.get("ac").and_then(serde_json::Value::as_str).map(str::to_owned).ok_or("`ac` is a string")?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ac).map_err(|e| e.to_string())?,
+            serde_json::json!([{ "Scope": "refs/pull/7/merge", "Permission": 3 }, { "Scope": "refs/heads/main", "Permission": 1 }])
+        );
+        // One minted with `ac` as a list, before, is read still.
+        let mut old = payload(&t)?;
+        old.as_object_mut().ok_or("an object")?.insert("ac".into(), serde_json::from_str(&ac).map_err(|e| e.to_string())?);
+        let signing = format!("{}.{}", t.split('.').next().unwrap_or_default(), B64.encode(old.to_string()));
+        let then = format!("{signing}.{}", B64.encode(hmac_raw(k, signing.as_bytes())));
+        assert_eq!(verify_at(k, &then, 1500).ok_or("the older form verifies")?.read_scopes(), vec!["refs/pull/7/merge", "refs/heads/main"]);
         // Expired, not yet valid, another key, or tampered: refused.
         assert!(verify_at(k, &t, 1000 + 3600).is_none());
         assert!(verify_at(k, &t, 1000 - 61).is_none());

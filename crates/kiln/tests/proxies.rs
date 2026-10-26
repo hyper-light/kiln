@@ -545,3 +545,101 @@ fn w12_r04_publish() -> anyhow::Result<()> {
     assert!(!log.contains("npm_fake_token"), "the token is masked: {log}");
     Ok(())
 }
+
+/// A stand-in for Packagist and ConanCenter.
+fn packagist_and_conan() -> anyhow::Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(match stream.try_clone() {
+                Ok(s) => s,
+                Err(_) => continue,
+            });
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                continue;
+            }
+            let path = line.split_whitespace().nth(1).unwrap_or_default().to_owned();
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).is_err() || h.trim().is_empty() {
+                    break;
+                }
+            }
+            let mut s = reader.into_inner();
+            let body: Option<&str> = match path.as_str() {
+                "/composer/packages.json" => Some(r#"{"packages":[],"metadata-url":"/p2/%package%.json","notify-batch":"https://packagist.org/downloads/"}"#),
+                "/composer/p2/psr/log.json" => {
+                    Some(r#"{"packages":{"psr/log":[{"version":"3.0.2","dist":{"type":"zip","url":"https://api.github.com/repos/php-fig/log/zipball/f16e1d5863e37f8d8c2a01719f5b34baa2b714d3"}}]}}"#)
+                }
+                "/conan/v2/conans/zlib/1.3.1/_/_/revisions/latest" => Some(r#"{"revision":"b8bc2603263cf7eccbd6e17e66b0ed76","time":"2024-01-01T00:00:00Z"}"#),
+                _ => None,
+            };
+            let (status, body) = body.map_or((404, "not here"), |b| (200, b));
+            let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    Ok(port)
+}
+
+/// A request with a body, and headers: its status, headers (lowercase) and body.
+fn send(port: u16, method: &str, path: &str, auth: Option<&str>, body: &[u8]) -> anyhow::Result<(u16, HashMap<String, String>, Vec<u8>)> {
+    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let a = auth.map(|a| format!("Authorization: {a}\r\n")).unwrap_or_default();
+    write!(s, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{a}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len())?;
+    s.write_all(body)?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw)?;
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| anyhow::anyhow!("no head"))?;
+    let head = String::from_utf8_lossy(raw.get(..split).unwrap_or_default()).into_owned();
+    let mut lines = head.lines();
+    let status = lines.next().and_then(|l| l.split(' ').nth(1)).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let headers = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned())).collect();
+    Ok((status, headers, raw.get(split + 4..).unwrap_or_default().to_vec()))
+}
+
+/// Appendix D.1's rest (docs/ci.md W12-R04): Composer's root and metadata pointing back at kiln
+/// (each version's archive through it); Conan's ping, sign-in and revisions; and vcpkg's binary
+/// cache, which kiln keeps itself: a miss, a package put by a person, then served, and a put
+/// without credentials refused.
+#[test]
+fn w12_r04_composer_conan_and_vcpkg() -> anyhow::Result<()> {
+    let up = packagist_and_conan()?;
+    let u = format!("http://127.0.0.1:{up}");
+    let dir = tempfile::tempdir()?;
+    let extra = format!(
+        "[[ci.registry.proxies]]\necosystem = \"composer\"\nupstream = \"{u}/composer\"\n\n[[ci.registry.proxies]]\necosystem = \"conan\"\nupstream = \"{u}/conan\"\n\n[[ci.registry.proxies]]\necosystem = \"vcpkg\"\n"
+    );
+    let s = start(dir.path(), &Options { extra: &extra, ..Options::default() })?;
+    let port = s.port;
+    let auth = format!("Bearer {}", s.admin);
+    let a = Some(auth.as_str());
+    let here = format!("http://127.0.0.1:{port}/_kiln/proxy");
+
+    let (st, _, body) = get(port, "/_kiln/proxy/composer/packages.json", a)?;
+    let root = String::from_utf8_lossy(&body).into_owned();
+    assert!(st == 200 && root.contains(&format!("\"metadata-url\":\"{here}/composer/p2/%package%.json\"")) && !root.contains("notify-batch"), "{st} {root}");
+    let (st, _, body) = get(port, "/_kiln/proxy/composer/p2/psr/log.json", a)?;
+    let meta = String::from_utf8_lossy(&body).into_owned();
+    assert!(st == 200 && meta.contains(&format!("\"{here}/composer/dist/api.github.com/repos/php-fig/log/zipball/f16e1d5863e37f8d8c2a01719f5b34baa2b714d3\"")), "{st} {meta}");
+
+    let (st, h, _) = get(port, "/_kiln/proxy/conan/v2/ping", None)?;
+    assert!(st == 200 && h.get("x-conan-server-capabilities").is_some_and(|c| c.contains("revisions")), "{st} {h:?}");
+    let basic = format!("Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("ci:{}", s.admin)));
+    let (st, _, token) = get(port, "/_kiln/proxy/conan/v2/users/authenticate", Some(&basic))?;
+    assert!(st == 200 && token == s.admin.as_bytes(), "{st}: Conan's token is the kiln token it signed in with");
+    let (st, _, body) = get(port, "/_kiln/proxy/conan/v2/conans/zlib/1.3.1/_/_/revisions/latest", Some(&format!("Bearer {}", String::from_utf8_lossy(&token))))?;
+    assert!(st == 200 && String::from_utf8_lossy(&body).contains("b8bc2603263cf7eccbd6e17e66b0ed76"), "{st}");
+
+    let package = "/_kiln/proxy/vcpkg/zlib/1.3.1/0a1b2c3d4e5f";
+    assert_eq!(get(port, package, a)?.0, 404, "a miss");
+    assert_eq!(send(port, "PUT", package, None, b"a binary")?.0, 403, "not without credentials");
+    assert_eq!(send(port, "PUT", package, a, b"a binary")?.0, 200);
+    let (st, _, body) = get(port, package, a)?;
+    assert!(st == 200 && body == b"a binary", "{st} {}", String::from_utf8_lossy(&body));
+    let (st, _, _) = send(port, "PUT", "/_kiln/proxy/vcpkg/../escape", a, b"x")?;
+    assert!(matches!(st, 400 | 404), "no path out of the cache: {st}");
+    Ok(())
+}

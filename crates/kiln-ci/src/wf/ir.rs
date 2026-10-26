@@ -203,8 +203,26 @@ pub struct Workflow {
     pub run_env: bool,
     /// kiln: `kiln: { honour-skip-ci }` (W03-R06).
     pub honour_skip_ci: bool,
+    /// kiln: `kiln: { chain-depth }`, how deep a chain of `workflow_run` (and `pipeline`) runs
+    /// this workflow takes part in: 3 when unset (GitHub's), at most 10 (W03-R13).
+    pub chain_depth: Option<u32>,
     /// kiln: the implicit checkout (W06-R14); GHA workflows never have one.
     pub checkout: bool,
+    /// Where a called workflow came from when that isn't the run's own repository and commit: a
+    /// remote one's repository, its ref and the commit it was pinned to. Its jobs' `job.workflow_*`
+    /// say so (W06-R03). `None` for the run's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
+}
+
+/// A workflow file's repository, ref and commit, for `job.workflow_*` (W06-R03).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    /// `owner/repo`.
+    pub repository: String,
+    /// The ref as GitHub writes it: `refs/heads/main`, `refs/tags/v1`, or a commit's SHA.
+    pub git_ref: String,
+    pub sha: String,
 }
 
 impl Workflow {
@@ -353,6 +371,10 @@ pub struct JobKiln {
     pub priority: Option<YVal>,
     pub retry: Option<YVal>,
     pub reuse: Option<YVal>,
+    /// `work:` (W24), as written: its `warm` read by `work::slots::warm`. Left out of the model's
+    /// JSON when unset, so a workflow without it hashes as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<YVal>,
     pub cache: Vec<YVal>,
     pub exports_env: Vec<String>,
     pub env_from: Vec<String>,
@@ -364,6 +386,8 @@ pub struct JobKiln {
     pub quarantine_enforce: bool,
     pub bench_gate: Option<YVal>,
     pub deploy: Option<YVal>,
+    /// `discover`: the usual reports, after the job's steps (W16-R01).
+    pub test_results: Option<YVal>,
     pub agents: Option<YVal>,
     /// v1's `artifacts: [globs]`.
     pub artifacts: Vec<String>,
@@ -455,6 +479,15 @@ pub struct StepKiln {
     pub test_results: Option<YVal>,
     pub integrations: Vec<String>,
     pub tty: bool,
+    /// `memo:` (W24-R07), as written: read by `work::memo::Memo`. Left out of the model's JSON
+    /// when unset, so a step without it hashes as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<YVal>,
+    /// `tests:` (W24-R10): the step runs a build's test binaries itself, those whose binary or
+    /// what they read changed, and replays the others' recorded passes: `{ cargo: [args] }`.
+    /// Skipped when unset, so a step without it hashes as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<YVal>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

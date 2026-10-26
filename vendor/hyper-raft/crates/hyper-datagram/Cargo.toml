@@ -1,0 +1,26 @@
+[package]
+name = "hyper-datagram"
+description = "The sealed UDP datagram plane for consensus control and membership: AES-256-GCM under per-epoch keys from the QUIC connection's TLS exporter, an RFC 4303 replay window, one packed datagram per peer per flush"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+crc32c = "0.6"
+
+[dev-dependencies]
+hyper-measure = { path = "../hyper-measure" }
+
+[[bench]]
+name = "allocs"
+harness = false
+
+[[bench]]
+name = "round"
+harness = false
+
+[lints]
+workspace = true

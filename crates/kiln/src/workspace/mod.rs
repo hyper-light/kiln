@@ -104,6 +104,10 @@ pub enum Ask {
     Stack(Stacked),
     /// A new version of one step of a plan run's stack, and the steps above it made again on it.
     Restack(Restack),
+    /// Look for quotes a finding cites (docs/research.md, "Checks"): each in a file, read in the
+    /// agent's folder, or a page, fetched from here as the agent would; only whether each is
+    /// there comes back.
+    Cite { looks: Vec<crate::research::check::Look> },
 }
 
 /// A push of one commit to one ref, as one principal.
@@ -170,15 +174,21 @@ pub struct Change {
 /// How long the server waits for a machine's answer about its folder (a push can be slow).
 pub const WAIT: Duration = Duration::from_secs(240);
 
-/// Answers `ask` (JSON) about the folder `cwd` of an agent (and its workspace `ws`, when it has
-/// one of its own), on the machine it is on: `{"facts"}`, `{"made", "said"}`, `{"drift"}`,
-/// `{"plan"}`, `{"landed"}`, or `{"error"}`.
-pub async fn serve(cwd: &Path, ws: Option<&Workspace>, ask: &str) -> Value {
+/// Answers `ask` (JSON) about an agent's work on the machine it is on: git's questions in the
+/// working tree its work is in (`work`: its folder's, or a worktree it went into,
+/// [`crate::harness::session::Info::work_dir`]), the files a finding cites under its folder
+/// (`cwd`), and its workspace `ws` when it has one of its own: `{"facts"}`, `{"made", "said"}`,
+/// `{"drift"}`, `{"plan"}`, `{"landed"}`, or `{"error"}`.
+pub async fn serve(cwd: &Path, work: &Path, ws: Option<&Workspace>, ask: &str) -> Value {
     let ask: Ask = match serde_json::from_str(ask) {
         Ok(a) => a,
         Err(e) => return json!({"error": format!("a question this machine doesn't understand ({e}): its kiln may be older than the server's")}),
     };
-    match answer(cwd, ws, ask).await {
+    let r = match ask {
+        Ask::Cite { looks } => Ok(json!({"looks": crate::research::check::local(cwd, looks).await})),
+        ask => answer(work, ws, ask).await,
+    };
+    match r {
         Ok(v) => v,
         Err(e) => json!({"error": format!("{e:#}")}),
     }
@@ -221,6 +231,7 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask) -> anyhow::Result<
             })
         }
         Ask::Git => Ok(json!({"facts": git::facts(cwd).await?})),
+        Ask::Cite { looks } => Ok(json!({"looks": crate::research::check::local(cwd, looks).await})),
         Ask::Change(c) => {
             let facts = git::facts(cwd).await?;
             let top = Path::new(&facts.top);

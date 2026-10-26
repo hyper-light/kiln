@@ -11,6 +11,7 @@
 use std::time::Duration;
 
 use anyhow::{Result, bail};
+use kiln_cd::apps::{SECRET_CHANGED, SECRET_REF};
 use kiln_cd::obj::{self, ResKey};
 use kiln_cd::providers::aws_lambda::{self as p, CodeSource, GROUP, PUBLISHED};
 use kiln_cd::rollout::State;
@@ -40,12 +41,30 @@ async fn get_function(cx: &Cx<'_>, name: &str) -> Result<Option<Value>> {
     }
 }
 
-/// The function as an object: code reads as what kiln applied while Lambda still holds it.
+/// The function as an object: code reads as what kiln applied while Lambda still holds it, and
+/// the app's secrets as the references kiln applied while the function is at the revision kiln
+/// left it at (another revision: [`SECRET_CHANGED`]; their values never show).
 async fn function(cx: &Cx<'_>, name: &str) -> Result<Option<Value>> {
     let Some(answer) = get_function(cx, name).await? else { return Ok(None) };
     let rec = cx.applied(GROUP, "Function", "", name);
     let code = rec.as_ref().and_then(|a| Some((a.object.pointer("/spec/Code")?, a.made.get("CodeSha256")?.as_str()?)));
-    Ok(p::live_function(&answer, code))
+    let Some(mut o) = p::live_function(&answer, code) else { return Ok(None) };
+    if let Some(r) = &rec {
+        let same = r.made.get("RevisionId").and_then(Value::as_str).is_some_and(|x| answer.pointer("/Configuration/RevisionId").and_then(Value::as_str) == Some(x));
+        if let (Some(Value::Object(ours)), Some(vars)) = (r.object.pointer("/spec/Environment/Variables"), o.pointer_mut("/spec/Environment/Variables").and_then(Value::as_object_mut)) {
+            for (k, v) in ours.iter().filter(|(_, v)| v.as_str().is_some_and(|s| s.starts_with(SECRET_REF))) {
+                if let Some(live) = vars.get_mut(k) {
+                    *live = if same { v.clone() } else { Value::String(SECRET_CHANGED.into()) };
+                }
+            }
+        }
+    }
+    Ok(Some(o))
+}
+
+/// The app's secrets among a Function object's variables (kiln's references): their names.
+fn kiln_vars(o: &Value) -> Vec<String> {
+    o.pointer("/spec/Environment/Variables").and_then(Value::as_object).into_iter().flatten().filter(|(_, v)| v.as_str().is_some_and(|s| s.starts_with(SECRET_REF))).map(|(k, _)| k.clone()).collect()
 }
 
 /// The version an alias at `$PUBLISHED` points to: the one kiln published with the function's
@@ -276,7 +295,8 @@ async fn apply_function(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     match &live {
         None => {
             cx.conn.budget().await;
-            aws.rest("lambda", Method::Post, FUNCTIONS, &[], Some(&p::create_body(desired, &code))).await?;
+            let body = super::resolve_secrets(cx, desired, p::create_body(desired, &code)).await?;
+            aws.rest("lambda", Method::Post, FUNCTIONS, &[], Some(&body)).await?;
             changed = true;
         }
         Some(live) => {
@@ -289,10 +309,12 @@ async fn apply_function(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
                 aws.rest("lambda", Method::Put, &format!("{}/code", function_path(name)), &[], Some(&body)).await.map_err(|e| changed_meanwhile(e, &format!("function {name}")))?;
                 changed = true;
             }
-            if !p::configuration_matches(desired, live) {
+            // A secret kiln put there that the app no longer has goes too.
+            let stale = record.as_ref().is_some_and(|r| kiln_vars(&r.object).iter().any(|k| desired.pointer("/spec/Environment/Variables").and_then(|v| v.get(k)).is_none()));
+            if !p::configuration_matches(desired, live) || stale {
                 let settled = settle(cx, name).await?;
                 cx.conn.budget().await;
-                let body = with_revision(p::configuration_body(desired), revision_of(&settled));
+                let body = super::resolve_secrets(cx, desired, with_revision(p::configuration_body(desired), revision_of(&settled))).await?;
                 aws.rest("lambda", Method::Put, &format!("{}/configuration", function_path(name)), &[], Some(&body)).await.map_err(|e| changed_meanwhile(e, &format!("function {name}")))?;
                 changed = true;
             }
@@ -317,7 +339,9 @@ async fn apply_function(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
         cx.conn.budget().await;
         aws.rest("lambda", Method::Post, &format!("/2017-03-31/tags/{}", encode(&arn, false)), &[], Some(&json!({ "Tags": want }))).await?;
     }
-    cx.record(GROUP, "Function", "", name, Some(applied(desired, json!({ "CodeSha256": sha, "Version": version, "FunctionArn": arn })))).await?;
+    // The revision kiln leaves it at: its secrets are kiln's while it is.
+    let revision = get_function(cx, name).await?.and_then(|a| a.pointer("/Configuration/RevisionId").cloned());
+    cx.record(GROUP, "Function", "", name, Some(applied(desired, json!({ "CodeSha256": sha, "Version": version, "FunctionArn": arn, "RevisionId": revision })))).await?;
     function(cx, name).await?.ok_or_else(|| anyhow::anyhow!("function {name} is gone"))
 }
 
@@ -703,6 +727,65 @@ mod tests {
             delete(&cx, &key_of(&a2)).await?;
             delete(&cx, &key_of(&f2)).await?;
             assert!(list(&cx, "Function", &[(String::new(), "thumbs".to_owned())]).await?.is_empty());
+            Ok(())
+        })
+    }
+
+    /// An app's secrets on Lambda (docs/deploy-api.md §3.5): environment variables, whose values
+    /// go to Lambda alone; the function, its record and what views show hold the reference while
+    /// the function is at the revision kiln left it at. A value changed by hand is drift, and
+    /// never shows; a new version updates the configuration.
+    #[test]
+    fn secrets_are_the_functions_environment_by_reference() -> anyhow::Result<()> {
+        let _one = fake::LAMBDA.lock();
+        crate::rt::block_on(async {
+            let fake = Arc::new(Fake::default());
+            let base = fake::start(fake.clone()).await?;
+            for service in ["lambda", "sts", "s3"] {
+                aws::override_endpoint(service, &base);
+            }
+            let target = Target::parse("aws-lambda/aws-test/us-east-1").ok_or_else(|| anyhow::anyhow!("target"))?;
+            let def = target.def().ok_or_else(|| anyhow::anyhow!("provider"))?;
+            let conn = Conn { settle_every: std::time::Duration::from_millis(5), gap: std::time::Duration::ZERO, ..Conn::new(target, def) };
+            let records = MemRecords::default();
+            let creds = Credentials { access_key_id: "AKIDFAKE".into(), secret_access_key: "s".into(), session_token: Some("t".into()), expires_at: None };
+            let files = fake::MemFiles::default();
+            let cx = Cx { conn: &conn, creds: Creds::Aws(Aws { creds, region: "us-east-1".into() }), records: &records, files: &files };
+            let with = |version: u32| -> anyhow::Result<Value> {
+                let mut objs = desired("s3://bucket/thumbs/v1.zip", 512)?;
+                kiln_cd::apps::platform_secrets(&mut objs, "app/thumbs/production", &[("API_KEY".into(), version)]).map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(objs.into_iter().next().unwrap_or_default())
+            };
+            let env = |fake: &Fake| fake.state.lock().functions.get("thumbs").and_then(|f| f.config.get("Environment").and_then(|e| e.pointer("/Variables/API_KEY")).cloned());
+            files.1.lock().insert("kiln-secret:app/thumbs/production/API_KEY@1".into(), b"s3cret".to_vec());
+            files.1.lock().insert("kiln-secret:app/thumbs/production/API_KEY@2".into(), b"n3w".to_vec());
+
+            let f = with(1)?;
+            let live = cx.with_applied(apply(&cx, &f).await?);
+            assert_eq!(env(&fake), Some(json!("s3cret")), "the value is Lambda's");
+            assert_eq!(live.pointer("/spec/Environment/Variables/API_KEY"), Some(&json!("kiln-secret:app/thumbs/production/API_KEY@1")));
+            assert!(p::configuration_matches(&f, &live));
+            assert!(!live.to_string().contains("s3cret") && !format!("{:?}", records.0.lock()).contains("s3cret"), "no value in what kiln shows or keeps");
+            apply(&cx, &f).await?;
+            assert_eq!(fake.state.lock().calls, ["CreateFunction thumbs", "PublishVersion thumbs 1"], "the same secret again changes nothing");
+
+            // Changed by hand: drift, the value unshown; kiln's apply puts its own back (the
+            // configuration version 1 has, so Lambda publishes no other).
+            if let Some(func) = fake.state.lock().functions.get_mut("thumbs") {
+                func.config.insert("Environment".into(), json!({ "Variables": { "API_KEY": "handmade" } }));
+                func.revision += 1;
+            }
+            let drifted = list(&cx, "Function", &[(String::new(), "thumbs".to_owned())]).await?.into_iter().next().unwrap_or_default();
+            assert_eq!(drifted.pointer("/spec/Environment/Variables/API_KEY"), Some(&json!(kiln_cd::apps::SECRET_CHANGED)));
+            assert!(!p::configuration_matches(&f, &drifted) && !drifted.to_string().contains("handmade"));
+            apply(&cx, &f).await?;
+            assert_eq!(env(&fake), Some(json!("s3cret")));
+
+            // A new version: the configuration, and a version published with it.
+            let f2 = with(2)?;
+            apply(&cx, &f2).await?;
+            assert_eq!(env(&fake), Some(json!("n3w")));
+            assert_eq!(fake.state.lock().calls.last().map(String::as_str), Some("PublishVersion thumbs 2"));
             Ok(())
         })
     }

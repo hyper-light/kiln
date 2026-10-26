@@ -8,6 +8,10 @@ export interface PlanSource {
   machine?: string | null;
   cwd?: string | null;
   agent?: string | null;
+  /** The goal it was made from: once every step is met, so is the goal. */
+  goal?: { agent: string; id: string; text: string } | null;
+  /** The plan its agent proposed (plan mode), kept by kiln: one an agent, a version each time it proposes another. */
+  proposed?: boolean;
 }
 
 /** How a measure compares with its threshold (crates/kiln/src/plans/criteria.rs `Op`). */
@@ -50,6 +54,8 @@ export interface PlanItem {
   testing: PlanTest[];
   /** The steps it waits for, by number (from 1): run with an agent per step, it starts once each is met. */
   needs?: number[];
+  /** The findings of its plan's research it rests on (`f1`, …). */
+  basis?: string[];
 }
 
 export const emptyItem = (): PlanItem => ({ title: "", description: "", examples: "", acceptance: [], testing: [] });
@@ -70,6 +76,10 @@ export interface Plan {
   updated_at: number;
   steps: string[];
   runs: number;
+  /** `planning`: made from a goal, its agent researching it and writing its steps; not run until it says it's ready. */
+  phase: "planning" | "ready";
+  /** Its research: what its steps rest on. */
+  research: string | null;
 }
 
 export interface PlanVersion {
@@ -205,6 +215,14 @@ export interface PlanRan {
   session: string;
   sent: number;
   run: string;
+  /** As goals, split into its acceptance criteria and tests: how many steps were. */
+  split?: number;
+}
+
+/** Which of a plan's steps a run takes (`only`, by number), and as goals, each split into its acceptance criteria and tests (`split`). */
+export interface PlanPick {
+  only?: number[];
+  split?: boolean;
 }
 
 export interface SharedPlan {
@@ -225,22 +243,31 @@ const enc = encodeURIComponent;
 
 export const plansApi = {
   list: (signal?: AbortSignal) => request<Plan[]>("GET", "/api/plans", undefined, { signal }),
+  /** The plans kept with agent `session`: made in its Plan tab, by it, from its goals, or proposed by it. */
+  of: (session: string, signal?: AbortSignal) => request<Plan[]>("GET", `/api/plans?session=${enc(session)}`, undefined, { signal }),
   get: (id: string, signal?: AbortSignal) => request<Plan>("GET", `/api/plans/${enc(id)}`, undefined, { signal }),
+  /** The plan agent `session` proposed (plan mode), as kiln keeps it: one at most. */
+  proposedBy: (session: string, signal?: AbortSignal) => request<Plan[]>("GET", `/api/plans?session=${enc(session)}&proposed=1`, undefined, { signal }),
   create: (p: { title?: string; body: string; items?: PlanItem[]; tags?: string[]; source?: PlanSource }) => request<Plan>("POST", "/api/plans", p),
   update: (id: string, patch: { title?: string; body?: string; items?: PlanItem[]; tags?: string[] }) => request<Plan>("PATCH", `/api/plans/${enc(id)}`, patch),
   remove: (id: string) => request<void>("DELETE", `/api/plans/${enc(id)}`),
   versions: (id: string, signal?: AbortSignal) => request<PlanVersion[]>("GET", `/api/plans/${enc(id)}/versions`, undefined, { signal }),
   runs: (id: string, signal?: AbortSignal) => request<PlanRun[]>("GET", `/api/plans/${enc(id)}/runs`, undefined, { signal }),
   restore: (id: string, version: number) => request<Plan>("POST", `/api/plans/${enc(id)}/restore`, { version }),
-  run: (id: string, target: PlanRunTarget, mode: Exclude<PlanMode, "agents">) => request<PlanRan>("POST", `/api/plans/${enc(id)}/run`, { ...target, mode }),
-  /** One agent per step, on the machine and harness given, one after another. */
-  runAgents: (id: string, to: { target: string; kind: string; cwd?: string }) => request<PlanStarted>("POST", `/api/plans/${enc(id)}/run`, { new: to, mode: "agents" }),
+  /** `key`: the run asked again under it (its answer lost) is the same run, never a second (CP-T3.2). */
+  run: (id: string, target: PlanRunTarget, mode: Exclude<PlanMode, "agents">, pick: PlanPick = {}, key?: string) =>
+    request<PlanRan>("POST", `/api/plans/${enc(id)}/run`, { ...target, mode, ...pick, key }),
+  /** One agent per step, on the machine and harness given, one after another (`key`, as `run`'s). */
+  runAgents: (id: string, to: { target: string; kind: string; cwd?: string }, pick: Pick<PlanPick, "only"> = {}, key?: string) =>
+    request<PlanStarted>("POST", `/api/plans/${enc(id)}/run`, { new: to, mode: "agents", ...pick, key }),
   /** Runs of one agent per step (`active`: those under way). */
   agentRuns: (active: boolean, signal?: AbortSignal) => request<{ runs: PlanRunBrief[] }>("GET", `/api/plans/runs${active ? "?active=1" : ""}`, undefined, { signal }),
   runView: (run: string, signal?: AbortSignal) => request<PlanRunView>("GET", `/api/plans/runs/${enc(run)}`, undefined, { signal }),
   stopRun: (run: string) => request<PlanRunView>("POST", `/api/plans/runs/${enc(run)}/stop`),
   /** Retry a step with a new agent; take it over (kiln stops holding its agent to it); or say it's met. */
-  step: (run: string, n: number, act: "retry" | "take" | "met") => request<PlanRunView>("POST", `/api/plans/runs/${enc(run)}/steps/${n}/${act}`),
+  /** `tries`: for a retry, the try it replaces (asked again once it was tried again, nothing more starts: CP-T3.2). */
+  step: (run: string, n: number, act: "retry" | "take" | "met", tries?: number) =>
+    request<PlanRunView>("POST", `/api/plans/runs/${enc(run)}/steps/${n}/${act}`, act === "retry" && tries !== undefined ? { try: tries } : undefined),
   share: (id: string, on: boolean) => request<Plan>("POST", `/api/plans/${enc(id)}/share`, { on }),
   shared: (token: string, signal?: AbortSignal) => request<SharedPlan>("GET", `/api/shared/plans/${enc(token)}`, undefined, { signal }),
 };

@@ -134,15 +134,18 @@ export type BuildState = "current" | "behind" | "building" | "queued" | "failed"
 
 /** A platform's build as the Builds section shows it: what runners of it download, and where it stands. */
 export interface PlatformView {
-  /** `<target>:<origin>`, `<target>:none` for a platform without a build. */
+  /** Its target: one platform, one build runners get. */
   key: string;
   target: string;
   os: string;
   arch: string;
   abi: string;
-  /** "linux · x86_64", with its ABI when another platform shares the rest. */
+  /** "linux · x86_64 · musl": its target in words, so no two platforms read alike. */
   label: string;
+  /** What runners of it download: the server's own for the server's platform, else the one kept for it. */
   binary: KilnBinary | null;
+  /** Builds kept for it that runners don't get: an older one beside the server's own. */
+  shadowed: KilnBinary[];
   /** The commit it is built from, when kiln knows it. */
   commit: string | null;
   state: BuildState;
@@ -155,12 +158,17 @@ export interface PlatformView {
   runners: string[];
 }
 
-const ORIGIN_ORDER: Record<KilnBinary["origin"], number> = { server: 0, built: 1, machine: 2, release: 3, upload: 4 };
+/** "x86_64 · musl": a platform's arch and its ABI, what follows its OS. */
+export function archWords(p: { arch: string; abi: string }): string {
+  return p.abi ? `${p.arch} · ${p.abi}` : p.arch;
+}
 
 /**
  * Every platform with a build here, every platform kiln's release pipeline is behind on, and every
- * platform a runner waits for a build of: the build each has, and what the release run under way
- * (its `jobs`, when read) does about it.
+ * platform a runner waits for a build of: the build runners of each get (the server's own for its
+ * platform, which shadows any other kept for it), and what the release run under way (its `jobs`,
+ * when read) does about each: its job of the platform's family queued, running or failed, whatever
+ * commit the run builds.
  */
 export function platformsOf(data: UpdatesOverview, jobs: Job[] | null): PlatformView[] {
   const build = data.build;
@@ -169,17 +177,21 @@ export function platformsOf(data: UpdatesOverview, jobs: Job[] | null): Platform
   const behind = new Set(build?.behind ?? []);
   const lastOfIt = last !== null && build?.commit != null && last.sha.toLowerCase() === build.commit.toLowerCase();
   const newestOfServer = data.newest?.from === "server" ? data.newest.commit : null;
-  const entries: { target: string; binary: KilnBinary | null }[] = data.binaries.map((b) => ({ target: b.target, binary: b }));
   const wanted = [...behind, ...data.runners.filter((r) => r.connected && !r.up_to_date && !r.target_build && r.target).map((r) => r.target as string)];
-  for (const t of wanted) if (!entries.some((e) => e.target === t)) entries.push({ target: t, binary: null });
-  const out = entries.map(({ target, binary }): PlatformView => {
+  const targets = [...new Set([...data.binaries.map((b) => b.target), ...wanted])];
+  const out = targets.map((target): PlatformView => {
+    const kept = data.binaries.filter((b) => b.target === target);
+    const binary = kept.find((b) => b.origin === "server") ?? kept.reduce<KilnBinary | null>((a, b) => (a === null || b.at > a.at ? b : a), null);
     const { os, arch, abi } = platformOf(target);
-    const job = building && behind.has(target) ? (jobs?.find((j) => j.key === platformJob(target)) ?? null) : null;
+    const job = building ? (jobs?.find((j) => j.key === platformJob(target)) ?? null) : null;
+    const s = job?.status;
     let state: BuildState;
-    if (building && behind.has(target) && binary?.origin !== "server") {
-      const s = job?.status;
-      state = s === "queued" || s === "pending" ? "queued" : s === "failed" || s === "cancelled" || s === "timed_out" ? "failed" : "building";
-    } else if (binary && behind.has(target)) state = lastOfIt && last?.status === "failed" ? "failed" : "behind";
+    if (s === "queued" || s === "pending") state = "queued";
+    else if (s === "running") state = "building";
+    else if (s === "failed" || s === "cancelled" || s === "timed_out") state = "failed";
+    // The run's jobs aren't read yet: what it is to build, building.
+    else if (building && jobs === null && behind.has(target) && binary?.origin !== "server") state = "building";
+    else if (binary && behind.has(target)) state = lastOfIt && last?.status === "failed" ? "failed" : "behind";
     else if (binary) state = "current";
     else state = lastOfIt && last?.status === "failed" ? "failed" : "missing";
     const runners = data.runners.filter((r) => r.target === target).map((r) => r.name);
@@ -187,29 +199,23 @@ export function platformsOf(data: UpdatesOverview, jobs: Job[] | null): Platform
       state === "current" ? "ok" : state === "behind" ? "warn" : state === "building" ? "run" : state === "failed" ? "bad" : state === "queued" ? "off" : runners.length ? "warn" : "off";
     const commit = binary ? (binary.sha ?? (binary.origin === "server" ? newestOfServer : null)) : null;
     return {
-      key: `${target}:${binary?.origin ?? "none"}`,
+      key: target,
       target,
       os,
       arch,
       abi,
-      label: `${os} · ${arch}`,
+      label: `${os} · ${archWords({ arch, abi })}`,
       binary,
+      shadowed: kept.filter((b) => b !== binary),
       commit,
       state,
       tone,
-      job,
-      lit: state === "building" && job?.status === "running",
+      job: state === "current" || state === "behind" || state === "missing" ? null : job,
+      lit: s === "running",
       runners,
     };
   });
-  out.sort(
-    (a, b) =>
-      (OS_ORDER[a.os] ?? 9) - (OS_ORDER[b.os] ?? 9) ||
-      (ARCH_ORDER[a.arch] ?? 9) - (ARCH_ORDER[b.arch] ?? 9) ||
-      a.abi.localeCompare(b.abi) ||
-      (a.binary ? ORIGIN_ORDER[a.binary.origin] : 9) - (b.binary ? ORIGIN_ORDER[b.binary.origin] : 9),
-  );
-  for (const p of out) if (out.some((q) => q !== p && q.os === p.os && q.arch === p.arch && q.abi !== p.abi) && p.abi) p.label = `${p.os} · ${p.arch} · ${p.abi}`;
+  out.sort((a, b) => (OS_ORDER[a.os] ?? 9) - (OS_ORDER[b.os] ?? 9) || (ARCH_ORDER[a.arch] ?? 9) - (ARCH_ORDER[b.arch] ?? 9) || a.abi.localeCompare(b.abi));
   return out;
 }
 
@@ -239,7 +245,7 @@ export function platformLine(p: PlatformView, last: Run | null): string {
   const run = last ? `run #${last.number}` : "the release run";
   switch (p.state) {
     case "building":
-      return `building · ${run}`;
+      return last ? `building ${last.sha.slice(0, 7)} · ${run}` : "building";
     case "queued":
       return `queued · ${run}`;
     case "failed":
@@ -268,16 +274,24 @@ export interface BuildStatus {
   more: string | null;
 }
 
-export function buildStatus(build: ReleaseBuild, platforms: PlatformView[], nowMs: number): BuildStatus {
+/** How far a release run's jobs are, as its words say it: "1 of 3 running", "2 of 3 queued", "3 of 3 built", and how many failed. */
+export function runProgress(jobs: Job[]): string {
+  const n = jobs.length;
+  const count = (...s: string[]) => jobs.filter((j) => s.includes(j.status)).length;
+  const [running, queued, done, failed] = [count("running"), count("queued", "pending"), count("succeeded", "skipped"), count("failed", "cancelled", "timed_out")];
+  const words = running ? `${running} of ${n} running` : queued ? `${queued} of ${n} queued` : `${done} of ${n} built`;
+  return failed ? `${words} · ${failed} failed` : words;
+}
+
+export function buildStatus(build: ReleaseBuild, platforms: PlatformView[], nowMs: number, jobs: Job[] | null = null): BuildStatus {
   const last = build.last ?? null;
   const commit = build.commit ? build.commit.slice(0, 7) : null;
   const behind = build.behind ?? [];
   const lastOfIt = last !== null && build.commit != null && last.sha.toLowerCase() === build.commit.toLowerCase();
   if (build.error) return { tone: "warn", before: "Can't build here", run: null, after: "", more: build.error };
   if (last && isBuilding(last)) {
-    const theirs = platforms.filter((p) => p.binary?.origin !== "server");
-    const done = theirs.filter((p) => p.state === "current").length;
-    return { tone: "run", before: "Release ", run: last, after: ` · ${done} of ${theirs.length} built`, more: null };
+    // What the run does, from its jobs: whatever commit it builds, the server's or a newer one.
+    return { tone: "run", before: "Release ", run: last, after: ` building ${last.sha.slice(0, 7)}${jobs?.length ? ` · ${runProgress(jobs)}` : ""}`, more: null };
   }
   if (build.in_step) return { tone: "ok", before: `All built from ${commit}`, run: null, after: "", more: null };
   if (commit) {
@@ -403,12 +417,13 @@ export function runnerView(r: RunnerUpdate, job: UpdateJob | undefined, newest: 
   if (job?.state === "running" || (r.connected && r.how === "upgrading")) {
     const build = job?.method === "build";
     const toWords = to ?? "the new build";
+    const doing = build && job?.on ? `getting ${toWords} from ${job.on}` : build ? `building ${toWords} itself` : `upgrading to ${toWords}`;
     return {
       ...base,
       tone: "run",
-      word: build ? "Building itself" : "Upgrading",
-      sub: switching ? `old runner holds ${oldHolds}` : build ? `building ${toWords} itself` : `upgrading to ${toWords}`,
-      scene: switching ? "switching · nothing stops" : build ? `building ${toWords} itself` : `upgrading to ${toWords}`,
+      word: build && !job?.on ? "Building itself" : "Upgrading",
+      sub: switching ? `old runner holds ${oldHolds}` : doing,
+      scene: switching ? "switching · nothing stops" : doing,
       lit: true,
     };
   }
@@ -700,9 +715,9 @@ export function diagnosisPrompt(r: RunnerUpdate, job: UpdateJob | undefined, new
     `- ${r.name} runs kiln ${r.version}${r.commit ? `, commit ${r.commit}` : ""}${r.build ? `, build ${r.build}` : ""}.`,
     newest ? `- The newest kiln is commit ${newest.commit}.` : "",
     failed
-      ? `- Its upgrade, ${failed.method === "build" ? `a build of ${failed.commit ? shortSha(failed.commit) : "the newest kiln"} on the machine` : `to build ${failed.to_build ?? "the new build"}`}, started ${at(failed.started_at)} and failed: ${failed.error ?? "kiln wasn't told why"}`
+      ? `- Its upgrade, ${failed.method === "build" ? `a build of ${failed.commit ? shortSha(failed.commit) : "the newest kiln"} on ${failed.on ? `${failed.on}, for it to download` : "the machine"}` : `to build ${failed.to_build ?? "the new build"}`}, started ${at(failed.started_at)} and failed: ${failed.error ?? "kiln wasn't told why"}`
       : "",
-    ...stuck.map((w) => `- ${w.way === "build" ? "It can't build kiln itself now" : "It can't download a build now"}: ${w.why}.`),
+    ...stuck.map((w) => `- ${w.way === "build" ? "kiln can't be built for it now" : "It can't download a build now"}: ${w.why}.`),
     r.next ? `- What kiln does next: it ${r.next}.` : "",
     tail.length ? `- Its last lines, as kiln kept them:\n\n${tail.map((l) => `    ${l}`).join("\n")}` : "",
     ...(findings ?? [])
@@ -716,7 +731,9 @@ export function diagnosisPrompt(r: RunnerUpdate, job: UpdateJob | undefined, new
       : r.os === "macos"
         ? "- The runner's log: kiln.log in its state directory, usually ~/.local/share/kiln/agent/kiln.log."
         : "- The runner's log, in its state directory.",
-    failed?.method === "build" ? `- The build's whole output: ~/.cache/kiln/self-build/build-${failed.id}.log (the build works in ~/.cache/kiln/self-build).` : "",
+    failed?.method === "build"
+      ? `- The build's whole output: ~/.cache/kiln/self-build/build-${failed.id}.log${failed.on ? ` on ${failed.on}, where it ran` : ""} (the build works in ~/.cache/kiln/self-build).`
+      : "",
     "- Free disk and memory, and for a build the Rust toolchain (rustup show, cargo --version) and npm.",
     "",
     "Rules:",

@@ -7,7 +7,7 @@
  * kiln waits on an upgrade before it calls it failed.
  */
 import * as React from "react";
-import { Bot, ChevronDown, RefreshCw } from "lucide-react";
+import { Bot, ChevronDown, CircleArrowUp, Hammer, RefreshCw, RotateCcw, Stethoscope, Terminal, Upload } from "lucide-react";
 import { attachApi, type IncidentBrief } from "@/api/attach";
 import { api } from "@/api/client";
 import type { FleetTarget, ReleaseWait, RunnerDiagnosis, RunnerFinding, RunnerUpdate, ServerUpdate, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "@/api/types";
@@ -134,7 +134,11 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
       started(job);
       if (job.state === "failed") throw new Error(job.error ?? "The upgrade couldn't start.");
       toggleOutput(r.name, true);
-      toast({ title: way === "build" ? `Building kiln on ${r.name}` : `Upgrading ${r.name}`, description: "Its terminals, agents and jobs keep running.", tone: "running" });
+      toast({
+        title: way === "build" ? (job.on ? `Building kiln for ${r.name} on ${job.on}` : `Building kiln on ${r.name}`) : `Upgrading ${r.name}`,
+        description: "Its terminals, agents and jobs keep running.",
+        tone: "running",
+      });
     } catch (e) {
       toast.error(`Couldn't upgrade ${r.name}`, errorMessage(e));
       throw e;
@@ -206,11 +210,13 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
     const again = job?.state === "failed";
     const build = way === "build";
     const failedWay = offer.failed ? wayOf(offer.failed) : null;
+    const chosen = offer.open.find((w) => w.way === way);
+    const where = build && chosen?.on ? `for ${r.name} on ${chosen.on}` : `on ${r.name}`;
     setConfirm({
       scope: `runner:${r.name}`,
-      title: again ? (build ? `Try building kiln on ${r.name} again?` : `Try upgrading ${r.name} again?`) : build ? `Build the newest kiln on ${r.name}?` : `Upgrade ${r.name}?`,
+      title: again ? (build ? `Try building kiln ${where} again?` : `Try upgrading ${r.name} again?`) : build ? `Build the newest kiln ${where}?` : `Upgrade ${r.name}?`,
       lead: "What will happen:",
-      plan: <RunnerPlan r={r} newest={newest} build={build} />,
+      plan: <RunnerPlan r={r} newest={newest} build={build} on={build ? chosen?.on : undefined} why={chosen?.why} />,
       confirmLabel: again ? "Try again" : build ? "Build and upgrade" : "Upgrade",
       run: () => startRunner(r, way),
       instead: offer.open.filter((w) => w.way !== way).map((w) => ({ label: wayLabel(w.way, false, failedWay === w.way), ask: () => askRunner(e, w.way) })),
@@ -229,13 +235,14 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
           <p>{summary}</p>
           {data.follow === false && <p>Automatic upgrades are disabled on this server. Runners can still be upgraded here.</p>}
         </div>
-        <div className="up-panel-actions">
-          <Button size="xs" variant="ghost" disabled={checking || data.server.checking} onClick={() => void check()}>
+        <div className="up-panel-actions up-fleet-actions">
+          <Button size="xs" variant="ghost" className="up-check-updates" disabled={checking || data.server.checking} onClick={() => void check()}>
             <RefreshCw className={cn((checking || data.server.checking) && "animate-spin motion-reduce:animate-none")} /> Check for updates
           </Button>
           <Button
             size="xs"
             variant="secondary"
+            className="up-upgrade-all"
             disabled={starting || fleet.ready.length === 0 || fleet.ready.every((r) => runningRunners.has(r.name))}
             onClick={() =>
               setConfirm({
@@ -374,7 +381,7 @@ export function MachinesHead({ box }: { box?: React.ReactNode }) {
           Updates
         </th>
         <th className="up-c-act" scope="col">
-          <span className="sr-only">Actions</span>
+          Actions
         </th>
       </tr>
     </thead>
@@ -514,25 +521,25 @@ function ServerRows({
           <span className="up-sub up-policy-words">{view.policy}</span>
         </td>
         <td className="up-c-act">
-          <span className="up-acts">
+          <span className="up-acts" data-lead={(s.action === "restart" && s.newer) || (s.action === "replace" && s.replacement) ? "pill" : undefined}>
             {s.action === "restart" && (s.newer || !!s.image?.error) && (
               <Button size="xs" variant={s.newer ? "secondary" : "ghost"} disabled={busy} onClick={() => onAction("restart")}>
-                {s.newer ? "Upgrade server" : "Restart anyway"}
+                {s.newer ? <CircleArrowUp /> : <RotateCcw />} {s.newer ? "Upgrade server" : "Restart anyway"}
               </Button>
             )}
             {s.action === "replace" && s.replacement && (
               <Button size="xs" variant="secondary" disabled={busy} onClick={() => onAction("replace")}>
-                {s.replacement.origin === "upload" ? `Install build ${s.replacement.build ?? ""}` : `Install kiln ${s.replacement.version ?? ""}`}
+                <CircleArrowUp /> {s.replacement.origin === "upload" ? `Install build ${s.replacement.build ?? ""}` : `Install kiln ${s.replacement.version ?? ""}`}
               </Button>
             )}
             {s.mode !== "kubernetes" && (
               <Button size="xs" variant="ghost" disabled={uploading !== null} onClick={onUpload}>
-                {uploading === s.target ? "Uploading…" : "Upload a build"}
+                <Upload /> {uploading === s.target ? "Uploading…" : "Upload a build"}
               </Button>
             )}
             {job && (
               <Button size="xs" variant="ghost" aria-expanded={output} onClick={onOutput}>
-                Output
+                <Terminal /> Output
               </Button>
             )}
           </span>
@@ -733,25 +740,26 @@ function RunnerRows({
           )}
         </td>
         <td className="up-c-act">
-          <span className="up-acts">
+          {/* In one order on every row: its upgrade first, then a build to upload, its output, Diagnose. */}
+          <span className="up-acts" data-lead={primary ? "pill" : undefined}>
             {primary && (
               <Button size="xs" variant="secondary" disabled={saving || starting} title={sentence(primary.why)} onClick={() => onUpgrade(primary.way)}>
-                {wayLabel(primary.way, true, failedWay === primary.way)}
+                {failedWay === primary.way ? <RotateCcw /> : primary.way === "build" ? <Hammer /> : <CircleArrowUp />} {wayLabel(primary.way, true, failedWay === primary.way)}
               </Button>
             )}
             {offer.missing && (
               <Button size="xs" variant="ghost" disabled={uploading !== null} onClick={onUpload}>
-                {uploading === r.target ? "Uploading…" : "Upload a build"}
+                <Upload /> {uploading === r.target ? "Uploading…" : "Upload a build"}
               </Button>
             )}
             {job && (
               <Button size="xs" variant="ghost" aria-expanded={output} onClick={onOutput}>
-                Output
+                <Terminal /> Output
               </Button>
             )}
             {r.connected && !plan && (
               <Button size="xs" variant="ghost" aria-expanded={diag !== null} onClick={() => (diag ? setDiag(null) : void look())}>
-                Diagnose
+                <Stethoscope /> Diagnose
               </Button>
             )}
           </span>
@@ -803,14 +811,25 @@ function RunnerRows({
   );
 }
 
-function RunnerPlan({ r, newest: target, build }: { r: RunnerUpdate; newest: FleetTarget | null; build: boolean }) {
+function RunnerPlan({ r, newest: target, build, on, why }: { r: RunnerUpdate; newest: FleetTarget | null; build: boolean; on?: string; why?: string }) {
   const newest = r.instances.find((i) => i.newest);
   const inPlace = r.method === "native" && newest !== undefined && newest.id !== "main" && !newest.legacy;
   const of = target ? ` (${shortSha(target.commit)})` : "";
   const to = r.target_build ? `build ${r.target_build}${of}` : `the ${r.target ?? ""} build (this version's GitHub release, if one is published)`;
   return (
     <ul className="up-plan">
-      {build ? (
+      {build && on ? (
+        <>
+          <li>
+            {why ?? `${on} builds ${target ? shortSha(target.commit) : "the newest kiln"} for ${r.target ?? "its platform"}`}. The build runs in a terminal kiln opens on {on} (it won&rsquo;t appear
+            among your terminals): it fetches the source from this server, builds it in <code>~/.cache/kiln/self-build</code> and hands the binary back to this server. Neither machine needs a checkout
+            of kiln.
+          </li>
+          <li>
+            Then {r.name} downloads it from this server, checks its SHA-256 and runs <code>kiln install --agent --upgrade</code>. The other machines of its platform download the same build.
+          </li>
+        </>
+      ) : build ? (
         <>
           <li>
             {r.how === "build" ? (
@@ -825,16 +844,7 @@ function RunnerPlan({ r, newest: target, build }: { r: RunnerUpdate; newest: Fle
             : kiln opens a terminal on it (it won&rsquo;t appear among your terminals) that fetches the source from this server, builds it in <code>~/.cache/kiln/self-build</code> and runs{" "}
             <code>kiln install --agent --upgrade</code>.
           </li>
-          <li>
-            {r.checkout ? (
-              <>
-                Its kiln checkout at <code>{r.checkout}</code> is left as it is.
-              </>
-            ) : (
-              "Its kiln checkout is left as it is."
-            )}{" "}
-            It brings its stable Rust toolchain up to date first (kiln needs a recent one), and the build takes its CPU for a few minutes.
-          </li>
+          <li>It needs no checkout of kiln. It brings its stable Rust toolchain up to date first (kiln needs a recent one), and the build takes its CPU for a few minutes.</li>
           {r.os === "macos" && <li>The binary comes back to this server, so other Macs download it instead of building.</li>}
         </>
       ) : r.method === "native" ? (
@@ -890,7 +900,7 @@ function DoctorLine({ runner }: { runner: string }) {
   if (!i) return null;
   return (
     <p className="up-note">
-      <Link to="/agents/attached">{i.name}</Link>: {i.title} · {i.state === "open" ? (i.report ?? "its agent is on it") : (i.why ?? "waiting for you")}
+      {i.name}: {i.title} · {i.state === "open" ? (i.report ?? "its agent is on it") : (i.why ?? "waiting for you")}
       {i.agent && (
         <>
           {" · "}

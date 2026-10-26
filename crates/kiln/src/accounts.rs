@@ -1,5 +1,5 @@
-//! Signing a machine's harnesses in and out from kiln (Claude Code, Codex), so `/login` and
-//! `/logout` work from the console: each harness's own CLI (`claude auth …`, `codex login …`)
+//! Signing a machine's harnesses in and out from kiln (Claude Code, Codex, Devin), so `/login` and
+//! `/logout` work from the console: each harness's own CLI (`claude auth …`, `codex login …`, `devin auth …`)
 //! runs in a terminal kiln opens on that machine for the purpose (never listed as anyone's), and
 //! what a sign-in asks for (a page to open, a code to enter there, a code or an API key to give
 //! back) is read from its output and shown in the console. What is typed in goes to the CLI only:
@@ -33,6 +33,8 @@ const LINES: usize = 12;
 const CLAUDE_PASTE: &str = "Paste code here";
 /// Its whole prompt: dropped from the output shown (the console asks for the code instead).
 const CLAUDE_PROMPT: &str = "Paste code here if prompted >";
+/// Devin's manual sign-in waits for the code its page shows.
+const DEVIN_PASTE: &str = "Paste the code from the sign-in page";
 
 /// A way to sign in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -84,10 +86,19 @@ const CLIS: &[Cli] = &[
         ],
         read: read_codex,
     },
+    Cli {
+        kind: "devin",
+        name: "Devin",
+        program: "devin",
+        status: "auth status",
+        logout: "auth logout",
+        methods: &[Method { id: "devin", label: "Devin account", asks: Some("code"), args: "auth login --force-manual-token-flow" }],
+        read: read_devin,
+    },
 ];
 
 fn cli(kind: &str) -> anyhow::Result<&'static Cli> {
-    CLIS.iter().find(|c| c.kind == kind).ok_or_else(|| anyhow::anyhow!("kiln can't sign {kind} in or out (it can: claude, codex)"))
+    CLIS.iter().find(|c| c.kind == kind).ok_or_else(|| anyhow::anyhow!("kiln can't sign {kind} in or out (it can: claude, codex, devin)"))
 }
 
 /// A harness's account on a machine.
@@ -149,6 +160,20 @@ fn read_codex(out: &str) -> Account {
     } else {
         Account { error: Some(if line.is_empty() { "it gave no status".to_owned() } else { line.to_owned() }), ..Account::default() }
     }
+}
+
+/// `devin auth status`: its sign-in method, then the user and account fields.
+fn read_devin(out: &str) -> Account {
+    let text = plain(out);
+    if text.lines().any(|l| l.trim() == "Not logged in.") {
+        return Account { signed_in: Some(false), ..Account::default() };
+    }
+    let Some(line) = text.lines().map(str::trim).find(|l| l.starts_with("Logged in")) else {
+        return Account { error: Some(last_words(&text).unwrap_or_else(|| "it gave no status".to_owned())), ..Account::default() };
+    };
+    let field = |name: &str| text.lines().filter_map(|l| l.trim().split_once(':')).find_map(|(k, v)| (k == name && !v.trim().is_empty()).then(|| v.trim().to_owned()));
+    let method = line.strip_prefix("Logged in (via ").and_then(|s| s.strip_suffix(").")).map(str::to_owned);
+    Account { signed_in: Some(true), method, email: field("Email"), plan: field("Plan"), ..Account::default() }
 }
 
 /// A sign-in or sign-out, as the console follows it.
@@ -276,7 +301,7 @@ pub async fn login(hub: &Arc<Hub>, target: &str, kind: &str, method: Option<&str
 
 /// Follow a sign-in's terminal until it ends, then read the account as it is now.
 async fn drive(hub: &Arc<Hub>, cli: &'static Cli, id: &str, target: &str, session: &Arc<Session>) {
-    let (code, failed) = follow(hub, id, session).await;
+    let (code, failed) = follow(hub, id, session, cli.kind == "devin").await;
     session.close();
     forget(hub, session);
     let cancelled = get(id).is_some_and(|f| f.state == "cancelled");
@@ -284,6 +309,7 @@ async fn drive(hub: &Arc<Hub>, cli: &'static Cli, id: &str, target: &str, sessio
     let signed_in = account.as_ref().and_then(|a| a.signed_in);
     let lines = get(id).map(|f| f.lines).unwrap_or_default();
     let mut ok = false;
+    let told = account.clone();
     finish(hub, id, |f| {
         if f.state != "cancelled" {
             ok = failed.is_none() && code == Some(0) && signed_in == Some(true);
@@ -296,16 +322,17 @@ async fn drive(hub: &Arc<Hub>, cli: &'static Cli, id: &str, target: &str, sessio
     });
     // Signed in (perhaps as someone else): the machine's sessions of this harness take it up.
     if ok {
-        hub.harness.signed_in(hub, target, cli.kind).await;
+        hub.harness.signed_in(hub, target, cli.kind, told.as_ref()).await;
     }
 }
 
 /// Read a sign-in's output into its flow until the terminal ends (or nobody finishes it in
 /// time): its exit code, and why it failed when that was not up to the CLI.
-async fn follow(hub: &Hub, id: &str, session: &Session) -> (Option<i32>, Option<String>) {
+async fn follow(hub: &Hub, id: &str, session: &Session, terminal_queries: bool) -> (Option<i32>, Option<String>) {
     let mut att = session.attach();
     let mut out = String::new();
-    push(&mut out, &att.replay);
+    let mut terminal = terminal_queries.then(|| vt100::Parser::new_with_callbacks(50, COLS, 0, SignInTerminal::default()));
+    sign_in_output(&mut out, &mut terminal, session, &att.replay);
     let deadline = Instant::now() + SIGN_IN_TIMEOUT;
     let result = match att.ended.take() {
         Some((code, error)) => (code, exit_error(error)),
@@ -314,7 +341,7 @@ async fn follow(hub: &Hub, id: &str, session: &Session) -> (Option<i32>, Option<
             let left = deadline.saturating_duration_since(Instant::now());
             match crate::rt::timeout(left, att.live.recv()).await {
                 Err(_) => break (None, Some("nobody finished signing in within 15 minutes".to_owned())),
-                Ok(Ok(Frame::Data(d))) => push(&mut out, &d),
+                Ok(Ok(Frame::Data(d))) => sign_in_output(&mut out, &mut terminal, session, &d),
                 Ok(Ok(Frame::Exit { code, error })) => break (code, exit_error(error)),
                 Ok(Ok(Frame::Size { .. }) | Err(async_broadcast::RecvError::Overflowed(_))) => {}
                 Ok(Err(async_broadcast::RecvError::Closed)) => break (None, Some("its terminal closed".to_owned())),
@@ -324,6 +351,40 @@ async fn follow(hub: &Hub, id: &str, session: &Session) -> (Option<i32>, Option<
     update(hub, id, &out);
     session.detach();
     result
+}
+
+/// Devin waits for terminal replies before showing its code prompt; its hidden terminal has no
+/// browser attached to send them.
+#[derive(Default)]
+struct SignInTerminal(Vec<u8>);
+
+impl vt100::Callbacks for SignInTerminal {
+    fn unhandled_csi(&mut self, screen: &mut vt100::Screen, i1: Option<u8>, i2: Option<u8>, params: &[&[u16]], c: char) {
+        if i2.is_some() {
+            return;
+        }
+        let zero = params.iter().all(|p| p.iter().all(|n| *n == 0));
+        match (i1, c) {
+            (None, 'n') if params.len() == 1 && params.first().copied() == Some(&[6][..]) => {
+                let (row, col) = screen.cursor_position();
+                self.0.extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+            }
+            (None, 'c') if zero => self.0.extend_from_slice(b"\x1b[?1;2c"),
+            (Some(b'?'), 'u') if zero => self.0.extend_from_slice(b"\x1b[?0u"),
+            _ => {}
+        }
+    }
+}
+
+fn sign_in_output(out: &mut String, terminal: &mut Option<vt100::Parser<SignInTerminal>>, session: &Session, bytes: &[u8]) {
+    push(out, bytes);
+    if let Some(t) = terminal {
+        t.process(bytes);
+        let reply = std::mem::take(&mut t.callbacks_mut().0);
+        if !reply.is_empty() {
+            session.send(Input::Data(reply));
+        }
+    }
 }
 
 /// A terminal's end, as the runner reports it: why it failed, when it was not the program.
@@ -482,7 +543,7 @@ fn reachable(hub: &Hub, target: &str) -> anyhow::Result<()> {
         anyhow::ensure!(a.terminal && !a.ephemeral, "{machine} has terminals (and so agents) turned off");
         a.os == "windows"
     };
-    anyhow::ensure!(!windows, "signing in from kiln isn't available on Windows yet: run `claude auth login` or `codex login` on that machine");
+    anyhow::ensure!(!windows, "signing in from kiln isn't available on Windows yet: run `claude auth login`, `codex login` or `devin auth login` on that machine");
     Ok(())
 }
 
@@ -565,14 +626,14 @@ fn seen(out: &str, typed: &[String]) -> Seen {
     let mut lines: Vec<String> = Vec::new();
     for l in text.lines().map(str::trim) {
         let l = l.split_once(CLAUDE_PROMPT).map_or(l, |(_, rest)| rest.trim());
-        if l.is_empty() || typed.iter().any(|t| l.contains(t.as_str())) || lines.last().is_some_and(|p| p == l) {
+        if l.is_empty() || l.contains(DEVIN_PASTE) || typed.iter().any(|t| l.contains(t.as_str())) || lines.last().is_some_and(|p| p == l) {
             continue;
         }
         lines.push(l.to_owned());
     }
     let code = lines.iter().find_map(|l| device_code(l));
     let skip = lines.len().saturating_sub(LINES);
-    Seen { url, code, prompts: text.matches(CLAUDE_PASTE).count(), lines: lines.split_off(skip) }
+    Seen { url, code, prompts: text.matches(CLAUDE_PASTE).count() + text.matches(DEVIN_PASTE).count(), lines: lines.split_off(skip) }
 }
 
 /// A one-time code as a device sign-in shows it on its own line ("1FYU-ZAUR8").
@@ -694,6 +755,44 @@ mod tests {
         assert_eq!((s.url.as_deref(), s.code.as_deref(), s.prompts), (Some("https://auth.openai.com/codex/device"), Some("1FYU-ZAUR8"), 0));
         assert_eq!(device_code("v0.162.1"), None);
         assert_eq!(device_code("TO-DO"), None);
+    }
+
+    #[test]
+    fn a_devin_manual_sign_in_gives_its_page_and_asks_for_the_code() {
+        let link = "https://app.devin.ai/auth/cli/continue?state=synthetic";
+        let out = format!("Visit \x1b]8;;{link}\x1b\\{link}\x1b]8;;\x1b\\ to sign in, then copy the code and paste it below.\r\n\r\nCode:\r\n❭ {DEVIN_PASTE}\r\n↵ submit · esc cancel");
+        let s = seen(&out, &[]);
+        assert_eq!((s.url.as_deref(), s.prompts, s.code), (Some(link), 1, None));
+        assert!(s.lines.iter().all(|l| !l.contains(DEVIN_PASTE)));
+        let s = seen(&format!("{out}\r\nsynthetic-auth-code\r\nLogin successful.\r\n"), &["synthetic-auth-code".to_owned()]);
+        assert!(s.lines.iter().all(|l| !l.contains("synthetic-auth-code")) && s.lines.iter().any(|l| l == "Login successful."));
+    }
+
+    #[test]
+    fn a_devin_sign_in_gets_terminal_replies_even_when_a_query_is_split() {
+        let mut t = vt100::Parser::new_with_callbacks(50, COLS, 0, SignInTerminal::default());
+        t.process(b"\x1b[?u\x1b[c\x1b[4;8H\x1b[6");
+        assert_eq!(std::mem::take(&mut t.callbacks_mut().0), b"\x1b[?0u\x1b[?1;2c");
+        t.process(b"n");
+        assert_eq!(std::mem::take(&mut t.callbacks_mut().0), b"\x1b[4;8R");
+        t.process(b"\x1b[5n\x1b[>c");
+        assert!(t.callbacks().0.is_empty());
+    }
+
+    #[test]
+    fn devin_status_keeps_only_the_account_fields_the_card_uses() {
+        let out = "\x1b[32mLogged in (via Devin).\x1b[0m\r\n\r\nCredentials:\r\n  File: /home/test/.local/share/devin/credentials.toml\r\nUser:\r\n  Name: Test User\r\n  Email: agent@example.test\r\n  User ID: user-synthetic\r\nAccount:\r\n  Tier: Teams\r\n  Plan: Teams\r\n  Account ID: account-synthetic\r\n";
+        let a = read_devin(out);
+        assert_eq!((a.signed_in, a.method.as_deref(), a.email.as_deref(), a.plan.as_deref()), (Some(true), Some("Devin"), Some("agent@example.test"), Some("Teams")));
+        assert!(a.org.is_none() && a.error.is_none());
+        let out = serde_json::to_string(&a).unwrap_or_default();
+        assert!(!out.contains("user-synthetic") && !out.contains("account-synthetic") && !out.contains("credentials.toml"));
+        assert_eq!(read_devin("Not logged in.\r\n  Credentials path: /tmp/devin/credentials.toml\r\nRun `devin auth login` to authenticate.\r\n").signed_in, Some(false));
+        assert_eq!(read_devin("Error: status unavailable\r\n").error.as_deref(), Some("Error: status unavailable"));
+        assert_eq!(read_devin("").signed_in, None);
+        let c = cli("devin").ok();
+        assert_eq!(c.map(|c| (c.status, c.logout)), Some(("auth status", "auth logout")));
+        assert_eq!(c.and_then(|c| c.methods.first()).map(|m| (m.asks, m.args)), Some((Some("code"), "auth login --force-manual-token-flow")));
     }
 
     #[test]

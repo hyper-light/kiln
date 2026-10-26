@@ -8,11 +8,19 @@
  *   /agents/fam-docs   "Update the docs" (Claude Code, metal-ryzen-02), finished
  *   /agents/fam-migr   "Check the migration" (Claude Code, metal-epyc-01), asks to run a command
  *
+ * And what agents leave running (the activity line by the composer, its Stop and output):
+ *
+ *   /agents/sub-busy   "System page" (Claude Code), its turn over, a subagent still at work, a
+ *                      shell whose output grows, and a monitor; working until they end
+ *   /agents/sub-done   "Release notes" (Claude Code), its subagents done: finished
+ *   /agents/sub-codex  "Scheduler audit" (Codex), a subagent kiln can't stop
+ *
  * The `agents.*` routes answer as the server's do, from these and nothing else.
  */
 import type http from "node:http";
 import type { WebSocket } from "ws";
-import type { AgentInfo, Approval, HEvent, Meta, State } from "../src/api/harness.ts";
+import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task, Todo } from "../src/api/harness.ts";
+import { PROPOSED } from "./pages.ts";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -34,6 +42,8 @@ interface Member {
   info: AgentInfo;
   events: HEvent[];
   approval?: Approval;
+  /** Its subagents and what it left running (`State.tasks`). */
+  tasks?: Task[];
 }
 
 const t0 = Date.now() - 18 * 60_000;
@@ -144,6 +154,244 @@ const family = new Map<string, Member>(
   if (m) m.info.approvals = [{ id: migrApproval.id, tool: migrApproval.tool, tool_name: migrApproval.tool_name, title: migrApproval.title, at: migrApproval.at }];
 }
 
+// /agents/fan-lead "Replication lead": its goal "Replicated log" runs its plan's steps side by side
+// (docs/goals.md, "A plan's steps side by side"; goals.ts), a subagent of its own for each step
+// that's ready, one of them asking you something; and a goal of its own (not a plan's step) out on a
+// subagent too. It coordinates them, at work itself on nothing.
+const fanApproval: Approval = {
+  id: "fan-s3-ap1",
+  tool_name: "Bash",
+  tool: "shell",
+  title: "cargo run --bin chaos -- --partition 2",
+  command: "cargo run --bin chaos -- --partition 2",
+  input: { command: "cargo run --bin chaos -- --partition 2" },
+  cwd: CWD,
+  at: Date.now() - 45_000,
+};
+for (const m of [
+  member("fan-lead", "claude", "local", "Replication lead", "idle", "default", "Replicate the metadata store's log over QUIC, then rotate the release signing key.", "Its steps are out on subagents; I'll check each as it comes back."),
+  member("fan-s2", "claude", "agent:metal-ryzen-01", "Step 2: Leader election over QUIC", "running", "default", 'Step 2 of 5 of the plan "Replicated log": Leader election over QUIC', "Electing a leader across three nodes.", {
+    parent: "fan-lead",
+    doing: "Running cargo test -p hyper-raft election",
+  }),
+  { ...member("fan-s3", "codex", "agent:metal-epyc-01", "Step 3: Follower catch-up", "waiting", "untrusted", 'Step 3 of 5 of the plan "Replicated log": Follower catch-up', "I'll partition a follower and let it catch up.", { parent: "fan-lead" }), approval: fanApproval },
+  member("fan-s4", "claude", "agent:metal-ryzen-02", "Step 4: Snapshot transfer", "running", "default", 'Step 4 of 5 of the plan "Replicated log": Snapshot transfer', "Streaming a snapshot to a lagging follower.", {
+    parent: "fan-lead",
+    doing: "Streaming a 10 GB snapshot",
+  }),
+  member("fan-sign", "claude", "local", "Rotate the release signing key", "running", "default", "Rotate the release signing key and re-sign 0.2.1's binaries", "Re-signing the binaries.", { parent: "fan-lead", doing: "Signing kiln-x86_64-linux" }),
+]) {
+  family.set(m.info.id, m);
+}
+{
+  const m = family.get("fan-s3");
+  if (m) m.info.approvals = [{ id: fanApproval.id, tool: fanApproval.tool, tool_name: fanApproval.tool_name, title: fanApproval.title, at: fanApproval.at }];
+}
+
+// Release prep proposed a plan (plan mode), kept by kiln (pages.ts `pl_proposed`), and works through its to-do list.
+{
+  const m = family.get("fam-orch");
+  m?.events.push({ id: "fam-orch-plan", seq: 3, at: t0 + 50_000, kind: "tool", tool_id: "tp1", name: "ExitPlanMode", tool: "plan", title: "Plan ready for review", input: { plan: PROPOSED }, status: "done", started: t0 + 50_000 } as unknown as HEvent);
+  // It records what it found in its research (pages.ts `rs_quic`), as kiln's MCP tool.
+  m?.events.push({
+    id: "fam-orch-research",
+    seq: 4,
+    at: t0 + 55_000,
+    kind: "tool",
+    tool_id: "tr1",
+    name: "mcp__kiln__research_add",
+    tool: "mcp",
+    server: "kiln",
+    tool_short: "research_add",
+    title: "research_add",
+    input: { id: "rs_quic", findings: [{ claim: "hyper-raft's log transport takes any stream with ordered delivery, so a QUIC stream carries it as it is." }] },
+    output: '{"id": "rs_quic", "question": "Add full hyperaraft dual UDP/QUIC stack replication"}',
+    status: "done",
+    started: t0 + 55_000,
+    ended: t0 + 56_000,
+  } as unknown as HEvent);
+}
+// Asked to plan three of its goals now (goals.ts, Make a plan), each by a subagent of its own: kiln's
+// steer for each (`kiln-plan-…`, the plan's id in it), a subagent at "The planner" (its calls so far,
+// the last still going), none yet for "Store and transfer", and one that stopped before "Optimize"
+// was ready.
+{
+  const m = family.get("fam-orch");
+  const now = Date.now();
+  const brief = (plan: string, research: string, goal: string) =>
+    `Plan the goal "${goal}" as plan ${plan}, its research ${research}. Research it inside and out, record what you find (research_add), write its steps (plans_update) and say it's ready (plans_ready). Report back the plan's title and steps.`;
+  const ask = (plan: string, research: string, goal: string, seq: number, at: number) =>
+    ({
+      id: `fam-orch-ask-${plan}`,
+      seq,
+      at,
+      kind: "user",
+      client_id: `kiln-plan-${plan}`,
+      origin: "kiln",
+      text: `Your person asked for one of your goals to be planned now, beside what you're doing: "${goal}". Dispatch a subagent for it, give it the brief below, and go on with your own work meanwhile.\n\nThe brief: ${brief(plan, research, goal)}`,
+    }) as HEvent;
+  let seq = 5;
+  const call = (parent: string | undefined, at: number, name: string, tool: string, title: string, input: unknown, going = false, extra: Record<string, unknown> = {}) =>
+    ({
+      id: `fam-orch-c${seq}`,
+      seq: seq++,
+      at,
+      ...(parent && { parent }),
+      kind: "tool",
+      tool_id: `toolu_c${seq}`,
+      name,
+      tool,
+      title,
+      input,
+      status: going ? "running" : "done",
+      started: at,
+      ...(!going && { ended: at + 1500 }),
+      ...extra,
+    }) as unknown as HEvent;
+  const kiln = (tool: string) => ({ server: "kiln", tool_short: tool });
+  const PLANNER = "The planner, researched and audited";
+  const OPT = "Optimize the QUIC API and s3 HTTP API";
+  m?.events.push(
+    ask("pl_planner", "rs_planner", PLANNER, seq++, now - 80_000),
+    call(
+      undefined,
+      now - 74_000,
+      "Agent",
+      "agent",
+      "Plan the planner goal",
+      { description: "Plan the planner goal", subagent_type: "general-purpose", prompt: brief("pl_planner", "rs_planner", PLANNER) },
+      true,
+      { task: "a-planner", tool_id: "toolu_planner" },
+    ),
+    call("toolu_planner", now - 70_000, "mcp__kiln__research_get", "mcp", "kiln · research_get", { id: "rs_planner" }, false, kiln("research_get")),
+    call("toolu_planner", now - 62_000, "WebSearch", "web", "DPhyp join enumeration DuckDB optimizer", { query: "DPhyp join enumeration DuckDB optimizer" }),
+    call("toolu_planner", now - 51_000, "WebFetch", "web", "https://duckdb.org/2024/11/14/optimizers.html", { url: "https://duckdb.org/2024/11/14/optimizers.html" }),
+    call(
+      "toolu_planner",
+      now - 38_000,
+      "mcp__kiln__research_add",
+      "mcp",
+      "kiln · research_add",
+      {
+        id: "rs_planner",
+        findings: [
+          { claim: "DuckDB enumerates join orders with DPhyp and falls back to a greedy order past 12 relations." },
+          { claim: "Umbra's adaptive compilation picks its plan before it compiles." },
+        ],
+      },
+      false,
+      kiln("research_add"),
+    ),
+    call("toolu_planner", now - 21_000, "Grep", "search", "fn join_order", { pattern: "fn join_order" }),
+    call("toolu_planner", now - 6_000, "Read", "read", "crates/amphora/src/planner/cost.rs", { file_path: "/home/ada/src/amphora/crates/amphora/src/planner/cost.rs" }, true),
+    ask("pl_store", "rs_store", "Build the data storage/transfer layer", seq++, now - 25_000),
+    ask("pl_opt", "rs_opt", OPT, seq++, now - 9 * 60_000),
+    call(
+      undefined,
+      now - 8.8 * 60_000,
+      "Agent",
+      "agent",
+      "Plan the API optimization goal",
+      { description: "Plan the API optimization goal", subagent_type: "general-purpose", prompt: brief("pl_opt", "rs_opt", OPT) },
+      false,
+      { task: "a-opt", tool_id: "toolu_opt" },
+    ),
+    call(
+      "toolu_opt",
+      now - 8.5 * 60_000,
+      "mcp__kiln__research_add",
+      "mcp",
+      "kiln · research_add",
+      { id: "rs_opt", findings: [{ claim: "The s3 API's PUT path copies each part twice before it reaches the store." }, { claim: "hyper-quic's send path allocates a frame per write." }] },
+      false,
+      kiln("research_add"),
+    ),
+    call("toolu_opt", now - 6 * 60_000, "Bash", "shell", "ssh fedora 'cd ~/src/amphora && ./bench/run.sh s3-put'", { command: "ssh fedora 'cd ~/src/amphora && ./bench/run.sh s3-put'" }, false, {
+      status: "error",
+      exit_code: 255,
+    }),
+  );
+  if (m) {
+    m.tasks = [
+      {
+        id: "a-planner",
+        tool_id: "toolu_planner",
+        description: "Plan the planner goal",
+        class: "agent",
+        kind: "general-purpose",
+        status: "running",
+        started: now - 74_000,
+        prompt: brief("pl_planner", "rs_planner", PLANNER),
+        last_tool: "Read",
+        tool_uses: 14,
+        tokens: 48_200,
+        stoppable: true,
+      },
+      {
+        id: "a-opt",
+        tool_id: "toolu_opt",
+        description: "Plan the API optimization goal",
+        class: "agent",
+        kind: "general-purpose",
+        status: "completed",
+        started: now - 8.8 * 60_000,
+        ended: now - 5.5 * 60_000,
+        prompt: brief("pl_opt", "rs_opt", OPT),
+        summary: "I couldn't reach fedora to measure the current read path (ssh: connection refused), so the plan isn't ready: 2 findings, no steps.",
+        tool_uses: 9,
+        tokens: 21_400,
+        stoppable: true,
+      },
+    ];
+    m.info.subagents = m.tasks.map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, started: t.started, ended: t.ended }));
+    // "The planner"'s subagent at work: every few seconds its call under way ends and the next starts.
+    const next: [string, string, string, unknown, Record<string, unknown>?][] = [
+      ["WebSearch", "web", "Umbra adaptive query compilation cost model", { query: "Umbra adaptive query compilation cost model" }],
+      [
+        "mcp__kiln__research_add",
+        "mcp",
+        "kiln · research_add",
+        { id: "rs_planner", findings: [{ claim: "DataFusion's join selection reorders by estimated rows, with no histograms." }] },
+        kiln("research_add"),
+      ],
+      ["Read", "read", "crates/amphora/src/planner/joins.rs", { file_path: "/home/ada/src/amphora/crates/amphora/src/planner/joins.rs" }],
+      [
+        "mcp__kiln__plans_update",
+        "mcp",
+        "kiln · plans_update",
+        { id: "pl_planner", items: [{ title: "Measure our planner on the TPC-H joins" }, { title: "Order joins by DPhyp, greedy past 12" }, { title: "Cost joins from distinct counts" }] },
+        kiln("plans_update"),
+      ],
+      ["Grep", "search", "fn estimate_rows", { pattern: "fn estimate_rows" }],
+      ["WebFetch", "web", "https://db.in.tum.de/~neumann/papers/umbra-cidr.pdf", { url: "https://db.in.tum.de/~neumann/papers/umbra-cidr.pdf" }],
+    ];
+    let k = 0;
+    const task = m.tasks[0]!;
+    const tick = setInterval(() => {
+      if (task.status !== "running") return clearInterval(tick);
+      const at = Date.now();
+      const going = m.events.findLast((e) => e.parent === "toolu_planner" && e.kind === "tool" && e.status === "running");
+      const done = going && ({ ...going, status: "done", ended: at } as HEvent);
+      if (done) m.events[m.events.indexOf(going)] = done;
+      const [name, tool, title, input, extra] = next[k++ % next.length]!;
+      const fresh = call("toolu_planner", at, name, tool, title, input, true, extra);
+      m.events.push(fresh);
+      task.tool_uses = (task.tool_uses ?? 0) + 1;
+      task.last_tool = name;
+      const out = [JSON.stringify({ t: "events", events: [...(done ? [done] : []), fresh] }), JSON.stringify({ t: "state", state: stateOf(m) })];
+      for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) out.forEach((o) => ws.send(o));
+    }, 4000);
+    tick.unref?.();
+  }
+}
+const ORCH_TODOS: Todo[] = [
+  { text: "Reproduce it with the CLI test", status: "completed" },
+  { text: "Key WritableOpens by handle and inode", status: "completed" },
+  { text: "Adopt unseen handles on a restored mount", status: "in_progress" },
+  { text: "Red-first tests: the CLI and coherence tests", status: "pending" },
+  { text: "Clippy, the doc gate and CI", status: "pending" },
+];
+
 /* ------------------------------------------------------------------ a plan run, one agent per step */
 
 const RUN = "pr_agents1";
@@ -160,6 +408,177 @@ for (const m of [
   }),
 ])
   family.set(m.info.id, m);
+
+/* ------------------------------------------------------------------ what agents leave running */
+
+const at = Date.now();
+/** Its entry as the list has it, from its tasks: its subagents, and how many tasks still run. */
+function leaves(m: Member) {
+  const tasks = m.tasks ?? [];
+  const live = tasks.filter((t) => t.status === "running" || t.status === "pending" || t.status === "paused");
+  m.info.subagents = tasks
+    .filter((t) => t.class === "agent")
+    .map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, started: t.started, ended: t.ended }));
+  m.info.tasks_running = live.length;
+  m.info.left_behind = live.length;
+}
+for (const [m, tasks] of [
+  [
+    member(
+      "sub-busy",
+      "claude",
+      "agent:metal-ryzen-01",
+      "System page",
+      "idle",
+      "acceptEdits",
+      "Bring the System page's figures, the table and the build logs up to date, and keep the mock running while you do.",
+      "Committed locally. The subagent is still on the figures; I'll review its screenshots when it reports.",
+      {
+        last_activity: at - 3 * 60_000,
+      },
+    ),
+    [
+      {
+        id: "a6f2e91c0b7d4e5f8",
+        tool_id: "toolu_figs",
+        description: "System page figures, table, build logs",
+        class: "agent",
+        kind: "local_agent",
+        status: "running",
+        background: true,
+        started: at - 17 * 60_000,
+        last_tool: "Bash",
+        stoppable: true,
+      },
+      {
+        id: "b7x4k2",
+        tool_id: "toolu_mock",
+        description: "Serve the mock",
+        command: "npm exec tsx mock/server.ts",
+        class: "shell",
+        kind: "local_bash",
+        status: "running",
+        background: true,
+        started: at - 7.5 * 60_000,
+        cwd: "/home/ada/src/kiln/ui",
+        output: "/tmp/claude-1000/tasks/b7x4k2.output",
+        stoppable: true,
+      },
+      {
+        id: "m9q1",
+        description: "Wake me if build 412 fails",
+        command: "tail -f build.log | grep -m1 ERROR",
+        class: "monitor",
+        kind: "local_bash",
+        status: "running",
+        started: at - 5 * 60_000,
+        events: 3,
+        last_event: "build 412: 61/80 tests",
+        wakes: "agent",
+        stoppable: true,
+      },
+    ],
+  ],
+  [
+    member(
+      "sub-done",
+      "claude",
+      "agent:metal-ryzen-02",
+      "Release notes",
+      "idle",
+      "default",
+      "Draft the 0.2.1 release notes from what merged this week, one subagent per area.",
+      "The notes are in docs/releases/0.2.1.md: three areas, each checked by its subagent.",
+      {
+        last_activity: at - 2 * 60_000,
+      },
+    ),
+    [
+      {
+        id: "c1",
+        tool_id: "toolu_c1",
+        description: "Notes for the scheduler",
+        class: "agent",
+        kind: "local_agent",
+        status: "completed",
+        started: at - 9 * 60_000,
+        ended: at - 4 * 60_000,
+        stoppable: true,
+      },
+      { id: "c2", tool_id: "toolu_c2", description: "Notes for the UI", class: "agent", kind: "local_agent", status: "completed", started: at - 9 * 60_000, ended: at - 3 * 60_000, stoppable: true },
+    ],
+  ],
+  [
+    member(
+      "sub-codex",
+      "codex",
+      "agent:metal-epyc-01",
+      "Scheduler audit",
+      "idle",
+      "untrusted",
+      "Audit the scheduler's retry paths; send a subagent through the backoff code.",
+      "The subagent is reading the backoff code; I'll fold in what it finds.",
+      {
+        last_activity: at - 60_000,
+      },
+    ),
+    [
+      {
+        id: "019a-child",
+        tool_id: "call_child",
+        description: "Read the backoff code",
+        class: "agent",
+        kind: "subagent",
+        status: "running",
+        started: at - 4 * 60_000,
+        last_tool: "rg backoff",
+        stoppable: false,
+      },
+    ],
+  ],
+] as [Member, Task[]][]) {
+  m.tasks = tasks;
+  leaves(m);
+  family.set(m.info.id, m);
+}
+
+/** A shell's output so far: a line a second while it runs, as a server's log grows. */
+function shellOutput(t: Task): string {
+  const lines = ["> kiln-ui@0.2.0 mock", "> tsx mock/server.ts", "", "mock kiln on http://localhost:7070 (MOCK_NO_AUTH)"];
+  const n = Math.floor(((t.ended ?? Date.now()) - t.started) / 1000);
+  const paths = ["/api/harness/sessions", "/api/overview", "/api/harness/sessions/sub-busy/goals", "/api/me", "/api/runners"];
+  for (let i = 0; i < n; i++) lines.push(`${new Date(t.started + i * 1000).toISOString().slice(11, 19)} GET ${paths[i % paths.length]} 200 ${2 + ((i * 7) % 11)}ms`);
+  if (t.ended) lines.push("^C", "stopped");
+  return `${lines.join("\n")}\n`;
+}
+
+/** A task's output (`taskOutput`), as the server reads it: a shell's file; a monitor keeps none. */
+function taskOutput(m: Member, id: string, since: number | undefined) {
+  const t = m.tasks?.find((x) => x.id === id);
+  if (!t) return { error: "no such task in this session" };
+  const live = t.status === "running" || t.status === "pending" || t.status === "paused";
+  if (t.class !== "shell") return { data: "", offset: since ?? 0, live, gone: true };
+  const text = shellOutput(t);
+  const from = since ?? Math.max(0, text.length - 64 * 1024);
+  return { data: text.slice(from), offset: text.length, live, truncated: from > 0 && since === undefined };
+}
+
+/** Each member's open pages: what changes reaches them. */
+const viewers = new Map<string, Set<WebSocket>>();
+
+/** Stop one of its tasks, as its harness would: it ends, and its entry says so. */
+function stopTask(m: Member, id: string) {
+  const t = m.tasks?.find((x) => x.id === id);
+  if (!t || !(t.status === "running" || t.status === "pending" || t.status === "paused") || !t.stoppable) return;
+  t.status = "stopped";
+  t.ended = Date.now();
+  leaves(m);
+  // A subagent stopped is reported back to it: the last word is new.
+  if (t.class === "agent") m.info.last_activity = Date.now();
+  const state = JSON.stringify({ t: "state", state: stateOf(m) });
+  for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
+  emitEvent({ type: "harness", info: m.info });
+}
 
 interface MockStep {
   title: string;
@@ -309,10 +728,51 @@ const META: Meta = {
     { id: "acceptEdits", label: "Accept edits", description: "Edits files without asking; asks before commands" },
   ],
   models: [],
-  commands: [],
+  commands: [{ name: "btw", description: "Ask a side question without interrupting", hint: "<question>", group: "Session", args: "required", route: { kind: "prompt" } }],
   agents: [],
   features: ["interrupt", "set_mode", "steer"],
 };
+
+/** How a person's message reaches one of its subagents, as its harness lets one in (harness/subagent.rs): a Codex one on its own thread, a Claude Code one by way of its agent (not once stopped). */
+function withTakes(m: Member, t: Task): Task {
+  if (t.class !== "agent" || !t.tool_id) return t;
+  const live = t.status === "running" || t.status === "pending" || t.status === "paused";
+  if (m.info.kind === "codex") return { ...t, takes: live ? ["queue", "steer", "now"] : ["queue"] };
+  if (t.status === "stopped" || t.status === "killed") return t;
+  return { ...t, takes: live && t.background ? ["queue", "steer"] : ["queue"], via: "parent" };
+}
+
+/** A person's message to subagent `task`: in its thread, or waiting in its queue for it to finish. */
+function tellSubagent(m: Member, task: string, id: string, text: string, mode: string) {
+  const t = m.tasks?.find((x) => x.id === task);
+  if (!t?.tool_id) return;
+  const live = t.status === "running" || t.status === "pending" || t.status === "paused";
+  const out: unknown[] = [];
+  if (mode === "queue" && live) t.queue = [...(t.queue ?? []), { id, text, at: Date.now() }];
+  else {
+    const e = { id, seq: Math.max(0, ...m.events.map((x) => x.seq)) + 1, at: Date.now(), parent: t.tool_id, kind: "user", text, client_id: id } as HEvent;
+    m.events.push(e);
+    out.push({ t: "events", events: [e] });
+  }
+  out.unshift({ t: "state", state: stateOf(m) });
+  for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) for (const u of out) ws.send(JSON.stringify(u));
+}
+
+/** A command about a message waiting in one of its subagents' queues (harness/subagent.rs): edited, moved or taken out there, or sent to it now. */
+function subagentQueue(m: Member, c: { type?: string; id?: string; text?: string; index?: number }) {
+  const t = m.tasks?.find((x) => x.queue?.some((q) => q.id === c.id));
+  const queue = t?.queue ?? [];
+  const at = queue.findIndex((q) => q.id === c.id);
+  const q = queue[at];
+  if (!t || !q) return;
+  if (c.type === "queue_edit" && c.text !== undefined) q.text = c.text;
+  else if (c.type === "queue_move" && c.index !== undefined) queue.splice(Math.max(0, Math.min(c.index, queue.length - 1)), 0, ...queue.splice(at, 1));
+  else if (c.type === "queue_remove" || c.type === "queue_steer" || c.type === "queue_send_now") queue.splice(at, 1);
+  else return;
+  if (c.type === "queue_steer" || c.type === "queue_send_now") return tellSubagent(m, t.id, q.id, q.text, "steer");
+  const state = JSON.stringify({ t: "state", state: stateOf(m) });
+  for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
+}
 
 function stateOf(m: Member): State {
   return {
@@ -326,8 +786,8 @@ function stateOf(m: Member): State {
     approvals: m.approval ? [m.approval] : [],
     queue: [],
     delivery: {},
-    tasks: [],
-    todos: [],
+    tasks: (m.tasks ?? []).map((t) => withTakes(m, t)),
+    todos: m.info.id === "fam-orch" ? ORCH_TODOS : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
   } as State;
@@ -338,6 +798,19 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   const m = family.get(id);
   if (!m) return false;
   const send = (u: unknown) => ws.send(JSON.stringify(u));
+  const seen = viewers.get(id) ?? new Set<WebSocket>();
+  viewers.set(id, seen.add(ws));
+  ws.on("close", () => seen.delete(ws));
+  ws.on("message", (raw) => {
+    try {
+      const c = JSON.parse(raw.toString()) as { type?: string; task?: string; id?: string; text?: string; mode?: string; index?: number };
+      if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
+      if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
+      if (c.type?.startsWith("queue_")) subagentQueue(m, c);
+    } catch {
+      // Not a command.
+    }
+  });
   send({ t: "open", info: m.info });
   send({ t: "meta", meta: { ...META, version: m.info.kind === "claude" ? "2.3.1" : "0.46.0" } });
   send({ t: "state", state: stateOf(m) });
@@ -536,6 +1009,13 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   const p = url.pathname;
   const m = req.method ?? "GET";
   const all = () => [...familyInfos(), ...others()];
+  const om = p.match(/^\/api\/harness\/sessions\/([^/]+)\/tasks\/([^/]+)\/output$/);
+  const owner = om ? family.get(decodeURIComponent(om[1] ?? "")) : undefined;
+  if (om && owner && m === "GET") {
+    const since = url.searchParams.get("since");
+    json(res, 200, taskOutput(owner, decodeURIComponent(om[2] ?? ""), since === null ? undefined : Number(since)));
+    return true;
+  }
   if (p === "/api/harness/workspaces" && m === "GET") {
     json(res, 200, {
       local: { available: true },

@@ -1,0 +1,63 @@
+[package]
+name = "hyper-raft"
+description = "A Raft core with no clock, disk or network, shared by slates, focal and mantle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# The planted defects of `src/mutant.rs`, for tests that show the oracles catch them
+# (docs/sim.md §4.6). No consumer enables it.
+mutants = []
+# raft-rs's precedence of length in elections (`Config::raft_rs_precedence`), for the differential
+# tests that compare this core with raft-rs under one rule (docs/raft.md §3.3). It can leave a group
+# that could elect without a leader; no consumer enables it.
+raft-rs-precedence = []
+
+[dependencies]
+crc32c.workspace = true
+# The election law's draw (`election_delay`); a crate of this repository with no dependencies.
+hyper-timing = { path = "../hyper-timing" }
+thiserror.workspace = true
+
+[dev-dependencies]
+# The oracles, the liveness rule and the linearizability checkers its schedules are judged by
+# (docs/sim.md §4, `tests/check.rs`), and this crate with its planted defects for the runs that show
+# the oracles catch them (`src/mutant.rs`).
+hyper-check = { path = "../hyper-check" }
+hyper-raft = { path = ".", features = ["mutants", "raft-rs-precedence"] }
+# The core focal ran on before this one: the differential tests run both on
+# one schedule and compare what they say.
+raft.workspace = true
+raft-proto.workspace = true
+slog.workspace = true
+# The counting allocator: what a proposal allocates at any backlog (`tests/backlog.rs`).
+hyper-measure = { path = "../hyper-measure" }
+# The typed write queue a member's lagged persistence runs on (`tests/support/lagged.rs`,
+# docs/sim.md §3.5).
+hyper-sim = { path = "../hyper-sim" }
+
+[[bench]]
+name = "replicate"
+harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "idle"
+harness = false
+
+[[bench]]
+name = "repair"
+harness = false
+
+[[bench]]
+name = "backlog"
+harness = false

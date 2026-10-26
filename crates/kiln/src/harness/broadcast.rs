@@ -56,6 +56,10 @@ pub struct Broadcast {
     /// Answer every tool call waiting on you: "allow" or "deny" (questions are left to answer).
     #[serde(default)]
     pub approvals: Option<String>,
+    /// An idempotency key (CP-T3.2): sent again with it, each agent's message is the same one,
+    /// which it gets once. Without one, each broadcast is new.
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 /// One agent's outcome.
@@ -78,6 +82,9 @@ pub struct Report {
     pub skipped: usize,
     pub failed: usize,
     pub results: Vec<Outcome>,
+    /// Agents asked for by id that the caller doesn't act on (or kiln doesn't run): not sent to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreached: Vec<String>,
 }
 
 /// The machine an agent runs on, as people name it.
@@ -112,7 +119,7 @@ pub fn pick(infos: &[Info], to: &To) -> Vec<Info> {
 fn plan(b: &Broadcast, info: &Info, meta: Option<&Value>, approvals: &[(String, bool)], client: &str) -> Result<Vec<Command>, String> {
     let text = b.text.as_deref().map_or("", str::trim);
     if !text.is_empty() || !b.attachments.is_empty() {
-        let send = |text: String| Command::Send { id: client.to_owned(), text, mode: b.mode.unwrap_or_default(), attachments: b.attachments.clone(), overrides: None };
+        let send = |text: String| Command::Send { id: client.to_owned(), text, mode: b.mode.unwrap_or_default(), attachments: b.attachments.clone(), overrides: None, reply_to: None, task: None };
         let Some(rest) = text.strip_prefix('/') else { return Ok(vec![send(text.to_owned())]) };
         let (name, args) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(n, a)| (n, a.trim()));
         let found = meta.and_then(|m| m.get("commands")).and_then(Value::as_array).and_then(|cs| {
@@ -123,7 +130,7 @@ fn plan(b: &Broadcast, info: &Info, meta: Option<&Value>, approvals: &[(String, 
         return match route.get("kind").and_then(Value::as_str) {
             Some("control") => {
                 let filled = fill(route.get("command").cloned().unwrap_or(Value::Null), args, client);
-                serde_json::from_value::<Command>(filled).map(|c| vec![c]).map_err(|e| format!("/{name} can't be sent from here ({e})"))
+                serde_json::from_value::<Command>(filled).map(|c| vec![with_id(c, client)]).map_err(|e| format!("/{name} can't be sent from here ({e})"))
             }
             Some("view") => Err(format!("/{name} opens {} in its console: nothing to send", route.get("view").and_then(Value::as_str).unwrap_or("a panel"))),
             Some("unsupported") => Err(route.get("reason").and_then(Value::as_str).map_or_else(|| format!("{} can't do /{name} from kiln", info.kind_name), |r| format!("/{name}: {r}"))),
@@ -135,11 +142,8 @@ fn plan(b: &Broadcast, info: &Info, meta: Option<&Value>, approvals: &[(String, 
         };
     }
     if let Some(c) = &b.command {
-        let mut c: Command = serde_json::from_value(c.clone()).map_err(|e| format!("not a command kiln knows: {e}"))?;
-        if let Command::Send { id, .. } = &mut c {
-            *id = client.to_owned();
-        }
-        return Ok(vec![c]);
+        let c: Command = serde_json::from_value(c.clone()).map_err(|e| format!("not a command kiln knows: {e}"))?;
+        return Ok(vec![with_id(c, client)]);
     }
     if let Some(answer) = b.approvals.as_deref() {
         let decision = match answer {
@@ -171,8 +175,26 @@ fn fill(v: Value, args: &str, client: &str) -> Value {
     }
 }
 
-/// Send it: every picked agent at once.
-pub async fn run(hub: &Arc<Hub>, b: &Broadcast) -> anyhow::Result<Report> {
+/// Command `c` as agent's message `client`: a send's id, and a skill run's (delivered like a message,
+/// it goes through the agent's inbox too). Anything else as it is.
+fn with_id(mut c: Command, client: &str) -> Command {
+    match &mut c {
+        Command::Send { id, .. } => client.clone_into(id),
+        Command::SkillRun { id, .. } => *id = Some(client.to_owned()),
+        _ => {}
+    }
+    c
+}
+
+/// The id of broadcast `id`'s message to agent `agent`.
+pub fn message_for(id: &str, agent: &str) -> String {
+    crate::util::derive_id(&["broadcast-message", id, agent])
+}
+
+/// Send `b` to the agents it asks for among `among`, the agents its caller acts on
+/// (`lineage::reached`): every picked agent at once. `by`: whose it is (the agent and person it comes
+/// from): a key is its caller's, so another caller's same key is another broadcast.
+pub async fn run(hub: &Arc<Hub>, b: &Broadcast, by: &str, among: &[Info]) -> anyhow::Result<Report> {
     let prompt = b.text.as_deref().is_some_and(|t| !t.trim().is_empty()) || !b.attachments.is_empty();
     let given = [prompt, b.command.is_some(), b.approvals.is_some()].into_iter().filter(|x| *x).count();
     anyhow::ensure!(given == 1, "send one of text (or attachments), command or approvals");
@@ -180,10 +202,16 @@ pub async fn run(hub: &Arc<Hub>, b: &Broadcast) -> anyhow::Result<Report> {
     let mut b = b.clone();
     b.attachments = hub.harness.inline_uploads(std::mem::take(&mut b.attachments));
     let b = &b;
-    let id = format!("bc-{}", crate::util::new_id());
-    let picked = pick(&hub.harness.list(), &b.to);
-    let sends = picked.iter().enumerate().map(|(n, info)| {
-        let client = format!("{id}-{n}");
+    let id = match b.key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        Some(k) => format!("bc-{}", crate::util::derive_id(&["broadcast", by, k])),
+        None => format!("bc-{}", crate::util::new_id()),
+    };
+    let picked = pick(among, &b.to);
+    let unreached: Vec<String> = b.to.ids.iter().filter(|id| !among.iter().any(|i| &i.id == *id)).cloned().collect();
+    let sends = picked.iter().map(|info| {
+        // Its own message, by the agent it goes to (not its place in the list, which can change
+        // between one try and the next).
+        let client = message_for(&id, &info.id);
         async move {
             let meta = hub.harness.meta(&info.id);
             let approvals: Vec<(String, bool)> = hub.harness.state(&info.id).map(|s| s.approvals.iter().map(|a| (a.id.clone(), !a.questions.is_empty())).collect()).unwrap_or_default();
@@ -201,7 +229,9 @@ pub async fn run(hub: &Arc<Hub>, b: &Broadcast) -> anyhow::Result<Report> {
             };
             for c in commands {
                 match hub.harness.command(hub, &info.id, c).await {
-                    Sent::Ok => {}
+                    Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => {}
+                    Sent::Refused(r) => return outcome("failed", Some(r.to_string())),
+                    s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => return outcome("failed", s.failure().map(|(_, why)| why)),
                     Sent::NoSession => return outcome("failed", Some("it has gone".to_owned())),
                     Sent::Unreachable => return outcome("failed", Some(format!("{} is not connected", machine(&info.target)))),
                 }
@@ -211,7 +241,7 @@ pub async fn run(hub: &Arc<Hub>, b: &Broadcast) -> anyhow::Result<Report> {
     });
     let results = futures::future::join_all(sends).await;
     let count = |r: &str| results.iter().filter(|o| o.result == r).count();
-    Ok(Report { id, sent: count("sent"), skipped: count("skipped"), failed: count("failed"), results })
+    Ok(Report { id, sent: count("sent"), skipped: count("skipped"), failed: count("failed"), results, unreached })
 }
 
 #[cfg(test)]
@@ -254,7 +284,7 @@ mod tests {
             {"name": "model", "route": {"kind": "view", "view": "model"}},
             {"name": "doctor", "route": {"kind": "unsupported", "reason": "a setting of Claude Code's terminal interface"}}
         ]});
-        let say = |text: &str| Broadcast { to: To::default(), text: Some(text.into()), attachments: Vec::new(), mode: None, command: None, approvals: None };
+        let say = |text: &str| Broadcast { to: To::default(), text: Some(text.into()), attachments: Vec::new(), mode: None, command: None, approvals: None, key: None };
         let sent = |text: &str| plan(&say(text), &info, Some(&meta), &[], "bc-1-0");
         assert!(matches!(sent("/compact keep the plan").as_deref(), Ok([Command::Send { text, id, .. }]) if text == "/compact keep the plan" && id == "bc-1-0"));
         assert!(matches!(sent("/name nightly").as_deref(), Ok([Command::Control { .. }])), "an alias, a control");
@@ -270,7 +300,7 @@ mod tests {
         assert!(info.is_some(), "the fixture reads");
         let Some(info) = info else { return };
         let file = Attachment { name: "shot.png".into(), mime: "image/png".into(), data_base64: "iVBORw0KGgo=".into(), file_id: None, path: None };
-        let with = |text: Option<&str>| Broadcast { to: To::default(), text: text.map(str::to_owned), attachments: vec![file.clone()], mode: Some(SendMode::Steer), command: None, approvals: None };
+        let with = |text: Option<&str>| Broadcast { to: To::default(), text: text.map(str::to_owned), attachments: vec![file.clone()], mode: Some(SendMode::Steer), command: None, approvals: None, key: None };
         for (text, said) in [(Some("Look at this"), "Look at this"), (None, "")] {
             let sent = plan(&with(text), &info, None, &[], "bc-1-0");
             assert!(
@@ -285,12 +315,27 @@ mod tests {
         let info = agent("a1", "agent:adacachy", "claude", "waiting");
         assert!(info.is_some(), "the fixture reads");
         let Some(info) = info else { return };
-        let b = Broadcast { to: To::default(), text: None, attachments: Vec::new(), mode: None, command: None, approvals: Some("allow".into()) };
+        let b = Broadcast { to: To::default(), text: None, attachments: Vec::new(), mode: None, command: None, approvals: Some("allow".into()), key: None };
         let waiting = [("p1".to_owned(), false), ("q1".to_owned(), true)];
         assert!(matches!(plan(&b, &info, None, &waiting, "c").as_deref(), Ok([Command::Approve { id, decision: Decision::Allow, .. }]) if id == "p1"));
         assert_eq!(plan(&b, &info, None, &waiting[1..], "c").err().as_deref(), Some("only questions waiting: answer those in its console"));
         assert_eq!(plan(&b, &info, None, &[], "c").err().as_deref(), Some("nothing waiting on you"));
-        let cmd = Broadcast { to: To::default(), text: None, attachments: Vec::new(), mode: None, command: Some(json!({"type": "interrupt"})), approvals: None };
+        let cmd = Broadcast { to: To::default(), text: None, attachments: Vec::new(), mode: None, command: Some(json!({"type": "interrupt"})), approvals: None, key: None };
         assert!(matches!(plan(&cmd, &info, None, &[], "c").as_deref(), Ok([Command::Interrupt])));
+    }
+    /// CP-T3.2: a skill run is delivered like a message, so sent to many agents it carries each
+    /// agent's message id (made from the broadcast's key and the agent), and its inbox takes it once.
+    #[test]
+    fn a_skill_run_sent_to_many_carries_each_agents_message_id() {
+        let info = agent("a1", "agent:adacachy", "claude", "idle");
+        assert!(info.is_some(), "the fixture reads");
+        let Some(info) = info else { return };
+        let b = Broadcast { to: To::default(), text: None, attachments: Vec::new(), mode: None, command: Some(json!({"type": "skill_run", "name": "review", "args": "the diff"})), approvals: None, key: Some("k1".into()) };
+        let client = message_for("bc-k1", "a1");
+        let planned = plan(&b, &info, None, &[], &client);
+        assert!(matches!(planned.as_deref(), Ok([c @ Command::SkillRun { .. }]) if crate::harness::registry::message_id(c).as_deref() == Some(client.as_str())), "{planned:?}");
+        // A send's id is made the same way.
+        let send = Broadcast { command: Some(json!({"type": "send", "id": "theirs", "text": "go"})), ..b };
+        assert!(matches!(plan(&send, &info, None, &[], &client).as_deref(), Ok([Command::Send { id, .. }]) if *id == client));
     }
 }

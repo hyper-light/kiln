@@ -7,7 +7,9 @@
 //! - [`flaky`] classifies a test from its results (W16-R04).
 //! - [`quarantine`] reads `.kiln/quarantine.yaml` and judges a step's failures (W16-R05).
 //! - [`metrics`]: benchmark metrics from `$KILN_METRICS` and the common tools (W16-R07).
+//! - [`discover`]: where test tools usually write their reports, for a job's opt-in discovery.
 
+pub mod discover;
 mod junit;
 mod lines;
 pub mod metrics;

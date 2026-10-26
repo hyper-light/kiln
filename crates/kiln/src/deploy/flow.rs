@@ -15,30 +15,30 @@ use http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{appset, argocd, git, github};
+use super::{appset, argocd, git, remote};
 use super::host::{Author, Change, CommitError};
 use super::kilncd;
 use super::provider::{Landed, Undelivered};
 use super::gates::{self, Verdict};
-use super::model::{App, Approval, Artifact, Concurrency, Contacts, Environment, GITHUB_HOST, KILN_HOST, KILNCD, Kind, Origin, Package, Registration, Release, ReleaseFile, State, Template, Via};
+use super::model::{App, Approval, Artifact, BITBUCKET_HOST, Concurrency, Contacts, Environment, GITHUB_HOST, GITLAB_HOST, KILN_HOST, KILNCD, Kind, Origin, Package, Registration, Release, ReleaseFile, State, Template, Via, remote_host};
 use super::{Deploy, repo, store};
 
 /// An error and the status that says what went wrong.
 pub type Fail = (StatusCode, String);
 
-fn bad(msg: impl Into<String>) -> Fail {
+pub(super) fn bad(msg: impl Into<String>) -> Fail {
     (StatusCode::BAD_REQUEST, msg.into())
 }
 
-fn missing(msg: impl Into<String>) -> Fail {
+pub(super) fn missing(msg: impl Into<String>) -> Fail {
     (StatusCode::NOT_FOUND, msg.into())
 }
 
-fn conflict(msg: impl Into<String>) -> Fail {
+pub(super) fn conflict(msg: impl Into<String>) -> Fail {
     (StatusCode::CONFLICT, msg.into())
 }
 
-fn internal(e: anyhow::Error) -> Fail {
+pub(super) fn internal(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
 }
 
@@ -52,9 +52,35 @@ fn dns_label(what: &str, s: &str) -> Result<(), Fail> {
     if ok { Ok(()) } else { Err(bad(format!("{what} {s:?}: lowercase letters, digits and '-', at most 63, starting and ending with a letter or digit"))) }
 }
 
+/// Who may approve a release, as its approvals gate found them.
+fn approvers(r: &Release) -> Value {
+    r.gates.iter().find(|g| g.gate == "approvals").and_then(|g| g.evidence.get("reviewers")).cloned().unwrap_or(Value::Null)
+}
+
+/// A release as clients and chats are told of it: with who may approve it (`approvers`) while it
+/// waits for them.
+pub fn release_value(r: &Release) -> Value {
+    let mut v = serde_json::to_value(r).unwrap_or(Value::Null);
+    if r.state == State::WaitingApproval
+        && let Some(m) = v.as_object_mut()
+    {
+        m.insert("approvers".into(), approvers(r));
+    }
+    v
+}
+
 /// Tells every client, and whoever waits on it, that a release moved; one waiting for approval
 /// says so, and who may give it (`needs`, `approvers`).
 pub(super) fn emit_release(d: &Deploy, r: &Release) {
+    tell(d, r, false);
+}
+
+/// [`emit_release`], for a release just recorded: `release.started` is said of it too.
+pub(super) fn emit_new_release(d: &Deploy, r: &Release) {
+    tell(d, r, true);
+}
+
+fn tell(d: &Deploy, r: &Release, new: bool) {
     let mut e = json!({
         "type": "deploy",
         "id": r.id,
@@ -68,33 +94,30 @@ pub(super) fn emit_release(d: &Deploy, r: &Release) {
     if r.state == State::WaitingApproval
         && let Some(m) = e.as_object_mut()
     {
-        let reviewers = r.gates.iter().find(|g| g.gate == "approvals").and_then(|g| g.evidence.get("reviewers")).cloned().unwrap_or(Value::Null);
         m.insert("needs".into(), json!("approval"));
-        m.insert("approvers".into(), reviewers);
+        m.insert("approvers".into(), approvers(r));
     }
     d.hub.emit(&e);
     d.changes.send(r.id);
-    // GitHub's deployment of its commit, where the release repository is GitHub's (§7).
-    github::report(d, r);
-    // Chat, paging and webhooks: the server's rules, and the app's own channels.
-    let event = match r.state {
+    // The host's deployment of its commit, where the release repository is on another host (§7).
+    remote::report(d, r);
+    // Chat, paging and webhooks: the server's rules and the app's own channels, each message a
+    // release has in a chat brought up to date (`crate::ci::chat`).
+    let mut events = Vec::new();
+    if new {
+        events.push("release.started");
+    }
+    events.extend(match r.state {
         State::WaitingApproval => Some("release.waiting_approval"),
         State::Succeeded => Some("release.succeeded"),
         State::Failed => Some("release.failed"),
         State::Cancelled => Some("release.cancelled"),
         _ => None,
-    };
-    if let Some(event) = event {
-        let (hub, app) = (Arc::clone(&d.hub), r.app.clone());
-        let mut release = serde_json::to_value(r).unwrap_or(Value::Null);
-        if let (Some(m), Some(approvers)) = (release.as_object_mut(), e.get("approvers")) {
-            m.insert("approvers".into(), approvers.clone());
-        }
-        crate::rt::spawn(async move {
-            let channels = store::app(&hub.store, &app).await.ok().flatten().map(|a| a.contacts.channels).unwrap_or_default();
-            crate::ci::notify::release_event(hub, event, release, channels).await;
-        });
-    }
+    });
+    let (hub, id) = (Arc::clone(&d.hub), r.id);
+    crate::rt::spawn(async move {
+        crate::ci::notify::release_moved(hub, id, events).await;
+    });
 }
 
 /// Who asks for a change: the name the audit, the release and its commit say, and whether it is
@@ -103,12 +126,82 @@ pub(super) fn emit_release(d: &Deploy, r: &Release) {
 pub struct Who {
     pub name: String,
     pub agent: bool,
+    /// What it may do; `None`: kiln itself (a promotion, a revert), or a server without sign-in.
+    pub caller: Option<crate::authz::Caller>,
 }
 
 impl Who {
     pub fn of(caller: &crate::authz::Caller) -> Self {
-        Self { name: caller.name.clone(), agent: caller.kind == crate::authz::gate::Kind::Agent }
+        Self { name: caller.name.clone(), agent: caller.kind == crate::authz::gate::Kind::Agent, caller: Some(caller.clone()) }
     }
+
+    /// kiln itself, or a caller it acts for that isn't checked again (`name` for the audit).
+    pub fn kiln(name: impl Into<String>) -> Self {
+        Self { name: name.into(), agent: false, caller: None }
+    }
+}
+
+/// The deploy environment as an authorization scope.
+fn deploy_scope(env: &str) -> crate::authz::Scope {
+    crate::authz::Scope::Deploy { environment: env.to_owned() }
+}
+
+/// Releasing every app in an environment (§15): `environments.deploy` on it, or on the server.
+fn may_deploy(who: &Who, env: &Environment, what: &str) -> Result<(), Fail> {
+    match &who.caller {
+        Some(c) if !c.can("environments.deploy", &deploy_scope(&env.name)) => {
+            Err((StatusCode::FORBIDDEN, format!("{} may not {what} in {}: that needs environments.deploy on it (deploy:{})", who.name, env.name, env.name)))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Releasing an app in an environment (§15): what [`may_deploy`] allows, or being in one of the
+/// app's owner teams where the environment lets owners release (a token as far as its own grant
+/// would let it deploy there).
+pub async fn may_release(d: &Deploy, who: &Who, a: &App, env: &Environment, what: &str) -> Result<(), Fail> {
+    let Some(c) = &who.caller else { return Ok(()) };
+    let scope = deploy_scope(&env.name);
+    if c.can("environments.deploy", &scope) {
+        return Ok(());
+    }
+    if env.owners.release
+        && let Some(user) = &c.user
+        && c.token_allows("environments.deploy", &scope)
+        && crate::authz::groups::member_of_any(&d.hub, user, &a.owners).await.map_err(internal)?
+    {
+        return Ok(());
+    }
+    let owners = if a.owners.is_empty() { format!("{} has no owner team", a.name) } else { format!("its owner teams are {}", a.owners.join(", ")) };
+    let lets = if env.owners.release { "" } else { ", and this environment doesn't let owners release (owners: { release: true })" };
+    Err((StatusCode::FORBIDDEN, format!("{} may not {what} {} in {}: that needs environments.deploy on deploy:{}, or a place in one of its owner teams ({owners}){lets}", who.name, a.name, env.name, env.name)))
+}
+
+/// Who may give an app its owner teams (§3.1): each a group (kiln's, or an identity provider's);
+/// someone in the owner team it gets (and in the one it had, when that changes), unless an admin.
+async fn owners_ok(d: &Deploy, who: &Who, owners: &[String], had: Option<&[String]>) -> Result<(), Fail> {
+    for o in owners {
+        crate::authz::groups::ref_ok(o).map_err(bad)?;
+    }
+    if owners.len() > 3 {
+        return Err(bad("owner teams: the owner, and a co-owner and an ops owner at most"));
+    }
+    let Some(c) = &who.caller else { return Ok(()) };
+    if crate::authz::groups::admin(c) || had.is_some_and(|h| h == owners) {
+        return Ok(());
+    }
+    let forbidden = |m: String| (StatusCode::FORBIDDEN, m);
+    let Some(user) = &c.user else { return Err(forbidden(format!("{} may not give an app its owners: a person in its owner team does, or an administrator", who.name))) };
+    let Some(owner) = owners.first() else { return Err(forbidden("name the app's owner team, one you're in (owners: [<group>, …])".to_owned())) };
+    if !crate::authz::groups::member_of_any(&d.hub, user, std::slice::from_ref(owner)).await.map_err(internal)? {
+        return Err(forbidden(format!("{} isn't in {owner}: an app's owner team is one its maker is in, unless an administrator makes it", who.name)));
+    }
+    if let Some(before) = had.and_then(|h| h.first())
+        && !crate::authz::groups::member_of_any(&d.hub, user, std::slice::from_ref(before)).await.map_err(internal)?
+    {
+        return Err(forbidden(format!("{} isn't in {before}, the owner team the app has: someone in it, or an administrator, changes its owners", who.name)));
+    }
+    Ok(())
 }
 
 /// Agents change what runs only where the environment lets them.
@@ -122,12 +215,12 @@ fn agents_may(who: &Who, env: &Environment, what: &str) -> Result<(), Fail> {
     ))
 }
 
-async fn audit(d: &Deploy, actor: &str, action: &str, detail: String) {
+pub(super) async fn audit(d: &Deploy, actor: &str, action: &str, detail: String) {
     d.hub.store.audit(actor.to_owned(), action.to_owned(), detail).await;
 }
 
 /// The author of a commit made for `who`.
-fn author(who: &str) -> Author {
+pub(super) fn author(who: &str) -> Author {
     let name = if who.is_empty() { "kiln" } else { who };
     let local: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' }).collect();
     Author { name: name.to_owned(), email: format!("{local}@kiln") }
@@ -160,9 +253,9 @@ fn watch_argo(d: &Deploy, integration: &str) {
         let label = |k: &str| app.pointer(&format!("/metadata/labels/{}", k.replace('/', "~1"))).and_then(Value::as_str).map(str::to_owned);
         let (Some(a), Some(e), Some(d)) = (label("kiln.dev/app"), label("kiln.dev/environment"), super::get()) else { return };
         crate::rt::spawn(async move {
-            if let Ok(Some(r)) = store::in_flight(&d.hub.store, &a, &e).await
+            if let Ok(Some(r)) = store::in_flight(&*d.records, &a, &e).await
                 && r.state == State::Delivering
-                && store::schedule(&d.hub.store, r.id, crate::util::now_unix()).await.is_ok()
+                && store::schedule(&*d.records, r.id, crate::util::now_unix()).await.is_ok()
             {
                 d.wake.notify();
             }
@@ -191,7 +284,7 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     dns_label("environment", &e.name)?;
     // What agents may do is a person's to say.
     if who.agent {
-        let before = store::environment(&d.hub.store, &e.name).await.map_err(internal)?.map(|b| b.agents).unwrap_or_default();
+        let before = store::environment(&*d.records, &e.name).await.map_err(internal)?.map(|b| b.agents).unwrap_or_default();
         if e.agents != before {
             return Err((StatusCode::FORBIDDEN, format!("agents may not change what agents may do in {}: a person does", e.name)));
         }
@@ -208,22 +301,21 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     }
     match e.release_repo.host.as_str() {
         KILN_HOST => {}
-        GITHUB_HOST => {
-            github::name_ok(&e.release_repo.repo).map_err(bad)?;
-            if crate::githost::github::app(&d.hub).await.is_none() {
-                return Err(bad("a release repository on GitHub is written through kiln's GitHub App, and kiln has none: make one in Settings (GitHub), or give `[ci.github]` its id and key"));
-            }
+        // GitHub through kiln's App, a GitLab with its token, Bitbucket with `[ci.bitbucket]`'s
+        // credentials: one reaches it, or it's refused.
+        GITHUB_HOST | GITLAB_HOST | BITBUCKET_HOST => {
+            remote::open(d, &e.release_repo).await.map_err(bad)?;
         }
-        other => return Err(bad(format!("{other}: a release repository is on kiln's own git server (`kiln`) or on GitHub (`github`); GitLab and Bitbucket come later"))),
+        other => return Err(bad(format!("{other}: a release repository is on kiln's own git server (`kiln`), on GitHub (`github`), on a GitLab (`gitlab`) or on Bitbucket (`bitbucket`)"))),
     }
     // The merge of a pull request is its approval (docs/deploy-api.md §9.1), and only a host with
     // pull requests has one.
     if e.gates.via == Via::PullRequest {
-        if e.release_repo.host != GITHUB_HOST {
-            return Err(bad("gates.via: pull-request: releases as pull requests need a release repository on GitHub (host: github)"));
+        if !remote_host(&e.release_repo.host) {
+            return Err(bad("gates.via: pull-request: releases as pull requests need a release repository on GitHub (host: github), GitLab (host: gitlab) or Bitbucket (host: bitbucket)"));
         }
         if e.gates.approvals.is_some() {
-            return Err(bad("gates.via: pull-request: the merge of a release's pull request is its approval; leave out gates.approvals (who may merge is the branch's protection on GitHub)"));
+            return Err(bad("gates.via: pull-request: the merge of a release's pull request is its approval; leave out gates.approvals (who may merge is the branch's protection on the host)"));
         }
     }
     let branch = &e.release_repo.branch;
@@ -255,11 +347,11 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
         return Err(bad("watch: timeout_secs at least 30, settle_secs and refused_secs at most timeout_secs"));
     }
     gates::check(d, &e.gates).await.map_err(|why| bad(format!("gates: {why}")))?;
-    let before = store::environment(&d.hub.store, &e.name).await.map_err(internal)?;
+    let before = store::environment(&*d.records, &e.name).await.map_err(internal)?;
     // Its provider changes by a move, which hands what runs over (§8.4).
     if let Some(b) = &before
         && b.provider != e.provider
-        && !store::registrations(&d.hub.store, None, Some(&e.name)).await.map_err(internal)?.is_empty()
+        && !store::registrations(&*d.records, None, Some(&e.name)).await.map_err(internal)?.is_empty()
     {
         return Err(conflict(format!(
             "{} has apps registered on {}: move it (POST /api/deploy/environments/{}/move, `kiln deploy env move`), which hands what runs to {} with nothing made again",
@@ -283,12 +375,12 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
             None => {}
         }
     }
-    store::put_environment(&d.hub.store, &e).await.map_err(internal)?;
+    store::put_environment(&*d.records, &e).await.map_err(internal)?;
     // Its gates may have changed: what waits on them looks again now.
-    let held = store::releases(&d.hub.store, store::ReleaseQuery { app: None, environment: Some(e.name.clone()), state: None, version: None, limit: 1000 }).await.map_err(internal)?;
+    let held = store::releases(&*d.records, store::ReleaseQuery { app: None, environment: Some(e.name.clone()), state: None, version: None, limit: 1000 }).await.map_err(internal)?;
     let now = crate::util::now_unix();
     for r in held.iter().filter(|r| gates::holding(r.state)) {
-        store::schedule(&d.hub.store, r.id, now).await.map_err(internal)?;
+        store::schedule(&*d.records, r.id, now).await.map_err(internal)?;
     }
     d.wake.notify();
     audit(d, actor, "deploy.environment.put", e.name.clone()).await;
@@ -298,10 +390,11 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
 /// An environment's release repository there: on kiln's own git server, one of kiln's native
 /// repositories (docs/ci.md W14), its bare repository and its row, so kiln's git server serves it
 /// to readers with a token, its review rules hold, and people change it in diffs as any
-/// repository's; on GitHub, the repository, made through kiln's GitHub App if it isn't there.
+/// repository's; on another host, the repository, made there if it isn't (GitHub's through kiln's
+/// GitHub App).
 pub async fn ensure_release_repo(d: &Deploy, rr: &super::model::RepoRef) -> Result<(), String> {
-    if rr.host == GITHUB_HOST {
-        return github::ensure(d, rr).await;
+    if remote_host(&rr.host) {
+        return remote::ensure(d, rr).await;
     }
     if crate::ci::hosting::path_of(&d.hub, &rr.repo).is_none() {
         return Err(format!("{}: a release repository on kiln's git server is `owner/name`, of letters, digits, '-', '_' and '.'", rr.repo));
@@ -336,12 +429,12 @@ pub async fn ensure_release_repo(d: &Deploy, rr: &super::model::RepoRef) -> Resu
         .await
         .map_err(|e| format!("{e:#}"))?;
     d.hub.store.audit("kiln".into(), "repo.add".into(), format!("{} (a release repository, docs/deploy-api.md §6)", rr.repo)).await;
-    d.hub.gitops_kick.notify();
+    crate::gitops::wake(&d.hub);
     Ok(())
 }
 
 pub async fn delete_environment(d: &Deploy, actor: &str, name: &str) -> Result<(), Fail> {
-    let regs = store::registrations(&d.hub.store, None, Some(name)).await.map_err(internal)?;
+    let regs = store::registrations(&*d.records, None, Some(name)).await.map_err(internal)?;
     if !regs.is_empty() {
         let apps: Vec<&str> = regs.iter().map(|r| r.app.as_str()).collect();
         return Err(conflict(format!("{name} has apps registered: {}. Deregister them first", apps.join(", "))));
@@ -357,27 +450,34 @@ pub async fn delete_environment(d: &Deploy, actor: &str, name: &str) -> Result<(
             tracing::warn!(environment = %name, error = %why, "deploy: an environment's ApplicationSet couldn't be deleted with it");
         }
     }
-    if !store::delete_environment(&d.hub.store, name).await.map_err(internal)? {
+    if !store::delete_environment(&*d.records, name).await.map_err(internal)? {
         return Err(missing(format!("no environment {name}")));
     }
     audit(d, actor, "deploy.environment.delete", name.to_owned()).await;
     // Its apps' secrets there go with it (§3.5).
     let secrets = crate::secrets::of(&d.hub);
-    for a in store::apps(&d.hub.store).await.map_err(internal)? {
+    for a in store::apps(&*d.records).await.map_err(internal)? {
         secrets.forget(&crate::secrets::Scope::of(&a.name, name), actor).await.map_err(internal)?;
     }
     Ok(())
 }
 
 async fn environment(d: &Deploy, name: &str) -> Result<Environment, Fail> {
-    store::environment(&d.hub.store, name).await.map_err(internal)?.ok_or_else(|| missing(format!("no environment {name}")))
+    store::environment(&*d.records, name).await.map_err(internal)?.ok_or_else(|| missing(format!("no environment {name}")))
 }
 
 // ------------------------------------------------------------------ apps
 
-pub async fn put_app(d: &Deploy, actor: &str, a: App) -> Result<App, Fail> {
+pub async fn put_app(d: &Deploy, who: &Who, a: App) -> Result<App, Fail> {
+    let had = store::app(&*d.records, &a.name).await.map_err(internal)?.map(|a| a.owners);
+    owners_ok(d, who, &a.owners, had.as_deref()).await?;
+    keep_app(d, &who.name, a).await
+}
+
+/// An app checked and kept, its owners already allowed.
+async fn keep_app(d: &Deploy, actor: &str, a: App) -> Result<App, Fail> {
     check_app(d, &a).await?;
-    store::put_app(&d.hub.store, &a).await.map_err(internal)?;
+    store::put_app(&*d.records, &a).await.map_err(internal)?;
     audit(d, actor, "deploy.app.put", a.name.clone()).await;
     Ok(a)
 }
@@ -395,7 +495,10 @@ async fn check_app(d: &Deploy, a: &App) -> Result<(), Fail> {
         super::model::Package::Git { repo, .. } if repo.is_empty() => return Err(bad("a git package names its repository")),
         super::model::Package::Platform { provider, spec, .. } => {
             match kiln_cd::providers::get(provider) {
-                None => return Err(bad(format!("kiln deploys to no platform {provider} (aws-ecs, aws-lambda, cloudflare-workers, vercel)"))),
+                None => {
+                    let built: Vec<&str> = kiln_cd::providers::CATALOG.iter().filter(|p| p.built).map(|p| p.name).collect();
+                    return Err(bad(format!("kiln deploys to no platform {provider}: it deploys to {}", built.join(", "))));
+                }
                 Some(def) if !def.built => return Err(bad(format!("{} isn't built yet: kiln lists it, and deploys to it once it is", def.title))),
                 Some(_) => {}
             }
@@ -438,7 +541,7 @@ async fn check_app(d: &Deploy, a: &App) -> Result<(), Fail> {
 /// deleted, or kept with `keep`; otherwise an app still registered somewhere stays.
 pub async fn delete_app(d: &Deploy, who: &Who, name: &str, everywhere: bool, keep: bool) -> Result<(), Fail> {
     let actor = who.name.as_str();
-    let regs = store::registrations(&d.hub.store, Some(name), None).await.map_err(internal)?;
+    let regs = store::registrations(&*d.records, Some(name), None).await.map_err(internal)?;
     if everywhere {
         for r in &regs {
             deregister(d, who, name, &r.environment, keep).await?;
@@ -447,20 +550,20 @@ pub async fn delete_app(d: &Deploy, who: &Who, name: &str, everywhere: bool, kee
         let envs: Vec<&str> = regs.iter().map(|r| r.environment.as_str()).collect();
         return Err(conflict(format!("{name} is registered in {}. Deregister it first, or delete it everywhere", envs.join(", "))));
     }
-    if !store::delete_app(&d.hub.store, name).await.map_err(internal)? {
+    if !store::delete_app(&*d.records, name).await.map_err(internal)? {
         return Err(missing(format!("no app {name}")));
     }
     audit(d, actor, "deploy.app.delete", name.to_owned()).await;
     // Its secrets go with it (§3.5): an app made later with its name doesn't get them.
     let secrets = crate::secrets::of(&d.hub);
-    for e in store::environments(&d.hub.store).await.map_err(internal)? {
+    for e in store::environments(&*d.records).await.map_err(internal)? {
         secrets.forget(&crate::secrets::Scope::of(name, &e.name), actor).await.map_err(internal)?;
     }
     Ok(())
 }
 
 async fn app(d: &Deploy, name: &str) -> Result<App, Fail> {
-    store::app(&d.hub.store, name).await.map_err(internal)?.ok_or_else(|| missing(format!("no app {name}")))
+    store::app(&*d.records, name).await.map_err(internal)?.ok_or_else(|| missing(format!("no app {name}")))
 }
 
 /// An app as asked for (`POST /apps`): its template may give its package and its namespace.
@@ -491,7 +594,11 @@ pub struct AppAsk {
 }
 
 /// Creates (or replaces) an app from what was asked: what its template gives fills what wasn't.
-pub async fn create_app(d: &Deploy, actor: &str, ask: AppAsk) -> Result<App, Fail> {
+pub async fn create_app(d: &Deploy, who: &Who, ask: AppAsk) -> Result<App, Fail> {
+    let actor = who.name.as_str();
+    // Its owners first: nothing is made (its repository) for an app its maker may not own.
+    let before = store::app(&*d.records, &ask.name).await.map_err(internal)?;
+    owners_ok(d, who, &ask.owners, before.as_ref().map(|a| a.owners.as_slice())).await?;
     let t = match &ask.template {
         Some(name) => Some(template(d, name).await?),
         None => None,
@@ -507,7 +614,7 @@ pub async fn create_app(d: &Deploy, actor: &str, ask: AppAsk) -> Result<App, Fai
         None => from_template()?.ok_or_else(|| bad("how is it deployed? give a package, or a template that has one"))?,
     };
     let namespace = ask.namespace.clone().or_else(|| t.as_ref().and_then(|t| t.namespace.as_ref()).map(|p| p.replace("{app}", &ask.name)));
-    let had = store::app(&d.hub.store, &ask.name).await.map_err(internal)?.and_then(|a| a.source);
+    let (had, had_registries) = before.map_or((None, None), |a| (a.source, a.registries));
     let mut a = App {
         name: ask.name,
         project: ask.project.unwrap_or_else(|| "default".to_owned()),
@@ -519,8 +626,15 @@ pub async fn create_app(d: &Deploy, actor: &str, ask: AppAsk) -> Result<App, Fai
         contacts: ask.contacts,
         source: None,
         archived: ask.archived,
+        registries: had_registries,
     };
     check_app(d, &a).await?;
+    // Its registries, before its repository: the starter names them (`{{kiln.image}}` …).
+    if a.registries.is_none()
+        && let Some(r) = t.as_ref().and_then(|t| t.registry.as_ref())
+    {
+        a.registries = Some(super::registries::make(d, r, &a, actor).await?);
+    }
     // Its source repository: the one named, the one it has, or one its template makes, once the
     // rest of it is known to be right.
     let mut made = None;
@@ -533,7 +647,7 @@ pub async fn create_app(d: &Deploy, actor: &str, ask: AppAsk) -> Result<App, Fai
         }
         (None, None, None) => None,
     };
-    put_app(d, actor, a).await.map_err(|(code, why)| match &made {
+    keep_app(d, actor, a).await.map_err(|(code, why)| match &made {
         Some(r) => (code, format!("{why} (its repository {r} is made: give it as the app's source)")),
         None => (code, why),
     })
@@ -577,12 +691,13 @@ pub struct AppPatch {
 
 /// Changes what a patch gives of an app; the package's change reaches each environment with its
 /// next release.
-pub async fn patch_app(d: &Deploy, actor: &str, name: &str, p: AppPatch) -> Result<App, Fail> {
+pub async fn patch_app(d: &Deploy, who: &Who, name: &str, p: AppPatch) -> Result<App, Fail> {
     let mut a = app(d, name).await?;
     if let Some(x) = p.project {
         a.project = x;
     }
     if let Some(x) = p.owners {
+        owners_ok(d, who, &x, Some(&a.owners)).await?;
         a.owners = x;
     }
     if let Some(x) = p.package {
@@ -609,7 +724,7 @@ pub async fn patch_app(d: &Deploy, actor: &str, name: &str, p: AppPatch) -> Resu
     if let Some(x) = p.archived {
         a.archived = x;
     }
-    put_app(d, actor, a).await
+    keep_app(d, &who.name, a).await
 }
 
 /// Whether `name` is free for a new app, and why not.
@@ -617,7 +732,7 @@ pub async fn app_name_free(d: &Deploy, name: &str) -> Result<Value, Fail> {
     if let Err((_, why)) = dns_label("app", name) {
         return Ok(json!({ "name": name, "available": false, "why": why }));
     }
-    let taken = store::app(&d.hub.store, name).await.map_err(internal)?.is_some();
+    let taken = store::app(&*d.records, name).await.map_err(internal)?.is_some();
     Ok(json!({ "name": name, "available": !taken, "why": if taken { Some(format!("{name} is an app already")) } else { None } }))
 }
 
@@ -653,19 +768,25 @@ pub fn catalog_info(a: &App) -> String {
 // ------------------------------------------------------------------ templates
 
 async fn template(d: &Deploy, name: &str) -> Result<Template, Fail> {
-    store::template(&d.hub.store, name).await.map_err(internal)?.ok_or_else(|| missing(format!("no template {name}")))
+    store::template(&*d.records, name).await.map_err(internal)?.ok_or_else(|| missing(format!("no template {name}")))
 }
 
 /// Puts a template. One that makes repositories, or changes how, is put by someone who may add
 /// repositories (`adds_repos`: `settings.manage`), since each app made from it makes one.
 pub async fn put_template(d: &Deploy, actor: &str, t: Template, adds_repos: bool) -> Result<Template, Fail> {
     dns_label("template", &t.name)?;
+    let before = store::template(&*d.records, &t.name).await.map_err(internal)?;
     if let Some(r) = &t.repository {
-        let before = store::template(&d.hub.store, &t.name).await.map_err(internal)?.and_then(|b| b.repository);
-        if !adds_repos && before.as_ref() != Some(r) {
+        if !adds_repos && before.as_ref().and_then(|b| b.repository.as_ref()) != Some(r) {
             return Err((StatusCode::FORBIDDEN, "a template that makes repositories is put by someone who may add them (settings.manage)".into()));
         }
         super::scaffold::check(d, r).map_err(bad)?;
+    }
+    if let Some(r) = &t.registry {
+        if !adds_repos && before.as_ref().and_then(|b| b.registry.as_ref()) != Some(r) {
+            return Err((StatusCode::FORBIDDEN, "a template that makes registries is put by someone who may (settings.manage)".into()));
+        }
+        super::registries::check(d, r).await.map_err(bad)?;
     }
     gates::check_checks(d, &t.checks).await.map_err(|why| bad(format!("checks: {why}")))?;
     if let Some(p) = &t.package {
@@ -673,17 +794,17 @@ pub async fn put_template(d: &Deploy, actor: &str, t: Template, adds_repos: bool
             repo::check(v).map_err(|e| bad(format!("package.set {k}: {e}")))?;
         }
     }
-    store::put_template(&d.hub.store, &t).await.map_err(internal)?;
+    store::put_template(&*d.records, &t).await.map_err(internal)?;
     audit(d, actor, "deploy.template.put", t.name.clone()).await;
     Ok(t)
 }
 
 pub async fn delete_template(d: &Deploy, actor: &str, name: &str) -> Result<(), Fail> {
-    let using: Vec<String> = store::apps(&d.hub.store).await.map_err(internal)?.into_iter().filter(|a| a.template.as_deref() == Some(name)).map(|a| a.name).collect();
+    let using: Vec<String> = store::apps(&*d.records).await.map_err(internal)?.into_iter().filter(|a| a.template.as_deref() == Some(name)).map(|a| a.name).collect();
     if !using.is_empty() {
         return Err(conflict(format!("apps are made from {name}: {}", using.join(", "))));
     }
-    if !store::delete_template(&d.hub.store, name).await.map_err(internal)? {
+    if !store::delete_template(&*d.records, name).await.map_err(internal)? {
         return Err(missing(format!("no template {name}")));
     }
     audit(d, actor, "deploy.template.delete", name.to_owned()).await;
@@ -733,7 +854,7 @@ pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -
     if a.archived {
         return Err(conflict(format!("{app_name} is archived")));
     }
-    if store::registration(&d.hub.store, app_name, env_name).await.map_err(internal)?.is_some() {
+    if store::registration(&*d.records, app_name, env_name).await.map_err(internal)?.is_some() {
         return Err(conflict(format!("{app_name} is registered in {env_name} already")));
     }
     if let Some(name) = &a.template {
@@ -767,7 +888,7 @@ pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -
     let message = format!("register {app_name} in {env_name}\n\n{REGISTRATION_TRAILER}: {app_name}/{env_name}\n{}: {actor}\n", repo::REQUESTED_BY_TRAILER);
     commit_files(d, &env, changes, message, actor).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     let reg = Registration { app: app_name.to_owned(), environment: env_name.to_owned(), enabled: false, paused: false, running: None, created_at: crate::util::now_unix(), degraded: None };
-    store::put_registration(&d.hub.store, &reg).await.map_err(internal)?;
+    store::put_registration(&*d.records, &reg).await.map_err(internal)?;
     // On Argo CD, its project allows it from now (the first release does, if Argo CD is away now).
     if let Some(integration) = appset::integration_of(&env) {
         let ready = match argocd::Argo::of(&d.hub, integration).await {
@@ -789,7 +910,7 @@ pub async fn deregister(d: &Deploy, who: &Who, app_name: &str, env_name: &str, k
     let (a, env) = (app(d, app_name).await?, environment(d, env_name).await?);
     agents_may(who, &env, "deregister apps")?;
     let reg = registration(d, app_name, env_name).await?;
-    if let Some(r) = store::in_flight(&d.hub.store, app_name, env_name).await.map_err(internal)? {
+    if let Some(r) = store::in_flight(&*d.records, app_name, env_name).await.map_err(internal)? {
         return Err(conflict(format!("release {} is in flight for {app_name} in {env_name}: wait for it, or cancel it", r.id)));
     }
     let runs = reg.running.is_some() || reg.enabled;
@@ -819,14 +940,14 @@ pub async fn deregister(d: &Deploy, who: &Who, app_name: &str, env_name: &str, k
         let argo = argocd::Argo::of(&d.hub, name).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
         appset::remove(d, &argo, &env, &argocd::application_name(&a, env_name), keep).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     }
-    store::delete_registration(&d.hub.store, app_name, env_name).await.map_err(internal)?;
+    store::delete_registration(&*d.records, app_name, env_name).await.map_err(internal)?;
     audit(d, actor, "deploy.deregister", format!("{app_name} from {env_name}{}", if keep { " (objects kept)" } else { "" })).await;
     d.hub.emit(&json!({ "type": "deploy_registration", "removed": { "app": app_name, "environment": env_name } }));
     Ok(())
 }
 
 async fn registration(d: &Deploy, app_name: &str, env_name: &str) -> Result<Registration, Fail> {
-    store::registration(&d.hub.store, app_name, env_name).await.map_err(internal)?.ok_or_else(|| missing(format!("{app_name} isn't registered in {env_name}")))
+    store::registration(&*d.records, app_name, env_name).await.map_err(internal)?.ok_or_else(|| missing(format!("{app_name} isn't registered in {env_name}")))
 }
 
 /// Pauses (or resumes) the provider's automation for a registration, git left as it is: hand edits
@@ -849,7 +970,7 @@ pub async fn pause(d: &Deploy, actor: &str, app_name: &str, env_name: &str, paus
         }
     }
     reg.paused = paused;
-    store::put_registration(&d.hub.store, &reg).await.map_err(internal)?;
+    store::put_registration(&*d.records, &reg).await.map_err(internal)?;
     audit(d, actor, if paused { "deploy.pause" } else { "deploy.resume" }, format!("{app_name} in {env_name}")).await;
     d.hub.emit(&json!({ "type": "deploy_registration", "registration": reg }));
     Ok(reg)
@@ -900,12 +1021,16 @@ pub struct RollbackAsk {
     pub to: Option<i64>,
 }
 
-/// A change to many apps of an environment at once (docs/deploy-api.md §3.3): each app selected is
-/// released, at one version, or with values set in its own (a config release each). Each passes
-/// the environment's gates as any release does.
-#[derive(Debug, Clone, Deserialize)]
+/// A change to many apps at once (docs/deploy-api.md §3.3): in an environment, each app selected is
+/// released, at one version, or with values set in its own (a config release each), each through
+/// the environment's gates as any release; or, with `source`, the change is proposed in each app's
+/// source repository (one pull request per repository, [`super::sources`]).
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FleetAsk {
+    /// Where the apps are released; with `source`, only apps registered there are selected (any
+    /// app, without it).
+    #[serde(default)]
     pub environment: String,
     /// The apps: these, or those made from `template`, in `project`, owned by `owner` (each given
     /// must hold); every app registered in the environment when none is given.
@@ -924,6 +1049,10 @@ pub struct FleetAsk {
     /// numbers and `true`/`false` as such, the rest as text.
     #[serde(default)]
     pub set: BTreeMap<String, String>,
+    /// The change made in each app's source repository instead (a kiln-base version, or values
+    /// set in its chart), proposed as one pull request per repository.
+    #[serde(default)]
+    pub source: Option<super::sources::SourceChange>,
     /// Asked for again with the same key, it is the same fleet: the same releases.
     #[serde(default)]
     pub idempotency_key: Option<String>,
@@ -962,26 +1091,20 @@ pub fn merge_values(text: &str, set: &BTreeMap<String, String>) -> Result<String
 /// Releases each selected app of a fleet change (see [`FleetAsk`]): its id, and each app's release,
 /// or why it has none.
 pub async fn fleet(d: &Deploy, who: &Who, f: FleetAsk) -> Result<Value, Fail> {
+    if let Some(s) = &f.source {
+        if f.version.is_some() || !f.set.is_empty() {
+            return Err(bad("a fleet change releases (a version, or values to set) or changes apps' sources (`source`): one of them"));
+        }
+        return super::sources::propose(d, who, &f, s).await;
+    }
     if f.version.is_some() == !f.set.is_empty() {
         return Err(bad("a fleet change is a version to deploy, or values to set: one of them"));
     }
-    let env = store::environment(&d.hub.store, &f.environment).await.map_err(internal)?.ok_or_else(|| missing(format!("no environment {}", f.environment)))?;
+    let env = store::environment(&*d.records, &f.environment).await.map_err(internal)?.ok_or_else(|| missing(format!("no environment {}", f.environment)))?;
     agents_may(who, &env, "release apps")?;
+    may_deploy(who, &env, "release apps across")?;
     let id = f.idempotency_key.clone().unwrap_or_else(crate::util::new_id);
-    let registered: Vec<String> = store::registrations(&d.hub.store, None, Some(&env.name)).await.map_err(internal)?.into_iter().map(|r| r.app).collect();
-    let apps: Vec<App> = store::apps(&d.hub.store)
-        .await
-        .map_err(internal)?
-        .into_iter()
-        .filter(|a| registered.contains(&a.name))
-        .filter(|a| f.apps.is_empty() || f.apps.contains(&a.name))
-        .filter(|a| f.template.as_ref().is_none_or(|t| a.template.as_ref() == Some(t)))
-        .filter(|a| f.project.as_ref().is_none_or(|p| &a.project == p))
-        .filter(|a| f.owner.as_ref().is_none_or(|o| a.owners.contains(o)))
-        .collect();
-    if apps.is_empty() {
-        return Err(bad(format!("no app registered in {} is selected", env.name)));
-    }
+    let apps = selected(d, &f).await?;
     let mut out = Vec::new();
     for a in &apps {
         let key = Some(format!("fleet:{id}:{}", a.name));
@@ -1007,9 +1130,42 @@ pub async fn fleet(d: &Deploy, who: &Who, f: FleetAsk) -> Result<Value, Fail> {
     Ok(json!({ "fleet": id, "environment": env.name, "releases": out }))
 }
 
-/// A fleet change's releases as they stand, and whether each has finished.
+/// The apps a fleet change selects: those named, or made from its template, in its project, owned
+/// by its owner (each given must hold); of those registered in its environment, when it names one.
+pub(super) async fn selected(d: &Deploy, f: &FleetAsk) -> Result<Vec<App>, Fail> {
+    let registered: Option<Vec<String>> = match f.environment.as_str() {
+        "" => None,
+        env => {
+            store::environment(&*d.records, env).await.map_err(internal)?.ok_or_else(|| missing(format!("no environment {env}")))?;
+            Some(store::registrations(&*d.records, None, Some(env)).await.map_err(internal)?.into_iter().map(|r| r.app).collect())
+        }
+    };
+    let apps: Vec<App> = store::apps(&*d.records)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .filter(|a| registered.as_ref().is_none_or(|r| r.contains(&a.name)))
+        .filter(|a| f.apps.is_empty() || f.apps.contains(&a.name))
+        .filter(|a| f.template.as_ref().is_none_or(|t| a.template.as_ref() == Some(t)))
+        .filter(|a| f.project.as_ref().is_none_or(|p| &a.project == p))
+        .filter(|a| f.owner.as_ref().is_none_or(|o| a.owners.contains(o)))
+        .collect();
+    if apps.is_empty() {
+        return Err(bad(match f.environment.as_str() {
+            "" => "no app is selected".to_owned(),
+            env => format!("no app registered in {env} is selected"),
+        }));
+    }
+    Ok(apps)
+}
+
+/// A fleet change as it stands: its releases, and whether each has finished; or, one in apps'
+/// sources, its proposals (§3.3).
 pub async fn fleet_status(d: &Deploy, id: &str) -> Result<Value, Fail> {
-    let list = store::releases_keyed(&d.hub.store, &format!("fleet:{id}:")).await.map_err(internal)?;
+    if let Some(v) = super::sources::status(d, id).await? {
+        return Ok(v);
+    }
+    let list = store::releases_keyed(&*d.records, &format!("fleet:{id}:")).await.map_err(internal)?;
     if list.is_empty() {
         return Err(missing(format!("no fleet change {id}")));
     }
@@ -1023,9 +1179,9 @@ pub async fn fleet_status(d: &Deploy, id: &str) -> Result<Value, Fail> {
 
 /// The values file an app runs with in an environment (`None`: nothing runs, or it has none).
 async fn current_values(d: &Deploy, a: &App, env: &Environment) -> Result<Option<String>, Fail> {
-    let reg = store::registration(&d.hub.store, &a.name, &env.name).await.map_err(internal)?;
+    let reg = store::registration(&*d.records, &a.name, &env.name).await.map_err(internal)?;
     let running = match reg.and_then(|r| r.running) {
-        Some(id) => store::release(&d.hub.store, id).await.map_err(internal)?,
+        Some(id) => store::release(&*d.records, id).await.map_err(internal)?,
         None => None,
     };
     let Some(commit) = running.and_then(|r| r.commit) else { return Ok(None) };
@@ -1036,7 +1192,7 @@ async fn current_values(d: &Deploy, a: &App, env: &Environment) -> Result<Option
 /// any rolled back from left out (as txst's rule).
 pub async fn candidates(d: &Deploy, app_name: &str, env_name: &str) -> Result<Vec<Release>, Fail> {
     let reg = registration(d, app_name, env_name).await?;
-    let all = store::releases(&d.hub.store, store::ReleaseQuery { app: Some(app_name.into()), environment: Some(env_name.into()), state: None, version: None, limit: 500 }).await.map_err(internal)?;
+    let all = store::releases(&*d.records, store::ReleaseQuery { app: Some(app_name.into()), environment: Some(env_name.into()), state: None, version: None, limit: 500 }).await.map_err(internal)?;
     Ok(all
         .into_iter()
         .filter(|r| matches!(r.state, State::Succeeded | State::Superseded) && Some(r.id) != reg.running && r.commit.is_some() && matches!(r.kind, Kind::Deploy | Kind::Rollback | Kind::Config))
@@ -1050,6 +1206,7 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
     let env = environment(d, &ask.environment).await?;
     let _reg = registration(d, &ask.app, &ask.environment).await?;
     agents_may(who, &env, "release apps")?;
+    may_release(d, who, &a, &env, "release").await?;
     let key = ask.idempotency_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned);
     if key.as_ref().is_some_and(|k| k.len() > 255) {
         return Err(bad("an idempotency key is at most 255 characters"));
@@ -1095,7 +1252,7 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
     };
     // Asked for before with this key: that release, whatever it has become.
     if let Some(k) = &r.idempotency_key
-        && let Some(same) = store::release_by_key(&d.hub.store, &a.name, &env.name, k).await.map_err(internal)?
+        && let Some(same) = store::release_by_key(&*d.records, &a.name, &env.name, k).await.map_err(internal)?
     {
         return Ok(same);
     }
@@ -1139,7 +1296,7 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
         }
         let up = registration(d, &a.name, &from).await?;
         let running = match up.running {
-            Some(id) => store::release(&d.hub.store, id).await.map_err(internal)?,
+            Some(id) => store::release(&*d.records, id).await.map_err(internal)?,
             None => None,
         };
         let running = running.filter(|x| x.version.is_some()).ok_or_else(|| conflict(format!("nothing of {} runs in {from} to promote", a.name)))?;
@@ -1165,7 +1322,7 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
         }
         Verdict::Go(results) => r.gates = results,
     }
-    if let Some(other) = store::in_flight(&d.hub.store, &a.name, &env.name).await.map_err(internal)? {
+    if let Some(other) = store::in_flight(&*d.records, &a.name, &env.name).await.map_err(internal)? {
         match env.concurrency {
             Concurrency::Reject => return Err(conflict(format!("release {} is in flight for {} in {}: wait for it, or cancel it", other.id, a.name, env.name))),
             Concurrency::Queue if r.state == State::Committing => {
@@ -1175,14 +1332,14 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
             Concurrency::Queue => {}
         }
     }
-    let (r, new) = store::insert_release(&d.hub.store, &r).await.map_err(internal)?;
+    let (r, new) = store::insert_release(&*d.records, &r).await.map_err(internal)?;
     if !new {
         return Ok(r);
     }
-    store::schedule(&d.hub.store, r.id, now).await.map_err(internal)?;
+    store::schedule(&*d.records, r.id, now).await.map_err(internal)?;
     d.wake.notify();
     audit(d, actor, "deploy.release", format!("{} {} in {}: release {}", r.kind.as_str(), r.version.as_deref().unwrap_or(""), r.environment, r.id)).await;
-    emit_release(d, &r);
+    emit_new_release(d, &r);
     Ok(r)
 }
 
@@ -1190,8 +1347,13 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
 /// worker reverts its commit, and hands the provider what ran before (docs/deploy-api.md §9).
 pub async fn cancel(d: &Deploy, who: &Who, id: i64, again: bool) -> Result<Release, Fail> {
     let actor = who.name.as_str();
-    let mut r = store::release(&d.hub.store, id).await.map_err(internal)?.ok_or_else(|| missing(format!("no release {id}")))?;
-    agents_may(who, &environment(d, &r.environment).await?, "cancel releases")?;
+    let mut r = store::release(&*d.records, id).await.map_err(internal)?.ok_or_else(|| missing(format!("no release {id}")))?;
+    let env = environment(d, &r.environment).await?;
+    agents_may(who, &env, "cancel releases")?;
+    match store::app(&*d.records, &r.app).await.map_err(internal)? {
+        Some(a) => may_release(d, who, &a, &env, "cancel a release of").await?,
+        None => may_deploy(who, &env, "cancel releases")?,
+    }
     let was = r.state;
     match was {
         State::Waiting | State::WaitingApproval | State::Delivering => {}
@@ -1214,13 +1376,13 @@ pub async fn cancel(d: &Deploy, who: &Who, id: i64, again: bool) -> Result<Relea
     if withdraw {
         note(&mut r.provider, "withdraw", json!(true));
     }
-    if !store::update_release(&d.hub.store, &r, was).await.map_err(internal)? {
+    if !store::update_release(&*d.records, &r, was).await.map_err(internal)? {
         return Err(conflict(format!("release {id} moved meanwhile: look again")));
     }
     if undo || withdraw {
-        store::schedule(&d.hub.store, id, now).await.map_err(internal)?;
+        store::schedule(&*d.records, id, now).await.map_err(internal)?;
     } else {
-        store::done(&d.hub.store, id).await.map_err(internal)?;
+        store::done(&*d.records, id).await.map_err(internal)?;
     }
     d.wake.notify();
     audit(d, actor, "deploy.cancel", format!("release {id}")).await;
@@ -1232,7 +1394,7 @@ pub async fn cancel(d: &Deploy, who: &Who, id: i64, again: bool) -> Result<Relea
 /// counts toward the environment's `approvals`, and the release goes once there are enough; a
 /// rejection cancels it.
 pub async fn answer(d: &Deploy, who: &Who, id: i64, approved: bool, note: Option<String>) -> Result<Release, Fail> {
-    let mut r = store::release(&d.hub.store, id).await.map_err(internal)?.ok_or_else(|| missing(format!("no release {id}")))?;
+    let mut r = store::release(&*d.records, id).await.map_err(internal)?.ok_or_else(|| missing(format!("no release {id}")))?;
     let env = environment(d, &r.environment).await?;
     if who.agent && !env.agents.approve {
         return Err((StatusCode::FORBIDDEN, format!("agents may not answer approvals in {}: a person does, unless they allow it (agents: {{ approve: true }})", env.name)));
@@ -1258,13 +1420,13 @@ pub async fn answer(d: &Deploy, who: &Who, id: i64, approved: bool, note: Option
         r.ended_at = Some(now);
         r.message = Some(format!("rejected by {}{}", who.name, note.as_deref().map(|n| format!(": {n}")).unwrap_or_default()));
     }
-    if !store::update_release(&d.hub.store, &r, was).await.map_err(internal)? {
+    if !store::update_release(&*d.records, &r, was).await.map_err(internal)? {
         return Err(conflict(format!("release {id} moved meanwhile: look again")));
     }
     if approved {
-        store::schedule(&d.hub.store, id, now).await.map_err(internal)?;
+        store::schedule(&*d.records, id, now).await.map_err(internal)?;
     } else {
-        store::done(&d.hub.store, id).await.map_err(internal)?;
+        store::done(&*d.records, id).await.map_err(internal)?;
     }
     d.wake.notify();
     audit(d, &who.name, if approved { "deploy.approve" } else { "deploy.reject" }, format!("release {id}")).await;
@@ -1278,8 +1440,8 @@ pub async fn answer(d: &Deploy, who: &Who, id: i64, approved: bool, note: Option
 const LEASE_SECS: i64 = 60;
 /// How often release repositories are looked at for commits kiln didn't make.
 const SCAN_SECS: i64 = 30;
-/// How often Argo CD's tokens for release repositories on GitHub are looked at (each is replaced
-/// every half hour).
+/// How often Argo CD's credentials for release repositories on other hosts are looked at (GitHub's
+/// tokens are replaced every half hour).
 const READERS_SECS: i64 = 300;
 
 /// Follows every release due, until the server shuts down.
@@ -1290,12 +1452,12 @@ pub async fn work(d: &Arc<Deploy>) -> anyhow::Result<()> {
             return Ok(());
         }
         let now = crate::util::now_unix();
-        match store::claim(&d.hub.store, &d.owner, now, LEASE_SECS, 16).await {
+        match store::claim(&*d.records, &d.owner, now, LEASE_SECS, 16).await {
             Ok(ids) => {
                 for id in ids {
                     if let Err(e) = step(d, id).await {
                         tracing::warn!(release = id, error = %format!("{e:#}"), "deploy: a step failed; trying again shortly");
-                        let _ = store::schedule(&d.hub.store, id, now + 5).await;
+                        let _ = store::schedule(&*d.records, id, now + 5).await;
                     }
                 }
             }
@@ -1303,9 +1465,9 @@ pub async fn work(d: &Arc<Deploy>) -> anyhow::Result<()> {
         }
         if now - last_readers >= READERS_SECS {
             last_readers = now;
-            github::refresh_readers(d).await;
+            remote::refresh_readers(d).await;
         }
-        if now - last_scan >= SCAN_SECS || d.github.take_scan() {
+        if now - last_scan >= SCAN_SECS || d.remote.take_scan() {
             last_scan = now;
             if let Err(e) = scan_git(d).await {
                 tracing::warn!(error = %format!("{e:#}"), "deploy: release repositories can't be scanned");
@@ -1317,7 +1479,7 @@ pub async fn work(d: &Arc<Deploy>) -> anyhow::Result<()> {
 
 /// Moves one release as far as it can go now.
 async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let Some(mut r) = store::release(st, id).await? else {
         store::done(st, id).await?;
         return Ok(());
@@ -1394,10 +1556,9 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 store::schedule(st, id, now + PROPOSAL_LOOK).await?;
             }
             // The merge is its approval (§9.1), and its commit.
-            Ok(Committed::Merged { commit, by, secrets, irreversible }) => {
-                let number = r.provider.pointer("/pull_request/number").and_then(Value::as_u64).unwrap_or(0);
+            Ok(Committed::Merged { commit, by, merged, secrets, irreversible }) => {
                 if let Some(by) = by {
-                    r.approvals.push(Approval { by: format!("{by} on GitHub"), at: now, approved: true, note: Some(format!("merged pull request #{number}")) });
+                    r.approvals.push(Approval { by, at: now, approved: true, note: Some(merged) });
                 }
                 committed(d, r, commit, secrets, irreversible, now).await?;
             }
@@ -1562,7 +1723,7 @@ const PROPOSAL_LOOK: i64 = 60;
 
 /// A release committed (`sha`): delivering from now, handed to its provider.
 async fn committed(d: &Deploy, mut r: Release, sha: String, secrets: Option<String>, irreversible: Option<String>, now: i64) -> anyhow::Result<()> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     r.irreversible = irreversible;
     r.commit = Some(sha);
     // What it changes of the app's secrets, as it pinned them (§3.5).
@@ -1592,32 +1753,33 @@ async fn withdraw(d: &Deploy, r: &mut Release) -> String {
     let (Some(number), branch) = (r.provider.pointer("/pull_request/number").and_then(Value::as_u64), r.provider.pointer("/pull_request/branch").and_then(Value::as_str).unwrap_or_default().to_owned()) else {
         return "it had no pull request".to_owned();
     };
-    let env = match store::environment(&d.hub.store, &r.environment).await {
+    let env = match store::environment(&*d.records, &r.environment).await {
         Ok(Some(e)) => e,
-        _ => return format!("its environment is gone: close pull request #{number} on GitHub"),
+        _ => return format!("its environment is gone: close its pull request ({number}) on its host"),
     };
+    let (it, on) = (remote::change_name(&env.release_repo.host, number), remote::host_label(&env.release_repo.host));
     let at = match git::open(d, &env.release_repo).await {
         Ok(at) => at,
-        Err(e) => return format!("its pull request #{number} couldn't be closed ({e}): close it on GitHub"),
+        Err(e) => return format!("its {it} couldn't be closed ({e}): close it on {on}"),
     };
-    let Some(gh) = at.github() else { return format!("its release repository isn't on GitHub any more: close pull request #{number} there") };
+    let Some(gh) = at.remote() else { return format!("its release repository isn't where its {it} is any more: close it there") };
     let why = r.message.clone().unwrap_or_else(|| "cancelled".to_owned());
     match gh.proposal(number).await {
-        Ok(crate::githost::ChangeState::Open) => match gh.withdraw(number, &branch, &format!("kiln's release {} is {why}: this pull request goes with it.", r.id)).await {
-            Ok(()) => format!("its pull request #{number} is closed"),
-            Err(e) => format!("its pull request #{number} couldn't be closed ({e:#}): close it on GitHub"),
+        Ok(crate::githost::ChangeState::Open) => match gh.withdraw(number, &branch, &format!("kiln's release {} is {why}: this {} goes with it.", r.id, if env.release_repo.host == GITLAB_HOST { "merge request" } else { "pull request" })).await {
+            Ok(()) => format!("its {it} is closed"),
+            Err(e) => format!("its {it} couldn't be closed ({e:#}): close it on {on}"),
         },
         Ok(crate::githost::ChangeState::Merged { commit: Some(sha), .. }) => {
             gh.drop_branch(&branch).await;
             r.commit = Some(sha);
-            format!("its pull request #{number} was merged meanwhile; {}", undo(d, r, &format!("{why} (release {} was proposed)", r.id)).await)
+            format!("its {it} was merged meanwhile; {}", undo(d, r, &format!("{why} (release {} was proposed)", r.id)).await)
         }
-        Ok(crate::githost::ChangeState::Merged { commit: None, .. }) => format!("its pull request #{number} was merged meanwhile, into a commit GitHub hasn't said: roll back to undo it"),
+        Ok(crate::githost::ChangeState::Merged { commit: None, .. }) => format!("its {it} was merged meanwhile, into a commit {on} hasn't said: roll back to undo it"),
         Ok(crate::githost::ChangeState::Closed) => {
             gh.drop_branch(&branch).await;
-            format!("its pull request #{number} was closed already")
+            format!("its {it} was closed already")
         }
-        Err(e) => format!("its pull request #{number} couldn't be looked at ({e:#}): close it on GitHub"),
+        Err(e) => format!("its {it} couldn't be looked at ({e:#}): close it on {on}"),
     }
 }
 
@@ -1633,16 +1795,17 @@ enum Committed {
     Proposed(Value, String),
     /// Its pull request is open: what it waits for.
     Waiting(String),
-    /// Its pull request merged: the merge, who merged it, and what it was proposed with (its
-    /// secrets' changes, what it runs that a revert couldn't undo).
-    Merged { commit: String, by: Option<String>, secrets: Option<String>, irreversible: Option<String> },
+    /// Its pull request merged: the merge, who merged it (`ada on GitHub`), what that was (`merged
+    /// pull request #3`), and what it was proposed with (its secrets' changes, what it runs that a
+    /// revert couldn't undo).
+    Merged { commit: String, by: Option<String>, merged: String, secrets: Option<String>, irreversible: Option<String> },
     /// Its pull request closed unmerged: why it's cancelled.
     Closed(String),
 }
 
-/// What a release proposed as a pull request waits for.
-fn waits_for(number: u64, url: &str) -> String {
-    format!("waits for its pull request #{number} to be merged: {url}")
+/// What a release proposed as a pull request waits for (`kind`: its release repository's host).
+fn waits_for(kind: &str, number: u64, url: &str) -> String {
+    format!("waits for its {} to be merged: {url}", remote::change_name(kind, number))
 }
 
 /// Commits a release to its environment's release repository, once its preflight finds nothing
@@ -1650,13 +1813,24 @@ fn waits_for(number: u64, url: &str) -> String {
 /// is found by its trailer, not made again. With `via: pull-request` it's proposed as a pull
 /// request instead, and followed until it's merged or closed.
 async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
-    let a = store::app(&d.hub.store, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
-    let env = store::environment(&d.hub.store, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
+    let a = store::app(&*d.records, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
+    let env = store::environment(&*d.records, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
     let rr = env.release_repo.clone();
     let at = git::open(d, &rr).await?;
     let e = |e: anyhow::Error| format!("{e:#}");
     if let Some(pr) = r.provider.get("pull_request").filter(|p| p.is_object()) {
-        return proposed(&at, pr).await;
+        let c = proposed(&at, pr).await?;
+        // On Argo CD, its merge delivers the app's secrets, as the merge pins them, before kiln
+        // hands the merge to Argo CD (§3.5): an open pull request changes nothing that runs.
+        if let Committed::Merged { commit, .. } = &c
+            && env.provider.starts_with("argocd/")
+        {
+            let merged = at.read(commit, &repo::release_file(&rr, &a, &env.name)).await.map_err(e)?.map(|b| repo::decode(&b)).transpose().map_err(e)?;
+            if let Some(why) = super::argo_secrets::deliver(d, &a, &env, merged.as_ref().map_or("", |f| f.secrets.as_str())).await? {
+                return Err(format!("merged, and its secrets can't be delivered: {why}"));
+            }
+        }
+        return Ok(c);
     }
     if env.gates.via != Via::PullRequest
         && let Some(sha) = at.find_trailer(repo::RELEASE_TRAILER, &r.id.to_string()).await.map_err(e)?
@@ -1690,10 +1864,19 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
     }
     // Checked before it changes anything: its secrets, its images, and on KilnCD its render and
     // its cluster's dry run (§8.1).
-    let reg = store::registration(&d.hub.store, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
+    let reg = store::registration(&*d.records, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
     let found = super::preflight::check(d, &a, &env, &reg, &file, r.values.as_deref()).await;
     if let Some(why) = found.refused {
         return Ok(Committed::Refused(why));
+    }
+    // On Argo CD, the app's secrets are in place before its commit reaches Argo CD (§3.5); one
+    // proposed as a pull request delivers them as its merge is seen, so here kiln only makes sure
+    // it can.
+    if env.provider.starts_with("argocd/") {
+        let refused = if env.gates.via == Via::PullRequest { super::argo_secrets::unreachable(&a, &env, &file.secrets) } else { super::argo_secrets::deliver(d, &a, &env, &file.secrets).await? };
+        if let Some(why) = refused {
+            return Ok(Committed::Refused(why));
+        }
     }
     let mut changes = vec![
         Change { path: repo::app_file(&rr, &a), content: Some(repo::app_yaml(&a).map_err(|e| format!("{e:#}"))?) },
@@ -1703,10 +1886,10 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
         changes.push(Change { path: values_path, content: Some(v.clone().into_bytes()) });
     }
     if env.gates.via == Via::PullRequest {
-        let gh = at.github().ok_or("gates.via: pull-request needs a release repository on GitHub")?;
-        let p = gh.propose(&github::proposal_branch(r), changes, repo::message(&a, &env.name, r), author(&r.requested_by), &proposal_body(d, r, &env)).await.map_err(e)?;
+        let gh = at.remote().ok_or("gates.via: pull-request needs a release repository on GitHub, GitLab or Bitbucket")?;
+        let p = gh.propose(&remote::proposal_branch(r), changes, repo::message(&a, &env.name, r), author(&r.requested_by), &proposal_body(d, r, &env)).await.map_err(e)?;
         let kept = json!({ "number": p.number, "url": p.url, "branch": p.branch, "secrets": changed, "irreversible": found.irreversible });
-        return Ok(Committed::Proposed(kept, waits_for(p.number, &p.url)));
+        return Ok(Committed::Proposed(kept, waits_for(&rr.host, p.number, &p.url)));
     }
     let sha = commit_files(d, &env, changes, repo::message(&a, &env.name, r), &r.requested_by).await?;
     Ok(Committed::Done(sha, Some(changed), found.irreversible))
@@ -1715,20 +1898,22 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
 /// Where a release proposed as a pull request is: merged, its merge is its commit; closed
 /// unmerged, it's cancelled; open, it waits. A merged or closed one's branch goes.
 async fn proposed(at: &git::Repo, pr: &Value) -> Result<Committed, String> {
-    let gh = at.github().ok_or("its pull request is on GitHub, and its release repository isn't any more")?;
+    let gh = at.remote().ok_or("its pull request is on another host, and its release repository isn't any more")?;
     let number = pr.get("number").and_then(Value::as_u64).ok_or("its pull request has no number")?;
     let (url, branch) = (pr.get("url").and_then(Value::as_str).unwrap_or_default(), pr.get("branch").and_then(Value::as_str).unwrap_or_default());
     let text = |key: &str| pr.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+    let (kind, on) = (gh.host.kind(), gh.host.label());
+    let it = remote::change_name(kind, number);
     match gh.proposal(number).await.map_err(|e| format!("{e:#}"))? {
-        crate::githost::ChangeState::Open => Ok(Committed::Waiting(waits_for(number, url))),
+        crate::githost::ChangeState::Open => Ok(Committed::Waiting(waits_for(kind, number, url))),
         crate::githost::ChangeState::Merged { commit: Some(commit), by } => {
             gh.drop_branch(branch).await;
-            Ok(Committed::Merged { commit, by, secrets: text("secrets"), irreversible: text("irreversible") })
+            Ok(Committed::Merged { commit, by: by.map(|b| format!("{b} on {on}")), merged: format!("merged {it}"), secrets: text("secrets"), irreversible: text("irreversible") })
         }
-        crate::githost::ChangeState::Merged { commit: None, .. } => Ok(Committed::Waiting(format!("its pull request #{number} is merged; GitHub hasn't said into which commit yet"))),
+        crate::githost::ChangeState::Merged { commit: None, .. } => Ok(Committed::Waiting(format!("its {it} is merged; {on} hasn't said into which commit yet"))),
         crate::githost::ChangeState::Closed => {
             gh.drop_branch(branch).await;
-            Ok(Committed::Closed(format!("its pull request #{number} was closed without merging ({url})")))
+            Ok(Committed::Closed(format!("its {it} was closed without merging ({url})")))
         }
     }
 }
@@ -1779,9 +1964,9 @@ pub(super) async fn kilncd_preview(d: &Deploy, a: &App, env: &Environment, versi
     let cd = crate::cd::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "KilnCD isn't running".to_owned()))?;
     let nothing = || conflict(format!("nothing runs for {} in {} yet: release a version first", a.name, env.name));
     let now = cd.definition(&kilncd::app_id(a, &env.name)).ok_or_else(nothing)?;
-    let reg = store::registration(&d.hub.store, &a.name, &env.name).await.map_err(internal)?.ok_or_else(|| missing(format!("{} isn't registered in {}", a.name, env.name)))?;
+    let reg = store::registration(&*d.records, &a.name, &env.name).await.map_err(internal)?.ok_or_else(|| missing(format!("{} isn't registered in {}", a.name, env.name)))?;
     let running = match reg.running {
-        Some(id) => store::release(&d.hub.store, id).await.map_err(internal)?,
+        Some(id) => store::release(&*d.records, id).await.map_err(internal)?,
         None => None,
     };
     let commit = running.and_then(|r| r.commit).ok_or_else(nothing)?;
@@ -1812,16 +1997,30 @@ async fn file_at(d: &Deploy, env: &Environment, commit: &str, path: String) -> R
 }
 
 /// Hands a release's commit to the environment's provider.
+/// What stands in for the providers, in a test that has one.
+#[cfg(test)]
+fn stand_in(d: &Deploy) -> Option<Arc<dyn super::provider::StandIn>> {
+    d.stand_in.clone()
+}
+
+#[cfg(not(test))]
+fn stand_in(_: &Deploy) -> Option<Arc<dyn super::provider::StandIn>> {
+    None
+}
+
 async fn deliver(d: &Deploy, r: &Release) -> Result<(), Undelivered> {
+    if let Some(p) = stand_in(d) {
+        return p.deliver(r);
+    }
     let commit = r.commit.clone().ok_or("no commit to deliver")?;
-    let a = store::app(&d.hub.store, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
-    let env = store::environment(&d.hub.store, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
-    let mut reg = store::registration(&d.hub.store, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
+    let a = store::app(&*d.records, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
+    let env = store::environment(&*d.records, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
+    let mut reg = store::registration(&*d.records, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
     let file = release_file_at(d, &a, &env, &commit).await?;
     // A release resumes the provider's automation (docs/deploy-api.md §5).
     if file.enabled && file.version.is_some() && reg.paused {
         reg.paused = false;
-        store::put_registration(&d.hub.store, &reg).await.map_err(|e| format!("{e:#}"))?;
+        store::put_registration(&*d.records, &reg).await.map_err(|e| format!("{e:#}"))?;
     }
     if let Some(name) = argo_of(&env) {
         let argo = argocd::Argo::of(&d.hub, name).await?;
@@ -1869,14 +2068,17 @@ async fn deliver(d: &Deploy, r: &Release) -> Result<(), Undelivered> {
 /// Where a delivering release stands, delivered again when the provider lost it (a restart
 /// between the commit and the delivery).
 async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value), String> {
-    let a = store::app(&d.hub.store, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
-    let env = store::environment(&d.hub.store, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
+    if let Some(p) = stand_in(d) {
+        return Ok(p.follow(r, commit));
+    }
+    let a = store::app(&*d.records, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
+    let env = store::environment(&*d.records, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
     let file = release_file_at(d, &a, &env, commit).await?;
     if let Some(name) = argo_of(&env) {
         let argo = argocd::Argo::of(&d.hub, name).await?;
         watch_argo(d, name);
         if appset::integration_of(&env).is_some() {
-            let reg = store::registration(&d.hub.store, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
+            let reg = store::registration(&*d.records, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
             return appset::follow(d, &argo, r, &a, &env, &reg, &file, commit).await;
         }
         let app_name = argocd::application_name(&a, &env.name);
@@ -1953,7 +2155,7 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
 
 /// Ends a release: its state, its registration's, and the release it replaced.
 async fn finish(d: &Deploy, mut r: Release, state: State, message: Option<String>) -> anyhow::Result<()> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let was = r.state;
     r.state = state;
     r.message = message;
@@ -2016,7 +2218,7 @@ fn onward(envs: &[Environment], registered: &[String], from: &str) -> Vec<String
 /// this runs. One refused (a release already in flight there, an `after` it doesn't run in yet)
 /// goes when the next of its `after` lands, or by hand.
 async fn promote_onward(d: &Deploy, landed: &Release) {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let next = async {
         let envs = store::environments(st).await?;
         let registered: Vec<String> = store::registrations(st, Some(&landed.app), None).await?.into_iter().map(|r| r.environment).collect();
@@ -2029,7 +2231,7 @@ async fn promote_onward(d: &Deploy, landed: &Release) {
             return;
         }
     };
-    let who = Who { name: landed.requested_by.clone(), agent: false };
+    let who = Who::kiln(landed.requested_by.clone());
     for env in next {
         // A registration that needs a person is theirs to release to.
         if let Ok(Some(reg)) = store::registration(st, &landed.app, &env).await
@@ -2054,8 +2256,8 @@ const REVERT_TRAILER: &str = "Kiln-Reverts";
 /// What's Degraded of a release's registration, object by object as its provider says it: the
 /// evidence it failed on (`Deployment web: ReplicaSet "web-6f9d" has timed out progressing`).
 async fn degraded_objects(d: &Deploy, r: &Release) -> Option<String> {
-    let a = store::app(&d.hub.store, &r.app).await.ok()??;
-    let env = store::environment(&d.hub.store, &r.environment).await.ok()??;
+    let a = store::app(&*d.records, &r.app).await.ok()??;
+    let env = store::environment(&*d.records, &r.environment).await.ok()??;
     let read = super::reads::read(d, &a, &env, super::reads::Read::Resources).await.ok()?;
     let text = |o: &Value, k: &str| o.get(k).and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_owned);
     let objects: Vec<String> = read
@@ -2101,6 +2303,9 @@ async fn failed(d: &Deploy, mut r: Release, why: String) -> anyhow::Result<()> {
     if let Aftermath::Hold(reason) = aftermath(&r) {
         return hold(d, r, &why, &reason).await;
     }
+    if let Some(off) = auto_rollback_off(d, &r).await {
+        return hold(d, r, &why, &off).await;
+    }
     match revert(d, &r, &why).await {
         Ok((Some(sha), _)) => match start_revert(d, &r, &sha).await {
             Ok(back) => {
@@ -2113,6 +2318,16 @@ async fn failed(d: &Deploy, mut r: Release, why: String) -> anyhow::Result<()> {
         Ok((None, _)) => finish(d, r, State::Failed, Some(format!("{why}; nothing of its commit was left to revert"))).await,
         Err(e) => hold(d, r, &why, &format!("its commit couldn't be reverted ({e})")).await,
     }
+}
+
+/// Why a failed release isn't reverted: auto-rollback is off for its app in KilnCD (set for the
+/// app, its repository, or by its rollout's `auto-rollback`; docs/cd.md, "Auto-rollback").
+async fn auto_rollback_off(d: &Deploy, r: &Release) -> Option<String> {
+    let cd = crate::cd::get()?;
+    let a = store::app(&*d.records, &r.app).await.ok().flatten()?;
+    let id = kilncd::app_id(&a, &r.environment);
+    let auto = cd.auto_rollback(&id, None);
+    (!auto.decision.on).then(|| format!("auto-rollback is off for {id} ({})", auto.why()))
 }
 
 /// A release its provider refused, or never got: nothing of it was applied, and git goes back
@@ -2139,7 +2354,7 @@ async fn hold(d: &Deploy, r: Release, why: &str, reason: &str) -> anyhow::Result
 
 /// Marks a release's registration as needing a person, for `why`.
 async fn degrade(d: &Deploy, r: &Release, why: &str) -> anyhow::Result<()> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     if let Some(mut reg) = store::registration(st, &r.app, &r.environment).await? {
         reg.degraded = Some(why.to_owned());
         store::put_registration(st, &reg).await?;
@@ -2151,7 +2366,7 @@ async fn degrade(d: &Deploy, r: &Release, why: &str) -> anyhow::Result<()> {
 /// followed as any release, so it says whether what ran before runs again. Asked for once however
 /// often this runs (a restart between the revert and its record).
 async fn start_revert(d: &Deploy, failed: &Release, sha: &str) -> anyhow::Result<Release> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let a = store::app(st, &failed.app).await?.ok_or_else(|| anyhow::anyhow!("no app {}", failed.app))?;
     let env = store::environment(st, &failed.environment).await?.ok_or_else(|| anyhow::anyhow!("no environment {}", failed.environment))?;
     let running = store::registration(st, &failed.app, &failed.environment).await?.and_then(|reg| reg.running);
@@ -2196,7 +2411,7 @@ async fn start_revert(d: &Deploy, failed: &Release, sha: &str) -> anyhow::Result
         }
         store::schedule(st, back.id, now + 2).await?;
         audit(d, "kiln", "deploy.release", format!("revert of release {} in {}: release {}", failed.id, back.environment, back.id)).await;
-        emit_release(d, &back);
+        emit_new_release(d, &back);
     }
     Ok(back)
 }
@@ -2226,7 +2441,7 @@ fn keeps(file: Option<&ReleaseFile>, writer: Option<&Release>) -> bool {
 /// [`keeps`], the release that wrote `file` looked up.
 async fn keeps_objects(d: &Deploy, file: Option<&ReleaseFile>) -> bool {
     let writer = match file.map(|f| f.release).filter(|id| *id > 0) {
-        Some(id) => store::release(&d.hub.store, id).await.ok().flatten(),
+        Some(id) => store::release(&*d.records, id).await.ok().flatten(),
         None => None,
     };
     keeps(file, writer.as_ref())
@@ -2246,7 +2461,7 @@ async fn undo(d: &Deploy, r: &Release, why: &str) -> String {
         None => "nothing of its commit was left to revert".to_owned(),
     };
     let Some(head) = head else { return said };
-    let (a, env) = (store::app(&d.hub.store, &r.app).await.ok().flatten(), store::environment(&d.hub.store, &r.environment).await.ok().flatten());
+    let (a, env) = (store::app(&*d.records, &r.app).await.ok().flatten(), store::environment(&*d.records, &r.environment).await.ok().flatten());
     let file = match (&a, &env) {
         (Some(a), Some(env)) => release_file_at(d, a, env, &head).await.ok(),
         _ => None,
@@ -2266,8 +2481,8 @@ async fn undo(d: &Deploy, r: &Release, why: &str) -> String {
 /// someone changed it since. The revert's commit (`None`: nothing to revert), and the head after.
 async fn revert(d: &Deploy, r: &Release, why: &str) -> Result<(Option<String>, Option<String>), String> {
     let Some(commit) = r.commit.clone() else { return Ok((None, None)) };
-    let a = store::app(&d.hub.store, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
-    let env = store::environment(&d.hub.store, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
+    let a = store::app(&*d.records, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
+    let env = store::environment(&*d.records, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
     let rr = env.release_repo.clone();
     let at = git::open(d, &rr).await?;
     let e = |e: anyhow::Error| format!("{e:#}");
@@ -2308,16 +2523,16 @@ fn seen_key(env: &str, repo: &str, branch: &str) -> String {
 /// Commits on release repositories that kiln didn't make become releases (origin `git`), so the
 /// records never disagree with git (docs/deploy-api.md §6).
 async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     for env in store::environments(st).await? {
         let rr = env.release_repo.clone();
         // Where each environment has looked to, its own: environments share a release repository
         // (kiln/releases by default), and each looks at every commit for its registrations. One
         // from before kept a repository's mark: it starts from there.
         let key = seen_key(&env.name, &rr.repo, &rr.branch);
-        let seen = match st.kv_get(key.clone()).await? {
+        let seen = match store::kv_get(st, &key).await? {
             Some(s) => Some(s),
-            None => st.kv_get(format!("deploy/seen/{}/{}", rr.repo, rr.branch)).await?,
+            None => store::kv_get(st, &format!("deploy/seen/{}/{}", rr.repo, rr.branch)).await?,
         };
         // The first look only notes where the branch is: history before it is kiln's own. One on
         // GitHub is looked at once a minute, or when its webhook says it changed.
@@ -2388,10 +2603,10 @@ async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
                     tracing::warn!(release = r.id, error = %e, "deploy: delivering a commit kiln didn't make");
                 }
                 store::schedule(st, r.id, now + 2).await?;
-                emit_release(d, &r);
+                emit_new_release(d, &r);
             }
         }
-        st.kv_set(key, head).await?;
+        store::kv_set(st, &key, &head).await?;
     }
     Ok(())
 }
@@ -2407,18 +2622,20 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let root = tempfile::tempdir()?;
             let d = Deploy {
+                records: Arc::clone(&hub.records),
+                stand_in: None,
                 hosted: super::super::host::Hosted::new(root.path()),
                 owner: "test".into(),
                 wake: crate::rt::Notify::new(),
                 changes: crate::rt::Broadcast::new(16),
                 argo: Default::default(),
-                github: Default::default(),
+                remote: Default::default(),
                 hub: Arc::clone(&hub),
             };
-            let st = &hub.store;
+            let st = &*d.records;
             // Two environments on one release repository: kiln's default.
             let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
-            let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false };
+            let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false, registries: None };
             store::put_app(st, &web).await?;
             for name in ["staging", "production"] {
                 store::put_environment(st, &Environment { name: name.into(), ..env(false) }).await?;
@@ -2456,12 +2673,14 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let root = tempfile::tempdir()?;
             let d = Deploy {
+                records: Arc::clone(&hub.records),
+                stand_in: None,
                 hosted: super::super::host::Hosted::new(root.path()),
                 owner: "test".into(),
                 wake: crate::rt::Notify::new(),
                 changes: crate::rt::Broadcast::new(16),
                 argo: Default::default(),
-                github: Default::default(),
+                remote: Default::default(),
                 hub: Arc::clone(&hub),
             };
             let mut e = env(false);
@@ -2494,6 +2713,7 @@ mod tests {
             concurrency: Default::default(),
             agents: super::super::model::AgentPolicy { deploy: agents_deploy, approve: false },
             argocd: Default::default(),
+            owners: Default::default(),
         }
     }
 
@@ -2515,6 +2735,7 @@ mod tests {
             contacts: Contacts { oncall: Some("ada".into()), channels: vec!["#deploys".into()], links: BTreeMap::from([("dashboard".into(), "https://grafana.example/d/web".into())]) },
             source: Some("shop/web".into()),
             archived: false,
+            registries: None,
         };
         let doc: Value = serde_yaml::from_str(&catalog_info(&a)).map_err(|e| e.to_string())?;
         assert_eq!(doc.pointer("/metadata/annotations/kiln.dev~1source"), Some(&json!("shop/web")));
@@ -2616,7 +2837,7 @@ mod tests {
     #[test]
     fn what_a_release_made_goes_with_its_revert_where_nothing_ran_before() -> anyhow::Result<()> {
         let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
-        let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false };
+        let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false, registries: None };
         let registered = repo::registered_json(&web, "production");
         assert!(!keeps(Some(&registered), None), "the first release: nothing ran before");
         let running = ReleaseFile { release: 7, enabled: true, version: Some("1.4.0".into()), ..registered.clone() };
@@ -2646,5 +2867,207 @@ mod tests {
         assert!(matches!(agents_may(&agent, &env(false), "release apps"), Err((StatusCode::FORBIDDEN, m)) if m.contains("agents: { deploy: true }")));
         assert!(agents_may(&agent, &env(true), "release apps").is_ok());
         assert!(agents_may(&person, &env(false), "release apps").is_ok(), "a person releases anywhere the route table lets them");
+    }
+
+    /// A person as the gate hands them to the flow: their user (`<name>-id`) and grants, and a
+    /// token's own grant when they came with one.
+    fn person(name: &str, grants: &[&str], token: Option<&[&str]>) -> Who {
+        let rights = |g: &[&str]| crate::authz::Rights { grants: g.iter().filter_map(|g| crate::authz::Grant::parse(g).ok()).collect(), custom: Default::default() };
+        let mut c = crate::authz::Caller::with(CallerKind::User, &format!("user:{name}"), Some(rights(grants)), token.map(rights));
+        c.user = Some(format!("{name}-id"));
+        Who::of(&c)
+    }
+
+    /// docs/deploy-api.md §3.1 and §15: an app's owner teams are groups (kiln's, or an identity
+    /// provider's); its owners release it where their environment lets them, a deployer anywhere
+    /// they have environments.deploy, a token no further than its own grant; an app's owners are
+    /// given by someone in its owner team (the one it has, and the one it gets), or an admin.
+    #[test]
+    fn owners_release_their_app_where_their_environment_lets_them() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let root = tempfile::tempdir()?;
+            let d = Deploy {
+                records: Arc::clone(&hub.records),
+                stand_in: None,
+                hosted: super::super::host::Hosted::new(root.path()),
+                owner: "test".into(),
+                wake: crate::rt::Notify::new(),
+                changes: crate::rt::Broadcast::new(16),
+                argo: Default::default(),
+                remote: Default::default(),
+                hub: Arc::clone(&hub),
+            };
+            let st = &*d.records;
+            // ada is in kiln's group shop; carol in acme/platform on GitHub, as she last signed in.
+            hub.store.call(|c| {
+                c.execute_batch(
+                    "INSERT INTO user_groups (name, created_at, created_by) VALUES ('shop', 0, 'admin'), ('payments', 0, 'admin');
+                     INSERT INTO user_group_members (group_name, user_id, added_at, added_by) VALUES ('shop', 'ada-id', 0, 'admin'), ('payments', 'bob-id', 0, 'admin');
+                     INSERT INTO user_identities (provider, subject, user_id, login, groups, created_at, last_at) VALUES ('github', '42', 'carol-id', 'carol', '[\"acme\",\"acme/platform\"]', 0, 0);",
+                )?;
+                Ok(())
+            })
+            .await?;
+            let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
+            let web = App { name: "web".into(), project: "shop".into(), owners: vec!["shop".into(), "github:acme/platform".into()], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false, registries: None };
+            store::put_app(st, &web).await?;
+            for (name, owners) in [("staging", true), ("production", false)] {
+                let mut e = Environment { name: name.into(), ..env(false) };
+                e.owners.release = owners;
+                store::put_environment(st, &e).await?;
+                store::put_registration(st, &Registration { app: "web".into(), environment: name.into(), enabled: true, paused: false, running: Some(1), created_at: 0, degraded: None }).await?;
+            }
+            let (Some(staging), Some(production)) = (store::environment(st, "staging").await?, store::environment(st, "production").await?) else { anyhow::bail!("the environments") };
+            let forbidden = |r: &Result<(), Fail>| matches!(r, Err((StatusCode::FORBIDDEN, _)));
+            let viewer: &[&str] = &["viewer"];
+            let (ada, bob, carol) = (person("ada", viewer, None), person("bob", viewer, None), person("carol", viewer, None));
+            let dave = person("dave", &["environments.deploy@deploy:production"], None);
+
+            // Owners, kiln's group or GitHub's, where the environment lets them; nobody else.
+            anyhow::ensure!(may_release(&d, &ada, &web, &staging, "release").await.is_ok(), "ada is in shop");
+            anyhow::ensure!(may_release(&d, &carol, &web, &staging, "release").await.is_ok(), "carol is in github:acme/platform");
+            let r = may_release(&d, &ada, &web, &production, "release").await;
+            anyhow::ensure!(forbidden(&r) && format!("{r:?}").contains("doesn't let owners release"), "production doesn't let owners: {r:?}");
+            let r = may_release(&d, &bob, &web, &staging, "release").await;
+            anyhow::ensure!(forbidden(&r) && format!("{r:?}").contains("shop, github:acme/platform"), "bob owns nothing of web: {r:?}");
+            // A deployer of one environment releases there, whoever owns the app, and nowhere else.
+            anyhow::ensure!(may_release(&d, &dave, &web, &production, "release").await.is_ok());
+            anyhow::ensure!(forbidden(&may_release(&d, &dave, &web, &staging, "release").await));
+            anyhow::ensure!(may_deploy(&dave, &production, "release apps across").is_ok() && may_deploy(&dave, &staging, "release apps across").is_err());
+            anyhow::ensure!(may_deploy(&ada, &staging, "release apps across").is_err(), "a fleet is a deployer's: owners have their own apps, not the environment");
+            // ada's token, held to reading, releases nothing on the strength of her team.
+            let reading = person("ada", viewer, Some(&["runs.read"]));
+            anyhow::ensure!(forbidden(&may_release(&d, &reading, &web, &staging, "release").await));
+            // kiln itself (a promotion, a revert) is never stopped.
+            anyhow::ensure!(may_release(&d, &Who::kiln("kiln"), &web, &production, "release").await.is_ok());
+
+            // Through the flow: a release, and its cancel, are its owners'.
+            let ask = || Ask { app: "web".into(), environment: "staging".into(), values: Some("replicaCount: 2\n".into()), ..Ask::default() };
+            let r = release(&d, &bob, ask()).await;
+            anyhow::ensure!(matches!(r, Err((StatusCode::FORBIDDEN, _))), "{r:?}");
+            let made = release(&d, &ada, ask()).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            // Waiting on its gates, it can be cancelled.
+            let mut waiting = made.clone();
+            waiting.state = State::Waiting;
+            anyhow::ensure!(store::update_release(st, &waiting, made.state).await?);
+            let r = cancel(&d, &bob, made.id, false).await;
+            anyhow::ensure!(matches!(r, Err((StatusCode::FORBIDDEN, _))), "bob cancels nothing of web: {r:?}");
+            let gone = cancel(&d, &carol, made.id, false).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            anyhow::ensure!(gone.state == State::Cancelled, "a co-owner cancels: {gone:?}");
+            let fleet_ask = FleetAsk { environment: "staging".into(), set: [("replicaCount".to_owned(), "3".to_owned())].into(), ..FleetAsk::default() };
+            let r = fleet(&d, &ada, fleet_ask).await;
+            anyhow::ensure!(matches!(r, Err((StatusCode::FORBIDDEN, _))), "{r:?}");
+
+            // Who gives an app its owners.
+            let names = |o: &[&str]| o.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>();
+            anyhow::ensure!(owners_ok(&d, &ada, &names(&["shop"]), None).await.is_ok(), "ada makes an app shop owns");
+            anyhow::ensure!(owners_ok(&d, &ada, &names(&["shop", "payments", "github:acme/platform"]), None).await.is_ok(), "with a co-owner and an ops owner she isn't in");
+            let r = owners_ok(&d, &ada, &names(&["payments"]), None).await;
+            anyhow::ensure!(forbidden(&r) && format!("{r:?}").contains("isn't in payments"), "{r:?}");
+            anyhow::ensure!(forbidden(&owners_ok(&d, &ada, &[], None).await), "a person names an owner team");
+            anyhow::ensure!(matches!(owners_ok(&d, &ada, &names(&["slack:acme"]), None).await, Err((StatusCode::BAD_REQUEST, _))));
+            anyhow::ensure!(matches!(owners_ok(&d, &ada, &names(&["a", "b", "c", "d"]), None).await, Err((StatusCode::BAD_REQUEST, _))), "three at most");
+            let admin = person("root", &["admin"], None);
+            anyhow::ensure!(owners_ok(&d, &admin, &names(&["anyone"]), None).await.is_ok() && owners_ok(&d, &Who::kiln("kiln"), &[], None).await.is_ok());
+            // Changing them: someone in the team it has, and in the one it gets.
+            let had = names(&["shop"]);
+            anyhow::ensure!(owners_ok(&d, &ada, &names(&["shop", "payments"]), Some(&had)).await.is_ok());
+            let r = owners_ok(&d, &bob, &names(&["payments"]), Some(&had)).await;
+            anyhow::ensure!(forbidden(&r) && format!("{r:?}").contains("the owner team the app has"), "bob takes nothing over: {r:?}");
+            anyhow::ensure!(forbidden(&owners_ok(&d, &ada, &names(&["payments"]), Some(&had)).await), "nor gives it to a team she isn't in");
+            anyhow::ensure!(owners_ok(&d, &bob, &had, Some(&had)).await.is_ok(), "owners unchanged need nothing");
+            Ok(())
+        })
+    }
+
+    /// What the servers of a test deploy to: whatever is handed it runs, and it says so.
+    #[derive(Default)]
+    struct Cluster {
+        /// Each release handed to it, with its commit.
+        delivered: parking_lot::Mutex<Vec<(i64, String)>>,
+    }
+
+    impl super::super::provider::StandIn for Cluster {
+        fn deliver(&self, r: &Release) -> Result<(), Undelivered> {
+            self.delivered.lock().push((r.id, r.commit.clone().unwrap_or_default()));
+            Ok(())
+        }
+
+        fn follow(&self, r: &Release, commit: &str) -> (Landed, Value) {
+            // It runs what it was handed last.
+            let runs = self.delivered.lock().last().is_some_and(|(id, c)| *id == r.id && c == commit);
+            (if runs { Landed::Yes } else { Landed::No }, json!({ "sync": "Synced", "health": if runs { "Healthy" } else { "Progressing" } }))
+        }
+    }
+
+    /// P6 (docs/deploy-api.md §16): a server killed mid-release has its release finished by
+    /// another. Two servers, each a hub of its own, share their records (one store through the
+    /// Records seam, as servers share KilnDB) and the release repository. Server A takes the
+    /// release's lease, commits it and hands it to the provider, and dies there. Server B can't
+    /// take it while A's lease holds; once the lease lapses, B takes it and follows it until it
+    /// lands, with A's commit: one commit, handed over once, nothing done twice.
+    #[test]
+    fn a_server_killed_mid_release_has_its_release_finished_by_another() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::new());
+            let git = tempfile::tempdir()?;
+            let cluster = Arc::new(Cluster::default());
+            let server = |hub: Arc<crate::hub::Hub>, name: &str| Deploy {
+                records: Arc::clone(&records),
+                stand_in: Some(Arc::clone(&cluster) as Arc<dyn super::super::provider::StandIn>),
+                hosted: super::super::host::Hosted::new(git.path()),
+                owner: name.into(),
+                wake: crate::rt::Notify::new(),
+                changes: crate::rt::Broadcast::new(16),
+                argo: Default::default(),
+                remote: Default::default(),
+                hub,
+            };
+            let a = server(crate::hub::tests::scratch_hub().await?, "server-a");
+            let b = server(crate::hub::tests::scratch_hub().await?, "server-b");
+            let st = &*records;
+            // An app on a platform, in an environment that takes it: no gates, settled at once.
+            let package = Package::Platform { provider: "aws-lambda".into(), spec: json!({ "function": "web" }), repo: None, path: String::new() };
+            let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false, registries: None };
+            store::put_app(st, &web).await?;
+            let mut e = env(false);
+            e.targets.platforms.insert("aws-lambda".into(), serde_json::Map::from_iter([("account".to_owned(), json!("test")), ("region".to_owned(), json!("eu-west-1"))]));
+            e.watch.settle_secs = 0;
+            store::put_environment(st, &e).await?;
+            ensure_release_repo(&a, &e.release_repo).await.map_err(anyhow::Error::msg)?;
+            register(&a, "admin", "web", &e.name).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let ask = Ask { app: "web".into(), environment: e.name.clone(), version: Some("1.0.0".into()), ..Ask::default() };
+            let r = release(&a, &Who::kiln("admin"), ask).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            // Server A takes it, and moves it on: through its gates, committed, handed over.
+            let now = crate::util::now_unix();
+            anyhow::ensure!(store::claim(st, &a.owner, now, LEASE_SECS, 16).await? == vec![r.id], "server A takes the release");
+            for _ in 0..4 {
+                if store::release(st, r.id).await?.is_some_and(|x| x.state == State::Delivering) {
+                    break;
+                }
+                step(&a, r.id).await?;
+            }
+            let delivering = store::release(st, r.id).await?.ok_or_else(|| anyhow::anyhow!("the release"))?;
+            anyhow::ensure!(delivering.state == State::Delivering, "server A delivers it: {:?} ({:?})", delivering.state, delivering.message);
+            let commit = delivering.commit.clone().ok_or_else(|| anyhow::anyhow!("its commit"))?;
+            // Server A dies here: it does nothing more, and its lease stands until it lapses.
+            drop(a);
+            // Due again, but A's: B doesn't take it while A's lease holds.
+            anyhow::ensure!(store::claim(st, &b.owner, now + LEASE_SECS / 2, LEASE_SECS, 16).await?.is_empty(), "server B waits while A's lease holds");
+            // Once A's lease has lapsed, B takes the release and follows it until it lands.
+            let later = now + LEASE_SECS + 1;
+            anyhow::ensure!(store::claim(st, &b.owner, later, LEASE_SECS, 16).await? == vec![r.id], "server B takes it once the lease lapses");
+            step(&b, r.id).await?;
+            let landed = store::release(st, r.id).await?.ok_or_else(|| anyhow::anyhow!("the release"))?;
+            anyhow::ensure!(landed.state == State::Succeeded, "server B finishes it: {:?} ({:?})", landed.state, landed.message);
+            anyhow::ensure!(landed.commit.as_deref() == Some(commit.as_str()), "with A's commit");
+            anyhow::ensure!(store::registration(st, "web", &e.name).await?.and_then(|reg| reg.running) == Some(r.id), "it runs there now");
+            let delivered = cluster.delivered.lock().clone();
+            anyhow::ensure!(delivered == vec![(r.id, commit.clone())], "handed over once: {delivered:?}");
+            // Nothing is left to follow.
+            anyhow::ensure!(store::claim(st, &b.owner, later + 3600, LEASE_SECS, 16).await?.is_empty(), "nothing is left in the work queue");
+            Ok(())
+        })
     }
 }

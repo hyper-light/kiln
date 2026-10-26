@@ -58,6 +58,41 @@ fn helper(command: &str) -> bool {
     program == "kiln" || program == "kiln.exe" || lower.contains("mcp") || lower.contains("modelcontextprotocol")
 }
 
+/// An `ssh-agent` as a shell's startup file starts it (`eval "$(ssh-agent -s)"`, fish's
+/// `eval (ssh-agent -c)`): one more for every shell that reads the file (a harness's shell
+/// snapshots, its tools' login shells), each running on after its shell, so a session left dozens.
+/// No work of the agent's: never left running, and stopped once [`AGENT_KEPT`] old.
+pub fn login_agent(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let program = words.next().map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p)).unwrap_or("");
+    program == "ssh-agent" && words.all(|w| matches!(w, "-s" | "-c"))
+}
+
+/// How long a shell's `ssh-agent` in a session is left alone: a command that started one on purpose
+/// (`eval "$(ssh-agent -s)" && ssh-add … && git push`) has had its use of it by then.
+pub const AGENT_KEPT: Duration = Duration::from_secs(30 * 60);
+
+/// Of the shells' ssh-agents a look found, the ones to stop at `now_s` (seconds since the epoch):
+/// those [`AGENT_KEPT`] old.
+pub fn agents_to_stop(seen: &HashMap<String, Seen>, now_s: u64) -> Vec<u32> {
+    seen.values().flat_map(|s| &s.agents).filter(|r| now_s.saturating_sub(r.started) >= AGENT_KEPT.as_secs()).map(|r| r.pid).collect()
+}
+
+/// What a look found that goes now, for [`stop`]: the shells' ssh-agents old enough, and, of the
+/// agents between turns (`settled`), their ssh-agents and everything they have apart from their
+/// harness (what their commands left running). Two lists: the ssh-agents, and the rest.
+pub fn to_stop(seen: &HashMap<String, Seen>, settled: &HashSet<String>, now_s: u64) -> (Vec<u32>, Vec<u32>) {
+    let mut agents = agents_to_stop(seen, now_s);
+    let mut left = Vec::new();
+    for s in seen.iter().filter(|(id, _)| settled.contains(*id)).map(|(_, s)| s) {
+        left.extend(s.apart.iter().map(|r| r.pid));
+        agents.extend(s.agents.iter().map(|r| r.pid));
+    }
+    agents.sort_unstable();
+    agents.dedup();
+    (agents, left)
+}
+
 fn system(pids: Option<&[u32]>) -> sysinfo::System {
     refreshed(pids, false)
 }
@@ -133,10 +168,15 @@ pub fn session_of(pid: u32, sessions: &[(String, Option<u32>)]) -> Option<String
 pub struct Seen {
     /// Its harness, when it runs.
     pub harness: Option<Ran>,
-    /// What runs under the harness now.
+    /// What runs under the harness now (the first [`MAX_RAN`], its helpers left out).
     pub under: Vec<Ran>,
+    /// Every process under the harness now, by pid, however many, its helpers' included: what
+    /// isn't left running.
+    pub below: HashSet<u32>,
     /// What it started that runs apart from it (marked as its, not under it): left running.
     pub apart: Vec<Ran>,
+    /// The `ssh-agent`s shells' startup files started for it, apart from it ([`login_agent`]).
+    pub agents: Vec<Ran>,
 }
 
 /// One look at the sessions' processes (blocking): for each session (its id, and its harness's
@@ -186,15 +226,17 @@ pub fn scan(sessions: &[(String, Option<u32>)]) -> HashMap<String, Seen> {
             let mut seen = Seen { harness: harness.and_then(|h| ran_of(&sys, Pid::from_u32(h))), ..Seen::default() };
             let mut below: HashSet<Pid> = HashSet::new();
             if let Some(h) = harness {
-                let root = Pid::from_u32(*h);
-                let mut todo = vec![root];
-                while let Some(p) = todo.pop() {
+                // All of it is followed (a helper's browser too); what runs under a helper isn't noted.
+                let mut todo = vec![(Pid::from_u32(*h), false)];
+                while let Some((p, helping)) = todo.pop() {
                     for c in kids.get(&p).into_iter().flatten() {
-                        if !below.insert(*c) || skip(*c) {
+                        if !below.insert(*c) {
                             continue;
                         }
-                        todo.push(*c);
-                        if seen.under.len() < MAX_RAN
+                        let helping = helping || skip(*c);
+                        todo.push((*c, helping));
+                        if !helping
+                            && seen.under.len() < MAX_RAN
                             && let Some(r) = ran_of(&sys, *c)
                         {
                             seen.under.push(r);
@@ -204,13 +246,16 @@ pub fn scan(sessions: &[(String, Option<u32>)]) -> HashMap<String, Seen> {
             }
             let me = harness.map(Pid::from_u32);
             for pid in marked.get(id).into_iter().flatten() {
-                if Some(*pid) == me || below.contains(pid) || skip(*pid) || seen.apart.len() >= MAX_RAN {
+                if Some(*pid) == me || below.contains(pid) || skip(*pid) {
                     continue;
                 }
-                if let Some(r) = ran_of(&sys, *pid) {
-                    seen.apart.push(r);
+                let Some(r) = ran_of(&sys, *pid) else { continue };
+                let into = if login_agent(&r.command) { &mut seen.agents } else { &mut seen.apart };
+                if into.len() < MAX_RAN {
+                    into.push(r);
                 }
             }
+            seen.below = below.into_iter().map(|p| p.as_u32()).collect();
             (id.clone(), seen)
         })
         .collect()
@@ -361,6 +406,8 @@ pub fn task(root: &Ran) -> super::model::Task {
         started: i64::try_from(root.started).unwrap_or(0).saturating_mul(1000),
         class: Some("shell".to_owned()),
         command: Some(shown),
+        // kiln stops it itself, whatever the harness (`Session`'s `stop_left`).
+        stoppable: true,
         ..super::model::Task::default()
     }
 }
@@ -395,6 +442,29 @@ pub(crate) fn sleeper(secs: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ssh_agents_shells_start_are_no_work_of_the_agents() {
+        assert!(login_agent("ssh-agent -s") && login_agent("ssh-agent -c") && login_agent("/usr/bin/ssh-agent"));
+        assert!(!login_agent("ssh-agent -a /run/user/1000/agent.sock") && !login_agent("ssh-agent -D") && !login_agent("ssh-agent bash") && !login_agent("ssh-add -l"));
+        let agent = |pid, started| Ran { pid, ppid: 1, started, command: "ssh-agent -s".into() };
+        let kept = AGENT_KEPT.as_secs();
+        let seen = HashMap::from([("s".to_owned(), Seen { agents: vec![agent(7, 1_000), agent(8, 1_001)], ..Seen::default() })]);
+        assert_eq!(agents_to_stop(&seen, 1_000 + kept), vec![7], "only those kept long enough");
+    }
+
+    #[test]
+    fn between_turns_nothing_its_commands_left_running_stays() {
+        let ran = |pid, command: &str| Ran { pid, ppid: 1, started: 1_000, command: command.into() };
+        let working = Seen { apart: vec![ran(10, "npm run dev")], agents: vec![ran(11, "ssh-agent -s")], ..Seen::default() };
+        let idle = Seen { under: vec![ran(20, "bash -c sleep 99")], apart: vec![ran(21, "python3 -m http.server")], agents: vec![ran(22, "ssh-agent -c")], ..Seen::default() };
+        let seen = HashMap::from([("working".to_owned(), working), ("idle".to_owned(), idle)]);
+        let settled = HashSet::from(["idle".to_owned()]);
+        // The idle one's leftovers and ssh-agent go; what runs under its harness stays, and so does
+        // everything of the one at work (its ssh-agent until it's old enough).
+        assert_eq!(to_stop(&seen, &settled, 1_001), (vec![22], vec![21]));
+        assert_eq!(to_stop(&seen, &settled, 1_000 + AGENT_KEPT.as_secs()), (vec![11, 22], vec![21]));
+    }
 
     #[test]
     fn helpers_are_left_out_and_wrappers_give_way() {
@@ -440,7 +510,15 @@ mod tests {
         let out = std::process::Command::new("sh").arg("-c").arg(format!("{sleep_32} >/dev/null 2>&1 & echo $!")).env(MARK, "s1").output()?;
         let apart: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
         let me = std::process::id();
-        let seen = scan(&[("s1".to_owned(), Some(me)), ("s2".to_owned(), None)]);
+        let look = || scan(&[("s1".to_owned(), Some(me)), ("s2".to_owned(), None)]);
+        // Its shell forked it: looked at again until it runs as the sleeper (a process caught
+        // between fork and exec shows no environment on macOS, so no mark).
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let mut seen = look();
+        while !seen.get("s1").is_some_and(|s| s.apart.iter().any(|r| r.pid == apart)) && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+            seen = look();
+        }
         let s1 = seen.get("s1").cloned().unwrap_or_default();
         let sleep = s1.under.iter().find(|r| r.pid == child.id()).cloned().ok_or_else(|| anyhow::anyhow!("the child isn't seen under its harness: {:?}", s1.under))?;
         assert!(sleep.command.contains("sleep 31"));
@@ -455,6 +533,29 @@ mod tests {
         let marked = s1.apart.iter().find(|r| r.pid == apart).cloned().ok_or_else(|| anyhow::anyhow!("not found apart"))?;
         stop_tree(&marked);
         assert!(alive(&[marked]).is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn what_a_harness_s_helper_runs_is_the_harness_s_and_never_left_running() -> anyhow::Result<()> {
+        // An MCP server (as its command names it) under this process, running a command that runs
+        // another (as a browser's processes do), all marked as a session of this test's own (another
+        // run of it at the same time has its own).
+        let id = format!("helped-{}", std::process::id());
+        let mut helper = std::process::Command::new("sh").arg("-c").arg("sh -c 'sleep 33; true' & wait").arg("mcp-server-lab").env(MARK, &id).spawn()?;
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while under(helper.id()).len() < 2 && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let theirs = under(helper.id());
+        let seen = scan(&[(id.clone(), Some(std::process::id()))]).remove(&id).unwrap_or_default();
+        stop(&[vec![helper.id()], theirs.clone()].concat());
+        let _ = helper.wait();
+        assert!(theirs.len() >= 2, "the helper's command and what it runs: {theirs:?}");
+        assert!(theirs.iter().all(|p| seen.below.contains(p)), "{theirs:?} under the harness: {:?}", seen.below);
+        assert!(seen.apart.is_empty(), "{:?}", seen.apart);
+        assert!(!seen.under.iter().any(|r| r.pid == helper.id() || theirs.contains(&r.pid)), "a helper's work isn't noted as the agent's: {:?}", seen.under);
         Ok(())
     }
 }

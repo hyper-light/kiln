@@ -41,12 +41,36 @@ pub struct Config {
     pub agents: Agents,
     /// Where kiln keeps its bytes (docs/blobs.md): the server's data directory, or any S3.
     pub blobs: crate::blobs::Config,
+    /// The bus kiln's events ride (docs/bus.md): Quiver, in the server's process.
+    pub bus: crate::bus::Config,
     /// What a runner's administrator declares of it (docs/ci.md W13-R02): `[agent.facts]` and
     /// `[agent.probes]`. The server's own runner reads them here; `kiln agent` from its config file.
     pub agent: crate::runner::probe::Declared,
     /// Environment variables injected into every job (e.g. registry mirrors). Values starting with
     /// `file:` are read from that path at job dispatch time and masked in logs.
     pub secrets: BTreeMap<String, String>,
+    /// kiln's records through the cluster group (docs/p2p.md).
+    pub cluster: Cluster,
+}
+
+/// `[cluster]` (docs/p2p.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Cluster {
+    /// The store's writes go through the cluster group (P1): one hyper-raft group with kiln.db as
+    /// its state machine, its log in `<data>/cluster`. Off (or `KILN_CLUSTER_GROUP=0`), writes go
+    /// straight to kiln.db, as before it; the database is whole either way.
+    pub group: bool,
+    /// The runners hold learner replicas of the group (P2), each fed by the server over its link,
+    /// from a copy of kiln.db. Off (or `KILN_CLUSTER_LEARNERS=0`), none is added; the learners the
+    /// group has stay in it, lagging.
+    pub learners: bool,
+}
+
+impl Default for Cluster {
+    fn default() -> Self {
+        Self { group: true, learners: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,13 +232,15 @@ pub struct Conversations {
 pub struct Agents {
     /// How many agents deep a chain may go below the one a person started (that one is 0).
     pub max_depth: u32,
-    /// How many children still running one agent may have at once.
-    pub max_children: u32,
+    /// The most subagents at work one agent may have at once, whatever its own Subagents setting
+    /// says. None (the default): as many as that setting says, and with none, no limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_children: Option<u32>,
 }
 
 impl Default for Agents {
     fn default() -> Self {
-        Self { max_depth: 3, max_children: 24 }
+        Self { max_depth: 3, max_children: None }
     }
 }
 
@@ -499,6 +525,12 @@ impl Config {
         if let Ok(v) = std::env::var("KILN_PUBLIC_URL") {
             cfg.server.public_url = v;
         }
+        if let Ok(v) = std::env::var("KILN_CLUSTER_GROUP") {
+            cfg.cluster.group = !matches!(v.trim(), "0" | "false" | "off" | "no");
+        }
+        if let Ok(v) = std::env::var("KILN_CLUSTER_LEARNERS") {
+            cfg.cluster.learners = !matches!(v.trim(), "0" | "false" | "off" | "no");
+        }
         if let Ok(v) = std::env::var("KILN_QUIC_ADVERTISE") {
             cfg.server.quic_advertise = v;
         }
@@ -562,6 +594,14 @@ pub struct Updates {
     pub wait_for_jobs_minutes: u64,
     /// Minutes a machine has to build kiln itself, install included.
     pub build_minutes: u64,
+    /// Version skew (`crate::skew`): a runner on the server's commit or one of this many release
+    /// branch commits before it (its first parents) does everything. System → Updates can change
+    /// it, and the one below.
+    pub skew_full: u32,
+    /// Version skew: a runner on one of this many commits before the server's, past `skew_full`,
+    /// connects to be upgraded and takes no new work until it is; further behind, it's refused.
+    /// Never less than `skew_full`.
+    pub skew_upgrade: u32,
 }
 
 impl Default for Updates {
@@ -576,6 +616,9 @@ impl Default for Updates {
             upgrade_minutes: 15,
             wait_for_jobs_minutes: 6 * 60,
             build_minutes: 60,
+            // About three days of main, and about a month: a runner a day behind does everything.
+            skew_full: 100,
+            skew_upgrade: 1000,
         }
     }
 }

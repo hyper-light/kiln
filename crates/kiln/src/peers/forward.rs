@@ -36,7 +36,6 @@ use crate::http::client::Roots;
 use crate::http::io::{RtFuturesIo, RtIo};
 use crate::http::server::{self as srv, Request, Response};
 use crate::http::tls::{ClientTls, TlsStream};
-use crate::http::ws::FuturesIo;
 
 /// Where a frame starts at a peer's address: the grant is posted here.
 pub const ENTER: &str = "/.kiln-peer/enter";
@@ -360,7 +359,7 @@ async fn forward_http(live: &Live, req: Request, grant: &str, base: &str) -> any
 /// A WebSocket: the upgrade asked of the peer first, its answer the browser's; then both
 /// connections piped until either ends.
 async fn forward_ws(live: &Live, mut req: Request, grant: &str, base: &str) -> anyhow::Result<Response> {
-    let browser = hyper::upgrade::on(&mut req);
+    let browser = kiln_http::upgrade::on(&mut req);
     let (parts, _) = req.into_parts();
     let mut up = http::Request::builder().method(Method::GET).uri(target(&parts.uri)).body(srv::empty())?;
     let mut headers = upstream_headers(&parts.headers, &live.origin, &live.authority, grant, base);
@@ -370,14 +369,14 @@ async fn forward_ws(live: &Live, mut req: Request, grant: &str, base: &str) -> a
     let tcp = crate::http::io::connect_out(&live.host, live.port, live.https).await?;
     let mut sender = if live.https {
         let stream = TlsStream::connect(RtFuturesIo::new(tcp), live.tls.config()?, crate::http::tls::server_name(&live.host)?).await.map_err(|e| anyhow::anyhow!("TLS to {}: {e}", live.host))?;
-        let (sender, conn) = hyper::client::conn::http1::handshake::<_, srv::Body>(stream).await?;
+        let (sender, conn) = kiln_http::client::http1::handshake::<_, srv::Body>(stream).await?;
         crate::rt::spawn_local(async move {
             let _ = conn.with_upgrades().await;
         })
         .map_err(|e| anyhow::anyhow!("spawn connection task: {e}"))?;
         sender
     } else {
-        let (sender, conn) = hyper::client::conn::http1::handshake::<_, srv::Body>(RtIo::new(tcp)).await?;
+        let (sender, conn) = kiln_http::client::http1::handshake::<_, srv::Body>(RtIo::new(tcp)).await?;
         crate::rt::spawn_local(async move {
             let _ = conn.with_upgrades().await;
         })
@@ -390,7 +389,7 @@ async fn forward_ws(live: &Live, mut req: Request, grant: &str, base: &str) -> a
         downstream_headers(&mut head.headers, &live.origin, base);
         return Ok(http::Response::from_parts(head, body.map_err(std::io::Error::other).boxed()));
     }
-    let peer = hyper::upgrade::on(&mut resp);
+    let peer = kiln_http::upgrade::on(&mut resp);
     let mut out = http::Response::new(srv::empty());
     *out.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
     for k in [header::UPGRADE, header::CONNECTION, header::SEC_WEBSOCKET_ACCEPT, header::SEC_WEBSOCKET_PROTOCOL, header::SEC_WEBSOCKET_EXTENSIONS] {
@@ -402,7 +401,7 @@ async fn forward_ws(live: &Live, mut req: Request, grant: &str, base: &str) -> a
     crate::rt::spawn_local(async move {
         match (browser.await, peer.await) {
             (Ok(b), Ok(p)) => {
-                if let Err(e) = crate::frontdoor::proxy::pipe(FuturesIo(b), FuturesIo(p)).await {
+                if let Err(e) = crate::frontdoor::proxy::pipe(b, p).await {
                     tracing::debug!(peer = %name, error = %e, "a WebSocket to a peered cluster ended");
                 }
             }

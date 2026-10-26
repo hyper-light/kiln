@@ -10,11 +10,15 @@
 //!   that federate (AWS, Google Cloud, Azure) exchange kiln's OIDC identity for short-lived
 //!   credentials; the rest use a stored token.
 
+pub mod alibaba;
 pub mod aws;
 pub mod azure;
 pub mod cloudflare;
 pub mod gcp;
+pub mod hosting;
 pub mod oci;
+pub mod oracle;
+pub mod stores;
 pub mod vercel;
 
 use std::collections::HashMap;
@@ -84,6 +88,10 @@ pub struct KindInfo {
     pub secret: Option<&'static str>,
     /// Whether kiln can use it yet (the catalog lists what's coming too).
     pub built: bool,
+    /// What a second secret it keeps is, beside the first: one requests from the service are
+    /// checked with (a Slack app's signing secret).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing: Option<&'static str>,
 }
 
 const fn f(name: &'static str, required: bool, help: &'static str) -> Field {
@@ -101,22 +109,30 @@ pub const KINDS: &[KindInfo] = &[
             f("registry", true, "as image references name it: docker.io, ghcr.io, quay.io, registry.example.com:5000"),
             f("username", false, "for a private registry, or Docker Hub pulls without the anonymous limit"),
             f("insecure", false, "true for a registry that speaks plain HTTP (a local network, a test)"),
-            f("federation", false, "aws (ECR), gcp (Artifact Registry) or azure (ACR): short-lived credentials from the job's ID token, no stored secret"),
-            f("role_arn", false, "federation = aws: the IAM role that may pull and push"),
-            f("region", false, "federation = aws: the registry's region (read from its host otherwise)"),
+            f(
+                "federation",
+                false,
+                "aws (ECR), gcp (Artifact Registry), azure (ACR), quay, jfrog, cloudsmith, chainguard, alibaba (Container Registry) or oracle (OCIR): short-lived credentials from the job's ID token",
+            ),
+            f("role_arn", false, "federation = aws or alibaba: the role that may pull and push"),
+            f("region", false, "federation = aws or alibaba: the registry's region (read from its host otherwise)"),
             f("audience", false, "the ID token's audience the cloud trusts"),
             f("provider", false, "federation = gcp: projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>"),
             f("service_account", false, "federation = gcp: a service account to impersonate"),
             f("tenant_id", false, "federation = azure: the Entra tenant"),
-            f("client_id", false, "federation = azure: the app registration with the federated credential"),
+            f("client_id", false, "federation = azure: the app registration with the federated credential; oracle: the identity domain's confidential application"),
             f("robot", false, "federation = quay: the robot account (org+name) that trusts kiln's ID tokens"),
             f("url", false, "federation = jfrog: the platform's URL, when not the registry's host"),
             f("org", false, "federation = cloudsmith: the organization"),
             f("service", false, "federation = cloudsmith: the service account's slug"),
             f("identity", false, "federation = chainguard: the assumable identity's id"),
+            f("oidc_provider_arn", false, "federation = alibaba: the RAM OIDC provider that trusts kiln's ID tokens (acs:ram::<account>:oidc-provider/<name>)"),
+            f("instance_id", false, "federation = alibaba: the Enterprise Edition instance (cri-…); none for the Personal Edition"),
+            f("domain", false, "federation = oracle: the OCI IAM identity domain's URL (https://idcs-….identity.oraclecloud.com); its client secret is the token"),
         ],
         secret: Some("access token or password"),
         built: true,
+        signing: None,
     },
     KindInfo {
         kind: "package",
@@ -130,6 +146,7 @@ pub const KINDS: &[KindInfo] = &[
         ],
         secret: Some("token or password"),
         built: true,
+        signing: None,
     },
     KindInfo {
         kind: "aws",
@@ -139,6 +156,7 @@ pub const KINDS: &[KindInfo] = &[
         fields: &[f("role_arn", true, "the IAM role kiln assumes"), f("region", false, "the default region"), f("audience", false, "the token audience the role trusts (sts.amazonaws.com)")],
         secret: None,
         built: true,
+        signing: None,
     },
     KindInfo {
         kind: "gcp",
@@ -152,6 +170,7 @@ pub const KINDS: &[KindInfo] = &[
         ],
         secret: None,
         built: true,
+        signing: None,
     },
     KindInfo {
         kind: "azure",
@@ -161,6 +180,60 @@ pub const KINDS: &[KindInfo] = &[
         fields: &[f("tenant_id", true, "the Entra tenant"), f("client_id", true, "the app registration with kiln's federated credential"), f("subscription_id", false, "the default subscription")],
         secret: None,
         built: true,
+        signing: None,
+    },
+    // Secret stores legs' secrets come from (W09-R08): `vault:`, `infisical:`, `doppler:`,
+    // `1password:` sources.
+    KindInfo {
+        kind: "vault",
+        title: "HashiCorp Vault",
+        category: "secrets",
+        mode: Mode::Oidc,
+        fields: &[
+            f("address", true, "https://vault.example.com:8200 (one on a private network needs [ci] allow_private_targets)"),
+            f("role", true, "the JWT auth role kiln signs in as"),
+            f("auth_path", false, "where the JWT auth method is mounted (jwt)"),
+            f("namespace", false, "a Vault Enterprise namespace"),
+            f("audience", false, "the audience the role binds (vault)"),
+        ],
+        secret: None,
+        built: true,
+        signing: None,
+    },
+    KindInfo {
+        kind: "infisical",
+        title: "Infisical",
+        category: "secrets",
+        mode: Mode::Optional,
+        fields: &[
+            f("project_id", true, "the project secrets are read from"),
+            f("identity_id", false, "a machine identity's id, to sign in by OIDC"),
+            f("site", false, "Infisical's address (https://app.infisical.com), or yours"),
+            f("audience", false, "the audience the identity binds (infisical)"),
+        ],
+        secret: Some("a machine identity's universal auth <client id>:<client secret>, when not by OIDC"),
+        built: true,
+        signing: None,
+    },
+    KindInfo {
+        kind: "doppler",
+        title: "Doppler",
+        category: "secrets",
+        mode: Mode::Optional,
+        fields: &[f("identity", false, "a service account identity's id, to sign in by OIDC"), f("audience", false, "the audience the identity binds (doppler)")],
+        secret: Some("a service token (dp.st…), when not by OIDC"),
+        built: true,
+        signing: None,
+    },
+    KindInfo {
+        kind: "1password",
+        title: "1Password",
+        category: "secrets",
+        mode: Mode::Token,
+        fields: &[f("connect", true, "your 1Password Connect server: https://op-connect.internal:8080")],
+        secret: Some("a Connect token"),
+        built: true,
+        signing: None,
     },
     // CD providers (docs/deploy-api.md §8.3): an Argo CD instance kiln deploys through.
     KindInfo {
@@ -176,6 +249,7 @@ pub const KINDS: &[KindInfo] = &[
         ],
         secret: Some("an account's API token (argocd account generate-token --account <name>)"),
         built: true,
+        signing: None,
     },
     // Another kiln whose environments this one's releases run in first (docs/deploy-api.md §11):
     // what runs there comes back signed by its OIDC issuer.
@@ -191,23 +265,140 @@ pub const KINDS: &[KindInfo] = &[
         ],
         secret: Some("a token of an account there that may read its releases (runs.read)"),
         built: true,
+        signing: None,
     },
-    KindInfo { kind: "cloudflare", title: "Cloudflare", category: "hosting", mode: Mode::Token, fields: &[f("account_id", true, "the account Workers and Pages live in")], secret: Some("API token"), built: true },
+    KindInfo { kind: "cloudflare", title: "Cloudflare", category: "hosting", mode: Mode::Token, fields: &[f("account_id", true, "the account Workers and Pages live in")], secret: Some("API token"), built: true, signing: None },
     // Chat, paging and webhooks: where notifications go (docs/ci.md W11-R06, W19-R06).
-    KindInfo { kind: "slack", title: "Slack", category: "notify", mode: Mode::Token, fields: &[f("channel", false, "the channel a bot token posts to when a rule names none (#ci)")], secret: Some("incoming webhook URL, or a bot token (xoxb-…)"), built: true },
-    KindInfo { kind: "discord", title: "Discord", category: "notify", mode: Mode::Token, fields: &[], secret: Some("webhook URL"), built: true },
-    KindInfo { kind: "teams", title: "Microsoft Teams", category: "notify", mode: Mode::Token, fields: &[], secret: Some("Workflows webhook URL"), built: true },
-    KindInfo { kind: "telegram", title: "Telegram", category: "notify", mode: Mode::Token, fields: &[f("chat_id", false, "the chat a rule that names none posts to")], secret: Some("bot token"), built: true },
-    KindInfo { kind: "pagerduty", title: "PagerDuty", category: "notify", mode: Mode::Token, fields: &[], secret: Some("Events API v2 routing key"), built: true },
-    KindInfo { kind: "opsgenie", title: "Opsgenie", category: "notify", mode: Mode::Token, fields: &[], secret: Some("API key"), built: true },
-    KindInfo { kind: "webhook", title: "Webhook", category: "notify", mode: Mode::Optional, fields: &[f("url", true, "where kiln POSTs each event, as JSON"), f("events", false, "kiln events to send as they happen: run, job, agent, queue, cd_plan, cd_apps, cd_app_deleted, or * (comma-separated); without, only notify rules use it")], secret: Some("signing key (X-Kiln-Signature-256: sha256=<HMAC of the body>)"), built: true },
-    KindInfo { kind: "vercel", title: "Vercel", category: "hosting", mode: Mode::Token, fields: &[f("team_id", false, "the team, when not a personal account")], secret: Some("access token"), built: true },
-    KindInfo { kind: "railway", title: "Railway", category: "hosting", mode: Mode::Token, fields: &[f("workspace", false, "the workspace")], secret: Some("API token"), built: false },
-    KindInfo { kind: "fly", title: "Fly.io", category: "hosting", mode: Mode::Token, fields: &[f("org", false, "the organization slug")], secret: Some("access token"), built: false },
-    KindInfo { kind: "netlify", title: "Netlify", category: "hosting", mode: Mode::Token, fields: &[f("account", false, "the team slug")], secret: Some("personal access token"), built: false },
-    KindInfo { kind: "render", title: "Render", category: "hosting", mode: Mode::Token, fields: &[f("owner_id", false, "the workspace")], secret: Some("API key"), built: false },
-    KindInfo { kind: "heroku", title: "Heroku", category: "hosting", mode: Mode::Token, fields: &[], secret: Some("API key"), built: false },
-    KindInfo { kind: "digitalocean", title: "DigitalOcean", category: "hosting", mode: Mode::Token, fields: &[], secret: Some("personal access token"), built: false },
+    KindInfo {
+        kind: "slack",
+        title: "Slack",
+        category: "notify",
+        mode: Mode::Token,
+        fields: &[
+            f("channel", false, "the channel a bot token posts to when a rule names none (#ci)"),
+            f("api", false, "Slack's API for a bot token: https://slack.com/api (the default), or GovSlack's"),
+        ],
+        secret: Some("incoming webhook URL, or a bot token (xoxb-…)"),
+        built: true,
+        signing: Some("the Slack app's signing secret: commands, buttons and events from Slack are checked with it"),
+    },
+    KindInfo {
+        kind: "discord",
+        title: "Discord",
+        category: "notify",
+        mode: Mode::Token,
+        fields: &[
+            f("public_key", false, "your Discord application's public key: its commands (/kiln) come to kiln, checked with it"),
+            f("api", false, "Discord's API, for answers that take a while: https://discord.com/api/v10 (the default)"),
+        ],
+        secret: Some("webhook URL"),
+        built: true,
+        signing: None,
+    },
+    KindInfo {
+        kind: "teams",
+        title: "Microsoft Teams",
+        category: "notify",
+        mode: Mode::Token,
+        fields: &[],
+        secret: Some("Workflows webhook URL"),
+        built: true,
+        signing: Some("an outgoing webhook's security token: @-mentions of it in a team come to kiln as commands, checked with it"),
+    },
+    KindInfo {
+        kind: "telegram",
+        title: "Telegram",
+        category: "notify",
+        mode: Mode::Token,
+        fields: &[
+            f("chat_id", false, "the chat a rule that names none posts to"),
+            f("api", false, "Telegram's Bot API: https://api.telegram.org (the default), or a Bot API server of yours"),
+            f("commands", false, "on once kiln has the bot's webhook (set by POST /api/ci/integrations/<name>/chat): its chats' commands and buttons come to kiln"),
+        ],
+        secret: Some("bot token"),
+        built: true,
+        signing: None,
+    },
+    KindInfo { kind: "pagerduty", title: "PagerDuty", category: "notify", mode: Mode::Token, fields: &[], secret: Some("Events API v2 routing key"), built: true, signing: None },
+    KindInfo { kind: "opsgenie", title: "Opsgenie", category: "notify", mode: Mode::Token, fields: &[], secret: Some("API key"), built: true, signing: None },
+    KindInfo {
+        kind: "email",
+        title: "Email (SMTP)",
+        category: "notify",
+        mode: Mode::Optional,
+        fields: &[
+            f("host", true, "the SMTP server: smtp.example.com"),
+            f("from", true, "who the mail is from: kiln <ci@example.com>"),
+            f("port", false, "587 with STARTTLS (the default), 465 with TLS from the start"),
+            f("tls", false, "starttls (the default), tls, or none for a relay that takes mail in the clear"),
+            f("user", false, "who signs in, when the server wants it"),
+            f("to", false, "where a rule that names no address sends (comma-separated)"),
+            f("replies", false, "a mailbox kiln reads replies to its review emails in (review@example.com): they're posted to their threads"),
+            f("imap_host", false, "replies: the mailbox's IMAP server (imap.example.com)"),
+            f("imap_port", false, "replies: 993 with TLS (the default), 143 with STARTTLS"),
+            f("imap_tls", false, "replies: tls (the default), starttls, or none for this machine's own server"),
+            f("imap_user", false, "replies: who signs in to the mailbox (`user` otherwise); the password is the integration's"),
+            f("imap_folder", false, "replies: the folder replies arrive in (INBOX)"),
+            f("imap_every", false, "replies: how often the mailbox is read (30s)"),
+        ],
+        secret: Some("the password, when the server wants one"),
+        built: true,
+        signing: None,
+    },
+    // Issue trackers: the issues runs' and diffs' trailers name hear of them, and quarantined
+    // tests get issues (docs/ci.md W11-R07).
+    KindInfo {
+        kind: "linear",
+        title: "Linear",
+        category: "notify",
+        mode: Mode::Token,
+        fields: &[
+            f("team", false, "the team new issues go in, by its key (ENG), when a rule names none (linear:ENG)"),
+            f("prefixes", false, "the issue keys that are this workspace's (ENG, OPS), comma-separated; without, every key is tried"),
+            f("api", false, "Linear's API, or a proxy in front of it (https://api.linear.app/graphql)"),
+        ],
+        secret: Some("a personal API key (lin_api_…), or an OAuth app's <client id>:<client secret>"),
+        built: true,
+        signing: None,
+    },
+    KindInfo {
+        kind: "jira",
+        title: "Jira",
+        category: "notify",
+        mode: Mode::Token,
+        fields: &[
+            f("site", true, "the Jira Cloud site: https://acme.atlassian.net"),
+            f("email", false, "the account an API token is of; without, the secret is a service account's"),
+            f("project", false, "the project new issues go in, by its key (OPS), when a rule names none (jira:OPS)"),
+            f("issue_type", false, "the type of the issues it opens (Bug)"),
+            f("prefixes", false, "the issue keys that are this site's (OPS, WEB), comma-separated; without, every key is tried"),
+        ],
+        secret: Some("an API token, or a service account's <client id>:<client secret>"),
+        built: true,
+        signing: None,
+    },
+    KindInfo { kind: "webhook", title: "Webhook", category: "notify", mode: Mode::Optional, fields: &[f("url", true, "where kiln POSTs each event, as JSON"), f("events", false, "kiln events to send as they happen: run, job, agent, queue, cd_plan, cd_apps, cd_app_deleted, or * (comma-separated); without, only notify rules use it")], secret: Some("signing key (X-Kiln-Signature-256: sha256=<HMAC of the body>)"), built: true, signing: None },
+    // Where runs' traces go (docs/ci.md W19-R02, W11-R09).
+    KindInfo {
+        kind: "otel",
+        title: "OpenTelemetry",
+        category: "observability",
+        mode: Mode::Optional,
+        fields: &[
+            f("endpoint", true, "an OTLP/HTTP receiver: https://otlp.example.com, or http://collector:4318 (one on a private network needs [ci] allow_private_targets)"),
+            f("service_name", false, "the traces' service.name (kiln-ci)"),
+        ],
+        secret: Some("a header the receiver wants, `Name: value` (an API key: `x-honeycomb-team: …`, `Authorization: Bearer …`)"),
+        built: true,
+        signing: None,
+    },
+    KindInfo { kind: "vercel", title: "Vercel", category: "hosting", mode: Mode::Token, fields: &[f("team_id", false, "the team, when not a personal account")], secret: Some("access token"), built: true, signing: None },
+    KindInfo { kind: "railway", title: "Railway", category: "hosting", mode: Mode::Token, fields: &[f("workspace", false, "the workspace")], secret: Some("API token"), built: false, signing: None },
+    KindInfo { kind: "fly", title: "Fly.io", category: "hosting", mode: Mode::Token, fields: &[f("org", false, "the organization slug")], secret: Some("access token"), built: true, signing: None },
+    KindInfo { kind: "netlify", title: "Netlify", category: "hosting", mode: Mode::Token, fields: &[f("account", false, "the team slug")], secret: Some("personal access token"), built: true, signing: None },
+    KindInfo { kind: "render", title: "Render", category: "hosting", mode: Mode::Token, fields: &[f("owner_id", false, "the workspace")], secret: Some("API key"), built: true, signing: None },
+    KindInfo { kind: "heroku", title: "Heroku", category: "hosting", mode: Mode::Token, fields: &[], secret: Some("API key"), built: true, signing: None },
+    KindInfo { kind: "digitalocean", title: "DigitalOcean", category: "hosting", mode: Mode::Token, fields: &[], secret: Some("personal access token"), built: true, signing: None },
     KindInfo {
         kind: "nomad",
         title: "Nomad",
@@ -215,10 +406,11 @@ pub const KINDS: &[KindInfo] = &[
         mode: Mode::Token,
         fields: &[f("address", true, "https://nomad.example.com:4646"), f("namespace", false, "default"), f("region", false, "the region")],
         secret: Some("ACL token"),
-        built: false,
+        built: true,
+        signing: None,
     },
-    KindInfo { kind: "terraform", title: "HCP Terraform", category: "infrastructure", mode: Mode::Token, fields: &[f("organization", true, "the organization"), f("hostname", false, "app.terraform.io, or a Terraform Enterprise host")], secret: Some("team token"), built: false },
-    KindInfo { kind: "pulumi", title: "Pulumi Cloud", category: "infrastructure", mode: Mode::Token, fields: &[f("organization", true, "the organization")], secret: Some("access token"), built: false },
+    KindInfo { kind: "terraform", title: "HCP Terraform", category: "infrastructure", mode: Mode::Token, fields: &[f("organization", true, "the organization"), f("hostname", false, "app.terraform.io, or a Terraform Enterprise host")], secret: Some("team token"), built: false, signing: None },
+    KindInfo { kind: "pulumi", title: "Pulumi Cloud", category: "infrastructure", mode: Mode::Token, fields: &[f("organization", true, "the organization")], secret: Some("access token"), built: false, signing: None },
 ];
 
 /// The catalog entry for `kind`.
@@ -235,6 +427,9 @@ pub struct Integration {
     pub config: Value,
     /// Whether it holds a secret.
     pub has_secret: bool,
+    /// Whether it holds a signing secret too (its kind's `signing`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub has_signing_secret: bool,
     pub scope: String,
     pub created_by: String,
     pub created_at: i64,
@@ -245,6 +440,8 @@ pub struct Integration {
 }
 
 const SECRET_NAME: &str = "TOKEN";
+/// The second secret a kind with `signing` keeps.
+const SIGNING_NAME: &str = "SIGNING";
 
 fn secret_scope(id: &str) -> Scope {
     Scope { kind: ScopeKind::Integration, id: id.to_owned() }
@@ -274,6 +471,21 @@ fn check_config(info: &KindInfo, config: &Value) -> Result<(), String> {
     if info.kind == "webhook" {
         crate::ci::webhooks::check_events(config)?;
     }
+    if info.kind == "otel"
+        && let Some(e) = obj.get("endpoint").and_then(Value::as_str)
+        && !(e.trim().starts_with("http://") || e.trim().starts_with("https://"))
+    {
+        return Err(format!("`{e}` is not an OTLP/HTTP endpoint: http:// or https://"));
+    }
+    // A tracker's site or API, a store's address: where kiln's requests go.
+    for (kind, field) in [("jira", "site"), ("linear", "api"), ("vault", "address"), ("infisical", "site"), ("1password", "connect")] {
+        if info.kind == kind
+            && let Some(u) = obj.get(field).and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty())
+            && !(u.starts_with("https://") || u.starts_with("http://"))
+        {
+            return Err(format!("`{field}: {u}` isn't a URL: https://…"));
+        }
+    }
     if info.kind == "oci"
         && let Some(r) = obj.get("registry").and_then(Value::as_str)
     {
@@ -299,10 +511,11 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Integration> {
         verified_at: r.get(10)?,
         last_error: r.get(11)?,
         last_used_at: r.get(12)?,
+        has_signing_secret: r.get::<_, Option<String>>(13)?.is_some(),
     })
 }
 
-const COLUMNS: &str = "id, kind, name, config, secret_ref, scope_kind, scope_id, created_by, created_at, updated_at, verified_at, last_error, last_used_at";
+const COLUMNS: &str = "id, kind, name, config, secret_ref, scope_kind, scope_id, created_by, created_at, updated_at, verified_at, last_error, last_used_at, signing_ref";
 
 /// Whether `repo`'s runs may use integration `i`: its scope holds the repository.
 pub fn usable_by(i: &Integration, repo: &crate::store::Repo) -> bool {
@@ -339,13 +552,26 @@ pub async fn get(hub: &Hub, name: &str) -> anyhow::Result<Option<Integration>> {
     hub.store.call(move |c| Ok(c.query_row(&format!("SELECT {COLUMNS} FROM ci_integrations WHERE name = ?1"), params![name], row).optional()?)).await
 }
 
-/// Creates an integration; `secret` is its token or password, kept as a W09 secret.
-pub async fn create(hub: &Hub, kind_name: &str, name: &str, config: Value, secret: Option<&str>, scope: Option<&str>, by: &str) -> Result<Integration, String> {
+/// What an integration is made with that's secret: its token or password, and its signing secret
+/// for a kind that keeps one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Secrets<'a> {
+    pub secret: Option<&'a str>,
+    pub signing: Option<&'a str>,
+}
+
+/// Creates an integration; its secrets are kept as W09 secrets.
+pub async fn create(hub: &Hub, kind_name: &str, name: &str, config: Value, secrets: Secrets<'_>, scope: Option<&str>, by: &str) -> Result<Integration, String> {
+    let Secrets { secret, signing } = secrets;
     let info = kind(kind_name).ok_or_else(|| format!("no integration kind `{kind_name}` (kinds: {})", KINDS.iter().map(|k| k.kind).collect::<Vec<_>>().join(", ")))?;
     let name = check_name(name)?;
     check_config(info, &config)?;
     if secret.is_some_and(|s| !s.trim().is_empty()) && info.secret.is_none() {
         return Err(format!("{} federates with kiln's identity: it stores no secret", info.title));
+    }
+    let signing = signing.map(str::trim).filter(|s| !s.is_empty());
+    if signing.is_some() && info.signing.is_none() {
+        return Err(format!("{} keeps no signing secret", info.title));
     }
     let scope = match scope.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => secrets::parse_scope(hub, s).await?,
@@ -356,7 +582,10 @@ pub async fn create(hub: &Hub, kind_name: &str, name: &str, config: Value, secre
     if let Some(s) = secret {
         secrets::set(hub, &secret_scope(&id), SECRET_NAME, s, by).await?;
     }
-    let (row_id, n, k, cfg, has, by_s) = (id.clone(), name.clone(), info.kind.to_owned(), config.to_string(), secret.is_some(), by.to_owned());
+    if let Some(s) = signing {
+        secrets::set(hub, &secret_scope(&id), SIGNING_NAME, s, by).await?;
+    }
+    let (row_id, n, k, cfg, has, signs, by_s) = (id.clone(), name.clone(), info.kind.to_owned(), config.to_string(), secret.is_some(), signing.is_some(), by.to_owned());
     let inserted = hub
         .store
         .call(move |c| {
@@ -366,22 +595,23 @@ pub async fn create(hub: &Hub, kind_name: &str, name: &str, config: Value, secre
                 anyhow::bail!("an integration named `{n}` exists");
             }
             c.execute(
-                "INSERT INTO ci_integrations (id, kind, name, config, secret_ref, scope_kind, scope_id, created_by, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-                params![row_id, k, n, cfg, has.then_some(SECRET_NAME), scope.kind.as_str(), scope.id, by_s, now],
+                "INSERT INTO ci_integrations (id, kind, name, config, secret_ref, scope_kind, scope_id, created_by, created_at, updated_at, signing_ref) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
+                params![row_id, k, n, cfg, has.then_some(SECRET_NAME), scope.kind.as_str(), scope.id, by_s, now, signs.then_some(SIGNING_NAME)],
             )?;
             Ok(())
         })
         .await;
     if let Err(e) = inserted {
         let _ = secrets::delete(hub, &secret_scope(&id), SECRET_NAME).await;
+        let _ = secrets::delete(hub, &secret_scope(&id), SIGNING_NAME).await;
         return Err(format!("{e:#}"));
     }
     hub.store.audit(by.to_owned(), "integration.create".into(), format!("{name} ({})", info.kind)).await;
     get(hub, &name).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| "the integration vanished".into())
 }
 
-/// Changes an integration's configuration and/or secret (`Some("")` removes the secret).
-pub async fn update(hub: &Hub, name: &str, config: Option<Value>, secret: Option<&str>, by: &str) -> Result<Integration, String> {
+/// Changes an integration's configuration, secret and/or signing secret (`Some("")` removes one).
+pub async fn update(hub: &Hub, name: &str, config: Option<Value>, secret: Option<&str>, signing: Option<&str>, by: &str) -> Result<Integration, String> {
     let have = get(hub, name).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no integration `{name}`"))?;
     let info = kind(&have.kind).ok_or("its kind is no longer known")?;
     if let Some(c) = &config {
@@ -399,7 +629,19 @@ pub async fn update(hub: &Hub, name: &str, config: Option<Value>, secret: Option
         }
         None => {}
     }
-    let (id, cfg, has) = (have.id.clone(), config.map(|c| c.to_string()), secret.map(|s| !s.trim().is_empty()));
+    match signing.map(str::trim) {
+        Some("") => {
+            secrets::delete(hub, &secret_scope(&have.id), SIGNING_NAME).await.map_err(|e| format!("{e:#}"))?;
+        }
+        Some(s) => {
+            if info.signing.is_none() {
+                return Err(format!("{} keeps no signing secret", info.title));
+            }
+            secrets::set(hub, &secret_scope(&have.id), SIGNING_NAME, s, by).await?;
+        }
+        None => {}
+    }
+    let (id, cfg, has, signs) = (have.id.clone(), config.map(|c| c.to_string()), secret.map(|s| !s.trim().is_empty()), signing.map(|s| !s.trim().is_empty()));
     hub.store
         .call(move |c| {
             let now = crate::util::now_unix();
@@ -408,6 +650,9 @@ pub async fn update(hub: &Hub, name: &str, config: Option<Value>, secret: Option
             }
             if let Some(has) = has {
                 c.execute("UPDATE ci_integrations SET secret_ref = ?2, verified_at = NULL, updated_at = ?3 WHERE id = ?1", params![id, has.then_some(SECRET_NAME), now])?;
+            }
+            if let Some(signs) = signs {
+                c.execute("UPDATE ci_integrations SET signing_ref = ?2, updated_at = ?3 WHERE id = ?1", params![id, signs.then_some(SIGNING_NAME), now])?;
             }
             Ok(())
         })
@@ -420,6 +665,7 @@ pub async fn update(hub: &Hub, name: &str, config: Option<Value>, secret: Option
 pub async fn delete(hub: &Hub, name: &str, by: &str) -> anyhow::Result<bool> {
     let Some(have) = get(hub, name).await? else { return Ok(false) };
     secrets::delete(hub, &secret_scope(&have.id), SECRET_NAME).await?;
+    secrets::delete(hub, &secret_scope(&have.id), SIGNING_NAME).await?;
     let id = have.id.clone();
     hub.store.call(move |c| Ok(c.execute("DELETE FROM ci_integrations WHERE id = ?1", params![id])?)).await?;
     hub.store.audit(by.to_owned(), "integration.delete".into(), have.name).await;
@@ -438,6 +684,15 @@ async fn secret(hub: &Hub, i: &Integration) -> anyhow::Result<Option<String>> {
         return Ok(None);
     }
     secrets::reveal(hub, &secret_scope(&i.id), SECRET_NAME).await
+}
+
+/// The integration's signing secret (a Slack app's, a Teams outgoing webhook's), for checking what
+/// its service sends kiln.
+pub async fn signing_secret(hub: &Hub, i: &Integration) -> anyhow::Result<Option<String>> {
+    if !i.has_signing_secret {
+        return Ok(None);
+    }
+    secrets::reveal(hub, &secret_scope(&i.id), SIGNING_NAME).await
 }
 
 async fn mark(hub: &Hub, id: &str, result: &Result<String, String>) {
@@ -530,10 +785,15 @@ pub async fn verify(hub: &Hub, name: &str, as_: &VerifyAs) -> anyhow::Result<Res
             },
             // Each kind's check on the heap: inline, their futures overflowed a shard's stack in a
             // debug build (a webhook's verify took the server down).
-            "aws" | "gcp" | "azure" => Box::pin(verify_federated(hub, &i, as_)).await,
+            "aws" | "gcp" | "azure" | "vault" | "infisical" | "doppler" | "1password" => Box::pin(verify_federated(hub, &i, as_)).await,
             k if crate::ci::notify::CHANNELS.contains(&k) => Box::pin(crate::ci::notify::verify(hub, &i)).await,
             "vercel" => match secret(hub, &i).await {
                 Ok(Some(token)) => Box::pin(vercel::verify(&token, i.config.get("team_id").and_then(Value::as_str))).await.map_err(|e| format!("{e:#}")),
+                Ok(None) => Err("no token stored".into()),
+                Err(e) => Err(format!("{e:#}")),
+            },
+            "render" | "netlify" | "heroku" | "digitalocean" | "fly" => match secret(hub, &i).await {
+                Ok(Some(token)) => Box::pin(hosting::verify(&i.kind, &token, &i.config)).await.map_err(|e| format!("{e:#}")),
                 Ok(None) => Err("no token stored".into()),
                 Err(e) => Err(format!("{e:#}")),
             },
@@ -543,6 +803,7 @@ pub async fn verify(hub: &Hub, name: &str, as_: &VerifyAs) -> anyhow::Result<Res
                 Err(e) => Err(format!("{e:#}")),
             },
             "argocd" => Box::pin(crate::deploy::argocd::verify(hub, &i.name)).await,
+            "otel" => Box::pin(crate::ci::otel::verify(hub, &i)).await,
             "kiln" => Box::pin(crate::deploy::link::check(hub, &i.name)).await,
             other => Err(format!("no check for {other} yet")),
         }
@@ -583,6 +844,7 @@ async fn verify_federated(hub: &Hub, i: &Integration, as_: &VerifyAs) -> Result<
                 Err(explain(e, advice))
             }
         },
+        k if stores::KINDS.contains(&k) => stores::verify(hub, i, &w).await.map(|said| format!("{said} as {subject}")).map_err(|e| explain(anyhow::anyhow!(e), None)),
         _ => match azure::token(hub, i, &w, None).await {
             Ok(_) => Ok(format!("signed in to Azure as {subject}")),
             Err(e) => {
@@ -608,6 +870,8 @@ struct Create {
     #[serde(default)]
     secret: Option<String>,
     #[serde(default)]
+    signing_secret: Option<String>,
+    #[serde(default)]
     scope: Option<String>,
 }
 
@@ -617,10 +881,12 @@ struct Patch {
     config: Option<Value>,
     #[serde(default)]
     secret: Option<String>,
+    #[serde(default)]
+    signing_secret: Option<String>,
 }
 
 /// `/api/ci/integrations…`.
-pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap<String, String>, body: hyper::body::Incoming) -> Result<Response, Fail> {
+pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap<String, String>, body: kiln_http::Incoming) -> Result<Response, Fail> {
     use http::Method;
     let internal = |e: anyhow::Error| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     match (method, rest) {
@@ -631,7 +897,8 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap
         (&Method::POST, ["integrations"]) => {
             let c: Create = srv::body_json(body, 256 << 10).await.map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             let config = if c.config.is_null() { json!({}) } else { c.config };
-            let i = create(hub, &c.kind, &c.name, config, c.secret.as_deref(), c.scope.as_deref(), "admin").await.map_err(|e| fail(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            let secrets = Secrets { secret: c.secret.as_deref(), signing: c.signing_secret.as_deref() };
+            let i = create(hub, &c.kind, &c.name, config, secrets, c.scope.as_deref(), "admin").await.map_err(|e| fail(StatusCode::UNPROCESSABLE_ENTITY, e))?;
             Ok(srv::json(StatusCode::CREATED, &i))
         }
         (&Method::GET, ["integrations", "kinds"]) => Ok(srv::json(StatusCode::OK, &json!({ "kinds": KINDS }))),
@@ -641,7 +908,7 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap
         },
         (&Method::PATCH, ["integrations", name]) => {
             let p: Patch = srv::body_json(body, 256 << 10).await.map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-            let i = update(hub, name, p.config, p.secret.as_deref(), "admin").await.map_err(|e| fail(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            let i = update(hub, name, p.config, p.secret.as_deref(), p.signing_secret.as_deref(), "admin").await.map_err(|e| fail(StatusCode::UNPROCESSABLE_ENTITY, e))?;
             Ok(srv::json(StatusCode::OK, &i))
         }
         (&Method::DELETE, ["integrations", name]) => {
@@ -650,6 +917,27 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap
             } else {
                 Err(fail(StatusCode::NOT_FOUND, format!("no integration `{name}`")))
             }
+        }
+        // Where Slack's Events API sends a Slack integration's events: replies in its threads
+        // (docs/ci.md W14-R05).
+        (&Method::GET, ["integrations", name, "replies"]) => {
+            let i = get(hub, name).await.map_err(internal)?.ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("no integration `{name}`")))?;
+            match i.kind.as_str() {
+                "slack" => Ok(srv::json(
+                    StatusCode::OK,
+                    &json!({ "events_url": crate::ci::replies::events_url(hub, &i), "scopes": ["chat:write", "users:read", "users:read.email"], "events": ["message.channels", "message.groups"] }),
+                )),
+                "email" => Ok(srv::json(StatusCode::OK, &json!({ "replies": i.config.get("replies"), "imap_host": i.config.get("imap_host") }))),
+                other => Err(fail(StatusCode::NOT_FOUND, format!("a {other} integration takes no replies"))),
+            }
+        }
+        // Where a chat sends kiln its commands and buttons (docs/deploy-api.md §12.3), and what to
+        // set there; `POST` points a Telegram bot's webhook at kiln.
+        (&Method::GET | &Method::POST, ["integrations", name, "chat"]) => {
+            let i = get(hub, name).await.map_err(internal)?.ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("no integration `{name}`")))?;
+            let set = method == Method::POST;
+            let v = Box::pin(crate::ci::chat::setup(hub, &i, set)).await.map_err(|e| fail(if set { StatusCode::BAD_GATEWAY } else { StatusCode::NOT_FOUND }, e))?;
+            Ok(srv::json(StatusCode::OK, &v))
         }
         (&Method::POST, ["integrations", name, "verify"]) => {
             // Optional: whose identity a federated check runs with.

@@ -35,7 +35,7 @@ use serde_json::Value;
 use super::{Error, Item, Plan, R};
 use crate::goals::{At, By, Change, NewGoal, StepRef};
 use crate::harness::lineage::{Ask, Starter};
-use crate::harness::model::{Command, Status};
+use crate::harness::model::Command;
 use crate::hub::Hub;
 
 /// Steps one run has at the most.
@@ -94,6 +94,10 @@ pub struct Config {
     pub opener: Option<String>,
     /// Who ran it, as the audit trail names them.
     pub actor: String,
+    /// Only these steps, by their number from 0 (none: every step): the steps they wait for
+    /// outside them are taken as done.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub only: Option<Vec<usize>>,
 }
 
 /// One step of a run, as it stands.
@@ -163,7 +167,13 @@ pub fn goal_of(p: &Plan, i: usize, n: usize) -> String {
         Some(it) => it.goal(),
         None => p.steps.get(i).cloned().unwrap_or_default(),
     };
-    let line = format!("Step {} of {} of the plan \"{}\": {}", i + 1, n, p.title.trim(), step).split_whitespace().collect::<Vec<_>>().join(" ");
+    step_goal(&p.title, i, n, &step)
+}
+
+/// Step `i` (from 0) of `n` of the plan `title`, held to as a goal: where it stands in the plan, then
+/// `step` (the step as a goal).
+pub fn step_goal(title: &str, i: usize, n: usize, step: &str) -> String {
+    let line = format!("Step {} of {} of the plan \"{}\": {}", i + 1, n, title.trim(), step).split_whitespace().collect::<Vec<_>>().join(" ");
     if line.chars().count() > GOAL { format!("{}…", line.chars().take(GOAL).collect::<String>()) } else { line }
 }
 
@@ -210,8 +220,8 @@ fn steps_words(i: &[usize]) -> String {
 
 /// What a run says of how its steps run: which run side by side, and, side by side in one folder,
 /// that each step's agent keeps to its own files. None when every step waits for the one before.
-fn side_by_side(hub: &Hub, cfg: &Config, needs: &[Vec<usize>], given: &[Option<String>]) -> Option<String> {
-    let rounds = super::rounds(needs);
+fn side_by_side(hub: &Hub, cfg: &Config, needs: &[Vec<usize>], given: &[Option<String>], picked: &[usize]) -> Option<String> {
+    let rounds: Vec<Vec<usize>> = super::rounds(needs).into_iter().map(|r| r.into_iter().filter(|i| picked.contains(i)).collect()).collect();
     let together: Vec<&Vec<usize>> = rounds.iter().filter(|r| r.len() > 1).collect();
     if together.is_empty() {
         return None;
@@ -235,46 +245,85 @@ fn side_by_side(hub: &Hub, cfg: &Config, needs: &[Vec<usize>], given: &[Option<S
 }
 
 /// Runs plan `p` as one agent per step, as `cfg` says. The steps that wait for none start at once.
-pub async fn start(hub: &Arc<Hub>, p: &Plan, cfg: Config) -> R<Started> {
+/// Under `key` (CP-T3.2), asked for again, it's the run it started then, as it stands.
+pub async fn start(hub: &Arc<Hub>, p: &Plan, cfg: Config, key: Option<&str>) -> R<Started> {
+    super::ready_to_run(p)?;
     let n = p.steps.len().min(STEPS);
     if n == 0 {
         return Err(Error::Bad("this plan has no steps (no list in it) to give agents".into()));
     }
-    let given: Vec<Option<String>> = (0..n).map(|i| given_to(hub, &cfg, i)).collect::<R<_>>()?;
+    let picked = super::Pick { only: cfg.only.clone(), split: false }.of(n);
+    if picked.is_empty() {
+        return Err(Error::Bad(format!("none of those steps is in this plan: it has {n}")));
+    }
+    let given: Vec<Option<String>> = (0..n).map(|i| if picked.contains(&i) { given_to(hub, &cfg, i) } else { Ok(None) }).collect::<R<_>>()?;
     let blank = |k: &Option<String>| k.as_deref().is_none_or(|k| k.trim().is_empty());
-    if blank(&cfg.place.kind) && (0..n).any(|i| given.get(i).is_some_and(Option::is_none) && cfg.steps.get(i).is_none_or(|s| blank(&s.kind))) {
+    if blank(&cfg.place.kind) && picked.iter().any(|&i| given.get(i).is_some_and(Option::is_none) && cfg.steps.get(i).is_none_or(|s| blank(&s.kind))) {
         return Err(Error::Bad("say which harness runs its steps: `new.kind` (or each step's `kind`)".into()));
     }
-    let needs = super::waits(&p.items, n, cfg.parallel);
-    let note = side_by_side(hub, &cfg, &needs, &given);
-    let steps: Vec<(String, String, String, Option<String>)> = (0..n)
-        .map(|i| (title_of(p, i), goal_of(p, i, n), serde_json::to_string(needs.get(i).map_or(&[][..], Vec::as_slice)).unwrap_or_else(|_| "[]".into()), given.get(i).cloned().flatten()))
+    // The steps it takes wait only for each other: those outside the run are taken as done.
+    let all = super::waits(&p.items, n, cfg.parallel);
+    let needs: Vec<Vec<usize>> = all.iter().enumerate().map(|(i, d)| if picked.contains(&i) { d.iter().copied().filter(|j| picked.contains(j)).collect() } else { d.clone() }).collect();
+    let outside: Vec<String> = picked
+        .iter()
+        .filter_map(|&i| {
+            let o: Vec<usize> = all.get(i)?.iter().copied().filter(|j| !picked.contains(j)).collect();
+            (!o.is_empty()).then(|| format!("step {} waits for {}", i + 1, steps_words(&o)))
+        })
         .collect();
-    let (run, now, version, plan_id, by) = (crate::util::new_id(), crate::util::now_unix(), p.version, p.id.clone(), cfg.actor.clone());
+    let outside = (!outside.is_empty()).then(|| format!("Not in this run, taken as done: {}.", outside.join("; ")));
+    let note = [side_by_side(hub, &cfg, &needs, &given, &picked), outside].into_iter().flatten().collect::<Vec<_>>();
+    let note = (!note.is_empty()).then(|| note.join(" "));
+    // Each step keeps its number in the plan.
+    let steps: Vec<(usize, String, String, String, Option<String>)> = picked
+        .iter()
+        .map(|&i| (i, title_of(p, i), goal_of(p, i, n), serde_json::to_string(needs.get(i).map_or(&[][..], Vec::as_slice)).unwrap_or_else(|_| "[]".into()), given.get(i).cloned().flatten()))
+        .collect();
+    let taken = steps.len();
+    // The same id as `plans::run` makes under the key: one key, one request, whatever its mode.
+    let run = key.map_or_else(crate::util::new_id, |k| crate::util::derive_id(&["plans.run", &p.id, k]));
+    let (now, version, plan_id, by) = (crate::util::now_unix(), p.version, p.id.clone(), cfg.actor.clone());
     let config = serde_json::to_string(&cfg).map_err(anyhow::Error::from)?;
     let (run_c, note_c) = (run.clone(), note.clone());
-    hub.store
+    // The run it started before under its key: its steps and note as they were, what it was asked
+    // (its config), and whether it was one agent per step too.
+    let had: Option<(usize, Option<String>, Option<String>, bool)> = hub
+        .store
         .call(move |c| {
-            let tx = c.transaction()?;
-            tx.execute(
-                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by, state, config, note) VALUES (?1, ?2, ?3, '', 'agents', ?4, ?5, 'running', ?6, ?7)",
+            let tx = crate::store::tx(c)?;
+            let made = tx.execute(
+                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by, state, config, note) VALUES (?1, ?2, ?3, '', 'agents', ?4, ?5, 'running', ?6, ?7) ON CONFLICT (id) DO NOTHING",
                 params![run_c, plan_id, version, now, by, config, note_c],
             )?;
-            for (i, (title, goal, needs, given)) in steps.iter().enumerate() {
+            if made == 0 {
+                let steps: i64 = tx.query_row("SELECT COUNT(*) FROM plan_run_steps WHERE run_id = ?1", params![run_c], |r| r.get(0))?;
+                let (note, was, mode): (Option<String>, Option<String>, String) = tx.query_row("SELECT note, config, mode FROM plan_runs WHERE id = ?1", params![run_c], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                return Ok(Some((usize::try_from(steps).unwrap_or(0), note, was, mode == "agents")));
+            }
+            for (i, title, goal, needs, given) in &steps {
                 tx.execute(
                     "INSERT INTO plan_run_steps (run_id, idx, title, goal, needs, given_to) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![run_c, i64::try_from(i).unwrap_or(0), title, goal, needs, given],
+                    params![run_c, i64::try_from(*i).unwrap_or(0), title, goal, needs, given],
                 )?;
             }
             tx.commit()?;
-            Ok(())
+            Ok(None)
         })
         .await?;
+    if let Some((steps, note, was, agents)) = had {
+        // Asked again under its key for other steps, or after a run of it in another mode, it's
+        // another request: refused, never answered as the run it isn't.
+        let was_cfg = was.as_deref().and_then(|c| serde_json::from_str::<Config>(c).ok());
+        if !agents || was_cfg.as_ref().is_none_or(|c| c.only != cfg.only) {
+            return Err(Error::Refused(http::StatusCode::CONFLICT, "this key was given to another request (other steps, or another mode): give this one a key of its own".into()));
+        }
+        return Ok(Started { run, steps, note });
+    }
     // The first steps' agents, now rather than at the next look.
     if let Err(e) = advance(hub, &run).await {
         tracing::warn!(%run, error = %format!("{e:#}"), "plan run");
     }
-    Ok(Started { run, steps: n, note })
+    Ok(Started { run, steps: taken, note })
 }
 
 struct Row {
@@ -514,7 +563,7 @@ async fn mark_started(hub: &Hub, run: &str, idx: i64, agent: &str) -> R<()> {
 async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
     let at = usize::try_from(row.idx).unwrap_or(0);
     let step = StepRef { plan: head.plan.clone(), version: head.version, n: at + 1, run: Some(run.to_owned()) };
-    let goal = vec![NewGoal { text: row.goal.clone(), step: Some(step) }];
+    let goal = vec![NewGoal { text: row.goal.clone(), step: Some(step), ..NewGoal::default() }];
     if let Some(to) = row.given_to.as_deref() {
         if hub.harness.info(to).is_none() {
             return Err(Error::Bad("the agent it was given to has ended".into()));
@@ -532,7 +581,13 @@ async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
         Some(p) => Some(hub.harness.info(p).ok_or_else(|| Error::Bad("the agent that ran this plan has ended, so its steps can't be held to it: run the plan again".into()))?),
         None => None,
     };
-    let starter = Starter { parent, opener: head.config.opener.clone(), actor: head.config.actor.clone(), plan_run: Some(run.to_owned()) };
+    // The person who ran the plan needs runners.terminal where each step's agent starts, as they
+    // would to start it themselves (docs/agents.md, "Whose agents").
+    let asker = match head.config.opener.as_deref() {
+        Some(o) => crate::authz::gate::agent_for(hub, &head.config.actor, o).await,
+        None => None,
+    };
+    let starter = Starter { parent, opener: head.config.opener.clone(), actor: head.config.actor.clone(), plan_run: Some(run.to_owned()), asker };
     let name: String = format!("Step {}: {}", at + 1, row.title).chars().take(80).collect();
     let ask = Ask {
         kind: pick(&own.kind, &base.kind).unwrap_or_default(),
@@ -588,15 +643,12 @@ async fn let_go(hub: &Hub, run: &str, row: &Row, interrupt: bool) {
 }
 
 /// How many more steps may start now: (steps at all, steps that start an agent) within the run's
-/// `max_parallel` (`at_work` are at work) and the agents its parent may run at once (`[agents]
-/// max_children`).
-fn room(hub: &Hub, head: &Head, at_work: usize) -> (usize, usize) {
+/// `max_parallel` (`at_work` are at work) and the room left in its parent's pool of subagents at
+/// work (its Subagents setting, whatever each does; none set, no limit: `lineage::room`).
+async fn room(hub: &Hub, head: &Head, at_work: usize) -> (usize, usize) {
     let all = head.config.max_parallel.filter(|m| *m > 0).map_or(usize::MAX, |m| m.saturating_sub(at_work));
-    let agents = match head.config.parent.as_deref() {
-        Some(p) => {
-            let max = usize::try_from(hub.cfg.agents.max_children).unwrap_or(usize::MAX);
-            max.saturating_sub(hub.harness.list().iter().filter(|i| i.parent.as_deref() == Some(p) && i.status != Status::Exited).count())
-        }
+    let agents = match head.config.parent.as_deref().and_then(|p| hub.harness.info(p)) {
+        Some(p) => crate::harness::lineage::room(hub, &p).await,
         None => usize::MAX,
     };
     (all, agents)
@@ -656,7 +708,7 @@ async fn advance_locked(hub: &Arc<Hub>, run: &str) -> R<()> {
     }
     let met: Vec<usize> = rows.iter().filter(|r| r.status == "met").filter_map(|r| usize::try_from(r.idx).ok()).collect();
     let mut at_work = rows.iter().filter(|r| matches!(r.status.as_str(), "started" | "taken")).count();
-    let (mut all, mut agents) = room(hub, &head, at_work);
+    let (mut all, mut agents) = room(hub, &head, at_work).await;
     let mut no_room = false;
     for row in rows.iter_mut().filter(|r| r.status == "waiting" && r.needs.iter().all(|d| met.contains(d))) {
         let own = row.given_to.is_none();
@@ -680,8 +732,17 @@ async fn advance_locked(hub: &Arc<Hub>, run: &str) -> R<()> {
         }
     }
     if at_work == 0 {
-        let why = match head.config.parent.as_deref().and_then(|p| hub.harness.info(p)) {
-            Some(p) if no_room => format!("{} runs as many agents as it may at once ([agents] max_children): end some it no longer needs, then retry the run's next step", p.name),
+        let parent = head.config.parent.as_deref().and_then(|p| hub.harness.info(p));
+        // No room while its parent has other subagents at work (one pool, whatever each does:
+        // docs/agentic.md P2): its steps wait for one to finish, rather than the run stopping.
+        if no_room
+            && let Some(p) = &parent
+            && crate::harness::lineage::busy(hub, p).await
+        {
+            return Ok(());
+        }
+        let why = match parent {
+            Some(p) if no_room => format!("{} may have no subagents at work ({}): raise that, then retry the run's next step", p.name, crate::harness::lineage::limit_words(hub, &p).await),
             _ => held_up(&rows),
         };
         set_run(hub, run, "stopped", Some(why)).await?;
@@ -738,13 +799,19 @@ fn step_row(rows: &[Row], n: usize) -> R<&Row> {
 }
 
 /// Tries step `n` again (a new agent for it; given to an agent that's there, its goal again on that
-/// agent's stack): the one before, if it still runs, ends, and the run goes on from there.
-pub async fn retry(hub: &Arc<Hub>, run: &str, n: usize, by: &str) -> R<Run> {
+/// agent's stack): the one before, if it still runs, ends, and the run goes on from there. `seen`:
+/// the try the asker means to replace (the step's `tries` as it saw them): asked again once the step
+/// was tried again since, nothing more is started (CP-T3.2), and the run is answered as it is.
+pub async fn retry(hub: &Arc<Hub>, run: &str, n: usize, seen: Option<i64>, by: &str) -> R<Run> {
     {
         let lock = looking(run);
         let _one = lock.lock().await;
         let (_, rows) = load_run(hub, run).await?;
         let row = step_row(&rows, n)?;
+        if seen.is_some_and(|t| t != row.tries) {
+            drop(_one);
+            return view(hub, run).await;
+        }
         if row.status == "met" {
             return Err(Error::Bad(format!("step {n} is met already")));
         }
@@ -852,7 +919,7 @@ mod tests {
                     actor: "admin".into(),
                     ..Config::default()
                 };
-                let started = start(&hub, &p, cfg).await?;
+                let started = start(&hub, &p, cfg, None).await?;
                 anyhow::ensure!(started.steps == 3 && started.note.is_none(), "each step waits for the one before: nothing side by side to say");
                 let run = started.run;
                 let meet = |agent: String| {
@@ -884,9 +951,12 @@ mod tests {
                 let v = view(&hub, &run).await?;
                 anyhow::ensure!(v.state == "stopped" && v.steps.get(2).is_some_and(|s| s.stand == "unmet") && v.reason.as_deref().is_some_and(|r| r.contains("step 3 wasn't met")), "{:?} {:?}", v.state, v.reason);
                 // Retried: a new agent, and the run goes on to done.
-                let v = retry(&hub, &run, 3, "admin").await?;
+                let v = retry(&hub, &run, 3, Some(1), "admin").await?;
                 let a3b = v.steps.get(2).and_then(|s| s.agent_id.clone()).unwrap_or_default();
                 anyhow::ensure!(v.state == "running" && a3b != a3 && v.steps.get(2).is_some_and(|s| s.tries == 2), "a new agent for the step");
+                // Asked again for the try it replaced (its answer lost, CP-T3.2): nothing more starts.
+                let again = retry(&hub, &run, 3, Some(1), "admin").await?;
+                anyhow::ensure!(again.steps.get(2).is_some_and(|s| s.tries == 2 && s.agent_id.as_deref() == Some(a3b.as_str())), "the retry asked again started another: {:?}", again.steps.get(2).map(|s| (s.tries, s.agent_id.clone())));
                 meet(a3b).await?;
                 advance(&hub, &run).await?;
                 let v = view(&hub, &run).await?;
@@ -960,7 +1030,7 @@ mod tests {
                 let items = vec![it("Schema", &[]), it("API", &[1]), it("UI", &[1]), it("Docs", &[]), it("Ship", &[2, 3])];
                 let p = super::super::create(&hub, super::super::New { title: "Graph".into(), items, ..Default::default() }, "admin").await?;
                 let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some("/nonexistent/kiln-plan-dag".into()), ..Place::default() };
-                let started = start(&hub, &p, Config { place, opener: Some("owner".into()), actor: "admin".into(), ..Config::default() }).await?;
+                let started = start(&hub, &p, Config { place, opener: Some("owner".into()), actor: "admin".into(), ..Config::default() }, None).await?;
                 let note = started.note.clone().unwrap_or_default();
                 anyhow::ensure!(note.contains("steps 1 and 4; steps 2 and 3") && note.contains("one folder"), "{note}");
                 let run = started.run;
@@ -987,7 +1057,7 @@ mod tests {
                 let v = view(&hub, &run).await?;
                 anyhow::ensure!(v.state == "stopped" && v.reason.as_deref().is_some_and(|r| r.starts_with("step 2 wasn't met")), "{} {:?}", v.state, v.reason);
                 // Retried: a new agent for step 2 only; met, step 5 starts; met, done.
-                let v = retry(&hub, &run, 2, "admin").await?;
+                let v = retry(&hub, &run, 2, None, "admin").await?;
                 anyhow::ensure!(v.state == "running" && stands(&v) == strs(&["met", "working", "met", "met", "waiting"]) && v.steps.get(1).is_some_and(|s| s.tries == 2), "{:?}", stands(&v));
                 meet(&hub, &run, 2).await?;
                 advance(&hub, &run).await?;
@@ -1003,6 +1073,50 @@ mod tests {
         })
     }
 
+    /// The plan an agent proposes (plan mode) is kept as one of kiln's plans: one an agent, a new
+    /// version each time it proposes another, the same words again changing nothing.
+    #[test]
+    fn an_agents_proposed_plan_is_kept_one_an_agent() -> anyhow::Result<()> {
+        on_a_hub(|hub| {
+            Box::pin(async move {
+                let keep = |agent: &'static str, words: &'static str| super::super::keep_proposed(&hub, agent, words);
+                let first = keep("a1", "# Fix the mount\n\n1. Read the log\n2. Fix the rule").await?;
+                anyhow::ensure!(first.title == "Fix the mount" && first.version == 1 && first.steps.len() == 2, "{first:?}");
+                anyhow::ensure!(first.source.as_ref().is_some_and(|s| s.proposed && s.session.as_deref() == Some("a1")), "{:?}", first.source);
+                let same = keep("a1", "# Fix the mount\n\n1. Read the log\n2. Fix the rule\n").await?;
+                anyhow::ensure!(same.id == first.id && same.version == 1, "the same words change nothing: {same:?}");
+                let next = keep("a1", "# Fix the mount, again\n\n1. Read the log\n2. Fix the rule\n3. Test it").await?;
+                anyhow::ensure!(next.id == first.id && next.version == 2 && next.title == "Fix the mount, again" && next.steps.len() == 3, "{next:?}");
+                let other = keep("a2", "1. Something else").await?;
+                anyhow::ensure!(other.id != first.id, "one an agent");
+                Ok(())
+            })
+        })
+    }
+
+    /// A run of some of a plan's steps (`only`) keeps each step's number; the steps they wait for
+    /// outside the run are taken as done (and the run says so), those inside it still wait.
+    #[test]
+    fn a_run_of_some_steps_keeps_their_numbers_and_takes_the_rest_as_done() -> anyhow::Result<()> {
+        on_a_hub(|hub| {
+            Box::pin(async move {
+                let item = |t: &str, needs: Vec<usize>| Item { title: t.into(), needs, ..Item::default() };
+                let items = vec![item("Schema", vec![]), item("Server", vec![1]), item("Client", vec![2]), item("Docs", vec![])];
+                let p = super::super::create(&hub, super::super::New { title: "Some".into(), items, ..Default::default() }, "admin").await?;
+                let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some("/nonexistent/kiln-plan-some".into()), ..Place::default() };
+                let cfg = Config { place, only: Some(vec![1, 2]), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
+                let started = start(&hub, &p, cfg, None).await?;
+                anyhow::ensure!(started.steps == 2, "{started:?}");
+                anyhow::ensure!(started.note.as_deref().is_some_and(|n| n.contains("Not in this run, taken as done: step 2 waits for step 1.")), "{:?}", started.note);
+                let v = view(&hub, &started.run).await?;
+                let ns: Vec<usize> = v.steps.iter().map(|s| s.n).collect();
+                anyhow::ensure!(ns == [2, 3], "{ns:?}");
+                anyhow::ensure!(stands(&v) == strs(&["working", "waiting"]), "{:?}", stands(&v));
+                Ok(())
+            })
+        })
+    }
+
     /// Run side by side, steps of a plan that doesn't say what they wait for start together, as
     /// many at once as `max_parallel` lets: the next starts as one ends.
     #[test]
@@ -1013,11 +1127,38 @@ mod tests {
                 let p = super::super::create(&hub, super::super::New { title: "Fan out".into(), items, ..Default::default() }, "admin").await?;
                 let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some("/nonexistent/kiln-plan-fan".into()), ..Place::default() };
                 let cfg = Config { place, parallel: true, max_parallel: Some(2), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
-                let run = start(&hub, &p, cfg).await?.run;
+                let run = start(&hub, &p, cfg, None).await?.run;
                 anyhow::ensure!(stands(&view(&hub, &run).await?) == strs(&["working", "working", "waiting"]));
                 meet(&hub, &run, 2).await?;
                 advance(&hub, &run).await?;
                 anyhow::ensure!(stands(&view(&hub, &run).await?) == strs(&["working", "met", "working"]));
+                Ok(())
+            })
+        })
+    }
+
+    /// docs/agentic.md P2: run by an agent held to fewer subagents than `[agents] max_children` (its
+    /// Subagents setting), steps side by side wait for room within it, rather than fail to start.
+    #[test]
+    fn p2_side_by_side_waits_for_room_within_the_parent_s_subagents_setting() -> anyhow::Result<()> {
+        on_a_hub(|hub| {
+            Box::pin(async move {
+                let folder = tempfile::tempdir()?;
+                let cwd = folder.path().to_string_lossy().into_owned();
+                let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(cwd.clone()), mode: Some("default".into()), name: Some("Main".into()), max_subagents: Some(1), ..Default::default() };
+                let main = hub.harness.open(&hub, "local", spec, 1).await?.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("no agent"))?;
+                for _ in 0..200 {
+                    if hub.harness.info(&main).is_some_and(|i| i.max_subagents == Some(1)) {
+                        break;
+                    }
+                    crate::rt::sleep(Duration::from_millis(20)).await;
+                }
+                let items = ["One", "Two", "Three"].iter().map(|t| Item { title: (*t).to_owned(), ..Item::default() }).collect();
+                let p = super::super::create(&hub, super::super::New { title: "Fan out".into(), items, ..Default::default() }, "admin").await?;
+                let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some(cwd), ..Place::default() };
+                let cfg = Config { place, parallel: true, main: Some(main.clone()), parent: Some(main), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
+                let v = view(&hub, &start(&hub, &p, cfg, None).await?.run).await?;
+                anyhow::ensure!(stands(&v) == strs(&["working", "waiting", "waiting"]), "{:?} {:?}", stands(&v), v.steps.iter().map(|s| &s.reason).collect::<Vec<_>>());
                 Ok(())
             })
         })
@@ -1034,7 +1175,7 @@ mod tests {
             Box::pin(async move {
                 let folder = tempfile::tempdir()?;
                 let cwd = folder.path().to_string_lossy().into_owned();
-                let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None };
+                let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
                 let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd.clone()), mode: Some("default".into()), name: Some("Main".into()), count: Some(1), ..Ask::default() };
                 let main = crate::harness::lineage::start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?.id;
                 crate::goals::add(&hub, &main, vec!["keep the docs current".into()], false).await?;
@@ -1050,7 +1191,7 @@ mod tests {
                 let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some(cwd.clone()), ..Place::default() };
                 let steps = vec![Place { agent: Some("main".into()), ..Place::default() }];
                 let cfg = Config { place, steps, main: Some(main.clone()), parent: Some(main.clone()), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
-                let run = start(&hub, &p, cfg).await?.run;
+                let run = start(&hub, &p, cfg, None).await?.run;
                 let v = view(&hub, &run).await?;
                 anyhow::ensure!(stands(&v) == strs(&["working", "waiting"]) && v.steps.first().is_some_and(|s| s.given && s.agent_id.as_deref() == Some(main.as_str())), "{:?}", stands(&v));
                 anyhow::ensure!(hub.harness.list().iter().all(|i| i.parent.as_deref() != Some(main.as_str())), "no agent started for a step given to the main agent");
@@ -1106,7 +1247,22 @@ mod tests {
     }
 
     fn plan(items: Vec<Item>, steps: Vec<String>) -> Plan {
-        Plan { id: "p".into(), title: "Retry rework".into(), body: String::new(), tags: vec![], source: None, share: None, version: 1, created_at: 0, updated_at: 0, steps, items, runs: 0 }
+        Plan {
+            id: "p".into(),
+            title: "Retry rework".into(),
+            body: String::new(),
+            tags: vec![],
+            source: None,
+            share: None,
+            version: 1,
+            created_at: 0,
+            updated_at: 0,
+            steps,
+            items,
+            runs: 0,
+            phase: "ready".into(),
+            research: None,
+        }
     }
 
     #[test]

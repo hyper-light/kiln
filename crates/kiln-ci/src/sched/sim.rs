@@ -2,7 +2,7 @@
 //! driving the real [`Scheduler`]. Tests and `kiln ci bench --scheduler` use it.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use super::retry::{Failed, FailureClass};
 use super::state::{Command, Config, Input, LegIn, Outcome, RunnerIn, Scheduler, WaitReason};
@@ -32,6 +32,8 @@ pub struct Sim {
     events: HashMap<u64, Ev>,
     seq: u64,
     durations: HashMap<String, i64>,
+    /// A leg's duration on one runner, where it differs (a warm runner's, W24-R18): (leg, runner).
+    pub durations_on: HashMap<(String, String), i64>,
     failures: HashMap<String, Vec<FailureClass>>,
     repos: HashMap<String, String>,
     running: HashMap<String, (String, i64)>,
@@ -41,6 +43,13 @@ pub struct Sim {
     pub runs: Vec<(i64, Command)>,
     /// Slot-time: (repo, start, end).
     pub busy: Vec<(String, i64, i64)>,
+    /// How long a host takes to start a pool's executor (W13-R09).
+    pub executor_start_ms: i64,
+    /// Hosts whose executors fail to start.
+    pub failing_hosts: HashSet<String>,
+    /// Executors started: (time, executor, host); and stopped: (time, executor).
+    pub executors_started: Vec<(i64, String, String)>,
+    pub executors_stopped: Vec<(i64, String)>,
 }
 
 impl Sim {
@@ -52,6 +61,7 @@ impl Sim {
             events: HashMap::new(),
             seq: 0,
             durations: HashMap::new(),
+            durations_on: HashMap::new(),
             failures: HashMap::new(),
             repos: HashMap::new(),
             running: HashMap::new(),
@@ -60,6 +70,10 @@ impl Sim {
             waits: Vec::new(),
             runs: Vec::new(),
             busy: Vec::new(),
+            executor_start_ms: 500,
+            failing_hosts: HashSet::new(),
+            executors_started: Vec::new(),
+            executors_stopped: Vec::new(),
         }
     }
 
@@ -124,8 +138,8 @@ impl Sim {
             match c {
                 Command::Assign { leg, runner, attempt, .. } => {
                     self.assigned.push(Assigned { at: self.now, leg: leg.clone(), runner: runner.clone(), attempt });
+                    let d = self.durations_on.get(&(leg.clone(), runner.clone())).or_else(|| self.durations.get(&leg)).copied().unwrap_or(60_000);
                     self.running.insert(leg.clone(), (runner, self.now));
-                    let d = self.durations.get(&leg).copied().unwrap_or(60_000);
                     self.at(self.now + d, Ev::Finish { leg, attempt });
                 }
                 Command::Cancel { leg, attempt, .. } => {
@@ -143,6 +157,25 @@ impl Sim {
                     }
                 }
                 Command::Timer { at } => self.at(at, Ev::Tick),
+                Command::StartExecutor { executor, runner, .. } => {
+                    self.executors_started.push((self.now, executor.clone(), runner.clone()));
+                    let t = self.now + self.executor_start_ms;
+                    if self.failing_hosts.contains(&runner) {
+                        self.input(t, Input::ExecutorFailed { executor, error: format!("{runner} couldn't start it") });
+                    } else if runner.is_empty() {
+                        // The server's executor (a `k8s` pool's pod): its own runner connects.
+                        self.input(t, Input::RunnerUp(Box::new(RunnerIn { id: format!("pod-{executor}"), slots: 1, executor: Some(executor), ..RunnerIn::default() })));
+                    } else {
+                        self.input(t, Input::ExecutorReady { executor });
+                    }
+                }
+                Command::StopExecutor { executor, runner } => {
+                    self.executors_stopped.push((self.now, executor));
+                    // A pod goes with its runner.
+                    if runner.starts_with("pod-") {
+                        self.input(self.now, Input::RunnerLost { runner });
+                    }
+                }
                 Command::Settled { leg, outcome, .. } => self.settled.push((self.now, leg, outcome)),
                 Command::Wait { leg, reason } => self.waits.push((self.now, leg, reason)),
                 c @ (Command::StartRun { .. } | Command::CancelRun { .. }) => self.runs.push((self.now, c)),

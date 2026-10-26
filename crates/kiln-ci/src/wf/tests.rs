@@ -83,6 +83,19 @@ fn w02_s05_untrusted_input_in_run() {
     assert_eq!(step.first().map(|(k, v)| (k.as_str(), v.src.as_str())), Some(("PULL_REQUEST_TITLE", "${{ github.event.pull_request.title }}")));
 }
 
+/// W21-R01's quick fixes: an unknown key close to a known one comes with its rename.
+#[test]
+fn w21_r01_an_unknown_keys_fix() {
+    let src = "on: push\njobs:\n  a:\n    runs_on: x\n    steps: [{run: echo}]\n";
+    let (_, d) = gha(src);
+    let e = d.iter().find(|x| x.code == "KCI1010");
+    assert_eq!(e.and_then(|x| x.fix.as_ref()).map(|f| f.title.as_str()), Some("Rename it `runs-on`"), "{d:?}");
+    let fixed = e.map(|x| apply_fix(src, x)).unwrap_or_default();
+    assert_eq!(fixed, src.replace("runs_on", "runs-on"));
+    let (_, again) = gha(&fixed);
+    assert!(errors(&again).is_empty(), "{:?}", errors(&again));
+}
+
 #[test]
 fn w02_s05_fix_quotes_for_the_shell() {
     // A block scalar, single and no quotes, an existing env, the same value twice.
@@ -143,6 +156,30 @@ fn kiln_keys_are_refused_in_github_workflows() {
     assert!(codes(&d).contains(&"KCI5001"), "{d:?}");
 }
 
+/// W05-R03, W05-R22: a job's `resources:` and `requires:` are checked at their lines, not when a
+/// leg waits for a runner none can be (or, for a lone `=`, never stops reading the constraint).
+#[test]
+fn resources_and_requires_are_checked_at_their_lines() {
+    let src = "on: push\njobs:\n  a:\n    resources: { cpu: lots, memory: 512m, gpu: two, memroy: 1Gi }\n    requires: ['os == linux', 'os = linux', '${{ matrix.needs }}']\n    steps:\n      - run: make\n";
+    let (_, d) = kiln(src);
+    let found = errors(&d);
+    for want in [
+        "KCI1011 4:",
+        "resources.cpu` isn't a number of CPUs (`2`, `0.5`, `500m`): `lots`",
+        "resources.memory` isn't a size (`512Mi`, `32Gi`, `2G`): `512m`",
+        "resources.gpu` isn't a number of GPUs: `two`",
+        "KCI1010 4:",
+        "unknown key `memroy` in `resources`",
+        "KCI1011 5:",
+        "`os = linux`: `=` alone isn't an operator (`==`?)",
+    ] {
+        assert!(found.iter().any(|e| e.contains(want)), "{want}: {found:?}");
+    }
+    assert_eq!(found.len(), 5, "the good constraint and the templated one pass: {found:?}");
+    let (_, d) = kiln("on: push\njobs:\n  a:\n    resources: { cpu: 500m, memory: 32Gi, disk: 50G, gpu: 1 }\n    requires: ['os == linux && arch == x86_64']\n    steps:\n      - run: make\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+}
+
 #[test]
 fn w02_r06_v1_forms() {
     let src = "name: ci\non:\n  push: { branches: [main] }\n  tag: { branches: ['v*'] }\n  schedule: ['0 6 * * *']\njobs:\n  test:\n    toolchain: rust\n    matrix: { profile: [dev, release] }\n    retries: 2\n    artifacts: ['target/**']\n    cache: ['.cargo/registry']\n    exclusive: true\n    if: branch == 'main'\n    steps:\n      - run: cargo test --profile ${{ matrix.profile }}\n        tty: true\n";
@@ -187,6 +224,21 @@ fn w02_ac05_overlays() {
     assert!(d.iter().any(|x| x.code == "KCI1010"), "overlays can't change GitHub keys: {d:?}");
 }
 
+/// W05-R03: a GitHub workflow's job says what it needs through its overlay (kiln's own keys, in
+/// `.kiln/overlays/`), and the scheduler reads it as it reads the kiln dialect's (`sched::needs`).
+#[test]
+fn w05_r03_a_github_jobs_needs_come_from_its_overlay() {
+    let (wf, d) = gha("on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let mut wf = wf.unwrap_or_default();
+    let (ov, d) = parse_overlay("jobs:\n  build:\n    exclusive: true\n    resources: { cpu: 8, memory: 32Gi }\n    requires: [\"os == linux\", \"arch == x86_64\"]\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let d = apply_overlay(&mut wf, &ov.unwrap_or_default());
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let j = wf.job("build").cloned().unwrap_or_default();
+    assert_eq!(crate::sched::needs::of_job(&j.kiln), crate::sched::needs::parse("cpus=8,mem=32g,linux/amd64,exclusive"));
+}
+
 #[test]
 fn file_kinds_and_precedence() {
     assert_eq!(file_kind(".github/workflows/ci.yml"), Some(FileKind::GhaWorkflow));
@@ -212,6 +264,21 @@ fn actions() {
     assert!(d.iter().any(|x| x.code == "KCI1010" && x.severity == Severity::Warning), "unknown keys only warn");
     let (_, d) = parse_action("runs:\n  using: node20\n");
     assert!(codes(&d).contains(&"KCI1014"));
+}
+
+/// W09-AC06: an action reading a secret it doesn't declare is told so (`KCI4041`, a warning:
+/// inside it the secret is nothing), where it reads it; what it declares, and `GITHUB_TOKEN`,
+/// are fine.
+#[test]
+fn actions_read_only_the_secrets_they_declare() {
+    let (_, d) = parse_action(
+        "name: deploy\nsecrets:\n  DEPLOY_KEY: { required: true }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo ${{ secrets.deploy_key }} ${{ secrets.GITHUB_TOKEN }}\n    - shell: bash\n      env:\n        O: ${{ secrets.OTHER }}\n      run: echo $O\n",
+    );
+    let found: Vec<&Diag> = d.iter().filter(|x| x.code == "KCI4041").collect();
+    assert_eq!(found.len(), 1, "{d:?}");
+    assert!(found.iter().all(|x| x.severity == Severity::Warning && x.message.contains("`OTHER`") && x.path == "runs.steps[1].env.O" && x.range.start.line == 11), "{found:?}");
+    let (_, d) = parse_action("name: plain\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo ${{ secrets.TOKEN }}\n");
+    assert!(d.iter().any(|x| x.code == "KCI4041" && x.message.contains("`TOKEN`")), "declaring none, it reads none: {d:?}");
 }
 
 #[test]
@@ -281,4 +348,19 @@ fn needs_of_itself_and_twice_end() {
     assert!(errors(&d).is_empty(), "{d:?}");
     let (_, d) = gha("on: push\njobs:\n  a:\n    runs-on: x\n    needs: b\n    steps: [{run: a}]\n  b:\n    runs-on: x\n    needs: [a, b]\n    steps: [{run: b}]\n");
     assert!(errors(&d).iter().any(|e| e.contains("form a cycle")), "{d:?}");
+}
+
+/// `kiln: { chain-depth }` (W03-R13): how deep a `workflow_run` chain a workflow takes part in,
+/// from 1 to 10; GitHub's three when unset.
+#[test]
+fn w03_r13_chain_depth() {
+    let (w, d) = kiln("on:\n  pipeline: { name: build }\nkiln:\n  chain-depth: 6\njobs:\n  a:\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(w.and_then(|w| w.chain_depth), Some(6));
+    let (w, _) = kiln("on: push\njobs:\n  a:\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert_eq!(w.and_then(|w| w.chain_depth), None);
+    for bad in ["11", "0", "deep"] {
+        let (_, d) = kiln(&format!("on: push\nkiln:\n  chain-depth: {bad}\njobs:\n  a:\n    runs-on: x\n    steps: [{{run: echo}}]\n"));
+        assert!(d.iter().any(|x| x.code == "KCI1015" && x.message.contains("1 to 10")), "{bad}: {d:?}");
+    }
 }

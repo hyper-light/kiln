@@ -15,12 +15,13 @@ import { extname, join, normalize, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import { WebSocketServer, WebSocket } from "ws";
-import type { Agent, AuditEntry, Child, HostSample, Job, PlannedJob, Repo, Run, ServerEvent, Status, Step } from "../src/api/types.ts";
+import type { Agent, AuditEntry, Child, HostSample, Job, JobTools, PlannedJob, Repo, Run, ServerEvent, Status, Step } from "../src/api/types.ts";
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
 import { handleGoals } from "./goals.ts";
+import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
@@ -84,6 +85,8 @@ interface SimJob {
   failStep: number | null; // step index that will fail
   stepStartedMs: number | null;
   planned: PlannedJob;
+  /** Queued, it waits for a machine until then (unix seconds): one machine builds kiln's platforms in turn. */
+  holdUntil?: number;
 }
 interface LogStream {
   data: string;
@@ -659,16 +662,25 @@ const RELEASE_JOBS: JobTpl[] = [
     needs: [],
     labels: ["baremetal", "macos"],
     toolchain: "rust",
-    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh aarch64-apple-darwin x86_64-apple-darwin", dur: [24, 32], kind: "compile" }],
+    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh aarch64-apple-darwin", dur: [24, 32], kind: "compile" }],
   },
 ];
 let releaseRun: Run | null = null;
 
-function startRelease(commit: string): Run {
+/**
+ * A release run: Build every platform's (a manual run of `commit`), or a push to main's. `hold`
+ * keeps a job queued that many seconds (one machine builds Linux and Windows in turn), `slow`
+ * draws its steps out, so a page shows it building for a while.
+ */
+function startRelease(commit: string, opts: { event?: string; message?: string; hold?: Record<string, number>; slow?: number } = {}): Run {
   const repo = repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!;
-  const { run } = makeRun(repo, { created: now(), branch: "main", event: "manual", pipeline: "release" });
-  Object.assign(run, { sha: commit, message: "Build every platform", author: "admin" });
+  const { run } = makeRun(repo, { created: now(), branch: "main", event: opts.event ?? "manual", pipeline: "release" });
+  Object.assign(run, { sha: commit, message: opts.message ?? "Build every platform", author: opts.event === "push" ? "ada" : "admin" });
   const sjobs = RELEASE_JOBS.map((tpl, i) => newSimJob(run, tpl, i));
+  for (const sj of sjobs) {
+    if (opts.slow) sj.steps.forEach((s) => (s.dur *= opts.slow!));
+    if (opts.hold?.[sj.tpl.key]) sj.holdUntil = now() + opts.hold[sj.tpl.key]!;
+  }
   runs.unshift(run);
   jobsByRun.set(run.id, sjobs);
   sjobs.forEach((s) => jobsById.set(s.job.id, s));
@@ -677,6 +689,56 @@ function startRelease(commit: string): Run {
   releaseRun = run;
   return run;
 }
+
+/**
+ * The release runs the kept binaries came from, newest first: two of kiln's past runs, made release
+ * runs of `sha`, every job done, so a binary's run number opens its job's log. The older one built
+ * the server's own platform, which the server's own build shadows.
+ */
+const pastReleases: Run[] = [
+  { ago: 80_000, sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678" },
+  { ago: 205_000, sha: "df17c34639ecbf9d5c9caefb6af28aa67ee01257" },
+].flatMap(({ ago, sha }) => {
+  const kiln = runs.filter((r) => r.repo_name === "hyper-light/kiln");
+  const run = kiln.reduce<Run | null>((a, r) => (a === null || Math.abs(r.created_at - (now() - ago)) < Math.abs(a.created_at - (now() - ago)) ? r : a), null);
+  if (!run) return [];
+  for (const s of jobsByRun.get(run.id) ?? []) jobsById.delete(s.job.id);
+  Object.assign(run, { pipeline: "release", event: "push", branch: "main", sha, message: "Release builds", status: "succeeded", error: null });
+  let end = run.created_at;
+  const sjobs = RELEASE_JOBS.map((tpl, i) => {
+    const sj = newSimJob(run, tpl, i);
+    const start = run.created_at + 4 + i * 3;
+    let t = start;
+    for (const s of sj.steps) {
+      s.dur *= 12;
+      Object.assign(s, { status: "succeeded", exit_code: 0, started_at: Math.floor(t), finished_at: Math.floor((t += s.dur)) });
+    }
+    const agent = tpl.labels.includes("macos") ? "metal-mac-mini" : "metal-ryzen-01";
+    Object.assign(sj.job, {
+      status: "succeeded",
+      agent,
+      executor: "baremetal",
+      queued_at: run.created_at + 2,
+      started_at: start,
+      finished_at: Math.floor(t),
+      exit_code: 0,
+      peak_rss: 3_100_000_000,
+      cpu_seconds: Math.round((t - start) * 5),
+    });
+    syncJob(sj);
+    end = Math.max(end, Math.floor(t));
+    return sj;
+  });
+  Object.assign(run, { started_at: run.created_at + 4, finished_at: end });
+  jobsByRun.set(run.id, sjobs);
+  sjobs.forEach((s) => jobsById.set(s.job.id, s));
+  return [run];
+});
+
+// A push to main builds a commit newer than the server's (main moved on since it was built): its
+// Mac builds first while Linux and Windows wait their turn on one machine. kiln keeps none of
+// it (it takes builds of the server's own commit only); the page shows it building.
+startRelease("25159ff8b2d4c6e0a1f3b5d7c9e1a3f5b7d9c1e3", { event: "push", message: "Builds open their logs under the platforms", hold: { linux: 45, windows: 100 }, slow: 4 });
 
 function finishJob(sj: SimJob, status: Status, error: string | null) {
   const j = sj.job;
@@ -715,7 +777,7 @@ function tick() {
           emit({ type: "job", job: j });
         }
       } else if (j.status === "queued") {
-        if (nowS - (j.queued_at ?? nowS) >= 1 && rnd() < 0.7 && assign(sj)) {
+        if ((sj.holdUntil ?? 0) <= nowS && nowS - (j.queued_at ?? nowS) >= 1 && rnd() < 0.7 && assign(sj)) {
           j.status = "running";
           j.started_at = nowS;
           const s0 = sj.steps[0]!;
@@ -1154,6 +1216,49 @@ function newSession(res: http.ServerResponse) {
   res.setHeader("set-cookie", `kiln_session=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
 }
 
+/** A log line without its terminal colours (`ESC [ … letter`), as toolfix.rs reads it. */
+function plain(s: string): string {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) === 27 && s[i + 1] === "[") {
+      i += 2;
+      while (i < s.length && !/[A-Za-z]/.test(s[i]!)) i++;
+      continue;
+    }
+    out += s[i];
+  }
+  return out;
+}
+
+/** The command a shell's line says wasn't there (toolfix.rs `tool_of`, its commonest ways). */
+function notFound(line: string): string | null {
+  if (line.includes("No developer tools were found")) return "xcode-command-line-tools";
+  const m = line.match(/(?:^|: )([\w.+-]+): command not found$/) ?? line.match(/command not found: ([\w.+-]+)$/) ?? line.match(/^(?:\/bin\/)?(?:sh|dash): \d+: ([\w.+-]+): not found$/);
+  return m?.[1] ?? null;
+}
+
+/** What a failed job lacks (`GET /api/jobs/:id/tools`): the commands its failed steps' logs say weren't there. The mock's runners meet every job's `requires`, and it starts no agent to install anything. */
+function lacks(sj: SimJob): JobTools["missing"] {
+  const out: JobTools["missing"] = { tools: [], on: null, why: null, no_agent: null, runners: [] };
+  if (sj.job.status !== "failed") return out;
+  for (const st of sj.steps.filter((x) => x.status === "failed")) {
+    for (const raw of getStream(sj, st.idx).data.split("\n").slice(-400)) {
+      const line = plain(raw).trim();
+      const t = notFound(line);
+      if (t && !out.tools.includes(t)) {
+        out.tools.push(t);
+        out.why = line;
+      }
+    }
+  }
+  if (out.tools.length) {
+    out.on = sj.job.agent;
+    // A pod's tools are its image's; the mock's other runners host no agent it could start.
+    out.no_agent = sj.job.executor === "k8s" ? `it ran in a pod: add ${out.tools.join(", ")} to the job's image or toolchain` : "the mock starts no agents";
+  }
+  return out;
+}
+
 function json(res: http.ServerResponse, status: number, body: unknown) {
   const s = JSON.stringify(body);
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -1328,6 +1433,7 @@ const server = http.createServer(async (req, res) => {
     if (opened && m === "POST") return err(res, 409, "opening an app on your device needs pages' own site: set [server] pages_url (docs/previews.md)");
     // ---- goal stacks ----
     if (await handleGoals(req, res, url)) return;
+    if (await handlePrograms(req, res, url)) return;
     // ---- agents that run agents ----
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
@@ -1475,6 +1581,11 @@ const server = http.createServer(async (req, res) => {
       if (!sj.steps[idx]) return err(res, 404, "no such step");
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
       return void res.end(getStream(sj, idx).data);
+    }
+    if ((mm = p.match(/^\/api\/jobs\/([^/]+)\/tools$/)) && m === "GET") {
+      const sj = jobsById.get(decodeURIComponent(mm[1]!));
+      if (!sj) return err(res, 404, "no such job");
+      return json(res, 200, { job: sj.job.id, missing: lacks(sj), fix: null } satisfies JobTools);
     }
 
     // ---- agents ----
@@ -1669,7 +1780,11 @@ const server = http.createServer(async (req, res) => {
         err,
         body,
         emit,
-        release: { start: startRelease, latest: () => (releaseRun ? { run: releaseRun, jobs: (jobsByRun.get(releaseRun.id) ?? []).map((s) => s.job) } : null) },
+        release: {
+          start: (commit) => startRelease(commit),
+          latest: () => (releaseRun ? { run: releaseRun, jobs: (jobsByRun.get(releaseRun.id) ?? []).map((s) => s.job) } : null),
+          past: () => pastReleases,
+        },
       })
     )
       return;

@@ -30,7 +30,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use kiln_seams::Clock;
 use kiln_seams::blobs::{self as seam, Access, Blobs, Cond, Listed, Listing, Meta, Method, Put, Range, Refusal};
-use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
 
 use super::chunks::{self, Chunks};
@@ -196,7 +196,7 @@ struct Write {
 /// and what the key held released (its object kept an hour for reads under way). The object's
 /// answer, and a file the key named before (to remove).
 fn commit(c: &mut Connection, w: &Write) -> anyhow::Result<Result<(Meta, Option<String>), Refusal>> {
-    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::store::tx(c)?;
     if let Some(up) = &w.upload {
         let there: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM blob_uploads WHERE id = ?1)", [up], |r| r.get(0))?;
         if !there {
@@ -292,7 +292,7 @@ impl LocalBlobs {
             let (found, taken, dropped) = self
                 .store
                 .call(move |c| {
-                    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let tx = crate::store::tx(c)?;
                     let gone: Vec<(String, String)> = {
                         let mut q = tx.prepare("SELECT key, digest FROM blob_keys WHERE file IS NULL AND digest NOT IN (SELECT digest FROM cas_objects) LIMIT ?1")?;
                         q.query_map([page], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
@@ -359,7 +359,7 @@ impl LocalBlobs {
                 let dropped = self
                     .store
                     .call(move |c| {
-                        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                        let tx = crate::store::tx(c)?;
                         let mut n = 0usize;
                         for (key, file) in &changed {
                             n = n.saturating_add(tx.execute("DELETE FROM blob_keys WHERE key = ?1 AND file = ?2", params![key, file])?);
@@ -407,6 +407,23 @@ impl LocalBlobs {
             Ok(Err(e)) => Err(Refusal::Unavailable(format!("the disk: {e}"))),
             Err(e) => Err(unavailable(format!("{e:#}"))),
         }
+    }
+
+    /// An object of chunks this store keeps already ([`chunks::keep`]), put at `key`: what kiln's
+    /// chunked cache protocol (`crate::ci::services::chunks`, docs/ci.md W08-R09) commits once a
+    /// runner has sent the chunks the store lacked. The caller checked that each chunk is here and
+    /// that together they hash to `digest`.
+    pub async fn put_chunks(&self, key: &str, digest: &str, chunks: Chunks) -> Result<Meta, Refusal> {
+        seam::check_key(key)?;
+        seam::check_sha256(digest)?;
+        let size = chunks.iter().map(|(_, n)| *n).sum::<u64>();
+        if size > self.limits.object {
+            return Err(Refusal::TooLarge { what: "an object", size, limit: self.limits.object });
+        }
+        let w = Write { key: key.to_owned(), digest: digest.to_owned(), size, chunks, cond: Cond::Always, now_ms: self.clock.unix_ms(), upload: None };
+        let (meta, released) = self.sql(move |c| commit(c, &w)).await?;
+        Self::release(released).await;
+        Ok(meta)
     }
 
     /// Removes a file a replaced or deleted key named, where it lay.
@@ -488,7 +505,7 @@ impl LocalBlobs {
             let (taken, redundant) = self
                 .store
                 .call(move |c| {
-                    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let tx = crate::store::tx(c)?;
                     let (mut n, mut redundant) = (0usize, Vec::new());
                     for (key, digest, size, modified, path) in &rows {
                         let took = tx.execute(
@@ -520,7 +537,7 @@ impl LocalBlobs {
         let (stale, objects, used) = self
             .store
             .call(move |c| {
-                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let tx = crate::store::tx(c)?;
                 let stale: Vec<String> = {
                     let mut q = tx.prepare("SELECT id FROM blob_uploads WHERE started_ms < ?1")?;
                     q.query_map([stale_before], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?
@@ -553,7 +570,7 @@ impl LocalBlobs {
         let gone = swept.digests.clone();
         self.store
             .call(move |c| {
-                let tx = c.transaction()?;
+                let tx = crate::store::tx(c)?;
                 for d in &gone {
                     tx.execute("DELETE FROM cas_chunks WHERE digest = ?1", [d])?;
                 }
@@ -651,7 +668,7 @@ impl Blobs for LocalBlobs {
             let (k, now_s) = (key.to_owned(), self.clock.unix_ms().div_euclid(1000));
             let released = self
                 .sql(move |c| {
-                    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let tx = crate::store::tx(c)?;
                     let old = row(&tx, &k)?;
                     tx.execute("DELETE FROM blob_keys WHERE key = ?1", [&k])?;
                     if let Some(o) = old.as_ref().filter(|o| o.file.is_none()) {
@@ -739,7 +756,7 @@ impl Blobs for LocalBlobs {
             .await?;
             let (up, e) = (upload.to_owned(), etag.clone());
             self.sql(move |c| {
-                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let tx = crate::store::tx(c)?;
                 let there: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM blob_uploads WHERE id = ?1)", [&up], |r| r.get(0))?;
                 if !there {
                     return Ok(Err(Refusal::NoSuchUpload(up)));
@@ -809,7 +826,7 @@ impl Blobs for LocalBlobs {
         Box::pin(async move {
             let up = upload.to_owned();
             self.sql(move |c| {
-                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let tx = crate::store::tx(c)?;
                 tx.execute("DELETE FROM blob_parts WHERE upload = ?1", [&up])?;
                 let gone = tx.execute("DELETE FROM blob_uploads WHERE id = ?1", [&up])?;
                 tx.commit()?;
@@ -967,7 +984,7 @@ pub(crate) mod tests {
     /// enough by hand). How many objects it let go.
     fn older_kiln_upkeep(c: &mut Connection, root: &Path, now: i64) -> anyhow::Result<usize> {
         let grace = 3600;
-        let tx = c.transaction()?;
+        let tx = crate::store::tx(c)?;
         let gone = tx.execute(
             "DELETE FROM cas_objects WHERE last_used_at < ?1
                AND digest NOT IN (SELECT object FROM ci_caches WHERE object IS NOT NULL)

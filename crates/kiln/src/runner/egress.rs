@@ -36,7 +36,7 @@ const HEAD_MAX: usize = 16 * 1024;
 /// releases are), else `KILN_EGRESS_BINARY`.
 pub fn relay_binary() -> Option<PathBuf> {
     if cfg!(all(target_os = "linux", target_env = "musl")) {
-        return std::env::current_exe().ok();
+        return crate::os::this_kiln().ok();
     }
     std::env::var_os("KILN_EGRESS_BINARY").map(PathBuf::from).filter(|p| p.is_file())
 }
@@ -68,6 +68,13 @@ impl Policy {
             }
         }
         Policy { allow, kiln }
+    }
+
+    /// A leg's: `allow`, and kiln's server as the leg's runtime services reach it.
+    pub fn for_leg(rt: &kiln_ci::wire::Runtime, allow: Vec<String>) -> Policy {
+        let urls: Vec<&str> =
+            [rt.results_url.as_str(), rt.cache_url.as_str(), rt.facade_url.as_str(), rt.api_url.as_str(), rt.graphql_url.as_str()].into_iter().chain(rt.id_token_url.as_deref()).collect();
+        Policy::new(allow, &urls)
     }
 
     fn is_kiln(&self, host: &str, port: u16) -> bool {
@@ -373,9 +380,22 @@ impl Pool {
     pub fn start(port: u16, token: String, policy: Policy) -> Pool {
         let (tx, blocked) = async_channel::unbounded();
         let stop = Shutdown::new();
-        let (token, policy) = (Arc::new(token), Arc::new(policy));
+        let (token, then) = (Arc::new(token), Then::Proxy(Arc::new(policy), tx));
         for _ in 0..IDLE {
-            crate::rt::spawn(wait_at_relay(port, Arc::clone(&token), Arc::clone(&policy), tx.clone(), stop.clone()));
+            crate::rt::spawn(wait_at_relay(port, Arc::clone(&token), then.clone(), stop.clone()));
+        }
+        Pool { stop, blocked }
+    }
+
+    /// Connections waiting at a loopback relay (published on the host's loopback at `port`), each
+    /// spliced on to `to`, kiln's server as the runner reaches it, when the relay hands it one
+    /// (a BuildKit container's `kiln.localhost`: [`super::docker_sock::Loopback`]).
+    pub fn direct(port: u16, token: String, to: (String, u16)) -> Pool {
+        let (_, blocked) = async_channel::unbounded();
+        let stop = Shutdown::new();
+        let (token, then) = (Arc::new(token), Then::Direct(Arc::new(to)));
+        for _ in 0..IDLE {
+            crate::rt::spawn(wait_at_relay(port, Arc::clone(&token), then.clone(), stop.clone()));
         }
         Pool { stop, blocked }
     }
@@ -404,6 +424,12 @@ impl Pool {
         Ok((Pool { stop, blocked }, port))
     }
 
+    /// A proxy that runs elsewhere (a microVM's leg's, on its host: docs/ci.md W13-R05), whose
+    /// refusals come on `blocked`.
+    pub fn remote(blocked: async_channel::Receiver<String>) -> Pool {
+        Pool { stop: Shutdown::new(), blocked }
+    }
+
     /// What was refused since last asked.
     pub fn blocked(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
@@ -422,8 +448,27 @@ impl Drop for Pool {
     }
 }
 
+/// What a connection the relay hands over goes to: the egress proxy, with the leg's policy (its
+/// refusals told on the sender); or straight to kiln's server.
+#[derive(Clone)]
+enum Then {
+    Proxy(Arc<Policy>, async_channel::Sender<String>),
+    Direct(Arc<(String, u16)>),
+}
+
+/// One of a loopback relay's connections, on to kiln's server.
+async fn direct(conn: TcpStream, to: Arc<(String, u16)>) {
+    let Ok(addrs) = crate::rt::resolve_host(&to.0, to.1).await else { return };
+    for a in addrs {
+        if let Ok(Ok(up)) = crate::rt::timeout(Duration::from_secs(10), TcpStream::connect(a)).await {
+            relay(Arc::new(conn), up).await;
+            return;
+        }
+    }
+}
+
 /// One connection waiting at the relay, again and again until the leg ends.
-async fn wait_at_relay(port: u16, token: Arc<String>, policy: Arc<Policy>, blocked: async_channel::Sender<String>, stop: Shutdown) {
+async fn wait_at_relay(port: u16, token: Arc<String>, then: Then, stop: Shutdown) {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut backoff = Duration::from_millis(50);
     while !stop.is_cancelled() {
@@ -452,7 +497,10 @@ async fn wait_at_relay(port: u16, token: Arc<String>, policy: Arc<Policy>, block
             continue;
         }
         if &go == b"GO\n" {
-            crate::rt::spawn(serve(conn, Arc::clone(&policy), blocked.clone()));
+            match &then {
+                Then::Proxy(policy, blocked) => crate::rt::spawn(serve(conn, Arc::clone(policy), blocked.clone())),
+                Then::Direct(to) => crate::rt::spawn(direct(conn, Arc::clone(to))),
+            };
         }
     }
 }
@@ -470,11 +518,14 @@ async fn read_exact(s: &TcpStream, buf: &mut [u8]) -> bool {
 }
 
 /// `kiln egress-relay` (in a leg's relay container): each connection of the leg's on
-/// [`CLIENT_PORT`] goes to one the runner opened on [`RUNNER_PORT`] (`KILN_EGRESS_<token>`).
+/// [`CLIENT_PORT`] goes to one the runner opened on [`RUNNER_PORT`] (`KILN_EGRESS_<token>`). A
+/// loopback relay (in a BuildKit container, [`super::docker_sock::Loopback`]) takes its
+/// connections where `KILN_RELAY_LISTEN` says instead: `127.0.0.1:<port>`.
 pub fn relay_main() -> anyhow::Result<()> {
     use std::io::{Read as _, Write as _};
     let token = std::env::var("KILN_EGRESS_TOKEN").map_err(|_| anyhow::anyhow!("KILN_EGRESS_TOKEN isn't set"))?;
-    let clients = std::net::TcpListener::bind(("0.0.0.0", CLIENT_PORT))?;
+    let listen = std::env::var("KILN_RELAY_LISTEN").unwrap_or_else(|_| format!("0.0.0.0:{CLIENT_PORT}"));
+    let clients = std::net::TcpListener::bind(listen.as_str()).map_err(|e| anyhow::anyhow!("{listen}: {e}"))?;
     let runners = std::net::TcpListener::bind(("0.0.0.0", RUNNER_PORT))?;
     let (tx, rx) = std::sync::mpsc::channel::<std::net::TcpStream>();
     let rx = Arc::new(std::sync::Mutex::new(rx));

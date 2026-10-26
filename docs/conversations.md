@@ -53,7 +53,10 @@ For each agent session (kiln's id):
 - **The harness's record** is numbered among each file's non-empty lines, from 0. A move carries
   those lines alone, so a copy of the file on another machine numbers them the same way. After a
   restart, following a file goes on where the store's copy ends. The file is first checked: one
-  that was replaced since (shorter, or not ending with the line kept) starts over.
+  that was replaced since (shorter, or not ending with the line kept) starts over. A store that
+  can't say where its copy ends (busy, or stopped) is asked again at the next look. It was once
+  taken to have nothing of the file, which was read from its top and sent again: 1.88M rows on
+  adas-macbook-pro-2 after a restart on 2026-10-25, its store too busy to answer in time.
 
 ## The store: Turso, per machine
 
@@ -77,7 +80,11 @@ C, no SIMD, no FTS.
   never by lock.
 - **Revisions.** Every write gets the store's next number (`rev`). That is what a feed sends: what
   came after a number (see Replication). Each reset of a session's events is a row of its own in
-  `drops`, numbered like the writes, so a feed sends it in its place.
+  `drops`, numbered like the writes, so a feed sends it in its place. An event or a record line
+  that comes again as it is kept writes nothing and gets no number: a timeline or a transcript
+  read again, or a runner's new store sending what the server has from its old one, costs a
+  lookup each, not a write, and no feed sends it again (the mirrors' included). The server counts
+  them (`same`, in its intake's view of each store).
 - **Schema** (`convo/sql.rs`, migrations by number; one that shipped is never edited):
   - `sessions(id, info, meta, state, changes, updated_at, closed_at, epoch, rev, machine)`. The JSON
     columns hold the model as it serializes. `machine` is the machine whose feed brought the
@@ -109,6 +116,15 @@ what it took, and says through where it has it.
   3. The runner sends batches from there, two ahead of what the server has acknowledged. A batch
      larger than a frame goes in parts, so a transcript line of any size arrives whole. Reading a
      batch reads no more of the store than the batch takes: a page of rows stops at its bytes.
+  4. A batch that doesn't follow what the server has, or doesn't come whole, is answered with the
+     number the server has and the batch it answers (`about`). The runner goes on from there, unless
+     the batch that starts there is on its way already and the answer is about one sent before it
+     (which didn't follow either) or is a hello's answer come late. An answer about a batch it sent
+     since says those before it were lost, and it goes on from there. Each batch says where the
+     runner was last told to go on from (`told`). A runner from before says neither and goes on
+     from every answer, so the server tells it once until a batch of it is taken. Answered each
+     time, such a runner sent the same batches again for every answer, and each was answered the
+     same: on 2026-10-24 a store on a busy server took nothing for 12 minutes.
 - **Nothing is lost.** A runner killed, a server killed mid-turn, or a runner away for days: the
   server's number says where to go on, and the runner's store still has everything after it.
   Applying is idempotent: events upsert by id, record lines by number.
@@ -369,6 +385,11 @@ compact = true       # make the store's file compact once a third of it is free 
   once copied the whole file in one go (`VACUUM INTO`, one transaction), which took more memory
   than the first server had: it was killed for it every minute until rolled back (2026-10-18).
 - **A runner's first feed** sends its whole store, everything it kept before the feed.
+- **A runner's upgrade** starts the new process's store anew (`<state>/instances/<id>/`): it
+  writes what each session it takes over has, and its feed sends all of it to the server. The
+  server has it already, as it is, so it writes nothing of it (a lookup a row), but the runner
+  reads it all and sends it (609k rows from adacachy on 2026-10-25). A mirror's new copy takes
+  the server's whole store again (5.7 GB). Neither store goes on with its upgrade yet.
 
 ## Status
 

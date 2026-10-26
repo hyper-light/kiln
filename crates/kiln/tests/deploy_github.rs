@@ -33,12 +33,15 @@ struct Github {
     made: bool,
     /// Each token's request: its permissions and repositories.
     tokens: Vec<Value>,
-    /// GitHub's JSON for each pull request.
+    /// GitHub's JSON for each pull request, with `repo` (its repository's name in acme), numbered
+    /// in its repository.
     pulls: Vec<Value>,
     /// Each deployment: `{id, sha, environment}`.
     deployments: Vec<Value>,
     /// Each status: (deployment id, its body).
     statuses: Vec<(u64, Value)>,
+    /// Repositories made besides the release repository (apps' sources), by name.
+    sources: Vec<String>,
 }
 
 type Shared = Arc<Mutex<Github>>;
@@ -130,6 +133,8 @@ fn fake_github(public_key: Vec<u8>, root: PathBuf) -> anyhow::Result<(u16, Share
             let seg: Vec<&str> = path.trim_start_matches('/').split('/').collect();
             let (status, reply) = match (method.as_str(), seg.as_slice()) {
                 ("GET", ["orgs", "acme", "installation"] | ["repos", "acme", "releases", "installation"]) if jwt_ok => (200, json!({ "id": 7 })),
+                // The organization's installation covers every repository in it, a new one too.
+                ("GET", ["repos", "acme", name, "installation"]) if jwt_ok && g.sources.iter().any(|s| s == name) => (200, json!({ "id": 7 })),
                 ("POST", ["app", "installations", "7", "access_tokens"]) if jwt_ok => {
                     next_token += 1;
                     g.tokens.push(body.clone());
@@ -139,31 +144,44 @@ fn fake_github(public_key: Vec<u8>, root: PathBuf) -> anyhow::Result<(u16, Share
                     if g.made { (200, json!({ "full_name": "acme/releases", "private": true })) } else { (404, json!({ "message": "Not Found" })) }
                 }
                 ("POST", ["orgs", "acme", "repos"]) if token_ok => {
-                    let made = git(&root, &["init", "-q", "--bare", "acme/releases.git"]).is_ok();
-                    g.made = made;
-                    if made { (201, json!({ "full_name": "acme/releases" })) } else { (422, json!({ "message": "Repository creation failed." })) }
+                    let name = body.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    let made = !name.is_empty() && git(&root, &["init", "-q", "--bare", &format!("acme/{name}.git")]).is_ok();
+                    if made && name == "releases" {
+                        g.made = true;
+                    } else if made {
+                        g.sources.push(name.clone());
+                    }
+                    if made { (201, json!({ "full_name": format!("acme/{name}") })) } else { (422, json!({ "message": "Repository creation failed." })) }
                 }
-                ("GET", ["repos", "acme", "releases", "pulls"]) if token_ok => {
+                ("GET", ["repos", "acme", name]) if token_ok && *name != "releases" => {
+                    if g.sources.iter().any(|s| s == name) { (200, json!({ "full_name": format!("acme/{name}"), "private": true })) } else { (404, json!({ "message": "Not Found" })) }
+                }
+                ("DELETE", ["repos", "acme", name]) if token_ok && g.sources.iter().any(|s| s == name) => {
+                    let gone = std::fs::remove_dir_all(root.join(format!("acme/{name}.git"))).is_ok();
+                    g.sources.retain(|s| s != name);
+                    if gone { (204, Value::Null) } else { (404, json!({ "message": "Not Found" })) }
+                }
+                ("GET", ["repos", "acme", repo, "pulls"]) if token_ok => {
                     let head = arg("head");
-                    let found: Vec<Value> = g.pulls.iter().filter(|p| format!("acme:{}", p.pointer("/head/ref").and_then(Value::as_str).unwrap_or_default()) == head).cloned().collect();
+                    let found: Vec<Value> = g.pulls.iter().filter(|p| p.get("repo") == Some(&json!(repo)) && format!("acme:{}", p.pointer("/head/ref").and_then(Value::as_str).unwrap_or_default()) == head).cloned().collect();
                     (200, json!(found))
                 }
-                ("POST", ["repos", "acme", "releases", "pulls"]) if token_ok => {
-                    let number = g.pulls.len() + 1;
+                ("POST", ["repos", "acme", repo, "pulls"]) if token_ok => {
+                    let number = g.pulls.iter().filter(|p| p.get("repo") == Some(&json!(repo))).count() + 1;
                     let pull = json!({
-                        "number": number, "state": "open", "merged": false, "merged_at": null, "merge_commit_sha": null,
+                        "repo": repo, "number": number, "state": "open", "merged": false, "merged_at": null, "merge_commit_sha": null,
                         "title": body.get("title"), "body": body.get("body"),
                         "head": { "ref": body.get("head") }, "base": { "ref": body.get("base") },
-                        "html_url": format!("https://github.example/acme/releases/pull/{number}"),
+                        "html_url": format!("https://github.example/acme/{repo}/pull/{number}"),
                     });
                     g.pulls.push(pull.clone());
                     (201, pull)
                 }
-                ("GET", ["repos", "acme", "releases", "pulls", n]) if token_ok => match n.parse::<usize>().ok().and_then(|n| g.pulls.get(n.wrapping_sub(1))) {
+                ("GET", ["repos", "acme", repo, "pulls", n]) if token_ok => match g.pulls.iter().find(|p| p.get("repo") == Some(&json!(repo)) && p.get("number").and_then(Value::as_u64).map(|x| x.to_string()).as_deref() == Some(n)) {
                     Some(p) => (200, p.clone()),
                     None => (404, json!({ "message": "Not Found" })),
                 },
-                ("PATCH", ["repos", "acme", "releases", "pulls", n]) if token_ok => match n.parse::<usize>().ok().and_then(|n| g.pulls.get_mut(n.wrapping_sub(1))) {
+                ("PATCH", ["repos", "acme", repo, "pulls", n]) if token_ok => match g.pulls.iter_mut().find(|p| p.get("repo") == Some(&json!(repo)) && p.get("number").and_then(Value::as_u64).map(|x| x.to_string()).as_deref() == Some(n)) {
                     Some(p) => {
                         if let (Some(o), Some(s)) = (p.as_object_mut(), body.get("state")) {
                             o.insert("state".into(), s.clone());
@@ -172,10 +190,10 @@ fn fake_github(public_key: Vec<u8>, root: PathBuf) -> anyhow::Result<(u16, Share
                     }
                     None => (404, json!({ "message": "Not Found" })),
                 },
-                ("POST", ["repos", "acme", "releases", "issues", _, "comments"]) if token_ok => (201, json!({ "id": 1 })),
-                ("DELETE", ["repos", "acme", "releases", "git", "refs", "heads", rest @ ..]) if token_ok => {
+                ("POST", ["repos", "acme", _, "issues", _, "comments"]) if token_ok => (201, json!({ "id": 1 })),
+                ("DELETE", ["repos", "acme", repo, "git", "refs", "heads", rest @ ..]) if token_ok => {
                     let branch = rest.join("/");
-                    let gone = git(&root.join("acme/releases.git"), &["update-ref", "-d", &format!("refs/heads/{branch}")]).is_ok();
+                    let gone = git(&root.join(format!("acme/{repo}.git")), &["update-ref", "-d", &format!("refs/heads/{branch}")]).is_ok();
                     if gone { (204, Value::Null) } else { (422, json!({ "message": "Reference does not exist" })) }
                 }
                 ("GET", ["repos", "acme", "releases", "deployments"]) if token_ok => {
@@ -554,6 +572,20 @@ fn p3_release_repositories_on_github() -> anyhow::Result<()> {
         let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
         let found = v.get("releases").and_then(Value::as_array).is_some_and(|l| l.iter().any(|r| r.get("origin") == Some(&json!("git")) && r.get("commit") == Some(&json!(c))));
         Ok((!found).then(|| format!("{body}\n{}", s.log())))
+    })?;
+
+    // An app's source repository made on GitHub through the App, from a starter there.
+    common::source_on_host(&s, "github", &gh, &format!("http://127.0.0.1:{port}/acme/app.git"), ("deploy/config.yaml", "hello: world"), false)?;
+    // A fleet change in it: a pull request there, followed until GitHub merges it.
+    common::fleet_on_host(&s, "github", &gh, |n, merge| {
+        let mut g = fake.lock().map_err(|_| anyhow::anyhow!("the fake GitHub"))?;
+        let p = g.pulls.iter_mut().find(|p| p.get("repo") == Some(&json!("github-web")) && p.get("number") == Some(&json!(n))).and_then(Value::as_object_mut).ok_or_else(|| anyhow::anyhow!("no pull request {n} of acme/github-web"))?;
+        p.insert("state".into(), json!("closed"));
+        p.insert("merged".into(), json!(true));
+        p.insert("merged_at".into(), json!("2026-10-22T12:00:00Z"));
+        p.insert("merge_commit_sha".into(), json!(merge));
+        p.insert("merged_by".into(), json!({ "login": "ada" }));
+        Ok(())
     })?;
     Ok(())
 }

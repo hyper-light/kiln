@@ -56,6 +56,14 @@ impl std::fmt::Display for Undelivered {
     }
 }
 
+/// A provider standing in for KilnCD and Argo CD, in a test: what it does with a release handed
+/// to it, and what it says of one it holds. The servers of one test share one, as servers share
+/// the clusters they deploy to (§16's two servers).
+pub trait StandIn: Send + Sync {
+    fn deliver(&self, r: &super::model::Release) -> Result<(), Undelivered>;
+    fn follow(&self, r: &super::model::Release, commit: &str) -> (Landed, serde_json::Value);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

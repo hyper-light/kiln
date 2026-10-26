@@ -1,0 +1,26 @@
+# F-13 (docs/ci.md Appendix F; W04-S02, AC07): a matrix an earlier job makes. `test`'s legs exist
+# only once `plan` says which; `docs` is decided before anything runs (it runs for pull requests
+# alone).
+name: dynamic
+on: push
+jobs:
+  plan:
+    runs-on: self-hosted
+    outputs:
+      shards: ${{ steps.p.outputs.shards }}
+    steps:
+      - id: p
+        run: echo 'shards=["core","cli","ui"]' >> "$GITHUB_OUTPUT"
+  test:
+    needs: plan
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - run: echo "testing ${{ matrix.shard }}"
+  docs:
+    if: github.event_name == 'pull_request'
+    runs-on: self-hosted
+    steps:
+      - run: echo "never on a push"

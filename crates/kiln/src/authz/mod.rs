@@ -16,6 +16,10 @@
 pub mod api;
 pub mod cli;
 pub mod gate;
+pub mod groups;
+pub mod ops;
+pub mod passkeys;
+pub mod passwords;
 pub mod sso;
 pub mod tokens;
 
@@ -39,6 +43,8 @@ pub const CAPABILITIES: &[&str] = &[
     "artifacts.write",
     "caches.write",
     "workflows.edit",
+    // Any secret given to the runs one starts; `secrets.use:<NAME>` is one of them (see `capability`).
+    "secrets.use",
     "secrets.manage",
     "variables.manage",
     "integrations.manage",
@@ -57,6 +63,9 @@ pub const CAPABILITIES: &[&str] = &[
     "diffs.land",
     "queue.manage",
     "agents.run",
+    // Seeing and acting on every agent, whoever started it (docs/agents.md, "Whose agents");
+    // without it a person reaches only the agents that act for them.
+    "agents.manage",
     "agents.attach",
     "experiments.run",
     "settings.manage",
@@ -70,17 +79,19 @@ pub const CAPABILITIES: &[&str] = &[
 pub const SIGNED_IN: &str = "signed-in";
 
 /// The built-in roles (W10-R02, access.md): `viewer` reads; `developer` also triggers, reruns,
-/// submits and reviews; `maintainer` also lands, attaches agents, debugs, approves, deploys and
-/// manages the queue, secrets and variables; `admin` and `owner` have every capability.
+/// submits and reviews, its runs given any secret; `maintainer` also lands, attaches agents,
+/// manages everyone's agents, debugs, approves, deploys and manages the queue, secrets and
+/// variables; `admin` and `owner` have every capability.
 pub fn role(name: &str) -> Option<Vec<&'static str>> {
     const VIEWER: &[&str] = &["runs.read", "logs.read", "artifacts.read", "runners.read", "diffs.read"];
-    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run"];
+    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run", "secrets.use"];
     const MAINTAINER: &[&str] = &[
         "runs.debug",
         "runs.approve",
         "diffs.land",
         "queue.manage",
         "agents.attach",
+        "agents.manage",
         "experiments.run",
         "environments.deploy",
         "variables.manage",
@@ -110,15 +121,17 @@ pub enum Scope {
     Environment { repo: String, environment: String },
     Runner { runner: String },
     Pool { pool: String },
+    /// An environment apps are deployed to (docs/deploy-api.md §4, §15): releasing every app there.
+    Deploy { environment: String },
 }
 
 impl Scope {
     /// `server`, `org:<o>`, `repo:<o>/<r>`, `workflow:<o>/<r>:<path>`, `environment:<o>/<r>:<env>`
-    /// (or `env:`, as secrets write it), `runner:<name>`, `pool:<name>`.
+    /// (or `env:`, as secrets write it), `runner:<name>`, `pool:<name>`, `deploy:<environment>`.
     pub fn parse(s: &str) -> Result<Scope, String> {
         let s = s.trim();
         let bad = || {
-            format!("`{s}` is not a scope: server, org:<org>, repo:<owner>/<repo>, workflow:<owner>/<repo>:<path>, environment:<owner>/<repo>:<env>, runner:<name> or pool:<name>")
+            format!("`{s}` is not a scope: server, org:<org>, repo:<owner>/<repo>, workflow:<owner>/<repo>:<path>, environment:<owner>/<repo>:<env>, runner:<name>, pool:<name> or deploy:<environment>")
         };
         if s == "server" {
             return Ok(Scope::Server);
@@ -138,6 +151,7 @@ impl Scope {
             }
             "runner" => Scope::Runner { runner: need(rest)? },
             "pool" => Scope::Pool { pool: need(rest)? },
+            "deploy" => Scope::Deploy { environment: need(rest)? },
             _ => return Err(bad()),
         })
     }
@@ -151,6 +165,7 @@ impl Scope {
             Scope::Environment { repo, environment } => format!("environment:{repo}:{environment}"),
             Scope::Runner { runner } => format!("runner:{runner}"),
             Scope::Pool { pool } => format!("pool:{pool}"),
+            Scope::Deploy { environment } => format!("deploy:{environment}"),
         }
     }
 
@@ -184,7 +199,7 @@ impl Scope {
             Scope::Repo { repo } => target.repo().is_some_and(|r| same(r, repo)),
             Scope::Workflow { repo, path } => matches!(target, Scope::Workflow { repo: r, path: p } if same(r, repo) && p == path),
             Scope::Environment { repo, environment } => matches!(target, Scope::Environment { repo: r, environment: e } if same(r, repo) && e == environment),
-            Scope::Runner { .. } | Scope::Pool { .. } => self == target,
+            Scope::Runner { .. } | Scope::Pool { .. } | Scope::Deploy { .. } => self == target,
         }
     }
 }
@@ -219,13 +234,35 @@ impl Grant {
     }
 
     pub fn gives(&self, capability: &str, custom: &HashMap<String, Vec<String>>) -> bool {
-        self.what == capability || role(&self.what).is_some_and(|caps| caps.contains(&capability)) || custom.get(&self.what).is_some_and(|caps| caps.iter().any(|c| c == capability))
+        held_gives(&self.what, capability)
+            || role(&self.what).is_some_and(|caps| caps.iter().any(|c| held_gives(c, capability)))
+            || custom.get(&self.what).is_some_and(|caps| caps.iter().any(|c| held_gives(c, capability)))
+    }
+}
+
+/// Whether `what` is a capability: one of [`CAPABILITIES`], or `secrets.use:<NAME>` (one secret by
+/// name, letters, digits and `_`; `*` for any).
+pub fn capability(what: &str) -> bool {
+    CAPABILITIES.contains(&what) || what.strip_prefix("secrets.use:").is_some_and(|n| n == "*" || (!n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')))
+}
+
+/// Whether holding capability `held` gives `wanted`: the same one, or `secrets.use` (and
+/// `secrets.use:*`) giving `secrets.use:<NAME>` for any name. Secrets' names compare as kiln
+/// keeps them, without case.
+fn held_gives(held: &str, wanted: &str) -> bool {
+    if held == wanted {
+        return true;
+    }
+    match (held.strip_prefix("secrets.use"), wanted.strip_prefix("secrets.use:")) {
+        (Some("" | ":*"), Some(_)) => true,
+        (Some(h), Some(w)) => h.strip_prefix(':').is_some_and(|h| h.eq_ignore_ascii_case(w)),
+        _ => false,
     }
 }
 
 /// Whether `what` names a capability or a role (built-in, or one of `custom`).
 pub fn known(what: &str, custom: &HashMap<String, Vec<String>>) -> bool {
-    CAPABILITIES.contains(&what) || role(what).is_some() || custom.contains_key(what)
+    capability(what) || role(what).is_some() || custom.contains_key(what)
 }
 
 /// Whether `grants` give `capability` in `target`: some grant reaching it gives it, and no deny
@@ -265,6 +302,10 @@ pub enum At {
     /// The caller's own (tokens): any user may manage theirs, `tokens.manage` anyone's; the
     /// handler tells them apart.
     Own,
+    /// Releasing an app (docs/deploy-api.md §15): the capability somewhere, or a person in a group
+    /// (an app's owner team, where its environment lets owners release); the handler checks the
+    /// app and the environment the request names.
+    Deploy,
 }
 
 /// One route's rule: its method (`None`: any), path pattern (`*` one segment, `**` one or more),
@@ -288,12 +329,28 @@ const fn any(pattern: &'static str, capability: &'static str, at: At) -> Rule {
 /// The API behind authentication (W10-R05), first match wins. docs/ci.md §4.1 lists the CI part.
 pub static ROUTES: &[Rule] = &[
     r("GET", "/api/openapi.json", SIGNED_IN, At::Server),
+    // A person's own notification rules (W19-R06).
+    r("GET", "/api/me/notifications", SIGNED_IN, At::Server),
+    r("PUT", "/api/me/notifications", SIGNED_IN, At::Server),
+    // W10: one's own passkeys and password.
+    r("GET", "/api/me/passkeys", SIGNED_IN, At::Server),
+    r("POST", "/api/me/passkeys", SIGNED_IN, At::Server),
+    r("POST", "/api/me/passkeys/options", SIGNED_IN, At::Server),
+    r("DELETE", "/api/me/passkeys/*", SIGNED_IN, At::Server),
+    r("GET", "/api/me/password", SIGNED_IN, At::Server),
+    r("PUT", "/api/me/password", SIGNED_IN, At::Server),
+    // One's own chat accounts (docs/deploy-api.md §12.3): those linked, a code to link one with.
+    r("GET", "/api/me/chat", SIGNED_IN, At::Server),
+    r("POST", "/api/me/chat/codes", SIGNED_IN, At::Server),
+    r("DELETE", "/api/me/chat/*/*", SIGNED_IN, At::Server),
     r("GET", "/api/peers/open", SIGNED_IN, At::Server),
     r("POST", "/api/peers/*/frame", SIGNED_IN, At::Server),
     r("GET", "/api/ci/schema/*", SIGNED_IN, At::Server),
-    r("GET", "/api/overview", "runs.read", At::Server),
+    // A person of some repositories gets theirs (W10).
+    r("GET", "/api/overview", "runs.read", At::Anywhere),
     r("GET", "/api/system", "runners.read", At::Server),
-    r("GET", "/api/events", "runs.read", At::Server),
+    // Each event narrowed to the repositories the caller may read (W10).
+    r("GET", "/api/events", "runs.read", At::Anywhere),
     r("GET", "/api/metrics/history", "runners.read", At::Server),
     // Every conversation store and its series (docs/conversations.md, "Telemetry").
     r("GET", "/api/conversations/status", "runners.read", At::Server),
@@ -311,6 +368,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/abandon", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/reclaim", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/commandeer", "diffs.submit", At::Diff(2)),
+    r("PATCH", "/api/diffs/*", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/labels", "diffs.review", At::Diff(2)),
+    r("DELETE", "/api/diffs/*/labels/*", "diffs.review", At::Diff(2)),
     r("GET", "/api/stacks/*", "diffs.read", At::Stack(2)),
     r("POST", "/api/diffs/*/comments", "diffs.review", At::Diff(2)),
     r("POST", "/api/diffs/*/review", "diffs.review", At::Diff(2)),
@@ -320,6 +380,8 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/comments/*/apply", "diffs.submit", At::Comment(2)),
     r("POST", "/api/repos/*/submit", "diffs.submit", At::Repo(2)),
     r("GET", "/api/review/inbox", "diffs.read", At::Anywhere),
+    // The caller's own notifications, marked read (W19-R06).
+    r("POST", "/api/review/inbox/read", "diffs.read", At::Anywhere),
     r("GET", "/api/repos/*/queue", "diffs.read", At::Repo(2)),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
     // Change requests (W14-R04), as diffs.
@@ -335,20 +397,41 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/change-requests/*/abandon", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/reclaim", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/commandeer", "diffs.submit", At::Diff(2)),
-    r("GET", "/api/runs", "runs.read", At::RepoQuery),
+    r("PATCH", "/api/change-requests/*", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/labels", "diffs.review", At::Diff(2)),
+    r("DELETE", "/api/change-requests/*/labels/*", "diffs.review", At::Diff(2)),
+    // Experiments (W20-R11): each checked against its repository by its handler.
+    r("GET", "/api/experiments", "runs.read", At::Anywhere),
+    r("GET", "/api/experiments/*", "runs.read", At::Anywhere),
+    r("POST", "/api/experiments", "experiments.run", At::Anywhere),
+    r("POST", "/api/experiments/*/*", "experiments.run", At::Anywhere),
+    // Lists narrowed row by row to the repositories the caller may read (W10).
+    r("GET", "/api/runs", "runs.read", At::Anywhere),
     r("GET", "/api/runs/*", "runs.read", At::Run(2)),
     r("POST", "/api/runs/*/cancel", "runs.cancel", At::Run(2)),
     r("POST", "/api/runs/*/retry", "runs.rerun", At::Run(2)),
     r("GET", "/api/jobs/*", "runs.read", At::Job(2)),
+    r("GET", "/api/jobs/*/tools", "runs.read", At::Job(2)),
+    // The agent it starts is the asker's (`agents.start`), so at most their permissions.
+    r("POST", "/api/jobs/*/tools/fix", "runs.rerun", At::Job(2)),
     r("GET", "/api/jobs/*/logs", "logs.read", At::Job(2)),
     r("GET", "/api/jobs/*/logs/ws", "logs.read", At::Job(2)),
     r("GET", "/api/jobs/*/artifacts", "artifacts.read", At::Job(2)),
     // The CI engine.
     r("POST", "/api/ci/validate", "runs.read", At::Anywhere),
+    r("POST", "/api/ci/images/validate", "runs.read", At::Anywhere),
+    r("POST", "/api/ci/images/build", "runs.trigger", At::RepoQuery),
+    r("POST", "/api/ci/images", "diffs.submit", At::RepoQuery),
     r("POST", "/api/ci/attestations/verify", "runs.read", At::Anywhere),
     r("GET", "/api/ci/images", "runs.read", At::RepoQuery),
+    r("GET", "/api/ci/registry/mirrors", "runners.read", At::Server),
+    r("GET", "/api/ci/pools", "runners.read", At::Server),
+    r("GET", "/api/ci/pools/*", "runners.read", At::Server),
+    r("GET", "/api/ci/pools/*/history", "runners.read", At::Server),
+    r("PUT", "/api/ci/pools/*", "pools.manage", At::Server),
+    r("DELETE", "/api/ci/pools/*", "pools.manage", At::Server),
     r("POST", "/api/ci/plan-preview", "runs.read", At::Anywhere),
-    r("GET", "/api/ci/runs", "runs.read", At::RepoQuery),
+    r("GET", "/api/ci/runs", "runs.read", At::Anywhere),
     r("GET", "/api/ci/runs/*", "runs.read", At::Run(3)),
     r("GET", "/api/ci/runs/*/artifacts/*/download", "artifacts.read", At::Run(3)),
     r("GET", "/api/ci/runs/*/**", "runs.read", At::Run(3)),
@@ -356,6 +439,8 @@ pub static ROUTES: &[Rule] = &[
     // Who may review is the environment's to say too: the handler checks its reviewers.
     r("POST", "/api/ci/runs/*/approve", "runs.approve", At::Anywhere),
     r("POST", "/api/ci/runs/*/rerun", "runs.rerun", At::Run(3)),
+    // Bisecting a failure is diagnosing it (W20-R09's `diagnose`).
+    r("POST", "/api/ci/runs/*/bisect", "runs.debug", At::Run(3)),
     r("GET", "/api/ci/legs/*", "runs.read", At::Job(3)),
     r("GET", "/api/ci/legs/*/logs", "logs.read", At::Job(3)),
     r("GET", "/api/ci/legs/*/logs/*", "logs.read", At::Job(3)),
@@ -374,9 +459,14 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ci/repos/*/pulls/*/comments", "diffs.review", At::Repo(3)),
     r("POST", "/api/ci/repos/*/pulls/*/reviews", "diffs.review", At::Repo(3)),
     r("POST", "/api/ci/repos/*/pulls/*/merge", "diffs.land", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/hooks", "secrets.manage", At::Repo(3)),
+    r("DELETE", "/api/ci/repos/*/hooks/*", "secrets.manage", At::Repo(3)),
     r("GET", "/api/ci/repos/*/**", "runs.read", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/caches/*", "caches.write", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/workflows/**/edit", "workflows.edit", At::Repo(3)),
     r("POST", "/api/ci/repos/*/**", "runs.trigger", At::Repo(3)),
+    // What notification rules sent (W19-R06), every repository's.
+    r("GET", "/api/ci/notify/deliveries", "settings.manage", At::Server),
     any("/api/ci/secrets", "secrets.manage", At::ScopeQuery),
     any("/api/ci/secrets/**", "secrets.manage", At::ScopeQuery),
     any("/api/ci/variables", "variables.manage", At::ScopeQuery),
@@ -388,9 +478,17 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/oidc/subject", "runs.read", At::ScopeQuery),
     any("/api/ci/oidc/subject", "settings.manage", At::ScopeQuery),
     any("/api/ci/oidc", "settings.manage", At::Server),
+    // An agent kiln started, its own workload token (W10-R11); the handler refuses anyone else.
+    r("POST", "/api/ci/oidc/token", "agents.run", At::Server),
     any("/api/ci/oidc/**", "settings.manage", At::Server),
+    // Every repository's environments the caller may read (W15-R09): it narrows by itself.
+    r("GET", "/api/ci/environments/board", "runs.read", At::Anywhere),
     r("GET", "/api/ci/environments", "runs.read", At::RepoQuery),
     r("GET", "/api/ci/environments/**", "runs.read", At::RepoQuery),
+    // The store, verified or collected (W08-R01): the server's own.
+    r("POST", "/api/ci/store/*", "settings.manage", At::Server),
+    // A deployment by hand: the workflow that deploys there, dispatched (W15, §4.1).
+    r("POST", "/api/ci/environments/*/deploy", "environments.deploy", At::RepoQuery),
     any("/api/ci/environments", "environments.manage", At::RepoQuery),
     any("/api/ci/environments/**", "environments.manage", At::RepoQuery),
     r("POST", "/api/ci/routing/explain", "runs.read", At::Anywhere),
@@ -410,13 +508,14 @@ pub static ROUTES: &[Rule] = &[
     // Deploying by API (docs/deploy-api.md §15): releases are deploys; apps, environments and
     // registrations are their management.
     r("GET", "/api/deploy/**", "runs.read", At::Server),
-    r("POST", "/api/deploy/releases", "environments.deploy", At::Server),
-    r("POST", "/api/deploy/fleets", "environments.deploy", At::Server),
+    // Releases are a deployer's in their environment, or an owner team's where it lets owners.
+    r("POST", "/api/deploy/releases", "environments.deploy", At::Deploy),
+    r("POST", "/api/deploy/fleets", "environments.deploy", At::Anywhere),
     r("POST", "/api/deploy/releases/*/approve", "runs.approve", At::Server),
     r("POST", "/api/deploy/releases/*/reject", "runs.approve", At::Server),
-    r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Server),
+    r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Deploy),
     // Acting on what runs (a restart, a scale, a pod deleted) is a deployer's.
-    r("POST", "/api/deploy/apps/*/environments/*/actions", "environments.deploy", At::Server),
+    r("POST", "/api/deploy/apps/*/environments/*/actions", "environments.deploy", At::Deploy),
     // An app's secrets (§3.5) are read as the rest of it (names and versions: no value is read
     // back), and set or deleted by those who manage secrets.
     any("/api/deploy/apps/*/environments/*/secrets/*", "secrets.manage", At::Server),
@@ -431,6 +530,7 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/agents/*/diagnose", "runners.read", At::Runner(2)),
     r("POST", "/api/agents/*/repair", "runners.manage", At::Runner(2)),
     r("POST", "/api/agents/*/drain", "runners.manage", At::Runner(2)),
+    r("POST", "/api/agents/*/probe", "runners.manage", At::Runner(2)),
     r("DELETE", "/api/agents/*", "runners.manage", At::Runner(2)),
     r("GET", "/api/machines/*/dirs", "runners.terminal", At::Runner(2)),
     any("/api/terminal/**", "runners.terminal", At::Server),
@@ -457,6 +557,12 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/incidents/*", "runs.read", At::Anywhere),
     any("/api/plans", "agents.run", At::Server),
     any("/api/plans/**", "agents.run", At::Server),
+    // Multi-stack programs (docs/programs.md): the handler keeps their settings to a person.
+    any("/api/programs", "agents.run", At::Server),
+    any("/api/programs/**", "agents.run", At::Server),
+    // Research (docs/research.md): agents' and people's, each finding graded.
+    any("/api/research", "agents.run", At::Server),
+    any("/api/research/**", "agents.run", At::Server),
     any("/api/places", "agents.run", At::Server),
     any("/api/places/**", "agents.run", At::Server),
     any("/api/voice", "agents.run", At::Server),
@@ -471,6 +577,9 @@ pub static ROUTES: &[Rule] = &[
     any("/api/roles/**", "users.manage", At::Server),
     any("/api/users", "users.manage", At::Server),
     any("/api/users/**", "users.manage", At::Server),
+    // Groups of users, which own apps (docs/deploy-api.md §15).
+    any("/api/groups", "users.manage", At::Server),
+    any("/api/groups/**", "users.manage", At::Server),
     any("/api/grants", "users.manage", At::Server),
     any("/api/grants/**", "users.manage", At::Server),
 ];
@@ -484,7 +593,9 @@ fn matches(pattern: &str, segs: &[&str]) -> bool {
     let pat: Vec<&str> = pattern.trim_matches('/').split('/').collect();
     for (n, p) in pat.iter().enumerate() {
         if *p == "**" {
-            return segs.len() > n;
+            // One segment or more, then the pattern's own after it, at the end.
+            let after = pat.get(n + 1..).unwrap_or_default();
+            return segs.len() > n + after.len() && after.iter().rev().zip(segs.iter().rev()).all(|(p, s)| *p == "*" || p == s);
         }
         match segs.get(n) {
             Some(s) if *p == "*" || p == s => {}
@@ -503,8 +614,28 @@ pub fn rule(method: &Method, segs: &[&str]) -> &'static Rule {
 
 /// The OpenAPI 3.1 document of the table (W10-R05): each route's method and path, the capability
 /// it needs (`x-kiln-capability`) and where that is checked (`x-kiln-scope`).
-pub fn openapi(version: &str) -> serde_json::Value {
+pub fn openapi(version: &str, ops: &[crate::ops::Info]) -> serde_json::Value {
     let mut paths = serde_json::Map::new();
+    // Every operation (W20-R01), each a route of its own: its summary and its input's schema.
+    // Its rights are its own route's, which `x-kiln-route` doesn't repeat: the operation says.
+    paths.insert(
+        "/api/ops".into(),
+        serde_json::json!({ "get": { "operationId": "ops", "summary": "Every operation: its name, summary, whether it changes anything, and its input's schema", "security": [{ "bearer": [] }, { "session": [] }], "responses": { "200": { "description": "OK" } } } }),
+    );
+    for o in ops {
+        paths.insert(
+            format!("/api/ops/{}", o.name),
+            serde_json::json!({ "post": {
+                "operationId": o.name,
+                "summary": o.summary,
+                "x-kiln-read-only": o.read_only,
+                "x-kiln-destructive": o.destructive,
+                "requestBody": { "required": false, "content": { "application/json": { "schema": (o.input)() } } },
+                "security": [{ "bearer": [] }, { "session": [] }],
+                "responses": { "200": { "description": "its answer" }, "400": { "description": "the input isn't right" }, "403": { "description": "its route's capability is missing in that scope" }, "404": { "description": "no such operation, or what it names" } },
+            } }),
+        );
+    }
     for r in ROUTES {
         // A parameter is named for the segment before it: `/runs/{run}`, `/repos/{repo}`.
         let segs: Vec<&str> = r.pattern.split('/').collect();
@@ -558,6 +689,19 @@ mod tests {
         p.trim_matches('/').split('/').collect()
     }
 
+    /// Each pattern's segments are what [`matches`] knows: a word, `*` or `**`. A `:name` would
+    /// never match, and its route would fall to [`UNNAMED`] (as the pools' once did).
+    #[test]
+    fn w10_r05_patterns_match_their_routes() {
+        for r in ROUTES {
+            for s in segs(r.pattern) {
+                assert!(!s.starts_with(':') && !s.starts_with('{'), "{}: `{s}` is no segment the table matches (use `*`)", r.pattern);
+            }
+        }
+        assert_eq!(rule(&Method::PUT, &segs("/api/ci/pools/linux")).capability, "pools.manage");
+        assert_eq!(rule(&Method::GET, &segs("/api/ci/pools/linux")).capability, "runners.read");
+    }
+
     #[test]
     fn w10_r02_scopes_reach_what_they_contain() -> Result<(), String> {
         let repo = Scope::parse("repo:acme/app")?;
@@ -592,6 +736,29 @@ mod tests {
         Ok(())
     }
 
+    /// `secrets.use:<NAME>` (access.md): a developer's runs may use any secret, one denied by name
+    /// excepted; a grant of one name gives that one alone (as kiln keeps names, any case); `*`
+    /// any; a viewer none. Custom roles name them too.
+    #[test]
+    fn w10_r02_secrets_use_by_name() -> Result<(), String> {
+        let wf = Scope::Workflow { repo: "acme/app".into(), path: ".kiln/ci.yaml".into() };
+        let env = Scope::Environment { repo: "acme/app".into(), environment: "production".into() };
+        let none = HashMap::new();
+        let dev = vec![Grant::parse("developer@repo:acme/app")?, Grant::parse("!secrets.use:DEPLOY_KEY@repo:acme/app")?];
+        assert!(allows(&dev, &none, "secrets.use:NPM_TOKEN", &wf));
+        assert!(!allows(&dev, &none, "secrets.use:DEPLOY_KEY", &wf) && !allows(&dev, &none, "secrets.use:DEPLOY_KEY", &env), "the deny wins, in its environments too");
+        let one = vec![Grant::parse("viewer@repo:acme/app")?, Grant::parse("secrets.use:deploy_key@repo:acme/app")?];
+        assert!(allows(&one, &none, "secrets.use:DEPLOY_KEY", &env) && !allows(&one, &none, "secrets.use:NPM_TOKEN", &env));
+        assert!(allows(&[Grant::parse("secrets.use:*@repo:acme/app")?], &none, "secrets.use:ANY", &wf));
+        assert!(!allows(&[Grant::parse("viewer@repo:acme/app")?], &none, "secrets.use:ANY", &wf), "a viewer starts no runs");
+        let custom: HashMap<String, Vec<String>> = [("deployer".to_owned(), vec!["runs.trigger".to_owned(), "secrets.use:DEPLOY_KEY".to_owned()])].into_iter().collect();
+        assert!(allows(&[Grant::parse("deployer@repo:acme/app")?], &custom, "secrets.use:DEPLOY_KEY", &wf) && !allows(&[Grant::parse("deployer@repo:acme/app")?], &custom, "secrets.use:OTHER", &wf));
+        assert!(capability("secrets.use:DEPLOY_KEY") && capability("secrets.use:*") && capability("secrets.use"));
+        assert!(!capability("secrets.use:") && !capability("secrets.use:a-b") && !capability("secrets.used"));
+        assert!(known("secrets.use:X", &none) && Grant::parse("!secrets.use:X@env:acme/app:production").is_ok_and(|g| g.deny && g.what == "secrets.use:X"));
+        Ok(())
+    }
+
     /// Every rule is reachable: the request its own pattern describes finds it, not an earlier
     /// rule; and the routes the table doesn't name need `settings.manage`.
     #[test]
@@ -612,6 +779,8 @@ mod tests {
             (Method::GET, "/api/ci/actions/policy", "runs.read"),
             (Method::PUT, "/api/ci/actions/policy", "settings.manage"),
             (Method::POST, "/api/ci/repos/acme%2Fapp/workflows/.github/workflows/ci.yml/dispatches", "runs.trigger"),
+            (Method::POST, "/api/ci/repos/acme%2Fapp/workflows/.github/workflows/ci.yml/edit", "workflows.edit"),
+            (Method::POST, "/api/ci/repos/acme%2Fapp/workflows/edit", "runs.trigger"),
             (Method::DELETE, "/api/ci/repos/r/caches/9", "caches.write"),
             (Method::DELETE, "/api/updates/binaries/x86_64-linux", "settings.manage"),
             (Method::HEAD, "/api/ci/runs/r1", "runs.read"),
@@ -632,7 +801,7 @@ mod tests {
 
     #[test]
     fn w10_r05_the_openapi_document_comes_from_the_table() {
-        let doc = openapi("0.1.0");
+        let doc = openapi("0.1.0", &[]);
         assert_eq!(doc.pointer("/paths/~1api~1ci~1runs~1{run}~1rerun/post/x-kiln-capability").and_then(serde_json::Value::as_str), Some("runs.rerun"));
         assert_eq!(doc.pointer("/paths/~1api~1tokens/delete/x-kiln-capability").and_then(serde_json::Value::as_str), Some("tokens.manage"));
         assert_eq!(doc.get("openapi").and_then(serde_json::Value::as_str), Some("3.1.0"));

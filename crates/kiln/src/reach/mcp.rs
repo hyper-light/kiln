@@ -48,17 +48,21 @@ fn instructions(prefer: Option<&str>, machines: &str, session: &str) -> String {
     let mut s = "This is kiln's own MCP server: the machines of this kiln (its runners), and kiln itself (CI, deployments). \
 When a step has to happen on another machine (the person's Mac, a server, the box with the GPU), run it there yourself: \
 don't hand the person a command to type. When a step needs a person at that machine (a password, a system dialog to \
-allow, something physical), start it yourself and tell them exactly what will appear and what to do. Use another machine \
-too when work needs another platform or more power than this one: build and test for Linux x86-64 from a Mac (on: \
-\"linux/amd64\"), use the machine with the GPU (on: \"+gpu\"). `run` runs one command on one machine. `code_run` runs a \
+allow, something physical), start it yourself and tell them exactly what will appear and what to do. Everything else \
+runs on this machine, with your own tools: use another only when this one can't do the step, because it needs another \
+platform (build and test for Linux x86-64 from a Mac: needs: \"linux/amd64\"), a GPU (needs: \"+gpu\"), or more memory, \
+disk or cores than this machine has (needs: \"cpus=16,mem=32g\": that many cores idle and that much memory free); `on` \
+names a machine for a step that has to happen on that one. `run` runs one command on one machine. `code_run` runs a \
 JavaScript program against kiln, and only what it returns comes back to you: the same build or test on several machines at \
-once, returning just what failed (`const [mac, linux] = await Promise.all([kiln.machines.run({on: \"macos\", command: \
-\"cargo test\"}), kiln.machines.run({on: \"linux/amd64\", command: \"cargo test\"})])`), or CI runs and deployments \
+once, returning just what failed (`const [mac, linux] = await Promise.all([kiln.machines.run({needs: \"macos\", command: \
+\"cargo test\"}), kiln.machines.run({needs: \"linux/amd64\", command: \"cargo test\"})])`), or CI runs and deployments \
 (`kiln.ci.*`, `kiln.cd.*`; `code_search` lists every operation and its input). The repository you are in is synced to \
 the other machine first (only what changed; git sees the same state there), and the command runs in the matching \
-folder, so edit here and build or test there; for a command that isn't about this repository, pass sync: false (it runs \
-in that machine's home folder). `runners` lists the machines, best first. Long commands can run in the background \
-(background: true), then `output` and `stop`. To hand parts of the work to other agents (any harness, any machine), \
+folder, so you edit here and it builds or tests there; for a command that isn't about this repository, pass sync: false (it runs \
+in that machine's home folder). `runners` lists the machines, this one first when it suits. Long commands can run in the background \
+(background: true), then `output` and `stop`. Nothing a command leaves running outlives it: what a run leaves behind \
+(`nohup … &`, a daemon) ends when it does, and what your own shell commands leave running on their own ends when your \
+turn does; run a server or anything that must keep going as a background task of your shell tool, or a background run. To hand parts of the work to other agents (any harness, any machine), \
 `agents_start` them with a clear brief, then carry on or end your turn: kiln tells you when each is done (`agents_wait` \
 when you can't go on without one), and `agents_result` reads what it concluded: \
 they get no more permissions than you have, and what they ask a person stays a person's to answer (the kiln-agents \
@@ -121,13 +125,24 @@ fn describe(v: &Value) -> String {
     out.join(", ")
 }
 
-const WANT: &str = "What the machine must be (optional): a runner's name, or `linux/amd64`, `macos`, `arm64`, `linux,+gpu`, `cpus>=16`, `mem>=32g`.";
+const WANT: &str = "What the machine must be and have (optional), as `needs` says it: `linux/amd64`, `macos`, `+gpu`, `cpus=8,mem=32g`, `tool:cargo`; or a runner's name.";
+
+/// Where a command of `run` and `kiln.machines.run` goes, as its runner reads it: `on` and `needs`
+/// as one spelling ([`super::directory::target`]), the session's preferred runner when neither is
+/// given.
+fn run_target(args: &Value, prefer: Option<&str>) -> Result<String, String> {
+    let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty());
+    let (on, needs) = (s("on"), s("needs").unwrap_or_default());
+    let on = on.or(if needs.is_empty() { prefer } else { None }).unwrap_or_default();
+    super::directory::target(on, needs).map_err(|e| format!("`needs`: {e}"))
+}
 
 /// A command's input, as `run` and `kiln.machines.run` take it (`run` adds how long to wait).
 fn command_schema(waits: bool) -> Value {
     let mut props = json!({
         "command": {"type": "string", "description": "Shell text, run by bash in the synced copy of this repository."},
-        "on": {"type": "string", "description": "Where: a runner's name or what it must be (`linux/amd64`). Default: the session's preferred runner, else the best of all."},
+        "needs": {"type": "string", "description": "What the machine must be and have: `linux/amd64`, `macos`, `+gpu` (a label), `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it. Picks this machine when it has them and room to spare, else the idlest that has them."},
+        "on": {"type": "string", "description": "A runner by name, for a step that has to happen on that machine (it must still meet `needs`). Default: what `needs` picks; with neither, the session's preferred runner, else this machine."},
         "sync": {"type": "boolean", "description": "Copy this repository over first and run in it (default: true inside a git repository)."},
         "cwd": {"type": "string", "description": "With sync: the folder here whose repository is synced and whose counterpart the command runs in (default: the session's folder). Without sync: the folder on the other machine (default: its home)."},
         "timeout_s": {"type": "number", "description": "Stop the command after this many seconds."},
@@ -141,38 +156,59 @@ fn command_schema(waits: bool) -> Value {
     json!({"type": "object", "properties": props, "required": ["command"]})
 }
 
-/// The plans operations an agent has as tools: keeping plans, running them and following their
-/// runs (a plan's versions, and deleting one, are code mode's).
-const PLAN_TOOLS: &[&str] = &["plans.list", "plans.get", "plans.create", "plans.update", "plans.run", "plans.runs.list", "plans.runs.get", "plans.runs.stop", "plans.runs.retry"];
-
-/// kiln's operations an agent uses most: `agents.*`, `goals.*` and most of `plans.*`.
-fn agent_ops() -> Vec<crate::ops::Op> {
-    crate::harness::ops::list_ops().into_iter().chain(crate::goals::ops::list_ops()).chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name))).collect()
-}
-
-/// [`agent_ops`] as tools of their own (`agents_start`, `goals_add`, `plans_run`, …), asked of the
-/// server for this session like the rest of kiln's operations: what an agent starts here is its
-/// child, and the goals it lines up without naming an agent are its own.
+/// kiln's operations an agent has as tools of its own ([`crate::mcp::agent_ops`]: `agents_start`,
+/// `goals_plan`, `plans_run`, …), as this binary knows them: what's offered when the server can't
+/// say (one from before it said, or out of reach).
 fn agent_tools() -> Vec<Value> {
-    agent_ops()
-        .iter()
-        .map(|o| {
-            json!({
-                "name": crate::mcp::tool_name(o.name),
-                "title": o.name,
-                "description": o.summary,
-                "inputSchema": (o.input)(),
-                "annotations": {"readOnlyHint": o.read_only, "destructiveHint": o.destructive, "openWorldHint": false},
+    crate::mcp::agent_ops().iter().map(|o| tool_of(o.name, &json!(o.summary), &(o.input)(), o.read_only, o.destructive)).collect()
+}
+
+/// One operation as an agent's tool, asked of the server for this session like the rest of kiln's
+/// operations: what an agent starts here is its child, and the goals it lines up without naming an
+/// agent are its own.
+fn tool_of(op: &str, summary: &Value, input: &Value, read_only: bool, destructive: bool) -> Value {
+    json!({
+        "name": crate::mcp::tool_name(op),
+        "title": op,
+        "description": summary,
+        "inputSchema": input,
+        "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "openWorldHint": false},
+    })
+}
+
+/// The agent tools as the server lists them (`agent_tools`, each as its registry has it); `None`
+/// from a server that doesn't say.
+fn agent_tools_of(registry: &[Value], names: Option<&[String]>) -> Option<Vec<Value>> {
+    let names = names?;
+    let by_name: HashMap<&str, &Value> = registry.iter().filter_map(|o| Some((o.get("name")?.as_str()?, o))).collect();
+    Some(
+        names
+            .iter()
+            .filter_map(|n| by_name.get(n.as_str()))
+            .filter_map(|o| {
+                let op = o.get("name")?.as_str()?;
+                let flag = |k: &str| o.get(k).and_then(Value::as_bool).unwrap_or(false);
+                Some(tool_of(op, o.get("summary").unwrap_or(&Value::Null), o.get("input").unwrap_or(&json!({"type": "object"})), flag("read_only"), flag("destructive")))
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
-/// The operation of [`agent_ops`] a tool is, by its name (`agents_start` is `agents.start`).
-fn agent_op(tool: &str) -> Option<&'static str> {
-    agent_ops().iter().map(|o| o.name).find(|n| crate::mcp::tool_name(n) == tool)
+/// The operation a tool is, by its name (`agents_start` is `agents.start`), among `tools`.
+fn op_of(tools: &[Value], tool: &str) -> Option<String> {
+    tools.iter().find(|t| t.get("name").and_then(Value::as_str) == Some(tool)).and_then(|t| t.get("title")?.as_str().map(str::to_owned))
 }
 
+/// What a list of tools is, to tell when it changes.
+fn fingerprint(tools: &Value) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tools.to_string().hash(&mut h);
+    h.finish()
+}
+
+/// The tools as this binary knows them alone.
+#[cfg(test)]
 fn tools() -> Value {
     let mut t = base_tools();
     if let Some(list) = t.as_array_mut() {
@@ -185,7 +221,7 @@ fn base_tools() -> Value {
     json!([
         {
             "name": "code_run",
-            "description": "Run a JavaScript program against kiln and get back only what it returns. `await kiln.machines.run({on, command})` runs a shell command on one of this kiln's machines (this repository synced over first, as with `run`) and resolves when it ends, with {runner, exit_code, output}; start several and `await Promise.all([...])` to run them side by side. Also `kiln.machines.list({want})`, `kiln.machines.start(...)` (background: {id}), `kiln.machines.output({id, wait_s})`, `kiln.machines.stop({id})`, and kiln's CI and deployments under `kiln.ci.*` and `kiln.cd.*` (`code_search` lists every operation and its input; `kiln.call(name, input)` calls one by name). A refused call throws an Error with `result`. `input` is given as `input`. Bounded: 10 minutes unless timeout_s says otherwise (at most an hour), 16 calls at once, 4 MiB per answer; runs a program ends without are stopped.",
+            "description": "Run a JavaScript program against kiln and get back only what it returns. `await kiln.machines.run({needs, command})` runs a shell command on one of this kiln's machines that has what it needs (or `on`, one by name) (this repository synced over first, as with `run`) and resolves when it ends, with {runner, exit_code, output}; start several and `await Promise.all([...])` to run them side by side. Also `kiln.machines.list({want})`, `kiln.machines.start(...)` (background: {id}), `kiln.machines.output({id, wait_s})`, `kiln.machines.stop({id})`, and kiln's CI and deployments under `kiln.ci.*` and `kiln.cd.*` (`code_search` lists every operation and its input; `kiln.call(name, input)` calls one by name). A refused call throws an Error with `result`. `input` is given as `input`. Bounded: 10 minutes unless timeout_s says otherwise (at most an hour), 16 calls at once, 4 MiB per answer; runs a program ends without are stopped.",
             "inputSchema": {"type": "object", "properties": {
                 "program": {"type": "string", "description": "The body of an async function; `return` its answer."},
                 "input": {"description": "Any JSON, available as `input`."},
@@ -201,13 +237,13 @@ fn base_tools() -> Value {
         },
         {
             "name": "runners",
-            "description": "The machines (kiln runners) commands can run on, best first for `want`: platform, idle cores, free memory, installed agents, and why others don't suit. `want` is a runner's name or what it must be: `linux/amd64`, `macos`, `arm64`, `linux,+gpu`, `cpus>=16`, `mem>=32g`.",
+            "description": "The machines (kiln runners) commands can run on, best first for `want` (this one first when it suits and has memory to spare): platform, idle cores, free memory, installed agents, and why others don't suit. `want` is what it must be and have, as `run`'s `needs` takes it (`linux/amd64`, `+gpu`, `cpus=8,mem=32g`, `tool:cargo`), or a runner's name.",
             "inputSchema": {"type": "object", "properties": {"want": {"type": "string", "description": "What the machine must be (optional)."}}},
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
         {
             "name": "run",
-            "description": "Run a shell command (bash) on another machine. `on` picks it: a runner's name, or what it must be (`linux/amd64`, `macos/arm64`, `+gpu`, `cpus>=16`); the idlest that suits is used. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id for `output` and `stop`.",
+            "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory, disk or cores than it has, or one that has to happen on that machine (everything else, run here with your own tools). `needs` picks it: what it must be and have (`linux/amd64`, `macos/arm64`, `+gpu`, `tool:cargo`, `cpus=8,mem=32g` idle and free): this machine when it suits and has room to spare, else the idlest that suits; `on` names a machine when the step has to happen on that one. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. What the command leaves running when it ends (`nohup … &`, a daemon) ends with it: run a server with background: true, and `stop` it when done. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id for `output` and `stop`.",
             "inputSchema": command_schema(true),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
         },
@@ -445,8 +481,8 @@ fn running(v: &Value) -> bool {
 }
 
 /// kiln's operations as the server lists them for this session, when it does: (when asked, the
-/// registry, why there is none).
-type Registry = (Instant, Vec<Value>, Option<String>);
+/// registry, why there is none, which are agents' tools when it says).
+type Registry = (Instant, Vec<Value>, Option<String>, Option<Vec<String>>);
 
 struct Server {
     sock: std::path::PathBuf,
@@ -457,6 +493,11 @@ struct Server {
     runs: Runs,
     next: Mutex<u64>,
     registry: Mutex<Option<Registry>>,
+    /// The agent tools as the server last listed them: kept while it's out of reach.
+    agent_tools: Mutex<Option<Vec<Value>>>,
+    /// What the agent was last given as the tools (`fingerprint`): when the server's change, it's
+    /// told to ask again (`notifications/tools/list_changed`).
+    listed: Mutex<Option<u64>>,
 }
 
 impl Server {
@@ -479,12 +520,12 @@ impl Server {
         let sync = args.get("sync").and_then(Value::as_bool).unwrap_or(in_repo);
         let env: Vec<(String, String)> = args.get("env").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned()))).collect()).unwrap_or_default();
         let req = RunReq {
-            target: s("on").or_else(|| self.prefer.clone()).unwrap_or_default(),
+            target: run_target(args, self.prefer.as_deref())?,
             command,
             cwd: Some(cwd.clone()),
             remote_cwd: if sync { None } else { s("cwd") },
             sync,
-            env,
+            env: super::directory::with_needs(env, s("needs").as_deref().unwrap_or_default()),
             stdin: false,
             timeout_ms: args.get("timeout_s").and_then(Value::as_f64).map(|t| (t.max(0.0) * 1000.0) as u64),
             shell: s("shell"),
@@ -639,26 +680,57 @@ impl Server {
     /// server can't be asked, the ones this kiln knows, and why they can't be called: a program
     /// calling one learns that, rather than finding `kiln.ci` undefined.
     fn remote(&self) -> (Vec<Value>, Option<String>) {
+        let (reg, why, _) = self.remote_with_tools();
+        (reg, why)
+    }
+
+    /// [`Self::remote`], and which of the operations are agents' tools, when the server says.
+    fn remote_with_tools(&self) -> (Vec<Value>, Option<String>, Option<Vec<String>>) {
         if let Ok(g) = self.registry.lock()
-            && let Some((at, reg, why)) = g.as_ref()
+            && let Some((at, reg, why, tools)) = g.as_ref()
             && at.elapsed() < REGISTRY_TTL
         {
-            return (reg.clone(), why.clone());
+            return (reg.clone(), why.clone(), tools.clone());
         }
-        let (reg, why) = match self.ask(json!({"op": "registry"})) {
+        let (reg, why, tools) = match self.ask(json!({"op": "registry"})) {
             Ok(a) => match (a.get("registry").and_then(Value::as_array), a.get("error").and_then(Value::as_str)) {
-                (Some(r), _) => (r.clone(), None),
-                (None, Some(e)) => (Vec::new(), Some(e.to_owned())),
+                (Some(r), _) => {
+                    let tools = a.get("agent_tools").and_then(Value::as_array).map(|t| t.iter().filter_map(|n| n.as_str().map(str::to_owned)).collect());
+                    (r.clone(), None, tools)
+                }
+                (None, Some(e)) => (Vec::new(), Some(e.to_owned()), None),
                 // A server from before: "unknown reach question".
-                (None, None) => (Vec::new(), Some("this kiln server doesn't offer its operations to agents on runners yet: upgrade it".to_owned())),
+                (None, None) => (Vec::new(), Some("this kiln server doesn't offer its operations to agents on runners yet: upgrade it".to_owned()), None),
             },
-            Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+            Err(e) => (Vec::new(), Some(format!("{e:#}")), None),
         };
         let reg = if why.is_some() { code::registry_of(&crate::ops::listed(true)).as_array().cloned().unwrap_or_default() } else { reg };
         if let Ok(mut g) = self.registry.lock() {
-            *g = Some((Instant::now(), reg.clone(), why.clone()));
+            *g = Some((Instant::now(), reg.clone(), why.clone(), tools.clone()));
         }
-        (reg, why)
+        (reg, why, tools)
+    }
+
+    /// The tools to offer: this server's own, then kiln's operations an agent has as tools, as
+    /// the kiln server lists them (those it last listed while it's out of reach; this binary's own
+    /// from a server that doesn't say), so a deploy reaches the agents at work.
+    fn tools(&self) -> Value {
+        let (reg, why, names) = self.remote_with_tools();
+        let listed = if why.is_none() { agent_tools_of(&reg, names.as_deref()) } else { None };
+        let agent = match listed {
+            Some(t) => {
+                if let Ok(mut g) = self.agent_tools.lock() {
+                    *g = Some(t.clone());
+                }
+                t
+            }
+            None => self.agent_tools.lock().ok().and_then(|g| g.clone()).unwrap_or_else(agent_tools),
+        };
+        let mut t = base_tools();
+        if let Some(list) = t.as_array_mut() {
+            list.extend(agent);
+        }
+        t
     }
 
     fn call(self: &Arc<Self>, name: &str, args: &Value) -> Value {
@@ -733,7 +805,7 @@ impl Server {
                 text_result(&v, failed)
             }
             // kiln's agents, goals and plans operations, asked of the server for this session.
-            other => match agent_op(other) {
+            other => match op_of(self.tools().as_array().map_or(&[][..], Vec::as_slice), other) {
                 Some(op) => match self.ask(json!({"op": "call", "name": op, "input": args})) {
                     Ok(a) => match a.get("ok") {
                         Some(v) => text_result(v, false),
@@ -836,7 +908,7 @@ pub fn serve() -> anyhow::Result<()> {
     let session = std::env::var("KILN_SESSION").unwrap_or_default();
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let machines = machines(&sock);
-    let server = Arc::new(Server { sock, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None) });
+    let server = Arc::new(Server { sock, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None) });
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let say = |out: &Arc<Mutex<std::io::Stdout>>, v: &Value| {
         if let Ok(mut o) = out.lock() {
@@ -844,6 +916,24 @@ pub fn serve() -> anyhow::Result<()> {
             let _ = o.flush();
         }
     };
+    // The tools the server offers change (a deploy): the agent is told to ask for them again,
+    // once it has asked for them at all.
+    {
+        let (server, out) = (Arc::clone(&server), Arc::clone(&out));
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(REGISTRY_TTL);
+                let Some(before) = server.listed.lock().ok().and_then(|g| *g) else { continue };
+                let now = fingerprint(&server.tools());
+                if now != before {
+                    if let Ok(mut g) = server.listed.lock() {
+                        *g = Some(now);
+                    }
+                    say(&out, &json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}));
+                }
+            }
+        });
+    }
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -868,7 +958,7 @@ pub fn serve() -> anyhow::Result<()> {
                         id,
                         json!({
                             "protocolVersion": version,
-                            "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false}},
+                            "capabilities": {"tools": {"listChanged": true}, "resources": {"listChanged": false}},
                             "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
                             "instructions": instructions(server.prefer.as_deref(), &machines, &server.session),
                         }),
@@ -876,7 +966,13 @@ pub fn serve() -> anyhow::Result<()> {
                 );
             }
             "ping" => say(&out, &rpc_ok(id, json!({}))),
-            "tools/list" => say(&out, &rpc_ok(id, json!({"tools": tools()}))),
+            "tools/list" => {
+                let t = server.tools();
+                if let Ok(mut g) = server.listed.lock() {
+                    *g = Some(fingerprint(&t));
+                }
+                say(&out, &rpc_ok(id, json!({"tools": t})));
+            }
             "tools/call" => {
                 let (server, out) = (Arc::clone(&server), Arc::clone(&out));
                 std::thread::spawn(move || {
@@ -952,6 +1048,29 @@ pub fn acp_config(kiln: &std::path::Path, sock: &str, prefer: Option<&str>, sess
 mod tests {
     use super::*;
 
+    /// The agent tools are the server's: those it names (each as its registry has it, one it
+    /// added since this binary was built included), and this binary's own from a server that
+    /// doesn't say; the list's fingerprint tells a change.
+    #[test]
+    fn agent_tools_are_the_ones_the_server_names() {
+        let registry = vec![
+            json!({"name": "goals.add", "summary": "Line goals up.", "read_only": false, "destructive": false, "input": {"type": "object", "properties": {"goals": {"type": "array"}}}}),
+            json!({"name": "goals.later", "summary": "A goal for later (new on the server).", "read_only": false, "destructive": false, "input": {"type": "object"}}),
+            json!({"name": "ci.runs.list", "summary": "Runs.", "read_only": true, "destructive": false, "input": {"type": "object"}}),
+        ];
+        let names = vec!["goals.add".to_owned(), "goals.later".to_owned(), "goals.gone".to_owned()];
+        let tools = agent_tools_of(&registry, Some(&names)).unwrap_or_default();
+        let listed: Vec<&str> = tools.iter().filter_map(|t| t.get("name").and_then(Value::as_str)).collect();
+        assert_eq!(listed, ["goals_add", "goals_later"], "named and in the registry; code mode's ci.runs.list isn't a tool");
+        assert_eq!(tools.get(1).and_then(|t| t.get("description")), Some(&json!("A goal for later (new on the server).")));
+        assert_eq!(op_of(&tools, "goals_later").as_deref(), Some("goals.later"));
+        assert!(agent_tools_of(&registry, None).is_none(), "a server that doesn't say: this binary's own");
+        let before = fingerprint(&json!(tools));
+        let fewer = agent_tools_of(&registry, names.get(..1)).unwrap_or_default();
+        assert_ne!(before, fingerprint(&json!(fewer)));
+        assert_eq!(before, fingerprint(&json!(agent_tools_of(&registry, Some(&names)).unwrap_or_default())));
+    }
+
     #[test]
     fn long_output_keeps_its_head_and_tail() {
         let s: String = (0..50_000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
@@ -986,7 +1105,9 @@ mod tests {
         let devices: Vec<&str> = crate::browser::devices::DEVICES.iter().map(|d| d.name).collect();
         assert_eq!(live.pointer("/inputSchema/properties/device/enum"), Some(&json!(devices)));
         assert_eq!(live.pointer("/inputSchema/properties/engine/enum"), Some(&json!(["chromium", "firefox", "webkit"])));
-        assert_eq!(agent_op("agents_wait"), Some("agents.wait"));
+        let list = t.as_array().map_or(&[][..], Vec::as_slice);
+        let agent_op = |tool: &str| op_of(list, tool);
+        assert_eq!(agent_op("agents_wait").as_deref(), Some("agents.wait"));
         assert_eq!(agent_op("run"), None);
         // Its own goal stack and plans are tools too, the agent's own without naming it.
         for (tool, op) in [
@@ -998,7 +1119,7 @@ mod tests {
             ("plans_runs_get", "plans.runs.get"),
         ] {
             assert!(names.contains(&tool), "{tool}: {names:?}");
-            assert_eq!(agent_op(tool), Some(op));
+            assert_eq!(agent_op(tool).as_deref(), Some(op));
         }
         assert_eq!(agent_op("plans_delete"), None, "deleting a plan is code mode's");
         let add = t.as_array().into_iter().flatten().find(|t| t.get("name") == Some(&json!("goals_add"))).cloned().unwrap_or_default();
@@ -1006,6 +1127,7 @@ mod tests {
         assert!(instructions(Some("adacachy"), "", "").contains("prefers commands to run on adacachy"));
         let i = instructions(None, "", "");
         assert!(i.contains("run it there yourself") && i.contains("don't hand the person a command to type") && i.contains("code_run"));
+        assert!(i.contains("Everything else runs on this machine") && !i.contains("build or test there"), "{i}");
         assert!(i.contains("goals_add") && i.contains("plans_run") && !i.contains("You are kiln agent"), "{i}");
         assert!(instructions(None, "", "01a14ab9").contains("You are kiln agent 01a14ab9"), "an agent is told who it is");
         let v = json!({"me": "adacachy", "runners": [{"runner": {"name": "adacachy", "os": "linux", "arch": "x86_64"}}, {"runner": {"name": "mac", "os": "macos", "arch": "aarch64"}}], "passed": [{"runner": {"name": "box", "os": "windows", "arch": "x86_64"}}]});
@@ -1020,5 +1142,22 @@ mod tests {
         let names: Vec<&str> = ops.iter().filter_map(|o| o.get("name").and_then(Value::as_str)).collect();
         assert_eq!(names, ["machines.list", "machines.run", "machines.start", "machines.output", "machines.stop"]);
         assert!(ops.iter().all(|o| o.pointer("/input/type") == Some(&json!("object"))));
+    }
+
+    /// `run` and `kiln.machines.run` take `needs` beside `on`: the runner gets both as one spelling,
+    /// the session's preferred runner only when neither is given, and a bad need is refused here.
+    #[test]
+    fn run_takes_needs_beside_on() {
+        let t = |args: Value| run_target(&args, Some("mac"));
+        assert_eq!(t(json!({"command": "make", "needs": "cpus=8,mem=32g,linux/amd64"})).as_deref(), Ok("cpus=8,mem=32g,linux/amd64"));
+        assert_eq!(t(json!({"command": "make", "on": "adacachy", "needs": "mem=32g"})).as_deref(), Ok("adacachy,mem=32g"));
+        assert_eq!(t(json!({"command": "make", "on": "linux/amd64"})).as_deref(), Ok("linux/amd64"));
+        assert_eq!(t(json!({"command": "make", "needs": " "})).as_deref(), Ok("mac"));
+        assert_eq!(run_target(&json!({"command": "make"}), None).as_deref(), Ok(""));
+        assert_eq!(t(json!({"command": "make", "needs": "memm=4g"})), Err("`needs`: memm=4g: no such need".to_owned()));
+        assert_eq!(command_schema(true).pointer("/properties/needs/type"), Some(&json!("string")));
+        let runs: Vec<Value> = machine_ops().into_iter().filter(|o| o.get("name").and_then(Value::as_str).is_some_and(|n| n == "machines.run" || n == "machines.start")).collect();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|o| o.pointer("/input/properties/needs").is_some()), "{runs:?}");
     }
 }

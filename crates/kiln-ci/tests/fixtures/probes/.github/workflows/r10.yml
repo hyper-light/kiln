@@ -1,0 +1,8 @@
+# F-22: level 10 of the nesting probe (make_reusable.py).
+name: r10
+on: workflow_call
+jobs:
+  leaf:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "PROBE depth.leaf=reached"

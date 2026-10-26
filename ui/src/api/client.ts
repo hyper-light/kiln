@@ -1,5 +1,5 @@
 import { apiPath } from "@/lib/peer-base";
-import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
+import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JobTools, ToolFix, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncMode, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -101,6 +101,8 @@ export interface IntegrationKind {
   fields: { name: string; required: boolean; help: string }[];
   secret: string | null;
   built: boolean;
+  /** What a second secret it keeps is (a Slack app's signing secret), when it keeps one. */
+  signing?: string;
 }
 
 export interface Integration {
@@ -109,6 +111,8 @@ export interface Integration {
   name: string;
   config: Record<string, unknown>;
   has_secret: boolean;
+  /** Whether it keeps its kind's signing secret too. */
+  has_signing_secret?: boolean;
   scope: string;
   created_at: number;
   verified_at: number | null;
@@ -119,6 +123,36 @@ export interface Integration {
 export interface Integrations {
   kinds: IntegrationKind[];
   integrations: Integration[];
+}
+
+/** Where a chat sends kiln its commands and buttons, and what to set there (docs/deploy-api.md §12.3). */
+export interface ChatSetup {
+  address: string;
+  how: string;
+  /** Slack and Teams: whether kiln has the signing secret it checks them with. */
+  signing_secret?: boolean;
+  /** Discord: whether kiln has the application's public key. */
+  public_key?: boolean;
+  /** Telegram: whether the bot's webhook is kiln's. */
+  commands?: boolean;
+  scopes?: string[];
+  events?: string[];
+}
+
+/** A chat account linked to the signed-in person's kiln account. */
+export interface ChatLink {
+  integration: string | null;
+  kind: string | null;
+  id: string;
+  account: string;
+  name: string;
+  created_at: number;
+}
+
+export interface ChatLinks {
+  links: ChatLink[];
+  /** The chats kiln has, by integration. */
+  chats: { name: string; kind: string }[];
 }
 
 export interface OidcIssuer {
@@ -135,7 +169,7 @@ export const api = {
     setAuthed(true);
   },
   /** Which sign-in methods this server offers (public). */
-  authMethods: (signal?: AbortSignal) => get<{ password: boolean; token: boolean }>("/api/auth/methods", signal),
+  authMethods: (signal?: AbortSignal) => get<{ password: boolean; token: boolean; passkey?: boolean; people?: boolean }>("/api/auth/methods", signal),
   loginPassword: async (password: string) => {
     await post<void>("/api/auth/password", { password });
     setAuthed(true);
@@ -161,7 +195,18 @@ export const api = {
   setCdImage: (name: string, home: ImageHome) => request<CdImages>("PUT", `/api/cd/images/${encodeURIComponent(name)}`, home),
   /** Integrations (docs/ci.md W11): the catalog of kinds and the ones set up. */
   integrations: (signal?: AbortSignal) => get<Integrations>("/api/ci/integrations", signal),
-  createIntegration: (body: { kind: string; name: string; config: Record<string, string>; secret?: string }) => post<Integration>("/api/ci/integrations", body),
+  createIntegration: (body: { kind: string; name: string; config: Record<string, string>; secret?: string; signing_secret?: string }) => post<Integration>("/api/ci/integrations", body),
+  /** An integration's configuration, secret or signing secret changed (each given replaces it; "" removes a secret). */
+  updateIntegration: (name: string, body: { config?: Record<string, unknown>; secret?: string; signing_secret?: string }) =>
+    request<Integration>("PATCH", `/api/ci/integrations/${encodeURIComponent(name)}`, body),
+  /** Where a chat integration's commands and buttons come to kiln (docs/deploy-api.md §12.3). */
+  integrationChat: (name: string, signal?: AbortSignal) => get<ChatSetup>(`/api/ci/integrations/${encodeURIComponent(name)}/chat`, signal),
+  /** A Telegram bot's webhook pointed at kiln, so its chats' commands and buttons come here. */
+  connectIntegrationChat: (name: string) => post<ChatSetup>(`/api/ci/integrations/${encodeURIComponent(name)}/chat`, {}),
+  /** The chat accounts linked to yours, and a code to link another with (`link <code>`, said there). */
+  myChat: (signal?: AbortSignal) => get<ChatLinks>("/api/me/chat", signal),
+  chatCode: () => post<{ code: string; expires_at: number; say: string }>("/api/me/chat/codes", {}),
+  unlinkChat: (integration: string, account: string) => del<void>(`/api/me/chat/${encodeURIComponent(integration)}/${encodeURIComponent(account)}`),
   /** A real exchange with the integration; a federated one as `repository`'s `environment` (docs/cd-targets.md §6). */
   verifyIntegration: (name: string, as?: { repository?: string; environment?: string }) =>
     post<{ ok: boolean; message?: string; error?: string }>(`/api/ci/integrations/${encodeURIComponent(name)}/verify`, as ?? {}),
@@ -173,7 +218,7 @@ export const api = {
   sync: (signal?: AbortSignal) => get<SyncView>("/api/sync", signal),
   /** What happened in the synced repos: events numbered `since` on, newest first. */
   syncActivity: (since: number, limit: number, signal?: AbortSignal) => get<SyncActivity>(`/api/sync/activity?since=${since}&limit=${limit}`, signal),
-  syncCreate: (body: { name: string; copies: { machine: string; path: string }[]; exclude: string[] }) => post<{ id: string }>("/api/sync", body),
+  syncCreate: (body: { name: string; copies: { machine: string; path: string }[]; exclude: string[]; mode?: SyncMode }) => post<{ id: string }>("/api/sync", body),
   syncAddCopy: (id: string, copy: { machine: string; path: string }) => post<{ member: number }>(`/api/sync/${enc(id)}/copies`, copy),
   syncRemoveCopy: (id: string, member: number) => del<void>(`/api/sync/${enc(id)}/copies/${member}`),
   syncDelete: (id: string) => del<void>(`/api/sync/${enc(id)}`),
@@ -191,13 +236,16 @@ export const api = {
   pollRepo: (id: string) => post<void>(`/api/repos/${enc(id)}/poll`),
   triggerRepo: (id: string, body: { branch?: string; pipeline?: string }) => post<Run[]>(`/api/repos/${enc(id)}/trigger`, body),
 
-  runs: (params: { repo?: string; limit?: number; before?: string | number }, signal?: AbortSignal) =>
-    get<Run[]>(`/api/runs${qs({ repo: params.repo, limit: params.limit ?? 50, before: params.before })}`, signal),
+  /** Newest first, older pages `before` a time; or by `sort` (`oldest`, `longest`, `shortest`), later pages from `offset`. */
+  runs: (params: { repo?: string; limit?: number; before?: string | number; sort?: string; offset?: number }, signal?: AbortSignal) =>
+    get<Run[]>(`/api/runs${qs({ repo: params.repo, limit: params.limit ?? 50, before: params.before, sort: params.sort, offset: params.offset })}`, signal),
   run: (id: string, signal?: AbortSignal, attempt?: number) => get<RunDetail>(`/api/runs/${enc(id)}${attempt ? `?attempt=${attempt}` : ""}`, signal),
   cancelRun: (id: string) => post<void>(`/api/runs/${enc(id)}/cancel`),
   retryRun: (id: string, onlyFailed: boolean) => post<void>(`/api/runs/${enc(id)}/retry`, { only_failed: onlyFailed }),
 
   job: (id: string, signal?: AbortSignal) => get<Job>(`/api/jobs/${enc(id)}`, signal),
+  jobTools: (id: string, signal?: AbortSignal) => get<JobTools>(`/api/jobs/${enc(id)}/tools`, signal),
+  fixJobTools: (id: string, body: { runner?: string; kind?: string; mode?: string }) => post<{ fix: ToolFix }>(`/api/jobs/${enc(id)}/tools/fix`, body),
   jobLogsUrl: (id: string, step: number) => apiPath(`/api/jobs/${enc(id)}/logs${qs({ step })}`),
   jobLogs: (id: string, step: number) => request<string>("GET", `/api/jobs/${enc(id)}/logs${qs({ step })}`, undefined, { raw: true }),
 

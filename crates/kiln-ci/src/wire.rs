@@ -48,9 +48,16 @@ pub struct AssignmentV2 {
     pub job_defaults: Defaults,
     /// The job's `outputs`, evaluated after its steps.
     pub outputs: Vec<(String, Tpl)>,
+    /// The workflow file that defines the job, for `job.workflow_*` (W06-R03).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_workflow: Option<crate::plan::DefinedIn>,
     /// `environment.url`, evaluated after its steps too (W15-R04).
     #[serde(default)]
     pub environment_url: Option<Tpl>,
+    /// The environment the job is bound to (W15-R04): where `kiln/deploy@v1` deploys on the runner
+    /// itself, for a `container` or `microvm` one (W15-R02).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Bound>,
     pub contexts: Contexts,
     /// Secrets the leg may read (W09 narrows them to what it references).
     pub secrets: Vec<Secret>,
@@ -89,6 +96,80 @@ pub struct AssignmentV2 {
     /// `None` when they connect freely.
     #[serde(default)]
     pub network: Option<Network>,
+    /// The leg runs trusted code (W18-R07): only such a leg gets v1's kept `cache:` folders
+    /// (W02-R06, W24-R11). An older server never says so, so its legs keep none.
+    #[serde(default)]
+    pub trusted: bool,
+    /// W24-R11: the job keeps a warm workspace (`work: { warm }`). An older server never sends
+    /// it, so its legs get fresh workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm: Option<Warm>,
+    /// The leg is a cold run's (`kiln rerun --cold`, W24-R23): it starts from nothing kept, its
+    /// v1 `cache:` folders empty. An older server never says so; an older runner ignores it.
+    #[serde(default)]
+    pub cold: bool,
+    /// It has its runner to itself (`exclusive: true`, W05-R03), and what of the runner it holds:
+    /// the CPUs and memory it asked for, the rest free for other legs; none, the whole runner.
+    /// From an older server, neither: a leg like any other.
+    pub exclusive: bool,
+    pub holds: Option<crate::sched::state::Resources>,
+}
+
+/// A leg's warm workspace (W24-R11, R15), from its job's `work: { warm }`: the runner keeps it for
+/// the next leg of its lane, checked out in place with these folders kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Warm {
+    /// The folders kept, relative to the workspace (`target`).
+    pub paths: Vec<String>,
+    /// The most the lane's workspaces keep on a runner, in bytes; else only the runner's own
+    /// budget holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u64>,
+}
+
+/// A job's environment, as its runner deploys to it (W15-R02).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Bound {
+    pub name: String,
+    /// One of `kubernetes`, `host`, `container`, `microvm`, `platform`; `None` for one with no
+    /// targets of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// A preview's (W15-R07): the `previews:` entry it was made from and what it's for, `name`
+    /// being both (`preview-D12`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<PreviewOf>,
+}
+
+/// What a preview environment (W15-R07) was made from: its template (the name jobs give their
+/// `environment:`) and what it's for (`D12`, `CR7`, `PR42`, or a stack's lowest diff).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PreviewOf {
+    pub template: String,
+    pub id: String,
+}
+
+/// A deployment a runner made (W15-R02) that it's asked to take down, as its environment went (a
+/// preview, W15-R07): `ServerMsg::Undeploy`. `kind` is `container` (its Compose project) or
+/// `microvm`; `repo` and `environment` name it as the runner named it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Undeploy {
+    pub kind: String,
+    pub repo: String,
+    pub environment: String,
+}
+
+/// What the runner says once it's done (`AgentMsg::Undeployed`): it, gone, or why it couldn't be.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Undeployed {
+    pub asked: Undeploy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A leg's egress (W18-R08): the hosts it may reach (`*.example.com`, `host:port`) besides kiln's
@@ -137,6 +218,9 @@ pub struct ExecutorSpec {
     pub kind: String,
     pub image: Option<String>,
     pub options: serde_json::Value,
+    /// The pool's executor, ready on the runner, the leg runs in (W13-R09).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
 }
 
 /// The contexts the server knows (W06-R03).
@@ -184,6 +268,12 @@ pub struct Runtime {
     /// The registries kiln mirrors (W12-R02): `(upstream, prefix)`; the runner pulls their images
     /// through kiln.
     pub mirrors: Vec<(String, String)>,
+    /// kiln's certificate authority (PEM), when the server serves HTTPS: legs trust it beside
+    /// their machine's roots (§2.6), since jobs reach the facade through the same front door and
+    /// certificate as everything else, and GitHub Enterprise Server's clients go `https://` to the
+    /// host they're given whatever its scheme.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_ca: Option<String>,
 }
 
 /// A remote action, resolved (W07-R02).
@@ -203,11 +293,21 @@ pub struct ActionRef {
     pub secrets: Vec<(String, bool)>,
     pub requires: Vec<String>,
     pub permissions: Vec<(String, String)>,
+    /// Why it couldn't be resolved when the run started (W07-R03): its source unreachable and
+    /// never mirrored, no such ref. A job using it fails as it starts, as GitHub's fails at "Set
+    /// up job", and the run's other jobs go on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// A Docker container action (`runs.using: docker`), or a composite one with one beneath it:
+    /// where a leg uses it there must be Docker (W07-R06, W13-R07).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub docker: bool,
 }
 
 impl ActionRef {
     /// Its declarations, from its metadata.
     pub fn declares(&mut self, a: &crate::wf::ir::Action) {
+        self.docker = a.runs.using.eq_ignore_ascii_case("docker");
         self.secrets = a.secrets.iter().map(|d| (d.name.to_ascii_uppercase(), d.required)).collect();
         self.requires = a.requires.clone();
         self.permissions = match &a.permissions {
@@ -386,6 +486,22 @@ pub enum JobEventV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What an exclusive leg holds travels with it; from an older server, neither field is there,
+    /// and the leg is like any other; to an older runner, they're keys it doesn't read.
+    #[test]
+    fn an_assignment_says_what_its_leg_holds_and_reads_without_it() -> Result<(), serde_json::Error> {
+        let share = crate::sched::state::Resources { cpu: 16.0, mem: 16 << 30, ..Default::default() };
+        let a = AssignmentV2 { job_id: "bench".into(), exclusive: true, holds: Some(share), ..AssignmentV2::default() };
+        let back: AssignmentV2 = serde_json::from_str(&serde_json::to_string(&a)?)?;
+        assert!(back.exclusive);
+        assert_eq!(back.holds, Some(share));
+        let old: AssignmentV2 = serde_json::from_str(r#"{"job_id":"leg"}"#)?;
+        assert!(!old.exclusive && old.holds.is_none(), "from an older server: a leg like any other");
+        let v: serde_json::Value = serde_json::to_value(&a)?;
+        assert_eq!(v.get("holds").and_then(|h| h.get("cpu")).and_then(serde_json::Value::as_f64), Some(16.0));
+        Ok(())
+    }
 
     #[test]
     fn events_read_as_the_spec_writes_them() -> Result<(), serde_json::Error> {

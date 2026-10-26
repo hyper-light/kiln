@@ -15,6 +15,7 @@ pub struct Overlay {
     pub supersede: Option<YVal>,
     pub routing_infer: Option<bool>,
     pub honour_skip_ci: Option<bool>,
+    pub chain_depth: Option<u32>,
     pub jobs: Vec<OverlayJob>,
 }
 
@@ -46,7 +47,10 @@ pub(crate) fn parse(root: &Node, diags: &mut Vec<Diag>) -> Overlay {
         match k.as_str() {
             "supersede" => ov.supersede = Some(fe.yval(v)),
             "routing" => ov.routing_infer = Some(v.get("infer").and_then(Node::as_scalar) == Some(&Scalar::Bool(true))),
-            "kiln" => ov.honour_skip_ci = Some(v.get("honour-skip-ci").and_then(Node::as_scalar) == Some(&Scalar::Bool(true))),
+            "kiln" => {
+                ov.honour_skip_ci = Some(v.get("honour-skip-ci").and_then(Node::as_scalar) == Some(&Scalar::Bool(true)));
+                ov.chain_depth = fe.chain_depth(v);
+            }
             "jobs" => {
                 let Some(map) = v.as_map() else { continue };
                 for (jk, jv) in map {
@@ -170,6 +174,9 @@ pub fn apply(wf: &mut Workflow, ov: &Overlay) -> Vec<Diag> {
     if let Some(b) = ov.honour_skip_ci {
         wf.honour_skip_ci = b;
     }
+    if ov.chain_depth.is_some() {
+        wf.chain_depth = ov.chain_depth;
+    }
     for oj in &ov.jobs {
         let Some(job) = wf.jobs.iter_mut().find(|j| j.id == oj.id) else {
             diags.push(Diag::warning("KCI4010", format!("the overlay sets job `{}`, which this workflow doesn't have", oj.id), oj.range).at(format!("jobs.{}", oj.id)));
@@ -223,6 +230,10 @@ pub fn apply(wf: &mut Workflow, ov: &Overlay) -> Vec<Diag> {
                     if !sk.integrations.is_empty() {
                         step.kiln.integrations = sk.integrations.clone();
                     }
+                    // W24-R25: an overlay makes a GitHub workflow's step a memo step (W24-R07).
+                    if sk.memo.is_some() {
+                        step.kiln.memo = sk.memo.clone();
+                    }
                 }
                 None => diags.push(Diag::warning("KCI4010", format!("the overlay sets step `{sid}` of job `{}`, which has no step with that id", oj.id), *range).at(format!("jobs.{}.steps.{sid}", oj.id))),
             }
@@ -241,6 +252,10 @@ fn merge_kiln(dst: &mut JobKiln, src: &JobKiln, set: &[String]) {
             "priority" => dst.priority = src.priority.clone(),
             "retry" => dst.retry = src.retry.clone(),
             "reuse" => dst.reuse = src.reuse.clone(),
+            "work" => {
+                dst.reuse = src.reuse.clone();
+                dst.work = src.work.clone();
+            }
             "cache" => dst.cache = src.cache.clone(),
             "exports" => dst.exports_env = src.exports_env.clone(),
             "env-from" => dst.env_from = src.env_from.clone(),

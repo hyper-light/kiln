@@ -36,14 +36,16 @@ pub async fn webhook(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
         ("check_run", "rerequested") => {
             let run = v.pointer("/check_run/external_id").and_then(Value::as_str).unwrap_or_default().to_owned();
             if !run.is_empty() {
-                let r = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "all" })).await;
+                let by = v.pointer("/sender/login").and_then(Value::as_str).unwrap_or("github").to_owned();
+                let r = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "all" }), &by).await;
                 hub.store.audit("github".into(), "ci.runs.rerun".into(), format!("{run} from GitHub's Re-run ({})", if r.is_ok() { "started" } else { "refused" })).await;
             }
         }
         ("check_suite", "rerequested") => {
             let (sha, full) = (v.pointer("/check_suite/head_sha").and_then(Value::as_str).unwrap_or_default().to_owned(), v.pointer("/repository/full_name").and_then(Value::as_str).unwrap_or_default().to_owned());
             for run in runs_of(hub, &full, &sha).await {
-                let _ = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "failed" })).await;
+                let by = v.pointer("/sender/login").and_then(Value::as_str).unwrap_or("github").to_owned();
+                let _ = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "failed" }), &by).await;
             }
         }
         // GitHub Actions' runs, for repositories whose CI provider it is (W23-R03).
@@ -64,14 +66,14 @@ pub async fn webhook(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
             if matches!(event.as_str(), "push" | "pull_request")
                 && let Some(d) = crate::deploy::get()
             {
-                crate::deploy::github::on_event(&d, &event, &v).await;
+                crate::deploy::remote::on_github_event(&d, &event, &v).await;
             }
             let hub2 = Arc::clone(hub);
             let delivery = (!delivery.is_empty()).then_some(delivery);
             crate::rt::spawn(async move {
                 if let Err(e) = crate::ci::hooks::github(&hub2, &event, delivery, &body).await {
                     tracing::warn!(event = %event, error = %format!("{e:#}"), "the GitHub App's event");
-                    hub2.gitops_kick.notify();
+                    crate::ci::hooks::want_github(&hub2, &body).await;
                 }
             });
         }

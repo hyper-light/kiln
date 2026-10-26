@@ -21,13 +21,18 @@
 //! - [`secrets`]: secret scopes, and which secrets a leg reads (W09).
 //! - [`stats`]: bootstrap intervals for benchmarks and experiments (W16, W20).
 //! - [`facts`]: what runners report about themselves (W13).
+//! - [`graphql`]: GraphQL documents, for the facade's GraphQL (W14).
 //! - [`wire`]: the JSON payloads between the server and CI runners (§2.5).
+//! - [`work`]: fingerprints for doing the least work a change needs (W24).
 
 pub mod attest;
 pub mod compare;
+pub mod dockerfile;
 pub mod env;
+pub mod experiments;
 pub mod expr;
 pub mod facts;
+pub mod graphql;
 pub mod insights;
 pub mod land;
 pub mod oidc;
@@ -45,3 +50,4 @@ pub mod trigger;
 pub mod trust;
 pub mod wf;
 pub mod wire;
+pub mod work;

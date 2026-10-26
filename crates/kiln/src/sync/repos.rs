@@ -7,7 +7,7 @@
 //! Bundles travel over HTTP to and from the server (`/api/sync/bundles/:batch`), with the token the
 //! server gives this machine with its copies: the same links, the same ports.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
 
 use super::git::{self, Kept, Registry};
-use super::wire::{self, CloneOrder, Msg, Repos, TaskNews};
+use super::wire::{self, CloneOrder, Msg, Repos, ShareSlot, TaskNews, Work};
 use crate::http::client::Client;
 use crate::proto::AgentMsg;
 
@@ -44,7 +44,26 @@ pub enum Job {
     /// The folders of this machine's synced copies (looked at wherever they are).
     Paths(Vec<String>),
     Connected(bool),
+    /// What a look found: looks go on beside the orders, never in their way.
+    Looked(git::Looked),
 }
+
+/// How the worker looks at the machine's repositories: [`git::look`], but for tests.
+type Scan = Arc<dyn Fn(PathBuf, Vec<PathBuf>, BTreeSet<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = git::Looked> + Send>> + Send + Sync>;
+
+/// What this machine's work in a repository was when it last went: its branches' and its folders'
+/// fingerprints, and when.
+struct Sent {
+    branches: String,
+    files: String,
+    at: Instant,
+}
+
+/// A repository's work goes at most this often (a new slot from the server aside).
+const SHARE_EVERY: Duration = Duration::from_secs(120);
+/// Its folders' work in progress goes for those git worked in this recently, the latest first, at most so many.
+const WIP_RECENT: i64 = 7 * 86_400;
+const WIP_FOLDERS: usize = 16;
 
 /// What the worker and the tasks it runs share.
 struct Shared {
@@ -62,6 +81,14 @@ struct Shared {
     kick: async_channel::Sender<Job>,
     /// Folders a task is cloning into or deleting now: never two at once.
     busy: Mutex<BTreeSet<String>>,
+    scan: Scan,
+    /// The repositories others hold too, and where this machine's work in each goes next
+    /// (`super::share`); its folders of each, as it last looked, with when git last worked there;
+    /// what its work in each was when it last shared it; and whether it is sharing now.
+    slots: Mutex<Vec<ShareSlot>>,
+    folders: Mutex<HashMap<String, Vec<(PathBuf, i64)>>>,
+    shared: Mutex<HashMap<String, Sent>>,
+    sharing: AtomicBool,
 }
 
 impl Shared {
@@ -99,12 +126,17 @@ impl Shared {
 /// Starts this machine's worker (its state in `dir`, `<state>/sync`); what it says goes out through
 /// `say`. Hand it [`Job`]s.
 pub fn start(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: async_channel::Sender<AgentMsg>) -> async_channel::Sender<Job> {
+    let scan: Scan = Arc::new(|home, extra, kiln| Box::pin(git::look(home, extra, kiln)));
+    start_with(dir, me, http, server, say, crate::os::home_dir(), scan)
+}
+
+fn start_with(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: async_channel::Sender<AgentMsg>, home: PathBuf, scan: Scan) -> async_channel::Sender<Job> {
     let (tx, rx) = async_channel::unbounded();
     let registry = Registry::load(&dir.join("clones.json"));
     let shared = Arc::new(Shared {
         dir,
         me,
-        home: crate::os::home_dir(),
+        home,
         http,
         server,
         say,
@@ -114,8 +146,13 @@ pub fn start(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: a
         registry: Mutex::new(registry),
         kick: tx.clone(),
         busy: Mutex::new(BTreeSet::new()),
+        scan,
+        slots: Mutex::new(Vec::new()),
+        folders: Mutex::new(HashMap::new()),
+        shared: Mutex::new(HashMap::new()),
+        sharing: AtomicBool::new(false),
     });
-    crate::rt::spawn(async move { Worker { s: shared, paths: Vec::new(), told: None, told_at: None, looked: None, soon: true }.run(rx).await });
+    crate::rt::spawn(async move { Worker { s: shared, paths: Vec::new(), told: None, told_at: None, looked: None, looking: false, soon: true }.run(rx).await });
     tx
 }
 
@@ -126,6 +163,8 @@ struct Worker {
     told: Option<Repos>,
     told_at: Option<Instant>,
     looked: Option<Instant>,
+    /// A look is under way.
+    looking: bool,
     /// Look at the next chance.
     soon: bool,
 }
@@ -143,9 +182,9 @@ impl Worker {
             }
             self.again();
             let due = self.looked.is_none_or(|t| t.elapsed() >= LOOK_EVERY);
-            if self.s.connected.load(Ordering::SeqCst) && (self.soon || due) {
+            if self.s.connected.load(Ordering::SeqCst) && (self.soon || due) && !self.looking {
                 self.soon = false;
-                self.look().await;
+                self.look();
             }
         }
     }
@@ -172,6 +211,19 @@ impl Worker {
                 }
             }
             Job::Order(Msg::Look) => self.soon = true,
+            Job::Looked(looked) => self.report(looked),
+            Job::Order(Msg::Shares { shares }) => {
+                // Only new slots (a repository, a fresh one) start a share; looks do the rest.
+                let changed = *self.s.slots.lock() != shares;
+                *self.s.slots.lock() = shares;
+                if changed {
+                    share_soon(&self.s);
+                }
+            }
+            Job::Order(Msg::Take(w)) => {
+                let s = self.s.clone();
+                crate::rt::spawn(async move { take_work(&s, *w).await });
+            }
             Job::Order(Msg::Forget { path }) => {
                 let changed = self.s.registry.lock().clones.remove(&path).is_some();
                 if changed {
@@ -221,8 +273,9 @@ impl Worker {
         }
     }
 
-    /// Looks at this machine's repositories, and says what it found if that changed (or it is time).
-    async fn look(&mut self) {
+    /// Starts looking at this machine's repositories. A look runs git in each one, which takes
+    /// minutes on a busy machine with many: the orders that come meanwhile go on at once.
+    fn look(&mut self) {
         let (extra, kiln) = {
             let r = self.s.registry.lock();
             let kiln: BTreeSet<String> = r.clones.keys().cloned().collect();
@@ -230,9 +283,27 @@ impl Worker {
             extra.extend(self.paths.iter().map(|p| git::expand(p, &self.s.home)));
             (extra, kiln)
         };
-        let looked = git::look(self.s.home.clone(), extra, kiln).await;
+        self.looking = true;
+        let (looking, kick) = ((self.s.scan)(self.s.home.clone(), extra, kiln), self.s.kick.clone());
+        crate::rt::spawn(async move {
+            let _ = kick.send(Job::Looked(looking.await)).await;
+        });
+    }
+
+    /// Says what a look found, if that changed (or it is time).
+    fn report(&mut self, looked: git::Looked) {
+        self.looking = false;
         self.looked = Some(Instant::now());
         let report = Repos { home: self.s.home.to_string_lossy().into_owned(), repos: looked.repos, error: looked.error, at: crate::util::now_unix() };
+        // Its folders of each repository with a remote, for sharing its work and taking others'.
+        let mut folders: HashMap<String, Vec<(PathBuf, i64)>> = HashMap::new();
+        for f in &report.repos {
+            if let Some(key) = f.origin.as_deref().and_then(super::places::key_of) {
+                folders.entry(key).or_default().push((PathBuf::from(&f.path), f.active));
+            }
+        }
+        *self.s.folders.lock() = folders;
+        share_soon(&self.s);
         let same = self.told.as_ref().is_some_and(|t| Repos { at: report.at, ..t.clone() } == report);
         let stale = self.told_at.is_none_or(|t| t.elapsed() >= SAY_EVERY);
         if !same || stale {
@@ -292,7 +363,7 @@ async fn bundle(s: &Arc<Shared>, task: &str, path: &str) {
         git::bundle(&git::expand(path, &s.home), &file).await?;
         let size = std::fs::metadata(&file)?.len();
         s.tell(TaskNews::new(task, "sending", format!("sending the bundle ({})", bytes(size))));
-        send_bundle(s, task, &file, size).await
+        send_bundle(s, Some(task), task, &file, size).await
     }
     .await;
     let _ = std::fs::remove_file(&file);
@@ -302,24 +373,27 @@ async fn bundle(s: &Arc<Shared>, task: &str, path: &str) {
     }
 }
 
-async fn send_bundle(s: &Arc<Shared>, task: &str, file: &Path, size: u64) -> anyhow::Result<(String, u64)> {
+/// Sends a bundle to the server for batch `batch`, saying how it goes on task `task`, if one.
+async fn send_bundle(s: &Arc<Shared>, task: Option<&str>, batch: &str, file: &Path, size: u64) -> anyhow::Result<(String, u64)> {
     let src = crate::rt::file_source(file.to_path_buf())?;
     let (tx, rx) = async_channel::bounded(8);
-    let (s2, t2) = (s.clone(), task.to_owned());
+    let (s2, t2) = (s.clone(), task.map(str::to_owned));
     crate::rt::spawn(async move {
         let (mut sent, mut said) = (0u64, Instant::now());
         while let Ok(chunk) = src.recv().await {
             sent = sent.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-            if said.elapsed() >= PROGRESS {
+            if let Some(t) = &t2
+                && said.elapsed() >= PROGRESS
+            {
                 said = Instant::now();
-                s2.tell(TaskNews::new(&t2, "sending", format!("sent {} of {}", bytes(sent), bytes(size))));
+                s2.tell(TaskNews::new(t, "sending", format!("sent {} of {}", bytes(sent), bytes(size))));
             }
             if tx.send(chunk).await.is_err() {
                 break;
             }
         }
     });
-    let resp = s.http.put(&s.url(task)).bearer(&s.token()).header("content-type", "application/octet-stream").body_stream(rx).timeout(Duration::from_secs(4 * 3600)).send().await?;
+    let resp = s.http.put(&s.url(batch)).bearer(&s.token()).header("content-type", "application/octet-stream").body_stream(rx).timeout(Duration::from_secs(4 * 3600)).send().await?;
     let status = resp.status();
     if !(200..300).contains(&status) {
         let body = resp.bytes(64 << 10).await.unwrap_or_default();
@@ -335,7 +409,7 @@ async fn send_bundle(s: &Arc<Shared>, task: &str, file: &Path, size: u64) -> any
 }
 
 /// Fetches a batch's bundle into `file`, checking it is the one named.
-async fn fetch_bundle(s: &Arc<Shared>, task: &str, batch: &str, hash: &str, size: u64, file: &Path) -> anyhow::Result<()> {
+async fn fetch_bundle(s: &Arc<Shared>, task: Option<&str>, batch: &str, hash: &str, size: u64, file: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(size <= BUNDLE_MAX, "the bundle is {}: more than this machine fetches", bytes(size));
     let mut resp = s.http.get(&s.url(batch)).bearer(&s.token()).timeout(Duration::from_secs(900)).send().await?;
     anyhow::ensure!(resp.is_success(), "the server gave no bundle ({})", resp.status());
@@ -348,7 +422,9 @@ async fn fetch_bundle(s: &Arc<Shared>, task: &str, batch: &str, hash: &str, size
             Ok(Some(chunk)) => {
                 h.update(&chunk);
                 got = got.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-                if said.elapsed() >= PROGRESS {
+                if let Some(task) = task
+                    && said.elapsed() >= PROGRESS
+                {
                     said = Instant::now();
                     s.tell(TaskNews::new(task, "fetching", format!("fetched {} of {}", bytes(got), bytes(size))));
                 }
@@ -381,7 +457,7 @@ async fn clone(s: &Arc<Shared>, order: CloneOrder) {
         let source: OsString = match (&order.bundle, &order.hash, &order.url) {
             (Some(batch), Some(hash), _) => {
                 s.tell(TaskNews::new(&task, "fetching", format!("fetching the bundle ({})", bytes(order.size))));
-                fetch_bundle(s, &task, batch, hash, order.size, &bundle).await?;
+                fetch_bundle(s, Some(&task), batch, hash, order.size, &bundle).await?;
                 bundle.clone().into_os_string()
             }
             (_, _, Some(url)) => url.into(),
@@ -410,6 +486,117 @@ async fn clone(s: &Arc<Shared>, order: CloneOrder) {
             let _ = s.kick.try_send(Job::Order(Msg::Look));
         }
         Err(e) => s.tell(TaskNews::failed(&task, format!("{e:#}"))),
+    }
+}
+
+/// Shares this machine's work in the repositories others hold too, unless it is already at it.
+fn share_soon(s: &Arc<Shared>) {
+    if s.sharing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let s = s.clone();
+    crate::rt::spawn(async move {
+        share_all(&s).await;
+        s.sharing.store(false, Ordering::SeqCst);
+    });
+}
+
+/// For each repository others hold too, this machine's work in it, if it changed since it last
+/// went (or the server has none of it): from the repository among its folders of it that git last
+/// worked in. Its branches' bundle goes when they moved; its folders' work in progress (the ones git
+/// worked in lately) when it changed.
+async fn share_all(s: &Arc<Shared>) {
+    let slots = s.slots.lock().clone();
+    let now = crate::util::now_unix();
+    for slot in slots {
+        let Some(mine) = s.folders.lock().get(&slot.key).cloned() else { continue };
+        let recent = s.shared.lock().get(&slot.key).is_some_and(|sent| sent.at.elapsed() < SHARE_EVERY);
+        if recent && !slot.fresh {
+            continue;
+        }
+        let mut repos: BTreeMap<PathBuf, (i64, Vec<(PathBuf, i64)>)> = BTreeMap::new();
+        for (f, active) in mine {
+            let Some(r) = super::share::repository_of(&f).await else { continue };
+            let e = repos.entry(r).or_default();
+            e.0 = e.0.max(active);
+            e.1.push((f, active));
+        }
+        let Some((repo, (_, mut group))) = repos.into_iter().max_by_key(|(_, (active, _))| *active) else { continue };
+        group.retain(|(_, active)| now.saturating_sub(*active) <= WIP_RECENT);
+        group.sort_by_key(|(_, active)| std::cmp::Reverse(*active));
+        group.truncate(WIP_FOLDERS);
+        let folders: Vec<PathBuf> = group.into_iter().map(|(f, _)| f).collect();
+        let (branches_print, files_print) = super::share::fingerprints(&repo, &folders).await;
+        let before = s.shared.lock().get(&slot.key).map(|sent| (sent.branches.clone(), sent.files.clone()));
+        let branches_moved = slot.fresh || before.as_ref().is_none_or(|(b, _)| *b != branches_print);
+        let files_changed = slot.fresh || before.as_ref().is_none_or(|(_, f)| *f != files_print);
+        if !branches_moved && !files_changed {
+            continue;
+        }
+        let (file, wip_file) = (s.bundle_file(&format!("share-{}", slot.batch)), s.bundle_file(&format!("share-{}", slot.wip_batch)));
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let out = async {
+            let mut w = Work { key: slot.key.clone(), branches: super::share::branches(&repo).await?, wip: super::share::wips(&folders, &s.me).await, ..Work::default() };
+            if branches_moved {
+                w.batch.clone_from(&slot.batch);
+                if super::share::bundle_branches(&repo, &w.branches, &file).await? {
+                    let size = std::fs::metadata(&file)?.len();
+                    send_bundle(s, None, &slot.batch, &file, size).await?;
+                }
+            }
+            if files_changed {
+                w.wip_batch.clone_from(&slot.wip_batch);
+                if super::share::bundle_wip(&repo, &w.wip, &w.branches, &wip_file).await? {
+                    let size = std::fs::metadata(&wip_file)?.len();
+                    send_bundle(s, None, &slot.wip_batch, &wip_file, size).await?;
+                }
+            }
+            anyhow::Ok(w)
+        }
+        .await;
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&wip_file);
+        match out {
+            Ok(w) => {
+                s.shared.lock().insert(slot.key.clone(), Sent { branches: branches_print, files: files_print, at: Instant::now() });
+                s.send(&Msg::Shared(Box::new(w)));
+            }
+            Err(e) => tracing::warn!(target: "kiln.sync", repo = %slot.key, error = %format!("{e:#}"), "this machine's work couldn't be shared"),
+        }
+    }
+}
+
+/// Takes another machine's work into each repository of it this machine holds.
+async fn take_work(s: &Arc<Shared>, w: Work) {
+    let Some(mine) = s.folders.lock().get(&w.key).cloned() else { return };
+    let mut repos: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    for (f, _) in mine {
+        if let Some(r) = super::share::repository_of(&f).await {
+            repos.entry(r).or_insert(f);
+        }
+    }
+    let mut files = Vec::new();
+    for (batch, hash, size) in [(&w.batch, &w.hash, w.size), (&w.wip_batch, &w.wip_hash, w.wip_size)] {
+        let Some(hash) = hash else { continue };
+        let file = s.bundle_file(&format!("take-{batch}"));
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match fetch_bundle(s, None, batch, hash, size, &file).await {
+            Ok(()) => files.push(file),
+            Err(e) => tracing::warn!(target: "kiln.sync", repo = %w.key, from = %w.from, error = %format!("{e:#}"), "another machine's work couldn't be fetched"),
+        }
+    }
+    let bundles: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+    for folder in repos.values() {
+        if let Err(e) = super::share::take(folder, &w, &bundles).await {
+            tracing::warn!(target: "kiln.sync", repo = %w.key, from = %w.from, folder = %folder.display(), error = %format!("{e:#}"), "another machine's work couldn't be taken in");
+        }
+    }
+    for f in &files {
+        let _ = std::fs::remove_file(f);
     }
 }
 
@@ -444,6 +631,56 @@ async fn delete(s: &Arc<Shared>, task: &str, path: &str, origin: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_order_goes_on_at_once_while_a_slow_look_is_under_way() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (src, home) = (dir.path().join("src"), dir.path().join("home"));
+        std::fs::create_dir_all(&src)?;
+        std::fs::create_dir_all(&home)?;
+        for args in [&["init", "-q", "-b", "main"][..], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "first"]] {
+            let mut git = std::process::Command::new("git");
+            git.arg("-C").arg(&src).args(args).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
+            anyhow::ensure!(git.status()?.success(), "git {}", args.join(" "));
+        }
+        crate::rt::block_on(async move {
+            // A look that starts, then waits until the test lets it end.
+            let (started_tx, started) = async_channel::unbounded::<()>();
+            let (end, ended) = async_channel::bounded::<()>(1);
+            let scan: Scan = Arc::new(move |_, _, _| {
+                let (started_tx, ended) = (started_tx.clone(), ended.clone());
+                Box::pin(async move {
+                    let _ = started_tx.send(()).await;
+                    let _ = ended.recv().await;
+                    git::Looked { repos: Vec::new(), error: None }
+                })
+            });
+            let (say, heard) = async_channel::unbounded();
+            let http = Arc::new(Client::new(crate::http::client::Roots::WebPki, None)?);
+            let jobs = start_with(dir.path().join("state"), "me".into(), http, "http://127.0.0.1:9".into(), say, home.clone(), scan);
+            jobs.send(Job::Connected(true)).await?;
+            crate::rt::timeout(Duration::from_secs(10), started.recv()).await??;
+            let order = CloneOrder { task: "t1".into(), key: "k".into(), path: home.join("b").to_string_lossy().into_owned(), url: Some(src.to_string_lossy().into_owned()), ..CloneOrder::default() };
+            jobs.send(Job::Order(Msg::Clone(order))).await?;
+            let next = || async {
+                loop {
+                    let AgentMsg::Sync { json, .. } = heard.recv().await? else { continue };
+                    match wire::decode(&json) {
+                        Some(Msg::Task(n)) if n.over() => return anyhow::Ok(Some(n)),
+                        Some(Msg::Repos(_)) => return Ok(None),
+                        _ => {}
+                    }
+                }
+            };
+            let done = crate::rt::timeout(Duration::from_secs(30), next()).await??.ok_or_else(|| anyhow::anyhow!("the look ended before the clone"))?;
+            assert_eq!((done.state.as_str(), done.error, done.branch.as_deref()), ("done", None, Some("main")));
+            assert!(home.join("b/.git").exists());
+            // The look ends, and says what it found.
+            end.send(()).await?;
+            anyhow::ensure!(crate::rt::timeout(Duration::from_secs(10), next()).await??.is_none(), "the look said what it found");
+            Ok(())
+        })
+    }
 
     #[test]
     fn sizes_read_as_people_say_them() {

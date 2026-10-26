@@ -1,18 +1,19 @@
-//! HTTP/1.1 and HTTP/2 server: hyper's runtime-agnostic connection state machines, driven on
-//! hyper-rt. Each accepted connection becomes one hyper-rt task (an HTTP/2 connection's requests
-//! each one more); upgrades (WebSocket) are HTTP/1.1's.
+//! HTTP/1.1 and HTTP/2 server: kiln-http's connections on hyper-rt. Each accepted connection is one
+//! hyper-rt task, its requests' handlers polled in it (an HTTP/2 connection's all side by side);
+//! upgrades (WebSocket) are HTTP/1.1's.
 
-use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::io::{AsyncRead, AsyncWrite};
 use http::{HeaderValue, StatusCode, header};
+use http_body::Frame;
 use http_body_util::BodyExt;
 use http_body_util::combinators::BoxBody;
-use hyper::body::{Frame, Incoming};
-use hyper::server::conn::{http1, http2};
-use hyper::service::service_fn;
+pub use kiln_http::Incoming;
+use kiln_http::server::{http1, http2};
+use kiln_http::service_fn;
 
 /// Response bodies: whole buffers or streams of chunks, boxed to one type.
 pub type Body = BoxBody<Bytes, std::io::Error>;
@@ -41,7 +42,7 @@ pub struct Secure;
 /// clients disappearing mid-request are normal.
 pub async fn serve_connection<I, H>(io: I, handler: Arc<H>, remote: Option<std::net::SocketAddr>)
 where
-    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
     serve_connection_with(io, handler, remote, false).await;
@@ -50,6 +51,9 @@ where
 /// How long a new connection may take to say whether it speaks TLS, and to finish the handshake.
 const FIRST_BYTE: std::time::Duration = std::time::Duration::from_secs(30);
 const HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(15);
+/// The most a connection's socket holds that it hasn't sent (`TCP_NOTSENT_LOWAT`): past that,
+/// kiln's writer waits. Linux would let a slow reader's backlog grow to 4 MiB in the kernel.
+const NOTSENT_LOWAT: u32 = 128 << 10;
 
 /// What a client speaking HTTP/2 without TLS sends first (RFC 9113 §3.4): the front door, which
 /// ends a browser's TLS and passes its bytes on, passes HTTP/2 on this way.
@@ -81,6 +85,9 @@ fn opening(head: &[u8]) -> Opening {
 /// HTTP/2 inside. Over TLS the client says which (ALPN); in the clear, HTTP/2 starts with its
 /// preface. Nearly every connection tells by its first byte; only those starting with `P` take more.
 pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handler: Arc<H>, remote: Option<std::net::SocketAddr>, tls: Option<&super::tls::ServerTls>) {
+    // Where the platform offers it: a slow reader's backlog waits here, where kiln can catch it
+    // up (a session's viewer: docs/wire.md, "Revisions"), not megabytes deep in the kernel.
+    let _ = stream.set_notsent_lowat(NOTSENT_LOWAT);
     let mut head = Vec::with_capacity(H2_PREFACE.len());
     let mut buf = [0u8; 32];
     let kind = loop {
@@ -95,20 +102,22 @@ pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handle
             kind => break kind,
         }
     };
-    let io = super::tls::Prefixed::new(head, super::io::RtFuturesIo::new(stream));
+    let io = super::io::TcpIo::new(stream);
+    // Each protocol's connection is boxed: a connection's task is the size of the one it speaks.
     match (kind, tls) {
         (Opening::Tls, Some(tls)) => {
             let Ok(config) = tls.config_alpn(&[super::tls::H2, super::tls::HTTP11]) else { return };
+            let io = super::tls::Prefixed::new(head, io);
             match crate::rt::timeout(HANDSHAKE, super::tls::ServerTlsStream::accept(io, config)).await {
-                Ok(Ok(s)) if s.alpn_protocol() == Some(super::tls::H2) => serve_h2(s, handler, remote, true).await,
-                Ok(Ok(s)) => serve_connection_with(s, handler, remote, true).await,
+                Ok(Ok(s)) if s.alpn_protocol() == Some(super::tls::H2) => Box::pin(serve_h2(s, Bytes::new(), handler, remote, true)).await,
+                Ok(Ok(s)) => Box::pin(serve_read(s, Bytes::new(), handler, remote, true)).await,
                 Ok(Err(e)) => tracing::debug!(error = %e, ?remote, "TLS handshake failed"),
                 Err(_) => tracing::debug!(?remote, "TLS handshake timed out"),
             }
         }
-        (Opening::H2, _) => serve_h2(super::tls::HyperIo::new(io), handler, remote, false).await,
+        (Opening::H2, _) => Box::pin(serve_h2(io, Bytes::from(head), handler, remote, false)).await,
         // HTTP/1.1, or TLS without a certificate here: HTTP/1.1 answers what it can.
-        _ => serve_connection_with(super::tls::HyperIo::new(io), handler, remote, false).await,
+        _ => Box::pin(serve_read(io, Bytes::from(head), handler, remote, false)).await,
     }
 }
 
@@ -125,51 +134,54 @@ fn mark(req: &mut Request, remote: Option<std::net::SocketAddr>, secure: bool) {
 /// [`serve_connection`], saying whether the connection is TLS ([`Secure`] on its requests).
 pub async fn serve_connection_with<I, H>(io: I, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool)
 where
-    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    H: Handler,
+{
+    serve_read(io, Bytes::new(), handler, remote, secure).await;
+}
+
+/// HTTP/1.1 over `io`, whose first bytes `read` were taken off it already.
+async fn serve_read<I, H>(io: I, read: Bytes, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool)
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
     let service = service_fn(move |mut req: Request| {
-        let h = handler.clone();
         mark(&mut req, remote, secure);
-        async move { Ok::<_, Infallible>(h.handle(req).await) }
+        handler.clone().handle(req)
     });
     let conn = http1::Builder::new()
         // Slow or idle clients cannot pin a connection: headers must arrive within the timeout
-        // (hyper's timer runs on the shard's timing wheel).
-        .timer(super::io::RtTimer)
-        .header_read_timeout(std::time::Duration::from_secs(30))
+        // (on the shard's timing wheel).
+        .header_read_timeout(Some(std::time::Duration::from_secs(30)))
         .keep_alive(true)
-        .max_buf_size(1 << 20)
-        .serve_connection(io, service)
-        .with_upgrades();
+        .max_head_size(1 << 20)
+        .serve_read(io, read, service);
     if let Err(e) = conn.await {
         tracing::debug!(error = %e, "http connection ended with an error");
     }
 }
 
-/// Serve an HTTP/2 connection: every request at once over the one connection, each its own task.
-/// Requests reach the handler shaped as HTTP/1.1's ([`as_http1`]). WebSockets stay HTTP/1.1's: no
-/// extended CONNECT is offered, so a browser opens an HTTP/1.1 connection for them.
-pub(crate) async fn serve_h2<I, H>(io: I, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool)
+/// Serve an HTTP/2 connection (whose first bytes `read` were taken off it already): every request
+/// at once over the one connection, each handler polled in the connection's task. Requests reach
+/// the handler shaped as HTTP/1.1's ([`as_http1`]). WebSockets stay HTTP/1.1's: no extended CONNECT
+/// is offered, so a browser opens an HTTP/1.1 connection for them.
+pub(crate) async fn serve_h2<I, H>(io: I, read: Bytes, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool)
 where
-    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
     let service = service_fn(move |mut req: Request| {
-        let h = handler.clone();
         as_http1(&mut req);
         mark(&mut req, remote, secure);
-        async move { Ok::<_, Infallible>(h.handle(req).await) }
+        handler.clone().handle(req)
     });
-    let conn = http2::Builder::new(super::io::RtExec)
-        .timer(super::io::RtTimer)
+    let conn = http2::Builder::new()
         // A connection whose client has gone quiet without closing is found and ended.
         .keep_alive_interval(Some(std::time::Duration::from_secs(30)))
         .keep_alive_timeout(std::time::Duration::from_secs(20))
-        // Windows sized to the link (a phone over a tunnel, a long log) rather than fixed.
-        .adaptive_window(true)
         .max_header_list_size(64 << 10)
-        .serve_connection(io, service);
+        .serve_read(io, read, service);
     if let Err(e) = conn.await {
         tracing::debug!(error = %e, "http/2 connection ended with an error");
     }
@@ -391,9 +403,9 @@ mod tests {
     /// One HTTP/2 request over `io`, its body as text.
     async fn h2_get<I>(io: I, uri: &str) -> anyhow::Result<String>
     where
-        I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (mut send, conn) = hyper::client::conn::http2::handshake(super::super::io::RtExec, io).await?;
+        let (mut send, conn) = kiln_http::client::http2::handshake::<_, http_body_util::Empty<Bytes>>(io).await?;
         crate::rt::spawn(conn);
         let req = http::Request::builder().uri(uri).header(header::COOKIE, "kiln_session=abc").header(header::COOKIE, "theme=dark").body(http_body_util::Empty::<Bytes>::new())?;
         let resp = send.send_request(req).await?;
@@ -415,7 +427,7 @@ mod tests {
 
             // In the clear, with prior knowledge.
             let tcp = hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-            let said = h2_get(super::super::io::RtIo::new(tcp), "http://kiln.test/api/runs?limit=5").await?;
+            let said = h2_get(super::super::io::TcpIo::new(tcp), "http://kiln.test/api/runs?limit=5").await?;
             assert_eq!(said, "HTTP/2.0 kiln.test /api/runs?limit=5 [kiln_session=abc; theme=dark] secure=false");
 
             // Over TLS, agreed by ALPN.

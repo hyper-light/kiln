@@ -2,7 +2,7 @@
 //! content store by their SHA-256, and the zips the toolkit uploads them as, opened.
 //!
 //! Providers read them through [`Files`], which the CD service implements over the store and
-//! tests over memory.
+//! tests over memory; and, through it, the values of an app's secrets its objects reference.
 
 use std::io::Read as _;
 use std::pin::Pin;
@@ -15,18 +15,44 @@ use crate::hub::Hub;
 /// The most an artifact may hold to be read whole.
 pub const LIMIT: u64 = 512 << 20;
 
-/// Where a provider reads artifacts' content.
+/// Where a provider reads what kiln holds for it: artifacts' content, the values of an app's
+/// secrets as it applies the objects that reference them (docs/deploy-api.md §3.5), and kiln's
+/// runners, for the providers that act through them (docs/cd-targets.md §2.2).
 pub trait Files: Send + Sync {
     /// The content of the artifact whose SHA-256 is `hex`, streamed, with its size.
     fn open<'a>(&'a self, hex: &'a str) -> Pin<Box<dyn std::future::Future<Output = Result<(async_channel::Receiver<Bytes>, u64)>> + Send + 'a>>;
+    /// The value `reference` ([`kiln_cd::apps::SECRET_REF`]) stands for, which must be one of
+    /// `app`'s secrets: read now, and the read kept in the secret's log.
+    fn secret<'a>(&'a self, app: &'a str, reference: &'a str) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + 'a>>;
+    /// kiln's runners: none where the providers' calls go only to platforms' APIs.
+    fn runners(&self) -> Option<&dyn crate::cd::targets::runner::Runners> {
+        None
+    }
 }
 
 impl Files for Hub {
+    fn runners(&self) -> Option<&dyn crate::cd::targets::runner::Runners> {
+        Some(self)
+    }
+
     fn open<'a>(&'a self, hex: &'a str) -> Pin<Box<dyn std::future::Future<Output = Result<(async_channel::Receiver<Bytes>, u64)>> + Send + 'a>> {
         Box::pin(async move {
             let obj = crate::ci::services::cas::object(self, hex).await?.with_context(|| format!("no artifact sha256:{hex} in kiln's store (expired?)"))?;
             let size = obj.size;
             Ok((crate::ci::services::cas::read(self, &obj, 0, size), size))
+        })
+    }
+
+    fn secret<'a>(&'a self, app: &'a str, reference: &'a str) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move {
+            let (scope, name, version) = kiln_cd::apps::parse_secret_ref(reference).with_context(|| format!("`{reference}` isn't a secret's reference"))?;
+            // Only the app's own: its definition names the scope and the secret.
+            let cd = crate::cd::get().context("KilnCD isn't running")?;
+            ensure!(cd.definition(app).and_then(|d| d.secrets).is_some_and(|s| s.scope == scope && s.versions.contains_key(name)), "{app} has no secret {name} in {scope}");
+            let at = crate::secrets::Scope::from_key(scope).with_context(|| format!("`{scope}` isn't a secrets scope"))?;
+            let why = crate::secrets::Use { by: "kilncd".into(), purpose: format!("deliver {app}'s {name}@{version}") };
+            let b = crate::secrets::of(&cd.hub).resolve(&at, &[(name.to_owned(), version)], &why).await?;
+            b.items.into_iter().find(|(n, _, _)| n == name).map(|(_, _, v)| v.bytes().to_vec()).with_context(|| format!("no {name}@{version} in {scope}"))
         })
     }
 }

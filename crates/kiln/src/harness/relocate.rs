@@ -156,9 +156,10 @@ async fn say(hub: &Arc<Hub>, id: &str, text: &str) {
 #[allow(clippy::too_many_arguments)]
 async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, now: bool, kind: Option<String>, model: Option<String>) -> Result<(), String> {
     let (there, note) = folder(hub, id, from, to, cwd, false).await?;
-    match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note, now, kind, model }).await {
-        Sent::Ok => Ok(()),
-        _ => Err(format!("{from} is not connected")),
+    match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note, now, kind, model, local: false }).await {
+        Sent::Ok | Sent::Taken => Ok(()),
+        Sent::Unreachable => Err(format!("{from} is not connected")),
+        s => Err(s.failure().map_or_else(|| format!("{from} didn't take it"), |(_, why)| why)),
     }
 }
 
@@ -204,6 +205,7 @@ async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, away:
         branch: None,
         to: vec![Target { machine: to.to_owned(), path: target.clone() }],
         delete: false,
+        mode: crate::sync::Mode::Files,
     };
     let tasks = crate::sync::tasks::start(hub, ask).await?;
     let task = tasks.into_iter().next().ok_or_else(|| "the copy was not started".to_owned())?;

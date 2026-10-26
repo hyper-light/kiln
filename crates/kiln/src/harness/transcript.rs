@@ -191,6 +191,7 @@ fn load_with(core: &mut Core, lines: &[String], started: Option<i64>, upto: Opti
     core.state.turn_started = None;
     core.state.doing = None;
     core.state.activity = None;
+    core.state.compacting = None;
     core.state.delivery.clear();
     core.state.usage = Default::default();
     core.take_writes();
@@ -218,7 +219,7 @@ pub fn view(file: &Path, cwd: &str, started: Option<i64>) -> Option<serde_json::
     core.state.cwd = cwd.to_owned();
     load_for(&mut core, &lines, started);
     for job in std::mem::take(&mut core.change_jobs) {
-        let (change, resolved) = super::diff::file_change(&job);
+        let (change, resolved) = super::diff::placed_change(&job, cwd);
         core.set_change(&job.abs, change, resolved);
     }
     let events: Vec<&super::model::Event> = core.events().collect();
@@ -285,7 +286,9 @@ mod tests {
                 Body::Thinking { .. } => None,
             })
             .collect();
-        assert_eq!(texts, vec!["first prompt", "first reply", "Conversation compacted (was 900k tokens)", "second prompt", "tool:a.txt:Done", "edited"]);
+        assert_eq!(texts, vec!["first prompt", "first reply", "Compacted · was 900k tokens", "second prompt", "tool:a.txt:Done", "edited"]);
+        // The compaction is its marker, the boundary the UI draws.
+        assert!(core.events().any(|e| e.id.starts_with(crate::harness::core::COMPACTION) && matches!(&e.body, Body::Notice { text, .. } if text.starts_with("Compacted"))));
         assert!(!texts.iter().any(|t| t == "other process"));
         assert_eq!(core.state.title, "Fix the thing");
         assert_eq!(core.state.goal, "first prompt");

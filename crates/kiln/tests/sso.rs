@@ -157,6 +157,8 @@ create_users = true
     assert_eq!((who.get("authenticated"), who.get("principal")), (Some(&json!(true)), Some(&json!("user:octo"))), "{who}");
     let grants = who.get("grants").cloned().unwrap_or_default().to_string();
     assert!(grants.contains("developer@org:acme") && grants.contains("viewer@org:acme"), "{grants}");
+    // Their groups there, as an app's owner teams name them (docs/deploy-api.md §15).
+    assert_eq!(who.get("groups"), Some(&json!(["github:acme", "github:acme/devs"])), "{who}");
 
     // An outsider: refused.
     let (st, cookie, _, why) = sign_in(s.port, "github", "outsider", "/")?;
@@ -164,13 +166,17 @@ create_users = true
     // The team's grants go with the team.
     let (st, cookie, _, _) = sign_in(s.port, "github", "lost", "/")?;
     assert_eq!(st, 303);
-    let grants = me(s.port, &cookie.unwrap_or_default())?.get("grants").cloned().unwrap_or_default().to_string();
+    let lost = me(s.port, &cookie.unwrap_or_default())?;
+    let grants = lost.get("grants").cloned().unwrap_or_default().to_string();
     assert!(grants.contains("viewer@org:acme") && !grants.contains("developer@org:acme"), "{grants}");
+    assert_eq!(lost.get("groups"), Some(&json!(["github:acme"])), "the team goes with it: {lost}");
 
     // GitLab makes nobody, but finds octo by the verified email.
     let (st, cookie, _, why) = sign_in(s.port, "gitlab", "gl", "/")?;
     assert_eq!(st, 303, "{why}");
-    assert_eq!(me(s.port, &cookie.unwrap_or_default())?.get("principal"), Some(&json!("user:octo")));
+    let octo = me(s.port, &cookie.unwrap_or_default())?;
+    assert_eq!(octo.get("principal"), Some(&json!("user:octo")));
+    assert_eq!(octo.get("groups"), Some(&json!(["github:acme", "gitlab:acme/platform"])), "each provider's, as last signed in: {octo}");
     // Bitbucket makes a new user.
     let (st, cookie, _, why) = sign_in(s.port, "bitbucket", "bb", "/")?;
     assert_eq!(st, 303, "{why}");

@@ -95,3 +95,45 @@ fn artifacts_come_whole_or_in_pieces_and_only_whole_are_kept() -> anyhow::Result
     assert!(st == 200 && got == tar, "{st}, {} bytes", got.len());
     Ok(())
 }
+
+/// A piece that stops short of its length is answered once nothing more comes for a while: what
+/// came of it is kept, the runner told where the pieces end, and the connection closed. (A runner's
+/// HTTP client could leave a piece's end unsent and wait for an answer, the server for the rest,
+/// until the runner gave up on the piece and sent it again: over Wi-Fi, the Macs' release uploads
+/// ran out of time.)
+#[test]
+fn a_piece_that_stops_short_keeps_what_came_and_is_answered() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let server = common::start(dir.path(), &common::Options::default())?;
+    let (port, admin) = (server.port, server.admin.clone());
+    let tar: Vec<u8> = (0..300_000u32).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+    let up = "/api/jobs/j3/artifacts/upload";
+
+    // A piece of 100,000 bytes, of which 60,000 come; then nothing, the connection left open.
+    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(Duration::from_secs(60)))?;
+    write!(s, "PUT {up}?at=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {admin}\r\nContent-Type: application/octet-stream\r\nContent-Length: 100000\r\n\r\n")?;
+    s.write_all(tar.get(..60_000).unwrap_or_default())?;
+    let started = std::time::Instant::now();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw)?;
+    let waited = started.elapsed();
+    let at = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| anyhow::anyhow!("no answer, {waited:?}: {}", String::from_utf8_lossy(&raw)))?;
+    let head = String::from_utf8_lossy(raw.get(..at).unwrap_or_default()).to_ascii_lowercase();
+    let rest = raw.get(at + 4..).unwrap_or_default();
+    let body = if head.contains("transfer-encoding: chunked") { dechunk(rest) } else { rest.to_vec() };
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("connection: close"), "the unread rest ends the connection: {head}");
+    assert_eq!(have(&body), Some(60_000), "what came is kept");
+    assert!(waited < Duration::from_secs(40), "answered well inside a runner's 120 s for a piece: {waited:?}");
+
+    // The rest goes on from there, and the whole is kept as it was sent.
+    let (st, body) = send(port, "PUT", &format!("{up}?at=60000"), &admin, tar.get(60_000..).unwrap_or_default())?;
+    assert_eq!((st, have(&body)), (200, Some(300_000)));
+    let digest = hex::encode(sha2::Sha256::digest(&tar));
+    let (st, _) = send(port, "POST", &format!("{up}?size=300000&sha256={digest}"), &admin, b"")?;
+    assert_eq!(st, 204, "{}", server.log());
+    let (st, got) = send(port, "GET", "/api/jobs/j3/artifacts", &admin, b"")?;
+    assert!(st == 200 && got == tar, "{st}, {} bytes", got.len());
+    Ok(())
+}

@@ -24,7 +24,6 @@ import { Route as AppTerminalRouteImport } from './routes/_app.terminal'
 import { Route as AppWorkflowsRouteImport } from './routes/_app.workflows'
 import { Route as AppAgentsIndexRouteImport } from './routes/_app.agents.index'
 import { Route as AppAgentsIdRouteImport } from './routes/_app.agents.$id'
-import { Route as AppAgentsAttachedRouteImport } from './routes/_app.agents.attached'
 import { Route as AppAgentsSessionsRouteImport } from './routes/_app.agents.sessions'
 import { Route as AppDeploymentsIndexRouteImport } from './routes/_app.deployments.index'
 import { Route as AppDeploymentsNewRouteImport } from './routes/_app.deployments.new'
@@ -38,6 +37,9 @@ import { Route as AppRunsIndexRouteImport } from './routes/_app.runs.index'
 import { Route as SharedPlansTokenRouteImport } from './routes/shared.plans.$token'
 import { Route as AppAgentsPlansIndexRouteImport } from './routes/_app.agents.plans.index'
 import { Route as AppAgentsPlansIdRouteImport } from './routes/_app.agents.plans.$id'
+import { Route as AppAgentsResearchIdRouteImport } from './routes/_app.agents.research.$id'
+import { Route as AppDeploymentsEnvironmentsIndexRouteImport } from './routes/_app.deployments.environments.index'
+import { Route as AppDeploymentsEnvironmentsNameRouteImport } from './routes/_app.deployments.environments.$name'
 import { Route as AppDeploymentsReleasesIndexRouteImport } from './routes/_app.deployments.releases.index'
 import { Route as AppDeploymentsReleasesIdRouteImport } from './routes/_app.deployments.releases.$id'
 import { Route as AppDeploymentsReleasesNewRouteImport } from './routes/_app.deployments.releases.new'
@@ -48,6 +50,12 @@ import { Route as AppAgentsPlansRunsRunRouteImport } from './routes/_app.agents.
 import { Route as AppDeploymentsAppsProjectNameRouteImport } from './routes/_app.deployments.apps.$project.$name'
 import { Route as AppDeploymentsReleasesAppsAppRouteImport } from './routes/_app.deployments.releases.apps.$app'
 import { Route as AppDeploymentsReleasesEnvironmentsEnvRouteImport } from './routes/_app.deployments.releases.environments.$env'
+import { Route as AppDeploymentsReleasesFleetsIdRouteImport } from './routes/_app.deployments.releases.fleets.$id'
+import { Route as AppDeploymentsReleasesFleetsNewRouteImport } from './routes/_app.deployments.releases.fleets.new'
+import { Route as AppDeploymentsReleasesTemplatesIndexRouteImport } from './routes/_app.deployments.releases.templates.index'
+import { Route as AppDeploymentsReleasesTemplatesNameRouteImport } from './routes/_app.deployments.releases.templates.$name'
+import { Route as AppReviewHostsRepoIndexRouteImport } from './routes/_app.review.hosts.$repo.index'
+import { Route as AppReviewHostsRepoNumberRouteImport } from './routes/_app.review.hosts.$repo.$number'
 import { Route as AppRunsIdJobsJobIdRouteImport } from './routes/_app.runs.$id.jobs.$jobId'
 import { Route as AppDeploymentsReleasesAppsAppEnvironmentsEnvRouteImport } from './routes/_app.deployments.releases.apps.$app_.environments.$env'
 
@@ -125,11 +133,6 @@ const AppAgentsIdRoute = AppAgentsIdRouteImport.update({
   path: '/agents/$id',
   getParentRoute: () => AppRoute,
 } as any)
-const AppAgentsAttachedRoute = AppAgentsAttachedRouteImport.update({
-  id: '/agents/attached',
-  path: '/agents/attached',
-  getParentRoute: () => AppRoute,
-} as any)
 const AppAgentsSessionsRoute = AppAgentsSessionsRouteImport.update({
   id: '/agents/sessions',
   path: '/agents/sessions',
@@ -195,6 +198,23 @@ const AppAgentsPlansIdRoute = AppAgentsPlansIdRouteImport.update({
   path: '/agents/plans/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppAgentsResearchIdRoute = AppAgentsResearchIdRouteImport.update({
+  id: '/agents/research/$id',
+  path: '/agents/research/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppDeploymentsEnvironmentsIndexRoute =
+  AppDeploymentsEnvironmentsIndexRouteImport.update({
+    id: '/deployments/environments/',
+    path: '/deployments/environments/',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsEnvironmentsNameRoute =
+  AppDeploymentsEnvironmentsNameRouteImport.update({
+    id: '/deployments/environments/$name',
+    path: '/deployments/environments/$name',
+    getParentRoute: () => AppRoute,
+  } as any)
 const AppDeploymentsReleasesIndexRoute =
   AppDeploymentsReleasesIndexRouteImport.update({
     id: '/deployments/releases/',
@@ -251,6 +271,41 @@ const AppDeploymentsReleasesEnvironmentsEnvRoute =
     path: '/deployments/releases/environments/$env',
     getParentRoute: () => AppRoute,
   } as any)
+const AppDeploymentsReleasesFleetsIdRoute =
+  AppDeploymentsReleasesFleetsIdRouteImport.update({
+    id: '/deployments/releases/fleets/$id',
+    path: '/deployments/releases/fleets/$id',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesFleetsNewRoute =
+  AppDeploymentsReleasesFleetsNewRouteImport.update({
+    id: '/deployments/releases/fleets/new',
+    path: '/deployments/releases/fleets/new',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesTemplatesIndexRoute =
+  AppDeploymentsReleasesTemplatesIndexRouteImport.update({
+    id: '/deployments/releases/templates/',
+    path: '/deployments/releases/templates/',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesTemplatesNameRoute =
+  AppDeploymentsReleasesTemplatesNameRouteImport.update({
+    id: '/deployments/releases/templates/$name',
+    path: '/deployments/releases/templates/$name',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppReviewHostsRepoIndexRoute = AppReviewHostsRepoIndexRouteImport.update({
+  id: '/review/hosts/$repo/',
+  path: '/review/hosts/$repo/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppReviewHostsRepoNumberRoute =
+  AppReviewHostsRepoNumberRouteImport.update({
+    id: '/review/hosts/$repo/$number',
+    path: '/review/hosts/$repo/$number',
+    getParentRoute: () => AppRoute,
+  } as any)
 const AppRunsIdJobsJobIdRoute = AppRunsIdJobsJobIdRouteImport.update({
   id: '/runs/$id/jobs/$jobId',
   path: '/runs/$id/jobs/$jobId',
@@ -277,7 +332,6 @@ export interface FileRoutesByFullPath {
   '/terminal': typeof AppTerminalRoute
   '/workflows': typeof AppWorkflowsRoute
   '/agents/$id': typeof AppAgentsIdRoute
-  '/agents/attached': typeof AppAgentsAttachedRoute
   '/agents/sessions': typeof AppAgentsSessionsRoute
   '/deployments/new': typeof AppDeploymentsNewRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
@@ -291,18 +345,27 @@ export interface FileRoutesByFullPath {
   '/runners/': typeof AppRunnersIndexRoute
   '/runs/': typeof AppRunsIndexRoute
   '/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/agents/research/$id': typeof AppAgentsResearchIdRoute
+  '/deployments/environments/$name': typeof AppDeploymentsEnvironmentsNameRoute
   '/deployments/releases/$id': typeof AppDeploymentsReleasesIdRoute
   '/deployments/releases/new': typeof AppDeploymentsReleasesNewRoute
   '/review/stacks/$id': typeof AppReviewStacksIdRoute
   '/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/agents/plans/': typeof AppAgentsPlansIndexRoute
+  '/deployments/environments/': typeof AppDeploymentsEnvironmentsIndexRoute
   '/deployments/releases/': typeof AppDeploymentsReleasesIndexRoute
   '/runs/$id/': typeof AppRunsIdIndexRoute
   '/agents/plans/runs/$run': typeof AppAgentsPlansRunsRunRoute
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
   '/deployments/releases/apps/$app': typeof AppDeploymentsReleasesAppsAppRoute
   '/deployments/releases/environments/$env': typeof AppDeploymentsReleasesEnvironmentsEnvRoute
+  '/deployments/releases/fleets/$id': typeof AppDeploymentsReleasesFleetsIdRoute
+  '/deployments/releases/fleets/new': typeof AppDeploymentsReleasesFleetsNewRoute
+  '/deployments/releases/templates/$name': typeof AppDeploymentsReleasesTemplatesNameRoute
+  '/review/hosts/$repo/$number': typeof AppReviewHostsRepoNumberRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/deployments/releases/templates/': typeof AppDeploymentsReleasesTemplatesIndexRoute
+  '/review/hosts/$repo/': typeof AppReviewHostsRepoIndexRoute
   '/deployments/releases/apps/$app/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
 }
 export interface FileRoutesByTo {
@@ -319,7 +382,6 @@ export interface FileRoutesByTo {
   '/workflows': typeof AppWorkflowsRoute
   '/': typeof AppIndexRoute
   '/agents/$id': typeof AppAgentsIdRoute
-  '/agents/attached': typeof AppAgentsAttachedRoute
   '/agents/sessions': typeof AppAgentsSessionsRoute
   '/deployments/new': typeof AppDeploymentsNewRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
@@ -333,18 +395,27 @@ export interface FileRoutesByTo {
   '/runners': typeof AppRunnersIndexRoute
   '/runs': typeof AppRunsIndexRoute
   '/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/agents/research/$id': typeof AppAgentsResearchIdRoute
+  '/deployments/environments/$name': typeof AppDeploymentsEnvironmentsNameRoute
   '/deployments/releases/$id': typeof AppDeploymentsReleasesIdRoute
   '/deployments/releases/new': typeof AppDeploymentsReleasesNewRoute
   '/review/stacks/$id': typeof AppReviewStacksIdRoute
   '/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/agents/plans': typeof AppAgentsPlansIndexRoute
+  '/deployments/environments': typeof AppDeploymentsEnvironmentsIndexRoute
   '/deployments/releases': typeof AppDeploymentsReleasesIndexRoute
   '/runs/$id': typeof AppRunsIdIndexRoute
   '/agents/plans/runs/$run': typeof AppAgentsPlansRunsRunRoute
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
   '/deployments/releases/apps/$app': typeof AppDeploymentsReleasesAppsAppRoute
   '/deployments/releases/environments/$env': typeof AppDeploymentsReleasesEnvironmentsEnvRoute
+  '/deployments/releases/fleets/$id': typeof AppDeploymentsReleasesFleetsIdRoute
+  '/deployments/releases/fleets/new': typeof AppDeploymentsReleasesFleetsNewRoute
+  '/deployments/releases/templates/$name': typeof AppDeploymentsReleasesTemplatesNameRoute
+  '/review/hosts/$repo/$number': typeof AppReviewHostsRepoNumberRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/deployments/releases/templates': typeof AppDeploymentsReleasesTemplatesIndexRoute
+  '/review/hosts/$repo': typeof AppReviewHostsRepoIndexRoute
   '/deployments/releases/apps/$app/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
 }
 export interface FileRoutesById {
@@ -363,7 +434,6 @@ export interface FileRoutesById {
   '/_app/workflows': typeof AppWorkflowsRoute
   '/_app/': typeof AppIndexRoute
   '/_app/agents/$id': typeof AppAgentsIdRoute
-  '/_app/agents/attached': typeof AppAgentsAttachedRoute
   '/_app/agents/sessions': typeof AppAgentsSessionsRoute
   '/_app/deployments/new': typeof AppDeploymentsNewRoute
   '/_app/deployments/plans': typeof AppDeploymentsPlansRoute
@@ -377,18 +447,27 @@ export interface FileRoutesById {
   '/_app/runners/': typeof AppRunnersIndexRoute
   '/_app/runs/': typeof AppRunsIndexRoute
   '/_app/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/_app/agents/research/$id': typeof AppAgentsResearchIdRoute
+  '/_app/deployments/environments/$name': typeof AppDeploymentsEnvironmentsNameRoute
   '/_app/deployments/releases/$id': typeof AppDeploymentsReleasesIdRoute
   '/_app/deployments/releases/new': typeof AppDeploymentsReleasesNewRoute
   '/_app/review/stacks/$id': typeof AppReviewStacksIdRoute
   '/_app/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/_app/agents/plans/': typeof AppAgentsPlansIndexRoute
+  '/_app/deployments/environments/': typeof AppDeploymentsEnvironmentsIndexRoute
   '/_app/deployments/releases/': typeof AppDeploymentsReleasesIndexRoute
   '/_app/runs/$id/': typeof AppRunsIdIndexRoute
   '/_app/agents/plans/runs/$run': typeof AppAgentsPlansRunsRunRoute
   '/_app/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
   '/_app/deployments/releases/apps/$app': typeof AppDeploymentsReleasesAppsAppRoute
   '/_app/deployments/releases/environments/$env': typeof AppDeploymentsReleasesEnvironmentsEnvRoute
+  '/_app/deployments/releases/fleets/$id': typeof AppDeploymentsReleasesFleetsIdRoute
+  '/_app/deployments/releases/fleets/new': typeof AppDeploymentsReleasesFleetsNewRoute
+  '/_app/deployments/releases/templates/$name': typeof AppDeploymentsReleasesTemplatesNameRoute
+  '/_app/review/hosts/$repo/$number': typeof AppReviewHostsRepoNumberRoute
   '/_app/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/_app/deployments/releases/templates/': typeof AppDeploymentsReleasesTemplatesIndexRoute
+  '/_app/review/hosts/$repo/': typeof AppReviewHostsRepoIndexRoute
   '/_app/deployments/releases/apps/$app_/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
 }
 export interface FileRouteTypes {
@@ -407,7 +486,6 @@ export interface FileRouteTypes {
     | '/terminal'
     | '/workflows'
     | '/agents/$id'
-    | '/agents/attached'
     | '/agents/sessions'
     | '/deployments/new'
     | '/deployments/plans'
@@ -421,18 +499,27 @@ export interface FileRouteTypes {
     | '/runners/'
     | '/runs/'
     | '/agents/plans/$id'
+    | '/agents/research/$id'
+    | '/deployments/environments/$name'
     | '/deployments/releases/$id'
     | '/deployments/releases/new'
     | '/review/stacks/$id'
     | '/runs/$id/compare'
     | '/agents/plans/'
+    | '/deployments/environments/'
     | '/deployments/releases/'
     | '/runs/$id/'
     | '/agents/plans/runs/$run'
     | '/deployments/apps/$project/$name'
     | '/deployments/releases/apps/$app'
     | '/deployments/releases/environments/$env'
+    | '/deployments/releases/fleets/$id'
+    | '/deployments/releases/fleets/new'
+    | '/deployments/releases/templates/$name'
+    | '/review/hosts/$repo/$number'
     | '/runs/$id/jobs/$jobId'
+    | '/deployments/releases/templates/'
+    | '/review/hosts/$repo/'
     | '/deployments/releases/apps/$app/environments/$env'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -449,7 +536,6 @@ export interface FileRouteTypes {
     | '/workflows'
     | '/'
     | '/agents/$id'
-    | '/agents/attached'
     | '/agents/sessions'
     | '/deployments/new'
     | '/deployments/plans'
@@ -463,18 +549,27 @@ export interface FileRouteTypes {
     | '/runners'
     | '/runs'
     | '/agents/plans/$id'
+    | '/agents/research/$id'
+    | '/deployments/environments/$name'
     | '/deployments/releases/$id'
     | '/deployments/releases/new'
     | '/review/stacks/$id'
     | '/runs/$id/compare'
     | '/agents/plans'
+    | '/deployments/environments'
     | '/deployments/releases'
     | '/runs/$id'
     | '/agents/plans/runs/$run'
     | '/deployments/apps/$project/$name'
     | '/deployments/releases/apps/$app'
     | '/deployments/releases/environments/$env'
+    | '/deployments/releases/fleets/$id'
+    | '/deployments/releases/fleets/new'
+    | '/deployments/releases/templates/$name'
+    | '/review/hosts/$repo/$number'
     | '/runs/$id/jobs/$jobId'
+    | '/deployments/releases/templates'
+    | '/review/hosts/$repo'
     | '/deployments/releases/apps/$app/environments/$env'
   id:
     | '__root__'
@@ -492,7 +587,6 @@ export interface FileRouteTypes {
     | '/_app/workflows'
     | '/_app/'
     | '/_app/agents/$id'
-    | '/_app/agents/attached'
     | '/_app/agents/sessions'
     | '/_app/deployments/new'
     | '/_app/deployments/plans'
@@ -506,18 +600,27 @@ export interface FileRouteTypes {
     | '/_app/runners/'
     | '/_app/runs/'
     | '/_app/agents/plans/$id'
+    | '/_app/agents/research/$id'
+    | '/_app/deployments/environments/$name'
     | '/_app/deployments/releases/$id'
     | '/_app/deployments/releases/new'
     | '/_app/review/stacks/$id'
     | '/_app/runs/$id/compare'
     | '/_app/agents/plans/'
+    | '/_app/deployments/environments/'
     | '/_app/deployments/releases/'
     | '/_app/runs/$id/'
     | '/_app/agents/plans/runs/$run'
     | '/_app/deployments/apps/$project/$name'
     | '/_app/deployments/releases/apps/$app'
     | '/_app/deployments/releases/environments/$env'
+    | '/_app/deployments/releases/fleets/$id'
+    | '/_app/deployments/releases/fleets/new'
+    | '/_app/deployments/releases/templates/$name'
+    | '/_app/review/hosts/$repo/$number'
     | '/_app/runs/$id/jobs/$jobId'
+    | '/_app/deployments/releases/templates/'
+    | '/_app/review/hosts/$repo/'
     | '/_app/deployments/releases/apps/$app_/environments/$env'
   fileRoutesById: FileRoutesById
 }
@@ -633,13 +736,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppAgentsIdRouteImport
       parentRoute: typeof AppRoute
     }
-    '/_app/agents/attached': {
-      id: '/_app/agents/attached'
-      path: '/agents/attached'
-      fullPath: '/agents/attached'
-      preLoaderRoute: typeof AppAgentsAttachedRouteImport
-      parentRoute: typeof AppRoute
-    }
     '/_app/agents/sessions': {
       id: '/_app/agents/sessions'
       path: '/agents/sessions'
@@ -731,6 +827,27 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppAgentsPlansIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/agents/research/$id': {
+      id: '/_app/agents/research/$id'
+      path: '/agents/research/$id'
+      fullPath: '/agents/research/$id'
+      preLoaderRoute: typeof AppAgentsResearchIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/environments/': {
+      id: '/_app/deployments/environments/'
+      path: '/deployments/environments'
+      fullPath: '/deployments/environments/'
+      preLoaderRoute: typeof AppDeploymentsEnvironmentsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/environments/$name': {
+      id: '/_app/deployments/environments/$name'
+      path: '/deployments/environments/$name'
+      fullPath: '/deployments/environments/$name'
+      preLoaderRoute: typeof AppDeploymentsEnvironmentsNameRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/deployments/releases/': {
       id: '/_app/deployments/releases/'
       path: '/deployments/releases'
@@ -801,6 +918,48 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppDeploymentsReleasesEnvironmentsEnvRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/deployments/releases/fleets/$id': {
+      id: '/_app/deployments/releases/fleets/$id'
+      path: '/deployments/releases/fleets/$id'
+      fullPath: '/deployments/releases/fleets/$id'
+      preLoaderRoute: typeof AppDeploymentsReleasesFleetsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/fleets/new': {
+      id: '/_app/deployments/releases/fleets/new'
+      path: '/deployments/releases/fleets/new'
+      fullPath: '/deployments/releases/fleets/new'
+      preLoaderRoute: typeof AppDeploymentsReleasesFleetsNewRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/templates/': {
+      id: '/_app/deployments/releases/templates/'
+      path: '/deployments/releases/templates'
+      fullPath: '/deployments/releases/templates/'
+      preLoaderRoute: typeof AppDeploymentsReleasesTemplatesIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/templates/$name': {
+      id: '/_app/deployments/releases/templates/$name'
+      path: '/deployments/releases/templates/$name'
+      fullPath: '/deployments/releases/templates/$name'
+      preLoaderRoute: typeof AppDeploymentsReleasesTemplatesNameRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/review/hosts/$repo/': {
+      id: '/_app/review/hosts/$repo/'
+      path: '/review/hosts/$repo'
+      fullPath: '/review/hosts/$repo/'
+      preLoaderRoute: typeof AppReviewHostsRepoIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/review/hosts/$repo/$number': {
+      id: '/_app/review/hosts/$repo/$number'
+      path: '/review/hosts/$repo/$number'
+      fullPath: '/review/hosts/$repo/$number'
+      preLoaderRoute: typeof AppReviewHostsRepoNumberRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/runs/$id/jobs/$jobId': {
       id: '/_app/runs/$id/jobs/$jobId'
       path: '/runs/$id/jobs/$jobId'
@@ -832,7 +991,6 @@ interface AppRouteChildren {
   AppWorkflowsRoute: typeof AppWorkflowsRoute
   AppIndexRoute: typeof AppIndexRoute
   AppAgentsIdRoute: typeof AppAgentsIdRoute
-  AppAgentsAttachedRoute: typeof AppAgentsAttachedRoute
   AppAgentsSessionsRoute: typeof AppAgentsSessionsRoute
   AppDeploymentsNewRoute: typeof AppDeploymentsNewRoute
   AppDeploymentsPlansRoute: typeof AppDeploymentsPlansRoute
@@ -845,18 +1003,27 @@ interface AppRouteChildren {
   AppRunnersIndexRoute: typeof AppRunnersIndexRoute
   AppRunsIndexRoute: typeof AppRunsIndexRoute
   AppAgentsPlansIdRoute: typeof AppAgentsPlansIdRoute
+  AppAgentsResearchIdRoute: typeof AppAgentsResearchIdRoute
+  AppDeploymentsEnvironmentsNameRoute: typeof AppDeploymentsEnvironmentsNameRoute
   AppDeploymentsReleasesIdRoute: typeof AppDeploymentsReleasesIdRoute
   AppDeploymentsReleasesNewRoute: typeof AppDeploymentsReleasesNewRoute
   AppReviewStacksIdRoute: typeof AppReviewStacksIdRoute
   AppRunsIdCompareRoute: typeof AppRunsIdCompareRoute
   AppAgentsPlansIndexRoute: typeof AppAgentsPlansIndexRoute
+  AppDeploymentsEnvironmentsIndexRoute: typeof AppDeploymentsEnvironmentsIndexRoute
   AppDeploymentsReleasesIndexRoute: typeof AppDeploymentsReleasesIndexRoute
   AppRunsIdIndexRoute: typeof AppRunsIdIndexRoute
   AppAgentsPlansRunsRunRoute: typeof AppAgentsPlansRunsRunRoute
   AppDeploymentsAppsProjectNameRoute: typeof AppDeploymentsAppsProjectNameRoute
   AppDeploymentsReleasesAppsAppRoute: typeof AppDeploymentsReleasesAppsAppRoute
   AppDeploymentsReleasesEnvironmentsEnvRoute: typeof AppDeploymentsReleasesEnvironmentsEnvRoute
+  AppDeploymentsReleasesFleetsIdRoute: typeof AppDeploymentsReleasesFleetsIdRoute
+  AppDeploymentsReleasesFleetsNewRoute: typeof AppDeploymentsReleasesFleetsNewRoute
+  AppDeploymentsReleasesTemplatesNameRoute: typeof AppDeploymentsReleasesTemplatesNameRoute
+  AppReviewHostsRepoNumberRoute: typeof AppReviewHostsRepoNumberRoute
   AppRunsIdJobsJobIdRoute: typeof AppRunsIdJobsJobIdRoute
+  AppDeploymentsReleasesTemplatesIndexRoute: typeof AppDeploymentsReleasesTemplatesIndexRoute
+  AppReviewHostsRepoIndexRoute: typeof AppReviewHostsRepoIndexRoute
   AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute: typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
 }
 
@@ -874,7 +1041,6 @@ const AppRouteChildren: AppRouteChildren = {
   AppWorkflowsRoute: AppWorkflowsRoute,
   AppIndexRoute: AppIndexRoute,
   AppAgentsIdRoute: AppAgentsIdRoute,
-  AppAgentsAttachedRoute: AppAgentsAttachedRoute,
   AppAgentsSessionsRoute: AppAgentsSessionsRoute,
   AppDeploymentsNewRoute: AppDeploymentsNewRoute,
   AppDeploymentsPlansRoute: AppDeploymentsPlansRoute,
@@ -887,11 +1053,14 @@ const AppRouteChildren: AppRouteChildren = {
   AppRunnersIndexRoute: AppRunnersIndexRoute,
   AppRunsIndexRoute: AppRunsIndexRoute,
   AppAgentsPlansIdRoute: AppAgentsPlansIdRoute,
+  AppAgentsResearchIdRoute: AppAgentsResearchIdRoute,
+  AppDeploymentsEnvironmentsNameRoute: AppDeploymentsEnvironmentsNameRoute,
   AppDeploymentsReleasesIdRoute: AppDeploymentsReleasesIdRoute,
   AppDeploymentsReleasesNewRoute: AppDeploymentsReleasesNewRoute,
   AppReviewStacksIdRoute: AppReviewStacksIdRoute,
   AppRunsIdCompareRoute: AppRunsIdCompareRoute,
   AppAgentsPlansIndexRoute: AppAgentsPlansIndexRoute,
+  AppDeploymentsEnvironmentsIndexRoute: AppDeploymentsEnvironmentsIndexRoute,
   AppDeploymentsReleasesIndexRoute: AppDeploymentsReleasesIndexRoute,
   AppRunsIdIndexRoute: AppRunsIdIndexRoute,
   AppAgentsPlansRunsRunRoute: AppAgentsPlansRunsRunRoute,
@@ -899,7 +1068,15 @@ const AppRouteChildren: AppRouteChildren = {
   AppDeploymentsReleasesAppsAppRoute: AppDeploymentsReleasesAppsAppRoute,
   AppDeploymentsReleasesEnvironmentsEnvRoute:
     AppDeploymentsReleasesEnvironmentsEnvRoute,
+  AppDeploymentsReleasesFleetsIdRoute: AppDeploymentsReleasesFleetsIdRoute,
+  AppDeploymentsReleasesFleetsNewRoute: AppDeploymentsReleasesFleetsNewRoute,
+  AppDeploymentsReleasesTemplatesNameRoute:
+    AppDeploymentsReleasesTemplatesNameRoute,
+  AppReviewHostsRepoNumberRoute: AppReviewHostsRepoNumberRoute,
   AppRunsIdJobsJobIdRoute: AppRunsIdJobsJobIdRoute,
+  AppDeploymentsReleasesTemplatesIndexRoute:
+    AppDeploymentsReleasesTemplatesIndexRoute,
+  AppReviewHostsRepoIndexRoute: AppReviewHostsRepoIndexRoute,
   AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute:
     AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute,
 }

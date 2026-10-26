@@ -56,6 +56,17 @@ export interface DiffRun {
   event: string;
   status: string;
   conclusion: string | null;
+  /** What its jobs' `bench-gate`s said (W16-R09). */
+  gates?: BenchGate[];
+}
+
+/** A job's `bench-gate` result on a commit (W16-R09): failing (`error`) or a warning, and why. */
+export interface BenchGate {
+  run: string;
+  leg: string;
+  job: string;
+  level: string;
+  message: string;
 }
 
 export interface Reviewer {
@@ -157,14 +168,31 @@ export interface InboxThread {
   last: string;
 }
 
+/** What a notification rule put in your inbox (W19-R06). */
+export interface InboxNote {
+  id: string;
+  event: string;
+  title: string;
+  line: string;
+  url: string;
+  repo: string | null;
+  at: number;
+  read: boolean;
+}
+
 export interface Inbox {
   you: string;
+  /** What notification rules put here, newest first. */
+  notifications: InboxNote[];
+  unread: number;
   /** Threads whose last word isn't yours. */
   waiting_for_you: InboxThread[];
   /** Threads whose last word is yours. */
   waiting_for_others: InboxThread[];
   review_requested: { repo: string; diff: string; title: string; author: string; your_state: string }[];
   your_diffs: { repo: string; diff: string; title: string; state: string }[];
+  /** Pull requests on the hosts kiln's repositories are on that ask your review there (W23-R06). */
+  elsewhere?: { repo: string; host: HostName; number: number; title: string; author: string; url: string; updated_at: number | null }[];
 }
 
 export interface Stack {
@@ -189,6 +217,8 @@ export interface QueueEntry {
   enqueued_by: string;
   created_at: number;
   updated_at: number;
+  /** What the candidate's `bench-gate`s said (W16-R09). */
+  gates?: BenchGate[];
 }
 
 export type ReviewAction = "accept" | "request_changes" | "comment" | "resign";
@@ -197,9 +227,12 @@ const enc = encodeURIComponent;
 
 export const reviewApi = {
   inbox: (signal?: AbortSignal) => request<Inbox>("GET", "/api/review/inbox", undefined, { signal }),
+  readAll: () => request<{ read: number }>("POST", "/api/review/inbox/read", { all: true }),
   diff: (key: string, signal?: AbortSignal) => request<DiffDetail>("GET", `/api/diffs/${enc(key)}`, undefined, { signal }),
   files: (key: string, version: number, signal?: AbortSignal) => request<VersionFiles>("GET", `/api/diffs/${enc(key)}/versions/${version}/files`, undefined, { signal }),
   interdiff: (key: string, from: number, to: number, signal?: AbortSignal) => request<Interdiff>("GET", `/api/diffs/${enc(key)}/interdiff?from=${from}&to=${to}`, undefined, { signal }),
+  dependencies: (key: string, to: number, from: number | null, signal?: AbortSignal) =>
+    request<Dependencies>("GET", `/api/diffs/${enc(key)}/dependencies?to=${to}${from != null ? `&from=${from}` : ""}`, undefined, { signal }),
   threads: (key: string, signal?: AbortSignal) => request<{ threads: Thread[] }>("GET", `/api/diffs/${enc(key)}/comments`, undefined, { signal }).then((r) => r.threads),
   comment: (
     key: string,
@@ -221,13 +254,102 @@ export const reviewApi = {
   blobUrl: (key: string, version: number, path: string, side: "old" | "new") => apiPath(`/api/diffs/${enc(key)}/versions/${version}/blob?path=${enc(path)}&side=${side}`),
 };
 
+export type HostName = "github" | "gitlab" | "bitbucket";
+
+/** A pull request (GitLab's merge request) on a repository's host, in one shape (W23-R06). */
+export interface HostPull {
+  host: HostName;
+  number: number;
+  title: string;
+  body: string;
+  author: string;
+  state: "open" | "merged" | "closed" | string;
+  draft: boolean;
+  head: string;
+  sha: string;
+  base: string;
+  base_sha: string;
+  url: string;
+  updated_at: number | null;
+  mergeable: boolean | null;
+  reviewers: string[];
+}
+
+export interface HostCheck {
+  run: string;
+  provider: string;
+  name: string | null;
+  status: string;
+  conclusion: string | null;
+  url: string | null;
+  number: number;
+}
+
+export interface HostComment {
+  id: string;
+  author: string;
+  body: string;
+  at: number | null;
+}
+
+export interface HostThread {
+  id: string;
+  path: string | null;
+  line: number | null;
+  side: "left" | "right" | null;
+  resolved: boolean | null;
+  comments: HostComment[];
+}
+
+export interface HostPullDetail extends HostPull {
+  files: { path: string; old_path: string | null; status: string; additions: number | null; deletions: number | null; patch: string | null }[];
+  conversation: HostComment[];
+  threads: HostThread[];
+  reviews: { author: string; state: string; body: string; at: number | null }[];
+  merge_methods: string[];
+  /** Every provider's runs of its head commit, from kiln's own tables. */
+  checks: { state?: "success" | "failure" | "pending" | "none"; checks?: HostCheck[]; error?: string };
+}
+
+/** Who acted on the host: you, with the account you signed in with, or kiln's credentials there. */
+type Acted = { as: "person" | "kiln" };
+
+export const hostPullsApi = {
+  list: (repo: string, signal?: AbortSignal) => request<{ repo: string; pulls: HostPull[] }>("GET", `/api/ci/repos/${enc(repo)}/pulls`, undefined, { signal }).then((r) => r.pulls),
+  get: (repo: string, n: number, signal?: AbortSignal) => request<HostPullDetail>("GET", `/api/ci/repos/${enc(repo)}/pulls/${n}`, undefined, { signal }),
+  comment: (repo: string, n: number, body: { body: string; path?: string; line?: number; side?: "left" | "right"; reply_to?: string }) =>
+    request<Acted>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/comments`, body),
+  review: (repo: string, n: number, verdict: "approve" | "request_changes" | "comment", body: string) => request<Acted>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/reviews`, { verdict, body }),
+  merge: (repo: string, n: number, method: string) => request<Acted & { merged: boolean; commit: string | null }>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/merge`, { method }),
+};
+
+export const hostPullsRes = (repo: string): Res<HostPull[]> => ({ key: `review/host/${repo}`, fetch: (s) => hostPullsApi.list(repo, s) });
+export const hostPullRes = (repo: string, n: number): Res<HostPullDetail> => ({ key: `review/host/${repo}/${n}`, fetch: (s) => hostPullsApi.get(repo, n, s) });
+
+export const HOST_WORD: Record<HostName, string> = { github: "GitHub", gitlab: "GitLab", bitbucket: "Bitbucket" };
+/** How each host writes a change's number. */
+export const hostNumber = (host: HostName, n: number) => (host === "gitlab" ? `!${n}` : `#${n}`);
+
 /** Events that change what review pages show. */
-const REVIEW_EVENTS = ["diff", "diff_version", "review", "comment", "queue", "landed", "diff_run", "run"];
+const REVIEW_EVENTS = ["diff", "diff_version", "review", "comment", "queue", "landed", "diff_run", "run", "inbox"];
 
 export const inboxRes: Res<Inbox> = { key: "review/inbox", fetch: (s) => reviewApi.inbox(s), opts: { on: REVIEW_EVENTS } };
 export const diffRes = (key: string): Res<DiffDetail> => ({ key: `review/diff/${key}`, fetch: (s) => reviewApi.diff(key, s), opts: { on: REVIEW_EVENTS } });
 export const threadsRes = (key: string): Res<Thread[]> => ({ key: `review/threads/${key}`, fetch: (s) => reviewApi.threads(key, s), opts: { on: ["comment", "review", "diff_version"] } });
 export const filesRes = (key: string, version: number): Res<VersionFiles> => ({ key: `review/files/${key}/${version}`, fetch: (s) => reviewApi.files(key, version, s) });
+
+/** What a version changes in the dependencies its lockfiles pin (docs/ci.md W18-R03). */
+export interface Dependencies {
+  diff: string;
+  from: string;
+  to: string;
+  lockfiles: { path: string; added: number; removed: number; changed: number; changes: { ecosystem: string; name: string; from: string[]; to: string[] }[] }[];
+}
+
+export const dependenciesRes = (key: string, to: number, from: number | null): Res<Dependencies> => ({
+  key: `review/dependencies/${key}/${from ?? "base"}/${to}`,
+  fetch: (s) => reviewApi.dependencies(key, to, from, s),
+});
 export const readinessRes = (key: string): Res<Readiness> => ({ key: `review/land/${key}`, fetch: (s) => reviewApi.readiness(key, s), opts: { on: REVIEW_EVENTS } });
 
 /** Who someone is, in words: `agent:a1b2` → "agent a1b2", `user:ada` → "ada". */

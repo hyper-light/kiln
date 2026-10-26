@@ -135,7 +135,7 @@ fn cluster(env: &Environment) -> Result<std::sync::Arc<crate::cd::kube::Cluster>
 /// The object as it runs, once it's one the registration runs: in its namespace, and (but for a
 /// pod, which its workloads make) one of KilnCD's app's.
 async fn live(d: &Deploy, a: &App, env: &Environment, group: &str, t: &Target) -> Result<Value, Fail> {
-    let reg = store::registration(&d.hub.store, &a.name, &env.name).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let reg = store::registration(&*d.records, &a.name, &env.name).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     if reg.is_none() {
         return Err((StatusCode::NOT_FOUND, format!("{} isn't registered in {}", a.name, env.name)));
     }

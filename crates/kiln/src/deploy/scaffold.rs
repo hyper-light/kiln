@@ -1,9 +1,12 @@
 //! An app's source repository, made with it (docs/deploy-api.md §3.1, step 4): one of kiln's own
-//! repositories, named as its template says (`acme/{app}`). Its first commit holds the files of the
-//! template's starter repository as they are (its branch's tree, not its history), with
-//! `{{kiln.app}}`, `{{kiln.project}}`, `{{kiln.owner}}` and `{{kiln.repository}}` filled in, in
-//! files and in file names. The starter's `.kiln/ci.yaml` builds what it holds, so the app's first
-//! build starts with its first commit.
+//! repositories, or one on GitHub, a GitLab or Bitbucket (made there through P3's clients, then
+//! one of kiln's repositories as any upstream is), named as its template says (`acme/{app}`). Its
+//! first commit holds the files of the template's starter repository as they are (its branch's
+//! tree, not its history), with `{{kiln.app}}`, `{{kiln.project}}`, `{{kiln.owner}}` and
+//! `{{kiln.repository}}` filled in, in files and in file names (and, where kiln made its
+//! registries, `{{kiln.image}}`, `{{kiln.snapshots}}` and `{{kiln.chart}}`: where its images and
+//! chart go). The starter's `.kiln/ci.yaml` builds what it holds, so the app's first build starts
+//! with its first commit.
 //!
 //! The starter is data: kiln copies its files and runs nothing from it. Links stay links, as git
 //! keeps them; files keep their modes.
@@ -14,7 +17,7 @@ use std::time::Duration;
 
 use super::Deploy;
 use super::flow::Fail;
-use super::model::{App, RepoTemplate};
+use super::model::{App, KILN_HOST, RepoRef, RepoTemplate};
 use http::StatusCode;
 
 /// The most a starter may hold.
@@ -45,12 +48,16 @@ pub fn name_for(t: &RepoTemplate, app: &App) -> String {
 }
 
 /// What `{{kiln.*}}` stands for in an app's starter.
-fn values(app: &App, repository: &str) -> [(&'static str, String); 4] {
+fn values(app: &App, repository: &str) -> [(&'static str, String); 7] {
+    let r = app.registries.as_ref();
     [
         ("{{kiln.app}}", app.name.clone()),
         ("{{kiln.project}}", app.project.clone()),
         ("{{kiln.owner}}", app.owners.first().cloned().unwrap_or_default()),
         ("{{kiln.repository}}", repository.to_owned()),
+        ("{{kiln.image}}", r.map(|r| r.images.clone()).unwrap_or_default()),
+        ("{{kiln.snapshots}}", r.map(|r| r.snapshots.clone()).unwrap_or_default()),
+        ("{{kiln.chart}}", r.map(|r| r.chart.clone()).unwrap_or_default()),
     ]
 }
 
@@ -117,8 +124,14 @@ pub fn ref_name(s: &str) -> bool {
 /// for every app, a starter kiln may copy, branches git takes.
 pub fn check(d: &Deploy, t: &RepoTemplate) -> Result<(), String> {
     let example = t.name.replace("{app}", "app").replace("{project}", "project");
-    if crate::ci::hosting::path_of(&d.hub, &example).is_none() {
-        return Err(format!("repository.name {}: `owner/name`, of letters, digits, `-`, `_` and `.`, with {{app}} and {{project}} filled in", t.name));
+    if t.host == KILN_HOST {
+        if crate::ci::hosting::path_of(&d.hub, &example).is_none() {
+            return Err(format!("repository.name {}: `owner/name`, of letters, digits, `-`, `_` and `.`, with {{app}} and {{project}} filled in", t.name));
+        }
+    } else if super::model::remote_host(&t.host) {
+        super::remote::name_ok(&t.host, &example).map_err(|e| format!("repository.name {} (with {{app}} and {{project}} filled in): {e}", t.name))?;
+    } else {
+        return Err(format!("repository.host {}: kiln (its own), github, gitlab or bitbucket", t.host));
     }
     if let Some(from) = &t.starter {
         crate::ci::hosting::importable(from).map_err(|e| format!("repository.starter: {e}"))?;
@@ -138,6 +151,9 @@ fn fail(e: anyhow::Error) -> Fail {
 /// Makes the app's repository from its template: the native repository and its row, its first
 /// commit the starter's files filled in (empty, when the template names no starter). Its name.
 pub async fn create(d: &Deploy, t: &RepoTemplate, app: &App, by: &str) -> Result<String, Fail> {
+    if t.host != KILN_HOST {
+        return create_there(d, t, app, by).await;
+    }
     let name = name_for(t, app);
     let path = crate::ci::hosting::path_of(&d.hub, &name)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("{name}: a repository is `owner/name`, of letters, digits, `-`, `_` and `.`")))?;
@@ -192,20 +208,94 @@ pub async fn create(d: &Deploy, t: &RepoTemplate, app: &App, by: &str) -> Result
     if seeded.is_some() {
         // In a task of its own: what a push starts goes deep, and the app's answer needn't wait.
         let (hub, branch) = (d.hub.clone(), t.branch.clone());
-        crate::rt::spawn(async move { first_build(&hub, &repo, &path, &branch).await });
+        crate::rt::spawn(async move {
+            let (p, head) = (path.to_string_lossy().into_owned(), format!("refs/heads/{branch}"));
+            match crate::gitops::run_git(&hub, &["-C", &p, "rev-parse", "--verify", &head], crate::gitops::LS_REMOTE_TIMEOUT).await {
+                Ok(out) => first_build(&hub, &repo, &branch, String::from_utf8_lossy(&out).trim().to_owned()).await,
+                Err(e) => tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "an app's new repository: its first commit isn't there"),
+            }
+        });
     }
-    d.hub.gitops_kick.notify();
+    crate::gitops::wake(&d.hub);
     Ok(name)
 }
 
-/// Starts what a push of the repository's first commit starts (its `.kiln/` pipelines, its
-/// workflows): the poller takes a new repository's refs as they are, and builds from the next
+/// Makes the app's repository on another host (GitHub, a GitLab, Bitbucket): there, private, its
+/// first commit the starter's files filled in (pushed with credentials that write that
+/// repository), then one of kiln's repositories as any upstream is, so CI runs from it. A name
+/// the host has already is refused before anything is made; one made whose first commit didn't
+/// reach it is deleted again. Its name.
+async fn create_there(d: &Deploy, t: &RepoTemplate, app: &App, by: &str) -> Result<String, Fail> {
+    let name = name_for(t, app);
+    super::remote::name_ok(&t.host, &name).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let on = super::remote::host_label(&t.host);
+    let taken = || (StatusCode::CONFLICT, format!("{name} exists already on {on}: give it as the app's source, or have the template name another"));
+    let _making = Making::hold(&name).ok_or_else(taken)?;
+    let repos = d.hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if repos.iter().any(|r| r.name.eq_ignore_ascii_case(&name)) {
+        return Err((StatusCode::CONFLICT, format!("kiln has a repository {name} already: give it as the app's source, or have the template name another")));
+    }
+    let rr = RepoRef { host: t.host.clone(), repo: name.clone(), branch: t.branch.clone(), root: String::new() };
+    let there = super::remote::open(d, &rr).await.map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if there.exists().await.map_err(fail)? {
+        return Err(taken());
+    }
+    let seeded = match &t.starter {
+        Some(from) => Some(seed(d, t, from, app, &name, by).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the starter {from}: {e:#}")))?),
+        None => None,
+    };
+    let made = async {
+        there.make(&format!("{}: {}'s source, made by kiln", app.name, app.project)).await?;
+        let Some(dir) = &seeded else { return anyhow::Ok(None) };
+        let (dir_s, head) = (dir.to_string_lossy().into_owned(), format!("HEAD:refs/heads/{}", t.branch));
+        let pushed = there.push_from(dir, &head).await;
+        let sha = crate::gitops::run_git(&d.hub, &["-C", &dir_s, "rev-parse", "HEAD"], Duration::from_secs(30)).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned());
+        if let Err(e) = pushed {
+            // Nothing half made stays: the repository is new, and empty.
+            let gone = there.delete().await;
+            anyhow::bail!("{name} was made on {on}, but its first commit didn't reach it ({e:#}){}", if gone.is_ok() { "; it's deleted again" } else { ": delete it there, or give it as the app's source" });
+        }
+        anyhow::Ok(sha.ok())
+    }
+    .await;
+    if let Some(dir) = &seeded {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    let first = made.map_err(fail)?;
+    let repo = d
+        .hub
+        .store
+        .upsert_repo(crate::store::Repo {
+            id: crate::util::new_id(),
+            name: name.clone(),
+            clone_url: there.url(),
+            branches: Vec::new(),
+            poll_seconds: d.hub.cfg.gitops.poll_seconds,
+            enabled: true,
+            created_at: crate::util::now_unix(),
+            last_polled_at: None,
+            last_error: None,
+            mode: "upstream".into(),
+            default_branch: Some(t.branch.clone()),
+            mirror: None,
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    d.hub.store.audit(by.to_owned(), "repo.add".into(), format!("{name} on {on}, the source of app {}{}", app.name, t.starter.as_ref().map(|s| format!(", from {s}")).unwrap_or_default())).await;
+    if let Some(sha) = first {
+        let (hub, branch) = (d.hub.clone(), t.branch.clone());
+        crate::rt::spawn(async move { first_build(&hub, &repo, &branch, sha).await });
+    }
+    crate::gitops::wake(&d.hub);
+    Ok(name)
+}
+
+/// Starts what a push of the repository's first commit (`sha`) starts (its `.kiln/` pipelines,
+/// its workflows): the poller takes a new repository's refs as they are, and builds from the next
 /// change on.
-async fn first_build(hub: &crate::hub::Hub, repo: &crate::store::Repo, path: &Path, branch: &str) {
-    let (p, head) = (path.to_string_lossy().into_owned(), format!("refs/heads/{branch}"));
+async fn first_build(hub: &crate::hub::Hub, repo: &crate::store::Repo, branch: &str, sha: String) {
+    let head = format!("refs/heads/{branch}");
     let started = async {
-        let out = crate::gitops::run_git(hub, &["-C", &p, "rev-parse", "--verify", &head], crate::gitops::LS_REMOTE_TIMEOUT).await?;
-        let sha = String::from_utf8_lossy(&out).trim().to_owned();
         // Whoever records the ref's move first triggers it; the poller won't again.
         if !hub.store.advance_ref(repo.id.clone(), head.clone(), sha.clone()).await? {
             return anyhow::Ok(0);
@@ -283,6 +373,7 @@ mod tests {
             contacts: Default::default(),
             source: None,
             archived: false,
+            registries: None,
         }
     }
 
@@ -326,7 +417,7 @@ mod tests {
 
     #[test]
     fn a_template_names_each_app_s_repository() {
-        let t = RepoTemplate { name: "{project}/{app}".into(), starter: None, starter_ref: None, branch: "main".into() };
+        let t = RepoTemplate { name: "{project}/{app}".into(), starter: None, starter_ref: None, branch: "main".into(), host: KILN_HOST.into() };
         assert_eq!(name_for(&t, &app()), "shop/web");
         for good in ["main", "release/v1", "v1.2.3", "feature_x"] {
             assert!(ref_name(good), "{good}");

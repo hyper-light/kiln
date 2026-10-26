@@ -20,6 +20,7 @@ struct Source {
     workflows: HashMap<String, Arc<Workflow>>,
     durations: HashMap<String, f64>,
     files: Vec<String>,
+    graph: Option<Arc<Graph>>,
 }
 
 impl PlanSource for Source {
@@ -32,6 +33,9 @@ impl PlanSource for Source {
     fn files(&self, pattern: &str) -> Vec<String> {
         let p = Patterns::new(&[pattern]).unwrap_or_default();
         self.files.iter().filter(|f| p.matches(f)).cloned().collect()
+    }
+    fn graph(&self) -> Option<Arc<Graph>> {
+        self.graph.clone()
     }
 }
 
@@ -136,6 +140,7 @@ fn empty_plan() -> RunPlan {
         output_bytes: 0,
         run_env: Vec::new(),
         removed: BTreeMap::new(),
+        graph: None,
     }
 }
 
@@ -165,6 +170,9 @@ fn dead_spec() -> LegSpec {
         items: Vec::new(),
         emulated: false,
         reads: Vec::new(),
+        cache_cap: None,
+        unaffected: None,
+        defined_in: DefinedIn::default(),
         workflow: Arc::new(Workflow::default()),
         job_index: 0,
     }
@@ -353,7 +361,7 @@ fn runs_on_timeouts_environment_concurrency_and_permissions() {
     let d = r.spec("d");
     assert_eq!(d.runs_on.labels, vec!["self-hosted", "staging"]);
     assert_eq!(d.timeout_minutes, 30);
-    assert_eq!(d.environment, Some(EnvironmentSpec { name: "staging".into(), url: Some("https://${{ inputs.env }}.example".into()), deployment: true }));
+    assert_eq!(d.environment, Some(EnvironmentSpec { name: "staging".into(), url: Some("https://${{ inputs.env }}.example".into()), deployment: true, preview: None }));
     assert!(d.concurrency.as_ref().is_some_and(|c| c.group == "d-staging" && c.queue_max));
     assert_eq!(d.container.as_deref(), Some("node:20"));
     assert_eq!(d.services, vec![("db".to_owned(), "postgres".to_owned())]);
@@ -408,6 +416,26 @@ fn w04_ac04_inputs_outputs_secrets_permissions() {
     assert_eq!(r.finished, Some(S));
 }
 
+/// W08-R14 (AC09's last part): a job's cache mode caps the workflow it calls. A called workflow
+/// or job asking for more doesn't start; legs that ask nothing carry the cap to the dispatcher.
+#[test]
+fn w08_r14_the_callers_cache_mode_caps_the_called() {
+    let greedy = "on: workflow_call\njobs:\n  inner:\n    runs-on: x\n    cache-mode: write\n    steps: [{run: a}]\n";
+    let modest = "on: workflow_call\njobs:\n  inner:\n    runs-on: x\n    steps: [{run: a}]\n";
+    let src = || with_called(&[("./.github/workflows/greedy.yml", greedy), ("./.github/workflows/modest.yml", modest)]);
+    let caller = |called: &str, mode: &str| format!("on: push\njobs:\n  call:\n    uses: ./.github/workflows/{called}.yml\n{mode}");
+    let r = Run::with(&caller("greedy", "    cache-mode: read\n"), Dialect::Gha, RunInput { trusted: true, ..RunInput::default() }, src());
+    assert!(r.logged("asks for `cache-mode: write` (its job `inner`), more than its caller's `cache-mode: read` allows"), "{:?}", r.log);
+    assert!(r.queued.is_empty());
+    let r = Run::with(&caller("modest", "    cache-mode: read\n"), Dialect::Gha, RunInput { trusted: true, ..RunInput::default() }, src());
+    assert_eq!(r.spec("call / inner").cache_cap.as_deref(), Some("read"));
+    // Without a mode of its own, the caller caps nothing.
+    let r = Run::with(&caller("greedy", ""), Dialect::Gha, RunInput { trusted: true, ..RunInput::default() }, src());
+    assert_eq!(r.spec("call / inner").cache_cap, None);
+    assert_eq!(crate::store::cache::Mode::Write.min(crate::store::cache::Mode::Read), crate::store::cache::Mode::Read);
+    assert_eq!(crate::store::cache::Mode::WriteOnly.min(crate::store::cache::Mode::Read), crate::store::cache::Mode::None);
+}
+
 #[test]
 fn w04_ac04_inputs_and_secrets_are_checked() {
     let run = |with: &str, secrets: &str| {
@@ -420,6 +448,31 @@ fn w04_ac04_inputs_and_secrets_are_checked() {
     let r = run("    with: { n: 1 }\n", "    secrets: { token: '${{ secrets.T }}' }\n");
     assert!(matches!(r.spec("call / inner").secrets, SecretsSpec::Mapped { ref map, .. } if map == &vec![("token".to_owned(), "${{ secrets.T }}".to_owned())]));
     assert_eq!(run("    with: { n: 1 }\n", "").spec("call / inner").secrets, SecretsSpec::None);
+}
+
+/// W06-R03: a leg knows the workflow file that defines its job, as `job.workflow_*` say it: the
+/// run's own; a `./` one's (the run's repository and commit, at its ref); a remote one's (its
+/// repository, its ref as GitHub writes it, and the commit it was pinned to).
+#[test]
+fn w06_r03_a_legs_job_knows_its_workflow() {
+    let caller = "on: push\njobs:\n  top:\n    runs-on: x\n    steps: [{run: a}]\n  local:\n    uses: ./.github/workflows/called.yml\n    with: { n: 1 }\n  remote:\n    uses: octo-org/automation/.github/workflows/deploy.yml@v1\n";
+    let at = |src: &str, path: &str, origin: Option<crate::wf::ir::Origin>| Arc::new(Workflow { path: path.into(), origin, ..(*workflow(src, Dialect::Gha)).clone() });
+    let mut src = Source::default();
+    src.workflows.insert("./.github/workflows/called.yml".into(), at(CALLED, ".github/workflows/called.yml", None));
+    let far = "on: workflow_call\njobs:\n  far:\n    runs-on: x\n    steps: [{run: b}]\n";
+    let pinned = crate::wf::ir::Origin { repository: "octo-org/automation".into(), git_ref: "refs/tags/v1".into(), sha: "f".repeat(40) };
+    src.workflows.insert("octo-org/automation/.github/workflows/deploy.yml@v1".into(), at(far, ".github/workflows/deploy.yml", Some(pinned)));
+    let github = serde_json::json!({ "repository": "acme/app", "ref": "refs/heads/main", "sha": "a".repeat(40) });
+    let r = Run::with(caller, Dialect::Gha, RunInput { trusted: true, github, ..RunInput::default() }, src);
+    let defined = |repo: &str, path: &str, git_ref: &str, sha: String| DefinedIn {
+        workflow_ref: format!("{repo}/{path}@{git_ref}"),
+        workflow_sha: sha,
+        workflow_repository: repo.into(),
+        workflow_file_path: path.into(),
+    };
+    assert_eq!(r.spec("top").defined_in, defined("acme/app", ".github/workflows/t.yml", "refs/heads/main", "a".repeat(40)), "the run's own");
+    assert_eq!(r.spec("local / inner").defined_in, defined("acme/app", ".github/workflows/called.yml", "refs/heads/main", "a".repeat(40)), "a `./` one, at the run's commit");
+    assert_eq!(r.spec("remote / far").defined_in, defined("octo-org/automation", ".github/workflows/deploy.yml", "refs/tags/v1", "f".repeat(40)), "a remote one, pinned");
 }
 
 #[test]
@@ -665,4 +718,104 @@ fn preview_lists_the_combinations_exclude_removed() -> Result<(), String> {
     assert_eq!(p.legs.len(), 3);
     assert_eq!(p.removed.get("t").cloned().unwrap_or_default(), vec![(serde_json::json!({"os": "mac", "node": 20}), "removed by exclude entry 2".to_owned())]);
     Ok(())
+}
+
+// ------------------------------------------------------------------ affected() (W24-R17)
+
+/// A Cargo workspace of three crates, where `cli` depends on `core`.
+fn crates() -> Arc<Graph> {
+    let files: HashMap<&str, &str> = HashMap::from([
+        ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+        ("crates/core/Cargo.toml", "[package]\nname = \"core\"\n"),
+        ("crates/cli/Cargo.toml", "[package]\nname = \"cli\"\n\n[dependencies]\ncore = { path = \"../core\" }\n"),
+        ("crates/docs/Cargo.toml", "[package]\nname = \"docs\"\n"),
+    ]);
+    let paths: Vec<String> = files.keys().map(|p| (*p).to_owned()).collect();
+    Arc::new(graph::read(&|p| files.get(p).map(|t| (*t).to_owned()), &paths))
+}
+
+/// A push that changed `files`.
+fn changed(files: &[&str]) -> RunInput {
+    RunInput { trusted: true, changed: Some(Arc::new(files.iter().map(|f| (*f).to_owned()).collect())), ..RunInput::default() }
+}
+
+/// W24-R17: `affected()` in a dynamic matrix and in a condition, from the run's changed files and
+/// the commit's package graph.
+#[test]
+fn w24_r17_affected_in_matrices_and_conditions() {
+    let wf = "name: k\non: push\njobs:\n  test:\n    strategy:\n      matrix:\n        crate: ${{ affected('cargo') }}\n    steps: [{run: t}]\n  docs:\n    if: contains(affected('cargo'), 'docs')\n    steps: [{run: d}]\n";
+    let r = Run::with(wf, Dialect::Kiln, changed(&["crates/core/src/lib.rs", "README.md"]), Source { graph: Some(crates()), ..Source::default() });
+    assert_eq!(r.queued, ["test (cli)", "test (core)"], "core, and cli, which depends on it: {:?}", r.log);
+    assert!(r.logged("docs skipped"), "{:?}", r.log);
+    let r = Run::with(wf, Dialect::Kiln, changed(&["crates/docs/book.md"]), Source { graph: Some(crates()), ..Source::default() });
+    let mut queued = r.queued.clone();
+    queued.sort();
+    assert_eq!(queued, ["docs", "test (docs)"]);
+}
+
+/// What `affected()` can't know is an error that says why, never an empty list.
+#[test]
+fn w24_r17_affected_says_what_it_lacks() {
+    let wf = |eco: &str| format!("name: k\non: push\njobs:\n  test:\n    strategy:\n      matrix:\n        crate: ${{{{ affected('{eco}') }}}}\n    steps: [{{run: t}}]\n");
+    let failed = |r: &Run, why: &str| r.logged(&format!("test failure: strategy.matrix.crate: {why}"));
+    let r = Run::with(&wf("cargo"), Dialect::Kiln, changed(&["x"]), Source::default());
+    assert!(failed(&r, "affected() needs the repository's package graph"), "{:?}", r.log);
+    let r = Run::with(&wf("cargo"), Dialect::Kiln, RunInput { trusted: true, ..RunInput::default() }, Source { graph: Some(crates()), ..Source::default() });
+    assert!(failed(&r, "affected() needs the event's changed files"), "{:?}", r.log);
+    let r = Run::with(&wf("maven"), Dialect::Kiln, changed(&["x"]), Source { graph: Some(crates()), ..Source::default() });
+    assert!(failed(&r, "affected(): `maven` is not an ecosystem"), "{:?}", r.log);
+    let broken = Arc::new(graph::read(&|_| Some("[workspace\n".to_owned()), &["Cargo.toml".to_owned()]));
+    let r = Run::with(&wf("cargo"), Dialect::Kiln, changed(&["x"]), Source { graph: Some(broken), ..Source::default() });
+    assert!(failed(&r, "affected('cargo'): the cargo package graph couldn't be read: Cargo.toml: isn't valid TOML"), "{:?}", r.log);
+}
+
+// ------------------------------------------------------------------ unaffected legs (W24-R06)
+
+/// W24-R06: a job that opts in to reuse, whose `if:` is false only for what the change didn't
+/// touch, is queued to finish reused (`unaffected` saying why it would have been skipped); one whose
+/// `if:` is false for another reason, or that doesn't opt in, is skipped as before; one the change
+/// affects runs.
+#[test]
+fn w24_r06_legs_the_change_cannot_affect_are_queued_to_be_reused() {
+    let wf = "name: k\non: push\njobs:\n  core:\n    if: contains(affected('cargo'), 'core')\n    work: { memo: { paths: [crates/core] } }\n    steps: [{run: t}]\n  plain:\n    if: contains(affected('cargo'), 'core')\n    steps: [{run: t}]\n  prs:\n    if: github.event_name == 'pull_request' && contains(affected('cargo'), 'core')\n    work: { memo: true }\n    steps: [{run: t}]\n  docs:\n    if: changed('docs/**')\n    reuse: true\n    steps: [{run: d}]\n  cli:\n    if: contains(affected('cargo'), 'cli')\n    reuse: true\n    steps: [{run: c}]\n";
+    let r = Run::with(wf, Dialect::Kiln, changed(&["crates/cli/src/main.rs"]), Source { graph: Some(crates()), ..Source::default() });
+    let mut queued = r.queued.clone();
+    queued.sort();
+    assert_eq!(queued, ["cli", "core", "docs"], "{:?}", r.log);
+    assert_eq!(r.spec("core").unaffected.as_deref(), Some("skipped: `if: contains(affected('cargo'), 'core')` was false"));
+    assert_eq!(r.spec("docs").unaffected.as_deref(), Some("skipped: `if: changed('docs/**')` was false"));
+    assert_eq!(r.spec("cli").unaffected, None, "the change affects it: it runs");
+    assert!(r.logged("plain skipped") && r.logged("prs skipped"), "no reuse, or false whatever changed: {:?}", r.log);
+    // Not part of what the leg is: its reuse key is the same either way.
+    let json = serde_json::to_value(r.spec("core")).unwrap_or_default();
+    assert!(json.get("unaffected").is_none(), "{json}");
+}
+
+/// W24-R06 with `when:`: a matrix's legs the change can't affect are queued to be reused, the
+/// others run.
+#[test]
+fn w24_r06_when_over_affected() {
+    let wf = "name: k\non: push\njobs:\n  test:\n    strategy:\n      matrix:\n        crate: [core, cli, docs]\n      when: contains(affected('cargo'), matrix.crate)\n    work: { memo: true }\n    steps: [{run: t}]\n";
+    let r = Run::with(wf, Dialect::Kiln, changed(&["crates/cli/src/main.rs"]), Source { graph: Some(crates()), ..Source::default() });
+    assert_eq!(r.queued, ["test (core)", "test (cli)", "test (docs)"], "{:?}", r.log);
+    assert_eq!(r.spec("test (cli)").unaffected, None);
+    assert_eq!(r.spec("test (core)").unaffected.as_deref(), Some("skipped by when"));
+    assert_eq!(r.spec("test (docs)").unaffected.as_deref(), Some("skipped by when"));
+}
+
+/// W24-R06: what the dispatcher makes of an unaffected leg is what follows it: reused, its
+/// dependents run on its outputs; skipped (nothing to reuse), they're skipped as they'd have been.
+#[test]
+fn w24_r06_an_unaffected_legs_end_is_its_dependents_need() {
+    let wf = "name: k\non: push\njobs:\n  core:\n    if: contains(affected('cargo'), 'core')\n    reuse: true\n    steps: [{run: t}]\n  after:\n    needs: core\n    steps: [{run: a}]\n";
+    let input = || changed(&["crates/cli/src/main.rs"]);
+    let mut r = Run::with(wf, Dialect::Kiln, input(), Source { graph: Some(crates()), ..Source::default() });
+    assert_eq!(r.queued, ["core"]);
+    r.outputs("core", &[("v", "1")]);
+    assert_eq!(r.queued, ["core", "after"], "reused: {:?}", r.log);
+    assert_eq!(at(&r.spec("after").needs, "/core/outputs/v"), serde_json::json!("1"));
+    let mut r = Run::with(wf, Dialect::Kiln, input(), Source { graph: Some(crates()), ..Source::default() });
+    r.finish("core", Conclusion::Skipped);
+    assert!(r.logged("after skipped"), "{:?}", r.log);
+    assert_eq!(r.finished, Some(Conclusion::Success));
 }

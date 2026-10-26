@@ -172,29 +172,11 @@ enum DeployCmd {
     },
     /// A fleet change: one version, or values set (`--set path=value`), released to many apps of
     /// an environment at once (those given, or of a template, a project or an owner; all registered
-    /// there when none is), each through its gates. With `--show <id>`, how one stands.
-    Fleet {
-        #[arg(long, visible_alias = "to")]
-        env: Option<String>,
-        #[arg(long = "app")]
-        apps: Vec<String>,
-        #[arg(long)]
-        template: Option<String>,
-        #[arg(long)]
-        project: Option<String>,
-        #[arg(long)]
-        owner: Option<String>,
-        #[arg(long, conflicts_with = "set")]
-        version: Option<String>,
-        /// `path=value` in each app's values: `image.pullPolicy=Always`, `replicaCount=2`.
-        #[arg(long = "set")]
-        set: Vec<String>,
-        /// Asked again with the same key, the same fleet change.
-        #[arg(long)]
-        key: Option<String>,
-        #[arg(long, conflicts_with_all = ["env", "version", "set"])]
-        show: Option<String>,
-    },
+    /// there when none is), each through its gates. Or a change in each app's source repository,
+    /// one pull request per repository: a kiln-base version (`--base`), or values set in its chart
+    /// (`--set … --in-source`); on kiln's own git server a branch and its diff, merged with
+    /// `--merge <id>`. With `--show <id>`, how one stands; `--withdraw <id>` closes what's open.
+    Fleet(Box<FleetArgs>),
     /// Delivery metrics (DORA's four keys) from the releases: of an app, an environment, or all.
     Metrics {
         #[arg(long)]
@@ -324,9 +306,10 @@ enum AppCmd {
     /// Add (or replace) a template from a YAML or JSON file.
     TemplateAdd { file: PathBuf },
     TemplateRm { name: String },
-    /// An app's chart on kiln's base chart, written into a repository: charts/<app> (kiln-base
-    /// vendored in it) and deploy/<env>.yaml, each environment's values to start from. What's
-    /// there is kept unless `--force`; `--base` writes only kiln-base, as this kiln ships it.
+    /// An app's chart on kiln's base chart, written into a repository: charts/<app> (depending on
+    /// kiln-base in kiln's registry, or with it vendored) and deploy/<env>.yaml, each environment's
+    /// values to start from. What's there is kept unless `--force`; `--base` moves only kiln-base
+    /// to the version this kiln ships.
     Init {
         app: String,
         /// The repository to write into.
@@ -344,6 +327,14 @@ enum AppCmd {
         force: bool,
         #[arg(long, conflicts_with = "force")]
         base: bool,
+        /// The kiln whose registry kiln-base comes from (`kiln.example.com`); the server's URL
+        /// (`--url`, KILN_URL) by default.
+        #[arg(long)]
+        registry: Option<String>,
+        /// Copy kiln-base into the chart rather than depend on it in a registry (no kiln needed to
+        /// build it).
+        #[arg(long, conflicts_with = "registry")]
+        vendor: bool,
     },
 }
 
@@ -417,6 +408,52 @@ enum SecretCmd {
     },
 }
 
+/// `kiln deploy fleet`'s arguments (see [`DeployCmd::Fleet`]).
+#[derive(clap::Args)]
+struct FleetArgs {
+    #[arg(long, visible_alias = "to")]
+    env: Option<String>,
+    #[arg(long = "app")]
+    apps: Vec<String>,
+    #[arg(long)]
+    template: Option<String>,
+    #[arg(long)]
+    project: Option<String>,
+    #[arg(long)]
+    owner: Option<String>,
+    #[arg(long, conflicts_with_all = ["set", "base"])]
+    version: Option<String>,
+    /// `path=value` in each app's values: `image.pullPolicy=Always`, `replicaCount=2`.
+    #[arg(long = "set")]
+    set: Vec<String>,
+    /// kiln-base at this version in each app's chart, proposed in its source repository.
+    #[arg(long, conflicts_with = "set")]
+    base: Option<String>,
+    /// `--set` in each app's chart in its source repository, proposed there, rather than
+    /// released.
+    #[arg(long)]
+    in_source: bool,
+    /// Where each app's chart is in its repository (`charts/{app}`), for a change there.
+    #[arg(long)]
+    chart: Option<String>,
+    /// Its values file (`<chart>/values.yaml`), for a change there.
+    #[arg(long)]
+    values_file: Option<String>,
+    /// Asked again with the same key, the same fleet change.
+    #[arg(long)]
+    key: Option<String>,
+    #[arg(long, conflicts_with_all = ["env", "version", "set", "base"])]
+    show: Option<String>,
+    /// Merges a source change's proposals on kiln's own git server (`--repo`: one of them).
+    #[arg(long, conflicts_with_all = ["env", "version", "set", "base", "show"])]
+    merge: Option<String>,
+    #[arg(long, requires = "merge")]
+    repo: Option<String>,
+    /// Withdraws a source change's open proposals.
+    #[arg(long, conflicts_with_all = ["env", "version", "set", "base", "show", "merge"])]
+    withdraw: Option<String>,
+}
+
 /// `kiln app create`: an app and how it is deployed.
 #[derive(clap::Args)]
 struct NewApp {
@@ -471,58 +508,7 @@ enum EnvCmd {
     /// Add (or replace) an environment, deployed from a release repository on kiln's own git
     /// server or on GitHub, through KilnCD or through an Argo CD integration (`--provider
     /// argocd/<name>`).
-    Add {
-        env: String,
-        /// `kilncd`, or `argocd/<integration>`.
-        #[arg(long, default_value = "kilncd")]
-        provider: String,
-        /// Where the release repository is: `kiln` (kiln's git server), or `github` (through kiln's
-        /// GitHub App, which makes it in an organization if it isn't there).
-        #[arg(long, default_value = "kiln")]
-        host: String,
-        /// The release repository (`owner/name`).
-        #[arg(long, default_value = "kiln/releases")]
-        repo: String,
-        #[arg(long, default_value = "main")]
-        branch: String,
-        #[arg(long, default_value = "")]
-        root: String,
-        /// A cluster it deploys to (KilnCD's name); none: the cluster kiln runs in.
-        #[arg(long = "cluster")]
-        clusters: Vec<String>,
-        /// Don't delete what git no longer holds.
-        #[arg(long)]
-        no_prune: bool,
-        /// Undo hand edits.
-        #[arg(long)]
-        self_heal: bool,
-        /// How long a release has to land, in seconds.
-        #[arg(long, default_value_t = 900)]
-        timeout: u64,
-        /// How long a landed release must stay synced and healthy, in seconds.
-        #[arg(long, default_value_t = 30)]
-        settle: u64,
-        /// How long the provider may refuse a release before it fails and its commit is
-        /// reverted, in seconds.
-        #[arg(long, default_value_t = 60)]
-        refused: u64,
-        /// A release asked for while another is in flight waits, rather than being refused.
-        #[arg(long)]
-        queue: bool,
-        /// Agents may release here (docs/cd-targets.md D6); only a person sets it.
-        #[arg(long)]
-        agents: bool,
-        /// The gates its releases pass (docs/deploy-api.md §9.1), a YAML or JSON file: after (an
-        /// environment of a linked server as `staging@eu`), soak, approvals, windows, checks (built
-        /// in by name, or `{name, http: {url}}`, `{name, workflow: {repository, workflow, ref}}`),
-        /// require_provenance, freeze.
-        #[arg(long)]
-        gates: Option<PathBuf>,
-        /// On Argo CD, kiln writes each Application itself rather than through an ApplicationSet
-        /// (for an Argo CD that doesn't allow them).
-        #[arg(long)]
-        applications: bool,
-    },
+    Add(Box<EnvAdd>),
     Rm { env: String },
     /// Move an environment to another provider (docs/deploy-api.md §8.4): the new one compares in
     /// shadow and never writes; `--handover` hands what runs over once it agrees (`--force`: even
@@ -546,6 +532,70 @@ enum EnvCmd {
         #[arg(long)]
         no_wait: bool,
     },
+}
+
+/// `kiln deploy env add`'s arguments (boxed in [`EnvCmd`]: the variant is much the largest).
+#[derive(clap::Args)]
+struct EnvAdd {
+    env: String,
+    /// `kilncd`, or `argocd/<integration>`.
+    #[arg(long, default_value = "kilncd")]
+    provider: String,
+    /// Where the release repository is: `kiln` (kiln's git server), `github` (through kiln's
+    /// GitHub App), `gitlab` (a `[[ci.gitlab]]`) or `bitbucket` (`[ci.bitbucket]`); on another
+    /// host, kiln makes it if it isn't there.
+    #[arg(long, default_value = "kiln")]
+    host: String,
+    /// The release repository (`owner/name`; on GitLab `group/…/name`).
+    #[arg(long, default_value = "kiln/releases")]
+    repo: String,
+    #[arg(long, default_value = "main")]
+    branch: String,
+    #[arg(long, default_value = "")]
+    root: String,
+    /// A cluster it deploys to (KilnCD's name); none: the cluster kiln runs in.
+    #[arg(long = "cluster")]
+    clusters: Vec<String>,
+    /// On Argo CD, the KilnCD cluster that reaches one of Argo CD's, where kiln writes an app's
+    /// secrets (docs/deploy-api.md §3.5): `<Argo CD's name>=<KilnCD's>`, as `in-cluster=prod-k`.
+    #[arg(long = "kilncd", value_name = "ARGO=KILNCD")]
+    kilncd: Vec<String>,
+    /// Don't delete what git no longer holds.
+    #[arg(long)]
+    no_prune: bool,
+    /// Undo hand edits.
+    #[arg(long)]
+    self_heal: bool,
+    /// How long a release has to land, in seconds.
+    #[arg(long, default_value_t = 900)]
+    timeout: u64,
+    /// How long a landed release must stay synced and healthy, in seconds.
+    #[arg(long, default_value_t = 30)]
+    settle: u64,
+    /// How long the provider may refuse a release before it fails and its commit is
+    /// reverted, in seconds.
+    #[arg(long, default_value_t = 60)]
+    refused: u64,
+    /// A release asked for while another is in flight waits, rather than being refused.
+    #[arg(long)]
+    queue: bool,
+    /// Agents may release here (docs/cd-targets.md D6); only a person sets it.
+    #[arg(long)]
+    agents: bool,
+    /// An app's owner teams may release it here without environments.deploy on it
+    /// (docs/deploy-api.md §15).
+    #[arg(long)]
+    owners_release: bool,
+    /// The gates its releases pass (docs/deploy-api.md §9.1), a YAML or JSON file: after (an
+    /// environment of a linked server as `staging@eu`), soak, approvals, windows, checks (built
+    /// in by name, or `{name, http: {url}}`, `{name, workflow: {repository, workflow, ref}}`),
+    /// require_provenance, freeze.
+    #[arg(long)]
+    gates: Option<PathBuf>,
+    /// On Argo CD, kiln writes each Application itself rather than through an ApplicationSet
+    /// (for an Argo CD that doesn't allow them).
+    #[arg(long)]
+    applications: bool,
 }
 
 struct Api {
@@ -836,21 +886,51 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             return Ok(());
         }
         Some(DeployCmd::Env { cmd }) => return env(&api, cmd).await,
-        Some(DeployCmd::Fleet { env, apps, template, project, owner, version, set, key, show }) => {
-            let v = match show {
-                Some(id) => api.call(Method::Get, &format!("/fleets/{}", enc(&id)), None).await?,
-                None => {
-                    let env = env.context("--env: the environment the fleet change goes to")?;
+        Some(DeployCmd::Fleet(f)) => {
+            let FleetArgs { env, apps, template, project, owner, version, set, base, in_source, chart, values_file, key, show, merge, repo, withdraw } = *f;
+            let v = match (show, merge, withdraw) {
+                (Some(id), _, _) => api.call(Method::Get, &format!("/fleets/{}", enc(&id)), None).await?,
+                (_, Some(id), _) => api.call(Method::Post, &format!("/fleets/{}/merge", enc(&id)), Some(json!({ "repo": repo }))).await?,
+                (_, _, Some(id)) => api.call(Method::Delete, &format!("/fleets/{}", enc(&id)), None).await?,
+                _ => {
                     let mut sets = serde_json::Map::new();
                     for kv in &set {
                         let (k, v) = kv.split_once('=').with_context(|| format!("{kv:?}: --set path=value"))?;
                         sets.insert(k.to_owned(), json!(v));
                     }
-                    let body = json!({ "environment": env, "apps": apps, "template": template, "project": project, "owner": owner, "version": version, "set": sets, "idempotency_key": key });
+                    let body = if base.is_some() || in_source {
+                        let source = json!({ "base": base, "set": if in_source { Value::Object(sets) } else { json!({}) }, "chart": chart, "values": values_file });
+                        json!({ "environment": env.unwrap_or_default(), "apps": apps, "template": template, "project": project, "owner": owner, "source": source, "idempotency_key": key })
+                    } else {
+                        let env = env.context("--env: the environment the fleet change goes to (or --base, --in-source: a change in the apps' sources)")?;
+                        json!({ "environment": env, "apps": apps, "template": template, "project": project, "owner": owner, "version": version, "set": sets, "idempotency_key": key })
+                    };
                     api.call(Method::Post, "/fleets", Some(body)).await?
                 }
             };
             api.print(&v, |v| {
+                if v.get("source").and_then(Value::as_bool) == Some(true) {
+                    println!("fleet change {} in apps' sources", s(v, "fleet"));
+                    for p in v.get("proposals").and_then(Value::as_array).into_iter().flatten() {
+                        let at = p.get("url").and_then(Value::as_str).map_or_else(|| format!("branch {}", s(p, "branch")), str::to_owned);
+                        let apps: Vec<&str> = p.get("apps").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+                        println!("{:<28} {:<10} {}  ({})", s(p, "repo"), s(p, "state"), at, apps.join(", "));
+                        if let Some(note) = p.get("note").and_then(Value::as_str) {
+                            println!("    {note}");
+                        }
+                        if let Some(diff) = p.get("diff").and_then(Value::as_str) {
+                            println!("{diff}");
+                        }
+                    }
+                    for k in v.get("skipped").and_then(Value::as_array).into_iter().flatten() {
+                        println!("{}  not changed: {}", s(k, "app"), s(k, "error"));
+                    }
+                    if let Some(states) = v.get("states").and_then(Value::as_object) {
+                        let parts: Vec<String> = states.iter().map(|(k, n)| format!("{n} {k}")).collect();
+                        println!("{}{}", parts.join(", "), if v.get("done").and_then(Value::as_bool) == Some(true) { " · done" } else { "" });
+                    }
+                    return;
+                }
                 println!("fleet change {} in {}", s(v, "fleet"), s(v, "environment"));
                 for r in v.get("releases").and_then(Value::as_array).into_iter().flatten() {
                     match r.get("release") {
@@ -1064,9 +1144,16 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
 
 /// Runs `kiln app`.
 pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
-    // Writes files where it's run: no server is asked.
-    if let AppCmd::Init { app, dir, image, port, environments, force, base } = &args.cmd {
-        return init(app, dir, image.as_deref(), *port, environments, *force, *base);
+    // Writes files where it's run: no server is asked. kiln-base comes from the registry of the
+    // kiln named, or is vendored when none is.
+    if let AppCmd::Init { app, dir, image, port, environments, force, base, registry, vendor } = &args.cmd {
+        let host = match (vendor, registry, &args.conn.url) {
+            (true, _, _) => None,
+            (false, Some(r), _) => Some(r.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_owned()),
+            (false, None, Some(url)) => Some(crate::githost::host_of(url)),
+            (false, None, None) => None,
+        };
+        return init(app, dir, image.as_deref(), *port, environments, *force, *base, host.as_deref());
     }
     let api = Api::new(cfg, &args.conn).await?;
     match args.cmd {
@@ -1240,7 +1327,13 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
             let v = api.call(Method::Get, &format!("/environments/{}", enc(&env)), None).await?;
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }
-        EnvCmd::Add { env, provider, host, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents, gates, applications } => {
+        EnvCmd::Add(a) => {
+            let EnvAdd { env, provider, host, repo, branch, root, clusters, kilncd, no_prune, self_heal, timeout, settle, refused, queue, agents, owners_release, gates, applications } = *a;
+            let mut reaches = serde_json::Map::new();
+            for pair in &kilncd {
+                let (argo, ours) = pair.split_once('=').filter(|(a, k)| !a.is_empty() && !k.is_empty()).with_context(|| format!("--kilncd {pair}: <Argo CD's cluster>=<KilnCD's cluster>"))?;
+                reaches.insert(argo.to_owned(), Value::String(ours.to_owned()));
+            }
             let gates: Value = match gates {
                 Some(path) => {
                     let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -1252,11 +1345,12 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
                 "name": env,
                 "provider": provider,
                 "release_repo": { "host": host, "repo": repo, "branch": branch, "root": root },
-                "targets": { "kubernetes": clusters },
+                "targets": { "kubernetes": clusters, "kilncd": reaches },
                 "sync": { "prune": !no_prune, "self_heal": self_heal },
                 "watch": { "timeout_secs": timeout, "settle_secs": settle, "refused_secs": refused },
                 "concurrency": if queue { "queue" } else { "reject" },
                 "agents": { "deploy": agents },
+                "owners": { "release": owners_release },
                 "gates": gates,
                 "argocd": { "applications": applications },
             });
@@ -1323,21 +1417,50 @@ fn print_move(v: &Value) {
 }
 
 /// `kiln app init`: an app's chart on kiln's base chart, written into the repository at `dir`.
-fn init(app: &str, dir: &std::path::Path, image: Option<&str>, port: u16, environments: &[String], force: bool, base: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn init(app: &str, dir: &std::path::Path, image: Option<&str>, port: u16, environments: &[String], force: bool, base: bool, registry: Option<&str>) -> Result<()> {
     let label = !app.is_empty() && app.len() <= 63 && app.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !app.starts_with('-') && !app.ends_with('-');
     if !label {
         bail!("{app:?}: an app's name is lowercase letters, digits and '-', as Kubernetes names things");
     }
     let image = image.map_or_else(|| format!("registry.example.com/{app}"), str::to_owned);
-    let files = super::init::files(&super::init::Init { app, image: &image, port, environments });
-    let base_dir = std::path::Path::new("charts").join(app).join("charts/kiln-base");
-    let chosen: Vec<(PathBuf, String)> = if base { files.into_iter().filter(|(p, _)| p.starts_with(&base_dir)).collect() } else { files };
-    let (wrote, kept) = super::init::write(dir, &chosen, force || base).with_context(|| format!("write into {}", dir.display()))?;
+    let chart = std::path::Path::new("charts").join(app);
+    let (wrote, kept) = if base {
+        // Only kiln-base moves: its dependency in Chart.yaml, and (vendored) its files.
+        let path = dir.join(&chart).join("Chart.yaml");
+        let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let repository = registry.map(super::init::charts_repository);
+        let moved = super::init::rebase(&text, repository.as_deref()).with_context(|| format!("{} doesn't depend on kiln-base", path.display()))?;
+        let mut files = vec![(chart.join("Chart.yaml"), moved)];
+        let vendored = dir.join(&chart).join("charts/kiln-base");
+        match registry {
+            None => files.extend(super::init::vendored(app)),
+            // From the registry now: the copy vendored before goes.
+            Some(_) if vendored.is_dir() => {
+                std::fs::remove_dir_all(&vendored).with_context(|| format!("remove {}", vendored.display()))?;
+                println!("removed {} (kiln-base comes from kiln's registry now)", vendored.display());
+            }
+            Some(_) => {}
+        }
+        super::init::write(dir, &files, true).with_context(|| format!("write into {}", dir.display()))?
+    } else {
+        let files = super::init::files(&super::init::Init { app, image: &image, port, environments, registry });
+        super::init::write(dir, &files, force).with_context(|| format!("write into {}", dir.display()))?
+    };
     for p in &wrote {
         println!("wrote {}", p.display());
     }
     for p in &kept {
         println!("kept {} (it was there: --force writes over it)", p.display());
+    }
+    match registry {
+        Some(host) if !base => println!(
+            "\nkiln-base comes from {} (anyone may pull it): `helm dependency build charts/{app}` fetches it{}.",
+            super::init::charts_repository(host),
+            if host.starts_with("127.") || host.starts_with("localhost") { " (`--plain-http` for a kiln without TLS)" } else { "" }
+        ),
+        None if !base => println!("\nkiln-base is vendored in charts/{app}/charts/kiln-base (no kiln named: --url, KILN_URL or --registry depends on it in kiln's registry instead)."),
+        _ => {}
     }
     if !base {
         println!(

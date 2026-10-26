@@ -7,9 +7,10 @@ class Socket {
   static CLOSED = 3;
   static all: Socket[] = [];
   readyState = Socket.OPEN;
+  url: string;
   onmessage?: (ev: { data: string | ArrayBuffer }) => void;
   onclose?: () => void;
-  constructor() { Socket.all.push(this); }
+  constructor(url?: string) { this.url = url ?? ""; Socket.all.push(this); }
   send() {}
   close() { this.readyState = Socket.CLOSED; this.onclose?.(); }
   frame(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }); }
@@ -97,6 +98,52 @@ await test("a previous connection's unpack cannot let text overtake a new snapsh
   }
 });
 
+await test("a reconnect resumes from what's shown, a resume adds to it, a snapshot replaces it", async () => {
+  const store = new SessionStore("resume");
+  const off = store.subscribe(() => {});
+  const ids = () => store.get().events.map((e) => e.id);
+  try {
+    const ws = Socket.all.at(-1)!;
+    ws.frame({ t: "open", info: { id: "resume", status: "running" }, rev: 10, born: 77 });
+    ws.frame({ t: "state", state });
+    ws.frame({ t: "events", events: [event(1), event(2)] });
+    ws.frame({ t: "synced" });
+    await tick();
+    ws.frame({ t: "events", events: [event(3)], rev: 11 });
+    await tick();
+    assert.deepEqual(ids(), ["e1", "e2", "e3"]);
+    // Away: it asks for only what came after what it shows.
+    ws.readyState = Socket.CLOSED;
+    store.wake();
+    const again = Socket.all.at(-1)!;
+    assert.notEqual(again, ws);
+    assert.match(again.url, /[?&]after=77\.11(&|$)/);
+    again.frame({ t: "resumed", info: { id: "resume", status: "running" }, rev: 14, born: 77 });
+    again.frame({ t: "state", state });
+    again.frame({ t: "events", events: [{ ...event(3), text: "changed" }, event(4)] });
+    again.frame({ t: "synced" });
+    await tick();
+    assert.deepEqual(ids(), ["e1", "e2", "e3", "e4"], "the resume adds to what's shown, none twice");
+    const e3 = store.get().events.find((e) => e.id === "e3");
+    assert.equal(e3?.kind === "assistant" && e3.text, "changed");
+    // A resume cut off before its synced isn't what's shown: the next asks from before it.
+    again.readyState = Socket.CLOSED;
+    store.wake();
+    const cut = Socket.all.at(-1)!;
+    assert.match(cut.url, /[?&]after=77\.14(&|$)/);
+    cut.frame({ t: "resumed", info: { id: "resume", status: "running" }, rev: 20, born: 77 });
+    cut.readyState = Socket.CLOSED;
+    cut.onclose?.();
+    store.wake();
+    const next = Socket.all.at(-1)!;
+    assert.match(next.url, /[?&]after=77\.14(&|$)/);
+    // A snapshot (another server, or one that can't resume) still replaces what's shown.
+    for (const frame of [{ t: "open", info: { id: "resume", status: "running" }, rev: 3, born: 91 }, { t: "state", state }, { t: "events", events: [event(9)] }, { t: "synced" }]) next.frame(frame);
+    await tick();
+    assert.deepEqual(ids(), ["e9"]);
+  } finally { off(); }
+});
+
 await test("cached resources do not process live events while nothing shows them", async () => {
   const { preload } = await import("../src/lib/resource.ts");
   const { events } = await import("../src/api/events.ts");
@@ -116,4 +163,14 @@ await test("cached resources do not process live events while nothing shows them
     assert.equal(reads, 1);
     assert.equal(applied, 0);
   } finally { events.stop(); }
+});
+
+await test("a message's id is a UUIDv7 made once: 32 hex digits, its time first, and never another's (CP-T3.2)", async () => {
+  const { clientId } = await import("../src/api/harness.ts");
+  const ids = Array.from({ length: 10_000 }, () => clientId());
+  for (const id of ids.slice(0, 100)) assert.match(id, /^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$/);
+  assert.equal(new Set(ids).size, ids.length);
+  const ms = Number.parseInt(ids[0]!.slice(0, 12), 16);
+  assert.ok(Math.abs(ms - Date.now()) < 60_000, `its time: ${ms}`);
+  assert.ok(ids.every((id, i) => i === 0 || id.slice(0, 12) >= ids[i - 1]!.slice(0, 12)), "made later, sorted later");
 });

@@ -54,12 +54,23 @@ return { ok: p.ok, diffs: p.diffs.map(d => ({ commit: d.commit.subject, ok: d.ok
 
 Undo a bad deploy from its history, not by hand:
 
-1. `kiln.cd.apps.history({ app })` lists deployments, newest first, each with an `id`.
-2. `kiln.cd.apps.rollback({ app })` goes back to the one before what runs now (`to: <id>` picks
-   one; `prune: true` also deletes what it didn't have). It waits for that render, then syncs.
+1. `kiln.cd.apps.rollback_targets({ app })` lists what it can go back to, newest first: each
+   deployment that succeeded (`id`, `revision`), its commit (`commit.subject`, `commit.body`) and
+   the `tags` that name it; `current` is what runs now. `kiln.cd.apps.history({ app })` is every
+   deployment, failures included.
+2. `kiln.cd.apps.rollback({ app })` goes back to the one before what runs now. `to: <id>` picks
+   one; `revision: "v1.4.2"` or `revision: "3f2a9c1"` picks the one that ran that tag or commit
+   (only what kiln deployed and kept: anything else is refused, and says so). `prune: true` also
+   deletes what it didn't have. It waits for that render, then syncs.
 3. The app holds there: automation won't redeploy the bad commit. When git changes the app (the
    fix lands), it follows git again by itself; `kiln.cd.apps.follow({ app })` lets go sooner.
    `kiln.cd.apps.get({ app }).pinned` says whether it is held, and since when.
+
+**Auto-rollback.** `kiln.cd.apps.get({ app }).auto_rollback` (or `kiln.cd.apps.auto_rollback`)
+says whether kiln goes back on its own when a deploy fails, and who said so. Turning it off for
+an app (`kiln.cd.apps.set_auto_rollback({ app, on: false })`, `on: null` to clear) is what a
+person asked for, never a way around a failing rollout; a repository's
+(`kiln.cd.repos.set_auto_rollback`) is a person's alone.
 
 ## Rules
 
@@ -90,11 +101,13 @@ knows the app, release it this way; the tools are `deploy_*` (code mode: `kiln.d
      soak, a window, a freeze). Its `gates` say which, each with `passed` and `detail`, and
      `message` says why. It goes by itself once the gate lets it.
    - `waiting_approval`: people must approve it. Tell the person who asked, with its link; don't
-     approve your own request.
-   - `committing` with "waits for its pull request #N to be merged": the environment releases
-     as pull requests (`via: pull-request`). A person merges it on GitHub, and that's the
-     approval: tell the person who asked, with the pull request's link (its `provider.pull_request.url`);
-     never merge it yourself. Closed unmerged, the release is cancelled.
+     approve your own request. Its message in the app's chat channels carries Approve and Reject
+     for whoever may.
+   - `committing` with "waits for its pull request #N to be merged" ("merge request !N" on
+     GitLab): the environment releases as pull requests (`via: pull-request`). A person merges it
+     on GitHub, GitLab or Bitbucket, and that's the approval: tell the person who asked, with its
+     link (the release's `provider.pull_request.url`); never merge it yourself. Closed unmerged
+     (declined, on Bitbucket), the release is cancelled.
    - `failed`: read `message` and `provider`. Its commit was reverted: what ran before runs
      again. Fix forward and release again.
 4. **Promote.** `kiln.deploy.releases.create({ app, environment: "production", promote_from: "staging" })`
@@ -121,14 +134,80 @@ return { id: r.id, state: w.release.state, done: w.done, message: w.release.mess
 **Rolling back.** `kiln.deploy.releases.rollback({ app, environment })` goes back to the newest
 release that succeeded before what runs (`to: <release id>` picks one of
 `kiln.deploy.registrations.candidates({ app, environment })`), as a new release with that one's
-version, artifacts and values. `kiln.deploy.releases.cancel({ id })` stops one still waiting or
-being delivered (a delivery is reverted).
+version, artifacts and values; `{ id }` in place of the app and environment names them by one of
+their releases. `kiln.deploy.releases.cancel({ id })` stops one still waiting or being delivered
+(a delivery is reverted).
+
+**Fleet changes.** `kiln.deploy.fleets.create({ environment, apps | template | project | owner,
+version | set, idempotency_key })` releases many apps of an environment at once, each through its
+gates. With `source: { base: "0.1.4" }` (kiln-base in each chart) or `source: { set: {...} }`
+(values in each chart) instead, it proposes the change in each app's source repository: one pull
+request per repository, and on kiln's own git server a branch and its diff. Follow it with
+`kiln.deploy.fleets.get({ id })`. Merging a pull request is a person's, on its host; on kiln's own,
+`kiln.deploy.fleets.merge({ id })` merges what a person asked you to merge.
+`kiln.deploy.fleets.withdraw({ id })` closes what's open.
+
+**Every operation**, as code mode names it (the MCP tools are the same with `_`:
+`deploy_releases_create`):
+
+- Where things stand: `kiln.deploy.board()` is every app in every environment, what runs and
+  what's on its way, and what waits for approval. `kiln.deploy.releases.list({ app, environment,
+  state })` and `kiln.deploy.releases.get({ id })` are releases; `kiln.deploy.metrics({ app,
+  environment, days })` how often changes land, their lead time, how often they fail, and how
+  long a restore takes.
+- What runs, as its provider sees it: `kiln.deploy.registrations.get({ app, environment })` (the
+  release that runs, the one on its way, what the provider says),
+  `kiln.deploy.registrations.resources`, `kiln.deploy.registrations.manifests`,
+  `kiln.deploy.registrations.diff` and `kiln.deploy.registrations.logs({ app, environment, kind,
+  name })`; `kiln.deploy.registrations.versions` what it has run there.
+- Releases: `kiln.deploy.releases.create`, `kiln.deploy.releases.wait`,
+  `kiln.deploy.releases.rollback`, `kiln.deploy.releases.cancel`, as above;
+  `kiln.deploy.releases.approve({ id, note })` and `kiln.deploy.releases.reject({ id, note })`
+  answer one waiting for approval, where the environment lets agents (`agents.approve`) and never
+  for your own request.
+- Acting on what runs: `kiln.deploy.registrations.actions` and `kiln.deploy.registrations.action`,
+  as above; `kiln.deploy.registrations.pause` and `kiln.deploy.registrations.resume` turn its
+  provider's automation off (hand edits survive) and on again (its next release resumes it too).
+- Apps: `kiln.deploy.apps.list()`, `kiln.deploy.apps.get({ app })`. Making and changing them is
+  what a person asked you for: `kiln.deploy.app_names.get({ name })` says whether a name is free,
+  `kiln.deploy.apps.create({ app: { name, template, owners } })` makes one (its template makes
+  its source repository and registries), `kiln.deploy.apps.patch({ app, patch })` changes some of
+  it (owners, contacts, template, its package: a chart, a path in git, or a platform's `{ kind:
+  "platform", provider, spec }` with `spec` its definition as `.kiln/deploy.yaml` holds it),
+  `kiln.deploy.apps.put({ app })` replaces it whole, `kiln.deploy.apps.delete({ app, everywhere,
+  keep })` deletes it. `kiln.deploy.apps.catalog_info({ app })` is its catalog-info.yaml for
+  Backstage.
+- Registrations: `kiln.deploy.registrations.create({ app, environment })` registers an app in an
+  environment, ready for its first release; `kiln.deploy.registrations.delete({ app, environment,
+  keep })` takes it out, what it runs there going with it unless `keep`.
+- Environments: `kiln.deploy.environments.list()`, `kiln.deploy.environments.get({ environment
+  })`; a person's to make, change or delete: `kiln.deploy.environments.put({ environment })` (its
+  provider, release repository, targets, gates; what agents may do there only a person changes)
+  and `kiln.deploy.environments.delete({ environment })` (refused while apps are registered
+  there). `kiln.deploy.git_hosts.list()` says where a release repository may be. Moving one to
+  another provider is a person's: `kiln.deploy.environments.move`,
+  `kiln.deploy.environments.move_status`, `kiln.deploy.environments.move_cancel`.
+- Templates, what apps are made from: `kiln.deploy.templates.list()`,
+  `kiln.deploy.templates.get({ template })`, `kiln.deploy.templates.put({ template })`,
+  `kiln.deploy.templates.delete({ template })` (refused while apps are made from it).
+- Fleet changes: `kiln.deploy.fleets.create`, `kiln.deploy.fleets.get`, `kiln.deploy.fleets.merge`,
+  `kiln.deploy.fleets.withdraw`, as above.
+- Linked servers: `kiln.deploy.link()` is this server as the servers linked to it see it;
+  `kiln.deploy.registrations.statement({ app, environment, audience })` what one of them is told
+  of an app here (signed for it alone).
+- Secrets: `kiln.deploy.secrets.list`, `kiln.deploy.secrets.versions({ app, environment, name })`
+  and `kiln.deploy.secrets.uses({ app, environment })` (which deliveries read which versions) are
+  yours to read. `kiln.deploy.secrets.put`, `kiln.deploy.secrets.delete` and
+  `kiln.deploy.secret_keys.rotate` refuse agents: they're a person's (see below).
 
 **Rules for agents.**
 - You release only where the environment lets agents (its `agents.deploy`); approve only where
-  `agents.approve` says so, and never your own request. A 403 means a person must: say so, with
-  what you would have released, and stop. Don't work around it (committing to a release
-  repository by hand, or asking another agent).
+  `agents.approve` says so, and never your own request. You act for your person, so an app's
+  release is also theirs to make: they deploy in that environment, or they're in one of the app's
+  owner teams and the environment lets owners release. A 403 means a person must (one who may,
+  as its message says): say so, with what you would have released, and stop. Don't work around
+  it (committing to a release repository by hand, asking another agent, or saying it to kiln in a
+  chat: a bot's command there acts as an agent for the person who linked it, held the same way).
 - One release at a time per app and environment: while one is in flight a second is refused
   (409), or queued where the environment says so. Wait for it, or cancel it if that's what the
   person asked.

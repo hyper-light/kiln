@@ -25,11 +25,13 @@ const TOKEN_DAYS: i64 = 90;
 const TOKEN_MARGIN_SECS: i64 = 30 * 86_400;
 
 /// Where an Argo CD reads an environment's release repository: kiln's git server, at the address
-/// the instance reaches kiln at (its integration's `kiln_url`, or kiln's public URL); or GitHub.
+/// the instance reaches kiln at (its integration's `kiln_url`, or kiln's public URL); or its host
+/// (GitHub, a GitLab, Bitbucket).
 pub async fn release_url(d: &Deploy, argo: &Argo, env: &Environment) -> String {
-    if env.release_repo.host == super::model::GITHUB_HOST {
-        let web = crate::githost::github::app(&d.hub).await.map_or_else(|| d.hub.cfg.ci.github.web_url.trim_end_matches('/').to_owned(), |a| a.web.clone());
-        return format!("{web}/{}.git", env.release_repo.repo);
+    if super::model::remote_host(&env.release_repo.host)
+        && let Some(url) = super::remote::release_url(d, &env.release_repo).await
+    {
+        return url;
     }
     argocd::release_repo_url(argo.kiln_url.as_deref().unwrap_or(&d.hub.cfg.server.public_url), &env.release_repo.repo)
 }
@@ -56,10 +58,10 @@ async fn put(d: &Deploy, argo: &Argo, env: &Environment, shadow: bool) -> Result
 /// that repository only: made again a month before it ends, or when Argo CD can't read with the
 /// one it has; the one it replaces revoked.
 async fn register_repo(d: &Deploy, argo: &Argo, env: &Environment, url: &str) -> Result<(), String> {
-    // GitHub's: read with an installation token of kiln's GitHub App.
-    if env.release_repo.host == super::model::GITHUB_HOST {
+    // Another host's: read with credentials of that host's that read that repository.
+    if super::model::remote_host(&env.release_repo.host) {
         super::flow::first_commit(d, env).await?;
-        return super::github::argo_reader(d, argo, env, url).await;
+        return super::remote::argo_reader(d, argo, env, url).await;
     }
     let repo_name = &env.release_repo.repo;
     let note = format!("Argo CD {} reads {repo_name}", argo.integration);
@@ -84,7 +86,7 @@ async fn register_repo(d: &Deploy, argo: &Argo, env: &Environment, url: &str) ->
 /// What an environment's AppProject allows: each registration's package repository and namespace,
 /// its template's cluster-scoped kinds, and the release repository.
 async fn allowed(d: &Deploy, env: &Environment, url: &str) -> Result<Allowed, String> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let e = |e: anyhow::Error| format!("{e:#}");
     let mut out = Allowed::default();
     out.sources.insert(url.to_owned());
@@ -248,6 +250,7 @@ mod tests {
             concurrency: Default::default(),
             agents: Default::default(),
             argocd: ArgoSettings { applications },
+            owners: Default::default(),
         };
         assert_eq!(integration_of(&env("argocd/prod", false)), Some("prod"));
         assert_eq!(integration_of(&env("argocd/prod", true)), None, "kiln writes its Applications");

@@ -68,6 +68,10 @@ pub enum AgentsCmd {
         /// Stop the current turn and send at once.
         #[arg(long)]
         now: bool,
+        /// An idempotency key: sent again with the same key, it's the same message, which the
+        /// agent gets once.
+        #[arg(long)]
+        key: Option<String>,
     },
     /// Wait until agents (by id or id prefix, on any machine) are done: idle, needing a person,
     /// paused for a usage limit, stopped or ended. Prints where each stands.
@@ -216,7 +220,7 @@ pub fn agents(a: AgentsArgs) -> anyhow::Result<()> {
             let v = request(&Request::Interrupt { id, shell: scope })?;
             print(&format!("interrupted {}", v.get("interrupted").and_then(Value::as_u64).unwrap_or(0)));
         }
-        AgentsCmd::Send { id, text, steer, now } => {
+        AgentsCmd::Send { id, text, steer, now, key } => {
             let mode = if now {
                 SendMode::Now
             } else if steer {
@@ -224,7 +228,7 @@ pub fn agents(a: AgentsArgs) -> anyhow::Result<()> {
             } else {
                 SendMode::Queue
             };
-            request(&Request::Send { id, text: text.join(" "), mode })?;
+            request(&Request::Send { id, text: text.join(" "), mode, key })?;
             print("sent");
         }
         AgentsCmd::Wait { ids, timeout, any, change, json } => {
@@ -245,6 +249,13 @@ pub fn agents(a: AgentsArgs) -> anyhow::Result<()> {
                     None => g("summary").lines().next().unwrap_or("").to_owned(),
                 };
                 print(&format!("{}  {:<10} {}  {}", short(&g("id")), g("stand"), g("name"), what));
+            }
+            // Messages other agents sent it, handed over here (taken out of its queue).
+            for m in v.get("messages").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let g = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+                let from = g("from");
+                let who = if g("name").is_empty() { short(&from).to_owned() } else { format!("{} ({})", g("name"), short(&from)) };
+                print(&format!("\nA message from {who}:\n{}", g("text").trim()));
             }
             if v.get("timed_out").and_then(Value::as_bool) == Some(true) {
                 print(&format!("still going after {timeout}s: wait again to keep waiting"));

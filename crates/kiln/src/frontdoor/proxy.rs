@@ -95,6 +95,25 @@ pub struct Shared {
     /// The clusters this one is peered with: a connection for one's address (`peer-<slug>.…`)
     /// is forwarded from here, not passed to the upstream.
     pub peers: RwLock<Option<Arc<crate::peers::forward::Forwarder>>>,
+    /// While this runner holds a replica of kiln's records: the handler that serves requests one
+    /// by one (kept across connections, with what it learned of whose credentials are whose).
+    pub door: RwLock<Option<Arc<super::replica::Door>>>,
+}
+
+/// The handler for requests one by one while this runner holds a replica of kiln's records
+/// (docs/p2p.md, P2); `None`: none here, and connections are piped to the upstream whole.
+fn door_for(shared: &Shared, upstream: &Upstream) -> Option<Arc<super::replica::Door>> {
+    let Some(learner) = crate::store::learner::global() else {
+        // None now: the one before lets its replica go.
+        shared.door.write().take();
+        return None;
+    };
+    if let Some(d) = shared.door.read().as_ref().filter(|d| d.serves(&learner, upstream)) {
+        return Some(Arc::clone(d));
+    }
+    let d = Arc::new(super::replica::Door::new(upstream.clone(), learner).ok()?);
+    *shared.door.write() = Some(Arc::clone(&d));
+    Some(d)
 }
 
 /// Serves one peered cluster's address on a front-door connection.
@@ -263,7 +282,10 @@ async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result
     let remote = tcp.peer_addr().ok();
     let tls = shared.tls.read().clone().context("no certificate yet")?;
     let upstream = shared.upstream.read().clone().context("no upstream")?;
-    let offer: &[&[u8]] = if shared.h2.load(Ordering::Relaxed) { &[H2, HTTP11] } else { &[HTTP11] };
+    let door = door_for(shared, &upstream);
+    // Served one by one, the browser's protocol is the front door's own: HTTP/2 whatever the
+    // upstream speaks.
+    let offer: &[&[u8]] = if door.is_some() || shared.h2.load(Ordering::Relaxed) { &[H2, HTTP11] } else { &[HTTP11] };
     let client = crate::rt::timeout(HANDSHAKE, ServerTlsStream::accept(RtFuturesIo::new(tcp), tls.config_alpn(offer)?))
         .await
         .context("TLS handshake timed out")?
@@ -279,7 +301,16 @@ async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result
     });
     if let Some(door) = peer {
         if h2 {
-            srv::serve_h2(client, door, remote, true).await;
+            srv::serve_h2(client, bytes::Bytes::new(), door, remote, true).await;
+        } else {
+            srv::serve_connection_with(client, door, remote, true).await;
+        }
+        return Ok(());
+    }
+    // A replica here: the owner's reads it holds are answered from it, the rest forwarded.
+    if let Some(door) = door {
+        if h2 {
+            srv::serve_h2(client, bytes::Bytes::new(), door, remote, true).await;
         } else {
             srv::serve_connection_with(client, door, remote, true).await;
         }
@@ -754,14 +785,14 @@ mod tests {
                 // A browser asks for HTTP/2 first.
                 let tcp = hyper_rt::tcp::TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await.map_err(|e| anyhow::anyhow!("{e}"))?;
                 let tls = TlsStream::connect(RtFuturesIo::new(tcp), roots.config_alpn(&[H2, HTTP11])?, crate::http::tls::server_name("kiln.test")?).await?;
-                let body = |r: http::Response<hyper::body::Incoming>| async move {
+                let body = |r: http::Response<kiln_http::Incoming>| async move {
                     use http_body_util::BodyExt as _;
                     Ok::<_, anyhow::Error>(String::from_utf8_lossy(&r.into_body().collect().await?.to_bytes()).into_owned())
                 };
                 let req = || http::Request::builder().uri("https://kiln.test/").header(header::HOST, "kiln.test").body(http_body_util::Empty::<bytes::Bytes>::new());
                 if h2_upstream {
                     assert_eq!(tls.alpn_protocol(), Some(H2));
-                    let (mut send, conn) = hyper::client::conn::http2::handshake(crate::http::io::RtExec, tls).await?;
+                    let (mut send, conn) = kiln_http::client::http2::handshake::<_, http_body_util::Empty<bytes::Bytes>>(tls).await?;
                     crate::rt::spawn(conn);
                     assert_eq!(body(send.send_request(req()?).await?).await?, "HTTP/2.0 kiln.test");
                     // Many at once, over the one connection.
@@ -769,7 +800,7 @@ mod tests {
                     assert!(many.iter().all(|r| r.as_ref().is_ok_and(|r| r.status() == StatusCode::OK)));
                 } else {
                     assert_eq!(tls.alpn_protocol(), Some(HTTP11));
-                    let (mut send, conn) = hyper::client::conn::http1::handshake(tls).await?;
+                    let (mut send, conn) = kiln_http::client::http1::handshake::<_, http_body_util::Empty<bytes::Bytes>>(tls).await?;
                     crate::rt::spawn(conn);
                     assert_eq!(body(send.send_request(req()?).await?).await?, "HTTP/1.1 kiln.test");
                 }

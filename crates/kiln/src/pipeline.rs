@@ -17,8 +17,14 @@ pub enum SpecError {
     Cycle(String),
     #[error("job `{0}` has no steps")]
     NoSteps(String),
+    /// An exclusive job's share is what it asks (docs/ci.md W05-R03): one that isn't a quantity
+    /// would take the whole runner unsaid.
+    #[error("job `{job}`: {why}")]
+    BadResources { job: String, why: String },
     #[error("matrix for job `{job}` expands to {count} combinations (limit {limit})")]
     MatrixTooLarge { job: String, count: usize, limit: usize },
+    #[error("job `{job}`'s requires `{expr}`: {why}")]
+    Requires { job: String, expr: String, why: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -29,8 +35,9 @@ pub struct Pipeline {
     pub on: Triggers,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Only one run of the same concurrency group executes at a time; newer runs cancel older
-    /// queued ones when `cancel-in-progress` is set.
+    /// Only one run of the same concurrency group executes at a time: a newer run cancels the older
+    /// ones when `cancel-in-progress` is set, and otherwise waits for the one under way, dropping
+    /// an older one that waits too (GitHub's single queue).
     #[serde(default)]
     pub concurrency: Option<Concurrency>,
     pub jobs: BTreeMap<String, JobSpec>,
@@ -125,6 +132,14 @@ pub struct JobSpec {
     pub artifacts: Vec<String>,
     #[serde(default)]
     pub cache: Vec<String>,
+    /// The CI engine's benchmark gate (docs/ci.md W16-R09): kept so a file both run stays valid
+    /// here, where it's ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench_gate: Option<serde_yaml::Value>,
+    /// Constraints on a runner's facts (docs/ci.md W05-R22: `tools has node`, `disk.free >= 50Gi`),
+    /// a string or a list: a job goes only to a runner that meets each, as the CI engine routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<serde_yaml::Value>,
     pub steps: Vec<StepSpec>,
 }
 
@@ -167,7 +182,7 @@ pub struct StepSpec {
 }
 
 /// A concrete, matrix-expanded unit of work ready to be queued.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PlannedJob {
     /// `test` or `test (profile=release)`.
     pub key: String,
@@ -186,7 +201,57 @@ pub struct PlannedJob {
     pub artifacts: Vec<String>,
     pub cache: Vec<String>,
     pub condition: Option<String>,
+    /// What a runner's facts must meet for the job to go there ([`JobSpec::requires`]). Written even
+    /// when empty: an assignment carries the job in postcard, which reads each field in turn, so one
+    /// left out puts every field after it out of step and the runner refuses the job as malformed.
+    /// Only a runner from before the CI work goes without it ([`PlannedJob::for_runner`]).
+    #[serde(default)]
+    pub requires: Vec<String>,
     pub steps: Vec<StepSpec>,
+    /// Written without `requires`, for a runner that reads a job without it; never kept.
+    #[serde(skip)]
+    pub without_requires: bool,
+}
+
+impl PlannedJob {
+    /// The job as a runner with capabilities `caps` reads it. One from before the CI work (no
+    /// [`crate::proto::CAP_CI2`], W22-AC09's mixed fleet) knows no `requires`, and it's sent only
+    /// jobs that require nothing, as it reports no facts to meet a requirement.
+    pub fn for_runner(mut self, caps: u32) -> Self {
+        self.without_requires = caps & crate::proto::CAP_CI2 == 0;
+        self
+    }
+}
+
+// By hand for `requires`, which a runner from before the CI work reads a job without: the fields
+// in their order, as the derived `Deserialize` reads them.
+impl Serialize for PlannedJob {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut j = s.serialize_struct("PlannedJob", 16 + usize::from(!self.without_requires))?;
+        j.serialize_field("key", &self.key)?;
+        j.serialize_field("spec_id", &self.spec_id)?;
+        j.serialize_field("display", &self.display)?;
+        j.serialize_field("needs", &self.needs)?;
+        j.serialize_field("labels", &self.labels)?;
+        j.serialize_field("image", &self.image)?;
+        j.serialize_field("toolchain", &self.toolchain)?;
+        j.serialize_field("env", &self.env)?;
+        j.serialize_field("timeout_minutes", &self.timeout_minutes)?;
+        j.serialize_field("retries", &self.retries)?;
+        j.serialize_field("exclusive", &self.exclusive)?;
+        j.serialize_field("resources", &self.resources)?;
+        j.serialize_field("artifacts", &self.artifacts)?;
+        j.serialize_field("cache", &self.cache)?;
+        j.serialize_field("condition", &self.condition)?;
+        if self.without_requires {
+            j.skip_field("requires")?;
+        } else {
+            j.serialize_field("requires", &self.requires)?;
+        }
+        j.serialize_field("steps", &self.steps)?;
+        j.end()
+    }
 }
 
 pub const MATRIX_LIMIT: usize = 256;
@@ -271,10 +336,33 @@ pub fn parse(src: &str) -> Result<Pipeline, SpecError> {
     Ok(p)
 }
 
+/// A job's `requires`, as written: a string is one, a list each of its strings.
+pub fn requirements(v: Option<&serde_yaml::Value>) -> Vec<String> {
+    match v {
+        Some(serde_yaml::Value::String(r)) => vec![r.clone()],
+        Some(serde_yaml::Value::Sequence(rs)) => rs.iter().map(yaml_scalar).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn validate(p: &Pipeline) -> Result<(), SpecError> {
     for (id, job) in &p.jobs {
         if job.steps.is_empty() {
             return Err(SpecError::NoSteps(id.clone()));
+        }
+        match &job.requires {
+            None | Some(serde_yaml::Value::String(_) | serde_yaml::Value::Sequence(_)) => {}
+            Some(other) => {
+                let expr = yaml_scalar(other);
+                return Err(SpecError::Requires { job: id.clone(), expr, why: "give a constraint, or a list of them".into() });
+            }
+        }
+        for r in requirements(job.requires.as_ref()).iter().filter(|r| !r.contains("${{")) {
+            kiln_ci::sched::routing::Constraint::parse(r).map_err(|why| SpecError::Requires { job: id.clone(), expr: r.clone(), why })?;
+        }
+        let asked = kiln_ci::sched::pools::ResourceSpec { cpu: job.resources.cpu.clone(), memory: job.resources.memory.clone(), ..Default::default() };
+        if let Err(why) = asked.resources() {
+            return Err(SpecError::BadResources { job: id.clone(), why });
         }
         for need in &job.needs {
             if !p.jobs.contains_key(need) {
@@ -400,6 +488,10 @@ pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
             exclusive: j.kiln.exclusive,
             artifacts: j.kiln.artifacts.clone(),
             cache: j.kiln.cache.iter().map(|c| c.as_str().map(str::to_owned).ok_or_else(|| format!("{} holds more than directories", at("cache")))).collect::<Result<_, _>>()?,
+            // The engine's; v1 doesn't gate on benchmarks.
+            bench_gate: None,
+            requires: (!j.kiln.requires.is_empty())
+                .then(|| serde_yaml::Value::Sequence(j.kiln.requires.iter().map(|t| serde_yaml::Value::String(t.src.clone())).collect())),
             steps,
         };
         jobs.insert(j.id.clone(), spec);
@@ -480,7 +572,9 @@ pub fn plan(p: &Pipeline, base: &Context) -> Result<Vec<PlannedJob>, SpecError> 
                 artifacts: job.artifacts.clone(),
                 cache: job.cache.clone(),
                 condition: job.condition.as_ref().map(|c| ctx.interpolate(c)),
+                requires: requirements(job.requires.as_ref()).iter().map(|r| ctx.interpolate(r)).collect(),
                 steps,
+                without_requires: false,
             });
         }
         legs.insert(id.clone(), keys);
@@ -569,6 +663,56 @@ jobs:
       - run: cargo bench
 "#;
 
+    /// kiln's own `.kiln/*.yaml` read both ways: as v1 pipelines and in the CI engine's kiln
+    /// dialect, so neither grows a key the other refuses.
+    #[test]
+    fn kilns_own_workflows_read_both_ways() -> anyhow::Result<()> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln");
+        let mut read = 0;
+        for e in std::fs::read_dir(&dir)?.filter_map(Result::ok) {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)?;
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            // Not every file there is a pipeline (environments.yaml, routing.yaml, …).
+            if !text.lines().any(|l| l.starts_with("jobs:")) {
+                continue;
+            }
+            parse(&text).map_err(|e| anyhow::anyhow!("{name} as v1: {e}"))?;
+            let (wf, diags) = kiln_ci::wf::parse_workflow(&format!(".kiln/{name}"), &text, kiln_ci::expr::Dialect::Kiln);
+            let errors: Vec<String> = diags.iter().filter(|d| d.is_error()).map(|d| format!("{d:?}")).collect();
+            anyhow::ensure!(wf.is_some() && errors.is_empty(), "{name} in the kiln dialect: {errors:?}");
+            read += 1;
+        }
+        anyhow::ensure!(read >= 3, "only {read} of kiln's own workflows read");
+        Ok(())
+    }
+
+    /// kiln's own benches hold a share of their machine (docs/ci.md W05-R03): the QUIC bench one
+    /// L3 domain's CPUs on adacachy, the CI engine's bench 8 so it fits every machine it may run on
+    /// (a Mac Studio has 14), and memory above their peaks, other work running beside them. A share
+    /// that isn't a quantity is refused, naming its job, rather than taking the whole runner unsaid.
+    #[test]
+    fn the_benches_hold_a_share_and_a_share_that_isnt_one_is_refused() -> anyhow::Result<()> {
+        use kiln_ci::sched::state::{Incoming, Resources};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln/bench.yaml");
+        let p = parse(&std::fs::read_to_string(dir)?)?;
+        for (job, cpu, gib) in [("quic-transport", 16.0, 48), ("ci-bench", 8.0, 16)] {
+            let j = p.jobs.get(job).ok_or_else(|| anyhow::anyhow!("no {job}"))?;
+            assert_eq!(crate::hub::v1_incoming(j.exclusive, &j.resources), Incoming::Share(Resources { cpu, mem: gib << 30, ..Resources::default() }), "{job}");
+        }
+        let noise = p.jobs.get("noise").ok_or_else(|| anyhow::anyhow!("no noise"))?;
+        assert_eq!(crate::hub::v1_incoming(noise.exclusive, &noise.resources), Incoming::Ordinary, "noise runs beside them");
+        let bad = "name: b\njobs:\n  bench:\n    exclusive: true\n    resources: { cpu: lots }\n    steps: [{ run: \"true\" }]\n";
+        match parse(bad) {
+            Err(SpecError::BadResources { job, why }) => assert!(job == "bench" && why.contains("isn't a number of CPUs"), "{why}"),
+            other => anyhow::bail!("not refused: {other:?}"),
+        }
+        Ok(())
+    }
+
     #[test]
     fn plans_matrix_and_needs() -> Result<(), SpecError> {
         let p = parse(SAMPLE)?;
@@ -582,6 +726,20 @@ jobs:
         let built = jobs.iter().any(|j| j.steps.iter().any(|s| s.run.contains("release # abc")));
         assert!(built);
         assert!(ctx.eval(bench.and_then(|b| b.condition.as_deref()).unwrap_or("false")));
+        Ok(())
+    }
+
+    /// A job's `requires` reach its plan, for dispatch to route by: a string as one, a list as
+    /// each, filled in as its labels are. One that isn't a constraint is refused with the pipeline.
+    #[test]
+    fn a_job_s_requires_reach_its_plan() -> Result<(), SpecError> {
+        let p = parse("name: r\njobs:\n  mac:\n    runs-on: [macos]\n    matrix: { tool: [node] }\n    requires: [\"os == macos\", \"tools has ${{ matrix.tool }}\"]\n    steps: [{run: x}]\n  one:\n    requires: tools has cargo\n    steps: [{run: x}]\n")?;
+        let jobs = plan(&p, &Context::default())?;
+        let of = |id: &str| jobs.iter().find(|j| j.spec_id == id).map(|j| j.requires.clone()).unwrap_or_default();
+        assert_eq!(of("mac"), vec!["os == macos".to_owned(), "tools has node".to_owned()]);
+        assert_eq!(of("one"), vec!["tools has cargo".to_owned()]);
+        let bad = parse("name: r\njobs:\n  a:\n    requires: [\"tools has\"]\n    steps: [{run: x}]\n");
+        assert!(matches!(bad, Err(SpecError::Requires { .. })), "{bad:?}");
         Ok(())
     }
 

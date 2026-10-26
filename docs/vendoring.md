@@ -1,8 +1,9 @@
 # Vendoring
 
-kiln builds from its own copies of the projects it's made of: Turso and Bun today, and the
-hyper-light products (Amphora, Quiver, Hex, Veil, Reliquary, Mantle, and what they take from Focal,
-Shards, Slates and hyper-raft) as the critical path brings them in (its master plan §5, CP-M1). Each
+kiln builds from its own copies of the projects it's made of: Turso, Bun, and Quiver with what it's
+built on (Focal's bus and hyper-raft, CP-T2.1, docs/bus.md) today, and the other hyper-light
+products (Amphora, Hex, Veil, Reliquary, Mantle, and what they take from Focal, Shards, Slates and
+hyper-raft) as the critical path brings them in (its master plan §5, CP-M1). Each
 copy is its upstream at one revision plus kiln's recorded changes, and one command takes a new
 revision.
 

@@ -4,19 +4,38 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Fault injection for tests (docs/ci.md W22-AC04): `kiln agent --chaos`, `KILN_CHAOS`.
+chaos = []
+
+# The wire lab drives faults only a build with `chaos` has: asked for without it, cargo says so
+# rather than running nothing (docs/wire.md, "The lab").
+[[test]]
+name = "wire_lab"
+required-features = ["chaos"]
+
 [dependencies]
 kiln-cd = { path = "../kiln-cd" }
 kiln-ci = { path = "../kiln-ci" }
+# kiln's own HTTP/1.1 and HTTP/2 on hyper-rt (no tokio, no hyper).
+kiln-http = { path = "../kiln-http" }
 # The seams kiln reaches every product through, with their simulators (docs/seams.md).
 kiln-seams = { path = "../kiln-seams" }
-hyper-transport = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-rt = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-rt-transport = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-quic = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1", default-features = false }
-hyper-raft = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-durable = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-log = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-block = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+# hyper-raft's shared crates, vendored at vendor/hyper-raft at the revision Focal's bus takes (the
+# root manifest's [patch.crates-io] points each name there; docs/vendoring.md). Every vendored name
+# is pinned exactly: crates.io has unrelated crates under some of them (`quiver`, `hyper-rt`), and
+# a newer compatible version there would be chosen over the patch.
+hyper-transport = "=0.1.0"
+hyper-rt = "=0.1.0"
+hyper-rt-transport = "=0.1.0"
+hyper-quic = { version = "=0.1.0", default-features = false }
+hyper-raft = "=0.1.0"
+hyper-durable = "=0.1.0"
+hyper-log = "=0.1.0"
+hyper-block = "=0.1.0"
+# The bus kiln's events ride (docs/bus.md): Quiver, vendored at vendor/quiver.
+quiver = "=0.1.0"
+quiver-api = "=0.1.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 anyhow = "1.0.104"
 base64 = "0.23.1"
@@ -25,11 +44,12 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 glob = "0.3.4"
 hex = "0.4.3"
+httparse = "1.10.1"
 mime_guess = "2.0.5"
 parking_lot = "0.12.5"
 portable-pty = "0.9.0"
 rand = "0.10.3"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 # The conversation store's engine (docs/conversations.md): Turso, vendored (vendor/turso), Rust
 # only: no simd and pure-Rust crypto, so no C is compiled; no fts (it needs C on musl).
 turso_core = { path = "../../vendor/turso/core", default-features = false, features = ["fs", "json", "pure-rust-crypto"] }
@@ -54,7 +74,6 @@ zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2
 hmac = "0.13.0"
 # Secrets at rest: AES-256-GCM (docs/ci.md W09-R03); already in the tree through hyper-raft.
 aws-lc-rs = "1.18.2"
-hyper = { version = "1.12.0", features = ["http1", "http2", "server", "client"] }
 http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
@@ -83,7 +102,7 @@ str0m = { version = "0.24.1", default-features = false, features = ["aws-lc-rs"]
 
 # Unix (Linux and macOS): signals and process groups, pidfd exit waits, PTY masters on readiness.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio"] }
+nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio", "mount", "reboot", "sched", "time"] }
 rustix = { version = "1.1", features = ["process", "termios", "net"] }
 filedescriptor = "0.8"
 
@@ -95,4 +114,18 @@ command-group = "5.0.1"
 workspace = true
 
 [dev-dependencies]
+kiln-sim = { path = "../kiln-sim" }
 tempfile = "3.27.0"
+# hyper-durable's RamStore, for sync's tests alone: kiln's copy compiles it only where a test asks
+# (vendor/hyper-raft/UPSTREAM.md).
+hyper-durable = { version = "=0.1.0", features = ["test-store"] }
+
+# What a session's inbox adds to a send (CP-T3.2, AC-T3.2.3): `cargo bench -p kiln --bench send_path`.
+[[bench]]
+name = "send_path"
+harness = false
+
+# A send end to end on a host (CP-T3.2), built alike on a branch and on main: `--bench send_e2e`.
+[[bench]]
+name = "send_e2e"
+harness = false

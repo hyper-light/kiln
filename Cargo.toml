@@ -1,8 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-# Turso (the conversation store's engine) is vendored with its own workspace: vendor/turso/UPSTREAM.md.
-exclude = ["vendor/turso", "bench/kilndb"]
+# Turso (the conversation store's engine) is vendored with its own workspace: vendor/turso/UPSTREAM.md;
+# so are Quiver, Focal's bus and hyper-raft (vendor/MANIFEST.toml), each a workspace of its own.
+exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "bench/kilndb", "bench/http"]
 
 [workspace.package]
 version = "0.2.0"
@@ -25,6 +26,12 @@ indexing_slicing = "deny"
 exit = "deny"
 type_complexity = "allow"
 
+# Debug builds hash with optimized SHA-256. A server hashes its own (debug: over a GiB) binary as
+# it starts, on one of its shards, and the content store hashes every chunk: unoptimized, that alone
+# kept test servers from answering within a minute on a loaded machine.
+[profile.dev.package.sha2]
+opt-level = 3
+
 # SQLite (the store's engine, built from C by rusqlite's libsqlite3-sys) optimized in dev and test
 # builds too: unoptimized, a store's migrations alone took a scratch hub 75 ms; optimized, about 20
 # (every test that opens a store, CP-M2's test timings among them).
@@ -36,3 +43,22 @@ lto = "thin"
 codegen-units = 4
 strip = true
 panic = "unwind"
+
+# What kiln vendors, each name pointed at its one copy (vendor/MANIFEST.toml; docs/vendoring.md,
+# "Products and [patch]"): Quiver, Focal's bus, and hyper-raft's shared crates, which kiln takes too.
+[patch.crates-io]
+focal-bus = { path = "vendor/focal-bus/crates/focal-bus" }
+focal-memory = { path = "vendor/focal-bus/crates/focal-memory" }
+hyper-block = { path = "vendor/hyper-raft/crates/hyper-block" }
+hyper-durable = { path = "vendor/hyper-raft/crates/hyper-durable" }
+hyper-liveness = { path = "vendor/hyper-raft/crates/hyper-liveness" }
+hyper-log = { path = "vendor/hyper-raft/crates/hyper-log" }
+hyper-quic = { path = "vendor/hyper-raft/crates/hyper-quic" }
+hyper-raft = { path = "vendor/hyper-raft/crates/hyper-raft" }
+hyper-rt = { path = "vendor/hyper-raft/crates/hyper-rt" }
+hyper-rt-transport = { path = "vendor/hyper-raft/crates/hyper-rt-transport" }
+hyper-seal = { path = "vendor/hyper-raft/crates/hyper-seal" }
+hyper-timing = { path = "vendor/hyper-raft/crates/hyper-timing" }
+hyper-transport = { path = "vendor/hyper-raft/crates/hyper-transport" }
+quiver = { path = "vendor/quiver/crates/quiver" }
+quiver-api = { path = "vendor/quiver/crates/quiver-api" }

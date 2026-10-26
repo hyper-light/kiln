@@ -739,7 +739,7 @@ mod end_to_end {
             let items = ["Write the engine", "Wire it", "Document it"].iter().map(|t| super::super::Item { title: (*t).to_owned(), ..Default::default() }).collect();
             let p = super::super::create(&hub, super::super::New { title: "Ship sync".into(), items, ..Default::default() }, "admin").await?;
             let cfg = Config { place: Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some(cwd.clone()), ..Place::default() }, opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
-            let run = agents::start(&hub, &p, cfg).await?.run;
+            let run = agents::start(&hub, &p, cfg, None).await?.run;
             let work_of = [("engine.rs", "fn engine() {}\n"), ("wire.rs", "fn wire() {\n    engine();\n}\n"), ("README.md", "app\n\nIt syncs.\n")];
             let mut ids: Vec<String> = Vec::new();
             for (i, (file, text)) in work_of.iter().enumerate() {

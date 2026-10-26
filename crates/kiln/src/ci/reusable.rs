@@ -21,6 +21,10 @@ use crate::store::Repo;
 /// also by their path).
 pub async fn files(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> HashMap<String, Arc<Workflow>> {
     let mut out: HashMap<String, Arc<Workflow>> = HashMap::new();
+    // A workflow that calls none (most do) needs nothing read: no git for its run to start.
+    if calls(wf).is_empty() {
+        return out;
+    }
     match load::load(hub, repo, sha).await {
         Ok(commit) => {
             for l in commit.workflows {
@@ -57,15 +61,32 @@ fn calls(wf: &Workflow) -> Vec<String> {
     wf.jobs.iter().filter_map(|j| j.uses.clone()).collect()
 }
 
-/// A remote reusable workflow at its pinned commit.
+/// A remote reusable workflow at its pinned commit. The workflows it calls by `./` are its own
+/// repository's at that commit, as on GitHub, not the caller's: they're named so. (A step's `./`
+/// action is the job's workspace's, wherever its workflow came from.)
 async fn remote(hub: &Hub, r: &Remote) -> anyhow::Result<Workflow> {
-    let sha = actions::pin(hub, r).await?;
-    let mirror = actions::mirror(hub, &r.owner, &r.repo).to_string_lossy().to_string();
+    let (sha, full_ref) = actions::pin_ref(hub, r).await?;
+    let mirror = r.mirror(hub).to_string_lossy().to_string();
     let src = gitops::run_git(hub, &["-C", &mirror, "show", &format!("{sha}:{}", r.path)], std::time::Duration::from_secs(60)).await?;
     let text = String::from_utf8_lossy(&src).into_owned();
     let (w, diags) = kiln_ci::wf::parse_workflow(&r.path, &text, Dialect::Gha);
     if let Some(d) = diags.iter().find(|d| d.is_error()) {
         anyhow::bail!("{}@{}: {} {}", r.path, r.git_ref, d.code, d.message);
     }
-    w.ok_or_else(|| anyhow::anyhow!("{} is not a workflow", r.path))
+    let mut w = w.ok_or_else(|| anyhow::anyhow!("{} is not a workflow", r.path))?;
+    own_calls(&mut w, r, &sha);
+    // Its jobs' `job.workflow_*` (W06-R03): its repository, its ref and the commit pinned.
+    w.origin = Some(kiln_ci::wf::ir::Origin { repository: format!("{}/{}", r.owner, r.repo), git_ref: full_ref, sha });
+    Ok(w)
+}
+
+/// `w`'s calls by `./`, named as `r`'s repository's at `sha`.
+fn own_calls(w: &mut Workflow, r: &Remote, sha: &str) {
+    for j in &mut w.jobs {
+        if let Some(u) = j.uses.as_mut()
+            && let Some(path) = u.strip_prefix("./")
+        {
+            *u = r.at(path, sha);
+        }
+    }
 }

@@ -4,6 +4,7 @@ import type {
   CdAdoption,
   CdApp,
   CdAppDetail,
+  CdAutoRollback,
   CdCluster,
   CdDiscovery,
   CdProvider,
@@ -20,6 +21,7 @@ import type {
   CdResource,
   CdResourceDetail,
   CdResourceKey,
+  CdRollbackTargets,
   CdRollout,
   CdRolloutAction,
   CdSummary,
@@ -43,6 +45,8 @@ export interface CdFilters {
   cluster?: string[];
   project?: string[];
   namespace?: string[];
+  /** The environments its deploy file names it for. */
+  environment?: string[];
   /** A part of the app's id, any case. */
   q?: string;
 }
@@ -70,6 +74,7 @@ const selector = (f: CdFilters) => ({
   cluster: f.cluster?.join(","),
   project: f.project?.join(","),
   namespace: f.namespace?.join(","),
+  environment: f.environment?.join(","),
   q: f.q,
 });
 
@@ -84,23 +89,19 @@ export const cdApi = {
     ),
   facets: (f: CdFilters, signal?: AbortSignal) => request<CdFacets>("GET", `/api/cd/facets${qs(selector(f))}`, undefined, { signal }),
   app: (id: string, signal?: AbortSignal) => request<CdAppDetail>("GET", appPath(id), undefined, { signal }),
-  resources: (id: string, signal?: AbortSignal) =>
-    request<{ resources: CdResource[] }>("GET", `${appPath(id)}/resources`, undefined, { signal }),
+  resources: (id: string, signal?: AbortSignal) => request<{ resources: CdResource[] }>("GET", `${appPath(id)}/resources`, undefined, { signal }),
   diff: (id: string, signal?: AbortSignal) => request<{ diffs: CdDiff[] }>("GET", `${appPath(id)}/diff`, undefined, { signal }),
   /** The app's objects and every live object they own. */
   tree: (id: string, signal?: AbortSignal) => request<CdTree>("GET", `${appPath(id)}/tree`, undefined, { signal }),
   /** One object in depth: live and desired manifests, diff, labels, conditions, owners. */
   resource: (id: string, k: CdResourceKey, signal?: AbortSignal) => request<CdResourceDetail>("GET", resPath(id, k), undefined, { signal }),
-  events: (id: string, k: CdResourceKey, signal?: AbortSignal) =>
-    request<{ events: CdEvent[] }>("GET", `${resPath(id, k)}/events`, undefined, { signal }),
+  events: (id: string, k: CdResourceKey, signal?: AbortSignal) => request<{ events: CdEvent[] }>("GET", `${resPath(id, k)}/events`, undefined, { signal }),
   logs: (id: string, k: CdResourceKey, q: CdLogQuery, signal?: AbortSignal) =>
     request<CdLogs>("GET", `${resPath(id, k)}/logs${qs({ ...q, previous: q.previous ? "true" : undefined })}`, undefined, { signal }),
   /** The path of a WebSocket that follows the logs. */
   logsFollowPath: (id: string, k: CdResourceKey, q: CdLogQuery) => `${resPath(id, k)}/logs/ws${qs({ ...q, previous: undefined })}`,
-  history: (id: string, signal?: AbortSignal) =>
-    request<{ history: CdDeployment[] }>("GET", `${appPath(id)}/history`, undefined, { signal }),
-  sync: (id: string, body: { prune?: boolean; dry_run?: boolean; options?: string[]; resources?: CdResourceKey[] }) =>
-    request<unknown>("POST", `${appPath(id)}/sync`, body),
+  history: (id: string, signal?: AbortSignal) => request<{ history: CdDeployment[] }>("GET", `${appPath(id)}/history`, undefined, { signal }),
+  sync: (id: string, body: { prune?: boolean; dry_run?: boolean; options?: string[]; resources?: CdResourceKey[] }) => request<unknown>("POST", `${appPath(id)}/sync`, body),
   /** Syncs every app the filters show. */
   syncMany: (f: CdFilters) => request<{ started: number }>("POST", "/api/cd/ops/cd.apps.sync_many", { ...selector(f), max: 100_000 }),
   refresh: (id: string, hard: boolean) => request<unknown>("POST", `${appPath(id)}/refresh${qs({ hard })}`, {}),
@@ -110,8 +111,14 @@ export const cdApi = {
   refreshMany: (f: CdFilters) => request<{ refreshing: number }>("POST", "/api/cd/ops/cd.apps.refresh_many", selector(f)),
   terminate: (id: string) => request<unknown>("POST", `${appPath(id)}/terminate`, {}),
   takeOver: (id: string) => request<unknown>("POST", `${appPath(id)}/take-over`, {}),
-  rollback: (id: string, body: { to?: number; prune?: boolean }) =>
-    request<{ to: number; revision: string | null }>("POST", `${appPath(id)}/rollback`, body),
+  /** Back to a deployment that succeeded: by its id (`to`), or by what it ran (`revision`: a commit, a tag, a chart version). */
+  rollback: (id: string, body: { to?: number; revision?: string; prune?: boolean }) => request<{ to: number; revision: string | null; tag: string | null }>("POST", `${appPath(id)}/rollback`, body),
+  /** What the app can be rolled back to, newest first, each with its commit's message and tags. */
+  rollbackTargets: (id: string, signal?: AbortSignal) => request<CdRollbackTargets>("GET", `${appPath(id)}/rollback-targets`, undefined, { signal }),
+  /** Auto-rollback for one app: on, off, or `null` to follow its repository. */
+  setAutoRollback: (id: string, on: boolean | null) => request<CdAutoRollback>("PUT", `${appPath(id)}/auto-rollback`, { on }),
+  /** Auto-rollback for every app of a repository: on, off, or `null` to clear it. */
+  setRepoAutoRollback: (repo: string, on: boolean | null) => request<unknown>("PUT", "/api/cd/repos/auto-rollback", { repo, on }),
   follow: (id: string) => request<unknown>("POST", `${appPath(id)}/follow`, {}),
   /** The app's rollouts on targets, the one under way first. */
   rollouts: (id: string, signal?: AbortSignal) => request<{ app: string; rollouts: CdRollout[] }>("GET", `${appPath(id)}/rollout`, undefined, { signal }),

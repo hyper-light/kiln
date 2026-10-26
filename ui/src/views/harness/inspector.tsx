@@ -3,7 +3,7 @@
  * its plan, subagents and the commands it ran; and what it works with — MCP servers, skills, usage.
  */
 import * as React from "react";
-import { Bot, ChevronRight, Square } from "lucide-react";
+import { Bot, Square } from "lucide-react";
 import { useSession, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
 import { changesetOf, duration, editsOf, money, relPath, runsOf, taskDot, taskLive, tokens, useSameList, type FileChange, type ToolEvent } from "./derive";
@@ -11,14 +11,17 @@ import { DiffStat, FileDiffView } from "./diff";
 import { Output, Prose } from "./parts";
 import { LimitMeter, StatusList } from "./limits";
 import { McpPanel, SkillsPanel } from "./tools";
-import { TaskElapsed, TodoList } from "./timeline";
+import { TaskElapsed } from "./timeline";
 import { Background, isBackground } from "./background";
 import { PlansHere } from "@/views/plans/here";
 import { PlanSourceContext, SavePlan, todosAsPlan } from "@/views/plans/save";
+import { ProposedPlan, TodoSteps } from "@/views/plans/its-plan";
+import { AgentResearch } from "@/views/research/research";
 import { Goals } from "./goals";
 import { LivePages } from "./live-pages";
 import { Loadable } from "@/components/ui/loading";
 import { ChangeBar } from "./change-bar";
+import { Fold, FoldOpen } from "./fold";
 import { WorkspaceBar } from "./workspace-bar";
 import { SubagentOutput } from "./task-output";
 
@@ -27,23 +30,14 @@ const NO_EVENTS: HEvent[] = [];
 /** Three places beside the conversation: what it changed, its plan (and goals, and saved plans to run), and its tools (what it has running, subagents, commands it ran, MCP, skills, usage). */
 export type InspectorTab = "changes" | "plan" | "tools";
 
-const ToolSectionOpen = React.createContext(true);
 
 /** Large tool inventories start folded; hiding them keeps searches and unfinished forms intact. */
-function ToolSection({ title, count, children }: { title: string; count?: number; children: React.ReactNode }) {
-  const [open, setOpen] = React.useState(false);
-  const bodyId = React.useId();
+/** A section that folds, closed until opened (what's in it is long, or read only once it's open). */
+function ToolSection({ id, title, count, children }: { id: string; title: string; count?: number; children: React.ReactNode }) {
   return (
-    <section className="in-fold" data-open={open || undefined}>
-      <h3 className="in-sec-head">
-        <button type="button" className="in-sec-toggle" aria-expanded={open} aria-controls={bodyId} onClick={() => setOpen(!open)}>
-          <ChevronRight size={12} className={cn("hx-chev", open && "rotate-90")} aria-hidden="true" />
-          {title}
-          {count !== undefined && <span className="in-sec-count">{count}</span>}
-        </button>
-      </h3>
-      <div id={bodyId} hidden={!open}><ToolSectionOpen.Provider value={open}>{children}</ToolSectionOpen.Provider></div>
-    </section>
+    <Fold id={id} title={title} count={count} defaultOpen={false}>
+      {children}
+    </Fold>
   );
 }
 
@@ -51,6 +45,7 @@ function ToolSection({ title, count, children }: { title: string; count?: number
 function fromServer(files: ServerChange[]): FileChange[] {
   return files.map((f) => ({
     path: f.path,
+    tree: f.tree,
     created: Boolean(f.created),
     add: f.added,
     del: f.removed,
@@ -76,8 +71,11 @@ export const Changes = React.memo(function Changes({
 }) {
   const local = React.useMemo(() => (changes ? null : changesetOf(events)), [events, changes]);
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
+  // A file in another working tree than its folder's (a worktree it left, the checkout it went
+  // from) is shown where it is; in its folder's, by its path there.
+  const nameOf = (f: FileChange) => relPath(f.tree && f.tree !== cwd && !cwd.startsWith(`${f.tree}/`) ? `${f.tree}/${f.path}` : f.path, cwd);
   const [sel, setSel] = React.useState<string | null>(null);
-  const shown: FileChange[] = sel ? files.filter((f) => f.path === sel) : files;
+  const shown: FileChange[] = sel ? files.filter((f) => nameOf(f) === sel) : files;
   const add = files.reduce((n, f) => n + f.add, 0);
   const del = files.reduce((n, f) => n + f.del, 0);
   const wsBar = agentId && volumeOver ? <WorkspaceBar agentId={agentId} over={volumeOver} /> : null;
@@ -92,7 +90,7 @@ export const Changes = React.memo(function Changes({
     <div className="hx-changes">
       {wsBar}
       {agentId && (
-        <Loadable label="Loading its change request" fallback={<div className="hx-change-bar" aria-busy="true" />}>
+        <Loadable label="Loading its change request" fallback={<div className="hx-cr" aria-busy="true" />}>
           <ChangeBar agentId={agentId} />
         </Loadable>
       )}
@@ -102,10 +100,10 @@ export const Changes = React.memo(function Changes({
           <DiffStat add={add} del={del} />
         </button>
         {files.map((f) => {
-          const rel = relPath(f.path, cwd);
+          const rel = nameOf(f);
           const slash = rel.lastIndexOf("/");
           return (
-            <button key={f.path} type="button" className="hx-file" aria-pressed={sel === f.path} onClick={() => setSel(sel === f.path ? null : f.path)} title={rel}>
+            <button key={rel} type="button" className="hx-file" aria-pressed={sel === rel} onClick={() => setSel(sel === rel ? null : rel)} title={rel}>
               <span className="hx-file-name">
                 {slash > 0 && <span className="hx-dim">{rel.slice(0, slash + 1)}</span>}
                 {rel.slice(slash + 1)}
@@ -121,14 +119,14 @@ export const Changes = React.memo(function Changes({
       <div className="hx-stack">
         {shown.map((f) =>
           f.edits.map((e, i) => (
-            <div key={`${f.path}-${i}`}>
+            <div key={`${nameOf(f)}-${i}`}>
               {f.edits.length > 1 && (
                 <div className="hx-dim mb-1 text-[11px]">
                   edit {i + 1} of {f.edits.length}
                   {e.call?.status === "error" ? " · failed" : ""}
                 </div>
               )}
-              <FileDiffView diff={e.diff} label={relPath(f.path, cwd)} defaultOpen={shown.length <= 4} />
+              <FileDiffView diff={e.diff} label={nameOf(f)} defaultOpen={shown.length <= 4} />
               {f.truncated && <div className="hx-dim mt-1 text-[11px]">Diff shortened — the file changed a lot.</div>}
             </div>
           )),
@@ -169,7 +167,7 @@ const Runs = React.memo(function Runs({ runs: ran }: { runs: ToolEvent[] }) {
 function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number; canStop: boolean; store: SessionStore; onOpen?: (toolId: string) => void }) {
   const live = taskLive(t);
   const [outputOpen, setOutputOpen] = React.useState(false);
-  const sectionOpen = React.useContext(ToolSectionOpen);
+  const sectionOpen = React.useContext(FoldOpen);
   const outputId = React.useId();
   return (
     <li className="hx-task" style={{ paddingLeft: depth * 14 }}>
@@ -323,6 +321,8 @@ export function Inspector({
   // The folder its workspace of its own is laid over, once made (a string: Changes stays memoized).
   const volumeOver = useSession(store, (s) => (s.info?.workspace?.made ? (s.info.workspace.over ?? "") : undefined));
   const state = useSession(store, (s) => s.state);
+  // At work now: the goal under way shimmers.
+  const working = useSession(store, (s) => s.info?.status === "running");
   const meta = useSession(store, (s) => s.meta);
   // What's worked out from the conversation stays as it was while it streams, unless it's what changed.
   const edits = useSameList(React.useMemo(() => (changes ? NO_EVENTS : editsOf(events)), [changes, events]));
@@ -361,39 +361,41 @@ export function Inspector({
         {tab === "plan" && (
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
-              <section>
-                <h3 className="in-sec-head">Its plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
-                {todos.length > 0 ? (
+              <Fold id="plan" title="Plan">
+                {/* Its to-do list, drawn as a plan's steps are: how far it's come. */}
+                {todos.length > 0 && (
                   <div className="hx-stack">
-                    <div className="hx-progress">
-                      <span style={{ width: `${(done / todos.length) * 100}%` }} />
-                    </div>
-                    <TodoList todos={todos} />
+                    <TodoSteps todos={todos} />
                     <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />
                   </div>
-                ) : proposed ? (
-                  <div className="hx-stack">
-                    <Prose text={proposed} className="hx-plan-text" />
-                    <SavePlan body={proposed} />
-                  </div>
-                ) : (
-                  <p className="in-none">None yet: the plan it writes (or its to-do list) shows here, to keep as one of your plans.</p>
                 )}
-              </section>
-              {todos.length > 0 && proposed && (
-                <section>
-                  <h3 className="in-sec-head">Proposed plan</h3>
-                  <Prose text={proposed} className="hx-plan-text" />
-                  <SavePlan body={proposed} />
-                </section>
+                {/* The plan it proposed (plan mode), in its words, kept by kiln. */}
+                {agentId ? (
+                  <Loadable label="its plan" fallback={null}>
+                    <ProposedPlan session={agentId} words={proposed} tracked={todos.length > 0} />
+                  </Loadable>
+                ) : (
+                  proposed && (
+                    <div className="hx-stack">
+                      <Prose text={proposed} className="hx-plan-text" />
+                      <SavePlan body={proposed} />
+                    </div>
+                  )
+                )}
+                {todos.length === 0 && !proposed && <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>}
+              </Fold>
+              {/* What it found out, graded by kiln (research.tsx): the newest in full. */}
+              {agentId && (
+                <Loadable label="its research" fallback={null}>
+                  <AgentResearch agent={agentId} />
+                </Loadable>
               )}
               {agentId && (
-                <section>
-                  <h3 className="in-sec-head">Your plans</h3>
+                <Fold id="your-plans" title="Your plans">
                   <PlansHere session={agentId} />
-                </section>
+                </Fold>
               )}
-              {agentId && <Goals agent={agentId} harness={harness} />}
+              {agentId && <Goals agent={agentId} harness={harness} working={working} store={store} onOpenTask={onOpenTask} />}
             </PlanSourceContext.Provider>
           </div>
         )}
@@ -403,31 +405,28 @@ export function Inspector({
                 every command it ran, last, since that list only grows. */}
             {agentId && send && <Background state={state} agent={agentId} send={send} />}
             {agentId && (
-              <section>
-                <h3 className="in-sec-head">Live pages</h3>
+              <Fold id="live-pages" title="Live pages">
                 <LivePages session={agentId} />
-              </section>
+              </Fold>
             )}
             {tasks.length > 0 && (
-              <ToolSection title="Subagents" count={tasks.length}>
+              <ToolSection id="subagents" title="Subagents" count={tasks.length}>
                 <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} />
               </ToolSection>
             )}
-            <ToolSection title="MCP servers" count={state?.mcp?.length}>
+            <ToolSection id="mcp" title="MCP servers" count={state?.mcp?.length}>
               <McpPanel state={state} store={store} />
             </ToolSection>
-            <ToolSection title="Skills" count={state?.skills?.length}>
+            <ToolSection id="skills" title="Skills" count={state?.skills?.length}>
               <SkillsPanel state={state} store={store} />
             </ToolSection>
-            <section>
-              <h3 className="in-sec-head">Usage and status</h3>
+            <Fold id="usage" title="Usage and status">
               <Status state={state} />
-            </section>
+            </Fold>
             {runs.length > 0 && (
-              <section>
-                <h3 className="in-sec-head">Commands it ran<span>{runs.length}</span></h3>
+              <Fold id="commands" title="Commands it ran" count={runs.length}>
                 <Runs runs={runs} />
-              </section>
+              </Fold>
             )}
           </div>
         )}

@@ -18,6 +18,8 @@
 //! - [`providers`]: every platform beyond Kubernetes, as clusters of objects (docs/cd-targets.md).
 //! - [`diff`]: comparing desired and live objects by field ownership.
 //! - [`sync`]: planning a sync: phases, waves, hooks and prunes, in Argo CD's order.
+//! - [`rollback`]: where a rollback goes (a deployment, a commit, a tag), and whether kiln goes
+//!   back on its own.
 //! - [`rollout`]: canary, linear and blue/green rollouts with checks, as a state machine.
 //! - [`engine`]: the controller.
 //! - [`tree`]: an app's resource tree: its objects and the live objects they own.
@@ -32,12 +34,14 @@ pub mod engine;
 pub mod git;
 pub mod harness;
 pub mod health;
+pub mod jsonc;
 pub mod lua;
 pub mod kube;
 pub mod model;
 pub mod obj;
 pub mod providers;
 pub mod render;
+pub mod rollback;
 pub mod rollout;
 pub mod sim;
 pub mod state;

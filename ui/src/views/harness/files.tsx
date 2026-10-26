@@ -85,7 +85,7 @@ const BY_EXT: Record<string, Kind> = {
   json: "text",
 };
 
-function kindOf(path: string, mime?: string): Kind {
+export function kindOf(path: string, mime?: string): Kind {
   if (mime) {
     if (mime.startsWith("image/")) return "image";
     if (mime.startsWith("video/")) return "video";

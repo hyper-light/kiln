@@ -52,7 +52,14 @@ impl Host for Ops {
         registry(&self.0.hub)
     }
 
-    fn call(&self, name: &str, input: Value) -> Result<Value, Value> {
+    fn call(&self, name: &str, mut input: Value) -> Result<Value, Value> {
+        // A program's wait hands over no messages unless it says so (`agents.wait`): what it
+        // returns of the answer is its own, and a message it left out would be lost.
+        if name == "agents.wait"
+            && let Some(o) = input.as_object_mut()
+        {
+            o.entry("hand_over").or_insert(Value::Bool(false));
+        }
         let (cx, name) = (self.0.clone(), name.to_owned());
         match crate::rt::block_on(async move { Ok(ops::call(cx, &name, input).await) }) {
             Ok(Ok(v)) => Ok(v),

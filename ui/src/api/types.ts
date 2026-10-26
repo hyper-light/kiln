@@ -2,26 +2,9 @@ import type { AgentInfo } from "./harness";
 // Types mirror docs/api.md (and crates/kiln/src/store.rs). Timestamps are unix
 // seconds unless the field name ends in `_ms`. Ids are opaque strings.
 
-export type Status =
-  | "pending"
-  | "queued"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "cancelled"
-  | "skipped"
-  | "timed_out";
+export type Status = "pending" | "queued" | "running" | "succeeded" | "failed" | "cancelled" | "skipped" | "timed_out";
 
-export const STATUSES: Status[] = [
-  "pending",
-  "queued",
-  "running",
-  "succeeded",
-  "failed",
-  "cancelled",
-  "skipped",
-  "timed_out",
-];
+export const STATUSES: Status[] = ["pending", "queued", "running", "succeeded", "failed", "cancelled", "skipped", "timed_out"];
 
 export type RunEvent = "push" | "pull_request" | "tag" | "manual" | "schedule";
 
@@ -29,12 +12,18 @@ export interface Me {
   authenticated: boolean;
   version: string;
   hostname: string;
+  /** Who is signed in: the owner, a person, or a token's or agent's principal. */
+  kind?: "owner" | "user" | "pat" | "agent" | "job" | "peer" | null;
+  /** Each capability held: on the whole server, or only somewhere (a repository, …). */
+  can?: Record<string, "server" | "some">;
   /** Where the server says it is reachable from other devices. */
   public_url?: string;
   /** Its runners' front doors (`https://kiln.home`, …). */
   origins?: string[];
   /** Where pages agents show are served, when not here (docs/previews.md). */
   pages_url?: string | null;
+  /** The groups the person is in: kiln's (`shop`), and their identity providers' (`github:acme/platform`), as an app's owner teams name them. */
+  groups?: string[];
 }
 
 export interface Repo {
@@ -48,6 +37,8 @@ export interface Repo {
   created_at: number;
   last_polled_at: number | null;
   last_error: string | null;
+  /** `native`: kiln hosts it (W14); `upstream`: kiln follows another host's. */
+  mode?: string;
 }
 
 export interface Run {
@@ -67,6 +58,9 @@ export interface Run {
   finished_at: number | null;
   error: string | null;
   concurrency_group: string | null;
+  /** The runners and executors its legs ran on (the runs list's facets). */
+  runners?: string[];
+  executors?: string[];
 }
 
 export interface Step {
@@ -134,6 +128,8 @@ export interface Job {
   cpu_seconds: number | null;
   steps: Step[];
   spec?: PlannedJob;
+  /** A CI matrix leg's values, by axis. */
+  matrix?: Record<string, unknown>;
 }
 
 export interface HostSample {
@@ -181,12 +177,22 @@ export interface Agent {
   sample: HostSample | null;
   /** Its battery, when it has one. */
   battery?: Battery | null;
+  /** What its QUIC layer let go before the wire, by lane and reason, as it last said; and what the server's let go of what it had for it (docs/wire.md, "Loss below the channel"). */
+  dropped?: NetDrop[];
+  dropped_toward?: NetDrop[];
   /** While a new runner replaces an old one without a restart: both processes, newest first. */
   instances?: RunnerInstance[];
   /** An outpost (`kiln outpost`): kiln run where it isn't installed. It takes no jobs and the server doesn't upgrade it. */
   outpost?: boolean;
   /** What its probes found and its administrator declared (docs/ci.md W13-R01, R02): what routing decides over. */
   facts?: RunnerFacts;
+}
+
+/** Frames a QUIC layer let go of one lane, for one reason: shed, stuck, refused, closed, ended or chaos. */
+export interface NetDrop {
+  lane: string;
+  reason: string;
+  frames: number;
 }
 
 /** A runner's facts (kiln_ci::facts::RunnerFacts). */
@@ -259,15 +265,19 @@ export interface OverviewStats {
 export interface Overview {
   stats: OverviewStats;
   queue: { queued: number; running: number };
-  agents: { connected: number; total: number; slots: number; busy: number };
+  /** `null` for a person of some repositories (W10): runners are the server's. */
+  agents: { connected: number; total: number; slots: number; busy: number } | null;
   system: {
     version: string;
     uptime_s: number;
-    hostname: string;
+    /** `null` for a person of some repositories. */
+    hostname: string | null;
     generation: number;
     children: Child[];
     sample: HostSample | null;
   };
+  /** The repositories it covers, for a person of some of them (W10); absent, it is the whole server's. */
+  narrowed?: string[];
 }
 
 export interface RunDetail {
@@ -581,6 +591,8 @@ export type ServerEvent =
   | { type: "places" }
   /** Your notifications changed (a device, a mute, a delivery): refetch GET /api/push and its devices. */
   | { type: "push" }
+  /** Someone marked notices (`principal`: whose; `tags`: agents whose shown notifications go): notices.ts. */
+  | { type: "notices"; principal: string; keys: string[]; how: "away" | "done" | "seen"; at: number; tags?: string[] }
   /** An agent's change request opened or moved on (`agents.change`, review, CI): refetch GET /api/harness/changes. */
   | { type: "agent_change"; agent: string };
 
@@ -729,8 +741,8 @@ export interface UpdateJob {
   /** The machine, or "server". */
   target: string;
   /** native: the runner's own upgrade command · terminal: through a terminal on an older runner ·
-   * build: the machine builds the newest kiln itself · restart: Kubernetes rollout restart ·
-   * replace: the server's binary replaced. */
+   * build: the newest kiln built from the server's source (on the machine itself, or on `on`) ·
+   * restart: Kubernetes rollout restart · replace: the server's binary replaced. */
   method: "native" | "terminal" | "build" | "restart" | "replace";
   state: "running" | "done" | "failed";
   started_at: number;
@@ -739,6 +751,8 @@ export interface UpdateJob {
   to_build: string | null;
   /** The commit it brings the machine to, when kiln knows it. */
   commit?: string;
+  /** A build's: the machine that builds it, when another than the runner's own; the runner downloads that build. */
+  on?: string;
   /** The machine reported running to_build. */
   reached: boolean;
   log: string[];
@@ -857,8 +871,9 @@ export interface RunnerUpdate {
   ways?: UpgradeWayOpen[];
 }
 
-/** How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built on
- * the machine itself, from the server's source. */
+/** How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built from
+ * the server's source, on the machine itself or, for a Mac that can't, on another machine whose
+ * build it then downloads. */
 export type UpgradeWay = "download" | "build";
 
 /** What a diagnosis found about a runner (`GET /api/agents/:name/diagnose`, docs/releases.md). */
@@ -899,6 +914,8 @@ export interface UpgradeWayOpen {
   ok: boolean;
   /** What it does ("downloads build 493003c712b0"), or why it can't. */
   why: string;
+  /** A build's: the machine it's made on, when another than the runner's own. */
+  on?: string;
 }
 
 /** How long kiln waits on a runner's upgrade before it calls it failed, in minutes. */
@@ -1121,6 +1138,45 @@ export interface CdAppDetail extends CdApp {
   children: string[];
   /** Who wrote the revision it is at, when, and what it says. */
   revision_info: CdCommit | null;
+  /** Whether kiln goes back on its own after a failure (older servers: absent). */
+  auto_rollback?: CdAutoRollback;
+}
+
+/** Auto-rollback set by a person, for an app or a repository. */
+export interface CdAutoRollbackSetting {
+  on: boolean;
+  by: string | null;
+  /** ms since the epoch. */
+  at_ms: number;
+}
+
+/**
+ * Whether kiln goes back on its own when an app's deploy fails (its rollout aborts, kiln's own
+ * restart doesn't take, a release fails after its commit), and who said so: the app's setting
+ * beats its repository's, which beats the deploy file's `rollout: { auto-rollback }`.
+ */
+export interface CdAutoRollback {
+  on: boolean;
+  from: "app" | "repo" | "deploy-file" | "default";
+  /** Why, in a few words: `set for this app by ada`. */
+  why: string;
+  app: CdAutoRollbackSetting | null;
+  /** The repository the app follows, when it has one. */
+  repo: string | null;
+  repo_setting: CdAutoRollbackSetting | null;
+  /** Its deploy file's rollout's `auto-rollback`, where it has a rollout. */
+  deploy_file: boolean | null;
+}
+
+/** What an app can be rolled back to, and what runs now. */
+export interface CdRollbackTargets {
+  app: string;
+  current: CdDeployment | null;
+  /** Newest first: each deployment that succeeded and can be rendered again, one per render. */
+  targets: CdDeployment[];
+  /** Deployments the app's history keeps. */
+  kept: number;
+  shadow: boolean;
 }
 
 /** An app's own sync options (Argo CD's), as its definition sets them: none, true or false. */
@@ -1325,6 +1381,8 @@ export interface CdDeployment {
   at_ms: number;
   /** What the deployed commit says. */
   commit?: CdCommit;
+  /** The tags that name what it ran. */
+  tags?: string[];
 }
 
 /** A rollout's step (docs/cd-targets.md §5). */
@@ -1633,11 +1691,16 @@ export interface SyncConflict {
   beside: string;
 }
 
+/** What a synced repo keeps the same on its copies: its files (uncommitted work too), its branches and commits, or both. */
+export type SyncMode = "files" | "files_and_git" | "git";
+
 export interface SyncRepo {
   id: string;
   name: string;
   created: number;
   exclude: string[];
+  /** Older servers: none, files. */
+  mode?: SyncMode;
   files: number;
   index: number;
   conflicts: SyncConflict[];
@@ -1744,6 +1807,8 @@ export interface GitState {
   active: number;
   /** kiln cloned it there. */
   kiln: boolean;
+  /** Its branch against the same branch on the other machines that hold it (their work, taken in as `kiln/<machine>/<branch>`). */
+  peers?: { machine: string; ahead: number; behind: number; wip: boolean }[];
 }
 
 /** `copy`: kept in step by sync; `clone`: kiln cloned it there; `found`: it was there. */
@@ -1830,6 +1895,8 @@ export interface PlaceAsk {
   branch?: string;
   to?: { machine: string; path: string }[];
   delete?: boolean;
+  /** A new sync's: what its copies keep the same. */
+  mode?: SyncMode;
 }
 
 /** What to plan (`/api/cd/plans`): one commit, a stack (`head`, from where it leaves trunk or
@@ -2051,4 +2118,31 @@ export interface CdValidation {
     objects?: Record<string, unknown>[];
     error?: string;
   }[];
+}
+
+/** An agent installing what a job lacks (`/api/jobs/:id/tools`), and how far it's got. */
+export interface ToolFix {
+  agent: string;
+  runner: string;
+  tools: string[];
+  state: "working" | "needs_you" | "checking" | "retried" | "waiting" | "still_missing" | "stopped";
+  note: string | null;
+  by: string;
+  started_at: number;
+}
+
+/** What a job lacks: tools its failed step's log says weren't there, or for a job waiting on its
+ *  `requires`, each runner its labels fit and what that runner doesn't meet. */
+export interface JobTools {
+  job: string;
+  missing: {
+    tools: string[];
+    on: string | null;
+    why: string | null;
+    /** Why no agent can install them where it failed (it ran in a pod; its runner is away, or hosts no agents). */
+    no_agent: string | null;
+    /** `fixable`: an agent there can fix it: installing `tools` is all it lacks (not so for `os == macos`), and it hosts agents (else `no_agent` says why not). */
+    runners: { runner: string; unmet: string[]; tools: string[]; fixable: boolean; no_agent: string | null }[];
+  };
+  fix: ToolFix | null;
 }

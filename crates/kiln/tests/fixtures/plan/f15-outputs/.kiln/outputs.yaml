@@ -1,0 +1,53 @@
+# F-15 (docs/ci.md Appendix F; W04-AC06, AC07, S05): what kiln's jobs hand on. A typed output,
+# a plain one and a secret one; `exports` and `env-from`; `run.env`; a matrix's last writer and
+# its `legs`.
+name: outputs
+on: push
+run-env: true
+jobs:
+  build:
+    runs-on: self-hosted
+    outputs:
+      info: ${{ steps.meta.outputs.info }}
+      plain: ${{ steps.meta.outputs.plain }}
+      token: { value: "${{ steps.meta.outputs.secret }}", secret: true }
+    exports: { env: [IMAGE_TAG] }
+    steps:
+      - id: meta
+        run: |
+          echo '{"name": "info", "value": {"version": "1.2.3", "count": 3}}' >> "$KILN_OUTPUT_JSON"
+          echo "plain=hello" >> "$GITHUB_OUTPUT"
+          echo "secret=f15-secret-value" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=abc" >> "$GITHUB_ENV"
+          echo "SHARED=from-build" >> "$KILN_RUN_ENV"
+  deploy:
+    needs: build
+    runs-on: self-hosted
+    env-from: [build]
+    steps:
+      - run: |
+          test "$IMAGE_TAG" = abc
+          test "${{ needs.build.outputs.info.version }}" = 1.2.3
+          test "${{ needs.build.outputs.info.count }}" = 3
+          test "${{ needs.build.outputs.plain }}" = hello
+          test -z "${{ needs.build.outputs.token }}"
+          test "$KILN_NEEDS_BUILD_TOKEN" = f15-secret-value
+          test "${{ run.env.SHARED }}" = from-build
+  each:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        v: [a, b]
+    outputs:
+      x: ${{ steps.s.outputs.x }}
+    steps:
+      - id: s
+        run: echo "x=${{ matrix.v }}" >> "$GITHUB_OUTPUT"
+  gather:
+    needs: each
+    runs-on: self-hosted
+    steps:
+      - run: |
+          case "${{ needs.each.outputs.x }}" in a|b) ;; *) exit 1 ;; esac
+          legs='${{ toJSON(needs.each.legs) }}'
+          case "$legs" in *'"a"'*'"b"'*|*'"b"'*'"a"'*) ;; *) echo "$legs"; exit 1 ;; esac

@@ -117,7 +117,7 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
 
 /// A new comment: on a thread (`thread`), or a new thread on a version's `file`, `side` and
 /// lines (or on the diff as a whole). A draft until a review publishes it, unless `publish`.
-pub async fn comment(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
     let (me, _) = who(caller);
     let text = body.get("body").and_then(Value::as_str).unwrap_or_default().trim().to_owned();
     let suggestion = body.get("suggestion").and_then(Value::as_str).map(str::to_owned);
@@ -177,8 +177,49 @@ pub async fn comment(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Resu
             "type": "comment", "repo": d.repo, "diff": d.name, "version": version, "thread": tid, "comment": cid, "author": me, "body": said,
             "file": file_c, "side": side_c, "start_line": start, "end_line": end.or(start), "diff_author": d.author, "diff_author_for": d.author_for,
         }));
+        tell(hub, d, &me, vec![(tid.clone(), said)]);
     }
     Ok(json!({ "id": cid, "thread": tid, "draft": !publish }))
+}
+
+/// Who a published comment is news to (W19-R06), for each `(thread, body)`: the people in its
+/// thread and the diff's author (`comment.reply`), and whom it mentions (`mention`), but whoever
+/// wrote it.
+fn tell(hub: &std::sync::Arc<Hub>, d: &Diff, me: &str, said: Vec<(String, String)>) {
+    if said.is_empty() {
+        return;
+    }
+    let (hub, d, me) = (std::sync::Arc::clone(hub), d.clone(), me.to_owned());
+    crate::rt::spawn(async move {
+        for (thread, body) in said {
+            let t = thread.clone();
+            let mut people: Vec<String> = hub
+                .store
+                .call(move |c| {
+                    let mut st = c.prepare("SELECT DISTINCT author FROM review_comments WHERE thread_id = ?1 AND published = 1")?;
+                    let rows = st.query_map([&t], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                })
+                .await
+                .unwrap_or_default();
+            people.push(d.author.clone());
+            super::notify::diff_event(
+                std::sync::Arc::clone(&hub),
+                d.repo.clone(),
+                "comment.reply",
+                d.name.clone(),
+                d.title.clone(),
+                d.trunk.clone(),
+                me.clone(),
+                body.clone(),
+                people,
+                Some(thread.clone()),
+            )
+            .await;
+            let named = kiln_ci::trigger::context::mentions(&body);
+            super::notify::diff_event(std::sync::Arc::clone(&hub), d.repo.clone(), "mention", d.name.clone(), d.title.clone(), d.trunk.clone(), me.clone(), body, named, Some(thread)).await;
+        }
+    });
 }
 
 /// `PATCH /api/comments/:id`: a comment's author edits it (`body`, `suggestion`); anyone who may
@@ -297,6 +338,35 @@ pub async fn checks_on(hub: &Hub, repo: &str, sha: &str) -> anyhow::Result<BTree
         .await
 }
 
+/// The `bench-gate` results on commits of a repository (W16-R09), by commit: what each leg's
+/// latest attempt was told, failing (`error`) or warning, with its run and job. Shown on the diff
+/// and in the land queue.
+pub async fn gates_on(hub: &Hub, repo: &str, shas: Vec<String>) -> anyhow::Result<HashMap<String, Vec<Value>>> {
+    if shas.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let (repo, shas) = (repo.to_owned(), serde_json::to_string(&shas)?);
+    hub.store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT r.sha, r.id, j.id, COALESCE(j.job_id, j.key), a.level, a.message FROM runs r JOIN repos p ON p.id = r.repo_id JOIN jobs j ON j.run_id = r.id JOIN ci_annotations a ON a.leg_id = j.id
+                 WHERE (p.name = ?1 OR p.id = ?1) AND r.sha IN (SELECT value FROM json_each(?2)) AND a.title = 'bench-gate'
+                   AND j.run_attempt = (SELECT MAX(k.run_attempt) FROM jobs k WHERE k.run_id = j.run_id AND k.key = j.key)
+                 ORDER BY a.id",
+            )?;
+            let mut out: HashMap<String, Vec<Value>> = HashMap::new();
+            let rows = st.query_map(params![repo, shas], |r| {
+                Ok((r.get::<_, String>(0)?, json!({ "run": r.get::<_, String>(1)?, "leg": r.get::<_, String>(2)?, "job": r.get::<_, String>(3)?, "level": r.get::<_, String>(4)?, "message": r.get::<_, String>(5)? })))
+            })?;
+            for row in rows {
+                let (sha, g) = row?;
+                out.entry(sha).or_default().push(g);
+            }
+            Ok(out)
+        })
+        .await
+}
+
 /// What keeps `d` from landing now, by its trunk's policy: each a sentence.
 pub async fn readiness(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
     let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
@@ -316,7 +386,7 @@ pub async fn readiness(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
 
 /// `POST /api/diffs/:id/review`: `{ action: accept | request_changes | comment | resign, body }`.
 /// Publishes the reviewer's drafts on the diff with it, and moves the diff's review state.
-pub async fn review(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
     let (me, agent) = who(caller);
     let action = body.get("action").and_then(Value::as_str).and_then(Action::parse).ok_or_else(|| bad("`action`: accept, request_changes, comment or resign"))?;
     let text = body.get("body").and_then(Value::as_str).unwrap_or_default().trim().to_owned();
@@ -330,11 +400,16 @@ pub async fn review(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Resul
     let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
     let latest = versions.last().map_or(1, |v| v.n);
     let (id, me2, text2) = (d.id.clone(), me.clone(), text.clone());
-    let published = hub
+    let (published, drafts) = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
+            // What the review publishes, for whom it's news (W19-R06).
+            let drafts: Vec<(String, String)> = {
+                let mut st = tx.prepare("SELECT c.thread_id, c.body FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.author = ?2 AND c.published = 0 ORDER BY c.created_at")?;
+                st.query_map(params![id, me2], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?
+            };
             let published = tx.execute("UPDATE review_comments SET published = 1, updated_at = ?3 WHERE author = ?2 AND published = 0 AND thread_id IN (SELECT id FROM review_threads WHERE diff_id = ?1)", params![id, me2, now])?;
             tx.execute(
                 "INSERT INTO reviews (id, diff_id, version, reviewer, reviewer_kind, action, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -357,10 +432,15 @@ pub async fn review(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Resul
                 }
             }
             tx.commit()?;
-            Ok(published)
+            Ok((published, drafts))
         })
         .await
         .map_err(fail)?;
+    tell(hub, d, &me, drafts);
+    if !text.is_empty() {
+        let named = kiln_ci::trigger::context::mentions(&text);
+        crate::rt::spawn(super::notify::diff_event(std::sync::Arc::clone(hub), d.repo.clone(), "mention", d.name.clone(), d.title.clone(), d.trunk.clone(), me.clone(), text.clone(), named, None));
+    }
     // The review state the reviews give it now (a draft stays a draft, landing stays landing).
     let (_, path) = super::diffs::home(hub, d).await?;
     let (policy, _) = policy(hub, &path, &d.trunk).await;
@@ -541,7 +621,7 @@ pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Call
             let msg = format!("Apply a suggestion from {suggested_by}\n\nOn {file}, lines {s}-{e}.\n");
             let c = super::diffs::make_commit(hub, &path, &tree, &latest.commit, (&applier, None), &applier, &msg).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
             gitops::run_git(hub, &["-C", &path, "update-ref", &format!("refs/heads/{branch}"), &c, &latest.commit], LS_REMOTE_TIMEOUT).await.map_err(|_| (StatusCode::CONFLICT, format!("{branch} moved: push or pull, then try again")))?;
-            let by = super::cr::By { pushed_by: caller.name.clone(), author: super::diffs::author_of(&caller.name, Some(caller.kind)) };
+            let by = super::cr::By { pushed_by: caller.name.clone(), author: super::diffs::author_of(&caller.name, Some(caller.kind)), started_by: caller.started_by() };
             super::cr::submit(hub, &repo, &path, &d.trunk, branch, &c, &by, &kiln_ci::review::Options::default()).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?.version
         }
         // A diff: its commit amended.
@@ -575,7 +655,8 @@ pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Call
 
 /// Says when a run on a diff's or change request's version finishes (`diff_run`): which version,
 /// how it ended, its failed legs (with where their failure excerpts are), and whose it is, for
-/// whoever follows the diff (an agent that wrote it, its person). For as long as the server runs.
+/// whoever follows the diff (an agent that wrote it, its person). And raises the workflow events
+/// of a diff's conversation (its comments and reviews). For as long as the server runs.
 pub async fn runs_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let mut rx = hub.events.subscribe();
@@ -585,6 +666,16 @@ pub async fn runs_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
             m = rx.recv().fuse() => match m {
                 Ok(text) => {
                     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    // A diff's conversation raises its workflow events (W03-R09).
+                    if matches!(v.get("type").and_then(Value::as_str), Some("comment" | "review"))
+                        && let Err(e) = super::diffs::conversation(&hub, &v).await
+                    {
+                        tracing::warn!(diff = %v.get("diff").and_then(serde_json::Value::as_str).unwrap_or_default(), error = %format!("{e:#}"), "a diff's conversation started no workflows");
+                    }
+                    // CD's apps moving raise kiln's `deploy` (W03-R09, W15-R06).
+                    if v.get("type").and_then(Value::as_str) == Some("cd_apps") {
+                        super::cd_events::observe(&hub, &v).await;
+                    }
                     let finished = v.get("type").and_then(Value::as_str) == Some("run")
                         && v.pointer("/run/status").and_then(Value::as_str).is_some_and(|s| matches!(s, "succeeded" | "failed" | "cancelled" | "timed_out" | "skipped"));
                     if finished

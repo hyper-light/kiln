@@ -10,7 +10,7 @@ import "./mission.css";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { ArrowUpRight, ChevronRight, Plus } from "lucide-react";
 import { api } from "@/api/client";
-import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
+import { clientId, harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
@@ -20,6 +20,8 @@ import { useAgentsLive } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useLocalStorage, useMediaQuery, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { Tries } from "@/lib/tries";
+import { heldWords } from "./cards";
 import { agentLabel, hasOwnName, plain } from "./derive";
 import { pauseLine } from "./pause";
 import { NameField, useAgentActions } from "./actions";
@@ -30,28 +32,19 @@ import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
-import { missionFoundSessions, missionRows, type MissionRow, type MissionStand as Stand } from "./mission-rows";
+import { missionFoundSessions, standOf, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
 import { answer, asAnswered, useAnswered } from "./answered";
 import { PushOffer } from "./push-offer";
 import { RowChange, RowReview } from "./change-bar";
+import { Shimmer } from "./signals";
+import { subagentsAtWork, throughSubagents } from "./tasks";
+import { Stands } from "./stands";
 
 /** A phone: the page's head is one line, and the message box folds. */
 const PHONE = "(max-width: 640px)";
-
-function standOf(a: AgentInfo, seen: number | undefined): Stand {
-  if (a.approvals.length > 0 || a.status === "waiting") return "needs";
-  if (a.status === "exited" && a.exit?.error) return "crashed";
-  // Waiting for a usage limit to reset (its current turn, if any, finishes first).
-  if (a.pause && a.status !== "running" && a.status !== "exited" && a.status !== "disconnected") return "paused";
-  if (a.status === "running" || a.status === "starting") return "working";
-  if (a.status === "idle") return a.last_activity > (seen ?? 0) + 1500 ? "finished" : "ready";
-  // Its machine is reconnecting (a runner or server restart): it stays where it is.
-  if (a.status === "disconnected") return "offline";
-  return "ended";
-}
 
 const WORD: Record<Stand, string> = {
   needs: "Needs you",
@@ -69,6 +62,7 @@ function lineOf(a: AgentInfo, stand: Stand): string {
   switch (stand) {
     case "needs": {
       const ap = a.approvals[0];
+      if (!ap && a.held) return heldWords(a.held.why) ? `Paused its goals for you: ${heldWords(a.held.why)}` : "Paused its goals for you";
       if (!ap) return "Waiting for you";
       const more = a.approvals.length > 1 ? ` (+${a.approvals.length - 1} more)` : "";
       return ap.tool === "question" ? `Asks: ${ap.title}${more}` : ap.tool === "plan" ? `Proposes a plan${more}` : `${ap.tool_name || ap.tool}: ${ap.title}${more}`;
@@ -79,7 +73,9 @@ function lineOf(a: AgentInfo, stand: Stand): string {
       return a.pause ? pauseLine(a.pause, Date.now()) : "Paused";
     case "working": {
       const plan = (a.todos_total ?? 0) > 0 ? `plan ${a.todos_done ?? 0}/${a.todos_total}` : "";
-      return [a.status === "starting" ? (a.harness_session ? "Resuming" : "Starting") : a.doing || a.activity || "Working", plan].filter(Boolean).join(" · ");
+      // Its turn over, what its subagents do.
+      const doing = a.status === "starting" ? (a.harness_session ? "Resuming" : "Starting") : throughSubagents(a) ? subagentsLine(subagentsAtWork(a.subagents)) : a.doing || a.activity || "Working";
+      return [doing, plan].filter(Boolean).join(" · ");
     }
     case "finished":
       return a.summary ? plain(a.summary) : a.goal || a.title || "Done";
@@ -95,23 +91,53 @@ function lineOf(a: AgentInfo, stand: Stand): string {
 /** Answered at once (answered.ts): the row moves on now; if the answer doesn't go, it's back. */
 function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
   const decide = (decision: "allow" | "deny") => void answer(a.id, { type: "approve", id: ap.id, decision }).catch((e: unknown) => toast.error("Couldn't answer", errorMessage(e)));
-  if (ap.tool === "question" || ap.tool === "plan")
+  if (ap.tool === "question")
     return (
       <Button size="xs" asChild>
-        <Link to={`/agents/${a.id}`}>{ap.tool === "plan" ? "Review the plan" : "Answer"}</Link>
+        <Link to={`/agents/${a.id}`}>Answer</Link>
+      </Button>
+    );
+  // A plan it proposes is approved here; to keep it planning (with what to change), review it on its page.
+  return (
+    <>
+      <Button size="xs" onClick={() => decide("allow")}>
+        {ap.tool === "plan" ? "Approve" : "Allow"}
+      </Button>
+      {ap.tool !== "plan" && (
+        <Button size="xs" variant="secondary" onClick={() => decide("deny")}>
+          Deny
+        </Button>
+      )}
+      <Link to={`/agents/${a.id}`} className="ms-link">
+        Review
+      </Link>
+    </>
+  );
+}
+
+/** Goals it paused for you: the plan they wait on to look at, and Resume. */
+function HeldDecide({ a }: { a: AgentInfo }) {
+  // Asked again (its answer lost, or it failed), the same resume under its key (CP-T3.2).
+  const [tries] = React.useState(() => new Tries(clientId));
+  const resume = () =>
+    void harnessApi.goalAction(a.id, "start", undefined, tries.keyFor(a.id)).then(
+      () => tries.done(),
+      (e: unknown) => toast.error("Couldn't resume its goals", errorMessage(e)),
+    );
+  if (!a.held?.plan)
+    return (
+      <Button size="xs" onClick={resume}>
+        Resume
       </Button>
     );
   return (
     <>
-      <Button size="xs" onClick={() => decide("allow")}>
-        Allow
+      <Button size="xs" asChild>
+        <Link to={`/agents/plans/${a.held.plan}`}>Review the plan</Link>
       </Button>
-      <Button size="xs" variant="secondary" onClick={() => decide("deny")}>
-        Deny
+      <Button size="xs" variant="secondary" onClick={resume}>
+        Resume
       </Button>
-      <Link to={`/agents/${a.id}`} className="ms-link">
-        Review
-      </Link>
     </>
   );
 }
@@ -130,10 +156,11 @@ const Row = React.memo(function Row({ a, stand, selected, picking, onSelect }: {
   const kind = label.toLowerCase() !== a.kind_name.toLowerCase();
   const line = (
     <span className="ms-line">
-      <span className="ms-word">
+      {/* Working: the prism flows through its word, each agent's its own way, so the list moves as one field. */}
+      <Shimmer on={stand === "working"} flow={a.id} className="ms-word">
         <i aria-hidden="true" />
         {WORD[stand]}
-      </span>
+      </Shimmer>
       <span className="ms-text">{lineOf(a, stand)}</span>
     </span>
   );
@@ -175,6 +202,7 @@ const Row = React.memo(function Row({ a, stand, selected, picking, onSelect }: {
         {/* What to answer; on a phone it takes the meta line's place, so the row's corner keeps one width. */}
         <span className="ms-decide">
           {stand === "needs" && ap && <Decide a={a} ap={ap} />}
+          {stand === "needs" && !ap && a.held && <HeldDecide a={a} />}
           {stand === "paused" && (
             <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "resume" }).catch((e: unknown) => toast.error("Couldn't resume", errorMessage(e)))}>
               Resume
@@ -229,29 +257,13 @@ function RowsLoading() {
   );
 }
 
-/** What the page's lead says before the agents are known. */
-const LEAD = "Every coding agent kiln runs, on every machine.";
-
-/** The lead: how your agents stand, and where (on a phone, how they stand). */
-function Lead({ short }: { short?: boolean }) {
+/** How your agents stand, in a row of its own under the page's head (stands.tsx). */
+function StandsNow() {
   const list = useAgentList();
   const seen = useSeen();
   const done = useAnswered();
-  const managed = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
-  const all = React.useMemo(() => missionRows(managed), [managed]);
-  const n = (s: Stand) => all.filter((r) => r.stand === s).length;
-  const machines = [...new Set(all.filter((r) => r.stand !== "ended").map((r) => machineName(r.a.target)))];
-  const status = [
-    n("needs") && `${n("needs")} need${n("needs") === 1 ? "s" : ""} you`,
-    n("crashed") && `${n("crashed")} stopped`,
-    n("paused") && `${n("paused")} paused`,
-    n("working") && `${n("working")} working`,
-    n("finished") && `${n("finished")} finished`,
-  ]
-    .filter(Boolean)
-    .join(", ");
-  if (short && all.length > 0) return <>{status || "All quiet"}</>;
-  return <>{all.length === 0 ? "Start coding agents on any of your machines and run them all from here." : `${status || "All quiet"}${machines.length ? ` — on ${machines.join(" and ")}` : ""}.`}</>;
+  const rows = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
+  return <Stands rows={rows} />;
 }
 
 export default function Mission() {
@@ -277,39 +289,21 @@ export default function Mission() {
         label="Agents"
         title="Mission control."
         compact
-        lead={
-          <React.Suspense fallback={LEAD}>
-            <Lead short={phone} />
-          </React.Suspense>
-        }
         actions={
           phone ? (
-            <>
-              <Button asChild variant="ghost" size="xs">
-                <Link to="/agents/plans">Plans</Link>
-              </Button>
-              <Button asChild variant="ghost" size="xs">
-                <Link to="/agents/attached">Attached</Link>
-              </Button>
-              <Button size="icon" aria-label="New agents" title="New agents" onClick={() => setSpawn(true)}>
-                <Plus />
-              </Button>
-            </>
+            <Button size="icon" aria-label="New agents" title="New agents" onClick={() => setSpawn(true)}>
+              <Plus />
+            </Button>
           ) : (
-            <>
-              <Button asChild variant="secondary">
-                <Link to="/agents/plans">Plans</Link>
-              </Button>
-              <Button asChild variant="secondary">
-                <Link to="/agents/attached">Attached</Link>
-              </Button>
-              <Button onClick={() => setSpawn(true)}>
-                New agents <Plus />
-              </Button>
-            </>
+            <Button onClick={() => setSpawn(true)}>
+              New agents <Plus />
+            </Button>
           )
         }
       />
+      <React.Suspense fallback={<div className="st" aria-hidden="true" />}>
+        <StandsNow />
+      </React.Suspense>
       <Loadable label="Loading agents" fallback={<RowsLoading />}>
         <Agents onSpawn={() => setSpawn(true)} />
       </Loadable>
@@ -467,8 +461,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   const [messaging, setMessaging] = React.useState(false);
 
   const done = useAnswered();
-  const managed = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
-  const all = React.useMemo(() => missionRows(managed), [managed]);
+  const all = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
   // How the list is shown (the sort and the facets chosen) is kept across visits; the words typed
   // to find a name are not. (A new key: everyone starts on Needs you first once.) While you're using
   // the list, or have agents selected, it holds still: see useListHold.
@@ -638,7 +631,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
 
       {/* Once kiln's own agents are known, so its own sessions never show here for a moment. */}
       <React.Suspense fallback={null}>
-        <Found all={managed} />
+        <Found all={all} />
       </React.Suspense>
 
       {ended.length > 0 && (

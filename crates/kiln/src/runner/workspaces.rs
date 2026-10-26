@@ -91,7 +91,7 @@ pub fn kept_until(ws: &Path) -> Option<i64> {
 }
 
 /// Removes a workspace. Files a Docker action wrote as root are removed by a container, as root.
-fn remove(p: &Path) {
+pub(super) fn remove(p: &Path) {
     if std::fs::remove_dir_all(p).is_ok() || !p.exists() {
         return;
     }
@@ -117,6 +117,13 @@ fn sweep(root: &Path, now: i64) -> usize {
         if !p.is_dir() {
             // A lock whose workspace is gone, that no one holds.
             if p.extension().is_some_and(|x| x == "lock") && !p.with_extension("").exists() && !held_elsewhere(&p.with_extension("")) {
+                let _ = std::fs::remove_file(&p);
+            }
+            // A leg's Docker socket (`docker_sock`) whose runner stopped short.
+            if let Some(ws) = p.to_str().and_then(|s| s.strip_suffix(".docker.sock")).map(PathBuf::from)
+                && !ws.exists()
+                && !held_elsewhere(&ws)
+            {
                 let _ = std::fs::remove_file(&p);
             }
             continue;
@@ -147,9 +154,18 @@ pub async fn claim(work: &Path, ws: &Path) {
 }
 
 /// A leg is done with `ws` (or a kept one's keep ran out): it is removed, and the sweep leaves
-/// it be no longer.
+/// it be no longer. A warm one goes back to its lane instead (docs/ci.md W24-R11).
 pub async fn release(ws: &Path) {
     let held = IN_USE.lock().remove(ws);
+    if super::warm::let_go(ws).await {
+        let lock = lock_path(ws);
+        let _ = crate::rt::blocking(move || {
+            let _ = std::fs::remove_file(lock);
+            drop(held);
+        })
+        .await;
+        return;
+    }
     let ws = ws.to_path_buf();
     let _ = crate::rt::blocking(move || {
         remove(&ws);
@@ -197,9 +213,15 @@ mod tests {
         }
         std::fs::write(kept.join(KEEP_FILE), "2000")?;
         std::fs::write(expired.join(KEEP_FILE), "500")?;
+        // Legs' Docker sockets (files stand in for them): a running leg's, and one a runner that
+        // stopped short left beside no workspace.
+        let (live, stale) = (root.join("aaaa0001.docker.sock"), root.join("aaaa0009.docker.sock"));
+        std::fs::write(&live, "")?;
+        std::fs::write(&stale, "")?;
         IN_USE.lock().insert(running.clone(), None);
         assert_eq!(sweep(&root, 1000), 2);
         assert!(running.exists() && kept.exists() && !expired.exists() && !left.exists());
+        assert!(live.exists() && !stale.exists());
         IN_USE.lock().remove(&running);
         assert_eq!(sweep(&root, 3000), 2, "once the leg ended and the keep ran out");
         assert!(!running.exists() && !kept.exists());

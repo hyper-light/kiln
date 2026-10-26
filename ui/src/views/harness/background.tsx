@@ -4,21 +4,23 @@
  * output reads live; it stops with one tap, or all of them at once.
  */
 import * as React from "react";
+import { Fold } from "./fold";
 import { ChevronRight, Square } from "lucide-react";
 import { harnessApi, useSession, type Command, type SessionStore, type State, type Task } from "@/api/harness";
-import { useNow } from "@/lib/hooks";
+import { Button } from "@/components/ui/button";
+import { Confirm } from "@/components/ui/misc";
+import { toast } from "@/components/ui/toast";
+import { errorMessage, useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { duration, tildify } from "./derive";
 import { glyphKind, KindGlyph, type GlyphKind } from "./kind-glyph";
+import { Shimmer } from "./signals";
+import { classOf, isSubagent, LEFT, stopperOf, subagentRunning, subagentTasksAtWork } from "./tasks";
 
 const BACKGROUND = new Set(["shell", "monitor", "mcp"]);
-/** What a task is; machines from before `class` only say the harness's own task type. */
-export const classOf = (t: Task): string =>
-  t.class ??
-  (t.kind?.startsWith("monitor") ? "monitor" : t.kind === "local_bash" ? "shell" : t.kind === "local_workflow" ? "workflow" : t.kind?.includes("mcp") ? "mcp" : "agent");
 export const isBackground = (t: Task) => BACKGROUND.has(classOf(t));
 const isLive = (t: Task) => t.status === "running" || t.status === "pending" || t.status === "paused";
-const WORD: Record<string, string> = { shell: "Shell", monitor: "Monitor", mcp: "MCP call" };
+const WORD: Record<string, string> = { shell: "Shell", monitor: "Monitor", workflow: "Workflow", mcp: "MCP call" };
 
 export function backgroundOf(state: State | null): Task[] {
   return (state?.tasks ?? []).filter(isBackground);
@@ -28,6 +30,8 @@ interface Tail {
   text: string;
   note: string | null;
   offset?: number;
+  /** Read at least once. */
+  read?: boolean;
 }
 
 const NO_TAIL: Tail = { text: "", note: null };
@@ -64,7 +68,13 @@ function useTail(agent: string, task: string, live: boolean): Tail {
             key,
             r.error
               ? { ...was, note: r.error }
-              : { text: r.reset ? (r.data ?? "").slice(-200_000) : r.data ? (was.text + r.data).slice(-200_000) : was.text, offset: r.offset ?? was.offset, note: r.gone ? "Its output file is gone: the task has ended." : null },
+              : {
+                  text: r.reset ? (r.data ?? "").slice(-200_000) : r.data ? (was.text + r.data).slice(-200_000) : was.text,
+                  offset: r.offset ?? was.offset,
+                  read: true,
+                  // No file while it runs: its harness keeps none for it (a Claude Code monitor's events).
+                  note: r.gone ? (r.live ? "Its harness keeps no output for it that kiln can read." : "Its output file is gone: the task has ended.") : null,
+                },
           );
           changed();
         } catch (e) {
@@ -94,9 +104,19 @@ function useTail(agent: string, task: string, live: boolean): Tail {
   );
 }
 
-/** The task's output, tailed while it runs. */
+/** The task's output, tailed while it runs. What kiln took over when a harness stopped has none kept. */
 export function Output({ agent, task }: { agent: string; task: Task }) {
-  const { text, note } = useTail(agent, task.id, isLive(task));
+  if (task.id.startsWith(LEFT))
+    return (
+      <div className="bg-out">
+        <p className="bg-note">kiln took this over when its agent&rsquo;s harness stopped, so its output isn&rsquo;t kept.</p>
+      </div>
+    );
+  return <Tailed agent={agent} task={task} />;
+}
+
+function Tailed({ agent, task }: { agent: string; task: Task }) {
+  const { text, note, read } = useTail(agent, task.id, isLive(task));
   // The newest output stays in view.
   const end = React.useCallback(
     (el: HTMLPreElement | null) => {
@@ -105,10 +125,11 @@ export function Output({ agent, task }: { agent: string; task: Task }) {
     },
     [text],
   );
+  // Nothing to show but why: that one line alone.
   return (
     <div className="bg-out">
-      <pre ref={end}>{text || (note ? "" : "No output yet.")}</pre>
-      {note && <p className="bg-note">{note}</p>}
+      {(text || !note) && <pre ref={end}>{text || (read ? "No output yet." : "Reading its output…")}</pre>}
+      {note && <p className="bg-note">{note.charAt(0).toUpperCase() + note.slice(1)}</p>}
     </div>
   );
 }
@@ -138,7 +159,7 @@ function Row({ t, agent, send }: { t: Task; agent: string; send: (c: Command) =>
         <button type="button" className="bg-btn" aria-expanded={open} onClick={() => setOpen(!open)}>
           <ChevronRight size={12} className={cn("bg-chev", open && "rotate-90")} aria-hidden="true" /> Output
         </button>
-        {live && t.stoppable !== false && (
+        {live && (t.id.startsWith(LEFT) || t.stoppable !== false) && (
           <button type="button" className="bg-btn bg-stop" onClick={() => send({ type: "stop_task", task: t.id })}>
             <Square size={9} fill="currentColor" aria-hidden="true" /> Stop
           </button>
@@ -158,9 +179,10 @@ export function Background({ state, agent, send }: { state: State | null; agent:
   const live = tasks.filter(isLive);
   const done = tasks.filter((t) => !isLive(t)).reverse();
   return (
-    <section>
-      <h3 className="in-sec-head">
-        In the background
+    <Fold
+      id="background"
+      title="In the background"
+      aside={
         <span>
           {live.length} running
           {live.length > 1 && !confirm && (
@@ -169,7 +191,8 @@ export function Background({ state, agent, send }: { state: State | null; agent:
             </button>
           )}
         </span>
-      </h3>
+      }
+    >
       {confirm && (
         <div className="bg-confirm" role="group" aria-label="Stop everything in the background">
           <span>Stop the {live.length} shells and monitors it left running? The agent keeps going.</span>
@@ -201,7 +224,7 @@ export function Background({ state, agent, send }: { state: State | null; agent:
         )}
         {ended && done.map((t) => <Row key={t.id} t={t} agent={agent} send={send} />)}
       </ul>
-    </section>
+    </Fold>
   );
 }
 
@@ -223,9 +246,10 @@ export function BackgroundStrip({ state, onView }: { state: State | null; onView
 /**
  * By the composer: what's running besides the agent itself — its subagents, and the shells and
  * monitors it started — as one line that opens in place. A subagent opens its thread; a shell or
- * monitor shows its output right there.
+ * monitor shows its output right there, following it while it runs. Each stops from its row.
  */
 const NO_TASKS: Task[] = [];
+const NO_FEATURES: string[] = [];
 
 /** How long it has run, counting by itself (only this text renders each second). */
 function Since({ from }: { from: number }) {
@@ -233,22 +257,139 @@ function Since({ from }: { from: number }) {
   return <>{duration(now - from)}</>;
 }
 
-export function ActivityLine({ store, agent, onOpenTask }: { store: SessionStore; agent: string; onOpenTask: (toolId: string) => void }) {
+/** What stopping it ends, said before it's done; a monitor only watches, so it stops at once. */
+const STOP_ASK: Record<string, string> = {
+  agent: "Stop this subagent? What it hasn't finished is lost; the agent keeps going.",
+  shell: "Stop this shell? What it runs is killed; the agent keeps going.",
+  workflow: "Stop this workflow? What it hasn't finished is lost; the agent keeps going.",
+  mcp: "Stop this call? Its answer is lost; the agent keeps going.",
+};
+
+/** A stop asked: said for a while (one that takes ends the row), then Stop is offered again. */
+function Stopping({ at, children }: { at: number; children: React.ReactNode }) {
+  const now = useNow();
+  return now - at < 15_000 ? (
+    <span className="al-stop" data-busy="" role="status">
+      Stopping…
+    </span>
+  ) : (
+    children
+  );
+}
+
+function ActivityItem({ t, store, mixed, shown, onShow, onOpenTask }: { t: Task; store: SessionStore; mixed: boolean; shown: boolean; onShow: () => void; onOpenTask: (toolId: string) => void }) {
+  const features = useSession(store, (s) => s.meta?.features ?? NO_FEATURES);
+  const harness = useSession(store, (s) => s.info?.kind_name ?? "");
+  const [asking, setAsking] = React.useState(false);
+  const [why, setWhy] = React.useState(false);
+  const [stopAt, setStopAt] = React.useState<number | null>(null);
+  const sub = isSubagent(t);
+  const cls = classOf(t);
+  const noun = sub ? "subagent" : cls === "mcp" ? "call" : cls;
+  // A subagent opens its thread; anything else (or a subagent without one) its output, under it.
+  const thread = sub ? t.tool_id : undefined;
+  const last = sub ? t.last_tool : cls === "monitor" ? t.last_event : undefined;
+  const stop = () => {
+    setAsking(false);
+    setStopAt(Date.now());
+    // Said over the socket, else over HTTP: a stop mustn't wait for a reconnect.
+    const c: Command = { type: "stop_task", task: t.id };
+    if (!store.send(c))
+      harnessApi.command(store.id, c).catch((e: unknown) => {
+        setStopAt(null);
+        toast.error("Couldn't stop it", errorMessage(e));
+      });
+  };
+  const stopButton = stopperOf(t, features) ? (
+    <button
+      type="button"
+      className="al-stop"
+      aria-expanded={STOP_ASK[cls] ? asking : undefined}
+      aria-label={`Stop ${t.description || t.command || noun}`}
+      onClick={() => (STOP_ASK[cls] ? setAsking(!asking) : stop())}
+    >
+      Stop
+    </button>
+  ) : (
+    // Its harness can't stop it: say so, rather than offer nothing.
+    <button type="button" className="al-stop" data-off="" aria-expanded={why} onClick={() => setWhy(!why)}>
+      Can&rsquo;t stop
+    </button>
+  );
+  return (
+    <li className="al-item">
+      <div className="al-head">
+        <button type="button" className="al-row" aria-expanded={thread ? undefined : shown} onClick={() => (thread ? onOpenTask(thread) : onShow())}>
+          {sub ? (
+            <Shimmer on={t.status === "running"} flow={t.id} className="al-glyph">
+              <KindGlyph kind="agent" pending={t.status === "pending"} />
+            </Shimmer>
+          ) : (
+            <KindGlyph kind={glyphKind(cls)} live={t.status === "running"} pending={t.status === "pending"} />
+          )}
+          <span className="al-what">
+            {mixed && <span className="al-kind">{sub ? "Subagent" : (WORD[cls] ?? cls)}</span>}
+            <span className="al-desc">{t.description || t.command || t.id}</span>
+          </span>
+          <span className="al-time">
+            {last && <span className="al-last">{last}</span>}
+            <Since from={t.started} />
+          </span>
+          {!thread && <ChevronRight size={12} className={cn("al-open", shown && "rotate-90")} aria-hidden="true" />}
+        </button>
+        {stopAt !== null ? <Stopping at={stopAt}>{stopButton}</Stopping> : stopButton}
+      </div>
+      {why && (
+        <p className="al-note">
+          {harness || "Its harness"} can&rsquo;t stop this {noun} from kiln.
+        </p>
+      )}
+      {asking && (
+        <Confirm
+          className="al-confirm"
+          label={`Stop this ${noun}`}
+          tone="danger"
+          actions={
+            <>
+              <Button size="xs" variant="danger" onClick={stop}>
+                Stop it
+              </Button>
+              <Button size="xs" variant="ghost" onClick={() => setAsking(false)}>
+                Keep it running
+              </Button>
+            </>
+          }
+        >
+          <p>{STOP_ASK[cls]}</p>
+        </Confirm>
+      )}
+      {shown && <Output agent={store.id} task={t} />}
+    </li>
+  );
+}
+
+export function ActivityLine({ store, onOpenTask }: { store: SessionStore; onOpenTask: (toolId: string) => void }) {
   const [open, setOpen] = React.useState(false);
   const [shown, setShown] = React.useState<string | null>(null);
   const tasks = useSession(store, (s) => s.state?.tasks ?? NO_TASKS);
-  const subs = tasks.filter((t) => !isBackground(t) && isLive(t));
-  const bg = tasks.filter((t) => isBackground(t) && isLive(t));
+  const subs = subagentTasksAtWork(tasks);
+  const bg = tasks.filter((t) => !isSubagent(t) && isLive(t));
   if (subs.length + bg.length === 0) return null;
   const count = (n: number, one: string, many = `${one}s`) => (n ? `${n} ${n === 1 ? one : many}` : "");
-  const shells = bg.filter((t) => classOf(t) === "shell").length;
-  const monitors = bg.filter((t) => classOf(t) === "monitor").length;
-  const other = bg.length - shells - monitors;
-  // One glyph per kind, so the line says what is running at a glance.
+  const of = (cls: string) => bg.filter((t) => classOf(t) === cls).length;
+  const shells = of("shell");
+  const monitors = of("monitor");
+  const workflows = of("workflow");
+  const other = bg.length - shells - monitors - workflows;
+  // The header already says what they are; a row names its kind only in a mixed list.
+  const mixed = subs.length > 0 && bg.length > 0;
+  // One glyph per kind, so the line says what is running at a glance; a subagent running, the
+  // prism sweeps through its words (the thinking line's shimmer).
   const segments: { kind: GlyphKind; text: string; live: boolean }[] = [
-    { kind: "agent" as const, text: count(subs.length, "subagent"), live: subs.some((t) => t.status === "running") },
+    { kind: "agent" as const, text: count(subs.length, "subagent"), live: subagentRunning(subs) },
     { kind: "shell" as const, text: count(shells, "shell"), live: true },
     { kind: "monitor" as const, text: count(monitors, "monitor"), live: true },
+    { kind: "workflow" as const, text: count(workflows, "workflow"), live: true },
     { kind: "mcp" as const, text: count(other, "background call"), live: true },
   ].filter((s) => s.text);
   return (
@@ -258,8 +399,17 @@ export function ActivityLine({ store, agent, onOpenTask }: { store: SessionStore
           {segments.map((s, i) => (
             <span key={s.kind} className="al-seg">
               {i > 0 && <span className="al-sep">·</span>}
-              <KindGlyph kind={s.kind} live={s.live} />
-              {s.text}
+              {s.kind === "agent" ? (
+                <Shimmer on={s.live} className="al-mark">
+                  <KindGlyph kind="agent" />
+                  {s.text}
+                </Shimmer>
+              ) : (
+                <>
+                  <KindGlyph kind={s.kind} live={s.live} />
+                  {s.text}
+                </>
+              )}
             </span>
           ))}
         </span>
@@ -267,35 +417,9 @@ export function ActivityLine({ store, agent, onOpenTask }: { store: SessionStore
       </button>
       {open && (
         <ul className="al-list">
-          {[...subs, ...bg].map((t) => {
-            const isSub = !isBackground(t);
-            const last = isSub ? t.last_tool : classOf(t) === "monitor" ? t.last_event : undefined;
-            // The header already says what they are; a row names its kind only in a mixed list.
-            const mixed = subs.length > 0 && bg.length > 0;
-            return (
-              <li key={t.id} className="al-item">
-                <button
-                  type="button"
-                  className="al-row"
-                  onClick={() => {
-                    if (isSub && t.tool_id) onOpenTask(t.tool_id);
-                    else setShown(shown === t.id ? null : t.id);
-                  }}
-                >
-                  <KindGlyph kind={isSub ? "agent" : glyphKind(classOf(t))} live={t.status === "running"} pending={t.status === "pending"} />
-                  <span className="al-what">
-                    {mixed && <span className="al-kind">{isSub ? "Subagent" : (WORD[classOf(t)] ?? classOf(t))}</span>}
-                    <span className="al-desc">{t.description || t.command || t.id}</span>
-                  </span>
-                  <span className="al-time">
-                    {last && <span className="al-last">{last}</span>}
-                    <Since from={t.started} />
-                  </span>
-                </button>
-                {shown === t.id && <Output agent={agent} task={t} />}
-              </li>
-            );
-          })}
+          {[...subs, ...bg].map((t) => (
+            <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />
+          ))}
         </ul>
       )}
     </div>

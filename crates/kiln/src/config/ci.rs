@@ -30,7 +30,36 @@ pub struct Ci {
     /// executor = ["host"]
     /// ```
     pub routing: Vec<kiln_ci::sched::routing::Rule>,
+    /// Pools of executors kiln starts and stops (docs/ci.md W13-R09):
+    ///
+    /// ```toml
+    /// [[ci.pools]]
+    /// name = "docker-linux"
+    /// executor = "docker"
+    /// hosts = "executors contains docker"
+    /// image = "kiln/runner-ubuntu-24.04"
+    /// labels = ["ubuntu-latest", "linux", "x64"]
+    /// min_idle = 2
+    /// max = 32
+    /// per_host_max = 16
+    /// idle_timeout = "10m"
+    /// ```
+    pub pools: Vec<kiln_ci::sched::pools::PoolSpec>,
+    /// Runners kept for matching legs in windows (docs/ci.md W05-R12); a pool's own go in its
+    /// `reserve`:
+    ///
+    /// ```toml
+    /// [[ci.reservations]]
+    /// name = "nightly-bench"
+    /// runners = "custom.rack == bench"
+    /// for = "workflow == 'bench'"
+    /// cron = "0 2 * * *"
+    /// duration = "2h"
+    /// ```
+    pub reservations: Vec<kiln_ci::sched::reserve::ReservationSpec>,
     pub cache: Cache,
+    /// `[ci.work]`: the work ledger's quotas (docs/ci.md W24-R15, R21, AC12).
+    pub work: Work,
     pub artifacts: Artifacts,
     pub oidc: Oidc,
     pub actions: Actions,
@@ -88,6 +117,7 @@ pub struct Ci {
     /// # or: username = "kiln-bot", password_file = "/etc/kiln/bitbucket-app-password"
     /// webhook_secret_file = "/etc/kiln/bitbucket-webhook-secret"
     /// workspaces = ["acme"]
+    /// # ssh_url = "ssh://git@bitbucket.org"   # where git reads over SSH (Argo CD, with a deploy key)
     /// ```
     pub bitbucket: Option<BitbucketHost>,
     /// `[ci.registry]`: kiln's own OCI registry at `/v2/` (docs/ci.md W12-R01).
@@ -99,6 +129,15 @@ pub struct Ci {
     /// max_blob = 21474836480             # bytes a blob may have (20 GiB)
     /// ```
     pub registry: Registry,
+    /// `[ci.advisories]`: the advisory database the dependency graph's compare looks up the
+    /// packages a change adds in (docs/ci.md W14-R11, for `actions/dependency-review-action`). None
+    /// by default: the changes are listed without vulnerabilities, and the answer says so.
+    ///
+    /// ```toml
+    /// [ci.advisories]
+    /// osv = "https://api.osv.dev"   # OSV's API (it carries GitHub's advisories), sent those packages' purls
+    /// ```
+    pub advisories: Advisories,
     /// `[ci.attest]`: how kiln signs attestations (docs/ci.md W18-R02).
     ///
     /// ```toml
@@ -108,6 +147,7 @@ pub struct Ci {
     /// rekor_url = "https://rekor.example.com"
     /// # key: key_file = "/etc/kiln/cosign.key", key_password_file = "/etc/kiln/cosign.password"
     /// # kms: kms = "awskms:///arn:aws:kms:eu-west-1:123456789012:key/…", integration = "aws-signing"
+    /// trusted_root = "/etc/kiln/trusted_root.json" # keyless bundles verify against it (default: Sigstore's public one)
     /// ```
     pub attest: Attest,
     /// `[ci.land_signing]`: the land queue signs the commits it writes (docs/ci.md W14-R07).
@@ -121,6 +161,14 @@ pub struct Ci {
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]
     pub local: bool,
+}
+
+/// `[ci.advisories]`'s settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Advisories {
+    /// OSV's API (`https://api.osv.dev`, or a mirror of it).
+    pub osv: Option<String>,
 }
 
 /// The GitHub App's settings.
@@ -176,6 +224,9 @@ pub struct BitbucketHost {
     pub webhook_secret_file: Option<std::path::PathBuf>,
     /// The workspaces it covers; none: every one.
     pub workspaces: Vec<String>,
+    /// Where git reads its repositories over SSH (`ssh://git@<web_url's host>` unless set): Argo
+    /// CD reads a release repository there with a deploy key kiln makes.
+    pub ssh_url: Option<String>,
 }
 
 impl Default for BitbucketHost {
@@ -188,6 +239,7 @@ impl Default for BitbucketHost {
             password_file: None,
             webhook_secret_file: None,
             workspaces: Vec::new(),
+            ssh_url: None,
         }
     }
 }
@@ -304,6 +356,10 @@ pub struct Attest {
     pub fulcio_url: Option<String>,
     pub rekor_url: Option<String>,
     pub audience: Option<String>,
+    /// The Sigstore trusted root (`trusted_root.json`: its Fulcios, Rekors and CT logs) keyless
+    /// bundles are verified against: the instance's kiln signs with, when that's its own.
+    /// Without one, Sigstore's public instance's, through its TUF repository.
+    pub trusted_root: Option<std::path::PathBuf>,
 }
 
 /// How landed commits are signed.
@@ -331,12 +387,83 @@ pub struct Scheduler {
     pub aging_per_minute: f64,
     /// Seconds a leg is expected to take when its job has no history (W19's medians).
     pub default_cost_seconds: f64,
+    /// `slots` (each runner takes its `slots` legs at once) or `resources` (W05-R03): a runner
+    /// offers what its facts say it has (CPUs, memory, the work volume's free disk, GPUs), times
+    /// `overcommit`, and a leg takes what its job's `resources:` asks, else `default_request`.
+    pub mode: String,
+    pub overcommit: Overcommit,
+    pub default_request: kiln_ci::sched::pools::ResourceSpec,
+    /// `[ci.scheduler.admission]` (docs/ci.md W24-R19): off when unset.
+    pub admission: Option<Admission>,
+}
+
+impl Scheduler {
+    /// Resource mode (W05-R03).
+    pub fn resources(&self) -> bool {
+        self.mode.trim().eq_ignore_ascii_case("resources")
+    }
 }
 
 impl Default for Scheduler {
     fn default() -> Self {
         let d = kiln_ci::sched::state::Config::default();
-        Scheduler { aging_per_minute: d.aging_per_minute, default_cost_seconds: d.default_cost }
+        Scheduler { aging_per_minute: d.aging_per_minute, default_cost_seconds: d.default_cost, mode: "slots".into(), overcommit: Overcommit::default(), default_request: Default::default(), admission: None }
+    }
+}
+
+/// `[ci.scheduler.admission]` (docs/ci.md W24-R19): legs heavy on I/O (their job's `resources: {
+/// io: heavy }`, or their job's legs lately took `heavy_after` seconds or more) aren't started on a
+/// runner whose I/O pressure is past `io_full` (scaled by the leg's `io-weight`) or whose work
+/// volume has less than `disk_free` free. Runners that don't report them aren't held.
+///
+/// ```toml
+/// [ci.scheduler.admission]
+/// io_full = 40          # percent: PSI's `full avg10`, for a leg of an even I/O weight
+/// disk_free = "20Gi"
+/// heavy_after = 600     # unset: only legs whose job says so are heavy
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Admission {
+    pub io_full: f64,
+    pub disk_free: String,
+    pub heavy_after: Option<f64>,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Admission { io_full: 40.0, disk_free: "20Gi".into(), heavy_after: None }
+    }
+}
+
+impl Admission {
+    /// As the scheduler takes it; why not when a value doesn't read.
+    pub fn admission(&self) -> Result<kiln_ci::sched::admit::Admission, String> {
+        if !self.io_full.is_finite() || !(0.0..=100.0).contains(&self.io_full) {
+            return Err(format!("`[ci.scheduler.admission] io_full` is a percentage from 0 to 100, not {}", self.io_full));
+        }
+        let disk_free = kiln_ci::sched::routing::number(self.disk_free.trim()).filter(|n| n.is_finite() && *n >= 0.0).ok_or_else(|| format!("`[ci.scheduler.admission] disk_free` isn't a size (`20Gi`, `500G`): `{}`", self.disk_free))?;
+        if let Some(h) = self.heavy_after.filter(|h| !h.is_finite() || *h < 0.0) {
+            return Err(format!("`[ci.scheduler.admission] heavy_after` is seconds, not {h}"));
+        }
+        Ok(kiln_ci::sched::admit::Admission { io_full: self.io_full, disk_free: disk_free as u64, heavy_after: self.heavy_after })
+    }
+}
+
+/// How far past what a runner has its legs may ask, in resource mode: CPUs 1.5 times, memory and
+/// disk once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Overcommit {
+    pub cpu: f64,
+    pub memory: f64,
+    pub disk: f64,
+}
+
+impl Default for Overcommit {
+    fn default() -> Self {
+        let d = kiln_ci::sched::state::Config::default();
+        Overcommit { cpu: d.overcommit_cpu, memory: d.overcommit_mem, disk: d.overcommit_disk }
     }
 }
 
@@ -436,11 +563,62 @@ pub struct Actions {
     /// Actions to mirror by `kiln actions sync` (`owner/repo@ref`), for servers that will run
     /// without reaching GitHub.
     pub prefetch: Vec<String>,
+    /// `[[ci.actions.sources]]`: where some owners' actions come from instead of GitHub, the
+    /// first that names the owner (W07-R02).
+    pub sources: Vec<ActionSource>,
 }
 
 impl Actions {
     pub fn policy(&self) -> kiln_ci::policy::Policy {
         kiln_ci::policy::Policy { allow: self.allow.clone(), deny: self.deny.clone(), require_sha_pins: self.require_sha_pins }
+    }
+
+    /// The source for `owner`'s actions, when one names it.
+    pub fn source_of(&self, owner: &str) -> Option<&ActionSource> {
+        let owner = owner.to_ascii_lowercase();
+        self.sources.iter().find(|s| s.owners.iter().any(|g| crate::pipeline::glob_match(&g.to_ascii_lowercase(), &owner)))
+    }
+}
+
+/// Another home for some owners' actions (W07-R02): a git host (`url`, with `{owner}` and
+/// `{repo}` filled in), or the repositories kiln hosts itself (`native`, W14-R01).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ActionSource {
+    /// Owner globs (`acme`, `acme-*`).
+    pub owners: Vec<String>,
+    /// The clone URL: `https://git.example.com/{owner}/{repo}.git`.
+    pub url: Option<String>,
+    /// `owner/repo` is one of kiln's native repositories.
+    pub native: bool,
+}
+
+/// `[ci.work]`: what the work ledger keeps of each repository's results, by trust domain (docs/ci.md
+/// W24-R15, R21, AC12). Past a domain's quota, its entries that save the least time per byte go,
+/// with the files they kept; one domain's entries never evict another's. Every quota 0, the
+/// default, keeps everything.
+///
+/// ```toml
+/// [ci.work]
+/// trusted_gb = 200
+/// untrusted_gb = 20
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Work {
+    pub trusted_gb: u64,
+    pub protected_gb: u64,
+    pub untrusted_gb: u64,
+    /// Each person's (`person:<id>`).
+    pub person_gb: u64,
+}
+
+impl Work {
+    /// The quotas, once any is set; a domain whose quota is 0 keeps everything.
+    pub fn quotas(&self) -> Option<kiln_ci::work::trust::Quotas> {
+        let gb = |g: u64| if g == 0 { u64::MAX } else { g.saturating_mul(1 << 30) };
+        let any = [self.trusted_gb, self.protected_gb, self.untrusted_gb, self.person_gb].iter().any(|g| *g > 0);
+        any.then(|| kiln_ci::work::trust::Quotas { trusted: gb(self.trusted_gb), protected: gb(self.protected_gb), untrusted: gb(self.untrusted_gb), person: gb(self.person_gb) })
     }
 }
 
@@ -480,6 +658,20 @@ impl Default for Artifacts {
     }
 }
 
+/// How kiln signs in to an S3-compatible store: an `aws` integration (kiln's own identity,
+/// exchanged for the role's short-lived credentials, so no key is stored), or a key pair whose
+/// secret is read from a file or an environment variable; with neither, the server's environment
+/// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`). The content-addressed
+/// store's own bucket is `[blobs.s3]`'s (docs/blobs.md).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct S3Credentials {
+    pub integration: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key_file: Option<std::path::PathBuf>,
+    pub secret_access_key_env: Option<String>,
+}
+
 /// `[ci.oidc]`: kiln as an OpenID Connect issuer for jobs (docs/ci.md W10-R06 to W10-R10).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -497,4 +689,49 @@ pub struct Oidc {
     /// Keep the discovery document and keys written here, for a static host that serves the
     /// directory at `issuer` (W10-R12): providers that fetch from the internet read them there.
     pub publish_dir: Option<std::path::PathBuf>,
+    /// Where the hourly upkeep and each rotation publish the two documents (W10-R12): a directory
+    /// for a static host, `s3://<bucket>[/<prefix>]` or `gs://<bucket>[/<prefix>]`. `issuer` is
+    /// then where that is served (`https://<bucket>.s3.<region>.amazonaws.com/<prefix>`, say).
+    pub publish_to: Option<String>,
+    /// For `s3://`: the store's endpoint, AWS S3's in `publish_region` by default (MinIO's, R2's).
+    pub publish_endpoint: Option<String>,
+    /// For `s3://`: the region requests are signed for (`us-east-1` by default).
+    pub publish_region: Option<String>,
+    /// How kiln signs in to publish: an integration (`aws` for
+    /// `s3://`, `gcp` for `gs://`), a key pair, or the server's environment. An `aws` integration
+    /// can't publish the first keys, since AWS checks kiln's token against them: start with a
+    /// key pair. Google Cloud takes the keys pasted into its pool, so a `gcp` one can.
+    pub publish_credentials: S3Credentials,
+    /// Addresses of the issuer's own (W10-R12), each serving its two documents and nothing else,
+    /// rate-limited, so they can face the internet without the rest of kiln: `["0.0.0.0:8444"]`.
+    /// Over TLS with `listen_cert` and `listen_key` (a certificate for the issuer's public name),
+    /// else the server's own when `server.https`, else plain HTTP (a TLS proxy or tunnel in front).
+    pub listen: Vec<String>,
+    pub listen_cert: Option<std::path::PathBuf>,
+    pub listen_key: Option<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W24-R19: `[ci.scheduler.admission]` as the scheduler takes it, its values checked, and the
+    /// I/O weights admission scales by held to the `Sandbox` seam's.
+    #[test]
+    fn w24_r19_admission_config() -> anyhow::Result<()> {
+        let s: Scheduler = toml::from_str("[admission]\nio_full = 35\ndisk_free = \"50Gi\"\nheavy_after = 900\n")?;
+        let a = s.admission.as_ref().map(Admission::admission).transpose().map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(a == Some(kiln_ci::sched::admit::Admission { io_full: 35.0, disk_free: 50 << 30, heavy_after: Some(900.0) }), "{a:?}");
+        anyhow::ensure!(Scheduler::default().admission.is_none(), "off until set");
+        let defaults: Scheduler = toml::from_str("[admission]\n")?;
+        anyhow::ensure!(defaults.admission.map(|a| a.admission()) == Some(Ok(kiln_ci::sched::admit::Admission { io_full: 40.0, disk_free: 20 << 30, heavy_after: None })));
+        for (bad, says) in [(Admission { io_full: 140.0, ..Admission::default() }, "io_full"), (Admission { disk_free: "lots".into(), ..Admission::default() }, "disk_free"), (Admission { heavy_after: Some(-1.0), ..Admission::default() }, "heavy_after")] {
+            anyhow::ensure!(bad.admission().is_err_and(|e| e.contains(says)), "{bad:?}");
+        }
+        anyhow::ensure!(toml::from_str::<Scheduler>("[admission]\nio = 3\n").is_err(), "an unknown key is an error");
+        use kiln_ci::sched::admit;
+        use kiln_seams::sandbox;
+        anyhow::ensure!((admit::WEIGHT_MIN, admit::WEIGHT_MAX, admit::WEIGHT_EVEN) == (sandbox::WEIGHT_MIN, sandbox::WEIGHT_MAX, sandbox::Limits::default().io_weight));
+        Ok(())
+    }
 }

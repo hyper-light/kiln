@@ -147,14 +147,22 @@ impl Row {
 pub fn of(session: &str, update: &Update, now: i64) -> Vec<Row> {
     let s = || session.to_owned();
     match update {
-        Update::Open { info } => vec![Row::Session { session: s(), info: json(info.as_ref()), meta: None, state: None, changes: None, epoch: None, open: true, at: now }],
+        Update::Open { info, since } => {
+            let open = Row::Session { session: s(), info: json(info.as_ref()), meta: None, state: None, changes: None, epoch: None, open: true, at: now };
+            // Going on from what the copy has (a runner that started again): its events after
+            // that go, and those its machine has come again.
+            match since {
+                Some(n) => vec![open, Row::Reset { session: s(), from: Some(n.saturating_add(1)), at: now }],
+                None => vec![open],
+            }
+        }
         Update::State { state } => vec![Row::Session { session: s(), info: None, meta: None, state: json(state.as_ref()), changes: None, epoch: Some(state.epoch), open: false, at: now }],
         Update::Meta { meta } => vec![Row::Session { session: s(), info: None, meta: json(meta.as_ref()), state: None, changes: None, epoch: None, open: false, at: now }],
         Update::Changes { files } => vec![Row::Session { session: s(), info: None, meta: None, state: None, changes: json(files), epoch: None, open: false, at: now }],
         Update::Events { events } => events.iter().filter_map(|e| event(session, e)).map(|e| Row::Event(Box::new(e))).collect(),
         Update::Reset { from } => vec![Row::Reset { session: s(), from: *from, at: now }],
         Update::Closed => vec![Row::Closed { session: s(), at: now }],
-        Update::Stream { .. } | Update::Reply { .. } => Vec::new(),
+        Update::Stream { .. } | Update::Reply { .. } | Update::Inbox { .. } => Vec::new(),
     }
 }
 
@@ -394,6 +402,14 @@ mod tests {
         // isn't merged into it.
         assert_eq!(out.len(), 3);
         assert!(matches!(out.get(1), Some(Row::Reset { .. })));
+    }
+
+    #[test]
+    fn an_open_that_goes_on_from_the_copy_drops_only_what_comes_after() {
+        let info = Box::new(crate::harness::session::Info::default());
+        let rows = of("a1", &Update::Open { info: info.clone(), since: Some(9) }, 1);
+        assert!(matches!(rows.as_slice(), [Row::Session { open: true, .. }, Row::Reset { from: Some(10), .. }]), "{rows:?}");
+        assert!(matches!(of("a1", &Update::Open { info, since: None }, 1).as_slice(), [Row::Session { .. }]));
     }
 
     #[test]

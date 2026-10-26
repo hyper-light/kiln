@@ -12,6 +12,13 @@
 //! - **Deployments**: a job bound to an environment (unless `deployment: false`) records one when
 //!   it starts and its status when it ends, with the job's evaluated `environment.url`; the
 //!   facade's `/deployments` serves them, and actions can make their own there.
+//! - **Kinds** (W15-R02): what an environment deploys to, and where ([`Targets`]): a `kubernetes`
+//!   one's clusters and namespace (kiln CD deploys there); the runners a `host`, `container` or
+//!   `microvm` one deploys on, which its jobs then run on ([`routing`]); a `platform` one's
+//!   integration, whose credentials its jobs get.
+//! - **The starter set** (W15-R08): `dev`, `staging` and `production` for a repository, in one
+//!   step; and **the board** (W15-R09): every environment the caller may read, with its latest
+//!   deployment and what waits to deploy there.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -20,7 +27,7 @@ use http::{Method, StatusCode};
 use kiln_ci::env::{Protection, Review};
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension as _, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::Fail;
@@ -29,19 +36,177 @@ use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
 use crate::store::Repo;
 
+/// What an environment deploys to (W15-R02).
+pub const KINDS: [&str; 5] = ["kubernetes", "host", "container", "microvm", "platform"];
+
+/// Where an environment deploys (W15-R02): a `kubernetes` one's clusters (kiln CD's) and
+/// namespace; the runners a `host`, `container` or `microvm` one deploys on, as a routing
+/// constraint (`label deploy-web`, `os == linux && label web`); a `platform` one's integration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Targets {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub clusters: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runners: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration: Option<String>,
+}
+
+impl Targets {
+    /// Only what `kind` deploys to.
+    fn of(self, kind: Option<&str>) -> Targets {
+        match kind {
+            Some("kubernetes") => Targets { clusters: self.clusters, namespace: self.namespace.filter(|n| !n.trim().is_empty()), ..Targets::default() },
+            Some("host" | "container" | "microvm") => Targets { runners: self.runners.map(|r| r.trim().to_owned()), ..Targets::default() },
+            Some("platform") => Targets { integration: self.integration.map(|i| i.trim().to_owned()), ..Targets::default() },
+            _ => Targets::default(),
+        }
+    }
+}
+
+/// That `kind` is one of [`KINDS`] and has where it deploys.
+pub fn check_kind(kind: Option<&str>, t: &Targets) -> Result<(), String> {
+    let Some(kind) = kind else { return Ok(()) };
+    match kind {
+        "kubernetes" if t.clusters.iter().all(|c| c.trim().is_empty()) => Err("a kubernetes environment deploys to one or more of kiln CD's clusters".into()),
+        "host" | "container" | "microvm" => match t.runners.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+            None => Err(format!("a {kind} environment deploys on runners: say which, as a constraint they meet (`label deploy-web`, `os == linux`)")),
+            Some(r) => kiln_ci::sched::routing::Constraint::parse(r).map(|_| ()).map_err(|e| format!("its runners ({r}): {e}")),
+        },
+        "platform" if t.integration.as_deref().is_none_or(|i| i.trim().is_empty()) => Err("a platform environment deploys through one of kiln's integrations: say which".into()),
+        "kubernetes" | "platform" => Ok(()),
+        other => Err(format!("`{other}` isn't a kind of environment: kubernetes, host, container, microvm or platform")),
+    }
+}
+
+/// What a leg deploying to `def` asks of its runner (W15-R02): a `host` environment's jobs run on
+/// its runners, a `container` one's on those of them with Docker, a `microvm` one's on those that
+/// run microVMs. Nothing for the other kinds, whose deploying is CD's or the platform's.
+pub fn routing(def: &EnvDef) -> Vec<String> {
+    let Some(r) = def.targets.runners.as_deref().map(str::trim).filter(|r| !r.is_empty()) else { return Vec::new() };
+    match def.kind.as_deref() {
+        Some("host") => vec![r.to_owned()],
+        Some("container") => vec![r.to_owned(), "executors has docker".into()],
+        Some("microvm") => vec![r.to_owned(), "executors has firecracker || executors has shards".into()],
+        _ => Vec::new(),
+    }
+}
+
 /// An environment, as runs use it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnvDef {
     pub name: String,
     pub protection: Protection,
     pub url: Option<String>,
+    /// One of [`KINDS`]; `None` for one with no targets of its own (as GitHub's).
+    pub kind: Option<String>,
+    pub targets: Targets,
     /// `file` (trunk's `.kiln/environments.yaml`), `kiln` (made in kiln), `run` (named by a job).
     pub source: String,
     /// Agents may approve its deployments.
     pub agents_approve: bool,
+    /// At most this many of its deployments at once (W15-R01); the rest wait their turn.
+    pub concurrency: Option<u32>,
+    /// A preview's (W15-R07): what it was made from and for, and until when it lasts.
+    pub preview: Option<Preview>,
 }
 
-/// One environment's CI keys in `.kiln/environments.yaml`; the rest are CD's.
+/// A preview environment (W15-R07), as the board and the API show it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Preview {
+    /// Its `previews:` entry: the name its jobs give `environment:`.
+    pub template: String,
+    /// What it's for, as people read it: `D12`, `CR7`, `#42`, or a stack's lowest diff.
+    pub of: String,
+    /// `diff`, `stack`, `change_request` or `pull_request`.
+    pub kind: &'static str,
+    pub created_at: i64,
+    /// Removed then, unless it's deployed again first.
+    pub expires_at: i64,
+    /// When it was removed, and why (`D12 landed`): it's kept an hour for its change's closing
+    /// runs.
+    pub removed_at: Option<i64>,
+    pub removed: Option<String>,
+}
+
+/// One of `.kiln/environments.yaml`'s `previews:` (W15-R07): the environment each preview it makes
+/// is (`def`: its kind and targets, protection, URL and concurrency), and which changes get one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Template {
+    /// What jobs give `environment:` to deploy to their change's preview.
+    pub name: String,
+    pub def: EnvDef,
+    /// One for each diff, rather than one for each stack, at its top diff.
+    pub per_diff: bool,
+    /// Kiln's diffs (and stacks) get one.
+    pub diffs: bool,
+    /// Pull requests get one: change requests and a host's.
+    pub pull_requests: bool,
+    /// How long one lasts after it was last deployed, in seconds.
+    pub ttl: i64,
+}
+
+/// A preview's default life after its last deployment: three days.
+pub const PREVIEW_TTL: i64 = 72 * 3600;
+
+/// One of `previews:` in `.kiln/environments.yaml`: an environment's keys, and what previews it
+/// makes.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct FileTemplate {
+    #[serde(flatten)]
+    env: FileEnv,
+    /// `stack` (the default) or `diff`.
+    per: Option<String>,
+    /// `diff`, `pull_request`, or both (the default).
+    on: Option<serde_yaml::Value>,
+    /// `72h` (the default), `7d`.
+    ttl: Option<String>,
+}
+
+impl FileTemplate {
+    /// The template, or why it can't be used.
+    fn template(self, repo: &str, name: &str) -> Result<Template, String> {
+        let per_diff = match self.per.as_deref().map(str::trim) {
+            None | Some("stack") => false,
+            Some("diff") => true,
+            Some(other) => return Err(format!("`per: {other}`: a preview is made per `stack` (the default) or per `diff`")),
+        };
+        let on: Vec<String> = match &self.on {
+            None => vec!["diff".into(), "pull_request".into()],
+            Some(serde_yaml::Value::String(s)) => vec![s.trim().to_owned()],
+            Some(serde_yaml::Value::Sequence(l)) => l.iter().map(|v| v.as_str().map(|s| s.trim().to_owned()).ok_or("`on` lists `diff` and `pull_request`")).collect::<Result<_, _>>()?,
+            Some(_) => return Err("`on` is `diff`, `pull_request`, or both".into()),
+        };
+        if let Some(bad) = on.iter().find(|o| !matches!(o.as_str(), "diff" | "pull_request")) {
+            return Err(format!("`on: {bad}`: previews are made for a `diff` (and its stack) or a `pull_request`"));
+        }
+        let ttl = match self.ttl.as_deref() {
+            None => PREVIEW_TTL,
+            Some(t) => kiln_ci::trigger::cron::seconds(t).and_then(|s| i64::try_from(s).ok()).filter(|s| *s > 0).ok_or_else(|| format!("`ttl: {t}` is a duration (`72h`, `7d`)"))?,
+        };
+        self.env.protection.check()?;
+        let (kind, targets) = self.env.kind(repo, name);
+        let def = EnvDef {
+            name: name.to_owned(),
+            protection: self.env.protection,
+            url: self.env.url,
+            kind,
+            targets,
+            source: "file".into(),
+            agents_approve: self.env.agents.approve,
+            concurrency: self.env.concurrency.filter(|n| *n > 0),
+            preview: None,
+        };
+        Ok(Template { name: name.to_owned(), def, per_diff, diffs: on.iter().any(|o| o == "diff"), pull_requests: on.iter().any(|o| o == "pull_request"), ttl })
+    }
+}
+
+/// One environment's CI keys in `.kiln/environments.yaml`; the rest are CD's (`clusters` is
+/// both's).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct FileEnv {
@@ -49,6 +214,40 @@ struct FileEnv {
     protection: Protection,
     url: Option<String>,
     agents: FileAgents,
+    concurrency: Option<u32>,
+    /// W15-R02; without it, what its targets say (`clusters`: kubernetes, `integration`:
+    /// platform, `runners`: host).
+    kind: Option<String>,
+    clusters: Vec<String>,
+    namespace: Option<String>,
+    runners: Option<String>,
+    integration: Option<String>,
+}
+
+impl FileEnv {
+    /// Its kind and targets, or none when they can't be used (said in the log).
+    fn kind(&self, repo: &str, env: &str) -> (Option<String>, Targets) {
+        let kind = self.kind.clone().or_else(|| {
+            let k = if !self.clusters.is_empty() {
+                "kubernetes"
+            } else if self.integration.is_some() {
+                "platform"
+            } else if self.runners.is_some() {
+                "host"
+            } else {
+                return None;
+            };
+            Some(k.to_owned())
+        });
+        let targets = Targets { clusters: self.clusters.clone(), namespace: self.namespace.clone(), runners: self.runners.clone(), integration: self.integration.clone() }.of(kind.as_deref());
+        match check_kind(kind.as_deref(), &targets) {
+            Ok(()) => (kind, targets),
+            Err(e) => {
+                tracing::warn!(repo, environment = env, error = e, "an environment's kind can't be used; it has none");
+                (None, Targets::default())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -58,7 +257,13 @@ struct FileAgents {
 }
 
 const FRESH: Duration = Duration::from_secs(20);
-type Cached = HashMap<String, (Instant, BTreeMap<String, EnvDef>)>;
+/// Trunk's file, read: its environments and its `previews:`, by lower-cased name.
+#[derive(Clone, Default)]
+struct FromFile {
+    envs: BTreeMap<String, EnvDef>,
+    previews: BTreeMap<String, Template>,
+}
+type Cached = HashMap<String, (Instant, FromFile)>;
 static FILES: Mutex<Option<Cached>> = Mutex::new(None);
 
 fn internal(e: anyhow::Error) -> Fail {
@@ -69,24 +274,51 @@ fn bad(m: impl Into<String>) -> Fail {
     (StatusCode::BAD_REQUEST, m.into())
 }
 
-/// Trunk's environments (cached for a few seconds); none when there is no file or it can't be
-/// read (which is logged).
-async fn from_file(hub: &Hub, repo: &Repo) -> BTreeMap<String, EnvDef> {
+/// Trunk's environments and `previews:` (cached for a few seconds); none when there is no file or
+/// it can't be read (which is logged). `previews` is that key's, never an environment's name.
+async fn from_file(hub: &Hub, repo: &Repo) -> FromFile {
     if let Some((at, m)) = FILES.lock().get_or_insert_with(HashMap::new).get(&repo.id)
         && at.elapsed() < FRESH
     {
         return m.clone();
     }
-    let mut out = BTreeMap::new();
+    let mut out = FromFile::default();
     if let Some((name, text)) = super::repo_config::trunk_file(hub, repo, &[".kiln/environments.yaml", ".kiln/environments.yml"]).await {
-        match serde_yaml::from_slice::<BTreeMap<String, FileEnv>>(&text) {
-            Ok(m) => {
+        let read = serde_yaml::from_slice::<serde_yaml::Mapping>(&text).and_then(|mut m| {
+            let previews = m.remove("previews");
+            Ok((serde_yaml::from_value::<BTreeMap<String, FileEnv>>(serde_yaml::Value::Mapping(m))?, previews.map(serde_yaml::from_value::<BTreeMap<String, FileTemplate>>).transpose()?))
+        });
+        match read {
+            Ok((m, previews)) => {
                 for (env, f) in m {
                     if let Err(e) = f.protection.check() {
                         tracing::warn!(repo = %repo.name, file = name, environment = env, error = e, "an environment's protection can't be used; it has none");
                     }
+                    let (kind, targets) = f.kind(&repo.name, &env);
                     let protection = if f.protection.check().is_ok() { f.protection } else { Protection::default() };
-                    out.insert(env.to_ascii_lowercase(), EnvDef { name: env, protection, url: f.url, source: "file".into(), agents_approve: f.agents.approve });
+                    out.envs.insert(
+                        env.to_ascii_lowercase(),
+                        EnvDef {
+                            name: env,
+                            protection,
+                            url: f.url,
+                            kind,
+                            targets,
+                            source: "file".into(),
+                            agents_approve: f.agents.approve,
+                            concurrency: f.concurrency.filter(|n| *n > 0),
+                            preview: None,
+                        },
+                    );
+                }
+                for (t, f) in previews.unwrap_or_default() {
+                    match f.template(&repo.name, &t) {
+                        Ok(p) if !t.contains('/') && t.trim() == t && !t.is_empty() => {
+                            out.previews.insert(t.to_ascii_lowercase(), p);
+                        }
+                        Ok(_) => tracing::warn!(repo = %repo.name, file = name, preview = t, "a preview's name is an environment's: without slashes or surrounding spaces"),
+                        Err(e) => tracing::warn!(repo = %repo.name, file = name, preview = t, error = e, "a preview can't be used"),
+                    }
                 }
             }
             Err(e) => tracing::warn!(repo = %repo.name, file = name, error = %e, "the repository's environments can't be read"),
@@ -96,21 +328,33 @@ async fn from_file(hub: &Hub, repo: &Repo) -> BTreeMap<String, EnvDef> {
     out
 }
 
+/// Trunk's `previews:` (W15-R07), by lower-cased name.
+pub async fn templates(hub: &Hub, repo: &Repo) -> BTreeMap<String, Template> {
+    from_file(hub, repo).await.previews
+}
+
 /// Every environment of a repository, by lower-cased name: trunk's file, then kiln's own.
 pub async fn defs(hub: &Hub, repo: &Repo) -> anyhow::Result<BTreeMap<String, EnvDef>> {
-    let mut out = from_file(hub, repo).await;
+    let FromFile { envs: mut out, previews } = from_file(hub, repo).await;
+    // Its previews (W15-R07), each as its template says.
+    for (key, d) in super::previews::defs(hub, repo, &previews).await? {
+        out.entry(key).or_insert(d);
+    }
     let id = repo.id.clone();
-    let rows: Vec<(String, String, Option<String>, String)> = hub
+    type Row = (String, String, Option<String>, String, Option<i64>, Option<String>, String);
+    let rows: Vec<Row> = hub
         .store
         .call(move |c| {
-            let mut st = c.prepare("SELECT name, protection, url, source FROM ci_environments WHERE repo_id = ?1 ORDER BY name")?;
-            let rows = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            let mut st = c.prepare("SELECT name, protection, url, source, concurrency, kind, targets FROM ci_environments WHERE repo_id = ?1 ORDER BY name")?;
+            let rows = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
-    for (name, protection, url, source) in rows {
+    for (name, protection, url, source, concurrency, kind, targets) in rows {
         let protection: Protection = serde_json::from_str(&protection).unwrap_or_default();
-        out.entry(name.to_ascii_lowercase()).or_insert(EnvDef { name, protection, url, source, agents_approve: false });
+        let concurrency = concurrency.and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0);
+        let targets: Targets = serde_json::from_str(&targets).unwrap_or_default();
+        out.entry(name.to_ascii_lowercase()).or_insert(EnvDef { name, protection, url, kind, targets, source, agents_approve: false, concurrency, preview: None });
     }
     Ok(out)
 }
@@ -130,7 +374,17 @@ pub async fn ensure(hub: &Hub, repo: &Repo, name: &str) -> anyhow::Result<EnvDef
             Ok(())
         })
         .await?;
-    Ok(EnvDef { name: name.to_owned(), protection: Protection::default(), url: None, source: "run".into(), agents_approve: false })
+    Ok(EnvDef {
+        name: name.to_owned(),
+        protection: Protection::default(),
+        url: None,
+        kind: None,
+        targets: Targets::default(),
+        source: "run".into(),
+        agents_approve: false,
+        concurrency: None,
+        preview: None,
+    })
 }
 
 /// The reviews of a run's deployments to `env`.
@@ -193,7 +447,7 @@ async fn repo_of(hub: &Hub, q: &HashMap<String, String>) -> Result<Repo, Fail> {
 }
 
 fn env_json(d: &EnvDef, latest: Option<Value>) -> Value {
-    json!({ "name": d.name, "source": d.source, "protection": d.protection, "url": d.url, "agents_can_approve": d.agents_approve, "latest_deployment": latest })
+    json!({ "name": d.name, "source": d.source, "kind": d.kind, "targets": d.targets, "protection": d.protection, "url": d.url, "agents_can_approve": d.agents_approve, "concurrency": d.concurrency, "preview": d.preview, "latest_deployment": latest })
 }
 
 /// The latest deployment of each environment of a repository, by lower-cased name.
@@ -227,13 +481,148 @@ struct EnvBody {
     protection: Option<Protection>,
     #[serde(default)]
     url: Option<String>,
+    /// At most this many deployments at once.
+    #[serde(default)]
+    concurrency: Option<u32>,
+    /// One of [`KINDS`], and where it deploys.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    targets: Option<Targets>,
+}
+
+/// Defines `name` in `repo` as kiln's own environment of `kind` on the runners `selector` picks,
+/// for a CD provider whose deployments the deploy action makes on its runners
+/// (docs/cd-targets.md §2.2, `microvm`), keeping the protection it has. One the repository's file
+/// defines is the file's: it must say that kind already.
+pub async fn define(hub: &Hub, repo: &Repo, name: &str, kind: &str, selector: &str) -> anyhow::Result<()> {
+    let targets = Targets { runners: Some(selector.trim().to_owned()), ..Targets::default() };
+    check_kind(Some(kind), &targets).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    let existing = defs(hub, repo).await?.remove(&name.to_ascii_lowercase());
+    if let Some(d) = &existing {
+        if d.source == "file" {
+            if d.kind.as_deref() == Some(kind) {
+                return Ok(());
+            }
+            anyhow::bail!("{name} is defined by {}'s .kiln/environments.yaml, as no {kind} environment", repo.name);
+        }
+        if d.kind.as_deref() == Some(kind) && d.targets == targets {
+            return Ok(());
+        }
+    }
+    let mut d = existing.unwrap_or(EnvDef { name: name.to_owned(), protection: Protection::default(), url: None, kind: None, targets: Targets::default(), source: "kiln".into(), agents_approve: false, concurrency: None, preview: None });
+    d.kind = Some(kind.to_owned());
+    d.targets = targets;
+    save(hub, repo, &d, "kilncd").await
+}
+
+/// Makes `d` in kiln (or changes the one made here): what saving an environment does.
+async fn save(hub: &Hub, repo: &Repo, d: &EnvDef, by: &str) -> anyhow::Result<()> {
+    let (id, n, p, u, who, limit, kind, targets) =
+        (repo.id.clone(), d.name.clone(), serde_json::to_string(&d.protection).unwrap_or_default(), d.url.clone(), by.to_owned(), d.concurrency, d.kind.clone(), serde_json::to_string(&d.targets).unwrap_or_default());
+    hub.store
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO ci_environments (repo_id, name, protection, url, source, created_at, created_by, concurrency, kind, targets) VALUES (?1, ?2, ?3, ?4, 'kiln', ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(repo_id, name) DO UPDATE SET protection = ?3, url = ?4, source = 'kiln', concurrency = ?7, kind = ?8, targets = ?9",
+                params![id, n, p, u, crate::util::now_unix(), who, limit, kind, targets],
+            )?;
+            Ok(())
+        })
+        .await?;
+    hub.store.audit(by.to_owned(), "ci.environments.save".into(), format!("{} {}", repo.name, d.name)).await;
+    Ok(())
+}
+
+/// A repository's starter set (W15-R08): `dev`, `staging` and `production`, each made unless the
+/// repository has one of its name. Staging and production deploy only from the trunk, production
+/// once its reviewer approves: whoever made the set (the owner, made by the server's own token).
+async fn starter(hub: &Hub, repo: &Repo, caller: Option<&Caller>, by: &str) -> Result<Response, Fail> {
+    let all = defs(hub, repo).await.map_err(internal)?;
+    let trunk = super::events::facts(hub, repo).await.default_branch;
+    let reviewer = caller.map(person_of).filter(|p| !p.is_empty() && *p != "admin").map_or_else(|| "owner".to_owned(), str::to_owned);
+    let set = [
+        ("dev", Protection::default()),
+        ("staging", Protection { branches: Some(vec![trunk.clone()]), ..Protection::default() }),
+        ("production", Protection { branches: Some(vec![trunk]), reviewers: vec![reviewer], ..Protection::default() }),
+    ];
+    let (mut made, mut kept) = (Vec::new(), Vec::new());
+    for (name, protection) in set {
+        if let Some(d) = all.get(name) {
+            kept.push(d.name.clone());
+            continue;
+        }
+        let d = EnvDef { name: name.to_owned(), protection, url: None, kind: None, targets: Targets::default(), source: "kiln".into(), agents_approve: false, concurrency: None, preview: None };
+        save(hub, repo, &d, by).await.map_err(internal)?;
+        made.push(name.to_owned());
+    }
+    Ok(srv::json(StatusCode::OK, &json!({ "repo": repo.name, "made": made, "kept": kept })))
+}
+
+/// The legs waiting to deploy (of `repo`'s runs, or every run's), newest run first: (repository
+/// id, the environment's lower-cased name, the leg, its run and why it waits).
+async fn waiting_legs(hub: &Hub, repo: Option<&str>) -> anyhow::Result<Vec<(String, String, Value)>> {
+    let repo = repo.map(str::to_owned);
+    hub.store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT r.repo_id, json_extract(j.wait_reason, '$.environment'), j.id, j.run_id, r.number, j.key, j.display, j.wait_reason, j.queued_at
+                 FROM jobs j JOIN runs r ON r.id = j.run_id
+                 WHERE j.status = 'queued' AND j.job_id IS NOT NULL AND json_extract(j.wait_reason, '$.environment') IS NOT NULL AND (?1 IS NULL OR r.repo_id = ?1)
+                 ORDER BY r.created_at DESC, j.rowid",
+            )?;
+            let rows = st.query_map([repo], |x| {
+                let why: Value = x.get::<_, Option<String>>(7)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
+                Ok((
+                    x.get::<_, String>(0)?,
+                    x.get::<_, String>(1)?.to_ascii_lowercase(),
+                    json!({ "leg": x.get::<_, String>(2)?, "run": x.get::<_, String>(3)?, "number": x.get::<_, i64>(4)?, "key": x.get::<_, String>(5)?, "name": x.get::<_, Option<String>>(6)?, "wait": why, "queued_at": x.get::<_, Option<i64>>(8)? }),
+                ))
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+}
+
+/// The board (W15-R09): every environment of every repository `caller` may read runs of, each
+/// with its latest deployment and the legs waiting to deploy there (for a review, a wait timer,
+/// a window, a promotion, a gate or their turn), newest run first.
+async fn board(hub: &Hub, caller: Option<&Caller>) -> Result<Response, Fail> {
+    let may = match caller {
+        Some(c) => crate::authz::gate::readable(hub, c, "runs.read").await,
+        None => None,
+    };
+    let repos: Vec<Repo> = hub.store.repos().await.map_err(internal)?.into_iter().filter(|r| may.as_ref().is_none_or(|m| m.contains(&r.name))).collect();
+    let waits = waiting_legs(hub, None).await.map_err(internal)?;
+    let mut rows = Vec::new();
+    for repo in &repos {
+        let all = defs(hub, repo).await.map_err(internal)?;
+        if all.is_empty() {
+            continue;
+        }
+        let mut last = latest(hub, repo).await.map_err(internal)?;
+        for (key, d) in &all {
+            let mut v = env_json(d, last.remove(key));
+            let waiting: Vec<&Value> = waits.iter().filter(|(r, e, _)| *r == repo.id && e == key).map(|(_, _, w)| w).collect();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("repo".into(), json!(repo.name));
+                o.insert("waiting".into(), json!(waiting));
+            }
+            rows.push(v);
+        }
+    }
+    Ok(srv::json(StatusCode::OK, &json!({ "environments": rows })))
 }
 
 /// `/api/ci/environments[/:name[/deployments]]?repo=`.
 pub async fn route(hub: &Hub, method: &Method, tail: &[&str], q: &HashMap<String, String>, body: Value, caller: Option<&Caller>) -> Result<Response, Fail> {
+    if (method, tail) == (&Method::GET, &["board"][..]) {
+        return board(hub, caller).await;
+    }
     let repo = repo_of(hub, q).await?;
     let by = caller.map_or_else(|| "admin".to_owned(), |c| c.name.clone());
     match (method, tail) {
+        (&Method::POST, ["starter"]) => starter(hub, &repo, caller, &by).await,
         (&Method::GET, []) => {
             let all = defs(hub, &repo).await.map_err(internal)?;
             let mut last = latest(hub, &repo).await.map_err(internal)?;
@@ -243,11 +632,20 @@ pub async fn route(hub: &Hub, method: &Method, tail: &[&str], q: &HashMap<String
             Ok(srv::json(StatusCode::OK, &json!({ "repo": repo.name, "environments": list })))
         }
         (&Method::GET, [name]) => {
-            let d = defs(hub, &repo).await.map_err(internal)?.remove(&name.to_ascii_lowercase()).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment `{name}`")))?;
-            let last = latest(hub, &repo).await.map_err(internal)?.remove(&name.to_ascii_lowercase());
-            Ok(srv::json(StatusCode::OK, &env_json(&d, last)))
+            let key = name.to_ascii_lowercase();
+            let d = defs(hub, &repo).await.map_err(internal)?.remove(&key).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment `{name}`")))?;
+            let last = latest(hub, &repo).await.map_err(internal)?.remove(&key);
+            let mut v = env_json(&d, last);
+            // What waits to deploy there (W15-R08).
+            let waits: Vec<Value> = waiting_legs(hub, Some(&repo.id)).await.map_err(internal)?.into_iter().filter(|(_, e, _)| *e == key).map(|(_, _, w)| w).collect();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("repo".into(), json!(repo.name));
+                o.insert("waiting".into(), json!(waits));
+            }
+            Ok(srv::json(StatusCode::OK, &v))
         }
         (&Method::GET, [name, "deployments"]) => deployments(hub, &repo, Some(name), q).await,
+        (&Method::POST, [name, "deploy"]) => deploy(hub, &repo, name, &body, caller).await,
         (&Method::POST, []) | (&Method::PUT | &Method::PATCH, [_]) => {
             let b: EnvBody = serde_json::from_value(body).map_err(|e| bad(format!("{e}")))?;
             let name = match tail {
@@ -263,23 +661,28 @@ pub async fn route(hub: &Hub, method: &Method, tail: &[&str], q: &HashMap<String
             }
             let protection = b.protection.unwrap_or_default();
             protection.check().map_err(bad)?;
-            let (id, n, p, u, who) = (repo.id.clone(), name.clone(), serde_json::to_string(&protection).unwrap_or_default(), b.url.clone(), by.clone());
-            hub.store
-                .call(move |c| {
-                    c.execute(
-                        "INSERT INTO ci_environments (repo_id, name, protection, url, source, created_at, created_by) VALUES (?1, ?2, ?3, ?4, 'kiln', ?5, ?6)
-                         ON CONFLICT(repo_id, name) DO UPDATE SET protection = ?3, url = ?4, source = 'kiln'",
-                        params![id, n, p, u, crate::util::now_unix(), who],
-                    )?;
-                    Ok(())
-                })
-                .await
-                .map_err(internal)?;
-            hub.store.audit(by, "ci.environments.save".into(), format!("{} {name}", repo.name)).await;
-            let d = EnvDef { name, protection, url: b.url, source: "kiln".into(), agents_approve: false };
-            Ok(srv::json(if *method == Method::POST { StatusCode::CREATED } else { StatusCode::OK }, &env_json(&d, None)))
+            if b.concurrency == Some(0) {
+                return Err(bad("a concurrency limit is 1 or more (leave it out for none)"));
+            }
+            let kind = b.kind.map(|k| k.trim().to_ascii_lowercase()).filter(|k| !k.is_empty());
+            let targets = b.targets.unwrap_or_default().of(kind.as_deref());
+            check_kind(kind.as_deref(), &targets).map_err(bad)?;
+            let d = EnvDef { name, protection, url: b.url, kind, targets, source: "kiln".into(), agents_approve: false, concurrency: b.concurrency, preview: None };
+            save(hub, &repo, &d, &by).await.map_err(internal)?;
+            let mut v = env_json(&d, None);
+            let (diagnostics, preview) = effect(hub, &repo, &d).await;
+            if let Some(o) = v.as_object_mut() {
+                o.insert("diagnostics".into(), json!(diagnostics));
+                o.insert("preview".into(), preview);
+            }
+            Ok(srv::json(if *method == Method::POST { StatusCode::CREATED } else { StatusCode::OK }, &v))
         }
         (&Method::DELETE, [name]) => {
+            // A preview goes as it would when its change closes (W15-R07): its deployments too.
+            if super::previews::end(hub, &repo, name, &format!("{by} removed it")).await.map_err(internal)? {
+                hub.store.audit(by, "ci.environments.delete".into(), format!("{} {name}", repo.name)).await;
+                return Ok(srv::status(StatusCode::NO_CONTENT));
+            }
             let (id, n) = (repo.id.clone(), (*name).to_owned());
             let gone = hub.store.call(move |c| Ok(c.execute("DELETE FROM ci_environments WHERE repo_id = ?1 AND name = ?2 COLLATE NOCASE", params![id, n])?)).await.map_err(internal)?;
             if gone == 0 {
@@ -290,6 +693,101 @@ pub async fn route(hub: &Hub, method: &Method, tail: &[&str], q: &HashMap<String
         }
         _ => Err((StatusCode::NOT_FOUND, "no such environments route".into())),
     }
+}
+
+/// What an environment's change does now (docs/ci.md W20-R03): warnings for a reviewer who isn't
+/// anyone here, for one reviewer who can't approve their own runs, and for a trunk its branches
+/// rule leaves out; and what a deployment from the trunk would meet now.
+async fn effect(hub: &Hub, repo: &Repo, d: &EnvDef) -> (Vec<Value>, Value) {
+    let p = &d.protection;
+    let mut diagnostics = Vec::new();
+    let people: Vec<String> = hub
+        .store
+        .call(|c| {
+            let mut st = c.prepare("SELECT name FROM users WHERE disabled_at IS NULL")?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap_or_default();
+    for r in p.reviewers.iter().filter(|r| !r.contains(':') && *r != "admin" && *r != "owner") {
+        if !people.iter().any(|n| n.eq_ignore_ascii_case(r)) {
+            diagnostics.push(json!({ "level": "warning", "message": format!("reviewer {r} isn't anyone here: they can't approve") }));
+        }
+    }
+    if p.prevent_self_review && p.reviewers.len() == 1 && !p.reviewers.iter().any(|r| r.contains(':')) {
+        diagnostics.push(json!({ "level": "warning", "message": format!("{} is the only reviewer and can't approve their own runs: their deployments to {} wait for no one", p.reviewers.join(""), d.name) }));
+    }
+    let trunk = super::events::facts(hub, repo).await.default_branch;
+    let now = crate::util::now_unix();
+    let meets = match kiln_ci::env::gate(&d.name, p, &format!("refs/heads/{trunk}"), now, now, &[]) {
+        kiln_ci::env::Gate::Open => "starts at once".to_owned(),
+        kiln_ci::env::Gate::Refused(why) => {
+            diagnostics.push(json!({ "level": "warning", "message": format!("the trunk ({trunk}) may not deploy to {}: {why}", d.name) }));
+            format!("refused: {why}")
+        }
+        kiln_ci::env::Gate::Rejected { by, .. } => format!("rejected by {by}"),
+        kiln_ci::env::Gate::Waiting { reviewers, until, window, promotion, gate } => {
+            let mut waits: Vec<String> = Vec::new();
+            if !reviewers.is_empty() {
+                waits.push(format!("a review by one of {}", reviewers.join(", ")));
+            }
+            if let Some(w) = window {
+                waits.push(w);
+            }
+            if let Some(pr) = promotion {
+                waits.push(pr);
+            }
+            if let Some(g) = gate {
+                waits.push(g);
+            }
+            if waits.is_empty() && until.is_some() {
+                waits.push(format!("its wait timer ({} minutes)", p.wait_timer));
+            }
+            format!("waits for {}", waits.join("; "))
+        }
+    };
+    (diagnostics, json!({ "trunk": trunk, "a_deployment_from_the_trunk": meets }))
+}
+
+/// A deployment to environment `name` by hand (`POST /api/ci/environments/:name/deploy`, §4.1):
+/// the workflow at `ref` (the trunk by default) that deploys there, one with a job bound to it
+/// (`environment: <name>`) and a `workflow_dispatch` trigger (`workflow` when several are),
+/// dispatched with `inputs`. Its job waits for the environment's protection as any deployment's
+/// does.
+async fn deploy(hub: &Hub, repo: &Repo, name: &str, body: &Value, caller: Option<&Caller>) -> Result<Response, Fail> {
+    let git_ref = match body.get("ref").and_then(Value::as_str).filter(|r| !r.is_empty()) {
+        Some(r) => r.to_owned(),
+        None => super::events::facts(hub, repo).await.default_branch,
+    };
+    let (_, sha) = super::events::named_ref(hub, repo, &git_ref).await.map_err(|r| (r.status, r.message))?;
+    let commit = super::load::load(hub, repo, &sha).await.map_err(internal)?;
+    let asked = body.get("workflow").and_then(Value::as_str).filter(|w| !w.is_empty());
+    let deploys: Vec<&str> = commit
+        .workflows
+        .iter()
+        .filter(|l| l.runs)
+        .filter_map(|l| {
+            let w = l.workflow.as_ref()?;
+            let by_hand = w.on.iter().any(|t| t.event == "workflow_dispatch");
+            let there = w.jobs.iter().any(|j| j.environment.as_ref().is_some_and(|e| e.name.src.trim().eq_ignore_ascii_case(name)));
+            (by_hand && there).then_some(l.path.as_str())
+        })
+        .filter(|p| asked.is_none_or(|a| *p == a || p.rsplit('/').next() == Some(a)))
+        .collect();
+    let path = match deploys.as_slice() {
+        [one] => (*one).to_owned(),
+        [] => return Err((StatusCode::CONFLICT, format!("no workflow at {git_ref} deploys to {name} by hand: one with `workflow_dispatch` and a job with `environment: {name}`"))),
+        many => return Err((StatusCode::CONFLICT, format!("{} deploy to {name}: say which (`workflow`)", many.join(", ")))),
+    };
+    let inputs = body.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
+    // A repository whose CI is another provider's (W23-R01): that provider starts it.
+    if let Some(started) = super::providers::dispatch(hub, repo, &path, &git_ref, &Value::Object(inputs.clone())).await {
+        started?;
+    } else {
+        super::events::workflow_dispatch(hub, repo, &git_ref, &path, &inputs, "kiln", caller.and_then(Caller::started_by)).await.map_err(|r| (r.status, r.message))?;
+    }
+    Ok(srv::json(StatusCode::ACCEPTED, &json!({ "environment": name, "workflow": path, "ref": git_ref })))
 }
 
 /// A repository's deployments, newest first: of one environment, or (`?environment=`) any.
@@ -328,18 +826,47 @@ struct ApproveBody {
     comment: String,
 }
 
-/// Whether `caller` may review deployments to `env` of a run by `actor`.
-fn may_review(caller: &Caller, env: &EnvDef, actor: &str) -> Result<(), String> {
+/// The person a caller acts for: `alice` of `user:alice`, of `agent:x for user:alice`.
+fn person_of(caller: &Caller) -> &str {
+    let user = caller.name.split(" for ").last().unwrap_or(&caller.name).split(" of ").last().unwrap_or(&caller.name);
+    user.strip_prefix("user:").unwrap_or(user)
+}
+
+/// The teams and groups a kiln user belongs to on the hosts they sign in with, as of their last
+/// sign-in (W23-R08: GitHub's `org/team`s, GitLab's groups' paths, Bitbucket's workspaces).
+async fn memberships(hub: &Hub, user: &str) -> Vec<String> {
+    let user = user.to_owned();
+    hub.store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT i.groups FROM user_identities i JOIN users u ON u.id = i.user_id WHERE u.name = ?1 COLLATE NOCASE AND u.disabled_at IS NULL")?;
+            let rows = q.query_map([&user], |r| r.get::<_, Option<String>>(0))?;
+            let mut all = Vec::new();
+            for g in rows {
+                all.extend(g?.and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()).unwrap_or_default());
+            }
+            Ok(all)
+        })
+        .await
+        .unwrap_or_default()
+}
+
+/// Whether `caller` may review deployments to `env` of a run by `actor` in a repository of
+/// `owner`'s. A listed reviewer is a person (`alice`) or a team (`team:acme/web`, or `team:web`
+/// for the owner's), which `teams`, the caller's memberships, must hold.
+fn may_review(caller: &Caller, env: &EnvDef, actor: &str, owner: &str, teams: &[String]) -> Result<(), String> {
     if caller.is_owner() {
         return Ok(());
     }
-    let user = caller.name.split(" for ").last().unwrap_or(&caller.name).split(" of ").last().unwrap_or(&caller.name);
-    let user = user.strip_prefix("user:").unwrap_or(user);
+    let user = person_of(caller);
     if caller.kind == crate::authz::gate::Kind::Agent && !env.agents_approve {
         return Err(format!("agents don't approve deployments to {} (its `agents: {{ approve: true }}` allows it)", env.name));
     }
-    if !env.protection.reviewers.is_empty() && !env.protection.reviewers.iter().any(|r| r.strip_prefix("user:").unwrap_or(r).eq_ignore_ascii_case(user)) {
-        return Err(format!("{user} is not a required reviewer of {}", env.name));
+    let listed = |r: &String| match r.strip_prefix("team:") {
+        Some(t) => teams.iter().any(|m| m.eq_ignore_ascii_case(t) || m.eq_ignore_ascii_case(&format!("{owner}/{t}"))),
+        None => r.strip_prefix("user:").unwrap_or(r).eq_ignore_ascii_case(user),
+    };
+    if !env.protection.reviewers.is_empty() && !env.protection.reviewers.iter().any(listed) {
+        return Err(format!("{user} is not a required reviewer of {} (nor in a team that is)", env.name));
     }
     if env.protection.prevent_self_review && user.eq_ignore_ascii_case(actor) {
         return Err(format!("{} prevents self-review: {user} started this run", env.name));
@@ -401,12 +928,14 @@ pub async fn approve(hub: &Hub, run: &str, body: Value, caller: Option<&Caller>)
     let all = defs(hub, &repo).await.map_err(internal)?;
     let owner = Caller::owner();
     let who = caller.unwrap_or(&owner);
+    let teams = if who.is_owner() { Vec::new() } else { memberships(hub, person_of(who)).await };
+    let repo_owner = repo.name.split_once('/').map_or(repo.name.as_str(), |(o, _)| o);
     for e in &named {
         let d = all.get(&e.to_ascii_lowercase()).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment `{e}`")))?;
         if !who.is_owner() && !who.can("runs.approve", &Scope::Environment { repo: repo.name.clone(), environment: d.name.clone() }) {
             return Err((StatusCode::FORBIDDEN, format!("{} may not review deployments to {}: that needs runs.approve there", who.name, d.name)));
         }
-        may_review(who, d, &actor).map_err(|m| (StatusCode::FORBIDDEN, m))?;
+        may_review(who, d, &actor, repo_owner, &teams).map_err(|m| (StatusCode::FORBIDDEN, m))?;
     }
     let (rid, by, comment, envs) = (run.to_owned(), who.name.clone(), b.comment.clone(), named.clone());
     hub.store
@@ -460,8 +989,12 @@ mod tests {
             name: "production".into(),
             protection: Protection { reviewers: reviewers.iter().map(|r| (*r).to_owned()).collect(), prevent_self_review: self_review, ..Protection::default() },
             url: None,
+            kind: None,
+            targets: Targets::default(),
             source: "file".into(),
             agents_approve: agents,
+            concurrency: None,
+            preview: None,
         }
     }
 
@@ -469,24 +1002,33 @@ mod tests {
     fn w15_r03_who_may_review() {
         let none = || Some(crate::authz::Rights::default());
         let alice = Caller::with(crate::authz::gate::Kind::User, "user:alice", none(), None);
-        assert!(may_review(&alice, &env(&["alice"], false, false), "bob").is_ok());
-        assert!(may_review(&alice, &env(&["user:ALICE"], false, false), "bob").is_ok());
-        assert!(may_review(&alice, &env(&["carol"], false, false), "bob").is_err(), "not a listed reviewer");
-        assert!(may_review(&alice, &env(&["alice"], true, false), "alice").is_err(), "self-review prevented");
-        assert!(may_review(&alice, &env(&[], false, false), "alice").is_ok(), "no reviewers listed: anyone with runs.approve");
+        let may = |c: &Caller, e: &EnvDef, actor: &str| may_review(c, e, actor, "acme", &[]);
+        assert!(may(&alice, &env(&["alice"], false, false), "bob").is_ok());
+        assert!(may(&alice, &env(&["user:ALICE"], false, false), "bob").is_ok());
+        assert!(may(&alice, &env(&["carol"], false, false), "bob").is_err(), "not a listed reviewer");
+        assert!(may(&alice, &env(&["alice"], true, false), "alice").is_err(), "self-review prevented");
+        assert!(may(&alice, &env(&[], false, false), "alice").is_ok(), "no reviewers listed: anyone with runs.approve");
         let agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:fixer for user:alice", none(), none());
-        assert!(may_review(&agent, &env(&["alice"], false, false), "bob").is_err(), "agents only where allowed");
-        assert!(may_review(&agent, &env(&["alice"], false, true), "bob").is_ok());
-        assert!(may_review(&Caller::owner(), &env(&["carol"], true, false), "admin").is_ok(), "the owner always may");
+        assert!(may(&agent, &env(&["alice"], false, false), "bob").is_err(), "agents only where allowed");
+        assert!(may(&agent, &env(&["alice"], false, true), "bob").is_ok());
+        assert!(may(&Caller::owner(), &env(&["carol"], true, false), "admin").is_ok(), "the owner always may");
+        // Teams: the host's `org/team`, or a team of the repository's owner.
+        let web = vec!["acme".to_owned(), "acme/web".to_owned()];
+        assert!(may_review(&alice, &env(&["team:acme/web"], false, false), "bob", "acme", &web).is_ok());
+        assert!(may_review(&alice, &env(&["team:web"], false, false), "bob", "acme", &web).is_ok(), "the owner's team");
+        assert!(may_review(&alice, &env(&["team:web"], false, false), "bob", "other", &web).is_err(), "another owner's team");
+        assert!(may_review(&alice, &env(&["team:acme/ops"], false, false), "bob", "acme", &web).is_err(), "not in it");
+        assert!(may_review(&alice, &env(&["team:acme/web"], true, false), "alice", "acme", &web).is_err(), "a team doesn't lift self-review");
     }
 
     #[test]
     fn w15_r01_the_file_s_ci_keys() -> Result<(), String> {
-        let m: BTreeMap<String, FileEnv> = serde_yaml::from_str("production:\n  branches: [main]\n  clusters: [in-cluster]\n  reviewers: [alice]\n  wait-timer: 5\n  url: https://example.com\n  agents: { approve: true, deploy: false }\nstaging: {}\n").map_err(|e| e.to_string())?;
+        let m: BTreeMap<String, FileEnv> = serde_yaml::from_str("production:\n  branches: [main]\n  clusters: [in-cluster]\n  reviewers: [alice]\n  wait-timer: 5\n  url: https://example.com\n  agents: { approve: true, deploy: false }\n  concurrency: 1\nstaging: {}\n").map_err(|e| e.to_string())?;
         let p = m.get("production").ok_or("production")?;
         assert_eq!(p.protection.branches, Some(vec!["main".to_owned()]));
         assert_eq!((p.protection.reviewers.clone(), p.protection.wait_timer, p.url.clone(), p.agents.approve), (vec!["alice".to_owned()], 5, Some("https://example.com".to_owned()), true));
-        assert!(m.get("staging").is_some_and(|s| s.protection.is_empty()));
+        assert!(m.get("staging").is_some_and(|s| s.protection.is_empty() && s.concurrency.is_none()));
+        assert_eq!(p.concurrency, Some(1));
         Ok(())
     }
 }

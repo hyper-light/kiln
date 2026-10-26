@@ -48,6 +48,10 @@ case "$(uname -m)" in
 esac
 # An x86_64 shell under Rosetta on Apple silicon still gets the native build.
 if [ "$OS" = apple-darwin ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 1 ]; then ARCH=aarch64; fi
+if [ "$OS" = apple-darwin ] && [ "$ARCH" = x86_64 ]; then
+  echo "kiln: Intel Macs aren't supported: kiln runs on Apple silicon Macs" >&2
+  exit 1
+fi
 TARGET="$ARCH-$OS"
 
 # Same machine type as the server (on Linux: same CPU, as before): the server's own binary.

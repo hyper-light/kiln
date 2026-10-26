@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use std::process::Command;
@@ -217,10 +217,39 @@ pub(crate) async fn commit_info(hub: &Hub, repo: &Repo, sha: &str) -> (String, S
     }
 }
 
+/// Where `repo`'s commits are read: kiln's own repository when kiln hosts it, whose diffs'
+/// versions (`refs/kiln/diffs/…`) its mirror never fetches, else its mirror.
+pub(crate) fn git_dir(hub: &Hub, repo: &Repo) -> PathBuf {
+    crate::ci::hosting::native_path(hub, repo).unwrap_or_else(|| mirror_path(hub, &repo.name))
+}
+
 pub(crate) async fn changed_files(hub: &Hub, repo: &Repo, old: &str, new: &str) -> Option<Vec<String>> {
-    let p = mirror_path(hub, &repo.name).to_string_lossy().to_string();
+    let p = git_dir(hub, repo).to_string_lossy().to_string();
     let o = run_git(hub, &["-C", &p, "diff", "--name-only", old, new], LS_REMOTE_TIMEOUT).await.ok()?;
     Some(String::from_utf8_lossy(&o).lines().map(str::to_owned).collect())
+}
+
+/// A pull request's counts in its payload (W03-R07), as GitHub's: the commits `base..head`, and
+/// the lines and files `base...head` changes (0 each that git can't say).
+pub(crate) async fn pr_counts(hub: &Hub, repo: &Repo, base: &str, head: &str) -> kiln_ci::trigger::context::Counts {
+    let mut c = kiln_ci::trigger::context::Counts::default();
+    if base.is_empty() || head.is_empty() {
+        return c;
+    }
+    let p = git_dir(hub, repo).to_string_lossy().to_string();
+    if let Ok(o) = run_git(hub, &["-C", &p, "rev-list", "--count", &format!("{base}..{head}")], LS_REMOTE_TIMEOUT).await {
+        c.commits = String::from_utf8_lossy(&o).trim().parse().unwrap_or(0);
+    }
+    if let Ok(o) = run_git(hub, &["-C", &p, "diff", "--numstat", &format!("{base}...{head}")], LS_REMOTE_TIMEOUT).await {
+        for l in String::from_utf8_lossy(&o).lines() {
+            // A binary file's lines are `-`: 0, as GitHub counts them.
+            let mut n = l.split('\t').map(|n| n.parse::<u64>().unwrap_or(0));
+            c.additions += n.next().unwrap_or(0);
+            c.deletions += n.next().unwrap_or(0);
+            c.changed_files += 1;
+        }
+    }
+    c
 }
 
 #[derive(Debug, Clone)]
@@ -340,12 +369,11 @@ pub async fn trigger(hub: &Hub, repo: &Repo, t: Trigger) -> anyhow::Result<Vec<R
             .await?;
         crate::metrics::global().runs_started.inc();
         tracing::info!(repo = %repo.name, run = run.number, event = t.event, branch = %t.branch, sha = %t.sha, "run created");
-        if let (Some(g), Some(c)) = (group, &p.concurrency)
-            && c.cancel_in_progress {
-                for old in hub.store.active_runs_in_group(g, run.id.clone()).await? {
-                    hub.cancel_run(&old, "superseded by a newer run").await?;
-                }
+        if let (Some(g), Some(c)) = (group, &p.concurrency) {
+            for old in hub.store.superseded_in_group(g, run.id.clone(), c.cancel_in_progress).await? {
+                hub.cancel_run(&old, "superseded by a newer run").await?;
             }
+        }
         report_status(hub, &run, Status::Pending).await;
         hub.emit_run(&run.id).await;
         runs.push(run);
@@ -527,33 +555,102 @@ pub async fn discover_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
         if let Err(e) = discover(&hub, http).await {
             tracing::warn!(error = %format!("{e:#}"), "repository discovery failed");
         }
-        hub.gitops_kick.notify();
+        wake(&hub);
         if !hub.shutdown.sleep(Duration::from_secs(u64::from(hub.cfg.gitops.discover_seconds.max(60)))).await {
             return Ok(());
         }
     }
 }
 
-/// Poll every repository when it is due (or immediately when kicked by a webhook / the UI).
+/// A failed poll's backoff: from 10 s, doubling with each failure in a row up to 5 minutes, with
+/// jitter. A repository is polled again only once it's over (and its interval, unless asked).
+const BACKOFF_FIRST: Duration = Duration::from_secs(10);
+const BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// The backoff after `failures` failed polls in a row.
+fn backoff(failures: u32) -> Duration {
+    let d = BACKOFF_FIRST.saturating_mul(2u32.saturating_pow(failures.saturating_sub(1).min(16)));
+    crate::sup::jitter(d.min(BACKOFF_MAX))
+}
+
+/// Asks the poller to poll repository `id` (by its id) now: a push, a webhook, a new repository.
+/// One backing off after a failed poll is polled once its backoff is over.
+pub fn want(hub: &Hub, id: &str) {
+    hub.gitops_wanted.lock().insert(id.to_owned());
+    hub.gitops_kick.notify();
+}
+
+/// [`want`] for the repository a webhook names (`owner/name`, as its host spells it), if kiln has
+/// it; otherwise the poller is only woken.
+pub async fn want_named(hub: &Hub, name: &str) {
+    match hub.store.repos().await {
+        Ok(repos) => match repos.into_iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
+            Some(r) => want(hub, &r.id),
+            None => wake(hub),
+        },
+        Err(e) => {
+            tracing::warn!(repo = %name, error = %format!("{e:#}"), "a webhook's repository couldn't be looked up; the poller is only woken");
+            wake(hub);
+        }
+    }
+}
+
+/// Wakes the poller to poll what's due (a repository discovered or added is: it was never
+/// polled). It asks for nothing else.
+pub fn wake(hub: &Hub) {
+    hub.gitops_kick.notify();
+}
+
+/// Polls each repository when its interval says, when it's asked for ([`want`]), and every one
+/// once as the server starts. A failed poll backs off ([`backoff`]) whatever asks, so polls that
+/// fail at once (a DNS outage) never spin, and a kick polls only what it names.
 pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
+    run_polls(hub, |hub: Arc<Hub>, repo: Repo| async move { poll_repo(&hub, &repo).await }).await
+}
+
+/// [`poll_loop`], with the poll it runs.
+async fn run_polls<P, F>(hub: Arc<Hub>, poll: P) -> anyhow::Result<()>
+where
+    P: Fn(Arc<Hub>, Repo) -> F + Clone + Send + Sync + 'static,
+    F: std::future::Future<Output = anyhow::Result<usize>> + Send + 'static,
+{
     let sem = Arc::new(async_lock::Semaphore::new(hub.cfg.gitops.git_concurrency.max(1)));
     let inflight = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
-    let mut force = true;
+    // Asked for while their poll ran (a push meanwhile): asked for again as that poll ends.
+    let again = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
+    // Each failing repository's failures in a row, and when it may be polled again.
+    let failing = Arc::new(parking_lot::Mutex::new(HashMap::<String, (u32, Instant)>::new()));
+    let mut start = true;
     loop {
         let now = crate::util::now_unix();
+        let asked = std::mem::take(&mut *hub.gitops_wanted.lock());
         for repo in hub.store.repos().await? {
             if !repo.enabled {
                 continue;
             }
-            let due = force || repo.last_polled_at.is_none_or(|t| now - t >= i64::from(repo.poll_seconds.max(10)));
-            if !due || inflight.lock().contains(&repo.id) {
+            let wanted = asked.contains(&repo.id);
+            if inflight.lock().contains(&repo.id) {
+                if wanted {
+                    again.lock().insert(repo.id.clone());
+                }
+                continue;
+            }
+            if failing.lock().get(&repo.id).is_some_and(|(_, until)| Instant::now() < *until) {
+                // Still asked for once its backoff is over.
+                if wanted {
+                    hub.gitops_wanted.lock().insert(repo.id.clone());
+                }
+                continue;
+            }
+            let due = start || wanted || repo.last_polled_at.is_none_or(|t| now - t >= i64::from(repo.poll_seconds.max(10)));
+            if !due {
                 continue;
             }
             inflight.lock().insert(repo.id.clone());
-            let (hub, sem, inflight) = (hub.clone(), sem.clone(), inflight.clone());
+            let (hub, sem, inflight, again, failing, poll) = (hub.clone(), sem.clone(), inflight.clone(), again.clone(), failing.clone(), poll.clone());
             crate::sup::spawn_guarded("poll-repo", async move {
                 let _permit = sem.acquire().await;
-                let r = poll_repo(&hub, &repo).await;
+                let r = poll(Arc::clone(&hub), repo.clone()).await;
                 let err = r.as_ref().err().map(|e| format!("{e:#}"));
                 let result = match &r {
                     Ok(0) => "unchanged",
@@ -561,18 +658,31 @@ pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
                     Err(_) => "error",
                 };
                 crate::metrics::global().gitops_polls.inc(&[result]);
-                if let Some(e) = &err {
-                    tracing::warn!(repo = %repo.name, error = %e, "poll failed");
+                match &err {
+                    Some(e) => {
+                        let mut f = failing.lock();
+                        let (n, until) = f.entry(repo.id.clone()).or_insert((0, Instant::now()));
+                        *n = n.saturating_add(1);
+                        let wait = backoff(*n);
+                        *until = Instant::now() + wait;
+                        tracing::warn!(repo = %repo.name, error = %e, failures = *n, retry_in_s = wait.as_secs(), "poll failed");
+                    }
+                    None => {
+                        failing.lock().remove(&repo.id);
+                    }
                 }
                 hub.store.repo_polled(repo.id.clone(), err).await?;
                 inflight.lock().remove(&repo.id);
+                if again.lock().remove(&repo.id) {
+                    want(&hub, &repo.id);
+                }
                 Ok(())
             });
         }
-        force = false;
+        start = false;
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
-            () = hub.gitops_kick.notified().fuse() => force = true,
+            () = hub.gitops_kick.notified().fuse() => {}
             () = crate::rt::sleep(Duration::from_secs(5)).fuse() => {}
         }
     }
@@ -698,7 +808,130 @@ pub async fn archive(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<async_
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    /// Repositories kiln polls, made in `hub`'s store: `n` of them, never polled, polled every
+    /// `every` seconds.
+    async fn repos(hub: &Hub, n: usize, every: u32) -> anyhow::Result<Vec<String>> {
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let r = hub
+                .store
+                .upsert_repo(Repo {
+                    id: crate::util::new_id(),
+                    name: format!("acme/r{i}"),
+                    clone_url: format!("https://git.example.invalid/acme/r{i}.git"),
+                    branches: Vec::new(),
+                    poll_seconds: every,
+                    enabled: true,
+                    created_at: crate::util::now_unix(),
+                    last_polled_at: None,
+                    last_error: None,
+                    mode: "upstream".into(),
+                    default_branch: None,
+                    mirror: None,
+                })
+                .await?;
+            ids.push(r.id);
+        }
+        Ok(ids)
+    }
+
+    /// Polls that fail at once don't spin (production, 2026-10-24: in a DNS outage each failed poll
+    /// kicked a round over every repository, some 880 `git ls-remote` a second). Every poll fails
+    /// in 5 ms while a kick comes every 10 ms, a plain one and one naming each repository: each is
+    /// polled once as the poller starts, then backs off.
+    #[test]
+    fn polls_that_fail_fast_stay_bounded_while_kicks_keep_coming() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let ids = repos(&hub, 6, 10).await?;
+            let polls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&polls);
+            let poller = crate::rt::spawn(run_polls(Arc::clone(&hub), move |_hub: Arc<Hub>, _repo: Repo| {
+                let counted = Arc::clone(&counted);
+                async move {
+                    counted.fetch_add(1, Ordering::AcqRel);
+                    crate::rt::sleep(Duration::from_millis(5)).await;
+                    Err::<usize, _>(anyhow::anyhow!("could not resolve host: git.example.invalid"))
+                }
+            }));
+            let until = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < until {
+                wake(&hub);
+                for id in &ids {
+                    want(&hub, id);
+                }
+                crate::rt::sleep(Duration::from_millis(10)).await;
+            }
+            hub.shutdown.cancel();
+            poller.await??;
+            let n = polls.load(Ordering::Acquire);
+            anyhow::ensure!(n <= 2 * ids.len(), "{n} polls of {} repositories in 2 s", ids.len());
+            for r in hub.store.repos().await? {
+                anyhow::ensure!(r.last_error.is_some(), "{} wasn't polled", r.name);
+            }
+            Ok(())
+        })
+    }
+
+    /// A kick polls what it names, and only that: a plain wake polls nothing that isn't due; a
+    /// repository asked for while its poll runs is polled once more as it ends.
+    #[test]
+    fn a_kick_polls_only_what_it_names() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let ids = repos(&hub, 3, 3600).await?;
+            let [a, b, c] = <[String; 3]>::try_from(ids.clone()).map_err(|_| anyhow::anyhow!("three repositories"))?;
+            let polls = Arc::new(parking_lot::Mutex::new(HashMap::<String, usize>::new()));
+            let (counted, slow) = (Arc::clone(&polls), a.clone());
+            let poller = crate::rt::spawn(run_polls(Arc::clone(&hub), move |_hub: Arc<Hub>, repo: Repo| {
+                let (counted, slow) = (Arc::clone(&counted), slow.clone());
+                async move {
+                    *counted.lock().entry(repo.id.clone()).or_default() += 1;
+                    crate::rt::sleep(Duration::from_millis(if repo.id == slow { 300 } else { 1 })).await;
+                    Ok::<usize, anyhow::Error>(0)
+                }
+            }));
+            let count = |id: &str| polls.lock().get(id).copied().unwrap_or(0);
+            let settle = |want: Vec<(String, usize)>| {
+                let polls = Arc::clone(&polls);
+                async move {
+                    let until = Instant::now() + Duration::from_secs(3);
+                    while Instant::now() < until {
+                        if want.iter().all(|(id, n)| polls.lock().get(id).copied().unwrap_or(0) == *n) {
+                            return true;
+                        }
+                        crate::rt::sleep(Duration::from_millis(10)).await;
+                    }
+                    false
+                }
+            };
+            // As it starts, each once.
+            anyhow::ensure!(settle(ids.iter().map(|i| (i.clone(), 1)).collect()).await, "the first round: {:?}", polls.lock());
+            crate::rt::sleep(Duration::from_millis(400)).await;
+            // A plain wake: nothing is due.
+            wake(&hub);
+            crate::rt::sleep(Duration::from_millis(200)).await;
+            anyhow::ensure!(ids.iter().all(|i| count(i) == 1), "a wake polled what wasn't due: {:?}", polls.lock());
+            // One named: that one.
+            want(&hub, &b);
+            anyhow::ensure!(settle(vec![(b.clone(), 2)]).await, "the one asked for wasn't polled: {:?}", polls.lock());
+            anyhow::ensure!(count(&a) == 1 && count(&c) == 1, "others were polled: {:?}", polls.lock());
+            // Asked for while its poll runs: once more as it ends, and no more.
+            want(&hub, &a);
+            anyhow::ensure!(settle(vec![(a.clone(), 2)]).await, "a wasn't polled: {:?}", polls.lock());
+            want(&hub, &a);
+            anyhow::ensure!(settle(vec![(a.clone(), 3)]).await, "a wasn't polled again after its poll: {:?}", polls.lock());
+            crate::rt::sleep(Duration::from_millis(800)).await;
+            anyhow::ensure!(count(&a) == 3 && count(&b) == 2 && count(&c) == 1, "polled more than asked: {:?}", polls.lock());
+            hub.shutdown.cancel();
+            poller.await??;
+            Ok(())
+        })
+    }
 
     #[test]
     fn empty_repository_has_no_commits() {

@@ -250,11 +250,64 @@ pub async fn put(hub: &Hub, q: &HashMap<String, String>, body: Value, by: &str) 
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     hub.store.audit(by.to_owned(), "ci.routing.rules".into(), format!("{scope}: {n} rules")).await;
     hub.ci.send(super::dispatch::Msg::RoutingChanged);
-    Ok(srv::json(StatusCode::OK, &json!({ "scope": scope, "rules": rules })))
+    // What the change does now (W20-R03): the dispatcher has the new rules before it answers.
+    let (diagnostics, preview) = effect(hub, &rules).await;
+    Ok(srv::json(StatusCode::OK, &json!({ "scope": scope, "rules": rules, "diagnostics": diagnostics, "preview": preview })))
+}
+
+/// Where `route` goes now, as the dispatcher explains it.
+async fn route_now(hub: &Hub, route: LegRoute) -> Option<Value> {
+    let (tx, rx) = async_channel::bounded(1);
+    hub.ci.send(super::dispatch::Msg::ExplainRoute { route: Box::new(route), reply: tx });
+    crate::rt::timeout(Duration::from_secs(5), rx.recv()).await.ok()?.ok()
+}
+
+/// The runners a route's explanation says take it now: connected, and every check passing.
+fn takers(v: &Value) -> Vec<String> {
+    v.get("runners").and_then(Value::as_array).into_iter().flatten().filter(|r| r.get("connected") == Some(&json!(true)) && r.get("eligible") == Some(&json!(true))).filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_owned)).collect()
+}
+
+/// What a change of rules does now (W20-R03): for each rule that matches labels, a warning when
+/// no runner connected now meets it (its legs would wait); and for the label sets the last week's
+/// legs asked for, where each would go now (at most 20).
+pub async fn effect(hub: &Hub, rules: &[Rule]) -> (Vec<Value>, Vec<Value>) {
+    let leg = |labels: Vec<String>, repo: String| LegRoute { labels, repo, event: "push".into(), caps: u64::from(crate::proto::CAP_CI2), ..LegRoute::default() };
+    let mut diagnostics = Vec::new();
+    for (i, r) in rules.iter().enumerate().filter(|(_, r)| !r.matches.labels.is_empty()) {
+        // A repository the rule is for, when it names one plainly.
+        let repo = r.matches.repos.iter().find(|g| !g.contains('*')).cloned().unwrap_or_default();
+        if let Some(v) = route_now(hub, leg(r.matches.labels.clone(), repo)).await
+            && takers(&v).is_empty()
+        {
+            diagnostics.push(json!({ "rule": i + 1, "level": "warning", "message": format!("no runner connected now meets rule {} ({}): its legs would wait", i + 1, r.matches.labels.join(", ")) }));
+        }
+    }
+    let since = crate::util::now_unix() - 7 * 86_400;
+    let recent: Vec<String> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT labels FROM jobs WHERE queued_at >= ?1 GROUP BY labels ORDER BY MAX(queued_at) DESC LIMIT 20")?;
+            let rows = st.query_map([since], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap_or_default();
+    let mut preview = Vec::new();
+    for text in recent {
+        let labels: Vec<String> = serde_json::from_str(&text).unwrap_or_default();
+        if labels.is_empty() {
+            continue;
+        }
+        if let Some(v) = route_now(hub, leg(labels.clone(), String::new())).await {
+            preview.push(json!({ "labels": labels, "runners": takers(&v), "executors": v.get("executors"), "constraints": v.get("constraints") }));
+        }
+    }
+    (diagnostics, preview)
 }
 
 /// `POST /api/ci/routing/explain` with a leg's routing (`labels`, `repo`, `job`, `workflow`,
-/// `event`, `requires`): where it would go now, and why each runner can or can't take it.
+/// `event`, `requires`, `untrusted`, `nests_containers`): where it would go now, and why each
+/// runner can or can't take it.
 pub async fn explain(hub: &Hub, body: Value) -> Result<Response, Fail> {
     if !hub.ci.enabled() {
         return Err((StatusCode::NOT_FOUND, "the CI engine is off".into()));
@@ -277,6 +330,8 @@ pub async fn explain(hub: &Hub, body: Value) -> Result<Response, Fail> {
         caps: u64::from(crate::proto::CAP_CI2),
         // `untrusted: true`: where an untrusted leg would go (W18-R07).
         untrusted: body.get("untrusted").and_then(Value::as_bool).unwrap_or(false).then(|| hub.cfg.ci.untrusted.route()),
+        // `nests_containers: true`: where one whose steps run podman would go.
+        nests_containers: body.get("nests_containers").and_then(Value::as_bool).unwrap_or(false),
     };
     let (tx, rx) = async_channel::bounded(1);
     hub.ci.send(super::dispatch::Msg::ExplainRoute { route: Box::new(route), reply: tx });

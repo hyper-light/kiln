@@ -15,6 +15,17 @@ pub const KILN_HOST: &str = "kiln";
 /// GitHub, through kiln's GitHub App (docs/deploy-api.md §7).
 pub const GITHUB_HOST: &str = "github";
 
+/// A GitLab `[[ci.gitlab]]` names, with its token (docs/deploy-api.md §7).
+pub const GITLAB_HOST: &str = "gitlab";
+
+/// Bitbucket Cloud, with `[ci.bitbucket]`'s credentials (docs/deploy-api.md §7).
+pub const BITBUCKET_HOST: &str = "bitbucket";
+
+/// Whether a release repository is on another git host (GitHub, a GitLab, Bitbucket), not kiln's own.
+pub fn remote_host(host: &str) -> bool {
+    matches!(host, GITHUB_HOST | GITLAB_HOST | BITBUCKET_HOST)
+}
+
 /// A stage apps are released to (docs/deploy-api.md §4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +52,10 @@ pub struct Environment {
     /// What agents may do here (docs/cd-targets.md D6). Nothing, by default: a person releases.
     #[serde(default)]
     pub agents: AgentPolicy,
+    /// What an app's owner teams may do here without `environments.deploy` on it (§15). Nothing,
+    /// by default.
+    #[serde(default, skip_serializing_if = "OwnerPolicy::is_default")]
+    pub owners: OwnerPolicy,
     /// How kiln drives Argo CD here (§8.3), when it's the provider.
     #[serde(default)]
     pub argocd: ArgoSettings,
@@ -66,6 +81,22 @@ pub struct AgentPolicy {
     /// Answer what waits for an approval here (when gates do).
     #[serde(default)]
     pub approve: bool,
+}
+
+/// What an app's owner teams may do in an environment (docs/deploy-api.md §15).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerPolicy {
+    /// Release their app here: deploy, config, rollback, enable, disable, cancel, and act on what
+    /// it runs (a restart, a scale).
+    #[serde(default)]
+    pub release: bool,
+}
+
+impl OwnerPolicy {
+    pub fn is_default(&self) -> bool {
+        *self == OwnerPolicy::default()
+    }
 }
 
 fn kilncd() -> String {
@@ -340,6 +371,11 @@ pub struct Targets {
     /// §4): `aws-lambda: { account: aws-prod, region: us-east-1 }`. KilnCD environments only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub platforms: BTreeMap<String, serde_json::Map<String, Value>>,
+    /// Where kiln reaches the clusters Argo CD deploys this environment to: one of KilnCD's
+    /// clusters of this server, by Argo CD's name for it (`in-cluster: argo-cluster`). An app's
+    /// secrets are written there before its release reaches Argo CD (§3.5).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub kilncd: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,6 +477,24 @@ pub struct App {
     pub source: Option<String>,
     #[serde(default)]
     pub archived: bool,
+    /// The repositories made for its images and chart (§3.1, step 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registries: Option<Registries>,
+}
+
+/// The repositories made for an app's images and chart (docs/deploy-api.md §3.1, step 5), as
+/// references name them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Registries {
+    /// Where they are: `kiln`, or the integration they were made through.
+    pub at: String,
+    /// Release images, their tags immutable: `kiln.example.com/shop/web`.
+    pub images: String,
+    /// Snapshot images (prereleases), only the newest kept: `kiln.example.com/shop/web/snapshots`.
+    pub snapshots: String,
+    /// Its chart, versions immutable: `oci://kiln.example.com/charts/shop/web`.
+    pub chart: String,
 }
 
 /// Who to reach about an app (§3.1): on call, the chat channels its release messages go to, links.
@@ -489,6 +543,10 @@ pub struct Template {
     /// The source repository kiln makes for each of its apps (§3.1), unless the app names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<RepoTemplate>,
+    /// The registry each of its apps gets its image and chart repositories on (§3.1, step 5),
+    /// made by kiln with the app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<RegistryTemplate>,
     /// The cluster-scoped kinds its apps may make (`ClusterRole`, as `rbac.authorization.k8s.io/ClusterRole`;
     /// a core kind by its name alone): on Argo CD its apps' AppProject allows them, and a Namespace.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -514,6 +572,43 @@ pub struct RepoTemplate {
     /// The new repository's default branch.
     #[serde(default = "main_branch")]
     pub branch: String,
+    /// Where it's made (§3.1, §7): `kiln` (one of kiln's own repositories, the default), `github`
+    /// (through kiln's GitHub App), `gitlab` (the `[[ci.gitlab]]` whose token covers its group)
+    /// or `bitbucket` (`[ci.bitbucket]`).
+    #[serde(default = "kiln_host", skip_serializing_if = "is_kiln_host")]
+    pub host: String,
+}
+
+fn is_kiln_host(h: &str) -> bool {
+    h == KILN_HOST
+}
+
+/// Where a template's apps get their image and chart repositories (docs/deploy-api.md §3.1,
+/// step 5), and their names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryTemplate {
+    /// `kiln` (kiln's own registry), or an integration: an `aws` one (ECR, in the account and
+    /// region its role is in) or a `gcp` one (Artifact Registry, in `project` and `location`).
+    #[serde(default = "kiln_host")]
+    pub at: String,
+    /// The repositories' name, with `{app}` and `{project}` filled in: release images at it,
+    /// snapshots at `<it>/snapshots`, the chart at `charts/<it>`.
+    #[serde(default = "default_repo_name")]
+    pub name: String,
+    /// How many snapshots are kept: the newest.
+    #[serde(default = "keep_snapshots")]
+    pub keep_snapshots: u32,
+    /// Artifact Registry's location (`europe-west1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// Artifact Registry's project: the integration's when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+}
+
+fn keep_snapshots() -> u32 {
+    20
 }
 
 fn default_repo_name() -> String {
@@ -555,7 +650,7 @@ pub enum Package {
         set: BTreeMap<String, String>,
     },
     /// A platform KilnCD deploys to beyond Kubernetes (docs/cd-targets.md §3): its provider
-    /// (`aws-lambda`, `aws-ecs`, `cloudflare-workers`, `vercel`) and its definition, as the
+    /// (`aws-lambda`, `gcp-run`, `fly`: one of KilnCD's that's built) and its definition, as the
     /// provider's key in `.kiln/deploy.yaml` holds it, with `${{ release.* }}`, `${{ env.name }}`
     /// and `${{ app.name }}` filled for each release (KilnCD's `${{ git.* }}` and
     /// `${{ artifacts.* }}` left to it). The platform's own files (a task definition,

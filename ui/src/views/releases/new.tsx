@@ -6,13 +6,15 @@
  *    makes), or a package given here.
  * 3. Its source repository: the template's, one kiln has, or none.
  * 4. Where it runs: the environments it's registered in once it's made.
+ * 5. Its first releases: a version, released to those of them asked for once it's registered.
  *
- * Then its page, to release it.
+ * Then its page, where they're followed.
  */
 import * as React from "react";
 import { Rocket } from "lucide-react";
 
-import { boardHref, checkName, deployApi, packageWords, providerName, releaseAppHref, type AppAsk, type Package } from "@/api/deploy";
+import { api } from "@/api/client";
+import { boardHref, checkName, deployApi, packageWords, providerName, releaseAppHref, type AppAsk, type Package, type RegistryTemplate } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -21,7 +23,7 @@ import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { reposRes, useRes, warm } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate } from "@/lib/resource";
+import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useNavigate } from "@/lib/router";
 import { environmentsRes, templatesRes } from "./index";
 import "@/views/deployments/deployments.css";
@@ -43,7 +45,7 @@ export default function NewDeployApp() {
       <title>New app · Releases · kiln</title>
       <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: "New app" }]} />
       <h1 className="cd-new-title">A new app.</h1>
-      <p className="lead">Its name and owners, what it's made from, where its source lives, where it runs. Then release it from its page.</p>
+      <p className="lead">Its name and owners, what it's made from, where its source lives, where it runs, and its first releases: then its page follows them.</p>
       <Loadable label="the templates and environments" fallback={<Hold height={320} />}>
         <Builder />
       </Loadable>
@@ -61,6 +63,8 @@ function Builder() {
   const [checked, setChecked] = React.useState<NameCheck | null>(null);
   const [project, setProject] = React.useState("default");
   const [owners, setOwners] = React.useState("");
+  // The groups the person is in: an app's owner team is one its maker is in (docs/deploy-api.md §3.1).
+  const groups = useSuspenseResource("me", (s) => api.me(s)).data.groups ?? [];
   const [templateName, setTemplateName] = React.useState(templates[0]?.name ?? "");
   const [kind, setKind] = React.useState<Kind>("helm");
   const [repo, setRepo] = React.useState("");
@@ -69,6 +73,9 @@ function Builder() {
   const [source, setSource] = React.useState<Source | null>(null);
   const [linked, setLinked] = React.useState(repos[0]?.name ?? "");
   const [envs, setEnvs] = React.useState<string[]>([]);
+  const [version, setVersion] = React.useState("");
+  // The environments its first release goes to: each it's registered in, unless left out.
+  const [held, setHeld] = React.useState<string[]>([]);
   const [busy, setBusy] = React.useState(false);
 
   const t = templates.find((x) => x.name === templateName);
@@ -114,6 +121,17 @@ function Builder() {
     };
   };
 
+  // Where it's registered, in the order kiln lists its environments; and where it's first released:
+  // straight there, unless a release has to run in another environment first (its `after`), when
+  // that environment's landing promotes it there (`promote: auto`) or a person releases it later.
+  const registering = allowed.filter((e) => envs.includes(e.name)).map((e) => e.name);
+  const gated = (env: string) => (environments.find((e) => e.name === env)?.gates.after ?? []).filter(Boolean);
+  const promotes = (env: string) => environments.find((e) => e.name === env)?.gates.promote === "auto";
+  const chosen = version.trim() ? registering.filter((e) => !held.includes(e)) : [];
+  const releasing = chosen.filter((e) => !gated(e).length);
+  const promoted = chosen.filter((e) => gated(e).length && promotes(e) && gated(e).every((a) => releasing.includes(a)));
+  const later = chosen.filter((e) => !releasing.includes(e) && !promoted.includes(e));
+
   const make = async () => {
     const a = ask();
     if (!a) return;
@@ -121,16 +139,35 @@ function Builder() {
     try {
       const app = await deployApi.createApp(a);
       const failed: string[] = [];
-      for (const env of envs.filter((e) => allowed.some((x) => x.name === e))) {
+      const registered: string[] = [];
+      for (const env of registering) {
         try {
           await deployApi.register(app.name, env);
+          registered.push(env);
         } catch (e) {
           failed.push(`${env}: ${errorMessage(e)}`);
         }
       }
+      // Its first releases, each through its environment's gates as any release.
+      const released: string[] = [];
+      for (const env of releasing.filter((e) => registered.includes(e))) {
+        try {
+          const r = await deployApi.create({ app: app.name, environment: env, version: version.trim(), idempotency_key: `first:${app.name}:${env}` });
+          released.push(`${env} (release ${r.id})`);
+        } catch (e) {
+          failed.push(`${env}: not released (${errorMessage(e)})`);
+        }
+      }
+      const made = [
+        app.source ? `Its source: ${app.source}.` : "",
+        app.registries ? `Its images: ${app.registries.images}.` : "",
+        released.length ? `${version.trim()} released to ${released.join(", ")}.` : "",
+        promoted.length ? `${promoted.join(", ")} take${promoted.length === 1 ? "s" : ""} it once it lands in ${[...new Set(promoted.flatMap(gated))].join(", ")}.` : "",
+        later.length ? `Release it to ${later.join(", ")} once it runs in ${[...new Set(later.flatMap(gated))].join(", ")}.` : "",
+      ];
       toast({
         title: `${app.name} is made`,
-        description: [app.source ? `Its source: ${app.source}.` : "", failed.length ? `Not registered in ${failed.join("; ")}` : ""].filter(Boolean).join(" ") || undefined,
+        description: [...made, failed.length ? `Not done: ${failed.join("; ")}` : ""].filter(Boolean).join(" ") || undefined,
         tone: failed.length ? "info" : "succeeded",
         href: releaseAppHref(app.name),
       });
@@ -181,7 +218,7 @@ function Builder() {
           placeholder="payments, platform"
           value={owners}
           onChange={(e) => setOwners(e.target.value)}
-          hint="The owner first, then a co-owner and an ops owner, separated by commas."
+          hint={`The owner first, then a co-owner and an ops owner, separated by commas: kiln's groups (shop) or an identity provider's (github:acme/platform). The owner team is one you're in${groups.length ? `: ${groups.join(", ")}` : ""}.`}
         />
       </Panel>
 
@@ -216,6 +253,12 @@ function Builder() {
             )}
             {!!t.checks?.length && <li>Every release passes {t.checks.map(checkName).join(", ")}</li>}
             {!!t.environments?.length && <li>May go to {t.environments.join(", ")}</li>}
+            {t.registry && (
+              <li>
+                Makes its image, snapshot and chart repositories {registryWhere(t.registry)}: <code>{filled(t.registry.name || "{project}/{app}")}</code>
+                {t.registry.keep_snapshots ? `, keeping its newest ${t.registry.keep_snapshots} snapshots` : ""}
+              </li>
+            )}
             {makes && (
               <li>
                 Makes <code>{filled(makes.name)}</code>
@@ -282,7 +325,7 @@ function Builder() {
           ))}
       </Panel>
 
-      <Panel eyebrow="4" title="Where it runs" description="Registered once it's made; nothing is released until you release it.">
+      <Panel eyebrow="4" title="Where it runs" description="Registered once it's made.">
         {allowed.length ? (
           <div className="cd-new-checks">
             {allowed.map((e) => (
@@ -299,11 +342,45 @@ function Builder() {
         )}
       </Panel>
 
+      <Panel eyebrow="5" title="Its first releases" description="A version released once it's registered, each through its environment's gates as any release; or none, to release it from its page.">
+        <TextField
+          label="Version"
+          placeholder={t?.package?.kind === "git" || (!t && kind === "git") ? "main" : "1.0.0"}
+          value={version}
+          spellCheck={false}
+          onChange={(e) => setVersion(e.target.value)}
+          hint={t?.package?.kind === "git" || (!t && kind === "git") ? "A branch, tag or commit of its package." : "Its chart's version."}
+        />
+        {version.trim() &&
+          (registering.length ? (
+            <div className="cd-new-checks rel-gap">
+              {registering.map((e) => (
+                <label key={e} className="cd-new-check">
+                  <input type="checkbox" className="check" checked={!held.includes(e)} onChange={(ev) => setHeld((xs) => (ev.target.checked ? xs.filter((x) => x !== e) : [...xs, e]))} />
+                  <span>
+                    Release {version.trim()} to {e}
+                    {promoted.includes(e) && <span className="rel-quiet"> · once it lands in {gated(e).join(", ")}</span>}
+                    {later.includes(e) && <span className="rel-quiet"> · after it runs in {gated(e).join(", ")}: from its page</span>}
+                  </span>
+                </label>
+              ))}
+            </div>
+          ) : (
+            <p className="cd-new-note">Choose where it runs first.</p>
+          ))}
+      </Panel>
+
       <div className="rel-new-actions">
         <Button disabled={busy || !ask()} onClick={() => void make()}>
-          <Rocket /> Make {clean || "the app"}
+          <Rocket /> {releasing.length ? `Make ${clean || "the app"} and release it` : `Make ${clean || "the app"}`}
         </Button>
       </div>
     </div>
   );
+}
+
+/** Where a template's registry is, in words. */
+function registryWhere(r: RegistryTemplate): string {
+  if (r.at === "kiln") return "on kiln's registry";
+  return `through ${r.at}${r.location ? ` in ${r.location}` : ""}`;
 }

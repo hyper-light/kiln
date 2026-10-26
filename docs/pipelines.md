@@ -121,6 +121,7 @@ They are `${{ inputs.target }}` in expressions. Scheduled runs may pass `inputs`
 | --- | --- |
 | `name` | display name; expressions allowed (`"test ${{ matrix.profile }}"`) |
 | `runs-on` | labels a runner must have, or a runner's name. Default `[k8s]` |
+| `requires` | constraints a runner's facts must meet, one or a list (`tools has node`, `disk.free >= 50Gi`, `os == macos`: docs/ci.md W05-R22); see [Runners](#runners) |
 | `isolation` ✦ | `none` (on the host), `container`, `microvm`; see [Runners](#runners) |
 | `image` | OCI image for `container` / `microvm` / Kubernetes jobs; overrides `toolchain` |
 | `toolchain` | `rust` · `go` · `python` · `node` · `bun` · `erlang`: an image plus its caches |
@@ -245,6 +246,29 @@ keys), `changed(glob, …)` (whether the trigger changed any matching file).
 | `[baremetal]`, `[bench]`, a name | `none` (default) | A process tree on the runner's host, killed as a group. |
 | any runner with `docker` ✦ | `container` | A container per job; steps run in it; caches as volumes; `services` on a private network. Docker or Podman. |
 | any runner with `microvm` ✦ | `microvm` | A Firecracker microVM per job, booted from `image` (or a warm snapshot of it). kiln runs as the guest's PID 1 and talks to the host runner over vsock; the network goes through a policy proxy on the host. Shards will be a second backend. |
+
+A job goes to a runner that carries every label of its `runs-on`, in any case: one of the runner's
+own, its name, or what its platform is (`linux`, `macos`, `windows`; `x86_64`, `amd64`, `x64`;
+`aarch64`, `arm64`; `self-hosted`), so `[linux]` fits every Linux runner, not only those labelled
+so; and whose facts, as it last reported them, meet each of its `requires` (one that hasn't
+reported any meets none, so the job waits for a runner known to have what it needs). Of those
+with a slot free, the one with the most room: its idle cores (by its busy share or its
+load average, whichever leaves fewer), then its free memory, the share of its slots in use counting
+against it. A runner that's overloaded (under 2 GiB or a twentieth of its memory free, or a load
+past twice its cores) takes no job: the job goes to another, or waits for room.
+
+A job that can't run for want of a tool says so on its page: one that failed because a command
+wasn't there (its step's log says `command not found`, or a Mac says it has no developer tools), or
+one waiting because no runner its labels fit meets its `requires`, where installing tools would
+change that (`tools has node`, not `os == macos`). Where an agent can work (a connected runner with
+terminals, not a pod, whose image is what lacks the tool), **Install with an agent** starts an agent
+on that runner, as whoever asks (who needs `runs.rerun` on the repository and `agents.run`, as for
+any agent), to install only what's missing; a step that needs a person there (a password, an
+installer's dialog) waits for them in the agent. When it's done, kiln asks the runner what it has
+again, then runs the run's failed jobs again, or the waiting job goes there once the runner meets it
+([api.md](api.md): `GET /api/jobs/:id/tools`, `POST /api/jobs/:id/tools/fix`). kiln follows the
+agent for up to three hours, and only while kiln runs: a restart forgets the fix (the agent goes on,
+and Retry runs the job again).
 
 If `isolation` is absent, a job runs as it does in v1: in a pod on `[k8s]`, and on the host
 everywhere else (where `image` is ignored, as before). Containers and microVMs are always asked

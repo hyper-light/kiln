@@ -6,10 +6,59 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{Approval, Body, Event, Meta, State, Status, Task, ToolStatus, TurnEnd, clip_middle};
+use super::model::{Approval, Body, Compacting, Event, Level, Meta, State, Status, Task, ToolStatus, TurnEnd, clip_middle};
 
 /// The ids of the messages kiln sends to keep an agent going (`goals::keep`); they show as kiln's.
 pub const KEEP_ID: &str = "kiln-keep-";
+
+/// What every compaction's marker's id starts with: a notice, which the UI draws as the boundary
+/// it is (above it, the agent works from a summary).
+pub const COMPACTION: &str = "compaction:";
+/// What an agent is doing while its harness compacts its conversation (`State::doing`).
+pub const COMPACTING: &str = "Compacting the conversation";
+
+/// A count of tokens, short: "850", "967k", "1.2M".
+pub fn tokens_short(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// How long something took, short: "42s", "1m 38s", "1h 02m" (as the UI's clocks say it).
+fn took(ms: i64) -> String {
+    let s = ms.max(0) / 1_000;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3_600 => format!("{}m {:02}s", s / 60, s % 60),
+        _ => format!("{}h {:02}m", s / 3_600, s % 3_600 / 60),
+    }
+}
+
+/// A compaction's marker, with what's known of it: "Compacted · 967k → 48k tokens · 1m 38s".
+pub fn compacted_words(before: Option<u64>, after: Option<u64>, ms: Option<i64>) -> String {
+    let mut words = vec!["Compacted".to_owned()];
+    match (before, after) {
+        (Some(b), Some(a)) => words.push(format!("{} → {} tokens", tokens_short(b), tokens_short(a))),
+        (Some(b), None) => words.push(format!("was {} tokens", tokens_short(b))),
+        _ => {}
+    }
+    if let Some(ms) = ms.filter(|ms| *ms >= 1_000) {
+        words.push(took(ms));
+    }
+    words.join(" · ")
+}
+
+/// The marker of a compaction that didn't happen, and why, as its harness said.
+pub fn compaction_failed_words(why: Option<&str>) -> String {
+    match why.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(why) => format!("Couldn't compact: {}", clip_middle(why, 300).0),
+        None => "Couldn't compact the conversation".to_owned(),
+    }
+}
 
 /// Tasks a session's state keeps: beyond these the oldest finished go. The state goes to viewers
 /// whole, in one frame, and a long Codex session runs hundreds of terminals.
@@ -71,8 +120,14 @@ pub const MAX_EVENTS: usize = 4_000;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Update {
-    /// A session appeared, or is announced again after a reconnect (a snapshot follows).
-    Open { info: Box<super::session::Info> },
+    /// A session appeared, or is announced again after a reconnect (a snapshot follows). `since`:
+    /// the server's copy keeps its events through that number and only what's after them follows
+    /// (a runner that started again, `crate::wire::uplink`); None: the whole snapshot follows.
+    Open {
+        info: Box<super::session::Info>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+    },
     /// The session is gone.
     Closed,
     State { state: Box<State> },
@@ -85,6 +140,9 @@ pub enum Update {
     Stream { id: String, text: String },
     /// The answer to one client's request (file suggestions ...).
     Reply { client: String, value: serde_json::Value },
+    /// What became of a message sent to the session (CP-T3.2): its inbox took it (or had: the first
+    /// time's answer), or refused it. For its sender; nothing a viewer shows or a store keeps.
+    Inbox { said: Box<super::inbox::Said> },
     /// The timeline starts over (a snapshot follows). `from`: the number of the snapshot's first
     /// event. What came before it isn't in memory any more but is still the timeline's: a store
     /// keeps it, and drops only its events from there on that the snapshot doesn't bring again (a
@@ -121,11 +179,27 @@ pub struct ChangeJob {
     pub baseline: Baseline,
 }
 
+/// A go-back operation done by kiln (`harness::goback`) where a harness lacks it natively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoBackOp {
+    /// Undo the prompt and everything after it: the conversation and the file changes.
+    Rewind,
+    /// Undo the file changes made since the prompt; keep the conversation.
+    RewindFiles,
+    /// A new session with the conversation up to the end of the prompt's turn.
+    Branch,
+    /// A new session with the whole conversation.
+    Fork,
+}
+
 /// Something only the session (which owns the process) can do, asked for by an adapter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     /// Start the harness again, continuing its session from `resume_at` (a rewind).
     Restart { resume_at: Option<String> },
+    /// The go-back (rewind, restore files, branch, fork) that `harness::goback` does where the
+    /// harness has none of its own: `event` is the prompt it goes back to (empty for a fork).
+    GoBack { op: GoBackOp, event: String },
     /// From its next start the harness may skip every permission check: a person chose a mode
     /// that turns checks off, which it was not started able to use.
     AllowBypass,
@@ -234,11 +308,17 @@ pub struct Core {
     pub task_output: HashMap<String, TaskOutput>,
     /// The timeline was cut (a rewind): viewers start over from a snapshot.
     reset: bool,
+    /// Its timeline is the conversation store's as the store has it (it started again from it,
+    /// [`Core::restore`]): its announcement needn't write the store it again.
+    pub stored: bool,
     /// kiln's queue waits: the session goes on in another harness once the turn under way ends,
     /// and what is queued goes to that one.
     pub hold: bool,
     /// The harness running now (its name): new events say so (`Event::by`).
     pub harness: Option<String>,
+    /// A limit another session on the account reached, asked of the harness before it holds this
+    /// one too (`pause::account_hold`).
+    pub limit_ask: Option<super::pause::Ask>,
 }
 
 impl Default for Core {
@@ -292,8 +372,10 @@ impl Core {
             effects: Vec::new(),
             task_output: HashMap::new(),
             reset: false,
+            stored: false,
             hold: false,
             harness: None,
+            limit_ask: None,
         }
     }
 
@@ -352,18 +434,40 @@ impl Core {
     /// Take over the timeline and state the session had on another machine (it moved here): its
     /// events as they were (ids, order, times, who said them), its queue, todos and title. What
     /// belonged to the process over there (its tasks, a turn's state) stays there.
-    pub fn adopt(&mut self, mut events: Vec<Event>, state: State) {
+    pub fn adopt(&mut self, events: Vec<Event>, state: State) {
+        self.take_in(events, state);
+        self.reset = true;
+    }
+
+    /// Go on from the timeline and state the conversation store kept of this session (it starts
+    /// again on this machine). Its events go out again only when their numbers had to change (the
+    /// store lacked some of them): else the store has them as they are, and the server's copy
+    /// gets what it lacks when the session's stream starts (`crate::wire::sums`). True: they kept
+    /// their numbers.
+    pub fn restore(&mut self, events: Vec<Event>, state: State) -> bool {
+        let kept = self.take_in(events, state);
+        self.reset = !kept;
+        self.stored = kept;
+        kept
+    }
+
+    /// The timeline and state as [`Core::adopt`] and [`Core::restore`] take them in: whether the
+    /// events kept their numbers.
+    fn take_in(&mut self, mut events: Vec<Event>, state: State) -> bool {
         // A conversation cleared since: what came before it is history, not the timeline.
         if let Some(from) = state.cleared {
             events.retain(|e| e.seq >= from);
         }
         let first = events.first().map_or(1, |e| e.seq.max(1));
+        let mut kept = true;
         // Numbers stay contiguous: an event's place is found from its number.
         self.events = events
             .into_iter()
             .enumerate()
             .map(|(i, mut e)| {
-                e.seq = first + i as u64;
+                let seq = first + i as u64;
+                kept &= e.seq == seq;
+                e.seq = seq;
                 e
             })
             .collect();
@@ -380,13 +484,14 @@ impl Core {
         self.state.tasks.clear();
         self.state.exit = None;
         self.state.activity = None;
+        self.state.compacting = None;
         self.state.doing = None;
         self.state.switching = None;
         self.changed.clear();
         self.stream.clear();
-        self.reset = true;
         self.state_dirty = true;
         self.meta_dirty = true;
+        kept
     }
 
     /// Drop `id` and every event after it (a rewind); viewers get the timeline again.
@@ -490,6 +595,9 @@ impl Core {
         s.files_changed = u32::try_from(self.changes.len()).unwrap_or(u32::MAX);
         s.lines_added = self.changes.values().map(|c| c.added).sum();
         s.lines_removed = self.changes.values().map(|c| c.removed).sum();
+        // Its work is in the working tree of its latest change in one (a worktree it went into, or
+        // its folder's own): a scratch file elsewhere doesn't move it.
+        s.tree = self.changes.values().filter(|c| c.tree.is_some()).max_by_key(|c| c.at).and_then(|c| c.tree.clone());
         self.changes_dirty = true;
         self.state_dirty = true;
     }
@@ -502,12 +610,17 @@ impl Core {
         crate::util::now_ms()
     }
 
-    /// A message went to the agent: one kiln sent to keep it going counts toward `State::kept`;
-    /// anyone else's starts the count again.
-    pub fn note_sent(&mut self, client_id: &str) {
+    /// A message went to the agent, saying `text`: one kiln sent to keep it going counts toward
+    /// `State::kept`; anyone else's starts the count again. One of kiln's own is noted given
+    /// (`State::given`), with what it said then, in the state that shows it gone from the queue.
+    pub fn note_sent(&mut self, client_id: &str, text: &str) {
         let kept = if client_id.starts_with(KEEP_ID) { self.state.kept.saturating_add(1) } else { 0 };
         if kept != self.state.kept {
             self.state.kept = kept;
+            self.touch_state();
+        }
+        if super::queued::own(client_id) && !self.state.given.iter().any(|g| g.id == client_id) {
+            super::queued::note_given(&mut self.state.given, client_id, super::queued::stable(text));
             self.touch_state();
         }
     }
@@ -535,6 +648,53 @@ impl Core {
         };
         self.state.last_turn = Some(TurnEnd { at: Self::now(), how: how.to_owned(), why: why.map(str::to_owned), tools, after_error, asks, kept: self.state.kept });
         self.touch_state();
+    }
+
+    /// Its harness began compacting the conversation of `parent` (a subagent's, by its call's id;
+    /// None: the main thread's), or says again that it goes on: when it began stays as it was.
+    pub fn compacting(&mut self, parent: Option<String>) {
+        if self.state.compacting.as_ref().is_some_and(|c| c.parent == parent || c.parent.is_none()) {
+            return;
+        }
+        let main = parent.is_none();
+        self.state.compacting = Some(Compacting { since: Self::now(), tokens: if main { self.state.usage.context_tokens } else { None }, parent });
+        if main {
+            self.state.doing = Some(COMPACTING.to_owned());
+        }
+        self.touch_state();
+    }
+
+    /// The compaction of `parent`'s conversation under way, if there is one.
+    pub fn compacting_of(&self, parent: Option<&str>) -> Option<&Compacting> {
+        self.state.compacting.as_ref().filter(|c| c.parent.as_deref() == parent)
+    }
+
+    /// The compaction of `parent`'s conversation under way is over, however it went: what it was.
+    pub fn compacting_over(&mut self, parent: Option<&str>) -> Option<Compacting> {
+        self.compacting_of(parent)?;
+        let c = self.state.compacting.take();
+        if parent.is_none() && self.state.doing.as_deref() == Some(COMPACTING) {
+            self.state.doing = (self.state.status == Status::Running).then(|| "Thinking".to_owned());
+        }
+        self.touch_state();
+        c
+    }
+
+    /// `parent`'s conversation was compacted, or wasn't (`level` Warn), as `text` says: its marker
+    /// goes where the conversation is now, as `compaction:<key>` (said again with the same key, the
+    /// same marker, where it was).
+    pub fn compacted(&mut self, key: &str, parent: Option<String>, level: Level, text: String) {
+        self.compacting_over(parent.as_deref());
+        self.upsert(&format!("{COMPACTION}{key}"), parent, Body::Notice { level, text });
+    }
+
+    /// A compaction of `parent`'s conversation still under way ended without its harness saying
+    /// how (its turn or its process ended first): its marker says it stopped, after how long.
+    pub fn compaction_stopped(&mut self, parent: Option<&str>) {
+        let Some(c) = self.compacting_over(parent) else { return };
+        let ms = Self::now() - c.since;
+        let text = if ms >= 1_000 { format!("Compaction stopped after {}", took(ms)) } else { "Compaction stopped".to_owned() };
+        self.upsert(&format!("{COMPACTION}stopped-{}", self.next_seq), c.parent, Body::Notice { level: Level::Warn, text });
     }
 
     pub fn events(&self) -> impl DoubleEndedIterator<Item = &Event> {
@@ -574,11 +734,17 @@ impl Core {
         self.events.push_back(Event { id: id.to_owned(), seq, at: Self::now(), parent, by: self.harness.clone(), body });
         self.index.insert(id.to_owned(), seq);
         self.changed.push(id.to_owned());
-        while self.events.len() > MAX_EVENTS {
-            if let Some(old) = self.events.pop_front() {
-                self.index.remove(&old.id);
-                self.state.dropped += 1;
-                self.state_dirty = true;
+        if self.events.len() > MAX_EVENTS {
+            // Whole runs of the server's digests at a time (`crate::wire::sums::run_after`): its
+            // copy, which keeps more, compares run for run with what's here after a restart.
+            let over = self.events.len() - MAX_EVENTS;
+            let from = self.events.get(over).map_or(0, |e| crate::wire::sums::run_after(e.seq));
+            while self.events.front().is_some_and(|e| e.seq < from) {
+                if let Some(old) = self.events.pop_front() {
+                    self.index.remove(&old.id);
+                    self.state.dropped += 1;
+                    self.state_dirty = true;
+                }
             }
         }
     }
@@ -662,6 +828,9 @@ impl Core {
     /// whatever its adapter knew. Its tasks still live end stopped, its calls still running or
     /// waiting end cancelled, text it was writing stops; all of it stays to read.
     pub fn end_harness_work(&mut self) {
+        if let Some(parent) = self.state.compacting.as_ref().map(|c| c.parent.clone()) {
+            self.compaction_stopped(parent.as_deref());
+        }
         let now = Self::now();
         for t in self.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT)) {
             t.status = "stopped".into();
@@ -845,11 +1014,72 @@ mod tests {
         Body::Assistant { text: text.into(), streaming: false }
     }
 
+    /// A compaction under way: what the agent does says so, its harness saying so again keeps when
+    /// it began, and its marker (a `compaction:` notice) goes where the conversation is at its end.
+    #[test]
+    fn a_compaction_goes_on_until_its_marker() {
+        let mut core = Core::new();
+        core.set_status(Status::Running);
+        core.state.usage.context_tokens = Some(967_000);
+        core.compacting(None);
+        let since = core.state.compacting.as_ref().map(|c| c.since);
+        assert_eq!(core.state.compacting.as_ref().and_then(|c| c.tokens), Some(967_000));
+        assert_eq!(core.state.doing.as_deref(), Some(COMPACTING));
+        core.compacting(None);
+        assert_eq!(core.state.compacting.as_ref().map(|c| c.since), since);
+        // A subagent's waits behind the main thread's.
+        core.compacting(Some("toolu_9".into()));
+        assert_eq!(core.state.compacting.as_ref().and_then(|c| c.parent.clone()), None);
+        core.compacted("k1", None, Level::Info, compacted_words(Some(967_000), Some(48_400), Some(98_000)));
+        assert!(core.state.compacting.is_none());
+        assert_eq!(core.state.doing.as_deref(), Some("Thinking"));
+        assert!(matches!(core.get("compaction:k1").map(|e| &e.body), Some(Body::Notice { level: Level::Info, text }) if text == "Compacted · 967k → 48k tokens · 1m 38s"));
+    }
+
+    /// One its harness's process ended during says it stopped, in its thread; one taken up again
+    /// elsewhere isn't under way there.
+    #[test]
+    fn a_compaction_its_process_ended_during_stopped() {
+        let mut core = Core::new();
+        core.compacting(Some("toolu_9".into()));
+        core.end_harness_work();
+        assert!(core.state.compacting.is_none());
+        let stopped = core.events().find(|e| e.id.starts_with(COMPACTION));
+        assert!(matches!(stopped.map(|e| (&e.body, e.parent.as_deref())), Some((Body::Notice { level: Level::Warn, text }, Some("toolu_9"))) if text.starts_with("Compaction stopped")));
+        core.compacting(None);
+        let state = core.state.clone();
+        core.restore(Vec::new(), state);
+        assert!(core.state.compacting.is_none());
+    }
+
+    #[test]
+    fn compaction_words() {
+        assert_eq!(compacted_words(Some(967_000), Some(48_400), Some(98_000)), "Compacted · 967k → 48k tokens · 1m 38s");
+        assert_eq!(compacted_words(Some(1_240_000), None, Some(42_400)), "Compacted · was 1.2M tokens · 42s");
+        assert_eq!(compacted_words(None, None, Some(400)), "Compacted");
+        assert_eq!(compacted_words(None, None, Some(3_725_000)), "Compacted · 1h 02m");
+        assert_eq!(compaction_failed_words(Some(" prompt too long ")), "Couldn't compact: prompt too long");
+        assert_eq!(compaction_failed_words(None), "Couldn't compact the conversation");
+    }
+
+    /// CP-T3.2 (the fourteenth adversarial check's): kiln's own message handed to the harness is
+    /// noted given (`State::given`) with what it said then, once, in the state its queue goes in;
+    /// another's message isn't.
+    #[test]
+    fn kiln_s_own_message_handed_is_noted_given_once() {
+        let mut core = Core::new();
+        core.note_sent("goal-1", "/goal tests pass");
+        core.note_sent("goal-1", "/goal tests pass, sent again");
+        core.note_sent("m-person", "hello");
+        let digest = crate::harness::queued::stable("/goal tests pass");
+        assert_eq!(core.state.given, vec![crate::harness::model::Given { id: "goal-1".into(), digest }]);
+    }
+
     #[test]
     fn a_turn_end_says_what_the_turn_did() {
         let mut core = Core::new();
-        core.note_sent("u1");
-        core.upsert("u1", None, Body::User { text: "go".into(), images: 0, client_id: Some("u1".into()), origin: Some("human".into()), attachments: Vec::new() });
+        core.note_sent("u1", "");
+        core.upsert("u1", None, Body::User { text: "go".into(), images: 0, client_id: Some("u1".into()), origin: Some("human".into()), attachments: Vec::new(), reply_to: None });
         core.upsert("a1", None, said("Running it."));
         core.upsert("t1", None, tool(ToolStatus::Done));
         core.upsert("t2", None, tool(ToolStatus::Error));
@@ -866,9 +1096,9 @@ mod tests {
     #[test]
     fn child_work_cannot_change_the_parent_turns_keep_going_decision() -> anyhow::Result<()> {
         let mut core = Core::new();
-        core.upsert("parent-prompt", None, Body::User { text: "go".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("parent-prompt", None, Body::User { text: "go".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new(), reply_to: None });
         core.upsert("parent-tool", None, tool(ToolStatus::Error));
-        core.upsert("child-prompt", Some("spawn".into()), Body::User { text: "audit".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("child-prompt", Some("spawn".into()), Body::User { text: "audit".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new(), reply_to: None });
         core.upsert("child-tool", Some("spawn".into()), tool(ToolStatus::Done));
         core.upsert("child-answer", Some("spawn".into()), said("Should I try again?"));
         // Distinct times also exercise the fallback to the parent's prompt when no start
@@ -895,12 +1125,12 @@ mod tests {
         let mut core = Core::new();
         assert_eq!(origin_of("kiln-keep-1"), "kiln");
         assert_eq!(origin_of("m1"), "human");
-        core.note_sent(&format!("{KEEP_ID}1"));
-        core.note_sent(&format!("{KEEP_ID}2"));
+        core.note_sent(&format!("{KEEP_ID}1"), "");
+        core.note_sent(&format!("{KEEP_ID}2"), "");
         assert_eq!(core.state.kept, 2);
         core.end_turn(None, "cut", Some("stop_sequence"));
         assert_eq!(core.state.last_turn.as_ref().map(|t| t.kept), Some(2));
-        core.note_sent("m2");
+        core.note_sent("m2", "");
         assert_eq!(core.state.kept, 0);
     }
 
@@ -953,14 +1183,40 @@ mod tests {
         for i in 0..(MAX_EVENTS + 10) {
             c.upsert(&format!("e{i}"), None, Body::Assistant { text: "x".repeat(100), streaming: false });
         }
-        assert_eq!(c.events().count(), MAX_EVENTS);
-        assert_eq!(c.state.dropped, 10);
-        assert!(c.get("e0").is_none() && c.get("e10").is_some());
+        // Past the bound it lets go of a whole run (`crate::wire::sums`): it begins where one does.
+        let run = usize::try_from(crate::wire::sums::RUN).unwrap_or(64);
+        let n = c.events().count();
+        assert_eq!(n, MAX_EVENTS + 10 - run);
+        assert_eq!(c.state.dropped, crate::wire::sums::RUN);
+        assert_eq!(c.events().next().map(|e| e.seq), Some(crate::wire::sums::RUN + 1));
+        assert!(c.get("e63").is_none() && c.get("e64").is_some());
         let snap = c.snapshot(64 * 1024);
         assert!(matches!(snap.first(), Some(Update::Reset { .. })));
         let total: usize = snap.iter().map(|u| if let Update::Events { events } = u { events.len() } else { 0 }).sum();
-        assert_eq!(total, MAX_EVENTS);
+        assert_eq!(total, n);
         assert!(snap.len() > 4);
+    }
+
+    /// Started again from the conversation store: its events go out again only when their numbers
+    /// had to change.
+    #[test]
+    fn a_timeline_restored_as_the_store_kept_it_goes_out_once() {
+        let ev = |seq: u64| Event { id: format!("e{seq}"), seq, at: 0, parent: None, by: None, body: Body::Assistant { text: format!("line {seq}"), streaming: false } };
+        let mut c = Core::new();
+        assert!(c.restore((1..=5).map(ev).collect(), State::default()));
+        assert!(c.stored);
+        let out = c.take_out();
+        assert!(!out.iter().any(|u| matches!(u, Update::Reset { .. } | Update::Events { .. })), "the store has them: {out:?}");
+        // A gap in what the store kept: numbered again, so they go out again.
+        let mut c = Core::new();
+        assert!(!c.restore([1, 2, 4, 5].into_iter().map(ev).collect(), State::default()));
+        assert!(!c.stored);
+        let out = c.take_out();
+        assert!(matches!(out.first(), Some(Update::Reset { .. })), "{out:?}");
+        // One that moved here goes out whole, as it always did.
+        let mut c = Core::new();
+        c.adopt((1..=5).map(ev).collect(), State::default());
+        assert!(matches!(c.take_out().first(), Some(Update::Reset { .. })));
     }
 
     #[test]
@@ -988,7 +1244,7 @@ mod tests {
         use super::super::model::FileChange;
         let mut c = Core::new();
         let change = |added, at| FileChange {
-            path: "a.rs".into(), created: false, deleted: false, added, removed: 1,
+            path: "a.rs".into(), tree: None, created: false, deleted: false, added, removed: 1,
             hunks: Vec::new(), truncated: true, at,
         };
         let before = change(1, 1);
@@ -1022,12 +1278,33 @@ mod tests {
     }
 
     #[test]
+    fn its_work_is_in_the_working_tree_of_its_latest_change_in_one() {
+        use super::super::model::FileChange;
+        let mut c = Core::new();
+        let change = |path: &str, tree: Option<&str>, at| FileChange {
+            path: path.into(), tree: tree.map(str::to_owned), created: true, deleted: false, added: 1, removed: 0,
+            hunks: Vec::new(), truncated: false, at,
+        };
+        c.set_change("/r/a.rs", Some(change("a.rs", Some("/r"), 1)), None);
+        assert_eq!(c.state.tree.as_deref(), Some("/r"));
+        // Into a worktree of its repository: its work is there now.
+        c.set_change("/r/.claude/worktrees/w/b.rs", Some(change("b.rs", Some("/r/.claude/worktrees/w"), 2)), None);
+        assert_eq!(c.state.tree.as_deref(), Some("/r/.claude/worktrees/w"));
+        // A scratch file in no working tree of it doesn't move it.
+        c.set_change("/tmp/x.txt", Some(change("/tmp/x.txt", None, 3)), None);
+        assert_eq!(c.state.tree.as_deref(), Some("/r/.claude/worktrees/w"));
+        // Its change there undone, its work is back where its latest one is.
+        c.set_change("/r/.claude/worktrees/w/b.rs", None, None);
+        assert_eq!(c.state.tree.as_deref(), Some("/r"));
+    }
+
+    #[test]
     fn unchanged_diffs_do_not_resend_the_changeset() {
         use super::super::model::{FileChange, Hunk};
         let mut c = Core::new();
         c.take_out();
         let first = FileChange {
-            path: "a.rs".into(), created: true, deleted: false, added: 1, removed: 0,
+            path: "a.rs".into(), tree: None, created: true, deleted: false, added: 1, removed: 0,
             hunks: vec![Hunk { old_start: 0, old_lines: 0, new_start: 1, new_lines: 1, lines: vec!["+one".into()] }],
             truncated: false, at: 1,
         };

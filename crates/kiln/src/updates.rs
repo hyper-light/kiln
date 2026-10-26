@@ -32,7 +32,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::hub::Hub;
-use crate::proto::{AgentMsg, CAP_UPGRADE, LANE_CONTROL, ServerMsg};
+use crate::proto::{AgentMsg, CAP_UPGRADE, ServerMsg};
 
 /// Jobs kept for the UI.
 const KEEP_JOBS: usize = 40;
@@ -87,6 +87,10 @@ pub struct Job {
     /// The commit it brings the machine to, when kiln knows it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// A build's: the machine that builds it, when another than the runner's own
+    /// (`crate::fleet`); the runner downloads that build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
     /// The machine reported running `to_build`.
     pub reached: bool,
     pub log: Vec<String>,
@@ -166,6 +170,10 @@ pub struct Updates {
     in_step_wake: crate::rt::Notify,
     /// How long upgrades are waited on, once read (`waits`).
     waits: Mutex<Option<Waits>>,
+    /// The version-skew tolerances, once read (`crate::skew::tolerance`).
+    pub(crate) skew: Mutex<Option<crate::skew::Tolerance>>,
+    /// Where each commit runners said stands under them (`crate::skew::weigh`).
+    pub(crate) skew_seen: Mutex<crate::skew::Seen>,
     /// Every runner on the newest kiln.
     pub fleet: crate::fleet::Fleet,
     /// The binaries kept for other platforms, by target, as kiln's store of bytes holds them
@@ -196,6 +204,13 @@ pub fn own_binary() -> Result<(String, u64), String> {
     .clone()
 }
 
+/// Reads this build's hash ([`own_binary`]) once, off the runtime. The runner and the server ask
+/// for it from async code without waiting (`own_build()`), and the first ask reads the whole
+/// binary: seconds for a test build, a runtime shard and every task on it held that long.
+pub async fn warm_own_binary() {
+    let _ = crate::rt::blocking(own_binary).await;
+}
+
 /// This binary's build id ("unknown" if it can't be read): the build it was before kiln signed it
 /// on this Mac, when it did (`crate::os::macsign`).
 pub fn own_build() -> String {
@@ -222,12 +237,12 @@ pub(crate) fn hash_file(p: &Path) -> anyhow::Result<(String, u64)> {
     Ok((hex::encode(h.finalize()), size))
 }
 
-/// The release build for an OS and architecture (Linux gets the static one).
+/// The release build for an OS and architecture (Linux gets the static one). An Intel Mac has
+/// none: kiln runs on Apple silicon only.
 fn release_target(os: &str, arch: &str) -> Option<&'static str> {
     Some(match (os, arch) {
         ("linux", "x86_64") => "x86_64-unknown-linux-musl",
         ("linux", "aarch64") => "aarch64-unknown-linux-musl",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
         ("macos", "aarch64") => "aarch64-apple-darwin",
         ("windows", "x86_64") => "x86_64-pc-windows-msvc",
         ("windows", "aarch64") => "aarch64-pc-windows-msvc",
@@ -726,7 +741,7 @@ pub fn binaries(hub: &Hub) -> Vec<Binary> {
 }
 
 /// GET with redirects followed (GitHub release assets redirect to their storage).
-async fn get_following(client: &crate::http::client::Client, url: &str, timeout: Duration) -> anyhow::Result<crate::http::client::Response> {
+pub(crate) async fn get_following(client: &crate::http::client::Client, url: &str, timeout: Duration) -> anyhow::Result<crate::http::client::Response> {
     let mut url = url.to_owned();
     for _ in 0..6 {
         let resp = client.get(&url).timeout(timeout).send().await?;
@@ -1192,6 +1207,7 @@ pub(crate) fn new_job(kind: &'static str, target: &str, method: &'static str, fr
         from_build,
         to_build,
         commit: None,
+        on: None,
         reached: false,
         log: Vec::new(),
         error: None,
@@ -1254,8 +1270,9 @@ pub struct RunnerInfo {
     pub instances: Vec<crate::instances::InstanceView>,
 }
 
-/// How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built on
-/// the machine itself, from the server's source.
+/// How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built from
+/// the server's source, on the machine itself or, for a Mac that can't, on another machine whose
+/// build it then downloads (`crate::fleet`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Way {
@@ -1271,6 +1288,9 @@ pub struct WayOpen {
     /// What it does ("downloads build 493003c712b0"), or why it can't ("no binary of 31c0bbaf734c
     /// for aarch64-apple-darwin yet").
     pub why: String,
+    /// A build's: the machine it's made on, when another than the runner's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
 }
 
 /// What a runner does with a newer kiln (`crate::fleet`), as chosen for it in System → Updates.
@@ -1525,10 +1545,10 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
 }
 
 /// Start upgrading `machine`'s runner to the newest kiln (`crate::fleet`): the `way` asked for, or
-/// a binary of it when kiln has one for its platform, else a build of it on the machine itself.
-/// A person asking now isn't held back by the wait between automatic tries. With no newest known
-/// (a server built without knowing its commit), to the build kiln has for its platform. Nothing it
-/// runs is stopped.
+/// a binary of it when kiln has one for its platform, else a build of it (on the machine itself,
+/// or one another machine makes for its platform, which it downloads). A person asking now isn't
+/// held back by the wait between automatic tries. With no newest known (a server built without
+/// knowing its commit), to the build kiln has for its platform. Nothing it runs is stopped.
 pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str, way: Option<Way>) -> anyhow::Result<Job> {
     if let Some(j) = hub.updates.running_for("runner", machine) {
         return Ok(j);
@@ -1551,7 +1571,8 @@ pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str, way: Option<Way>) -> 
         };
         return match plan {
             crate::fleet::Plan::Download(b) => upgrade_with(hub, &r, &b, "admin").await,
-            crate::fleet::Plan::Build(c) => crate::fleet::self_build(hub, &r, &t.commit, c, "admin").await,
+            crate::fleet::Plan::Build(b) => crate::fleet::build(hub, &r, &t.commit, &b, "admin").await,
+            crate::fleet::Plan::Join { job, on } => crate::fleet::join(hub, &r, &t.commit, &job, &on, "admin").await,
             crate::fleet::Plan::Wait(why) => anyhow::bail!("{machine} can't be upgraded yet: it {why}"),
         };
     }
@@ -1607,6 +1628,43 @@ pub async fn upgrade_with(hub: &Arc<Hub>, r: &RunnerInfo, b: &Binary, by: &str) 
     Ok(job)
 }
 
+/// Job `id` goes on to upgrade `machine` to `b`, a build another machine made for its platform
+/// (`crate::fleet`): downloaded and installed as [`upgrade_with`] has it done. Nothing it runs is
+/// stopped.
+pub(crate) async fn upgrade_into(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
+    let u = &hub.updates;
+    let Some(r) = runners(hub).await.into_iter().find(|r| r.name == machine) else {
+        u.finish(hub, id, Err(format!("there is no runner called {machine}")));
+        return;
+    };
+    let cant = if !r.connected {
+        Some(format!("{machine} is not connected"))
+    } else if r.method != "native" && !r.terminal {
+        Some(format!("{machine} runs a kiln too old to upgrade itself and has terminals turned off: run `kiln install --agent --upgrade` with a new kiln binary on it"))
+    } else {
+        None
+    };
+    if let Some(e) = cant {
+        u.finish(hub, id, Err(e));
+        return;
+    }
+    if r.build.as_deref() == Some(b.build.as_str()) {
+        u.finish(hub, id, Ok(format!("{machine} runs build {} already", b.build)));
+        return;
+    }
+    u.update(hub, id, |j| {
+        j.from_build.clone_from(&r.build);
+        j.to_build = Some(b.build.clone());
+    });
+    hub.store.audit("kiln".into(), "upgrade.runner".into(), format!("{machine} to build {} ({}, {}), built by {}", b.build, b.target, r.method, b.by.as_deref().unwrap_or("another machine"))).await;
+    u.say(hub, id, format!("upgrading {machine} to build {} ({}); nothing it runs is stopped", b.build, b.target));
+    if r.method == "native" {
+        native(hub, id, machine, b).await;
+    } else {
+        terminal(hub, id, machine, b, &instance8(&r)).await;
+    }
+}
+
 /// The runner does it itself: it fetches the binary from this server, checks it and runs
 /// `install --agent --upgrade`, reporting back (UpgradeLog / UpgradeDone). A runner that takes
 /// the binary in place restarts its own process (same pid, terminals handed over) and so may
@@ -1615,9 +1673,14 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
     let u = &hub.updates;
     // That exact build: the server may hand out more than one for a platform.
     let msg = ServerMsg::Upgrade { job: id.to_owned(), path: format!("/dl/kiln/{}/{}", b.target, b.build), sha256: b.sha256.clone(), size: b.size };
-    if !hub.send_to_agent(machine, LANE_CONTROL, &msg).await {
-        u.finish(hub, id, Err(format!("{machine} is not connected")));
-        return;
+    // A live command: refused at once while its runner is away. Refused, the upgrade ends there;
+    // unanswered (the runner restarting into its new build, say), it goes on to see what came of it.
+    match hub.command_start(machine, &msg).await.answer(crate::hub::COMMAND_WITHIN).await {
+        crate::wire::commands::Answer::Taken | crate::wire::commands::Answer::Sent | crate::wire::commands::Answer::Unanswered { .. } | crate::wire::commands::Answer::Parked => {}
+        other => {
+            u.finish(hub, id, Err(format!("{machine}: {}", other.words())));
+            return;
+        }
     }
     // A runner that upgrades blue/green is through once it says its new build took over.
     let blue_green = {
@@ -2358,15 +2421,20 @@ pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
     "kiln-agent".to_owned()
 }
 
-/// What a runner announces after Hello ([`AgentMsg::Build`]): what this build can do, and
-/// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01, probed once).
-pub fn runner_build() -> AgentMsg {
-    let docker = if crate::runner::docker::available() { crate::proto::CAP_DOCKER } else { 0 };
+/// What a runner announces after Hello ([`AgentMsg::Build`]): what this build can do,
+/// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01: probed until it answers,
+/// waited for 10 s at a time), and `CAP_FIRECRACKER` when it can boot microVMs (W13-R05).
+pub async fn runner_build() -> AgentMsg {
+    let docker = if crate::rt::blocking(crate::runner::docker::available).await.unwrap_or(false) { crate::proto::CAP_DOCKER } else { 0 };
+    #[cfg(target_os = "linux")]
+    let microvms = if crate::runner::firecracker::Machine::find().is_some() { crate::proto::CAP_FIRECRACKER } else { 0 };
+    #[cfg(not(target_os = "linux"))]
+    let microvms = 0;
     // Under a supervisor that can start a new build beside it (`kiln supervise` on Unix).
     let blue_green = if crate::bluegreen::Supervisor::from_env().is_some() { crate::proto::CAP_BLUE_GREEN } else { 0 };
     // Rootless engines are where untrusted legs may run (docs/ci.md W18-R07).
-    let rootless = if docker != 0 && crate::runner::docker::rootless_engine() { crate::proto::CAP_DOCKER_ROOTLESS } else { 0 };
-    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | blue_green | rootless }
+    let rootless = if docker != 0 && crate::rt::blocking(crate::runner::docker::rootless_engine).await.unwrap_or(false) { crate::proto::CAP_DOCKER_ROOTLESS } else { 0 };
+    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | microvms | blue_green | rootless }
 }
 
 /// What a runner says of itself after its build ([`AgentMsg::Facts`]): for now, the kiln it
@@ -2424,7 +2492,11 @@ pub const RUNNER_CAPS: u32 = CAP_UPGRADE
     | crate::proto::CAP_PREVIEW
     | crate::proto::CAP_PORTS
     | crate::proto::CAP_ENGINES
-    | crate::proto::CAP_WORKSPACE;
+    | crate::proto::CAP_WORKSPACE
+    | crate::proto::CAP_POOLS
+    | crate::proto::CAP_RECEIVED
+    | crate::proto::CAP_UNDEPLOY
+    | crate::proto::CAP_CLUSTER;
 
 /// What an outpost (`kiln outpost`) does ([`AgentMsg::Build`]): a runner's terminals, AI sessions
 /// and agents (taking a session over, listing folders), none of its jobs, upgrades, front door,
@@ -2519,7 +2591,7 @@ mod tests {
     #[test]
     fn runners_announce_every_capability_they_have() -> anyhow::Result<()> {
         use crate::proto::{CAP_DIRS, CAP_FRONT_DOOR, CAP_TAKEOVER, CAP_TAKEOVER_STOP};
-        let AgentMsg::Build { caps, build } = runner_build() else { anyhow::bail!("runner_build is not a Build") };
+        let AgentMsg::Build { caps, build } = crate::rt::block_on(async { Ok(runner_build().await) })? else { anyhow::bail!("runner_build is not a Build") };
         assert!(!build.is_empty());
         for cap in [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_FRONT_DOOR] {
             assert_eq!(caps & cap, cap, "capability {cap} is announced");

@@ -9,6 +9,8 @@ import type {
   Agent,
   CdApp,
   CdAppDetail,
+  CdAutoRollback,
+  CdAutoRollbackSetting,
   CdDeployment,
   CdDiff,
   CdEvent,
@@ -45,8 +47,8 @@ export interface PagesCtx {
   err: (res: http.ServerResponse, status: number, message: string) => void;
   body: <T>(req: http.IncomingMessage) => Promise<T>;
   emit?: (ev: ServerEvent) => void;
-  /** kiln's release pipeline in the simulation: Build every platform starts it. */
-  release?: { start: (commit: string) => Run; latest: () => { run: Run; jobs: Job[] } | null };
+  /** kiln's release pipeline in the simulation: Build every platform starts it; `past`, the runs the kept builds came from, newest first. */
+  release?: { start: (commit: string) => Run; latest: () => { run: Run; jobs: Job[] } | null; past: () => Run[] };
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -66,6 +68,54 @@ interface MockApp {
   detail: CdAppDetail;
   history: CdDeployment[];
   rollouts?: CdRollout[];
+  /** Auto-rollback set for the app. */
+  autoRollback?: CdAutoRollbackSetting | null;
+}
+
+/** Auto-rollback set for every app of a repository, by its URL. */
+const repoAutoRollback = new Map<string, CdAutoRollbackSetting>();
+
+const COMMIT_SUBJECTS = [
+  "Raise worker memory limit to 1Gi",
+  "Roll the api image forward to 1.42.0",
+  "Add a canary step at 25% for checkout",
+  "Tune HPA thresholds after the Friday spike",
+  "Pin the ingress controller's chart to 4.11",
+  "Move the session cache to its own namespace and give it a PodDisruptionBudget so node drains stop taking every replica at once",
+  'Revert "Enable HTTP/3 on the edge"',
+];
+const COMMIT_BODIES = [
+  "",
+  "The worker was OOM-killed twice an hour under the nightly import.\nA heap profile shows the parser holding whole batches; 1Gi fits\nthe largest batch we've seen with room to spare.\n\nRefs: OPS-2211",
+  "1.42.0 fixes the slow /search queries (an index the planner skipped).\n\n- api: 1.41.3 → 1.42.0\n- migrations: none\n- config: unchanged\n\nRolled out to staging yesterday; p99 dropped from 840 ms to 190 ms.",
+  "Checkout takes 25% for 10 minutes, measured against the error rate\nand p95 latency, before the rest.",
+  "Scale-up reacted too late on Friday: CPU sat at 92% for six minutes\nbefore the first new pod. Target 60% instead of 80%, and a shorter\nstabilization window up.\n\nCo-Authored-By: Mira K <mira@example.com>",
+  "This reverts commit 4be7e1c0. HTTP/3 broke clients behind two corporate proxies that drop UDP 443 without an ICMP reply, so they waited out the whole handshake timeout before falling back. We'll try again with Alt-Svc only on a canary hostname.",
+  "",
+];
+
+/** An app's auto-rollback, as the server works it out: its own, its repository's, its deploy file's, else on. */
+function autoRollbackOf(a: MockApp): CdAutoRollback {
+  const repo = a.detail.origin.kind === "deploy" ? a.detail.origin.repo : (a.detail.definition?.sources[0]?.repo ?? null);
+  const repoSetting = repo ? (repoAutoRollback.get(repo) ?? null) : null;
+  const app = a.autoRollback ?? null;
+  const name = (u: string) => u.replace(/^https:\/\/(github\.com\/)?/, "");
+  const by = (s: CdAutoRollbackSetting | null) => (s?.by ? ` by ${s.by}` : "");
+  if (app) return { on: app.on, from: "app", why: `set for this app${by(app)}`, app, repo, repo_setting: repoSetting, deploy_file: null };
+  if (repoSetting) return { on: repoSetting.on, from: "repo", why: `set for ${name(repo ?? "")}${by(repoSetting)}`, app, repo, repo_setting: repoSetting, deploy_file: null };
+  return { on: true, from: "default", why: "kiln's default", app, repo, repo_setting: null, deploy_file: null };
+}
+
+/** What a rollback can go to: what succeeded, newest first, what runs now and repeats left out. */
+function rollbackTargets(a: MockApp) {
+  const current = a.history.find((d) => d.succeeded) ?? null;
+  const seen = new Set<string>(current?.revision ? [current.revision] : []);
+  const targets = a.history.filter((d) => {
+    if (!d.succeeded || !d.revision || seen.has(d.revision)) return false;
+    seen.add(d.revision);
+    return true;
+  });
+  return { app: a.detail.app, current, targets, kept: 10, shadow: a.detail.shadow };
 }
 
 const apps = new Map<string, MockApp>();
@@ -143,20 +193,40 @@ const apps = new Map<string, MockApp>();
           body: "",
         },
       };
-      const history: CdDeployment[] = Array.from({ length: 6 }, (_, i) => ({
-        app: id,
-        id: 6 - i,
-        op: 6 - i,
-        revision: i === 0 ? revision : hex(r, 40),
-        trigger: pick(r, ["manual", "auto", "self-heal"]),
-        by: r() < 0.4 ? "ada" : null,
-        succeeded: !(i === 2 && r() < 0.4),
-        message: i === 2 ? "one or more objects failed to apply" : "",
-        applied: resources,
-        pruned: i === 1 ? 1 : 0,
-        at_ms: Date.now() - (i + 1) * 9 * 3_600_000,
-        commit: { sha: revision, author: "ada", email: "dev@example.com", at_ms: Date.now() - (i + 1) * 9 * 3_600_000, subject: `Change ${6 - i} to ${name}`, body: "" },
-      }));
+      // Twelve deployments, newest first: tagged releases among them, messages of every length,
+      // one failure, and one render deployed twice.
+      const history: CdDeployment[] = Array.from({ length: 12 }, (_, i) => {
+        const rev = i === 0 ? revision : hex(r, 40);
+        const at = Date.now() - (i + 1) * 9 * 3_600_000;
+        const subject = i === 0 ? (detail.revision_info?.subject ?? "") : (COMMIT_SUBJECTS[(i + n) % COMMIT_SUBJECTS.length] ?? `Change ${12 - i} to ${name}`);
+        return {
+          app: id,
+          id: 12 - i,
+          op: 12 - i,
+          revision: rev,
+          commits: [rev],
+          trigger: pick(r, ["manual", "auto", "self-heal"]),
+          by: r() < 0.4 ? "ada" : null,
+          succeeded: i !== 2,
+          message: i === 2 ? "one or more objects failed to apply" : "",
+          applied: resources,
+          pruned: i === 1 ? 1 : 0,
+          at_ms: at,
+          commit: {
+            sha: rev,
+            author: pick(r, ["ada", "mira.k", "jonas", "ines"]),
+            email: "dev@example.com",
+            at_ms: at - 1_800_000,
+            subject,
+            body: COMMIT_BODIES[(i + n) % COMMIT_BODIES.length] ?? "",
+          },
+          tags: i % 3 === 1 ? [`v1.${40 - i}.0`, ...(i === 4 ? [`release-${40 - i}`] : [])] : [],
+        };
+      });
+      // Deployment 6 deployed again what 7 did.
+      const twin = history[6];
+      const again = history[5];
+      if (twin && again) Object.assign(again, { revision: twin.revision, commits: twin.commits, commit: twin.commit, tags: twin.tags });
       apps.set(id, { app, detail, history });
     }
   }
@@ -194,7 +264,10 @@ const apps = new Map<string, MockApp>();
     };
     const detail: CdAppDetail = {
       ...app,
-      definition: { sources: [{ repo: "https://github.com/hyper-light/thumbs", path: ".kiln/deploy.yaml", revision: "main", chart: null, as_ref: null }], sync: { auto: true, prune: true, self_heal: true, allow_empty: false } },
+      definition: {
+        sources: [{ repo: "https://github.com/hyper-light/thumbs", path: ".kiln/deploy.yaml", revision: "main", chart: null, as_ref: null }],
+        sync: { auto: true, prune: true, self_heal: true, allow_empty: false },
+      },
       commits: [revision],
       children: [],
       revision_info: { sha: revision, author: "ada", email: "dev@example.com", at_ms: at - 360_000, subject: "Resize thumbnails in WebP", body: "" },
@@ -204,7 +277,12 @@ const apps = new Map<string, MockApp>();
   const run = (name: string, against: "preview" | "production", passed: number, failed: number, verdict: CdRollout["checks"][number]["verdict"], why = "", asked = false) => ({
     name,
     against,
-    measurements: [...Array(passed).fill("pass"), ...Array(failed).fill("fail")].map((v, i) => ({ at_ms: at - (passed + failed - i) * 20_000, verdict: v, value: { status: v === "pass" ? 200 : 503 }, message: v === "pass" ? "" : "503 from /healthz" })),
+    measurements: [...Array(passed).fill("pass"), ...Array(failed).fill("fail")].map((v, i) => ({
+      at_ms: at - (passed + failed - i) * 20_000,
+      verdict: v,
+      value: { status: v === "pass" ? 200 : 503 },
+      message: v === "pass" ? "" : "503 from /healthz",
+    })),
     tally: { passed, failed, inconclusive: 0, errors: 0, streak: passed, errors_in_a_row: 0 },
     asked: asked ? { id: 9, at_ms: at - 2_000 } : null,
     next_ms: at + 20_000,
@@ -391,8 +469,25 @@ function tree(id: string): CdTree | null {
     info: [{ name: "Ready", value: "3/3" }],
   });
   const off = a.sync === "OutOfSync";
-  managed("Service", a.name, "", off ? { sync: "OutOfSync", tracked_by: `default/${a.name}-argo`, shared_with: [`default/${a.name}-argo`], marks_only: true, why: `app default/${a.name}-argo's tracking is on it: a sync takes it over` } : {});
-  managed("ConfigMap", `${a.name}-config`, "", { health: null, info: [{ name: "Keys", value: "4" }], ...(off ? { sync: "OutOfSync" as const, marks_only: true, why: ".metadata.labels.kiln.dev/app is missing live" } : {}) });
+  managed(
+    "Service",
+    a.name,
+    "",
+    off
+      ? {
+          sync: "OutOfSync",
+          tracked_by: `default/${a.name}-argo`,
+          shared_with: [`default/${a.name}-argo`],
+          marks_only: true,
+          why: `app default/${a.name}-argo's tracking is on it: a sync takes it over`,
+        }
+      : {},
+  );
+  managed("ConfigMap", `${a.name}-config`, "", {
+    health: null,
+    info: [{ name: "Keys", value: "4" }],
+    ...(off ? { sync: "OutOfSync" as const, marks_only: true, why: ".metadata.labels.kiln.dev/app is missing live" } : {}),
+  });
   if (off) {
     managed("PodDisruptionBudget", a.name, "policy", { health: "Missing", sync: "OutOfSync", missing: true, why: "not in the cluster" });
     managed("ConfigMap", `${a.name}-old`, "", { health: null, sync: "OutOfSync", requires_pruning: true, why: "not in git: requires pruning" });
@@ -547,7 +642,9 @@ function diffOf(id: string): CdDiff[] {
   const a = apps.get(id)?.app;
   if (!a || a.sync !== "OutOfSync") return [];
   const ns = a.namespace;
-  const marks = (app: string) => [{ old_start: 4, old_lines: 3, new_start: 4, new_lines: 3, lines: ["   labels:", `-    app.kubernetes.io/instance: ${app}`, `+    kiln.dev/app: 0123456789abcdef`, `   name: ${a.name}`] }];
+  const marks = (app: string) => [
+    { old_start: 4, old_lines: 3, new_start: 4, new_lines: 3, lines: ["   labels:", `-    app.kubernetes.io/instance: ${app}`, `+    kiln.dev/app: 0123456789abcdef`, `   name: ${a.name}`] },
+  ];
   return [
     {
       key: { group: "apps", kind: "Deployment", namespace: ns, name: a.name },
@@ -556,10 +653,39 @@ function diffOf(id: string): CdDiff[] {
       predicted: "",
       hunks: [{ old_start: 7, old_lines: 3, new_start: 7, new_lines: 3, lines: [" spec:", "-  replicas: 2", "+  replicas: 3", "   revisionHistoryLimit: 5"] }],
     },
-    { key: { group: "", kind: "Service", namespace: ns, name: a.name }, why: `app default/${a.name}-argo's tracking is on it: a sync takes it over`, live: "", predicted: "", hunks: marks(`${a.name}-argo`), tracked_by: `default/${a.name}-argo`, marks_only: true },
-    { key: { group: "", kind: "ConfigMap", namespace: ns, name: `${a.name}-config` }, why: ".metadata.labels.kiln.dev/app is missing live", live: "", predicted: "", hunks: marks(""), marks_only: true },
-    { key: { group: "policy", kind: "PodDisruptionBudget", namespace: ns, name: a.name }, why: "not in the cluster", live: "", predicted: "", hunks: [{ old_start: 0, old_lines: 0, new_start: 1, new_lines: 2, lines: ["+kind: PodDisruptionBudget", `+name: ${a.name}`] }], missing: true },
-    { key: { group: "", kind: "ConfigMap", namespace: ns, name: `${a.name}-old` }, why: "not in git: requires pruning", live: "", predicted: "", hunks: [{ old_start: 1, old_lines: 2, new_start: 0, new_lines: 0, lines: ["-kind: ConfigMap", `-name: ${a.name}-old`] }], requires_pruning: true },
+    {
+      key: { group: "", kind: "Service", namespace: ns, name: a.name },
+      why: `app default/${a.name}-argo's tracking is on it: a sync takes it over`,
+      live: "",
+      predicted: "",
+      hunks: marks(`${a.name}-argo`),
+      tracked_by: `default/${a.name}-argo`,
+      marks_only: true,
+    },
+    {
+      key: { group: "", kind: "ConfigMap", namespace: ns, name: `${a.name}-config` },
+      why: ".metadata.labels.kiln.dev/app is missing live",
+      live: "",
+      predicted: "",
+      hunks: marks(""),
+      marks_only: true,
+    },
+    {
+      key: { group: "policy", kind: "PodDisruptionBudget", namespace: ns, name: a.name },
+      why: "not in the cluster",
+      live: "",
+      predicted: "",
+      hunks: [{ old_start: 0, old_lines: 0, new_start: 1, new_lines: 2, lines: ["+kind: PodDisruptionBudget", `+name: ${a.name}`] }],
+      missing: true,
+    },
+    {
+      key: { group: "", kind: "ConfigMap", namespace: ns, name: `${a.name}-old` },
+      why: "not in git: requires pruning",
+      live: "",
+      predicted: "",
+      hunks: [{ old_start: 1, old_lines: 2, new_start: 0, new_lines: 0, lines: ["-kind: ConfigMap", `-name: ${a.name}-old`] }],
+      requires_pruning: true,
+    },
   ];
 }
 
@@ -630,7 +756,98 @@ function plan(ask: { head?: string; commit?: string; pr?: number }): CdPlan {
 
 /* ------------------------------------------------------------------ plans */
 
+/** A goal turned into a plan here (Make a plan): a plan being planned, its words the goal's. */
+export function planning(goal: { agent: string; id: string; text: string }): string {
+  const id = `pl_${Math.random().toString(36).slice(2, 8)}`;
+  const now = Math.floor(Date.now() / 1000);
+  const title = goal.text.split(/[.:—]/)[0]!.trim().slice(0, 80);
+  PLANS.unshift({
+    ...PLANS[0]!,
+    id,
+    title,
+    body: goal.text,
+    items: [],
+    steps: [],
+    tags: [],
+    version: 1,
+    runs: 0,
+    updated_at: now,
+    share: undefined,
+    phase: "planning",
+    research: undefined,
+    source: { goal },
+  } as unknown as (typeof PLANS)[number]);
+  return id;
+}
+
+/** The plan Release prep proposed (plan mode), as its conversation has it and as kiln keeps it (`pl_proposed`). */
+export const PROPOSED = `# Fix: a mount taken over by a restarted daemon dropped a store
+
+The successor's handle store starts fresh, so a page re-fetched after the takeover was never tracked, and its write-back was judged fresh.
+
+1. Reproduce it: the CLI test that writes through a mount taken over by a restarted daemon fails 3 of 3.
+2. Track handles the successor never saw opened: \`WritableOpens\` keyed by handle and inode (coherence.rs).
+3. Adopt an unseen handle on a restored mount before serving its write (channel.rs).
+4. Tests, red first: the CLI test and the coherence unit tests, then the guest tests on the box.
+5. Verify: workspace clippy, the doc gate, and CI.`;
+
 const PLANS = [
+  {
+    id: "pl_search",
+    title: "Search across agents' conversations",
+    body: "Agents can search every conversation they may read.",
+    items: [
+      { title: "Store: search by agent and time", description: "", examples: "", acceptance: [], testing: [], needs: [] },
+      { title: "Op: conversations.search", description: "", examples: "", acceptance: [], testing: [], needs: [1] },
+      { title: "Agents use it in code mode", description: "", examples: "", acceptance: [], testing: [], needs: [1] },
+      { title: "UI: search in Mission Control", description: "", examples: "", acceptance: [], testing: [], needs: [2, 3] },
+      { title: "Docs and the kiln-agents skill", description: "", examples: "", acceptance: [], testing: [], needs: [2] },
+      { title: "Bench: a million events under 50 ms", description: "", examples: "", acceptance: [], testing: [], needs: [2] },
+      { title: "WebKit and phone check", description: "", examples: "", acceptance: [], testing: [], needs: [4] },
+      { title: "Ship it", description: "", examples: "", acceptance: [], testing: [], needs: [4, 5, 6, 7] },
+    ],
+    tags: [],
+    source: null,
+    share: null,
+    version: 1,
+    created_at: T0 - 7_200,
+    updated_at: T0 - 3_600,
+    steps: [
+      "Store: search by agent and time",
+      "Op: conversations.search",
+      "Agents use it in code mode",
+      "UI: search in Mission Control",
+      "Docs and the kiln-agents skill",
+      "Bench: a million events under 50 ms",
+      "WebKit and phone check",
+      "Ship it",
+    ],
+    runs: 0,
+    phase: "ready",
+    research: null,
+  },
+  {
+    id: "pl_proposed",
+    title: "Fix: a mount taken over by a restarted daemon dropped a store",
+    body: PROPOSED,
+    items: [],
+    tags: [],
+    source: { session: "fam-orch", agent: "Release prep", harness: "claude", proposed: true },
+    share: null,
+    version: 2,
+    created_at: T0 - 40 * 60,
+    updated_at: T0 - 20 * 60,
+    steps: [
+      "Reproduce it: the CLI test that writes through a mount taken over by a restarted daemon fails 3 of 3.",
+      "Track handles the successor never saw opened: `WritableOpens` keyed by handle and inode (coherence.rs).",
+      "Adopt an unseen handle on a restored mount before serving its write (channel.rs).",
+      "Tests, red first: the CLI test and the coherence unit tests, then the guest tests on the box.",
+      "Verify: workspace clippy, the doc gate, and CI.",
+    ],
+    runs: 0,
+    phase: "ready",
+    research: null,
+  },
   {
     id: "pl_release",
     title: "Cut the 0.2 release",
@@ -661,7 +878,99 @@ const PLANS = [
     updated_at: T0 - 3_600 * 5,
     steps: ["Freeze main", "Run the full bench", "Tag and publish"],
     runs: 2,
+    phase: "ready",
+    research: null,
   },
+  {
+    id: "pl_quic",
+    title: "QUIC replication",
+    body: "Goal: Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
+    items: [
+      {
+        title: "Replicate over QUIC",
+        description: "Carry the metadata store's raft log over hyper-quic.",
+        examples: "",
+        acceptance: [{ kind: "qualitative", text: "The replication suite passes on three nodes." }],
+        testing: [],
+        basis: ["f1", "f2"],
+      },
+      {
+        title: "Bench with replication on",
+        description: "",
+        examples: "",
+        acceptance: [
+          { kind: "qualitative", text: "Fills stay at least 4x ahead of RocksDB." },
+          { kind: "qualitative", text: "Gets and seeks stay at least 4x ahead of Splinter." },
+        ],
+        testing: [],
+        needs: [1],
+        basis: ["f3"],
+      },
+      { title: "Document the replication protocol", description: "", examples: "", acceptance: [], testing: [], needs: [1], basis: ["f1"] },
+    ],
+    tags: ["from a goal"],
+    source: {
+      session: "fam-orch",
+      agent: "Release prep",
+      goal: { agent: "fam-orch", id: "g-quic", text: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB" },
+    },
+    share: null,
+    version: 1,
+    created_at: T0 - 3 * 3600,
+    updated_at: T0 - 2 * 3600,
+    steps: ["Replicate over QUIC", "Bench with replication on", "Document the replication protocol"],
+    runs: 1,
+    phase: "planning",
+    research: "rs_quic",
+  },
+  // Replication lead's "Replicated log" (goals.ts): steps 2, 3 and 4 wait only for 1, so they go side
+  // by side, each on a subagent of its own; 5 waits for all three.
+  {
+    id: "pl_fan",
+    title: "Replicated log",
+    body: "Goal: Replicate the metadata store's log over QUIC: elect, catch up, snapshot",
+    items: [
+      { title: "The log's schema", description: "", examples: "", acceptance: [], testing: [], basis: [] },
+      { title: "Leader election over QUIC", description: "", examples: "", acceptance: [], testing: [], needs: [1], basis: [] },
+      { title: "Follower catch-up", description: "", examples: "", acceptance: [], testing: [], needs: [1], basis: [] },
+      { title: "Snapshot transfer", description: "", examples: "", acceptance: [], testing: [], needs: [1], basis: [] },
+      { title: "Land it, with docs", description: "", examples: "", acceptance: [], testing: [], needs: [2, 3, 4], basis: [] },
+    ],
+    tags: ["from a goal"],
+    source: { session: "fan-lead", agent: "Replication lead", goal: { agent: "fan-lead", id: "g-fan", text: "Replicate the metadata store's log over QUIC: elect, catch up, snapshot" } },
+    share: null,
+    version: 1,
+    created_at: T0 - 2 * 3600,
+    updated_at: T0 - 3600,
+    steps: ["The log's schema", "Leader election over QUIC", "Follower catch-up", "Snapshot transfer", "Land it, with docs"],
+    runs: 1,
+    phase: "ready",
+    research: null,
+  },
+  // Release prep's goals being planned now, each by a subagent of its own (agents.ts): a subagent at
+  // "The planner", one asked for "Store and transfer", one that stopped before "Optimize" was ready.
+  ...(
+    [
+      ["pl_planner", "The planner, researched and audited", "rs_planner", "g-planner"],
+      ["pl_store", "Build the data storage/transfer layer and replication using hyper-raft and its crates", "rs_store", "g-store"],
+      ["pl_opt", "Optimize the QUIC API and s3 HTTP API using the same benchmarking and profiling we have in steps 1-3", "rs_opt", "g-opt"],
+    ] as const
+  ).map(([id, title, research, goal]) => ({
+    id,
+    title,
+    body: "",
+    items: [],
+    tags: ["from a goal"],
+    source: { session: "fam-orch", agent: "Release prep", goal: { agent: "fam-orch", id: goal, text: title } },
+    share: null,
+    version: 1,
+    created_at: T0 - 600,
+    updated_at: T0 - 60,
+    steps: [],
+    runs: 0,
+    phase: "planning",
+    research,
+  })),
   {
     id: "pl_parser",
     title: "Fix the YAML anchor parser",
@@ -675,6 +984,8 @@ const PLANS = [
     updated_at: T0 - 86_400 * 2,
     steps: ["Read the failing test", "Fix the parser", "Run the suite"],
     runs: 0,
+    phase: "ready",
+    research: null,
   },
   {
     id: "pl_docs",
@@ -689,8 +1000,128 @@ const PLANS = [
     updated_at: T0 - 86_400 * 3,
     steps: [],
     runs: 1,
+    phase: "ready",
+    research: null,
   },
 ];
+
+const conf = (score: number, why: string, extra: Record<string, number> = {}) => {
+  const grade = score >= 85 ? "A" : score >= 70 ? "B" : score >= 50 ? "C" : score >= 30 ? "D" : "F";
+  const words = { A: "high", B: "good", C: "moderate", D: "low", F: "very low" }[grade];
+  return { score, grade, words, support: score / 100, against: 0, reliability: 0.9, citation: 1, independent: 2, cites: 2, found: 2, failed: 0, why, ...extra };
+};
+
+/** Research (docs/research.md), as the server answers it: a plan's planning, its findings graded. */
+const RESEARCH = {
+  rs_quic: {
+    id: "rs_quic",
+    question: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
+    agent: "fam-orch",
+    by: "agent:Release prep",
+    plan: "pl_quic",
+    sources: [
+      { id: "s1", type: "code", title: "hyper-raft's log transport", locator: "crates/hyper-raft/src/transport.rs:88-140", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s2", type: "measurement", title: "the replication suite", locator: "cargo test -p meta-store --test replication", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s3", type: "standard", title: "RFC 9000: QUIC", locator: "https://www.rfc-editor.org/rfc/rfc9000#section-2.2", published: "2021-05", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s4", type: "blog", title: "QUIC under load", locator: "https://example.dev/quic-under-load", published: "2023", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s5", type: "forum", title: "a thread on QUIC and head-of-line blocking", locator: "https://forum.example.org/t/4812", published: "2022", retrieved_at: Date.now() - 3 * 3600_000 },
+    ],
+    findings: [
+      {
+        id: "f1",
+        claim: "hyper-raft's log transport takes any stream with ordered delivery, so a QUIC stream carries it as it is.",
+        cites: [
+          { source: "s1", quote: "pub trait LogStream: AsyncRead + AsyncWrite + Unpin + Send", at: "line 88", check: { state: "found", at: Date.now() - 3 * 3600_000 } },
+          { source: "s3", quote: "Streams in QUIC provide a lightweight, ordered byte-stream abstraction", check: { state: "found", at: Date.now() - 3 * 3600_000 } },
+        ],
+        against: [],
+        at: Date.now() - 3 * 3600_000,
+        confidence: conf(98, "2 independent sources (code, a standard); 2 of 2 quotes found where cited"),
+        against_weights: [],
+      },
+      {
+        id: "f2",
+        claim: "The replication suite passes over QUIC on three nodes today.",
+        cites: [{ source: "s2", quote: "test result: ok. 48 passed; 0 failed", check: { state: "found", at: Date.now() - 2 * 3600_000, said: "in the agent's own tool output" } }],
+        against: [],
+        at: Date.now() - 2 * 3600_000,
+        confidence: conf(95, "1 independent source (a measurement); 1 of 1 quotes found where cited", { independent: 1, cites: 1, found: 1, reliability: 0.95 }),
+        against_weights: [],
+      },
+      {
+        id: "f3",
+        claim: "QUIC's per-stream ordering keeps tail latency within 10% of TCP under load.",
+        cites: [{ source: "s4", quote: "p99 stayed within 8% of TCP at 40k req/s", check: { state: "not_found", at: Date.now() - 3 * 3600_000, said: "the page doesn't hold those words" } }],
+        against: [{ claim: "Head-of-line blocking returns when one stream carries everything.", cites: [{ source: "s5", check: { state: "found", at: Date.now() - 3 * 3600_000 } }] }],
+        at: Date.now() - 3 * 3600_000,
+        confidence: conf(13, "1 independent source (a blog); 0 of 1 quotes found where cited, 1 not; 1 counterclaim, the strongest moderate", {
+          independent: 1,
+          cites: 1,
+          found: 0,
+          failed: 1,
+          reliability: 0.5,
+          citation: 0.3,
+          against: 0.2,
+          support: 0.15,
+        }),
+        against_weights: [0.2],
+      },
+    ],
+    skipped: {},
+    summary: { findings: 3, grades: { A: 2, F: 1 }, sources: 5, internal: 2, external: 3, checking: 0 },
+    created_at: Date.now() - 3 * 3600_000,
+    updated_at: Date.now() - 2 * 3600_000,
+  },
+  // The research of the goals being planned now (agents.ts): what their subagents found so far.
+  ...Object.fromEntries(
+    (
+      [
+        [
+          "rs_planner",
+          "pl_planner",
+          "The planner, researched and audited",
+          [
+            "DuckDB enumerates join orders with DPhyp and falls back to a greedy order past 12 relations.",
+            "Umbra's adaptive compilation picks its plan before it compiles, from the same cost model.",
+            "Our planner costs a join by its inputs' row counts alone, with no distinct counts.",
+          ],
+          { A: 2, B: 1 },
+        ],
+        ["rs_store", "pl_store", "Build the data storage/transfer layer", [], {}],
+        [
+          "rs_opt",
+          "pl_opt",
+          "Optimize the QUIC API and s3 HTTP API",
+          ["The s3 API's PUT path copies each part twice before it reaches the store.", "hyper-quic's send path allocates a frame per write."],
+          { B: 1, C: 1 },
+        ],
+      ] as const
+    ).map(([id, plan, question, claims, grades]) => [
+      id,
+      {
+        id,
+        question,
+        agent: "fam-orch",
+        by: "agent:Release prep",
+        plan,
+        sources: [],
+        findings: claims.map((claim, i) => ({
+          id: `${id}-f${i + 1}`,
+          claim,
+          cites: [],
+          against: [],
+          at: Date.now() - 60_000,
+          confidence: conf(80, "1 independent source; 1 of 1 quotes found where cited"),
+          against_weights: [],
+        })),
+        skipped: {},
+        summary: { findings: claims.length, grades, sources: claims.length, internal: claims.length, external: 0, checking: 0 },
+        created_at: Date.now() - 10 * 60_000,
+        updated_at: Date.now() - 60_000,
+      },
+    ]),
+  ),
+} as Record<string, unknown>;
 
 /* ------------------------------------------------------------------ the rest */
 
@@ -705,9 +1136,10 @@ const started = new Map<string, UpdateJob>();
 const upgraded = new Set<string>();
 /** Update policies chosen on the page, by runner (else automatic). */
 const policies = new Map<string, UpdatePolicy>();
-/** Binaries removed, and uploaded, on the page. */
-const removed = new Set<string>();
+/** When each platform's kept binary was removed on the page (unix seconds), and what was uploaded, or a machine built of itself, for a platform since. */
+const removedAt = new Map<string, number>();
 const uploaded = new Map<string, KilnBinary>();
+const machineBuilt = new Map<string, KilnBinary>();
 /** The platforms each job of the release pipeline builds (`.kiln/release.yaml`), as the mock's targets name them. */
 const RELEASE_TARGETS: Record<string, string[]> = { linux: ["aarch64-unknown-linux-gnu"], windows: ["x86_64-pc-windows-msvc"], macos: ["aarch64-apple-darwin"] };
 
@@ -746,6 +1178,13 @@ function tickUpgrades(ctx: PagesCtx) {
       if (t >= lines[lines.length - 1]![0] + 2) {
         Object.assign(job, { state: "done", ended_at: now(), reached: true });
         upgraded.add(job.target);
+        // A machine that built kiln of itself hands the binary back: others of its platform download it.
+        const a = job.method === "build" ? ctx.agents().find((x) => x.name === job.target) : undefined;
+        if (a) {
+          const target = `${a.arch}-${a.os === "macos" ? "apple-darwin" : "unknown-linux-gnu"}`;
+          const sha256 = hex(mulberry32(hashStr(`${target}:${job.id}`)), 64);
+          machineBuilt.set(target, { target, sha256, size: 36_400_000, build: sha256.slice(0, 12), origin: "machine", at: now(), sha: NEWEST, by: a.name });
+        }
         ctx.emit?.({ type: "updates" });
       }
       ctx.emit?.({ type: "update_job", job: { ...job, log: [...job.log] } });
@@ -800,13 +1239,12 @@ function failedJobs(ctx: PagesCtx): UpdateJob[] {
       reached: false,
       log: [
         `upgrading ${mac.name}: it builds ${NEWEST.slice(0, 12)} itself; nothing it runs is stopped`,
-        "kiln checkout: /Users/ada/Projects/kiln (left as it is: the build is of 94f0847a1b2c, from the server)",
         "fetching the source of 94f0847a1b2c from https://kiln.lan",
         "   Compiling kiln-cd v0.2.0 (/Users/ada/.cache/kiln/self-build/src-9d2f61c08b7e4a55/crates/kiln-cd)",
         "   Compiling kiln v0.2.0 (/Users/ada/.cache/kiln/self-build/src-9d2f61c08b7e4a55/crates/kiln)",
         "cargo exited with 101. What it said that went wrong:",
         "error: linking with `cc` failed: exit status: 1",
-        "error: could not compile `kiln` (bin \"kiln\") due to 1 previous error",
+        'error: could not compile `kiln` (bin "kiln") due to 1 previous error',
         "failed: kiln did not build (its full output is /Users/ada/.cache/kiln/self-build/build-9d2f61c08b7e4a55.log on this machine)",
       ],
       error: "kiln did not build (its full output is /Users/ada/.cache/kiln/self-build/build-9d2f61c08b7e4a55.log on this machine)",
@@ -836,18 +1274,43 @@ function failedJobs(ctx: PagesCtx): UpdateJob[] {
   return out;
 }
 
-/** The binaries kept here: the server's own and one the release pipeline built, then what the page's release run, uploads and removals made of them. */
+/**
+ * The binaries kept here: the server's own, then one for each platform, the newest of what kiln's
+ * release pipeline built, a machine built of itself or was uploaded (crate::updates::stored). An
+ * older release build of the server's own platform stays kept beside the server's own, which
+ * runners of it get instead. The page's release runs, uploads and removals change them.
+ */
 function binariesOf(ctx: PagesCtx): KilnBinary[] {
-  const base: KilnBinary[] = [
-    { target: "x86_64-unknown-linux-gnu", sha256: "ab".repeat(32), size: 38_200_000, build: "0.1.0+a1b2c3d", origin: "server", at: T0 - 86_400 },
-    { target: "aarch64-unknown-linux-gnu", sha256: "cd".repeat(32), size: 36_900_000, build: "0.1.0+a1b2c3d", origin: "built", at: T0 - 80_000, run: 412, sha: "a1b2c3d4e5" },
+  const [recent, older] = ctx.release?.past() ?? [];
+  const own: KilnBinary = { target: "x86_64-unknown-linux-gnu", sha256: "ab".repeat(32), size: 38_200_000, build: "0.1.0+a1b2c3d", origin: "server", at: T0 - 86_400 };
+  const kept: KilnBinary[] = [
+    {
+      target: "aarch64-unknown-linux-gnu",
+      sha256: "cd".repeat(32),
+      size: 36_900_000,
+      build: "0.1.0+a1b2c3d",
+      origin: "built",
+      at: recent?.finished_at ?? T0 - 80_000,
+      run: recent?.number ?? 412,
+      sha: recent?.sha ?? "a1b2c3d4e5",
+    },
+    {
+      target: "x86_64-unknown-linux-gnu",
+      sha256: "ef".repeat(32),
+      size: 37_500_000,
+      build: "0.0.9+df17c34",
+      origin: "built",
+      at: older?.finished_at ?? T0 - 205_000,
+      run: older?.number ?? 380,
+      sha: older?.sha ?? "df17c34639ecbf9d5c9caefb6af28aa67ee01257",
+    },
   ];
+  // A release run of the server's own commit keeps its builds of the other platforms (crate::updates::adopts); one of any other commit, none.
   const rel = ctx.release?.latest();
-  const built = new Map<string, KilnBinary>();
-  for (const j of rel?.jobs ?? []) {
+  for (const j of rel && rel.run.sha === NEWEST ? rel.jobs : []) {
     if (j.status !== "succeeded") continue;
     for (const t of RELEASE_TARGETS[j.key] ?? []) {
-      built.set(t, {
+      kept.push({
         target: t,
         sha256: hex(mulberry32(hashStr(t)), 64),
         size: t.includes("windows") ? 43_000_000 : t.includes("darwin") ? 36_100_000 : 39_600_000,
@@ -855,26 +1318,24 @@ function binariesOf(ctx: PagesCtx): KilnBinary[] {
         origin: "built",
         at: j.finished_at ?? now(),
         run: rel!.run.number,
-        sha: NEWEST,
+        sha: rel!.run.sha,
       });
     }
   }
-  const out = base.filter((b) => b.origin === "server" || !built.has(b.target)).concat([...built.values()]);
-  for (const [t, b] of uploaded) {
-    const i = out.findIndex((x) => x.target === t && x.origin !== "server");
-    if (i >= 0) out.splice(i, 1);
-    out.push(b);
-  }
-  return out.filter((b) => !removed.has(`${b.target}:${b.at}`));
+  kept.push(...machineBuilt.values(), ...uploaded.values());
+  const newest = new Map<string, KilnBinary>();
+  for (const b of kept) if (b.at > (removedAt.get(b.target) ?? 0) && b.at >= (newest.get(b.target)?.at ?? 0)) newest.set(b.target, b);
+  return [own, ...newest.values()];
 }
 
 function updates(ctx: PagesCtx): UpdatesOverview {
   const binaries = binariesOf(ctx);
   const rel = ctx.release?.latest() ?? null;
   const darwin = binaries.find((b) => b.target === "aarch64-apple-darwin" && b.sha === NEWEST);
-  // While the page's release run goes, what it builds and isn't built from the newest yet; else the Mac's platform, as before.
+  // While a release run of the server's commit goes, what it builds and isn't built from it yet; else the Mac's platform, until a build of it is kept.
   const releaseTargets = Object.values(RELEASE_TARGETS).flat();
-  const behind = rel ? releaseTargets.filter((t) => !binaries.some((b) => b.target === t && b.sha === NEWEST)) : ["aarch64-apple-darwin"];
+  const behind = (rel && rel.run.sha === NEWEST ? releaseTargets : ["aarch64-apple-darwin"]).filter((t) => !binaries.some((b) => b.target === t && b.sha === NEWEST));
+  const recent = ctx.release?.past()[0];
   const runners = ctx
     .agents()
     .filter((a) => !a.ephemeral)
@@ -887,7 +1348,7 @@ function updates(ctx: PagesCtx): UpdatesOverview {
         name: a.name,
         policy: policies.get(a.name) ?? ("auto" as const),
         locked: false,
-        from: up || mac ? null : "built by release run #412",
+        from: up || mac ? null : `built by release run #${recent?.number ?? 412}`,
         hostname: a.hostname,
         os: a.os,
         arch: a.arch,
@@ -915,7 +1376,7 @@ function updates(ctx: PagesCtx): UpdatesOverview {
                 ]
               : [
                   { way: "download" as const, ok: true, why: "downloads build 0.1.0+a1b2c3d" },
-                  { way: "build" as const, ok: false, why: "no kiln checkout on it to build from" },
+                  { way: "build" as const, ok: false, why: "it has no cargo or node to build kiln with" },
                 ],
       };
     });
@@ -1124,7 +1585,8 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
   if ((mm = p.match(/^\/api\/updates\/binaries\/([^/]+)$/)) && m === "DELETE") {
     const target = decodeURIComponent(mm[1] ?? "");
     uploaded.delete(target);
-    for (const b of binariesOf(ctx)) if (b.target === target && b.origin !== "server") removed.add(`${b.target}:${b.at}`);
+    machineBuilt.delete(target);
+    removedAt.set(target, now());
     ctx.emit?.({ type: "updates" });
     res.statusCode = 204;
     res.end();
@@ -1195,6 +1657,12 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     a.app.auto = def.sync.auto;
     return (void json(res, 200, { app: a.detail.app }), true);
   }
+  if (p === "/api/cd/repos/auto-rollback" && m === "PUT") {
+    const { repo, on } = await ctx.body<{ repo: string; on: boolean | null }>(req);
+    if (on === null) repoAutoRollback.delete(repo);
+    else repoAutoRollback.set(repo, { on, by: "ada", at_ms: Date.now() });
+    return (void json(res, 200, { repo, setting: on === null ? null : { on, by: "ada" } }), true);
+  }
   if (p === "/api/cd/plans/repos") return (void json(res, 200, { repos: PLAN_REPOS }), true);
   if (p === "/api/cd/plans" && m === "POST") {
     const ask = await ctx.body<{ head?: string; commit?: string; pr?: number }>(req);
@@ -1206,10 +1674,26 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     const rest = mm[3] ?? "";
     const a = apps.get(id);
     if (!a) return (err(res, 404, `no app ${id}`), true);
+    if (rest === "/auto-rollback" && m === "PUT") {
+      const { on } = await ctx.body<{ on: boolean | null }>(req);
+      a.autoRollback = on === null ? null : { on, by: "ada", at_ms: Date.now() };
+      return (void json(res, 200, autoRollbackOf(a)), true);
+    }
+    if (rest === "/rollback" && m === "POST") {
+      const { to } = await ctx.body<{ to?: number }>(req);
+      const d = rollbackTargets(a).targets.find((t) => t.id === to);
+      if (!d) return (err(res, 400, `${id} has no deployment ${to} to roll back to`), true);
+      const pin = { to: d.id, revision: d.revision, by: "ada", at_ms: Date.now() };
+      a.detail.pinned = pin;
+      a.app.pinned = pin;
+      return (void json(res, 200, { rolling_back: id, to: d.id, revision: d.revision, commits: d.commits, tag: null }), true);
+    }
     if (m !== "GET") return (void json(res, 200, {}), true);
-    if (rest === "") return (void json(res, 200, a.detail), true);
+    if (rest === "") return (void json(res, 200, { ...a.detail, auto_rollback: autoRollbackOf(a) }), true);
     if (rest === "/tree") return (void json(res, 200, tree(id)), true);
     if (rest === "/history") return (void json(res, 200, { history: a.history }), true);
+    if (rest === "/rollback-targets") return (void json(res, 200, rollbackTargets(a)), true);
+    if (rest === "/auto-rollback") return (void json(res, 200, autoRollbackOf(a)), true);
     if (rest === "/rollout") return (void json(res, 200, { app: id, rollouts: a.rollouts ?? [] }), true);
     if (rest === "/diff") return (void json(res, 200, { diffs: diffOf(id) }), true);
     if (rest === "/resources") return (void json(res, 200, { resources: [] }), true);
@@ -1224,8 +1708,33 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     return (err(res, 404, `no route for ${p}`), true);
   }
 
+  // Research
+  if (p === "/api/research" && m === "GET") {
+    // One agent's, one plan's, or all, as the server answers.
+    const agent = url.searchParams.get("agent");
+    const plan = url.searchParams.get("plan");
+    const all = Object.values(RESEARCH) as { agent?: string | null; plan?: string | null }[];
+    return (void json(res, 200, { research: all.filter((r) => (!agent || r.agent === agent) && (!plan || r.plan === plan)) }), true);
+  }
+  if ((mm = p.match(/^\/api\/research\/([^/]+)$/)) && m === "GET") {
+    const r = RESEARCH[decodeURIComponent(mm[1]!)];
+    return (r ? json(res, 200, r) : err(res, 404, "no such research"), true);
+  }
   // Plans
-  if (p === "/api/plans" && m === "GET") return (void json(res, 200, PLANS), true);
+  if (p === "/api/plans" && m === "GET") {
+    // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked.
+    const session = url.searchParams.get("session");
+    const proposed = url.searchParams.get("proposed") === "1";
+    const of = (pl: (typeof PLANS)[number]) => (pl as { source?: { session?: string; proposed?: boolean } | null }).source;
+    return (
+      void json(
+        res,
+        200,
+        PLANS.filter((pl) => (!session || of(pl)?.session === session) && (!proposed || of(pl)?.proposed)),
+      ),
+      true
+    );
+  }
   if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/runs)?$/)) && m === "GET") {
     const pl = PLANS.find((x) => x.id === decodeURIComponent(mm![1]!));
     if (!pl) return (err(res, 404, "no such plan"), true);
@@ -1248,6 +1757,18 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
         true
       );
     return (void json(res, 200, pl), true);
+  }
+  // A plan run (`plans.run`): some of its steps (`only`), as goals split into their criteria and tests (`split`), or an agent each.
+  if ((mm = p.match(/^\/api\/plans\/([^/]+)\/run$/)) && m === "POST") {
+    const pl = PLANS.find((x) => x.id === decodeURIComponent(mm![1]!));
+    if (!pl) return (err(res, 404, "no such plan"), true);
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const b = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as { mode?: string; only?: number[]; split?: boolean; session?: string };
+    const n = b.only?.length ?? (pl.items?.length || pl.steps?.length || 0);
+    if (b.mode === "agents")
+      return (void json(res, 200, { run: "pr_agents1", steps: n, note: b.only?.length ? `Not in this run, taken as done: the steps step ${b.only[0]} waits for.` : null }), true);
+    return (void json(res, 200, { session: b.session ?? "fam-orch", sent: n, run: "pr_goals1", split: b.mode === "goals" && b.split ? n : 0 }), true);
   }
   if ((mm = p.match(/^\/api\/shared\/plans\/([^/]+)$/))) {
     const pl = PLANS.find((x) => x.share === decodeURIComponent(mm![1]!));

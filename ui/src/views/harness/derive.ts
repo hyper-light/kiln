@@ -28,7 +28,9 @@ export type Item =
   | { type: "note"; key: string; event: Extract<HEvent, { kind: "assistant" }> }
   | { type: "thought"; key: string; event: Extract<HEvent, { kind: "thinking" }>; more?: Extract<HEvent, { kind: "thinking" }>[] }
   /** `repeats`: the same notice said again right after itself, shown once with a count. */
-  | { type: "notice"; key: string; event: Extract<HEvent, { kind: "notice" }>; repeats?: number };
+  | { type: "notice"; key: string; event: Extract<HEvent, { kind: "notice" }>; repeats?: number }
+  /** A compaction's marker: the boundary where its conversation was summarized. */
+  | { type: "compaction"; key: string; event: Extract<HEvent, { kind: "notice" }> };
 
 export interface Turn {
   key: string;
@@ -47,6 +49,9 @@ export interface Turn {
 
 /** The notice kiln puts where a conversation went on in another harness, on another machine, or with another setting its harness starts with (`harness-switch:` ids). */
 const switchOf = (e: HEvent): Extract<HEvent, { kind: "notice" }> | null => (e.kind === "notice" && e.id.startsWith("harness-switch:") ? e : null);
+
+/** A compaction's marker (`compaction:` ids), or what kiln said of one before it had them. */
+export const isCompaction = (e: Extract<HEvent, { kind: "notice" }>): boolean => e.id.startsWith("compaction:") || /^Conversation compacted\b/.test(e.text);
 
 const GROUP: Record<ToolKind, StepGroup> = {
   read: "explore",
@@ -117,7 +122,7 @@ export function turnsFrom(was: TurnsMemo | null, events: HEvent[], parent?: stri
     if (t.divider) continue;
     for (let i = t.items.length - 1; i >= 0; i--) {
       const it = t.items[i];
-      if (!it || it.type === "thought" || it.type === "notice") continue;
+      if (!it || it.type === "thought" || it.type === "notice" || it.type === "compaction") continue;
       if (it.type === "note" && !it.event.streaming) {
         t.outcome = it.event;
         t.items.splice(i, 1);
@@ -177,6 +182,8 @@ function readTurns(events: HEvent[], at: number, parent: string | undefined, thr
       const last = t.items.at(-1);
       if (last && last.type === "thought" && !last.event.streaming && !e.redacted) (last.more ??= []).push(e);
       else t.items.push({ type: "thought", key: e.id, event: e });
+    } else if (isCompaction(e)) {
+      t.items.push({ type: "compaction", key: e.id, event: e });
     } else {
       const last = t.items.at(-1);
       if (last && last.type === "notice" && last.event.level === e.level && last.event.text === e.text) last.repeats = (last.repeats ?? 1) + 1;
@@ -232,6 +239,8 @@ export function diffStats(diffs: Pick<FileDiff, "hunks">[] | undefined): { add: 
 
 export interface FileChange {
   path: string;
+  /** Its working tree's top, `path` being relative to it (the server's changeset). */
+  tree?: string;
   created: boolean;
   deleted?: boolean;
   truncated?: boolean;

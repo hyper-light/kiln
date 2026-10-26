@@ -332,6 +332,27 @@ impl Mirror {
         run(c).with_context(|| format!("fetching {what} from {}", self.url)).map(|_| ())
     }
 
+    /// Every tag and the commit it names (an annotated tag's peeled to its commit).
+    pub fn tags(&self) -> Result<Vec<(String, String)>> {
+        let mut c = git(Some(&self.dir), &self.auth);
+        c.args(["for-each-ref", "--format=%(refname:short)%00%(objectname)%00%(*objectname)", "refs/tags"]);
+        Ok(text(run(c)?)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split('\0');
+                let (name, object, peeled) = (f.next()?, f.next()?, f.next().unwrap_or(""));
+                Some((name.to_owned(), if peeled.is_empty() { object } else { peeled }.to_owned()))
+            })
+            .collect())
+    }
+
+    /// The commit a tag names, if the mirror has the tag.
+    pub fn tag(&self, name: &str) -> Option<String> {
+        let mut c = git(Some(&self.dir), &self.auth);
+        c.args(["rev-parse", "--verify", "--quiet", &format!("refs/tags/{name}^{{commit}}")]);
+        run(c).ok().map(text).filter(|s| !s.is_empty())
+    }
+
     /// The remote's default branch, as the mirror's `HEAD` names it.
     pub fn default_branch(&self) -> Option<String> {
         let mut c = git(Some(&self.dir), &self.auth);
@@ -396,8 +417,10 @@ mod tests {
     use super::*;
 
     fn sh(dir: &Path, args: &[&str]) -> Result<String> {
+        // Free of this machine's git config: one that signs tags makes a lightweight `git tag` ask
+        // for a message.
         let out = Command::new("git").current_dir(dir).args(args).env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").output()?;
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").output()?;
         if !out.status.success() {
             bail!("{}", String::from_utf8_lossy(&out.stderr));
         }
@@ -422,6 +445,33 @@ mod tests {
         assert_eq!(c.body, "It timed out on cold starts.");
         assert!(c.at > 1_600_000_000);
         assert!(m.commit("0000000000000000000000000000000000000000").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tags_name_their_commits_annotated_or_not() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work)?;
+        sh(&work, &["init", "-q", "-b", "main"])?;
+        std::fs::write(work.join("a.yaml"), "kind: ConfigMap\n")?;
+        sh(&work, &["add", "."])?;
+        sh(&work, &["commit", "-qm", "one"])?;
+        let one = sh(&work, &["rev-parse", "HEAD"])?;
+        sh(&work, &["tag", "v1.0.0"])?;
+        sh(&work, &["tag", "-a", "release-1", "-m", "the first release"])?;
+        std::fs::write(work.join("a.yaml"), "kind: Secret\n")?;
+        sh(&work, &["commit", "-qam", "two"])?;
+        let two = sh(&work, &["rev-parse", "HEAD"])?;
+        sh(&work, &["tag", "-a", "v1.1.0", "-m", "annotated"])?;
+        let m = Mirror::open(&tmp.path().join("mirror.git"), work.to_str().unwrap_or(""), Auth::default())?;
+        let mut tags = m.tags()?;
+        tags.sort();
+        assert_eq!(tags, [("release-1".to_owned(), one.clone()), ("v1.0.0".to_owned(), one.clone()), ("v1.1.0".to_owned(), two.clone())], "an annotated tag names its commit, not itself");
+        assert_eq!(m.tag("v1.1.0"), Some(two));
+        assert_eq!(m.tag("release-1"), Some(one));
+        assert_eq!(m.tag("main"), None, "a branch is no tag");
+        assert_eq!(m.tag("v9"), None);
         Ok(())
     }
 

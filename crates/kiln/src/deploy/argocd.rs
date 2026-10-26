@@ -38,6 +38,9 @@ pub const KIND: &str = "argocd";
 
 /// The Helm parameter a release's Application carries, read back from what Argo CD compared.
 pub const RELEASE_PARAM: &str = "kiln.release";
+/// The secrets' versions a release pins, as Helm reads them (`API_KEY@1 DB_PASSWORD@4`): kiln-base
+/// stamps them on the pod template, so pods roll onto new ones (docs/deploy-api.md §3.5).
+pub const SECRETS_PARAM: &str = "kiln.secrets";
 
 /// An Argo CD instance, reached with its integration's token.
 pub struct Argo {
@@ -295,11 +298,12 @@ impl Argo {
         self.ok(Method::Post, "/api/v1/projects", Some(&json!({ "project": project, "upsert": true }))).await.map(|_| ())
     }
 
-    /// A repository Argo CD reads, and how its last connection went; `None` when it has none.
-    /// Argo CD answers 403 for a repository it doesn't have, as for one the token may not see:
-    /// putting it says which.
+    /// A repository Argo CD reads, and how connecting to it goes now (`forceRefresh`: Argo CD tries
+    /// it again; its cached answer can say a credential that was revoked still reads); `None` when
+    /// it has none. Argo CD answers 403 for a repository it doesn't have, as for one the token may
+    /// not see: putting it says which.
     pub async fn repository(&self, url: &str) -> Result<Option<Value>, String> {
-        let (status, v) = self.call(Method::Get, &format!("/api/v1/repositories/{}", enc(url)), None).await?;
+        let (status, v) = self.call(Method::Get, &format!("/api/v1/repositories/{}?forceRefresh=true", enc(url)), None).await?;
         match status {
             200 => Ok(Some(v)),
             403 | 404 => Ok(None),
@@ -311,6 +315,14 @@ impl Argo {
     /// tries the repository first: one it can't read is refused, with why.
     pub async fn put_repository(&self, url: &str, name: &str, username: &str, password: &str) -> Result<(), String> {
         let body = json!({ "repo": url, "type": "git", "name": name, "username": username, "password": password });
+        self.ok(Method::Post, "/api/v1/repositories?upsert=true", Some(&body)).await.map(|_| ())
+    }
+
+    /// Makes Argo CD read a git repository over SSH with `private_key` (a deploy key of kiln's),
+    /// tried first as [`Self::put_repository`] is. Argo CD checks the server's host key against
+    /// the ones it knows (`argocd-ssh-known-hosts-cm`).
+    pub async fn put_repository_ssh(&self, url: &str, name: &str, private_key: &str) -> Result<(), String> {
+        let body = json!({ "repo": url, "type": "git", "name": name, "sshPrivateKey": private_key });
         self.ok(Method::Post, "/api/v1/repositories?upsert=true", Some(&body)).await.map(|_| ())
     }
 
@@ -396,8 +408,12 @@ pub fn application(namespace: &str, app: &App, env: &Environment, reg: &Registra
     let values = if values.as_object().is_some_and(|m| !m.is_empty()) { Some(values) } else { None };
     let helm_wanted = matches!(file.package, Package::Helm { .. }) || !set.is_empty() || values.is_some() || file.helm == Some(true);
     set.insert(RELEASE_PARAM.to_owned(), file.release.to_string());
+    // The secrets' versions it pins, which kiln-base stamps on the pod template (§3.5).
+    if !file.secrets.is_empty() {
+        set.insert(SECRETS_PARAM.to_owned(), file.secrets.replace(',', " "));
+    }
     let helm = |values: Option<Value>| {
-        let parameters: Vec<Value> = set.iter().map(|(name, value)| json!({ "name": name, "value": value, "forceString": name == RELEASE_PARAM || repo::sets_string(file, name) })).collect();
+        let parameters: Vec<Value> = set.iter().map(|(name, value)| json!({ "name": name, "value": value, "forceString": name == RELEASE_PARAM || name == SECRETS_PARAM || repo::sets_string(file, name) })).collect();
         let mut h = json!({ "releaseName": app.name, "parameters": parameters });
         if let (Some(v), Some(m)) = (values, h.as_object_mut()) {
             m.insert("valuesObject".into(), v);
@@ -443,7 +459,7 @@ pub fn application(namespace: &str, app: &App, env: &Environment, reg: &Registra
 }
 
 /// The cluster an environment's Applications run in, as Argo CD names it.
-fn cluster_of(env: &Environment) -> String {
+pub(crate) fn cluster_of(env: &Environment) -> String {
     env.targets.kubernetes.first().cloned().unwrap_or_else(|| "in-cluster".to_owned())
 }
 
@@ -505,7 +521,12 @@ spec:
       - name: kiln.release
         value: {{ .release | toString | toJson }}
         forceString: true
-{{- range $name, $value := .set }}{{ if ne $name "kiln.release" }}
+{{- with .secrets }}
+      - name: kiln.secrets
+        value: {{ replace "," " " . | toJson }}
+        forceString: true
+{{- end }}
+{{- range $name, $value := .set }}{{ if and (ne $name "kiln.release") (ne $name "kiln.secrets") }}
       - name: {{ $name | toJson }}
         value: {{ $value | toString | toJson }}
         forceString: {{ contains "${{" (get $raw $name | toString) }}
@@ -945,11 +966,12 @@ mod tests {
             concurrency: Default::default(),
             agents: Default::default(),
             argocd: Default::default(),
+            owners: Default::default(),
         }
     }
 
     fn app(package: Package) -> App {
-        App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Default::default(), source: None, archived: false }
+        App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Default::default(), source: None, archived: false, registries: None }
     }
 
     fn helm() -> Package {

@@ -23,6 +23,7 @@ import { errorMessage } from "@/lib/hooks";
 import { useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
 import { useWindowedRows } from "@/lib/virtual";
+import { environmentsHref } from "@/views/environments/shared";
 import { whatDiffers } from "./model";
 import { HEALTH_TONE, HealthPair, StatePair, SYNC_TONE, SyncPair, opWords, placeOf, running, shortRev } from "./parts";
 import "./deployments.css";
@@ -146,6 +147,9 @@ export default function Deployments() {
         lead="What git says, and what runs: every app's sync and health, live."
         actions={
           <>
+            <Button asChild size="sm" variant="secondary">
+              <Link to={environmentsHref}>Environments</Link>
+            </Button>
             <Button asChild size="sm" variant="secondary">
               <Link to={boardHref}>Releases</Link>
             </Button>

@@ -1,0 +1,26 @@
+[package]
+name = "hyper-sim"
+description = "The deterministic world every simulation here runs in: one seeded generator with a named stream per source, virtual time and each node's clocks, one event queue under the ordered or the free discipline, every choice recorded in a trace that replays the run, and the run-twice check (docs/sim.md, step S-1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# std only (docs/sim.md §2: build, not pull).
+
+[dev-dependencies]
+proptest.workspace = true
+# The step benchmark counts allocations and page faults, and runs hyper-liveness's simulation on
+# its own world and on this one (docs/benchmarks.md, "hyper-sim's world against the harnesses").
+hyper-measure = { path = "../hyper-measure" }
+hyper-liveness = { path = "../hyper-liveness" }
+hyper-timing = { path = "../hyper-timing" }
+
+[[bench]]
+name = "step"
+harness = false
+
+[lints]
+workspace = true

@@ -357,6 +357,133 @@ mod tests {
         assert!(matches(&w, &Event { name: "schedule".into(), action: "0 4 * * *".into(), ..Event::default() }).is_err());
     }
 
+    /// W03-AC01: each `types:` example of GitHub's "Events that trigger workflows", row by row: the
+    /// listed activity types run it and another doesn't; without `types`, every activity runs it,
+    /// but for `pull_request` and `pull_request_target`, whose default is opened, synchronize and
+    /// reopened.
+    #[test]
+    fn w03_ac01_every_events_documented_types() {
+        let g = Dialect::Gha;
+        let ev = |name: &str, action: &str| Event { name: name.into(), action: action.into(), base_ref: Some("main".into()), git_ref: "refs/pull/1/merge".into(), ..Event::default() };
+        // (event, `types`, an activity they list, one they don't)
+        let rows: &[(&str, &str, &str, &str)] = &[
+            ("branch_protection_rule", "[created, deleted]", "deleted", "edited"),
+            ("check_run", "[rerequested, completed]", "completed", "created"),
+            ("check_suite", "[completed]", "completed", "requested"),
+            ("discussion", "[created, edited, answered]", "answered", "deleted"),
+            ("discussion_comment", "[created, deleted]", "created", "edited"),
+            ("issue_comment", "[created, deleted]", "deleted", "edited"),
+            ("issues", "[opened, edited, milestoned]", "milestoned", "closed"),
+            ("label", "[created, deleted]", "created", "edited"),
+            ("merge_group", "[checks_requested]", "checks_requested", "destroyed"),
+            ("milestone", "[opened, deleted]", "opened", "closed"),
+            ("pull_request", "[assigned, opened, synchronize, reopened]", "assigned", "closed"),
+            ("pull_request_review", "[edited, dismissed]", "dismissed", "submitted"),
+            ("pull_request_review_comment", "[created, deleted]", "created", "edited"),
+            ("pull_request_target", "[assigned, opened, synchronize, reopened]", "assigned", "labeled"),
+            ("registry_package", "[published]", "published", "updated"),
+            ("release", "[published]", "published", "created"),
+            ("repository_dispatch", "[on-demand-test]", "on-demand-test", "other"),
+            ("watch", "[started]", "started", "deleted"),
+        ];
+        for (name, types, listed, other) in rows {
+            let w = wf(&format!("  {name}:\n    types: {types}"), g);
+            assert!(matches(&w, &ev(name, listed)).is_ok(), "{name} {types} runs for {listed}");
+            assert!(matches(&w, &ev(name, other)).is_err(), "{name} {types} doesn't run for {other}");
+        }
+        // Without `types`: every activity, but the pull request events' three.
+        for (name, action) in [("issues", "transferred"), ("release", "edited"), ("check_run", "requested_action"), ("label", "edited"), ("watch", "started"), ("workflow_run", "in_progress")] {
+            let w = wf(&format!("  {name}:"), g);
+            assert!(matches(&w, &ev(name, action)).is_ok(), "{name} without types runs for {action}");
+        }
+        for name in ["pull_request", "pull_request_target"] {
+            let w = wf(&format!("  {name}:"), g);
+            for a in ["opened", "synchronize", "reopened"] {
+                assert!(matches(&w, &ev(name, a)).is_ok(), "{name} runs for {a} by default");
+            }
+            for a in ["closed", "labeled", "edited", "ready_for_review"] {
+                assert!(matches(&w, &ev(name, a)).is_err(), "{name} doesn't run for {a} by default");
+            }
+        }
+        // The events with no activity types run for any.
+        for name in ["create", "delete", "deployment", "deployment_status", "fork", "gollum", "page_build", "public", "status", "workflow_dispatch"] {
+            let w = wf(&format!("  {name}:"), g);
+            assert!(matches(&w, &ev(name, "")).is_ok(), "{name}");
+        }
+        // The documented multi-event forms: a list, and a map with some events filtered.
+        let w = wf("  [push, fork]", g);
+        assert!(matches(&w, &push("refs/heads/x", None)).is_ok() && matches(&w, &ev("fork", "")).is_ok() && matches(&w, &ev("watch", "started")).is_err());
+        let w = wf("  label:\n    types: [created]\n  push:\n    branches: [main]\n  page_build:", g);
+        assert!(matches(&w, &ev("label", "created")).is_ok() && matches(&w, &ev("label", "deleted")).is_err());
+        assert!(matches(&w, &push("refs/heads/main", None)).is_ok() && matches(&w, &push("refs/heads/dev", None)).is_err());
+        assert!(matches(&w, &ev("page_build", "")).is_ok());
+    }
+
+    /// W03-AC01: the filter examples of GitHub's workflow syntax (`on.push.<branches|tags|…>`,
+    /// `on.<pull_request|pull_request_target>.<branches|branches-ignore>`, `on.<…>.<paths|…>`,
+    /// `on.workflow_run.<branches|branches-ignore>`), as written there.
+    #[test]
+    fn w03_ac01_the_filter_examples() {
+        let g = Dialect::Gha;
+        // "Including branches and tags".
+        let w = wf("  push:\n    branches:\n      - main\n      - 'mona/octocat'\n      - 'releases/**'\n    tags:\n      - v2\n      - v1.*", g);
+        for r in ["refs/heads/main", "refs/heads/mona/octocat", "refs/heads/releases/10", "refs/tags/v2", "refs/tags/v1.9.1"] {
+            assert!(matches(&w, &push(r, None)).is_ok(), "{r}");
+        }
+        assert!(matches(&w, &push("refs/heads/feature", None)).is_err() && matches(&w, &push("refs/tags/v3", None)).is_err());
+        // "Excluding branches and tags".
+        let w = wf("  push:\n    branches-ignore:\n      - 'mona/octocat'\n      - 'releases/**-alpha'\n    tags-ignore:\n      - v2\n      - v1.*", g);
+        for r in ["refs/heads/mona/octocat", "refs/heads/releases/beta/3-alpha", "refs/tags/v2", "refs/tags/v1.9"] {
+            assert!(matches(&w, &push(r, None)).is_err(), "{r}");
+        }
+        assert!(matches(&w, &push("refs/heads/main", None)).is_ok() && matches(&w, &push("refs/tags/v3", None)).is_ok());
+        // Only one kind of ref filtered, by exclusion: the other kind doesn't run it.
+        let w = wf("  push:\n    branches-ignore: [dev]", g);
+        assert!(matches(&w, &push("refs/heads/main", None)).is_ok() && matches(&w, &push("refs/tags/v1", None)).is_err());
+        let w = wf("  push:\n    tags-ignore: [v1]", g);
+        assert!(matches(&w, &push("refs/tags/v2", None)).is_ok() && matches(&w, &push("refs/heads/main", None)).is_err());
+        // Pull requests' branches, which are the base's, in the three forms.
+        let w = wf("  pull_request:\n    branches:\n      - main\n      - 'mona/octocat'\n      - 'releases/**'", g);
+        assert!(matches(&w, &pr("opened", "releases/10", &["x"])).is_ok() && matches(&w, &pr("opened", "dev", &["x"])).is_err());
+        let w = wf("  pull_request:\n    branches-ignore:\n      - 'mona/octocat'\n      - 'releases/**-alpha'", g);
+        assert!(matches(&w, &pr("opened", "releases/beta/3-alpha", &["x"])).is_err() && matches(&w, &pr("opened", "main", &["x"])).is_ok());
+        for event in ["pull_request", "pull_request_target"] {
+            let w = wf(&format!("  {event}:\n    branches:\n      - 'releases/**'\n      - '!releases/**-alpha'"), g);
+            let at = |base: &str| Event { name: event.into(), ..pr("opened", base, &["x"]) };
+            assert!(matches(&w, &at("releases/10")).is_ok() && matches(&w, &at("releases/10-alpha")).is_err(), "{event}");
+        }
+        // "Including paths" for a pull request, and "Including and excluding paths": a push that
+        // changed sub-project/index.js runs it, one changing only sub-project/docs/readme.md doesn't.
+        let w = wf("  pull_request:\n    paths:\n      - '**.js'", g);
+        assert!(matches(&w, &pr("opened", "main", &["src/app.js"])).is_ok() && matches(&w, &pr("opened", "main", &["README.md"])).is_err());
+        let w = wf("  push:\n    paths:\n      - 'sub-project/**'\n      - '!sub-project/docs/**'", g);
+        assert!(matches(&w, &push("refs/heads/main", Some(&["sub-project/index.js"]))).is_ok());
+        assert!(matches(&w, &push("refs/heads/main", Some(&["sub-project/src/index.js"]))).is_ok());
+        assert!(matches(&w, &push("refs/heads/main", Some(&["sub-project/docs/readme.md"]))).is_err());
+        assert!(matches(&w, &push("refs/heads/main", Some(&["sub-project/docs/readme.md", "sub-project/index.js"]))).is_ok());
+        // kiln's difference (A.7): every changed file counts, not GitHub's first 300.
+        let w = wf("  push:\n    paths: ['src/**']", g);
+        let mut many: Vec<String> = (0..400).map(|i| format!("docs/{i}.md")).collect();
+        many.push("src/main.rs".into());
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(matches(&w, &push("refs/heads/main", Some(&many))).is_ok());
+        // `workflow_run`'s branches are the triggering run's, in the three forms.
+        let done = |branch: &str| Event { name: "workflow_run".into(), action: "requested".into(), workflow: Some("Build".into()), workflow_branch: Some(branch.into()), ..Event::default() };
+        let w = wf("  workflow_run:\n    workflows: [\"Build\"]\n    types: [requested]\n    branches:\n      - 'releases/**'", g);
+        assert!(matches(&w, &done("releases/10")).is_ok() && matches(&w, &done("main")).is_err());
+        let w = wf("  workflow_run:\n    workflows: [\"Build\"]\n    types: [requested]\n    branches-ignore:\n      - \"canary\"", g);
+        assert!(matches(&w, &done("canary")).is_err() && matches(&w, &done("main")).is_ok());
+        let w = wf("  workflow_run:\n    workflows: [\"Build\"]\n    types: [requested]\n    branches:\n      - 'releases/**'\n      - '!releases/**-alpha'", g);
+        assert!(matches(&w, &done("releases/10")).is_ok() && matches(&w, &done("releases/10-alpha")).is_err());
+        // "You can't use both `branches` and `branches-ignore` for the same event" (nor tags',
+        // nor paths').
+        for (a, b) in [("branches", "branches-ignore"), ("tags", "tags-ignore"), ("paths", "paths-ignore")] {
+            let src = format!("on:\n  push:\n    {a}: [x]\n    {b}: [y]\njobs:\n  a:\n    runs-on: x\n    steps: [{{run: a}}]\n");
+            let (_, d) = parse_workflow(".github/workflows/t.yml", &src, g);
+            assert!(d.iter().any(|x| x.is_error() && x.code == "KCI1015"), "{a} and {b}: {d:?}");
+        }
+    }
+
     #[test]
     fn w03_ac03_skip_markers_in_matching() {
         let w = wf("  push:\n  workflow_dispatch:", Dialect::Gha);

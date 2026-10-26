@@ -6,12 +6,17 @@
 use super::store::Store;
 use crate::harness::core::MAX_EVENTS;
 use crate::harness::kinds::{Kind, Protocol};
-use crate::harness::model::{Event, State};
+use crate::harness::model::{Body, Event, State};
 use crate::harness::moving::{self, Carry, Package};
 use crate::harness::session::{Info, Spec};
 
 /// Lines of a record read from the store at once.
 const PAGE: usize = 4096;
+/// Events read at once looking for the ids of the messages a session was sent.
+const IDS_PAGE: usize = 1000;
+/// Most events looked at for them (a session sent few messages among very many events carries
+/// fewer).
+const IDS_LOOK_MAX: usize = 200_000;
 
 /// Every line the store has of `session`'s record from `source`, in order.
 fn lines_of(store: &Store, session: &str, source: &str) -> anyhow::Result<Vec<String>> {
@@ -31,6 +36,33 @@ fn lines_of(store: &Store, session: &str, source: &str) -> anyhow::Result<Vec<St
             return Ok(out);
         }
     }
+}
+
+/// The ids of the newest messages `session` was sent, as the store's timeline of it shows them (at
+/// most [`crate::harness::inbox::KEEP`]), the oldest of them first: what its inbox took, as near as
+/// the server knows (the machine it was on is gone, and its inbox with it). Blocking.
+fn sent_ids(store: &Store, session: &str) -> anyhow::Result<Vec<String>> {
+    let most = usize::try_from(crate::harness::inbox::KEEP).unwrap_or(usize::MAX);
+    let (mut ids, mut before, mut looked) = (Vec::new(), None, 0usize);
+    while ids.len() < most && looked < IDS_LOOK_MAX {
+        let page = store.events(session, before, IDS_PAGE)?;
+        let Some(first) = page.first() else { break };
+        before = Some(first.seq);
+        looked = looked.saturating_add(page.len());
+        for row in page.iter().rev().filter(|r| r.kind == "user") {
+            if ids.len() >= most {
+                break;
+            }
+            if let Ok(Event { body: Body::User { client_id: Some(id), .. }, .. }) = serde_json::from_str::<Event>(&row.body) {
+                ids.push(id);
+            }
+        }
+        if page.len() < IDS_PAGE {
+            break;
+        }
+    }
+    ids.reverse();
+    Ok(ids)
 }
 
 /// The harness's record of `session` as the harness on the machine it goes to takes it; `events`,
@@ -90,7 +122,13 @@ pub fn package(store: &Store, id: &str, from: &str, to: &str, cwd: Option<&str>)
         allow_bypass: !info.no_bypass,
         ..Spec::default()
     };
-    Ok(moving::pack(id, spec, &goes_on_in, from, &from_cwd, carry, events, state))
+    let mut pkg = moving::pack(id, spec, &goes_on_in, from, &from_cwd, carry, events, state);
+    // The messages it was sent go with it, so one sent again after it goes on is answered there.
+    pkg.inbox = sent_ids(store, id).unwrap_or_else(|e| {
+        tracing::warn!(target: "kiln.sends", event = "carry_failed", session = %id, error = %format!("{e:#}"), "the ids of the messages a session was sent couldn't be read from the store: those its timeline shows go with it");
+        Vec::new()
+    });
+    Ok(pkg)
 }
 
 #[cfg(test)]
@@ -103,7 +141,7 @@ mod tests {
     /// What a session is, as kiln makes it from a spec.
     fn info(kind: &str, own: Option<&str>) -> anyhow::Result<Info> {
         let spec = serde_json::json!({ "kind": kind, "cwd": "/work/parser", "name": "the parser" }).to_string();
-        let mut i = crate::harness::host::refusal("s1", &spec, "").into_iter().find_map(|u| if let Update::Open { info } = u { Some(*info) } else { None }).ok_or_else(|| anyhow::anyhow!("no info"))?;
+        let mut i = crate::harness::host::refusal("s1", &spec, "").into_iter().find_map(|u| if let Update::Open { info, .. } = u { Some(*info) } else { None }).ok_or_else(|| anyhow::anyhow!("no info"))?;
         i.harness_session = own.map(str::to_owned);
         i.exit = None;
         Ok(i)
@@ -112,7 +150,7 @@ mod tests {
     #[test]
     fn a_claude_session_is_packed_from_the_store_with_its_transcript_and_timeline() -> anyhow::Result<()> {
         let (_d, store) = crate::convo::store::scratch()?;
-        store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?) });
+        store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?), since: None });
         store.send("s1", &Update::State { state: Box::new(State { harness_session: Some("cc-1".into()), model: "opus".into(), epoch: 2, ..State::default() }) });
         store.send("s1", &Update::Events { events: vec![Event { id: "m1".into(), seq: 1, at: 5, parent: None, by: None, body: Body::Assistant { text: "done".into(), streaming: false } }] });
         let line = |n: u64, l: &str| Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n, end: (n + 1) * 10, line: l.into(), kept: None }));
@@ -136,14 +174,14 @@ mod tests {
     #[test]
     fn a_record_with_a_line_missing_is_refused() -> anyhow::Result<()> {
         let (_d, store) = crate::convo::store::scratch()?;
-        store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?) });
+        store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?), since: None });
         store.put(vec![Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n: 1, end: 20, line: "{}".into(), kept: None }))]);
         store.sync()?;
         let err = package(&store, "s1", "gone-box", "here", None).err().map(|e| e.to_string()).unwrap_or_default();
         assert!(err.contains("missing line 0"), "{err}");
         // And nothing at all of it: refused too, saying why.
         let (_d2, empty) = crate::convo::store::scratch()?;
-        empty.send("s2", &Update::Open { info: Box::new(info("claude", Some("cc-2"))?) });
+        empty.send("s2", &Update::Open { info: Box::new(info("claude", Some("cc-2"))?), since: None });
         empty.sync()?;
         assert!(package(&empty, "s2", "gone-box", "here", None).is_err());
         Ok(())

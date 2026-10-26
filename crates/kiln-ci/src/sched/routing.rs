@@ -90,6 +90,18 @@ pub fn fact(f: &RunnerFacts, name: &str) -> Fact {
     }
 }
 
+/// Whether [`fact`] knows a fact by this name: its own, `tools.<tool>`, `executors.<executor>` or
+/// `custom.<name>`. A constraint reads any other name as a custom fact (false when the runner has
+/// none); the needs spelling refuses it, as a typo.
+pub fn known_fact(name: &str) -> bool {
+    const OWN: &[&str] = &[
+        "os", "os.version", "os.distro", "kernel", "arch", "arch_variant", "arch.variant", "cpu.cores", "cpu.threads", "cpu.model", "cpu.flags", "mem.total", "mem.free", "disk.total",
+        "disk.free", "gpu.count", "gpu.model", "gpu.vendor", "gpu.memory", "virt.kvm", "virt.hvf", "virt.nested", "executors", "binfmt", "tools", "net.egress",
+    ];
+    let n = name.to_ascii_lowercase();
+    OWN.contains(&n.as_str()) || ["tools.", "executors.", "custom."].iter().any(|p| n.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))
+}
+
 /// A literal in a constraint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Lit {
@@ -98,7 +110,7 @@ pub enum Lit {
 }
 
 impl Lit {
-    fn show(&self) -> String {
+    pub fn show(&self) -> String {
         match self {
             Lit::Str(s) => s.clone(),
             Lit::Num(n) => expr::js_number_to_string(*n),
@@ -180,6 +192,16 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             }
             v.push(d);
             i += 1;
+        }
+        // A lone `=`, `&` or `|` (`os = linux`) is no symbol and no word: without this it was an
+        // empty word, again and again, never moving on.
+        if v.is_empty() {
+            let meant = match c {
+                '=' => "==",
+                '&' => "&&",
+                _ => "||",
+            };
+            return Err(format!("`{s}`: `{c}` alone isn't an operator (`{meant}`?)"));
         }
         out.push(Tok::Word(v));
     }
@@ -500,6 +522,49 @@ pub struct Preference {
     /// Runners carrying this label.
     pub label: Option<String>,
     pub weight: Option<f64>,
+    /// `warm: true` (W24-R18): the runners where the leg is expected to finish first, from what
+    /// each holds warm for its lane (`sched::warm`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub warm: bool,
+    /// `affinity: { job: <id> }` (W05-R23): as `warm`, from that job's workspaces in the leg's
+    /// repository and workflow (W24-R18).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<Affinity>,
+    /// With `warm` or `affinity`: the share (0 to 1) of what a busy warm runner would save that
+    /// the leg may wait for it (W24-R18); the server's when unset, and 0 never to wait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patience: Option<f64>,
+}
+
+/// `affinity: { job: <id> }`: the job whose warm workspaces a leg goes after (W05-R23, W24-R18).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Affinity {
+    pub job: String,
+}
+
+/// A job's `prefer:` (W05-R23, W24-R18) as routing takes it: each item that reads as a
+/// [`Preference`]. The editor warns of the others ([`preference`]), which count for nothing.
+pub fn preferences(items: &[crate::wf::ir::YVal]) -> Vec<Preference> {
+    items.iter().filter_map(|i| preference(i).ok()).collect()
+}
+
+/// One item of a job's `prefer:`, or why routing can't read it: it isn't a mapping, a value has
+/// the wrong type, it names no term routing reads (`fact`, `label`, `warm`, `affinity`), or its
+/// `patience` isn't a share from 0 to 1.
+pub fn preference(item: &crate::wf::ir::YVal) -> Result<Preference, String> {
+    let v = serde_json::to_value(item).map_err(|e| e.to_string())?;
+    if !v.is_object() {
+        return Err("a preference is a mapping, as `{ warm: true }` or `{ fact: disk.free, higher: true }`".into());
+    }
+    let p: Preference = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    if p.fact.is_none() && p.label.is_none() && !p.warm && p.affinity.is_none() {
+        return Err("it names none of the terms routing reads: `fact`, `label`, `warm`, `affinity`".into());
+    }
+    if p.patience.is_some_and(|x| !(0.0..=1.0).contains(&x)) {
+        return Err("`patience` is a share of what a warm runner saves, from 0 to 1".into());
+    }
+    Ok(p)
 }
 
 /// What selects the legs a routing rule applies to.
@@ -512,6 +577,8 @@ pub struct RuleMatch {
     pub job: Option<String>,
     /// Repository globs.
     pub repos: Vec<String>,
+    /// Whether the leg's steps run containers themselves (`podman`, `buildah`: [`runs_containers`]).
+    pub nests_containers: Option<bool>,
 }
 
 /// A routing rule (W05-R21): declared, ordered data.
@@ -545,13 +612,22 @@ pub fn github_label_rules() -> Vec<Rule> {
     };
     vec![
         rule(&["ubuntu-latest"], "linux", "x86_64", "kiln/runner-ubuntu-24.04"),
+        rule(&["ubuntu-26.04"], "linux", "x86_64", "kiln/runner-ubuntu-26.04"),
         rule(&["ubuntu-24.04"], "linux", "x86_64", "kiln/runner-ubuntu-24.04"),
         rule(&["ubuntu-22.04"], "linux", "x86_64", "kiln/runner-ubuntu-22.04"),
+        rule(&["ubuntu-26.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-26.04"),
         rule(&["ubuntu-24.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-24.04"),
         rule(&["ubuntu-22.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-22.04"),
+        // GitHub's lightweight Ubuntu 24.04 in a container. Its smaller set of tools still has
+        // Node.js and npm, the Docker CLI, gh and PowerShell, which kiln's own `-slim` (the basics
+        // alone) leaves out: the full image has them.
+        rule(&["ubuntu-slim"], "linux", "x86_64", "kiln/runner-ubuntu-24.04"),
         rule(&["macos-latest"], "macos", "aarch64", ""),
+        rule(&["macos-26"], "macos", "aarch64", ""),
         rule(&["macos-15"], "macos", "aarch64", ""),
         rule(&["macos-14"], "macos", "aarch64", ""),
+        rule(&["macos-15-intel"], "macos", "x86_64", ""),
+        rule(&["macos-13"], "macos", "x86_64", ""),
         rule(&["windows-latest"], "windows", "x86_64", ""),
         rule(&["windows-2025"], "windows", "x86_64", ""),
         rule(&["windows-2022"], "windows", "x86_64", ""),
@@ -581,6 +657,8 @@ pub struct LegRoute {
     pub caps: u64,
     /// An untrusted leg's limits (W18-R07); `None` for a trusted one.
     pub untrusted: Option<Untrusted>,
+    /// Its steps run containers themselves ([`runs_containers`]).
+    pub nests_containers: bool,
 }
 
 /// Where untrusted legs may run (`ci.untrusted`, W18-R07).
@@ -611,6 +689,8 @@ pub struct Requirement {
     pub rules: Vec<usize>,
     /// Docker only when its engine runs rootless (an untrusted leg's, W18-R07).
     pub rootless_docker: bool,
+    /// The pool whose executors run it (W13-R09).
+    pub pool: Option<String>,
 }
 
 impl Requirement {
@@ -621,7 +701,16 @@ impl Requirement {
         labels.dedup();
         let mut cs: Vec<&str> = self.constraints.iter().map(|(s, _)| s.as_str()).collect();
         cs.sort_unstable();
-        format!("labels={};group={};req={};caps={:x};exec={}{}", labels.join(","), self.group.as_deref().unwrap_or(""), cs.join(" && "), self.caps, self.executors.join(","), if self.rootless_docker { ";rootless" } else { "" })
+        format!(
+            "labels={};group={};req={};caps={:x};exec={}{}{}",
+            labels.join(","),
+            self.group.as_deref().unwrap_or(""),
+            cs.join(" && "),
+            self.caps,
+            self.executors.join(","),
+            if self.rootless_docker { ";rootless" } else { "" },
+            self.pool.as_deref().map(|p| format!(";pool={p}")).unwrap_or_default()
+        )
     }
 }
 
@@ -633,19 +722,41 @@ fn rule_applies(r: &Rule, leg: &LegRoute) -> bool {
     if !m.repos.is_empty() && !m.repos.iter().any(|g| Pattern::new(g).is_ok_and(|p| p.matches(&leg.repo))) {
         return false;
     }
-    if let Some(j) = &m.job {
-        let Ok(c) = Condition::parse(j, &ParseOptions::permissive(Dialect::Kiln)) else { return false };
-        let cx = MapContexts::default()
-            .with("job", Value::object([("id".to_owned(), Value::str(&leg.job)), ("name".to_owned(), Value::str(&leg.job_name))]))
-            .with("workflow", Value::str(&leg.workflow))
-            .with("repo", Value::str(&leg.repo))
-            .with("event", Value::str(&leg.event));
-        if !expr::eval_condition(&c, &cx, &mut Budget::default()).unwrap_or(false) {
-            return false;
-        }
+    if let Some(j) = &m.job
+        && !job_condition(j, leg)
+    {
+        return false;
+    }
+    if m.nests_containers.is_some_and(|n| n != leg.nests_containers) {
+        return false;
     }
     // A rule with nothing to match applies to every leg (a fleet-wide default).
     true
+}
+
+/// Whether a `run:` script runs containers itself: calls `podman` or `buildah` as a command (at a
+/// line's start, after `;`, `&&`, `||`, `|`, `(` or a backquote, past `sudo`, `exec`, `time` and
+/// `NAME=value`), not in a comment. Their containers need what a container executor's container
+/// doesn't give (W13).
+pub fn runs_containers(script: &str) -> bool {
+    script.lines().map(str::trim_start).filter(|l| !l.starts_with('#')).any(|line| {
+        line.split([';', '|', '&', '(', '`']).any(|cmd| {
+            let mut words = cmd.split_whitespace().skip_while(|w| matches!(*w, "sudo" | "exec" | "time" | "-E") || (w.contains('=') && !w.starts_with('-')));
+            words.next().is_some_and(|w| matches!(w.trim_start_matches('\\'), "podman" | "buildah"))
+        })
+    })
+}
+
+/// Whether a condition over a leg holds (a rule's `match.job`, a reservation's `for`): over `job`
+/// (`id`, `name`), `workflow`, `repo` and `event`. One that doesn't parse holds for none.
+pub fn job_condition(src: &str, leg: &LegRoute) -> bool {
+    let Ok(c) = Condition::parse(src, &ParseOptions::permissive(Dialect::Kiln)) else { return false };
+    let cx = MapContexts::default()
+        .with("job", Value::object([("id".to_owned(), Value::str(&leg.job)), ("name".to_owned(), Value::str(&leg.job_name))]))
+        .with("workflow", Value::str(&leg.workflow))
+        .with("repo", Value::str(&leg.repo))
+        .with("event", Value::str(&leg.event));
+    expr::eval_condition(&c, &cx, &mut Budget::default()).unwrap_or(false)
 }
 
 /// A leg's requirement (W05-R19): rules that match it, in order, add their constraints and
@@ -674,6 +785,14 @@ pub fn resolve(leg: &LegRoute, rules: &[Rule]) -> Result<Requirement, String> {
     }
     for c in &leg.requires {
         req.constraints.push((c.clone(), Constraint::parse(c)?));
+    }
+    // Steps that run containers themselves can't in a container executor's container (`docker`,
+    // `k8s`): such a leg goes where it can, the other executors the rules allow, else a microVM.
+    if leg.nests_containers && req.executors.iter().any(|e| e == "docker" || e == "k8s") {
+        req.executors.retain(|e| e != "docker" && e != "k8s");
+        if req.executors.is_empty() {
+            req.executors = vec!["firecracker".to_owned()];
+        }
     }
     // An untrusted leg: only the executors the server lets untrusted code run on, whatever the
     // rules would have chosen (W18-R07).
@@ -861,9 +980,10 @@ mod tests {
         assert!(holds("!(os == windows) && executors has docker", &f, &[]));
         // Unknown facts are false, never errors.
         assert!(!holds("gpu.memory > 0", &f, &[]) && !holds("custom.rack == a1", &f, &[]) && holds("!custom.rack", &f, &[]));
-        for bad in ["", "os ==", "(os == linux", "arch in x86_64", "os == linux ]"] {
+        for bad in ["", "os ==", "(os == linux", "arch in x86_64", "os == linux ]", "os = linux", "label a & label b", "label a | label b"] {
             assert!(Constraint::parse(bad).is_err(), "{bad}");
         }
+        assert_eq!(Constraint::parse("os = linux"), Err("`os = linux`: `=` alone isn't an operator (`==`?)".into()));
         assert_eq!(number("50Gi"), Some(50.0 * 1024.0 * 1024.0 * 1024.0));
         assert_eq!(number("8m"), Some(480.0));
     }
@@ -903,8 +1023,38 @@ mod tests {
         assert_eq!((req.rules.clone(), req.executors.clone()), (vec![0], vec!["firecracker".to_owned()]));
         let other = LegRoute { repo: "other/x".into(), ..leg.clone() };
         assert!(resolve(&other, &[rule])?.rules.is_empty());
+        // GitHub's newer labels, each its image.
+        for (label, image) in [("ubuntu-26.04", "kiln/runner-ubuntu-26.04"), ("ubuntu-26.04-arm", "kiln/runner-ubuntu-26.04"), ("ubuntu-slim", "kiln/runner-ubuntu-24.04")] {
+            let req = resolve(&LegRoute { labels: vec![label.into()], ..leg.clone() }, &github_label_rules())?;
+            assert_eq!(req.image.as_deref(), Some(image), "{label}");
+        }
         // The same requirement, the same signature.
         assert_eq!(resolve(&leg, &github_label_rules())?.signature(), resolve(&LegRoute { job: "test".into(), ..leg }, &github_label_rules())?.signature());
+        Ok(())
+    }
+
+    /// Steps that run containers themselves (rails' `podman build`): such a leg leaves container
+    /// executors for the others its rules allow, else a microVM, and a rule can match it to send
+    /// it to one (docs/ci.md W13).
+    #[test]
+    fn w13_a_leg_that_runs_podman_leaves_container_executors() -> Result<(), String> {
+        for script in ["podman build -t app .", "set -e\npodman run --rm app", "cd x && sudo podman ps", "FOO=1 buildah bud .", "echo $(podman --version)", "  podman \\\n  build ."] {
+            assert!(runs_containers(script), "{script:?}");
+        }
+        for script in ["echo podman", "# podman build", "docker build .", "./podman-compose up", "apt-get install podman-docker", "grep -r podman ."] {
+            assert!(!runs_containers(script), "{script:?}");
+        }
+        let leg = LegRoute { labels: vec!["ubuntu-latest".into()], nests_containers: true, ..LegRoute::default() };
+        assert_eq!(resolve(&leg, &github_label_rules())?.executors, vec!["host".to_owned()], "not in the runner image's container");
+        let docker_only = Rule { executor: vec!["docker".into()], ..Rule::default() };
+        assert_eq!(resolve(&leg, std::slice::from_ref(&docker_only))?.executors, vec!["firecracker".to_owned()]);
+        // The rule the corpus lab has: such legs to Firecracker microVMs, the image still the label's.
+        let microvm = Rule { matches: RuleMatch { nests_containers: Some(true), ..RuleMatch::default() }, executor: vec!["firecracker".into()], ..Rule::default() };
+        let rules: Vec<Rule> = std::iter::once(microvm).chain(github_label_rules()).collect();
+        let req = resolve(&leg, &rules)?;
+        assert_eq!((req.executors, req.image.as_deref()), (vec!["firecracker".to_owned()], Some("kiln/runner-ubuntu-24.04")));
+        let plain = resolve(&LegRoute { nests_containers: false, ..leg }, &rules)?;
+        assert_eq!(plain.executors, vec!["docker".to_owned(), "host".to_owned()], "others as before");
         Ok(())
     }
 
@@ -943,7 +1093,32 @@ mod tests {
         let a = RunnerView { name: "a".into(), facts: linux(100 << 30), ..RunnerView::default() };
         let b = RunnerView { name: "b".into(), facts: linux(400 << 30), labels: vec!["fast".into()], ..RunnerView::default() };
         assert!(scores(&[], &[&a, &b]).is_empty());
-        let s = scores(&[Preference { fact: Some("disk.free".into()), higher: true, weight: Some(2.0), label: None }, Preference { label: Some("fast".into()), ..Preference::default() }], &[&a, &b]);
+        let s = scores(&[Preference { fact: Some("disk.free".into()), higher: true, weight: Some(2.0), label: None, ..Preference::default() }, Preference { label: Some("fast".into()), ..Preference::default() }], &[&a, &b]);
         assert_eq!(s, vec![0.0, 3.0]);
+    }
+
+    /// W05-R23, W24-R18: a job's `prefer:` as routing reads it, each term; an item routing can't
+    /// read counts for nothing, and the editor says why (a warning, not an error).
+    #[test]
+    fn w24_r18_a_jobs_preferences() -> Result<(), String> {
+        let src = "on: push\njobs:\n  test:\n    runs-on: local\n    prefer:\n      - { warm: true, patience: 0.25, weight: 2 }\n      - { affinity: { job: build } }\n      - { fact: disk.free, higher: true }\n      - { label: fast }\n      - { warmth: true }\n      - { warm: true, patience: 2 }\n      - fast\n      - { weight: heavy, label: fast }\n    steps:\n      - run: make test\n";
+        let (w, d) = crate::wf::parse_workflow(".kiln/ci.yaml", src, Dialect::Kiln);
+        let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or("no job")?;
+        let read = preferences(&job.kiln.prefer);
+        let want = vec![
+            Preference { warm: true, patience: Some(0.25), weight: Some(2.0), ..Preference::default() },
+            Preference { affinity: Some(Affinity { job: "build".into() }), ..Preference::default() },
+            Preference { fact: Some("disk.free".into()), higher: true, ..Preference::default() },
+            Preference { label: Some("fast".into()), ..Preference::default() },
+        ];
+        assert_eq!(read, want);
+        assert!(d.iter().all(|x| !x.is_error()), "{d:?}");
+        let warned: Vec<&str> = d.iter().filter(|x| x.code == "KCI1011").map(|x| x.message.as_str()).collect();
+        let expect = [("prefer[4]", "names none of the terms"), ("prefer[5]", "from 0 to 1"), ("prefer[6]", "is a mapping"), ("prefer[7]", "invalid type")];
+        assert_eq!(warned.len(), expect.len(), "{warned:?}");
+        for ((at, why), said) in expect.iter().zip(&warned) {
+            assert!(said.contains(at) && said.contains(why) && said.contains("counts for nothing"), "{said}");
+        }
+        Ok(())
     }
 }

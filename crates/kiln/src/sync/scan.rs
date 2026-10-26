@@ -9,7 +9,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::Version;
-use super::blobs::hash_file;
+use super::blobs::hash_file_on;
+use super::fs::Fs;
 
 /// Never synced, in a folder that isn't a git repo (a git repo's own ignore rules decide there).
 pub const DEFAULT_EXCLUDE: &[&str] = &[".git", "node_modules", "target", ".venv", "__pycache__", ".DS_Store", ".kiln-sync"];
@@ -17,12 +18,22 @@ pub const DEFAULT_EXCLUDE: &[&str] = &[".git", "node_modules", "target", ".venv"
 /// A temporary file kiln writes while applying a step: never synced.
 pub const TEMP_PREFIX: &str = ".kiln-sync-";
 
+/// How recent a file's time may be, at a look, for a later look to know the file by its size and
+/// time: a file changed again within its filesystem's time step keeps both, so one this recent is
+/// read again at the next look, as git reads its racily clean entries again. Over two seconds:
+/// FAT keeps times to two, HFS+ to one, and Linux stamps them by a clock a tick behind.
+pub const RACY_NS: i128 = 3_000_000_000;
+
 /// What a scan keeps of a path between looks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub size: u64,
     pub mtime_ns: i128,
     pub version: Version,
+    /// Changed so close to the look that saw it that a change since could have kept its size and
+    /// time: read again at the next look, never known by them ([`RACY_NS`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub racy: bool,
 }
 
 /// What a copy syncs and how much.
@@ -32,11 +43,14 @@ pub struct Limits {
     pub max_size: u64,
     /// Names or `/`-separated path prefixes left out, besides the defaults and git's rules.
     pub exclude: Vec<String>,
+    /// Its files, its git refs, or both.
+    #[serde(default)]
+    pub mode: super::Mode,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_size: 256 << 20, exclude: Vec::new() }
+        Self { max_size: 256 << 20, exclude: Vec::new(), mode: super::Mode::Files }
     }
 }
 
@@ -48,35 +62,38 @@ pub struct Skipped {
 }
 
 /// Each synced path's entry (hashing only what changed since `seen`), and what was left out.
-pub fn scan(root: &Path, seen: &BTreeMap<String, Entry>, limits: &Limits) -> io::Result<(BTreeMap<String, Entry>, Vec<Skipped>)> {
+pub fn scan(fs: &dyn Fs, root: &Path, seen: &BTreeMap<String, Entry>, limits: &Limits) -> io::Result<(BTreeMap<String, Entry>, Vec<Skipped>)> {
     let mut found = BTreeMap::new();
     let mut skipped = Vec::new();
-    for path in list(root, limits)? {
+    // Before anything is read: a file changed after it is changed after the look.
+    let started = fs.now_ns();
+    for path in list(fs, root, limits)? {
         let full = root.join(&path);
-        let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
-        let mtime_ns = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| i128::try_from(d.as_nanos()).unwrap_or(i128::MAX));
-        if meta.file_type().is_symlink() {
-            let target = std::fs::read_link(&full)?.to_string_lossy().replace('\\', "/");
-            found.insert(path, Entry { size: 0, mtime_ns, version: Version::Link { target } });
+        let Ok(meta) = fs.meta(&full) else { continue };
+        let mtime_ns = meta.mtime_ns;
+        if meta.is_symlink() {
+            let target = fs.read_link(&full)?.to_string_lossy().replace('\\', "/");
+            found.insert(path, Entry { size: 0, mtime_ns, version: Version::Link { target }, racy: false });
             continue;
         }
         if !meta.is_file() {
             continue;
         }
-        if meta.len() > limits.max_size {
-            skipped.push(Skipped { why: format!("{} bytes, over the {} byte limit", meta.len(), limits.max_size), path });
+        if meta.len > limits.max_size {
+            skipped.push(Skipped { why: format!("{} bytes, over the {} byte limit", meta.len, limits.max_size), path });
             continue;
         }
-        let exec = executable(&meta);
+        let exec = meta.exec;
         let version = match seen.get(&path) {
-            Some(e) if e.size == meta.len() && e.mtime_ns == mtime_ns && matches!(&e.version, Version::File { exec: x, .. } if *x == exec) => e.version.clone(),
-            _ => match hash_file(&full) {
+            Some(e) if !e.racy && e.size == meta.len && e.mtime_ns == mtime_ns && matches!(&e.version, Version::File { exec: x, .. } if *x == exec) => e.version.clone(),
+            _ => match hash_file_on(fs, &full) {
                 Ok(hash) => Version::File { hash, exec },
                 // Gone or unreadable between listing and reading: next look.
                 Err(_) => continue,
             },
         };
-        found.insert(path, Entry { size: meta.len(), mtime_ns, version });
+        let racy = mtime_ns.saturating_add(RACY_NS) > started;
+        found.insert(path, Entry { size: meta.len, mtime_ns, version, racy });
     }
     Ok((found, skipped))
 }
@@ -95,8 +112,8 @@ pub(crate) fn executable(_meta: &std::fs::Metadata) -> bool {
 /// The paths to sync: git's list (tracked, and untracked but not ignored) in a git repo, else a
 /// walk that leaves out [`DEFAULT_EXCLUDE`]. Never `.git/`, kiln's own temporary files, or
 /// `limits.exclude`.
-pub fn list(root: &Path, limits: &Limits) -> io::Result<Vec<String>> {
-    let paths = if root.join(".git").exists() { git_list(root)? } else { walk(root)? };
+pub fn list(fs: &dyn Fs, root: &Path, limits: &Limits) -> io::Result<Vec<String>> {
+    let paths = if fs.exists(&root.join(".git")) { git_list(root)? } else { walk(fs, root)? };
     Ok(paths.into_iter().filter(|p| keep(p, limits)).collect())
 }
 
@@ -118,20 +135,17 @@ fn git_list(root: &Path) -> io::Result<Vec<String>> {
 }
 
 /// Every file under `root`, breadth first, leaving out [`DEFAULT_EXCLUDE`] at any depth.
-fn walk(root: &Path) -> io::Result<Vec<String>> {
+fn walk(fs: &dyn Fs, root: &Path) -> io::Result<Vec<String>> {
     let mut out = Vec::new();
     let mut dirs = VecDeque::from([String::new()]);
     while let Some(rel) = dirs.pop_front() {
         let dir = if rel.is_empty() { root.to_owned() } else { root.join(&rel) };
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
+        for (name, kind) in fs.read_dir(&dir)? {
             if DEFAULT_EXCLUDE.contains(&name.as_str()) {
                 continue;
             }
             let path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
-            let ty = entry.file_type()?;
-            if ty.is_dir() {
+            if kind == super::fs::Kind::Dir {
                 dirs.push_back(path);
             } else {
                 out.push(path);
@@ -144,6 +158,7 @@ fn walk(root: &Path) -> io::Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fs::Std;
     use super::*;
 
     fn write(root: &Path, path: &str, body: &str) -> io::Result<()> {
@@ -162,8 +177,8 @@ mod tests {
             write(root, p, b)?;
         }
         let limits = Limits { exclude: vec!["docs".into()], ..Limits::default() };
-        assert_eq!(list(root, &limits)?, ["a.txt", "src/lib.rs"]);
-        let (found, _) = scan(root, &BTreeMap::new(), &Limits { max_size: 3, ..Limits::default() })?;
+        assert_eq!(list(&Std, root, &limits)?, ["a.txt", "src/lib.rs"]);
+        let (found, _) = scan(&Std, root, &BTreeMap::new(), &Limits { max_size: 3, ..Limits::default() })?;
         assert!(matches!(found.get("a.txt").map(|e| &e.version), Some(Version::File { exec: false, .. })));
         Ok(())
     }
@@ -181,24 +196,56 @@ mod tests {
             write(root, p, b)?;
         }
         git(&["add", "main.rs", ".gitignore"])?;
-        assert_eq!(list(root, &Limits::default())?, [".gitignore", "main.rs", "new.txt"], "tracked and untracked, never ignored or .git");
+        assert_eq!(list(&Std, root, &Limits::default())?, [".gitignore", "main.rs", "new.txt"], "tracked and untracked, never ignored or .git");
         Ok(())
+    }
+
+    /// Sets `path`'s modification time to `secs_ago` seconds before now.
+    fn aged(path: &Path, secs_ago: u64) -> io::Result<()> {
+        let t = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(secs_ago)).unwrap_or(std::time::UNIX_EPOCH);
+        std::fs::File::options().write(true).open(path)?.set_modified(t)
     }
 
     #[test]
     fn only_what_changed_is_hashed_again() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         write(dir.path(), "f", "one")?;
-        let (first, _) = scan(dir.path(), &BTreeMap::new(), &Limits::default())?;
+        // Changed long before the look: it's known by its size and time after.
+        aged(&dir.path().join("f"), 3600)?;
+        let (first, _) = scan(&Std, dir.path(), &BTreeMap::new(), &Limits::default())?;
         // An entry that says otherwise for the same size and time is believed: nothing was read.
         let mut seen = first.clone();
         if let Some(e) = seen.get_mut("f") {
             e.version = Version::File { hash: "cached".into(), exec: false };
         }
-        let (again, _) = scan(dir.path(), &seen, &Limits::default())?;
+        let (again, _) = scan(&Std, dir.path(), &seen, &Limits::default())?;
         assert!(matches!(again.get("f").map(|e| &e.version), Some(Version::File { hash, .. }) if hash == "cached"));
-        let (big, skipped) = scan(dir.path(), &BTreeMap::new(), &Limits { max_size: 2, ..Limits::default() })?;
+        let (big, skipped) = scan(&Std, dir.path(), &BTreeMap::new(), &Limits { max_size: 2, ..Limits::default() })?;
         assert!(big.is_empty() && skipped.first().is_some_and(|s| s.path == "f"));
+        Ok(())
+    }
+
+    /// CP-T6.1, AC-T6.1.3: the third bug kiln-sim found: a file changed again just after a look,
+    /// keeping its size and (within its filesystem's time step) its time, is read again at the next
+    /// look, not taken for what the look saw; once its time is long past, it's known by them.
+    #[test]
+    fn a_change_that_keeps_a_file_s_size_and_time_just_after_a_look_is_still_seen() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let f = dir.path().join("f");
+        write(dir.path(), "f", "one")?;
+        let t = std::fs::metadata(&f)?.modified()?;
+        let (first, _) = scan(&Std, dir.path(), &BTreeMap::new(), &Limits::default())?;
+        assert!(first.get("f").is_some_and(|e| e.racy), "changed just now: read again next time");
+        // Changed again within the same time step: the same size and time.
+        write(dir.path(), "f", "two")?;
+        std::fs::File::options().write(true).open(&f)?.set_modified(t)?;
+        let (again, _) = scan(&Std, dir.path(), &first, &Limits::default())?;
+        let (now, before) = (Version::File { hash: hash_file_on(&Std, &f)?, exec: false }, first.get("f").map(|e| e.version.clone()));
+        assert!(again.get("f").is_some_and(|e| e.version == now) && Some(now) != before, "the second change was seen");
+        // Long since: known by its size and time.
+        aged(&f, 3600)?;
+        let (old, _) = scan(&Std, dir.path(), &again, &Limits::default())?;
+        assert!(old.get("f").is_some_and(|e| !e.racy));
         Ok(())
     }
 }

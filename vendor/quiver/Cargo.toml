@@ -1,0 +1,74 @@
+[workspace]
+members = ["crates/*"]
+# vendor/ holds what Quiver vendors (vendor/MANIFEST.toml), each project a workspace of its own.
+exclude = ["vendor"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+# The least toolchain Quiver builds on: Focal's bus's and hyper-raft's, so whoever vendors it (kiln)
+# builds it on theirs. The gate pins its own exactly (rust-toolchain.toml).
+rust-version = "1.98.1"
+repository = "https://github.com/hyper-light/quiver"
+publish = false
+
+# The no-panic rule and the rest of CLAUDE.md as lints. Production code is checked again by
+# scripts/check-production.sh, without the test allowances.
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+string_slice = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+disallowed_macros = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+undocumented_unsafe_blocks = "deny"
+mem_forget = "deny"
+exit = "deny"
+
+# What Quiver vendors, each name pointed at its one copy (vendor/MANIFEST.toml; kiln's
+# docs/vendoring.md, "Products and [patch]"): Focal's bus and the crates of Focal's it builds on, and
+# the hyper-raft crates the bus names. kiln patches the same names to its own copies.
+[patch.crates-io]
+focal-bus = { path = "vendor/focal-bus/crates/focal-bus" }
+focal-memory = { path = "vendor/focal-bus/crates/focal-memory" }
+hyper-block = { path = "vendor/hyper-raft/crates/hyper-block" }
+hyper-durable = { path = "vendor/hyper-raft/crates/hyper-durable" }
+hyper-liveness = { path = "vendor/hyper-raft/crates/hyper-liveness" }
+hyper-log = { path = "vendor/hyper-raft/crates/hyper-log" }
+hyper-measure = { path = "vendor/hyper-raft/crates/hyper-measure" }
+hyper-raft = { path = "vendor/hyper-raft/crates/hyper-raft" }
+hyper-rt = { path = "vendor/hyper-raft/crates/hyper-rt" }
+hyper-rt-transport = { path = "vendor/hyper-raft/crates/hyper-rt-transport" }
+hyper-seal = { path = "vendor/hyper-raft/crates/hyper-seal" }
+hyper-timing = { path = "vendor/hyper-raft/crates/hyper-timing" }
+hyper-transport = { path = "vendor/hyper-raft/crates/hyper-transport" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# A dependency's overflow unwinds to the boundary that contains it instead of wrapping into a wrong
+# value; Quiver's own arithmetic is checked and never reaches this.
+overflow-checks = true
+# Symbols for profilers; no effect on generated code.
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"

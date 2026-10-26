@@ -29,7 +29,7 @@ The image is built from the top-level `Dockerfile` (`docker build -t kiln:dev .`
 ```sh
 cargo build --release -p kiln              # or: docker build -t kiln:dev .
 sudo deploy/cluster/privileged-setup.sh --install-kiln   # optional: /usr/local/bin/kiln, docker group, sysctls
-kiln install                               # boot hook (systemd / @reboot / XDG autostart), see docs/architecture.md
+kiln install --on machine                  # boot hook (systemd / @reboot / XDG autostart), see docs/architecture.md
 deploy/baremetal/up.sh                     # Prometheus :9090 + Grafana :3000 (localhost only)
 ```
 

@@ -54,6 +54,13 @@ pub struct Spec {
     /// The effort / reasoning level to start with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The speed to start at (`State::speed`: "" standard); None: the harness's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
+    /// The most subagents it runs at once (as `State::max_subagents`): Codex takes it as its own
+    /// limit when it starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subagents: Option<u32>,
     /// With `resume`: continue only up to this point of that session (a message or turn id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_at: Option<String>,
@@ -109,6 +116,8 @@ impl Default for Spec {
             allow_bypass: true,
             program: None,
             effort: None,
+            speed: None,
+            max_subagents: None,
             resume_at: None,
             fork: false,
             takeover_pid: None,
@@ -151,16 +160,7 @@ impl SubagentBrief {
     pub(super) fn of(tasks: &[Task]) -> Vec<Self> {
         tasks
             .iter()
-            .filter(|t| match t.class.as_deref() {
-                Some(class) => class == "agent",
-                // Older machines only report the harness's own task kind. Keep this the same
-                // as the task inspector's classOf fallback.
-                None => {
-                    !t.kind.starts_with("monitor")
-                        && !matches!(t.kind.as_str(), "local_bash" | "local_workflow")
-                        && !t.kind.contains("mcp")
-                }
-            })
+            .filter(|t| t.subagent())
             .map(|t| Self {
                 id: t.id.clone(),
                 tool_id: t.tool_id.clone(),
@@ -172,6 +172,18 @@ impl SubagentBrief {
             })
             .collect()
     }
+}
+
+/// Goals an agent paused for a person, until someone resumes them (`Info::held`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Held {
+    /// Why, as the stack says it ("Paused by the agent: …").
+    pub why: String,
+    /// The plan it waits for you to look at first, when that's why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// Unix ms it paused.
+    pub since: i64,
 }
 
 /// A session as lists show it.
@@ -187,6 +199,10 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
     pub cwd: String,
+    /// The working tree its work is in (`State::tree`): what's asked of git about its work is
+    /// asked there ([`Info::work_dir`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     pub created_at: i64,
     pub status: Status,
     #[serde(default)]
@@ -201,6 +217,16 @@ pub struct Info {
     pub approvals: Vec<ApprovalBrief>,
     #[serde(default)]
     pub queued: usize,
+    /// What waits in its queue, each message by its id and a digest of its words (as
+    /// `State::queue`): the server's, for the messages kiln keeps there itself
+    /// (`super::queued`). Lists don't show it.
+    #[serde(skip)]
+    pub queue: Vec<super::queued::Queued>,
+    /// kiln's own messages its harness was handed lately (a goal stack's words, a parent's news),
+    /// each by its id and a digest of the words it had then, as its timeline shows them: the
+    /// server's (`super::queued::Kept::look`). Lists don't show it.
+    #[serde(skip)]
+    pub said: Vec<super::model::Given>,
     #[serde(default)]
     pub tasks_running: usize,
     /// Native harness subagents, including finished work, for the list's child disclosure.
@@ -268,6 +294,10 @@ pub struct Info {
     /// Kiln doesn't keep it going when it stops part-way (`goals::keep`; set on the server).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_off: bool,
+    /// Its goals wait on a person: it paused them for you, until you resume them (`goals::held_stacks`;
+    /// set on the server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<Held>,
     /// At a usage limit it goes on on another machine with room (as `State::move_on_limit`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub move_on_limit: bool,
@@ -277,6 +307,9 @@ pub struct Info {
     /// Where it pauses as its limits fill (as `State::pause_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_at: Option<u8>,
+    /// The most subagents it runs at once (as `State::max_subagents`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subagents: Option<u32>,
     /// The agent that started it (as `Spec::parent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
@@ -297,6 +330,13 @@ fn is_zero(n: &u32) -> bool {
 }
 
 impl Info {
+    /// Where git is asked about its work: the working tree its latest change is in, else its
+    /// folder (an agent in a worktree commits and pushes from there, not from the checkout it
+    /// started in).
+    pub fn work_dir(&self) -> &str {
+        self.tree.as_deref().filter(|t| !t.is_empty()).unwrap_or(&self.cwd)
+    }
+
     /// Refresh the live fields from the session's state.
     pub fn apply(&mut self, s: &State) {
         if !s.name.is_empty() {
@@ -309,6 +349,7 @@ impl Info {
         if !s.cwd.is_empty() {
             self.cwd.clone_from(&s.cwd);
         }
+        self.tree.clone_from(&s.tree);
         self.harness_session.clone_from(&s.harness_session);
         self.epoch = s.epoch;
         self.approvals = s
@@ -317,6 +358,7 @@ impl Info {
             .map(|a| ApprovalBrief { id: a.id.clone(), tool: a.tool, tool_name: a.tool_name.clone(), title: a.title.clone(), at: a.at })
             .collect();
         self.queued = s.queue.len();
+        self.queue = s.queue.iter().map(|q| super::queued::Queued::of(&q.id, &q.text)).collect();
         self.tasks_running = s.tasks.iter().filter(|t| t.status == "running").count();
         self.subagents = SubagentBrief::of(&s.tasks);
         self.cost_usd = s.usage.cost_usd;
@@ -337,6 +379,10 @@ impl Info {
             _ => None,
         };
         self.turn_started = s.turn_started;
+        // What its harness was handed, added to what was known (a runner started again knows less).
+        for g in &s.given {
+            super::queued::note_given(&mut self.said, &g.id, g.digest.clone());
+        }
         self.limits.clone_from(&s.limits);
         self.account.clone_from(&s.account);
         self.plan.clone_from(&s.plan);
@@ -347,11 +393,13 @@ impl Info {
         self.move_on_limit = s.move_on_limit;
         self.move_plan.clone_from(&s.move_plan);
         self.pause_at = s.pause_at;
+        self.max_subagents = s.max_subagents;
     }
 
-    /// The parts lists care about changed (activity timestamps aside).
+    /// The parts lists care about changed (activity timestamps aside, the words of what's queued: a
+    /// message edited while it waits changes nothing they show, and what kiln's own were handed).
     pub fn differs(&self, o: &Self) -> bool {
-        let strip = |i: &Self| Self { last_activity: 0, ..i.clone() };
+        let strip = |i: &Self| Self { last_activity: 0, queue: Vec::new(), said: Vec::new(), ..i.clone() };
         strip(self) != strip(o)
     }
 }
@@ -362,6 +410,18 @@ pub type Sink = async_channel::Sender<(String, Update)>;
 /// What a session needs from the machine that holds it: where it keeps the files attached to
 /// its messages, how it collects ones that arrived separately (uploaded, or sent in pieces from
 /// the server), and how it starts another session (a branch).
+/// What gives the ids of the messages a session took, by its id, to go with it as it moves.
+pub type CarriedIds = Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, Result<Vec<(String, String)>, String>> + Send + Sync>;
+
+/// Fences a session's inbox as it moves to another machine (`true`), or lifts the fence (`false`:
+/// its move failed, and it goes on here) ([`super::host::Host::moving_fence`]).
+pub type FenceFor = Arc<dyn Fn(String, bool) -> futures::future::BoxFuture<'static, Result<(), String>> + Send + Sync>;
+
+/// The machine's decision on a try at handing a session to its newer runner process (the try, the
+/// session), or (`true`) made now, not taken over, if there's none yet
+/// ([`super::host::Host::settle`]).
+pub type SettleFor = Arc<dyn Fn(String, String, bool) -> futures::future::BoxFuture<'static, Result<Option<super::host::Decided>, String>> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Files {
     pub dir: std::path::PathBuf,
@@ -369,6 +429,14 @@ pub struct Files {
     pub spawn: Arc<dyn Fn(Spec) + Send + Sync>,
     /// The session went on on another machine: this one lets go of it (it isn't closed).
     pub release: Arc<dyn Fn(&str) + Send + Sync>,
+    /// The ids of the messages a session took that go with it when it moves ([`super::host::Host::carried`]).
+    pub carried: CarriedIds,
+    /// Its inbox fenced before its conversation goes to the machine it moves to, or lifted when
+    /// the move fails (CP-T3.2).
+    pub fence: FenceFor,
+    /// How a try at handing it to this machine's newer runner process went, as the machine decided
+    /// it (CP-T3.2).
+    pub settle: SettleFor,
 }
 
 /// What a session that moved here starts from (`super::moving`): its timeline and state as they
@@ -390,6 +458,9 @@ pub struct Seed {
     /// Where its folder stood in the sync log on the machine it left: it goes on once the folder
     /// here has taken the log that far.
     pub synced: Option<crate::sync::runner::Mark>,
+    /// Not from another machine: an older runner process of this one handed it over, taking its
+    /// leave (`super::handing`). Same folder, same record: only the process holding it changed.
+    pub local: bool,
 }
 
 /// Put a message's attachments on disk, so the harness can read them: each gets a `path`;
@@ -481,11 +552,11 @@ fn reach_words(reach: Option<&str>) -> String {
 /// A command as the adapter should see it (attachments stored first).
 async fn prepare(files: &Files, c: Command) -> Command {
     match c {
-        Command::Send { id, text, mode, attachments, overrides } if !attachments.is_empty() => {
+        Command::Send { id, text, mode, attachments, overrides, reply_to, task } if !attachments.is_empty() => {
             let files = files.clone();
             let msg = id.clone();
             let stored = crate::rt::blocking(move || store_attachments(&files, &msg, attachments)).await.unwrap_or_default();
-            Command::Send { id, text, mode, attachments: stored, overrides }
+            Command::Send { id, text, mode, attachments: stored, overrides, reply_to, task }
         }
         other => other,
     }
@@ -541,6 +612,10 @@ pub struct Session {
     /// What it started that still runs once what started it is gone, each shown as a task
     /// (`left-<pid>`) and stoppable from kiln.
     pub left: Mutex<Vec<super::survivors::Ran>>,
+    /// It's on its way to another machine: messages sent to it from now on go where it goes, so
+    /// it takes none here (CP-T3.2). A message is checked against it and handed over under this
+    /// lock, and a move sets it and gathers what it was sent under it too: none slips in between.
+    moving: Mutex<bool>,
 }
 
 impl Session {
@@ -550,7 +625,29 @@ impl Session {
         i
     }
 
+    /// Its epoch ([`State::epoch`]): how many times it went on on another machine.
+    pub fn epoch(&self) -> u64 {
+        self.core.lock().state.epoch
+    }
+
+    /// It's on its way to another machine: it takes no messages here.
+    pub fn is_moving(&self) -> bool {
+        *self.moving.lock()
+    }
+
+    /// It's being handed to another runner process of this machine (blue/green): it takes no
+    /// messages from now on (each refused `Moved`; sent again, it goes where the session went).
+    pub fn stop_taking(&self) {
+        *self.moving.lock() = true;
+    }
+
+    /// Hands `c` to the session. False when it can't take it: it has ended, or `c` is a message
+    /// and the session is on its way to another machine.
     pub fn command(&self, c: Command) -> bool {
+        let moving = self.moving.lock();
+        if *moving && is_message(&c) {
+            return false;
+        }
         self.ctl.try_send(Ctl::Cmd(Box::new(c))).is_ok()
     }
 
@@ -575,7 +672,7 @@ impl Session {
 
     /// Everything a new viewer (or a restarted server) needs, starting with the announcement.
     pub fn snapshot(&self) -> Vec<Update> {
-        let mut out = vec![Update::Open { info: Box::new(self.info()) }];
+        let mut out = vec![Update::Open { info: Box::new(self.info()), since: None }];
         out.extend(self.core.lock().snapshot(256 * 1024));
         out
     }
@@ -649,12 +746,17 @@ impl Session {
         if !core.state.effort.is_empty() {
             s.effort = Some(core.state.effort.clone());
         }
+        // Standard too, once it has a faster speed to choose: its harness's own settings may name one.
+        if !core.state.speed.is_empty() || !core.meta.speeds.is_empty() {
+            s.speed = Some(core.state.speed.clone());
+        }
         if !core.state.mode.is_empty() {
             s.mode = Some(core.state.mode.clone());
         }
         if !core.state.model.is_empty() {
             s.model = Some(core.state.model.clone());
         }
+        s.max_subagents = core.state.max_subagents;
         s
     }
 }
@@ -762,7 +864,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     let restored = seed.as_ref().is_some_and(|sd| sd.restored);
     if let Some(sd) = seed.as_ref().filter(|_| restored) {
         // Restarted here: its timeline and state as the store kept them, and nothing said of it.
-        core.adopt(sd.events.clone(), sd.state.clone());
+        core.restore(sd.events.clone(), sd.state.clone());
         core.state.model = spec.model.clone().unwrap_or_default();
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
@@ -774,12 +876,16 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
         let folder = if core.state.cwd == sd.from_cwd { String::new() } else { format!(" (it works in {} here; it was in {})", core.state.cwd, sd.from_cwd) };
-        let mut text = format!("Moved here from {}{folder} — the conversation, its timeline and queue came along", sd.from);
+        let mut text = if sd.local {
+            "Taken over by this machine's newer kiln runner, which replaces the older one — the conversation, its timeline and queue came along".to_owned()
+        } else {
+            format!("Moved here from {}{folder} — the conversation, its timeline and queue came along", sd.from)
+        };
         // Interrupted to move: the turn goes on here, first thing.
         if sd.picks_up {
             text.push_str(", and the turn it was in the middle of goes on here");
             let ask = format!("This conversation just moved here from {}, which interrupted your last turn. Pick up where you left off.", sd.from);
-            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: ask, at: Core::now(), attachments: Vec::new(), overrides: None });
+            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: ask, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
         }
         if let Some(n) = &sd.note {
             text.push_str(". ");
@@ -796,8 +902,9 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
 /// A session with this core, its task started (`adopt`: going on with a harness process the
 /// previous image of this process handed over).
 #[allow(clippy::too_many_arguments)]
-fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
+fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
     let now = crate::util::now_ms();
+    core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
     let cwd = core.state.cwd.clone();
     let info = Info {
         id: id.clone(),
@@ -807,6 +914,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         name: spec.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| kind.name.to_owned()),
         shell: spec.shell.clone(),
         cwd,
+        tree: None,
         created_at: now,
         status: Status::Starting,
         title: String::new(),
@@ -815,6 +923,8 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         harness_session: spec.resume.clone(),
         approvals: Vec::new(),
         queued: 0,
+        queue: Vec::new(),
+        said: Vec::new(),
         tasks_running: 0,
         subagents: Vec::new(),
         cost_usd: 0.0,
@@ -841,9 +951,11 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         pause: None,
         last_turn: None,
         keep_off: false,
+        held: None,
         move_on_limit: false,
         move_plan: Default::default(),
         pause_at: None,
+        max_subagents: core.state.max_subagents,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
         no_bypass: !spec.allow_bypass,
@@ -861,6 +973,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         turn_open: std::sync::atomic::AtomicBool::new(false),
         ran: Mutex::new((None, Vec::new())),
         left: Mutex::new(Vec::new()),
+        moving: Mutex::new(false),
     });
     let run = Arc::clone(&s);
     crate::rt::spawn(async move {
@@ -870,6 +983,76 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         }
     });
     Ok(s)
+}
+
+/// A message for the agent (what a session's inbox takes once, CP-T3.2), not a command to kiln.
+pub fn is_message(c: &Command) -> bool {
+    matches!(c, Command::Send { .. } | Command::SkillRun { .. })
+}
+
+/// Most of what's waiting in a session's channel a move looks at.
+const GATHER_MAX: usize = 100_000;
+
+/// A move begins: the session takes no messages from now on, and those it was sent and hasn't taken
+/// (still in its channel, or carried while its harness was down) join the end of its queue, in the
+/// order they came, to go with it (one for a subagent, its subagent's). Everything else in its
+/// channel is held back, for if it stays.
+fn gather(s: &Session, ctl_rx: &async_channel::Receiver<Ctl>, carry: &mut Vec<Command>) -> Vec<Ctl> {
+    let mut held = Vec::new();
+    let mut waiting = Vec::new();
+    {
+        let mut moving = s.moving.lock();
+        *moving = true;
+        // Under the lock no message goes in, so this ends; bounded besides.
+        for _ in 0..GATHER_MAX {
+            match ctl_rx.try_recv() {
+                Ok(Ctl::Cmd(c)) if is_message(&c) => waiting.push(*c),
+                Ok(other) => held.push(other),
+                Err(_) => break,
+            }
+        }
+    }
+    let (carried, rest): (Vec<Command>, Vec<Command>) = std::mem::take(carry).into_iter().partition(is_message);
+    *carry = rest;
+    let mut core = s.core.lock();
+    let before = core.state.queue.len();
+    for c in carried.into_iter().chain(waiting) {
+        let task = match &c {
+            Command::Send { task, .. } => task.clone(),
+            _ => None,
+        };
+        let Some(m) = queued(c) else { continue };
+        match task {
+            // One for a subagent waits in its queue, which goes with the session, or (one that takes
+            // none now) is shown not sent there: never in the agent's own (CP-T3.2, the nineteenth
+            // adversarial check's).
+            Some(task) if core.state.tasks.iter().any(|t| t.id == task && t.takes.contains(&super::model::SendMode::Queue)) => {
+                super::subagent::hold(&mut core, &task, super::model::QueueItem { overrides: None, ..m });
+            }
+            Some(task) => super::subagent::refuse(&mut core, &task, &m, "it takes no message from kiln now."),
+            None => core.state.queue.push(m),
+        }
+    }
+    if core.state.queue.len() != before {
+        core.touch_state();
+    }
+    held
+}
+
+/// A message as it waits in a session's queue.
+fn queued(c: Command) -> Option<super::model::QueueItem> {
+    let at = Core::now();
+    match c {
+        Command::Send { id, text, attachments, overrides, reply_to, .. } => Some(super::model::QueueItem { id, text, at, attachments, overrides, reply_to }),
+        Command::SkillRun { name, args, id, .. } => {
+            let text = match args.filter(|a| !a.trim().is_empty()) {
+                Some(a) => format!("/{name} {a}"),
+                None => format!("/{name}"),
+            };
+            Some(super::model::QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at, attachments: Vec::new(), overrides: None, reply_to: None })
+        }
+        _ => None,
+    }
 }
 
 /// Background work a step asked for.
@@ -1189,6 +1372,50 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_ch
                 (files.spawn)(b);
             }
             super::core::Effect::Restart { resume_at } => restart = Some(resume_at),
+            // The go-back a harness without one gets from kiln (`harness::goback`): the store's
+            // timeline truncates, its transcript seeds a branch, the workspace's checkpoint
+            // (a hidden ref) restores its files.
+            super::core::Effect::GoBack { op, event } => {
+                match op {
+                    super::core::GoBackOp::Fork | super::core::GoBackOp::Branch => {
+                        let mut b = s.resume_spec();
+                        // No native resume: the branch is seeded with the conversation in words.
+                        b.resume = None;
+                        b.resume_at = None;
+                        b.fork = false;
+                        b.name = Some(format!("{} (branch)", s.info().name));
+                        b.prompt = Some(super::goback::branch_prompt(&s.core.lock(), if op == super::core::GoBackOp::Branch { Some(event.as_str()) } else { None }));
+                        (files.spawn)(b);
+                    }
+                    _ => {
+                        let mut core = s.core.lock();
+                        let (at, words) = match core.get(&event) {
+                            Some(e) => (e.at, match &e.body { super::model::Body::User { text, .. } => super::model::clip_middle(text.trim(), 80).0, _ => String::new() }),
+                            None => continue,
+                        };
+                        let cwd = core.state.cwd.clone();
+                        // The workspace goes back to the checkpoint the prompt's own moment made.
+                        let did = if cwd.is_empty() { "the folder isn't known".to_owned() } else { super::goback::restore_files(&cwd, &s.id, at) };
+                        if op == super::core::GoBackOp::RewindFiles {
+                            super::goback::notice(&mut core, super::model::Level::Info, format!("Restored files to \"{words}\": {did}."));
+                        } else {
+                            // The process can't come back at the point natively: it starts over
+                            // and the truncated conversation is said to it (the store keeps the
+                            // record of what went).
+                            core.truncate_from(&event);
+                            let transcript = super::goback::seed_prompt(&core, None);
+                            let keep: std::collections::HashSet<String> = core.events().map(|e| e.id.clone()).collect();
+                            core.state.delivery.retain(|k, _| keep.contains(k));
+                            core.state.harness_session = None;
+                            s.spec.lock().resume = None;
+                            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: format!("The conversation was rewound here. What it is now:\n\n{transcript}\n\nGo on from the last message."), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
+                            super::goback::notice(&mut core, super::model::Level::Info, format!("Rewound to \"{words}\": {did}. The agent starts again with the conversation up to here."));
+                            restart = Some(None);
+                        }
+                        core.touch_state();
+                    }
+                }
+            }
             super::core::Effect::AllowBypass => s.spec.lock().allow_bypass = true,
             super::core::Effect::Run { job, args } => {
                 let mut spec = s.spec.lock().clone();
@@ -1399,7 +1626,8 @@ struct Switch {
 }
 
 /// Nothing is under way: no turn, nothing waiting for a person.
-fn settled(s: &Session) -> bool {
+/// Between turns: idle, nothing waiting on a person, no turn under way.
+pub(super) fn settled(s: &Session) -> bool {
     settled_core(&s.core.lock())
 }
 
@@ -1544,6 +1772,10 @@ fn for_harness(st: &mut super::model::State, session: Option<String>, model: &st
     model.clone_into(&mut st.model);
     st.mode = mode.unwrap_or_default();
     st.effort = effort.unwrap_or_default();
+    // A speed is its harness's own (Claude Code's fast mode isn't one of Codex's tiers).
+    st.speed.clear();
+    st.speed_blocked = None;
+    st.speed_cooldown = false;
     st.mcp.clear();
     st.skills.clear();
     st.plugins.clear();
@@ -1626,6 +1858,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         sp.model = Some(sw.model.clone());
         sp.mode.clone_from(&mode);
         sp.effort.clone_from(&effort);
+        sp.speed = None;
         sp.resume.clone_from(&resume);
         sp.resume_at = None;
         sp.fork = false;
@@ -1647,7 +1880,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         // the limit cut off goes on first.
         let unpaused = core.state.pause.take();
         if unpaused.as_ref().is_some_and(|p| p.cut.is_some()) {
-            core.state.queue.insert(0, super::model::QueueItem { id: format!("{}{}", super::pause::KILN_ID, crate::util::new_id()), text: super::pause::CONTINUE_ELSEWHERE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None });
+            core.state.queue.insert(0, super::model::QueueItem { id: format!("{}{}", super::pause::KILN_ID, crate::util::new_id()), text: super::pause::CONTINUE_ELSEWHERE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
         }
         let mut text = format!("Now {} ({})", model_label(to, &sw.model), to.name);
         if !empty {
@@ -1693,17 +1926,22 @@ struct Move {
     /// It goes on there in this harness (its conversation carried over), with this model.
     kind: Option<&'static Kind>,
     model: Option<String>,
+    /// To this machine's newer runner process, which takes this one's place (`super::handing`).
+    local: bool,
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
 /// `now`: the turn under way isn't waited for (the caller interrupts it).
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>) -> Move {
+#[allow(clippy::too_many_arguments)]
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool) -> Move {
     let mut core = s.core.lock();
     core.hold = true;
     let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
     let picks_up = now && busy;
     let into = kind.map(|k| format!(", to go on in {}", k.name)).unwrap_or_default();
-    let text = if picks_up {
+    let text = if local {
+        if busy { "This machine's newer kiln runner takes this agent over when this turn ends".to_owned() } else { "This machine's newer kiln runner takes this agent over…".to_owned() }
+    } else if picks_up {
         format!("Moving to {to}{into} now: this turn stops here and goes on there")
     } else if busy {
         format!("Moving to {to}{into} when this turn ends")
@@ -1712,7 +1950,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     };
     core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
     core.touch_state();
-    Move { to, cwd, note, picks_up, kind, model }
+    Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local }
 }
 
 /// How a move is getting on before it starts (its repository being copied there).
@@ -1746,9 +1984,9 @@ async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<Synced>, S
     loop {
         let Some(looked) = sync.look_now(folder).await else { return Ok(None) };
         let st = sync.standing(folder).await.unwrap_or_default();
-        if looked.looked && looked.proposed == 0 && st.unsent == 0 && st.behind == 0 {
+        if let Some(mark) = crate::sync::runner::left_at(&looked, &st) {
             left_behind(cwd, &st).await?;
-            return Ok(Some(Synced { mark: crate::sync::runner::Mark { repo: looked.repo, index: st.reached }, folder: st.folder, name: st.name }));
+            return Ok(Some(Synced { mark, folder: st.folder, name: st.name }));
         }
         let why = match (&st.error, st.connected) {
             (Some(e), _) => format!(" ({e})"),
@@ -1972,7 +2210,7 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
     let mut said = String::new();
     loop {
         let now = match sync.standing(folder).await {
-            Some(st) if st.repo == mark.repo && st.reached >= mark.index => {
+            Some(st) if crate::sync::runner::arrived(&st, mark) => {
                 let waited = started.elapsed();
                 note(format!("Its folder's last changes are here (in {}s); it goes on", waited.as_secs()), Level::Info);
                 crate::metrics::sync().move_files_wait.observe(waited.as_secs_f64());
@@ -2032,13 +2270,155 @@ fn move_failed(s: &Session, mv: &Move, why: &str) {
     let mut core = s.core.lock();
     core.hold = false;
     core.touch_state();
-    core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text: format!("Couldn't move to {}: {why} — it goes on here", mv.to) });
+    let text = if mv.local {
+        format!("This machine's newer kiln runner couldn't take this agent over: {why} — it goes on here")
+    } else {
+        format!("Couldn't move to {}: {why} — it goes on here", mv.to)
+    };
+    core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text });
+}
+
+/// Hand the session to this machine's newer runner process (its turn is over, its harness down),
+/// which takes this one's place: its timeline, state and queue, by way of the server. Same disk,
+/// same home: its folder and its harness's own record stay where they are, and it resumes from
+/// them there under the same harness session, as it would after a restart. A harness whose own
+/// record kiln doesn't keep (ACP agents, Antigravity) may not load it again: its conversation
+/// goes in words, as a move carries it. Ok once that process has taken it over. Its inbox's ids go
+/// with it and its inbox here is fenced first, as for a move (`ids`, `fence`; CP-T3.2): the newer
+/// process keeps an inbox of its own. With no word of how it went, it waits here and asks again
+/// until it's known, as a move does.
+async fn hand_to_newer(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &CarriedIds, fence: &FenceFor, settle: &SettleFor) -> Result<(), String> {
+    let id = s.id.clone();
+    let send = |bytes: Vec<u8>| {
+        let id = id.clone();
+        async move { super::handing::send(&id, &bytes).await }
+    };
+    let handed = hand_to_newer_by(s, kind, mv, ids, fence, settle, send, crate::rt::sleep).await;
+    super::handing::done(&s.id);
+    handed
+}
+
+/// [`hand_to_newer`], each try's package sent by `send` (`super::handing::send`), the time
+/// between tries waited by `wait`.
+#[allow(clippy::too_many_arguments)]
+async fn hand_to_newer_by<F, Fut, W, WFut>(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &CarriedIds, fence: &FenceFor, settle: &SettleFor, send: F, wait: W) -> Result<(), String>
+where
+    F: Fn(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), super::handing::NotHanded>>,
+    W: Fn(Duration) -> WFut,
+    WFut: std::future::Future<Output = ()>,
+{
+    use super::handing::NotHanded;
+    use super::moving::Carry;
+    // Its inbox here fenced first, so it takes nothing more: a copy of it this process goes on with
+    // takes nothing the newer one may have taken (CP-T3.2). Then the ids of the messages it took,
+    // read once what its lane holds is done (a message its inbox took before the fence, and it then
+    // refused, is taken back by then), and only then what it holds, copied. So no id goes without
+    // its message, which a retry would find taken there and never deliver, and nothing it holds
+    // stays behind (the hand-over review's point 2).
+    fence(s.id.clone(), true).await.map_err(|e| format!("its inbox couldn't be fenced, so it stays here: {e}"))?;
+    // The ids go with it (it takes none while it's handed over): the newer process's inbox would
+    // take one sent again as new. Never without them: it stays here.
+    let kept = match ids(s.id.clone()).await {
+        Ok(kept) => kept,
+        Err(e) => return Err(unfenced(s, fence, format!("its inbox couldn't be read, so it stays here: {e}")).await),
+    };
+    let spec = s.resume_spec();
+    let (resume, program) = (spec.resume.clone(), spec.program.clone());
+    let (events, state, cwd) = {
+        let core = s.core.lock();
+        // The note that it was about to go is this process's alone.
+        (core.events().filter(|e| e.id != "move-pending").cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone())
+    };
+    let carry = match kind.protocol {
+        super::kinds::Protocol::Acp(_) | super::kinds::Protocol::AgyStreamJson => {
+            super::moving::words(&events, "This conversation went on in this machine's newer kiln runner, which took the older one's place.")
+        }
+        _ => Carry::Nothing,
+    };
+    let mut pkg = super::moving::pack(&s.id, spec, &cwd, &mv.to, &cwd, carry, events, state);
+    // Its harness's own record is here already: it goes on from it, nothing started anew.
+    if matches!(pkg.carry, Carry::Nothing) {
+        pkg.spec.resume = resume;
+    }
+    pkg.spec.program = program;
+    pkg.handover = true;
+    // The same try each time it's sent again: the machine decides it once.
+    let attempt = crate::util::new_id();
+    pkg.attempt = Some(attempt.clone());
+    (pkg.inbox, pkg.inbox_digests) = super::host::split_kept(kept);
+    let bytes = match serde_json::to_vec(&pkg) {
+        Ok(bytes) => bytes,
+        Err(e) => return Err(unfenced(s, fence, e.to_string()).await),
+    };
+    // How it went, until it's known (CP-T3.2, the eighteenth and nineteenth adversarial checks'):
+    // the machine decides each try once, whichever of its processes comes first (`settle`), so the
+    // server's word, which may be an earlier try's come late, says only when to look. Taken over,
+    // it lets go; refused (or, before any try went without a word, not passed on), it takes the try
+    // back unless a newer process took it first, and goes on here. With no word, or the server's
+    // own after a try that went without one, it looks: while it isn't decided, the newer process
+    // may run it now, so it waits (its harness down, its queue held, its inbox fenced) and its
+    // package goes again. Where the machine's record isn't kept, the word alone says, as before.
+    let mut pause = UNKNOWN_FIRST;
+    let mut unknown = false;
+    let handed = loop {
+        let word = send(bytes.clone()).await;
+        let take_back = match &word {
+            Ok(()) => break Ok(()),
+            Err(NotHanded::Refused(_)) => true,
+            Err(NotHanded::NotPassed(_)) => !unknown,
+            Err(NotHanded::Unknown(_)) => false,
+        };
+        let why = word.err().map(|e| e.to_string()).unwrap_or_default();
+        let why = match settle(attempt.clone(), s.id.clone(), take_back).await {
+            Ok(Some(super::host::Decided::Taken)) => break Ok(()),
+            Ok(Some(super::host::Decided::Refused)) => break Err(why),
+            Ok(None) if take_back => break Err(why),
+            Ok(None) => why,
+            Err(e) => format!("{why}; how it went can't be read here now: {e}"),
+        };
+        unknown = true;
+        tracing::warn!(target: "kiln.sends", event = "handover_unknown", session = %s.id, error = %why, "a session's hand-over to this machine's newer runner process isn't known to have gone or not: it takes no messages here, and runs nothing, until it is; asking again");
+        moving_note(s, &format!("Handing over to this machine's newer kiln runner: how it went isn't known yet ({why}), so it may run there now. It takes no messages here until it's known; asking again"));
+        wait(pause).await;
+        pause = (pause * 2).min(UNKNOWN_MOST);
+    };
+    // Refused for sure: it goes on here, taking messages again.
+    if handed.is_err()
+        && let Err(e) = fence(s.id.clone(), false).await
+    {
+        tracing::warn!(target: "kiln.sends", event = "unfence_failed", session = %s.id, error = %e, "a session whose hand-over failed couldn't take messages again: its inbox stays fenced until it's handed over");
+    }
+    handed
+}
+
+/// A move whose answer never came asks the runner it went to again after this, then twice as long
+/// each time, up to [`UNKNOWN_MOST`].
+const UNKNOWN_FIRST: Duration = Duration::from_secs(5);
+const UNKNOWN_MOST: Duration = Duration::from_secs(60);
+
+/// Session `s`'s inbox, fenced as it began to go, takes messages again: nothing of it went, and it
+/// goes on here. `why` it didn't go, as it's said.
+async fn unfenced(s: &Session, fence: &FenceFor, why: String) -> String {
+    if let Err(e) = fence(s.id.clone(), false).await {
+        tracing::warn!(target: "kiln.sends", event = "unfence_failed", session = %s.id, error = %e, "a session that couldn't go couldn't take messages again: its inbox stays fenced until it goes");
+    }
+    why
 }
 
 /// Hand the session to runner `mv.to` (its turn is over, its harness down): its record, timeline
-/// and queue, over reach. Ok once that runner has taken it over and runs it.
-async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(), String> {
+/// and queue, over reach. Ok once that runner has taken it over and runs it. One that may have taken
+/// it (all of it went, and no answer came) is asked again until it says: meanwhile the session
+/// takes nothing here.
+async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &CarriedIds, fence: &FenceFor, settle: &SettleFor) -> Result<(), String> {
     use super::moving::Carry;
+    if mv.local {
+        // Its process is a terminal's: it stays with the process it runs in until it ends.
+        if matches!(kind.protocol, super::kinds::Protocol::Terminal) {
+            return Err("an agent in a terminal stays where it runs until it ends".into());
+        }
+        return hand_to_newer(s, kind, mv, ids, fence, settle).await;
+    }
     let reach = crate::reach::node::global().ok_or_else(|| "this runner can't reach other runners (an older one?)".to_owned())?;
     let me = reach.name().to_owned();
     let mut spec = s.resume_spec();
@@ -2061,11 +2441,19 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
         note.push(' ');
         note.push_str(n);
     }
-    let carry = match mv.kind {
+    let (carry, home) = match mv.kind {
+        // Its record, and what its harness keeps for it in its home besides (`homes`).
         None => {
             let env = spec.env.clone();
             let timeline = events.clone();
-            crate::rt::blocking(move || super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)).await.map_err(|e| format!("{e:#}"))??
+            let (cwd, objective) = (from_cwd.clone(), state.objective.clone());
+            crate::rt::blocking(move || {
+                let carry = super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)?;
+                let home = super::homes::pack(kind.id, &super::homes::Dirs::here(&env), session.as_deref(), &cwd, super::moving::transcript_of(&carry), objective.as_ref());
+                Ok::<_, String>((carry, Some(home)))
+            })
+            .await
+            .map_err(|e| format!("{e:#}"))??
         }
         // The other harness's own record of it, as a switch writes one (`carried`).
         Some(to) => {
@@ -2080,10 +2468,12 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
             spec.model.clone_from(&mv.model);
             spec.mode.clone_from(&c.mode);
             spec.effort.clone_from(&c.effort);
+            spec.speed = None;
             // A program of its own was the old harness's.
             spec.program = None;
             for_harness(&mut state, there, &model, c.mode, c.effort);
-            carry
+            // What the old harness keeps in its home is its own: the other one doesn't read it.
+            (carry, None)
         }
     };
     // Its folder's last changes go first, so it goes on there from them; then its repository's
@@ -2136,18 +2526,55 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
             return Err(why);
         }
     };
-    let carried = carried_bytes(&out);
+    let carried = carried_bytes(&out, home.as_ref());
     // Paused for a limit: it goes on there, where it moved for room, the cut-off turn first.
     let cut = picks_up_there(&mut state);
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
+    if let Some(home) = home {
+        pkg = pkg.with_home(home);
+    }
     pkg.picks_up = mv.picks_up || cut;
     pkg.synced = synced.as_ref().map(|x| x.mark.clone());
     pkg.git = out.git;
     pkg.ignored = out.ignored;
     pkg.worktree = out.worktree;
-    let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
+    // Its inbox here fenced before its conversation goes: a copy of it this host goes on with
+    // after a crash takes nothing for it (it may have gone on there), and is moved again
+    // (CP-T3.2). Fenced before the ids of the messages it took are read, once what its lane holds
+    // is done, so no id goes without its message (the hand-over review's point 2). What it holds
+    // was copied above, after it stopped taking messages: none reached it since.
+    fence(s.id.clone(), true).await.map_err(|e| format!("its inbox couldn't be fenced, so it stays here: {e}"))?;
+    // The ids of the messages it took go with it (it takes none while it moves).
+    // Never without them: a message sent again where it went would be taken there as new. It
+    // stays here, and the move can be tried again.
+    let kept = match ids(s.id.clone()).await {
+        Ok(kept) => kept,
+        Err(e) => return Err(unfenced(s, fence, format!("its inbox couldn't be read, so it stays here: {e}")).await),
+    };
+    (pkg.inbox, pkg.inbox_digests) = super::host::split_kept(kept);
+    let bytes = match serde_json::to_vec(&pkg) {
+        Ok(bytes) => bytes,
+        Err(e) => return Err(unfenced(s, fence, e.to_string()).await),
+    };
     moving_note(s, &format!("Moving to {}: handing over the conversation ({} KB)", mv.to, bytes.len() / 1024));
-    let handed = reach.adopt(&mv.to, &bytes).await;
+    let mut handed = reach.adopt(&mv.to, &bytes, false).await;
+    // All of it went and no answer came: it may run there now. Going on here, it could take a
+    // message it takes there too, so it doesn't: its inbox stays fenced, and it asks that runner
+    // again until it says (it runs it: moved; it takes it now: moved; it refuses it: it stays).
+    let mut pause = UNKNOWN_FIRST;
+    while let Err(crate::reach::node::NotAdopted::Unknown(why)) = &handed {
+        tracing::warn!(target: "kiln.sends", event = "move_unknown", session = %s.id, to = %mv.to, error = %why, "a session's move got no answer: it takes no messages here until the runner it went to says whether it took it over");
+        moving_note(s, &format!("Moving to {}: no answer came ({why}), so it may run there now. It takes no messages here until {} says; asking again", mv.to, mv.to));
+        crate::rt::sleep(pause).await;
+        pause = (pause * 2).min(UNKNOWN_MOST);
+        handed = reach.adopt(&mv.to, &bytes, true).await;
+    }
+    if handed.is_err()
+        && let Err(e) = fence(s.id.clone(), false).await
+    {
+        tracing::warn!(target: "kiln.sends", event = "unfence_failed", session = %s.id, error = %e, "a session whose move failed couldn't take messages again: its inbox stays fenced until it's moved");
+    }
+    let handed = handed.map_err(|e| e.to_string());
     if let (Some(x), Err(e)) = (&synced, &handed) {
         tell_move(news(&x.mark.repo, x.mark.index, "failed", Some(e)));
     }
@@ -2173,9 +2600,10 @@ fn tell_move(news: crate::sync::wire::MoveNews) {
     }
 }
 
-/// What a leaving session's repository carries besides its synced files, in bytes: what the
-/// machine it goes to lacks of its git history, the files git ignores, and its worktree.
-fn carried_bytes(out: &GitOut) -> [(&'static str, u64); 3] {
+/// What a leaving session carries besides its synced files, in bytes: what the machine it goes to
+/// lacks of its git history, the files git ignores, its worktree, and what its harness keeps for
+/// it in its home.
+fn carried_bytes(out: &GitOut, home: Option<&super::homes::Home>) -> [(&'static str, u64); 4] {
     // Base64, as the package carries them: three bytes in four.
     let b64 = |s: &str| u64::try_from(s.len() / 4 * 3).unwrap_or(u64::MAX);
     let files = |c: &super::carry::Carried| c.files.iter().map(|f| b64(&f.data)).sum::<u64>();
@@ -2183,6 +2611,7 @@ fn carried_bytes(out: &GitOut) -> [(&'static str, u64); 3] {
         ("git", out.git.as_ref().and_then(|g| g.bundle.as_deref()).map_or(0, b64)),
         ("ignored", out.ignored.as_ref().map_or(0, files)),
         ("worktree", out.worktree.as_ref().map_or(0, |w| files(&w.changed).saturating_add(files(&w.ignored)))),
+        ("home", home.map_or(0, super::homes::Home::size)),
     ]
 }
 
@@ -2222,8 +2651,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             }
         }
     }
-    // Announce it, whole, before anything else: whoever mirrors it starts from all of it.
+    // Announce it, whole, before anything else: whoever mirrors it starts from all of it. One
+    // that started again from the conversation store announces all but its timeline: the store
+    // has that, and the server's copy gets what it lacks as the session's stream starts.
+    let stored = std::mem::take(&mut s.core.lock().stored);
     for u in s.snapshot() {
+        if stored && matches!(u, Update::Reset { .. } | Update::Events { .. }) {
+            continue;
+        }
         let _ = sink.send((s.id.clone(), u)).await;
     }
     let mut first = !handed;
@@ -2274,8 +2709,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         // The harness it ran in is down: on in the other one.
         // Its turn is over: on to the other runner (or, if that can't be, on here).
         if let Some(mv) = moving.take() {
+            // From here on it takes no messages (they go where it goes); those it was sent and
+            // hasn't taken go with it in its queue, and the rest it was told waits for the move.
+            let held = gather(&s, &ctl_rx, &mut carry);
             let span = tracing::info_span!(target: "kiln.sync", "move", repo = tracing::field::Empty, machine = %mv.to, session = %s.id, result = tracing::field::Empty);
-            let handed = hand_over(&s, kind, &mv).instrument(span.clone()).await;
+            let handed = hand_over(&s, kind, &mv, &files.carried, &files.fence, &files.settle).instrument(span.clone()).await;
             let result = if handed.is_ok() { "ok" } else { "failed" };
             span.record("result", result);
             drop(span);
@@ -2288,6 +2726,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 }
                 Err(why) => {
                     tracing::warn!(session = %s.id, to = %mv.to, %why, "agent session could not move");
+                    // It stays: it takes messages again, and what it was told meanwhile, in order.
+                    *s.moving.lock() = false;
+                    for c in held {
+                        let _ = s.ctl.try_send(c);
+                    }
                     move_failed(&s, &mv, &why);
                     flush(&s, &sink, None).await;
                     on_change();
@@ -2341,6 +2784,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     adapter.seed(items.clone());
                 }
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
+                // One the machine's own PATH lacks may be on its user's: their login shell is asked
+                // first (once, then kept ten minutes).
+                if blocked.is_none() && spec.program.is_none() && !kind.available() {
+                    crate::reach::serve::login_env().await;
+                }
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
                     // In the session's group of processes where the machine has them, and marked as
@@ -2381,7 +2829,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     core.touch_state();
                     adapter.start(&mut core);
                     if first && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
-                        adapter.command(&mut core, Command::Send { id: crate::util::new_id(), text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None });
+                        // Its id is the session's own (CP-T3.2): made once, the same if it's ever made again.
+                        let id = crate::util::derive_id(&["first-prompt", &s.id]);
+                        adapter.command(&mut core, Command::Send { id, text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None });
                     }
                     for c in carry.drain(..) {
                         adapter.command(&mut core, c);
@@ -2415,10 +2865,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         });
                     }
                     for job in jobs.changes.drain(..) {
-                        s.core.lock().start_change(&job.abs);
+                        // Placed among its folder's repository's working trees (a worktree it went into).
+                        let home = {
+                            let mut core = s.core.lock();
+                            core.start_change(&job.abs);
+                            core.state.cwd.clone()
+                        };
                         changes.push(async move {
                             let abs = job.abs.clone();
-                            let change = crate::rt::blocking(move || super::diff::file_change(&job)).await.unwrap_or((None, None));
+                            let change = crate::rt::blocking(move || super::diff::placed_change(&job, &home)).await.unwrap_or((None, None));
                             (abs, change)
                         });
                     }
@@ -2508,8 +2963,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     switching = Some(sw);
                                 }
                             }
-                            Command::MoveTo { to, cwd, note, now, kind: into, model } => {
-                                let mv = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model);
+                            Command::MoveTo { to, cwd, note, now, kind: into, model, local } => {
+                                let mv = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local);
                                 // Not waiting for the turn: it stops here, and goes on there.
                                 if mv.picks_up {
                                     adapter.command(&mut s.core.lock(), Command::Interrupt);
@@ -2557,6 +3012,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 drop(core);
                                 on_change();
                             }
+                            Command::MaxSubagents { count } => {
+                                let mut core = s.core.lock();
+                                core.state.max_subagents = count.filter(|n| *n >= 1);
+                                core.touch_state();
+                                drop(core);
+                                on_change();
+                            }
                             Command::MoveOnLimit { on, to, kind, model } => {
                                 let mut core = s.core.lock();
                                 core.state.move_on_limit = on;
@@ -2565,9 +3027,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 drop(core);
                                 on_change();
                             }
-                            Command::LimitHold { window, until, said, .. } => {
+                            Command::LimitHold { window, until, said, account, .. } => {
                                 let mut core = s.core.lock();
-                                super::pause::hold(&mut core, super::pause::LIMIT, "account", super::pause::Hit { window, until, said }, None);
+                                super::pause::account_hold(&mut core, super::pause::Hit { window, until, said }, account);
                                 drop(core);
                                 on_change();
                             }
@@ -2839,8 +3301,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                     }
                     // Another runner: it goes there, now.
-                    Command::MoveTo { to, cwd, note, now, kind: into, model } => {
-                        moving = Some(move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model));
+                    Command::MoveTo { to, cwd, note, now, kind: into, model, local } => {
+                        moving = Some(move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local));
                         break;
                     }
                     Command::Moving { text } => moving_note(&s, &text),
@@ -2850,6 +3312,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                     Command::StopTasks => {
                         stop_left(&s, None).await;
+                        on_change();
+                    }
+                    // For a subagent: it ended with its harness, so it isn't started again for it.
+                    c @ Command::Send { task: Some(_), .. } => {
+                        adapter.command(&mut s.core.lock(), c);
                         on_change();
                     }
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {
@@ -2870,6 +3337,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         if let Some(c) = name_session(&s, value.as_ref()) {
                             carry.push(c);
                         }
+                        on_change();
+                    }
+                    // Its threshold, set while it isn't running (a person's, or kiln's for a
+                    // program's worker): kept, and it holds from its next start.
+                    Command::PauseAt { percent } => {
+                        let mut core = s.core.lock();
+                        core.state.pause_at = percent.filter(|p| (1..=100).contains(p));
+                        core.touch_state();
+                        drop(core);
                         on_change();
                     }
                     c => adapter.command(&mut s.core.lock(), c),
@@ -2913,10 +3389,210 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
 
 #[cfg(test)]
 mod tests {
+    /// A session that runs nothing, and the receiving end of its channel (what its task would read).
+    fn idle(id: &str) -> (Session, async_channel::Receiver<Ctl>) {
+        let (ctl, rx) = async_channel::unbounded();
+        let s = Session {
+            id: id.into(),
+            spec: Mutex::new(Spec::default()),
+            created_at: 0,
+            core: Mutex::new(Core::new()),
+            info: Mutex::new(Info::default()),
+            ctl,
+            pid: Mutex::new(None),
+            turn_open: std::sync::atomic::AtomicBool::new(false),
+            ran: Mutex::new((None, Vec::new())),
+            left: Mutex::new(Vec::new()),
+            moving: Mutex::new(false),
+        };
+        (s, rx)
+    }
+
+    fn message(id: &str, text: &str) -> Command {
+        Command::Send { id: id.into(), text: text.into(), mode: super::super::model::SendMode::Now, attachments: Vec::new(), overrides: None, reply_to: None, task: None }
+    }
+
+    /// CP-T3.2: a move gathers what a session was sent and hasn't taken (carried while its harness
+    /// was down, then still in its channel) into its queue, in the order it came, to go with it; it
+    /// holds back everything else; and from then on the session takes no message (its inbox takes
+    /// it back, and the sender is told it moved), while commands still go in.
+    #[test]
+    fn a_move_takes_what_its_session_was_sent_and_lets_no_message_in_after() {
+        let (s, rx) = idle("moving");
+        s.core.lock().state.queue.push(super::super::model::QueueItem { id: "q0".into(), text: "queued before".into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None });
+        let mut carry = vec![message("c1", "sent while it was down"), Command::Restart];
+        assert!(s.command(message("m1", "in its channel")));
+        assert!(s.command(Command::Interrupt));
+        assert!(s.command(Command::SkillRun { name: "review".into(), args: Some("the diff".into()), id: Some("k1".into()), mode: Default::default() }));
+        let held = gather(&s, &rx, &mut carry);
+        let queue: Vec<(String, String)> = s.core.lock().state.queue.iter().map(|q| (q.id.clone(), q.text.clone())).collect();
+        assert_eq!(
+            queue,
+            [("q0", "queued before"), ("c1", "sent while it was down"), ("m1", "in its channel"), ("k1", "/review the diff")].map(|(i, t)| (i.to_owned(), t.to_owned())),
+            "in the order they came, after what was queued"
+        );
+        assert!(matches!(held.as_slice(), [Ctl::Cmd(c)] if matches!(**c, Command::Interrupt)), "the rest held back");
+        assert!(matches!(carry.as_slice(), [Command::Restart]), "what isn't a message stays carried");
+        assert!(s.is_moving());
+        assert!(!s.command(message("m2", "too late")), "no message goes in once it's moving");
+        assert!(s.command(Command::Interrupt), "a command still does");
+    }
+
+    /// CP-T3.2 (the nineteenth adversarial check's): a move gathers a message for one of its
+    /// subagents into that subagent's queue, which goes with the session, never into the agent's
+    /// own; one for a subagent that takes none now is shown not sent, there.
+    #[test]
+    fn a_move_keeps_a_message_for_a_subagent_its_subagent_s() {
+        use super::super::model::{Delivery, SendMode, Task};
+        let (s, rx) = idle("moving-tasks");
+        s.core.lock().state.tasks = vec![
+            Task { id: "t1".into(), class: Some("agent".into()), status: "running".into(), takes: vec![SendMode::Queue], ..Task::default() },
+            Task { id: "t2".into(), class: Some("agent".into()), status: "completed".into(), ..Task::default() },
+        ];
+        let to = |id: &str, task: &str| Command::Send { id: id.into(), text: format!("for {task}"), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: Some(task.into()) };
+        let mut carry = vec![to("c1", "t1")];
+        assert!(s.command(to("m1", "t2")));
+        assert!(s.command(message("m2", "for the agent")));
+        let _held = gather(&s, &rx, &mut carry);
+        let core = s.core.lock();
+        let own: Vec<&str> = core.state.queue.iter().map(|q| q.id.as_str()).collect();
+        assert_eq!(own, ["m2"], "the agent's own queue holds its own message alone");
+        let t1: Vec<&str> = core.state.tasks.iter().find(|t| t.id == "t1").map(|t| t.queue.iter().map(|q| q.id.as_str()).collect()).unwrap_or_default();
+        assert_eq!(t1, ["c1"], "the subagent's message waits in its queue, which goes with the session");
+        assert!(matches!(core.state.delivery.get("m1"), Some(Delivery::Cancelled)), "one for a subagent that takes none is shown not sent: {:?}", core.state.delivery.get("m1"));
+    }
 
     /// A switch carries the same latitude (never more) and the nearest effort the new model takes,
     /// named by the new harness's own choices: what its page shows while the switch waits, rather
     /// than the old harness's (Opus shown with Codex's Full access, an empty effort, Codex's limit).
+    /// CP-T3.2 (the merge with main's one runner a machine, and the eighteenth adversarial check's):
+    /// a session handed to its machine's newer runner process carries its inbox's ids, as a move
+    /// does, its inbox here fenced before it goes: the newer process keeps an inbox of its own, which
+    /// would take a message sent again as new. Refused, the fence lifts and it goes on here. With no
+    /// word of it, the newer process may run it: it waits, fenced, and its package goes again until
+    /// it's known; once a try went without a word, only the newer process's own word ends it (the
+    /// server's own refusal doesn't). Its ids unreadable, it doesn't go at all. And (the nineteenth
+    /// adversarial check's) where the machine keeps its record of its hand-overs, that says how it
+    /// went, whatever the word: a refusal that's an earlier try's, come late while a newer process
+    /// took this one, lets go of it; a refusal takes the try back, unless one took it first; with no
+    /// word, it looks, and goes on waiting while it isn't decided, or while the record can't be read.
+    #[test]
+    fn a_session_handed_to_its_machine_s_newer_runner_takes_its_inbox_s_ids_and_waits_to_know() -> anyhow::Result<()> {
+        use super::super::handing::NotHanded;
+        use super::super::host::Decided;
+        let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
+        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true };
+        let kept: CarriedIds = Arc::new(|_| Box::pin(async { Ok(vec![("m1".to_owned(), "d1".to_owned()), ("m2".to_owned(), "d2".to_owned())]) }));
+        let unreadable: CarriedIds = Arc::new(|_| Box::pin(async { Err("its records are gone".to_owned()) }));
+        let unknown = || -> Result<(), NotHanded> { Err(NotHanded::Unknown("the link dropped".into())) };
+        let not_passed = || -> Result<(), NotHanded> { Err(NotHanded::NotPassed("no newer process".into())) };
+        let refused = || -> Result<(), NotHanded> { Err(NotHanded::Refused("no room".into())) };
+        let none = Vec::<Result<Option<Decided>, String>>::new;
+        crate::rt::block_on(async move {
+            // (its ids, each try's word, what the machine's record says each time it's asked, how
+            // it's fenced, whether it went, how many tries, whether each ask takes the try back)
+            for (ids, words, settled, fenced, ok, tries, asks) in [
+                (&kept, vec![Ok(())], none(), vec![true], true, 1, vec![]),
+                (&kept, vec![refused()], none(), vec![true, false], false, 1, vec![true]),
+                (&kept, vec![not_passed()], none(), vec![true, false], false, 1, vec![true]),
+                (&kept, vec![unknown(), unknown(), Ok(())], none(), vec![true], true, 3, vec![false, false]),
+                (&kept, vec![unknown(), not_passed(), refused()], none(), vec![true, false], false, 3, vec![false, false, true]),
+                // Its ids unreadable: fenced first, then the fence lifted, and it stays.
+                (&unreadable, vec![Ok(())], none(), vec![true, false], false, 0, vec![]),
+                // A refusal that's an earlier try's, come late: the record says it was taken over.
+                (&kept, vec![refused()], vec![Ok(Some(Decided::Taken))], vec![true], true, 1, vec![true]),
+                (&kept, vec![not_passed()], vec![Ok(Some(Decided::Taken))], vec![true], true, 1, vec![true]),
+                // Taken back: decided not taken.
+                (&kept, vec![refused()], vec![Ok(Some(Decided::Refused))], vec![true, false], false, 1, vec![true]),
+                // No word: it looks, until it's decided.
+                (&kept, vec![unknown(), unknown()], vec![Ok(None), Ok(Some(Decided::Taken))], vec![true], true, 2, vec![false, false]),
+                (&kept, vec![unknown(), refused()], vec![Ok(None), Ok(Some(Decided::Refused))], vec![true, false], false, 2, vec![false, true]),
+                // The record unreadable: a refusal isn't taken at its word; it asks again.
+                (&kept, vec![refused(), Ok(())], vec![Err("a disk fault".to_owned())], vec![true], true, 2, vec![true]),
+                (&kept, vec![unknown(), refused(), refused()], vec![Ok(None), Err("a disk fault".to_owned()), Ok(Some(Decided::Refused))], vec![true, false], false, 3, vec![false, true, true]),
+            ] {
+                let (s, _rx) = idle("h1");
+                let s = Arc::new(s);
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let c = Arc::clone(&calls);
+                let fence: FenceFor = Arc::new(move |_, on| {
+                    c.lock().push(on);
+                    Box::pin(async { Ok(()) })
+                });
+                let words = Arc::new(Mutex::new(std::collections::VecDeque::from(words)));
+                let packages = Arc::new(Mutex::new(Vec::new()));
+                let (w, got) = (Arc::clone(&words), Arc::clone(&packages));
+                let send = move |bytes: Vec<u8>| {
+                    got.lock().push(bytes);
+                    let word = w.lock().pop_front().unwrap_or(Ok(()));
+                    async move { word }
+                };
+                let record = Arc::new(Mutex::new(std::collections::VecDeque::from(settled)));
+                let asked = Arc::new(Mutex::new(Vec::new()));
+                let (r, a) = (Arc::clone(&record), Arc::clone(&asked));
+                let settle: SettleFor = Arc::new(move |attempt, _, take_back| {
+                    a.lock().push((attempt, take_back));
+                    let said = r.lock().pop_front().unwrap_or(Ok(None));
+                    Box::pin(async move { said })
+                });
+                let went = hand_to_newer_by(&s, kind, &mv, ids, &fence, &settle, send, |_| async {}).await;
+                let sent = std::mem::take(&mut *packages.lock());
+                let asked = std::mem::take(&mut *asked.lock());
+                let takes: Vec<bool> = asked.iter().map(|(_, t)| *t).collect();
+                anyhow::ensure!(went.is_ok() == ok && *calls.lock() == fenced && sent.len() == tries && takes == asks, "{went:?}, fenced {:?}, {} tries, asked {takes:?}", calls.lock(), sent.len());
+                let mut attempts = std::collections::HashSet::new();
+                for bytes in sent {
+                    let pkg: serde_json::Value = serde_json::from_slice(&bytes)?;
+                    anyhow::ensure!(pkg.get("inbox") == Some(&serde_json::json!(["m1", "m2"])) && pkg.get("inbox_digests") == Some(&serde_json::json!(["d1", "d2"])) && pkg.get("handover") == Some(&serde_json::json!(true)), "{pkg}");
+                    attempts.insert(pkg.get("attempt").and_then(serde_json::Value::as_str).map(str::to_owned));
+                }
+                // Each try the same one, and the one the record is asked of.
+                attempts.extend(asked.into_iter().map(|(a, _)| Some(a)));
+                anyhow::ensure!(attempts.len() <= 1 && !attempts.contains(&None), "the tries' attempts: {attempts:?}");
+            }
+            Ok(())
+        })
+    }
+
+    /// The hand-over review's point 2: a session handed to its machine's newer runner process fences
+    /// its inbox, then reads the ids that go with it, then copies what it holds. What it holds once
+    /// its ids are read goes, with every id, so no id goes without its message.
+    #[test]
+    fn a_hand_over_fences_its_inbox_then_reads_its_ids_then_copies_what_it_holds() -> anyhow::Result<()> {
+        let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
+        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true };
+        crate::rt::block_on(async move {
+            let (s, _rx) = idle("h1");
+            let s = Arc::new(s);
+            let log = Arc::new(Mutex::new(Vec::<String>::new()));
+            let l = Arc::clone(&log);
+            let fence: FenceFor = Arc::new(move |_, on| {
+                l.lock().push(format!("fence {on}"));
+                Box::pin(async { Ok(()) })
+            });
+            // As its ids are read, what it holds is as its lane left it: m1 in its queue.
+            let (l, held) = (Arc::clone(&log), Arc::clone(&s));
+            let ids: CarriedIds = Arc::new(move |_| {
+                l.lock().push("ids".into());
+                held.core.lock().state.queue.push(super::super::model::QueueItem { id: "m1".into(), text: "then test it".into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None });
+                Box::pin(async { Ok(vec![("m1".to_owned(), "d1".to_owned())]) })
+            });
+            let settle: SettleFor = Arc::new(|_, _, _| Box::pin(async { Ok(None) }));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let got = Arc::clone(&sent);
+            let send = move |bytes: Vec<u8>| {
+                got.lock().push(bytes);
+                async { Ok(()) }
+            };
+            hand_to_newer_by(&s, kind, &mv, &ids, &fence, &settle, send, |_| async {}).await.map_err(|e| anyhow::anyhow!(e))?;
+            anyhow::ensure!(*log.lock() == ["fence true", "ids"], "{:?}", log.lock());
+            let bytes = sent.lock().first().cloned().ok_or_else(|| anyhow::anyhow!("nothing went"))?;
+            let pkg: serde_json::Value = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(pkg.pointer("/state/queue/0/id") == Some(&serde_json::json!("m1")) && pkg.get("inbox") == Some(&serde_json::json!(["m1"])), "{pkg}");
+            Ok(())
+        })
+    }
+
     #[test]
     fn a_switch_carries_the_same_latitude_and_the_nearest_effort_named_by_the_new_harness() -> anyhow::Result<()> {
         use super::{Kind, carried_choices};
@@ -3180,6 +3856,7 @@ mod tests {
             name: "x".into(),
             shell: None,
             cwd: "/w".into(),
+            tree: None,
             created_at: 1,
             status: Status::Starting,
             title: String::new(),
@@ -3188,6 +3865,8 @@ mod tests {
             harness_session: None,
             approvals: vec![],
             queued: 0,
+            queue: Vec::new(),
+            said: Vec::new(),
             tasks_running: 0,
             subagents: Vec::new(),
             cost_usd: 0.0,
@@ -3214,9 +3893,11 @@ mod tests {
             pause: None,
             last_turn: None,
             keep_off: false,
+            held: None,
             move_on_limit: false,
             move_plan: Default::default(),
             pause_at: None,
+            max_subagents: None,
             parent: None,
             plan_run: None,
             no_bypass: false,

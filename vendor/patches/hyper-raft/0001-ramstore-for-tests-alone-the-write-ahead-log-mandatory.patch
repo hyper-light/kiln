@@ -1,0 +1,45 @@
+Subject: RamStore for tests alone: the write-ahead log mandatory
+Why: Quiver's plan mandates hyper-durable's GroupStore on a real device and makes RamStore test-only (kiln's CP-T2.1, T-T2.1.2: RamStore outside cfg(test) fails the build). RamStore is compiled only for this crate's own tests or where a dev-dependency asks for the test-store feature, so a production build that names it fails; the crate's own tests ask for it through a dev-dependency on itself.
+
+diff --git a/crates/hyper-durable/Cargo.toml b/crates/hyper-durable/Cargo.toml
+index b467d5b3a76ec34a607b4645fceef80caf91a8d4..70816c64b84374a2e5b2e6abba7eaa5b9f9f1686 100644
+--- a/crates/hyper-durable/Cargo.toml
++++ b/crates/hyper-durable/Cargo.toml
+@@ -15,7 +15,14 @@ hyper-raft = { path = "../hyper-raft" }
+ hyper-timing = { path = "../hyper-timing" }
+ thiserror.workspace = true
+ 
++[features]
++# `RamStore`, a store whose writes complete as they're submitted, for tests alone: a dev-dependency
++# asks for it (this crate's own tests, below). Quiver's and kiln's copies make it so, as the
++# write-ahead log is mandatory there (Quiver's docs/design/focal-bus.md, "GroupStore mandated").
++test-store = []
++
+ [dev-dependencies]
++hyper-durable = { path = ".", features = ["test-store"] }
+ hyper-block = { path = "../hyper-block", features = ["sim"] }
+ # The oracles the simulated groups are held to, and their crash enumeration by fork (docs/sim.md
+ # S-6, `tests/support/cluster.rs`).
+diff --git a/crates/hyper-durable/src/lib.rs b/crates/hyper-durable/src/lib.rs
+index 74b33584b8fec3c2408f49d21285dc395d6c3b00..cbfae70f626feca4d4d98458387e6d0901722a91 100644
+--- a/crates/hyper-durable/src/lib.rs
++++ b/crates/hyper-durable/src/lib.rs
+@@ -39,6 +39,10 @@ mod compaction;
+ mod held;
+ mod hyperlog;
+ mod machine;
++// A store whose writes complete as they're submitted: for tests alone where this copy is built
++// (Quiver's and kiln's: the write-ahead log is mandatory there), its feature asked for by a
++// dev-dependency.
++#[cfg(any(test, feature = "test-store"))]
+ mod memory;
+ mod owner;
+ mod replica;
+@@ -49,6 +53,7 @@ pub use compaction::Compaction;
+ pub use held::Held;
+ pub use hyperlog::{ClaimError, ENTRY_OVERHEAD, GroupStore, LogGroups, decode_entry, encode_entry};
+ pub use machine::{Fatal, StateMachine};
++#[cfg(any(test, feature = "test-store"))]
+ pub use memory::RamStore;
+ pub use owner::{Full, Handle, Owner};
+ pub use replica::{Cause, Driven, OpenError, Output, Replica, ReplicaError, Settings, Writes};

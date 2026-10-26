@@ -38,7 +38,8 @@ pub enum Req {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunReq {
-    /// Where: a runner's name, what it must be (`linux/amd64`, `macos,+gpu`), or empty for the best.
+    /// Where: a runner's name and what the work needs, as one spelling (`linux/amd64`,
+    /// `cpus=8,mem=32g`, `adacachy,mem=32g`: [`directory::target`]), or empty for the best.
     pub target: String,
     pub command: String,
     /// This machine's folder the command is about: its tree is copied over when `sync`, and the
@@ -384,22 +385,20 @@ async fn run_here(spec: RunSpec, ev: &async_channel::Sender<Ev>, ctl: async_chan
 
 /// Serve the socket at `path` until this process exits. Unix only.
 #[cfg(unix)]
-pub fn serve(handle: Handle, me: String, path: PathBuf) -> anyhow::Result<PathBuf> {
+pub fn serve(handle: Handle, me: String, path: PathBuf, take: bool) -> anyhow::Result<PathBuf> {
     use std::os::fd::{AsRawFd as _, OwnedFd};
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::os::unix::net::UnixListener;
 
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
+    // Kept as `kiln spawn`'s is (crate::harness::socket::Kept): `take` when a new build takes the
+    // machine over, else served once nothing else serves it, and served again if left dead.
+    let mut kept = crate::harness::socket::Kept::new(path.clone(), take, "`kiln run`")?;
     crate::rt::spawn(async move {
-        let fd = listener.as_raw_fd();
         loop {
+            let Some(listener) = kept.listener() else {
+                crate::rt::sleep(Duration::from_secs(1)).await;
+                kept.check();
+                continue;
+            };
+            let fd = listener.as_raw_fd();
             match listener.accept() {
                 Ok((stream, _)) => {
                     if stream.set_nonblocking(true).is_err() {
@@ -409,9 +408,12 @@ pub fn serve(handle: Handle, me: String, path: PathBuf) -> anyhow::Result<PathBu
                     crate::rt::spawn(async move { connection(handle, me, std::sync::Arc::new(OwnedFd::from(stream))).await });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if hyper_rt::readiness::readable(fd).await.is_err() {
+                    // Woken when a connection waits, and each second regardless, to look at its
+                    // path while it's quiet.
+                    if let Ok(Err(_)) = crate::rt::timeout(Duration::from_secs(1), hyper_rt::readiness::readable(fd)).await {
                         crate::rt::sleep(Duration::from_millis(200)).await;
                     }
+                    kept.check();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
@@ -425,7 +427,7 @@ pub fn serve(handle: Handle, me: String, path: PathBuf) -> anyhow::Result<PathBu
 }
 
 #[cfg(not(unix))]
-pub fn serve(_handle: Handle, _me: String, _path: PathBuf) -> anyhow::Result<PathBuf> {
+pub fn serve(_handle: Handle, _me: String, _path: PathBuf, _take: bool) -> anyhow::Result<PathBuf> {
     anyhow::bail!("reach's local socket needs Unix sockets")
 }
 

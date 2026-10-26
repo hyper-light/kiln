@@ -69,6 +69,11 @@ Methods: `spawn_boxed`.
 Every record kiln keeps, by family and key, each at the revision of the commit that last wrote it.
 
 - **Implementations:** Amphora's typed records (CP-T1.5, which takes this suite past 200 cases);
+  until then two of kiln's own: a host's over kiln's embedded Turso (`kiln::records::turso`, a
+  file per host, each commit synced before it's answered, commits that come together written
+  together; CP-T3.2), the one `records::open` swaps for Amphora's; and the server's
+  (`kiln::records::StoreRecords`, durable in kiln's store, until CP-T1.5 takes its place, copying
+  each family through the seam);
   `kiln_seams::records::SimRecords`: linearizable, snapshot reads from each key's last 32
   versions and the last 100,000 deleted keys' histories (older: refused `Compacted`), a change
   feed of the last 100,000 changes (a read of changes or a wait from before it: refused
@@ -76,9 +81,11 @@ Every record kiln keeps, by family and key, each at the revision of the commit t
   lost a version, a snapshot from before the oldest kept is refused for every key (coarse,
   never wrong). Its `compact` forgets the history before a revision at once, as a compaction
   does; a suite's fixture makes its store do that for RECORDS-14.
-- **Used by:** goal stacks, goal items, plans, plan runs and keep-going, once CP-T1.5 moves them
-  off rusqlite; the session journal (CP-T3.1).
-- **Passed by:** the simulator, every clause; Amphora's, when CP-T1.5 lands it.
+- **Used by:** sessions' inboxes (CP-T3.2, `harness/inbox`); deploying by API's records
+  (docs/deploy-api.md §14.1); goal stacks, goal items, plans, plan runs and keep-going, once
+  CP-T1.5 moves them off rusqlite; the session journal (CP-T3.1).
+- **Passed by:** the simulator, every clause; kiln's Turso store, every clause
+  (`records/turso.rs`'s test); kiln's store's, every clause; Amphora's, when CP-T1.5 lands it.
 - **Bounds:** family names 1 to 64 of `a-z 0-9 _ - .`; keys 1 to 1024 bytes; values to 1 MiB;
   1000 conditions and 1000 writes a transaction; 1000 rows a page or a change read.
 
@@ -104,15 +111,17 @@ Methods: `get`, `scan`, `commit`, `changes`, `wait`, `head`.
 Topics of messages, in order, read from any offset kept, each topic of a durability class
 (Focal's doc 33: ephemeral, replicated, persisted, windowed).
 
-- **Implementations:** Quiver (CP-T2.1, on Focal's bus); `kiln_seams::bus::SimBus`: in memory
-  (ephemeral, whatever class is asked), messages stamped by its clock, 10,000 topics.
-- **Used by:** the UI's live feed of session events (CP-T2.1), then CI and CD events, webhooks and
-  sends.
-- **Passed by:** the simulator, every clause; Quiver, when CP-T2.1 lands it.
+- **Implementations:** Quiver (CP-T2.1, `kiln::bus`: the vendored `quiver` node, on Focal's bus,
+  in the server's process; it serves the ephemeral class and refuses the others, typed, until
+  their goals land); `kiln_seams::bus::SimBus`: in memory (ephemeral, whatever class is asked),
+  messages stamped by its clock, 10,000 topics.
+- **Used by:** the UI's live feed of session events (CP-T2.1, docs/bus.md), then CI and CD
+  events, webhooks and sends.
+- **Passed by:** the simulator and Quiver, every clause.
 - **Bounds:** topic names 1 to 128 of `A-Z a-z 0-9 _ - . /`; payloads to 1 MiB, keys to 1024
   bytes; 1000 messages a read; a topic retains 1 to a million messages.
 
-Methods: `create`, `publish`, `read`, `wait`, `bounds`.
+Methods: `create`, `publish`, `read`, `wait`, `bounds`, `delete`.
 
 - **BUS-1** a topic's messages get offsets 0, 1, 2… in the order they were published
 - **BUS-2** a read from an offset gives the messages from it in publish order, keys and payloads intact, and where to go on
@@ -124,6 +133,7 @@ Methods: `create`, `publish`, `read`, `wait`, `bounds`.
 - **BUS-8** a payload over the limit is refused TooLarge and publishes nothing
 - **BUS-9** a read gives at most its limit and says where to go on; at the end it's empty; a limit of 0 is refused
 - **BUS-10** topics are apart: each has its own messages and offsets
+- **BUS-11** a deleted topic is gone: its waits, publishes, reads and deletes are refused NoTopic, and created again its offsets start at 0
 
 ## Blobs
 
@@ -451,12 +461,9 @@ command catalog), and commands to them. Generic over kiln's types: an agent is k
   catalog, a machine away).
 - **Used by:** the goal driver and keep-going (`goals/mod.rs`, `goals/keep.rs`); the inbox and the
   dispatcher of sends (CP-T3.2, CP-T3.3).
-- **Passed by:** the simulator, every clause. kiln's registry passes HARNESS-1, HARNESS-2 and
-  HARNESS-4 (`harness/port.rs`'s test). Its "delivered" means the command is on its way to the
-  session's runner; HARNESS-3 and HARNESS-5 (each command reaches its agent once, in order, and
-  only it) are CP-T3.2's and CP-T3.3's: sends deduplicated, then acknowledged end to end. Until
-  then what reached an agent can't be seen there (its fixture's `heard` is `None`): the test runs
-  every clause, each on a hub of its own, and checks that those two fail for that alone.
+- **Passed by:** the simulator, every clause; kiln's registry, every clause (`harness/port.rs`'s
+  test, each clause on a hub of its own). A message reaches an agent when its inbox takes it
+  (CP-T3.2: once, whatever retried it); what reached one is what its inbox took, in order.
 
 Methods: `agents`, `agent`, `catalog`, `send`.
 

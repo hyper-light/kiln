@@ -22,6 +22,45 @@ export function planSteps(body: string): string[] {
   return out;
 }
 
+/**
+ * Step `n` (from 1) of a plain plan as its markdown, what's under it and all: its item of a top-level
+ * list, as `planSteps` counts them, with the lines indented under it (a nested list, a block of
+ * code), as far as the next line that isn't.
+ */
+export function stepMarkdown(body: string, n: number): string {
+  let fence = false;
+  let k = 0;
+  let out: string[] | null = null;
+  for (const line of body.split(/\r?\n/)) {
+    const trimmed = line.trimStart();
+    const top = line.length === trimmed.length;
+    if (trimmed.startsWith("```") || trimmed.startsWith("~~~")) {
+      fence = !fence;
+      if (out && top) break;
+      if (out) out.push(line);
+      continue;
+    }
+    if (fence) {
+      if (out) out.push(line);
+      continue;
+    }
+    const item = top ? listItem(trimmed) : null;
+    if (item !== null) {
+      if (out) break;
+      if (item) k += 1;
+      if (item && k === n) out = [item];
+      continue;
+    }
+    if (!out) continue;
+    if (top && trimmed) break;
+    out.push(line);
+  }
+  if (!out) return "";
+  const rest = out.slice(1);
+  const indent = Math.min(...rest.filter((l) => l.trim()).map((l) => l.length - l.trimStart().length));
+  return [out[0], ...rest.map((l) => l.slice(Number.isFinite(indent) ? indent : 0))].join("\n").trim();
+}
+
 function listItem(line: string): string | null {
   let rest: string | null = null;
   for (const m of ["- ", "* ", "+ "]) {
@@ -97,18 +136,19 @@ export function testSentence(t: PlanTest): string {
   return scenario && pass ? `${scenario} — passes when ${pass}` : scenario || pass;
 }
 
+/** What a step is, as markdown under no heading: what to do, examples, acceptance criteria, tests. */
+export function itemDetail(it: PlanItem): string {
+  const parts: string[] = [];
+  if (it.description.trim()) parts.push(it.description.trim());
+  if (it.examples.trim()) parts.push(`**Examples**\n\n${it.examples.trim()}`);
+  if (it.acceptance.length) parts.push(`**Acceptance criteria**\n\n${it.acceptance.map((c) => `- ${criterionSentence(c)}`).join("\n")}`);
+  if (it.testing.length) parts.push(`**Tests**\n\n${it.testing.map((t) => `- ${testSentence(t)}`).join("\n")}`);
+  return parts.join("\n\n");
+}
+
 /** A plan's steps as markdown, each under its own heading (crates/kiln/src/plans `markdown`). */
 export function itemsMarkdown(items: readonly PlanItem[]): string {
-  return items
-    .map((it, i) => {
-      const parts = [`## ${i + 1}. ${it.title.trim()}`];
-      if (it.description.trim()) parts.push(it.description.trim());
-      if (it.examples.trim()) parts.push(`**Examples**\n\n${it.examples.trim()}`);
-      if (it.acceptance.length) parts.push(`**Acceptance criteria**\n\n${it.acceptance.map((c) => `- ${criterionSentence(c)}`).join("\n")}`);
-      if (it.testing.length) parts.push(`**Tests**\n\n${it.testing.map((t) => `- ${testSentence(t)}`).join("\n")}`);
-      return parts.join("\n\n");
-    })
-    .join("\n\n");
+  return items.map((it, i) => [`## ${i + 1}. ${it.title.trim()}`, itemDetail(it)].filter(Boolean).join("\n\n")).join("\n\n");
 }
 
 /** A plan as one markdown file: its title as the heading, its text, then its items. */
