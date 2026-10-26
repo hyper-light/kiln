@@ -488,14 +488,23 @@ pub async fn get_in(store: &crate::store::Store, repo: &str, sha: &str, runners:
 
 
 // ---- In memory: a request reads memory only (plan step 5) ---------------------------------------
+//
+// The speed costs nothing in correctness: what memory serves is what the store says (a refresh
+// reloads every commit whose records changed, deleted ones included, and drops the commits and
+// repositories gone); no change is lost (the triggers note inserts, updates and deletes of every
+// table read, one row per commit with its seq moving forward, and a row is pruned only once a
+// refresh that read it is applied); refreshes run one at a time and the applied seq never goes
+// back; memory holds at most `cap` commits per repository, older pages coming from the store; and
+// a failed refresh keeps the last good model, retried on the next read.
 
-/// A repository's commits held in memory: each one's records and its list JSON already rendered,
-/// with their order newest first (first run's rowid, sha).
+/// A repository's newest commits held in memory: each one's records and its list JSON already
+/// rendered, their order newest first (first run's rowid, sha), and how many it has in all.
 #[derive(Debug, Default)]
 struct HeldRepo {
     ctx: RepoCtx,
     order: Vec<(i64, String)>,
     rows: HashMap<String, (Records, String)>,
+    total: usize,
 }
 
 #[derive(Debug, Default)]
@@ -506,19 +515,43 @@ struct Held {
     repos: HashMap<String, HeldRepo>,
 }
 
-/// Ship's read model in memory: built once, then kept current from `ship_changes`, which SQLite's
-/// triggers fill as runs, legs, attempts, images, the land queue, deployments, releases and tags
-/// change, so a refresh reloads only the commits that changed. A page is ready JSON joined.
-#[derive(Debug, Default)]
-pub struct ShipCache {
-    held: std::sync::RwLock<Held>,
+/// What a refresh read from the store, in one snapshot.
+struct Read {
+    top: i64,
+    loaded: Vec<(RepoCtx, Vec<Records>, bool, Vec<String>)>,
+    gone_repos: Vec<String>,
 }
 
-/// How old the model may be before a request brings it up to date.
+/// Ship's read model in memory.
+#[derive(Debug)]
+pub struct ShipCache {
+    held: std::sync::RwLock<Held>,
+    refreshing: std::sync::atomic::AtomicBool,
+    cap: usize,
+}
+
+impl Default for ShipCache {
+    fn default() -> Self {
+        Self::with_cap(CAP)
+    }
+}
+
+/// How old the model may be before a read brings it up to date.
 const FRESH_MS: i64 = 250;
+/// The most commits held per repository; older pages come from the store.
+const CAP: usize = 5000;
 
 fn poisoned() -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, "ship's read model lock was poisoned".to_string())
+}
+
+/// Lets the next refresh start when this one ends, however it ends.
+struct Flight<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl ShipCache {
@@ -526,65 +559,119 @@ impl ShipCache {
         Self::default()
     }
 
+    pub fn with_cap(cap: usize) -> Self {
+        Self { held: std::sync::RwLock::new(Held::default()), refreshing: std::sync::atomic::AtomicBool::new(false), cap: cap.max(1) }
+    }
+
     /// Whether the model is older than [`FRESH_MS`] (or not built yet).
     pub fn stale(&self, now: i64) -> bool {
         self.held.read().map(|h| !h.built || now - h.at_ms >= FRESH_MS).unwrap_or(true)
     }
 
-    /// Brings the model up to date: every commit the first time, then only those that changed
-    /// (a repository's environments or releases moving reloads its commits).
+    pub fn built(&self) -> bool {
+        self.held.read().map(|h| h.built).unwrap_or(false)
+    }
+
+    /// The last change applied (tests: it never goes back).
+    pub fn applied(&self) -> i64 {
+        self.held.read().map(|h| h.seq).unwrap_or(0)
+    }
+
+    /// Brings the model up to date: every commit the first time, then those whose records
+    /// changed since, the gone dropped. One at a time: while one runs, another returns at once
+    /// (its reader gets the model as it is, at most [`FRESH_MS`] old). A failure leaves the last
+    /// good model, and the next read tries again.
     pub async fn refresh(&self, store: &crate::store::Store, runners: &[RunnerSeen], now: i64) -> Result<(), Fail> {
+        use std::sync::atomic::Ordering;
+        if self.refreshing.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let _flight = Flight(&self.refreshing);
         let (built, seq) = {
             let h = self.held.read().map_err(|_| poisoned())?;
             (h.built, h.seq)
         };
-        let (top, loaded) = store
-            .call(move |c| -> anyhow::Result<(i64, Vec<(RepoCtx, Vec<Records>, bool)>)> {
-                let top: i64 = c.query_row("SELECT COALESCE(MAX(seq), 0) FROM ship_changes", [], |r| r.get(0))?;
+        let cap = self.cap;
+        let waiting: HashMap<String, Vec<String>> = {
+            let h = self.held.read().map_err(|_| poisoned())?;
+            h.repos.values().map(|r| (r.ctx.id.clone(), r.rows.iter().filter(|(_, (rec, _))| rec.releases.iter().any(|x| x.state == "waiting")).map(|(s, _)| s.clone()).collect())).collect()
+        };
+        let read = store
+            .call(move |c| -> anyhow::Result<Read> {
+                // One snapshot: the seq read and every record loaded agree.
+                let tx = c.unchecked_transaction()?;
+                let top: i64 = tx.query_row("SELECT n FROM ship_seq", [], |r| r.get(0))?;
                 let mut want: HashMap<String, (bool, std::collections::HashSet<String>)> = HashMap::new();
                 if !built {
-                    let mut st = c.prepare("SELECT id FROM repos")?;
+                    let mut st = tx.prepare("SELECT id FROM repos")?;
                     for id in st.query_map([], |r| r.get::<_, String>(0))? {
                         want.insert(id?, (true, Default::default()));
                     }
-                } else if top > seq {
-                    let mut st = c.prepare("SELECT repo_id, sha FROM ship_changes WHERE seq > ?1")?;
-                    for row in st.query_map([seq], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))? {
+                } else {
+                    let mut st = tx.prepare("SELECT repo_id, sha FROM ship_changes WHERE seq > ?1 AND seq <= ?2")?;
+                    for row in st.query_map(params![seq, top], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
                         let (repo, sha) = row?;
                         let e = want.entry(repo).or_default();
-                        match sha {
-                            None => e.0 = true,
-                            Some(s) => {
-                                e.1.insert(s);
-                            }
+                        if sha.is_empty() {
+                            e.0 = true;
+                        } else {
+                            e.1.insert(sha);
                         }
                     }
                 }
-                let mut out = Vec::new();
-                for (repo, (all, shas)) in want {
-                    let Some(ctx) = repo_ctx(c, &repo)? else { continue };
+                let mut read = Read { top, loaded: Vec::new(), gone_repos: Vec::new() };
+                for (repo, (mut all, mut shas)) in want {
+                    let Some(ctx) = repo_ctx(&tx, &repo)? else {
+                        read.gone_repos.push(repo);
+                        continue;
+                    };
+                    // What other commits are read against (what each environment runs, the
+                    // commit production waits on) changing: every commit of the repository.
+                    all |= shas.iter().any(|s| ctx.current.iter().any(|d| &d.sha == s) || ctx.waiting.as_ref().is_some_and(|(w, _)| w == s));
+                    // A commit waiting on approval counts the commits riding with it.
+                    shas.extend(waiting.get(&ctx.id).into_iter().flatten().cloned());
+                    let newest: std::collections::HashSet<&str> = ctx.commits.iter().take(cap).map(|(s, _, _)| s.as_str()).collect();
                     let mut recs = Vec::new();
-                    for (sha, first_row, _) in ctx.commits.iter().filter(|(s, _, _)| all || shas.contains(s)) {
-                        recs.push(load_with(c, &ctx, sha, *first_row)?);
+                    for (sha, first_row, _) in ctx.commits.iter().take(cap).filter(|(s, _, _)| all || shas.contains(s)) {
+                        recs.push(load_with(&tx, &ctx, sha, *first_row)?);
                     }
-                    out.push((ctx, recs, all));
+                    // A commit noted but no longer among the newest held (or gone): dropped.
+                    let drop: Vec<String> = shas.into_iter().filter(|s| !newest.contains(s.as_str())).collect();
+                    read.loaded.push((ctx, recs, all, drop));
                 }
+                tx.commit()?;
+                // What this read has seen may go: a row changed since has a later seq and stays.
                 c.execute("DELETE FROM ship_changes WHERE seq <= ?1", [top])?;
-                Ok((top, out))
+                Ok(read)
             })
             .await
             .map_err(internal)?;
         let mut h = self.held.write().map_err(|_| poisoned())?;
-        for (ctx, recs, all) in loaded {
+        if read.top < h.seq {
+            return Ok(());
+        }
+        h.repos.retain(|_, r| !read.gone_repos.contains(&r.ctx.id));
+        for (ctx, recs, all, drop) in read.loaded {
+            // A repository renamed: its commits move with it.
+            let old = h.repos.iter().find(|(name, r)| r.ctx.id == ctx.id && **name != ctx.name).map(|(name, _)| name.clone());
+            if let Some(r) = old.and_then(|old| h.repos.remove(&old)) {
+                h.repos.insert(ctx.name.clone(), r);
+            }
             let held = h.repos.entry(ctx.name.clone()).or_default();
             if all {
                 held.rows.clear();
             }
+            for sha in drop {
+                held.rows.remove(&sha);
+            }
             for rec in recs {
-                let json = serde_json::to_string(&summary(&rec, runners, now)).unwrap_or_default();
+                let json = serde_json::to_string(&summary(&rec, runners, now)).map_err(|e| internal(e.into()))?;
                 held.rows.insert(rec.sha.clone(), (rec, json));
             }
-            held.order = ctx.commits.iter().filter(|(s, _, _)| held.rows.contains_key(s)).map(|(s, f, _)| (*f, s.clone())).collect();
+            let newest: Vec<(i64, String)> = ctx.commits.iter().take(cap).map(|(s, f, _)| (*f, s.clone())).collect();
+            held.rows.retain(|sha, _| newest.iter().any(|(_, s)| s == sha));
+            held.order = newest.into_iter().filter(|(_, s)| held.rows.contains_key(s)).collect();
+            held.total = ctx.commits.len();
             held.ctx = ctx;
         }
         // What time and the runners move without a record changing: the guard and the soak run
@@ -593,29 +680,38 @@ impl ShipCache {
             let prod = held.ctx.current.iter().find(|d| d.production).map(|d| d.sha.clone());
             for (sha, (rec, json)) in held.rows.iter_mut() {
                 if prod.as_deref() == Some(sha.as_str()) || json.contains("\"guard\"") || json.contains("\"soaking\"") {
-                    *json = serde_json::to_string(&summary(rec, runners, now)).unwrap_or_default();
+                    *json = serde_json::to_string(&summary(rec, runners, now)).map_err(|e| internal(e.into()))?;
                 }
             }
         }
-        h.seq = top;
+        h.seq = read.top;
         h.built = true;
         h.at_ms = now;
         Ok(())
     }
 
     /// A page of commits, newest first, from memory: of `repo` (name or id) or every repository,
-    /// of those named in `only`, before `cursor`, at most `limit`.
-    pub fn page(&self, repo: Option<&str>, only: Option<&[String]>, cursor: i64, limit: usize) -> Result<String, Fail> {
+    /// of those named in `only`, before `cursor`, at most `limit`. None when memory can't answer
+    /// it whole (not built, or the page reaches past the commits held): the store answers then.
+    pub fn page(&self, repo: Option<&str>, only: Option<&[String]>, cursor: i64, limit: usize) -> Result<Option<String>, Fail> {
         let h = self.held.read().map_err(|_| poisoned())?;
+        if !h.built {
+            return Ok(None);
+        }
         let mut picked: Vec<(i64, &str)> = Vec::new();
         let repos: Vec<(&String, &HeldRepo)> = h.repos.iter().filter(|(name, r)| repo.is_none_or(|x| x == name.as_str() || x == r.ctx.id) && only.is_none_or(|o| o.iter().any(|n| n == *name))).collect();
         for (_, r) in &repos {
             // Newest first already: skip to the cursor, take what a page needs.
             let from = r.order.partition_point(|(f, _)| *f >= cursor);
+            let before = picked.len();
             for (f, sha) in r.order.iter().skip(from).take(limit + 1) {
                 if let Some((_, json)) = r.rows.get(sha) {
                     picked.push((*f, json.as_str()));
                 }
+            }
+            // Fewer than a page held past the cursor, and the repository has more: the store's.
+            if picked.len() - before < limit + 1 && r.order.len() < r.total {
+                return Ok(None);
             }
         }
         if repos.len() > 1 {
@@ -637,12 +733,15 @@ impl ShipCache {
             None => out.push_str("null"),
         }
         out.push('}');
-        Ok(out)
+        Ok(Some(out))
     }
 
-    /// One commit's detail from memory (`sha`: whole, or a prefix of seven or more).
+    /// One commit's detail from memory (`sha`: whole, or a prefix of seven or more), if held.
     pub fn detail(&self, repo: &str, sha: &str, runners: &[RunnerSeen], now: i64) -> Option<Value> {
         let h = self.held.read().ok()?;
+        if !h.built {
+            return None;
+        }
         let r = h.repos.iter().find(|(name, r)| name.as_str() == repo || r.ctx.id == repo).map(|(_, r)| r)?;
         let rec = r.rows.get(sha).map(|(rec, _)| rec).or_else(|| if sha.len() >= 7 { r.rows.iter().find(|(s, _)| s.starts_with(sha)).map(|(_, (rec, _))| rec) } else { None })?;
         Some(detail(rec, runners, now))
@@ -674,7 +773,7 @@ async fn runners_seen(hub: &std::sync::Arc<Hub>) -> Vec<RunnerSeen> {
 }
 
 /// `GET /api/ship/commits?…`: from memory, brought up to date first when it's older than
-/// [`FRESH_MS`].
+/// [`FRESH_MS`]; from the store when memory can't answer the page whole.
 pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller: Option<&crate::authz::Caller>) -> Result<Response, Fail> {
     let only: Option<Vec<String>> = match caller {
         Some(c) => crate::authz::gate::readable(hub, c, "runs.read").await,
@@ -682,14 +781,21 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
     };
     let now = crate::util::now_ms();
     let c = cache();
-    if c.stale(now) {
-        let runners = runners_seen(hub).await;
-        c.refresh(&hub.store, &runners, now).await?;
+    let runners = runners_seen(hub).await;
+    if c.stale(now)
+        && let Err((_, e)) = c.refresh(&hub.store, &runners, now).await
+    {
+        tracing::warn!("ship: the read model kept its last good state: {e}");
     }
     let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(30).clamp(1, 1000);
     let cursor = q.get("cursor").and_then(|c| c.parse::<i64>().ok()).unwrap_or(i64::MAX);
-    let body = c.page(q.get("repo").map(String::as_str).filter(|r| !r.is_empty()), only.as_deref(), cursor, limit)?;
-    Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
+    match c.page(q.get("repo").map(String::as_str).filter(|r| !r.is_empty()), only.as_deref(), cursor, limit)? {
+        Some(body) => Ok(srv::response(StatusCode::OK, "application/json", srv::full(body))),
+        None => {
+            let only = only.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
+            Ok(srv::json(StatusCode::OK, &list_in(&hub.store, q, only, runners, now).await?))
+        }
+    }
 }
 
 /// `GET /api/ship/commits/:repo/:sha`: from memory, else from the store.
@@ -697,8 +803,10 @@ pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str) -> Result<Res
     let now = crate::util::now_ms();
     let c = cache();
     let runners = runners_seen(hub).await;
-    if c.stale(now) {
-        c.refresh(&hub.store, &runners, now).await?;
+    if c.stale(now)
+        && let Err((_, e)) = c.refresh(&hub.store, &runners, now).await
+    {
+        tracing::warn!("ship: the read model kept its last good state: {e}");
     }
     match c.detail(repo, sha, &runners, now) {
         Some(v) => Ok(srv::json(StatusCode::OK, &v)),
@@ -827,6 +935,162 @@ mod tests {
         })
     }
 
+    fn ops(n: u64, op: u64, sha: &str) -> String {
+        let t = NOW_S - 3600 + i64::try_from(n).unwrap_or(0);
+        let env = if n.is_multiple_of(2) { "staging" } else { "production" };
+        let state = ["success", "in_progress", "failure"].get(usize::try_from(n % 3).unwrap_or(0)).copied().unwrap_or("success");
+        match op {
+            0 => format!("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, attempt) VALUES ('x{n}', 'kiln', {}, '{}', 'push', 'main', '{sha}', 'change {n}', 'ada', 'completed', {t}, 1);", 1000 + n, if n.is_multiple_of(3) { "release" } else { "ci" }),
+            1 => format!("INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, job_id, run_attempt) SELECT 'j{n}', id, 'leg {n}', 'leg {n}', 'completed', 'success', '[]', '[]', '{{}}', 'leg {n}', 1 FROM runs WHERE sha = '{sha}' LIMIT 1;"),
+            2 => format!("UPDATE jobs SET conclusion = CASE conclusion WHEN 'success' THEN 'failure' ELSE 'success' END WHERE id = (SELECT j.id FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.sha = '{sha}' LIMIT 1);"),
+            3 => format!("INSERT INTO ci_attempts (id, leg_id, number, status, conclusion, failure_class) SELECT 'a{n}', j.id, {n}, 'done', 'failure', 'runner-lost' FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.sha = '{sha}' LIMIT 1;"),
+            4 => format!("DELETE FROM runs WHERE id = (SELECT id FROM runs WHERE sha = '{sha}' ORDER BY rowid DESC LIMIT 1);"),
+            5 => format!("DELETE FROM jobs WHERE id = (SELECT j.id FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.sha = '{sha}' LIMIT 1);"),
+            6 => format!("INSERT INTO ci_images (repo_id, name, reference, digest, run_id, created_at) SELECT 'kiln', 'kiln', 'kiln:x', 'sha256:{n}', id, 1 FROM runs WHERE sha = '{sha}' LIMIT 1;"),
+            7 => format!("INSERT INTO ci_deployments (id, repo_id, environment, sha, git_ref, creator, production, created_at, updated_at) VALUES ({}, 'kiln', '{env}', '{sha}', 'main', 'kiln', {}, {t}, {t}); INSERT INTO ci_deployment_statuses (deployment_id, state, creator, created_at) VALUES ({}, '{state}', 'kiln', {t});", 100 + n, u8::from(env == "production"), 100 + n),
+            8 => format!("INSERT INTO deploy_releases (app, environment, state, spec, created_at) VALUES ('kiln', 'production', 'waiting', '{{\"version\": \"{sha}\"}}', 1);"),
+            9 => "UPDATE deploy_releases SET state = 'committing' WHERE state = 'waiting';".to_string(),
+            10 => "DELETE FROM deploy_releases WHERE id = (SELECT MIN(id) FROM deploy_releases);".to_string(),
+            11 => format!("INSERT OR IGNORE INTO ci_releases (repo_id, tag_name, target_commitish, author, created_at) VALUES ('kiln', 'v0.{n}', '{sha}', 'ada', 1);"),
+            12 => format!("DELETE FROM ci_releases WHERE id = (SELECT MIN(id) FROM ci_releases WHERE target_commitish = '{sha}');"),
+            13 => format!("UPDATE ci_deployment_statuses SET state = '{state}' WHERE id = (SELECT MAX(id) FROM ci_deployment_statuses);"),
+            _ => format!("DELETE FROM ci_deployments WHERE id = (SELECT MIN(id) FROM ci_deployments WHERE sha = '{sha}');"),
+        }
+    }
+
+    /// Memory against the store: how many answers memory gave, each equal to the store's.
+    async fn same(store: &crate::store::Store, cache: &ShipCache, now: i64, round: usize) -> anyhow::Result<usize> {
+        let mut compared = 0;
+        for limit in [2usize, 1000] {
+            let q = HashMap::from([("repo".to_string(), "hyper-light/kiln".to_string()), ("limit".to_string(), limit.to_string())]);
+            let want = list_in(store, &q, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            if let Some(got) = cache.page(Some("hyper-light/kiln"), None, i64::MAX, limit).map_err(|(_, m)| anyhow::anyhow!(m))? {
+                assert_eq!(serde_json::from_str::<Value>(&got)?, want, "round {round}: the list of {limit} from memory isn't the store's");
+                compared += 1;
+            }
+            for c in want.get("commits").and_then(Value::as_array).into_iter().flatten() {
+                let sha = c.get("sha").and_then(Value::as_str).unwrap_or_default();
+                if let Some(got) = cache.detail("hyper-light/kiln", sha, &runners(), now) {
+                    let want = get_in(store, "hyper-light/kiln", sha, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                    assert_eq!(got, want, "round {round}: {sha}'s detail from memory isn't the store's");
+                    compared += 1;
+                }
+            }
+        }
+        Ok(compared)
+    }
+
+    /// What memory serves is what the store says: random inserts, updates and deletes across every
+    /// table the model reads (runs, legs, attempts, images, deployments and their statuses, Deploy
+    /// API releases, tags), the list and every commit's detail compared after each refresh; a cap
+    /// of 3 so pages past memory come from the store.
+    #[test]
+    fn ship_memory_is_what_the_store_says_through_random_changes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let cache = ShipCache::with_cap(3);
+            let shas = [C1, C2, C3, "4444444ddddddddddddddddddddddddddddddddd", "5555555eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"];
+            let mut seed: u64 = 0x5eed_cafe;
+            let mut next = move |n: u64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed % n.max(1)
+            };
+            let mut now = NOW_S * 1000;
+            let mut n = 0u64;
+            let mut compared = 0;
+            for round in 0..80 {
+                for _ in 0..4 {
+                    n += 1;
+                    let sha = shas.get(usize::try_from(next(5)).unwrap_or(0)).copied().unwrap_or(C1);
+                    let sql = ops(n, next(15), sha);
+                    store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+                }
+                now += FRESH_MS;
+                let before = cache.applied();
+                cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                assert!(cache.applied() >= before, "the change applied went back");
+                compared += same(&store, &cache, now, round).await?;
+            }
+            assert!(compared >= 400, "memory answered only {compared} times");
+            // Nothing noted is left once applied: one row per commit at most while it waits.
+            let left: i64 = store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM ship_changes", [], |r| r.get(0))?)).await?;
+            assert_eq!(left, 0);
+            Ok(())
+        })
+    }
+
+    /// Refreshes run one at a time and the change applied never goes back, with writes between
+    /// and refreshes side by side; memory still says what the store says.
+    #[test]
+    fn ship_refreshes_side_by_side_lose_nothing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let cache = ShipCache::new();
+            let mut now = NOW_S * 1000;
+            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            for n in 0..40u64 {
+                let sql = ops(500 + n, n % 15, if n.is_multiple_of(2) { C2 } else { C3 });
+                let write = store.call(move |c| Ok(c.execute_batch(&sql)?));
+                now += FRESH_MS;
+                let before = cache.applied();
+                let (ra, rb) = (runners(), runners());
+                let (w, a, b) = futures::join!(write, cache.refresh(&store, &ra, now), cache.refresh(&store, &rb, now));
+                w?;
+                a.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                b.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                assert!(cache.applied() >= before, "the change applied went back");
+                // Whatever a refresh beside the write missed, the next one brings in.
+                now += FRESH_MS;
+                cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                same(&store, &cache, now, usize::try_from(n).unwrap_or(0)).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Bounded: a commit changed a hundred times is one row waiting; memory holds at most its cap
+    /// and the store answers past it; a failed refresh keeps serving the last good model and the
+    /// next read tries again.
+    #[test]
+    fn ship_stays_bounded_and_a_failed_refresh_keeps_the_last_good_model() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let cache = ShipCache::with_cap(2);
+            let now = NOW_S * 1000;
+            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            for _ in 0..100 {
+                store.call(|c| Ok(c.execute("UPDATE jobs SET conclusion = CASE conclusion WHEN 'success' THEN 'failure' ELSE 'success' END WHERE id = 'l3'", []).map(|_| ())?)).await?;
+            }
+            let rows: i64 = store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM ship_changes", [], |r| r.get(0))?)).await?;
+            assert_eq!(rows, 1, "a commit changed a hundred times is one row");
+            // Two held of three: a page of one comes from memory, a page of ten from the store.
+            assert!(cache.page(None, None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?.is_some());
+            assert!(cache.page(None, None, i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?.is_none());
+            let held = cache.page(None, None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?;
+            // The store failing: the refresh says so, memory keeps what it had, and stays stale.
+            store.call(|c| Ok(c.execute_batch("ALTER TABLE ship_changes RENAME TO ship_changes_away")?)).await?;
+            assert!(cache.refresh(&store, &runners(), now + FRESH_MS).await.is_err());
+            assert_eq!(cache.page(None, None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?, held);
+            assert!(cache.stale(now + FRESH_MS));
+            // Back: the next read brings everything in.
+            store.call(|c| Ok(c.execute_batch("ALTER TABLE ship_changes_away RENAME TO ship_changes")?)).await?;
+            cache.refresh(&store, &runners(), now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            same(&store, &cache, now + FRESH_MS, 0).await?;
+            Ok(())
+        })
+    }
+
     /// A change shows within 250 ms: the model is fresh for FRESH_MS, and the first read after
     /// brings in just what the triggers noted.
     #[test]
@@ -840,7 +1104,7 @@ mod tests {
             let now = NOW_S * 1000;
             cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let stand = |cache: &ShipCache| -> Option<String> {
-                let page: Value = serde_json::from_str(&cache.page(None, None, i64::MAX, 10).ok()?).ok()?;
+                let page: Value = serde_json::from_str(&cache.page(None, None, i64::MAX, 10).ok()??).ok()?;
                 page.get("commits")?.as_array()?.iter().find(|c| c.get("short").and_then(Value::as_str) == Some("2222222"))?.get("stand")?.as_str().map(str::to_string)
             };
             assert_eq!(stand(&cache).as_deref(), Some("needs_you"));
@@ -907,8 +1171,8 @@ mod tests {
                 let at = |q: f64| us.get(((us.len() as f64 * q) as usize).min(us.len().saturating_sub(1))).copied().unwrap_or(f64::MAX);
                 (at(0.5), at(0.95), at(0.99), bytes)
             };
-            let p1000 = time(&|| cache.page(Some("hyper-light/kiln"), None, i64::MAX, 1000).map(|s| s.len()).unwrap_or(0));
-            let p100 = time(&|| cache.page(Some("hyper-light/kiln"), None, i64::MAX, 100).map(|s| s.len()).unwrap_or(0));
+            let p1000 = time(&|| cache.page(Some("hyper-light/kiln"), None, i64::MAX, 1000).ok().flatten().map(|s| s.len()).unwrap_or(0));
+            let p100 = time(&|| cache.page(Some("hyper-light/kiln"), None, i64::MAX, 100).ok().flatten().map(|s| s.len()).unwrap_or(0));
             let one = time(&|| cache.detail("hyper-light/kiln", "00004d2", &runners(), now).map(|v| v.to_string().len()).unwrap_or(0));
             println!("ship bench: built 2,500 commits from 10,000 runs in {build:?}");
             for (name, (p50, p95, p99, bytes)) in [("limit=1000", p1000), ("limit=100", p100), ("detail", one)] {
