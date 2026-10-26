@@ -7894,8 +7894,43 @@ before this one call this workstream "W25 step N".
   same tree and every unit the key it has with its own change alone; and every decision names
   only what its two changes share. *Property test* (`cargo test -p kiln-ci land::conflict`).
 
+**Requirements: deploys by what they share**
+
+- **W28-R38 Deploys of independent targets run at once.** `kiln_cd::deploys`, pure: a deploy's
+  target is an app at its destination; besides it, a deploy holds its place (the target's cluster
+  and namespace), its app, and each object it deploys that another app deploys too. Deploys that
+  share none of these run at once. Deploys of different targets that share one take turns, oldest
+  first: one under way holds what it shares whatever its age, one ready to go holds it for those
+  behind it, and one its own gates hold (an approval, a soak, a window) holds nothing. Deploys of
+  one target coalesce to the newest revision, as rollouts supersede (docs/cd-targets.md §5): a
+  newer deploy takes an older one's place once its gates let it go, and a rolling one's once its
+  own write is done; a write is never cut short, its successor waiting for it so the newer
+  revision lands on top. The release worker (`crates/kiln/src/deploy`) carries the decisions out:
+  a superseded release ends cancelled, naming the release that took its place.
+- **W28-R39 Every wait names its resource.** Each deploy is decided against each deploy ahead of
+  it, and each under way behind it, and a wait says what the two share: `waits for release 5:
+  both deploy to prod's shop-web namespace`. The other decisions say why too: `deploys beside
+  release 4: nothing shared`, `goes before release 6, which its gates hold: both deploy app web`,
+  `supersedes release 3: the newest revision of web in staging rolls out`.
+
+**Acceptance criteria**
+
+- **W28-AC38 Deploys by what they share.** Three deploys, app a in namespace x, app b in namespace
+  y and app a again: a and b roll out together, and the second a supersedes the first, which rolls
+  on until the second's write is done. Over 10,000 random queues run to the end as the release
+  worker runs them: no two deploys under way of different targets share a resource; a target's
+  writes start oldest first, one at a time, none cut short; each target's newest deploy rolls out
+  and every other ends once, finished or superseded by a newer one that rolled out; a deploy that
+  shares nothing starts at once; and every wait names exactly what its two deploys share. *Unit
+  and property tests* (`cargo test -p kiln-cd deploys`, `cargo test -p kiln w28_r38`).
+
 **Progress.** R30–R34 and AC30 built (2026-10-25) in `kiln_ci::land::conflict`. The land queue
-doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.rs`.
+doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and
+AC38 built (2026-10-25): `kiln_cd::deploys` decides, and the release worker in
+`crates/kiln/src/deploy` carries it out for every release in flight, the objects two apps share
+read from KilnCD's engine (`Engine::shared_objects`). One target coalescing applies with an
+environment's `concurrency: queue`; with `reject`, the default, a second release is refused as
+before.
 
 ## 4. API, events, CLI and MCP reference
 
