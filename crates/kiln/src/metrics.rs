@@ -627,7 +627,14 @@ pub struct EventsMetrics {
     pub attempts: CounterVec,
     /// Events a reader never took, the topic having let them go first, by reader.
     pub missed: CounterVec,
+    /// How long a delivery waited from its logging to its sending, by kind.
+    pub delivery_seconds: HistogramVec,
+    /// Deliveries waiting to be sent, by kind, as their senders last counted.
+    pub pending: GaugeVec,
 }
+
+/// A delivery's wait, from a second (sent at once) to a day (tried until given up).
+const EVENT_DELIVERY_BUCKETS: &[f64] = &[1.0, 5.0, 30.0, 60.0, 300.0, 1800.0, 3600.0, 21_600.0, 86_400.0];
 
 pub fn events() -> &'static EventsMetrics {
     static M: OnceLock<EventsMetrics> = OnceLock::new();
@@ -640,6 +647,8 @@ pub fn events() -> &'static EventsMetrics {
         logged: CounterVec::new(&["kind"]),
         attempts: CounterVec::new(&["kind", "result"]),
         missed: CounterVec::new(&["reader"]),
+        delivery_seconds: HistogramVec::new(&["kind"], EVENT_DELIVERY_BUCKETS),
+        pending: GaugeVec::new(&["kind"]),
     })
 }
 
@@ -665,6 +674,10 @@ fn render_events(o: &mut String) {
     m.attempts.render(o, "kiln_events_delivery_attempts_total");
     help(o, "kiln_events_missed_total", "counter", "Events a reader of kiln.events never took, the topic having let them go first, by reader.");
     m.missed.render(o, "kiln_events_missed_total");
+    help(o, "kiln_events_delivery_seconds", "histogram", "How long a delivery made from kiln.events waited from its logging to its sending, by kind.");
+    m.delivery_seconds.render(o, "kiln_events_delivery_seconds");
+    help(o, "kiln_events_deliveries_pending", "gauge", "Deliveries made from kiln.events waiting to be sent, by kind, as their senders last counted.");
+    m.pending.render(o, "kiln_events_deliveries_pending");
 }
 
 /// The `kiln_blobs_*` families, in the exposition.

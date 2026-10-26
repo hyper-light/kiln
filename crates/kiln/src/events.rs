@@ -64,16 +64,19 @@ pub struct Event {
     pub about: Map<String, Value>,
 }
 
-impl Event {
-    /// The event as bytes on the topic.
-    pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap_or_default()
-    }
+/// Events a message on [`TOPIC`] carries at most, and its bytes at most: the relay publishes a
+/// pass's events in as few messages as these allow, each a flush of the topic's log, in order.
+const MESSAGE_EVENTS: usize = 128;
+const MESSAGE_BYTES: usize = 256 << 10;
 
-    /// An event read off the topic, if it is one.
-    pub fn decode(payload: &[u8]) -> Option<Event> {
-        serde_json::from_slice(payload).ok()
-    }
+/// A message on [`TOPIC`]: events, oldest first.
+pub fn encode(events: &[Event]) -> Vec<u8> {
+    serde_json::to_vec(events).unwrap_or_default()
+}
+
+/// The events a message read off the topic carries, if it's one of kiln's.
+pub fn decode(payload: &[u8]) -> Option<Vec<Event>> {
+    serde_json::from_slice(payload).ok()
 }
 
 /// Records an event in the transaction `c` is in: call it in the transaction that makes the change
@@ -149,6 +152,29 @@ pub enum Stop {
     BeforePublish,
     /// Rows published, not recorded relayed.
     BeforeRecord,
+}
+
+/// Relays the outbox to [`TOPIC`] for as long as the hub lives, once `readers` (the readers this
+/// server runs) stand on the topic: a reader new to it starts at its end, and so, placed before the
+/// relay publishes anything, it misses nothing this start makes. On a task of its own: the server's
+/// start waits for neither.
+pub fn start(hub: &Arc<Hub>, readers: &'static [&'static str]) {
+    let hub = Arc::clone(hub);
+    crate::rt::spawn(async move {
+        if hub.bus.persisted_refused().is_none() {
+            match hub.bus.create(TOPIC, Topic { class: Class::Persisted, retain: RETAIN }).await {
+                Ok(()) | Err(Refusal::Exists(_)) => {
+                    for name in readers {
+                        if let Err(e) = position(&hub, name).await {
+                            tracing::warn!(target: "kiln.events", event = "unplaced", reader = name, error = %format!("{e:#}"), "a reader of kiln's events couldn't take its place; it will as it starts");
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(target: "kiln.events", event = "no_topic", error = ?e, "kiln.events couldn't be made yet; the relay goes on trying"),
+            }
+        }
+        spawn(&hub);
+    });
 }
 
 /// Relays the outbox to [`TOPIC`] for as long as the hub lives.
@@ -227,16 +253,21 @@ pub(crate) async fn relay_once(hub: &Hub, ready: &mut bool, stop: Option<Stop>) 
         // the last of them, whose events may have gone only in part, so it goes again whole (its
         // events with the numbers they had: a delivery skips what it has passed), the rest before
         // it not again.
-        if let Some(last) = last_on_topic(hub).await? {
-            let before = last.saturating_sub(1);
-            hub.store
-                .call(move |c| {
-                    c.execute("UPDATE event_relay SET relayed = MAX(relayed, ?1)", [before])?;
+        let last = last_on_topic(hub).await?;
+        let (unrecorded, waiting) = hub
+            .store
+            .call(move |c| {
+                let recorded: i64 = c.query_row("SELECT relayed FROM event_relay", [], |r| r.get(0))?;
+                if let Some(last) = last {
+                    c.execute("UPDATE event_relay SET relayed = MAX(relayed, ?1)", [last.saturating_sub(1)])?;
                     c.execute("DELETE FROM event_outbox WHERE id <= (SELECT relayed FROM event_relay)", [])?;
-                    Ok(())
-                })
-                .await?;
-        }
+                }
+                let waiting: i64 = c.query_row("SELECT COUNT(*) FROM event_outbox", [], |r| r.get(0))?;
+                Ok((last.map_or(0, |l| l.saturating_sub(recorded).max(0)), waiting))
+            })
+            .await?;
+        // What the last stop left: rows it published and never recorded so, and rows to publish.
+        tracing::info!(target: "kiln.events", event = "relay_start", unrecorded, waiting, "the relay starts");
         *ready = true;
     }
     let rows: Vec<Row> = hub
@@ -254,7 +285,7 @@ pub(crate) async fn relay_once(hub: &Hub, ready: &mut bool, stop: Option<Stop>) 
     if stop == Some(Stop::BeforePublish) {
         return Ok(0);
     }
-    let m = crate::metrics::events();
+    let mut message = Message::default();
     for row in &rows {
         let events = derive(hub, &row.kind, &row.fact).await?;
         // The hub's viewers hear of a notification's event made here as `notify::emit` tells them
@@ -262,14 +293,18 @@ pub(crate) async fn relay_once(hub: &Hub, ready: &mut bool, stop: Option<Stop>) 
         let shown = !matches!(row.kind.as_str(), "run" | "job" | "said");
         for (i, (kind, about)) in events.into_iter().enumerate() {
             let e = Event { n: Number(row.id, u32::try_from(i).unwrap_or(u32::MAX)), at: row.at, kind, about };
-            let key = e.n.to_string().into_bytes();
-            hub.bus.publish(TOPIC, Some(key), e.encode()).await.map_err(|r| anyhow::anyhow!("publishing event {} to {TOPIC}: {r:?}", e.n))?;
-            m.published.inc();
-            if shown && let Some(body) = crate::ci::notify::shown(&e) {
-                hub.emit(&body);
+            let size = serde_json::to_vec(&e).map_or(0, |b| b.len());
+            if !message.events.is_empty() && (message.events.len() >= MESSAGE_EVENTS || message.bytes.saturating_add(size) > MESSAGE_BYTES) {
+                message.publish(hub).await?;
             }
+            if shown && let Some(body) = crate::ci::notify::shown(&e) {
+                message.shown.push(body);
+            }
+            message.bytes = message.bytes.saturating_add(size);
+            message.events.push(e);
         }
     }
+    message.publish(hub).await?;
     if stop == Some(Stop::BeforeRecord) {
         return Ok(0);
     }
@@ -280,10 +315,76 @@ pub(crate) async fn relay_once(hub: &Hub, ready: &mut bool, stop: Option<Stop>) 
             Ok(())
         })
         .await?;
+    let m = crate::metrics::events();
     m.relayed.add(u64::try_from(rows.len()).unwrap_or(0));
     let waiting = if rows.len() < BATCH { 0 } else { hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_outbox", [], |r| r.get::<_, i64>(0))?)).await? };
     m.outbox.set(waiting);
     Ok(rows.len())
+}
+
+/// The events of a pass the relay has yet to publish, as one message; and what the hub's viewers
+/// hear of them once they're published.
+#[derive(Default)]
+struct Message {
+    events: Vec<Event>,
+    bytes: usize,
+    shown: Vec<Value>,
+}
+
+impl Message {
+    /// Publishes the events kept, as one message (each alone, should the bus refuse them together
+    /// as too large), tells the hub's viewers, and starts the next.
+    async fn publish(&mut self, hub: &Hub) -> anyhow::Result<()> {
+        if self.events.is_empty() {
+            return Ok(());
+        }
+        let events = std::mem::take(&mut self.events);
+        match publish(hub, &events).await {
+            Err(Refusal::TooLarge { .. }) if events.len() > 1 => {
+                for e in events {
+                    match publish(hub, std::slice::from_ref(&e)).await {
+                        Ok(()) => {}
+                        Err(r) => Self::refused(&e, r)?,
+                    }
+                }
+            }
+            Ok(()) => {}
+            Err(r) => {
+                let first = events.first().map(|e| e.n);
+                if let (Some(e), Refusal::TooLarge { .. }) = (events.first(), &r) {
+                    Self::refused(e, r)?;
+                } else {
+                    anyhow::bail!("publishing events from {first:?} to {TOPIC}: {r:?}");
+                }
+            }
+        }
+        for body in self.shown.drain(..) {
+            hub.emit(&body);
+        }
+        self.bytes = 0;
+        Ok(())
+    }
+
+    /// An event the bus refused alone: one larger than a message may be can never go, so it's told
+    /// and counted and the rest go on; any other refusal stops the pass, to go again.
+    fn refused(e: &Event, r: Refusal) -> anyhow::Result<()> {
+        match r {
+            Refusal::TooLarge { size, limit, .. } => {
+                tracing::warn!(target: "kiln.events", event = "too_large", n = %e.n, size, limit, "an event is larger than a message on kiln.events may be: it won't be delivered");
+                crate::metrics::events().unrecorded.inc();
+                Ok(())
+            }
+            r => anyhow::bail!("publishing event {} to {TOPIC}: {r:?}", e.n),
+        }
+    }
+}
+
+/// Publishes `events` as one message on [`TOPIC`].
+async fn publish(hub: &Hub, events: &[Event]) -> Result<(), Refusal> {
+    let key = events.first().map(|e| e.n.to_string().into_bytes());
+    hub.bus.publish(TOPIC, key, encode(events)).await?;
+    crate::metrics::events().published.add(u64::try_from(events.len()).unwrap_or(0));
+    Ok(())
 }
 
 /// The outbox row the topic's last event came from, if the topic has one.
@@ -293,7 +394,7 @@ async fn last_on_topic(hub: &Hub) -> anyhow::Result<Option<i64>> {
         return Ok(None);
     }
     let read = hub.bus.read(TOPIC, end - 1, 1).await.map_err(|r| anyhow::anyhow!("{TOPIC}'s last event: {r:?}"))?;
-    Ok(read.messages.first().and_then(|m| Event::decode(&m.payload)).map(|e| e.n.0))
+    Ok(read.messages.first().and_then(|m| decode(&m.payload)).and_then(|events| events.last().map(|e| e.n.0)))
 }
 
 /// The events an outbox row makes, each its type and what it's about, in order.
@@ -466,27 +567,34 @@ async fn read_once<R: Reader>(hub: &Arc<Hub>, reader: &R) -> anyhow::Result<usiz
     }
     let took = batch.messages.len();
     for m in batch.messages {
-        let event = Event::decode(&m.payload);
-        let logged = match &event {
-            Some(e) if e.n > passed => reader.plan(hub, e).await?,
-            // One it took before a kill, published again: passed over.
-            Some(_) => Logged::none(),
-            None => {
-                tracing::warn!(target: "kiln.events", event = "unreadable", reader = name, offset = m.offset, "a message on kiln.events that isn't an event: passed over");
-                Logged::none()
-            }
-        };
-        let n = event.map(|e| e.n).filter(|n| *n > passed).unwrap_or(passed);
-        let (at, now, write, targets) = (i64::try_from(m.offset.saturating_add(1)).unwrap_or(i64::MAX), hub.clock.unix_s(), logged.write, logged.targets);
+        let events = decode(&m.payload).unwrap_or_else(|| {
+            tracing::warn!(target: "kiln.events", event = "unreadable", reader = name, offset = m.offset, "a message on kiln.events that isn't kiln's events: passed over");
+            Vec::new()
+        });
+        // The message's deliveries, every event's but those it took before a kill (published
+        // again), logged with its position past the message in one transaction.
+        let (mut writes, mut targets) = (Vec::new(), Vec::new());
+        let mut n = passed;
+        for e in events.iter().filter(|e| e.n > passed) {
+            let logged = reader.plan(hub, e).await?;
+            writes.push(logged.write);
+            targets.extend(logged.targets);
+            n = n.max(e.n);
+        }
+        let (at, now) = (i64::try_from(m.offset.saturating_add(1)).unwrap_or(i64::MAX), hub.clock.unix_s());
         hub.store
             .call(move |c| {
                 let tx = crate::store::tx(c)?;
-                write(&tx)?;
+                for write in writes {
+                    write(&tx)?;
+                }
                 tx.execute("UPDATE event_positions SET next = ?2, passed_row = ?3, passed_index = ?4, updated_at = ?5 WHERE reader = ?1", params![name, at, n.0, n.1, now])?;
                 tx.commit()?;
                 Ok(())
             })
             .await?;
+        targets.sort();
+        targets.dedup();
         reader.wake(hub, targets);
         passed = n;
     }
@@ -536,6 +644,8 @@ pub trait Log: Send + Sync + 'static {
     fn tried(&self, c: &Connection, row: i64, after: &After<'_>) -> rusqlite::Result<()>;
     /// The targets with deliveries pending: what a restart left.
     fn pending(&self, c: &Connection) -> rusqlite::Result<Vec<String>>;
+    /// How many deliveries are pending, every target's.
+    fn waiting(&self, c: &Connection) -> rusqlite::Result<i64>;
 }
 
 /// A sender for each target of a kind of delivery, each sending its target's deliveries one at a
@@ -577,7 +687,8 @@ impl<L: Log> Senders<L> {
     /// Wakes the senders of every target with deliveries pending (as a reader starts).
     pub async fn resume(self: &Arc<Self>, hub: &Arc<Hub>) -> anyhow::Result<()> {
         let log = Arc::clone(&self.log);
-        let targets = hub.store.call(move |c| Ok(log.pending(c)?)).await?;
+        let (targets, waiting) = hub.store.call(move |c| Ok((log.pending(c)?, log.waiting(c)?))).await?;
+        tracing::info!(target: "kiln.events", event = "senders_start", kind = self.log.name(), targets = targets.len(), waiting, "the senders start");
         for target in targets {
             self.wake(hub, &target);
         }
@@ -629,12 +740,25 @@ impl<L: Log> Senders<L> {
                 }
             };
             m.attempts.inc(&[name, if status == "pending" { "retry" } else { status }]);
+            if status == "sent" {
+                m.delivery_seconds.observe(&[name], f64::from(i32::try_from(now.saturating_sub(due.first_at)).unwrap_or(i32::MAX)));
+            }
             let (log, row, error) = (Arc::clone(&self.log), due.row, error);
             let status = status.to_owned();
-            if let Err(e) = hub.store.call(move |c| Ok(log.tried(c, row, &After { status: &status, code, error: error.as_deref(), next_at, now })?)).await {
-                tracing::warn!(target: "kiln.events", event = "unrecorded_try", kind = name, target = %target, row, error = %format!("{e:#}"), "a delivery's try couldn't be recorded: it goes again");
-                drop(hub);
-                clock.sleep(Duration::from_secs(1)).await;
+            let recorded = hub
+                .store
+                .call(move |c| {
+                    log.tried(c, row, &After { status: &status, code, error: error.as_deref(), next_at, now })?;
+                    Ok(log.waiting(c)?)
+                })
+                .await;
+            match recorded {
+                Ok(waiting) => m.pending.replace_owned(&std::iter::once(name.to_owned()).collect(), [(vec![name.to_owned()], waiting)]),
+                Err(e) => {
+                    tracing::warn!(target: "kiln.events", event = "unrecorded_try", kind = name, target = %target, row, error = %format!("{e:#}"), "a delivery's try couldn't be recorded: it goes again");
+                    drop(hub);
+                    clock.sleep(Duration::from_secs(1)).await;
+                }
             }
         }
     }
@@ -656,8 +780,8 @@ mod tests {
             let batch = hub.bus.read(TOPIC, at, 1000).await.map_err(|r| anyhow::anyhow!("{r:?}"))?;
             anyhow::ensure!(!batch.messages.is_empty(), "nothing at {at} of {end}");
             for m in &batch.messages {
-                let e = Event::decode(&m.payload).ok_or_else(|| anyhow::anyhow!("not an event at {}", m.offset))?;
-                held.push((e.n, e.kind));
+                let events = decode(&m.payload).ok_or_else(|| anyhow::anyhow!("not kiln's events at {}", m.offset))?;
+                held.extend(events.into_iter().map(|e| (e.n, e.kind)));
             }
             at = batch.next;
         }

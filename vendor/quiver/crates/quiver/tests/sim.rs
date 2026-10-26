@@ -72,6 +72,27 @@ fn root() -> PathBuf {
     )
 }
 
+/// The cluster's identities, as Ed25519 (named apart from the ECDSA directories earlier binaries
+/// made here, which would replay apart), made once in this process before any run takes them: a
+/// run that made them (`Host::open` makes what isn't there) did so inside its simulation, and so
+/// went apart from its rerun (seed 1 in a fresh target), and two tests at once made them together.
+fn identities() -> PathBuf {
+    static MADE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let dir = root().join("identities-ed25519-3");
+        focal_bus::pki::load_or_make_with(
+            &dir,
+            Some(&dir.with_extension("key")),
+            3,
+            3,
+            focal_bus::pki::KeyKind::Ed25519,
+        )
+        .expect("the cluster's identities");
+        dir
+    })
+    .clone()
+}
+
 fn settings(name: &str, seed: u64, path: SimPath) -> Settings {
     let dir = root().join(format!("{name}-{seed}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -79,9 +100,7 @@ fn settings(name: &str, seed: u64, path: SimPath) -> Settings {
         seed,
         nodes: 3,
         dir,
-        // Made as Ed25519 by the first run (`Host::open`); named apart from the ECDSA directories
-        // earlier binaries made here, which would replay apart.
-        identities: root().join("identities-ed25519-3"),
+        identities: identities(),
         path,
         quorum_wait: Duration::from_secs(3),
     }

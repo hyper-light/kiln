@@ -107,8 +107,11 @@ first run differed: the first at the bus's `b6cf8e3` against an identities direc
 binary had left in the clear, which the newer seals as it loads it (a run once, then never). At the
 older pins a run in a resend storm ran apart once, late (the planted build's seed 6 at 63.7 s, one
 run of four), and one seed had two outcomes in separate processes; neither came again at the newer
-pins. The identities are made once, by one process, before a sweep's processes start: made by
-several at once, they raced, and each one's first seed found no topic held everywhere.
+pins. The identities are made once, before any run takes them: by the test binary, once in its
+process (`tests/sim.rs`'s `identities`), and by one process before a sweep's processes start.
+Made inside a run (`Host::open` makes what isn't there), that run went apart from its rerun: seed 1
+in a fresh target, found by Quiver's gate on kiln's CP-T2.2 step 8. Made by several at once, they
+raced, and each one's first seed found no topic held everywhere.
 
 The first full sweep (both passes of the 10,000 seeds at `bf54d1e`) ran 1,067 seeds apart, 10.7%:
 every acknowledged publish present in both, but not alike. A log of every datagram the fabric

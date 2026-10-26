@@ -18,9 +18,9 @@ CREATE TABLE event_relay (
 );
 INSERT INTO event_relay (one, relayed) VALUES (1, 0);
 
--- A run or a job made, or its status or conclusion changed, whatever code changed it: the `run`
--- and `job` events outgoing webhooks take (docs/ci.md W19-R07). The cluster group's replay writes
--- these rows as the write made them, with triggers off (crate::store::group).
+-- A run or a job made, or its status or conclusion changed, or a job's step, whatever code changed
+-- it: the `run` and `job` events outgoing webhooks take (docs/ci.md W19-R07). The cluster group's
+-- replay writes these rows as the write made them, with triggers off (crate::store::group).
 CREATE TRIGGER event_run_made AFTER INSERT ON runs BEGIN
   INSERT INTO event_outbox (at, kind, fact)
   VALUES (CAST(unixepoch('subsec') * 1000 AS INTEGER), 'run', json_object('run', NEW.id, 'status', NEW.status, 'conclusion', NEW.conclusion));
@@ -38,4 +38,13 @@ CREATE TRIGGER event_job_changed AFTER UPDATE OF status, conclusion ON jobs
 WHEN OLD.status IS NOT NEW.status OR OLD.conclusion IS NOT NEW.conclusion BEGIN
   INSERT INTO event_outbox (at, kind, fact)
   VALUES (CAST(unixepoch('subsec') * 1000 AS INTEGER), 'job', json_object('job', NEW.id, 'run', NEW.run_id, 'status', NEW.status, 'conclusion', NEW.conclusion));
+END;
+-- A job moving through its steps: a `job` event too, the job's own status unchanged by it.
+CREATE TRIGGER event_step_made AFTER INSERT ON steps BEGIN
+  INSERT INTO event_outbox (at, kind, fact)
+  VALUES (CAST(unixepoch('subsec') * 1000 AS INTEGER), 'job', json_object('job', NEW.job_id, 'step', NEW.idx, 'step_status', NEW.status));
+END;
+CREATE TRIGGER event_step_changed AFTER UPDATE OF status ON steps WHEN OLD.status IS NOT NEW.status BEGIN
+  INSERT INTO event_outbox (at, kind, fact)
+  VALUES (CAST(unixepoch('subsec') * 1000 AS INTEGER), 'job', json_object('job', NEW.job_id, 'step', NEW.idx, 'step_status', NEW.status));
 END;

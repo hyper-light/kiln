@@ -76,7 +76,7 @@ files = { "ld-musl-aarch64.so.1" = "/lib/ld-musl-aarch64.so.1", "libstdc++.so.6"
 [projects.quiver]
 kind = "git"
 repository = "https://github.com/hyper-light/quiver"
-commit = "4edf13cdee82abb249421dfb24732e98bda2928d"
+commit = "772559a75711b06e12e0149b2e3ce45bd29597c3"
 path = "vendor/quiver"
 exclude = ["vendor", "bench/records"]
 

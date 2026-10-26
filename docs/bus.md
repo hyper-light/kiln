@@ -87,9 +87,10 @@ and delivered from it in that order, at least once, so a kill -9 of the server l
   recorded as it's said. The cluster group's replay writes a write's rows as they were, its
   triggers off, so a replica holds the same events, not twice them.
 - **Relayed in order.** One relay publishes the outbox to `kiln.events` oldest first, each row's
-  events with the row's number in them, and then records how far it got and lets the rows go; a
-  restart goes on from the first row not recorded, so a row published but not recorded is published
-  again, with the same number.
+  events with the row's number in them, up to 128 events (256 KiB) to a message so that one flush
+  of the topic's log carries them, one message after another; then it records how far it got and
+  lets the rows go. A restart goes on from the first row not recorded: of rows published before a
+  kill and not recorded, the last goes again (its events with the numbers they had), the rest not.
 - **Delivered from the topic.** Each kind of delivery reads `kiln.events` from a position of its
   own, kept in kiln.db: for each event it logs the deliveries the event makes (each subscription
   that takes it; each channel a rule sends it to), each with its body and a delivery id that is the
@@ -135,8 +136,23 @@ open: never kept as another class.
 | `kiln_bus_viewers` | Viewers reading sessions' live feeds. |
 | `kiln_bus_memory_bytes`, `kiln_bus_memory_limit_bytes` | Bytes the bus's messages take, and may take. |
 
-kiln's overview dashboard (`deploy/grafana/dashboards/kiln-overview.json`) has a "Live feed" row of
-them.
+kiln's events (above):
+
+| Metric | What it counts |
+|---|---|
+| `kiln_events_relayed_total` | Outbox rows the relay published to `kiln.events` and let go. |
+| `kiln_events_published_total` | Events published to `kiln.events` (a row makes none, one or several). |
+| `kiln_events_outbox` | Outbox rows waiting to be relayed, as the relay last saw. |
+| `kiln_events_unrecorded_total` | Events said that couldn't be recorded, so won't be delivered (a warning on target `kiln.events`). |
+| `kiln_events_unknown_total` | Outbox rows of a kind this build doesn't know (a later build's, after a rollback): they make no event. |
+| `kiln_events_deliveries_logged_total{kind}` | Deliveries the topic's readers logged, by kind (`webhook`, `notify`). |
+| `kiln_events_delivery_attempts_total{kind,result}` | Tries of those deliveries, by kind and result: `sent`, `retry` (tried again later), `failed` (given up after a day, or never able to go), `skipped`. |
+| `kiln_events_delivery_seconds{kind}` | How long a delivery waited from its logging to its sending. |
+| `kiln_events_deliveries_pending{kind}` | Deliveries waiting to be sent, as their senders last counted. |
+| `kiln_events_missed_total{reader}` | Events a reader never took, the topic having let them go first (a warning on target `kiln.events`). |
+
+kiln's overview dashboard (`deploy/grafana/dashboards/kiln-overview.json`) has a "Live feed" row and
+an "Events" row of them.
 
 ## Vendoring
 

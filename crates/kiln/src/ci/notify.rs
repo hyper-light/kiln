@@ -1013,6 +1013,10 @@ impl crate::events::Log for Channels {
         let rows = st.query_map([], |r| r.get(0))?;
         rows.collect()
     }
+
+    fn waiting(&self, c: &rusqlite::Connection) -> rusqlite::Result<i64> {
+        c.query_row("SELECT COUNT(*) FROM notify_deliveries WHERE status = 'pending'", [], |r| r.get(0))
+    }
 }
 
 /// Sends one delivery through `spec` once: kiln's own inbox, or the channel's integration. A

@@ -148,24 +148,18 @@ struct Webhooks {
 }
 
 impl Webhooks {
-    async fn subscriptions(&self, hub: &Hub) -> Vec<Integration> {
+    /// The subscriptions, read again every [`FRESH`]. Unreadable, the event waits for them: taken
+    /// as having none, it would be passed over for every subscriber.
+    async fn subscriptions(&self, hub: &Hub) -> anyhow::Result<Vec<Integration>> {
         {
             let subs = self.subs.lock();
             if subs.1.is_some_and(|t| t.elapsed() <= FRESH) {
-                return subs.0.clone();
+                return Ok(subs.0.clone());
             }
         }
-        match integrations::list(hub).await {
-            Ok(all) => {
-                let subs: Vec<Integration> = all.into_iter().filter(|i| i.kind == "webhook" && !wanted(&i.config).is_empty()).collect();
-                *self.subs.lock() = (subs.clone(), Some(Instant::now()));
-                subs
-            }
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "the webhook subscriptions couldn't be read");
-                self.subs.lock().0.clone()
-            }
-        }
+        let subs: Vec<Integration> = integrations::list(hub).await?.into_iter().filter(|i| i.kind == "webhook" && !wanted(&i.config).is_empty()).collect();
+        *self.subs.lock() = (subs.clone(), Some(Instant::now()));
+        Ok(subs)
     }
 }
 
@@ -179,7 +173,7 @@ impl Reader for Webhooks {
             if !EVENTS.iter().any(|(k, _)| *k == e.kind) {
                 return Ok(Logged::none());
             }
-            let subs = self.subscriptions(hub).await;
+            let subs = self.subscriptions(hub).await.map_err(|e| e.context("the webhook subscriptions"))?;
             let takers: Vec<Integration> = subs.into_iter().filter(|i| takes(&wanted(&i.config), &e.kind)).collect();
             if takers.is_empty() {
                 return Ok(Logged::none());
@@ -308,6 +302,10 @@ impl Log for Deliveries {
         let mut st = c.prepare("SELECT DISTINCT integration FROM webhook_deliveries WHERE status = 'pending'")?;
         let rows = st.query_map([], |r| r.get(0))?;
         rows.collect()
+    }
+
+    fn waiting(&self, c: &Connection) -> rusqlite::Result<i64> {
+        c.query_row("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'pending'", [], |r| r.get(0))
     }
 }
 
