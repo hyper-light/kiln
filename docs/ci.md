@@ -8288,6 +8288,61 @@ before this one call this workstream "W25 step N". Step 6's, admission, are R60�
   same tree and every unit the key it has with its own change alone; and every decision names
   only what its two changes share. *Property test* (`cargo test -p kiln-ci land::conflict`).
 
+**Requirements: order and admission within components**
+
+- **W28-R35 Order, side by side.** `kiln_ci::land::order`, pure: every component's work waits in
+  one pooled queue over every runner that can do it, so no component waits on another. The queue
+  ranks a unit by its score: 30 points on its component's critical path (the head's check's
+  critical path, which every landing behind the head waits for), up to 30 for the shortest
+  expected service (the median of the job's runs, falling linearly to none at 30 min), and
+  W05-R09's aging, `aging_per_minute` (default 1) a minute waited; ties go to the longer wait. The
+  aging bound is the score's range aged away, 60 min by default: once a unit has waited it, nothing
+  that arrives after passes it, and a unit past it keeps the runners it waits for from anything
+  ranked below it.
+- **W28-R36 The speculation window.** Each component tests its window, the first changes of its
+  queue, as many as its AIMD window allows: admission's `Window` (R68) with the land queue's
+  values, starting at its cap of 8, opening by one for each change landed and halving on a
+  failure, as Zuul's does, never past its cap nor below its floor of 1; a change past it waits.
+  By default the window is one batch (`Order::batch`): the union of its changes' checks on the
+  stack of them all, whose pass lands every change. A job's result is keyed by the job and the
+  tree its unit has on the stack, the set of the trunk's and the stack's changes of that unit
+  (R32, R33), so a result the trunk already has answers it. A failure stops the batch and narrows
+  the suspects to its changes of what failed: a sole suspect is ejected at once, else the next
+  batch ends at the middle suspect. With `batch: false` each change in the window has a candidate
+  of its own on its expected stack, side by side; a failure is the change's own once every change
+  ahead of it has passed, and the candidates behind an ejection re-key: what still keys keeps its
+  result, and what its leaving changed runs again.
+- **W28-R37 Admission.** Admission defers low-intent work. A batch that doesn't fill its window
+  is held while its component is busy (it decided a batch that ran work within the hold), for
+  more changes, never past `hold_s` (default 60 min, the aging bound) from its oldest change's
+  enqueue; an idle component's first change goes at once. With per-change candidates, a
+  component's head always starts its candidate; another change in the window starts its only
+  while the bottleneck its check needs is below `util_cap` (default 0.8) committed, the shortest
+  expected service first (aged): the bottleneck is, of each of its jobs' pools, the least
+  committed, and of those the most, counting what holds a pool and what waits for it. One
+  deferred for the aging bound starts regardless. Each deferral says why: `deferred: speculative,
+  and the bottleneck its check needs is at 89% of its capacity, at or past the 80% cap`.
+
+**Acceptance criteria: order and admission**
+
+- **W28-AC31 A burst of agent changes.** Twenty small changes at once, fifteen in components of
+  their own and five sharing kiln-ci, whose checks share two runners: the fifteen land without
+  waiting for each other, each as its own check ends; the five's jobs start the critical path
+  first, then the shortest expected service first, and their batch lands them together (with
+  per-change candidates, the head's check first, then the shortest). *Replay tests* (`cargo test
+  -p kiln-ci w28_ac31`, `w28_r36_per_change`).
+- **W28-AC32 Aging under a stream.** Long changes behind a constant stream of short ones on one
+  runner: each long change starts within the aging bound, and without aging none starts while the
+  stream lasts. *Replay test* (`cargo test -p kiln-ci w28_ac32`).
+- **W28-AC33 The recorded week.** The Oct 18-25 trace replayed through the land queue
+  (`kiln_ci::sched::sim::replay::land`, seeds 1-8) against today's serial batch-and-bisect at
+  kiln's own `queue.batch` (1): the mean time from enqueue to landed falls by at least 50%,
+  runner-hours per landed change fall by at least 50%, no job waits for a runner past the aging
+  bound, and no window passes its cap. In both queues a failure a push only inherited from a
+  broken trunk (the last push to finish the job had failed it at the same step) fails only on a
+  stack that holds the change that started its streak. *Replay* (`cargo test -p kiln-ci
+  w28_ac33`); ci/sim/README.md keeps the report.
+
 **Requirements: deploys by what they share**
 
 - **W28-R38 Deploys of independent targets run at once.** `kiln_cd::deploys`, pure: a deploy's
@@ -8394,8 +8449,13 @@ before this one call this workstream "W25 step N". Step 6's, admission, are R60�
 - **W28-AC65 Explained.** Every hold and skip names its reason; every attribution its source.
   *Unit tests* (`w28_r67_attribution`, the reasons in `w28_*`).
 
-**Progress.** R60–R69 and AC60–AC65 built (2026-10-25) in `kiln_ci::sched::{admit, intent, actor}`, the scheduler, the dialect (`coalesce:`, `cadence:`), `[ci.scheduler] priority` and `fair_by`, and the dispatcher; the replay's P4 runs on admit. R30–R34 and AC30 built (2026-10-25) in `kiln_ci::land::conflict`. The land queue
-doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built (2026-10-25): `kiln_cd::deploys` decides, and the release worker in `crates/kiln/src/deploy` carries it out for every release in flight, the objects two apps share read from KilnCD's engine (`Engine::shared_objects`). One target coalescing applies with an environment's `concurrency: queue`; with `reject`, the default, a second release is refused as before.
+**Progress.** R60–R69 and AC60–AC65 built (2026-10-25) in `kiln_ci::sched::{admit, intent, actor}`, the scheduler, the dialect (`coalesce:`, `cadence:`), `[ci.scheduler] priority` and `fair_by`, and the dispatcher; the replay's P4 runs on admit. R30–R34 and AC30 built (2026-10-25) in `kiln_ci::land::conflict`; R35–R37 and AC31–AC33
+(2026-10-25) in `kiln_ci::land::order` and the replay's `land`. On the recorded week, seeds 1-8,
+batches with a 60 min hold land changes 73% sooner than today's serial queue (5.0 h to 1.3 h) at
+54% fewer runner-hours per landed change (0.453 to 0.208), more than half on every seed; no job
+waits for a runner and no window opens past 8. Per-change speculation lands faster (-88%) but
+saves 7%, its candidates waiting past the aging bound (ci/sim/README.md). The land queue uses none of this yet: that
+is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built (2026-10-25): `kiln_cd::deploys` decides, and the release worker in `crates/kiln/src/deploy` carries it out for every release in flight, the objects two apps share read from KilnCD's engine (`Engine::shared_objects`). One target coalescing applies with an environment's `concurrency: queue`; with `reject`, the default, a second release is refused as before.
 
 **Requirements: demands and adopt-on-supersede** (step 4's, R40–R49; kiln plan
 `01a17607cd1273c5836771efb9d377d7`)

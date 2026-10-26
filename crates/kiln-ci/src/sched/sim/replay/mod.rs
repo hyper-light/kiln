@@ -30,6 +30,7 @@
 //! kept in ordered maps, so the same trace, policy and seed give the same outcome, byte for byte.
 
 pub mod draw;
+pub mod land;
 pub mod report;
 pub mod rng;
 pub mod synth;
