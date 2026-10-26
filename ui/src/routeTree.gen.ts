@@ -17,6 +17,7 @@ import { Route as AppInsightsRouteImport } from './routes/_app.insights'
 import { Route as AppLogsRouteImport } from './routes/_app.logs'
 import { Route as AppReposRouteImport } from './routes/_app.repos'
 import { Route as AppSettingsRouteImport } from './routes/_app.settings'
+import { Route as AppShipRouteImport } from './routes/_app.ship'
 import { Route as AppSyncRouteImport } from './routes/_app.sync'
 import { Route as AppSystemRouteImport } from './routes/_app.system'
 import { Route as AppTelemetryRouteImport } from './routes/_app.telemetry'
@@ -96,6 +97,11 @@ const AppReposRoute = AppReposRouteImport.update({
 const AppSettingsRoute = AppSettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppShipRoute = AppShipRouteImport.update({
+  id: '/ship',
+  path: '/ship',
   getParentRoute: () => AppRoute,
 } as any)
 const AppSyncRoute = AppSyncRouteImport.update({
@@ -326,6 +332,7 @@ export interface FileRoutesByFullPath {
   '/logs': typeof AppLogsRoute
   '/repos': typeof AppReposRoute
   '/settings': typeof AppSettingsRoute
+  '/ship': typeof AppShipRoute
   '/sync': typeof AppSyncRoute
   '/system': typeof AppSystemRoute
   '/telemetry': typeof AppTelemetryRoute
@@ -375,6 +382,7 @@ export interface FileRoutesByTo {
   '/logs': typeof AppLogsRoute
   '/repos': typeof AppReposRoute
   '/settings': typeof AppSettingsRoute
+  '/ship': typeof AppShipRoute
   '/sync': typeof AppSyncRoute
   '/system': typeof AppSystemRoute
   '/telemetry': typeof AppTelemetryRoute
@@ -427,6 +435,7 @@ export interface FileRoutesById {
   '/_app/logs': typeof AppLogsRoute
   '/_app/repos': typeof AppReposRoute
   '/_app/settings': typeof AppSettingsRoute
+  '/_app/ship': typeof AppShipRoute
   '/_app/sync': typeof AppSyncRoute
   '/_app/system': typeof AppSystemRoute
   '/_app/telemetry': typeof AppTelemetryRoute
@@ -480,6 +489,7 @@ export interface FileRouteTypes {
     | '/logs'
     | '/repos'
     | '/settings'
+    | '/ship'
     | '/sync'
     | '/system'
     | '/telemetry'
@@ -529,6 +539,7 @@ export interface FileRouteTypes {
     | '/logs'
     | '/repos'
     | '/settings'
+    | '/ship'
     | '/sync'
     | '/system'
     | '/telemetry'
@@ -580,6 +591,7 @@ export interface FileRouteTypes {
     | '/_app/logs'
     | '/_app/repos'
     | '/_app/settings'
+    | '/_app/ship'
     | '/_app/sync'
     | '/_app/system'
     | '/_app/telemetry'
@@ -685,6 +697,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof AppSettingsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/ship': {
+      id: '/_app/ship'
+      path: '/ship'
+      fullPath: '/ship'
+      preLoaderRoute: typeof AppShipRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/sync': {
@@ -984,6 +1003,7 @@ interface AppRouteChildren {
   AppLogsRoute: typeof AppLogsRoute
   AppReposRoute: typeof AppReposRoute
   AppSettingsRoute: typeof AppSettingsRoute
+  AppShipRoute: typeof AppShipRoute
   AppSyncRoute: typeof AppSyncRoute
   AppSystemRoute: typeof AppSystemRoute
   AppTelemetryRoute: typeof AppTelemetryRoute
@@ -1034,6 +1054,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppLogsRoute: AppLogsRoute,
   AppReposRoute: AppReposRoute,
   AppSettingsRoute: AppSettingsRoute,
+  AppShipRoute: AppShipRoute,
   AppSyncRoute: AppSyncRoute,
   AppSystemRoute: AppSystemRoute,
   AppTelemetryRoute: AppTelemetryRoute,

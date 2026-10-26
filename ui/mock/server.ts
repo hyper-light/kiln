@@ -30,6 +30,7 @@ import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchS
 import { fastInfos, handleFastSession } from "./fast.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
+import { handleShip } from "./ship.ts";
 import { handleDoctor } from "./doctor.ts";
 import { handleStores } from "./stores.ts";
 import {
@@ -1764,6 +1765,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, audit.slice(0, limit));
     }
     if (p.startsWith("/api/hooks/github")) return noContent(res);
+    if (handleShip(req, res, url, { json })) return;
     if (await handleReview(req, res, url, { json, err, body, emit: (ev) => emit(ev as never) })) return;
     if (await handlePush(req, res, url, { json, err, body, emit, noContent })) return;
     if (await handleDoctor(req, res, url, { json, err, body, runners: () => [...agents.values()].map((a) => ({ name: a.name, connected: a.connected, os: a.os })) })) return;

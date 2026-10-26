@@ -33,5 +33,12 @@ export default defineConfig({
   projects: [
     { name: "desktop", use: { browserName: "chromium", viewport: { width: 1440, height: 900 } } },
     { name: "phone", use: { ...devices["Pixel 7"], browserName: "chromium" } },
+    // WebKit too (E2E_WEBKIT=1, with Playwright's WebKit installed: `npx playwright install webkit`).
+    ...(process.env.E2E_WEBKIT
+      ? [
+          { name: "desktop-webkit", use: { browserName: "webkit" as const, channel: undefined, viewport: { width: 1440, height: 900 } } },
+          { name: "phone-webkit", use: { ...devices["iPhone 15"], browserName: "webkit" as const, channel: undefined } },
+        ]
+      : []),
   ],
 });
