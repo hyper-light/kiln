@@ -61,12 +61,24 @@ pub enum Frame {
     /// store and its copy of the server's (a mirror's), let go of and moved into green's folder
     /// (`own`, `mirror`: their files there), for green to go on with under the same ids and
     /// numbers, so nothing is sent to the server again (None: none to hand over; green opens one
-    /// of its own). Answered with an Ack, id [`STORES`].
+    /// of its own). Answered with [`Frame::StoresTaken`]; whatever it says, blue hands over the
+    /// rest: the stores never hold an upgrade back.
     Stores { own: Option<String>, mirror: Option<String> },
+    /// green → blue, the answer to [`Frame::Stores`]: whether green keeps a store (`kept`; not: it
+    /// couldn't even open a new one, and what was handed stays in its folder under its own name,
+    /// for its next start), where it set aside each handed one that wouldn't open (`own_aside`,
+    /// `mirror_aside`: kept whole there, blue's own as it was, which a rollback takes back), and
+    /// what it did (`note`).
+    StoresTaken {
+        kept: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        own_aside: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mirror_aside: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
 }
-
-/// The id green's Ack of [`Frame::Stores`] carries.
-pub const STORES: &str = "stores";
 
 /// Where a runner whose own directory is `own_dir` waits for the new build to take over from it:
 /// in the user's runtime directory (Unix socket paths are short), named after that directory.
@@ -313,6 +325,10 @@ mod unix {
             assert_eq!(serde_json::to_string(&Frame::Ready { pid: 7, instance: "g".into(), stores: true })?, r#"{"ready":{"pid":7,"instance":"g","stores":true}}"#);
             let said = serde_json::to_string(&Frame::Stores { own: Some("/s/instances/g/conversations.db".into()), mirror: None })?;
             assert!(matches!(serde_json::from_str::<Frame>(&said)?, Frame::Stores { own: Some(o), mirror: None } if o.ends_with("/g/conversations.db")));
+            // Its answer: where green set aside what wouldn't open, said only when it did.
+            assert_eq!(serde_json::to_string(&Frame::StoresTaken { kept: true, own_aside: None, mirror_aside: None, note: None })?, r#"{"stores_taken":{"kept":true}}"#);
+            let taken = serde_json::to_string(&Frame::StoresTaken { kept: true, own_aside: Some("/s/instances/g/conversations.db.unopened".into()), mirror_aside: None, note: Some("set aside".into()) })?;
+            assert!(matches!(serde_json::from_str::<Frame>(&taken)?, Frame::StoresTaken { kept: true, own_aside: Some(a), mirror_aside: None, note: Some(_) } if a.ends_with(".unopened")));
             Ok(())
         }
 

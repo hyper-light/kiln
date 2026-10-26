@@ -88,8 +88,8 @@ replaced while it runs. The new build comes up beside it, and takes over only on
    meanwhile (a message for an agent, keystrokes, a new session) goes on to the new build. Its
    conversation stores go first: let go of, moved into the new build's folder and gone on with
    there under the same ids, so nothing is sent to the server again (docs/conversations.md, "A
-   runner's upgrade"). A new build from before takes none, and opens its own; one that can't go
-   on with them stops the upgrade there, rolled back.
+   runner's upgrade"). A new build from before takes none, and opens its own; one that can't open
+   them sets them aside, kept whole, and opens its own: the stores never hold an upgrade back.
 4. The supervisor promotes the new build, and the server sends it new work from then on. The old
    runner finishes the jobs it's running (jobs aren't moved yet), then exits. The supervisor keeps
    the new build, and starts it again after a restart or reboot.

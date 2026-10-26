@@ -398,9 +398,16 @@ compact = true       # make the store's file compact once a third of it is free 
   says so first (`Frame::Stores`, the new build saying it takes them: `Ready.stores`). The new
   build opens them there, the same ids and numbers, so the server's feed of the store, and its
   feed to the copy, go on where they are and nothing is sent again. The mirror's feed follows the
-  process the machine promotes. A new build that can't go on with them rolls the upgrade back. A
-  rollback moves the files back before the new build's folder goes (one that couldn't be moved
-  back keeps the folder), and the old runner goes on with them. An old runner that ends before
+  process the machine promotes. The stores never hold an upgrade back: one the new build can't
+  open (tried three times, a second apart) it sets aside, kept whole beside its new one
+  (`conversations.db.unopened`, `.unopened.2` and on if that's taken, its log by the same name
+  and `-wal`, so it still opens as it is), and goes on in a new store (a new copy, for a
+  mirror's), saying where in its answer (`Frame::StoresTaken`). One that can't keep a store at
+  all (not even a new one opens) leaves what it was handed in its folder under its own name, for
+  its next start, and takes the rest of the upgrade all the same: nothing is lost either way. A
+  rollback moves the files back before the new build's folder goes (a store it set aside comes
+  back from where it said, as it was, not the new one; one that couldn't be moved back keeps the
+  folder), and the old runner goes on with them. An old runner that ends before
   it says (it died, or their link broke) leaves the new build the store in its own folder: the
   files it had moved there, or a new one. A build from before neither says nor takes: an upgrade
   from one opens a store of its own in the new build, which writes what each session it takes

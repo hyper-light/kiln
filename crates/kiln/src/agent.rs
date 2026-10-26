@@ -260,9 +260,10 @@ enum Bg {
     #[cfg(unix)]
     Ready { job: String, conn: Arc<crate::bluegreen::Conn>, stores: bool },
     /// Everything was sent: what the new build said of each, in order (`broke`: the connection
-    /// failed part-way).
+    /// failed part-way), and where it set aside each conversation store that wouldn't open there
+    /// (`aside`, as [`Given::aside`]).
     #[cfg(unix)]
-    Moved { job: String, conn: Arc<crate::bluegreen::Conn>, acks: Vec<Ack>, broke: Option<String> },
+    Moved { job: String, conn: Arc<crate::bluegreen::Conn>, acks: Vec<Ack>, broke: Option<String>, aside: Option<[Option<PathBuf>; 2]> },
     /// The new build didn't come up: this runner goes on.
     #[cfg(unix)]
     Failed { job: String, why: String },
@@ -273,10 +274,11 @@ enum Bg {
     #[cfg(unix)]
     TookOver { sessions: usize, terminals: usize, refused: usize },
     /// (The new build's runner.) The conversation stores it goes on with: the files the runner it
-    /// takes over from moved into this one's folder (`crate::bluegreen::Frame::Stores`), or none
-    /// (one of its own, then). Say how it went.
+    /// takes over from moved into this one's folder (`crate::bluegreen::Frame::Stores`: its own and
+    /// its copy of the server's), or none (one of its own, then). Say how it went: what it set aside
+    /// and went on without, or why it keeps none.
     #[cfg(unix)]
-    Stores { own: Option<PathBuf>, done: futures::channel::oneshot::Sender<Result<(), String>> },
+    Stores { own: Option<PathBuf>, mirror: Option<PathBuf>, done: futures::channel::oneshot::Sender<Taken> },
     /// (The new build's runner.) The runner it took over from is gone (or never answered).
     #[cfg(unix)]
     TakeOverEnded,
@@ -333,6 +335,21 @@ struct Given {
     held: crate::convo::store::Held,
     moves: Vec<(PathBuf, PathBuf)>,
     own_dir: PathBuf,
+    /// Where the new build set aside each (its own, the copy) that wouldn't open there, as it said
+    /// (`crate::bluegreen::Frame::StoresTaken`); None: its answer never came.
+    aside: Option<[Option<PathBuf>; 2]>,
+}
+
+/// (The new build's runner.) How it took the conversation stores handed to it ([`Bg::Stores`],
+/// `crate::bluegreen::Frame::StoresTaken`): whether it keeps one, where it set aside each that
+/// wouldn't open, and what it did.
+#[cfg(unix)]
+#[derive(Default)]
+struct Taken {
+    kept: bool,
+    own_aside: Option<PathBuf>,
+    mirror_aside: Option<PathBuf>,
+    note: Option<String>,
 }
 
 /// One thing handed to the new build (blue/green), as this runner keeps it until then.
@@ -388,6 +405,14 @@ const TAKE_OVER_GRACE: Duration = Duration::from_secs(30);
 /// said last to go into it (its tee to drain) before it lets go of it.
 #[cfg(unix)]
 const TEE_DRAIN: Duration = Duration::from_secs(10);
+
+/// How many times a new build tries to open a conversation store handed to it, how far apart (one
+/// the runner it takes over from hasn't quite let go of, a slow disk), before it sets it aside and
+/// goes on in a new one.
+#[cfg(unix)]
+const STORE_TRIES: usize = 3;
+#[cfg(unix)]
+const STORE_TRY_EVERY: Duration = Duration::from_secs(1);
 
 #[cfg(unix)]
 use crate::upgrade::with_instance;
@@ -793,15 +818,27 @@ fn give_stores(held: &crate::convo::store::Held, own: Option<crate::convo::store
 
 /// (The runner being upgraded, rolling back.) Its conversation stores, given to the new build
 /// ([`Given`]), moved back where they were (each that's in the new build's folder) and its own
-/// opened again for its tee: the store to go on with. What went wrong goes in `problems`.
+/// opened again for its tee: the store to go on with. One the new build set aside (it wouldn't open
+/// there) is this runner's own as it was: that comes back, from where the new build said it put it,
+/// not the new store in its place. What went wrong goes in `problems`.
 #[cfg(unix)]
 fn take_stores_back(g: &Given, problems: &mut Vec<String>) -> Option<crate::convo::store::Store> {
-    for (from, to) in &g.moves {
-        if to.exists()
+    for (i, (from, to)) in g.moves.iter().enumerate() {
+        let there = match &g.aside {
+            Some(said) => said.get(i).cloned().flatten().unwrap_or_else(|| to.clone()),
+            // Its answer never came: one it set aside in its folder, new with it, has the first name.
+            None => {
+                let mut first = to.as_os_str().to_owned();
+                first.push(crate::convo::SET_ASIDE);
+                Some(PathBuf::from(first)).filter(|f| f.exists()).unwrap_or_else(|| to.clone())
+            }
+        };
+        let there = &there;
+        if there.exists()
             && !from.exists()
-            && let Err(e) = crate::convo::move_file(to, from)
+            && let Err(e) = crate::convo::move_file(there, from)
         {
-            problems.push(format!("conversation store {}: {e:#} (it stays at {})", from.display(), to.display()));
+            problems.push(format!("conversation store {}: {e:#} (it stays at {})", from.display(), there.display()));
         }
     }
     let st = crate::convo::open(&g.own_dir, crate::config::Conversations::default().upkeep())?;
@@ -833,12 +870,13 @@ fn start_feed(st: &crate::convo::store::Store, harness: Option<&Arc<crate::harne
 
 /// (The new build's runner.) The stores it goes on with ([`Bg::Stores`]): how it went.
 #[cfg(unix)]
-async fn set_stores(tx: &async_channel::Sender<Bg>, own: Option<PathBuf>) -> Result<(), String> {
+async fn set_stores(tx: &async_channel::Sender<Bg>, own: Option<PathBuf>, mirror: Option<PathBuf>) -> Taken {
+    let stopping = || Taken { note: Some("this runner is stopping".to_owned()), ..Taken::default() };
     let (done, said) = futures::channel::oneshot::channel();
-    if tx.send(Bg::Stores { own, done }).await.is_err() {
-        return Err("this runner is stopping".to_owned());
+    if tx.send(Bg::Stores { own, mirror, done }).await.is_err() {
+        return stopping();
     }
-    said.await.unwrap_or_else(|_| Err("this runner is stopping".to_owned()))
+    said.await.unwrap_or_else(|_| stopping())
 }
 
 /// Stops the new build `green`, a rollback's first step: its supervisor `sup` kills it (none, or it
@@ -916,18 +954,21 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
                 break;
             }
         };
-        if let Frame::Stores { own, mirror: _ } = frame {
+        if let Frame::Stores { own, mirror } = frame {
             stores = true;
-            let r = set_stores(&tx, own.map(PathBuf::from)).await;
-            let ack = Frame::Ack { id: crate::bluegreen::STORES.to_owned(), ok: r.is_ok(), error: r.err() };
+            // Whether it keeps one, where it set aside what wouldn't open, and what it did.
+            let t = set_stores(&tx, own.map(PathBuf::from), mirror.map(PathBuf::from)).await;
+            let path = |p: Option<PathBuf>| p.map(|p| p.to_string_lossy().into_owned());
+            let taken = Frame::StoresTaken { kept: t.kept, own_aside: path(t.own_aside), mirror_aside: path(t.mirror_aside), note: t.note };
             let c = Arc::clone(&conn);
-            crate::rt::blocking(move || c.send(&ack, &[])).await??;
+            crate::rt::blocking(move || c.send(&taken, &[])).await??;
             continue;
         }
         if !stores && matches!(frame, Frame::Session { .. } | Frame::Terminal { .. } | Frame::Done) {
             stores = true;
-            if let Err(e) = set_stores(&tx, None).await {
-                tracing::warn!(error = %e, "the conversation store couldn't be opened");
+            let t = set_stores(&tx, None, None).await;
+            if !t.kept {
+                tracing::warn!(error = %t.note.unwrap_or_default(), "the conversation store couldn't be opened");
             }
         }
         let (id, r) = match frame {
@@ -971,7 +1012,7 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
                 }
                 continue;
             }
-            Frame::Ready { .. } | Frame::Ack { .. } | Frame::Stores { .. } => continue,
+            Frame::Ready { .. } | Frame::Ack { .. } | Frame::Stores { .. } | Frame::StoresTaken { .. } => continue,
         };
         if r.is_err() {
             refused += 1;
@@ -1658,7 +1699,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 if copy.is_some() {
                                     moves.push((own_dir.join(crate::convo::MIRROR_FILE), there.join(crate::convo::MIRROR_FILE)));
                                 }
-                                mv.stores = Some(Given { held: held.clone(), moves: moves.clone(), own_dir: own_dir.clone() });
+                                mv.stores = Some(Given { held: held.clone(), moves: moves.clone(), own_dir: own_dir.clone(), aside: None });
                                 Some((held.clone(), own, copy, moves))
                             }
                             _ => None,
@@ -1667,13 +1708,21 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let sent = std::thread::Builder::new().name("kiln-handover".into()).spawn(move || {
                             let mut acks = Vec::with_capacity(frames.len());
                             let mut broke: Option<String> = None;
+                            let mut aside = None;
                             if let Some((held, own, copy, moves)) = giving {
                                 let said = give_stores(&held, own, copy, &moves);
+                                // The stores never hold an upgrade back: one the new build can't open
+                                // it sets aside, kept whole, and goes on in a new one; one that keeps
+                                // none (it couldn't even open a new one) still takes the rest.
                                 match conn.send(&said, &[]).and_then(|()| conn.recv()) {
-                                    Ok((Frame::Ack { ok: true, .. }, _)) => {}
-                                    // It couldn't go on with them: the upgrade goes no further, and
-                                    // they come back here (a rollback) rather than go unkept.
-                                    Ok((Frame::Ack { error, .. }, _)) => broke = Some(format!("the new build couldn't go on with this runner's conversation stores: {}", error.unwrap_or_default())),
+                                    Ok((Frame::StoresTaken { kept, own_aside, mirror_aside, note }, _)) => {
+                                        aside = Some([own_aside.map(PathBuf::from), mirror_aside.map(PathBuf::from)]);
+                                        match (kept, note) {
+                                            (true, None) => {}
+                                            (true, Some(note)) => tracing::warn!(%note, "the new build went on with this runner's conversation stores, not all as they were"),
+                                            (false, note) => tracing::warn!(error = %note.unwrap_or_default(), "the new build keeps no conversation store; the upgrade goes on"),
+                                        }
+                                    }
                                     Ok(_) => broke = Some("the new build answered out of turn".to_owned()),
                                     Err(e) => broke = Some(format!("{e:#}")),
                                 }
@@ -1702,14 +1751,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             {
                                 broke = Some(format!("{e:#}"));
                             }
-                            let _ = tx.send_blocking(Bg::Moved { job, conn, acks, broke });
+                            let _ = tx.send_blocking(Bg::Moved { job, conn, acks, broke, aside });
                         });
                         if let Err(e) = sent {
                             tracing::error!(error = %e, "couldn't hand over to the new build");
                         }
                     }
-                    Bg::Moved { job, conn, acks, broke } => {
+                    Bg::Moved { job, conn, acks, broke, aside } => {
                         let Some(mut mv) = moving.take() else { continue };
+                        if let Some(g) = mv.stores.as_mut() {
+                            g.aside = aside;
+                        }
                         for (item, ack) in mv.items.iter().zip(&acks) {
                             let sp = tracing::info_span!(target: "kiln::upgrade", parent: &mv.root, "upgrade.move", what = item.what(), id = %item.id(), result = empty, error = empty);
                             match ack {
@@ -1841,33 +1893,73 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         tracing::warn!(%job, error = %why, "the new build didn't come up; this runner goes on");
                         uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(format!("the new build didn't come up ({why}): it was stopped, and this runner goes on as it was")) }).await;
                     }
-                    Bg::Stores { own, done } => {
+                    Bg::Stores { own, mirror: copy, done } => {
                         // Moved into this runner's folder by the runner it takes over from (its
                         // copy of the server's beside it, opened when the server first sends it),
-                        // or none came: one of its own, there.
-                        let file = own_dir.join(crate::convo::FILE);
-                        let mut said = match &own {
-                            Some(p) if *p != file => Err(format!("its store came as {}, not {}", p.display(), file.display())),
-                            _ => Ok(()),
-                        };
+                        // or none came: one of its own, there. One that won't open is set aside,
+                        // kept whole, and a new one takes its place: the stores never hold an
+                        // upgrade back.
+                        let here = [own_dir.join(crate::convo::FILE), own_dir.join(crate::convo::MIRROR_FILE)];
+                        // Handed where this one doesn't look for them (a build that lays its folder
+                        // out otherwise): moved where it does.
+                        for (handed, here) in [own.as_ref(), copy.as_ref()].into_iter().zip(&here) {
+                            if let Some(p) = handed.filter(|p| *p != here && !here.exists())
+                                && let Err(e) = crate::convo::move_file(p, here)
+                            {
+                                tracing::warn!(error = %format!("{e:#}"), from = %p.display(), "a conversation store handed over couldn't be moved where this runner keeps it");
+                            }
+                        }
+                        // One already open here (said again): kept as it is.
+                        let mut taken = Taken { kept: convo.is_some(), ..Taken::default() };
                         if convo.is_none()
-                            && let Some(held) = &convo_held
+                            && let Some(held) = convo_held.clone()
                         {
-                            match crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep()) {
+                            let (dir, upkeep, with_copy) = (own_dir.clone(), crate::config::Conversations::default().upkeep(), copy.is_some());
+                            let (st, aside, copy_aside) = crate::rt::blocking(move || {
+                                let (st, aside) = crate::convo::open_or_set_aside(&dir, crate::convo::FILE, upkeep, STORE_TRIES, STORE_TRY_EVERY);
+                                // The copy of the server's handed over: tried now, so that one that
+                                // won't open is set aside and the server's next batch starts a new
+                                // copy (opened then, as ever).
+                                let copy_aside = if with_copy {
+                                    let (c, aside) = crate::convo::open_or_set_aside(&dir, crate::convo::MIRROR_FILE, upkeep, STORE_TRIES, STORE_TRY_EVERY);
+                                    if let Some(c) = c
+                                        && let Err(e) = c.close()
+                                    {
+                                        tracing::warn!(error = %format!("{e:#}"), "the copy of the server's conversation store handed over couldn't be let go of after a look");
+                                    }
+                                    aside
+                                } else {
+                                    None
+                                };
+                                (st, aside, copy_aside)
+                            })
+                            .await
+                            .unwrap_or_default();
+                            let mut notes = Vec::new();
+                            if let Some(a) = &aside {
+                                notes.push(format!("its conversation store wouldn't open here: set aside, kept whole, at {}{}", a.display(), if st.is_some() { ", and a new one took its place" } else { "" }));
+                            }
+                            if let Some(a) = &copy_aside {
+                                notes.push(format!("its copy of the server's store wouldn't open here: set aside, kept whole, at {}, and a new copy is taken", a.display()));
+                            }
+                            match st {
                                 Some(st) => {
                                     held.give(st.clone());
                                     let ship = start_feed(&st, harness.as_ref(), &uplink.0);
                                     if connected {
                                         ship.link(crate::convo::feed::Link::Up);
                                     }
-                                    tracing::info!(store = %st.id(), handed = own.is_some(), "the conversations go on in this store");
+                                    tracing::info!(store = %st.id(), handed = own.is_some(), set_aside = aside.is_some(), "the conversations go on in this store");
                                     (convo, shipper) = (Some(st), Some(ship));
+                                    taken.kept = true;
                                 }
-                                None => said = Err("its conversation store couldn't be opened".to_owned()),
+                                // What was handed stays here, under its own name, for its next start.
+                                None => notes.push("no conversation store could be opened here".to_owned()),
                             }
+                            (taken.own_aside, taken.mirror_aside, taken.note) = (aside, copy_aside, (!notes.is_empty()).then(|| notes.join("; ")));
                         }
                         stores_wait = false;
-                        let _ = done.send(said);
+                        let _ = done.send(taken);
                     }
                     Bg::TakeTerminal { session, command, cols, rows, replay, fd, pid, done } => {
                         let state = crate::termsess::Session::detached(session.clone(), "agent".into(), command, cols, rows);
@@ -1894,7 +1986,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // got that far.
                         if stores_wait {
                             let (done, _) = futures::channel::oneshot::channel();
-                            let _ = bg_tx.try_send(Bg::Stores { own: None, done });
+                            let _ = bg_tx.try_send(Bg::Stores { own: None, mirror: None, done });
                         }
                         // Its link to the runner it upgraded ended, and no word of its promotion: that
                         // one is gone (one that takes its sessions back stops this one first), whether
@@ -4053,7 +4145,7 @@ mod tests {
             assert_eq!(texts(&there)?, vec!["before the upgrade".to_owned()]);
             there.close()?;
             // Rolled back: moved back, opened again, given to the tee, which keeps what passes in it.
-            let g = Given { held: held.clone(), moves, own_dir: blue.clone() };
+            let g = Given { held: held.clone(), moves, own_dir: blue.clone(), aside: Some([None, None]) };
             let mut problems = Vec::new();
             let back = take_stores_back(&g, &mut problems).ok_or_else(|| anyhow::anyhow!("nothing came back"))?;
             assert!(problems.is_empty(), "{problems:?}");
@@ -4061,6 +4153,47 @@ mod tests {
             sink.send(("a1".to_owned(), said("m2", 2, "after the rollback"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
             assert_eq!(texts(&back)?, vec!["before the upgrade".to_owned(), "after the rollback".to_owned()]);
+            Ok(())
+        })
+    }
+
+    /// A store the new build couldn't open it sets aside there, kept whole, and goes on in a new
+    /// one; rolled back, the runner being upgraded takes its own back as it was, from where the new
+    /// build said it set it aside (or, its answer lost, under the first name), not the new build's.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_the_new_build_set_aside_comes_back_as_it_was_on_a_rollback() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        let said = |id: &str, seq: u64, text: &str| Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] };
+        crate::rt::block_on(async move {
+            for answered in [true, false] {
+                let dir = tempfile::tempdir()?;
+                let (blue, green) = (dir.path().join("blue"), dir.path().join("green"));
+                std::fs::create_dir_all(&blue)?;
+                let upkeep = || crate::config::Conversations::default().upkeep();
+                let st = crate::convo::open(&blue, upkeep()).ok_or_else(|| anyhow::anyhow!("no store"))?;
+                st.send("a1", &said("m1", 1, "before the upgrade"));
+                let id = st.id().to_owned();
+                let (out, _passed) = async_channel::unbounded();
+                let (_sink, held) = crate::convo::store::tee_held(out, Some(st.clone()), 16);
+                let moves = vec![(blue.join(crate::convo::FILE), green.join(crate::convo::FILE))];
+                let (h, m) = (held.clone(), moves.clone());
+                crate::rt::blocking(move || give_stores(&h, Some(st), None, &m)).await?;
+                // The new build couldn't open it: set aside there, and a new store in its place.
+                let aside = crate::convo::set_aside(&green.join(crate::convo::FILE))?;
+                let fresh = crate::convo::open(&green, upkeep()).ok_or_else(|| anyhow::anyhow!("no new store"))?;
+                assert_ne!(fresh.id(), id.as_str());
+                fresh.close()?;
+                let answer = answered.then(|| [Some(aside.clone()), None]);
+                let mut problems = Vec::new();
+                let back = take_stores_back(&Given { held, moves, own_dir: blue.clone(), aside: answer }, &mut problems).ok_or_else(|| anyhow::anyhow!("nothing came back"))?;
+                assert!(problems.is_empty(), "{problems:?}");
+                assert_eq!(back.id(), id, "its own store, as it was (answered: {answered})");
+                assert!(!aside.exists());
+                back.sync()?;
+                assert_eq!(back.kept("a1", 10)?.map(|k| k.events.len()), Some(1));
+            }
             Ok(())
         })
     }

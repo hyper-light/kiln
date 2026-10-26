@@ -863,6 +863,48 @@ mod tests {
         Ok(())
     }
 
+    /// A store that won't open (here, not a database at all) is set aside whole, its log beside it,
+    /// never over another set aside before, and a new store takes its place: a new build handed it
+    /// keeps conversations all the same.
+    #[test]
+    fn a_store_that_wont_open_is_set_aside_whole_and_a_new_one_takes_its_place() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (name, junk) = (super::super::FILE, vec![0xab_u8; 8192]);
+        let at = |suffix: &str| dir.path().join(format!("{name}{suffix}"));
+        std::fs::write(at(""), &junk)?;
+        std::fs::write(at("-wal"), b"nor is this a log")?;
+        let (st, aside) = super::super::open_or_set_aside(dir.path(), name, Upkeep::default(), 2, Duration::from_millis(10));
+        let st = st.ok_or_else(|| anyhow::anyhow!("no new store"))?;
+        assert_eq!(aside, Some(at(".unopened")));
+        assert_eq!(std::fs::read(at(".unopened"))?, junk);
+        assert_eq!(std::fs::read(at(".unopened-wal"))?, b"nor is this a log");
+        st.send("a1", &said("m1", 1, "kept in the new one"));
+        st.sync()?;
+        assert_eq!(st.kept("a1", 10)?.map(|k| k.events.len()), Some(1));
+        st.close()?;
+        // Another that won't open, set aside beside the first.
+        std::fs::write(at(""), &junk)?;
+        for side in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(at(side));
+        }
+        let (st, aside) = super::super::open_or_set_aside(dir.path(), name, Upkeep::default(), 1, Duration::ZERO);
+        assert!(st.is_some());
+        assert_eq!(aside, Some(at(".unopened.2")));
+        assert_eq!(std::fs::read(at(".unopened"))?, junk);
+        // A store set aside still opens as it is, by its new name, its log by the same name.
+        let real = dir.path().join("real.db");
+        let st = Store::start(Box::new(super::super::turso::Turso::open(&real)?), Upkeep::default())?;
+        st.send("a1", &said("m1", 1, "set aside whole"));
+        let id = st.id().to_owned();
+        st.close()?;
+        let aside = super::super::set_aside(&real)?;
+        assert_eq!(aside, dir.path().join("real.db.unopened"));
+        let again = Store::start(Box::new(super::super::turso::Turso::open(&aside)?), Upkeep::default())?;
+        assert_eq!(again.id(), id);
+        assert_eq!(again.kept("a1", 10)?.map(|k| k.events.len()), Some(1));
+        Ok(())
+    }
+
     #[test]
     fn a_tee_whose_store_comes_later_passes_everything_on_and_keeps_it_all_in_order() -> anyhow::Result<()> {
         crate::rt::block_on(async move {

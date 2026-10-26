@@ -64,23 +64,18 @@ pub fn open_file(dir: &std::path::Path, file: &str, upkeep: store::Upkeep) -> Op
 /// beside it: for the process that goes on with it there (a new build taking over from the runner
 /// being upgraded keeps that runner's store, `crate::bluegreen`). Never over a file at `to`.
 pub fn move_file(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {
-    let side = |p: &std::path::Path, s: &str| {
-        let mut name = p.as_os_str().to_owned();
-        name.push(s);
-        std::path::PathBuf::from(name)
-    };
     for s in ["", "-wal", "-shm"] {
-        anyhow::ensure!(!side(to, s).exists(), "{} is there already", side(to, s).display());
+        anyhow::ensure!(!beside(to, s).exists(), "{} is there already", beside(to, s).display());
     }
     if let Some(dir) = to.parent() {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::rename(from, to).map_err(|e| anyhow::Error::from(e).context(format!("move {} to {}", from.display(), to.display())))?;
     for s in ["-wal", "-shm"] {
-        match std::fs::rename(side(from, s), side(to, s)) {
+        match std::fs::rename(beside(from, s), beside(to, s)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(anyhow::Error::from(e).context(format!("move {}", side(from, s).display()))),
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("move {}", beside(from, s).display()))),
         }
     }
     // The renames themselves on disk (not on Windows, which opens no folder).
@@ -90,4 +85,70 @@ pub fn move_file(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+/// What a store's file set aside is called, after its own name ([`set_aside`]): the first such.
+pub const SET_ASIDE: &str = ".unopened";
+
+/// A file beside `path`: its name with `suffix` added (a store's log is its name and `-wal`).
+fn beside(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
+/// Set the store's file at `path` aside, with its log, kept whole for a person to look at: moved
+/// beside it as `<file>.unopened` (`.unopened.2` and on, if that's taken), its log by the same name
+/// and `-wal`, so that it still opens as it is there; never over a file. Where it went.
+pub fn set_aside(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let to = (1..=100u32)
+        .map(|i| beside(path, &if i == 1 { SET_ASIDE.to_owned() } else { format!("{SET_ASIDE}.{i}") }))
+        .find(|to| ["", "-wal", "-shm"].iter().all(|s| !beside(to, s).exists()))
+        .ok_or_else(|| anyhow::anyhow!("no name beside {} is free to set it aside under", path.display()))?;
+    move_file(path, &to)?;
+    Ok(to)
+}
+
+/// The store in file `file` of `dir`, as [`open_file`] opens it, tried `tries` times `between`
+/// apart (a file another process hasn't quite let go of, a slow disk). One that still won't open is
+/// set aside ([`set_aside`]) once a new store opens in its place: what it holds is kept, beside it,
+/// and the machine goes on keeping its conversations. When not even a new one opens, it stays where
+/// it was, for a later start to try. The store (None: none opened, or the store is off), and where
+/// the one set aside went. Blocking.
+pub fn open_or_set_aside(dir: &std::path::Path, file: &str, upkeep: store::Upkeep, tries: usize, between: std::time::Duration) -> (Option<store::Store>, Option<std::path::PathBuf>) {
+    for i in 0..tries.max(1) {
+        if i > 0 {
+            std::thread::sleep(between);
+        }
+        if let Some(st) = open_file(dir, file, upkeep) {
+            return (Some(st), None);
+        }
+        if off() {
+            return (None, None);
+        }
+    }
+    let path = dir.join(file);
+    if !path.exists() {
+        return (None, None);
+    }
+    let aside = match set_aside(&path) {
+        Ok(aside) => aside,
+        Err(e) => {
+            tracing::warn!(file = %path.display(), error = %format!("{e:#}"), "a conversation store that wouldn't open couldn't be set aside");
+            return (None, None);
+        }
+    };
+    if let Some(st) = open_file(dir, file, upkeep) {
+        tracing::warn!(file = %path.display(), aside = %aside.display(), "a conversation store that wouldn't open is set aside, kept whole; a new one takes its place");
+        return (Some(st), Some(aside));
+    }
+    // Not even a new one: what that began goes, and the one set aside goes back where it was.
+    for s in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(beside(&path, s));
+    }
+    if let Err(e) = move_file(&aside, &path) {
+        tracing::warn!(file = %path.display(), aside = %aside.display(), error = %format!("{e:#}"), "a conversation store set aside couldn't be put back where it was; it stays set aside");
+        return (None, Some(aside));
+    }
+    (None, None)
 }
