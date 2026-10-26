@@ -142,6 +142,11 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
     if file.is_some() != start.is_some() {
         return Err(bad("a comment on code names its `file` and `start_line`"));
     }
+    // A new thread's kind (W26-R11): a question unless it says otherwise.
+    let kind = body.get("kind").and_then(Value::as_str).unwrap_or("question").to_owned();
+    if !matches!(kind.as_str(), "question" | "nit" | "issue" | "blocking") {
+        return Err(bad("`kind` is `question`, `nit`, `issue` or `blocking`"));
+    }
     let (diff_id, me2, said, file_c, side_c) = (d.id.clone(), me.clone(), text.clone(), file.clone(), side.clone());
     let (tid, cid) = hub
         .store
@@ -155,8 +160,8 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
                 None => {
                     let id = crate::util::new_id();
                     c.execute(
-                        "INSERT INTO review_threads (id, diff_id, version, file, side, start_line, end_line, state, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9)",
-                        params![id, diff_id, version, file, side, start, end.or(start), me2, now],
+                        "INSERT INTO review_threads (id, diff_id, version, file, side, start_line, end_line, state, created_by, created_at, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10)",
+                        params![id, diff_id, version, file, side, start, end.or(start), me2, now, kind],
                     )?;
                     id
                 }
@@ -374,6 +379,26 @@ pub async fn readiness(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
     let (_, path) = super::diffs::home(hub, d).await?;
     let (policy, owners) = policy(hub, &path, &d.trunk).await;
     let mut blockers = land::blockers(&policy.land, &owners, &f);
+    // A blocking thread holds landing, and any automatic land, until it's resolved (W26-R11): the
+    // change stays out of the queue until its review clears (W26-R02).
+    let id = d.id.clone();
+    let blocking: Vec<(Option<String>, Option<i64>)> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT t.file, t.start_line FROM review_threads t WHERE t.diff_id = ?1 AND t.state = 'open' AND t.kind = 'blocking' AND EXISTS (SELECT 1 FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1) ORDER BY t.created_at, t.id")?;
+            let rows = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .map_err(fail)?;
+    if !blocking.is_empty() {
+        let at: Vec<String> = blocking.iter().map(|(f, l)| match (f, l) {
+            (Some(f), Some(l)) => format!("{}:{l}", f.rsplit('/').next().unwrap_or(f)),
+            (Some(f), None) => f.clone(),
+            _ => "the conversation".to_string(),
+        }).collect();
+        blockers.push(format!("{} blocking thread{} open ({})", blocking.len(), if blocking.len() == 1 { " is" } else { "s are" }, at.join(", ")));
+    }
     match State::parse(&d.state) {
         Some(State::Draft) => blockers.insert(0, "it's a draft".into()),
         Some(State::Landed) => blockers = vec!["it landed".into()],
