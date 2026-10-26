@@ -11,6 +11,7 @@ import * as React from "react";
 import { flushSync } from "react-dom";
 import { ChevronRight, ChevronsUpDown, FileDiff as FileDiffIcon, FilePlus2 } from "lucide-react";
 import type { FileDiff, Hunk } from "@/api/harness";
+import { AboutCard, AboutContext, offsetAt, selecting, wordAt, type Asked } from "@/components/code/about";
 import { resolveLanguage, useHighlighter, type Highlight, type Tok } from "@/lib/syntax/browser";
 import { cn } from "@/lib/utils";
 import { diffStats } from "./derive";
@@ -421,18 +422,56 @@ function Words({ text, marks, toks }: { text: string; marks?: Span[]; toks?: rea
   );
 }
 
-const Row = React.memo(function Row({ line, toks, sr, split, unfolded, first }: { line: Line; toks?: readonly Tok[]; sr: number; split: boolean; unfolded?: boolean; first?: string }) {
+/** What tapping a line asks about: the name under the finger (none: the whole line), or the change on it. */
+type OnAsk = (line: Line, word: { start: number; end: number } | null, change: boolean) => void;
+
+const Row = React.memo(function Row({
+  line,
+  toks,
+  sr,
+  split,
+  unfolded,
+  first,
+  onAsk,
+  asked,
+}: {
+  line: Line;
+  toks?: readonly Tok[];
+  sr: number;
+  split: boolean;
+  unfolded?: boolean;
+  first?: string;
+  onAsk?: OnAsk;
+  asked?: boolean;
+}) {
   const hang: Vars | undefined = line.hang === 2 ? undefined : { "--hang": line.hang };
+  // In an agent's conversation a line can be asked about (components/code/about.tsx): a name in it, or its number for all of it.
+  const number = onAsk ? () => !selecting() && onAsk(line, null, line.kind !== "ctx") : undefined;
+  const word = onAsk
+    ? (e: React.MouseEvent<HTMLElement>) => {
+        if (selecting()) return;
+        const off = offsetAt(e.currentTarget, e.clientX, e.clientY);
+        onAsk(line, off === null ? null : wordAt(line.text, off), false);
+      }
+    : undefined;
   return (
-    <div className="hx-row" data-kind={line.kind} data-unfolded={unfolded || undefined} data-fold-start={first} tabIndex={first ? -1 : undefined} style={split ? at(sr) : undefined}>
-      <span className="hx-no" data-side="o" aria-hidden="true">
+    <div
+      className="hx-row"
+      data-kind={line.kind}
+      data-unfolded={unfolded || undefined}
+      data-fold-start={first}
+      data-asked={asked || undefined}
+      tabIndex={first ? -1 : undefined}
+      style={split ? at(sr) : undefined}
+    >
+      <span className="hx-no" data-side="o" aria-hidden="true" onClick={number}>
         {line.o ?? ""}
       </span>
-      <span className="hx-no" data-side="n" aria-hidden="true">
+      <span className="hx-no" data-side="n" aria-hidden="true" onClick={number}>
         {line.n ?? ""}
       </span>
       <span className="hx-mk">{SIGN[line.kind]}</span>
-      <code className="hx-code" style={hang}>
+      <code className="hx-code" style={hang} onClick={word}>
         <Words text={line.text} marks={line.marks} toks={toks} />
       </code>
       {split && line.kind === "ctx" && (
@@ -452,6 +491,9 @@ function HunkRows({
   split,
   unfolded,
   onUnfold,
+  onAsk,
+  asking,
+  card,
 }: {
   h: HunkModel;
   hi: number;
@@ -459,6 +501,10 @@ function HunkRows({
   split: boolean;
   unfolded: ReadonlySet<string>;
   onUnfold: (id: string) => void;
+  onAsk?: OnAsk;
+  /** The line a card is open under, and the card. */
+  asking: Line | null;
+  card: React.ReactNode;
 }) {
   const out: React.ReactNode[] = [];
   let sr = 1;
@@ -483,7 +529,10 @@ function HunkRows({
           }
           return;
         }
-        out.push(<Row key={`${si}.${k}`} line={l} toks={toks?.get(l)} sr={sr++} split={split} unfolded={folded} first={folded && k === fold?.head ? id : undefined} />);
+        out.push(
+          <Row key={`${si}.${k}`} line={l} toks={toks?.get(l)} sr={sr++} split={split} unfolded={folded} first={folded && k === fold?.head ? id : undefined} onAsk={onAsk} asked={l === asking} />,
+        );
+        if (l === asking && !split) out.push(<React.Fragment key="about">{card}</React.Fragment>);
       });
       return;
     }
@@ -498,11 +547,24 @@ function HunkRows({
       if (a !== null) rowA[a] = top + k;
       else if (split) fills.push(<span key={`${si}r${k}`} className="hx-fill" data-side="r" style={at(top + k)} />);
     });
-    seg.dels.forEach((l, k) => out.push(<Row key={`${si}d${k}`} line={l} toks={toks?.get(l)} sr={rowD[k] ?? top} split={split} />));
-    seg.adds.forEach((l, k) => out.push(<Row key={`${si}a${k}`} line={l} toks={toks?.get(l)} sr={rowA[k] ?? top} split={split} />));
+    for (const [list, rows, tag] of [
+      [seg.dels, rowD, "d"],
+      [seg.adds, rowA, "a"],
+    ] as const)
+      list.forEach((l, k) => {
+        out.push(<Row key={`${si}${tag}${k}`} line={l} toks={toks?.get(l)} sr={rows[k] ?? top} split={split} onAsk={onAsk} asked={l === asking} />);
+        if (l === asking && !split) out.push(<React.Fragment key="about">{card}</React.Fragment>);
+      });
     out.push(...fills);
     sr += seg.pairs.length;
   });
+  // Side by side, rows hold their places in the grid: the card goes under the hunk's last row.
+  if (split && asking && card)
+    out.push(
+      <div key="about" style={{ gridRow: sr, gridColumn: "1 / -1" }}>
+        {card}
+      </div>,
+    );
   return <div className="hx-hunk">{out}</div>;
 }
 
@@ -558,6 +620,36 @@ export function FileDiffView({
   const top = hunks[0]?.new_start === 1 ? (hunks[0].lines.find((l) => l.startsWith("+") || l.startsWith(" "))?.slice(1) ?? "") : "";
   const hl = useHighlighter(resolveLanguage(language, diff.path, top));
   const toks = React.useMemo(() => (hl && model.hunks.length ? tokensOf(model.hunks, hl) : null), [hl, model.hunks]);
+  // In an agent's conversation, a tapped line opens a card under it (components/code/about.tsx).
+  const about = React.useContext(AboutContext);
+  const [asked, setAsked] = React.useState<{ line: Line; ask: Asked } | null>(null);
+  const onAsk = React.useCallback<OnAsk>(
+    (line, word, change) => {
+      const hunk = model.hunks.find((x) => x.segs.some((sg) => (sg.t === "ctx" ? sg.lines.includes(line) : sg.dels.includes(line) || sg.adds.includes(line))));
+      const flat = (hunk?.segs ?? []).flatMap((sg) => (sg.t === "ctx" ? sg.lines : [...sg.dels, ...sg.adds]));
+      const i = flat.indexOf(line);
+      // The code around it as a diff's lines, so a change reads as one.
+      const code = flat
+        .slice(Math.max(0, i - 10), i + 11)
+        .map((l) => `${l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}${l.text}`)
+        .join("\n");
+      const no = line.n ?? line.o ?? undefined;
+      const selection = word ? line.text.slice(word.start, word.end) : undefined;
+      const file = diff.path.split("/").pop() ?? diff.path;
+      const ask: Asked = {
+        path: diff.path,
+        line: no,
+        selection,
+        change: change || undefined,
+        code,
+        label: change ? "this change" : (selection ?? `line ${no ?? ""}`),
+        where: no ? `${file} · line ${no}` : file,
+      };
+      setAsked((prev) => (prev && prev.line === line && prev.ask.label === ask.label ? null : { line, ask }));
+    },
+    [model.hunks, diff.path],
+  );
+  const card = asked ? <AboutCard key={`${asked.ask.label}@${asked.ask.line ?? ""}`} ask={asked.ask} onClose={() => setAsked(null)} /> : null;
   // Side by side only helps when lines changed on both sides (not in a new file or a pure deletion,
   // whose other column of numbers goes, too).
   const split = layout !== "unified" && !model.only ? (layout === "split" ? "on" : "auto") : undefined;
@@ -598,7 +690,7 @@ export function FileDiffView({
                     <span className="hx-sep-label">{h.where}</span>
                   </div>
                 )}
-                <HunkRows h={h} hi={hi} toks={toks} split={split !== undefined} unfolded={unfolded} onUnfold={unfold} />
+                <HunkRows h={h} hi={hi} toks={toks} split={split !== undefined} unfolded={unfolded} onUnfold={unfold} onAsk={about ? onAsk : undefined} asking={asked?.line ?? null} card={card} />
               </React.Fragment>
             ))
           )}

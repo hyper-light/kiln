@@ -108,6 +108,54 @@ async fn start(cx: Cx, v: Value) -> Out {
     Ok(json!({"agents": infos.iter().map(wait::brief).collect::<Vec<_>>(), "parent": parent}))
 }
 
+/// The four parts an answer about a piece of code comes in (the UI reads them by these headings).
+pub const ABOUT_PARTS: [&str; 4] = ["What it is", "What it does here", "Used elsewhere", "Worth knowing"];
+
+/// What a child is asked about a piece of code a person tapped in a conversation.
+pub fn about_prompt(path: &str, line: Option<u64>, selection: Option<&str>, code: &str, change: bool, question: Option<&str>) -> String {
+    let at = line.map_or_else(|| path.to_owned(), |l| format!("{path}:{l}"));
+    let subject = match (change, selection) {
+        (true, _) => format!("the change at {at}"),
+        (false, Some(s)) => format!("`{s}` at {at}"),
+        (false, None) => format!("line {at}"),
+    };
+    let asked = question.map_or_else(|| "what is this?".to_owned(), |q| format!("{q:?}"));
+    let parts = ABOUT_PARTS.iter().map(|p| format!("## {p}")).collect::<Vec<_>>().join("\n");
+    format!(
+        "A person reading a conversation about this repository tapped {subject} and asked: {asked}\n\nThe code there:\n```\n{code}\n```\n\nAnswer them in these four parts, each under its heading, briefly:\n{parts}\n\nUnder \"Used elsewhere\", each other place it's used, found by searching the repository, as `path:line` and that line. Read and search only: change nothing, and don't ask anything back."
+    )
+}
+
+/// What a person asks about a piece of code in an agent's conversation (a name, a line, a change):
+/// a child of the agent answers, reading the repository and changing nothing; when the agent runs
+/// no subagents, the agent itself, after its turn or (`now`) between its steps.
+async fn about(cx: Cx, v: Value) -> Out {
+    let id = agent_of(&v)?;
+    let info = known(&cx, &id)?;
+    lineage::may_message(&cx.hub, &cx.caller, &info.id).await?;
+    let path = text(&v, "path")?;
+    let code = text(&v, "code")?;
+    let opt = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let selection = opt("selection");
+    let prompt = about_prompt(&path, v.get("line").and_then(Value::as_u64), selection, &code, v.get("change").and_then(Value::as_bool).unwrap_or(false), opt("question"));
+    if info.max_subagents == Some(0) {
+        let mode = if v.get("now").and_then(Value::as_bool).unwrap_or(false) { "steer" } else { "queue" };
+        let sent = send(cx.clone(), json!({"agent": info.id, "text": prompt, "mode": mode})).await?;
+        return Ok(json!({"agents": [], "itself": true, "sent": sent}));
+    }
+    let by = Starter { parent: Some(info.clone()), opener: cx.caller.opener(), actor: cx.caller.name.clone(), plan_run: None, asker: Some(cx.caller.clone()) };
+    // Read-only, in the harnesses that have such a mode; the others start within what the agent has.
+    let mode = match info.kind.as_str() {
+        "claude" => Some("plan".to_owned()),
+        "codex" => Some("read-only".to_owned()),
+        _ => None,
+    };
+    let name = format!("About {}", selection.unwrap_or(&path).chars().take(48).collect::<String>());
+    let ask = Ask { kind: info.kind.clone(), prompt: Some(prompt), mode, name: Some(name), ..Ask::default() };
+    let infos = lineage::start(&cx.hub, &by, ask).await?;
+    Ok(json!({"agents": infos.iter().map(wait::brief).collect::<Vec<_>>(), "itself": false}))
+}
+
 async fn send(cx: Cx, v: Value) -> Out {
     let id = agent_of(&v)?;
     let body = text(&v, "text")?;
@@ -536,6 +584,29 @@ pub fn list_ops() -> Vec<Op> {
             run: |cx, v| Box::pin(start(cx, v)),
         },
         Op {
+            name: "agents.about",
+            summary: "Ask about a piece of code in an agent's conversation: a name, a line, or a change it made (`path`, `line`, `selection`, the `code` around it, `change`, and a `question` if not \"what is this?\"). A child of the agent answers in four parts (what it is, what it does here, where else it's used, what's worth knowing), reading the repository and changing nothing. When the agent runs no subagents (`max_subagents` 0) it answers itself: after its turn, or with `now` between its steps.",
+            read_only: false,
+            destructive: false,
+            input: || {
+                schema(
+                    json!({
+                        "agent": {"type": "string", "description": AGENT},
+                        "path": {"type": "string", "description": "The file the code is in."},
+                        "line": {"type": "integer", "description": "Its line there."},
+                        "selection": {"type": "string", "description": "The name tapped; none: the whole line."},
+                        "code": {"type": "string", "description": "The code around it."},
+                        "change": {"type": "boolean", "description": "It's about the change on that line."},
+                        "question": {"type": "string"},
+                        "now": {"type": "boolean", "description": "An agent answering itself does between its steps."}
+                    }),
+                    &["agent", "path", "code"],
+                )
+            },
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "about"]))),
+            run: |cx, v| Box::pin(about(cx, v)),
+        },
+        Op {
             name: "agents.send",
             summary: "Send an agent a message. To an agent you started (and theirs): `queue` (after its turn, the default), `steer` (into the turn under way) or `now` (stopping it). To any other agent that works for the same person: `queue` only, and it's told the message is from you and how to answer you. Give a `key` to send it safely again: a call with the same key is the same message, which the agent gets once, and every such call is answered as the first was.",
             read_only: false,
@@ -673,6 +744,19 @@ pub fn list_ops() -> Vec<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn about_asks_what_was_tapped_in_the_four_parts_the_card_reads() {
+        let name = about_prompt("crates/kiln/src/http/client.rs", Some(48), Some("next"), "let wait = backoff.next(now);", false, None);
+        assert!(name.contains("`next` at crates/kiln/src/http/client.rs:48") && name.contains("what is this?") && name.contains("backoff.next(now)"), "{name}");
+        for part in ABOUT_PARTS {
+            assert!(name.contains(&format!("## {part}")), "{part}: {name}");
+        }
+        assert!(name.contains("change nothing"), "{name}");
+        let change = about_prompt("a.rs", Some(3), Some("x"), "-a\n+b", true, Some("why this?"));
+        assert!(change.contains("the change at a.rs:3") && change.contains("\"why this?\""), "{change}");
+        assert!(about_prompt("a.rs", None, None, "x", false, None).contains("line a.rs"));
+    }
 
     #[test]
     fn no_operation_answers_for_a_person() {
