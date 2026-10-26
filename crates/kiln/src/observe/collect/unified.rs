@@ -131,10 +131,11 @@ impl Seen {
 
 /// This boot's id, as `log show` names its events' (`kern.bootsessionuuid`): `log stream` leaves
 /// theirs empty (macOS 26), so an event both read is known as one. Empty where it can't be asked.
+/// `sysctl` by its path: a service's PATH (launchd's, the tests' fleet's) has no `/usr/sbin`.
 fn this_boot() -> &'static str {
     static BOOT: OnceLock<String> = OnceLock::new();
     BOOT.get_or_init(|| {
-        let out = Command::new("sysctl").args(["-n", "kern.bootsessionuuid"]).output();
+        let out = Command::new("/usr/sbin/sysctl").args(["-n", "kern.bootsessionuuid"]).output();
         out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default()
     })
 }
