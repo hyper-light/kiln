@@ -869,7 +869,8 @@ impl Member {
         let liveness = Liveness::new(LiveSettings {
             local: settings.id,
             run,
-            max_peers: settings.peers.len(),
+            // A group of one watches no peer; the stream takes room for one it never uses.
+            max_peers: settings.peers.len().max(1),
             history: Exposure::new(),
             // The monotonic clock's resolution as the system reports it (`clock_getres`).
             resolution: Duration::from_nanos(hyper_rt::machine::clock::resolution_ns()),

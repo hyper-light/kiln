@@ -1,0 +1,17 @@
+Subject: A member's liveness stream takes room for one peer, so a group of one opens
+Why: Quiver's persisted class runs on one node as a group of one (kiln's CP-T2.2 step 4): hyper-liveness refuses a stream of no peers, and hyper-raft elects a sole voter on its own vote
+
+diff --git a/crates/focal-bus/src/member.rs b/crates/focal-bus/src/member.rs
+index c39b36df6a441e0746551137cd97f385a354c4d0..4e8fb255b0b99aeaff64913f4d738e9bcbf0e979 100644
+--- a/crates/focal-bus/src/member.rs
++++ b/crates/focal-bus/src/member.rs
+@@ -869,7 +869,8 @@ impl Member {
+         let liveness = Liveness::new(LiveSettings {
+             local: settings.id,
+             run,
+-            max_peers: settings.peers.len(),
++            // A group of one watches no peer; the stream takes room for one it never uses.
++            max_peers: settings.peers.len().max(1),
+             history: Exposure::new(),
+             // The monotonic clock's resolution as the system reports it (`clock_getres`).
+             resolution: Duration::from_nanos(hyper_rt::machine::clock::resolution_ns()),

@@ -2,8 +2,11 @@
 //! server's process, behind kiln-seams' [`Bus`]. Quiver keeps each topic's messages in memory (the
 //! ephemeral class, Focal's doc 33), each a Focal batch charged to one memory budget (`[bus]
 //! memory`), and a reader behind what a topic keeps is refused `Behind`, never skipped silently.
-//! The live feed of every session rides it (`crate::harness::live`). Classes other than ephemeral
-//! are refused, typed, until their goals land (CP-T2.2 on).
+//! The live feed of every session rides it (`crate::harness::live`). Opened as a node of a
+//! cluster ([`QuiverBus::open_persisted`]), it serves the persisted class too (CP-T2.2): each topic
+//! a part of Focal's replicated by the cluster's nodes, a publish acknowledged once a majority's
+//! disks hold it; on one server, a group of one, durable on its disk. Other classes are refused,
+//! typed, until their goals land.
 
 use std::sync::Arc;
 
@@ -49,6 +52,16 @@ pub struct QuiverBus {
 impl QuiverBus {
     /// The node `cfg` says, stamping messages by `clock`.
     pub fn open(cfg: &Config, clock: Arc<dyn kiln_seams::Clock>) -> anyhow::Result<Self> {
+        Self::open_with(cfg, clock, None)
+    }
+
+    /// The node `cfg` says as node `persisted.id` of the cluster `persisted` names, serving the
+    /// persisted class too, stamping messages by `clock`.
+    pub fn open_persisted(cfg: &Config, persisted: quiver::PersistedConfig, clock: Arc<dyn kiln_seams::Clock>) -> anyhow::Result<Self> {
+        Self::open_with(cfg, clock, Some(persisted))
+    }
+
+    fn open_with(cfg: &Config, clock: Arc<dyn kiln_seams::Clock>, persisted: Option<quiver::PersistedConfig>) -> anyhow::Result<Self> {
         let memory = usize::try_from(cfg.memory).map_err(|_| anyhow::anyhow!("[bus] memory: {} bytes is more than this machine addresses", cfg.memory))?;
         anyhow::ensure!(
             cfg.topic_bytes >= 1 && cfg.topic_bytes <= quiver_api::RETAIN_BYTES_MAX,
@@ -57,7 +70,7 @@ impl QuiverBus {
             quiver_api::RETAIN_BYTES_MAX
         );
         let stamp: quiver::Clock = Arc::new(move || u64::try_from(clock.unix_ms()).unwrap_or(0).saturating_mul(1000));
-        let node = quiver::Node::with_clock(quiver::NodeConfig { memory, topics: TOPICS, subscriptions: SUBSCRIPTIONS }, stamp).map_err(|e| anyhow::anyhow!("[bus]: {e}"))?;
+        let node = quiver::Node::with(quiver::NodeConfig { memory, topics: TOPICS, subscriptions: SUBSCRIPTIONS }, stamp, persisted).map_err(|e| anyhow::anyhow!("[bus]: {e}"))?;
         Ok(Self { node, topic_bytes: cfg.topic_bytes })
     }
 
@@ -99,6 +112,7 @@ fn refusal(r: quiver_api::Refusal) -> Refusal {
         quiver_api::Refusal::Behind { asked, first } => Refusal::Behind { asked, first },
         quiver_api::Refusal::Unsupported(c) => Refusal::Unavailable(format!("Quiver doesn't serve the {} class yet", c.name())),
         quiver_api::Refusal::Unavailable(why) => Refusal::Unavailable(why),
+        quiver_api::Refusal::NoQuorum(why) => Refusal::Unavailable(format!("no quorum: {why}")),
     }
 }
 
@@ -181,10 +195,72 @@ mod tests {
         Ok(())
     }
 
-    /// A class Quiver doesn't serve yet is refused, typed, and makes no topic.
+    struct PersistedFixture(QuiverBus, tempfile::TempDir);
+
+    impl BusFixture for PersistedFixture {
+        fn bus(&self) -> &dyn Bus {
+            &self.0
+        }
+
+        fn class(&self) -> Class {
+            Class::Persisted
+        }
+    }
+
+    /// Quiver's node as kiln on one server runs the persisted class: a cluster of one, its data in
+    /// `dir`, its catalog caught up with itself.
+    fn persisted(clock: &SimClock, dir: &std::path::Path) -> anyhow::Result<QuiverBus> {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?.port();
+        let cluster = quiver::PersistedConfig {
+            id: 1,
+            nodes: vec![(1, std::net::SocketAddr::from(([127, 0, 0, 1], port)))],
+            data: dir.join("bus"),
+            identities: dir.join("identities"),
+            part_memory: quiver::PersistedConfig::PART_MEMORY_MIN,
+            topics: 16,
+            publishes: 1024,
+            quorum_wait: Duration::from_secs(10),
+        };
+        let bus = QuiverBus::open_persisted(&Config::default(), cluster, Arc::new(clock.clone()))?;
+        let began = std::time::Instant::now();
+        while !bus.node.persisted_stats().is_some_and(|s| s.settled) {
+            anyhow::ensure!(began.elapsed() < Duration::from_secs(60), "the bus never caught up with its catalog");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        Ok(bus)
+    }
+
+    /// CP-T2.2 step 4: do the seam's every clause (BUS-1 to BUS-11) against Quiver's persisted
+    /// class on one server (a group of one, durable on its disk), a fresh node a clause, expect
+    /// every one to pass.
+    #[test]
+    fn cp_t2_2_quivers_persisted_class_passes_the_bus_suite_on_one_server() -> anyhow::Result<()> {
+        let (passed, failed) = crate::rt::block_on(async {
+            let (mut passed, mut failed) = (Vec::new(), Vec::new());
+            for case in cases::<PersistedFixture>() {
+                let dir = tempfile::tempdir()?;
+                let fixture = PersistedFixture(persisted(&SimClock::new(), dir.path())?, dir);
+                match crate::rt::timeout(Duration::from_secs(60), (case.check)(&fixture)).await {
+                    Ok(Ok(())) => passed.push(case.id),
+                    Ok(Err(why)) => failed.push(format!("{}: {why}", case.id)),
+                    Err(_) => failed.push(format!("{}: it didn't end in a minute", case.id)),
+                }
+            }
+            Ok((passed, failed))
+        })?;
+        assert!(failed.is_empty(), "{failed:#?}");
+        assert_eq!(passed.len(), cases::<PersistedFixture>().len());
+        Ok(())
+    }
+
+    /// A class Quiver doesn't serve yet is refused, typed, and makes no topic: the replicated
+    /// class, and the persisted class on a node of no cluster.
     #[test]
     fn a_class_quiver_doesnt_serve_yet_is_refused_typed() -> anyhow::Result<()> {
         let bus = quiver(&SimClock::new())?;
+        let replicated = Topic { class: Class::Replicated, retain: 10 };
+        let refused = futures::executor::block_on(bus.create("ci/events", replicated));
+        assert!(matches!(&refused, Err(Refusal::Unavailable(why)) if why.contains("replicated")), "{refused:?}");
         let persisted = Topic { class: Class::Persisted, retain: 10 };
         let refused = futures::executor::block_on(bus.create("ci/events", persisted));
         assert!(matches!(&refused, Err(Refusal::Unavailable(why)) if why.contains("persisted")), "{refused:?}");

@@ -2,9 +2,11 @@
 //! messages take charged to one memory budget (Focal's `focal_memory`), and as many topics and
 //! subscriptions as it states. It serves [`quiver_api::Topics`].
 //!
-//! It serves the ephemeral class (`crate::ephemeral`). The replicated and persisted classes come
-//! with Focal's replicated part (kiln's CP-T2.2), the windowed with CP-T2.4: until then a topic of
-//! those classes is refused [`Refusal::Unsupported`], never kept as another class.
+//! It serves the ephemeral class (`crate::ephemeral`), and, started with a cluster's configuration
+//! ([`Node::with_persisted`]), the persisted class (`crate::persisted`, kiln's CP-T2.2): each topic
+//! a part of Focal's replicated by the cluster's nodes, read from what its group committed. The
+//! replicated class comes with CP-T2.3, the windowed with CP-T2.4: until then a topic of those
+//! classes is refused [`Refusal::Unsupported`], never kept as another class.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -17,7 +19,8 @@ use quiver_api::{
     Batch, Class, Offset, Refusal, Start, Subscription, Topic, Topics, check_name, check_topic,
 };
 
-use crate::ephemeral::Log;
+use crate::ephemeral::{Log, record_into};
+use crate::persisted::{Persisted, PersistedConfig, PersistedStats};
 
 /// What a node holds at most.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +86,8 @@ struct Inner {
     /// Subscriptions live.
     live: Arc<AtomicUsize>,
     clock: Clock,
+    /// The persisted class's host, for a node of a cluster.
+    persisted: Option<Persisted>,
 }
 
 impl Node {
@@ -93,6 +98,23 @@ impl Node {
 
     /// A node of `config`, stamping messages by `clock`.
     pub fn with_clock(config: NodeConfig, clock: Clock) -> Result<Self, Refusal> {
+        Self::with(config, clock, None)
+    }
+
+    /// A node of `config` that serves the persisted class too, as node `persisted.id` of the
+    /// cluster `persisted` names: answers once its catalog is open (its topics come as the
+    /// catalog's group commits them), stamping messages by the system's wall clock.
+    pub fn with_persisted(config: NodeConfig, persisted: PersistedConfig) -> Result<Self, Refusal> {
+        Self::with(config, wall_clock(), Some(persisted))
+    }
+
+    /// A node of `config`, stamping messages by `clock`, serving the persisted class too as a
+    /// node of the cluster `persisted` names, if it names one.
+    pub fn with(
+        config: NodeConfig,
+        clock: Clock,
+        persisted: Option<PersistedConfig>,
+    ) -> Result<Self, Refusal> {
         if config.memory < NodeConfig::MEMORY_MIN {
             return Err(Refusal::Invalid {
                 what: "a node's memory",
@@ -113,6 +135,9 @@ impl Node {
             what: "a node's memory",
             why: e.to_string(),
         })?;
+        let persisted = persisted
+            .map(|p| Persisted::start(p, budget.clone(), Arc::clone(&clock)))
+            .transpose()?;
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
@@ -121,8 +146,23 @@ impl Node {
                 streams: AtomicU64::new(1),
                 live: Arc::new(AtomicUsize::new(0)),
                 clock,
+                persisted,
             }),
         })
+    }
+
+    /// The persisted class's figures, for a node of a cluster.
+    #[must_use]
+    pub fn persisted_stats(&self) -> Option<PersistedStats> {
+        self.inner.persisted.as_ref().map(Persisted::stats)
+    }
+
+    /// Stops the persisted class's host at once, as a crash would (a test's kill, in process):
+    /// its data is as a kill left it, and every request of the class is refused from then on.
+    pub fn halt_persisted(&self) {
+        if let Some(persisted) = &self.inner.persisted {
+            persisted.halt();
+        }
     }
 
     /// What it holds at most.
@@ -156,14 +196,68 @@ impl Node {
         }
     }
 
+    /// The ephemeral topic `name`, else the view of the persisted topic `name`.
     fn log(&self, name: &str) -> Result<Arc<Log>, Refusal> {
+        if let Some(log) = self.ephemeral(name) {
+            return Ok(log);
+        }
+        match &self.inner.persisted {
+            Some(persisted) => persisted.view(name),
+            None => Err(Refusal::NoTopic(name.to_owned())),
+        }
+    }
+
+    fn ephemeral(&self, name: &str) -> Option<Arc<Log>> {
         self.inner
             .topics
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(name)
             .cloned()
-            .ok_or_else(|| Refusal::NoTopic(name.to_owned()))
+    }
+
+    async fn create_persisted(&self, name: &str, topic: Topic) -> Result<(), Refusal> {
+        check_name(name)?;
+        check_topic(&topic)?;
+        let Some(persisted) = &self.inner.persisted else {
+            return Err(Refusal::Unsupported(topic.class));
+        };
+        if self.ephemeral(name).is_some() {
+            return Err(Refusal::Exists(name.to_owned()));
+        }
+        persisted.create(name, topic).await
+    }
+
+    async fn delete_any(&self, name: &str) -> Result<(), Refusal> {
+        if self.ephemeral(name).is_some() {
+            return self.delete_now(name);
+        }
+        match &self.inner.persisted {
+            Some(persisted) => persisted.delete(name).await,
+            None => Err(Refusal::NoTopic(name.to_owned())),
+        }
+    }
+
+    async fn publish_any(
+        &self,
+        name: &str,
+        key: Option<&[u8]>,
+        payload: &[u8],
+    ) -> Result<Offset, Refusal> {
+        let now_us = (self.inner.clock)();
+        if let Some(log) = self.ephemeral(name) {
+            return log.publish(name, key, payload, now_us);
+        }
+        let persisted = self
+            .inner
+            .persisted
+            .as_ref()
+            .ok_or_else(|| Refusal::NoTopic(name.to_owned()))?;
+        let view = persisted.view(name)?;
+        quiver_api::check_message(&view.topic, key, payload)?;
+        let mut record = Vec::new();
+        record_into(&mut record, key, payload);
+        persisted.publish(name, record, now_us).await
     }
 
     fn create_now(&self, name: &str, topic: Topic) -> Result<(), Refusal> {
@@ -171,6 +265,14 @@ impl Node {
         check_topic(&topic)?;
         if topic.class != Class::Ephemeral {
             return Err(Refusal::Unsupported(topic.class));
+        }
+        if self
+            .inner
+            .persisted
+            .as_ref()
+            .is_some_and(|p| p.view(name).is_ok())
+        {
+            return Err(Refusal::Exists(name.to_owned()));
         }
         let mut topics = self
             .inner
@@ -235,13 +337,15 @@ impl Node {
 
 impl Topics for Node {
     fn create<'a>(&'a self, name: &'a str, topic: Topic) -> BoxFuture<'a, Result<(), Refusal>> {
+        if topic.class == Class::Persisted {
+            return Box::pin(self.create_persisted(name, topic));
+        }
         let out = self.create_now(name, topic);
         Box::pin(async move { out })
     }
 
     fn delete<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), Refusal>> {
-        let out = self.delete_now(name);
-        Box::pin(async move { out })
+        Box::pin(self.delete_any(name))
     }
 
     fn publish<'a>(
@@ -250,10 +354,7 @@ impl Topics for Node {
         key: Option<&'a [u8]>,
         payload: &'a [u8],
     ) -> BoxFuture<'a, Result<Offset, Refusal>> {
-        let out = self
-            .log(name)
-            .and_then(|log| log.publish(name, key, payload, (self.inner.clock)()));
-        Box::pin(async move { out })
+        Box::pin(self.publish_any(name, key, payload))
     }
 
     fn read<'a>(

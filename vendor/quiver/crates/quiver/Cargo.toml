@@ -18,6 +18,14 @@ path = "src/main.rs"
 # newer compatible version there would be chosen over the [patch] (the root Cargo.toml).
 focal-bus = "=0.1.0"
 focal-memory = "=0.1.0"
+# The files a persisted node keeps beside its logs (its run, each part's port), made durable as
+# Focal makes every file it installs.
+focal-platform = "=0.1.0"
+# The persisted class's host (src/persisted): its shard, and the endpoints its members and
+# publishers run on, as Focal's bus runs them.
+hyper-rt = "=0.1.0"
+hyper-rt-transport = "=0.1.0"
+hyper-transport = "=0.1.0"
 futures = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }
 quiver-api = { version = "0.1.0", path = "../quiver-api" }
 

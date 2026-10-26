@@ -109,12 +109,15 @@ Topics of messages, in order, read from any offset kept, each topic of a durabil
 (Focal's doc 33: ephemeral, replicated, persisted, windowed).
 
 - **Implementations:** Quiver (CP-T2.1, `kiln::bus`: the vendored `quiver` node, on Focal's bus,
-  in the server's process; it serves the ephemeral class and refuses the others, typed, until
-  their goals land); `kiln_seams::bus::SimBus`: in memory (ephemeral, whatever class is asked),
-  messages stamped by its clock, 10,000 topics.
+  in the server's process; it serves the ephemeral class, and opened as a node of a cluster the
+  persisted class (CP-T2.2: each topic a part of Focal's replicated by the cluster's nodes, a
+  group of one on one server, its payloads 1,102 bytes under the limit), and refuses the others,
+  typed, until their goals land); `kiln_seams::bus::SimBus`: in memory (ephemeral, whatever class
+  is asked), messages stamped by its clock, 10,000 topics.
 - **Used by:** the UI's live feed of session events (CP-T2.1, docs/bus.md), then CI and CD
   events, webhooks and sends.
-- **Passed by:** the simulator and Quiver, every clause.
+- **Passed by:** the simulator and Quiver, every clause; Quiver for its ephemeral and persisted
+  classes alike (a fixture names the class its cases' topics take).
 - **Bounds:** topic names 1 to 128 of `A-Z a-z 0-9 _ - . /`; payloads to 1 MiB, keys to 1024
   bytes; 1000 messages a read; a topic retains 1 to a million messages.
 

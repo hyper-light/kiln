@@ -99,6 +99,9 @@ fn the_bounds_are_the_codes() {
     assert!(doc.contains("keys to 1024 bytes"));
     assert_eq!(quiver_api::PAYLOAD_MAX, 1 << 20);
     assert!(doc.contains("payloads to 1 MiB"));
+    assert_eq!(quiver_api::BATCH_FRAMING_MAX, 1102);
+    assert_eq!(quiver_api::Class::Persisted.payload_max(), (1 << 20) - 1102);
+    assert!(doc.contains("1 MiB less 1,102 bytes"));
     assert_eq!(quiver_api::READ_MAX, 1000);
     assert!(doc.contains("1000 messages a read"));
     assert_eq!(quiver_api::RETAIN_MESSAGES_MAX, 1_000_000);

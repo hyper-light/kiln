@@ -1288,9 +1288,13 @@ dependencies = [
  "event-listener",
  "focal-bus",
  "focal-memory",
+ "focal-platform",
  "futures",
  "hyper-block",
  "hyper-durable",
+ "hyper-rt",
+ "hyper-rt-transport",
+ "hyper-transport",
  "quiver-api",
  "trybuild",
 ]

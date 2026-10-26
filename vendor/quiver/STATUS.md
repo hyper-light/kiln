@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-10-23. A piece is done when its tests pass in the gate (`scripts/gates.sh`: Linux, with the
+Updated 2026-10-25. A piece is done when its tests pass in the gate (`scripts/gates.sh`: Linux, with the
 macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
@@ -28,6 +28,17 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   main.
 - **GroupStore mandated** (CP-T2.1, T-T2.1.2): hyper-durable's `RamStore` is for tests alone, and a
   build that names it outside one fails (`crates/quiver/tests/ram_store.rs`).
+- **The persisted class** (CP-T2.2 step 4, `docs/design/persisted.md`, `crates/quiver/src/persisted/`):
+  each topic a part of Focal's replicated by every node of the cluster (a group of one on one
+  node), a publish acknowledged once a majority's disks hold it and the publishing node applied
+  it; the cluster's topics in a catalog every node replicates; reads, waits and subscriptions from
+  each node's view of what its member applied; `NoQuorum` for a publish no leader could be found
+  for, Focal's redirects followed, nothing appended twice (the part's sessions). It passes the
+  suite on one node and on three (`crates/quiver/tests/persisted.rs`), and every acknowledged
+  publish survives a kill of the leader, a follower or the publisher's own node at every frame
+  its logs write, three nodes in one process and three processes killed with SIGKILL
+  (`tests/persisted_kill.rs`, `tests/persisted_processes.rs`, the `quiver-drill` binary). One
+  change to Focal's copy, a group of one opens (`vendor/focal-bus/UPSTREAM.md`).
 - **The `quiver` binary** says what it is (`quiver --version`, `quiver --help`), and nothing more yet.
 - **The bench** (`crates/quiver-bench`, `bench/README.md`): the ephemeral class's fan-out and soak,
   and the comparison, class for class, with NATS core, Redis Pub/Sub and Kafka on the same machine
@@ -46,10 +57,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   12 loads, all but one subscriber at 100,000 a second polling or waiting at either rate, and 100
   subscribers waiting at 10,000. The hour's soak on adacachy lost no frame (AC-T2.1.4): 360 billion
   deliveries to 1,000 subscribers that all kept up (`bench/records/2026-10-23-adacachy-soak/`).
-- **CP-T2.2**: The persisted class's 1.4 s tail fixed at its cause (a disk stall never costs leadership), cheaper elections, and kiln's CI and deploy events on the persisted class, on Focal's replicated part.
+- **CP-T2.2**: The persisted class's 1.4 s tail fixed at its cause (a disk stall never costs leadership), cheaper elections (a leader killed -9 costs about 2 s without one today, the liveness stream's suspicion and an election), and kiln's CI and deploy events on the persisted class.
 - **CP-T2.3**: Typed acknowledgements stating the fate reached and its loss bound.
 
 ## Open
+
+- **The catalog's snapshot**: the persisted class's catalog keeps what its part's window holds (some
+  hundreds of thousands of its records at the least part memory); a node that finds records it
+  never applied let go stops, saying so. Snapshotting it, or the catalog proper in Amphora, is
+  CP-T2.5's.
 
 - **Memory across topics**: a publish the node's memory can't take lets go only its own topic's
   oldest messages, never another topic's (`docs/design/focal-bus.md`); which topic gives way when

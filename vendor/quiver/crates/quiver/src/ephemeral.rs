@@ -74,15 +74,8 @@ impl Stored {
         size: u64,
     ) -> Result<Self, Refusal> {
         let key_len = key.map_or(0, <[u8]>::len);
-        let head = key.map_or(0, |k| {
-            u64::try_from(k.len()).unwrap_or(u64::MAX).saturating_add(1)
-        });
         let Scratch { record, builder } = scratch;
-        record.clear();
-        push_varint(record, head);
-        let head_len = record.len();
-        record.extend_from_slice(key.unwrap_or_default());
-        record.extend_from_slice(payload);
+        let head_len = record_into(record, key, payload);
         builder.begin(&Producing {
             stream,
             producer: 0,
@@ -164,6 +157,42 @@ fn framing(why: &str) -> Refusal {
         what: "a message's framing",
         why: why.to_owned(),
     }
+}
+
+/// Frames `key` and `payload` as Quiver's record into `out` (emptied first): the key's length plus
+/// one as a LEB128 (0: no key), the key, then the payload. Returns the head's length.
+pub(crate) fn record_into(out: &mut Vec<u8>, key: Option<&[u8]>, payload: &[u8]) -> usize {
+    let head = key.map_or(0, |k| {
+        u64::try_from(k.len()).unwrap_or(u64::MAX).saturating_add(1)
+    });
+    out.clear();
+    push_varint(out, head);
+    let head_len = out.len();
+    out.extend_from_slice(key.unwrap_or_default());
+    out.extend_from_slice(payload);
+    head_len
+}
+
+/// The key and payload of Quiver's record ([`record_into`]); `None` for bytes that aren't one.
+pub(crate) fn parse_record(record: &[u8]) -> Option<(Option<&[u8]>, &[u8])> {
+    let mut head: u64 = 0;
+    let mut at = 0_usize;
+    for shift in (0..VARINT_MAX).map(|i| i.saturating_mul(7)) {
+        let byte = *record.get(at)?;
+        at = at.checked_add(1)?;
+        head |= u64::from(byte & 0x7f).checked_shl(u32::try_from(shift).ok()?)?;
+        if byte & 0x80 == 0 {
+            let rest = record.get(at..)?;
+            return match head.checked_sub(1) {
+                None => Some((None, rest)),
+                Some(len) => {
+                    let len = usize::try_from(len).ok()?;
+                    Some((Some(rest.get(..len)?), rest.get(len..)?))
+                }
+            };
+        }
+    }
+    None
 }
 
 fn push_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -352,12 +381,23 @@ fn no_segment() -> Refusal {
 
 impl Log {
     pub(crate) fn new(topic: Topic, stream: u64, budget: MemoryBudget) -> Self {
+        Self::starting_at(topic, stream, budget, 0)
+    }
+
+    /// A topic whose first message takes offset `base`: a persisted topic's view of what its group
+    /// committed, from the oldest its part keeps (`crate::persisted`).
+    pub(crate) fn starting_at(
+        topic: Topic,
+        stream: u64,
+        budget: MemoryBudget,
+        base: Offset,
+    ) -> Self {
         let tail = Tail {
-            segments: VecDeque::from([Arc::new(Segment::new(0))]),
+            segments: VecDeque::from([Arc::new(Segment::new(base))]),
             filled: 0,
             filled_bytes: 0,
-            first: 0,
-            end: 0,
+            first: base,
+            end: base,
             bytes: 0,
             last_at_us: 0,
             scratch: Scratch::default(),
@@ -366,7 +406,7 @@ impl Log {
             topic,
             stream,
             tail: Mutex::new(tail),
-            end: AtomicU64::new(0),
+            end: AtomicU64::new(base),
             bell: Bell::new(),
             closed: AtomicBool::new(false),
             budget,
@@ -550,6 +590,35 @@ impl Log {
             t.bytes = 0;
         }
         true
+    }
+
+    /// Lets go of everything kept and takes the next message at `offset`, past the end: a
+    /// persisted topic's view whose part kept nothing below `offset` (its group's leader gave it an
+    /// image past what it had applied). Its readers are told what they missed. Nothing changes at
+    /// or before the end.
+    pub(crate) fn skip_to(&self, offset: Offset) {
+        {
+            let mut t = lock(&self.tail);
+            if offset <= t.end {
+                return;
+            }
+            let fresh = Arc::new(Segment::new(offset));
+            for gone in &t.segments {
+                gone.kept_from.store(offset, Ordering::Release);
+            }
+            if let Some(last) = t.segments.back() {
+                let _ = last.next.set(Arc::downgrade(&fresh));
+            }
+            t.segments.clear();
+            t.segments.push_back(fresh);
+            t.filled = 0;
+            t.filled_bytes = 0;
+            t.first = offset;
+            t.end = offset;
+            t.bytes = 0;
+            self.end.store(offset, Ordering::Release);
+        }
+        self.bell.ring();
     }
 
     /// Closes the topic: its subscriptions take the end, its waits are refused, and its segments

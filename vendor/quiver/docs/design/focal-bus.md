@@ -66,8 +66,8 @@ on the bus's format and budget:
   for no reader.
 
 The replicated and persisted classes are Focal's replicated part (`focal_bus::member`, `group`):
-CP-T2.2 builds on it, and until then a topic of those classes is refused `Unsupported`, never kept
-as ephemeral.
+CP-T2.2 built the persisted class on it (`persisted.md`), and a topic of the replicated class is
+refused `Unsupported` until CP-T2.3, never kept as another class.
 
 **Evidence and what would falsify it.** The conformance suite (`quiver-api`, QUIVER-1 to 19) and
 the stalled-subscriber test (`crates/quiver/tests/stalled.rs`: one stalled among 100) hold the

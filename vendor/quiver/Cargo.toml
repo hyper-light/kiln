@@ -49,6 +49,7 @@ exit = "deny"
 [patch.crates-io]
 focal-bus = { path = "vendor/focal-bus/crates/focal-bus" }
 focal-memory = { path = "vendor/focal-bus/crates/focal-memory" }
+focal-platform = { path = "vendor/focal-bus/crates/focal-platform" }
 hyper-block = { path = "vendor/hyper-raft/crates/hyper-block" }
 hyper-durable = { path = "vendor/hyper-raft/crates/hyper-durable" }
 hyper-liveness = { path = "vendor/hyper-raft/crates/hyper-liveness" }
