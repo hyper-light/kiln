@@ -301,6 +301,39 @@ fn typical(trace: &Trace) -> BTreeMap<(String, String), i64> {
         .collect()
 }
 
+/// The failures each change only inherited (W28-AC33). The week's pushes went straight to main,
+/// so once one broke a job every push after it failed that job too until a fix landed: of the 95
+/// pushes with a failing job, 72 failed only where the last push to finish that job before them
+/// had failed it at the same step. A land queue keeps the trunk green, so such a change fails only
+/// on a stack that still holds the change that started the streak, and passes without it; the
+/// streak's first failure is its change's own. By job, the streak's first change, for each failure
+/// only inherited.
+fn culprits(items: &[Item], draws: &[Vec<super::draw::Draw>]) -> Vec<Vec<Option<usize>>> {
+    let mut streak: BTreeMap<String, (usize, Option<String>)> = BTreeMap::new();
+    let mut out = Vec::with_capacity(items.len());
+    for (i, it) in items.iter().enumerate() {
+        let mut row = Vec::with_capacity(it.check.len());
+        for (j, sp) in it.check.iter().enumerate() {
+            match draws.get(it.run).and_then(|r| r.get(j)) {
+                Some(d) if !d.end.passed() => {
+                    let from = streak.get(&sp.key).filter(|(_, step)| step.is_none() || d.failed_step.is_none() || *step == d.failed_step).map(|(u, _)| *u);
+                    if from.is_none() {
+                        streak.insert(sp.key.clone(), (i, d.failed_step.clone()));
+                    }
+                    row.push(from);
+                }
+                Some(_) => {
+                    streak.remove(&sp.key);
+                    row.push(None);
+                }
+                None => row.push(None),
+            }
+        }
+        out.push(row);
+    }
+    out
+}
+
 /// The changes: ci's pushes to main, in the order they enqueued. A change affects the input
 /// classes whose keys its commit changed from the previous push's (all of them, for the first).
 fn items(trace: &Trace, typical: &BTreeMap<(String, String), i64>) -> Vec<Item> {
@@ -342,6 +375,8 @@ fn items(trace: &Trace, typical: &BTreeMap<(String, String), i64>) -> Vec<Item> 
 pub fn replay(trace: &Trace, policy: &LandPolicy, seed: u64) -> LandOut {
     let typical = typical(trace);
     let items = items(trace, &typical);
+    let draws = super::draw::draws(trace, seed);
+    let culprit = culprits(&items, &draws);
     // The conflict graph's units: one per input class, a change's files in the folders of the
     // classes it changes.
     let classes: BTreeSet<String> = items.iter().flat_map(|it| it.aff.iter().cloned()).collect();
@@ -357,7 +392,7 @@ pub fn replay(trace: &Trace, policy: &LandPolicy, seed: u64) -> LandOut {
         order,
         units,
         items,
-        draws: super::draw::draws(trace, seed),
+        draws,
         now: 0,
         seq: 0,
         events: BTreeMap::new(),
@@ -383,10 +418,12 @@ pub fn replay(trace: &Trace, policy: &LandPolicy, seed: u64) -> LandOut {
         told: BTreeSet::new(),
         limit: BTreeMap::new(),
         wakes: BTreeSet::new(),
+        busy: BTreeMap::new(),
         active: None,
         failures: 0,
         window_max: 0,
         decisions: Vec::new(),
+        culprit,
     };
     let arrivals: Vec<(usize, i64)> = e.items.iter().enumerate().map(|(i, it)| (i, it.at)).collect();
     for (i, at) in arrivals {
@@ -458,11 +495,16 @@ struct Engine<'a> {
     limit: BTreeMap<usize, usize>,
     /// The times a held batch wakes the queue.
     wakes: BTreeSet<i64>,
+    /// When a batch that ran work last decided, by the classes its changes change: a component
+    /// holds its next batch only while it is busy, one of its classes decided within the hold.
+    busy: BTreeMap<String, i64>,
     /// Serial: the candidate under test, and failures since the last land.
     active: Option<usize>,
     failures: u32,
     window_max: u32,
     decisions: Vec<String>,
+    /// For each change's job, the change whose failure it only inherited.
+    culprit: Vec<Vec<Option<usize>>>,
 }
 
 impl Engine<'_> {
@@ -789,11 +831,13 @@ impl Engine<'_> {
         let open = comp.first().and_then(|h| self.windows.get(h)).map_or(1, Speculation::open);
         let narrowed = comp.first().and_then(|h| self.limit.get(h).copied());
         let open = usize::try_from(open).unwrap_or(1);
-        // A batch that doesn't fill the window waits for more changes, never past its oldest
-        // change's hold (bounded by the aging bound).
+        // While the component is busy, a batch that doesn't fill the window waits for more
+        // changes, never past its oldest change's hold (bounded by the aging bound); an idle
+        // component's first change goes at once.
         let hold = self.order.hold_s.min(self.order.aging_bound());
         let ready = comp.first().and_then(|h| self.items.get(*h)).map_or(self.now, |it| it.at.saturating_add(hold));
-        if narrowed.is_none() && comp.len() < open && self.now < ready {
+        let busy = comp.iter().any(|m| self.items.get(*m).is_some_and(|it| it.aff.iter().any(|c| self.busy.get(c).is_some_and(|t| self.now.saturating_sub(*t) < hold))));
+        if narrowed.is_none() && comp.len() < open && busy && self.now < ready {
             if self.wakes.insert(ready) {
                 self.at(ready, Ev::Wake);
             }
@@ -907,6 +951,12 @@ impl Engine<'_> {
             }
             let ok = !failed && cd.jobs.iter().all(|s| matches!(s, JobSt::Done(e) if e.passed()));
             let batch = cd.batch.clone();
+            if !cd.jobs.is_empty() {
+                let classes: Vec<String> = batch.iter().filter_map(|m| self.items.get(*m)).flat_map(|it| it.aff.iter().cloned()).collect();
+                for class in classes {
+                    self.busy.insert(class, self.now);
+                }
+            }
             if let Some(cd) = self.cands.get_mut(c) {
                 cd.decided = true;
             }
@@ -1068,7 +1118,10 @@ impl Engine<'_> {
             }
         }
         let critical = !serial && critical && (self.order.batch || self.is_head(i));
-        let x = self.new_exec(src.0, src.1, key.clone(), critical);
+        // A failure only inherited from a change this tree doesn't hold passes (W28-AC33).
+        let from = self.culprit.get(src.0).and_then(|r| r.get(src.1)).copied().flatten();
+        let passes = from.is_some_and(|u| !stack.contains(&u) && self.out.get(u).is_none_or(|o| o.landed.is_none()));
+        let x = self.new_exec(src.0, src.1, key.clone(), critical, passes);
         if !serial {
             self.inflight.insert(key, x);
         }
@@ -1076,9 +1129,13 @@ impl Engine<'_> {
     }
 
     /// A new execution of change `i`'s job `j` at `key`, waiting for a runner. It takes the
-    /// change's drawn duration, and ends as the job on this tree ended before, else as drawn.
-    fn new_exec(&mut self, i: usize, j: usize, key: String, critical: bool) -> usize {
+    /// change's drawn duration, and ends as the job on this tree ended before, else as drawn; a
+    /// failure only inherited, on a tree without its culprit, passes instead, taking at least the
+    /// job's usual time.
+    fn new_exec(&mut self, i: usize, j: usize, key: String, critical: bool, inherited_passes: bool) -> usize {
         let (runtime, drawn) = self.draw(i, j).map_or((60, End::Succeeded), |d| (d.duration.max(0), d.end));
+        let typical = self.items.get(i).and_then(|it| it.check.get(j)).map_or(60, |sp| sp.typical);
+        let (runtime, drawn) = if inherited_passes { (runtime.max(typical), End::Succeeded) } else { (runtime, drawn) };
         let outcome = self.ledger.get(&key).copied().unwrap_or(drawn);
         self.execs.push(Exec { item: i, job: j, key, queued: self.now, placed: None, started: None, ended: None, end: None, stale: false, pool: None, runtime, critical, outcome });
         self.st.push(ExecSt::Queued);
@@ -1428,14 +1485,18 @@ pub fn report(trace: &Trace, seeds: &[u64]) -> String {
 /// queue first.
 pub fn sweeps(trace: &Trace, seeds: &[u64]) -> String {
     let mut policies = vec![LandPolicy::serial(1)];
-    for cap in [1, 2, 4, 8, 12] {
+    for hold in [0, 1800, 3600] {
+        policies.push(LandPolicy { name: format!("components, hold {} min", hold / 60), mode: Mode::Components(Order { hold_s: hold, ..Order::default() }) });
+    }
+    policies.push(LandPolicy { name: "components, hold 90 min, aging 2/3".into(), mode: Mode::Components(Order { hold_s: 5400, aging_per_minute: 2.0 / 3.0, ..Order::default() }) });
+    for cap in [2, 4, 12] {
         policies.push(LandPolicy { name: format!("components, window cap {cap}"), mode: Mode::Components(Order { window: admit::Window { initial: cap, floor: 1, cap }, ..Order::default() }) });
     }
-    for (cap, aging, hold) in [(8, 1.0, 0), (8, 1.0, 3600), (4, 0.75, 4800), (8, 0.75, 4800)] {
-        policies.push(LandPolicy { name: format!("components, batches, window cap {cap}, aging {aging}, hold {} min", hold / 60), mode: Mode::Components(Order { aging_per_minute: aging, window: admit::Window { initial: cap, floor: 1, cap }, batch: true, hold_s: hold, ..Order::default() }) });
+    for cap in [1, 2, 4, 8] {
+        policies.push(LandPolicy { name: format!("components, per-change speculation, window cap {cap}"), mode: Mode::Components(Order { batch: false, window: admit::Window { initial: cap, floor: 1, cap }, ..Order::default() }) });
     }
-    for util in [0.6, 0.8, 1.0] {
-        policies.push(LandPolicy { name: format!("components, admission cap {util}"), mode: Mode::Components(Order { util_cap: util, ..Order::default() }) });
+    for util in [0.6, 1.0] {
+        policies.push(LandPolicy { name: format!("components, per-change speculation, admission cap {util}"), mode: Mode::Components(Order { batch: false, util_cap: util, ..Order::default() }) });
     }
     let mut s = String::new();
     let _ = writeln!(s, "| Policy | Mean enqueue to landed | Runner-h per landed change | Changes landed | Longest wait for a runner | Runner-h stopped unused | Runner-h of failed jobs | Runner-h |");

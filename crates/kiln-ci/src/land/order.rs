@@ -1,18 +1,21 @@
 //! Order and admission inside the land queue (docs/ci.md W28-R35 to R37), the pure part: which of
-//! the pooled queue's waiting work runs first, how many candidates each component tests at once,
-//! and when admission defers a speculative one. The replayer
-//! ([`crate::sched::sim::replay::land`]) carries out what it says, as the server's queue will.
+//! the pooled queue's waiting work runs first, how many changes each component tests at once,
+//! and when admission defers low-intent work. The replayer ([`crate::sched::sim::replay::land`])
+//! carries out what it says, as the server's queue will.
 //!
 //! - One pooled queue, over every runner that can do the work, holds every component's work side
 //!   by side. Within a component the critical path's units come first, then the shortest expected
 //!   service; W05-R09's aging lifts what waits, so once a unit has waited [`Order::aging_bound`]
 //!   nothing that arrives after passes it (R35).
 //! - Each component keeps an AIMD speculation window (R36), admission's [`admit::Window`]
-//!   (W28-R68): one more candidate on a pass, halved on a failure, as Zuul's window does, between
-//!   its floor and its cap.
-//! - Admission holds the bottleneck's committed utilization below a cap by deferring speculative
-//!   candidates, shortest expected service first when it frees: a component's head always starts,
-//!   and so does a candidate deferred for the aging bound (R37).
+//!   (W28-R68): one more change for each one landed, halved on a failure, as Zuul's window does,
+//!   between its floor and its cap. By default the window is tested as one batch; else each change
+//!   in it has a candidate of its own.
+//! - Admission defers low-intent work (R37): a batch that doesn't fill its window, while its
+//!   component is busy, for at most [`Order::hold_s`]; with per-change candidates, a speculative
+//!   candidate while the bottleneck's committed utilization is at its cap, shortest expected
+//!   service first when it frees. A component's head always starts, and so does a candidate
+//!   deferred for the aging bound.
 
 use std::fmt;
 
@@ -40,11 +43,13 @@ pub struct Order {
     /// The share of the bottleneck's capacity committed at which speculative candidates defer
     /// (default 0.8).
     pub util_cap: f64,
-    /// Whether a component tests its window as one batch: the window's top candidate, on the
-    /// stack of every change in it, lands them all when it passes (W28-R36).
+    /// Whether a component tests its window as one batch, the union of its changes' checks on the
+    /// stack of them all, whose pass lands every change (default); else each change has a
+    /// candidate of its own on its expected stack (W28-R36).
     pub batch: bool,
-    /// Batches: how long a batch that doesn't fill its window waits for more changes, from its
-    /// oldest change's enqueue (seconds; at most the aging bound).
+    /// Batches: while its component is busy, how long a batch that doesn't fill its window waits
+    /// for more changes, from its oldest change's enqueue (seconds; at most the aging bound;
+    /// default an hour, the bound).
     pub hold_s: i64,
 }
 
@@ -61,7 +66,7 @@ pub const SJF_SPAN: i64 = 1800;
 
 impl Default for Order {
     fn default() -> Order {
-        Order { aging_per_minute: 1.0, window: WINDOW, util_cap: 0.8, batch: false, hold_s: 0 }
+        Order { aging_per_minute: 1.0, window: WINDOW, util_cap: 0.8, batch: true, hold_s: 3600 }
     }
 }
 
