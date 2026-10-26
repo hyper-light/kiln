@@ -2890,7 +2890,7 @@ mod tests {
             .await
     }
 
-    /// W25 step 3: with kiln's own workflows on the CI engine, release.yaml's legs upload their
+    /// W28 step 3: with kiln's own workflows on the CI engine, release.yaml's legs upload their
     /// `artifacts:` to CI's store, each as `artifacts-<key>`: a leg's binaries are kept as
     /// [`release_binaries_are_kept`] keeps a v1 run's, with its run's number and commit.
     #[test]
@@ -2960,7 +2960,7 @@ mod tests {
         })
     }
 
-    /// W25 step 3: `[updates] in_step`'s build of the server's commit, with kiln's own workflows on
+    /// W28 step 3: `[updates] in_step`'s build of the server's commit, with kiln's own workflows on
     /// the CI engine, is one engine run of release at that commit; asked again while it runs, it's
     /// that run again and nothing more starts.
     #[test]
