@@ -20,10 +20,15 @@ jiff = { version = "0.2.38", default-features = false, features = ["std", "tzdb-
 fancy-regex = "0.19.2"
 # Lockfiles for SBOMs (W18-R03).
 toml = "1.1.8"
+# Identities' certificate chains, checked (W27-R01): parsing and signatures, the same crates and
+# backend the kiln crate's CA uses.
+x509-parser = { version = "0.18.1", features = ["verify-aws"] }
+aws-lc-rs = "1.18.2"
 
 [dev-dependencies]
 anyhow = "1.0.104"
 proptest = "1"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 
 [[bench]]
 name = "expr"
