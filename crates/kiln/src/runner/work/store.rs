@@ -8,8 +8,9 @@
 //! - **Entries**: a tool's name for an object (sccache's key, Bazel's action digest, a Turborepo
 //!   hash) in a namespace, under a [`Scope`]: a repository and a trust domain (W24-R21). They're
 //!   the work ledger's (`crate::ci::work`, in `ledger.db`): each is a unit of kind `action` whose
-//!   definition is the tool's own key ([`entry_key`]), recorded and looked up on the ledger's one
-//!   path, as every key is (W24-R30).
+//!   definition is the tool's own key ([`entry_key`]), kept by its weak key as a name
+//!   (`work.entry`): a newer value or a removal replaces it, as a tool's cache expects, where the
+//!   ledger's results are never overwritten (W24-R22).
 //! - **Holdings**: the objects each scope put, so an existence check answers for the asker's own
 //!   scopes only. Bytes are kept once whoever sends them, but a repository never learns what
 //!   another stored: it sends the bytes again (`ci/services/chunks.rs` refuses probing alike).
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use kiln_ci::store::cdc;
-use kiln_ci::work::key::{self, Key, Kind, PathSet, Platform, Unit};
+use kiln_ci::work::key::{self, Key, Kind, Platform, Unit};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -157,8 +158,18 @@ fn entry_of(r: &Recorded) -> Option<Entry> {
 /// What `scope` records for `ns`/`name` on the ledger: an entry, a removal (`Some(None)`), or
 /// nothing.
 fn ledger_entry(c: &rusqlite::Connection, scope: &Scope, ns: &str, name: &str) -> anyhow::Result<Option<Option<Entry>>> {
-    let same = |p: &PathSet| p.clone();
-    Ok(crate::ci::work::lookup(c, &scope.key(), &entry_unit(ns, name, &scope.domain), &same)?.map(|h| entry_of(&h.recorded)))
+    let at = format!("{}{}", scope.key(), entry_key(ns, name, &scope.domain).hex());
+    match crate::ci::work::get(c, crate::ci::work::Family::Entry, &at)? {
+        Some(v) => Ok(Some(entry_of(&serde_json::from_slice(&v)?))),
+        None => Ok(None),
+    }
+}
+
+/// Keeps `r` as what `scope` names `ns`/`name` on the ledger, in place of what it named before.
+fn put_entry(c: &rusqlite::Connection, scope: &Scope, ns: &str, name: &str, r: &Recorded) -> anyhow::Result<()> {
+    let at = format!("{}{}", scope.key(), entry_key(ns, name, &scope.domain).hex());
+    crate::ci::work::put(c, crate::ci::work::Family::Entry, &at, &serde_json::to_vec(r)?, r.provenance.finished_at)?;
+    Ok(())
 }
 
 /// The store.
@@ -451,7 +462,7 @@ impl Store {
                 {
                     return Ok(false);
                 }
-                crate::ci::work::record(c, &s.key(), &entry_unit(&ns, &name, &s.domain), &PathSet::new(), &recorded(Some(&entry), &s.domain, entry.at))?;
+                put_entry(c, &s, &ns, &name, &recorded(Some(&entry), &s.domain, entry.at))?;
                 Ok(true)
             })
             .await
@@ -466,7 +477,7 @@ impl Store {
                 if !matches!(ledger_entry(c, &s, &ns, &name)?, Some(Some(_))) {
                     return Ok(false);
                 }
-                crate::ci::work::record(c, &s.key(), &entry_unit(&ns, &name, &s.domain), &PathSet::new(), &recorded(None, &s.domain, crate::util::now_unix()))?;
+                put_entry(c, &s, &ns, &name, &recorded(None, &s.domain, crate::util::now_unix()))?;
                 Ok(true)
             })
             .await
@@ -589,9 +600,8 @@ mod tests {
                 anyhow::ensure!(store.remove_entry(&a, "sccache", "gone").await? && !store.remove_entry(&a, "sccache", "gone").await?);
                 anyhow::ensure!(store.entry(&[a.clone(), t.clone()], "sccache", "gone").await?.map(|(s, e)| (s, e.digest)) == Some((t.clone(), td)));
                 // On the ledger: a unit whose definition is the tool's key.
-                let same = |p: &PathSet| p.clone();
-                let (sk, wk) = (a.key(), entry_unit("sccache", "k1", "untrusted"));
-                anyhow::ensure!(store.ledger().call(move |c| crate::ci::work::lookup(c, &sk, &wk, &same)).await?.is_some(), "recorded on the ledger");
+                let at = format!("{}{}", a.key(), entry_key("sccache", "k1", "untrusted").hex());
+                anyhow::ensure!(store.ledger().call(move |c| Ok(crate::ci::work::get(c, crate::ci::work::Family::Entry, &at)?)).await?.is_some(), "recorded on the ledger");
                 d
             };
             let store = Store::open(&root)?;
