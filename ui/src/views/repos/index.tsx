@@ -33,6 +33,7 @@ import { PlaceList, TaskList, taskLine } from "./places";
 import { PutForm, type PutMode } from "./put";
 import { SyncActivity } from "./sync-activity";
 import { ScopeSecrets } from "../settings-ci";
+import { RepoKeep } from "../keep/repo";
 import { Providers } from "./providers";
 import "./repos.css";
 
@@ -579,6 +580,12 @@ function Details({
         // What runs its CI (W23-R07), when its host makes a choice possible.
         <Loadable label="what runs its CI" fallback={<></>}>
           <Providers repo={r.name} />
+        </Loadable>
+      )}
+      {!e.key.startsWith("here:") && (
+        // The copies of its trees runners keep for others, and its rules for them (docs/reach.md §5.1).
+        <Loadable label="its copies on runners" fallback={<Hold height={160} />}>
+          <RepoKeep repoKey={e.key} />
         </Loadable>
       )}
       {r && (

@@ -11,7 +11,11 @@ import { formatBytes } from "@/lib/format";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import { Loadable } from "@/components/ui/loading";
 import { AtLimit } from "./elsewhere";
+
+/** Its copies on other runners and its rules for them (docs/reach.md §5.1), loaded with the sheet's group. */
+const AgentKeep = React.lazy(() => import("../keep/agent").then((m) => ({ default: m.AgentKeep })));
 
 type Send = (c: Command) => void;
 
@@ -256,6 +260,11 @@ export function SettingsSheet({
           <div className="hx-ctls">
             <LimitRows agent={agent} state={state} send={send} />
             <SubagentRows agent={agent} state={state} send={send} />
+            {agent && (
+              <Loadable label="its copies on other runners" fallback={null}>
+                <AgentKeep id={agent.id} />
+              </Loadable>
+            )}
             {groups.length === 0 && !meta?.hooks?.length && <div className="hx-dim text-[13px]">This harness reports no further settings.</div>}
             {groups.map(([g, cs]) => (
               <section key={g} className="hx-ctl-group">

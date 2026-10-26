@@ -43,6 +43,29 @@ extraConfig: |
   name = "hyper-light/kiln"
   clone_url = "https://github.com/hyper-light/kiln.git"
 
+  # W23-AC02/AC03's test repositories (docs/ci.md W23): gitlab.com through a project access token,
+  # Bitbucket Cloud through a repository access token, each from the Secret `kiln-w23-hosts`
+  # (keys gitlab.token, bitbucket.token). A token missing or not mounted yet is only warned about,
+  # and the files are read again each minute.
+  [[ci.gitlab]]
+  url = "https://gitlab.com"
+  token_file = "/etc/kiln/hosts/gitlab.token"
+
+  [ci.bitbucket]
+  token_file = "/etc/kiln/hosts/bitbucket.token"
+
+# The hosts' tokens above. Optional: kiln starts without it.
+extraVolumes:
+  - name: hosts
+    secret:
+      secretName: kiln-w23-hosts
+      defaultMode: 0400
+      optional: true
+extraVolumeMounts:
+  - name: hosts
+    mountPath: /etc/kiln/hosts
+    readOnly: true
+
 # Bare-metal agents outside the cluster: <minikube node IP>:30070/TCP and :30071/UDP
 # (deploy/cluster/expose-lan.sh forwards host ports 7070/7071 to these for LAN machines).
 externalService:

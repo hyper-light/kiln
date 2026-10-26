@@ -55,6 +55,14 @@ loads the harness's saved conversation; a replay already in kiln's timeline is n
 again. Context occupancy comes from `usage_update`; token totals use the prompt's reported
 usage, and costs are displayed only when denominated in USD.
 
+kiln offers ACP's [session compaction](https://agentclientprotocol.com/protocol/v1/prompt-turn)
+(`clientCapabilities.session.compaction`): a compaction an agent reports with `compaction_update`
+is under way (`state.compacting`) until it says how it ended (`completed`, `failed`,
+`cancelled`), then its marker shows where it ran, with the tokens and time
+`_meta.contextCompaction` gives (claude-agent-acp); its summary isn't shown. Devin keeps its own
+compactions out of ACP, so a `/compact` sent to an agent whose catalog has one is a compaction for
+its turn, its answer saying how it went.
+
 The Antigravity CLI runs as `agy --input-format stream-json --output-format stream-json`: kiln
 writes `{"event":"user","message":{"content":…}}` for each turn and reads `init` (its conversation,
 which a restart resumes with `--conversation`), `step_update`s (the reply as it streams, each tool
@@ -176,6 +184,7 @@ counted.
 | WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands go on it too, each under an id and answered `ack` or `nack` (docs/wire.md, "The UI's sockets") |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
+| GET / PUT / DELETE | `/api/harness/sessions/:id/keep` | its copies on other runners (each with what the rules say of it) and its own rules for them (docs/reach.md §5.1); DELETE: its repository's and runner's apply |
 | POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear,restore}` | run, pause, skip the goal under way, empty its goal stack, or bring back the goals cleared last |
 | POST | `/api/harness/sessions/:id/terminals` | `{what: "shell" \| "screen", command?, cols?, rows?}`: open one beside it → 201 `{terminal, what, command?, to_type?}`; see below |
 | GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Devin, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it), `takeover`, `fork` (a copy can be continued) and `managed_by?` (the agent session already continuing that conversation) |
@@ -947,6 +956,19 @@ changed outside it.
 Besides the timeline-related fields (`status`, `approvals`, `queue`, `delivery`, `tasks`,
 `todos`, `usage`, …):
 
+- `compacting?` — its harness compacting a conversation now (summarizing it to free context):
+  `{since, tokens?, parent?}`, `parent` a subagent's (its spawning call), one at a time, the main
+  thread's over a subagent's; meanwhile `doing` is "Compacting the conversation". Once it's done
+  its marker, a notice whose id starts `compaction:`, is where it ran: "Compacted · 967k → 48k
+  tokens · 1m 38s", as much as its harness says; a warning when it didn't compact ("Couldn't
+  compact: …"), or stopped first (its turn or its process ended: "Compaction stopped after 41s").
+  Claude Code says one with `status: "compacting"` (again every 30 s), its end (`compact_result`,
+  `compact_error`) and its boundary (`compact_metadata`); Codex with its `contextCompaction` item
+  (its older `thread/compacted` alone, from a Codex without the item); ACP agents as above. The
+  Antigravity CLI says nothing of one. The conversation draws the one under way where its live
+  line is, and each marker as the boundary it is, kiln's earlier words for one
+  ("Conversation compacted …") too.
+
 - `objective?` — the goal the harness itself pursues across turns (Claude Code's `/goal`,
   Codex's thread goal) and how it stands: `{text, status: "active" | "met" | "unmet" | "paused" |
   "cleared", reason?, at}`. Claude Code's comes from its `/goal` output and the verdict it writes
@@ -1299,6 +1321,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | subagents: tasks, nested messages, stop | ✓ | unit (read-only task and thread tracking; no direct stop) | — | — |
 | a person's message to a subagent: queue, steer, now | unit (by way of its agent's SendMessage; no now) | unit (v1 on its own thread; v2 by way of its agent) | — | — |
 | rewind, branch, compact, rename | ✓ | ✓ | — | — |
+| a compaction shown as it goes on, then marked where it ran (`compacting`) | unit | unit | unit (`compaction_update`; Devin: its own `/compact`) | — (their ACP says nothing of one) |
 | restore files on rewind | ✓ | — | — | — |
 | thinking display / budget, output style | ✓ | ✓ (reasoning summaries) | — | — |
 | plan limits (`limits`) | ✓ none for an API key; unit for subscriber windows | ✓ (pushed during turns); unit for ChatGPT reads | — | — |
