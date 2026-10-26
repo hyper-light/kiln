@@ -1359,7 +1359,9 @@ mod tests {
             let lane = lane_dir(work.path(), "acme/app", &format!("lane{l}"));
             anyhow::ensure!(read_slots(&lane).iter().any(|s| s.n == 0) && slot_dir(&lane, 0).exists(), "lane{l}'s newest remains");
         }
-        anyhow::ensure!(take_reaped().len() == went.len(), "kept for the server");
+        // Kept for the server; other tests' reaps in this process may be kept beside them.
+        let kept = take_reaped();
+        anyhow::ensure!(went.iter().all(|e| kept.iter().any(|k| k.id == e.id)), "kept for the server");
         // A day later the schedule is due: a slot unused for 40 days goes, by max_age.
         let lane = lane_dir(work.path(), "acme/app", "lane2");
         let old = read_slots(&lane).into_iter().find(|s| s.n != 0).ok_or_else(|| anyhow::anyhow!("lane2 kept only its newest"))?;
