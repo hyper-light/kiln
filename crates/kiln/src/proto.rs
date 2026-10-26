@@ -641,6 +641,8 @@ pub struct Assignment {
     pub event: String,
     pub run_number: i64,
     pub attempt: u32,
+    /// Without `requires`, in the layout runners have always read ([`crate::pipeline::planned_wire`]).
+    #[serde(with = "crate::pipeline::planned_wire")]
     pub spec: PlannedJob,
     /// Already resolved secrets; masked from logs by the agent.
     pub secrets: Vec<(String, String)>,
@@ -681,6 +683,29 @@ mod tests {
         let b = encode(&m)?;
         assert_eq!(decode::<AgentMsg>(&b)?, m);
         assert!(decode::<AgentMsg>(&[0xff, 0xff, 0xff]).is_err());
+        Ok(())
+    }
+
+    /// A v1 job's spec reaches a runner of the same build whatever its `requires` (W05-R22): its
+    /// `skip_serializing_if` misaligned every field after it on the wire when there were none, so
+    /// a runner refused the assignment as `Malformed` (rust, vendor and bench jobs never started).
+    #[test]
+    fn w05_r22_an_assignments_spec_reads_back_with_or_without_requires() -> anyhow::Result<()> {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Wire {
+            #[serde(with = "crate::pipeline::planned_wire")]
+            spec: PlannedJob,
+            after: String,
+        }
+        let p = crate::pipeline::parse("name: ci\njobs:\n  rust:\n    timeout-minutes: 45\n    env: { A: b }\n    steps:\n      - name: test\n        run: cargo test\n")?;
+        let planned = crate::pipeline::plan(&p, &crate::pipeline::Context::default())?;
+        let job = planned.into_iter().next().ok_or_else(|| anyhow::anyhow!("no job"))?;
+        for requires in [Vec::new(), vec!["os == macos".to_owned()]] {
+            let sent = Wire { spec: PlannedJob { requires: requires.clone(), ..job.clone() }, after: "secrets".into() };
+            let got: Wire = postcard::from_bytes(&postcard::to_allocvec(&sent)?)?;
+            assert_eq!(got.after, "secrets", "{requires:?}");
+            assert_eq!(got.spec, PlannedJob { requires: Vec::new(), ..job.clone() }, "{requires:?}");
+        }
         Ok(())
     }
 
