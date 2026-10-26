@@ -450,11 +450,39 @@ pub fn standing_as(j: &Journey, now: i64, yours: bool) -> Standing {
     let pips = pips(j, now);
     let (stand, line) = match &j.review {
         Some(Review { superseded_by: Some(by), .. }) => (Stand::Superseded, format!("Replaced by {by}")),
-        Some(r) if r.state == ReviewState::Approved && j.land == Land::NotYet => (Stand::Landing, "Approved · joining the queue".to_string()),
-        Some(r) => review_stand(r, yours).unwrap_or_else(|| stand_and_line(j)),
+        Some(r) => ranked(j, r, yours),
         None => stand_and_line(j),
     };
     Standing { stand, line, pips }
+}
+
+/// A commit under review stands as the more pressing of its review and its journey, so a review
+/// never hides a failure: needs you from the review, then the journey's needs you or failing,
+/// then the review's stand, then the journey's. A failure of the change's own checks needs whoever
+/// the change is theirs ([`in_turn_of`]); to everyone else it's failing.
+fn ranked(j: &Journey, r: &Review, yours: bool) -> (Stand, String) {
+    let review = if r.state == ReviewState::Approved && j.land == Land::NotYet { Some((Stand::Landing, "Approved · joining the queue".to_string())) } else { review_stand(r, yours) };
+    let journey = match stand_and_line(j) {
+        (Stand::NeedsYou, line) if review.is_some() && !yours && own_failure(j) => (Stand::Failing, line),
+        x => x,
+    };
+    match review {
+        Some(rv) if rv.0 == Stand::NeedsYou => rv,
+        _ if matches!(journey.0, Stand::NeedsYou | Stand::Failing) => journey,
+        Some(rv) => rv,
+        None => journey,
+    }
+}
+
+/// Whether the commit's own checks failed with no one on it (not a production approval waiting).
+fn own_failure(j: &Journey) -> bool {
+    checks_glyph(&j.checks) == Glyph::Failed && j.handled_by.is_none() && j.fixed_by.is_none() && !matches!(j.production, Production::WaitsForApproval { .. })
+}
+
+/// Whether a commit under review is the viewer's to act on: its review is ([`in_turn`]), or it's
+/// their change and its checks failed.
+pub fn in_turn_of(j: &Journey, viewer: &str) -> bool {
+    j.review.as_ref().filter(|r| r.superseded_by.is_none()).is_some_and(|r| in_turn(r, viewer) || (r.author == viewer && own_failure(j)))
 }
 
 /// Whether a review is the viewer's to act on: its turn holds them, or it's their change and
@@ -730,6 +758,37 @@ mod tests {
             assert_eq!((y.line.as_str(), o.line.as_str()), (line, line), "{state:?}: one line for everyone");
             assert_eq!((pip(&y, Stage::Review), pip(&o, Stage::Review)), (Some(glyph), Some(glyph)), "{state:?}");
             assert_eq!(standing(&j, 0), o, "{state:?}: viewer-blind callers see the others' rendering");
+        }
+    }
+
+    #[test]
+    fn w26_r02_a_review_never_hides_a_failure() {
+        let mut j = under_review(ReviewState::Requested, &["user:kim"], "");
+        j.checks = vec![Check { pipeline: "ci".into(), legs: vec![leg("rust lint + test", &[Attempt::Failed], "assertion failed in sync::reconnect")] }];
+        let r = j.review.clone();
+        assert!(r.as_ref().is_some_and(|r| !in_turn(r, "user:sam")), "a request alone isn't the author's");
+        assert!(in_turn_of(&j, "user:sam") && in_turn_of(&j, "user:kim") && !in_turn_of(&j, "user:ada"), "a failure is the author's; the review still kim's");
+        let others = standing_as(&j, 0, false);
+        assert_eq!((others.stand, others.line.as_str()), (Stand::Failing, "rust lint + test · assertion failed in sync::reconnect"));
+        let sam = standing_as(&j, 0, true);
+        assert_eq!((sam.stand, sam.line.as_str()), (Stand::NeedsYou, "Waiting on review"), "needs you from the review comes first");
+        // The author's own needs you: changes asked and a failure, the review's line first.
+        let mut j = under_review(ReviewState::Changes, &[], "outputs stay JSON");
+        j.checks = vec![Check { pipeline: "ci".into(), legs: vec![leg("rust lint + test", &[Attempt::Failed], "boom")] }];
+        assert_eq!(standing_as(&j, 0, true).line, "Changes asked · outputs stay JSON");
+        assert_eq!(standing_as(&j, 0, false).stand, Stand::Failing);
+    }
+
+    #[test]
+    fn w26_r02_approved_falls_through_to_the_journey_once_landed() {
+        let mut j = landed(Author::Person("user:sam".into()));
+        j.review = under_review(ReviewState::Approved, &[], "").review;
+        let plain = landed(Author::Person("user:sam".into()));
+        for yours in [true, false] {
+            let s = standing_as(&j, 0, yours);
+            let p = standing(&plain, 0);
+            assert_eq!((s.stand, s.line.as_str()), (p.stand, p.line.as_str()), "yours: {yours}");
+            assert_eq!(pip(&s, Stage::Review), Some(Glyph::Approved));
         }
     }
 
