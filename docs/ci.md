@@ -8049,18 +8049,57 @@ Production's engine is off, so it can't plan them itself.
 
 | File | Kind | Plan for a push to `main` | Legs | Before it can run on the engine |
 |---|---|---|---|---|
-| `ci.yaml` | workflow | runs | 5: `rust`, `ui`, `vendor` on `[k8s]`; `ui-checks` on `[baremetal, linux]`; `release-binary` on `[baremetal, local]` | the three `k8s` legs need a `k8s` pool (W13-R07, R09): production's `k8s` label comes from a runner today; else route them to bare metal |
+| `ci.yaml` | workflow | runs | 5: `rust`, `ui`, `vendor` on `[k8s]`; `ui-checks` on `[baremetal, linux]`; `release-binary` on `[baremetal, local]` | nothing left (W25 step 3): the `k8s` legs go to a `k8s` pool, in the pods v1 makes for them (W02-R06, W13-R07); `ui-checks`' `linux` matches `Linux` |
 | `bench.yaml` | workflow | runs | 3 on `[baremetal, bench]` | nothing: production has both labels |
-| `e2e.yaml` | workflow | doesn't run (`branches` doesn't match `main`) | 62 when it runs, its `k8s` jobs among them | the `k8s` legs, as `ci.yaml`'s |
-| `image.yaml` | workflow | runs | 1 on `[baremetal, local]` | nothing |
-| `release.yaml` | workflow | runs | 3: `linux`, `windows` on `[baremetal, local]`, `macos` on `[baremetal, macos]` | nothing from the engine |
-| `stress.yaml` | workflow | doesn't run on `push` | 113: a `gate` and a matrix on `[baremetal]`, one `k8s` job | the `k8s` leg |
+| `e2e.yaml` | workflow | doesn't run (`branches` doesn't match `main`) | 62 when it runs, its `k8s` jobs among them | nothing left: its `k8s` jobs as `ci.yaml`'s |
+| `image.yaml` | workflow | runs | 1 on `[baremetal, local]` | nothing left: it tags `kiln:$KILN_SHA`, which the engine's runner now sets (v1's job variables, W02-R06) |
+| `release.yaml` | workflow | runs | 3: `linux`, `windows` on `[baremetal, local]`, `macos` on `[baremetal, macos]` | nothing left: each leg's artifacts are its own (`artifacts-<key>`), and `[updates]` keeps runners' binaries from the engine's release runs as from v1's |
+| `stress.yaml` | workflow | doesn't run on `push` | 113: a `gate` and a matrix on `[baremetal]`, one `k8s` job | nothing left: its `k8s` job as `ci.yaml`'s |
+| `sim.yaml` | workflow | nightly (`schedule`), not on `push` | 1 on `[k8s]` | nothing left: as `ci.yaml`'s `k8s` legs |
+| `wire-lab.yaml` | workflow | nightly (`schedule`), not on `push` | 1 on `[baremetal, linux]` | nothing |
 | `deploy.yaml` | KilnCD's policy, not a workflow | not planned (no `jobs:`) | | nothing: CD reads it |
 | `environments.yaml` | KilnCD's environments, not a workflow | not planned (no `jobs:`) | | nothing: CD reads it |
 
-`ui-checks` asks for `linux`, which production's runners give as `Linux`; label matching is to be
-confirmed case-insensitive. The production change, for the person to make (not deployed): `[ci]
-enabled = true` and `kiln_workflows = true`, after the `k8s` pool above.
+W25 step 3 (branch `ci-w25-engine`) did what the last column asked, and holds it with tests:
+
+- *The `k8s` pool.* A `[[ci.pools]]` of `executor = "k8s"` and `labels = ["k8s"]` takes the
+  `[k8s]` legs, and a kiln-dialect leg on it gets a pod made for it as v1's job pod: the image of
+  its `image:` (else its `toolchain:`'s preset), its own `resources:` CPU and memory (memory its
+  limit too), v1's toolchain caches under the cache claim and v1's deadline
+  (`w02_r06_kilns_k8s_jobs_get_v1s_pods_on_a_k8s_pool` holds every `[k8s]` job of `.kiln` to
+  v1's pod, field by field; `w02_r06_a_kiln_dialect_leg_on_a_k8s_pool_gets_v1s_pod`, against
+  the Kubernetes stand-in). Routing them to bare metal instead would have put the test suite on
+  production's machines, outside the jobs namespace and its quota.
+- *Labels.* Matching ignores case, in the engine's routing, v1's `carries` and `KCI6007`, as
+  GitHub's does: `[baremetal, linux]` fits a runner labelled `Linux`, or one whose only Linux label
+  is the platform's (W05-R21's tests). `w25_kilns_own_workflows_check_plan_and_route` checks every
+  file above in the kiln dialect, plans it for its own trigger as the server does, and routes each
+  leg to the `k8s` pool or one of production's runners (their labels and facts from
+  `ci.runners.list`, `tests/fixtures/production-runners.json`).
+- *v1's job variables* (`KILN_SHA`, `KILN_BRANCH`, `KILN_AGENT`, `TMPDIR` on the work volume and
+  the rest) for kiln-dialect legs, beneath a job's own `env:`.
+- *Release binaries* from the engine's release runs for `[updates]`: adoption, `build_commit`
+  and keeping in step read the engine's runs, and a release under way isn't started again.
+- *A v1 fix found on the way:* v1's assignment sent `PlannedJob` with a `skip_serializing_if`
+  field by postcard, so a runner of the server's own build refused every job without `requires`
+  as `Malformed` (from 5e7d27bfb on). It goes in the layout runners have always read
+  (`w05_r22_an_assignments_spec_reads_back_with_or_without_requires`).
+
+Side by side (`ci/conformance/engine_vs_v1.py`): two throwaway servers on fedora, one per engine,
+each with its own bare repository, a minikube of their own and runners with production's labels,
+replay main's commits one at a time, a commit going to the engine's side once v1's side has run
+it. At the first commit (c8758a5f34) both sides' `rust` pods were the same (`rust:1-bookworm`,
+16Gi requested and its limit), `ci`'s five jobs concluded the same on both (`rust` and `vendor`
+failing on that commit's own errors, `ui` passing, the other two skipped), and so did bench's
+`quic-transport` and release's `macos`; the rest of that commit didn't finish. The 20-commit
+replay needs a quiet slot on fedora: beside other sessions' gates fedora ran out of memory, so the
+lab is stopped until it gets one.
+
+The production change, for the person to make (not deployed), in
+`deploy/argocd/values/kiln.yaml`'s `extraConfig`: `[ci] enabled = true` and `kiln_workflows =
+true`, with the pool (`[[ci.pools]] name = "k8s"`, `executor = "k8s"`, `labels = ["k8s"]`,
+`max = 64`). `kiln_workflows` moves every repository's `.kiln/` workflows to the engine, not only
+kiln's.
 
 **Warm workspaces (M1, step 5).** Built for host and `docker` legs, awaiting review (R11, R15;
 `kiln_ci::work::slots`, `runner/warm.rs`). A job's `work: { warm: [target] }` (or `{ paths,
