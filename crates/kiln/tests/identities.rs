@@ -196,3 +196,57 @@ fn walk(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
     }
     Ok(out)
 }
+
+/// W27-R01, R02: an agent session has a key per epoch, made by the runner process holding it and
+/// kept there; each epoch's certificate names the agent, the person it acts for and the epoch; a
+/// hand-over to a newer process raises the epoch, and what the old epoch signs from then is
+/// refused. No session key is written anywhere, in the runners' state or the server's.
+#[test]
+fn w27_r01_an_agent_session_a_key_per_epoch() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (_main, log) = agents::runner(dir.path(), s.port, "box-a", None, TALK)?;
+    agents::connected(s.port, &s.admin, "box-a", &log, Duration::from_secs(60))?;
+    let cwd = dir.path().join("work-here");
+    std::fs::create_dir_all(&cwd)?;
+    let id = agents::open_session(s.port, &s.admin, "box-a", &cwd, Duration::from_secs(60))?;
+    let agent_of = |l: &[Value], epoch: u64| l.iter().find(|i| field(i, "subject").ends_with(&format!("/agent/{id}/epoch/{epoch}"))).cloned();
+    let first = until_identities(&s, "agent", Duration::from_secs(60), |l| l.iter().any(|i| field(i, "subject").contains(&format!("/agent/{id}/epoch/")) && !field(i, "verified").is_empty()))?;
+    let e0 = first
+        .iter()
+        .filter_map(|i| field(i, "subject").rsplit_once("/epoch/").and_then(|(_, e)| e.parse::<u64>().ok()))
+        .min()
+        .ok_or_else(|| anyhow::anyhow!("no epoch: {first:?}"))?;
+    let v0 = agent_of(&first, e0).unwrap_or_default();
+    assert_eq!(field(&v0, "verified"), format!("agent {id}, epoch {e0}, for admin, of hyper-light"), "{v0}");
+
+    // Two newer processes of the machine, one after the other: the session is handed to each, an
+    // epoch up each time; the epoch it left is refused from the hand-over on.
+    let mut keep = Vec::new();
+    for (n, inst) in ["z1", "z2"].iter().enumerate() {
+        keep.push(instance(dir.path(), s.port, "box-a", inst)?);
+        let want = e0 + 1 + u64::try_from(n)?;
+        let list = until_identities(&s, "agent", Duration::from_secs(120), |l| {
+            agent_of(l, want).is_some_and(|i| !field(&i, "verified").is_empty()) && agent_of(l, want - 1).is_some_and(|i| field(&i, "refused").contains("revoked"))
+        })?;
+        let now = agent_of(&list, want).unwrap_or_default();
+        assert_eq!(field(&now, "verified"), format!("agent {id}, epoch {want}, for admin, of hyper-light"));
+        let left = agent_of(&list, want - 1).unwrap_or_default();
+        assert!(field(&left, "refused").contains(&format!("moved on to epoch {want}")), "{left}");
+        assert_ne!(field(&now, "key"), field(&left, "key"), "a new epoch, a new key");
+    }
+    let all = identities(&s, "agent")?;
+    let epochs: Vec<&Value> = all.iter().filter(|i| field(i, "subject").contains(&format!("/agent/{id}/epoch/"))).collect();
+    assert!(epochs.len() >= 3, "three epochs, each certified: {epochs:?}");
+
+    // No session key on disk: not beside the certificates, not in the server's data or logs.
+    for f in walk(dir.path())? {
+        let name = f.to_string_lossy().into_owned();
+        let watched = name.contains("/identities/") || name.ends_with("kiln.db") || name.ends_with(".log");
+        if watched {
+            let bytes = std::fs::read(&f).unwrap_or_default();
+            assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE KEY"), "a private key in {name}");
+        }
+    }
+    Ok(())
+}

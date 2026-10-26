@@ -88,6 +88,13 @@ pub fn sign(slot: &str, message: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
     Ok((kp.sign(message)?, cert))
 }
 
+/// Lets go of every slot starting with `prefix` (`agent/<session>/`: a session that closed).
+pub fn forget_prefix(prefix: &str) {
+    let mut held = HELD.lock();
+    held.keys.retain(|k, _| !k.starts_with(prefix));
+    held.certs.retain(|k, _| !k.starts_with(prefix));
+}
+
 /// Lets go of a slot's key and certificate (a session that left the epoch, a leg that ended).
 pub fn forget(slot: &str) {
     let mut held = HELD.lock();
