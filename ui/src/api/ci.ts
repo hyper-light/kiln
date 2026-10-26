@@ -943,8 +943,16 @@ export function waitSentence(w: unknown): string | null {
     reservation?: string;
     avoided?: string;
     refused?: boolean;
+    lane?: string;
+    deadline?: number;
+    next?: number;
+    size?: number;
+    in_flight?: number;
   };
   const list = (xs?: string[]) => (xs && xs.length ? `: ${xs.join(", ")}` : "");
+  // A lane is a repository's workflow on a branch (W28-R60): its workflow and branch.
+  const lane = (o.lane ?? "").split("\u0000").slice(1).join(" on ") || "its lane";
+  const time = (ms?: number | null) => (ms ? new Date(ms).toLocaleTimeString() : "soon");
   switch (o.reason) {
     case "capacity":
       return `Waiting for a free runner: ${o.eligible ?? 0} can take it, ${o.busy ?? 0} busy${o.draining ? `, ${o.draining} draining` : ""}.`;
@@ -979,6 +987,12 @@ export function waitSentence(w: unknown): string | null {
       return `Waiting for a deploy window of ${o.environment ?? "its environment"}: ${o.window ?? "it is closed"}.`;
     case "promotion":
       return `Waiting for ${o.promotion ?? "this commit to deploy to the environment before it"}, to deploy to ${o.environment ?? "its environment"}.`;
+    case "coalescing":
+      return `Coalescing a burst of pushes to ${lane} while the runners it needs are busy: until ${time(o.until)}, at the latest ${time(o.deadline)}.`;
+    case "cadence":
+      return `On its workflow's cadence: the newest commit of ${lane} runs at ${time(o.next)}.`;
+    case "speculation":
+      return `Waiting for room in ${lane}'s speculation window: ${o.in_flight ?? 0} of ${o.size ?? 0} in flight.`;
     case "gate":
       return `Waiting for ${o.gate ?? "its environment's gates to pass"}, to deploy to ${o.environment ?? "its environment"}.`;
     default:
