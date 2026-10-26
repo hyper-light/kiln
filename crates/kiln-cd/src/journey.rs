@@ -196,6 +196,8 @@ pub struct Review {
     pub fixing: Option<String>,
     /// What its line names first: the open question, the file in conflict, the thread being fixed.
     pub about: String,
+    /// The revision that replaced this commit's (`v6`): the commit then stands superseded.
+    pub superseded_by: Option<String>,
 }
 
 /// A commit's records, as the server read them.
@@ -236,6 +238,8 @@ pub enum Stand {
     Shipped,
     Fixed,
     RolledBack,
+    /// An older revision's commit: a newer one replaced it, and it folds quietly under that one.
+    Superseded,
 }
 
 /// The seven stages, review to replant.
@@ -445,6 +449,7 @@ pub fn standing(j: &Journey, now: i64) -> Standing {
 pub fn standing_as(j: &Journey, now: i64, yours: bool) -> Standing {
     let pips = pips(j, now);
     let (stand, line) = match &j.review {
+        Some(Review { superseded_by: Some(by), .. }) => (Stand::Superseded, format!("Replaced by {by}")),
         Some(r) if r.state == ReviewState::Approved && j.land == Land::NotYet => (Stand::Landing, "Approved · joining the queue".to_string()),
         Some(r) => review_stand(r, yours).unwrap_or_else(|| stand_and_line(j)),
         None => stand_and_line(j),
@@ -637,7 +642,7 @@ mod tests {
     fn under_review(state: ReviewState, turn: &[&str], about: &str) -> Journey {
         let mut j = landed(Author::Person("sam".into()));
         j.land = Land::NotYet;
-        j.review = Some(Review { state, turn: turn.iter().map(|t| t.to_string()).collect(), author: "user:sam".into(), open: Kinds::default(), conflicts: 0, fixing: None, about: about.into() });
+        j.review = Some(Review { state, turn: turn.iter().map(|t| t.to_string()).collect(), author: "user:sam".into(), open: Kinds::default(), conflicts: 0, fixing: None, about: about.into(), superseded_by: None });
         j
     }
 
@@ -703,6 +708,43 @@ mod tests {
         let s = standing_as(&j, 0, true);
         assert_eq!((s.stand, s.line.as_str()), (Stand::Landing, "Queued · 2 ahead"));
         assert_eq!(pip(&s, Stage::Review), Some(Glyph::Approved));
+    }
+
+    #[test]
+    fn w26_r02_every_review_state_as_yours_and_as_others() {
+        use ReviewState::*;
+        // (state, about, as yours, as others, the line both see, the Review pip)
+        let table = [
+            (Draft, "", Stand::Waiting, Stand::Waiting, "Draft", Glyph::Draft),
+            (Requested, "", Stand::NeedsYou, Stand::Waiting, "Waiting on review", Glyph::Requested),
+            (Changes, "outputs stay JSON", Stand::NeedsYou, Stand::Waiting, "Changes asked · outputs stay JSON", Glyph::Changes),
+            (Blocked, "expand.rs:22", Stand::NeedsYou, Stand::Waiting, "expand.rs:22 · 1 blocking thread", Glyph::Blocked),
+            (Fixing, "kim's thread", Stand::Checking, Stand::Checking, "An agent fixing · kim's thread", Glyph::Fixing),
+            (Conflict, "", Stand::NeedsYou, Stand::Waiting, "Conflicts with main · 1 conflict", Glyph::Conflict),
+            (Approved, "", Stand::Landing, Stand::Landing, "Approved · joining the queue", Glyph::Approved),
+        ];
+        for (state, about, yours, others, line, glyph) in table {
+            let j = under_review(state, &[], about);
+            let (y, o) = (standing_as(&j, 0, true), standing_as(&j, 0, false));
+            assert_eq!((y.stand, o.stand), (yours, others), "{state:?}");
+            assert_eq!((y.line.as_str(), o.line.as_str()), (line, line), "{state:?}: one line for everyone");
+            assert_eq!((pip(&y, Stage::Review), pip(&o, Stage::Review)), (Some(glyph), Some(glyph)), "{state:?}");
+            assert_eq!(standing(&j, 0), o, "{state:?}: viewer-blind callers see the others' rendering");
+        }
+    }
+
+    #[test]
+    fn w26_r01_a_replaced_revision_stands_superseded_naming_its_successor() {
+        for state in [ReviewState::Requested, ReviewState::Blocked, ReviewState::Approved] {
+            let mut j = under_review(state, &["user:kim"], "kim: empty matrix meant?");
+            if let Some(r) = j.review.as_mut() {
+                r.superseded_by = Some("v6".into());
+            }
+            for yours in [true, false] {
+                let s = standing_as(&j, 0, yours);
+                assert_eq!((s.stand, s.line.as_str()), (Stand::Superseded, "Replaced by v6"), "{state:?}, yours: {yours}");
+            }
+        }
     }
 
     #[test]
