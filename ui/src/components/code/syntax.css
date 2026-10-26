@@ -1,51 +1,46 @@
 /* Code in its language's colours (lib/syntax, components/code/highlighted.tsx), the same on every
-   surface (a conversation's code and diffs, the review page, deployments' YAML): hyperlight-site's
-   code colours (its articles' code blocks: keywords lavender, strings sage, functions blue,
-   numbers and types sand, comments grey), and the code editor's for what the site doesn't colour
-   (properties, attributes, punctuation). Over a diff's tints, as over its surface. */
+   surface (a conversation's code and diffs, the review page, deployments' YAML): kiln's own, the
+   code editor's (components/code/editor.tsx). Names stay bright, keywords and punctuation quiet,
+   data (strings, numbers, properties) in colour. Over a diff's tints, as over its surface. */
 
-.hl-com {
-  color: #858b9b;
-}
-.hl-kw {
-  color: #c6b2e1;
+.hl-prop,
+.hl-link {
+  color: #a6c4ed;
 }
 .hl-str {
-  color: #a8c5bb;
+  color: #b8d9d2;
 }
-.hl-esc {
-  color: #d6c4f0;
+.hl-num {
+  color: #d8cbb0;
 }
-.hl-num,
-.hl-type {
-  color: #d2b9a0;
+.hl-com {
+  color: #6d7078;
+  font-style: italic;
 }
-.hl-fn,
-.hl-tag {
-  color: #adc2df;
-}
-.hl-prop {
-  color: #a6c4ed;
+.hl-kw,
+.hl-punct {
+  color: #8c8f98;
 }
 .hl-meta {
   color: #b8a6d5;
 }
-.hl-punct {
-  color: #8c8f98;
+.hl-esc {
+  color: #d6c4f0;
+}
+.hl-type,
+.hl-tag {
+  color: #c9d6e6;
+}
+.hl-fn {
+  color: #dfe3ea;
 }
 .hl-strong {
   color: #e4e5e7;
-  font-weight: 600;
+  font-weight: 500;
 }
 .hl-em {
   font-style: italic;
 }
 .hl-strike {
   text-decoration: line-through;
-}
-.hl-link {
-  color: #a6c4ed;
-  text-decoration: underline;
-  text-decoration-color: rgb(166 196 237 / 35%);
-  text-underline-offset: 2px;
 }
