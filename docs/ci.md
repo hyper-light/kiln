@@ -7924,6 +7924,19 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   suspects (ceil(log2 n) runs for n; one is the culprit at once). A commit's verdict counts from
   when it was answered for good. ci/sim/README.md reports where the commits answered after an hour
   stood at the hour.
+- **W28-R54 A Cargo workspace's units.** `kiln_ci::verdict::cargo`, pure: from the root manifest's
+  `members` and `exclude`, one unit per member (its package name and folder) with the members it
+  depends on by path, normal, dev and build dependencies and target tables alike, `workspace =
+  true` resolved through `[workspace.dependencies]`; every member reads the root `Cargo.toml` and
+  `Cargo.lock`. A file no unit takes affects every unit.
+- **W28-R55 Verdicts on the server.** `ci.verdict` (`GET /api/ci/repos/:repo/commits/:sha/verdict`)
+  gives the commit's verdict on each lane whose first parents hold it, its commits named by SHA.
+  The server reads the lane from the mirror (the branch's first parents up to its newest run, 200
+  back from the commit), each commit's changed files over the units the newest commit's manifests
+  give, and each run's latest attempt: every test W16 recorded as a check (its unit from its file,
+  else its suite's crate, else its job), every job without a report as a check of its own (its
+  conclusion as the failure's signature). A test W16 found flaky in a run (W16-R04's first rule)
+  or quarantined (W16-R05) is marked: its failures don't count. `kiln_ci::verdict` decides.
 
 **Acceptance criteria**
 
@@ -7934,11 +7947,17 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   test* (`cargo test -p kiln-ci verdict`).
 - **W28-AC51 The recorded week.** At least 95% of ci's commits on main answered within an hour of
   their push, P3 over seeds 1-8 (`cargo run -p kiln-ci --example replay -- ci/sim/trace.json`).
+- **W28-AC52 End to end.** A native repository with a two-crate Cargo workspace whose workflow
+  reports each test with TAP: a test failing at the base makes no later commit suspect; a new
+  failure in crate p names exactly the commits whose diffs affect p; a quarantined test's failure
+  makes none, and its verdict says so; covered checks carry no outcome. *Integration test*
+  (`cargo test -p kiln --test verdicts`).
 
-**Progress.** R50–R53 and AC50 built (2026-10-25) in `kiln_ci::verdict` and the replayer. AC51 is
-not met: P3 answers 79.3% (77.4%–81.9%) of ci's commits within the hour, against 75.9% before. The
-late ones wait mostly for capacity (ci's rust jobs held out of the k8s quota through bursts of
-pushes), which steps 6 and 8 (admission, spreading load) reach, not verdicts.
+**Progress.** R50–R55, AC50 and AC52 built (2026-10-25) in `kiln_ci::verdict` and its `cargo`
+reader, the replayer, and `crates/kiln/src/ci/verdict.rs` (`ci.verdict`). AC51 is not met: P3
+answers 79.3% (77.4%–81.9%) of ci's commits within the hour, against 75.9% before. The late ones
+wait mostly for capacity (ci's rust jobs held out of the k8s quota through bursts of pushes),
+which steps 6 and 8 (admission, spreading load) reach, not verdicts.
 
 ## 4. API, events, CLI and MCP reference
 
@@ -8045,6 +8064,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | POST | `/api/ci/repos/:repo/providers/sync` | `ci.providers.sync` (other providers' runs, looked at now) | runs.read | W23 |
 | GET | `/api/ci/repos/:repo/providers/workflows` | `ci.providers.workflows` (each provider's CI files, checked) | runs.read | W23 |
 | GET | `/api/ci/repos/:repo/commits/:sha/checks` | `ci.providers.checks` (every provider's runs of a commit) | runs.read | W23 |
+| GET | `/api/ci/repos/:repo/commits/:sha/verdict?workflow=` | `ci.verdict` (a commit's verdict per unit and test on each lane: direct, covered, suspect, culprit) | runs.read | W28 |
 | GET | `/api/ci/runs/:id/pending` | `ci.runs.pending` (whichever provider's run) | runs.read | W23 |
 | GET · POST | `/api/ci/repos/:repo/pulls[/:n]` · `/:n/{comments,reviews,merge}` | `host.pulls.list`, `.get`, `.comment`, `.review`, `.merge` (GitHub's, GitLab's and Bitbucket's; as the person when they signed in with that host) | diffs.read · diffs.review · diffs.land | W23 |
 | POST | `/api/hooks/gitlab` · `/api/hooks/bitbucket` | GitLab's and Bitbucket's webhooks | open, their secret | W23 |
