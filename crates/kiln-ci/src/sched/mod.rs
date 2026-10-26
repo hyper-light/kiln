@@ -2,13 +2,19 @@
 //!
 //! - [`state`]: the scheduler.
 //! - [`sim`]: a simulator driving it.
+//! - [`actor`]: whose a commit is, from kiln's records (W28-R67).
+//! - [`admit`]: admission: coalescing, cadence, speculation windows (W28-R60 to R63, R68).
 //! - [`groups`]: concurrency groups.
+//! - [`intent`]: priority by intent: gate, waiting, trunk, work in progress (W28-R64, R65).
 //! - [`retry`]: retry policies and failure classes.
 //! - [`routing`]: requirements, rules, eligibility, preferences, explanations.
 //! - [`pools`]: pools of executors kiln starts and stops (W13-R09).
 //! - [`reserve`]: runners and pools kept for some legs in windows (W05-R12).
 
+pub mod actor;
+pub mod admit;
 pub mod groups;
+pub mod intent;
 pub mod pools;
 pub mod reserve;
 pub mod retry;
@@ -19,4 +25,4 @@ pub mod state;
 #[cfg(test)]
 mod tests;
 
-pub use state::{Command, Config, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason};
+pub use state::{Command, Config, FairBy, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason};

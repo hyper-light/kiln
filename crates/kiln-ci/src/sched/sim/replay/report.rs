@@ -255,6 +255,10 @@ pub fn sweeps(trace: &Trace, seeds: &[u64]) -> String {
     sweep(&format!("quiet on P4 (max_wait {MAX_WAIT} s)"), [0, 60, 120, 300].into_iter().map(|q| (format!("quiet {q} s"), p4(q, MAX_WAIT))).collect());
     sweep(&format!("max_wait on P4 (quiet {QUIET} s)"), [300, 600, 900, 1800].into_iter().map(|m| (format!("max_wait {m} s"), p4(QUIET, m))).collect());
     sweep("cadence on P4", vec![("cadence on".into(), Policy::p4()), ("cadence off".into(), Policy { cadence: false, ..Policy::p4() })]);
+    let window = |initial: u32| Policy { window: Some(crate::sched::admit::Window { initial, floor: 1, cap: 20 }), ..Policy::p4() };
+    let mut cases: Vec<(String, Policy)> = [1, 2, 4, 8].into_iter().map(|w| (format!("window {w}"), window(w))).collect();
+    cases.push(("no window".into(), Policy { window: None, ..Policy::p4() }));
+    sweep("speculation window on P4 (bisection runs; floor 1, cap 20)", cases);
     sweep("image_compile_share on P5 (assumed: the trace can't split the image's build)", [0.0, 0.3, 0.6].into_iter().map(|c| (format!("image_compile_share {c}"), Policy { share: Some(c), ..Policy::p5() })).collect());
     s
 }

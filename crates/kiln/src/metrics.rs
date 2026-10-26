@@ -345,6 +345,13 @@ pub struct SyncMetrics {
     pub move_barrier: Histogram,
     pub move_files_wait: Histogram,
     pub move_carried_bytes: CounterVec,
+    /// A runner's copies of other runners' trees (docs/reach.md §5.1): how many of each runner's
+    /// it holds (`from`) and their bytes; those it let go, by `trigger` (`schedule`, `room`,
+    /// `asked`), and their bytes.
+    pub reach_copies: GaugeVec,
+    pub reach_copies_bytes: GaugeVec,
+    pub reach_let_go: CounterVec,
+    pub reach_let_go_bytes: CounterVec,
 }
 
 pub fn sync() -> &'static SyncMetrics {
@@ -378,6 +385,10 @@ pub fn sync() -> &'static SyncMetrics {
         move_barrier: Histogram::new(LATENCY_BUCKETS),
         move_files_wait: Histogram::new(LATENCY_BUCKETS),
         move_carried_bytes: CounterVec::new(&["what"]),
+        reach_copies: GaugeVec::new(&["from"]),
+        reach_copies_bytes: GaugeVec::new(&["from"]),
+        reach_let_go: CounterVec::new(&["trigger"]),
+        reach_let_go_bytes: CounterVec::new(&["trigger"]),
     })
 }
 
@@ -716,6 +727,8 @@ fn render_sync(o: &mut String) {
         ("kiln_sync_transfer_bytes_total", "Bytes of contents moved with the server, by direction.", &m.transfer_bytes),
         ("kiln_moves_total", "Agent sessions moving off this machine, by result.", &m.moves),
         ("kiln_move_carried_bytes_total", "What moving sessions carried besides synced files (git, ignored, worktree; home: what their harness keeps for them).", &m.move_carried_bytes),
+        ("kiln_reach_copies_let_go_total", "Copies of other runners' trees this machine let go, by trigger (schedule, room, asked).", &m.reach_let_go),
+        ("kiln_reach_copies_let_go_bytes_total", "Bytes of the copies of other runners' trees this machine let go, by trigger.", &m.reach_let_go_bytes),
     ] {
         help(o, name, "counter", h);
         v.render(o, name);
@@ -728,6 +741,8 @@ fn render_sync(o: &mut String) {
         ("kiln_sync_copy_heard_age_seconds", "Seconds since a copy last said how it is.", &m.copy_heard_age),
         ("kiln_sync_conflict_files", "Conflict copies a synced repo holds, not resolved yet.", &m.conflict_files),
         ("kiln_sync_skipped_files", "Files a copy's last look left out.", &m.skipped_files),
+        ("kiln_reach_copies", "Copies of other runners' trees this machine holds, by the runner whose tree it is.", &m.reach_copies),
+        ("kiln_reach_copies_bytes", "What the copies of other runners' trees take on this machine's disk, as last measured.", &m.reach_copies_bytes),
     ] {
         help(o, name, "gauge", h);
         v.render(o, name);

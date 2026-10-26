@@ -616,6 +616,7 @@ pub struct Session {
     /// it takes none here (CP-T3.2). A message is checked against it and handed over under this
     /// lock, and a move sets it and gathers what it was sent under it too: none slips in between.
     moving: Mutex<bool>,
+    prompted: std::sync::atomic::AtomicBool,
 }
 
 impl Session {
@@ -740,7 +741,9 @@ impl Session {
             s.resume = Some(h);
         }
         // Where it is now, not where it started: its own session, settings as last chosen.
-        s.prompt = None;
+        if self.prompted.load(std::sync::atomic::Ordering::Relaxed) {
+            s.prompt = None;
+        }
         s.resume_at = None;
         s.fork = false;
         if !core.state.effort.is_empty() {
@@ -974,6 +977,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         ran: Mutex::new((None, Vec::new())),
         left: Mutex::new(Vec::new()),
         moving: Mutex::new(false),
+        prompted: std::sync::atomic::AtomicBool::new(false),
     });
     let run = Arc::clone(&s);
     crate::rt::spawn(async move {
@@ -2627,6 +2631,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     // Going on with the process the previous image of this process ran: its timeline came with it.
     let mut adopt = adopt;
     let handed = adopt.is_some();
+    if handed {
+        s.prompted.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     // Taking over a session: its transcript is read once it has ended (checked again before each
     // start while it has not).
     if !handed {
@@ -2828,7 +2835,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     core.set_status(Status::Starting);
                     core.touch_state();
                     adapter.start(&mut core);
-                    if first && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
+                    if !s.prompted.swap(true, std::sync::atomic::Ordering::Relaxed) && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
                         // Its id is the session's own (CP-T3.2): made once, the same if it's ever made again.
                         let id = crate::util::derive_id(&["first-prompt", &s.id]);
                         adapter.command(&mut core, Command::Send { id, text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None });
@@ -3404,12 +3411,22 @@ mod tests {
             ran: Mutex::new((None, Vec::new())),
             left: Mutex::new(Vec::new()),
             moving: Mutex::new(false),
+            prompted: std::sync::atomic::AtomicBool::new(false),
         };
         (s, rx)
     }
 
     fn message(id: &str, text: &str) -> Command {
         Command::Send { id: id.into(), text: text.into(), mode: super::super::model::SendMode::Now, attachments: Vec::new(), overrides: None, reply_to: None, task: None }
+    }
+
+    #[test]
+    fn a_first_message_its_harness_never_got_stays_in_what_resumes_it_until_it_goes() {
+        let (s, _rx) = idle("never-started");
+        *s.spec.lock() = Spec { kind: "claude".into(), prompt: Some("fix the flaky test".into()), ..Spec::default() };
+        assert_eq!(s.resume_spec().prompt.as_deref(), Some("fix the flaky test"));
+        s.prompted.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(s.resume_spec().prompt, None);
     }
 
     /// CP-T3.2: a move gathers what a session was sent and hasn't taken (carried while its harness

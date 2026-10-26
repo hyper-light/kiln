@@ -393,6 +393,8 @@ pub struct RunPlan {
     pub name: Option<String>,
     /// The workflow's concurrency group.
     pub concurrency: Option<GroupSpec>,
+    /// The workflow's `coalesce:` and `cadence:`, in seconds (W28-R61, R62).
+    pub admission: crate::sched::admit::Spec,
     input: RunInput,
     github: Value,
     vars: Value,
@@ -548,9 +550,11 @@ impl RunPlan {
             Some(c) => Some(group(c, dialect, &cx, "concurrency")?),
             None => None,
         };
+        let admission = crate::sched::admit::Spec::parse(wf.coalesce.as_ref(), wf.cadence.as_ref())?;
         let mut plan = RunPlan {
             name,
             concurrency,
+            admission,
             input,
             github,
             vars,

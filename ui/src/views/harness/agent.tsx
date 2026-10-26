@@ -20,6 +20,7 @@ import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
 import { AccountDialog } from "./account-card";
 import { Composer } from "./composer";
 import { useAgentActions } from "./actions";
+import { MoveDialog, movable } from "./move";
 import { SettingsSheet, useAttachments, type Attachments } from "./controls";
 import { agentLabel, changesetOf, editsOf, useSameList } from "./derive";
 import { useListener } from "./dom";
@@ -485,6 +486,9 @@ function Dock({
   const exit = useSession(store, (s) => s.state?.exit);
   const empty = useSession(store, (s) => s.events.length === 0);
   const resume = useSession(store, (s) => (s.meta?.features ?? []).includes("resume"));
+  const info = useSession(store, (s) => s.info);
+  const harnessSession = useSession(store, (s) => s.state?.harness_session ?? s.info?.harness_session);
+  const [moving, setMoving] = React.useState(false);
   return (
     <div className="hx-dock" onPointerDown={keepTyping} onMouseDown={keepTyping}>
       <ActivityLine store={store} onOpenTask={onOpenTask} />
@@ -492,6 +496,11 @@ function Dock({
         <div className="hx-startfail" role="alert">
           <b>This agent couldn't start.</b> {exit.error}
           <div className="mt-2 flex flex-wrap gap-2">
+            {info && movable({ target: info.target, status, harness_session: harnessSession }) && (
+              <Button size="sm" variant="secondary" onClick={() => setMoving(true)}>
+                Move to…
+              </Button>
+            )}
             <Button size="sm" variant="secondary" onClick={() => navigate("/agents?new=1")}>
               Start a new one
             </Button>
@@ -499,6 +508,7 @@ function Dock({
               Remove this one
             </Button>
           </div>
+          {moving && info && <MoveDialog agent={{ ...info, status }} onClose={() => setMoving(false)} />}
         </div>
       ) : status === "exited" ? (
         <div className="hx-exited">

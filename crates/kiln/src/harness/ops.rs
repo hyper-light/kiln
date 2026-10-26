@@ -774,6 +774,7 @@ mod end_to_end {
         crate::rt::spawn(async move {
             let _ = crate::harness::registry::Registry::run_local(h).await;
         });
+        hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
         Ok(hub)
     }
 

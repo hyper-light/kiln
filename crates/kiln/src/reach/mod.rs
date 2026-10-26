@@ -3,8 +3,11 @@
 //! encrypted link the server only relays.
 
 pub mod cli;
+pub mod copies;
 pub mod directory;
 pub mod e2e;
+pub mod keep;
+pub mod keeper;
 pub mod local;
 #[cfg(unix)]
 pub mod mcp;

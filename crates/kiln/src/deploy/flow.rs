@@ -7,7 +7,7 @@
 //! a second server can't make it move twice; a commit made before a crash is found again by its
 //! trailer (`Kiln-Release`), never made twice.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1325,12 +1325,21 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
     if let Some(other) = store::in_flight(&*d.records, &a.name, &env.name).await.map_err(internal)? {
         match env.concurrency {
             Concurrency::Reject => return Err(conflict(format!("release {} is in flight for {} in {}: wait for it, or cancel it", other.id, a.name, env.name))),
+            // One target: it takes release `other`'s place, or waits for its write; the worker's
+            // first look says which (docs/ci.md W28-R38).
             Concurrency::Queue if r.state == State::Committing => {
                 r.state = State::Waiting;
-                r.message = Some(format!("waits for release {}", other.id));
+                r.message = Some(format!("in line with release {}", other.id));
             }
             Concurrency::Queue => {}
         }
+    } else if r.state == State::Committing
+        && let Holds::Wait(why) = holds(d, &r, true).await.map_err(internal)?
+    {
+        // Another app's release sharing a resource with it holds it, the wait naming what they
+        // share (W28-R38, R39).
+        r.state = State::Waiting;
+        r.message = Some(why);
     }
     let (r, new) = store::insert_release(&*d.records, &r).await.map_err(internal)?;
     if !new {
@@ -1489,9 +1498,17 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
     let timeout = env.as_ref().map_or(15 * 60, |e| i64::try_from(e.watch.timeout_secs).unwrap_or(900));
     let unreachable = env.as_ref().map_or(6 * 60 * 60, |e| i64::try_from(e.watch.unreachable_secs).unwrap_or(21_600)).max(timeout);
     match r.state {
-        State::Waiting | State::WaitingApproval => match store::in_flight(st, &r.app, &r.environment).await? {
-            Some(o) if o.id != r.id => store::schedule(st, id, now + 2).await?,
-            _ => {
+        State::Waiting | State::WaitingApproval => match holds(d, &r, false).await? {
+            Holds::Superseded(by) => superseded(d, r, &by).await?,
+            Holds::Wait(why) => {
+                let moved = r.message.as_deref() != Some(why.as_str());
+                r.message = Some(why);
+                if store::update_release(st, &r, r.state).await? && moved {
+                    emit_release(d, &r);
+                }
+                store::schedule(st, id, now + 2).await?;
+            }
+            Holds::Go => {
                 let was = r.state;
                 let (Some(env), Some(a)) = (env.clone(), store::app(st, &r.app).await?) else {
                     return finish(d, r, State::Failed, Some("its app or environment is gone".into())).await;
@@ -1503,6 +1520,9 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                         r.message = None;
                         if store::update_release(st, &r, was).await? {
                             emit_release(d, &r);
+                            // One target: the newest deploy rolls out, and the older ones waiting
+                            // end (W28-R38).
+                            coalesce(d, &r.app, &r.environment).await?;
                         }
                         store::schedule(st, id, now).await?;
                     }
@@ -1577,6 +1597,10 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
             }
         },
         State::Delivering => {
+            // A newer release of its target rolling out supersedes it (docs/ci.md W28-R38).
+            if coalesce(d, &r.app, &r.environment).await?.contains(&r.id) {
+                return Ok(());
+            }
             let Some(commit) = r.commit.clone() else { return finish(d, r, State::Failed, Some("delivering, but no commit was recorded".into())).await };
             let committed_at = r.committed_at.unwrap_or(r.created_at);
             let settle = env.as_ref().map_or(30, |e| i64::try_from(e.watch.settle_secs).unwrap_or(30));
@@ -1721,6 +1745,154 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
 /// sooner).
 const PROPOSAL_LOOK: i64 = 60;
 
+/// What holds a waiting release's deploy (docs/ci.md W28-R38, R39).
+enum Holds {
+    /// A newer deploy of its target takes its place: that release (`release 9`).
+    Superseded(String),
+    /// It waits: each wait naming the release it waits for and what the two share.
+    Wait(String),
+    /// Nothing: it may go.
+    Go,
+}
+
+/// Where a release deploys (W28-R38): the cluster and namespace its objects go to. A platform's
+/// target and the scope that is its namespace there (an ECS cluster); for Kubernetes the
+/// environment's cluster (kiln's own without one), or the Argo CD connection that deploys it.
+fn deploy_place(a: &App, e: &Environment) -> (String, String) {
+    if let Package::Platform { provider, spec, .. } = &a.package
+        && let Some(place) = e.targets.platforms.get(provider)
+        && let Ok((target, _)) = kiln_cd::providers::target_of(provider, place)
+    {
+        let scope = kiln_cd::providers::get(provider).and_then(|d| d.scope).and_then(|k| spec.get(k)).and_then(Value::as_str).unwrap_or_default().to_owned();
+        return (target.name(), scope);
+    }
+    let cluster = if e.provider == KILNCD { e.targets.kubernetes.first().cloned().unwrap_or_else(|| kiln_cd::apps::IN_CLUSTER.to_owned()) } else { e.provider.clone() };
+    (cluster, a.namespace().to_owned())
+}
+
+/// An object as a person names it: `ConfigMap shop/settings`, `ClusterRole.rbac.authorization.k8s.io reader`.
+fn object_name(k: &kiln_cd::obj::ResKey) -> String {
+    let kind = if k.group.is_empty() { k.kind.to_string() } else { format!("{}.{}", k.kind, k.group) };
+    if k.namespace.is_empty() { format!("{kind} {}", k.name) } else { format!("{kind} {}/{}", k.namespace, k.name) }
+}
+
+/// How far a release is, as the deploy queue has it (W28-R38): its gates hold it, they let it go,
+/// or it is under way.
+fn phase(r: &Release) -> kiln_cd::deploys::Phase {
+    use kiln_cd::deploys::Phase;
+    match r.state {
+        State::Committing => Phase::Writing,
+        State::Delivering => Phase::Rolling,
+        State::Waiting if r.gates.iter().all(|g| g.passed) => Phase::Ready,
+        _ => Phase::Held,
+    }
+}
+
+/// A release's id and target in the deploy queue.
+fn queued(r: &Release) -> (String, String) {
+    (format!("release {}", r.id), format!("{} in {}", r.app, r.environment))
+}
+
+/// The deploy queue (W28-R38): every release in flight, oldest first, then `asked` (a release being
+/// asked for, its gates passed), each with what it holds: its place, its app, and the objects its
+/// KilnCD app deploys that another app deploys too.
+async fn queue(d: &Deploy, flying: &[Release], asked: Option<&Release>) -> Vec<kiln_cd::deploys::Deploy> {
+    use kiln_cd::deploys::{Phase, Resource};
+    let st = &*d.records;
+    let mut regs: BTreeMap<(String, String), Option<(App, Environment)>> = BTreeMap::new();
+    let keys: BTreeSet<(String, String)> = flying.iter().chain(asked).map(|r| (r.app.clone(), r.environment.clone())).collect();
+    for (app, env) in keys {
+        let found = match (store::app(st, &app).await, store::environment(st, &env).await) {
+            (Ok(Some(a)), Ok(Some(e))) => Some((a, e)),
+            _ => None,
+        };
+        regs.insert((app, env), found);
+    }
+    // What each KilnCD app shares, asked of the engine once.
+    let ids: Vec<String> = regs.values().flatten().filter(|(_, e)| e.provider == KILNCD).map(|(a, e)| kilncd::app_id(a, &e.name)).collect();
+    let shared: BTreeMap<String, Vec<kiln_cd::obj::ResKey>> = match crate::cd::get() {
+        Some(cd) if !ids.is_empty() => cd
+            .query(move |eng| {
+                ids.into_iter()
+                    .map(|id| {
+                        let keys = eng.shared_objects(&id);
+                        (id, keys)
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .await
+            .unwrap_or_default(),
+        _ => BTreeMap::new(),
+    };
+    flying
+        .iter()
+        .map(|r| (r, phase(r)))
+        .chain(asked.map(|r| (r, Phase::Ready)))
+        .map(|(r, phase)| {
+            let (id, target) = queued(r);
+            let mut resources = BTreeSet::from([Resource::App { name: r.app.clone() }]);
+            if let Some(Some((a, e))) = regs.get(&(r.app.clone(), r.environment.clone())) {
+                let (cluster, namespace) = deploy_place(a, e);
+                for k in shared.get(&kilncd::app_id(a, &e.name)).into_iter().flatten() {
+                    resources.insert(Resource::Config { cluster: cluster.clone(), object: object_name(k) });
+                }
+                resources.insert(Resource::Place { cluster, namespace });
+            }
+            kiln_cd::deploys::Deploy { id, target, resources, phase }
+        })
+        .collect()
+}
+
+/// What holds a waiting release (W28-R38, R39), decided against every release in flight: a newer
+/// one of its target taking its place, one sharing a resource with it that it waits for, or
+/// nothing. `asked`: the release is being asked for, and isn't in flight yet.
+async fn holds(d: &Deploy, r: &Release, asked: bool) -> anyhow::Result<Holds> {
+    let flying = store::in_flight_all(&*d.records).await?;
+    let q = queue(d, &flying, asked.then_some(r)).await;
+    let g = kiln_cd::deploys::Deploys::new(&q);
+    let (me, _) = queued(r);
+    if let Some(by) = g.superseded_by(&me) {
+        return Ok(Holds::Superseded(by.id.clone()));
+    }
+    Ok(match g.verdict(&me) {
+        Some(v) if !v.at_once() => Holds::Wait(v.waits().join("; ")),
+        _ => Holds::Go,
+    })
+}
+
+/// Ends the releases of a registration that a newer one supersedes (W28-R38), saying which: those
+/// waiting, once a newer one may go or is under way, and those rolling out, once a newer one's
+/// write is done and it rolls out. Each is cancelled, naming the release that took its place;
+/// nothing of it is reverted, the newer release's commit landing on top of its own, as a rollout's
+/// newer revision supersedes it.
+async fn coalesce(d: &Deploy, app: &str, env: &str) -> anyhow::Result<Vec<i64>> {
+    let flying = store::flying(&*d.records, app, env).await?;
+    let q: Vec<kiln_cd::deploys::Deploy> = flying
+        .iter()
+        .map(|r| {
+            let (id, target) = queued(r);
+            kiln_cd::deploys::Deploy { id, target, resources: BTreeSet::new(), phase: phase(r) }
+        })
+        .collect();
+    let g = kiln_cd::deploys::Deploys::new(&q);
+    let mut ended = Vec::new();
+    for r in flying {
+        if let Some(by) = g.superseded_by(&queued(&r).0) {
+            let (id, by) = (r.id, by.id.clone());
+            superseded(d, r, &by).await?;
+            ended.push(id);
+        }
+    }
+    Ok(ended)
+}
+
+/// Ends a release a newer one of its target supersedes (W28-R38): cancelled, saying which release
+/// took its place.
+async fn superseded(d: &Deploy, r: Release, by: &str) -> anyhow::Result<()> {
+    let why = format!("superseded by {by}: the newest revision of {} in {} rolls out", r.app, r.environment);
+    finish(d, r, State::Cancelled, Some(why)).await
+}
+
 /// A release committed (`sha`): delivering from now, handed to its provider.
 async fn committed(d: &Deploy, mut r: Release, sha: String, secrets: Option<String>, irreversible: Option<String>, now: i64) -> anyhow::Result<()> {
     let st = &*d.records;
@@ -1737,6 +1909,9 @@ async fn committed(d: &Deploy, mut r: Release, sha: String, secrets: Option<Stri
         return Ok(());
     }
     emit_release(d, &r);
+    // Its write done, it takes the place of the older releases of its target rolling out
+    // (docs/ci.md W28-R38).
+    coalesce(d, &r.app, &r.environment).await?;
     match deliver(d, &r).await {
         Ok(()) => note(&mut r.provider, "delivered_at", json!(now)),
         Err(e) => r.message = Some(e.to_string()),
@@ -2715,6 +2890,94 @@ mod tests {
             argocd: Default::default(),
             owners: Default::default(),
         }
+    }
+
+    /// docs/ci.md W28-R38, R39, the plan's test: app a in ns x, app b in ns y, app a again. a and b
+    /// roll out together; the second a supersedes the first, which rolls on until the second's
+    /// write is done. An app sharing a's namespace waits, naming it.
+    #[test]
+    fn w28_r38_a_and_b_roll_out_together_and_the_second_a_supersedes_the_first() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let root = tempfile::tempdir()?;
+            let d = Deploy {
+                records: Arc::clone(&hub.records),
+                stand_in: None,
+                hosted: super::super::host::Hosted::new(root.path()),
+                owner: "test".into(),
+                wake: crate::rt::Notify::new(),
+                changes: crate::rt::Broadcast::new(16),
+                argo: Default::default(),
+                remote: Default::default(),
+                hub: Arc::clone(&hub),
+            };
+            let st = &*d.records;
+            store::put_environment(st, &Environment { name: "prod".into(), targets: super::super::model::Targets { kubernetes: vec!["prod".into()], ..Default::default() }, ..env(false) }).await?;
+            for (name, ns) in [("a", "x"), ("b", "y"), ("c", "x")] {
+                let package = Package::Helm { repo: "oci://ghcr.io/acme/charts".into(), chart: name.into(), chart_version: None, set: BTreeMap::new() };
+                store::put_app(st, &App { name: name.into(), project: "shop".into(), owners: vec![], package, namespace: Some(ns.into()), properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false, registries: None }).await?;
+                store::put_registration(st, &Registration { app: name.into(), environment: "prod".into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None }).await?;
+            }
+            let release = |app: &str, version: &str, state: State| Release {
+                id: 0,
+                app: app.into(),
+                environment: "prod".into(),
+                kind: Kind::Deploy,
+                state,
+                origin: Origin::Api,
+                version: Some(version.into()),
+                artifacts: BTreeMap::new(),
+                values: None,
+                commit: (state == State::Delivering).then(|| format!("{app}-{version}")),
+                requested_by: "ada".into(),
+                message: None,
+                rollback_of: None,
+                rolled_back_by: None,
+                keep: false,
+                provider: Value::Null,
+                gates: Vec::new(),
+                approvals: Vec::new(),
+                promoted_from: None,
+                idempotency_key: None,
+                created_at: 0,
+                committed_at: None,
+                ended_at: None,
+                secrets: None,
+                no_revert: false,
+                reverts: None,
+                reverted_by: None,
+                irreversible: None,
+            };
+            let get = |id: i64| async move { store::release(st, id).await?.ok_or_else(|| anyhow::anyhow!("no release {id}")) };
+            // a and b rolling out together; a's second asked for.
+            let (a1, _) = store::insert_release(st, &release("a", "1.0", State::Delivering)).await?;
+            let (b, _) = store::insert_release(st, &release("b", "2.0", State::Delivering)).await?;
+            let (a2, _) = store::insert_release(st, &release("a", "1.1", State::Waiting)).await?;
+            anyhow::ensure!(matches!(holds(&d, &a2, false).await?, Holds::Go), "the second a goes beside b, superseding the first");
+            step(&d, a2.id).await?;
+            anyhow::ensure!(get(a2.id).await?.state == State::Committing, "the second a writes");
+            anyhow::ensure!(get(a1.id).await?.state == State::Delivering, "the first a rolls on while the second writes");
+            // Its write done, the second a rolls out and the first gives way to it; b rolls on.
+            let mut written = get(a2.id).await?;
+            written.state = State::Delivering;
+            written.commit = Some("a-1.1".into());
+            anyhow::ensure!(store::update_release(st, &written, State::Committing).await?);
+            step(&d, a1.id).await?;
+            let first = get(a1.id).await?;
+            anyhow::ensure!(first.state == State::Cancelled, "the first a ends: {:?}", first.state);
+            let said = format!("superseded by release {}: the newest revision of a in prod rolls out", a2.id);
+            anyhow::ensure!(first.message.as_deref() == Some(said.as_str()), "{:?}", first.message);
+            anyhow::ensure!(get(b.id).await?.state == State::Delivering && get(a2.id).await?.state == State::Delivering, "a and b roll out together");
+            // c shares a's namespace: it waits for a, naming it, asked for or in line.
+            let waits = format!("waits for release {}: both deploy to prod's x namespace", a2.id);
+            let Holds::Wait(why) = holds(&d, &release("c", "3.0", State::Committing), true).await? else { anyhow::bail!("c, asked for, doesn't wait") };
+            anyhow::ensure!(why == waits, "{why}");
+            let (c, _) = store::insert_release(st, &release("c", "3.0", State::Waiting)).await?;
+            step(&d, c.id).await?;
+            let c = get(c.id).await?;
+            anyhow::ensure!(c.state == State::Waiting && c.message.as_deref() == Some(waits.as_str()), "{:?} {:?}", c.state, c.message);
+            Ok(())
+        })
     }
 
     #[test]
