@@ -110,7 +110,7 @@ pub enum Lit {
 }
 
 impl Lit {
-    fn show(&self) -> String {
+    pub fn show(&self) -> String {
         match self {
             Lit::Str(s) => s.clone(),
             Lit::Num(n) => expr::js_number_to_string(*n),

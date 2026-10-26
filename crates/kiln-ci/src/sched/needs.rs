@@ -20,7 +20,7 @@
 //!
 //! Anything else is an error that names the word: `memm=4g: no such need`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::pools::{self, ResourceSpec};
 use super::routing::{self, Constraint};
@@ -29,7 +29,8 @@ use crate::expr;
 use crate::wf::ir::{JobKiln, YVal};
 
 /// What work needs of a runner.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Needs {
     /// What placement reserves on the runner it picks.
     pub request: Resources,
@@ -43,7 +44,7 @@ pub struct Needs {
 pub fn parse(spec: &str) -> Result<Needs, String> {
     let mut needs = Needs::default();
     for word in spec.split([',', ' ']).map(str::trim).filter(|w| !w.is_empty()) {
-        needs.word(word).map_err(|why| format!("{word}: {why}"))?;
+        needs.add(word).map_err(|why| format!("{word}: {why}"))?;
     }
     Ok(needs)
 }
@@ -84,7 +85,8 @@ impl Needs {
         if parts.is_empty() { "nothing in particular".into() } else { parts.join(", ") }
     }
 
-    fn word(&mut self, w: &str) -> Result<(), String> {
+    /// Adds one word of the spelling. An error says why it isn't one, without the word.
+    pub fn add(&mut self, w: &str) -> Result<(), String> {
         if w.eq_ignore_ascii_case("exclusive") {
             self.exclusive = true;
             return Ok(());
@@ -143,7 +145,7 @@ impl Needs {
     fn compare(&mut self, fact: &str, op: &str, value: &str) -> Result<(), String> {
         let (fact, value) = match fact.to_ascii_lowercase().as_str() {
             "cpus" | "cpu" => ("cpu.threads".to_owned(), value.to_owned()),
-            "mem" | "memory" => ("mem.free".to_owned(), size(value).ok_or("not a size (32g, 512m)")?.to_string()),
+            "mem" | "memory" => ("mem.free".to_owned(), binary(size(value).ok_or("not a size (32g, 512m)")?)),
             f if routing::known_fact(f) => (f.to_owned(), value.to_owned()),
             _ => return Err("no such fact (os, arch, cpu.cores, mem.total, disk.free, tools, …, custom.<name>)".into()),
         };
@@ -195,6 +197,15 @@ pub fn size(s: &str) -> Option<u64> {
     };
     let v = num.parse::<f64>().ok()? * k as f64;
     (v.is_finite() && v >= 0.0).then_some(v as u64)
+}
+
+/// Bytes as routing's language reads them back, in the largest binary unit that holds them whole:
+/// `32Gi`, `1536Mi`, or plain bytes.
+fn binary(n: u64) -> String {
+    [(1u64 << 40, "Ti"), (1 << 30, "Gi"), (1 << 20, "Mi"), (1 << 10, "Ki")]
+        .iter()
+        .find(|(k, _)| n >= *k && n.is_multiple_of(*k))
+        .map_or_else(|| n.to_string(), |(k, u)| format!("{}{u}", n / k))
 }
 
 /// What a request reserves, in words, leaving out what it doesn't ask for: `8 CPUs`, `32 GiB of
@@ -284,7 +295,8 @@ mod tests {
             ("cpu=500m memory=512Mi disk=50GB gpus=2", needs(Resources { cpu: 0.5, mem: 512 << 20, disk: 50 * GIB, gpu: 2 }, &[], false)),
             ("macos, arm64", needs(Resources::default(), &["os == macos", "arch == aarch64"], false)),
             ("darwin/apple-silicon", needs(Resources::default(), &["os == macos", "arch == aarch64"], false)),
-            ("cpus>=16,mem>=32g", needs(Resources::default(), &["cpu.threads >= 16", &format!("mem.free >= {}", 32 * GIB)], false)),
+            ("cpus>=16,mem>=32g", needs(Resources::default(), &["cpu.threads >= 16", "mem.free >= 32Gi"], false)),
+            ("mem>=1.5g,mem>=1000", needs(Resources::default(), &["mem.free >= 1536Mi", "mem.free >= 1000"], false)),
             ("disk.free>=50Gi,os.distro==fedora,custom.rack!=a3", needs(Resources::default(), &["disk.free >= 50Gi", "os.distro == fedora", "custom.rack != a3"], false)),
             ("executor:docker,flag:avx2,binfmt:linux/arm64", needs(Resources::default(), &["executors has docker", "cpu.flags has avx2", "binfmt has linux/arm64"], false)),
             ("label=bench,+bench", needs(Resources::default(), &["label bench"], false)),

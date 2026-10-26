@@ -38,7 +38,8 @@ pub enum Req {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunReq {
-    /// Where: a runner's name, what it must be (`linux/amd64`, `macos,+gpu`), or empty for the best.
+    /// Where: a runner's name and what the work needs, as one spelling (`linux/amd64`,
+    /// `cpus=8,mem=32g`, `adacachy,mem=32g`: [`directory::target`]), or empty for the best.
     pub target: String,
     pub command: String,
     /// This machine's folder the command is about: its tree is copied over when `sync`, and the
