@@ -69,6 +69,15 @@ HOSTED = {
     ("windows", "aarch64", None): ["github-windows-11-aarch64-8"],
 }
 
+# The corpus's Android jobs, in kiln's opt-in Android image of their label's Ubuntu (Android's SDK
+# and NDK 27 where GitHub's images have them): naming it accepts the Android SDK's licence, as the
+# user did (2026-10-23, the plan's step 7). (repository, job, label, image)
+ANDROID = [
+    ("astral-sh/uv", "build-binary-android-aarch64", "github-ubuntu-24.04-x86_64-8", "kiln/runner-ubuntu-24.04-android"),
+    ("python/cpython", "build-android", "ubuntu-26.04", "kiln/runner-ubuntu-26.04-android"),
+    ("bevyengine/bevy", "build-android", "ubuntu-latest", "kiln/runner-ubuntu-24.04-android"),
+]
+
 # Failures that aren't kiln's, by what their notes say: the reason the table gives.
 KNOWN = [
     (r"deploy-pages|Failed to create deployment \(status: 501\)", "GitHub Pages is outside kiln (docs/ci.md §1.3)"),
@@ -269,8 +278,12 @@ class Api:
 
 
 def route_hosted(api):
-    """The server's routing rules: [`HOSTED`]'s labels each routed as its GitHub equivalent."""
-    rules = []
+    """The server's routing rules: [`ANDROID`]'s jobs in the Android image, then [`HOSTED`]'s
+    labels each routed as its GitHub equivalent."""
+    rules = [
+        {"match": {"labels": [label], "job": f"job.id == '{job}'", "repos": [repo]}, "require": ["os == linux", "arch == x86_64"], "executor": ["docker", "host"], "image": image}
+        for repo, job, label, image in ANDROID
+    ]
     for (os_, arch, image), labels in HOSTED.items():
         for label in labels:
             rule = {"match": {"labels": [label]}, "require": [f"os == {os_}", f"arch == {arch}"]}
@@ -278,7 +291,7 @@ def route_hosted(api):
                 rule.update(executor=["docker", "host"], image=image)
             rules.append(rule)
     api.call("PUT", "/api/ci/routing/rules?scope=server", {"rules": rules})
-    print(f"routed {len(rules)} other hosted runners' labels as GitHub's", flush=True)
+    print(f"routed {len(ANDROID)} Android jobs to the Android image, {len(rules) - len(ANDROID)} other hosted runners' labels as GitHub's", flush=True)
 
 
 def git(cwd, *args, check=True, env=None):
@@ -649,10 +662,10 @@ LEFT = [
     # images have (mssql-tools18 and msodbcsql18, their EULA accepted in the image's build).
     (r"This extension requires the Microsoft ODBC Driver for SQL Server", "it reaches SQL Server through Microsoft's ODBC driver, which GitHub's image has and kiln's hasn't: installing it accepts Microsoft's licence (its EULA), the user's call, as Android's SDK's is (W13-R04, left)"),
     # cpython's Android build: Android's SDK at `ANDROID_HOME`, as bevy's below.
-    (r"The ANDROID_HOME environment variable is required", "it builds for Android with Android's SDK at `ANDROID_HOME`: GitHub's image has one, kiln's only its opt-in `-android` image, whose SDK licence the user accepts (the plan's step 7, left)"),
+    (r"The ANDROID_HOME environment variable is required", "it builds for Android with Android's SDK at `ANDROID_HOME`: GitHub's image has one, kiln's only its opt-in `-android` image, whose SDK licence the user accepted (the plan's step 7): `ANDROID` routes the corpus's Android jobs to it"),
     # bevy's Android build: cargo-ndk needs Android's NDK, in GitHub's image and only in kiln's
     # opt-in `-android` one, whose SDK licence the user accepts.
-    (r"Could not find any NDK", "it builds for Android with cargo-ndk, which needs Android's NDK: GitHub's image has one, kiln's only in its opt-in `-android` image, whose SDK licence the user accepts (the plan's step 7, left)"),
+    (r"Could not find any NDK", "it builds for Android with cargo-ndk, which needs Android's NDK: GitHub's image has one, kiln's only in its opt-in `-android` image, whose SDK licence the user accepted (the plan's step 7): `ANDROID` routes the corpus's Android jobs to it"),
     # buildx's update-deps: another repository's releases (moby/moby's) through the facade.
     (r"(HttpError: |error: )Not Found - https://github\.com/hyper-light/kiln/blob/main/docs/ci\.md#w14", "it reads a repository kiln doesn't have through the facade's REST API (`GITHUB_API_URL`: buildx's update-deps lists moby/moby's releases), which kiln answers Not Found: its git fetches go on to GitHub (W14-R11), its API reads don't; legs' reads of github.com's API wait for W18's egress proxy and a GitHub credential (W22, left)"),
     # TypeScript's file watcher tests take fanotify's file handles, which the docker executor's

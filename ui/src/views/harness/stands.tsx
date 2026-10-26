@@ -2,9 +2,11 @@
  * How your agents stand, in a row of its own under Mission control's head: a rule with a stretch
  * for each way they stand, as long as its share of them, and under it each one's badge and count
  * (on a desktop its name too). The rule is one string of light across every stretch, damped in
- * each as much as its agents are still, each stretch particles in its own ring's colours, reaching
- * for the next across the gap between them (stands-light.ts). It's drawn each frame while it's on
- * screen and motion plays; paused (Kiln's toggle, or reduced motion) it holds still.
+ * each as much as its agents are still, ripples running through it with each stretch a medium of
+ * its own, each stretch particles in its own ring's colours, reaching for the next across the gap
+ * between them (stands-light.ts). It's drawn each frame while it's on screen and motion plays;
+ * paused (Kiln's toggle, or reduced motion) it holds still. The badges keep their own steady
+ * animations (stands.css), each on its own.
  */
 import * as React from "react";
 import "./stands.css";

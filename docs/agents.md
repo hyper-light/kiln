@@ -55,6 +55,14 @@ loads the harness's saved conversation; a replay already in kiln's timeline is n
 again. Context occupancy comes from `usage_update`; token totals use the prompt's reported
 usage, and costs are displayed only when denominated in USD.
 
+kiln offers ACP's [session compaction](https://agentclientprotocol.com/protocol/v1/prompt-turn)
+(`clientCapabilities.session.compaction`): a compaction an agent reports with `compaction_update`
+is under way (`state.compacting`) until it says how it ended (`completed`, `failed`,
+`cancelled`), then its marker shows where it ran, with the tokens and time
+`_meta.contextCompaction` gives (claude-agent-acp); its summary isn't shown. Devin keeps its own
+compactions out of ACP, so a `/compact` sent to an agent whose catalog has one is a compaction for
+its turn, its answer saying how it went.
+
 The Antigravity CLI runs as `agy --input-format stream-json --output-format stream-json`: kiln
 writes `{"event":"user","message":{"content":…}}` for each turn and reads `init` (its conversation,
 which a restart resumes with `--conversation`), `step_update`s (the reply as it streams, each tool
@@ -189,6 +197,10 @@ Updates (`t`): `open {info}` (a snapshot follows), `state {state}`, `meta {meta}
 `events {events}` (upserts by id), `stream {id, text}` (text appended to a streaming event),
 `changes {files}` (the whole changeset), `reply {client, value}` (the answer to one client's
 request), `reset` (the timeline starts over), `synced` (the snapshot is complete), `closed`.
+
+A command on the socket is audited as its caller (`agent.command`), its row written beside the
+socket by a writer of its own, in order: the command goes on to the session without waiting for
+kiln's store, which a busy disk can hold for seconds (a message then showed seconds late).
 
 On a slow link most of what a long conversation sends is its snapshot, and during a turn its
 state changes all the time while most of it (skills, plugins, MCP servers) stays the same. A
@@ -940,6 +952,19 @@ changed outside it.
 Besides the timeline-related fields (`status`, `approvals`, `queue`, `delivery`, `tasks`,
 `todos`, `usage`, …):
 
+- `compacting?` — its harness compacting a conversation now (summarizing it to free context):
+  `{since, tokens?, parent?}`, `parent` a subagent's (its spawning call), one at a time, the main
+  thread's over a subagent's; meanwhile `doing` is "Compacting the conversation". Once it's done
+  its marker, a notice whose id starts `compaction:`, is where it ran: "Compacted · 967k → 48k
+  tokens · 1m 38s", as much as its harness says; a warning when it didn't compact ("Couldn't
+  compact: …"), or stopped first (its turn or its process ended: "Compaction stopped after 41s").
+  Claude Code says one with `status: "compacting"` (again every 30 s), its end (`compact_result`,
+  `compact_error`) and its boundary (`compact_metadata`); Codex with its `contextCompaction` item
+  (its older `thread/compacted` alone, from a Codex without the item); ACP agents as above. The
+  Antigravity CLI says nothing of one. The conversation draws the one under way where its live
+  line is, and each marker as the boundary it is, kiln's earlier words for one
+  ("Conversation compacted …") too.
+
 - `objective?` — the goal the harness itself pursues across turns (Claude Code's `/goal`,
   Codex's thread goal) and how it stands: `{text, status: "active" | "met" | "unmet" | "paused" |
   "cleared", reason?, at}`. Claude Code's comes from its `/goal` output and the verdict it writes
@@ -1079,6 +1104,18 @@ working: what you send is kept in your browser ("Kept here", editable and remova
 reloads) and goes to the agent in order once it can take it, ahead of anything sent after.
 Files attached go along when they were uploaded; ones that couldn't be (no server) stay with the
 page until it reloads.
+
+### What you sent, at once
+
+A message shows at the end of the conversation the moment it goes, marked *sending…*, then *sent*
+once its machine has it (the socket's `ack`), until the agent's session shows it (its prompt, or
+its place in a queue, the agent's or a subagent's), which then takes its place (`SessionStore`'s
+`outgoing`, `ui/src/api/harness.ts`). While it waits (its machine away, its inbox slow to answer)
+it goes again under its id by itself, as every command does (docs/wire.md, "The UI's sockets"),
+and the line above the composer says why. One refused for good (the socket's `nack`, or no answer
+at all) or whose agent ended before it got there says *failed to send* and why, with Retry and
+Remove. Retry sends its words, files and reply again as a new message: its id's answer stays the
+refusal. These are kept in the page only; CP-T3.4's outbox keeps them across reloads and tabs.
 
 ### A machine on battery
 
@@ -1292,6 +1329,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | subagents: tasks, nested messages, stop | ✓ | unit (read-only task and thread tracking; no direct stop) | — | — |
 | a person's message to a subagent: queue, steer, now | unit (by way of its agent's SendMessage; no now) | unit (v1 on its own thread; v2 by way of its agent) | — | — |
 | rewind, branch, compact, rename | ✓ | ✓ | — | — |
+| a compaction shown as it goes on, then marked where it ran (`compacting`) | unit | unit | unit (`compaction_update`; Devin: its own `/compact`) | — (their ACP says nothing of one) |
 | restore files on rewind | ✓ | — | — | — |
 | thinking display / budget, output style | ✓ | ✓ (reasoning summaries) | — | — |
 | plan limits (`limits`) | ✓ none for an API key; unit for subscriber windows | ✓ (pushed during turns); unit for ChatGPT reads | — | — |

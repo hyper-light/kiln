@@ -619,19 +619,15 @@ impl Hub {
         Ok(())
     }
 
-    /// A runner process of `machine` that can hold a learner said so: the newest such process
-    /// holds the machine's (it's told its member and the token its copies are fetched with), and
-    /// every other one lets its go, so one process at a time has the replica's files.
+    /// A runner process of `machine` that can hold a learner said so, or its newest process changed:
+    /// the newest such process holds the machine's (it's told its member and the token its copies
+    /// are fetched with), and every other one lets its go, so one process at a time has the
+    /// replica's files.
     async fn cluster_announced(&self, machine: &str) {
         // The server's own runner, in its process, reads kiln.db as it is.
         let own = self.cfg.local_agent.enabled && machine == crate::pki::sanitize_name(&self.cfg.local_agent_name());
         let group = self.store.group().filter(|_| self.cfg.cluster.learners && !own);
-        let (newest, mut others) = {
-            let inst = self.instances.lock();
-            let newest = inst.newest_with(machine, proto::CAP_CLUSTER);
-            let others: Vec<PeerId> = inst.of(machine).into_iter().filter(|p| Some(*p) != newest && inst.get(*p).is_some_and(|i| i.caps & proto::CAP_CLUSTER != 0)).collect();
-            (newest, others)
-        };
+        let (newest, mut others) = self.instances.lock().holder_of(machine, proto::CAP_CLUSTER);
         // With learners off, the newest lets its replica go too: its front door pipes to the
         // server again rather than wait for a replica that no longer follows.
         if group.is_none() {
@@ -1862,6 +1858,12 @@ impl Hub {
             // Hand-overs between a machine's runner processes (`crate::handovers`).
             AgentMsg::HarnessHandOver { session, offset, data, done } => self.handover_piece(&agent, peer, session, offset, data, done).await,
             AgentMsg::HarnessAdopted { session, error } => self.handover_adopted(&agent, peer, session, error).await,
+            // What it holds warm, for placement (docs/ci.md W24-R18); a job's pod holds nothing.
+            AgentMsg::WorkState { json } => match serde_json::from_str::<kiln_ci::work::slots::WorkState>(&json) {
+                Ok(state) if !self.agents.lock().get(&agent).is_none_or(|a| a.ephemeral) => self.ci.send(crate::ci::dispatch::Msg::WorkState { agent: agent.clone(), state: Box::new(state) }),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(agent = %agent, error = %e, "an unreadable report of warm workspaces"),
+            },
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -2155,7 +2157,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
@@ -2252,6 +2254,10 @@ impl Hub {
         self.check_handover().await;
         // The front door moves to the process that is newest now.
         crate::frontdoor::control::on_instance_lost(self, name).await;
+        // So does the replica: a blue/green upgrade's new build was told to let it go as it joined
+        // (ranked oldest), and nothing else tells it to hold it now (until 2026-10-25 a machine
+        // upgraded so held no replica until its runner next connected).
+        self.cluster_announced(name).await;
     }
 
     /// A machine's runner processes, while it has more than one, with what each holds.
@@ -2542,7 +2548,7 @@ impl Hub {
                         event: run.event.clone(),
                         run_number: run.number,
                         attempt: job.attempt,
-                        spec,
+                        spec: spec.for_runner(self.runner_caps(&agent)),
                         secrets: self.job_secrets(),
                         job_token: crate::api::job_token(&self.admin_token, &job.id),
                         server_url: self.server_url_for(&agent),
