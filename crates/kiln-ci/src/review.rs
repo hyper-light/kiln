@@ -53,13 +53,13 @@ impl State {
 }
 
 /// Whether `line` is a git trailer (`Key: value`, the key letters, digits and `-`).
-fn trailer(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn trailer(line: &str) -> Option<(&str, &str)> {
     let (k, v) = line.split_once(':')?;
     (!k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && v.starts_with(' ')).then(|| (k, v.trim()))
 }
 
 /// The message's paragraphs, without trailing blank lines.
-fn paragraphs(message: &str) -> Vec<Vec<&str>> {
+pub(crate) fn paragraphs(message: &str) -> Vec<Vec<&str>> {
     let mut out: Vec<Vec<&str>> = vec![Vec::new()];
     for line in message.trim_end().lines() {
         if line.trim().is_empty() {
@@ -121,7 +121,8 @@ pub fn title_and_summary(message: &str) -> (String, String) {
 
 /// A push's options (`git push -o …`): `draft`, `ready`, `reviewer=ada,agent:review`
 /// (repeatable), `message=…` (a note on the new versions), `topic=…`, `title=…` (a change
-/// request's); unknown ones are said back.
+/// request's), `change=<sha>:<D41|new>` (repeatable: which change a commit is, when kiln asked,
+/// W26-R03); unknown ones are said back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
     pub draft: bool,
@@ -131,6 +132,8 @@ pub struct Options {
     pub topic: Option<String>,
     /// A change request's title.
     pub title: Option<String>,
+    /// Answers to kiln's questions of which change a commit is.
+    pub answers: Vec<crate::identity::Answer>,
     pub unknown: Vec<String>,
 }
 
@@ -146,6 +149,7 @@ pub fn options<S: AsRef<str>>(given: &[S]) -> Options {
             ("message" | "m", Some(v)) => o.message = Some(v.to_owned()),
             ("topic", Some(v)) if !v.is_empty() => o.topic = Some(v.to_owned()),
             ("title", Some(v)) if !v.is_empty() => o.title = Some(v.to_owned()),
+            ("change", Some(v)) if crate::identity::answer(v).is_some() => o.answers.extend(crate::identity::answer(v)),
             _ => o.unknown.push(opt.to_owned()),
         }
     }
@@ -161,9 +165,11 @@ pub struct Commit {
     pub message: String,
     /// `git patch-id --stable`: the same patch on another base has the same one.
     pub patch_id: String,
+    /// The change it is, as [`crate::identity::identify`] settled it (W26-R03).
+    pub change: String,
 }
 
-/// An open or closed diff with this Change-Id, as the server keeps it: its latest version.
+/// An open or closed diff of this change, as the server keeps it: its latest version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Known {
     pub number: u32,
@@ -173,7 +179,7 @@ pub struct Known {
     pub parent: String,
     /// The trunk commit the version was based on.
     pub base: String,
-    /// The Change-Id of the diff below it in its stack (`None`: it sat on the trunk).
+    /// The change of the diff below it in its stack (`None`: it sat on the trunk).
     pub below: Option<String>,
     pub patch_id: String,
     pub message: String,
@@ -197,7 +203,8 @@ pub enum Step {
 pub struct Planned {
     pub sha: String,
     pub parent: String,
-    pub change_id: String,
+    /// Its change's identity.
+    pub change: String,
     pub title: String,
     pub summary: String,
     pub step: Step,
@@ -207,10 +214,11 @@ pub struct Planned {
 pub const MAX_STACK: usize = 100;
 
 /// What submitting `commits` (bottom first, everything between the trunk and the pushed commit,
-/// based on trunk commit `base`) does to the diffs there are (`known`, by Change-Id); refused
-/// whole, saying why, when any commit can't be a diff. Only the diffs that changed get versions
-/// (review.md): a diff restacked on a changed one below keeps its version; one whose patch only
-/// moved to a new base, or to a new place in the stack, gets a rebase-only version.
+/// based on trunk commit `base`, each with its change) does to the diffs there are (`known`, by
+/// change); refused whole, saying why, when any commit can't be a diff. Only the diffs that
+/// changed get versions (review.md): a diff restacked on a changed one below keeps its version;
+/// one whose patch only moved to a new base, or to a new place in the stack, gets a rebase-only
+/// version (its message compared without kiln's own `Kiln-Change` line, which a restack adds).
 pub fn plan(commits: &[Commit], known: &BTreeMap<String, Known>, base: &str) -> Result<Vec<Planned>, String> {
     if commits.is_empty() {
         return Err("nothing to submit: the commit is already on the trunk".into());
@@ -221,16 +229,17 @@ pub fn plan(commits: &[Commit], known: &BTreeMap<String, Known>, base: &str) -> 
     let mut seen = HashSet::new();
     let mut out: Vec<Planned> = Vec::with_capacity(commits.len());
     for c in commits {
-        let below = out.last().map(|p| p.change_id.clone());
+        let below = out.last().map(|p| p.change.clone());
         let short = c.sha.get(..12).unwrap_or(&c.sha);
         let [parent] = c.parents.as_slice() else {
             return Err(format!("{short} is a merge: a diff is one commit on another (a branch with merges is a change request, refs/for/<trunk>/branch/<name>)"));
         };
-        let Some(id) = change_id(&c.message) else {
-            return Err(format!("{short} has no Change-Id: install kiln's commit-msg hook (`kiln clone`, or `kiln hook install`) and amend, or submit with `kiln submit`, which adds them"));
-        };
+        let id = c.change.clone();
+        if id.is_empty() {
+            return Err(format!("{short} has no change identity"));
+        }
         if !seen.insert(id.clone()) {
-            return Err(format!("{short}: two commits of this push have Change-Id {id}; squash them, or give one a new Change-Id"));
+            return Err(format!("{short}: two commits of this push are one change ({id}); squash them, or take the `Kiln-Change:` line out of one"));
         }
         let (title, summary) = title_and_summary(&c.message);
         if title.is_empty() {
@@ -238,11 +247,11 @@ pub fn plan(commits: &[Commit], known: &BTreeMap<String, Known>, base: &str) -> 
         }
         let step = match known.get(&id) {
             None => Step::New,
-            Some(k) if k.state == State::Landed => return Err(format!("{short}: Change-Id {id} is D{}'s, which landed; give this commit a new Change-Id", k.number)),
+            Some(k) if k.state == State::Landed => return Err(format!("{short} is D{}, which landed: take its `Kiln-Change:` (or `Change-Id:`) line out (`git commit --amend`) and it is a new change", k.number)),
             Some(k) if k.state == State::Abandoned => return Err(format!("{short}: D{} is abandoned; reclaim it first (`kiln diff reclaim D{}`)", k.number, k.number)),
             Some(k) if k.commit == c.sha => Step::Unchanged { number: k.number, n: k.version },
             Some(k) => {
-                let same = !k.patch_id.is_empty() && k.patch_id == c.patch_id && k.message.trim_end() == c.message.trim_end();
+                let same = !k.patch_id.is_empty() && k.patch_id == c.patch_id && crate::identity::without_kiln_change(&k.message) == crate::identity::without_kiln_change(&c.message);
                 let reordered = k.below != below;
                 if same && !reordered && k.base == base {
                     Step::Unchanged { number: k.number, n: k.version }
@@ -251,7 +260,7 @@ pub fn plan(commits: &[Commit], known: &BTreeMap<String, Known>, base: &str) -> 
                 }
             }
         };
-        out.push(Planned { sha: c.sha.clone(), parent: parent.clone(), change_id: id, title, summary, step });
+        out.push(Planned { sha: c.sha.clone(), parent: parent.clone(), change: id, title, summary, step });
     }
     Ok(out)
 }
@@ -436,15 +445,18 @@ mod tests {
 
     #[test]
     fn w14_r03_options() {
-        let o = options(&["draft", "reviewer=ada,agent:review", "r=bob", "message=addressed comments", "topic=outputs", "nonsense=1"]);
+        let o = options(&["draft", "reviewer=ada,agent:review", "r=bob", "message=addressed comments", "topic=outputs", "nonsense=1", "change=abc1234:D41", "change=def5678:new", "change=zz:D1"]);
         assert!(o.draft && !o.ready);
         assert_eq!(o.reviewers, ["ada", "agent:review", "bob"]);
         assert_eq!((o.message.as_deref(), o.topic.as_deref()), (Some("addressed comments"), Some("outputs")));
-        assert_eq!(o.unknown, ["nonsense=1"]);
+        assert_eq!(o.unknown, ["nonsense=1", "change=zz:D1"]);
+        // W26-R03: answers to which change a commit is.
+        use crate::identity::{Answer, Choice};
+        assert_eq!(o.answers, [Answer { commit: "abc1234".into(), choice: Choice::Change("D41".into()) }, Answer { commit: "def5678".into(), choice: Choice::New }]);
     }
 
     fn commit(sha: &str, parent: &str, id: &str, title: &str, patch: &str) -> Commit {
-        Commit { sha: sha.repeat(40).get(..40).unwrap_or_default().to_owned(), parents: vec![parent.repeat(40).get(..40).unwrap_or_default().to_owned()], message: format!("{title}\n\nChange-Id: {id}\n"), patch_id: patch.into() }
+        Commit { sha: sha.repeat(40).get(..40).unwrap_or_default().to_owned(), parents: vec![parent.repeat(40).get(..40).unwrap_or_default().to_owned()], message: format!("{title}\n\nChange-Id: {id}\n"), patch_id: patch.into(), change: id.into() }
     }
 
     #[test]
@@ -487,9 +499,13 @@ mod tests {
         // A new message isn't rebase-only.
         let m1 = Commit { sha: "6".repeat(40), message: format!("one, reworded\n\nChange-Id: {A}\n"), ..d1.clone() };
         assert_eq!(steps(plan(&[m1], &k, "t")?), [Step::Version { number: 1, n: 2, rebase_only: false, reordered: false }]);
-        // Refusals: no Change-Id, a merge, the same Change-Id twice, landed and abandoned diffs.
-        let bare = Commit { message: "no id\n".into(), ..d1.clone() };
-        assert!(plan(&[bare], &k, "t").is_err_and(|e| e.contains("no Change-Id")));
+        // W26-R03: a version kiln restacked added its `Kiln-Change` line: still the same message.
+        let restacked: BTreeMap<String, Known> = [(A.to_owned(), Known { message: crate::identity::with_kiln_change(&d1.message, "kc-00000000000000aa"), ..known(1, &d1, None, State::NeedsReview) })].into();
+        let moved = Commit { sha: "3".repeat(40), parents: vec!["u".repeat(40)], ..d1.clone() };
+        assert_eq!(steps(plan(&[moved], &restacked, "u")?), [Step::Version { number: 1, n: 2, rebase_only: true, reordered: false }]);
+        // Refusals: no identity, a merge, one change twice, landed and abandoned diffs.
+        let bare = Commit { message: "no id\n".into(), change: String::new(), ..d1.clone() };
+        assert!(plan(&[bare], &k, "t").is_err_and(|e| e.contains("no change identity")));
         let merge = Commit { parents: vec!["t".repeat(40), "s".repeat(40)], ..d1.clone() };
         assert!(plan(&[merge], &k, "t").is_err_and(|e| e.contains("merge")));
         assert!(plan(&[d1.clone(), Commit { sha: "5".repeat(40), ..d1.clone() }], &k, "t").is_err_and(|e| e.contains("two commits")));

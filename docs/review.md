@@ -26,9 +26,23 @@ kiln clone hyper-light/kiln     # remote + commit-msg hook + `kiln` helpers
 
 ## Diffs, versions and stacks
 
-- **Diff**: a commit under review, numbered per kiln (`D123`). Its identity survives amends and
-  rebases through a `Change-Id: I<40 hex>` trailer (the Gerrit format, so existing hooks and
-  tools work). The commit-msg hook adds it; `kiln submit` adds it to commits that lack it.
+- **Diff**: a commit under review, numbered per kiln (`D123`). It is a **change** whose
+  identity is kiln's own (`kc-` and 16 hex digits, docs/ci.md W26-R03), kept with its history:
+  its versions, its numbers on each host, what it was split from or absorbed. A commit carries
+  it in a `Kiln-Change: kc-…` trailer, which survives every client's amend and rebase. No hook
+  is needed: a commit pushed without one is matched to the change it rewrites (the same
+  patch-id, else the open change of the same author and trunk its patch is clearly most like,
+  as `git range-diff` pairs commits), and kiln asks when it can't tell. Gerrit's `Change-Id`
+  trailer (which kiln wrote before) and the `change-id` header jj and GitButler write (and
+  GitButler's older `gitbutler-change-id`) find their change too, as aliases; a trailer and an
+  alias naming different changes are refused, saying why. Every commit kiln makes for a change
+  (submissions without git, lands, restacks, agents' stacks) carries its trailer, and kiln's
+  optional commit-msg hook adds one to new commits.
+- **Splits and squashes**: two commits that are one change (both keeping its trailer, or both
+  like it) are a split: the one most like the change keeps it, the other is a new diff, split
+  from it (`D43 v1 (new, split from D41)`). One commit holding two open changes side by side is
+  a squash: it keeps the one it's most like and absorbs the other, which is closed
+  (`D41 v3 (updated; absorbed D42)`).
 - **Version**: each push of a changed commit adds a version (`D123 v3`). A version records the
   commit, its parent and the trunk commit it was based on. A version whose patch is unchanged and
   only sits on a new base is marked **rebase-only**, so reviewers know nothing new is in it.
@@ -48,11 +62,12 @@ git commit -m "pipeline: dynamic matrices"   # D2, on top of D1
 kiln submit                                  # or: git push kiln HEAD:refs/for/main
 ```
 
-kiln takes the commits between trunk and `HEAD`, bottom to top. For each one it creates a diff,
-or adds a version to the diff with the same `Change-Id`. It links the stack, starts `diff`
-pipelines for every new version, and prints each diff's number and link. Push options:
-`-o draft`, `-o reviewer=ada,agent:review`, `-o message="addressed comments"` (a note on the new
-versions), `-o topic=<name>`.
+kiln takes the commits between trunk and `HEAD`, bottom to top. For each one it finds its
+change (its trailer, an alias, or the change it rewrites) and creates a diff, or adds a version
+to the change's diff. It links the stack, starts `diff` pipelines for every new version, and
+prints each diff's number and link. Push options: `-o draft`, `-o reviewer=ada,agent:review`,
+`-o message="addressed comments"` (a note on the new versions), `-o topic=<name>`, and
+`-o change=<commit>:<D41|new>`, the answer when kiln asked which change a commit is.
 
 To change something in the middle of a stack, amend that commit (`git rebase -i`, or
 `kiln absorb` to route working-copy edits to the commits that last touched those lines) and

@@ -506,7 +506,7 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "action": {"type": "string", "enum": ["accept", "request_changes", "comment", "resign"]}, "body": {"type": "string"}}), &["diff", "action"]),
                 route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "review"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "review"], &HashMap::new(), &v).await }),
-            op!("ci.diffs.submit_patch", "Submit commits as diffs without git: patches (`git format-patch`'s mbox, or a list) onto the trunk, each a diff or a new version of its diff (by Change-Id).", base: "", ro: false, destructive: false,
+            op!("ci.diffs.submit_patch", "Submit commits as diffs without git: patches (`git format-patch`'s mbox, or a list) onto the trunk, each a diff or a new version of its diff (by its change: its Kiln-Change, a Change-Id, or the diff it rewrites).", base: "", ro: false, destructive: false,
                 input: || schema(json!({"repo": {"type": "string", "description": REPO}, "mbox": {"type": "string"}, "patches": {"type": "array"}, "trunk": {"type": "string"}}), &["repo"]),
                 route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "submit"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { let repo = text(&v, "repo")?; diffs(&cx, Method::POST, &["repos", repo.as_str(), "submit"], &HashMap::new(), &v).await }),

@@ -151,6 +151,37 @@ mod tests {
         Ok(())
     }
 
+    /// W26-R03: diffs and change requests made before change identities each get one; their
+    /// Change-Ids become aliases (the newest diff's, for one used twice) and their numbers are
+    /// recorded; the epoch stays this build's.
+    #[test]
+    fn w26_r03_identities_are_backfilled() -> anyhow::Result<()> {
+        const MINE: &str = "20261026-1000_w26_change_identity";
+        let mut c = Connection::open_in_memory()?;
+        c.execute_batch(crate::store::SCHEMA)?;
+        let (before, after): (Vec<(&str, &str)>, Vec<(&str, &str)>) = MIGRATIONS.iter().copied().partition(|(n, _)| *n < MINE);
+        apply_list(&mut c, &before)?;
+        let row = "INSERT INTO diffs (id, repo_id, number, kind, change_id, title, author, author_kind, state, trunk, created_at, updated_at) VALUES (?1, 'r', ?2, ?3, ?4, 't', 'user:ada', 'human', ?5, 'main', 1, 1)";
+        for (id, n, kind, cid, state) in [("d1", 1, "diff", Some("I1111111111111111111111111111111111111111"), "landed"), ("d2", 2, "diff", Some("I2222222222222222222222222222222222222222"), "needs-review"), ("c3", 3, "change_request", None, "needs-review"), ("d4", 4, "diff", Some("I1111111111111111111111111111111111111111"), "draft")] {
+            c.execute(row, params![id, n, kind, cid, state])?;
+        }
+        apply_list(&mut c, &after)?;
+        let ids: Vec<(String, String)> = c.prepare("SELECT id, kiln_change FROM diffs ORDER BY number")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        assert_eq!(ids.len(), 4);
+        assert!(ids.iter().all(|(_, k)| kiln_ci::identity::is_kiln_change(k)), "{ids:?}");
+        let distinct: std::collections::BTreeSet<&String> = ids.iter().map(|(_, k)| k).collect();
+        assert_eq!(distinct.len(), 4, "each its own");
+        let change_of = |id: &str| ids.iter().find(|(d, _)| d == id).map(|(_, k)| k.clone()).unwrap_or_default();
+        let alias: String = c.query_row("SELECT change FROM change_aliases WHERE kind = 'change-id' AND alias = 'I1111111111111111111111111111111111111111'", [], |r| r.get(0))?;
+        assert_eq!(alias, change_of("d4"), "a Change-Id used twice points to the newest diff");
+        let numbers: Vec<String> = c.prepare("SELECT number FROM change_numbers WHERE host = 'kiln' ORDER BY number")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        assert_eq!(numbers, ["CR3", "D1", "D2", "D4"]);
+        let changes: i64 = c.query_row("SELECT COUNT(*) FROM changes", [], |r| r.get(0))?;
+        assert_eq!(changes, 4);
+        assert_eq!(read_min_reader(&c)?, 0, "no epoch raised: older builds still open it");
+        Ok(())
+    }
+
     #[test]
     fn shipped_epochs_are_this_builds() {
         for (name, sql) in MIGRATIONS {
