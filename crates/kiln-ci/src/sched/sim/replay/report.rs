@@ -129,6 +129,65 @@ pub fn measured_workflow(trace: &Trace, workflow: &str) -> Figures {
     figures(&pushes, used, wasted)
 }
 
+/// Where a commit without an answer an hour after its push stood then (W28-R53).
+pub const LATE: [&str; 6] = [
+    "a suspect: its bisection still going",
+    "pending: its answer's job waiting for a runner",
+    "pending: its answer's job running",
+    "pending: its answer's job waiting for its needs",
+    "pending: its answer's push not made yet",
+    "no answer in the window",
+];
+
+/// For a workflow's commits on main without an answer an hour after their push (P3 and later),
+/// how many stood where then, by [`LATE`]'s causes: a suspect waiting for its bisection, or
+/// pending on the job that answered it at last (waiting for a runner, running, waiting for its
+/// needs, or its push not made yet), or never answered in the window.
+pub fn late(trace: &Trace, out: &Outcome, workflow: &str) -> [usize; 6] {
+    let mut n = [0usize; 6];
+    if !out.covers {
+        return n;
+    }
+    let lanes = super::verdict::lanes(trace);
+    let Some(runs) = lanes.get(&format!("{workflow}|push|main")) else { return n };
+    for (p, d) in super::verdict::lane_detail(trace, out, runs, Some(SOON)).into_iter().enumerate() {
+        let (Some(at_hour), Some(last), Some(&r)) = (d.late, d.last, runs.get(p)) else { continue };
+        let Some(run) = trace.runs.get(r) else { continue };
+        let t = run.at + SOON;
+        let cause = if d.verdict.is_none() {
+            5
+        } else if at_hour.kind == crate::verdict::Kind::Suspect {
+            0
+        } else {
+            // The check still pending then that was answered last, and the job that answered it.
+            let pending: Vec<&crate::verdict::Check> = at_hour.checks.iter().filter(|c| c.status == crate::verdict::Status::Pending).map(|c| &c.check).collect();
+            let answer = last.checks.iter().filter(|c| pending.contains(&&c.check)).max_by_key(|c| c.at);
+            match answer {
+                Some(a) => {
+                    let by = a.by.and_then(|q| runs.get(q)).copied().unwrap_or(r);
+                    let pushed = trace.runs.get(by).is_some_and(|x| x.at <= t);
+                    let exec = out.execs.iter().filter(|e| e.bisect.is_none() && Some(e.ended) == Some(a.at)).find(|e| {
+                        let (Some(er), Some(br)) = (trace.runs.get(e.run), trace.runs.get(by)) else { return false };
+                        er.workflow == br.workflow && er.jobs.get(e.job).is_some_and(|j| j.key == a.check.unit)
+                    });
+                    match exec {
+                        _ if !pushed => 4,
+                        Some(e) if e.queued > t => 3,
+                        Some(e) if e.started.is_none_or(|s| s > t) => 1,
+                        Some(_) => 2,
+                        None => 3,
+                    }
+                }
+                None => 3,
+            }
+        };
+        if let Some(x) = n.get_mut(cause) {
+            *x += 1;
+        }
+    }
+    n
+}
+
 /// The report's columns as the trace recorded them.
 pub fn measured(trace: &Trace) -> Row {
     let waits: Vec<i64> = trace.runs.iter().filter(|r| r.workflow == "bench").flat_map(|r| r.jobs.iter()).filter(|j| j.exclusive).filter_map(|j| Some(j.started? - j.queued?)).collect();
@@ -210,6 +269,16 @@ pub fn report(trace: &Trace, policies: &[Policy], seeds: &[u64]) -> String {
             let _ = writeln!(s, "- {}", calibration(trace, o));
         }
     }
+    let covering: Vec<&(String, Vec<Outcome>)> = outs.iter().filter(|(_, runs)| runs.first().is_some_and(|o| o.covers)).collect();
+    if !covering.is_empty() {
+        let _ = writeln!(s, "\nWhere ci's commits on main without a verdict an hour after their push stood then (W28-R53), medians over seeds with their ranges:\n");
+        let _ = writeln!(s, "| Policy | {} |\n|---|{}", LATE.join(" | "), "---|".repeat(LATE.len()));
+        for (name, runs) in covering {
+            let counts: Vec<[usize; 6]> = runs.iter().map(|o| late(trace, o, "ci")).collect();
+            let cols: Vec<String> = (0..LATE.len()).map(|k| spread_i(&counts.iter().map(|c| c.get(k).map_or(0, |x| i64::try_from(*x).unwrap_or(0))).collect::<Vec<_>>(), |x| x.to_string())).collect();
+            let _ = writeln!(s, "| {name} | {} |", cols.join(" | "));
+        }
+    }
     for wf in WORKFLOWS {
         let _ = writeln!(s, "\n{wf} on main:\n");
         s.push_str("| Policy | Verdict within 60 min | Latency p50 | p90 | Longest gap | Longest wait for any verdict | Runner-h used | Wasted | Runner-h per verdict |\n|---|---|---|---|---|---|---|---|---|\n");
@@ -289,7 +358,7 @@ pub fn fingerprint(out: &Outcome) -> String {
         }
     }
     for b in &out.bisections {
-        let _ = writeln!(s, "b {} {} {:?} {:?}", b.lane, b.key, b.suspects, b.done);
+        let _ = writeln!(s, "b {} {} {:?} {:?} {:?}", b.lane, b.key, b.suspects, b.done, b.culprit);
     }
     for d in &out.decisions {
         let _ = writeln!(s, "d {} {} {}", d.at, d.run, d.what);

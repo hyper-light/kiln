@@ -11,6 +11,7 @@
 //! - [`oidc`]: the OIDC issuer's key rotation, claims and subjects (W10).
 //! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
 //! - [`results`]: test reports and flaky classification (W16).
+//! - [`verdict`]: each commit's verdict per unit and test: direct, covered, suspect, culprit (W28).
 //! - [`insights`]: rollups that merge, percentiles, critical paths (W19).
 //! - [`compare`]: what differs between two runs or legs (W19).
 //! - [`sbom`]: SBOMs from lockfiles, SPDX and CycloneDX (W18).
@@ -47,5 +48,6 @@ pub mod stats;
 pub mod store;
 pub mod trigger;
 pub mod trust;
+pub mod verdict;
 pub mod wf;
 pub mod wire;

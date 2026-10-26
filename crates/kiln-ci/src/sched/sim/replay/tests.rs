@@ -277,9 +277,11 @@ fn burst() -> Trace {
     t
 }
 
-/// W25 step 1: a commit without a result of its own is covered by a later one's pass, or by a later
-/// failure in the step already failing at its base; a new failure bisects the commits it may have
-/// come from, in ceil(log2(n + 1)) runs, and answers them when the bisection ends.
+/// W25 step 1, W28-R53: a commit without a result of its own is covered by a later one's pass, or
+/// by a later failure in the step already failing at its base; a new failure bisects its suspects,
+/// the commits since its base that changed the job's inputs, the failing one among them, in
+/// ceil(log2 n) runs for n of them, and answers them when the bisection ends: the culprit named,
+/// the rest cleared.
 #[test]
 fn w25_s1_p3_covers_and_bisects() {
     // The last push passes: the three before it are covered by it.
@@ -291,14 +293,36 @@ fn w25_s1_p3_covers_and_bisects() {
     let t = with_end(with_end(burst(), 0, "failed", Some("test")), 4, "failed", Some("test"));
     let v = verdicts(&t, &replay(&t, &Policy::p3(), 1));
     assert!(v.iter().skip(1).take(3).all(|x| x.is_some_and(|x| x.kind == Kind::Covered)), "{v:?}");
-    // A new failure: three suspects, bisected in two runs of the job (3300-4300, 4300-5300).
+    // A new failure: four suspects (the failing run's commit among them), bisected in two runs of
+    // the job (3300-4300, 4300-5300). None of the three before it would have failed: the failing
+    // run is the culprit, and they are cleared.
     let t = with_end(burst(), 4, "failed", Some("test"));
     let out = replay(&t, &Policy::p3(), 1);
-    assert_eq!(out.bisections.iter().map(|b| (b.suspects.clone(), b.done)).collect::<Vec<_>>(), vec![(vec![1, 2, 3], Some(5300))]);
+    assert_eq!(out.bisections.iter().map(|b| (b.suspects.clone(), b.done, b.culprit)).collect::<Vec<_>>(), vec![(vec![1, 2, 3, 4], Some(5300), Some(4))]);
     let v = verdicts(&t, &out);
-    assert!(v.iter().skip(1).take(3).all(|x| *x == Some(verdict::Verdict { at: 5300, kind: Kind::Bisected })), "{v:?}");
+    assert!(v.iter().skip(1).take(3).all(|x| *x == Some(verdict::Verdict { at: 5300, kind: Kind::Covered })), "{v:?}");
+    assert_eq!(v.get(4).copied().flatten(), Some(verdict::Verdict { at: 5300, kind: Kind::Culprit }));
     // Without verdicts (P2) the suspects have none.
     assert!(verdicts(&t, &replay(&t, &Policy::p2(), 1)).iter().skip(1).take(3).all(Option::is_none));
+}
+
+/// W28-R52, R53: a commit that didn't change a job's inputs is no suspect of its new failure; the
+/// one suspect left is the culprit at once, with no bisection run.
+#[test]
+fn w28_r53_suspects_are_the_commits_that_changed_the_jobs_inputs() {
+    let mut t = with_end(burst(), 4, "failed", Some("test"));
+    // Runs 1 to 3 build the inputs run 0 did; run 4 changes them.
+    for c in [1, 2, 3] {
+        let same = t.commits.first().cloned().unwrap_or_default();
+        if let Some(x) = t.commits.get_mut(c) {
+            *x = same;
+        }
+    }
+    let out = replay(&t, &Policy::p3(), 1);
+    assert_eq!(out.bisections.iter().map(|b| (b.suspects.clone(), b.culprit)).collect::<Vec<_>>(), vec![(vec![4], Some(4))]);
+    assert!(out.execs.iter().all(|e| e.bisect.is_none()), "one suspect needs no bisection run");
+    let v = verdicts(&t, &out);
+    assert_eq!(v.get(4).copied().flatten().map(|x| x.kind), Some(Kind::Culprit));
 }
 
 /// W25 step 1: coalescing holds a push only while its pools are saturated, each hold at most

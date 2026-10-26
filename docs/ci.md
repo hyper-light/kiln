@@ -7853,7 +7853,8 @@ plan:
 
 **Scope.** The land queue, builds and deploys of a trunk many agents change at once (kiln plan
 `01a17502affc74b3af5a30092f8418bc`). This section holds step 9's requirements, R30–R39 (kiln plan
-`01a1751638e773b98b5092662fc06bf5`); the other steps take their ranges as they come. Commits
+`01a1751638e773b98b5092662fc06bf5`), and step 5's, R50–R59 (kiln plan
+`01a17604e26a73e187efb3a2859aaacb`); the other steps take their ranges as they come. Commits
 before this one call this workstream "W25 step N".
 
 **Requirements: the conflict graph**
@@ -7896,6 +7897,48 @@ before this one call this workstream "W25 step N".
 
 **Progress.** R30–R34 and AC30 built (2026-10-25) in `kiln_ci::land::conflict`. The land queue
 doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.rs`.
+
+**Requirements: verdicts**
+
+- **W28-R50 Lanes, checks and verdicts.** `kiln_ci::verdict`, pure: a lane is a workflow's commits
+  on one branch, first parents, oldest first, each with the units its diff could affect (W24-R17,
+  `Units::affected`; every unit when that isn't known). A check is a workflow's test of a unit, or
+  the unit (a job) as a whole, with the checks it needs. A result is a check's outcome at a commit
+  (passed; failed, with its signature: the test, or a job's failed step; skipped because a need
+  failed), how it came (ran, reused, adopted) and when. Each commit gets a verdict per check, and
+  a kind for the whole: the weakest of the checks its diff could affect (direct, covered, pending,
+  suspect, culprit). Checks its diff can't affect are unaffected and never count against it; a
+  check whose need fails at a commit is settled with that need. Every verdict says why.
+- **W28-R51 Covered.** A check with no result of its own at a commit is covered by the nearest
+  later commit with one, when that result passed, or failed as the base (the nearest earlier
+  result) already did, or failed a test W16 marks flaky or quarantined. Covered is a kind of its
+  own, optimistic: it carries no outcome, so it is never shown or kept as passed.
+- **W28-R52 Suspects and culprits.** A failure is new when the check passed, or failed otherwise,
+  at its base. Its suspects are exactly the commits from just after the base to the failing one
+  whose diffs could affect the check's unit; a later commit's new failure makes a commit suspect
+  before its needs settle it. A culprit finding's outcome names the culprit among them (those before
+  it are cleared, those after it fail because of it), finds no culprit (a flake: all cleared), or
+  can't tell (they stay suspects, saying why).
+- **W28-R53 The replay.** Step 1's replayer decides P3's verdicts with `kiln_ci::verdict`: each job a
+  check, a commit affecting the jobs whose input keys it changed, a new failure bisecting only its
+  suspects (ceil(log2 n) runs for n; one is the culprit at once). A commit's verdict counts from
+  when it was answered for good. ci/sim/README.md reports where the commits answered after an hour
+  stood at the hour.
+
+**Acceptance criteria**
+
+- **W28-AC50 Random lanes.** Over 10,000 random lanes: each check's verdict is as worked out afresh;
+  a failure already at the base, or of a marked test, makes no suspect; a new failure names exactly
+  the commits whose diffs could affect its unit; covered is never shown as passed; the verdicts
+  don't depend on the order results come in; a culprit named clears those before it. *Property
+  test* (`cargo test -p kiln-ci verdict`).
+- **W28-AC51 The recorded week.** At least 95% of ci's commits on main answered within an hour of
+  their push, P3 over seeds 1-8 (`cargo run -p kiln-ci --example replay -- ci/sim/trace.json`).
+
+**Progress.** R50–R53 and AC50 built (2026-10-25) in `kiln_ci::verdict` and the replayer. AC51 is
+not met: P3 answers 79.3% (77.4%–81.9%) of ci's commits within the hour, against 75.9% before. The
+late ones wait mostly for capacity (ci's rust jobs held out of the k8s quota through bursts of
+pushes), which steps 6 and 8 (admission, spreading load) reach, not verdicts.
 
 ## 4. API, events, CLI and MCP reference
 
