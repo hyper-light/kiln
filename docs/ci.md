@@ -7960,6 +7960,11 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
 - **W28-R47 Every decision says why.** Each `Command::Demand` is a notice on its leg, which the
   run page shows, and the leg's `demand` in `ci.legs.routing`. An adopter's wait reads "Adopted
   `<leg>` of run `<run>`: the same work in flight".
+- **W28-R48 The replay decides as the scheduler does.** In W25 step 1's replayer, P2 and later ask
+  `kiln_ci::sched::demand` for every withdrawal, adoption, drop, finish and cancel; the moment it
+  made room for live work is contention. Capacity, durations, draws, warm credit and the ledger of
+  finished results stay the replayer's; keys stay the trace's path-set keys; pushes are trusted,
+  and `finish_within` is 300 s.
 
 **Acceptance criteria: demands**
 
@@ -7983,10 +7988,14 @@ doesn't use them yet: that is step 9's third step, in `crates/kiln/src/ci/land.r
   lane.) *E2E.*
 - **W28-AC44 Restart mid-adoption.** The server killed while B's leg adopts A's: after the restart
   the work in flight is rebuilt from SQLite, and both legs settle (W05-R25). *E2E.*
+- **W28-AC45 Superseded work, replayed.** Runner time on superseded work no demand used, under P2
+  deciding through `kiln_ci::sched::demand`, median over seeds 1-8 on the recorded week: at most 5%
+  (2.2 runner-h, about 0.6%). P0 still reproduces the week within 5 points, and the same seed gives
+  the same outcome byte for byte. *Replay* (`cargo test -p kiln-ci sched::sim::replay`; the report
+  in ci/sim/README.md).
 
-**Progress (step 4).** R40–R47 and AC40–AC44 built (2026-10-25) in `kiln_ci::sched::demand`,
-`kiln_ci::sched::state` and `crates/kiln/src/ci/dispatch.rs`. Step 1's replay doesn't use the
-demand table yet: that's the plan's step 4.
+**Progress (step 4).** R40–R48 and AC40–AC45 built (2026-10-25) in `kiln_ci::sched::demand`,
+`kiln_ci::sched::state`, `crates/kiln/src/ci/dispatch.rs` and step 1's replayer.
 
 ## 4. API, events, CLI and MCP reference
 
