@@ -140,7 +140,7 @@ fn part_of(status: &str, conclusion: Option<&str>) -> Part {
 }
 
 const DEPLOY_COLS: &str = "d.environment, (d.production = 1 OR lower(d.environment) = 'production'), d.sha,
-     (SELECT MIN(x.rowid) FROM runs x WHERE x.repo_id = d.repo_id AND x.sha = d.sha),
+     (SELECT o.seq FROM ship_order o WHERE o.repo_id = d.repo_id AND o.item = d.sha),
      (SELECT s.state FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1),
      (SELECT s.description FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1),
      (SELECT s.created_at FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1)";
@@ -179,13 +179,14 @@ fn repo_ctx(c: &rusqlite::Connection, repo: &str) -> anyhow::Result<Option<RepoC
     let current = st.query_map([&id], deploy_row)?.collect::<Result<_, _>>()?;
     let waiting = c
         .query_row(
-            "SELECT x.sha, MIN(x.rowid) FROM deploy_releases d JOIN runs x ON x.repo_id = ?1 AND x.sha = json_extract(d.spec, '$.version')
-             WHERE d.state = 'waiting' AND lower(d.environment) = 'production' GROUP BY x.sha ORDER BY MIN(x.rowid) DESC LIMIT 1",
+            "SELECT o.item, o.seq FROM deploy_releases d JOIN ship_order o ON o.repo_id = ?1 AND o.item = json_extract(d.spec, '$.version')
+             WHERE d.state = 'waiting' AND lower(d.environment) = 'production' AND EXISTS (SELECT 1 FROM runs r WHERE r.repo_id = o.repo_id AND r.sha = o.item)
+             ORDER BY o.seq DESC LIMIT 1",
             [&id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let mut st = c.prepare("SELECT sha, MIN(rowid) AS f, MIN(branch) FROM runs WHERE repo_id = ?1 GROUP BY sha ORDER BY f DESC")?;
+    let mut st = c.prepare("SELECT r.sha, o.seq, MIN(r.branch) FROM runs r JOIN ship_order o ON o.repo_id = r.repo_id AND o.item = r.sha WHERE r.repo_id = ?1 GROUP BY r.sha, o.seq ORDER BY o.seq DESC")?;
     let commits = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
     Ok(Some(RepoCtx { id, name, current, waiting, commits }))
 }
@@ -458,9 +459,10 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
     let recs = store
         .call(move |c| {
             let mut st = c.prepare(
-                "SELECT p.name, r.sha, MIN(r.rowid) AS f FROM runs r JOIN repos p ON p.id = r.repo_id
+                "SELECT p.name, o.item, o.seq FROM ship_order o JOIN repos p ON p.id = o.repo_id
                  WHERE (?1 IS NULL OR p.name = ?1 OR p.id = ?1) AND (?4 IS NULL OR p.name IN (SELECT value FROM json_each(?4)))
-                 GROUP BY r.repo_id, r.sha HAVING f < ?2 ORDER BY f DESC LIMIT ?3",
+                   AND o.seq < ?2 AND EXISTS (SELECT 1 FROM runs r WHERE r.repo_id = o.repo_id AND r.sha = o.item)
+                 ORDER BY o.seq DESC LIMIT ?3",
             )?;
             let keys: Vec<(String, String)> = st.query_map(params![repo, cursor, limit + 1, only], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
             let mut out = Vec::new();
@@ -498,7 +500,7 @@ pub async fn get_in(store: &crate::store::Store, repo: &str, sha: &str, runners:
 // a failed refresh keeps the last good model, retried on the next read.
 
 /// A repository's newest commits held in memory: each one's records and its list JSON already
-/// rendered, their order newest first (first run's rowid, sha), and how many it has in all.
+/// rendered, their order newest first (each one's place in ship_order, item), and how many it has.
 #[derive(Debug, Default)]
 struct HeldRepo {
     ctx: RepoCtx,
