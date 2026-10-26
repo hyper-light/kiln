@@ -200,45 +200,130 @@ async fn kms_sign(hub: &Hub, msg: &[u8], workload: &kiln_ci::oidc::Workload<'_>)
 
 // ------------------------------------------------------------------ keyless
 
+/// kiln's client of an outside Fulcio and Rekor: the real `kiln_seams::Sigstore` (docs/seams.md,
+/// "Sigstore"; W27-R12).
+pub struct Remote {
+    fulcio: String,
+    rekor: String,
+    http: crate::http::client::Client,
+}
+
+impl Remote {
+    pub fn new(fulcio: &str, rekor: &str) -> anyhow::Result<Self> {
+        Ok(Self { fulcio: fulcio.trim_end_matches('/').to_owned(), rekor: rekor.trim_end_matches('/').to_owned(), http: crate::http::client::Client::public()? })
+    }
+
+    /// The Fulcio and Rekor `[ci.attest]` names.
+    fn configured(hub: &Hub) -> anyhow::Result<Self> {
+        let c = &hub.cfg.ci.attest;
+        let fulcio = c.fulcio_url.as_deref().ok_or_else(|| anyhow::anyhow!("[ci.attest] signing = \"keyless\" needs fulcio_url"))?;
+        let rekor = c.rekor_url.as_deref().ok_or_else(|| anyhow::anyhow!("[ci.attest] signing = \"keyless\" needs rekor_url"))?;
+        Self::new(fulcio, rekor)
+    }
+
+    /// One of Rekor's entries (`{uuid: entry}`), as the seam has it.
+    fn logged(v: &Value) -> Result<Logged, SigRefusal> {
+        let (uuid, e) = v.as_object().and_then(|o| o.iter().next()).ok_or_else(|| SigRefusal::Unavailable(format!("Rekor's answer has no entry: {v}")))?;
+        Ok(Logged {
+            uuid: uuid.clone(),
+            index: e.get("logIndex").and_then(Value::as_u64).unwrap_or_default(),
+            integrated_time: e.get("integratedTime").and_then(Value::as_i64).unwrap_or_default(),
+            body: e.get("body").and_then(Value::as_str).unwrap_or_default().to_owned(),
+            answer: e.clone(),
+        })
+    }
+}
+
+use kiln_seams::sigstore::{CertifyAsk, Certified, Logged, Refusal as SigRefusal};
+
+impl kiln_seams::Sigstore for Remote {
+    fn certify(&self, ask: CertifyAsk) -> futures::future::BoxFuture<'_, Result<Certified, SigRefusal>> {
+        Box::pin(async move {
+            let body = json!({ "credentials": { "oidcIdentityToken": ask.token }, "publicKeyRequest": { "publicKey": { "algorithm": "ECDSA", "content": ask.public_key_pem }, "proofOfPossession": B64.encode(&ask.proof) } });
+            let r = self.http.post(&format!("{}/api/v2/signingCert", self.fulcio)).json(&body).send().await.map_err(|e| SigRefusal::Unavailable(format!("Fulcio: {e:#}")))?;
+            let st = r.status();
+            let v: Value = r.json(1 << 20).await.unwrap_or(Value::Null);
+            match st {
+                200..=299 => {}
+                400 => return Err(SigRefusal::Invalid { what: "request", why: v.to_string() }),
+                401 | 403 => return Err(SigRefusal::Unauthorized(v.to_string())),
+                _ => return Err(SigRefusal::Unavailable(format!("Fulcio issued no certificate ({st}): {v}"))),
+            }
+            let chain = v.pointer("/signedCertificateEmbeddedSct/chain/certificates").or_else(|| v.pointer("/signedCertificateDetachedSct/chain/certificates")).and_then(Value::as_array).cloned().unwrap_or_default();
+            let chain: Vec<String> = chain.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+            if chain.is_empty() {
+                return Err(SigRefusal::Unavailable("Fulcio's answer has no certificate".into()));
+            }
+            Ok(Certified { chain })
+        })
+    }
+
+    fn log(&self, entry: Value) -> futures::future::BoxFuture<'_, Result<Logged, SigRefusal>> {
+        Box::pin(async move {
+            let r = self.http.post(&format!("{}/api/v1/log/entries", self.rekor)).json(&entry).send().await.map_err(|e| SigRefusal::Unavailable(format!("Rekor: {e:#}")))?;
+            let st = r.status();
+            let v: Value = r.json(1 << 20).await.unwrap_or(Value::Null);
+            match st {
+                200 | 201 => Self::logged(&v),
+                409 => Err(SigRefusal::Conflict { index: v.get("logIndex").and_then(Value::as_u64).unwrap_or_default() }),
+                400 => Err(SigRefusal::Invalid { what: "entry", why: v.to_string() }),
+                _ => Err(SigRefusal::Unavailable(format!("Rekor logged nothing ({st}): {v}"))),
+            }
+        })
+    }
+
+    fn entry(&self, index: u64) -> futures::future::BoxFuture<'_, Result<Logged, SigRefusal>> {
+        Box::pin(async move {
+            let r = self.http.get(&format!("{}/api/v1/log/entries?logIndex={index}", self.rekor)).send().await.map_err(|e| SigRefusal::Unavailable(format!("Rekor: {e:#}")))?;
+            let st = r.status();
+            let v: Value = r.json(1 << 20).await.unwrap_or(Value::Null);
+            match st {
+                200 => Self::logged(&v),
+                404 => Err(SigRefusal::NotFound { index }),
+                _ => Err(SigRefusal::Unavailable(format!("Rekor ({st}): {v}"))),
+            }
+        })
+    }
+}
+
 /// Keyless: an ephemeral key, Fulcio's certificate for it (proven with the identity token's
 /// subject, signed), the signature logged in Rekor as a DSSE entry, and both in the bundle.
 async fn keyless(hub: &Hub, payload: &[u8], pae: &[u8], workload: &kiln_ci::oidc::Workload<'_>) -> anyhow::Result<Value> {
     let c = &hub.cfg.ci.attest;
-    let (fulcio, rekor) = (c.fulcio_url.as_deref().ok_or_else(|| anyhow::anyhow!("[ci.attest] signing = \"keyless\" needs fulcio_url"))?, c.rekor_url.as_deref().ok_or_else(|| anyhow::anyhow!("[ci.attest] signing = \"keyless\" needs rekor_url"))?);
-    let (fulcio, rekor) = (fulcio.trim_end_matches('/'), rekor.trim_end_matches('/'));
+    let remote = Remote::configured(hub)?;
     // kiln's identity token for the build, for Fulcio.
     let issuer = super::oidc::issuer(hub);
     let claims = kiln_ci::oidc::workload_claims(workload, &issuer, c.audience.as_deref().unwrap_or("sigstore"), &crate::util::random_token(), crate::util::now_unix(), 300, None);
     let subject = claims.get("sub").and_then(Value::as_str).unwrap_or_default().to_owned();
     let token = super::oidc::mint(hub, &claims).await?;
+    keyless_through(&remote, &token, &subject, payload, pae).await
+}
+
+/// Keyless signing through any Fulcio and Rekor (the seam's): `token` is the identity token and
+/// `subject` its subject, which the one-off key signs as its proof.
+pub async fn keyless_through(sigstore: &dyn kiln_seams::Sigstore, token: &str, subject: &str, payload: &[u8], pae: &[u8]) -> anyhow::Result<Value> {
     // A key for this one signature.
     let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new()).map_err(|_| anyhow::anyhow!("no signing key could be made"))?;
     let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, doc.as_ref()).map_err(|_| anyhow::anyhow!("the signing key"))?;
     let (public, _) = spki(&pair)?;
     let proof = pair.sign(&SystemRandom::new(), subject.as_bytes()).map_err(|_| anyhow::anyhow!("signing the proof"))?;
-    let http = crate::http::client::Client::public()?;
-    let ask = json!({ "credentials": { "oidcIdentityToken": token }, "publicKeyRequest": { "publicKey": { "algorithm": "ECDSA", "content": pem_of("PUBLIC KEY", &public) }, "proofOfPossession": B64.encode(proof.as_ref()) } });
-    let r = http.post(&format!("{fulcio}/api/v2/signingCert")).json(&ask).send().await.map_err(|e| anyhow::anyhow!("Fulcio: {e:#}"))?;
-    let st = r.status();
-    let v: Value = r.json(1 << 20).await.unwrap_or(Value::Null);
-    anyhow::ensure!((200..300).contains(&st), "Fulcio issued no certificate ({st}): {v}");
-    let chain = v.pointer("/signedCertificateEmbeddedSct/chain/certificates").or_else(|| v.pointer("/signedCertificateDetachedSct/chain/certificates")).and_then(Value::as_array).cloned().unwrap_or_default();
-    let leaf_pem = chain.first().and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("Fulcio's answer has no certificate"))?.to_owned();
+    let certified = sigstore
+        .certify(CertifyAsk { token: token.to_owned(), public_key_pem: pem_of("PUBLIC KEY", &public), proof: proof.as_ref().to_vec() })
+        .await
+        .map_err(|e| anyhow::anyhow!("Fulcio: {e}"))?;
+    let leaf_pem = certified.chain.first().cloned().ok_or_else(|| anyhow::anyhow!("Fulcio's answer has no certificate"))?;
     let (_, leaf) = der_of(&leaf_pem).ok_or_else(|| anyhow::anyhow!("Fulcio's certificate isn't PEM"))?;
     // The signature, and its entry in Rekor.
     let sig = pair.sign(&SystemRandom::new(), pae).map_err(|_| anyhow::anyhow!("signing failed"))?;
     let envelope = a::envelope(a::PAYLOAD_TYPE, payload, "", sig.as_ref());
     let entry = json!({ "apiVersion": "0.0.1", "kind": "dsse", "spec": { "proposedContent": { "envelope": envelope.to_string(), "verifiers": [B64.encode(leaf_pem.as_bytes())] } } });
-    let r = http.post(&format!("{rekor}/api/v1/log/entries")).json(&entry).send().await.map_err(|e| anyhow::anyhow!("Rekor: {e:#}"))?;
-    let st = r.status();
-    let logged: Value = r.json(1 << 20).await.unwrap_or(Value::Null);
-    anyhow::ensure!(st == 201 || st == 200, "Rekor logged nothing ({st}): {logged}");
-    let (uuid, e) = logged.as_object().and_then(|o| o.iter().next()).map(|(k, v)| (k.clone(), v.clone())).ok_or_else(|| anyhow::anyhow!("Rekor's answer has no entry"))?;
+    let logged = sigstore.log(entry).await.map_err(|e| anyhow::anyhow!("Rekor: {e}"))?;
+    let e = &logged.answer;
     let tlog = json!({
-        "logIndex": e.get("logIndex").map(|n| n.to_string()).unwrap_or_default(),
+        "logIndex": logged.index.to_string(),
         "logId": { "keyId": e.get("logID").and_then(Value::as_str).and_then(|h| hex::decode(h).ok()).map(|b| B64.encode(b)).unwrap_or_default() },
         "kindVersion": { "kind": "dsse", "version": "0.0.1" },
-        "integratedTime": e.get("integratedTime").map(|n| n.to_string()).unwrap_or_default(),
+        "integratedTime": logged.integrated_time.to_string(),
         "inclusionPromise": { "signedEntryTimestamp": e.pointer("/verification/signedEntryTimestamp").cloned().unwrap_or(Value::Null) },
         "inclusionProof": e.pointer("/verification/inclusionProof").map(|p| json!({
             "logIndex": p.get("logIndex").map(|n| n.to_string()).unwrap_or_default(),
@@ -247,15 +332,32 @@ async fn keyless(hub: &Hub, payload: &[u8], pae: &[u8], workload: &kiln_ci::oidc
             "hashes": p.get("hashes").and_then(Value::as_array).map(|l| l.iter().filter_map(Value::as_str).filter_map(|h| hex::decode(h).ok()).map(|b| B64.encode(b)).collect::<Vec<_>>()),
             "checkpoint": { "envelope": p.get("checkpoint").cloned().unwrap_or(Value::Null) },
         })),
-        "canonicalizedBody": e.get("body").cloned().unwrap_or(Value::Null),
+        "canonicalizedBody": logged.body,
     });
-    tracing::debug!(entry = %uuid, "an attestation logged in Rekor");
+    tracing::debug!(entry = %logged.uuid, "an attestation logged in Rekor");
     Ok(json!({ "mediaType": a::BUNDLE, "verificationMaterial": { "certificate": { "rawBytes": B64.encode(&leaf) }, "tlogEntries": [tlog] }, "dsseEnvelope": envelope }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W27-R12: keyless signing goes through the Sigstore seam: against its simulator, the bundle
+    /// carries the simulator's certificate and the entry it logged, by index and time.
+    #[test]
+    fn w27_r12_keyless_signing_through_the_seam() -> anyhow::Result<()> {
+        let sim = kiln_seams::sigstore::SimSigstore::new(1_790_000_000);
+        let sim2 = sim.clone();
+        let bundle = futures::executor::block_on(async move { keyless_through(&sim2, "eyJ.token", "repo:acme/app:ref:refs/heads/main", b"{}", b"pae").await })?;
+        let entry = futures::executor::block_on(kiln_seams::Sigstore::entry(&sim, 0)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(bundle.pointer("/verificationMaterial/tlogEntries/0/logIndex"), Some(&json!("0")));
+        assert_eq!(bundle.pointer("/verificationMaterial/tlogEntries/0/integratedTime"), Some(&json!(entry.integrated_time.to_string())));
+        assert_eq!(bundle.pointer("/verificationMaterial/tlogEntries/0/canonicalizedBody"), Some(&json!(entry.body)));
+        let raw = bundle.pointer("/verificationMaterial/certificate/rawBytes").and_then(Value::as_str).unwrap_or_default();
+        assert!(String::from_utf8_lossy(&B64.decode(raw)?).contains("SimSigstore certificate"), "the simulator's certificate");
+        Ok(())
+    }
+
 
     #[test]
     fn w18_r02_key_files() -> anyhow::Result<()> {
