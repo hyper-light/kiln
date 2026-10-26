@@ -2398,4 +2398,49 @@ mod tests {
             Ok(())
         })
     }
+
+    /// W24-AC15 on the server: a week of results in two repositories on a 60 GiB data volume, the
+    /// system's policy and acme/web's own max_age. After every reap free space is at or above the
+    /// floor while results remain; each repository's max_age drops its stale results; each scope's
+    /// newest stays unless the floor needed it; each eviction says why.
+    #[test]
+    fn w24_ac15_a_week_on_the_server() -> anyhow::Result<()> {
+        use kiln_ci::work::reap::{self as r, Policy, Reason, Scope, Size};
+        in_store(|c| {
+            let (volume, others) = (60u64 << 30, 30u64 << 30);
+            let system = Policy { floor: Some(Size::Bytes(10 << 30)), target: Some(Size::Bytes(12 << 30)), keep_last: Some(1), keep_within: Some(0), max_age: Some(4 * 86_400), ..Policy::default() };
+            let web = Policy { max_age: Some(2 * 86_400), ..Policy::default() };
+            let sys = r::resolve(volume, &[(Scope::System, &system)]);
+            let repos: BTreeMap<String, r::Resolved> = [("acme/web".to_owned(), r::resolve(volume, &[(Scope::System, &system), (Scope::Repo, &web)]))].into();
+            let start = 1_800_000_000i64;
+            let mut n = 100u64;
+            for day in 0..7i64 {
+                let now = start + day * 86_400;
+                for repo in ["acme/app", "acme/web", "acme/app"] {
+                    let sc = scope(repo, "trusted");
+                    let rec = Recorded { provenance: Provenance { ms: 1_000 * n, ..Provenance::default() }, size: 2 << 30, ..made("trusted", "", &[("bin", "sha256:aa")]) };
+                    let k = record(c, &sc, &unit(n), &reads(n, 0), &rec)?;
+                    c.execute("UPDATE work_records SET at = ?1 WHERE family = 'work.result' AND key = ?2", rusqlite::params![now, format!("{sc}{}", k.hex())])?;
+                    n += 1;
+                }
+                let held = |c: &Connection| -> anyhow::Result<u64> { Ok(scan(c, Family::Result, "")?.iter().map(|(_, v, _)| (v.len() as u64).saturating_add(2 << 30)).sum()) };
+                let free = volume - others - held(c)?;
+                let went = reap(c, &sys, &repos, free, now)?;
+                let after = volume - others - held(c)?;
+                let left = scan(c, Family::Result, "")?;
+                anyhow::ensure!(after >= 10 << 30 || left.is_empty(), "day {day}: {} GiB free after the reap", after >> 30);
+                let floor_needed = went.iter().any(|e| e.reason == Reason::Floor);
+                for repo in ["acme/app", "acme/web"] {
+                    let mine: Vec<&(String, Vec<u8>, i64)> = left.iter().filter(|(k, _, _)| k.starts_with(&format!("{repo}|"))).collect();
+                    anyhow::ensure!(floor_needed || mine.iter().any(|(_, _, at)| *at == now), "day {day}: {repo}'s newest stays");
+                    let max_age = if repo == "acme/web" { 2 * 86_400 } else { 4 * 86_400 };
+                    for (k, _, at) in &mine {
+                        anyhow::ensure!(now - at <= max_age || *at == now, "day {day}: {k} is past {repo}'s max_age");
+                    }
+                }
+                anyhow::ensure!(went.iter().all(|e| !e.rule.is_empty() && (e.reason != Reason::MaxAge || e.scope.is_some())), "each eviction says why: {went:?}");
+            }
+            Ok(())
+        })
+    }
 }
