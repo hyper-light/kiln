@@ -1,4 +1,4 @@
-//! W25 step 3 (docs/ci.md W02-R08, W05-R21, W13-R09): kiln's own workflows on the engine. Each
+//! W26 step 3 (docs/ci.md W02-R08, W05-R21, W13-R09): kiln's own workflows on the engine. Each
 //! `.kiln/*.yaml` is checked in the kiln dialect, matched against its own trigger, planned for it
 //! as the server plans a run, and each of its legs routed as the scheduler routes one: to the
 //! `k8s` pool production is to have, else to one of production's runners
@@ -56,7 +56,7 @@ fn production_runners() -> Result<Vec<Runner>, String> {
     serde_json::from_str(include_str!("../../tests/fixtures/production-runners.json")).map_err(|e| format!("production-runners.json: {e}"))
 }
 
-/// The pool production's change adds (W25 step 3's plan): Kubernetes pods for `[k8s]` legs.
+/// The pool production's change adds (W26 step 3's plan): Kubernetes pods for `[k8s]` legs.
 fn k8s_pool() -> PoolSpec {
     PoolSpec { name: "k8s".into(), executor: "k8s".into(), labels: vec!["k8s".into()], max: Some(64), ..PoolSpec::default() }
 }
@@ -163,7 +163,7 @@ fn read(file: &str) -> Result<String, String> {
 /// Every `.kiln` workflow has no errors and no `KCI6007`, runs on its own trigger, plans, and has
 /// a pool or one of production's runners for each leg; the CD files are CD's.
 #[test]
-fn w25_kilns_own_workflows_check_plan_and_route() -> Result<(), String> {
+fn w26_kilns_own_workflows_check_plan_and_route() -> Result<(), String> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln");
     let mut found: Vec<String> = std::fs::read_dir(&dir)
         .map_err(|e| e.to_string())?
@@ -198,7 +198,7 @@ fn w25_kilns_own_workflows_check_plan_and_route() -> Result<(), String> {
 /// The test above fails a workflow that asks for a label no runner or pool serves, on a pod leg
 /// and on a bare-metal one, and the `[k8s]` legs without the pool.
 #[test]
-fn w25_a_label_nothing_serves_fails() -> Result<(), String> {
+fn w26_a_label_nothing_serves_fails() -> Result<(), String> {
     let runners = production_runners()?;
     let pools = [k8s_pool()];
     let ci = read("ci.yaml")?;
