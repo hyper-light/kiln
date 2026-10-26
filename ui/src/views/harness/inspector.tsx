@@ -6,7 +6,7 @@ import * as React from "react";
 import { Bot, Square } from "lucide-react";
 import { useSession, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
-import { changesetOf, duration, editsOf, money, relPath, runsOf, taskDot, taskLive, tokens, useSameList, type FileChange, type ToolEvent } from "./derive";
+import { changesetOf, duration, editsOf, money, relPath, runsOf, taskDot, taskLive, tokens, useSameList, type ChangedFile, type ToolEvent } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
 import { Output, Prose } from "./parts";
 import { LimitMeter, StatusList } from "./limits";
@@ -42,7 +42,7 @@ function ToolSection({ id, title, count, children }: { id: string; title: string
 }
 
 /** The server's cumulative changeset as the file list and diffs show it (one diff per file). */
-function fromServer(files: ServerChange[]): FileChange[] {
+function fromServer(files: ServerChange[]): ChangedFile[] {
   return files.map((f) => ({
     path: f.path,
     tree: f.tree,
@@ -73,9 +73,9 @@ export const Changes = React.memo(function Changes({
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
   // A file in another working tree than its folder's (a worktree it left, the checkout it went
   // from) is shown where it is; in its folder's, by its path there.
-  const nameOf = (f: FileChange) => relPath(f.tree && f.tree !== cwd && !cwd.startsWith(`${f.tree}/`) ? `${f.tree}/${f.path}` : f.path, cwd);
+  const nameOf = (f: ChangedFile) => relPath(f.tree && f.tree !== cwd && !cwd.startsWith(`${f.tree}/`) ? `${f.tree}/${f.path}` : f.path, cwd);
   const [sel, setSel] = React.useState<string | null>(null);
-  const shown: FileChange[] = sel ? files.filter((f) => nameOf(f) === sel) : files;
+  const shown: ChangedFile[] = sel ? files.filter((f) => nameOf(f) === sel) : files;
   const add = files.reduce((n, f) => n + f.add, 0);
   const del = files.reduce((n, f) => n + f.del, 0);
   const wsBar = agentId && volumeOver ? <WorkspaceBar agentId={agentId} over={volumeOver} /> : null;

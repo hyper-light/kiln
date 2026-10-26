@@ -29,6 +29,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { crc32, deflateSync, gzipSync } from "node:zlib";
 import type { WebSocket } from "ws";
 import type { AgentInfo, HEvent, KeptFile, Meta, SaidHit, State } from "../src/api/harness.ts";
+import { defaultInfo, defaultMeta, defaultState } from "./defaults.ts";
 
 const ID = "demo-long";
 /** A fixed start, so the history is the same on every run. */
@@ -494,6 +495,7 @@ let movePlan: { to?: string; kind?: string; model?: string } = {};
 const OLD_RUNNER = process.env.MOCK_OLD_RUNNER === "1";
 
 const info: AgentInfo = {
+  ...defaultInfo(),
   id: ID,
   kind: "claude",
   kind_name: "Claude Code",
@@ -516,6 +518,7 @@ const info: AgentInfo = {
 };
 
 const meta: Meta = {
+  ...defaultMeta(),
   version: "2.3.1",
   modes: [
     { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
@@ -524,13 +527,13 @@ const meta: Meta = {
   ],
   models: [
     { id: "default", label: "Default (recommended)", description: "Opus 5.5" },
-    { id: "claude-opus-5-5", label: "claude-opus-5-5" },
-    { id: "claude-sonnet-5", label: "claude-sonnet-5" },
+    { id: "claude-opus-5-5", label: "claude-opus-5-5", description: "" },
+    { id: "claude-sonnet-5", label: "claude-sonnet-5", description: "" },
   ],
   efforts: ["low", "medium", "high", "max"].map((id) => ({ id, label: id.charAt(0).toUpperCase() + id.slice(1) })),
   commands: [
-    { name: "compact", description: "Summarize the conversation to free context", group: "Context", args: "optional", route: { kind: "prompt" } },
-    { name: "login", description: "Sign in to Claude Code on this machine", group: "Account", args: "none", route: { kind: "view", view: "login" } },
+    { name: "compact", description: "Summarize the conversation to free context", hint: "", group: "Context", args: "optional", route: { kind: "prompt" } },
+    { name: "login", description: "Sign in to Claude Code on this machine", hint: "", group: "Account", args: "none", route: { kind: "view", view: "login" } },
   ],
   agents: [],
   features: ["interrupt", "set_mode", "set_model", "set_effort", "steer", "send_now", "queue_cancel", "attachments", "switch_harness"],
@@ -549,6 +552,7 @@ let lastTurn: State["last_turn"];
 let compactingSince: number | undefined;
 let compactions = 0;
 const state = (): State => ({
+  ...defaultState(),
   status: offline() ? "disconnected" : running ? "running" : "idle",
   compacting: compactingSince === undefined ? undefined : { since: compactingSince, tokens: 967_000 },
   pause_at: pauseAt,

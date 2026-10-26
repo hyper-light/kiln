@@ -134,7 +134,7 @@ const apps = new Map<string, MockApp>();
       const revision = hex(r, 40);
       const running = r() < 0.06;
       const op: CdOperation | null = running
-        ? { id: 7, phase: "Running", trigger: "auto", attempt: 1, message: "waiting for healthy state of apps/Deployment/" + name, started_ms: Date.now() - 40_000, finished_ms: null }
+        ? { id: 7, phase: "Running", trigger: "auto", attempt: 1, message: "waiting for healthy state of apps/Deployment/" + name, by: null, started_ms: Date.now() - 40_000, finished_ms: null }
         : {
             id: 6,
             phase: health === "Degraded" && r() < 0.5 ? "Failed" : "Succeeded",

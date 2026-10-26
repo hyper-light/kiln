@@ -3,7 +3,7 @@ import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { ChartLine, GitBranch, Search, Activity } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Run, Status } from "@/api/types";
+import type { RunRow, Status } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -34,7 +34,7 @@ const STATUS_GROUPS: Record<StatusFilter, Status[] | null> = {
 };
 
 /** The facets the list filters by (W21-R03), each a URL parameter of its own, comma-separated. */
-const FACETS: { id: "repo" | "workflow" | "event" | "branch" | "author" | "runner" | "executor"; label: string; of: (r: Run) => string[] }[] = [
+const FACETS: { id: "repo" | "workflow" | "event" | "branch" | "author" | "runner" | "executor"; label: string; of: (r: RunRow) => string[] }[] = [
   { id: "repo", label: "Repository", of: (r) => [r.repo_name] },
   { id: "workflow", label: "Workflow", of: (r) => [r.pipeline] },
   { id: "event", label: "Event", of: (r) => [r.event] },
@@ -87,7 +87,7 @@ export default function Runs() {
 /** Older pages of one list (`key`: the repository filter they belong to). */
 interface Older {
   key: string;
-  runs: Run[];
+  runs: RunRow[];
   hasMore: boolean | null;
   loading: boolean;
   error: string | null;
@@ -182,7 +182,7 @@ function RunsBody() {
   // A repository may be chosen by its id (an older link): its name is what rows carry.
   const named = (f: (typeof FACETS)[number], v: string) => (f.id === "repo" ? (repos.find((r) => r.id === v)?.name ?? v) : v);
   const passes = React.useCallback(
-    (r: Run, except?: string) =>
+    (r: RunRow, except?: string) =>
       FACETS.every((f) => f.id === except || !chosen[f.id]?.length || (chosen[f.id] ?? []).some((v) => f.of(r).includes(named(f, v)))) &&
       (!words || [r.message, r.branch, r.pipeline, r.sha, r.author, r.repo_name].some((x) => x.toLowerCase().includes(words))),
     // eslint-disable-next-line react-hooks/exhaustive-deps
