@@ -695,6 +695,89 @@ mod tests {
     }
 
     #[test]
+    fn w05_r22_an_assignment_reaches_its_runner_whether_its_job_requires_anything_or_not() -> anyhow::Result<()> {
+        // A job that requires nothing went out with its `requires` left out, and every runner
+        // refused it ("Found an Option discriminant that wasn't 0 or 1"): no image built for hours.
+        let p = crate::pipeline::parse("name: r\njobs:\n  any:\n    steps: [{run: x}]\n  linux:\n    requires: [\"os == linux\"]\n    steps: [{run: y}]\n")?;
+        let jobs = crate::pipeline::plan(&p, &crate::pipeline::Context::default())?;
+        assert_eq!(jobs.len(), 2);
+        let assign = |spec: PlannedJob| {
+            ServerMsg::Assign(Box::new(Assignment {
+                job_id: "j".into(),
+                run_id: "r".into(),
+                repo: "o/r".into(),
+                clone_url: String::new(),
+                sha: "0".repeat(40),
+                branch: "main".into(),
+                event: "push".into(),
+                run_number: 7,
+                attempt: 0,
+                spec,
+                secrets: vec![("K".into(), "v".into())],
+                job_token: "t".into(),
+                server_url: "http://kiln".into(),
+            }))
+        };
+        for spec in &jobs {
+            let m = assign(spec.clone().for_runner(CAP_CI2));
+            assert_eq!(decode::<ServerMsg>(&encode(&m)?)?, m);
+            // The store keeps the job as JSON, and reads one kept before `requires` was.
+            assert_eq!(&serde_json::from_str::<PlannedJob>(&serde_json::to_string(spec)?)?, spec);
+            let mut before = serde_json::to_value(spec)?;
+            if let Some(o) = before.as_object_mut() {
+                o.remove("requires");
+            }
+            assert!(serde_json::from_value::<PlannedJob>(before)?.requires.is_empty());
+        }
+        // A runner from before the CI work (W22-AC09's mixed fleet, a kiln of edc9ae8) reads a job
+        // that requires nothing as it always did: every field but `requires`, nothing left over.
+        #[derive(Deserialize)]
+        #[allow(dead_code, reason = "read only for its layout")]
+        struct OldJob {
+            key: String,
+            spec_id: String,
+            display: String,
+            needs: Vec<String>,
+            labels: Vec<String>,
+            image: Option<String>,
+            toolchain: Option<String>,
+            env: std::collections::BTreeMap<String, String>,
+            timeout_minutes: u32,
+            retries: u32,
+            exclusive: bool,
+            resources: crate::pipeline::Resources,
+            artifacts: Vec<String>,
+            cache: Vec<String>,
+            condition: Option<String>,
+            steps: Vec<crate::pipeline::StepSpec>,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code, reason = "read only for its layout")]
+        struct OldAssignment {
+            job_id: String,
+            run_id: String,
+            repo: String,
+            clone_url: String,
+            sha: String,
+            branch: String,
+            event: String,
+            run_number: i64,
+            attempt: u32,
+            spec: OldJob,
+            secrets: Vec<(String, String)>,
+            job_token: String,
+            server_url: String,
+        }
+        let any = jobs.iter().find(|j| j.requires.is_empty()).cloned().ok_or_else(|| anyhow::anyhow!("no job that requires nothing"))?;
+        let (old, new) = (encode(&assign(any.clone().for_runner(0)))?, encode(&assign(any.for_runner(CAP_CI2)))?);
+        assert_eq!(old.first(), new.first(), "the same variant");
+        let (a, rest) = postcard::take_from_bytes::<OldAssignment>(old.get(1..).unwrap_or_default())?;
+        assert!(rest.is_empty(), "{} bytes past the assignment", rest.len());
+        assert_eq!((a.spec.key.as_str(), a.spec.steps.len(), a.secrets.len(), a.server_url.as_str()), ("any", 1, 1, "http://kiln"));
+        Ok(())
+    }
+
+    #[test]
     fn appended_variants_keep_their_indexes() -> anyhow::Result<()> {
         // Older peers decode by variant index: the new ones must come after every existing one.
         let i = encode(&AgentMsg::Instance(InstanceHello { id: "main".into(), created_at: 0, pid: 7 }))?;

@@ -15,6 +15,9 @@ jobs:
     name: build and publish kiln's image
     # The machine whose Docker runs the minikube cluster.
     runs-on: [baremetal, local]
+    # Linux, as that Docker is. Saying so also gets the job to its runner whole from a server that
+    # left an empty `requires` out of an assignment (a084bb776's): runners refused it as malformed.
+    requires: ["os == linux"]
     timeout-minutes: 60
     steps:
       - name: build
