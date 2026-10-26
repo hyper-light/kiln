@@ -102,3 +102,19 @@ fn w24_r31_sizes_and_schedules() {
     assert_eq!(due(&r, r.floor, 0, 0, Some(t), t + 86_400), Some(Trigger::Schedule));
     assert_eq!(due(&r, r.floor, 0, 0, Some(t), t + 60), None);
 }
+
+#[test]
+fn w24_r31_policies_as_people_write_them() {
+    let v = serde_json::json!({ "floor": "10%", "ceiling": "300GiB", "keep_last": 3, "keep_within": "2d", "max_age": "14d", "schedule": "30 3 * * *" });
+    let p = parse_policy(&v);
+    assert_eq!(p.as_ref().map(policy_text), Ok(v));
+    assert_eq!(parse_policy(&serde_json::json!({ "schedule": "6h" })).map(|p| p.schedule), Ok(Some(Schedule::Every(6 * 3600))));
+    assert!(parse_policy(&serde_json::json!({ "keep_forever": true })).is_err());
+    assert!(parse_policy(&serde_json::json!({ "schedule": "30s" })).is_err());
+    assert!(parse_policy(&serde_json::json!({ "keep_last": 5000 })).is_err());
+    let floor = Policy { floor: Some(Size::Share(1000)), ..Policy::default() };
+    assert!(check_scope(&floor, Scope::Repo).is_err() && check_scope(&floor, Scope::Session).is_err());
+    assert!(check_scope(&floor, Scope::Runner).is_ok() && check_scope(&floor, Scope::System).is_ok());
+    assert_eq!(parse_duration("90s"), Ok(90));
+    assert!(parse_duration("1y").is_err());
+}

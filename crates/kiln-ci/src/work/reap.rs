@@ -371,5 +371,140 @@ fn worth(e: &Entry) -> u128 {
     (u128::from(e.saved_ms) << 32) / u128::from(e.bytes.max(1))
 }
 
+/// The keys a policy has, as people write them.
+pub const KEYS: &[&str] = &["floor", "ceiling", "target", "keep_last", "keep_within", "max_age", "schedule"];
+
+/// A policy as people write it (the API's and the UI's form): sizes as `20GB` or `10%`, durations
+/// as `90s`, `30m`, `6h`, `1d` or seconds, the schedule as an interval or a cron expression. A key
+/// left out, or `null`, is left to other scopes; an unknown key is an error.
+pub fn parse_policy(v: &serde_json::Value) -> Result<Policy, String> {
+    let Some(obj) = v.as_object() else {
+        return if v.is_null() { Ok(Policy::default()) } else { Err("a policy is an object of its keys".into()) };
+    };
+    if let Some(k) = obj.keys().find(|k| !KEYS.contains(&k.as_str())) {
+        return Err(format!("`{k}` isn't a policy key: {}", KEYS.join(", ")));
+    }
+    let text = |k: &str| -> Result<Option<String>, String> {
+        match obj.get(k) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(serde_json::Value::Number(n)) => Ok(Some(n.to_string())),
+            Some(_) => Err(format!("`{k}` is a string or a number")),
+        }
+    };
+    let size = |k: &str| text(k)?.map(|s| Size::parse(&s).map_err(|e| format!("{k}: {e}"))).transpose();
+    let duration = |k: &str| text(k)?.map(|s| parse_duration(&s).map_err(|e| format!("{k}: {e}"))).transpose();
+    let keep_last = match text("keep_last")? {
+        None => None,
+        Some(s) => Some(s.parse::<u32>().ok().filter(|n| *n <= 1000).ok_or_else(|| format!("keep_last: `{s}` isn't a count from 0 to 1000"))?),
+    };
+    let schedule = text("schedule")?.map(|s| parse_schedule(&s).map_err(|e| format!("schedule: {e}"))).transpose()?;
+    Ok(Policy { floor: size("floor")?, ceiling: size("ceiling")?, target: size("target")?, keep_last, keep_within: duration("keep_within")?, max_age: duration("max_age")?, schedule })
+}
+
+/// A policy in the form [`parse_policy`] reads: only the keys it sets.
+pub fn policy_text(p: &Policy) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for (k, v) in [("floor", p.floor), ("ceiling", p.ceiling), ("target", p.target)] {
+        if let Some(v) = v {
+            m.insert(k.into(), size_text(v).into());
+        }
+    }
+    if let Some(n) = p.keep_last {
+        m.insert("keep_last".into(), n.into());
+    }
+    for (k, v) in [("keep_within", p.keep_within), ("max_age", p.max_age)] {
+        if let Some(v) = v {
+            m.insert(k.into(), duration_text(v).into());
+        }
+    }
+    if let Some(s) = &p.schedule {
+        m.insert("schedule".into(), schedule_text(s).into());
+    }
+    serde_json::Value::Object(m)
+}
+
+/// W24-R31: hardware limits are set for the system or a runner, never for a repository or a
+/// session.
+pub fn check_scope(p: &Policy, scope: Scope) -> Result<(), String> {
+    let hardware = p.floor.is_some() || p.ceiling.is_some() || p.target.is_some();
+    if hardware && matches!(scope, Scope::Repo | Scope::Session) {
+        return Err("floor, ceiling and target are set for the system or a runner, not a repository or a session".into());
+    }
+    Ok(())
+}
+
+/// `90s`, `30m`, `6h`, `1d`, `2w`, or seconds.
+pub fn parse_duration(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (n, unit) = t.split_at(split);
+    let n: u64 = n.parse().map_err(|_| format!("`{s}` isn't a duration (90s, 30m, 6h, 1d)"))?;
+    let mult = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        _ => return Err(format!("`{s}` isn't a duration (90s, 30m, 6h, 1d)")),
+    };
+    n.checked_mul(mult).ok_or_else(|| format!("`{s}` is too long"))
+}
+
+/// An interval (`6h`, at least a minute) or a five-field cron expression.
+pub fn parse_schedule(s: &str) -> Result<Schedule, String> {
+    if s.split_whitespace().count() == 5 {
+        Cron::parse(s)?;
+        return Ok(Schedule::Cron(s.split_whitespace().collect::<Vec<_>>().join(" ")));
+    }
+    let secs = parse_duration(s)?;
+    if secs < 60 {
+        return Err(format!("`{s}`: a schedule's interval is at least a minute"));
+    }
+    Ok(Schedule::Every(secs))
+}
+
+fn size_text(s: Size) -> String {
+    match s {
+        Size::Share(bp) if bp % 100 == 0 => format!("{}%", bp / 100),
+        Size::Share(bp) => format!("{}.{:02}%", bp / 100, bp % 100),
+        Size::Bytes(b) if b > 0 && b % GIB == 0 => format!("{}GiB", b / GIB),
+        Size::Bytes(b) => b.to_string(),
+    }
+}
+
+fn duration_text(secs: u64) -> String {
+    match secs {
+        0 => "0s".into(),
+        s if s % 86_400 == 0 => format!("{}d", s / 86_400),
+        s if s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+fn schedule_text(s: &Schedule) -> String {
+    match s {
+        Schedule::Every(secs) => duration_text(*secs),
+        Schedule::Cron(e) => e.clone(),
+    }
+}
+
+/// The effective policy as people read it: each key's value and the scope it came from (`null`:
+/// kiln's default), with the hardware limits in bytes on a volume of `volume` bytes.
+pub fn effective_text(r: &Resolved, volume: u64) -> serde_json::Value {
+    let from = |k: &str| r.from.get(k).copied().flatten();
+    serde_json::json!({
+        "volume": volume,
+        "floor": { "bytes": r.floor, "from": from("floor") },
+        "ceiling": { "bytes": r.ceiling, "from": from("ceiling") },
+        "target": { "bytes": r.target, "from": from("target") },
+        "keep_last": { "value": r.keep_last, "from": from("keep_last") },
+        "keep_within": { "value": duration_text(r.keep_within), "from": from("keep_within") },
+        "max_age": { "value": duration_text(r.max_age), "from": from("max_age") },
+        "schedule": { "value": schedule_text(&r.schedule), "from": from("schedule") },
+    })
+}
+
 #[cfg(test)]
 mod tests;

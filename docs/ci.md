@@ -8218,7 +8218,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/work/status?runner=` | `ci.work.status` | runs.read | W24 |
 | POST | `/api/ci/work/warm`, `/api/ci/work/verify` | `ci.work.warm`, `ci.work.verify` | runs.write | W24 |
 | POST | `/api/ci/work/gc` | `ci.work.gc` | admin | W24 |
-| GET, PUT | `/api/ci/work/reap/policies?scope=` | `ci.work.reap.policies`, `ci.work.reap.set` | runs.read; admin (system, runner), repos.admin (repository), the session's owner | W24 |
+| GET, PUT | `/api/ci/work/reap/policies?scope=` | `ci.work.reap.policies`, `ci.work.reap.set` | runs.read; caches.write at the scope (a session's: the server's) | W24 |
 | POST | `/api/ci/work/reap?runner=&dry_run=` | `ci.work.reap.run` | admin | W24 |
 | GET | `/api/ci/repos/:repo/workflows/:path?ref=` | `ci.workflows.get` (source, IR, diagnostics) | runs.read | W02 |
 | POST | `/api/ci/validate` | `ci.workflows.validate` | runs.read | W02 |

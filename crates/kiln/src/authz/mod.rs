@@ -492,6 +492,9 @@ pub static ROUTES: &[Rule] = &[
     any("/api/ci/environments", "environments.manage", At::RepoQuery),
     any("/api/ci/environments/**", "environments.manage", At::RepoQuery),
     r("POST", "/api/ci/routing/explain", "runs.read", At::Anywhere),
+    r("GET", "/api/ci/work/reap/policies", "runs.read", At::Anywhere),
+    // W24-R31: a scope's reaper policy, changed with caches.write there (a session's: the server's).
+    r("PUT", "/api/ci/work/reap/policies", "caches.write", At::ScopeQuery),
     any("/api/ci/routing/rules", "routing.manage", At::ScopeQuery),
     r("GET", "/api/ci/integrations/kinds", "runs.read", At::Anywhere),
     any("/api/ci/integrations", "integrations.manage", At::Server),
