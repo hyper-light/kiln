@@ -9,6 +9,10 @@
 //! are, among the open changes' latest versions by the same author on the same branch. A split
 //! keeps the change for the half most like it and makes the other a change split from it; a
 //! squash keeps one change and absorbs the rest; and kiln asks only when it can't tell.
+//!
+//! Actors' identities, and the chain of whom each acts for, are [`chain`] (W27-R01).
+
+pub mod chain;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
