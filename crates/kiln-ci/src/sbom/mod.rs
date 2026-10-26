@@ -225,7 +225,7 @@ fn tstr<'a>(t: &'a toml::Table, k: &str) -> Option<&'a str> {
 }
 
 /// A Python package's normalized name (PEP 503).
-fn pep503(name: &str) -> String {
+pub(crate) fn pep503(name: &str) -> String {
     let mut out = String::new();
     for c in name.chars() {
         let c = if matches!(c, '_' | '.' | '-') { '-' } else { c.to_ascii_lowercase() };

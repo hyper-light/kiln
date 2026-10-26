@@ -40,6 +40,19 @@ pub struct RunnerFacts {
     pub kiln: Option<KilnFacts>,
     /// Whether its agents can have workspaces of their own (Slates volumes), and why not.
     pub workspaces: Option<Workspaces>,
+    /// What W24's work needs to know of the machine (docs/ci.md W24, `RunnerFacts.work`).
+    pub work: Option<WorkFacts>,
+}
+
+/// The machine as W24's work sees it: its load now (admission, W24-R19). The work volume's free
+/// disk is [`RunnerFacts::disk`]'s.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkFacts {
+    /// The share of the last 10 seconds in which all the machine's non-idle tasks were stalled on
+    /// I/O at once, in percent: Linux's pressure stall information, `/proc/pressure/io`'s `full
+    /// avg10`. `None` where the system doesn't report it.
+    pub io_full: Option<f64>,
 }
 
 /// Agents' workspaces of their own on a machine: Slates volumes over their folders.

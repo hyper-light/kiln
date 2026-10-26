@@ -433,6 +433,8 @@ pub struct Hub {
     pub blobs: crate::blobs::Opened,
     /// The bus kiln's events ride: its sessions' live feeds (docs/bus.md).
     pub bus: crate::bus::QuiverBus,
+    /// Memo steps in flight, one execution per key and domain (docs/ci.md W28-R72).
+    pub flight: crate::ci::services::memo::Flights,
 }
 
 impl Hub {
@@ -542,22 +544,42 @@ impl Hub {
             push: crate::push::Service::default(),
             blobs,
             bus,
+            flight: Default::default(),
         }))
     }
 
-    /// A job of kiln's own release pipeline succeeded (`[updates]`): the binaries it built are what
-    /// each other platform's runners upgrade to now.
+    /// A job of kiln's own release pipeline succeeded (`[updates]`), a v1 job or a leg of the CI
+    /// engine's run: the binaries it built are what each other platform's runners upgrade to now.
     pub(crate) async fn adopt_release(&self, job: &str, run: &crate::store::Run) {
+        // The engine's run of a tag is a `push` of it.
+        let tagged;
+        let run = if run.event == "push" && run.branch != self.cfg.updates.release_branch && crate::updates::pushed_tag(self, &run.id).await {
+            tagged = crate::store::Run { event: "tag".into(), ..run.clone() };
+            &tagged
+        } else {
+            run
+        };
         // The server's commit, or the newest one a runner runs (`crate::fleet`).
         let newest = self.updates.fleet.target().map(|t| t.commit).unwrap_or_default();
         if !crate::updates::adopts(&self.cfg.updates, run, crate::api::COMMIT) && (newest.is_empty() || !crate::updates::adopts(&self.cfg.updates, run, &newest)) {
             return;
         }
-        let path = crate::api::artifact_path(self, job);
-        if !path.exists() {
-            return;
+        // v1's job keeps its artifacts as a tarball; the engine's leg uploaded them to CI's store.
+        let v1 = crate::api::artifact_path(self, job);
+        let (path, copied) = if v1.exists() {
+            (v1, false)
+        } else {
+            match crate::updates::leg_artifacts(self, job).await {
+                Ok(Some(p)) => (p, true),
+                Ok(None) => return,
+                Err(e) => return tracing::warn!(run = run.number, leg = job, error = %format!("{e:#}"), "the release pipeline's artifacts couldn't be read"),
+            }
+        };
+        let adopted = crate::updates::adopt_into(self, &path, run).await;
+        if copied {
+            let _ = std::fs::remove_file(&path);
         }
-        match crate::updates::adopt_into(self, &path, run).await {
+        match adopted {
             Ok(kept) if !kept.is_empty() => {
                 let targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
                 tracing::info!(run = run.number, targets = ?targets, "runners' binaries built by the release pipeline");
@@ -1827,6 +1849,19 @@ impl Hub {
                             hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                         });
                     }
+                    // Which runner holds which object of the runners' caches (docs/ci.md W24-R27).
+                    Some(op @ ("holds" | "holders")) => {
+                        let s = |k: &str| ask.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+                        let (repo, digest) = (s("repo"), s("digest"));
+                        let answer = if op == "holds" {
+                            crate::reach::directory::holds(&agent, &repo, &digest);
+                            serde_json::json!({})
+                        } else {
+                            let up: Vec<String> = crate::reach::directory::holders(&repo, &digest, &agent).into_iter().filter(|r| self.agents.lock().get(r).is_some_and(|a| a.connected)).collect();
+                            serde_json::json!({ "runners": up })
+                        };
+                        self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    }
                     // An agent's MCP server on the runner asks for kiln's operations: answered on
                     // their own, so a slow one holds up nothing else the runner says.
                     Some("registry" | "call" | "page" | "stream") => {
@@ -1853,6 +1888,12 @@ impl Hub {
             // Hand-overs between a machine's runner processes (`crate::handovers`).
             AgentMsg::HarnessHandOver { session, offset, data, done } => self.handover_piece(&agent, peer, session, offset, data, done).await,
             AgentMsg::HarnessAdopted { session, error } => self.handover_adopted(&agent, peer, session, error).await,
+            // What it holds warm, for placement (docs/ci.md W24-R18); a job's pod holds nothing.
+            AgentMsg::WorkState { json } => match serde_json::from_str::<kiln_ci::work::slots::WorkState>(&json) {
+                Ok(state) if !self.agents.lock().get(&agent).is_none_or(|a| a.ephemeral) => self.ci.send(crate::ci::dispatch::Msg::WorkState { agent: agent.clone(), state: Box::new(state) }),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(agent = %agent, error = %e, "an unreadable report of warm workspaces"),
+            },
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -2146,7 +2187,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
@@ -2537,7 +2578,7 @@ impl Hub {
                         event: run.event.clone(),
                         run_number: run.number,
                         attempt: job.attempt,
-                        spec,
+                        spec: spec.for_runner(self.runner_caps(&agent)),
                         secrets: self.job_secrets(),
                         job_token: crate::api::job_token(&self.admin_token, &job.id),
                         server_url: self.server_url_for(&agent),
@@ -2893,6 +2934,22 @@ pub(crate) mod tests {
             assert!(!fits(w), "{w}");
         }
         assert!(carries(&[], "macos", "aarch64", "mac", "arm64") && carries(&[], "macos", "aarch64", "mac", "darwin"));
+    }
+
+    /// W05-R21 in v1: `[baremetal, linux]` fits a Linux runner labelled only `baremetal` (its
+    /// platform says Linux), `[Linux]` fits one labelled `linux`, and `[baremetal, linux]` doesn't
+    /// fit a Mac labelled `baremetal`.
+    #[test]
+    fn w05_r21_labels_match_in_any_case() {
+        let fits = |labels: &[&str], os: &str, arch: &str, want: &[&str]| {
+            let own: Vec<String> = labels.iter().map(|l| (*l).to_owned()).collect();
+            want.iter().all(|w| carries(&own, os, arch, "runner", w))
+        };
+        assert!(fits(&["baremetal"], "linux", "x86_64", &["baremetal", "linux"]), "the platform's Linux");
+        assert!(fits(&["baremetal"], "linux", "x86_64", &["baremetal", "Linux"]) && fits(&["baremetal"], "linux", "x86_64", &["BAREMETAL", "LINUX"]));
+        assert!(fits(&["linux"], "linux", "x86_64", &["Linux"]), "`Linux` against `linux`");
+        assert!(fits(&["Linux"], "linux", "x86_64", &["linux"]), "`linux` against `Linux`");
+        assert!(!fits(&["baremetal"], "macos", "aarch64", &["baremetal", "linux"]), "a Mac isn't Linux");
     }
 
     /// A connected runner on `os`/`arch` that hosts agents (its terminals on), for a test's hub.
