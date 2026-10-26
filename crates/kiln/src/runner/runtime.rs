@@ -3352,6 +3352,59 @@ async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -
 static NODE_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
 static ACTION_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
 
+/// How many times a step asks the internet for what it needs (a Node build) before it fails, as
+/// GitHub's runner asks for an action's archive: three times, a random 10–30 s apart, and a 404
+/// or a 403 once (actions/runner, `ActionManager.DownloadRepositoryArchive`). nodejs.org's
+/// `SHASUMS256.txt` once stalled past its 60 s and failed its step on the first ask (2026-10-26).
+const DOWNLOAD_TRIES: u32 = 3;
+
+/// How long one ask for a Node build may take, its body read too (a stalled body is asked again).
+const DOWNLOAD_WITHIN: Duration = Duration::from_secs(600);
+
+/// The wait before a download is asked for again: GitHub's runner's, a random 10–30 s.
+fn download_backoff() -> Duration {
+    Duration::from_millis(10_000 + rand::random::<u64>() % 20_001)
+}
+
+/// An answer another ask won't change (a 404, a 403): asked once.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// `ask` (given its try, from 1) until it answers, at most [`DOWNLOAD_TRIES`] times: before each
+/// ask again, `again` is told why, how long it waits ([`download_backoff`], waited by `wait`) and
+/// which try comes. A [`Refused`] ends it at once.
+async fn tried<T, A, AF, G, GF, S, SF>(mut ask: A, mut again: G, mut wait: S) -> anyhow::Result<T>
+where
+    A: FnMut(u32) -> AF,
+    AF: Future<Output = anyhow::Result<T>>,
+    G: FnMut(String, Duration, u32) -> GF,
+    GF: Future<Output = ()>,
+    S: FnMut(Duration) -> SF,
+    SF: Future<Output = ()>,
+{
+    let mut n = 1;
+    loop {
+        match ask(n).await {
+            Ok(v) => return Ok(v),
+            Err(e) if n < DOWNLOAD_TRIES && !e.is::<Refused>() => {
+                let backoff = download_backoff();
+                again(format!("{e:#}"), backoff, n + 1).await;
+                wait(backoff).await;
+                n += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl Leg {
     /// Where an action is: in the workspace (`./`), or fetched at its pinned commit.
     async fn locate(&self, uses: &str) -> anyhow::Result<Located> {
@@ -3417,8 +3470,9 @@ impl Leg {
     /// `node12` on Node 20, as GitHub forces. Official builds from nodejs.org, checked against
     /// their `SHASUMS256.txt`, kept in `<work>/_externals`. Where the C library is musl (an Alpine
     /// job container, or an Alpine machine), musl builds, kept as GitHub's runner keeps them
-    /// (`node20_alpine`): see [`musl_node`].
-    async fn node(&self, using: &str, musl: bool) -> anyhow::Result<PathBuf> {
+    /// (`node20_alpine`): see [`musl_node`]. Asked for up to [`DOWNLOAD_TRIES`] times, each ask
+    /// again said in step `idx`'s log.
+    async fn node(&self, idx: u32, using: &str, musl: bool) -> anyhow::Result<PathBuf> {
         let major = if using == "node24" { 24 } else { 20 };
         let dir = self.work_dir.join("_externals").join(if musl { format!("node{major}_alpine") } else { format!("node{major}") });
         let bin = if cfg!(windows) { dir.join("node.exe") } else { dir.join("bin").join("node") };
@@ -3435,33 +3489,23 @@ impl Leg {
             "arm" => "armv7l",
             other => anyhow::bail!("no Node {major} build for {other}"),
         };
-        let (url, file, sha) = if musl {
-            musl_node(&self.http, major, arch).await?
-        } else {
-            let os = match std::env::consts::OS {
-                "linux" => "linux",
-                "macos" => "darwin",
-                other => anyhow::bail!("no Node {major} build for {other} here yet"),
-            };
-            let base = format!("https://nodejs.org/dist/latest-v{major}.x");
-            let sums = self.http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
-            let suffix = format!("-{os}-{arch}.tar.gz");
-            let (sha, file) =
-                listed(&String::from_utf8_lossy(&sums), |f| f.starts_with("node-v") && f.ends_with(&suffix)).ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
-            (format!("{base}/{file}"), file, sha)
-        };
-        let mut resp = crate::updates::get_following(&self.http, &url, Duration::from_secs(600)).await?;
-        anyhow::ensure!(resp.is_success(), "downloading {file}: HTTP {}", resp.status());
-        let mut bytes = Vec::new();
-        while let Some(c) = resp.chunk().await? {
-            bytes.extend_from_slice(&c);
-            anyhow::ensure!(bytes.len() < 1 << 30, "{file} is over 1 GiB");
-        }
-        let got = {
-            use sha2::Digest as _;
-            hex::encode(sha2::Sha256::digest(&bytes))
-        };
-        anyhow::ensure!(got == sha, "{file}: SHA-256 {got}, where it's listed as {sha}");
+        // `fetch` chaos: the first ask fails as a request that timed out does.
+        let chaos = super::chaos::for_leg(self.a.attempt).is_some_and(|c| c.fetch);
+        let (bytes, file) = tried(
+            |n| async move {
+                anyhow::ensure!(!(chaos && n == 1), "request timed out after 60s (chaos `fetch`)");
+                match crate::rt::timeout(DOWNLOAD_WITHIN, self.node_build(major, musl, arch)).await {
+                    Ok(got) => got,
+                    Err(_) => anyhow::bail!("Node {major} wasn't downloaded within {DOWNLOAD_WITHIN:?}"),
+                }
+            },
+            |why, backoff, n| {
+                let text = format!("Node {major}'s download: {why}; asking again in {} s (try {n} of {DOWNLOAD_TRIES})", backoff.as_secs());
+                async move { self.note(idx, &text).await }
+            },
+            crate::rt::sleep,
+        )
+        .await?;
         let d = dir.clone();
         crate::rt::blocking(move || -> anyhow::Result<()> {
             let tmp = d.with_extension("partial");
@@ -3488,6 +3532,42 @@ impl Leg {
         .await??;
         anyhow::ensure!(bin.exists(), "{file} has no {}", bin.strip_prefix(&dir).unwrap_or(&bin).display());
         Ok(bin)
+    }
+
+    /// One ask of [`Leg::node`]'s: Node `major`'s build for this machine, its bytes and its file,
+    /// checked against the digest its publisher lists.
+    async fn node_build(&self, major: u32, musl: bool, arch: &str) -> anyhow::Result<(Vec<u8>, String)> {
+        let (url, file, sha) = if musl {
+            musl_node(&self.http, major, arch).await?
+        } else {
+            let os = match std::env::consts::OS {
+                "linux" => "linux",
+                "macos" => "darwin",
+                other => return Err(Refused(format!("no Node {major} build for {other} here yet")).into()),
+            };
+            let base = format!("https://nodejs.org/dist/latest-v{major}.x");
+            let sums = self.http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
+            let suffix = format!("-{os}-{arch}.tar.gz");
+            let (sha, file) =
+                listed(&String::from_utf8_lossy(&sums), |f| f.starts_with("node-v") && f.ends_with(&suffix)).ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
+            (format!("{base}/{file}"), file, sha)
+        };
+        let mut resp = crate::updates::get_following(&self.http, &url, Duration::from_secs(600)).await?;
+        if matches!(resp.status(), 403 | 404) {
+            return Err(Refused(format!("downloading {file}: HTTP {}", resp.status())).into());
+        }
+        anyhow::ensure!(resp.is_success(), "downloading {file}: HTTP {}", resp.status());
+        let mut bytes = Vec::new();
+        while let Some(c) = resp.chunk().await? {
+            bytes.extend_from_slice(&c);
+            anyhow::ensure!(bytes.len() < 1 << 30, "{file} is over 1 GiB");
+        }
+        let got = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&bytes))
+        };
+        anyhow::ensure!(got == sha, "{file}: SHA-256 {got}, where it's listed as {sha}");
+        Ok((bytes, file))
     }
 
     /// An action's inputs (W07-R05): `with`, else the default, evaluated as an expression; inputs
@@ -4480,7 +4560,7 @@ impl Leg {
         aenv.extend(runs_env(st, action, &inputs));
         match action.runs.using.as_str() {
             "node12" | "node16" | "node20" | "node24" => {
-                let node = self.node(&action.runs.using, musl_here(st)).await?;
+                let node = self.node(idx, &action.runs.using, musl_here(st)).await?;
                 let main = action.runs.main.as_deref().ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.main`"))?;
                 let script = loc.dir.join(main);
                 let (dir, scripts) = (loc.dir.clone(), [Some(main.to_owned()), action.runs.post.clone()].into_iter().flatten().collect::<Vec<_>>());
@@ -4647,7 +4727,7 @@ impl Leg {
                 if crate::rt::blocking(move || refuses_ghes(&dir, &[script.as_str()])).await.unwrap_or(false) {
                     env.insert("GITHUB_SERVER_URL".into(), st.not_ghes.clone());
                 }
-                match self.node(&action.runs.using, musl_here(st)).await {
+                match self.node(idx, &action.runs.using, musl_here(st)).await {
                     Ok(node) => self.exec(st, idx, Run::Program { prog: node.to_string_lossy().to_string(), args: vec![loc.dir.join(pre).to_string_lossy().to_string()] }, &ws, env, deadline).await,
                     Err(e) => Err(e),
                 }
@@ -4917,6 +4997,53 @@ fn release_line(id: i64, r: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A download asked for as GitHub's runner asks for an action's archive: three times at most,
+    /// 10–30 s apart, each ask again said, and a refused one (a 404, a 403) once.
+    #[test]
+    fn a_download_is_asked_for_three_times_and_a_refused_one_once() -> anyhow::Result<()> {
+        type Said = std::sync::Arc<parking_lot::Mutex<Vec<(String, Duration, u32)>>>;
+        let run = |fails: u32, refused: bool| async move {
+            let (asks, said): (std::sync::Arc<parking_lot::Mutex<u32>>, Said) = Default::default();
+            let (a, s) = (asks.clone(), said.clone());
+            let got = tried(
+                move |n| {
+                    *a.lock() = n;
+                    async move {
+                        if refused {
+                            return Err(Refused("downloading node-v24.11.0-linux-x64.tar.gz: HTTP 404".into()).into());
+                        }
+                        anyhow::ensure!(n > fails, "request timed out after 60s");
+                        Ok(n)
+                    }
+                },
+                move |why, backoff, n| {
+                    s.lock().push((why, backoff, n));
+                    async {}
+                },
+                |_| async {},
+            )
+            .await;
+            let asks = *asks.lock();
+            let said = said.lock().clone();
+            (got, asks, said)
+        };
+        crate::rt::block_on(async move {
+            // Answered on its third ask, after two waits of 10–30 s, each said with the try it
+            // waits for.
+            let (got, asks, said) = run(2, false).await;
+            anyhow::ensure!(got.ok() == Some(3) && asks == 3, "{asks} asks");
+            anyhow::ensure!(said.iter().map(|(_, _, n)| *n).collect::<Vec<_>>() == [2, 3], "{said:?}");
+            anyhow::ensure!(said.iter().all(|(why, w, _)| why.contains("timed out") && (Duration::from_secs(10)..=Duration::from_secs(30)).contains(w)), "{said:?}");
+            // Never answered: three asks, then its last error.
+            let (got, asks, said) = run(5, false).await;
+            anyhow::ensure!(got.is_err_and(|e| e.to_string().contains("timed out")) && asks == 3 && said.len() == 2, "{asks} asks, {said:?}");
+            // Refused: asked once, nothing waited.
+            let (got, asks, said) = run(0, true).await;
+            anyhow::ensure!(got.is_err_and(|e| e.is::<Refused>()) && asks == 1 && said.is_empty(), "{asks} asks, {said:?}");
+            Ok(())
+        })
+    }
 
     /// The server URL actions that refuse GitHub Enterprise Server get keeps the server's port, so
     /// what they fetch from it reaches kiln (docs/ci.md W08-R08).
