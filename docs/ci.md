@@ -7909,13 +7909,14 @@ before this one call this workstream "W25 step N". Step 6's, admission, are R60â
   ranked below it.
 - **W28-R36 The speculation window.** Each component tests the first changes of its queue at once,
   each on its expected stack (the changes ahead of it in its component, then itself), as many as
-  its AIMD window allows: the window starts at its cap (`window_cap`, default 8), opens by one on a
-  pass and halves on a failure, as Zuul's does, never past its cap nor below one; a change past it
-  is suspended. A job's result is keyed by the job and the tree its unit has on the stack, the set
-  of the trunk's and the stack's changes of that unit (R32, R33), so a result the trunk or another
-  candidate has answers it and one in flight is shared. A failure is the change's own once every
-  change ahead of it has passed. It ejects the change, and the candidates behind it re-key: what
-  still keys keeps its result, and what its leaving changed runs again.
+  its AIMD window allows. The window is admission's `Window` (R68) with the land queue's values: it
+  starts at its cap of 8, opens by one on a pass and halves on a failure, as Zuul's does, never past
+  its cap nor below its floor of 1; a change past it is suspended. A job's result is keyed by the
+  job and the tree its unit has on the stack, the set of the trunk's and the stack's changes of that
+  unit (R32, R33), so a result the trunk or another candidate has answers it and one in flight is
+  shared. A failure is the change's own once every change ahead of it has passed. It ejects the
+  change, and the candidates behind it re-key: what still keys keeps its result, and what its
+  leaving changed runs again.
 - **W28-R37 Admission.** A component's head always starts its candidate. Another change in the
   window starts its only while the bottleneck its check needs is below `util_cap` (default 0.8)
   committed, the shortest expected service first (aged): the bottleneck is, of each of its jobs'

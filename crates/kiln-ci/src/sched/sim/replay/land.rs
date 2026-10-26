@@ -28,7 +28,8 @@ use std::fmt::Write as _;
 use crate::insights::{Node, critical_path};
 use crate::land::conflict::{Change, Conflicts, Decision, Unit, Units};
 use crate::land::next_batch;
-use crate::land::order::{Intent, Order, Waiting, Window};
+use crate::land::order::{Order, Role, Speculation, Waiting};
+use crate::sched::admit;
 
 use super::draw::Draw;
 use super::trace::{self, End, Trace};
@@ -386,7 +387,7 @@ pub fn replay(trace: &Trace, policy: &LandPolicy, seed: u64) -> LandOut {
         candidates: e.cands.iter().map(|c| c.batch.clone()).collect(),
         execs: e.execs,
         window_max: e.window_max,
-        window_cap: order.window_cap.max(1),
+        window_cap: Speculation::new(order.window).cap(),
         aging_bound: order.aging_bound(),
         end: trace.end,
         decisions: e.decisions,
@@ -434,7 +435,7 @@ struct Engine<'a> {
     comps: Vec<Vec<usize>>,
     comp_of: BTreeMap<usize, usize>,
     /// Each pending change's component's window: every member holds the same.
-    windows: BTreeMap<usize, Window>,
+    windows: BTreeMap<usize, Speculation>,
     /// The trunk's landed changes of each class: how many, and the sum of their [`mix`].
     trunk: BTreeMap<String, (usize, u64)>,
     /// Changes whose verdict the decisions have.
@@ -622,7 +623,7 @@ impl Engine<'_> {
         let mut windows = BTreeMap::new();
         let mut comp_of = BTreeMap::new();
         for (k, comp) in comps.iter().enumerate() {
-            let w = comp.iter().find_map(|i| self.windows.get(i).copied()).unwrap_or_else(|| Window::new(self.order.window_cap));
+            let w = comp.iter().find_map(|i| self.windows.get(i).copied()).unwrap_or_else(|| Speculation::new(self.order.window));
             self.window_max = self.window_max.max(w.max);
             for &i in comp {
                 windows.insert(i, w);
@@ -687,7 +688,7 @@ impl Engine<'_> {
     /// runs only for it.
     fn admit(&mut self) {
         for comp in self.comps.clone() {
-            let open = comp.first().and_then(|h| self.windows.get(h)).map_or(1, Window::open);
+            let open = comp.first().and_then(|h| self.windows.get(h)).map_or(1, Speculation::open);
             let open = usize::try_from(open).unwrap_or(1);
             for &i in comp.iter().skip(open) {
                 self.eligible.remove(&i);
@@ -709,7 +710,7 @@ impl Engine<'_> {
             let ws: Vec<Waiting> = want.iter().map(|&i| Waiting { critical: false, service_s: self.items.get(i).map_or(0, |it| it.service), waited_s: now - self.items.get(i).map_or(now, |it| it.at) }).collect();
             for i in self.order.rank(&ws).into_iter().filter_map(|k| want.get(k).copied()) {
                 let deferred_s = now - self.eligible.get(&i).copied().unwrap_or(now);
-                let a = self.order.admit(Intent::Speculative, self.bottleneck(i), deferred_s);
+                let a = self.order.admit(Role::Speculative, self.bottleneck(i), deferred_s);
                 if !a.runs() {
                     if self.deferred.insert(i) {
                         self.note(format!("#{i}: {a}"));
@@ -769,7 +770,7 @@ impl Engine<'_> {
                 if let Some(cd) = self.cands.get_mut(c) {
                     cd.decided = true;
                 }
-                let w = self.window_op(i, Window::fail);
+                let w = self.window_op(i, Speculation::fail);
                 self.note(format!("#{i} ejected: {} failed on its stack; its component's window halves to {w}", failed.join(", ")));
                 self.eject(i);
             }
@@ -781,7 +782,7 @@ impl Engine<'_> {
                 cd.decided = true;
             }
             self.passed.insert(i);
-            let w = self.window_op(i, Window::pass);
+            let w = self.window_op(i, Speculation::pass);
             self.note(format!("#{i} passed on its stack; its component's window opens to {w}"));
             changed = true;
         }
@@ -801,7 +802,7 @@ impl Engine<'_> {
     }
 
     /// Apply `op` to the window of `i`'s component, every member's copy; its width after.
-    fn window_op(&mut self, i: usize, op: fn(&mut Window)) -> u32 {
+    fn window_op(&mut self, i: usize, op: fn(&mut Speculation)) -> u32 {
         let Some(mut w) = self.windows.get(&i).copied() else { return 0 };
         op(&mut w);
         self.window_max = self.window_max.max(w.max);
@@ -1260,7 +1261,7 @@ pub fn report(trace: &Trace, seeds: &[u64]) -> String {
 pub fn sweeps(trace: &Trace, seeds: &[u64]) -> String {
     let mut policies = vec![LandPolicy::serial(1)];
     for cap in [1, 2, 4, 8, 12] {
-        policies.push(LandPolicy { name: format!("components, window cap {cap}"), mode: Mode::Components(Order { window_cap: cap, ..Order::default() }) });
+        policies.push(LandPolicy { name: format!("components, window cap {cap}"), mode: Mode::Components(Order { window: admit::Window { initial: cap, floor: 1, cap }, ..Order::default() }) });
     }
     for util in [0.6, 0.8, 1.0] {
         policies.push(LandPolicy { name: format!("components, admission cap {util}"), mode: Mode::Components(Order { util_cap: util, ..Order::default() }) });
