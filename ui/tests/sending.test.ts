@@ -221,3 +221,55 @@ await test("the agent ending fails what's still on its way but not what its mach
     off();
   }
 });
+
+await test("CP-T3.2: Retry sends a message that may have got there (no answer came, or its agent ended first) under its own id, so its inbox takes it once", async () => {
+  const store = new SessionStore("maybe");
+  const off = store.subscribe(() => {});
+  const realNow = Date.now;
+  try {
+    const ws = attach(store);
+    await tick();
+    // The server's own word that no answer came: it may have been applied.
+    send(store, "m14");
+    ws.frame({ t: "nack", id: "m14", code: "unanswered", why: "its runner never answered", again: false });
+    await tick();
+    assert.deepEqual(shown(store), [["m14", "failed"]]);
+    assert.equal(store.resend("m14"), true);
+    await tick();
+    const again = ws.said().at(-1);
+    assert.deepEqual([again?.id, again?.c.id], ["m14", "m14"], "under its own id: a second prompt never, its inbox answering a repeat");
+    assert.deepEqual(shown(store), [["m14", "sending"]], "on its way again, in its place");
+    // Its agent ended before it got there: it may have, all the same.
+    send(store, "m15");
+    ws.frame({ t: "closed" });
+    await tick();
+    assert.deepEqual(
+      shown(store).filter(([id]) => id === "m15"),
+      [["m15", "failed"]],
+    );
+    assert.equal(store.resend("m15"), true);
+    assert.deepEqual([ws.said().at(-1)?.id, ws.said().at(-1)?.c.id], ["m15", "m15"]);
+  } finally {
+    off();
+  }
+  // No answer at all for longer than a command waits for one: this page gives up on it, but not on its id.
+  const later = new SessionStore("unheard");
+  const done = later.subscribe(() => {});
+  try {
+    const ws = attach(later);
+    await tick();
+    send(later, "m16");
+    ws.close();
+    Date.now = () => realNow() + 11 * 60_000;
+    later.wake();
+    const next = attach(later);
+    await tick();
+    assert.notEqual(next, ws, "it reconnected");
+    assert.deepEqual(shown(later), [["m16", "failed"]], "no answer came");
+    assert.equal(later.resend("m16"), true);
+    assert.deepEqual([next.said().at(-1)?.id, next.said().at(-1)?.c.id], ["m16", "m16"]);
+  } finally {
+    Date.now = realNow;
+    done();
+  }
+});
