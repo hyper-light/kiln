@@ -490,6 +490,11 @@ impl Pki {
         Ok(signed.pem())
     }
 
+    /// Where its files are (`<data>/pki`).
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// The organization kiln's CA certifies for (its certificate's O), the root of every
     /// identity's chain (W27-R01); `kiln` when it names none.
     pub fn organization(&self) -> String {

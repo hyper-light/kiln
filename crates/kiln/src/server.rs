@@ -111,6 +111,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
     let tls = if cfg.server.https { Some(server_tls(&cfg, &leaf)?) } else { None };
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone())?;
+    // The server's and CD's own signing identities (docs/ci.md W27-R01).
+    if let Err(e) = crate::identities::own_identities(&hub.store, &pki).await {
+        tracing::warn!(error = %format!("{e:#}"), "the server's and CD's identities weren't issued");
+    }
     hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
     // Where kiln keeps its bytes (docs/blobs.md): what was kept before taken in, what's kept read.
     crate::blobs::start(&hub).await;

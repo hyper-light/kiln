@@ -419,3 +419,24 @@ fn w27_r01_a_ci_leg_its_own_certificate() -> anyhow::Result<()> {
     assert!(field(&leg, "subject").contains("/run/1/attempt/1/leg/e2e"), "{leg}");
     Ok(())
 }
+
+/// W27-R01: the server and CD sign as themselves, under certificates of their own whose keys stay
+/// in the server's data (0600), kept across a restart.
+#[test]
+fn w27_r01_the_server_and_cd_their_own_identities() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let mut s = start(dir.path(), &Options::default())?;
+    let server = until_identities(&s, "server", Duration::from_secs(10), |l| !l.is_empty())?;
+    assert_eq!(field(server.first().unwrap_or(&Value::Null), "verified"), "kiln server of hyper-light");
+    let cd = until_identities(&s, "cd", Duration::from_secs(10), |l| !l.is_empty())?;
+    assert_eq!(field(cd.first().unwrap_or(&Value::Null), "verified"), "CD, for the kiln server of hyper-light");
+    for k in ["server-signing.key", "cd-signing.key"] {
+        assert_eq!(std::fs::metadata(dir.path().join("data/pki").join(k))?.permissions().mode() & 0o777, 0o600, "{k}");
+    }
+    // A restart keeps them: nothing new issued.
+    s.restart()?;
+    assert_eq!(identities(&s, "server")?.len(), 1);
+    assert_eq!(identities(&s, "cd")?.len(), 1);
+    Ok(())
+}
