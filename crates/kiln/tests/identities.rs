@@ -250,3 +250,90 @@ fn w27_r01_an_agent_session_a_key_per_epoch() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// One request with a session cookie (`None`: none): status, body and head.
+fn call(port: u16, method: &str, path: &str, cookie: Option<&str>, body: Option<&Value>) -> anyhow::Result<(u16, String, String)> {
+    use std::io::{Read as _, Write as _};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let payload = body.map(Value::to_string).unwrap_or_default();
+    let cookie = cookie.map(|c| format!("Cookie: kiln_session={c}\r\n")).unwrap_or_default();
+    write!(s, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{cookie}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len())?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw)?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, rest) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status: u16 = head.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") { common::dechunk(rest) } else { rest.to_owned() };
+    Ok((status, body, head.to_owned()))
+}
+
+/// Person `name` added and signed in with the one-time link the owner makes: their cookie.
+fn signed_in(s: &Server, name: &str) -> anyhow::Result<String> {
+    let (st, body) = http(s.port, "POST", "/api/users", &s.admin, Some(&serde_json::json!({ "name": name, "grants": ["developer"] })))?;
+    anyhow::ensure!((200..300).contains(&st), "{name}: {st} {body}");
+    let (st, body) = http(s.port, "POST", &format!("/api/users/{name}/link"), &s.admin, None)?;
+    anyhow::ensure!(st == 200, "{name}'s link: {st} {body}");
+    let url = serde_json::from_str::<Value>(&body)?.get("url").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no link: {body}"))?;
+    let path = url.find("/api/").and_then(|at| url.get(at..)).ok_or_else(|| anyhow::anyhow!("a link without a path: {url}"))?;
+    let (_, _, head) = call(s.port, "GET", path, None, None)?;
+    head.lines()
+        .filter(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .find_map(|l| l.split_once(':').map(|(_, v)| v.trim()).and_then(|v| v.split(';').next()).and_then(|v| v.strip_prefix("kiln_session=")))
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{name} wasn't signed in: {head}"))
+}
+
+/// W27-R01, R02: a person's key is made on their own device and certified for a few hours after
+/// they sign in; disabling them refuses their certificates from then.
+#[test]
+fn w27_r01_people_certified_after_sign_in() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+
+    // The owner, from the CLI: the key stays in its config, 0600; the server keeps the certificate.
+    let config = dir.path().join("owner-config");
+    let out = common::kiln()
+        .args(["login", "--certificate", "--url", &format!("http://127.0.0.1:{}", s.port), "--token", &s.admin])
+        .env("XDG_CONFIG_HOME", &config)
+        .env("HOME", dir.path().join("home"))
+        .output()?;
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    anyhow::ensure!(out.status.success(), "kiln login --certificate: {said}");
+    assert!(said.contains("Certified: admin of hyper-light"), "{said}");
+    let key = config.join("kiln/identity.key");
+    assert_eq!(std::fs::metadata(&key)?.permissions().mode() & 0o777, 0o600);
+    assert!(config.join("kiln/identity.pem").exists());
+    let people = until_identities(&s, "person", Duration::from_secs(10), |l| !l.is_empty())?;
+    let owner = people.first().cloned().unwrap_or_default();
+    assert_eq!(field(&owner, "verified"), "admin of hyper-light");
+    let lived = owner.get("not_after").and_then(Value::as_i64).unwrap_or_default() - owner.get("not_before").and_then(Value::as_i64).unwrap_or_default();
+    assert!(lived <= 24 * 3600, "a day at most: {lived} s");
+
+    // A person signed in, their key made on their side.
+    let cookie = signed_in(&s, "ada")?;
+    let kp = rcgen::KeyPair::generate()?;
+    let csr = rcgen::CertificateParams::new(vec!["ada-laptop".to_owned()])?.serialize_request(&kp)?.pem()?;
+    let (st, body, _) = call(s.port, "POST", "/api/me/identity", Some(&cookie), Some(&serde_json::json!({ "csr": csr })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let v: Value = serde_json::from_str(&body)?;
+    assert_eq!(field(&v, "identity"), "ada of hyper-light");
+    let ada_uri = field(&v, "uri").to_owned();
+    // Nobody signed in gets none.
+    let (st, _, _) = call(s.port, "POST", "/api/me/identity", None, Some(&serde_json::json!({ "csr": csr })))?;
+    assert!(st == 401 || st == 403, "{st}");
+
+    // Disabled: refused from then.
+    let (st, body) = http(s.port, "DELETE", "/api/users/ada", &s.admin, None)?;
+    anyhow::ensure!((200..300).contains(&st), "{st} {body}");
+    let after = identities(&s, "person")?;
+    let ada = after.iter().find(|i| field(i, "subject") == ada_uri).cloned().unwrap_or_default();
+    assert!(field(&ada, "refused").contains("person disabled"), "{ada}");
+    assert!(!field(after.iter().find(|i| field(i, "subject").ends_with("/person/admin")).unwrap_or(&Value::Null), "verified").is_empty());
+
+    // No private key reached the server.
+    let db = std::fs::read(dir.path().join("data/kiln.db")).unwrap_or_default();
+    assert!(!String::from_utf8_lossy(&db).contains("PRIVATE KEY"));
+    Ok(())
+}

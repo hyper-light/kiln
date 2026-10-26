@@ -237,6 +237,8 @@ async fn disable_user(hub: &Hub, caller: &Caller, key: &str) -> Result<Response,
         })
         .await
         .map_err(internal)?;
+    // Their certificates with them (docs/ci.md W27-R01).
+    crate::identities::person_disabled(hub, &name, &caller.name).await.map_err(internal)?;
     hub.store.audit(caller.name.clone(), "users.disable".into(), name).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }

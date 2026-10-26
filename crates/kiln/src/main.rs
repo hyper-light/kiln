@@ -66,6 +66,10 @@ enum Cmd {
         /// Only print the links; do not open a browser.
         #[arg(long)]
         print: bool,
+        /// Instead, make a key on this device and get a short-lived certificate for it, naming
+        /// you (docs/ci.md W27-R02): the key stays here.
+        #[arg(long)]
+        certificate: bool,
         #[command(flatten)]
         server: ServerArgs,
     },
@@ -684,9 +688,13 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Install(a) => boxed(|| install::install(a)).await,
         Cmd::Uninstall { agent } => install::uninstall(agent),
-        Cmd::Login { print, server } => {
+        Cmd::Login { print, certificate, server } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             let t = boxed(|| server.resolve(&cfg)).await?;
+            if certificate {
+                out(&format!("Certified: {}", boxed(|| kiln::identities::login_certificate(&t)).await?));
+                return Ok(());
+            }
             let url = kiln::api::otp_url(&t.token, &t.url);
             out(&format!("Sign in on this machine (valid 5 minutes):\n  {url}"));
             if let Some(public) = t.public_url.as_deref().filter(|p| !kiln::access::is_loopback(p) && p.trim_end_matches('/') != t.url) {
