@@ -35,6 +35,7 @@ use std::ops::Range;
 use serde::{Deserialize, Serialize};
 
 pub mod cargo;
+pub mod culprit;
 
 /// What a check tests: a workflow's test of a unit, or with no test the unit (or job) as a whole
 /// (W28-R50).
