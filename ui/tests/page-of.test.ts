@@ -85,6 +85,36 @@ test("a page an agent showed, whatever its harness calls kiln's show_page", () =
   assert.equal(isShowPage({ name: "execute", tool: "shell", title: "cat answer.json", output: ANSWER }), false);
 });
 
+test("every harness's show_page call is a page, from the moment it's called where its harness says so", () => {
+  /** As kiln keeps an ACP agent's call (`crate::harness::acp`): its kind for a name, "tool" when it gave none. */
+  const acp = (title: string, output?: string, name = "other") => ({ name, tool: "other", title, output }) as const;
+  const kept = { claude: { name: "mcp__kiln__show_page", tool: "mcp", title: "Try it", server: "kiln", tool_short: "show_page", output: ANSWER } } as const;
+  const calls = {
+    // Claude Code and Codex: by name, kiln's answer on one line (`crate::reach::shown`).
+    "Claude Code": [kept.claude],
+    Codex: [{ ...kept.claude, title: "Database replication — interactive design preview" }],
+    // Devin: in its words.
+    Devin: [KEEPING, DEVIN],
+    // Gemini CLI: its display name for the tool; while it runs, its "explanation" (the call's input as JSON) is
+    // all its output; then its answer's text, and its picture in words.
+    "Gemini CLI": [acp("show_page (kiln MCP Server)", '{"title":"Try it","html":"<p>kiln_page</p>"}'), acp("show_page (kiln MCP Server)", `${ANSWER}\n[Image: image/png]`)],
+    // opencode: the tool's own id while it runs; done, its title is empty, so kiln keeps its kind as its title.
+    opencode: [acp("kiln_show_page"), acp("other", ANSWER)],
+    // Amp (amp-acp): the tool's name and its first argument.
+    Amp: [acp("mcp__kiln__show_page: Try it"), acp("mcp__kiln__show_page: Try it", ANSWER)],
+  };
+  for (const [harness, shown] of Object.entries(calls)) for (const c of shown) assert.ok(isShowPage(c), `${harness}: ${c.title}`);
+  assert.equal(pageOf(calls["Gemini CLI"][0]!), null, "Gemini CLI: its input isn't kiln's answer");
+  assert.equal(pageOf(calls["Gemini CLI"][1]!)?.id, ID);
+  // Goose has a model title each call ("kiln: show page" until it does): its calls are pages by kiln's answer.
+  assert.equal(isShowPage(acp("showing the harness check page", undefined, "tool")), false);
+  assert.ok(isShowPage(acp("showing the harness check page", ANSWER, "tool")));
+  // Words like these on a call of the harness's own tools, or another server's, aren't kiln's.
+  assert.equal(isShowPage({ name: "execute", tool: "shell", title: "kiln_show_page" }), false);
+  assert.equal(isShowPage(acp("show_page (github MCP Server)")), false);
+  assert.equal(isShowPage(acp("Called show_page from kilnx")), false);
+});
+
 test("kiln's page answer, however a harness passes it on", () => {
   const at = (output: string) => pageOf({ output })?.id ?? null;
   assert.equal(at(ANSWER), ID);
@@ -115,6 +145,9 @@ test("a page or live page being shown goes by its own title, not its harness's w
   assert.equal(shownTitle({ title: "Called show_page from kiln", input: '{"title": "Try it", "path": "/w/a.html"}' }, "A page"), "Try it");
   assert.equal(shownTitle({ title: "Retry latency by attempt", input: { html: "<p>" } }, "A page"), "Retry latency by attempt");
   assert.equal(shownTitle({ title: "", input: null }, "A live page"), "A live page");
+  // A harness's words for the call aren't the page's title.
+  assert.equal(shownTitle({ title: "Called show_page from kiln", input: { html: "<p>" } }, "A page"), "A page");
+  assert.equal(shownTitle({ title: "show_page (kiln MCP Server)", input: null }, "A page"), "A page");
 });
 
 test("a live page an agent showed, whatever its harness calls kiln's show_live", () => {

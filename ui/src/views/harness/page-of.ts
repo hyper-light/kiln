@@ -55,15 +55,40 @@ export function enginesOf(v: unknown): Record<string, [number, number][]> {
 /** A tool call, as much of it as says which of kiln's tools it is. */
 export type KilnCall = Pick<ToolCall, "name" | "tool" | "title" | "server" | "tool_short" | "output">;
 
+/** kiln's MCP server, as harnesses have it: `kiln`, and `kiln-reach` (`kiln_reach` as Codex names
+ *  it) in sessions from before it was called `kiln`. */
+const OURS = "kiln(?:-reach|_reach)?";
+const SERVER = new RegExp(`^${OURS}$`);
+/** Claude Code's and Codex's name for a call of one of its tools. */
+const NAMED = new RegExp(`^mcp__${OURS}__(\\w+)$`);
+
+/** How ACP agents word a call of one of kiln's tools, the tool's own name first: Devin's "Called
+ *  show_page from kiln", Gemini CLI's "show_page (kiln MCP Server)", opencode's "kiln_show_page",
+ *  Amp's "mcp__kiln__show_page: …". (Goose has a model word each call anew: its calls are known by
+ *  kiln's answer.) */
+const WORDED = [new RegExp(`^Called (\\w+) from ${OURS}\\b`), new RegExp(`^(\\w+) \\(${OURS} MCP Server\\)$`), new RegExp(`^${OURS}_(\\w+)$`), new RegExp(`^mcp__${OURS}__(\\w+)(?::|$)`)];
+
+/** The kiln tool a call's title words it as (`WORDED`). */
+function wordedTool(title: string): string | null {
+  for (const w of WORDED) {
+    const tool = w.exec(title)?.[1];
+    if (tool) return tool;
+  }
+  return null;
+}
+
+/** A call whose harness doesn't name the server it called: an ACP agent's (no server, no
+ *  `mcp__` name, its kind not one of its own tools'). */
+const unnamed = (c: Pick<ToolCall, "name" | "tool" | "server">) => !c.server && !c.name.startsWith("mcp__") && (c.tool === "mcp" || c.tool === "other");
+
 /**
- * Which of kiln's own tools a call is, where its harness names it: Claude Code's and Codex's
- * `mcp__kiln__show_page` (kiln reads its server and the tool's own name from it; `kiln-reach`,
- * `kiln_reach` in sessions from before it was called `kiln`), or an ACP agent's words for it
- * ("Called show_page from kiln", Devin). Null for another server's tool, or a call that doesn't say.
+ * Which of kiln's own tools a call is, where its harness says: Claude Code's and Codex's
+ * `mcp__kiln__show_page` (kiln reads its server and the tool's own name from it), or an ACP
+ * agent's words for it (`WORDED`). Null for another server's tool, or a call that doesn't say.
  */
-export function kilnTool(c: Pick<ToolCall, "name" | "title" | "server" | "tool_short">): string | null {
-  if (c.server) return /^kiln(?:-reach|_reach)?$/.test(c.server) ? (c.tool_short ?? null) : null;
-  return /^mcp__kiln(?:-reach|_reach)?__(\w+)$/.exec(c.name)?.[1] ?? /^Called (\w+) from kiln(?:-reach|_reach)?\b/.exec(c.title)?.[1] ?? null;
+export function kilnTool(c: Pick<ToolCall, "name" | "tool" | "title" | "server" | "tool_short">): string | null {
+  if (c.server) return SERVER.test(c.server) ? (c.tool_short ?? null) : null;
+  return NAMED.exec(c.name)?.[1] ?? (unnamed(c) ? wordedTool(c.title) : null);
 }
 
 /**
@@ -73,8 +98,7 @@ export function kilnTool(c: Pick<ToolCall, "name" | "title" | "server" | "tool_s
  */
 export function isKilnCall(c: KilnCall, tool: string, answered: (c: KilnCall) => boolean): boolean {
   const named = kilnTool(c);
-  if (named) return named === tool;
-  return !c.server && !c.name.startsWith("mcp__") && (c.tool === "mcp" || c.tool === "other") && answered(c);
+  return named ? named === tool : unnamed(c) && answered(c);
 }
 
 /** Whether a tool call is an agent showing a page (kiln's `show_page`). */
@@ -133,11 +157,13 @@ export function pageOf(c: Pick<ToolCall, "output">): ShownPage | null {
 }
 
 /** What a page (or live page) goes by while it's being shown: the title its call gave it (its input,
- *  as an object or as text), else its harness's words for the call, else `fallback`. */
+ *  as an object or as text), else its call's title unless that's only a harness's words for the
+ *  call (`WORDED`), else `fallback`. */
 export function shownTitle(c: Pick<ToolCall, "title" | "input">, fallback: string): string {
   const input = typeof c.input === "string" ? read(c.input) : c.input;
   const title = input && typeof input === "object" ? (input as { title?: unknown }).title : undefined;
-  return typeof title === "string" && title.trim() ? title.trim() : c.title || fallback;
+  if (typeof title === "string" && title.trim()) return title.trim();
+  return c.title && !wordedTool(c.title) ? c.title : fallback;
 }
 
 /** Its height at width `w`: the taller of the two measured widths nearest it (a page grows as it
