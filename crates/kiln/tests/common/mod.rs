@@ -1035,12 +1035,15 @@ fn start_full(dir: &Path, o: &Options<'_>, https: bool, cd: bool, env: &[(&str, 
 }
 
 /// `kiln server` with `dir`'s configuration, its home in `dir`, writing to `log`, in a process group
-/// of its own.
+/// of its own. Git's global configuration is its home's, as an installed server's is: a gate's
+/// `GIT_CONFIG_GLOBAL` (ci/gate.sh's own empty file) would reach its jobs' steps, where
+/// `actions/checkout` writes credentials to the global configuration and then edits
+/// `$HOME/.gitconfig` under a home of its own ("Unable to replace auth placeholder", W14-AC05).
 fn server_command(dir: &Path, log: std::fs::File) -> anyhow::Result<Command> {
     let home = dir.join("home");
     std::fs::create_dir_all(&home)?;
     let mut cmd = kiln();
-    cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"]).env("HOME", &home).env("NO_COLOR", "1").stdout(log.try_clone()?).stderr(log);
+    cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"]).env("HOME", &home).env_remove("GIT_CONFIG_GLOBAL").env("NO_COLOR", "1").stdout(log.try_clone()?).stderr(log);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     Ok(cmd)
