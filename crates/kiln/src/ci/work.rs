@@ -494,6 +494,7 @@ pub fn layer(kind: kiln_ci::work::key::Kind) -> &'static str {
         Kind::Step => "step",
         Kind::Action => "action",
         Kind::Test => "test",
+        Kind::Plan => "plan",
     }
 }
 
