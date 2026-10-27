@@ -102,3 +102,42 @@ test("a conflict resolves where it falls and commits", async ({ page }) => {
   await commit.click();
   await page.request.post("/api/mock/review", { data: { conflicts: false } });
 });
+
+test("every way to resolve a conflict, then Commit resolution clears the gate (W26-R12, AC04)", async ({ page }) => {
+  await page.request.post("/api/mock/review", { data: { conflicts: true } });
+  const row = await open(page, "pipeline: dynamic matrices");
+  const commit = row.locator(".rv-btn", { hasText: "Commit resolution" });
+  // While a conflict is unresolved, the gate holds Approve; once all are taken, Commit resolution stands in its place (the mock's conflictHTML).
+  await expect(row.getByRole("button", { name: /^Approve/ })).toBeDisabled();
+  await expect(commit).toHaveCount(0);
+  // A text conflict at its lines: each choice resolves it through the API, and Undo takes it back.
+  const text = row.locator(".rv-cf").first();
+  // The mock keeps what another project took: start from nothing taken.
+  for (const cf of [text, row.locator(".rv-cf").nth(1)]) if ((await cf.getAttribute("data-done")) === "1") await cf.getByRole("button", { name: "Undo" }).click();
+  await expect(text).toContainText("conflict 1/2");
+  await expect(text).toContainText("this change");
+  await expect(text).toContainText("a person takes it");
+  for (const take of [/^main$/, /^this$/, /^both$/, /^agent's$/]) {
+    await text.locator(".rv-seg button", { hasText: take }).click();
+    await expect(text).toHaveAttribute("data-done", "1");
+    await text.getByRole("button", { name: "Undo" }).click();
+    await expect(text).not.toHaveAttribute("data-done", "1");
+  }
+  await text.getByRole("button", { name: "Edit" }).click();
+  await text.getByRole("textbox", { name: "The resolution" }).fill("use serde_json::{Value, json};");
+  await text.locator(".rv-btn-go").click();
+  await expect(text).toHaveAttribute("data-done", "1");
+  // A binary file's conflict is named, never markers, and resolved by taking a side.
+  const binary = row.locator(".rv-cf").nth(1);
+  await expect(binary).toContainText("binary file changed on both sides");
+  await expect(binary).not.toContainText("<<<<<<<");
+  await expect(binary.locator(".rv-seg button", { hasText: /^both$/ })).toHaveCount(0);
+  await binary.locator(".rv-seg button", { hasText: /^this$/ }).click();
+  await expect(binary).toHaveAttribute("data-done", "1");
+  await expect(row.getByRole("button", { name: /^Approve/ })).toHaveCount(0);
+  // The commit makes the revision; the conflicts go and Approve is back in its place.
+  await commit.click();
+  await expect(commit).toHaveCount(0);
+  await expect(row.locator(".rv-cf")).toHaveCount(0);
+  await expect(row.getByRole("button", { name: /^Approve/ })).toBeVisible();
+});
