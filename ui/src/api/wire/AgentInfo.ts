@@ -80,6 +80,10 @@ reach?: string,
  */
 pause?: Pause, 
 /**
+ * Since when it waits for room on its machine to go to work (as `State::room_wait`).
+ */
+room_wait?: number | null, 
+/**
  * How its last turn ended (as `State::last_turn`).
  */
 last_turn?: TurnEnd, 

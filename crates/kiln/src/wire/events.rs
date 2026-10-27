@@ -93,6 +93,9 @@ pub enum ServerEvent {
     },
     /// A runner's front door changed: refetch it.
     FrontDoor { runner: String },
+    /// How many agent sessions a runner has at work at once changed (set here, or what it said it
+    /// holds): refetch it.
+    AgentLimit { runner: String },
     /// An agent's change request opened or moved on.
     AgentChange { agent: String, change: Box<crate::workspace::change::Record> },
     /// An agent session kiln runs appeared or changed.

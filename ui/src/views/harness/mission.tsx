@@ -56,6 +56,9 @@ const WORD: Record<Stand, string> = {
   ended: "Ended",
 };
 
+/** An agent waiting for room on its machine to go to work (`room_wait`): what it was sent waits in its queue. */
+const ROOM = "Waiting for room: its machine has as many agents at work as its limit lets";
+
 /** The one line that matters for this agent right now. */
 function lineOf(a: AgentInfo, stand: Stand): string {
   switch (stand) {
@@ -77,13 +80,14 @@ function lineOf(a: AgentInfo, stand: Stand): string {
       return [doing, plan].filter(Boolean).join(" · ");
     }
     case "finished":
+      if (a.room_wait) return ROOM;
       return a.summary ? plain(a.summary) : a.goal || a.title || "Done";
     case "ready":
-      return a.goal || a.title || "No task yet";
+      return a.room_wait ? ROOM : a.goal || a.title || "No task yet";
     case "offline":
       return "Its machine is offline";
     case "ended":
-      return a.goal || a.title || "Ended";
+      return a.room_wait ? ROOM : a.goal || a.title || "Ended";
   }
 }
 
