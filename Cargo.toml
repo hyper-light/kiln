@@ -26,15 +26,15 @@ indexing_slicing = "deny"
 exit = "deny"
 type_complexity = "allow"
 
-# Debug builds hash with optimized SHA-256. A server hashes its own (debug: over a GiB) binary as
-# it starts, on one of its shards, and the content store hashes every chunk: unoptimized, that alone
-# kept test servers from answering within a minute on a loaded machine.
 # Debug builds keep line tables (backtraces say file and line) but not full debug info: kiln's
 # test binaries were 1.3-2 GB each, about 130 GB written per `cargo test --workspace`, and several
 # gates at once stalled a whole file system's syncs (docs/headroom.md, 2026-10-26).
 [profile.dev]
 debug = "line-tables-only"
 
+# Debug builds hash with optimized SHA-256. A server hashes its own (debug: over a GiB) binary as
+# it starts, on one of its shards, and the content store hashes every chunk: unoptimized, that alone
+# kept test servers from answering within a minute on a loaded machine.
 [profile.dev.package.sha2]
 opt-level = 3
 

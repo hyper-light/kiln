@@ -19,6 +19,8 @@ pub struct Settings {
     pub pacing: Pacing,
     /// When a group of processes counts as heavy work.
     pub heavy: Heavy,
+    /// How decisions are kept from flapping on noise.
+    pub damping: Damping,
     /// How long a turn let in holds its place before its work shows (it may take a while to start).
     pub admit_hold_secs: u32,
     /// Work the user's service manager runs outside kiln's groups (a build started with
@@ -37,6 +39,7 @@ impl Default for Settings {
             window: Window::default(),
             pacing: Pacing::default(),
             heavy: Heavy::default(),
+            damping: Damping::default(),
             admit_hold_secs: 30,
             escapes: true,
             max_sessions: None,
@@ -128,6 +131,39 @@ impl Default for Heavy {
     }
 }
 
+/// What keeps decisions from flapping: a target is missing only when it misses repeatedly (or is
+/// stuck), work is heavy until it's been well under the thresholds a while, paced work is released
+/// on mostly-healthy rather than unbroken health, and the window must settle before more work is
+/// let in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Damping {
+    /// A target counts as missing when this many of its last `confirm_of` probes missed...
+    pub confirm_misses: u8,
+    pub confirm_of: u8,
+    /// ...or at once when one probe has been in flight this long, in percent of its goal.
+    pub stuck_pct: u32,
+    /// Heavy work stops counting as heavy only after this long under `heavy_exit_pct` of the
+    /// thresholds (its load smoothed over a few seconds).
+    pub heavy_exit_secs: u32,
+    pub heavy_exit_pct: u8,
+    /// Paced work runs at full speed again once this share of the last `release_after_secs` was
+    /// healthy (and targets are healthy now).
+    pub release_healthy_pct: u8,
+    /// More work is let in only once the window has stayed at a higher whole number this long (a
+    /// lower one applies at once).
+    pub settle_secs: u32,
+    /// With no one waiting, new work is held only once use reaches the window plus this many;
+    /// work already held goes in only below the window, oldest first.
+    pub admit_slack: u32,
+}
+
+impl Default for Damping {
+    fn default() -> Self {
+        Self { confirm_misses: 2, confirm_of: 4, stuck_pct: 200, heavy_exit_secs: 5, heavy_exit_pct: 50, release_healthy_pct: 90, settle_secs: 5, admit_slack: 1 }
+    }
+}
+
 impl Settings {
     /// These settings, or what's wrong with them.
     pub fn validated(self) -> Result<Self, String> {
@@ -153,6 +189,19 @@ impl Settings {
         }
         if p.freeze_after_secs == 0 || p.release_after_secs == 0 {
             return Err("pacing: freeze_after_secs and release_after_secs must be at least 1".into());
+        }
+        let d = &self.damping;
+        if d.confirm_of == 0 || d.confirm_of > 32 || d.confirm_misses == 0 || d.confirm_misses > d.confirm_of {
+            return Err(format!("damping: confirm_misses ({}) must be 1 to confirm_of ({}), confirm_of at most 32", d.confirm_misses, d.confirm_of));
+        }
+        if !(100..=10_000).contains(&d.stuck_pct) {
+            return Err("damping: stuck_pct must be 100 to 10000".into());
+        }
+        if d.heavy_exit_pct == 0 || d.heavy_exit_pct > 100 || d.heavy_exit_secs > 600 {
+            return Err("damping: heavy_exit_pct must be 1 to 100, heavy_exit_secs at most 600".into());
+        }
+        if d.release_healthy_pct == 0 || d.release_healthy_pct > 100 || d.settle_secs > 600 || d.admit_slack > 64 {
+            return Err("damping: release_healthy_pct must be 1 to 100, settle_secs at most 600, admit_slack at most 64".into());
         }
         if self.admit_hold_secs == 0 || self.admit_hold_secs > 600 {
             return Err("admit_hold_secs must be 1 to 600".into());
