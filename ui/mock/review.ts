@@ -493,9 +493,13 @@ function suggestionsOf(c: MockComment) {
     const body: string[] = [];
     i++;
     while (i < lines.length && lines[i]?.trim() !== fence) body.push(lines[i++] ?? "");
-    out.push({ index: out.length, lines: body, field: false, applied: appliedOf(c.id, out.length - 1), outdated: false });
+    const index = out.length;
+    out.push({ index, lines: body, field: false, applied: appliedOf(c.id, index), outdated: false });
   }
-  if (c.suggestion != null) out.push({ index: out.length, lines: c.suggestion.split("\n"), field: true, applied: appliedOf(c.id, out.length - 1), outdated: false });
+  if (c.suggestion != null) {
+    const index = out.length;
+    out.push({ index, lines: c.suggestion.split("\n"), field: true, applied: appliedOf(c.id, index), outdated: false });
+  }
   return out;
 }
 const appliedSuggestions = new Map<string, { version: number; by: string; at: number }>();

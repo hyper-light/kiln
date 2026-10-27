@@ -56,10 +56,17 @@ test("reply, resolve, change a kind, delete", async ({ page }) => {
 });
 
 test("apply a suggestion makes a revision", async ({ page }) => {
+  // The mock keeps what each project writes, so the suggestion this applies is its own.
+  const tag = test.info().project.name;
   const row = await open(page, "pipeline: dynamic matrices");
-  await expect(row.locator(".md-sug")).toBeVisible();
-  await row.locator(".md-apply").click();
-  await expect(row.locator(".md-applied")).toBeVisible();
+  const thread = row.locator(".rv-thread").first();
+  await thread.locator(".rv-btn", { hasText: "Reply" }).click();
+  await thread.locator("textarea").fill(`This, then (${tag}):\n\n\`\`\`suggestion\n        let axes = self.resolve(ctx).map_err(|e| e.legged())?;\n\`\`\``);
+  await thread.locator(".cp-send").click();
+  const mine = thread.locator(".rv-m", { hasText: `(${tag})` });
+  await expect(mine.locator(".md-sug")).toBeVisible();
+  await mine.locator(".md-apply").click();
+  await expect(mine.locator(".md-applied")).toBeVisible();
 });
 
 test("the whole file opens in place (no popup)", async ({ page }) => {
