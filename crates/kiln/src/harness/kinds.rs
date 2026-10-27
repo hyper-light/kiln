@@ -495,6 +495,29 @@ impl Adapter {
         self.drain_subagents(core);
     }
 
+    /// There may be room on its machine now for it to go to work (`super::limit`): what waits goes,
+    /// as it does once a turn ends, then what waits for its subagents.
+    pub fn room(&mut self, core: &mut Core) {
+        match self {
+            Self::Claude(a) => a.room(core),
+            Self::Codex(a) => a.room(core),
+            Self::Acp(a) => a.room(core),
+            Self::Agy(a) => a.room(core),
+        }
+        self.drain_subagents(core);
+    }
+
+    /// Something waits to go to its harness: kiln's queue, what its adapter holds till its harness
+    /// is ready, or what waits for one of its subagents.
+    pub fn waits(&self, core: &Core) -> bool {
+        let held = match self {
+            Self::Codex(a) => a.holds(),
+            Self::Acp(a) => a.holds(),
+            Self::Claude(_) | Self::Agy(_) => false,
+        };
+        held || !core.state.queue.is_empty() || core.state.tasks.iter().any(|t| !t.queue.is_empty())
+    }
+
     /// Start with a conversation carried over from another harness, in the harness's own form
     /// (Codex: Responses items for its new thread; Claude Code reads its own from a transcript).
     pub fn seed(&mut self, items: Vec<serde_json::Value>) {

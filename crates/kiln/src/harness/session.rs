@@ -193,6 +193,38 @@ impl SubagentBrief {
     }
 }
 
+/// How a session stands for its machine's agent limit (`super::limit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Work {
+    /// At work: on a turn (waiting on a person in the middle of one too), or between turns with
+    /// subagents it sent off still at work.
+    Yes,
+    /// Its harness starting: at work if it was let go to work (it's new, it was sent something, a
+    /// person started it again), as its machine keeps it until it's on a turn or isn't.
+    Starting,
+    /// Finished, ready, paused, ended, or its machine away.
+    No,
+}
+
+impl Work {
+    /// How a session with `status` stands: `paused` at a usage limit, `subagents` any it sent off
+    /// still at work.
+    pub fn of(status: Status, paused: bool, subagents: bool) -> Self {
+        match status {
+            Status::Running | Status::Waiting => Self::Yes,
+            // Paused at a usage limit: nothing goes to its harness until it goes on.
+            Status::Starting if !paused => Self::Starting,
+            Status::Idle if !paused && subagents => Self::Yes,
+            _ => Self::No,
+        }
+    }
+
+    /// As its state says it, on its machine.
+    pub fn in_state(s: &State) -> Self {
+        Self::of(s.status, s.pause.is_some(), s.tasks.iter().any(|t| t.subagent() && t.live()))
+    }
+}
+
 /// Goals an agent paused for a person, until someone resumes them (`Info::held`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -325,6 +357,9 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub pause: Option<super::model::Pause>,
+    /// Since when it waits for room on its machine to go to work (as `State::room_wait`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_wait: Option<i64>,
     /// How its last turn ended (as `State::last_turn`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -393,6 +428,15 @@ impl Info {
         self.tree.as_deref().filter(|t| !t.is_empty()).unwrap_or(&self.cwd)
     }
 
+    /// At work now, as Mission control shows it working, or needing you in the middle of a turn:
+    /// starting, on a turn (waiting on a person for an approval or an answer included), or between
+    /// turns with subagents it sent off still at work. What its machine's agent limit counts
+    /// (`super::limit`): a finished, ready, paused or ended session doesn't, nor does one whose
+    /// goals wait for a person.
+    pub fn at_work(&self) -> bool {
+        Work::of(self.status, self.pause.is_some(), self.subagents.iter().any(|t| super::model::live_task(&t.status))) != Work::No
+    }
+
     /// Refresh the live fields from the session's state.
     pub fn apply(&mut self, s: &State) {
         if !s.name.is_empty() {
@@ -445,6 +489,7 @@ impl Info {
         self.left_behind = s.count_left_behind();
         self.reach.clone_from(&s.reach);
         self.pause.clone_from(&s.pause);
+        self.room_wait = s.room_wait;
         self.last_turn.clone_from(&s.last_turn);
         self.move_on_limit = s.move_on_limit;
         self.move_plan.clone_from(&s.move_plan);
@@ -493,6 +538,13 @@ pub struct Files {
     /// How a try at handing it to this machine's newer runner process went, as the machine decided
     /// it (CP-T3.2).
     pub settle: SettleFor,
+    /// Whether it may go to work now: room on its machine, nobody waiting longer; at work already,
+    /// it may (`super::host::Host::room_for`). Asked with its core in hand: what it takes is never
+    /// waited on there.
+    pub room: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// How it stands for its machine's agent limit now, and whether anything waits to go to its
+    /// harness (`super::host::Host::stands`).
+    pub work: Arc<dyn Fn(Work, bool) + Send + Sync>,
 }
 
 /// What a session that moved here starts from (`super::moving`): its timeline and state as they
@@ -626,6 +678,9 @@ enum Ctl {
     HandOver(futures::channel::oneshot::Sender<Option<Box<Handed>>>),
     /// It went on on another machine: it stops here, and isn't closed.
     LetGo,
+    /// There may be room on its machine for it to go to work: what waited for that goes, if it
+    /// may now (`super::limit`).
+    Room,
 }
 
 /// A session handed from this image of the process to the next (an in-place upgrade) with its
@@ -710,6 +765,11 @@ impl Session {
 
     pub fn close(&self) {
         let _ = self.ctl.try_send(Ctl::Close);
+    }
+
+    /// There may be room on its machine now for it to go to work ([`Ctl::Room`]).
+    pub fn room(&self) {
+        let _ = self.ctl.try_send(Ctl::Room);
     }
 
     /// Hand its harness process to this process's next image (an in-place upgrade, next):
@@ -965,6 +1025,8 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
     let now = crate::util::now_ms();
     core.session_id.clone_from(&id);
     core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
+    // It goes to work only with room on its machine (`super::limit`).
+    core.room = Some(Arc::clone(&files.room));
     let cwd = core.state.cwd.clone();
     let info = Info {
         id: id.clone(),
@@ -1009,6 +1071,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         left_behind: 0,
         reach: spec.reach.clone(),
         pause: None,
+        room_wait: None,
         last_turn: None,
         keep_off: false,
         held: None,
@@ -2339,6 +2402,8 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
                 }
                 Ok(Ctl::LetGo) => return Arrived::End { let_go: true },
                 Ok(Ctl::Close) | Err(_) => return Arrived::End { let_go: false },
+                // What it carries goes once it's on, asking for room then.
+                Ok(Ctl::Room) => {}
             },
             () = tick => {}
         }
@@ -2748,6 +2813,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     let mut crashes: Vec<Instant> = Vec::new();
     // A message that arrived while the process was down, sent once it is back.
     let mut carry: Vec<Command> = Vec::new();
+    // Skill runs sent while there was no room on its machine for it to go to work: run once there
+    // is (a message waits in its queue instead; `super::limit`).
+    let mut for_room: Vec<Command> = Vec::new();
+    // What its machine was last told of how it stands for its agent limit, and whether anything
+    // waits to go to its harness.
+    let mut stood: Option<(Work, bool)> = None;
+    // Down, it starts again once there's room on its machine (a person restarted it, or it came
+    // back by itself after a crash).
+    let mut restart_wanted = false;
     // Moved here: on once its folder's last changes are (after a restart too: its state says so).
     let arriving = s.core.lock().state.arriving.clone();
     if let Some(mark) = arriving {
@@ -3130,12 +3204,29 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 }
                                 let c = prepare(&files, c).await;
                                 let mut core = s.core.lock();
-                                // Paused (or at its stop point): a message waits in the queue.
-                                if let Some(c) = super::pause::let_through(&mut core, c) {
+                                // No room on its machine for it to go to work: a skill run waits
+                                // for room (`super::limit`).
+                                if matches!(c, Command::SkillRun { .. }) && !core.has_room() {
+                                    for_room.push(c);
+                                }
+                                // Paused (or at its stop point), or no room on its machine for it
+                                // to go to work: a message waits in the queue.
+                                else if let Some(c) = super::pause::let_through(&mut core, c) {
                                     adapter.command(&mut core, c);
                                 }
                             }
                         },
+                        // There may be room on its machine now: the skill runs that waited for it
+                        // go, then its queue, if it may go to work now.
+                        Ev::Ctl(Some(Ctl::Room)) => {
+                            let mut core = s.core.lock();
+                            if !for_room.is_empty() && core.has_room() {
+                                for c in for_room.drain(..) {
+                                    adapter.command(&mut core, c);
+                                }
+                            }
+                            adapter.room(&mut core);
+                        }
                         Ev::Ctl(Some(Ctl::HandOver(reply))) => {
                             // This image of the process ends next (an in-place upgrade): the next
                             // one goes on with this very process. What it has said so far is taken
@@ -3305,10 +3396,25 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         ending = true;
                         break;
                     }
-                    let (session, queue, pause, status) = {
-                        let core = s.core.lock();
-                        (core.state.harness_session.clone(), core.state.queue.len(), pause_marks(&core.state), core.state.status)
+                    let (session, queue, pause, status, stands, unwaited) = {
+                        let mut core = s.core.lock();
+                        let work = Work::in_state(&core.state);
+                        // What waits to go to its harness, which goes once there's room (not
+                        // while it's paused, or held for a switch).
+                        let waits = (adapter.waits(&core) || !for_room.is_empty()) && core.state.pause.is_none() && !core.hold;
+                        // It waits for room no longer: it's at work, or nothing waits to go.
+                        let unwaited = (work == Work::Yes || !waits) && core.state.room_wait.take().is_some();
+                        if unwaited {
+                            core.touch_state();
+                        }
+                        (core.state.harness_session.clone(), core.state.queue.len(), pause_marks(&core.state), core.state.status, (work, waits), unwaited)
                     };
+                    // Its machine keeps who's at work and who waits for room (`super::limit`), told
+                    // again once it waits no longer, so no place in line is left behind.
+                    if stood != Some(stands) || unwaited {
+                        stood = Some(stands);
+                        (files.work)(stands.0, stands.1);
+                    }
                     let was = s.turn_open.load(std::sync::atomic::Ordering::Relaxed);
                     let open = turn_open(status, was);
                     s.turn_open.store(open, std::sync::atomic::Ordering::Relaxed);
@@ -3356,26 +3462,57 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         if switching.is_some() || moving.is_some() || reloading {
             continue;
         }
-        // A crash after a good run comes back by itself (a few times); a harness that will not
-        // start waits for a person.
+        // A crash after a good run comes back by itself (a few times), with room on its machine
+        // for it (at work when it crashed, it has its own still); a harness that will not start
+        // waits for a person.
         let ran = started.elapsed();
         crashes.retain(|t| t.elapsed() < Duration::from_secs(600));
         let auto = code != Some(0) && error.is_none() && ran > Duration::from_secs(20) && crashes.len() < 3;
         if auto {
             crashes.push(Instant::now());
-            crate::rt::sleep(Duration::from_secs(2)).await;
-            continue;
+            if s.core.lock().has_room() {
+                crate::rt::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            restart_wanted = true;
         }
-        // Down: a restart, or a message (which restarts it and is then delivered), brings it back.
-        // Other commands still get answers (a skill's file, an MCP server added with the CLI).
+        // Skill runs that waited for room go with its next start.
+        carry.append(&mut for_room);
+        // Down: a restart, or a message (which restarts it and is then delivered), brings it back
+        // once there's room on its machine for it to go to work. Other commands still get answers
+        // (a skill's file, an MCP server added with the CLI).
         loop {
+            // Its machine knows it isn't at work, and whether it waits for room to start again.
+            let (queued, unwaited) = {
+                let mut core = s.core.lock();
+                let queued = !core.state.queue.is_empty() && core.state.pause.is_none() && !core.hold;
+                // Nothing waits to start it again: it waits for room no longer.
+                let unwaited = !(restart_wanted || !carry.is_empty() || queued) && core.state.room_wait.take().is_some();
+                if unwaited {
+                    core.touch_state();
+                }
+                (queued, unwaited)
+            };
+            let stands = (Work::No, restart_wanted || !carry.is_empty() || queued);
+            if stood != Some(stands) || unwaited {
+                stood = Some(stands);
+                (files.work)(stands.0, stands.1);
+            }
+            if unwaited {
+                flush(&s, &sink, None).await;
+            }
             let ev = futures::select_biased! {
                 c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
                 f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
             };
             match ev {
                 Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
-                    Command::Restart => break,
+                    Command::Restart => {
+                        if s.core.lock().has_room() {
+                            break;
+                        }
+                        restart_wanted = true;
+                    }
                     Command::Snapshot => {
                         for u in s.snapshot() {
                             let _ = sink.send((s.id.clone(), u)).await;
@@ -3408,8 +3545,24 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         on_change();
                     }
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {
-                        carry.push(prepare(&files, c).await);
-                        break;
+                        let c = prepare(&files, c).await;
+                        let mut core = s.core.lock();
+                        if core.has_room() {
+                            drop(core);
+                            carry.push(c);
+                            break;
+                        }
+                        // No room on its machine for it to go to work: a message waits in its
+                        // queue till there is (a skill run with what goes with its next start).
+                        match c {
+                            Command::Send { id, text, attachments, overrides, reply_to, .. } => {
+                                core.state.queue.push(super::model::QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to });
+                                core.touch_state();
+                            }
+                            c => carry.push(c),
+                        }
+                        drop(core);
+                        on_change();
                     }
                     // Where its commands run, while it isn't running: from its next start.
                     Command::Control { id, value } if id == "reach" => {
@@ -3442,6 +3595,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 Ev::Ctl(Some(Ctl::HandOver(reply))) => {
                     let _ = reply.send(None);
                 }
+                // There may be room on its machine now: it starts again if anything waits for that,
+                // the first message in its queue first.
+                Ev::Ctl(Some(Ctl::Room)) => {
+                    let mut core = s.core.lock();
+                    let queued = !core.state.queue.is_empty() && core.state.pause.is_none() && !core.hold;
+                    if (restart_wanted || !carry.is_empty() || queued) && core.has_room() {
+                        if carry.is_empty() && queued {
+                            let q = core.state.queue.remove(0);
+                            core.touch_state();
+                            carry.push(Command::Send { id: q.id, text: q.text, mode: super::model::SendMode::Queue, attachments: q.attachments, overrides: q.overrides, reply_to: q.reply_to, task: None });
+                        }
+                        break;
+                    }
+                }
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
                     // Ending the agent ends what it left running that kiln took back over, and the
                     // rest of its group of processes, which then goes.
@@ -3472,6 +3639,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 break;
             }
         }
+        restart_wanted = false;
     }
 }
 
@@ -3989,6 +4157,7 @@ mod tests {
             left_behind: 0,
             reach: None,
             pause: None,
+            room_wait: None,
             last_turn: None,
             keep_off: false,
             held: None,
@@ -4030,6 +4199,47 @@ mod tests {
         assert_eq!(reach_words(None), "Its commands can run on any runner it needs");
         assert_eq!(reach_words(Some("off")), "Its commands run only on its own machine");
         assert_eq!(reach_words(Some("linux/amd64")), "Its commands can run on other runners, linux/amd64 first");
+    }
+
+    /// What a machine's agent limit counts (docs/agents.md, "How many agents a machine runs"): a
+    /// session at work, as Mission control shows it working or needing you in the middle of a turn;
+    /// not one finished, ready, paused, ended or away. Each as its state says it, through
+    /// `Info::apply` as a runner and the server's mirror both see it.
+    #[test]
+    fn only_a_session_at_work_counts_toward_its_machines_limit() {
+        use super::super::model::{Pause, Task};
+        let at_work = |state: State| {
+            let mut i = Info::default();
+            i.apply(&state);
+            i.at_work()
+        };
+        let of = |status: Status| State { status, ..State::default() };
+        let paused = || Some(Pause { reason: "limit".into(), ..Pause::default() });
+        let subagent = |status: &str| Task { id: "t1".into(), kind: "local_agent".into(), class: Some("agent".into()), status: status.into(), description: "looks".into(), ..Task::default() };
+        assert!(at_work(of(Status::Starting)), "starting");
+        assert!(at_work(of(Status::Running)), "on a turn");
+        assert!(at_work(of(Status::Waiting)), "waiting on a person in the middle of a turn");
+        assert!(at_work(State { pause: paused(), ..of(Status::Running) }), "a turn a usage limit stops at its next step goes on till then");
+        assert!(!at_work(of(Status::Idle)), "finished, or ready");
+        assert!(!at_work(of(Status::Exited)), "ended, or stopped");
+        assert!(!at_work(of(Status::Disconnected)), "its machine away");
+        assert!(!at_work(State { pause: paused(), ..of(Status::Idle) }), "paused at a usage limit");
+        assert!(!at_work(State { pause: paused(), ..of(Status::Starting) }), "paused, starting again");
+        let mut held = Info::default();
+        held.apply(&of(Status::Idle));
+        held.held = Some(Held { why: "Paused by the agent: a plan to look at".into(), plan: None, since: 1 });
+        assert!(!held.at_work(), "its goals paused for a person");
+        // Its turn over, subagents it sent off still at work keep it at work; finished ones don't,
+        // nor what it left running that isn't a subagent.
+        for s in ["running", "pending", "paused"] {
+            assert!(at_work(State { tasks: vec![subagent(s)], ..of(Status::Idle) }), "a subagent {s}");
+        }
+        for s in ["completed", "failed", "stopped", "killed"] {
+            assert!(!at_work(State { tasks: vec![subagent(s)], ..of(Status::Idle) }), "a subagent {s}");
+        }
+        let shell = Task { class: Some("shell".into()), kind: "local_bash".into(), ..subagent("running") };
+        assert!(!at_work(State { tasks: vec![shell], ..of(Status::Idle) }), "a shell left running");
+        assert!(!at_work(State { tasks: vec![subagent("running")], pause: paused(), ..of(Status::Idle) }), "paused, its subagents too");
     }
 
     #[test]

@@ -920,7 +920,9 @@ impl Codex {
     /// Subagent `thread` is between turns: a message sent now goes first, then what waits for it.
     fn drain_child(&mut self, core: &mut Core, thread: &str) {
         let Some(child) = self.children.get(thread) else { return };
-        if child.turn.is_some() || child.relaying || child.closed || !super::pause::open(core) || matches!(core.state.status, Status::Exited | Status::Starting) {
+        // Room on its machine is asked for only with something to send.
+        let has = child.now.is_some() || super::subagent::waiting(core).iter().any(|t| t.as_str() == thread);
+        if child.turn.is_some() || child.relaying || child.closed || !has || matches!(core.state.status, Status::Exited | Status::Starting) || !super::pause::open(core) {
             return;
         }
         if self.pending.values().any(|p| matches!(p, Pending::ChildTurn { thread: t, .. } if t == thread)) {
@@ -2038,6 +2040,16 @@ impl Codex {
             self.start_turn(core, &thread, item);
             super::pause::sent_from_queue(core, &id);
         }
+    }
+
+    /// There may be room on its machine for it to go to work: what waits goes, as between turns.
+    pub fn room(&mut self, core: &mut Core) {
+        self.next(core);
+    }
+
+    /// It holds messages till its thread can take them.
+    pub fn holds(&self) -> bool {
+        !self.waiting.is_empty()
     }
 
     /// The account reached its usage limit (`usageLimitExceeded`): the session pauses until it

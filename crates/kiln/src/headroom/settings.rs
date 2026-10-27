@@ -33,13 +33,11 @@ pub struct Settings {
     /// Work the user's service manager runs outside kiln's groups (a build an agent started with
     /// `systemd-run --user`) is paced too.
     pub escapes: bool,
-    /// Most agent sessions on this machine (none: the runner's own limit).
-    pub max_sessions: Option<u32>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { enabled: true, targets: Vec::new(), automatic: true, false_alarms_per_day: 1.0, probe_load_share: PLATFORM_PROBE_SHARE, escapes: true, max_sessions: None }
+        Self { enabled: true, targets: Vec::new(), automatic: true, false_alarms_per_day: 1.0, probe_load_share: PLATFORM_PROBE_SHARE, escapes: true }
     }
 }
 
@@ -90,9 +88,6 @@ impl Settings {
         }
         if !self.probe_load_share.is_finite() || self.probe_load_share <= 0.0 || self.probe_load_share > 1.0 {
             return Err("probe_load_share must be more than 0 and at most 1".into());
-        }
-        if self.max_sessions == Some(0) {
-            return Err("max_sessions must be at least 1 (leave it empty for the runner's own limit)".into());
         }
         for t in &self.targets {
             if t.tolerance_ms == Some(0) {
@@ -151,8 +146,6 @@ mod tests {
         assert!(s.validated().is_err());
         let s = Settings { targets: vec![Target { name: "web".into(), probe: Probe::Http { url: "https://x".into() }, tolerance_ms: None }], ..Settings::default() };
         assert!(s.validated().err().unwrap_or_default().contains("http://"));
-        let s = Settings { max_sessions: Some(0), ..Settings::default() };
-        assert!(s.validated().is_err());
     }
 
     #[test]

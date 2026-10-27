@@ -47,7 +47,6 @@ struct Shared {
     enabled: AtomicBool,
     /// Another process of this machine paces; this one only holds work back.
     standby: AtomicBool,
-    max_sessions: Mutex<Option<usize>>,
     admit: Mutex<Admit>,
     /// Held sessions wait on this; the engine notifies it when one may start.
     room: event_listener::Event,
@@ -55,21 +54,18 @@ struct Shared {
     pushed: Mutex<Option<Settings>>,
     latest: Mutex<Option<String>>,
     changed: crate::rt::Notify,
-    restoring: AtomicBool,
 }
 
 static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     running: AtomicBool::new(false),
     enabled: AtomicBool::new(true),
     standby: AtomicBool::new(false),
-    max_sessions: Mutex::new(None),
     admit: Mutex::new(Admit::default()),
     room: event_listener::Event::new(),
     kick: (Mutex::new(false), Condvar::new()),
     pushed: Mutex::new(None),
     latest: Mutex::new(None),
     changed: crate::rt::Notify::new(),
-    restoring: AtomicBool::new(false),
 });
 
 fn kick() {
@@ -123,17 +119,6 @@ pub async fn room() {
 /// Whether `session` is held now.
 pub fn held(session: &str) -> bool {
     SHARED.admit.lock().waiting.contains_key(session)
-}
-
-/// The most agent sessions this machine may run, when its settings say (new ones only: sessions
-/// a restart continues are never turned away).
-pub fn max_sessions() -> Option<usize> {
-    if SHARED.restoring.load(Ordering::Acquire) { None } else { *SHARED.max_sessions.lock() }
-}
-
-/// Sessions a restart continues are being opened (no session limit applies to them).
-pub fn restoring(on: bool) {
-    SHARED.restoring.store(on, Ordering::Release);
 }
 
 /// What a runner's headroom works from.
@@ -196,7 +181,6 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
 
 fn apply_shared(s: &Settings) {
     SHARED.enabled.store(s.enabled, Ordering::Release);
-    *SHARED.max_sessions.lock() = s.max_sessions.map(|n| n as usize);
 }
 
 /// The targets probed: the settings' own, and kiln's when `automatic`.

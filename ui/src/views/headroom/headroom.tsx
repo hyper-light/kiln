@@ -139,17 +139,6 @@ function HeadroomPanel({ runner }: { runner: string }) {
               value={Math.round(d.probe_load_share * 1000) / 10}
               onChange={(pct) => set({ probe_load_share: pct / 100 })}
             />
-            <Field label="Most agent sessions" hint="Empty: the runner's own limit. Sessions a restart continues are never turned away.">
-              {(id) => (
-                <input
-                  id={id}
-                  className="fd-input"
-                  inputMode="numeric"
-                  value={d.max_sessions ?? ""}
-                  onChange={(e) => set({ max_sessions: e.target.value.trim() === "" ? null : Number(e.target.value) })}
-                />
-              )}
-            </Field>
           </div>
         </fieldset>
         <Targets targets={d.targets} onChange={(targets) => set({ targets })} />

@@ -70,8 +70,8 @@ is stopped runs until the next stop. Neither system says what its disks write in
 
 **Failing safe.** What's stopped is noted in `<state>/headroom/paced.json` (a cgroup's folder; a
 process id on macOS and Windows) and started again on the next start; what was learned is kept in `<state>/headroom/learned.json`. Headroom runs on its own
-threads, from settings it kept, with the server away. `max_sessions` never turns away sessions a
-restart continues.
+threads, from settings it kept, with the server away. How many agent sessions a machine has at
+work at once is the agent limit's (`docs/agents.md`), not headroom's.
 
 ## Settings
 
@@ -91,8 +91,7 @@ them in `<state>/headroom/settings.json` and applies them at start, before any s
   "targets": [{ "name": "production", "probe": { "kind": "http", "url": "http://192.168.49.2:30070/healthz" }, "tolerance_ms": 3000 }],
   "false_alarms_per_day": 1,
   "probe_load_share": 0.1,
-  "escapes": true,
-  "max_sessions": null
+  "escapes": true
 }
 ```
 

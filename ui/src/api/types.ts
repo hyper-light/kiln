@@ -386,6 +386,43 @@ export interface NewRepo {
   poll_seconds?: number;
 }
 
+/* ---------------------------- agent limits (Runners → a runner) ---------------------------- */
+
+/** Where a machine's agent limit comes from: set here, its config's `[agent] max_agent_sessions`, or kiln's default. */
+export type AgentLimitSource = "server" | "config" | "default";
+
+/** The most agent sessions a machine has at work at once, as it last said. */
+export interface AgentLimitHeld {
+  max_sessions: number;
+  from: AgentLimitSource;
+  /** Its config's, when it says one: what it holds once nothing is set here. */
+  config?: number | null;
+}
+
+/** How many agent sessions a runner has at work at once (`GET /api/runners/:name/agent-limit`). */
+export interface AgentLimitView {
+  runner: string;
+  /** The server's own runner: it runs no agents; the server's own agents are held to this. */
+  own: boolean;
+  connected: boolean;
+  /** Whether it runs agent sessions at all; null while it's offline. */
+  runs_agents: boolean | null;
+  /** Whether it takes a limit from here; null while that isn't known (offline, or just connected). */
+  supported: boolean | null;
+  /** What's set here; null: nothing, its config's (or kiln's default) holds. */
+  max_sessions: number | null;
+  /** What it holds now, as it last said; null until it says. */
+  held: AgentLimitHeld | null;
+  /** Its agent sessions at work now (starting, on a turn, waiting on you in the middle of one, or with subagents at work): what the limit counts. Null while it's offline. */
+  working: number | null;
+  /** Its agent sessions waiting for room to go to work (what they were sent waits in their queues), the longest waiting going first. Null while it's offline. */
+  waiting: number | null;
+  /** Every agent session it has, finished, paused and ended ones too. */
+  sessions: number;
+  default: number;
+  max: number;
+}
+
 /* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
 
 export type DnsMode = "resolver" | "authoritative";
@@ -1951,7 +1988,6 @@ export interface HeadroomSettings {
   false_alarms_per_day: number;
   probe_load_share: number;
   escapes: boolean;
-  max_sessions: number | null;
 }
 
 export interface HeadroomAlarm {

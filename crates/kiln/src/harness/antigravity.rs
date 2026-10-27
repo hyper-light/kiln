@@ -454,6 +454,11 @@ impl Agy {
         super::pause::sent_from_queue(core, &id);
     }
 
+    /// There may be room on its machine for it to go to work: its queue goes, as between turns.
+    pub fn room(&mut self, core: &mut Core) {
+        self.next(core);
+    }
+
     /// A pause ended: the turn it cut off goes on first, then kiln's queue.
     pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
         if p.cut.is_some() && !self.busy() && core.state.status != Status::Exited {
