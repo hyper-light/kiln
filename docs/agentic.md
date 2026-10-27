@@ -77,16 +77,16 @@ them too, with W19's `where` and `throttle`.
 
 - Agents that need you are first, whatever the sort; the sort orders the rest.
 - On a phone the page's head is one line (its title and how the agents stand), the filter and the
-  sort share a row, and the message box for many agents stays folded until you select agents or
-  open it. It folds in the page's flow: no sheets or overlays.
+  sort share a row, and the composer is at the top as on a desktop: one line until it's used, then
+  open in the page's flow: no sheets or overlays.
 - When this device has notifications off, one quiet line offers to turn them on.
 
 **Acceptance.** N-AC1: an approval on an agent reaches a subscribed phone as one notification
 within 2 s of the harness asking, and tapping it opens the agent, verified with a real Chromium
 push subscription in a test (and by the user on an iPhone). N-AC2: a second state of the same agent
 replaces the first, and none shows while a focused window is on that agent. N-AC3: a dead
-subscription (410) is dropped. N-AC4: on a 390×844 screen the first agent row is in the top third
-of Mission Control.
+subscription (410) is dropped. N-AC4: on a 390×844 screen the composer and the first agent row are both
+in view without scrolling (the composer, one line until used, sits above the list).
 
 ## O: Agents that run agents
 
@@ -247,7 +247,7 @@ platform beside kiln (the release pipeline, fleet self-builds) is still to come:
 installs it (`cargo install --path crates/cli` in a Slates checkout puts `slates` on `PATH`).
 
 **W2 New agents choose.** `workspace`: `folder` (the folder itself, still the default) or
-`volume` (**its own Slates volume**), in New agents and `agents.start`, only where the machine can
+`volume` (**its own Slates volume**), in Mission control's composer (More options) and `agents.start`, only where the machine can
 make one; a machine that can't says why. Several agents on one folder each get their own.
 
 **W3 How.** On the agent's machine, before its harness starts: an **overlay volume** laid over its
@@ -296,7 +296,7 @@ cloned, or shipped, elsewhere.
 **W8 Shards, next.** `isolation: "shards"` runs the harness in a microVM built from an image (an
 Agentfile, W21-R01), its folder the agent's Slates volume, its network what kiln allows. Shards
 can't host a harness yet: guest networking and a file device (virtio-fs or vhost-user to Slates)
-are still to come in Shards. Until then New agents shows Shards with why it isn't available.
+are still to come in Shards. Until then Mission control's composer shows Shards with why it isn't available.
 
 ## C: From changes to landed
 
