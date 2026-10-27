@@ -640,7 +640,7 @@ impl Acp {
             if prominent {
                 match category {
                     "model" => {
-                        core.meta.models = choices.iter().map(|o| ModelOption { id: o.id.clone(), label: o.label.clone(), description: o.description.clone(), efforts: known.iter().find(|m| m.id == o.id).map(|m| m.efforts.clone()).unwrap_or_default(), default: known.iter().find(|m| m.id == o.id).is_some_and(|m| m.default) }).collect();
+                        core.meta.models = choices.iter().map(|o| ModelOption { id: o.id.clone(), label: o.label.clone(), description: o.description.clone(), efforts: known.iter().find(|m| m.id == o.id).map(|m| m.efforts.clone()).unwrap_or_default(), default: known.iter().find(|m| m.id == o.id).is_some_and(|m| m.default), speeds: known.iter().find(|m| m.id == o.id).map(|m| m.speeds.clone()).unwrap_or_default() }).collect();
                         core.state.model = current.as_str().unwrap_or_default().to_owned();
                         core.meta.features.push("set_model".into());
                     }

@@ -87,6 +87,18 @@ pub struct Spec {
     /// The plan run it does a step of (`plans::agents`): set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_run: Option<String>,
+    /// What it helps with when it's a card's helper (`harness::about`: `about`, answering what a
+    /// person tapped in its parent's conversation): no row of Mission Control, its parent not told
+    /// of it, ended once no card reads it. Set by kiln, never from what was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper: Option<String>,
+    /// It's its parent's subagent (`harness::lineage::start_subagent`): kiln started it for one of
+    /// its parent's goals or plan steps, on its parent's machine with its parent's settings, and it
+    /// shows in its parent's chat rather than as an agent of its own. Set by kiln, never from what
+    /// was asked (`POST /api/harness/sessions` drops it). Its machine copies its parent's
+    /// environment and program into it as it opens ([`super::host::Host::open`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subagent: bool,
     /// Where it works when not in its folder itself: a Slates volume of its own laid over the
     /// folder (`crate::workspace`), made on its machine before it starts and kept with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,6 +137,8 @@ impl Default for Spec {
             reach: None,
             parent: None,
             plan_run: None,
+            helper: None,
+            subagent: false,
             workspace: None,
         }
     }
@@ -132,6 +146,7 @@ impl Default for Spec {
 
 /// A pending approval, as lists show it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ApprovalBrief {
     pub id: String,
     pub tool: ToolKind,
@@ -143,16 +158,20 @@ pub struct ApprovalBrief {
 /// A native subagent as lists show it. Its work still belongs to its harness's task, not a
 /// separate kiln session, so this is tracking only and carries no execution settings or output.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct SubagentBrief {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub tool_id: Option<String>,
     pub description: String,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub parent_task: Option<String>,
     pub started: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub ended: Option<i64>,
 }
 
@@ -176,11 +195,14 @@ impl SubagentBrief {
 
 /// Goals an agent paused for a person, until someone resumes them (`Info::held`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "HeldGoals"))]
 pub struct Held {
     /// Why, as the stack says it ("Paused by the agent: …").
     pub why: String,
     /// The plan it waits for you to look at first, when that's why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub plan: Option<String>,
     /// Unix ms it paused.
     pub since: i64,
@@ -188,6 +210,8 @@ pub struct Held {
 
 /// A session as lists show it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentInfo"))]
 pub struct Info {
     pub id: String,
     pub kind: String,
@@ -197,11 +221,13 @@ pub struct Info {
     pub target: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub shell: Option<String>,
     pub cwd: String,
     /// The working tree its work is in (`State::tree`): what's asked of git about its work is
     /// asked there ([`Info::work_dir`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub tree: Option<String>,
     pub created_at: i64,
     pub status: Status,
@@ -212,6 +238,7 @@ pub struct Info {
     #[serde(default)]
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub harness_session: Option<String>,
     #[serde(default)]
     pub approvals: Vec<ApprovalBrief>,
@@ -235,21 +262,25 @@ pub struct Info {
     #[serde(default)]
     pub cost_usd: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub activity: Option<String>,
     pub last_activity: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub exit: Option<ExitInfo>,
     /// What the person first asked for.
     #[serde(default)]
     pub goal: String,
     /// The goal the harness itself pursues, and how it stands (see `State::objective`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub objective: Option<super::model::Objective>,
     /// The agent's latest words, shortened.
     #[serde(default)]
     pub summary: String,
     /// What it is doing right now, in plain words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub doing: Option<String>,
     /// Its writer's epoch ([`State::epoch`]): a machine that announces a copy from before the
     /// session went on elsewhere lets go of it.
@@ -267,29 +298,36 @@ pub struct Info {
     pub lines_removed: u32,
     /// How full the context window is, 0–100, when the harness says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub context_pct: Option<u8>,
     /// Unix ms the current turn started (None when idle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub turn_started: Option<i64>,
     /// The plan limits of the account it runs on (as `State::limits`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limits: Vec<super::model::Limit>,
     /// That account, as `State::account` (never an address).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub account: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub plan: Option<String>,
     /// Tasks it left running with no turn under way (as `State::left_behind`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub left_behind: u32,
     /// Where its commands may run besides its machine (as `State::reach`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub reach: Option<String>,
     /// It waits for a usage limit to reset (as `State::pause`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub pause: Option<super::model::Pause>,
     /// How its last turn ended (as `State::last_turn`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub last_turn: Option<super::model::TurnEnd>,
     /// Kiln doesn't keep it going when it stops part-way (`goals::keep`; set on the server).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -297,7 +335,12 @@ pub struct Info {
     /// Its goals wait on a person: it paused them for you, until you resume them (`goals::held_stacks`;
     /// set on the server).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub held: Option<Held>,
+    /// What of its messages couldn't be read (`crate::wire::unread`; set on the server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub refused: Option<crate::wire::unread::Kept>,
     /// At a usage limit it goes on on another machine with room (as `State::move_on_limit`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub move_on_limit: bool,
@@ -306,22 +349,35 @@ pub struct Info {
     pub move_plan: super::model::MovePlan,
     /// Where it pauses as its limits fill (as `State::pause_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub pause_at: Option<u8>,
     /// The most subagents it runs at once (as `State::max_subagents`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub max_subagents: Option<u32>,
     /// The agent that started it (as `Spec::parent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub parent: Option<String>,
     /// The plan run it does a step of (as `Spec::plan_run`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub plan_run: Option<String>,
+    /// What it helps with when it's a card's helper (as `Spec::helper`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub helper: Option<String>,
+    /// Its parent's subagent (as `Spec::subagent`): lists show it in its parent's chat and on its
+    /// parent's row, not as an agent of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subagent: bool,
     /// It was started without its harness's skip-every-check mode (`Spec::allow_bypass` off), so
     /// an agent it starts can't have it either.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_bypass: bool,
     /// Its workspace of its own, when it has one (as `Spec::workspace`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub workspace: Option<crate::workspace::Workspace>,
 }
 
@@ -616,6 +672,7 @@ pub struct Session {
     /// it takes none here (CP-T3.2). A message is checked against it and handed over under this
     /// lock, and a move sets it and gathers what it was sent under it too: none slips in between.
     moving: Mutex<bool>,
+    prompted: std::sync::atomic::AtomicBool,
 }
 
 impl Session {
@@ -740,7 +797,9 @@ impl Session {
             s.resume = Some(h);
         }
         // Where it is now, not where it started: its own session, settings as last chosen.
-        s.prompt = None;
+        if self.prompted.load(std::sync::atomic::Ordering::Relaxed) {
+            s.prompt = None;
+        }
         s.resume_at = None;
         s.fork = false;
         if !core.state.effort.is_empty() {
@@ -953,12 +1012,15 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         last_turn: None,
         keep_off: false,
         held: None,
+        refused: None,
         move_on_limit: false,
         move_plan: Default::default(),
         pause_at: None,
         max_subagents: core.state.max_subagents,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
+        helper: spec.helper.clone(),
+        subagent: spec.subagent,
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
     };
@@ -975,6 +1037,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         ran: Mutex::new((None, Vec::new())),
         left: Mutex::new(Vec::new()),
         moving: Mutex::new(false),
+        prompted: std::sync::atomic::AtomicBool::new(false),
     });
     let run = Arc::clone(&s);
     crate::rt::spawn(async move {
@@ -2644,6 +2707,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     // Going on with the process the previous image of this process ran: its timeline came with it.
     let mut adopt = adopt;
     let handed = adopt.is_some();
+    if handed {
+        s.prompted.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     // Taking over a session: its transcript is read once it has ended (checked again before each
     // start while it has not).
     if !handed {
@@ -2845,7 +2911,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     core.set_status(Status::Starting);
                     core.touch_state();
                     adapter.start(&mut core);
-                    if first && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
+                    if !s.prompted.swap(true, std::sync::atomic::Ordering::Relaxed) && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
                         // Its id is the session's own (CP-T3.2): made once, the same if it's ever made again.
                         let id = crate::util::derive_id(&["first-prompt", &s.id]);
                         adapter.command(&mut core, Command::Send { id, text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None });
@@ -3426,12 +3492,22 @@ mod tests {
             ran: Mutex::new((None, Vec::new())),
             left: Mutex::new(Vec::new()),
             moving: Mutex::new(false),
+            prompted: std::sync::atomic::AtomicBool::new(false),
         };
         (s, rx)
     }
 
     fn message(id: &str, text: &str) -> Command {
         Command::Send { id: id.into(), text: text.into(), mode: super::super::model::SendMode::Now, attachments: Vec::new(), overrides: None, reply_to: None, task: None }
+    }
+
+    #[test]
+    fn a_first_message_its_harness_never_got_stays_in_what_resumes_it_until_it_goes() {
+        let (s, _rx) = idle("never-started");
+        *s.spec.lock() = Spec { kind: "claude".into(), prompt: Some("fix the flaky test".into()), ..Spec::default() };
+        assert_eq!(s.resume_spec().prompt.as_deref(), Some("fix the flaky test"));
+        s.prompted.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(s.resume_spec().prompt, None);
     }
 
     /// CP-T3.2: a move gathers what a session was sent and hasn't taken (carried while its harness
@@ -3916,12 +3992,15 @@ mod tests {
             last_turn: None,
             keep_off: false,
             held: None,
+            refused: None,
             move_on_limit: false,
             move_plan: Default::default(),
             pause_at: None,
             max_subagents: None,
             parent: None,
             plan_run: None,
+            helper: None,
+            subagent: false,
             no_bypass: false,
             workspace: None,
         };

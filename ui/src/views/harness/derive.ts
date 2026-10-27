@@ -237,7 +237,7 @@ export function diffStats(diffs: Pick<FileDiff, "hunks">[] | undefined): { add: 
   return { add, del };
 }
 
-export interface FileChange {
+export interface ChangedFile {
   path: string;
   /** Its working tree's top, `path` being relative to it (the server's changeset). */
   tree?: string;
@@ -251,8 +251,8 @@ export interface FileChange {
 }
 
 /** Everything the agent changed (or proposed and was refused), file by file. */
-export function changesetOf(events: HEvent[]): FileChange[] {
-  const files = new Map<string, FileChange>();
+export function changesetOf(events: HEvent[]): ChangedFile[] {
+  const files = new Map<string, ChangedFile>();
   for (const e of events) {
     if (e.kind !== "tool" || e.tool !== "edit" || e.status === "denied") continue;
     for (const d of e.diffs ?? []) {
@@ -368,7 +368,7 @@ export function taskOfCall(call: Pick<ToolCall, "task" | "tool_id"> | undefined,
 }
 
 /** Pausing for an approval does not finish a child's turn or its elapsed time. */
-export function taskLive(task: Task): boolean {
+export function taskLive(task: Pick<Task, "status">): boolean {
   return task.status === "running" || task.status === "pending" || task.status === "paused";
 }
 

@@ -987,6 +987,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         std::thread::spawn(crate::os::macsign::keep_watching);
     }
     std::fs::create_dir_all(&o.work_dir).with_context(|| format!("create {}", o.work_dir.display()))?;
+    // Where the runner's cache service opens once something asks for it (docs/ci.md W24-R08).
+    crate::runner::work::service::set_home(&o.work_dir);
     let orphans = crate::exec::reap_orphans(&o.work_dir);
     if orphans > 0 {
         tracing::warn!(orphans, "killed job processes left over from a previous agent run");
@@ -1089,12 +1091,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Agent sessions other runners hand this one (a session moving here) are taken over by its
     // session host, once there is one (below).
     let (adopt_tx, adopt_rx) = async_channel::bounded::<crate::reach::node::Adoption>(4);
-    let reach = o.reach.filter(|_| !o.ephemeral).and_then(|accept| match crate::reach::node::start(crate::reach::node::Config {
-        adopt: Some(adopt_tx.clone()),
-        ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept)
-    }) {
+    let reach = o.reach.filter(|_| !o.ephemeral).map(|accept| {
+        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
+        (Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start(cfg))
+    });
+    let reach = reach.and_then(|(using, mirrors, started)| match started {
         Ok((handle, said)) => {
             crate::reach::node::set_global(handle.clone());
+            // What other runners' trees left here, kept as people's rules say (docs/reach.md §5.1).
+            crate::reach::keeper::start(handle.clone(), using, mirrors);
             let up = up_tx.clone();
             crate::rt::spawn(async move {
                 while let Ok(m) = said.recv().await {
@@ -1230,6 +1235,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut drops_said: Option<Vec<proto::NetDrop>> = None;
     // The server takes what this runner holds warm (`AgentMsg::WorkState`, docs/ci.md W24-R18),
     // and when it was last told it on this connection, and as of which change.
+    // W24-R31: the reaper of this runner's warm workspaces, on its clock.
+    if !o.outpost && !o.ephemeral {
+        crate::runner::warm::start_reaper(&o.work_dir);
+    }
     let mut server_work = false;
     let mut work_said: Option<(u64, Instant)> = None;
     // The channel's updates go (a server that keeps it welcomed this runner since it started).
@@ -1695,6 +1704,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 retire_span = Some(tracing::info_span!(target: "kiln::upgrade", parent: &mv.root, "upgrade.retire", jobs = left, result = empty, error = empty));
                                 tracing::info!(%job, sessions, terminals, jobs = left, "handed over to the new build; this runner retires once its jobs end");
                                 retiring = true;
+                                // The new build keeps the copies of other runners' trees from now on.
+                                crate::reach::keeper::retire();
                                 // No new jobs here: this runner finishes its own, then retires.
                                 draining = true;
                                 retire_at = Some(Instant::now() + RETIRE_QUIET);

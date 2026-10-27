@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::trigger::pattern::Patterns;
 
+pub mod conflict;
+pub mod order;
+
 /// A merge strategy, chosen at land time (W14-R07).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

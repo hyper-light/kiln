@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { Confirm, EmptyState, Facts, Meter, PageIntro, SelectField } from "@/components/ui/misc";
+import { Confirm, EmptyState, Facts, FilterBar, Meter, PageIntro, SelectField } from "@/components/ui/misc";
 import { WatchedBy } from "@/views/attach/here";
 import { Chips, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
@@ -337,10 +337,9 @@ function RunnersTools({
   onView: (v: "table" | "cards") => void;
 }) {
   return (
-    <div className="runners-tools">
-      <FacetBox className="runners-filter" label="Filter runners" placeholder="Filter by name, state, label, platform…" query={q} onQuery={onQ} facets={facets} chosen={chosen} onChosen={onChosen} />
+    <FilterBar className="runners-tools">
+      <FacetBox label="Filter runners" placeholder="Filter by name, state, label, platform…" query={q} onQuery={onQ} facets={facets} chosen={chosen} onChosen={onChosen} />
       <SelectField
-        className="runners-layout"
         label="Layout"
         hideLabel
         value={view}
@@ -350,7 +349,7 @@ function RunnersTools({
           { value: "cards", label: "Cards" },
         ]}
       />
-    </div>
+    </FilterBar>
   );
 }
 

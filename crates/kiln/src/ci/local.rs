@@ -691,8 +691,8 @@ mod tests {
     /// W24-R19: a leg held off runners by their load says which, and what's past each limit.
     #[test]
     fn w24_r19_a_wait_for_load_in_words() -> anyhow::Result<()> {
-        let held = kiln_ci::sched::admit::Held { runner: "fedora".into(), pressure: Some(5_550), limit: 4_000, free: 500 << 30, floor: 20 << 30 };
-        let full = kiln_ci::sched::admit::Held { runner: "jupiter".into(), pressure: None, limit: 4_000, free: 5 << 30, floor: 20 << 30 };
+        let held = kiln_ci::sched::load::Held { runner: "fedora".into(), pressure: Some(5_550), limit: 4_000, free: 500 << 30, floor: 20 << 30 };
+        let full = kiln_ci::sched::load::Held { runner: "jupiter".into(), pressure: None, limit: 4_000, free: 5 << 30, floor: 20 << 30 };
         let w = serde_json::to_value(kiln_ci::sched::state::WaitReason::Load { held: vec![held, full] })?;
         let said = waiting(&w).map(|(s, _)| s).unwrap_or_default();
         anyhow::ensure!(said == "a runner whose disk isn't under pressure or nearly full: it's heavy on I/O (fedora: I/O pressure 55.5 %, past 40.0 %; jupiter: 5.0 GiB free, under 20.0 GiB)", "{said}");

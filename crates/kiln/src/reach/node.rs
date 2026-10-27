@@ -63,6 +63,12 @@ pub struct Config {
     /// Who takes over what another runner hands this one (an agent session moving here); None:
     /// hand-overs are refused.
     pub adopt: Option<async_channel::Sender<Adoption>>,
+    /// The copies' uses, for their keeper (`super::keeper`, docs/reach.md §5.1): each sync and run
+    /// holds its copy in use while it's at it.
+    pub using: Arc<super::keeper::Using>,
+    /// The cache whose objects this runner's peers may ask for (docs/ci.md W24-R27); `None`, the
+    /// running cache service's.
+    pub objects: Option<Arc<crate::runner::work::store::Store>>,
 }
 
 /// Something another runner hands this one to take over, whole: `reply` says whether it was.
@@ -125,7 +131,7 @@ const ADOPT_PIECE: usize = 1 << 20;
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None }
     }
 }
 
@@ -307,6 +313,38 @@ impl Handle {
             }
         }
         Err(short(maybe, last))
+    }
+
+    /// `digest` for `repo` from `peer`'s cache (docs/ci.md W24-R27), written to `into`, a window at
+    /// a time: whether `peer` had it. What it sent is checked by its digest by the caller.
+    pub async fn object(&self, peer: &str, repo: &str, digest: &str, into: &std::path::Path) -> anyhow::Result<bool> {
+        use std::io::Write as _;
+        self.connect(peer).await?;
+        let (tx, rx) = async_channel::unbounded::<Say>();
+        let id = self.ask(|reply| Local::AdoptFollow { peer: peer.to_owned(), says: tx, reply }).await?;
+        let mut file = std::fs::File::create(into)?;
+        let mut offset = 0u64;
+        loop {
+            self.send(peer, Ask::Object { id, repo: repo.to_owned(), digest: digest.to_owned(), offset }).await;
+            let end = offset.saturating_add(wire::WINDOW);
+            while offset < end {
+                match crate::rt::timeout(Duration::from_secs(60), rx.recv()).await {
+                    Ok(Ok(Say::ObjectData { offset: at, data, last, .. })) => {
+                        anyhow::ensure!(at == offset, "{peer} sent {digest} out of order");
+                        file.write_all(&data)?;
+                        offset = offset.saturating_add(data.len() as u64);
+                        if last {
+                            file.flush()?;
+                            return Ok(true);
+                        }
+                    }
+                    Ok(Ok(Say::ObjectMissing { .. })) => return Ok(false),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) => anyhow::bail!("interrupted: the link to {peer} closed"),
+                    Err(_) => anyhow::bail!("{peer} did not answer in 60s"),
+                }
+            }
+        }
     }
 
     async fn adopt_once(&self, peer: &str, data: &[u8]) -> Result<(), Missed> {
@@ -1062,8 +1100,8 @@ impl Node {
                     }
                 }
             }
-            Say::AdoptGot { id, .. } | Say::Adopted { id, .. } => {
-                let done = matches!(s, Say::Adopted { .. });
+            Say::AdoptGot { id, .. } | Say::Adopted { id, .. } | Say::ObjectData { id, .. } | Say::ObjectMissing { id } => {
+                let done = matches!(s, Say::Adopted { .. } | Say::ObjectData { last: true, .. } | Say::ObjectMissing { .. });
                 if let Some(p) = self.peers.get_mut(&name) {
                     if let Some(tx) = p.adopts.get(&id) {
                         let _ = tx.send(s).await;
@@ -1197,6 +1235,20 @@ impl Node {
             Ask::Ping { at } => {
                 self.say_on(link, &Say::Pong { at }).await;
             }
+            Ask::Object { id, repo, digest, offset } => {
+                let store = self.cfg.objects.clone().or_else(|| crate::runner::work::service::running().map(|s| Arc::clone(s.store())));
+                let window = crate::rt::blocking(move || object_window(store.as_deref(), &repo, &digest, offset)).await;
+                match window {
+                    Ok(Ok(Some(pieces))) => {
+                        for (offset, data, last) in pieces {
+                            self.say_on(link, &Say::ObjectData { id, offset, data, last }).await;
+                        }
+                    }
+                    _ => {
+                        self.say_on(link, &Say::ObjectMissing { id }).await;
+                    }
+                }
+            }
         }
     }
 
@@ -1231,10 +1283,14 @@ impl Node {
         let room = Arc::new(event_listener::Event::new());
         let (ev_tx, ev_rx) = async_channel::bounded::<serve::Event>(16);
         let extra = vec![("KILN_REACH_FROM".to_owned(), key.0.clone())];
+        // A run in a copy holds it in use until the run's last event, noted as the agent's that
+        // asked for it (docs/reach.md §5.1).
+        let busy = spec.mirror.as_deref().map(|m| self.cfg.using.busy(&key.0, m, super::keeper::agent_of(&spec.env)));
         let stdin = serve::start(spec.clone(), cwd, shell, extra, ev_tx);
         // Forward the run's events into the node, waiting while its asker has too much unread.
         let (tx, k, h, r) = (self.tx.clone(), key.clone(), Arc::clone(&held), Arc::clone(&room));
         crate::rt::spawn(async move {
+            let _busy = busy;
             while let Ok(ev) = ev_rx.recv().await {
                 if let serve::Event::Output { data, .. } = &ev {
                     while h.load(Ordering::Relaxed) >= BUFFER {
@@ -1405,7 +1461,9 @@ impl Node {
                     return;
                 }
             };
-            s.syncs.insert(sync_key.clone(), sync_worker(root, sync_key.clone(), key.clone(), self.tx.clone()));
+            // The copy is in use while its sync's worker is at it (docs/reach.md §5.1).
+            let busy = self.cfg.using.busy(&key.0, &sync_key, None);
+            s.syncs.insert(sync_key.clone(), sync_worker(root, sync_key.clone(), key.clone(), self.tx.clone(), busy));
         }
         if let Some(w) = s.syncs.get(&sync_key)
             && w.send(a).await.is_err()
@@ -1666,10 +1724,11 @@ enum Msg {
 
 /// A sync done for another runner: its own task, the file system work on blocking threads. What it
 /// says goes back through the node.
-fn sync_worker(root: PathBuf, key: String, session: (String, String), node: async_channel::Sender<In>) -> async_channel::Sender<SyncAsk> {
+fn sync_worker(root: PathBuf, key: String, session: (String, String), node: async_channel::Sender<In>, busy: super::keeper::Busy) -> async_channel::Sender<SyncAsk> {
     // Unbounded: the node never waits on a sync; the asker's window bounds what is in flight.
     let (tx, rx) = async_channel::unbounded::<SyncAsk>();
     crate::rt::spawn(async move {
+        let _busy = busy;
         let say = |s: SyncSay| {
             let node = node.clone();
             let session = session.clone();
@@ -1740,4 +1799,48 @@ fn sync_worker(root: PathBuf, key: String, session: (String, String), node: asyn
         }
     });
     tx
+}
+
+/// The most of an object one piece carries (docs/ci.md W24-R27).
+const OBJECT_PIECE: usize = 1 << 20;
+
+/// What of `digest` this runner's cache holds for `repo`, from `offset`: at most a window, in
+/// pieces, the last saying so once the object's end is in it. `None` when it isn't held for that
+/// repository (a repository never learns through a peer what another stored). The object is put
+/// together once as a local file beside the cache, which later windows are read from.
+fn object_window(store: Option<&crate::runner::work::store::Store>, repo: &str, digest: &str, offset: u64) -> anyhow::Result<Option<Vec<(u64, Vec<u8>, bool)>>> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    use crate::runner::work::store::{Scope, is_digest};
+    let Some(store) = store else { return Ok(None) };
+    let scopes: Vec<Scope> = ["trusted", "protected", "untrusted"].iter().map(|d| Scope::new(repo, d)).collect();
+    if !is_digest(digest) || store.holder(&scopes, digest).is_none() {
+        return Ok(None);
+    }
+    let dir = store.root().join("peers");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(digest.replace(':', "-"));
+    if !path.exists() {
+        let tmp = store.temp();
+        if !store.copy_to(digest, &tmp)? {
+            return Ok(None);
+        }
+        std::fs::rename(&tmp, &path)?;
+    }
+    let mut f = std::fs::File::open(&path)?;
+    let size = f.metadata()?.len();
+    f.seek(SeekFrom::Start(offset.min(size)))?;
+    let mut out = Vec::new();
+    let (mut at, end) = (offset.min(size), offset.saturating_add(wire::WINDOW).min(size));
+    loop {
+        let n = usize::try_from(end.saturating_sub(at)).unwrap_or(OBJECT_PIECE).min(OBJECT_PIECE);
+        let mut data = vec![0u8; n];
+        f.read_exact(&mut data)?;
+        let next = at.saturating_add(n as u64);
+        out.push((at, data, next >= size));
+        at = next;
+        if at >= end {
+            break;
+        }
+    }
+    Ok(Some(out))
 }

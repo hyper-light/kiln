@@ -516,7 +516,7 @@ fn a_rejected_assignment_goes_elsewhere_on_the_same_attempt() {
     s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
     let c = s.handle(Input::Rejected { leg: "x".into() }, 1);
     assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
-    assert_eq!(s.reason("x"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: true }));
+    assert_eq!(s.reason("x"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: true, asked: false }));
 }
 
 /// W05-R16: the default retry after `runner-lost` goes to another runner when one could take it,
@@ -571,9 +571,86 @@ fn w05_r16_a_lost_runners_retry() {
     s.handle(Input::RunnerLost { runner: "a".into() }, 1);
     let c = s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 2);
     assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
-    assert_eq!(s.reason("z"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: false }));
+    assert_eq!(s.reason("z"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: false, asked: false }));
     let c = s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 3);
     assert!(assigned(&c, "z", "b", 2), "{c:?}");
+}
+
+/// W05-R28: a retry a person placed. `runner` runs it only there, waiting for it busy, draining,
+/// offline or unable, and saying which; `avoid` runs it anywhere else, waiting for another when
+/// only that one could. Either holds through the attempt's own retries, and a refusal by the
+/// runner asked for doesn't send it away for good.
+#[test]
+fn w05_r28_a_placed_retry() {
+    use super::state::{PinnedState, Placement};
+    let assigned = |c: &[Command], l: &str, r: &str| c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == l && runner == r));
+    let on = |r: &str| Placement { runner: Some(r.into()), avoid: None };
+    let off = |r: &str| Placement { runner: None, avoid: Some(r.into()) };
+    let pinned = |r: &str, state: PinnedState| Some(WaitReason::Pinned { runner: r.into(), state });
+
+    // Pinned to b while a is free: it waits for b, busy, and runs there once b has room.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(leg("busy", "acme/x", 60))), 0);
+    let first = if assigned(&c, "busy", "a") { "a" } else { "b" };
+    let other = if first == "a" { "b" } else { "a" };
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: on(first), ..leg("x", "acme/x", 60) })), 1);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{other} is free, and not the one asked for: {c:?}");
+    assert_eq!(s.reason("x"), pinned(first, PinnedState::Busy).as_ref());
+    // The explanation says why the free one can't take it.
+    let free = s.explain("x").into_iter().find(|e| e.runner == other);
+    assert!(free.as_ref().is_some_and(|e| !e.eligible && e.checks.iter().any(|c| !c.pass && c.requirement == format!("runner == {first} (asked by its retry)"))), "{free:?}");
+    let c = s.handle(Input::AttemptFinished { leg: "busy".into(), attempt: 1, outcome: Outcome::Success }, 2);
+    assert!(assigned(&c, "x", first), "{c:?}");
+    // Lost with its runner, its retry waits for that runner, offline, and goes back to it.
+    let c = s.handle(Input::RunnerLost { runner: first.into() }, 3);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "x")), "{c:?}");
+    assert_eq!(s.reason("x"), pinned(first, PinnedState::Offline).as_ref());
+    let c = s.handle(Input::RunnerUp(Box::new(linux(first, 1))), 4);
+    assert!(assigned(&c, "x", first), "{c:?}");
+
+    // Draining, or no longer able to run it (its labels changed): said so.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerDraining { runner: "a".into() }, 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { placement: on("a"), ..leg("d", "acme/x", 60) })), 1);
+    assert_eq!(s.reason("d"), pinned("a", PinnedState::Draining).as_ref());
+    let mut gpu = linux("a", 1);
+    gpu.view.labels = vec!["gpu".into()];
+    s.handle(Input::RunnerChanged(Box::new(gpu)), 2);
+    assert_eq!(s.reason("d"), pinned("a", PinnedState::Unable).as_ref());
+
+    // Refused by the runner asked for: it stays that runner's, asked again a while later, on the
+    // same attempt.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: on("a"), ..leg("r", "acme/x", 60) })), 0);
+    assert!(assigned(&c, "r", "a"), "{c:?}");
+    let c = s.handle(Input::Rejected { leg: "r".into() }, 1);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. } | Command::Retry { .. })), "neither the other nor at once: {c:?}");
+    assert!(c.contains(&Command::Timer { at: 1 + super::state::REFUSED_AGAIN_MS }), "{c:?}");
+    assert_eq!(s.reason("r"), pinned("a", PinnedState::Busy).as_ref());
+    let c = s.handle(Input::Tick, 1 + super::state::REFUSED_AGAIN_MS);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 1, .. } if leg == "r" && runner == "a")), "{c:?}");
+
+    // Anywhere but a: b takes it though a is free; with b busy it waits for room, and with only a
+    // left, for another runner, as its retry asked.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: off("a"), ..leg("e1", "acme/x", 60) })), 1);
+    assert!(assigned(&c, "e1", "b"), "{c:?}");
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: off("a"), ..leg("e2", "acme/x", 60) })), 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "e2")), "{c:?}");
+    assert_eq!(s.reason("e2"), Some(&WaitReason::Capacity { eligible: 1, busy: 1, draining: 0 }));
+    s.handle(Input::RunnerLost { runner: "b".into() }, 3);
+    assert_eq!(s.reason("e2"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: false, asked: true }));
+    // e1's retry after b was lost doesn't go to a either, though nothing else can take it.
+    assert!(matches!(s.reason("e1"), Some(WaitReason::OtherRunner { asked: true, .. })), "{:?}", s.reason("e1"));
+    let c = s.handle(Input::RunnerUp(Box::new(linux("c", 2))), 4);
+    assert!(assigned(&c, "e1", "c") && assigned(&c, "e2", "c"), "{c:?}");
 }
 
 // ------------------------------------------------------------------ pools (W13-R09, W05-R27)
@@ -879,18 +956,440 @@ fn w05_r03_requests_as_written() -> Result<(), String> {
     Ok(())
 }
 
+// ------------------------------------------------------------------ demands (W28-R45, W28-AC41)
+
+use super::demand::{Ask, Demand, Domain, Fate, Next, Work};
+use super::retry::Failed;
+use super::state::Decision;
+
+const LANE: &str = "acme/ci@refs/heads/main";
+
+/// A push's run arrives: its demand, then its `RunQueued`, which withdraws older demands on its
+/// lane (`supersede: { action: adopt }`).
+fn push(s: &mut Scheduler, run: &str, at: i64) -> Vec<Command> {
+    let demand = Demand { run: run.into(), lane: LANE.into(), commit: format!("c-{run}"), domain: Domain::Trusted, at, ..Demand::default() };
+    let mut c = s.handle(Input::Demand(Box::new(demand)), at);
+    c.extend(s.handle(Input::RunQueued { run: run.into(), group: None, supersede: Some((LANE.into(), Supersede::Adopt)) }, at));
+    c
+}
+
+/// `run`'s leg of job `job`, its work's key `key`, expected to take `cost` seconds.
+fn job(run: &str, job: &str, key: &str, cost: f64) -> LegIn {
+    LegIn {
+        id: format!("{run}/{job}"),
+        run: run.into(),
+        repo: "acme/x".into(),
+        route: LegRoute { labels: vec!["k8s".into()], ..LegRoute::default() },
+        priority: 60,
+        cost: Some(cost),
+        work: Some(Work { key: Some(key.into()), domain: Domain::Trusted, lane: format!("acme/x/{job}"), observed: false }),
+        ..LegIn::default()
+    }
+}
+
+fn assigns(c: &[Command]) -> Vec<(String, String)> {
+    c.iter().filter_map(|x| if let Command::Assign { leg, runner, .. } = x { Some((leg.clone(), runner.clone())) } else { None }).collect()
+}
+
+/// A leg's last decision in demands among `c`.
+fn decision(c: &[Command], leg: &str) -> Option<Decision> {
+    c.iter().rev().find_map(|x| match x {
+        Command::Demand { leg: l, decision } if l == leg => Some(decision.clone()),
+        _ => None,
+    })
+}
+
+fn endings(c: &[Command]) -> Vec<Command> {
+    c.iter().filter(|x| matches!(x, Command::Settled { .. } | Command::Adopted { .. })).cloned().collect()
+}
+
+fn adopted(leg: &str, exec: &str, run: &str) -> Command {
+    Command::Wait { leg: leg.into(), reason: WaitReason::Adopted { leg: exec.into(), run: run.into() } }
+}
+
+/// W28-AC41: push A, then push B touching only docs/ while A's rust leg runs. B's rust leg has
+/// A's key and adopts A's execution: one execution, both legs green, A never cancelled.
+#[test]
+fn w28_ac41_a_docs_only_push_adopts_the_rust_leg() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 0);
+    let mut all = push(&mut s, "A", 0);
+    let c = s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 0);
+    assert_eq!(assigns(&c), [("A/rust".to_owned(), "a".to_owned())]);
+    assert_eq!(decision(&c, "A/rust"), Some(Decision::Asked(Ask::Execute)));
+    all.extend(c);
+    // B arrives while it runs: A's demand is withdrawn, and its work runs on.
+    let c = push(&mut s, "B", 60_000);
+    assert_eq!(decision(&c, "A/rust"), Some(Decision::Fate(Fate::Run { by: vec!["B".into()] })));
+    all.extend(c);
+    let c = s.handle(Input::LegQueued(Box::new(job("B", "rust", "K1", 200.0))), 60_000);
+    assert!(c.contains(&adopted("B/rust", "A/rust", "A")), "{c:?}");
+    assert_eq!(decision(&c, "B/rust"), Some(Decision::Asked(Ask::Adopt { exec: "A/rust".into(), run: "A".into() })));
+    assert_eq!(decision(&c, "A/rust"), Some(Decision::Fate(Fate::Kept { priority: 60, by: vec!["B".into()] })), "wanted again");
+    all.extend(c);
+    let c = s.handle(Input::AttemptFinished { leg: "A/rust".into(), attempt: 1, outcome: Outcome::Success }, 200_000);
+    assert_eq!(
+        endings(&c),
+        [Command::Settled { leg: "A/rust".into(), outcome: Outcome::Success, reason: None }, Command::Adopted { leg: "B/rust".into(), from: "A/rust".into(), outcome: Outcome::Success }]
+    );
+    all.extend(c);
+    assert_eq!(assigns(&all).len(), 1, "one execution: {all:?}");
+    assert!(!all.iter().any(|x| matches!(x, Command::Cancel { .. } | Command::CancelRun { .. })), "A is never cancelled");
+}
+
+/// W28-AC41: push B touching crates/ while A's rust leg is 30% done and both slots are busy. B's
+/// ui leg adopts A's (the same key). B's rust leg contends for a slot: A's rust leg, which no live
+/// demand wants, is cancelled for it, saying how long it had left, and B's runs once it stopped.
+#[test]
+fn w28_ac41_a_crates_push_takes_the_unwanted_rust_legs_slot() {
+    let mut s = Scheduler::new(Config { finish_within: 60, ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 0);
+    push(&mut s, "A", 0);
+    let mut c = s.handle(Input::LegQueued(Box::new(job("A", "ui", "U1", 300.0))), 0);
+    c.extend(s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 0));
+    assert_eq!(assigns(&c).len(), 2, "both slots busy");
+    // 60 s into A's rust leg's 200, B arrives.
+    let c = push(&mut s, "B", 60_000);
+    assert_eq!(decision(&c, "A/rust"), Some(Decision::Fate(Fate::Run { by: vec!["B".into()] })));
+    assert_eq!(decision(&c, "A/ui"), Some(Decision::Fate(Fate::Run { by: vec!["B".into()] })));
+    let c = s.handle(Input::LegQueued(Box::new(job("B", "ui", "U1", 300.0))), 60_000);
+    assert!(c.contains(&adopted("B/ui", "A/ui", "A")), "{c:?}");
+    assert_eq!(decision(&c, "A/ui"), Some(Decision::Fate(Fate::Kept { priority: 60, by: vec!["B".into()] })));
+    let c = s.handle(Input::LegQueued(Box::new(job("B", "rust", "K2", 200.0))), 60_000);
+    let cancelled = Fate::Cancel { by: vec!["B".into()], left: Some(140), finish_within: 60, seeds: true, lane: "acme/x/rust".into() };
+    assert_eq!(decision(&c, "A/rust"), Some(Decision::Fate(cancelled.clone())));
+    assert!(c.contains(&Command::Cancel { leg: "A/rust".into(), attempt: 1, reason: cancelled.why() }), "{c:?}");
+    assert!(cancelled.why().contains("no live demand wants it") && cancelled.why().contains("about 140 s left"), "{}", cancelled.why());
+    assert!(assigns(&c).is_empty(), "B's rust leg waits for A's to stop");
+    let c = s.handle(Input::AttemptFinished { leg: "A/rust".into(), attempt: 1, outcome: Outcome::Cancelled }, 61_000);
+    assert_eq!(endings(&c), [Command::Settled { leg: "A/rust".into(), outcome: Outcome::Cancelled, reason: None }]);
+    assert_eq!(assigns(&c), [("B/rust".to_owned(), "a".to_owned())]);
+    let c = s.handle(Input::AttemptFinished { leg: "A/ui".into(), attempt: 1, outcome: Outcome::Success }, 300_000);
+    assert_eq!(endings(&c), [Command::Settled { leg: "A/ui".into(), outcome: Outcome::Success, reason: None }, Command::Adopted { leg: "B/ui".into(), from: "A/ui".into(), outcome: Outcome::Success }]);
+}
+
+/// W28-AC41: contended, work no one wants that is within finish_within of its end and seeds
+/// trusted entries finishes; live work waits for it.
+#[test]
+fn w28_r45_contended_work_near_its_end_finishes() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    push(&mut s, "A", 0);
+    s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 0);
+    push(&mut s, "B", 60_000);
+    let c = s.handle(Input::LegQueued(Box::new(job("B", "rust", "K2", 200.0))), 60_000);
+    assert_eq!(decision(&c, "A/rust"), Some(Decision::Fate(Fate::Finish { by: vec!["B".into()], left: 140, finish_within: 300 })));
+    assert!(!c.iter().any(|x| matches!(x, Command::Cancel { .. })), "{c:?}");
+    let c = s.handle(Input::AttemptFinished { leg: "A/rust".into(), attempt: 1, outcome: Outcome::Success }, 200_000);
+    assert_eq!(assigns(&c), [("B/rust".to_owned(), "a".to_owned())]);
+}
+
+/// W28-AC41: after a restart, B's leg, queued with A's key, is asked for before A's running leg is
+/// announced. It becomes A's adopter, and the work runs once.
+#[test]
+fn w28_ac41_a_restart_ends_with_one_execution() {
+    let mut s = Scheduler::new(Config::default());
+    let c = s.handle(Input::LegQueued(Box::new(job("B", "rust", "K1", 200.0))), 0);
+    assert_eq!(decision(&c, "B/rust"), Some(Decision::Asked(Ask::Execute)));
+    let running = LegIn { started: Some(-30_000), ..job("A", "rust", "K1", 200.0) };
+    let c = s.handle(Input::LegRunning { leg: Box::new(running), runner: "a".into(), attempt: 1 }, 0);
+    assert!(c.contains(&adopted("B/rust", "A/rust", "A")), "{c:?}");
+    let c = s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 1);
+    assert!(assigns(&c).is_empty(), "nothing runs twice: {c:?}");
+    let c = s.handle(Input::AttemptFinished { leg: "A/rust".into(), attempt: 1, outcome: Outcome::Success }, 170_000);
+    assert_eq!(endings(&c), [Command::Settled { leg: "A/rust".into(), outcome: Outcome::Success, reason: None }, Command::Adopted { leg: "B/rust".into(), from: "A/rust".into(), outcome: Outcome::Success }]);
+}
+
+/// W28-R44 through the scheduler: an execution that fails in class `failure` fails its adopter too.
+/// One whose runner is lost twice (its retry too) leaves its adopter to run the work itself.
+#[test]
+fn w28_r45_failures_and_lost_runners() {
+    let failed = |class| Outcome::Failed(Failed { class, exit_code: Some(1), log_hits: Vec::new() });
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 0);
+    s.handle(Input::LegQueued(Box::new(job("B", "rust", "K1", 200.0))), 1);
+    let c = s.handle(Input::AttemptFinished { leg: "A/rust".into(), attempt: 1, outcome: failed(FailureClass::Failure) }, 100_000);
+    assert!(c.contains(&Command::Adopted { leg: "B/rust".into(), from: "A/rust".into(), outcome: failed(FailureClass::Failure) }), "{c:?}");
+
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    assert_eq!(assigns(&s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 0)), [("A/rust".to_owned(), "a".to_owned())]);
+    assert!(s.handle(Input::LegQueued(Box::new(job("B", "rust", "K1", 200.0))), 1).contains(&adopted("B/rust", "A/rust", "A")));
+    // A's runner is lost: its retry runs elsewhere, and B still waits for it.
+    let c = s.handle(Input::RunnerLost { runner: "a".into() }, 10_000);
+    assert!(c.iter().any(|x| matches!(x, Command::Retry { leg, attempt: 2, .. } if leg == "A/rust")), "{c:?}");
+    assert_eq!(assigns(&c), [("A/rust".to_owned(), "b".to_owned())]);
+    assert!(endings(&c).is_empty());
+    // Lost again, A has failed for good, in a way B may not take over: B executes the work.
+    let c = s.handle(Input::RunnerLost { runner: "b".into() }, 20_000);
+    assert!(endings(&c).iter().all(|x| matches!(x, Command::Settled { leg, .. } if leg == "A/rust")) && !endings(&c).is_empty(), "{c:?}");
+    assert_eq!(decision(&c, "B/rust"), Some(Decision::Next(Next::Execute)));
+    let c = s.handle(Input::RunnerUp(Box::new(linux("c", 1))), 30_000);
+    assert_eq!(assigns(&c), [("B/rust".to_owned(), "c".to_owned())]);
+}
+
+/// W28-R45: B's push withdraws A. A's queued rust leg, which no live demand wants, settles
+/// cancelled, saying why; its test leg, which D wants, is kept at the highest priority left (D's 50,
+/// not A's 90), so X's leg at 70 goes first.
+#[test]
+fn w28_r45_withdrawn_queued_work_is_dropped_or_kept_at_the_highest_priority_left() {
+    let mut s = Scheduler::new(Config::default());
+    push(&mut s, "A", 0);
+    s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { priority: 90, ..job("A", "test", "T1", 100.0) })), 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { priority: 70, ..job("X", "lint", "L1", 100.0) })), 0);
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { priority: 50, ..job("D", "test", "T1", 100.0) })), 0);
+    assert!(c.contains(&adopted("D/test", "A/test", "A")), "{c:?}");
+    let c = push(&mut s, "B", 1_000);
+    let dropped = Fate::Drop { by: vec!["B".into()] };
+    assert!(c.contains(&Command::Settled { leg: "A/rust".into(), outcome: Outcome::Cancelled, reason: Some(dropped.why()) }), "{c:?}");
+    assert_eq!(decision(&c, "A/test"), Some(Decision::Fate(Fate::Kept { priority: 50, by: vec!["D".into()] })));
+    let c = s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 2_000);
+    assert_eq!(assigns(&c), [("X/lint".to_owned(), "a".to_owned())]);
+}
+
+/// W28-R45: a withdrawn run's leg queued later only takes what's in flight: with nothing there, it
+/// settles cancelled, saying why. An adopter cancelled with its run stops waiting, and the
+/// execution it adopted is decided again: its own run still wants it, so it's kept.
+#[test]
+fn w28_r45_withdrawn_runs_take_only_what_is_in_flight() {
+    let mut s = Scheduler::new(Config::default());
+    push(&mut s, "A", 0);
+    push(&mut s, "B", 1_000);
+    let c = s.handle(Input::LegQueued(Box::new(job("A", "rust", "K1", 200.0))), 2_000);
+    assert!(c.contains(&Command::Settled { leg: "A/rust".into(), outcome: Outcome::Cancelled, reason: Some(Ask::Drop.why()) }), "{c:?}");
+    // C's leg (no demand: its workflow doesn't adopt) executes K2, queued; B's leg adopts it. B
+    // cancelled, C's work is still C's own, so it stays.
+    s.handle(Input::LegQueued(Box::new(job("C", "rust", "K2", 200.0))), 3_000);
+    assert!(s.handle(Input::LegQueued(Box::new(job("B", "rust", "K2", 200.0))), 3_000).contains(&adopted("B/rust", "C/rust", "C")));
+    let c = s.handle(Input::LegCancelled { leg: "B/rust".into(), reason: "run cancelled".into() }, 4_000);
+    assert_eq!(endings(&c), [Command::Settled { leg: "B/rust".into(), outcome: Outcome::Cancelled, reason: Some("run cancelled".into()) }]);
+    assert_eq!(decision(&c, "C/rust"), Some(Decision::Fate(Fate::Kept { priority: 60, by: vec!["C".into()] })));
+}
+
+// ---------------------------------------------------------------------- admission (W28-R60 to R63)
+
+const SEC: i64 = 1_000;
+
+fn lane_leg(id: &str, order: u64, coalesce: Option<super::admit::Coalesce>, cadence: Option<super::admit::Cadence>) -> LegIn {
+    let admission = super::admit::Demand { lane: "acme/x\0ci\0main".into(), unit: "test".into(), order, coalesce, cadence, speculative: false };
+    LegIn { admission: Some(admission), ..leg(id, "acme/x", 60) }
+}
+
+/// W28-R61, W28-AC60: pushes every 30 s from 10 s, quiet 45 s, max_wait 5 min, the one runner busy
+/// with another workflow's leg until 290 s: each push skips the one held (coalesced, never
+/// started), and the newest is let go as the runner frees, before 300 s.
+#[test]
+fn w28_ac60_coalescing_runs_the_newest_once_the_runner_frees() {
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("a", 1));
+    sim.leg(0, leg("blocker", "acme/y", 60), 290 * SEC);
+    let busy = super::admit::Coalesce { quiet: 45 * SEC, max_wait: 300 * SEC, always: false };
+    for i in 0..10 {
+        sim.leg(10 * SEC + i * 30 * SEC, lane_leg(&format!("p{i}"), i as u64, Some(busy), None), 60 * SEC);
+    }
+    sim.run(400 * SEC);
+    let ran: Vec<&str> = sim.assigned.iter().map(|a| a.leg.as_str()).filter(|l| l.starts_with('p')).collect();
+    assert_eq!(ran, vec!["p9"], "only the newest ran");
+    assert_eq!(sim.started("p9"), Some(290 * SEC), "as the runner freed");
+    let coalesced = sim.settled.iter().filter(|(_, l, o)| l.starts_with('p') && *o == Outcome::Cancelled).count();
+    assert_eq!(coalesced, 9);
+    assert!(sim.waits.iter().any(|(_, l, r)| l == "p0" && matches!(r, WaitReason::Coalescing { until, deadline, .. } if *until == 55 * SEC && *deadline == 310 * SEC)));
+}
+
+/// W28-R61: on an idle system a push starts at once: admission delay 0 s.
+#[test]
+fn w28_r61_an_idle_system_starts_a_push_at_once() {
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("a", 1));
+    let busy = super::admit::Coalesce { quiet: 45 * SEC, max_wait: 300 * SEC, always: false };
+    sim.leg(5 * SEC, lane_leg("p0", 0, Some(busy), None), 60 * SEC);
+    sim.run(10 * SEC);
+    assert_eq!(sim.started("p0"), Some(5 * SEC));
+}
+
+/// W28-R61: under a stream that keeps the runner busy past max_wait, the burst's newest is let go at
+/// max_wait (it then waits for capacity like any leg), and later pushes start a burst of their own.
+#[test]
+fn w28_r61_max_wait_bounds_a_burst() {
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("a", 1));
+    sim.leg(0, leg("blocker", "acme/y", 60), 2_000 * SEC);
+    let busy = super::admit::Coalesce { quiet: 45 * SEC, max_wait: 300 * SEC, always: false };
+    for i in 0..20 {
+        sim.leg(10 * SEC + i * 30 * SEC, lane_leg(&format!("p{i}"), i as u64, Some(busy), None), 60 * SEC);
+    }
+    sim.run(700 * SEC);
+    // Let go at 310 s (10 s + max_wait): p10, the newest then (it arrived at the deadline), waits
+    // for the runner; the next burst's newest, p19, is let go at its own quiet's end.
+    for id in ["p10", "p19"] {
+        assert!(matches!(sim.last_wait(id), Some(WaitReason::Capacity { .. })), "{id}: {:?}", sim.last_wait(id));
+        assert!(!sim.settled.iter().any(|(_, l, _)| l == id), "{id} never skipped once let go");
+    }
+    assert_eq!(sim.settled.iter().filter(|(_, l, o)| l.starts_with('p') && *o == Outcome::Cancelled).count(), 18);
+}
+
+/// W28-R62: on a cadence an exclusive leg's runner takes no new work while it waits, so it starts
+/// once the work there ends; without, later work keeps filling the runner.
+#[test]
+fn w28_r62_cadence_drains_for_an_exclusive_leg() {
+    for (cadence, want) in [(Some(super::admit::Cadence::Free), vec![Some(0), Some(100 * SEC), Some(110 * SEC)]), (None, vec![Some(0), Some(120 * SEC), Some(20 * SEC)])] {
+        let mut sim = Sim::new(Config::default());
+        sim.runner(0, linux("bench", 2));
+        sim.leg(0, leg("a", "acme/x", 60), 100 * SEC);
+        let mut b = lane_leg("b", 1, None, cadence);
+        b.exclusive = true;
+        sim.leg(10 * SEC, b, 10 * SEC);
+        sim.leg(20 * SEC, leg("c", "acme/x", 60), 100 * SEC);
+        sim.run(500 * SEC);
+        assert_eq!(vec![sim.started("a"), sim.started("b"), sim.started("c")], want, "cadence {cadence:?}");
+    }
+}
+
+/// W28-R62: a newer leg on the cadence takes the place of the one waiting to start.
+#[test]
+fn w28_r62_cadence_runs_the_newest() {
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("bench", 1));
+    sim.leg(0, leg("busy", "acme/y", 60), 100 * SEC);
+    for i in 0..3 {
+        sim.leg(10 * SEC + i * 10 * SEC, lane_leg(&format!("b{i}"), i as u64, None, Some(super::admit::Cadence::Free)), 10 * SEC);
+    }
+    sim.run(500 * SEC);
+    assert_eq!(sim.started("b2"), Some(100 * SEC));
+    assert_eq!(sim.started("b0"), None);
+    assert!(sim.settled.iter().any(|(_, l, o)| l == "b1" && *o == Outcome::Cancelled));
+}
+
+/// W28-R68: a lane's speculative legs beyond its window wait, saying so, until one passes.
+#[test]
+fn w28_r68_speculation_window_holds_and_lets_go() {
+    let cfg = Config { window: super::admit::Window { initial: 2, floor: 1, cap: 4 }, ..Config::default() };
+    let mut sim = Sim::new(cfg);
+    sim.runner(0, linux("a", 4));
+    for i in 0..3 {
+        let mut l = lane_leg(&format!("s{i}"), i as u64, None, None);
+        if let Some(a) = l.admission.as_mut() {
+            a.speculative = true;
+            a.unit = format!("bisect{i}");
+        }
+        sim.leg(0, l, 30 * SEC);
+    }
+    sim.run(SEC);
+    assert!(matches!(sim.last_wait("s2"), Some(WaitReason::Speculation { size: 2, in_flight: 2, .. })));
+    assert_eq!(sim.started("s2"), None);
+    sim.run(40 * SEC);
+    assert_eq!(sim.started("s2"), Some(30 * SEC), "the first pass widened the window");
+}
+
+// ---------------------------------------------------------------------- priority by intent (W28-R64, R65)
+
+/// W28-R64, W28-AC62: one saturated runner; gate, waiting, trunk and WIP legs queued together
+/// start in that order.
+#[test]
+fn w28_ac62_intent_classes_go_in_order() {
+    use super::intent::Intent;
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("a", 1));
+    sim.leg(0, leg("busy", "acme/x", 60), MIN);
+    for (id, i) in [("wip", Intent::Wip), ("trunk", Intent::Trunk), ("gate", Intent::Gate), ("waiting", Intent::Waiting)] {
+        sim.leg(1, leg(id, "acme/x", i.priority()), MIN);
+    }
+    sim.run(10 * MIN);
+    let order: Vec<&str> = sim.assigned.iter().map(|a| a.leg.as_str()).filter(|l| *l != "busy").collect();
+    assert_eq!(order, vec!["gate", "waiting", "trunk", "wip"]);
+}
+
+/// W28-R65: W05-R09's aging bounds every class's wait: a WIP leg behind a steady stream of gate
+/// legs (one a minute, each a minute long) starts within (90 − 40) / 1 minutes, and one leg's time.
+#[test]
+fn w28_r65_aging_bounds_a_wip_legs_wait_behind_gate() {
+    use super::intent::Intent;
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("a", 1));
+    sim.leg(0, leg("gate-busy", "acme/x", Intent::Gate.priority()), MIN);
+    sim.leg(1, leg("wip", "acme/y", Intent::Wip.priority()), MIN);
+    for i in 0..120 {
+        sim.leg(i * MIN + 2, leg(&format!("gate{i}"), "acme/x", Intent::Gate.priority()), MIN);
+    }
+    sim.run(150 * MIN);
+    let start = sim.started("wip").unwrap_or(i64::MAX);
+    assert!(start <= 51 * MIN + 1, "the WIP leg started at {} min", start / MIN);
+    assert!(start >= 49 * MIN, "and not before aging lifted it: {} min", start / MIN);
+}
+
+// ---------------------------------------------------------------------- fair share by actor and lane (W28-R66)
+
+fn by_actor(id: &str, actor: &str, lane: &str) -> LegIn {
+    LegIn { actor: actor.into(), lane: lane.into(), ..leg(id, "acme/x", 60) }
+}
+
+/// W28-R66, W28-AC63: agent A pushes ten times a minute, agent B once, in one repository, each push
+/// a 40-second leg on one slot: with fair_by = [repo, actor] each gets half the capacity within 10
+/// points over every 10-minute window, where by repository alone B gets its arrival share.
+#[test]
+fn w28_ac63_two_agents_at_ten_to_one_share_alike() {
+    use super::state::FairBy;
+    for (fair_by, fair) in [(vec![FairBy::Repo, FairBy::Actor], true), (vec![FairBy::Repo], false)] {
+        let mut sim = Sim::new(Config { fair_by, default_cost: 40.0, ..Config::default() });
+        sim.runner(0, linux("a", 1));
+        for m in 0..80 {
+            for k in 0..10 {
+                sim.leg(m * MIN + k * 6 * SEC, by_actor(&format!("a{m}-{k}"), "agent:A", "acme/x\0ci\0agents/a"), 40 * SEC);
+            }
+            sim.leg(m * MIN + 3 * SEC, by_actor(&format!("b{m}"), "agent:B", "acme/x\0ci\0agents/b"), 40 * SEC);
+        }
+        sim.run(80 * MIN);
+        let mut w = 10;
+        while w + 10 <= 70 {
+            let share = sim.shares_by(w * MIN, (w + 10) * MIN, |l| l.get(..1).unwrap_or_default().to_owned()).get("b").copied().unwrap_or(0.0);
+            if fair {
+                assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: B got {share:.2}", w + 10);
+            } else {
+                assert!(share < 0.25, "by repository alone, window {w}–{}: B got {share:.2}", w + 10);
+            }
+            w += 10;
+        }
+    }
+}
+
+/// W28-R66: fair_by = [repo, actor, lane]: actor A's two lanes get about a quarter each, actor B's
+/// one lane about half.
+#[test]
+fn w28_r66_nested_levels_split_their_parents_share() {
+    use super::state::FairBy;
+    let mut sim = Sim::new(Config { fair_by: vec![FairBy::Repo, FairBy::Actor, FairBy::Lane], default_cost: 60.0, ..Config::default() });
+    sim.runner(0, linux("a", 2));
+    for i in 0..200 {
+        sim.leg(1, by_actor(&format!("x{i}"), "agent:A", "x"), MIN);
+        sim.leg(1, by_actor(&format!("y{i}"), "agent:A", "y"), MIN);
+        sim.leg(1, by_actor(&format!("z{i}"), "agent:B", "z"), MIN);
+    }
+    sim.run(100 * MIN);
+    let shares = sim.shares_by(0, 60 * MIN, |l| l.get(..1).unwrap_or_default().to_owned());
+    for (lane, want) in [("x", 0.25), ("y", 0.25), ("z", 0.5)] {
+        let got = shares.get(lane).copied().unwrap_or(0.0);
+        assert!((got - want).abs() <= 0.10, "lane {lane}: {got:.2}, want {want}");
+    }
+}
+
 // ------------------------------------------------------------------ warm placement (W24-R18)
 
-use super::routing::Affinity;
-use super::sim::Assigned;
-use super::warm::{self, Held, Wants, Workspace};
+mod warm_placement {
+use super::*;
+
+use crate::sched::routing::Affinity;
+use crate::sched::sim::Assigned;
+use crate::sched::warm::{self, Held, Wants, Workspace};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
 const LANE: &str = "acme-x-rust";
 
 fn warm_leg(id: &str, cold: f64, patience: Option<f64>) -> LegIn {
-    LegIn { lane: Some(LANE.into()), cold: Some(cold), prefer: vec![Preference { warm: true, patience, ..Preference::default() }], ..leg(id, "acme/x", 60) }
+    LegIn { warm_lane: Some(LANE.into()), cold: Some(cold), prefer: vec![Preference { warm: true, patience, ..Preference::default() }], ..leg(id, "acme/x", 60) }
 }
 
 /// A runner holding the lane's workspace: its warm runs take `warm_s`, it's `files` behind, and
@@ -1004,7 +1503,7 @@ fn w24_r18_affinity_goes_after_that_jobs_workspaces() {
 /// the one with Docker, though the other comes first by name, and the explanation says why.
 #[test]
 fn w24_r18_a_lanes_workspace_counts_where_the_leg_runs_with_its_toolchain() -> Result<(), String> {
-    use super::routing::{Rule, RuleMatch};
+    use crate::sched::routing::{Rule, RuleMatch};
     let rule = Rule { matches: RuleMatch { labels: vec!["k8s".into()], ..RuleMatch::default() }, executor: vec!["docker".into(), "host".into()], image: Some("kiln/runner-ubuntu-24.04".into()), ..Rule::default() };
     let mut s = Scheduler::new(Config { rules: vec![rule.clone()], ..Config::default() });
     let mut docker = linux("w", 1);
@@ -1305,7 +1804,7 @@ proptest! {
                 l.route.job = format!("job{}", j % 3);
                 l.route.workflow = "ci".into();
                 if terms {
-                    l.lane = Some(format!("lane{}", j % 3));
+                    l.warm_lane = Some(format!("lane{}", j % 3));
                     l.prefer = vec![if j % 2 == 0 { Preference { warm: true, patience: Some(share), ..Preference::default() } } else { Preference { affinity: Some(Affinity { job: "job0".into() }), weight: Some(3.0), ..Preference::default() } }];
                 }
                 sim.leg(*at, l, *took);
@@ -1319,4 +1818,5 @@ proptest! {
         prop_assert_eq!(&run(true, false), &before);
         prop_assert_eq!(&run(true, true), &before);
     }
+}
 }

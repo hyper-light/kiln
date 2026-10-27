@@ -6,6 +6,7 @@
 }
 .plan-page {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
 }
 .plan-meta {
@@ -16,6 +17,7 @@
 }
 .plan-edit {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
 }
 @media (min-width: 1024px) {
@@ -25,6 +27,7 @@
 }
 .plan-text {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
 }
 .plan-body {
@@ -51,6 +54,7 @@
 }
 .plan-preview {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   align-content: start;
   gap: 8px;
   min-width: 0;
@@ -108,6 +112,7 @@
 }
 .plan-section {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
   padding-top: 16px;
   border-top: 1px solid var(--color-line);
@@ -143,6 +148,7 @@
 }
 .plan-rows {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -177,6 +183,7 @@ a.plan-row-main:hover {
 }
 .plan-confirm {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   max-width: 72ch;
   padding: 10px 12px;
@@ -268,6 +275,7 @@ a.plan-row-main:hover {
 }
 .plan-here {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
 }
 .plan-here .plan-actions {
@@ -294,10 +302,12 @@ a.plan-row-main:hover {
    with which of their parts are filled. Then the plan creator in an agent's Plan tab (here.tsx). */
 .pi {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
 }
 .pi-list {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 0;
   margin: 0;
   padding: 0;
@@ -325,6 +335,7 @@ a.plan-row-main:hover {
 }
 .pi-title {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
   padding: 4px 0;
   border: 0;
@@ -368,6 +379,7 @@ a.plan-row-main:hover {
 }
 .pi-body {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   padding: 4px 12px 12px 40px;
 }
@@ -407,6 +419,7 @@ a.plan-row-main:hover {
 }
 .ph {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   min-width: 0;
 }
@@ -424,6 +437,7 @@ a.plan-row-main:hover {
 /* The steps a step runs after: a tick each. */
 .pi-needs {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 2px;
 }
 .pi-need {
@@ -439,6 +453,7 @@ a.plan-row-main:hover {
   color: #7d818b;
 }
 .pi-need-title {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -474,11 +489,13 @@ a.plan-row-main:hover {
    wraps; under each, the sentence the agent reads. */
 .cr-wrap {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
 }
 .cr-list,
 .ts-list {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   margin: 0;
   padding: 0;
@@ -487,6 +504,7 @@ a.plan-row-main:hover {
 .cr,
 .ts {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   padding: 10px;
   border: 1px solid #23272e;
@@ -511,6 +529,7 @@ a.plan-row-main:hover {
 }
 .cr-measure {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
 }
 .cr-row {
@@ -583,6 +602,7 @@ a.plan-row-main:hover {
 }
 .run-steps {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   margin: 6px 0 0;
   padding: 0;
   border-top: 1px solid var(--color-line);
@@ -590,6 +610,7 @@ a.plan-row-main:hover {
 }
 .run-step {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   padding: 16px 0 18px;
   border-bottom: 1px solid var(--color-line);
@@ -718,10 +739,12 @@ a.plan-row-main:hover {
   position: relative;
   display: grid;
   grid-auto-flow: row;
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px;
 }
 .ptree-round {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
 }
 .ptree-node {
@@ -778,6 +801,7 @@ button.ptree-node {
 }
 .ptree-text {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
 }
 .ptree-title {
@@ -880,11 +904,13 @@ button.ptree-node {
 }
 .sv-picked-steps {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
   margin-top: 12px;
 }
 .sv-details {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   margin: 0;
   padding: 0;
@@ -940,6 +966,7 @@ button.ptree-node {
    the plan it proposed in its words, kept by kiln. */
 .ip {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   min-width: 0;
 }

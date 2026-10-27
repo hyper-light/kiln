@@ -679,9 +679,32 @@ impl Host {
         self.sessions.lock().values().filter(|s| matches!(s.core.lock().state.status, Status::Running | Status::Waiting)).count()
     }
 
-    /// Start a session (`id` keeps a known one's identity, e.g. one the server named).
+    /// Start a session (`id` keeps a known one's identity, e.g. one the server named). A subagent
+    /// opens as its parent runs here ([`Host::like_its_parent`]).
     pub fn open(&self, id: Option<String>, spec: Spec) -> anyhow::Result<Arc<Session>> {
+        let spec = self.like_its_parent(spec);
         self.open_seeded(id, spec, None, None, Vec::new(), false)
+    }
+
+    /// A subagent (`Spec::subagent`) whose parent runs on this machine takes what only the machine
+    /// knows of how its parent runs: the environment its parent was given (its shell's, or what a
+    /// take-over found: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, an API's address), so it has its parent's
+    /// account and configuration, and, in its parent's harness, its parent's program. What its own
+    /// spec says stays.
+    fn like_its_parent(&self, mut spec: Spec) -> Spec {
+        if !spec.subagent {
+            return spec;
+        }
+        let Some(parent) = spec.parent.as_deref().and_then(|p| self.get(p)) else { return spec };
+        let theirs = parent.spec.lock();
+        if spec.env.is_empty() {
+            spec.env.clone_from(&theirs.env);
+        }
+        if spec.program.is_none() && theirs.kind == spec.kind {
+            spec.program.clone_from(&theirs.program);
+        }
+        drop(theirs);
+        spec
     }
 
     /// Take over a session another runner handed this one (`super::moving`): its record where its
@@ -1949,12 +1972,15 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         last_turn: None,
         keep_off: false,
         held: None,
+        refused: None,
         move_on_limit: false,
         move_plan: Default::default(),
         pause_at: None,
         max_subagents: None,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
+        helper: spec.helper.clone(),
+        subagent: spec.subagent,
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
     };
@@ -3251,6 +3277,41 @@ while True:
     /// machine's record says it was taken over, and m2 reaches one harness.
     fn a_late_refusal_of_a_local_hand_over_taken_over_is_one_prompt() -> anyhow::Result<()> {
         local_hand_over(5)
+    }
+
+    /// A subagent opened beside its parent runs as its parent does here: its parent's environment
+    /// (the account and configuration it was given) and, in its harness, its program; what its own
+    /// spec says stays. An agent its parent started that isn't its subagent, and a subagent whose
+    /// parent runs elsewhere, open as they're asked.
+    #[test]
+    fn a_subagent_opens_with_its_parent_s_environment_and_program() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = sim(tx, None, Limits::default());
+            let env = vec![("CLAUDE_CONFIG_DIR".to_owned(), dir.path().join("work-account").to_string_lossy().into_owned())];
+            let parent = Spec { env: env.clone(), ..no_harness(dir.path()) };
+            let program = parent.program.clone();
+            host.open(Some("main".into()), parent)?;
+            let child = |subagent: bool| Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), parent: Some("main".into()), subagent, ..Spec::default() };
+            // Opened: it runs as its parent does (its parent's program, which can't start here).
+            host.open(Some("sub".into()), child(true))?;
+            let sub = host.get("sub").map(|s| s.spec.lock().clone()).ok_or_else(|| anyhow::anyhow!("the subagent didn't open"))?;
+            assert_eq!((&sub.env, &sub.program), (&env, &program), "its parent's account and program");
+            // The rest as each would open (none started: a spec without a program runs the machine's own harness).
+            let own = host.like_its_parent(Spec { env: vec![("CLAUDE_CONFIG_DIR".into(), "/its/own".into())], program: Some("/its/own/claude".into()), ..child(true) });
+            assert_eq!((own.env.first().map(|(_, v)| v.as_str()), own.program.as_deref()), (Some("/its/own"), Some("/its/own/claude")), "what it was given stays");
+            let other = host.like_its_parent(Spec { kind: "codex".into(), ..child(true) });
+            assert_eq!((&other.env, other.program.as_deref()), (&env, None), "in another harness, its parent's account but not its program");
+            let plain = host.like_its_parent(child(false));
+            assert!(plain.env.is_empty() && plain.program.is_none(), "an agent of its own opens as asked");
+            let far = host.like_its_parent(Spec { parent: Some("elsewhere".into()), ..child(true) });
+            assert!(far.env.is_empty() && far.program.is_none(), "its parent runs on another machine: nothing to copy");
+            for id in ["main", "sub"] {
+                let _ = host.close(id);
+            }
+            Ok(())
+        })
     }
 }
 

@@ -20,6 +20,7 @@
 import type http from "node:http";
 import type { WebSocket } from "ws";
 import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task, Todo } from "../src/api/harness.ts";
+import { defaultInfo, defaultMeta, defaultState, defaultTask } from "./defaults.ts";
 import { PROPOSED } from "./pages.ts";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
@@ -52,6 +53,7 @@ const CWD = "/home/ada/src/kiln";
 function member(id: string, kind: "claude" | "codex", target: string, name: string, status: AgentInfo["status"], mode: string, prompt: string, reply: string, extra: Partial<AgentInfo> = {}): Member {
   const at = t0 + (id === "fam-orch" ? 0 : 60_000);
   const info: AgentInfo = {
+    ...defaultInfo(),
     id,
     kind,
     kind_name: kind === "claude" ? "Claude Code" : "Codex",
@@ -81,6 +83,7 @@ function member(id: string, kind: "claude" | "codex", target: string, name: stri
 
 const migrApproval: Approval = {
   id: "fam-migr-ap1",
+  tool_id: null,
   tool_name: "Bash",
   tool: "shell",
   title: "cargo run --bin migrate -- --dry-run",
@@ -160,6 +163,7 @@ const family = new Map<string, Member>(
 // subagent too. It coordinates them, at work itself on nothing.
 const fanApproval: Approval = {
   id: "fan-s3-ap1",
+  tool_id: null,
   tool_name: "Bash",
   tool: "shell",
   title: "cargo run --bin chaos -- --partition 2",
@@ -314,6 +318,7 @@ for (const m of [
   if (m) {
     m.tasks = [
       {
+        ...defaultTask(),
         id: "a-planner",
         tool_id: "toolu_planner",
         description: "Plan the planner goal",
@@ -328,6 +333,7 @@ for (const m of [
         stoppable: true,
       },
       {
+        ...defaultTask(),
         id: "a-opt",
         tool_id: "toolu_opt",
         description: "Plan the API optimization goal",
@@ -721,6 +727,7 @@ function descendants(id: string, all: AgentInfo[], live: boolean): AgentInfo[] {
 }
 
 const META: Meta = {
+  ...defaultMeta(),
   version: "2.3.1",
   modes: [
     { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
@@ -776,6 +783,7 @@ function subagentQueue(m: Member, c: { type?: string; id?: string; text?: string
 
 function stateOf(m: Member): State {
   return {
+    ...defaultState(),
     status: m.info.status,
     cwd: m.info.cwd,
     model: m.info.model,
@@ -790,7 +798,7 @@ function stateOf(m: Member): State {
     todos: m.info.id === "fam-orch" ? ORCH_TODOS : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
-  } as State;
+  };
 }
 
 /** A family member's socket: its snapshot. */
@@ -1003,6 +1011,27 @@ async function handleAttached(req: http.IncomingMessage, res: http.ServerRespons
   return false;
 }
 
+/** What a person asked about (agents.about), and the helpers answering. */
+interface AboutQ {
+  path: string;
+  line?: number;
+  selection?: string;
+  change?: boolean;
+}
+const helpers = new Map<string, { at: number; q: AboutQ; name: string }>();
+let aboutSeq = 0;
+
+/** A helper's answer, in the four parts (ABOUT_PARTS in crates/kiln/src/harness/ops.rs). */
+function aboutAnswer(q: AboutQ): [string, string][] {
+  const what = q.change ? "This change" : q.selection ? `\`${q.selection}\`` : `Line ${q.line ?? ""}`;
+  return [
+    ["What it is", `${what}, in \`${q.path}\`${q.line ? ` at line ${q.line}` : ""}: the retry delay for the next attempt, from 100 ms doubling with each one, with full jitter, at most 30 s.`],
+    ["What it does here", "It picks how long this loop sleeps before trying again; `.min(deadline - now)` keeps the last sleep from running past the request's deadline."],
+    ["Used elsewhere", "- `crates/kiln/src/http/retry.rs:31` `pub fn next(&mut self, now: Instant) -> Duration {`\n- `crates/kiln/src/rt/timer.rs:88` `let wait = reconnect.next(now);`\n- `crates/kiln/tests/retry.rs:24` `assert!(b.next(t0) <= Duration::from_millis(200));`"],
+    ["Worth knowing", "It counts attempts, so calling it twice in one pass skips a step. **The test at `tests/retry.rs:24` is the flaky one**: it compares against wall-clock time the jitter can overshoot."],
+  ];
+}
+
 export async function handleFamily(req: http.IncomingMessage, res: http.ServerResponse, url: URL, others: () => AgentInfo[]): Promise<boolean> {
   if (await handleRun(req, res, url)) return true;
   if (await handleAttached(req, res, url)) return true;
@@ -1053,6 +1082,48 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
       until: "settled",
       agents: ids.map((id) => all().find((a) => a.id === id)).map((a, i) => (a ? brief(a) : { id: ids[i], stand: "ended", closed: true })),
     });
+    return true;
+  }
+  // agents.about: a helper of the agent reads, searches, then answers in four parts, a part a moment, as a real one streams.
+  const ab = p.match(/^\/api\/harness\/agents\/([^/]+)\/about$/);
+  if (ab && m === "POST") {
+    const q = await body<AboutQ>(req);
+    const owner = all().find((x) => x.id === decodeURIComponent(ab[1] ?? ""));
+    if (!owner) json(res, 404, { error: "no such agent" });
+    else if (owner.max_subagents === 0) json(res, 200, { agents: [], itself: true, sent: { sent: true } });
+    else {
+      const id = `about-${++aboutSeq}`;
+      const name = `About ${q.selection ?? q.path.split("/").pop() ?? "this"}`;
+      helpers.set(id, { at: Date.now(), q, name });
+      json(res, 200, { agents: [{ id, name, kind: owner.kind, status: "running", stand: "working" }], itself: false });
+    }
+    return true;
+  }
+  const hr = p.match(/^\/api\/harness\/agents\/(about-\d+)\/(result|stop)$/);
+  if (hr) {
+    const id = hr[1] ?? "";
+    const h = helpers.get(id);
+    if (!h) json(res, 404, { error: "it ended" });
+    else if (hr[2] === "stop") {
+      helpers.delete(id);
+      json(res, 200, { ended: [id] });
+    } else {
+      const t = (Date.now() - h.at) / 1000;
+      const parts = aboutAnswer(h.q);
+      const shown = Math.max(0, Math.min(parts.length, Math.floor((t - 1.6) / 0.9) + 1));
+      const done = t > 1.6 + parts.length * 0.9;
+      const text = parts
+        .slice(0, shown)
+        .map(([head, said]) => `## ${head}\n${said}`)
+        .join("\n\n");
+      const doing = t < 0.8 ? `Reading ${h.q.path}` : t < 1.6 ? `Searching the repository for “${h.q.selection ?? "this"}”` : undefined;
+      json(res, 200, {
+        agent: { id, name: h.name, kind: "claude", status: "running", stand: done ? "finished" : "working", doing, model: "sonnet" },
+        reply: text ? { text, at: Date.now() } : null,
+        last_turn: done ? { ok: true } : null,
+        cost_usd: done ? 0.01 : 0,
+      });
+    }
     return true;
   }
   const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt|change|workspace|land))?$/);

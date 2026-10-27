@@ -4,9 +4,10 @@
  */
 import * as React from "react";
 import { Bot, Square } from "lucide-react";
-import { useSession, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
+import { useSession, type AgentInfo, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
-import { changesetOf, duration, editsOf, money, relPath, runsOf, taskDot, taskLive, tokens, useSameList, type FileChange, type ToolEvent } from "./derive";
+import { agentLabel, changesetOf, duration, editsOf, money, relPath, runsOf, taskDot, taskLive, tokens, useSameList, type ChangedFile, type ToolEvent } from "./derive";
+import { kilnStatus } from "./tasks";
 import { DiffStat, FileDiffView } from "./diff";
 import { Output, Prose } from "./parts";
 import { LimitMeter, StatusList } from "./limits";
@@ -26,10 +27,10 @@ import { WorkspaceBar } from "./workspace-bar";
 import { SubagentOutput } from "./task-output";
 
 const NO_EVENTS: HEvent[] = [];
+const NO_AGENTS: readonly AgentInfo[] = [];
 
 /** Three places beside the conversation: what it changed, its plan (and goals, and saved plans to run), and its tools (what it has running, subagents, commands it ran, MCP, skills, usage). */
 export type InspectorTab = "changes" | "plan" | "tools";
-
 
 /** Large tool inventories start folded; hiding them keeps searches and unfinished forms intact. */
 /** A section that folds, closed until opened (what's in it is long, or read only once it's open). */
@@ -42,7 +43,7 @@ function ToolSection({ id, title, count, children }: { id: string; title: string
 }
 
 /** The server's cumulative changeset as the file list and diffs show it (one diff per file). */
-function fromServer(files: ServerChange[]): FileChange[] {
+function fromServer(files: ServerChange[]): ChangedFile[] {
   return files.map((f) => ({
     path: f.path,
     tree: f.tree,
@@ -73,9 +74,9 @@ export const Changes = React.memo(function Changes({
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
   // A file in another working tree than its folder's (a worktree it left, the checkout it went
   // from) is shown where it is; in its folder's, by its path there.
-  const nameOf = (f: FileChange) => relPath(f.tree && f.tree !== cwd && !cwd.startsWith(`${f.tree}/`) ? `${f.tree}/${f.path}` : f.path, cwd);
+  const nameOf = (f: ChangedFile) => relPath(f.tree && f.tree !== cwd && !cwd.startsWith(`${f.tree}/`) ? `${f.tree}/${f.path}` : f.path, cwd);
   const [sel, setSel] = React.useState<string | null>(null);
-  const shown: FileChange[] = sel ? files.filter((f) => nameOf(f) === sel) : files;
+  const shown: ChangedFile[] = sel ? files.filter((f) => nameOf(f) === sel) : files;
   const add = files.reduce((n, f) => n + f.add, 0);
   const del = files.reduce((n, f) => n + f.del, 0);
   const wsBar = agentId && volumeOver ? <WorkspaceBar agentId={agentId} over={volumeOver} /> : null;
@@ -202,9 +203,42 @@ function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number;
   );
 }
 
-export function Subagents({ state, meta, store, onOpen }: { state: State | null; meta: Meta | null; store: SessionStore; onOpen?: (toolId: string) => void }) {
+/** A subagent kiln started for one of its goals or plan steps (a session of its own): where it stands, what it's at; it opens its thread here. */
+function KilnRow({ a, onOpen }: { a: AgentInfo; onOpen?: (id: string) => void }) {
+  const status = kilnStatus(a);
+  return (
+    <li className="hx-task">
+      <div className="hx-task-head">
+        <i className="dot" data-status={status === "running" ? "running" : status === "failed" ? "failed" : status === "completed" ? "succeeded" : "pending"} aria-hidden="true" />
+        <Bot size={12} className="text-[var(--color-subtle)]" />
+        <button type="button" className="hx-task-title" disabled={!onOpen} onClick={() => onOpen?.(a.id)}>
+          {agentLabel(a)}
+        </button>
+      </div>
+      <div className="hx-task-meta">
+        <span>{a.kind_name}</span>
+        <span>{status}</span>
+        {status === "running" && a.doing && <span className="hx-trunc">{a.doing}</span>}
+      </div>
+    </li>
+  );
+}
+
+export function Subagents({
+  state,
+  meta,
+  store,
+  onOpen,
+  kiln = NO_AGENTS,
+}: {
+  state: State | null;
+  meta: Meta | null;
+  store: SessionStore;
+  onOpen?: (toolId: string) => void;
+  kiln?: readonly AgentInfo[];
+}) {
   const tasks = (state?.tasks ?? []).filter((t) => !isBackground(t));
-  if (tasks.length === 0) return <div className="hx-empty">No subagents yet.</div>;
+  if (tasks.length === 0 && kiln.length === 0) return <div className="hx-empty">No subagents yet.</div>;
   const canStop = meta?.features.includes("stop_task") ?? false;
   // Children under their parents.
   const kids = new Map<string, Task[]>();
@@ -219,6 +253,7 @@ export function Subagents({ state, meta, store, onOpen }: { state: State | null;
     for (const k of kids.get(t.id) ?? []) walk(k, d + 1);
   };
   roots.forEach((t) => walk(t, 0));
+  for (const a of kiln) rows.push(<KilnRow key={a.id} a={a} onOpen={onOpen} />);
   return <ul className="hx-tasks">{rows}</ul>;
 }
 
@@ -298,7 +333,10 @@ export function Inspector({
   agentId,
   harness,
   send,
+  kiln = NO_AGENTS,
 }: {
+  /** The subagents kiln started for its goals or plan steps (sessions of their own), listed with its harness's own. */
+  kiln?: readonly AgentInfo[];
   /** The agent, and how to send it commands (background tasks: output, stop). */
   agentId?: string;
   /** The agent's harness, by name ("Claude Code"). */
@@ -337,11 +375,12 @@ export function Inspector({
     return e?.kind === "tool" ? ((e.input as { plan?: string } | null)?.plan ?? e.output ?? "") : "";
   }, [events, tab]);
   const tasks = (state?.tasks ?? []).filter((t) => !isBackground(t));
+  const subagents = tasks.length + kiln.length;
   const mcp = state?.mcp ?? [];
   const tabs: { id: InspectorTab; label: string; count?: string }[] = [
     { id: "changes", label: "Changes", count: fileCount ? String(fileCount) : undefined },
     { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : undefined },
-    { id: "tools", label: "Tools", count: tasks.length ? String(tasks.length) : mcp.length ? `${mcp.filter((m) => m.status === "connected").length}/${mcp.length}` : undefined },
+    { id: "tools", label: "Tools", count: subagents ? String(subagents) : mcp.length ? `${mcp.filter((m) => m.status === "connected").length}/${mcp.length}` : undefined },
   ];
   return (
     <div className={cn("hx-inspector", className)}>
@@ -409,9 +448,9 @@ export function Inspector({
                 <LivePages session={agentId} />
               </Fold>
             )}
-            {tasks.length > 0 && (
-              <ToolSection id="subagents" title="Subagents" count={tasks.length}>
-                <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} />
+            {subagents > 0 && (
+              <ToolSection id="subagents" title="Subagents" count={subagents}>
+                <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} kiln={kiln} />
               </ToolSection>
             )}
             <ToolSection id="mcp" title="MCP servers" count={state?.mcp?.length}>

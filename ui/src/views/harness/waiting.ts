@@ -7,7 +7,7 @@
  * the agents' routes need): one who may not gets no cards, and kiln isn't asked (it would refuse).
  */
 import { events } from "@/api/events";
-import { harnessApi, type AgentInfo } from "@/api/harness";
+import { harnessApi, listed, type AgentInfo } from "@/api/harness";
 import { useAuth } from "@/lib/auth";
 import { atLimit, notable, stoppedItself } from "./cards";
 
@@ -76,7 +76,7 @@ async function read() {
 
 function start() {
   const offEvents = events.on((ev) => {
-    if (ev.type === "harness") {
+    if (ev.type === "harness" && listed(ev.info)) {
       agents.set(ev.info.id, ev.info);
       if (changed(ev.info, ev.info.id)) publish();
     } else if (ev.type === "harness_closed") {

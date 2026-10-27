@@ -5,7 +5,25 @@
  * the files it read, the subagent it started.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUpRight, ChevronRight, CircleAlert, Copy, CornerDownRight, Download, FileDown, GitBranch, GitFork, Info, Pencil, Reply, SquarePlus, TriangleAlert, Undo2, X } from "lucide-react";
+import {
+  ArrowDown,
+  ArrowUpRight,
+  ChevronRight,
+  CircleAlert,
+  Copy,
+  CornerDownRight,
+  Download,
+  FileDown,
+  GitBranch,
+  GitFork,
+  Info,
+  Pencil,
+  Reply,
+  SquarePlus,
+  TriangleAlert,
+  Undo2,
+  X,
+} from "lucide-react";
 import { useSession, type Approval, type Command, type Compacting, type Delivery, type HEvent, type Meta, type Outgoing, type QueueItem, type SessionStore, type Task } from "@/api/harness";
 import { useNavigate } from "@/lib/router";
 import { useNow } from "@/lib/hooks";
@@ -34,7 +52,7 @@ import {
 import { ApprovalCard, type Decide } from "./approval";
 import { DiffStat, FileDiffView } from "./diff";
 import { MsgMenu, type MenuGroup, type MenuRow } from "./msgmenu";
-import { SpawnDialog } from "./spawn";
+import { startFrom } from "./new-agent-draft";
 import { fileUrl, keptFor, kindOf, resolvePath } from "./files";
 import { toast } from "@/components/ui/toast";
 import { Button } from "@/components/ui/button";
@@ -55,6 +73,7 @@ import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
 import { useHeld, useRecent } from "./dom";
 import { unsending } from "./unsend";
+import { Highlighted } from "@/components/code/highlighted";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
@@ -214,7 +233,9 @@ function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
       <button type="button" className="hx-cmd-head" aria-expanded={open} onClick={() => setOpen(!open)}>
         <i className="dot" data-status={dotFor(failed ? "error" : c.status)} aria-hidden="true" />
         {typeof c.runner === "string" && <Where runner={c.runner} />}
-        <code className="hx-cmd-line">{c.title}</code>
+        <code className="hx-cmd-line">
+          <Highlighted text={c.title} lang="bash" />
+        </code>
         <span className="hx-cmd-meta">
           {c.exit_code !== undefined && <span className={failed ? "hx-bad" : "hx-good"}>exit {c.exit_code}</span>}
           {c.status === "running" ? <Elapsed from={c.started} /> : c.ended ? <span className="hx-meta-num">{duration(c.ended - c.started)}</span> : null}
@@ -324,7 +345,11 @@ function ToolBody({ calls }: { calls: ToolEvent[] }) {
               lastOf.get(r.id) === i && <ResearchCard id={r.id} />
             ) : (
               <>
-                {input && (c.server || c.tool === "other" || c.tool === "mcp") && <pre className="hx-pre hx-tool-input">{input}</pre>}
+                {input && (c.server || c.tool === "other" || c.tool === "mcp") && (
+                  <pre className="hx-pre hx-tool-input">
+                    <Highlighted text={input} lang="json" />
+                  </pre>
+                )}
                 {c.output && <Output text={c.output} truncated={c.truncated} error={c.status === "error"} />}
               </>
             )}
@@ -780,7 +805,6 @@ const Prompt = React.memo(function Prompt({
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(e.text);
   const [unsent, setUnsent] = React.useState(false);
-  const [spawning, setSpawning] = React.useState(false);
   const queued = delivery === "queued" && Boolean(queueItem || e.client_id);
   const navigate = useNavigate();
   const why = delivery ? DELIVERY[delivery] : "sent";
@@ -848,7 +872,7 @@ const Prompt = React.memo(function Prompt({
         },
         ...(!onCommand ? [] : [{ label: "Go back", rows: goBackRows(e, meta, onCommand, kindName) }]),
         filesGroup,
-        { rows: [{ icon: <SquarePlus size={13} />, label: "Start new agent on this", onSelect: () => setSpawning(true) }] },
+        { rows: [{ icon: <SquarePlus size={13} />, label: "Start new agent on this", onSelect: () => startFrom(navigate, { ...spawn, prompt: e.text, from: "From your message" }) }] },
       ];
   return (
     // The swipe's pointer capture retargets moves to the wrap: the hold-to-copy shares these
@@ -923,9 +947,6 @@ const Prompt = React.memo(function Prompt({
           <div className="hx-prompt-text">{e.text}</div>
         )}
       </div>
-      {spawning && (
-        <SpawnDialog open={spawning} onOpenChange={setSpawning} defaults={{ ...spawn, prompt: e.text }} onStarted={(started) => navigate(started[0] ? `/agents/${started[0].id}` : "/agents")} />
-      )}
     </div>
   );
 });
@@ -1050,18 +1071,20 @@ function Said({
   spawn?: { target?: string; cwd?: string; kind?: string };
 }) {
   const navigate = useNavigate();
-  const [spawning, setSpawning] = React.useState(false);
   const hold = useHoldCopy(() => item.event.text);
   const replyTo = (item.event as { reply_to?: string }).reply_to;
   return (
     <div className="hx-said" data-ev={item.event.id} data-held={hold.held || undefined} tabIndex={-1} {...hold.props}>
       {/* The menu floats right: it has to come first, the quote's and the text's lines wrap around it. */}
       {!item.event.streaming && item.event.text && (
-        <MsgMenu groups={saidGroups(item.event, who ?? "Agent", onReply, () => setSpawning(true))} label="Actions on this message" className="hx-said-menu" />
+        <MsgMenu
+          groups={saidGroups(item.event, who ?? "Agent", onReply, () => startFrom(navigate, { ...spawn, prompt: item.event.text, from: `From ${who ?? "the agent"}'s message` }))}
+          label="Actions on this message"
+          className="hx-said-menu"
+        />
       )}
       {replyTo && lookup && <Quote id={replyTo} lookup={lookup} />}
       <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} streaming={item.event.streaming} />
-      {spawning && <SpawnDialog open={spawning} onOpenChange={setSpawning} defaults={{ ...spawn, prompt: item.event.text }} onStarted={(s) => navigate(s[0] ? `/agents/${s[0].id}` : "/agents")} />}
     </div>
   );
 }
@@ -1215,15 +1238,19 @@ function OutcomeBody({
   spawn?: { target?: string; cwd?: string; kind?: string };
 }) {
   const navigate = useNavigate();
-  const [spawning, setSpawning] = React.useState(false);
   const hold = useHoldCopy(() => outcome.text);
   return (
     <div className="hx-outcome-body" data-ev={outcome.id} data-held={hold.held || undefined} {...hold.props}>
       {/* The menu floats right: it has to come first, the quote's and the text's lines wrap around it. */}
-      {outcome.text && <MsgMenu groups={saidGroups(outcome, who ?? "Agent", onReply, () => setSpawning(true))} label="Actions on the answer" className="hx-outcome-menu" />}
+      {outcome.text && (
+        <MsgMenu
+          groups={saidGroups(outcome, who ?? "Agent", onReply, () => startFrom(navigate, { ...spawn, prompt: outcome.text, from: `From ${who ?? "the agent"}'s answer` }))}
+          label="Actions on the answer"
+          className="hx-outcome-menu"
+        />
+      )}
       {outcome.reply_to && lookup && <Quote id={outcome.reply_to} lookup={lookup} />}
       <Prose text={outcome.text} seq={outcome.seq} />
-      {spawning && <SpawnDialog open={spawning} onOpenChange={setSpawning} defaults={{ ...spawn, prompt: outcome.text }} onStarted={(s) => navigate(s[0] ? `/agents/${s[0].id}` : "/agents")} />}
     </div>
   );
 }

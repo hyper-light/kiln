@@ -647,42 +647,6 @@ button.rv-num:focus-visible {
   padding: 10px 4px;
 }
 
-/* ---------------------------------------------------------------- syntax (the editor's colours) */
-
-.hl-prop {
-  color: #a6c4ed;
-}
-.hl-str {
-  color: #b8d9d2;
-}
-.hl-num {
-  color: #d8cbb0;
-}
-.hl-com {
-  color: #6d7078;
-  font-style: italic;
-}
-.hl-kw,
-.hl-punct {
-  color: #8c8f98;
-}
-.hl-meta {
-  color: #b8a6d5;
-}
-.hl-type {
-  color: #c9d6e6;
-}
-.hl-fn {
-  color: #dfe3ea;
-}
-.hl-strong {
-  color: var(--rv-text);
-  font-weight: 500;
-}
-.hl-link {
-  color: #a6c4ed;
-}
-
 @media (max-width: 760px) {
   .rv-title {
     font-size: 22px;

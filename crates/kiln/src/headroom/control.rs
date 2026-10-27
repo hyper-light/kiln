@@ -104,7 +104,7 @@ pub async fn push(hub: &Hub, machine: &str) {
 pub async fn on_caps(hub: &Hub, machine: &str, caps: u64) {
     if caps & CAP_HEADROOM != 0 {
         push(hub, machine).await;
-        hub.emit(&json!({ "type": "headroom", "runner": machine }));
+        hub.emit(&crate::wire::events::ServerEvent::Headroom { runner: machine.to_string() });
     }
 }
 
@@ -123,7 +123,7 @@ pub fn on_status(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
         changed
     };
     if changed {
-        hub.emit(&json!({ "type": "headroom", "runner": machine }));
+        hub.emit(&crate::wire::events::ServerEvent::Headroom { runner: machine.to_string() });
     }
 }
 
@@ -184,6 +184,6 @@ pub async fn put(hub: &Hub, name: &str, req: Request) -> Answer {
     hub.headrooms.inner.lock().entry(name.to_owned()).or_default().settings = Some(settings.clone());
     hub.store.audit("admin".into(), "headroom.update".into(), format!("{name}: enabled={} fingerprint={}", settings.enabled, settings.fingerprint())).await;
     push(hub, name).await;
-    hub.emit(&json!({ "type": "headroom", "runner": name }));
+    hub.emit(&crate::wire::events::ServerEvent::Headroom { runner: name.to_string() });
     Ok(srv::json(StatusCode::OK, &view(hub, name)))
 }

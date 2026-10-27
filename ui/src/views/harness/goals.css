@@ -7,6 +7,7 @@
 .gs-panel {
   position: relative;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
   min-width: 0;
   padding: 14px 14px 16px;
@@ -97,6 +98,7 @@
 /* The chain. */
 .gs-chain {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   margin: 2px 0 0;
   padding: 0;
   list-style: none;
@@ -269,6 +271,7 @@
 }
 .gs-edit {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
 }
 .gs-actions,
@@ -345,6 +348,7 @@
   position: relative;
   grid-column: 1 / -1;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -403,6 +407,7 @@
 }
 .gp-text {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
 }
 .gp-title {
@@ -541,6 +546,7 @@
 .gp-live {
   grid-column: 2 / -1;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
   min-width: 0;
   margin-top: 6px;
