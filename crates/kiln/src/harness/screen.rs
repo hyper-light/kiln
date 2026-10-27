@@ -219,6 +219,11 @@ fn command_line(windows: bool, cwd: &str, program: &[&str], start: Option<&str>,
             "& (Get-Process -Id $PID).Path -NoLogo".to_owned()
         } else {
             let mut words: Vec<String> = program.iter().map(|w| q(w)).collect();
+            // The program, never a script of its name: PowerShell would take npm's `codex.ps1`
+            // over `codex.cmd`, and refuse it where it runs no scripts (Windows' default).
+            if let Some(exe) = words.first_mut() {
+                *exe = format!("(Get-Command -CommandType Application -TotalCount 1 {exe})");
+            }
             words.extend(start.map(q));
             format!("& {}", words.join(" "))
         };
@@ -244,7 +249,8 @@ mod tests {
         assert_eq!(command_line(false, "/home/a/it's", &[], None, "kiln-agent:x:shell"), r#"cd -- '/home/a/it'\''s' 2>/dev/null; exec "$SHELL" -l # kiln-agent:x:shell"#);
         assert_eq!(command_line(false, "/w", &["claude"], Some("/permissions"), "m"), "cd -- '/w' && exec 'claude' '/permissions' # m");
         assert_eq!(command_line(false, "", &["goose", "session"], None, "m"), "exec 'goose' 'session' # m");
-        assert_eq!(command_line(true, r"C:\it's", &["codex"], None, "m"), r"Set-Location -LiteralPath 'C:\it''s'; & 'codex' # m");
+        assert_eq!(command_line(true, r"C:\it's", &["codex"], None, "m"), r"Set-Location -LiteralPath 'C:\it''s'; & (Get-Command -CommandType Application -TotalCount 1 'codex') # m");
+        assert_eq!(command_line(true, "", &["goose", "session"], None, "m"), "& (Get-Command -CommandType Application -TotalCount 1 'goose') 'session' # m");
         assert_eq!(command_line(true, r"C:\w", &[], None, "m"), r"Set-Location -LiteralPath 'C:\w'; & (Get-Process -Id $PID).Path -NoLogo # m");
     }
 
