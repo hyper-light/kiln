@@ -6,11 +6,16 @@
  * does.
  */
 import type http from "node:http";
-import type { ShipChange, ShipCommit, ShipPage, ShipPip } from "../src/api/ship.ts";
+import type { ShipChange, ShipCommit, ShipDetail, ShipPage, ShipPip } from "../src/api/ship.ts";
+import { Trunk } from "./ship-sim.ts";
 
 interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
 }
+
+/** kiln's own trunk, simulated (ship-sim.ts); `MOCK_SHIP=static` serves the fixed rows alone, for
+ * tests that need the same page every time. `MOCK_SHIP_SPEED`: simulated seconds per second. */
+const trunk = process.env.MOCK_SHIP === "static" ? null : new Trunk("hyper-light/kiln", Number(process.env.MOCK_SHIP_SPEED ?? 12) || 12);
 
 const REPO = "hyper-light/kiln";
 const now = () => Math.floor(Date.now() / 1000);
@@ -182,11 +187,64 @@ function commits(): ShipCommit[] {
   ];
 }
 
-export function handleShip(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: Ctx): boolean {
-  if (url.pathname !== "/api/ship/commits" || (req.method ?? "GET") !== "GET") return false;
+/** Every row: the trunk's commits (newest first), then the fixed ones. */
+const all = (): ShipCommit[] => [...(trunk?.commits() ?? []), ...commits()];
+
+/** Ship's routes, and the actions its rows name for the trunk's own ids (`ship-run-…`,
+ * `ship-rel-…`, a trunk runner whose upgrade failed), so they answer before the routes the rest of
+ * the mock keeps for those paths. True when it answered. */
+export async function handleShip(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: Ctx): Promise<boolean> {
+  const p = url.pathname;
+  const m = req.method ?? "GET";
   const q = url.searchParams;
-  const list = commits().filter((c) => (!q.get("host") || c.host === q.get("host")) && (!q.get("kind") || c.kind === q.get("kind")) && (q.get("lens") !== "review" || c.kind !== "commit"));
-  const page: ShipPage = { commits: list, next_cursor: null };
-  ctx.json(res, 200, page);
-  return true;
+  if (p === "/api/ship/commits" && m === "GET") {
+    const repo = q.get("repo");
+    const list = all().filter(
+      (c) => (!repo || c.repo === repo) && (!q.get("host") || c.host === q.get("host")) && (!q.get("kind") || c.kind === q.get("kind")) && (q.get("lens") !== "review" || c.kind !== "commit"),
+    );
+    const page: ShipPage = { commits: list, next_cursor: null };
+    ctx.json(res, 200, page);
+    return true;
+  }
+  const one = m === "GET" ? p.match(/^\/api\/ship\/commits\/(.+)\/([0-9a-f]{7,40})$/) : null;
+  if (one) {
+    const [, repo, sha] = one;
+    const detail: ShipDetail | null = trunk?.detail(sha ?? "") ?? all().find((c) => c.repo === repo && c.sha.startsWith(sha ?? "")) ?? null;
+    if (!detail || detail.repo !== repo) ctx.json(res, 404, { error: "no such commit" });
+    else ctx.json(res, 200, detail);
+    return true;
+  }
+  if (!trunk || m !== "POST") return false;
+  const ok = (done: boolean) => (ctx.json(res, done ? 200 : 409, done ? { ok: true } : { error: "not now" }), true);
+  const rel = p.match(/^\/api\/deploy\/releases\/(ship-rel-[^/]+)\/(approve|reject)$/);
+  if (rel) return ok(rel[2] === "approve" ? trunk.approve(rel[1] ?? "") : trunk.hold(rel[1] ?? ""));
+  const rerun = p.match(/^\/api\/ci\/runs\/(ship-run-[^/]+)\/rerun$/);
+  if (rerun) return ok(trunk.retry(rerun[1] ?? ""));
+  const runner = p.match(/^\/api\/updates\/runners\/([^/]+)$/);
+  if (runner && trunk.failedRunner(decodeURIComponent(runner[1] ?? ""))) return ok(trunk.retryRunner(decodeURIComponent(runner[1] ?? "")));
+  if (p === "/api/mock/ship/burst") {
+    trunk.burst(Math.min(Number(q.get("n") ?? 14) || 14, 100));
+    return ok(true);
+  }
+  if (p === "/api/attachments") {
+    // Peek: a hand-off of one of the trunk's runs is ours; anything else goes on to the mock's
+    // agents, the same bytes replayed for whoever reads the body next.
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const raw = Buffer.concat(chunks);
+    Object.defineProperty(req, Symbol.asyncIterator, {
+      configurable: true,
+      value: async function* () {
+        yield raw;
+      },
+    });
+    let run: unknown;
+    try {
+      run = (JSON.parse(raw.toString("utf8") || "{}") as { run?: unknown }).run;
+    } catch {
+      run = undefined;
+    }
+    if (typeof run === "string" && run.startsWith("ship-run-")) return ok(trunk.handOff(run));
+  }
+  return false;
 }

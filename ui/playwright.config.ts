@@ -28,7 +28,7 @@ export default defineConfig({
     : {
         command: "npx tsx mock/server.ts",
         url: `http://127.0.0.1:${PORT}/agents/programs`,
-        env: { MOCK_NO_AUTH: "1", PORT: String(PORT), HOST: "127.0.0.1" },
+        env: { MOCK_NO_AUTH: "1", MOCK_SHIP: "static", PORT: String(PORT), HOST: "127.0.0.1" },
         reuseExistingServer: false,
         timeout: 60_000,
       },
