@@ -28,6 +28,11 @@
 //!
 //! Pure, as docs/ci.md §0.3 asks: no clock, disk or randomness beyond the seed given; state is
 //! kept in ordered maps, so the same trace, policy and seed give the same outcome, byte for byte.
+//!
+//! The replay measures and reports, and models the week it replays with draws and shares: float
+//! arithmetic is allowed here, as in `sim`'s measurements. The engine it drives decides in integers
+//! (docs/ci.md, docs/needs.md E1).
+#![allow(clippy::float_arithmetic)]
 
 pub mod draw;
 pub mod land;

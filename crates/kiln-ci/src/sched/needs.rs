@@ -183,7 +183,9 @@ fn quote(v: &str) -> Result<String, String> {
 }
 
 /// Bytes as the spelling writes them: `32g`, `32G`, `32GB`, `32Gi` and `512m` are binary, and a
-/// plain number is bytes.
+/// plain number is bytes. An edge of the engine's integers (`super::units`): what people write,
+/// read as the bytes it says.
+#[allow(clippy::float_arithmetic)]
 pub fn size(s: &str) -> Option<u64> {
     let s = s.trim().to_ascii_lowercase();
     let (num, unit) = s.split_at(s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len()));
@@ -241,7 +243,8 @@ pub fn gpus(n: u32) -> String {
     }
 }
 
-/// `32 GiB`, `512 MiB`, `1.5 TiB`.
+/// `32 GiB`, `512 MiB`, `1.5 TiB`: for people, to a tenth.
+#[allow(clippy::float_arithmetic)]
 pub fn show_size(n: u64) -> String {
     let units = [(1u64 << 40, "TiB"), (1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")];
     units

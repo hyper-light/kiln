@@ -200,7 +200,9 @@ impl Sim {
         }
     }
 
-    /// Each repository's share of the slot-time in `[from, to)`.
+    /// Each repository's share of the slot-time in `[from, to)`: a measurement of what the engine
+    /// did, for tests and the bench, not a decision.
+    #[allow(clippy::float_arithmetic)]
     pub fn shares(&self, from: i64, to: i64) -> HashMap<String, f64> {
         let mut by: HashMap<String, f64> = HashMap::new();
         for (repo, s, e) in &self.busy {
@@ -217,7 +219,8 @@ impl Sim {
     }
 
     /// Each group's share of the slot-time in `[from, to)`, legs grouped by `key` (their actor, their
-    /// lane).
+    /// lane): a measurement, as [`Self::shares`] is.
+    #[allow(clippy::float_arithmetic)]
     pub fn shares_by(&self, from: i64, to: i64, key: impl Fn(&str) -> String) -> HashMap<String, f64> {
         let mut by: HashMap<String, f64> = HashMap::new();
         for (leg, s, e) in &self.busy_legs {

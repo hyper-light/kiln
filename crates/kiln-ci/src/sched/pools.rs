@@ -214,7 +214,7 @@ impl PoolSpec {
             min_idle: self.min_idle,
             max,
             per_host_max: self.per_host_max.unwrap_or(max).max(1),
-            idle_timeout_ms: (idle * 1000.0) as i64,
+            idle_timeout_ms: i64::try_from(super::units::ms_of_secs(idle).unwrap_or(600_000)).unwrap_or(i64::MAX),
             request,
             caps: 0,
             hosted: self.executor == "k8s",

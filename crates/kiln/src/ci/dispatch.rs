@@ -399,7 +399,7 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
     // runners are nothing to them.
     let keeps = job.is_some_and(|j| kiln_ci::work::slots::warm(j.kiln.work.as_ref()).is_some());
     let lane = (keeps && !r.cold).then(|| kiln_ci::work::slots::placement(&kiln_ci::work::slots::lane_for(&r.repo.name, &r.path, &spec.job, &spec.matrix, String::new())).hex());
-    let cold = lane.as_deref().and_then(|l| kiln_ci::work::slots::cold_ms(warm.values().map(|(_, s)| s), l)).map(|ms| ms as f64 / 1000.0);
+    let cold = lane.as_deref().and_then(|l| kiln_ci::work::slots::cold_ms(warm.values().map(|(_, s)| s), l));
     let mut prefer = job.map(|j| kiln_ci::sched::routing::preferences(&j.kiln.prefer)).unwrap_or_default();
     if r.cold {
         prefer.retain(|p| !p.warm && p.affinity.is_none());
@@ -417,7 +417,8 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         exclusive: job.is_some_and(|j| j.kiln.exclusive),
         group,
         retry,
-        cost: r.costs.get(&spec.job).copied(),
+        // History's seconds, in the engine's milliseconds (docs/needs.md, E1).
+        cost: r.costs.get(&spec.job).copied().and_then(kiln_ci::sched::units::ms_of_secs),
         // On a `k8s` pool, a pod of its own, its containers in it (W13-R07); a kiln-dialect leg
         // that sets its `toolchain:`, `image:` or `resources:`, v1's job pod (W02-R06).
         own_executor: job.is_some_and(|j| j.container.is_some() || !j.services.is_empty() || (spec.workflow.dialect == Some(kiln_ci::expr::Dialect::Kiln) && super::pools::sets_pod(j))),
@@ -439,9 +440,10 @@ fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config 
     let (s, f) = (&hub.cfg.ci.scheduler, &hub.cfg.ci.fairness);
     Config {
         rules,
-        aging_per_minute: s.aging_per_minute,
-        default_cost: s.default_cost_seconds,
-        weights: f.weights.clone(),
+        // Config's numbers, in the engine's integers (docs/needs.md, E1).
+        aging_per_minute: kiln_ci::sched::units::thousandths_of(s.aging_per_minute),
+        default_cost: kiln_ci::sched::units::ms_of_secs(s.default_cost_seconds).unwrap_or(kiln_ci::sched::Config::default().default_cost),
+        weights: f.weights.iter().map(|(repo, w)| (repo.clone(), kiln_ci::sched::units::thousandths_of(*w))).collect(),
         quotas: f.quotas.clone(),
         resources: s.resources(),
         overcommit_cpu: kiln_ci::sched::state::per_mille(s.overcommit.cpu),

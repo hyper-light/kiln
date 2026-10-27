@@ -61,7 +61,7 @@ fn w05_ac03_aging_bounds_starvation() {
 /// share in every 10-minute window; 3:1 weights give 75 % ± 10 %.
 #[test]
 fn w05_ac04_fair_share() {
-    for (wa, wb, want) in [(1.0, 1.0, 0.5), (3.0, 1.0, 0.75)] {
+    for (wa, wb, want) in [(1000, 1000, 0.5), (3000, 1000, 0.75)] {
         let cfg = Config { weights: [("a/a".to_owned(), wa), ("b/b".to_owned(), wb)].into_iter().collect(), ..Config::default() };
         let mut sim = Sim::new(cfg);
         for r in 0..4 {
@@ -198,7 +198,7 @@ fn w05_ac06_retries() {
     let second = sim.assigned.get(1).cloned();
     assert!(second.as_ref().is_some_and(|a| a.runner != first && a.attempt == 2 && a.at == MIN), "{second:?}");
     // OOM with a policy: a second attempt after the backoff; a plain failure isn't retried.
-    let policy = RetryPolicy { max: 2, on: vec![super::retry::RetryOn::Class(FailureClass::Oom)], initial_ms: 10_000, factor: 2.0, max_ms: 60_000, runner: super::retry::RunnerChoice::Any };
+    let policy = RetryPolicy { max: 2, on: vec![super::retry::RetryOn::Class(FailureClass::Oom)], initial_ms: 10_000, factor: 2000, max_ms: 60_000, runner: super::retry::RunnerChoice::Any };
     let mut sim = Sim::new(Config::default());
     sim.runner(0, linux("a", 1));
     sim.leg(0, LegIn { retry: Some(policy.clone()), request: Resources { mem: 4 << 30, ..Resources::default() }, ..leg("m", "acme/x", 60) }, MIN);
@@ -248,7 +248,7 @@ fn w05_ac10_wait_reasons() {
     // retry.
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
-    let policy = RetryPolicy { max: 1, on: vec![super::retry::RetryOn::Class(FailureClass::Infra)], initial_ms: 30_000, factor: 1.0, max_ms: 30_000, runner: super::retry::RunnerChoice::Any };
+    let policy = RetryPolicy { max: 1, on: vec![super::retry::RetryOn::Class(FailureClass::Infra)], initial_ms: 30_000, factor: 1000, max_ms: 30_000, runner: super::retry::RunnerChoice::Any };
     s.handle(Input::LegQueued(Box::new(LegIn { retry: Some(policy), ..leg("r", "acme/x", 60) })), 0);
     s.handle(Input::AttemptFinished { leg: "r".into(), attempt: 1, outcome: Outcome::Failed(super::retry::Failed { class: FailureClass::Infra, exit_code: None, log_hits: Vec::new() }) }, 10);
     assert_eq!(s.reason("r"), Some(&WaitReason::Retry { at: 30_010 }));
@@ -589,7 +589,7 @@ fn w05_r16_a_lost_runners_retry() {
     let c = s.handle(Input::RunnerDraining { runner: other.into() }, 3);
     assert!(assigned(&c, "x", first, 2), "{c:?}");
     // `runner: different`: the only runner back, the retry waits for another.
-    let strict = RetryPolicy { max: 1, on: vec![super::retry::RetryOn::Class(FailureClass::RunnerLost)], initial_ms: 0, factor: 1.0, max_ms: 0, runner: super::retry::RunnerChoice::Different };
+    let strict = RetryPolicy { max: 1, on: vec![super::retry::RetryOn::Class(FailureClass::RunnerLost)], initial_ms: 0, factor: 1000, max_ms: 0, runner: super::retry::RunnerChoice::Different };
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
     let c = s.handle(Input::LegQueued(Box::new(LegIn { retry: Some(strict), ..leg("z", "acme/x", 60) })), 0);
@@ -1007,7 +1007,7 @@ fn job(run: &str, job: &str, key: &str, cost: f64) -> LegIn {
         repo: "acme/x".into(),
         route: LegRoute { labels: vec!["k8s".into()], ..LegRoute::default() },
         priority: 60,
-        cost: Some(cost),
+        cost: crate::sched::units::ms_of_secs(cost),
         work: Some(Work { key: Some(key.into()), domain: Domain::Trusted, lane: format!("acme/x/{job}"), observed: false }),
         ..LegIn::default()
     }
@@ -1359,7 +1359,7 @@ fn by_actor(id: &str, actor: &str, lane: &str) -> LegIn {
 fn w28_ac63_two_agents_at_ten_to_one_share_alike() {
     use super::state::FairBy;
     for (fair_by, fair) in [(vec![FairBy::Repo, FairBy::Actor], true), (vec![FairBy::Repo], false)] {
-        let mut sim = Sim::new(Config { fair_by, default_cost: 40.0, ..Config::default() });
+        let mut sim = Sim::new(Config { fair_by, default_cost: 40_000, ..Config::default() });
         sim.runner(0, linux("a", 1));
         for m in 0..80 {
             for k in 0..10 {
@@ -1386,7 +1386,7 @@ fn w28_ac63_two_agents_at_ten_to_one_share_alike() {
 #[test]
 fn w28_r66_nested_levels_split_their_parents_share() {
     use super::state::FairBy;
-    let mut sim = Sim::new(Config { fair_by: vec![FairBy::Repo, FairBy::Actor, FairBy::Lane], default_cost: 60.0, ..Config::default() });
+    let mut sim = Sim::new(Config { fair_by: vec![FairBy::Repo, FairBy::Actor, FairBy::Lane], default_cost: 60_000, ..Config::default() });
     sim.runner(0, linux("a", 2));
     for i in 0..200 {
         sim.leg(1, by_actor(&format!("x{i}"), "agent:A", "x"), MIN);
@@ -1414,8 +1414,8 @@ use std::collections::BTreeMap;
 
 const LANE: &str = "acme-x-rust";
 
-fn warm_leg(id: &str, cold: f64, patience: Option<f64>) -> LegIn {
-    LegIn { warm_lane: Some(LANE.into()), cold: Some(cold), prefer: vec![Preference { warm: true, patience, ..Preference::default() }], ..leg(id, "acme/x", 60) }
+fn warm_leg(id: &str, cold_s: f64, patience: Option<f64>) -> LegIn {
+    LegIn { warm_lane: Some(LANE.into()), cold: crate::sched::units::ms_of_secs(cold_s), prefer: vec![Preference { warm: true, patience, ..Preference::default() }], ..leg(id, "acme/x", 60) }
 }
 
 /// A runner holding the lane's workspace: its warm runs take `warm_s`, it's `files` behind, and
@@ -1458,7 +1458,7 @@ fn w24_r18_the_warm_term_places_where_it_finishes_first() {
     assert_eq!(placed, vec![Some("b".to_owned()), Some("c".to_owned()), Some("a".to_owned())]);
     let mut s = Scheduler::new(Config::default());
     fleet(&mut s);
-    let placed: Vec<Option<String>> = ["x1", "x2", "x3"].iter().map(|id| assigned_to(&s.handle(Input::LegQueued(Box::new(LegIn { cost: Some(120.0), ..leg(id, "acme/x", 60) })), 1), id)).collect();
+    let placed: Vec<Option<String>> = ["x1", "x2", "x3"].iter().map(|id| assigned_to(&s.handle(Input::LegQueued(Box::new(LegIn { cost: Some(120_000), ..leg(id, "acme/x", 60) })), 1), id)).collect();
     assert_eq!(placed, vec![Some("a".to_owned()), Some("b".to_owned()), Some("c".to_owned())], "by name, as before");
 }
 
@@ -1474,7 +1474,7 @@ fn w24_r18_explained() -> Result<(), String> {
     s.handle(warm_input("c", holding(10.0, 300, 2 << 30)), 0);
     // Every runner busy for 30 s.
     for f in ["f1", "f2", "f3"] {
-        s.handle(Input::LegQueued(Box::new(LegIn { cost: Some(30.0), ..leg(f, "acme/x", 60) })), 0);
+        s.handle(Input::LegQueued(Box::new(LegIn { cost: Some(30_000), ..leg(f, "acme/x", 60) })), 0);
     }
     s.handle(Input::LegQueued(Box::new(warm_leg("q", 120.0, Some(0.0)))), 0);
     assert!(matches!(s.reason("q"), Some(WaitReason::Capacity { eligible: 3, busy: 3, .. })), "{:?}", s.reason("q"));
@@ -1483,8 +1483,8 @@ fn w24_r18_explained() -> Result<(), String> {
     let (a, b, c) = (of("a")?, of("b")?, of("c")?);
     let (wa, wb, wc) = (a.warm.clone().ok_or("a")?, b.warm.clone().ok_or("b")?, c.warm.clone().ok_or("c")?);
     assert!(wa.estimate.lane.is_none() && near(wa.finish_s, 150.0), "cold: {wa:?}");
-    assert!(wb.estimate.lane.as_deref() == Some(LANE) && near(wb.estimate.run_s, 20.0) && near(wb.wait_s, 30.0) && near(wb.finish_s, 50.0), "{wb:?}");
-    assert!(near(wc.estimate.run_s, 92.5) && near(wc.estimate.fetch_s, 20.48) && (wc.estimate.files, wc.estimate.behind) == (300, 75), "{wc:?}");
+    assert!(wb.estimate.lane.as_deref() == Some(LANE) && wb.estimate.run_ms == 20_000 && near(wb.wait_s, 30.0) && near(wb.finish_s, 50.0), "{wb:?}");
+    assert!(wc.estimate.run_ms == 92_500 && wc.estimate.fetch_ms == 20_480 && (wc.estimate.files, wc.estimate.behind) == (300, 75), "{wc:?}");
     assert_eq!((a.score, b.score), (Some(0.0), Some(1.0)), "the soonest finish scores 1, the latest 0");
     assert!(c.score.is_some_and(|x| x > 0.0 && x < 0.1), "{c:?}");
     let json = serde_json::to_value(&b).map_err(|e| e.to_string())?;
@@ -1512,7 +1512,7 @@ fn w24_r18_affinity_goes_after_that_jobs_workspaces() {
     s.handle(warm_input("b", build("acme/x")), 0);
     s.handle(warm_input("c", build("other/y")), 0);
     let test = |id: &str, repo: &str, workflow: &str| {
-        let mut l = LegIn { cost: Some(100.0), prefer: vec![Preference { affinity: Some(Affinity { job: "build".into() }), ..Preference::default() }], ..leg(id, repo, 60) };
+        let mut l = LegIn { cost: Some(100_000), prefer: vec![Preference { affinity: Some(Affinity { job: "build".into() }), ..Preference::default() }], ..leg(id, repo, 60) };
         l.route.job = "test".into();
         l.workflow_file = workflow.into();
         l
@@ -1547,8 +1547,8 @@ fn w24_r18_a_lanes_workspace_counts_where_the_leg_runs_with_its_toolchain() -> R
     let why = s.explain("x");
     let of = |r: &str| why.iter().find(|e| e.runner == r).and_then(|e| e.warm.clone()).ok_or(format!("no {r}"));
     let (a, w) = (of("a")?, of("w")?);
-    assert!(a.estimate.lane.is_none() && near(a.estimate.run_s, 120.0), "on the host, cold: {a:?}");
-    assert!(w.estimate.lane.as_deref() == Some(LANE) && near(w.estimate.run_s, 20.0), "{w:?}");
+    assert!(a.estimate.lane.is_none() && a.estimate.run_ms == 120_000, "on the host, cold: {a:?}");
+    assert!(w.estimate.lane.as_deref() == Some(LANE) && w.estimate.run_ms == 20_000, "{w:?}");
     // A workspace made on the host is warm on `a` and not on `w`, where the leg would run in a
     // container.
     let mut s = Scheduler::new(Config { rules: vec![rule], ..Config::default() });
@@ -1578,7 +1578,7 @@ fn w24_r18_a_leg_waits_for_a_busy_warm_runner_within_its_patience() -> Result<()
     };
     let legs = |sim: &mut Sim, first_on_w: i64, terms: bool| {
         for (id, t) in [("first", 1), ("second", 1_000)] {
-            let l = if terms { warm_leg(id, 120.0, None) } else { LegIn { cost: Some(120.0), ..leg(id, "acme/x", 60) } };
+            let l = if terms { warm_leg(id, 120.0, None) } else { LegIn { cost: Some(120_000), ..leg(id, "acme/x", 60) } };
             sim.leg(t, l, 120_000);
             sim.durations_on.insert((id.into(), "w".into()), if id == "first" { first_on_w } else { 20_000 });
         }
@@ -1607,7 +1607,7 @@ fn w24_r18_a_leg_waits_for_a_busy_warm_runner_within_its_patience() -> Result<()
     let mut sim = Sim::new(Config::default());
     sim.runner(0, linux("w", 1));
     sim.input(0, warm_input("w", holding(20.0, 0, 0)));
-    sim.leg(1, LegIn { cost: Some(300.0), ..leg("slow", "acme/x", 60) }, 300_000);
+    sim.leg(1, LegIn { cost: Some(300_000), ..leg("slow", "acme/x", 60) }, 300_000);
     sim.runner(2, linux("a", 1));
     sim.leg(1_000, warm_leg("second", 120.0, None), 120_000);
     sim.run(10 * MIN);
@@ -1706,40 +1706,39 @@ proptest! {
             }
             if let Some(secs) = b.busy {
                 let f = format!("f{i}");
-                let mut l = LegIn { cost: Some(f64::from(secs)), ..leg(&f, "acme/x", 60) };
+                let mut l = LegIn { cost: Some(u64::from(secs) * 1000), ..leg(&f, "acme/x", 60) };
                 l.route.labels.push(name.clone());
                 prop_assert_eq!(assigned_to(&s.handle(Input::LegQueued(Box::new(l)), 0), &f), Some(name));
             }
         }
         let t0 = 500;
         let c = s.handle(Input::LegQueued(Box::new(warm_leg("x", cold, Some(share)))), t0);
-        // The rule, from each runner's estimate.
+        // The rule, from each runner's estimate, in the engine's units (E1): what's written in
+        // seconds and shares, converted at the edge as the engine converts it.
         let m = warm::Model::default();
-        let busy_s: Vec<f64> = fleet.iter().map(|b| warm::estimate(held(b).as_ref(), &[Wants::Lane(LANE)], cold, &m, None).busy_s()).collect();
-        let at = |i: usize| busy_s.get(i).copied().unwrap_or(f64::INFINITY);
+        let (cold_ms, share_ppm) = (crate::sched::units::ms_of_secs(cold).unwrap_or(0), crate::sched::units::ppm_of(share));
+        let busy: Vec<u64> = fleet.iter().map(|b| warm::estimate(held(b).as_ref(), &[Wants::Lane(LANE)], cold_ms, &m, None).busy_ms()).collect();
+        let at = |i: usize| busy.get(i).copied().unwrap_or(u64::MAX);
         let free: Vec<usize> = (0..fleet.len()).filter(|i| fleet.get(*i).is_some_and(|b| b.busy.is_none())).collect();
-        let Some(first) = free.iter().copied().min_by(|i, j| at(*i).total_cmp(&at(*j)).then(i.cmp(j))) else {
+        let Some(first) = free.iter().copied().min_by(|i, j| at(*i).cmp(&at(*j)).then(i.cmp(j))) else {
             prop_assert!(assigned_to(&c, "x").is_none());
             prop_assert!(matches!(s.reason("x"), Some(WaitReason::Capacity { .. })), "{:?}", s.reason("x"));
             return Ok(());
         };
         let here = at(first);
-        let mut wait: Option<(f64, usize, u64, i64)> = None;
+        let mut wait: Option<(u64, usize, u64, i64)> = None;
         for (i, b) in fleet.iter().enumerate() {
             let Some(secs) = b.busy else { continue };
-            let wait_s = (i64::from(secs) * 1000 - t0) as f64 / 1000.0;
+            let wait_ms = u64::try_from(i64::from(secs) * 1000 - t0).unwrap_or(0);
             let there = at(i);
-            let saves = here - there;
-            if saves < 1.0 {
+            let Some(saves_ms) = here.checked_sub(there).filter(|s| *s >= 1000) else { continue };
+            let saves_s = saves_ms / 1000;
+            let bound = u64::from(share_ppm) * saves_s * 1000 / 1_000_000;
+            if bound == 0 || wait_ms > bound || wait_ms + there >= here {
                 continue;
             }
-            let saves_s = saves.floor() as u64;
-            let bound = (share * saves_s as f64 * 1000.0).floor();
-            if bound <= 0.0 || (wait_s * 1000.0).ceil() > bound || wait_s + there >= here {
-                continue;
-            }
-            if wait.is_none_or(|(f, ..)| wait_s + there < f) {
-                wait = Some((wait_s + there, i, saves_s, t0 + bound as i64));
+            if wait.is_none_or(|(f, ..)| wait_ms + there < f) {
+                wait = Some((wait_ms + there, i, saves_s, t0 + i64::try_from(bound).unwrap_or(i64::MAX)));
             }
         }
         match wait {
@@ -1778,22 +1777,22 @@ proptest! {
                 sim.input(0, warm_input(&name, Held { workspaces: vec![Workspace { lane: LANE.into(), warm_s: Some(*warm_s), files: *files, missing: *missing, ..Workspace::default() }], bandwidth: None }));
             }
         }
-        let mut share: BTreeMap<String, f64> = BTreeMap::new();
+        let mut share: BTreeMap<String, u32> = BTreeMap::new();
         for (j, (at, cold, patience, took)) in legs.iter().enumerate() {
             let id = format!("x{j}");
             sim.leg(*at, warm_leg(&id, *cold, Some(*patience)), 60_000);
             for (i, d) in took.iter().enumerate() {
                 sim.durations_on.insert((id.clone(), format!("r{i}")), *d);
             }
-            share.insert(id, *patience);
+            share.insert(id, crate::sched::units::ppm_of(*patience));
         }
         sim.run(10_000 * MIN);
         prop_assert_eq!(sim.settled.len(), legs.len(), "every leg ran: {:?}", sim.settled);
         for (t0, l, r) in &sim.waits {
             let WaitReason::Warm { saves_s, until, .. } = r else { continue };
-            let p = share.get(l).copied().unwrap_or(0.0);
+            let p = share.get(l).copied().unwrap_or(0);
             prop_assert!(*saves_s >= 1);
-            prop_assert!(until - t0 <= (p * *saves_s as f64 * 1000.0).floor() as i64, "{} waited {} ms for {} s saved at {}", l, until - t0, saves_s, p);
+            prop_assert!(until - t0 <= i64::try_from(u64::from(p) * *saves_s * 1000 / 1_000_000).unwrap_or(i64::MAX), "{} waited {} ms for {} s saved at {} millionths", l, until - t0, saves_s, p);
             let next = sim.assigned.iter().filter(|a| a.leg == *l && a.at >= *t0).map(|a| a.at).chain(sim.waits.iter().filter(|(t, x, w)| x == l && t >= t0 && !matches!(w, WaitReason::Warm { .. })).map(|(t, _, _)| *t)).min();
             prop_assert!(next.is_some_and(|t| t <= *until), "{} still waits past {}: {:?}", l, until, next);
         }
@@ -1826,7 +1825,7 @@ proptest! {
                 sim.runner(at + back, linux(&format!("r{r}"), *slots));
             }
             for (j, (at, priority, repo, took, cost)) in legs.iter().enumerate() {
-                let mut l = LegIn { cost: *cost, ..leg(&format!("l{j}"), &format!("acme/r{repo}"), *priority) };
+                let mut l = LegIn { cost: cost.and_then(crate::sched::units::ms_of_secs), ..leg(&format!("l{j}"), &format!("acme/r{repo}"), *priority) };
                 l.route.job = format!("job{}", j % 3);
                 l.route.workflow = "ci".into();
                 if terms {

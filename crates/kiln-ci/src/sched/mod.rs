@@ -14,6 +14,12 @@
 //! - [`reserve`]: runners and pools kept for some legs in windows (W05-R12).
 //! - [`load`]: heavy legs held off machines under I/O pressure or short of disk (W24-R19).
 //! - [`warm`]: where a leg is expected to finish first from runners' warm state (W24-R18).
+//! - [`units`]: the integers the engine decides with, and the conversions at its edges.
+//!
+//! What the engine decides with is integers, so a decision comes out the same on every machine and
+//! in every replay (docs/needs.md, E1): float arithmetic happens only in [`units`]' conversions,
+//! where floats come in or go out, and in tests.
+#![cfg_attr(not(test), deny(clippy::float_arithmetic))]
 
 pub mod actor;
 pub mod admit;
@@ -28,6 +34,7 @@ pub mod retry;
 pub mod routing;
 pub mod sim;
 pub mod state;
+pub mod units;
 pub mod warm;
 
 #[cfg(test)]

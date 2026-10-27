@@ -209,7 +209,9 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
 }
 
 /// A number with an optional unit: sizes (`Ki`, `Mi`, `Gi`, `Ti`; `K`, `M`, `G`, `T`, `B`) and
-/// durations (`s`, `m`, `h`, `d`).
+/// durations (`s`, `m`, `h`, `d`). An edge of the engine's integers (`super::units`): what people
+/// write, read as the number it says.
+#[allow(clippy::float_arithmetic)]
 pub fn number(s: &str) -> Option<f64> {
     let split = s.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-')).unwrap_or(s.len());
     let (n, unit) = (s.get(..split)?, s.get(split..)?);
@@ -903,37 +905,41 @@ pub fn lacks_only_capability(req: &Requirement, r: &RunnerView) -> bool {
 }
 
 /// The preference score of each candidate (W05-R23): Σ weight × term, each term normalized to
-/// 0..1 across the candidates. Empty when there are no preferences.
-pub fn scores(prefs: &[Preference], candidates: &[&RunnerView]) -> Vec<f64> {
+/// 0..1 across the candidates. Empty when there are no preferences. In integers (E1): weights in
+/// thousandths, terms in millionths, so a score is in billionths ([`super::units::score`] says it
+/// as the weights are written); facts are read in millionths of themselves to compare.
+pub fn scores(prefs: &[Preference], candidates: &[&RunnerView]) -> Vec<i64> {
+    use super::units::{self, WHOLE};
     if prefs.is_empty() {
         return Vec::new();
     }
-    let mut total = vec![0.0f64; candidates.len()];
+    let whole = i128::from(WHOLE);
+    let mut total = vec![0i64; candidates.len()];
     for p in prefs {
-        let w = p.weight.unwrap_or(1.0);
+        let w = i128::from(units::milli_of(p.weight.unwrap_or(1.0)));
+        let add = |t: &mut i64, term: i128| *t = i64::try_from(i128::from(*t).saturating_add(w.saturating_mul(term))).unwrap_or(if w < 0 { i64::MIN } else { i64::MAX });
         if let Some(name) = &p.fact {
-            let vals: Vec<Option<f64>> = candidates
+            let vals: Vec<Option<i128>> = candidates
                 .iter()
                 .map(|r| match fact(&r.facts, name) {
-                    Fact::Num(n) => Some(n),
-                    Fact::Str(s) => number(&s),
-                    Fact::Bool(b) => Some(if b { 1.0 } else { 0.0 }),
+                    Fact::Num(n) => units::micro_of(n),
+                    Fact::Str(s) => number(&s).and_then(units::micro_of),
+                    Fact::Bool(b) => Some(if b { whole } else { 0 }),
                     _ => None,
                 })
                 .collect();
-            let known: Vec<f64> = vals.iter().flatten().copied().collect();
-            let (lo, hi) = (known.iter().copied().fold(f64::MAX, f64::min), known.iter().copied().fold(f64::MIN, f64::max));
+            let (lo, hi) = (vals.iter().flatten().min().copied().unwrap_or(0), vals.iter().flatten().max().copied().unwrap_or(0));
             for (t, v) in total.iter_mut().zip(&vals) {
                 if let Some(v) = v {
-                    let norm = if hi > lo { (v - lo) / (hi - lo) } else { 1.0 };
-                    *t += w * if p.higher { norm } else { 1.0 - norm };
+                    let norm = if hi > lo { v.saturating_sub(lo).saturating_mul(whole) / hi.saturating_sub(lo) } else { whole };
+                    add(t, if p.higher { norm } else { whole.saturating_sub(norm) });
                 }
             }
         }
         if let Some(l) = &p.label {
             for (t, r) in total.iter_mut().zip(candidates) {
                 if r.all_labels().iter().any(|x| x.eq_ignore_ascii_case(l)) {
-                    *t += w;
+                    add(t, whole);
                 }
             }
         }
@@ -1119,7 +1125,7 @@ mod tests {
         let b = RunnerView { name: "b".into(), facts: linux(400 << 30), labels: vec!["fast".into()], ..RunnerView::default() };
         assert!(scores(&[], &[&a, &b]).is_empty());
         let s = scores(&[Preference { fact: Some("disk.free".into()), higher: true, weight: Some(2.0), label: None, ..Preference::default() }, Preference { label: Some("fast".into()), ..Preference::default() }], &[&a, &b]);
-        assert_eq!(s, vec![0.0, 3.0]);
+        assert_eq!(s, vec![0, 3_000_000_000], "2 × the most free disk, and 1 for the label");
     }
 
     /// W05-R23, W24-R18: a job's `prefer:` as routing reads it, each term; an item routing can't
