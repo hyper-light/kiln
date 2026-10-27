@@ -284,8 +284,9 @@ pub fn plan(units: &Units, items: &[Item], candidates: &[Candidate], knobs: &Kno
 
 /// Whether a candidate's result stands on the trunk as it is now (W28-R102): `Ok(false)` where it
 /// was built, `Ok(true)` when the trunk moved since only for changes it shares nothing with, else
-/// why it doesn't.
-fn stands(units: &Units, since: &Result<Option<BTreeSet<String>>, String>, entries: Vec<Change>) -> Result<bool, String> {
+/// why it doesn't. The server asks it again just before a move, the trunk perhaps moved since the
+/// plan by another component's.
+pub fn stands(units: &Units, since: &Result<Option<BTreeSet<String>>, String>, entries: Vec<Change>) -> Result<bool, String> {
     let files = match since {
         Err(why) => return Err(why.clone()),
         Ok(None) => return Ok(false),

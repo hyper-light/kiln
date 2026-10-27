@@ -7,7 +7,8 @@
 -- `reason` says why). When it last joined the queue (`queued_at`; its order, before `created_at`).
 -- Which queue lands it (`route`: `kiln`, or the name of its host's queue) and, on a host's, its
 -- changes there (`host`: JSON, the repository's name and each change's number, head and ETag).
--- The files it conflicts with the trunk in, while it's back with Review (`conflicts`, JSON).
+-- The files it conflicts with the trunk in, while it's back with Review (`conflicts`, JSON). How
+-- many candidates have held it (`tested`: one, unless it was tested again).
 -- New states beside queued, testing, landed, ejected and cancelled: `held`, `returned` (it
 -- conflicts with the trunk: back to Review's conflict ladder) and `withdrawn` (by Review).
 ALTER TABLE land_queue ADD COLUMN component TEXT;
@@ -21,6 +22,7 @@ ALTER TABLE land_queue ADD COLUMN queued_at INTEGER;
 ALTER TABLE land_queue ADD COLUMN route TEXT;
 ALTER TABLE land_queue ADD COLUMN host TEXT;
 ALTER TABLE land_queue ADD COLUMN conflicts TEXT;
+ALTER TABLE land_queue ADD COLUMN tested INTEGER;
 
 -- What each land keeps (W28-R108), one row per entry landed: its changes and their kind, the
 -- revisions approved with their patch-ids, the candidate tested (and the trunk it was built on),

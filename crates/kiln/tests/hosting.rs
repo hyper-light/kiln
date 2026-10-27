@@ -547,11 +547,13 @@ fn w14_ac02_strategies() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// W14-AC03: four entries tested as one batch whose candidate fails (one of them brings `BAD`,
-/// which only the `merge_group` run rejects): the queue bisects, ejects the culprit with its
-/// reason and lands the other three; and an entry that conflicts with the trunk is ejected as
-/// "needs rebase". The checks run for real on the server's own runner, which fetches each commit
-/// through kiln's git with the leg's token.
+/// W14-AC03, with W28-R100 to R103 and R107: four diffs in two components of the conflict graph
+/// (packages `a` and `b` of an npm workspace), one of them bringing `b/BAD`, which only the
+/// `merge_group` run rejects. Each component gets a candidate of its own, tested beside the other's;
+/// the clean component lands at once, none of its entries tested again; the culprit's is bisected
+/// inside it, ejecting only the culprit with its reason. An entry that conflicts with the trunk goes
+/// back to Review, "needs rebase", not out. The checks run for real on the server's own runner,
+/// which fetches each commit through kiln's git with the leg's token.
 #[test]
 fn w14_ac03_queue() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -564,29 +566,37 @@ fn w14_ac03_queue() -> anyhow::Result<()> {
     let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
     let rev = person(&s, "rev", &["developer@repo:acme/app"])?;
     let lead = person(&s, "lead", &["maintainer@repo:acme/app"])?;
+    // While it's missing, every candidate's gate waits: the queue's candidates side by side.
+    let release = dir.path().join("release");
 
     must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(work.join(".kiln"))?;
     std::fs::create_dir_all(work.join(".github/workflows"))?;
     std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n  checks: [gate]\nqueue:\n  batch: 4\n")?;
+    workspace(&work)?;
     std::fs::write(
         work.join(".github/workflows/gate.yml"),
-        r#"name: gate
+        format!(
+            r#"name: gate
 on: [pull_request, merge_group]
 jobs:
   gate:
     runs-on: local
     steps:
       - env:
-          TOKEN: ${{ github.token }}
+          TOKEN: ${{{{ github.token }}}}
         run: |
           git init -q .
           git -c http.extraHeader="Authorization: Bearer $TOKEN" fetch -q --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
           git checkout -q FETCH_HEAD
       - if: github.event_name == 'merge_group'
-        run: test ! -f BAD
+        run: |
+          while [ ! -f '{}' ]; do sleep 0.2; done
+          test ! -f b/BAD
 "#,
+            release.display()
+        ),
     )?;
     // GitHub's merge queue events (W03-R02): each entry's enqueued and dequeued, with why.
     std::fs::write(
@@ -599,8 +609,9 @@ jobs:
     must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
     let trunk0 = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
 
-    // Four diffs, each on the trunk: one brings BAD. Two more change the same line.
-    let files = [("a.txt", "a: one"), ("BAD", "b: the culprit"), ("c.txt", "c: three"), ("d.txt", "d: four")];
+    // Four diffs, each on the trunk, two in package a and two in b: one brings b/BAD. Two more
+    // change the same line.
+    let files = [("a/one.txt", "a: one"), ("b/BAD", "b: the culprit"), ("a/three.txt", "c: three"), ("b/four.txt", "d: four")];
     for (i, (file, title)) in files.iter().enumerate() {
         must(git(&home, &work, &["checkout", "-q", "-B", &format!("s{i}"), &trunk0]), "checkout")?;
         commit(&home, &work, file, "x\n", title, &format!("I{}", format!("{i}").repeat(40)))?;
@@ -623,36 +634,61 @@ jobs:
         })?;
     }
 
-    // Four entries at once: one batch, which fails; bisected, the culprit goes, three land.
+    // Four entries: a candidate for each component, side by side, their gates waiting.
     for d in ["D1", "D2", "D3", "D4"] {
         let (st, e) = post(&s, &lead, &format!("/api/diffs/{d}/land"), &json!({}))?;
         anyhow::ensure!(st == 200, "{d}: {e}");
     }
+    let queue = || api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue");
+    until(120, "a candidate for each component, side by side", || {
+        let q = queue()?;
+        let (a, b) = (entry_of(&q, "D1"), entry_of(&q, "D2"));
+        let side = text(&a, "state") == "testing" && text(&b, "state") == "testing" && text(&a, "batch") != text(&b, "batch");
+        Ok((!side).then(|| q.to_string()))
+    })?;
+    let q = queue()?;
+    assert_ne!(entry_of(&q, "D1").get("component"), entry_of(&q, "D2").get("component"), "two components: {q}");
+    // The gates go on: the clean component lands; the culprit's is bisected inside it.
+    std::fs::write(&release, "")?;
     let state = |d: &str| -> anyhow::Result<String> { Ok(text(&api(&s, &dev, "GET", &format!("/api/diffs/{d}"))?, "state").to_owned()) };
     until(400, "the queue settles", || {
         let states: Vec<String> = ["D1", "D2", "D3", "D4"].iter().map(|d| state(d)).collect::<anyhow::Result<_>>()?;
-        Ok((states != ["landed", "accepted", "landed", "landed"]).then(|| format!("{states:?}\n{}", api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue").map(|q| q.to_string()).unwrap_or_default())))
+        Ok((states != ["landed", "accepted", "landed", "landed"]).then(|| format!("{states:?}\n{}", queue().map(|q| q.to_string()).unwrap_or_default())))
     })?;
-    let q = api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue")?;
-    let culprit = q.get("entries").and_then(Value::as_array).and_then(|l| l.iter().find(|x| x.get("diffs") == Some(&json!(["D2"])))).cloned().unwrap_or_default();
+    let q = queue()?;
+    let culprit = entry_of(&q, "D2");
     assert!(text(&culprit, "state") == "ejected" && text(&culprit, "reason").contains("`gate` failure"), "{culprit}");
+    for d in ["D1", "D3", "D4"] {
+        assert_eq!(text(&entry_of(&q, d), "state"), "landed", "only the culprit is ejected: {q}");
+    }
+    // The clean component landed at once: none of its entries tested again, its first move before
+    // the culprit's bisection ended.
+    for d in ["D1", "D3"] {
+        assert_eq!(entry_of(&q, d).get("tested"), Some(&json!(1)), "{d} tested once: {q}");
+    }
+    let at = |d: &str, key: &str| entry_of(&q, d).get(key).and_then(Value::as_i64).unwrap_or(i64::MAX);
+    assert!(at("D1", "updated_at") <= at("D2", "updated_at"), "{q}");
+    let record = entry_of(&q, "D1").get("record").cloned().unwrap_or_default();
+    assert_eq!(record.get("changes"), Some(&json!(["D1"])), "the land kept: {record}");
+    assert!(record.get("runs").and_then(Value::as_array).is_some_and(|r| r.iter().any(|run| text(run, "workflow").ends_with("gate.yml"))), "its candidate's checks: {record}");
     must(git(&home, &work, &["fetch", "-q", "origin"]), "fetch")?;
     let landed = must(git(&home, &work, &["log", "--format=%s", &format!("{trunk0}..origin/main")]), "log")?;
     assert_eq!(landed.lines().count(), 3, "{landed}");
     assert!(!landed.contains("culprit"), "{landed}");
 
-    // The two README changes: the first lands, the second needs a rebase.
+    // The two README changes: the first lands; the second conflicts with it on the trunk, and goes
+    // back to Review, not out (W28-R107).
     for d in ["D5", "D6"] {
         let (st, e) = post(&s, &lead, &format!("/api/diffs/{d}/land"), &json!({}))?;
         anyhow::ensure!(st == 200, "{d}: {e}");
     }
-    until(300, "D5 lands and D6 is ejected", || {
+    until(300, "D5 lands and D6 goes back to Review", || {
         let (a, b) = (state("D5")?, state("D6")?);
         Ok(!(a == "landed" && b == "accepted")).map(|w| w.then(|| format!("{a} {b}")))
     })?;
-    let q = api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue")?;
-    let d6 = q.get("entries").and_then(Value::as_array).and_then(|l| l.iter().find(|x| x.get("diffs") == Some(&json!(["D6"])))).cloned().unwrap_or_default();
-    assert!(text(&d6, "reason").contains("needs rebase") && text(&d6, "reason").contains("README.md"), "{d6}");
+    let d6 = entry_of(&queue()?, "D6");
+    assert!(text(&d6, "state") == "returned" && text(&d6, "reason").contains("needs rebase") && text(&d6, "reason").contains("README.md"), "{d6}");
+    assert_eq!(d6.get("conflicts"), Some(&json!(["README.md"])), "{d6}");
     // Each entry's merge queue events, with GitHub's reasons.
     let wanted = ["queue enqueued  D1", "queue dequeued MERGE D1", "queue dequeued CI_FAILURE D2", "queue dequeued MERGE D5", "queue dequeued INVALID_MERGE_COMMIT D6"];
     until(240, "the merge queue events", || {
@@ -667,6 +703,361 @@ jobs:
         }
         Ok((!wanted.iter().all(|w| said.contains(w))).then_some(said))
     })?;
+    Ok(())
+}
+
+/// An npm workspace of packages `a` and `b` in `work` (docs/ci.md W28-R100): units of the land
+/// queue's conflict graph, so that changes to one and to the other are components of their own.
+fn workspace(work: &Path) -> anyhow::Result<()> {
+    std::fs::write(work.join("package.json"), "{ \"name\": \"app\", \"private\": true, \"workspaces\": [\"a\", \"b\"] }\n")?;
+    for p in ["a", "b"] {
+        std::fs::create_dir_all(work.join(p))?;
+        std::fs::write(work.join(p).join("package.json"), format!("{{ \"name\": \"{p}\", \"version\": \"1.0.0\" }}\n"))?;
+    }
+    Ok(())
+}
+
+/// The land queue's newest entry holding diff `d`, of `GET /api/repos/:repo/queue`'s.
+fn entry_of(q: &Value, d: &str) -> Value {
+    q.get("entries").and_then(Value::as_array).and_then(|l| l.iter().find(|x| x.get("diffs").and_then(Value::as_array).is_some_and(|ds| ds.iter().any(|n| n == d)))).cloned().unwrap_or_default()
+}
+
+/// A native repository for the land queue's tests (docs/ci.md W28-R100 to R107): `acme/app`, an
+/// npm workspace of packages `a` and `b` landing with one accept, cloned by its developer at
+/// `<dir>/tree`. Gated, its own runner runs a `gate` workflow on each candidate, which waits while
+/// `<dir>/release` is missing; else candidates have no checks and land as soon as they're built.
+struct Lab {
+    s: Server,
+    home: std::path::PathBuf,
+    work: std::path::PathBuf,
+    dev: String,
+    rev: String,
+    lead: String,
+    release: std::path::PathBuf,
+    trunk0: String,
+    /// The repository's own git, where the candidates are.
+    bare: std::path::PathBuf,
+}
+
+impl Lab {
+    fn new(dir: &Path, gated: bool) -> anyhow::Result<Lab> {
+        let s = start(dir, &Options { agent: gated, ..Options::default() })?;
+        let home = dir.join("githome");
+        std::fs::create_dir_all(&home)?;
+        let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+        anyhow::ensure!(st == 200, "native repository: {st} {body}");
+        let bare = std::path::PathBuf::from(text(&serde_json::from_str(&body)?, "clone_url").trim_start_matches("file://"));
+        let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+        let rev = person(&s, "rev", &["developer@repo:acme/app"])?;
+        let lead = person(&s, "lead", &["maintainer@repo:acme/app"])?;
+        let release = dir.join("release");
+        must(git(&home, dir, &["clone", "-q", &format!("http://x:{dev}@127.0.0.1:{}/git/acme/app.git", s.port), "tree"]), "clone")?;
+        let work = dir.join("tree");
+        std::fs::create_dir_all(work.join(".kiln"))?;
+        std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n")?;
+        workspace(&work)?;
+        if gated {
+            std::fs::create_dir_all(work.join(".github/workflows"))?;
+            std::fs::write(work.join(".github/workflows/gate.yml"), format!("name: gate\non: merge_group\njobs:\n  gate:\n    runs-on: local\n    steps:\n      - run: while [ ! -f '{}' ]; do sleep 0.2; done\n", release.display()))?;
+        }
+        std::fs::write(work.join("README.md"), "app\n")?;
+        must(git(&home, &work, &["add", "."]), "add")?;
+        must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+        must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+        let trunk0 = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+        Ok(Lab { s, home, work, dev, rev, lead, release, trunk0, bare })
+    }
+
+    /// A diff of `file` holding `text` on `base`, with Change-Id `id` (a new version of the diff
+    /// that has it), submitted: its commit.
+    fn diff(&self, base: &str, file: &str, text: &str, title: &str, id: &str) -> anyhow::Result<String> {
+        must(git(&self.home, &self.work, &["checkout", "-q", "--detach", base]), "checkout")?;
+        let sha = commit(&self.home, &self.work, file, text, title, id)?;
+        must(git(&self.home, &self.work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+        Ok(sha)
+    }
+
+    fn review(&self, d: &str, action: &str) -> anyhow::Result<()> {
+        let (st, r) = post(&self.s, &self.rev, &format!("/api/diffs/{d}/review"), &json!({ "action": action }))?;
+        anyhow::ensure!(st == 200, "{d} {action}: {r}");
+        Ok(())
+    }
+
+    fn land(&self, d: &str) -> anyhow::Result<(u16, Value)> {
+        post(&self.s, &self.lead, &format!("/api/diffs/{d}/land"), &json!({}))
+    }
+
+    /// Review's word on an entry: `hold`, `release` or `withdraw`.
+    fn word(&self, entry: &str, action: &str, reason: &str) -> anyhow::Result<Value> {
+        let (st, r) = post(&self.s, &self.rev, &format!("/api/queue/{entry}/{action}"), &json!({ "reason": reason }))?;
+        anyhow::ensure!(st == 200, "{action} {entry}: {st} {r}");
+        Ok(r)
+    }
+
+    fn queue(&self) -> anyhow::Result<Value> {
+        api(&self.s, &self.dev, "GET", "/api/repos/acme%2Fapp/queue")
+    }
+
+    fn state(&self, d: &str) -> anyhow::Result<String> {
+        Ok(text(&api(&self.s, &self.dev, "GET", &format!("/api/diffs/{d}"))?, "state").to_owned())
+    }
+
+    /// Waits for diff `d` to land.
+    fn landed(&self, d: &str, secs: u64) -> anyhow::Result<()> {
+        until(secs, &format!("{d} lands"), || {
+            let s = self.state(d)?;
+            Ok((s != "landed").then(|| format!("{s}\n{}", self.queue().map(|q| q.to_string()).unwrap_or_default())))
+        })
+    }
+
+    /// The trunk's tip, as the server has it.
+    fn trunk(&self) -> anyhow::Result<String> {
+        let refs = must(git(&self.home, &self.work, &["ls-remote", "origin", "refs/heads/main"]), "ls-remote")?;
+        Ok(refs.split_whitespace().next().unwrap_or_default().to_owned())
+    }
+
+    /// A file at a commit of the repository's own git (a candidate's, say).
+    fn show(&self, rev: &str, file: &str) -> anyhow::Result<String> {
+        must(git(&self.home, &self.bare, &["show", &format!("{rev}:{file}")]), "show")
+    }
+
+    /// The subjects of the trunk's commits since `from`, newest first.
+    fn log_since(&self, from: &str) -> anyhow::Result<Vec<String>> {
+        let tip = self.trunk()?;
+        Ok(must(git(&self.home, &self.bare, &["log", "--format=%s", &format!("{from}..{tip}")]), "log")?.lines().map(str::to_owned).collect())
+    }
+}
+
+/// W28-R100 to R103: two diffs that share nothing, a candidate each, tested side by side on the
+/// same trunk. The trunk moves for one; the other's result stands: it lands as tested, applied
+/// again onto the trunk's tip, neither tested again. Each move of the trunk takes one candidate.
+#[test]
+fn w28_r102_independent_diffs_land_without_testing_each_other_again() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let lab = Lab::new(dir.path(), true)?;
+    let t0 = lab.trunk0.clone();
+    lab.diff(&t0, "a/x.txt", "x\n", "a: x", &format!("I{}", "1".repeat(40)))?;
+    lab.diff(&t0, "b/y.txt", "y\n", "b: y", &format!("I{}", "2".repeat(40)))?;
+    for d in ["D1", "D2"] {
+        lab.review(d, "accept")?;
+        let (st, e) = lab.land(d)?;
+        anyhow::ensure!(st == 200, "{d}: {e}");
+    }
+    until(120, "a candidate each, side by side", || {
+        let q = lab.queue()?;
+        let (a, b) = (entry_of(&q, "D1"), entry_of(&q, "D2"));
+        Ok((!(text(&a, "state") == "testing" && text(&b, "state") == "testing" && text(&a, "batch") != text(&b, "batch"))).then(|| q.to_string()))
+    })?;
+    std::fs::write(&lab.release, "")?;
+    lab.landed("D1", 240)?;
+    lab.landed("D2", 240)?;
+    let q = lab.queue()?;
+    let (a, b) = (entry_of(&q, "D1"), entry_of(&q, "D2"));
+    for e in [&a, &b] {
+        assert_eq!(e.get("tested"), Some(&json!(1)), "each tested once: {q}");
+        assert_eq!(e.pointer("/record/base"), Some(&json!(t0)), "both built on the same trunk: {q}");
+    }
+    let rebased = [&a, &b].iter().filter(|e| e.pointer("/record/rebased") == Some(&json!(true))).count();
+    assert_eq!(rebased, 1, "the second landed as tested onto the trunk the first moved: {q}");
+    assert_ne!(a.pointer("/record/to"), b.pointer("/record/to"), "a move each: {q}");
+    let mut log = lab.log_since(&t0)?;
+    log.sort();
+    assert_eq!(log, ["a: x", "b: y"]);
+    Ok(())
+}
+
+/// W28-R104: Review's gate, `review::readiness`, decides `land` and the queue's re-check just
+/// before a move. Ready lands; blockers hold, with them as the reason, and once they're gone the
+/// entry lands; Review holds an entry and lets it go, or withdraws it.
+#[test]
+fn w28_r104_one_gate_for_land_and_the_move() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let lab = Lab::new(dir.path(), true)?;
+    let t0 = lab.trunk0.clone();
+    for (i, f) in ["a/one.txt", "b/two.txt", "a/three.txt"].iter().enumerate() {
+        lab.diff(&t0, f, "x\n", &format!("change {}", i + 1), &format!("I{}", format!("{}", i + 1).repeat(40)))?;
+    }
+    // `land`: blockers hold it, as the gate says.
+    let (st, why) = lab.land("D1")?;
+    assert!(st == 409 && why.to_string().contains("0 of 1 accepts"), "{st} {why}");
+    assert_eq!(api(&lab.s, &lab.dev, "GET", "/api/diffs/D1/land")?.pointer("/gate/gate"), Some(&json!("hold")));
+    lab.review("D1", "accept")?;
+    assert_eq!(api(&lab.s, &lab.dev, "GET", "/api/diffs/D1/land")?.pointer("/gate/gate"), Some(&json!("ready")));
+    let (st, e) = lab.land("D1")?;
+    anyhow::ensure!(st == 200, "{e}");
+    let e1 = text(&e, "entry").to_owned();
+    until(60, "D1's candidate under test", || {
+        let q = lab.queue()?;
+        Ok((text(&entry_of(&q, "D1"), "state") != "testing").then(|| q.to_string()))
+    })?;
+    // Changes asked for while its candidate is tested: just before the move, the gate holds it.
+    lab.review("D1", "request_changes")?;
+    std::fs::write(&lab.release, "")?;
+    until(120, "D1 held by the gate", || {
+        let d1 = entry_of(&lab.queue()?, "D1");
+        Ok((!(text(&d1, "state") == "held" && text(&d1, "hold") == "gate" && text(&d1, "reason").contains("asked for changes"))).then(|| d1.to_string()))
+    })?;
+    assert_eq!(lab.trunk()?, t0, "nothing landed");
+    assert_eq!(lab.state("D1")?, "changes-requested", "back with Review");
+    // Accepted again: the same entry joins the queue and lands.
+    lab.review("D1", "accept")?;
+    lab.landed("D1", 180)?;
+    assert_eq!(text(&entry_of(&lab.queue()?, "D1"), "id"), e1);
+    // Review holds an entry, and lets it go.
+    std::fs::remove_file(&lab.release)?;
+    lab.review("D2", "accept")?;
+    let (st, e) = lab.land("D2")?;
+    anyhow::ensure!(st == 200, "{e}");
+    let e2 = text(&e, "entry").to_owned();
+    lab.word(&e2, "hold", "after the release")?;
+    std::fs::write(&lab.release, "")?;
+    std::thread::sleep(Duration::from_secs(5));
+    let d2 = entry_of(&lab.queue()?, "D2");
+    assert!(text(&d2, "state") == "held" && text(&d2, "hold") == "review" && text(&d2, "reason").contains("after the release"), "{d2}");
+    assert_ne!(lab.state("D2")?, "landed", "Review holds it");
+    lab.word(&e2, "release", "")?;
+    lab.landed("D2", 180)?;
+    // Review withdraws one: out, its diff Review's again.
+    std::fs::remove_file(&lab.release)?;
+    lab.review("D3", "accept")?;
+    let (st, e) = lab.land("D3")?;
+    anyhow::ensure!(st == 200, "{e}");
+    lab.word(text(&e, "entry"), "withdraw", "not this one")?;
+    let d3 = entry_of(&lab.queue()?, "D3");
+    assert!(text(&d3, "state") == "withdrawn" && text(&d3, "reason").contains("not this one"), "{d3}");
+    assert_eq!(lab.state("D3")?, "accepted");
+    Ok(())
+}
+
+/// W28-R105: an entry pins the revision Review approved, by its commit and patch-id, and its
+/// candidate is that revision onto the trunk. A newer revision that changes the patch holds it
+/// until Review approves that one; one that only rebased, with the same patch-id, doesn't.
+#[test]
+fn w28_r105_entries_pin_what_review_approved() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let lab = Lab::new(dir.path(), true)?;
+    let t0 = lab.trunk0.clone();
+    let id = format!("I{}", "1".repeat(40));
+    lab.diff(&t0, "a/one.txt", "first\n", "one", &id)?;
+    lab.review("D1", "accept")?;
+    let (st, e) = lab.land("D1")?;
+    anyhow::ensure!(st == 200, "{e}");
+    let d1 = || -> anyhow::Result<Value> { Ok(entry_of(&lab.queue()?, "D1")) };
+    until(60, "D1 under test", || {
+        let e = d1()?;
+        Ok((text(&e, "state") != "testing").then(|| e.to_string()))
+    })?;
+    assert_eq!(d1()?.pointer("/pinned/0/version"), Some(&json!(1)));
+    // v2 changes the patch: what's queued isn't what Review approved any more, and it holds.
+    let v2 = lab.diff(&t0, "a/one.txt", "second\n", "one", &id)?;
+    until(60, "D1 held for its v2", || {
+        let e = d1()?;
+        Ok((!(text(&e, "state") == "held" && text(&e, "reason").contains("v2 lands once Review approves it"))).then(|| e.to_string()))
+    })?;
+    // Approved, v2 is pinned, and the candidate is v2 onto the trunk.
+    lab.review("D1", "accept")?;
+    until(60, "D1's v2 under test", || {
+        let e = d1()?;
+        Ok((!(text(&e, "state") == "testing" && e.pointer("/pinned/0/version") == Some(&json!(2)))).then(|| e.to_string()))
+    })?;
+    let e = d1()?;
+    assert_eq!(e.pointer("/pinned/0/commit"), Some(&json!(v2)), "{e}");
+    assert_eq!(lab.show(text(&e, "candidate"), "a/one.txt")?, "second\n", "the candidate is v2 onto the trunk");
+    // The trunk moves; v3 only rebases v2 onto it, with its patch-id: the pin holds.
+    must(git(&lab.home, &lab.work, &["checkout", "-q", "--detach", &t0]), "checkout")?;
+    std::fs::write(lab.work.join("b/other.txt"), "other\n")?;
+    must(git(&lab.home, &lab.work, &["add", "."]), "add")?;
+    must(git(&lab.home, &lab.work, &["commit", "-qm", "other"]), "commit")?;
+    let owner = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", lab.s.admin, lab.s.port);
+    must(git(&lab.home, &lab.work, &["push", "-q", &owner, "HEAD:main"]), "the trunk moves")?;
+    must(git(&lab.home, &lab.work, &["cherry-pick", &v2]), "v2 rebased")?;
+    must(git(&lab.home, &lab.work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "v3")?;
+    until(60, "v3, rebase-only", || {
+        let d = api(&lab.s, &lab.dev, "GET", "/api/diffs/D1")?;
+        Ok((versions(&d).last() != Some(&(3, true))).then(|| d.to_string()))
+    })?;
+    std::thread::sleep(Duration::from_secs(4));
+    let e = d1()?;
+    assert!(text(&e, "state") == "testing" && e.pointer("/pinned/0/version") == Some(&json!(2)), "a rebase-only revision with the same patch-id keeps the pin: {e}");
+    // It lands as Review approved it, onto the trunk as it moved.
+    std::fs::write(&lab.release, "")?;
+    lab.landed("D1", 180)?;
+    let record = d1()?.get("record").cloned().unwrap_or_default();
+    assert_eq!(record.pointer("/revisions/0/version"), Some(&json!(2)), "{record}");
+    assert!(record.pointer("/revisions/0/patch_id").and_then(Value::as_str).is_some_and(|p| !p.is_empty()), "{record}");
+    let tip = lab.trunk()?;
+    assert_eq!((lab.show(&tip, "a/one.txt")?, lab.show(&tip, "b/other.txt")?), ("second\n".to_owned(), "other\n".to_owned()));
+    Ok(())
+}
+
+/// W28-R106: a stack lands its clear prefix, in order, the rest holding with why; once Review
+/// clears the rest, it follows.
+#[test]
+fn w28_r106_a_stack_lands_its_clear_prefix() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let lab = Lab::new(dir.path(), false)?;
+    let t0 = lab.trunk0.clone();
+    must(git(&lab.home, &lab.work, &["checkout", "-q", "--detach", &t0]), "checkout")?;
+    for (i, f) in ["a/one.txt", "a/two.txt", "a/three.txt"].iter().enumerate() {
+        commit(&lab.home, &lab.work, f, "x\n", &format!("stack {}", i + 1), &format!("I{}", format!("{}", i + 1).repeat(40)))?;
+    }
+    must(git(&lab.home, &lab.work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+    for d in ["D1", "D2"] {
+        lab.review(d, "accept")?;
+    }
+    let (st, e) = lab.land("D3")?;
+    anyhow::ensure!(st == 200, "{st} {e}");
+    assert_eq!(e.get("diffs"), Some(&json!(["D1", "D2"])), "its clear prefix: {e}");
+    assert!(e.pointer("/held/0/diff") == Some(&json!("D3")) && e.pointer("/held/0/why/0").and_then(Value::as_str).is_some_and(|w| w.contains("0 of 1 accepts")), "{e}");
+    lab.landed("D2", 60)?;
+    assert_eq!(lab.log_since(&t0)?, ["stack 2", "stack 1"], "in order");
+    let held = entry_of(&lab.queue()?, "D3");
+    assert!(text(&held, "state") == "held" && text(&held, "hold") == "gate" && text(&held, "reason").contains("D3: 0 of 1 accepts"), "{held}");
+    assert_ne!(lab.state("D3")?, "landing", "its diff is Review's while it holds");
+    lab.review("D3", "accept")?;
+    lab.landed("D3", 60)?;
+    assert_eq!(lab.log_since(&t0)?, ["stack 3", "stack 2", "stack 1"]);
+    Ok(())
+}
+
+/// W28-R107: an entry that comes to conflict with the trunk goes back to Review, not out:
+/// returned, saying where it conflicts. Once a version resolves it and Review approves that, the
+/// same entry joins the queue again and lands.
+#[test]
+fn w28_r107_a_conflict_goes_back_to_review_and_comes_back() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let lab = Lab::new(dir.path(), true)?;
+    let t0 = lab.trunk0.clone();
+    lab.diff(&t0, "README.md", "app, said one way\n", "one way", &format!("I{}", "1".repeat(40)))?;
+    let id2 = format!("I{}", "2".repeat(40));
+    lab.diff(&t0, "README.md", "app, said another\n", "another", &id2)?;
+    for d in ["D1", "D2"] {
+        lab.review(d, "accept")?;
+        let (st, e) = lab.land(d)?;
+        anyhow::ensure!(st == 200, "{d}: {e}");
+    }
+    std::fs::write(&lab.release, "")?;
+    lab.landed("D1", 180)?;
+    until(120, "D2 back with Review", || {
+        let d2 = entry_of(&lab.queue()?, "D2");
+        Ok((text(&d2, "state") != "returned").then(|| d2.to_string()))
+    })?;
+    let d2 = entry_of(&lab.queue()?, "D2");
+    assert!(text(&d2, "reason").contains("needs rebase: conflicts with the trunk in README.md"), "{d2}");
+    assert_eq!(d2.get("conflicts"), Some(&json!(["README.md"])), "{d2}");
+    assert_eq!(lab.state("D2")?, "accepted", "Review's again, not ejected");
+    // Its author resolves it on the trunk as it is: v2, held until Review approves it, then queued
+    // again and landed.
+    must(git(&lab.home, &lab.work, &["fetch", "-q", "origin"]), "fetch")?;
+    lab.diff(&lab.trunk()?, "README.md", "app, said one way, and another\n", "another", &id2)?;
+    until(60, "D2 waits for Review to approve v2", || {
+        let d = entry_of(&lab.queue()?, "D2");
+        Ok((!(text(&d, "state") == "held" && text(&d, "reason").contains("0 of 1 accepts"))).then(|| d.to_string()))
+    })?;
+    lab.review("D2", "accept")?;
+    lab.landed("D2", 180)?;
+    assert_eq!(text(&entry_of(&lab.queue()?, "D2"), "id"), text(&d2, "id"), "the same entry, queued again");
+    assert_eq!(lab.show(&lab.trunk()?, "README.md")?, "app, said one way, and another\n");
     Ok(())
 }
 

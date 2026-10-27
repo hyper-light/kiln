@@ -384,6 +384,10 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/review/inbox/read", "diffs.read", At::Anywhere),
     r("GET", "/api/repos/*/queue", "diffs.read", At::Repo(2)),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
+    // Review holds, lets go of or withdraws a land queue entry (docs/ci.md W28-R104).
+    r("POST", "/api/queue/*/hold", "diffs.review", At::Entry(2)),
+    r("POST", "/api/queue/*/release", "diffs.review", At::Entry(2)),
+    r("POST", "/api/queue/*/withdraw", "diffs.review", At::Entry(2)),
     // Change requests (W14-R04), as diffs.
     r("GET", "/api/repos/*/change-requests", "diffs.read", At::Repo(2)),
     r("POST", "/api/repos/*/change-requests", "diffs.submit", At::Repo(2)),
