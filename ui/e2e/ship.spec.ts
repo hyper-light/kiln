@@ -16,7 +16,7 @@ test("changes are Ship items, drawn by Ship's own row, needs you first", async (
   await expect(rows.first()).toContainText("pipeline: dynamic matrices");
   await expect(rows.first()).toContainText("Needs you");
   await expect(rows.first()).toContainText("kim: empty matrix meant? · 1 thread");
-  await expect(rows.first()).toContainText("D41 · requested");
+  await expect(rows.first()).toContainText("D41");
   await expect(rows.first().getByRole("img", { name: /^Review: requested, Land: not yet, Checks: passed/ })).toBeVisible();
   await expect(rows.first().getByRole("button", { name: "Hand off" })).toBeVisible();
   await expect(rows.first().getByRole("button", { name: "Review" })).toBeVisible();

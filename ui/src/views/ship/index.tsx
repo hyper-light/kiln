@@ -21,7 +21,7 @@ import { errorMessage } from "@/lib/hooks";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "../shared";
-import { ACTION_WORD, fold, HOSTS, KINDS, order, reviewWord, standWord, strip, type Item, type Sort } from "./model";
+import { ACTION_WORD, fold, HOSTS, KINDS, order, standWord, strip, type Item, type Sort } from "./model";
 import "./ship.css";
 
 const LIMIT = 100;
@@ -42,9 +42,7 @@ function ShipList() {
   const [params, setParams] = useSearchParams();
   const lens = params.get("lens") === "review" ? "review" : "all";
   const sort: Sort = params.get("sort") === "newest" ? "newest" : "needs";
-  const chosen: Chosen = Object.fromEntries(
-    (["host", "kind"] as const).map((k): [string, string[]] => [k, (params.get(k) ?? "").split(",").filter(Boolean)]).filter(([, v]) => v.length > 0),
-  );
+  const chosen: Chosen = Object.fromEntries((["host", "kind"] as const).map((k): [string, string[]] => [k, (params.get(k) ?? "").split(",").filter(Boolean)]).filter(([, v]) => v.length > 0));
   // One value of a facet is the server's to narrow by; several are narrowed here.
   const one = (k: string) => (chosen[k]?.length === 1 ? chosen[k][0] : undefined);
   const q: ShipQuery = { repo: params.get("repo") ?? undefined, host: one("host"), kind: one("kind"), lens: lens === "review" ? "review" : undefined, limit: LIMIT };
@@ -127,7 +125,6 @@ function Row({ item, reload }: { item: Item; reload: () => void }) {
   const c = item.head;
   const [open, setOpen] = React.useState(false);
   const [riders, setRiders] = React.useState(false);
-  const review = reviewWord(c);
   return (
     <li className="ship-row" data-stand={c.stand}>
       <div className="ship-r">
@@ -148,7 +145,7 @@ function Row({ item, reload }: { item: Item; reload: () => void }) {
             {c.author} · <RelTime ts={c.at} />
           </span>
           <span className="ship-m2">
-            {review && <span className="ship-change">{review}</span>}
+            {c.change && <span className="ship-change">{c.change.name}</span>}
             {c.tags?.map((t) => (
               <span key={t} className="ship-tag">
                 {t}
@@ -211,7 +208,13 @@ function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () 
   return (
     <span className="ship-acts">
       {acts.map((a, i) => (
-        <Button key={a.name} size="xs" variant={i === 0 ? "primary" : "secondary"} disabled={busy !== null} onClick={() => (a.method === "GET" && !commit.change ? navigate(a.path.replace(/^\/api/, "")) : void act(a))}>
+        <Button
+          key={a.name}
+          size="xs"
+          variant={i === 0 ? "primary" : "secondary"}
+          disabled={busy !== null}
+          onClick={() => (a.method === "GET" && !commit.change ? navigate(a.path.replace(/^\/api/, "")) : void act(a))}
+        >
           {ACTION_WORD[a.name] ?? a.name}
         </Button>
       ))}
@@ -259,11 +262,7 @@ function Dropdown({ commit }: { commit: ShipCommit }) {
       </section>
       <section aria-label="Lanes" className="ship-sec">
         <h3>Lanes</h3>
-        {commit.environments?.length ? (
-          <p>Runs in {commit.environments.map((e) => e.environment).join(", ")}.</p>
-        ) : (
-          <p>Not in an environment yet.</p>
-        )}
+        {commit.environments?.length ? <p>Runs in {commit.environments.map((e) => e.environment).join(", ")}.</p> : <p>Not in an environment yet.</p>}
       </section>
     </div>
   );

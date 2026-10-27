@@ -3,7 +3,7 @@
  * the needs-you-first order by stand, the words of each stand and action, and the facets.
  */
 import type { ShipCommit, ShipPip } from "@/api/ship";
-import { GLYPHS, STAGES, type GlyphState, type Pip } from "@/components/ui/status-glyph-spec";
+import { GLYPHS, type GlyphState, type Pip } from "@/components/ui/status-glyph-spec";
 
 /** Each stand's place in the needs-you-first order, and its word. */
 export const STANDS: { id: string; word: string }[] = [
@@ -74,18 +74,9 @@ export function order(items: readonly Item[], sort: Sort): Item[] {
     .map((x) => x.it);
 }
 
-/** The pips the journey strip draws, Review first: the stages and states it knows (others wait for their glyphs). */
+/** The pips the journey strip draws, Review first, every one the server sends; a state the page has no glyph for yet shows as not yet. */
 export function strip(pips: readonly ShipPip[]): Pip[] {
-  const stages = STAGES as readonly string[];
-  return pips.filter((p) => stages.includes(p.stage) && p.state in GLYPHS).map((p) => ({ stage: p.stage as Pip["stage"], state: p.state as GlyphState, p: p.p }));
-}
-
-/** The change and its review's state on the row, beside its Review pip: `D41 · requested`. */
-export function reviewWord(c: ShipCommit): string | null {
-  const ch = c.change;
-  if (!ch) return null;
-  const state = c.pips.find((p) => p.stage === "review")?.state;
-  return [ch.name, state && state !== "none" ? state : null].filter(Boolean).join(" · ");
+  return pips.map((p) => ({ stage: p.stage as Pip["stage"], state: (p.state in GLYPHS ? p.state : "none") as GlyphState, p: p.p }));
 }
 
 export const HOSTS = [

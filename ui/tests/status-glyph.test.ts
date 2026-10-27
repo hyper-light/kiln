@@ -4,8 +4,11 @@ import { arcPath, GLYPHS, journeyLabel, moves, pipDone, pipFlows, signature, STA
 
 test("every state has a word and a shape no other state has, so none needs its colour to be told apart", () => {
   const seen = new Map<string, string>();
+  const words = new Map<string, string>();
   for (const state of STATES) {
     assert.ok(GLYPHS[state].word.length > 0, `${state} has no word`);
+    assert.equal(words.get(GLYPHS[state].word), undefined, `${state} has the same word as ${words.get(GLYPHS[state].word)}`);
+    words.set(GLYPHS[state].word, state);
     const shape = signature(state);
     assert.equal(seen.get(shape), undefined, `${state} has the same shape as ${seen.get(shape)}`);
     seen.set(shape, state);

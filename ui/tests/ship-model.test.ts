@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ShipCommit } from "../src/api/ship.ts";
-import { fold, order, reviewWord, standWord, strip } from "../src/views/ship/model.ts";
+import { fold, order, standWord, strip } from "../src/views/ship/model.ts";
 
 const c = (sha: string, stand: string, extra: Partial<ShipCommit> = {}): ShipCommit => ({
   repo: "r",
@@ -43,12 +43,11 @@ test("w26_r02: needs you first, then failing, by stand; newest keeps Ship's orde
   assert.equal(standWord("superseded"), "Superseded");
 });
 
-test("w26_r02: the strip draws Review first, then the stages after it; what it doesn't know waits for its glyph", () => {
+test("w26_r02: the strip draws every pip the server sends, Review first; a state with no glyph yet shows as not yet", () => {
   const pips = [
     { stage: "review", state: "requested" },
     { stage: "land", state: "none" },
     { stage: "checks", state: "passed" },
-    { stage: "orbit", state: "passed" },
     { stage: "build", state: "levitating" },
   ];
   assert.deepEqual(
@@ -57,9 +56,7 @@ test("w26_r02: the strip draws Review first, then the stages after it; what it d
       ["review", "requested"],
       ["land", "none"],
       ["checks", "passed"],
+      ["build", "none"],
     ],
   );
-  const d41 = c("d", "needs_you", { pips, change: { name: "D41", kind: "diff", host: "kiln", title: "t", revision: 1, latest: 1, state: "requested", turn: [], open: null, superseded_by: null } });
-  assert.equal(reviewWord(d41), "D41 · requested");
-  assert.equal(reviewWord(c("x", "shipped")), null);
 });
