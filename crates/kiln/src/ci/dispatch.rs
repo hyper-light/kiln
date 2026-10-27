@@ -1299,6 +1299,10 @@ impl Dispatch {
 
     /// A runner's latest sample, to the engine ([`sample_of`]).
     async fn runner_sample(&mut self, agent: &str) {
+        // With headroom off, runners are placed as before their samples (W05-R03).
+        if !self.hub.cfg.ci.scheduler.headroom {
+            return;
+        }
         let sample = {
             let g = self.hub.agents.lock();
             g.get(agent).and_then(|a| a.sample.as_ref().map(|s| sample_of(s, a.facts.as_deref())))

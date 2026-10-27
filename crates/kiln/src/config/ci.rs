@@ -404,6 +404,10 @@ pub struct Scheduler {
     /// The share of a runner's CPUs and memory placement fills it to, by its live samples (docs/ci.md
     /// W05-R03, docs/runners.md): a leg goes only where it leaves the runner within it.
     pub target_use: f64,
+    /// Whether runners' live samples place work at all (W05-R03's headroom): off, CI legs and v1
+    /// jobs go by slots or resources alone, as before. kiln's own integration tests turn it off:
+    /// their runners share whatever machine runs the tests, whose load isn't theirs to wait for.
+    pub headroom: bool,
 }
 
 impl Scheduler {
@@ -448,6 +452,7 @@ impl Default for Scheduler {
             fair_by: vec!["repo".into()],
             admission: None,
             target_use: d.target_use,
+            headroom: true,
         }
     }
 }

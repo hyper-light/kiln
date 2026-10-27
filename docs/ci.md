@@ -1661,7 +1661,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   engine, and a leg goes only where what the sample has in use, what kiln placed there since and
   the leg's request stay within `[ci.scheduler] target_use` (0.85 by default, at most 1) of the
   runner's CPUs and of its memory; a sample over a minute old is unknown, and the runner is placed
-  by its room alone, as before samples. The engine and the v1 dispatcher place through one function
+  by its room alone, as before samples. `[ci.scheduler] headroom = false` places by room alone
+  everywhere (kiln's integration tests do: their runners share the machine running the tests). The engine and the v1 dispatcher place through one function
   shaped as kiln-seams' `Placement`, `kiln_ci::sched::place`, which Hex's placement (CP-T7.1) takes
   over (docs/runners.md §5). **None starves**: smaller legs would otherwise take every gap before a
   bigger one, so the first legs in a queue that no runner has had room for since a minute hold a

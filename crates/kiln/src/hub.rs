@@ -2875,7 +2875,7 @@ impl Hub {
             // job goes to another, or waits for one (a pod made for it is its own).
             .filter(|a| a.ephemeral || !strain_of(a).overloaded)
             // By the engine's own rule (W05): within the target use, the most headroom left.
-            .map(|a| V1Candidate { name: &a.name, slots: a.slots, headroom: if a.ephemeral { None } else { fresh_headroom(a, now) }, room: crate::reach::directory::room(strain_of(a), a.busy, a.slots) });
+            .map(|a| V1Candidate { name: &a.name, slots: a.slots, headroom: if a.ephemeral || !self.cfg.ci.scheduler.headroom { None } else { fresh_headroom(a, now) }, room: crate::reach::directory::room(strain_of(a), a.busy, a.slots) });
         v1_best(found, &asked, target).map(str::to_owned)
     }
 
