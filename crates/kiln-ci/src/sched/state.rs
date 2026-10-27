@@ -413,8 +413,10 @@ pub enum WaitReason {
     /// W05-R03): what it asks, and what each of those runners has of what it's short of.
     Oversized { asked: String, short: Vec<String> },
     /// Every runner with room for it would pass the target use with it, by its live headroom
-    /// (W05): the target in percent, and those runners.
-    Headroom { target: u32, runners: Vec<String> },
+    /// (W05): what it asks (`request`) and where (`place`: its platform, else its labels), the
+    /// target in percent, those runners, and the runner held for it (W05's admission) with when
+    /// that's expected to have room for it.
+    Headroom { target: u32, runners: Vec<String>, request: String, place: String, held: Option<String>, room_at: Option<i64> },
 }
 
 /// Why the runner a retry asked for can't take its leg now (W05-R28).
@@ -840,7 +842,7 @@ impl Scheduler {
             }
         }
         // Whatever came, the runners held for legs that can't fit, as they now stand (W05).
-        self.refresh_holds(now);
+        self.refresh_holds(now, &mut out);
         out
     }
 
@@ -2168,9 +2170,16 @@ impl Scheduler {
     /// the one with the most headroom now; as many legs as the signature has runners at most. A hold
     /// ends when its leg starts or leaves the queue, or its runner goes or drains; a runner without
     /// a fresh sample isn't held, and is placed as before.
-    fn refresh_holds(&mut self, now: i64) {
+    fn refresh_holds(&mut self, now: i64, out: &mut Vec<Command>) {
         let (legs, runners) = (&self.legs, &self.runners);
-        self.holds.retain(|r, h| legs.get(&h.leg).is_some_and(|l| l.state == State::Queued) && runners.get(r).is_some_and(|x| x.connected && !x.draining));
+        let mut changed: Vec<String> = Vec::new();
+        self.holds.retain(|r, h| {
+            let keep = legs.get(&h.leg).is_some_and(|l| l.state == State::Queued) && runners.get(r).is_some_and(|x| x.connected && !x.draining);
+            if !keep {
+                changed.push(h.leg.clone());
+            }
+            keep
+        });
         let wait = self.config().hold_after_ms;
         let mut firsts: Vec<String> = Vec::new();
         for s in self.sigs.values() {
@@ -2183,6 +2192,14 @@ impl Scheduler {
             }
             if let Some((runner, hold)) = self.hold_for(&id, now) {
                 self.holds.insert(runner, hold);
+                changed.push(id);
+            }
+        }
+        // Their waits say so.
+        for id in changed {
+            if self.legs.get(&id).is_some_and(|l| l.state == State::Queued) {
+                let reason = self.wait_reason(&id);
+                self.set_reason(&id, reason, out);
             }
         }
     }
@@ -2822,7 +2839,15 @@ impl Scheduler {
             let mut past: Vec<String> = eligible.iter().filter(|r| r.connected && !r.draining && self.room(r, l) && !self.under_target(r, l)).map(|r| r.input.view.name.clone()).collect();
             past.sort();
             if !past.is_empty() {
-                return WaitReason::Headroom { target: (self.config().target_use * 100.0).round() as u32, runners: past };
+                let held = self.holds.iter().find(|(_, h)| h.leg == l.input.id);
+                return WaitReason::Headroom {
+                    target: (self.config().target_use * 100.0).round() as u32,
+                    runners: past,
+                    request: needs::request_words(&l.input.request).join(" and "),
+                    place: place_of(&l.req),
+                    held: held.map(|(r, _)| name(r)),
+                    room_at: held.map(|(_, h)| h.shadow),
+                };
             }
             let draining = eligible.iter().filter(|r| r.draining).count();
             let busy = eligible.iter().filter(|r| !r.draining && !self.fits(r, l)).count();
@@ -2998,6 +3023,22 @@ fn ahead(a: (f64, u64, u64), b: (f64, u64, u64)) -> bool {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => (a.1, a.2) < (b.1, b.2),
+    }
+}
+
+/// Where a leg runs, in words: its platform where its constraints say one (`linux/x86_64`), else
+/// the labels it asks for.
+fn place_of(req: &Requirement) -> String {
+    let said = |fact: &str| {
+        req.constraints.iter().find_map(|(text, _)| {
+            let t: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            t.strip_prefix(fact).and_then(|r| r.strip_prefix("==")).map(|v| v.trim_matches(|c| c == '\'' || c == '"').to_owned())
+        })
+    };
+    match (said("os"), said("arch")) {
+        (Some(os), Some(arch)) => format!("{os}/{arch}"),
+        (Some(os), None) => os,
+        _ => req.labels.join(", "),
     }
 }
 

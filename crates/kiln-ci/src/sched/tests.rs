@@ -1888,7 +1888,11 @@ fn legs_go_where_samples_leave_the_most_headroom_within_the_target() {
     say(&mut s, "b", 0.84, 0.0, 5_000);
     let c = s.handle(Input::LegQueued(Box::new(asking("third", 1.0, 2))), 6_000);
     assert_eq!(to(&c, "third"), None, "{c:?}");
-    assert_eq!(s.reason("third"), Some(&WaitReason::Headroom { target: 85, runners: vec!["a".into(), "b".into()] }));
+    assert!(
+        matches!(s.reason("third"), Some(WaitReason::Headroom { target: 85, runners, request, place, held: None, room_at: None }) if *runners == ["a", "b"] && request == "1 CPU and 2 GiB of memory" && place == "k8s"),
+        "{:?}",
+        s.reason("third")
+    );
     // b's next sample shows room: it goes there.
     let c = say(&mut s, "b", 0.5, 0.0, 7_000);
     assert_eq!(to(&c, "third").as_deref(), Some("b"), "{c:?}");
@@ -1979,6 +1983,12 @@ fn a_leg_that_cant_fit_holds_a_runner_for_itself() {
     let h = s.held("a").cloned();
     assert!(h.as_ref().is_some_and(|h| h.leg == "big" && h.shadow == 121_000 && (h.extra.cpu - 1.2).abs() < 1e-9), "{h:?}");
     assert!(s.held("b").is_none());
+    // Its wait says what it waits for, and the runner held for it.
+    assert!(
+        matches!(s.reason("big"), Some(WaitReason::Headroom { request, held: Some(on), room_at: Some(121_000), .. }) if request == "14 CPUs and 1 GiB of memory" && on == "a"),
+        "{:?}",
+        s.reason("big")
+    );
     // On a, a leg expected to run past then doesn't start, though it fits; one that ends by then does.
     let c = s.handle(Input::LegQueued(Box::new(asking("long", 2.0, 600.0))), 63_000);
     assert_eq!(to(&c, "long"), None, "{c:?}");

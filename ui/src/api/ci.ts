@@ -933,6 +933,11 @@ export function waitSentence(w: unknown): string | null {
     failing?: string[];
     runners?: string[];
     target?: number;
+    /** What a leg waiting for room asks, where, and the runner held for it with when it's to have room (W05). */
+    request?: string;
+    place?: string;
+    held?: string | null;
+    room_at?: number | null;
     group?: string;
     holders?: string[];
     limit?: number;
@@ -972,8 +977,10 @@ export function waitSentence(w: unknown): string | null {
       return `Waiting for a free runner: ${o.eligible ?? 0} can take it, ${o.busy ?? 0} busy${o.draining ? `, ${o.draining} draining` : ""}.`;
     case "oversized":
       return `It asks for more than any runner that can take it has (${o.asked ?? "its request"})${list(o.short)}.`;
-    case "headroom":
-      return `Every runner with room for it would pass ${o.target ?? 85}% use with it${list(o.runners)}.`;
+    case "headroom": {
+      const held = o.held ? `: ${o.held} is held for it, with room about ${time(o.room_at)}` : "";
+      return `Waiting for ${o.request || "room"} free${o.place ? ` on a ${o.place} runner` : ""}${held}. Every runner with room for it would pass ${o.target ?? 85}% use with it${list(o.runners)}.`;
+    }
     case "no-runner":
       return `No runner that can take it is connected${list(o.offline)}.`;
     case "unroutable":
