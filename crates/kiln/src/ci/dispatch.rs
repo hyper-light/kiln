@@ -1102,13 +1102,13 @@ impl Dispatch {
             Msg::Warm { agent, seq, held } => {
                 if self.warm.get(&agent).is_some_and(|(newest, _)| *newest == seq) {
                     let cmds = self.sched.handle(Input::Warm { runner: agent, held: *held }, now_ms());
-                    self.commands(cmds).await;
+                    Box::pin(self.commands(cmds)).await;
                 }
                 Ok(())
             }
             Msg::RunnerLost { agent } => {
                 let cmds = self.sched.handle(Input::RunnerLost { runner: agent }, now_ms());
-                self.commands(cmds).await;
+                Box::pin(self.commands(cmds)).await;
                 Ok(())
             }
             Msg::Event { agent, leg, json } => self.event(&agent, &leg, &json).await,
@@ -1123,7 +1123,7 @@ impl Dispatch {
                     l.agent = None;
                 }
                 let cmds = self.sched.handle(Input::Rejected { leg }, now_ms());
-                self.commands(cmds).await;
+                Box::pin(self.commands(cmds)).await;
                 Ok(())
             }
             Msg::Cancel { run, reason } => self.cancel_run(&run, &reason).await,
@@ -1163,13 +1163,13 @@ impl Dispatch {
                     }
                 };
                 let cmds = self.sched.handle(input, now_ms());
-                self.commands(cmds).await;
+                Box::pin(self.commands(cmds)).await;
                 Ok(())
             }
             Msg::PoolsChanged => {
                 let (pools, reservations) = super::pools::sources(&self.hub).await;
                 let cmds = self.sched.handle(Input::PoolsChanged { pools, reservations }, now_ms());
-                self.commands(cmds).await;
+                Box::pin(self.commands(cmds)).await;
                 Ok(())
             }
             Msg::Pools { reply } => {
@@ -1207,7 +1207,7 @@ impl Dispatch {
     /// Hands the scheduler the rules as they now stand: waiting legs are routed again.
     async fn rules_changed(&mut self) {
         let cmds = self.sched.handle(Input::RulesChanged(self.routing.effective()), now_ms());
-        self.commands(cmds).await;
+        Box::pin(self.commands(cmds)).await;
     }
 
     async fn tick(&mut self) {
@@ -1231,7 +1231,7 @@ impl Dispatch {
             }
         }
         let cmds = self.sched.handle(Input::Tick, now);
-        self.commands(cmds).await;
+        Box::pin(self.commands(cmds)).await;
     }
 
     /// A runner as the scheduler sees it: what its probes found (W13-R01), else what its build
@@ -1286,7 +1286,7 @@ impl Dispatch {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
         let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
-        self.commands(cmds).await;
+        Box::pin(self.commands(cmds)).await;
     }
 
     async fn runner_up(&mut self, agent: &str, running: &[String]) {
@@ -1305,7 +1305,7 @@ impl Dispatch {
         let r = RunnerIn { id: agent.to_owned(), view, slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());
         cmds.extend(self.lose(gone, "the runner lost it").await);
-        self.commands(cmds).await;
+        Box::pin(self.commands(cmds)).await;
     }
 
     /// The legs the rebuild after a restart found running on runners that haven't said hello
@@ -1318,7 +1318,7 @@ impl Dispatch {
         }
         tracing::warn!(legs = gone.len(), "legs' runners didn't come back after the restart: the legs were lost with them");
         let cmds = self.lose(gone, "its runner didn't come back after the server restarted").await;
-        self.commands(cmds).await;
+        Box::pin(self.commands(cmds)).await;
     }
 
     /// `gone`'s legs (each with its attempt) lost with their runner: each attempt fails so, for the
@@ -1434,7 +1434,9 @@ impl Dispatch {
         self.hub.ci.runs.lock().insert(id.clone());
         self.hub.emit_run(&id).await;
         let cmds = self.run_queued(&id, group, Arrival::New);
-        self.commands(cmds).await;
+        // Boxed, as each step of the commands-actions-queue cycle is: its futures otherwise nest
+        // in one another's frames, past a shard's stack in a debug build.
+        Box::pin(self.commands(cmds)).await;
         Ok(())
     }
 
@@ -1476,7 +1478,7 @@ impl Dispatch {
         if approve {
             self.hub.emit_run(run).await;
             let cmds = self.run_queued(run, waiting.group, Arrival::New);
-            self.commands(cmds).await;
+            Box::pin(self.commands(cmds)).await;
         } else {
             self.cancel_run(run, &format!("{by} didn't approve it")).await?;
         }
@@ -1674,7 +1676,7 @@ impl Dispatch {
                     // A rerun's leg that isn't run again keeps the last attempt's result.
                     match self.runs.get_mut(run).and_then(|r| r.keep.remove(&spec.key)) {
                         Some((report, old)) => Box::pin(self.keep(run, *spec, report, &old)).await?,
-                        None => self.queue(run, *spec).await?,
+                        None => Box::pin(self.queue(run, *spec)).await?,
                     }
                 }
                 PlanAction::Settle { leg, conclusion, reason } => {
@@ -1859,7 +1861,7 @@ impl Dispatch {
         self.hub.ci.runs.lock().insert(run.to_owned());
         self.hub.emit_run(run).await;
         let cmds = self.run_queued(run, group, Arrival::Rerun);
-        self.commands(cmds).await;
+        Box::pin(self.commands(cmds)).await;
         Ok(attempt)
     }
 
@@ -2144,7 +2146,7 @@ impl Dispatch {
             let r = match c {
                 Command::StartRun { run } => {
                     let held = self.runs.get_mut(&run).and_then(|r| r.held.take()).unwrap_or_default();
-                    self.actions(&run, held).await
+                    Box::pin(self.actions(&run, held)).await
                 }
                 Command::CancelRun { run, reason } => self.cancel_run(&run, &reason).await,
                 Command::Assign { leg, runner, attempt, executor, image, docker, slot } => self.assign(&leg, &runner, attempt, Placement { executor, image, docker, slot }).await,
@@ -2846,7 +2848,7 @@ impl Dispatch {
             tracing::warn!(leg = %r.job, error = %format!("{e:#}"), "the attempt could not be recorded");
         }
         let cmds = self.sched.handle(Input::AttemptFinished { leg: r.job.clone(), attempt, outcome }, now_ms());
-        self.commands(cmds).await;
+        Box::pin(self.commands(cmds)).await;
         Ok(())
     }
 
@@ -2870,7 +2872,7 @@ impl Dispatch {
             for leg in legs {
                 // Its runner hears the cancel while the leg still says where it runs.
                 let cmds = self.sched.handle(Input::LegGone { leg: leg.clone() }, now_ms());
-                self.commands(cmds).await;
+                Box::pin(self.commands(cmds)).await;
                 match self.legs.get_mut(&leg) {
                     // Running: kept until its runner says it ended (its slot is the runner's until then).
                     Some(l) if l.agent.is_some() => l.gone = true,
@@ -2884,7 +2886,7 @@ impl Dispatch {
             self.runs.remove(&run);
             self.hub.ci.runs.lock().remove(&run);
             let cmds = self.sched.handle(Input::RunFinished { run }, now_ms());
-            self.commands(cmds).await;
+            Box::pin(self.commands(cmds)).await;
         }
     }
 
@@ -3167,7 +3169,7 @@ impl Dispatch {
         // Its demand again, so withdrawals are worked out afresh in creation order (W28-R46). It has
         // started already.
         let cmds: Vec<Command> = self.run_queued(run, None, Arrival::Restore).into_iter().filter(|c| !matches!(c, Command::StartRun { .. })).collect();
-        self.commands(cmds).await;
+        Box::pin(self.commands(cmds)).await;
         for li in queued {
             // Held for its environment before the restart: held again, its wait counted from then.
             if let Some(env) = self.legs.get(&li.id).and_then(|l| l.spec.environment.as_ref()).map(|e| e.name.clone()).filter(|n| !n.is_empty()) {
@@ -3181,7 +3183,7 @@ impl Dispatch {
                 continue;
             }
             let cmds = self.sched.handle(Input::LegQueued(Box::new(li)), now_ms());
-            self.commands(cmds).await;
+            Box::pin(self.commands(cmds)).await;
         }
         for (key, reason) in cancelled {
             let Some(id) = self.runs.get(run).and_then(|r| r.keys.get(&key).cloned()).filter(|id| self.legs.contains_key(id)) else { continue };
@@ -3190,7 +3192,7 @@ impl Dispatch {
                 continue;
             }
             let cmds = self.sched.handle(Input::LegCancelled { leg: id, reason }, now_ms());
-            self.commands(cmds).await;
+            Box::pin(self.commands(cmds)).await;
         }
         for (key, report) in late {
             let Some(r) = self.runs.get_mut(run) else { break };
