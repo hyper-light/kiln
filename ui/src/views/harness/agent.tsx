@@ -12,21 +12,8 @@ import "./harness.css";
 import "./console.css";
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ArrowLeft, ChevronRight, RotateCcw, X } from "lucide-react";
-import {
-  harnessApi,
-  lastTurnFrom,
-  sessionStore,
-  useSession,
-  useSessionReady,
-  useStopAt,
-  type AgentInfo,
-  type Command,
-  type FileChange,
-  type HEvent,
-  type Meta,
-  type SessionStore,
-  type Todo,
-} from "@/api/harness";
+import { harnessApi, lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt } from "@/api/harness";
+import type { AgentInfo, Command, FileChange, HEvent, Meta, SessionStore, Todo } from "@/api/harness";
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import { kilnSubagentsOf } from "./tasks";
 import { Button } from "@/components/ui/button";
