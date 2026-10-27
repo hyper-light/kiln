@@ -316,3 +316,31 @@
     width: 100%;
   }
 }
+
+/* A row keeps one height whatever its state (step 5): one line for its name, one for its words, a
+   pair of actions of one width, an empty slot holding its place unseen. */
+.ship-name,
+.ship-text,
+.ship-m2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ship-acts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.ship-act-slot {
+  visibility: hidden;
+}
+.ship-act-slot > * {
+  width: 100%;
+}
+/* Its one environment: production in mint, another in grey. */
+.ship-env {
+  color: #a1a4ad;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.ship-env[data-prod] {
+  color: #bfdccf;
+}

@@ -148,6 +148,15 @@ function Row({ item, reload }: { item: Item; reload: () => void }) {
   const c = item.head;
   const [open, setOpen] = React.useState(false);
   const [riders, setRiders] = React.useState(false);
+  // One environment flag: production when it runs there, else the first it runs in.
+  const env = c.environments?.find((e) => e.production) ?? c.environments?.[0];
+  const n = item.riders.length;
+  const what =
+    item.folds === "rides"
+      ? `${n} commit${n === 1 ? "" : "s"} riding with it`
+      : item.folds === "shipped"
+        ? `${n} more shipped`
+        : `${n} more commit${n === 1 ? "" : "s"} of ${c.change?.name ?? "this change"}`;
   return (
     <li className="ship-row" data-stand={c.stand}>
       <div className="ship-r">
@@ -174,6 +183,11 @@ function Row({ item, reload }: { item: Item; reload: () => void }) {
                 {t}
               </span>
             ))}
+            {env && (
+              <span className="ship-env" data-prod={env.production || undefined}>
+                {env.environment}
+              </span>
+            )}
             <span className="ship-sha">{c.short}</span>
           </span>
         </span>
@@ -184,7 +198,7 @@ function Row({ item, reload }: { item: Item; reload: () => void }) {
       </div>
       {item.riders.length > 0 && (
         <button type="button" className="ship-fold" aria-expanded={riders} onClick={() => setRiders(!riders)}>
-          {riders ? "Hide" : "Show"} {item.riders.length} more commit{item.riders.length === 1 ? "" : "s"} of {c.change?.name ?? "this change"}
+          {riders ? "Hide" : "Show"} {what}
         </button>
       )}
       {riders && (
@@ -227,7 +241,15 @@ function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () 
     }
   };
   const acts = (commit.actions ?? []).slice(0, 2);
-  if (acts.length === 0) return <span className="ship-acts" />;
+  // Always a pair of one width: a slot no action fills keeps its place, unseen.
+  const slot = (k: number) => (
+    <span key={`slot-${k}`} className="ship-act-slot" aria-hidden="true">
+      <Button size="xs" variant="secondary" tabIndex={-1} disabled>
+        ·
+      </Button>
+    </span>
+  );
+  if (acts.length === 0) return <span className="ship-acts">{[slot(0), slot(1)]}</span>;
   return (
     <span className="ship-acts">
       {acts.map((a, i) => (
@@ -241,6 +263,7 @@ function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () 
           {ACTION_WORD[a.name] ?? a.name}
         </Button>
       ))}
+      {acts.length === 1 && slot(1)}
     </span>
   );
 }

@@ -44,6 +44,8 @@ export const ACTION_WORD: Record<string, string> = {
 export interface Item {
   head: ShipCommit;
   riders: ShipCommit[];
+  /** What folds under it: its change's other commits, the commits riding with its approval, or the shipped ones after it. */
+  folds?: "change" | "rides" | "shipped";
 }
 
 /** The page's commits as rows: each folds under its change's tip when the page has the tip. */
@@ -58,9 +60,37 @@ export function fold(commits: readonly ShipCommit[]): Item[] {
     at.set(c.sha, item);
   }
   for (const c of commits) {
-    if (c.fold_under) at.get(c.fold_under)?.riders.push(c);
+    const it = c.fold_under ? at.get(c.fold_under) : undefined;
+    if (it) {
+      it.riders.push(c);
+      it.folds = "change";
+    }
   }
-  return items;
+  // Riders fold under the approval they ride with (the commit production waits on in their repository),
+  // and a run of shipped commits under its newest (plan 01a175b7f20b7277b15bddd2ad001bcc, step 5).
+  const approval = new Map<string, Item>();
+  for (const it of items) if (it.head.actions?.some((a) => a.name === "approve")) approval.set(it.head.repo, it);
+  const plain = (it: Item) => !it.head.change && it.riders.length === 0;
+  const out: Item[] = [];
+  let shipped: Item | null = null;
+  for (const it of items) {
+    const to = approval.get(it.head.repo);
+    if (to && to !== it && it.head.stand === "waiting" && plain(it)) {
+      to.riders.push(it.head);
+      to.folds ??= "rides";
+      continue;
+    }
+    if (it.head.stand === "shipped" && plain(it)) {
+      if (shipped && shipped.head.repo === it.head.repo) {
+        shipped.riders.push(it.head);
+        shipped.folds = "shipped";
+        continue;
+      }
+      shipped = it;
+    } else shipped = null;
+    out.push(it);
+  }
+  return out;
 }
 
 export type Sort = "needs" | "newest" | "trunk" | "stage" | "author" | "oldest";
