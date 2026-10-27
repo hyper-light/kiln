@@ -157,6 +157,16 @@ counted.
 - **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select
   it (and drag over more), tap rows while selecting, or swipe one right; the list's head says how
   many, with Select all and Done. With a mouse, rows keep their checkboxes.
+- **What to do with those selected.** The list's head offers each of one agent's own actions that
+  some of the selected take, saying how many: **Resume** (those paused at a usage limit, and those
+  whose goals are paused part-way), **Pause** (their goals running), **Stop** (their turns under
+  way), **Restart** and **Remove** (those stopped or ended), **Move to…** and **End…**. Moving
+  and ending are asked in a line under the buttons: Move offers each machine that takes some of
+  them (how many, when not all, and why the rest stay), once their turns are over or now; End
+  says what goes with them and ends the agents they started that still run too, unless unticked.
+  **More** holds where their commands run, keeping them going, and muting their notifications.
+  Each goes to every agent it's for at once; a line says how it went (done, skipped, failed) and
+  opens to each agent's outcome and why. Those all ended leave the selection.
 - **The composer.** At the top of the page, on a desktop and a phone alike (where it's one line
   until it's used). There is no New agents button and no dialog: with nothing selected it starts an
   agent, its words the agent's first message. Above the box is the agent page's own line,
