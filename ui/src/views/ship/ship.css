@@ -189,10 +189,11 @@
   font-size: 11px;
   color: #8b8e96;
 }
+/* The dropdown's sections one under another, each the lanes card's width at every size (W26-R06). */
 .ship-open {
   padding: 2px 4px 18px 16px;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
 }
 .ship-sec {
@@ -343,4 +344,87 @@
 }
 .ship-env[data-prod] {
   color: #bfdccf;
+}
+
+/* An opened commit's job cards (opened-commit plan, step 1): as many to a view as fit, the cards and
+   their gaps together exactly the lanes card's width, snapping a card at a time. */
+.ship-jobs {
+  container-type: inline-size;
+}
+.ship-jobs__track {
+  --n: 1;
+  --gap: 0.75rem;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: calc((100% - (var(--n) - 1) * var(--gap)) / var(--n));
+  column-gap: var(--gap);
+  margin: 0;
+  padding: 0;
+  overflow-x: auto;
+  list-style: none;
+  scroll-snap-type: x mandatory;
+  scrollbar-width: none;
+}
+.ship-jobs__track::-webkit-scrollbar {
+  display: none;
+}
+@container (min-width: 420px) {
+  .ship-jobs__track {
+    --n: 2;
+  }
+}
+@container (min-width: 620px) {
+  .ship-jobs__track {
+    --n: 3;
+  }
+}
+@container (min-width: 820px) {
+  .ship-jobs__track {
+    --n: 4;
+  }
+}
+@container (min-width: 1100px) {
+  .ship-jobs__track {
+    --n: 6;
+  }
+}
+.ship-job {
+  display: flex;
+  min-height: 4.5rem;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-radius: 0.75rem;
+  background: rgb(255 255 255 / 0.02);
+  scroll-snap-align: start;
+}
+.ship-job__head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #e4e5e9;
+  font-size: 0.875rem;
+}
+.ship-job__state {
+  color: #a3a5ad;
+  font-size: 0.8125rem;
+}
+.ship-jobs__pager {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.25rem;
+  margin-top: 0.5rem;
+}
+.ship-jobs__page {
+  display: inline-grid;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  border: 1px solid rgb(255 255 255 / 0.12);
+  border-radius: 999px;
+  color: #e4e5e9;
+}
+.ship-jobs__page:disabled {
+  opacity: 0.35;
 }

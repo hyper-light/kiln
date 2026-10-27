@@ -27,6 +27,7 @@ import { ShipViews } from "./views";
 import { Stands } from "@/views/harness/stands";
 import { SelectField } from "@/components/ui/misc";
 import { useGlide, useListHold } from "@/views/harness/list-tools";
+import { JobCards } from "./jobs";
 
 const LIMIT = 100;
 
@@ -329,6 +330,7 @@ function Dropdown({ commit }: { commit: ShipCommit }) {
       </section>
       <section aria-label="Jobs" className="ship-sec">
         <h3>Jobs</h3>
+        <JobCards commit={commit} />
         <ul>
           {(commit.runs ?? []).map((r) => (
             <li key={r.id}>
