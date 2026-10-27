@@ -670,7 +670,8 @@ jobs:
     assert!(at("D1", "updated_at") <= at("D2", "updated_at"), "{q}");
     let record = entry_of(&q, "D1").get("record").cloned().unwrap_or_default();
     assert_eq!(record.get("changes"), Some(&json!(["D1"])), "the land kept: {record}");
-    assert!(record.get("runs").and_then(Value::as_array).is_some_and(|r| r.iter().any(|run| text(run, "workflow").ends_with("gate.yml"))), "its candidate's checks: {record}");
+    assert!(record.get("runs").and_then(Value::as_array).is_some_and(|r| r.iter().any(|run| text(run, "workflow") == "gate" && text(run, "conclusion") == "success")), "its candidate's checks: {record}");
+    assert_eq!((record.get("rebased"), record.pointer("/revisions/0/version")), (Some(&json!(false)), Some(&json!(1))), "{record}");
     must(git(&home, &work, &["fetch", "-q", "origin"]), "fetch")?;
     let landed = must(git(&home, &work, &["log", "--format=%s", &format!("{trunk0}..origin/main")]), "log")?;
     assert_eq!(landed.lines().count(), 3, "{landed}");
