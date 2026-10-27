@@ -238,6 +238,11 @@ pub enum AgentMsg {
     /// changed, and every 10 minutes, each superseding the last; only to a server announcing
     /// [`CAP_WORK`]. Appended last: postcard encodes variants by index.
     WorkState { json: String },
+    /// This machine's headroom (JSON [`crate::headroom::Status`], docs/headroom.md): its targets'
+    /// latencies, its window, what waits and what is paced. Sent on every (re)connect and when what
+    /// it decides changes; only to a server announcing [`CAP_HEADROOM`]. Appended last: postcard
+    /// encodes variants by index.
+    HeadroomStatus { json: String },
 }
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
@@ -372,6 +377,12 @@ pub const CAP_HANDOVER: u64 = 1 << 35;
 /// (docs/ci.md W24-R18). A runner that says it tells the server what it holds warm
 /// ([`AgentMsg::WorkState`]); a server that says it takes that.
 pub const CAP_WORK: u64 = 1 << 36;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: headroom (docs/headroom.md). A runner
+/// that says it keeps its machine's headroom from settings the server sends
+/// ([`ServerMsg::Headroom`]) and reports it ([`AgentMsg::HeadroomStatus`]); a server that says it
+/// takes that.
+pub const CAP_HEADROOM: u64 = 1 << 37;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -616,6 +627,10 @@ pub enum ServerMsg {
     /// wire's, the cluster group's and the restarts' `Kept` (CP-T3.2 landed after them): postcard
     /// encodes variants by index.
     HarnessSend { session: String, epoch: u64, json: String },
+    /// This machine's headroom settings (JSON [`crate::headroom::Push`]): applied at once and kept
+    /// for the runner's next start. Only to runners announcing [`CAP_HEADROOM`]. Appended last:
+    /// postcard encodes variants by index.
+    Headroom { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests

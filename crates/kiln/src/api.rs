@@ -585,6 +585,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::POST, ["api", "agents", name, "probe"]) => boxed(|| probe_agent(&hub, name)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "front-doors"]) => front_door(boxed(|| crate::frontdoor::control::list(&hub)).await),
+        (&Method::GET, ["api", "headroom"]) => front_door(boxed(|| crate::headroom::control::list(&hub)).await),
+        (&Method::GET, ["api", "runners", name, "headroom"]) => front_door(boxed(|| crate::headroom::control::get(&hub, name)).await),
+        (&Method::PUT, ["api", "runners", name, "headroom"]) => {
+            let name = (*name).to_owned();
+            front_door(boxed(|| crate::headroom::control::put(&hub, &name, req)).await)
+        }
         (&Method::GET, ["api", "runners", name, "front-door"]) => front_door(boxed(|| crate::frontdoor::control::get(&hub, name)).await),
         (&Method::PUT, ["api", "runners", name, "front-door"]) => {
             let name = (*name).to_owned();

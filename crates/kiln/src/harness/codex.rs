@@ -2001,7 +2001,7 @@ impl Codex {
     }
 
     /// Between turns: the next waiting message, then kiln's queue.
-    fn next(&mut self, core: &mut Core) {
+    pub(crate) fn next(&mut self, core: &mut Core) {
         if self.busy(core) || core.state.status == Status::Exited {
             return;
         }

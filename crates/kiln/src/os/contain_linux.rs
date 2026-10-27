@@ -192,6 +192,11 @@ impl Group {
     }
 }
 
+/// The folder that holds this runner's agents' groups (headroom paces them), when it has one.
+pub fn agents_dir() -> Option<PathBuf> {
+    base().map(|b| b.dir.clone())
+}
+
 /// The agent session process `pid` belongs to by its group, when it's in one.
 pub fn session_of(pid: u32) -> Option<String> {
     base()?.session_of(pid)

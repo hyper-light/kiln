@@ -879,7 +879,8 @@ impl Host {
             {
                 return Ok(Arc::clone(s));
             }
-            if g.len() >= self.limits.per_machine {
+            let most = crate::headroom::max_sessions().map_or(self.limits.per_machine, |n| n.min(self.limits.per_machine));
+            if g.len() >= most {
                 anyhow::bail!("this machine already runs {} agent sessions (the limit)", g.len());
             }
             if let Some(shell) = &spec.shell {
@@ -1370,6 +1371,10 @@ impl Host {
         let now_s = u64::try_from(self.clock.unix_s()).unwrap_or(0);
         // What the sessions started that still runs: found by their mark, and as recorded.
         let found = super::survivors::scan(&saved.iter().map(|s| (s.id.clone(), None)).collect::<Vec<_>>());
+        // Sessions a restart continues are never turned away by headroom's session limit; their
+        // work starts as headroom lets it (the window starts small).
+        crate::headroom::restoring(true);
+        let _restored = scopeguard_restoring();
         for s in saved {
             let id = s.id.clone();
             if let Some(h) = handed.remove(&id) {
@@ -1955,6 +1960,17 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info), since: None }, super::core::Update::State { state: Box::new(state) }]
+}
+
+/// Ends headroom's "restoring" when dropped (the restore returned, or panicked).
+fn scopeguard_restoring() -> impl Drop {
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            crate::headroom::restoring(false);
+        }
+    }
+    Done
 }
 
 #[cfg(test)]
@@ -3237,3 +3253,4 @@ while True:
         local_hand_over(5)
     }
 }
+

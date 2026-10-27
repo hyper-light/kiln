@@ -431,6 +431,19 @@ impl Adapter {
         }
     }
 
+    /// What waits in kiln's queue goes on, if it may now (headroom had room for it).
+    pub fn drain(&mut self, core: &mut Core) {
+        if core.state.queue.is_empty() {
+            return;
+        }
+        match self {
+            Self::Claude(a) => a.drain_queue(core),
+            Self::Codex(a) => a.next(core),
+            Self::Acp(a) => a.next(core),
+            Self::Agy(a) => a.next(core),
+        }
+    }
+
     /// Every few seconds while the process runs: a chance to poll what the harness only reports
     /// when asked (plan usage, servers still connecting).
     pub fn tick(&mut self, core: &mut Core) {

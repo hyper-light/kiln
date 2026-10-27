@@ -31,6 +31,7 @@ pub mod githost;
 pub mod gitops;
 pub mod handovers;
 pub mod harness;
+pub mod headroom;
 pub mod host;
 pub mod hub;
 pub mod install;

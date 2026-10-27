@@ -277,6 +277,8 @@ pub fn run_tag() -> String {
 }
 
 pub struct Core {
+    /// The agent session it is (kiln's id): headroom holds and lets in work by it.
+    pub session_id: String,
     pub state: State,
     pub meta: Meta,
     events: VecDeque<Event>,
@@ -352,6 +354,7 @@ pub struct Frozen {
 impl Core {
     pub fn new() -> Self {
         Self {
+            session_id: String::new(),
             state: State::default(),
             meta: Meta::default(),
             events: VecDeque::new(),

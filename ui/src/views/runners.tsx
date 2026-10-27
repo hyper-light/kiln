@@ -20,6 +20,7 @@ import { usePref } from "@/lib/prefs";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { FrontDoorSection, frontDoorsRes } from "./front-door/front-door";
+import { HeadroomSection } from "./headroom/headroom";
 import { HostCharts } from "./host-charts";
 import { discoveryRes, joinRequestsRes } from "./add-machines/data";
 import { JoinNotice } from "./add-machines/notice";
@@ -313,6 +314,7 @@ function RunnersBody() {
       )}
 
       {all.length > 0 && <FrontDoorSection agents={all} index="02" />}
+      {all.length > 0 && <HeadroomSection agents={all} index="03" />}
     </>
   );
 }

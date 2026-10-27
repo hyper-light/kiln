@@ -509,7 +509,7 @@ pub fn let_through(core: &mut Core, c: Command) -> Option<Command> {
 /// Whether kiln's queue may send its next message now: not held for a switch, not paused, not at
 /// the stop point (which starts a pause).
 pub fn open(core: &mut Core) -> bool {
-    !core.hold && !at_threshold(core)
+    !core.hold && !at_threshold(core) && crate::headroom::admit(&core.session_id, crate::headroom::Class::Agent)
 }
 
 /// The job an `Effect::Checkpoint` comes back under (`run_done`), followed by the pause's start.

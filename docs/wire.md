@@ -391,6 +391,7 @@ Four edges are left, and the lab steers clear of each:
 | `HarnessHistory` | answer | Answers `HarnessHistory`. | As its class says. |
 | `Sync` | carried (repo sync's Raft) | Repo sync: hyper-raft acknowledges and resends its own messages. | As its class says. |
 | `FrontDoorStatus` | state | The machine's front door. | Sent on every connect and change, not acknowledged. |
+| `HeadroomStatus` | state | The machine's headroom: its targets, window, held and paced work (docs/headroom.md). | Sent on every connect and when what it decides changes, not acknowledged. |
 | `JobEvent` | stream | A v2 leg's events, numbered per leg (`seq`). | Kept until `Received` and sent again after a reconnect (`CAP_RECEIVED`). |
 | `Facts` | state | What the runner is: OS, CPUs, tools and so on. | Sent on connect, every 10 minutes and when asked. |
 | `Reach` | carried (reach link) | A frame of a link between two runners, relayed. The link's ends frame it. | As its class says. |
@@ -444,6 +445,7 @@ Four edges are left, and the lab steers clear of each:
 | `HarnessHistory` | ask | Answered by `HarnessHistory`. | As its class says. |
 | `Sync` | carried (repo sync's Raft) | Repo sync. | As its class says. |
 | `FrontDoor` | state | The front door's settings and certificate. | On the channel ("Commands"), parked: the newest goes, answered once taken. Sent on connect and change. |
+| `Headroom` | state | The machine's headroom settings (docs/headroom.md). | Sent on connect and on change; the runner keeps them. |
 | `AssignV2` | command, refused while away | A v2 leg to run, as `Assign`. | On the channel ("Commands"): answered once taken, then by `JobStarted` or `Reject`. |
 | `SecretsFor` | command, parked | A running leg's secrets. A leg still running when its runner is back needs them. | Fire-and-forget. |
 | `JobTerminalOpen` | command, refused while away | A terminal into a leg. | On the channel ("Commands"): answered once applied; refused at once while away. |

@@ -295,6 +295,8 @@ enum Ev {
     Harness(String, crate::harness::core::Update),
     /// The front door's status changed.
     FrontDoor,
+    /// What headroom decides changed (docs/headroom.md).
+    Headroom,
     /// A blue/green upgrade step done off the loop (`crate::bluegreen`).
     #[cfg(unix)]
     Bg(Bg),
@@ -948,6 +950,13 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, rec
 }
 
 /// Completes when the front door (if this runner has one) reports something new.
+async fn headroom_changed(h: Option<&crate::headroom::Handle>) {
+    match h {
+        Some(h) => h.changed().await,
+        None => futures::future::pending().await,
+    }
+}
+
 async fn front_door_changed(fd: Option<&crate::frontdoor::runner::Handle>) {
     match fd {
         Some(h) => h.changed().await,
@@ -1030,6 +1039,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     });
     // What the server last heard of it on this connection.
     let mut front_door_sent: Option<String> = None;
+    // This machine's headroom (docs/headroom.md): started before any agent session resumes, so a
+    // restart's sessions come back a few at a time; it runs from the settings it kept, server or not.
+    let headroom = (!o.ephemeral && !o.outpost)
+        .then(|| crate::headroom::start(crate::headroom::Ctx { dir: o.state_dir.join("headroom"), server_url: o.server_url.clone(), data_dir: o.state_dir.clone() }));
+    // What the server last heard of it, and whether this server takes it.
+    let mut headroom_sent: Option<String> = None;
+    let mut server_headroom = false;
     let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
     // A test build's faults: frames lost, sent twice or sent late below the channel, which it
     // makes up for.
@@ -1418,6 +1434,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             h = harness_rx.recv().fuse() => match h { Ok((s, u)) => Ev::Harness(s, u), Err(_) => Ev::Watchdog },
             () = front_door_changed(front_door.as_ref()).fuse() => Ev::FrontDoor,
+            () = headroom_changed(headroom.as_ref()).fuse() => Ev::Headroom,
             b = bg_rx.recv().fuse() => match b {
                 #[cfg(unix)]
                 Ok(Bg::Forwarded(data)) => Ev::Forwarded(data),
@@ -1967,7 +1984,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if !o.ephemeral && !crate::runner::chaos::get().is_some_and(|c| c.old) {
                     let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work }) {
+                    let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | headroom_cap }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2130,6 +2148,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_wire = caps & proto::CAP_WIRE != 0;
                         server_drops = caps & proto::CAP_NET_DROPS != 0;
                         server_work = caps & proto::CAP_WORK != 0;
+                        server_headroom = caps & proto::CAP_HEADROOM != 0;
+                        // How headroom does, now that this server takes it.
+                        headroom_sent = None;
+                        if server_headroom
+                            && let Some(json) = headroom.as_ref().and_then(crate::headroom::Handle::latest)
+                        {
+                            uplink.0.send(Up::Term(AgentMsg::HeadroomStatus { json: json.clone() })).await.ok();
+                            headroom_sent = Some(json);
+                        }
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                         }
@@ -2906,6 +2933,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::Term(AgentMsg::DirList { req, json })).await;
                         });
                     }
+                    ServerMsg::Headroom { json } => {
+                        if let Some(h) = &headroom {
+                            h.push(&json);
+                        }
+                    }
                     ServerMsg::FrontDoor { json } => {
                         // Settings (and certificates) are never logged: an upload carries a key.
                         if let Some(fd) = &front_door {
@@ -3137,6 +3169,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::SecretsFor { .. } => {
                         tracing::debug!("ignoring a CI message this runner does not take yet");
                     }
+                }
+            }
+            Ev::Headroom => {
+                if connected
+                    && server_headroom
+                    && let Some(json) = headroom.as_ref().and_then(crate::headroom::Handle::latest)
+                    && headroom_sent.as_deref() != Some(json.as_str())
+                    && let Ok(b) = proto::encode(&AgentMsg::HeadroomStatus { json: json.clone() })
+                {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                    headroom_sent = Some(json);
                 }
             }
             Ev::FrontDoor => {

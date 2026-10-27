@@ -579,6 +579,8 @@ export type ServerEvent =
   | { type: "update_job"; job: UpdateJob }
   /** A runner's front door changed (settings, or what the runner reported): refetch it. */
   | { type: "front_door"; runner: string }
+  /** A runner's headroom changed (settings, or what the runner reported): refetch it. */
+  | { type: "headroom"; runner: string }
   /** The tailnet's DNS for the front doors changed (credential, sync): refetch GET /api/tailscale. */
   | { type: "tailscale" }
   /** Apps' statuses changed (batched, at most every 300 ms). */
@@ -2145,4 +2147,64 @@ export interface JobTools {
     runners: { runner: string; unmet: string[]; tools: string[]; fixable: boolean; no_agent: string | null }[];
   };
   fix: ToolFix | null;
+}
+
+/* ---------------------------- headroom (Runners → Headroom, docs/headroom.md) ---------------------------- */
+
+export type HeadroomProbe = { kind: "fsync"; path: string } | { kind: "http"; url: string } | { kind: "tcp"; addr: string };
+
+export interface HeadroomTarget {
+  name: string;
+  probe: HeadroomProbe;
+  goal_ms: number;
+}
+
+export interface HeadroomSettings {
+  enabled: boolean;
+  targets: HeadroomTarget[];
+  automatic: boolean;
+  window: { min: number; max: number; start: number; grow_secs: number; cooldown_ms: number };
+  pacing: { enabled: boolean; period_ms: number; min_duty_pct: number; freeze_after_secs: number; release_after_secs: number };
+  heavy: { cpu_pct: number; write_mb_s: number };
+  admit_hold_secs: number;
+  escapes: boolean;
+  max_sessions: number | null;
+}
+
+export type HeadroomVerdict = { state: "unknown" } | { state: "met"; ms: number } | { state: "missed"; ms: number } | { state: "unavailable"; why: string };
+
+export type HeadroomTargetStatus = HeadroomTarget & HeadroomVerdict;
+
+export interface HeadroomGroup {
+  label: string;
+  session?: string;
+  cpu_pct: number;
+  write_mb_s: number;
+  heavy: boolean;
+  share: number;
+}
+
+export interface HeadroomStatus {
+  settings: string;
+  enabled: boolean;
+  pacing: "cgroup" | "none";
+  window: number;
+  allowed: number;
+  healthy: boolean;
+  targets: HeadroomTargetStatus[];
+  groups: HeadroomGroup[];
+  held: number;
+  starting: number;
+}
+
+export interface HeadroomView {
+  runner: string;
+  connected: boolean;
+  /** null until the runner has said what it can do. */
+  supported: boolean | null;
+  settings: HeadroomSettings;
+  customized: boolean;
+  applied: boolean | null;
+  status: HeadroomStatus | null;
+  status_at: number | null;
 }

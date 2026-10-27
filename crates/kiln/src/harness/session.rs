@@ -904,6 +904,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
 #[allow(clippy::too_many_arguments)]
 fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
     let now = crate::util::now_ms();
+    core.session_id.clone_from(&id);
     core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
     let cwd = core.state.cwd.clone();
     let info = Info {
@@ -1103,6 +1104,8 @@ enum Ev {
     Exit(Option<i32>),
     Fx(Option<Done>),
     Tick,
+    /// Headroom has room for work it held (docs/headroom.md).
+    Room,
 }
 
 /// What of a session's pause is kept on disk (`host::Saved`): a change is written there.
@@ -1128,6 +1131,20 @@ const RUN_OUTPUT_MAX: usize = 32 * 1024;
 const READ_MAX: u64 = 512 * 1024;
 /// How often the adapter gets a tick while the process runs.
 const TICK: Duration = Duration::from_secs(5);
+
+/// Completes when headroom has room for this session's held work: only while it holds some (so
+/// sessions with nothing waiting don't wake for it).
+async fn held_room(core: &Mutex<Core>) {
+    let waiting = {
+        let c = core.lock();
+        !c.state.queue.is_empty() && crate::headroom::held(&c.session_id)
+    };
+    if waiting {
+        crate::headroom::room().await;
+    } else {
+        futures::future::pending::<()>().await;
+    }
+}
 /// How long a take-over waits for the session it takes over to end.
 const TAKEOVER_WAIT: Duration = Duration::from_secs(15);
 /// How long a session taken over from outside kiln has to quit before it is killed.
@@ -2886,6 +2903,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
                         x = (&mut p.exit).fuse() => Ev::Exit(x.ok().flatten()),
                         _ = crate::rt::sleep_until(next_tick).fuse() => Ev::Tick,
+                        () = held_room(&s.core).fuse() => Ev::Room,
                     };
                     match ev {
                         Ev::Out(Some(chunk)) => {
@@ -3156,6 +3174,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         Ev::Fx(Some(d)) => d.apply(&mut adapter, &mut s.core.lock()),
                         Ev::Fx(None) => {}
                         Ev::Tick => {}
+                        Ev::Room => {
+                            let mut core = s.core.lock();
+                            adapter.drain(&mut core);
+                        }
                         Ev::Exit(c) => {
                             code = c;
                             // Read what is left on stdout (the last lines often explain the exit).
