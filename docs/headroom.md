@@ -45,9 +45,10 @@ between the highest level held calm and the lowest level trouble began at. Where
 what its disks write (Linux), what they delivered while trouble last showed is all they take, and
 the write budget is never raised past it less what others write.
 
-**Holding.** A session's next turn, a turn kiln continues after a restart, or a goal starts only
-while some of the budgets is left (past that the pacer slows it, so they are used whole) and its
-learned peak memory fits what's free: highest response ratio first, with
+**Holding.** Writes and CPU aren't held for: the pacer shares the budgets among what runs, from
+the first moment it runs, so holding work it could slow would protect nothing and only delay it.
+Memory can't be slowed: a session's next turn, a turn kiln continues after a restart, or a goal
+starts when its learned peak memory fits what's free, highest response ratio first, with
 conservative backfilling, so short work goes first and nothing starves. It waits in kiln's queue
 and goes the moment the engine lets it (held sessions are woken; nothing polls). A message a
 person sends "now" never waits.
@@ -121,10 +122,13 @@ decides.
 | A level held | the mean kiln's work used over the hold (its integral over time), not its peak: a burst a buffer took isn't a rate the machine sustains |
 | A bound tried | once the bisection's gap is finer than the pacer applies (a share is whole percent: what's wanted / 100), the bound itself; held calm there, it was wrong and the next bound up (any higher level trouble began at) takes its place |
 | Cutting again | only on evidence: a probe of the same target sent after the first answer since the cut, itself rising (past CUSUM's reference), and no faster. Probes already out at a cut can't show it |
-| The disks' capacity | the most the machine delivered while trouble last showed (a queue built up), on systems that say what they write |
+| The disks' capacity | the most the machine delivered while trouble showed (a queue built up), on systems that say what they write: the trouble under way's while it lasts, else the last |
+| A cut, with the capacity known | to what drains what's queued within the tolerance: capacity x (1 - latency / tolerance) - what others write (Little: what's queued is the latency times the capacity) |
+| Calm to calibrate on | an excursion that ended with no alarm, with kiln quiet, or within the longest a cut takes to show (so it ended on its own); one kiln's cut may have ended isn't noise |
+| A probe still out | at least as slow as it has been out: it raises the alarm once that alone would take the CUSUM past its threshold |
 | How long a level must hold | the slowest target's expected detection time plus the longest a cut took to show (the first probe after it that answered faster) |
 | A run's demand | its peak unslowed write rate, CPU cores and memory, and its duration (a session's turn, a build's unit), recorded when it ends; the mean per kind of work, with the mean over everything as the prior |
-| Who starts | class, then response ratio ((wait + run) / run); every waiting item a reservation on the time profile of when running work is expected to free room (conservative backfilling), starting while some of each budget is left and its peak memory fits; with nothing learned, one at a time |
+| Who starts | when its peak memory fits (writes and CPU are paced, not held for); in order of class, then response ratio ((wait + run) / run); every waiting item a reservation on the time profile of when running work is expected to free memory (conservative backfilling); with nothing learned, one at a time |
 | Each running group's share | each budget water-filled class by class, max-min fair within a class; a group runs at the smaller of its two shares, so work is slowed only for the resource that's short |
 | When shares change | only when the budget or the set of running work does |
 
@@ -139,49 +143,61 @@ passes the tolerance), and no control over the same traces, deterministically (v
 seeded generator). The machine is a fluid model of the 10-26 mechanism: work writes into the page
 cache, the disk drains it at its capacity, writers are throttled only once the dirty backlog
 reaches its limit (10 GB), and a sync waits behind the whole backlog. It is adacachy-like (32
-cores, 128 GB, a 1 GB/s disk); gates write 400 MB/s for 150 s on 4 cores, turns 5 MB/s for 60 s.
-None of that is given to the engine. Traces: the 10-26 crash (five gates, then 47 resumed at once
-at 600 s), Poisson arrivals at 80% of the disk for two hours, four bursts of 8 gates and 10 turns,
-and the steady trace with the disk halving at 30 minutes. `cargo test -p kiln-ci
-headroom::sim::compare -- --nocapture` prints the table (seed 1):
+cores, 128 GB, a 1 GB/s disk); gates write 400 MB/s for 150 s on 4 cores with 8 GB, turns 5 MB/s
+for 60 s. None of that is given to the engine. Traces: the 10-26 crash (five gates, then 47
+resumed at once at 600 s), Poisson arrivals at 80% of the disk for two hours, four bursts of 8
+gates and 10 turns, and the steady trace with the disk halving at 30 minutes. `cargo test -p
+kiln-ci headroom::sim::compare -- --nocapture` prints the table (seed 1) and asserts, on every
+trace and seeds 1-3: v2 does as much work as AIMD by the time the first of them finishes, with a
+lower mean wait, less time over the tolerance and a lower peak, and none at all once it has
+detected trouble.
 
 | trace | control | done | mean wait s | p99 wait s | mean flow s | makespan s | peak sync s | s over 1 s |
 |---|---|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|---|---|
 | 10-26 crash | none | 52/52 | 0 | 0 | 2568 | 3410 | 10.00 | 3108 |
 | 10-26 crash | AIMD+FCFS | 52/52 | 1148 | 2709 | 1424 | 3459 | 10.00 | 2958 |
-| 10-26 crash | v2 | 52/52 | 1213 | 2748 | 1406 | 3498 | 0.20 | 0 |
+| 10-26 crash | v2 | 52/52 | 849 | 1920 | 1729 | 3420 | 0.20 | 0 |
 | steady 80% | none | 350/350 | 0 | 0 | 115 | 7299 | 10.00 | 3776 |
 | steady 80% | AIMD+FCFS | 350/350 | 42 | 260 | 129 | 7324 | 10.00 | 3313 |
-| steady 80% | v2 | 350/350 | 38 | 249 | 127 | 7326 | 0.22 | 0 |
+| steady 80% | v2 | 350/350 | 0 | 0 | 104 | 7304 | 0.15 | 0 |
 | bursts | none | 72/72 | 0 | 0 | 313 | 4073 | 10.00 | 1918 |
 | bursts | AIMD+FCFS | 72/72 | 248 | 492 | 472 | 4152 | 10.00 | 1906 |
-| bursts | v2 | 72/72 | 131 | 378 | 279 | 4124 | 0.20 | 0 |
+| bursts | v2 | 72/72 | 1 | 4 | 250 | 4083 | 0.20 | 0 |
 | disk halves at 30 min | none | 350/350 | 0 | 0 | 1401 | 10238 | 20.00 | 9204 |
 | disk halves at 30 min | AIMD+FCFS | 350/350 | 1238 | 3073 | 1355 | 10360 | 20.00 | 8898 |
-| disk halves at 30 min | v2 | 350/350 | 720 | 4185 | 827 | 11636 | 2.61 | 12 |
+| disk halves at 30 min | v2 | 350/350 | 205 | 2017 | 628 | 10324 | 0.75 | 0 |
 
 Over seeds 1-3:
 
-- **The tolerance.** v2 keeps every sync under 1 s on the crash, steady and burst traces (0 s
-  over; peak 0.20-0.26 s). When the disk halves without warning it overshoots until it sees it:
-  12-122 s over, against 8,898-10,059 s for AIMD. Without control and under AIMD, syncs sit at
-  the dirty limit (10-20 s) for most of every trace: what hung Docker on 10-26.
-- **Work done** by the time the first of v2 and AIMD finished, v2's over AIMD's: bursts
-  1.034-1.035, steady 0.9999-1.0005, the crash 0.986-0.990, the disk halving 0.940-0.953. AIMD
-  keeps the 10 GB buffer full, so the disk never idles; v2 holds the backlog near empty to keep
-  syncs fast, so a gap in demand idles it. That is the price of the tolerance.
-- **Waits.** Mean wait to start, v2 against AIMD: bursts 131 against 248 s, the disk halving
-  720-998 against 1,238-1,811 s, steady 38-80 against 42-89 s, the crash 1,212-1,216 against
-  1,148 s. Mean time to finish: v2 lower on every trace and seed but steady seed 2 (174 against
-  152 s).
+- **The tolerance.** v2 keeps every sync under 1 s on every trace (peak 0.15-0.75 s; 0 s over),
+  the disk halving without warning included. Without control and under AIMD, syncs sit at the
+  dirty limit (10-20 s) for most of every trace: what hung Docker on 10-26.
+- **Work done** by the time the first of v2 and AIMD finished, v2's over AIMD's: 1.0000-1.0882;
+  v2 finishes first on every trace but steady seed 2 (the same second).
+- **Waits.** Mean wait to start, v2 against AIMD: the crash 849 against 1,148 s, steady 0 against
+  42-89 s, bursts 1 against 248 s, the disk halving 205-369 against 1,238-1,811 s.
+- **Time to finish.** v2's mean is lower on every trace but the crash (1,729 against 1,424 s):
+  there every job is the same size, where first come first served is best on that measure and
+  sharing (v2 holds work only for memory) is not; with jobs of different sizes, as kiln's are,
+  sharing's mean doesn't grow with how much they vary, and v2's is lower (steady 104-126 against
+  129-186 s, bursts 250 against 472 s).
 
-The simulation found, and these changes fixed, eight faults in the engine that the unit tests
-hadn't: cuts made by probes already out when a cut was made, ratcheting the budget to nothing;
-trouble with nothing of kiln's in use setting a bound at zero, which nothing could raise again;
-false bounds kept for good; work larger than the budget never starting; admission leaving a
-paced budget unused; the CPU budget never raised while work waited on it; a moment's burst
-counted as a level held; and a cut's lag measured to the end of the drain rather than to when
-it showed. The capacity ceiling and sparing the CPU on saturated disks came from the same runs.
+The simulation found, and these changes fixed, faults in the engine the unit tests hadn't:
+
+- cuts made by probes already out when a cut was made, ratcheting the budget to nothing;
+- trouble with nothing of kiln's in use setting a bound at zero, which nothing could raise again;
+- false bounds kept for good, and higher bounds forgotten when a lower one was shown wrong;
+- work larger than the budget never starting, and work held that the pacer could have shared;
+- the CPU budget never raised while work waited on it, and cut when the disks were the cause;
+- a moment's burst counted as a level held;
+- a cut's lag measured to the end of the drain rather than to when it showed, and never measured
+  when a cut drained before a slow answer came;
+- cuts halving blindly where the queue says how much drains it;
+- excursions kiln's own cuts ended counted as noise, so each intervention taught the detector to
+  alarm later;
+- work started in a step running unpaced until the next;
+- a probe still out not counted as evidence until it answered.
 
 ## Debug builds
 

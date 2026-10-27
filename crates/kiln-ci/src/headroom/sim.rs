@@ -184,8 +184,14 @@ struct Report {
     peak_sync_s: f64,
     /// Time the machine's sync latency was over the tolerance.
     over_s: f64,
+    /// Of it, the time the controller had already detected trouble (v2: an alarm up since an
+    /// earlier step; the others detect nothing).
+    over_detected_s: f64,
     /// Full-speed seconds of work done by each 10 s of the trace.
     work: Vec<f64>,
+    /// While work remained: the disk's mean utilization, and the mean number of jobs running.
+    busy: f64,
+    running: f64,
 }
 
 impl Report {
@@ -208,6 +214,8 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
     let mut answers: Vec<(String, Answer)> = Vec::new();
     let mut delivered = 0.0;
     let (mut peak, mut over) = (0.0f64, 0.0);
+    let (mut busy, mut ran, mut steps) = (0.0, 0.0, 0.0);
+    let (mut over_detected, mut detected) = (0.0, false);
     let mut work = Vec::new();
     let mut t = -HISTORY_S;
     let cap = 6.0 * 3600.0;
@@ -277,6 +285,8 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
                     ended: Vec::new(),
                 };
                 let plan = e.step(&obs);
+                // Trouble known from this step on (counted from the next).
+                let alarmed = plan.status.targets.iter().any(|t| t.alarm.is_some());
                 if std::env::var_os("KILN_SIM_TRACE").is_some() && (t >= 0.0 && (t % 20.0 < DT || !plan.events.is_empty())) {
                     let run: Vec<String> = jobs.iter().filter(|j| j.start.is_some() && j.done.is_none()).map(|j| format!("{:.2}", j.share)).collect();
                     eprintln!(
@@ -304,6 +314,11 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
                 for j in &mut jobs {
                     j.share = plan.shares.iter().find(|p| p.id == j.id).map_or(1.0, |p| p.share);
                 }
+                let was = detected;
+                detected = alarmed;
+                if was && m.sync_now_s() * 1e6 > TOLERANCE_US && t >= 0.0 {
+                    over_detected += DT;
+                }
             }
         }
 
@@ -314,6 +329,9 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
             }
         }
         if t >= 0.0 {
+            steps += 1.0;
+            busy += delivered / m.disk_bps;
+            ran += jobs.iter().filter(|j| j.start.is_some() && j.done.is_none()).count() as f64;
             let s = m.sync_now_s();
             peak = peak.max(s);
             if s * 1e6 > TOLERANCE_US {
@@ -343,7 +361,10 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
         makespan_s: jobs.iter().filter_map(|j| j.done).fold(0.0, f64::max),
         peak_sync_s: peak,
         over_s: over,
+        over_detected_s: over_detected,
         work,
+        busy: busy / f64::max(steps, 1.0),
+        running: ran / f64::max(steps, 1.0),
     }
 }
 
@@ -384,8 +405,9 @@ fn every_control_finishes_the_steady_trace() {
 }
 
 /// The comparison docs/headroom.md records ("Simulation"): its table is this test's output
-/// (`cargo test -p kiln-ci headroom::sim::compare -- --nocapture`). What it asserts holds on every
-/// trace and seed; the rest (work, waits) it reports, as the docs do, trace by trace.
+/// (`cargo test -p kiln-ci headroom::sim::compare -- --nocapture`). On every trace and seed, v2
+/// does as much work as AIMD+FCFS by the time the first of them finishes, with a lower mean wait,
+/// less time over the tolerance and a lower peak, and none at all once it has detected trouble.
 #[test]
 fn compare() {
     let mut table = vec![
@@ -403,8 +425,8 @@ fn compare() {
             }
             let h = new.makespan_s.min(aimd.makespan_s);
             println!(
-                "seed {seed} {}: work by {h:.0} s v2/AIMD {:.4} | mean wait v2 {:.0} AIMD {:.0} | mean flow v2 {:.0} AIMD {:.0} | makespan v2 {:.0} AIMD {:.0} | s over v2 {:.0} AIMD {:.0}",
-                trace.name, new.work_by(h) / aimd.work_by(h), new.mean_wait_s, aimd.mean_wait_s, new.mean_flow_s, aimd.mean_flow_s, new.makespan_s, aimd.makespan_s, new.over_s, aimd.over_s
+                "seed {seed} {}: over after detection v2 {:.2} | util v2 {:.3} AIMD {:.3} | running v2 {:.1} AIMD {:.1} | work by {h:.0} s v2/AIMD {:.4} | mean wait v2 {:.0} AIMD {:.0} | mean flow v2 {:.0} AIMD {:.0} | makespan v2 {:.0} AIMD {:.0} | s over v2 {:.0} AIMD {:.0}",
+                trace.name, new.over_detected_s, new.busy, aimd.busy, new.running, aimd.running, new.work_by(h) / aimd.work_by(h), new.mean_wait_s, aimd.mean_wait_s, new.mean_flow_s, aimd.mean_flow_s, new.makespan_s, aimd.makespan_s, new.over_s, aimd.over_s
             );
             for r in [&none, &aimd, &new] {
                 if r.done != r.jobs {
@@ -413,6 +435,15 @@ fn compare() {
             }
             if new.over_s >= aimd.over_s || new.peak_sync_s >= aimd.peak_sync_s {
                 failures.push(format!("{} seed {seed}: v2 {:.0} s over the tolerance (peak {:.2} s), AIMD {:.0} s (peak {:.2} s)", trace.name, new.over_s, new.peak_sync_s, aimd.over_s, aimd.peak_sync_s));
+            }
+            if new.over_detected_s > 0.0 {
+                failures.push(format!("{} seed {seed}: v2 over the tolerance {:.2} s after it detected trouble", trace.name, new.over_detected_s));
+            }
+            if new.work_by(h) < aimd.work_by(h) {
+                failures.push(format!("{} seed {seed}: v2 did {:.0} s of work by {h:.0} s, AIMD {:.0}", trace.name, new.work_by(h), aimd.work_by(h)));
+            }
+            if new.mean_wait_s >= aimd.mean_wait_s {
+                failures.push(format!("{} seed {seed}: v2 mean wait {:.0} s, AIMD {:.0}", trace.name, new.mean_wait_s, aimd.mean_wait_s));
             }
         }
     }

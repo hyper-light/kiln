@@ -34,9 +34,11 @@ pub struct Knee {
 }
 
 impl Knee {
-    /// An alarm began with `delivered` bytes a second being written: that rate is unsafe; the
-    /// budget drops to the highest rate held calm below it, or to half of it when there's none.
-    pub fn alarm(&mut self, now_us: u64, delivered: f64, unit: Unit) -> String {
+    /// An alarm began with `delivered` bytes a second being written: that rate is unsafe. With
+    /// `drain` (the level that empties what's queued in time, where the machine's capacity is
+    /// known) below it, the budget drops to that; else to the highest rate held calm below it, or
+    /// to half of it when there's none.
+    pub fn alarm(&mut self, now_us: u64, delivered: f64, drain: Option<f64>, unit: Unit) -> String {
         let r = delivered.max(0.0);
         if r <= 0.0 {
             // Trouble with none of it in use: nothing of kiln's to cut, and no level learned.
@@ -52,25 +54,27 @@ impl Knee {
             // What held calm before doesn't now: the machine got slower under us.
             self.safe = None;
         }
-        let to = self.safe.unwrap_or(r / 2.0);
+        let drained = drain.filter(|d| *d < r).map(|d| d.max(0.0));
+        let to = drained.unwrap_or_else(|| self.safe.unwrap_or(r / 2.0));
         self.budget = Some(to);
         self.held_since = None;
         self.held_area = 0.0;
         self.held_last = None;
         self.cut_at = Some(now_us);
-        format!("{} cut to {}: trouble began at {}{}", unit.what(), unit.fmt(to), unit.fmt(r), self.safe.map(|s| format!(", {} held calm before", unit.fmt(s))).unwrap_or_default())
+        let why = if drained.is_some() { ", what drains the queue within the tolerance".to_owned() } else { self.safe.map(|s| format!(", {} held calm before", unit.fmt(s))).unwrap_or_default() };
+        format!("{} cut to {}: trouble began at {}{why}", unit.what(), unit.fmt(to), unit.fmt(r))
     }
 
     /// Still in trouble, and `worse`: of the probes sent since the last cut, a later one came back
     /// (or is out) no faster than an earlier one, so the cut has shown and isn't draining it. The rate now
     /// is unsafe too, and it is cut again. Probes already out when it was cut can't show it, so they
     /// never cut again: cuts follow evidence, not time.
-    pub fn persisting(&mut self, now_us: u64, delivered: f64, worse: bool, unit: Unit) -> Option<String> {
+    pub fn persisting(&mut self, now_us: u64, delivered: f64, drain: Option<f64>, worse: bool, unit: Unit) -> Option<String> {
         self.cut_at?;
         if !worse {
             return None;
         }
-        Some(self.alarm(now_us, delivered, unit))
+        Some(self.alarm(now_us, delivered, drain, unit))
     }
 
     /// The last cut showed (trouble began to drain): how long that took is noted.
@@ -198,9 +202,9 @@ mod tests {
             let delivered = k.budget.map_or(want, |b| want.min(b));
             if delivered > knee {
                 if alarmed {
-                    k.persisting(now, delivered, true, Unit::Writes);
+                    k.persisting(now, delivered, None, true, Unit::Writes);
                 } else {
-                    k.alarm(now, delivered, Unit::Writes);
+                    k.alarm(now, delivered, None, Unit::Writes);
                     alarmed = true;
                 }
             } else {
@@ -228,7 +232,7 @@ mod tests {
     #[test]
     fn work_under_the_budget_never_raises_it_and_a_new_regime_forgets() {
         let mut k = Knee::default();
-        k.alarm(0, 400e6, Unit::Writes);
+        k.alarm(0, 400e6, None, Unit::Writes);
         assert_eq!(k.budget, Some(200e6));
         assert_eq!(k.calm(5_000_000, Calm { delivered: 50e6, limited: false, hold_us: 1e6, resolution: 0.5e6, cap: None }, Unit::Writes), None);
         assert_eq!(k.calm(7_000_000, Calm { delivered: 50e6, limited: false, hold_us: 1e6, resolution: 0.5e6, cap: None }, Unit::Writes), None);
@@ -243,7 +247,7 @@ mod tests {
     fn a_wrong_bound_is_tried_and_forgotten_and_trouble_with_nothing_in_use_cuts_nothing() {
         let mut k = Knee::default();
         // An alarm at 400 MB/s that the disk could in fact take (its cause was elsewhere).
-        k.alarm(0, 400e6, Unit::Writes);
+        k.alarm(0, 400e6, None, Unit::Writes);
         let mut t = 0;
         for _ in 0..64 {
             t += 1_000_000;
@@ -253,7 +257,7 @@ mod tests {
         assert_eq!(k.unsafe_at, None, "{k:?}");
         assert!(k.budget.unwrap_or_default() > 400e6, "{k:?}");
         let mut k = Knee::default();
-        k.alarm(0, 0.0, Unit::Writes);
+        k.alarm(0, 0.0, None, Unit::Writes);
         assert_eq!((k.budget, k.unsafe_at), (None, None));
     }
 

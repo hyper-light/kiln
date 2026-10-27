@@ -255,6 +255,10 @@ impl Engine {
 
         // Detection.
         let was = self.alarmed();
+        let lag = self.learned.knee.lag_us;
+        for d in self.learned.detectors.values_mut() {
+            d.lag_us = lag;
+        }
         for (name, a) in &o.answers {
             let Some(d) = self.learned.detectors.get_mut(name) else { continue };
             let ev = match a {
@@ -274,7 +278,7 @@ impl Engine {
         }
         for (name, age) in &o.inflight {
             if let Some(d) = self.learned.detectors.get_mut(name)
-                && let detect::Event::Alarm(why) = d.inflight(now, *age, quiet)
+                && let detect::Event::Alarm(why) = d.inflight(now, *age, quiet, budget_per_day)
             {
                 events.push(format!("{name}: {why}"));
             }
@@ -309,8 +313,8 @@ impl Engine {
                     continue;
                 }
                 if !rising(n, *us) {
-                    // Calm again: it drained.
-                    shown |= first.as_ref().is_some_and(|(n0, came, _)| n0 == n && sent >= *came);
+                    // Calm again, sent after the cut: it has shown (and drained).
+                    shown |= first.as_ref().is_none_or(|(n0, came, _)| n0 == n && sent >= *came);
                     continue;
                 }
                 match first {
@@ -332,7 +336,22 @@ impl Engine {
         } else if !now_alarmed && let Some(t) = self.trouble_bps.take() {
             self.learned.capacity_bps = Some(t);
         }
-        let cap_w = self.learned.capacity_bps.map(|c| c - o.delivered_bps.map_or(0.0, |d| (d - ours_w).max(0.0)));
+        let tolerance = |name: &str| self.targets.iter().find(|t| t.name == name).map_or(f64::INFINITY, |t| t.tolerance_us);
+        let others = o.delivered_bps.map_or(0.0, |d| (d - ours_w).max(0.0));
+        // During trouble, what's delivered now is the freshest measure (the disks may have slowed).
+        let capacity = self.trouble_bps.or(self.learned.capacity_bps);
+        let cap_w = capacity.map(|c| c - others);
+        // How far toward harm the worst target is now (its slowest answer or probe out, over its
+        // tolerance): with the disks' capacity known, what's queued is that latency times it
+        // (Little), and what drains it within the tolerance is the capacity less that and less
+        // what others write.
+        let worst: f64 = o
+            .answers
+            .iter()
+            .filter_map(|(n, a)| if let Answer::Took(us) = a { Some(us / tolerance(n)) } else { None })
+            .chain(o.inflight.iter().map(|(n, age)| age / tolerance(n)))
+            .fold(0.0, f64::max);
+        let drain_w = capacity.map(|c| c * (1.0 - worst.min(1.0)) - others);
         if shown {
             self.learned.knee.shown(now);
             self.learned.cpu_knee.shown(now);
@@ -341,14 +360,14 @@ impl Engine {
         let disks_full = matches!((o.delivered_bps, self.learned.capacity_bps), (Some(d), Some(c)) if d + wanted / pace::SHARE_STEPS >= c);
         use knee::Unit;
         if now_alarmed && !was {
-            events.push(self.learned.knee.alarm(now, ours_w, Unit::Writes));
+            events.push(self.learned.knee.alarm(now, ours_w, drain_w, Unit::Writes));
             if !disks_full {
-                events.push(self.learned.cpu_knee.alarm(now, ours_c, Unit::Cpu));
+                events.push(self.learned.cpu_knee.alarm(now, ours_c, None, Unit::Cpu));
             }
             self.cut = Some((now, None));
         } else if now_alarmed {
-            let cut_w = self.learned.knee.persisting(now, ours_w, worse, Unit::Writes);
-            let cut_c = if disks_full { None } else { self.learned.cpu_knee.persisting(now, ours_c, worse, Unit::Cpu) };
+            let cut_w = self.learned.knee.persisting(now, ours_w, drain_w, worse, Unit::Writes);
+            let cut_c = if disks_full { None } else { self.learned.cpu_knee.persisting(now, ours_c, None, worse, Unit::Cpu) };
             if cut_w.is_some() || cut_c.is_some() {
                 self.cut = Some((now, None));
             }
@@ -407,6 +426,29 @@ impl Engine {
             let demand = self.learned.demand.demand(&key);
             let until = demand.map_or(u64::MAX, |d| now.saturating_add(d.duration_us as u64));
             self.promises.push(admit::Promise { id: d.id.clone(), demand, until_us: until });
+        }
+
+        // Work started now is paced from its first moment, at what its kind was learned to want.
+        let started: Vec<&Waiting> = decisions.iter().filter(|d| d.start).filter_map(|d| o.waiting.iter().find(|w| w.id == d.id)).collect();
+        if !started.is_empty() {
+            let running: Vec<pace::Running> = o
+                .running
+                .iter()
+                .map(|g| pace::Running {
+                    id: g.id.clone(),
+                    class: g.class,
+                    demand_bps: self.runs.get(&g.id).map_or(g.write_bps, |r| r.demand),
+                    demand_cpu: self.runs.get(&g.id).map_or(g.cpu_cores, |r| r.demand_cpu),
+                    protected: g.protected,
+                })
+                .chain(started.iter().map(|w| {
+                    let d = self.learned.demand.demand(&w.key).unwrap_or_default();
+                    pace::Running { id: w.id.clone(), class: w.class, demand_bps: d.write_bps, demand_cpu: d.cpu_cores, protected: false }
+                }))
+                .collect();
+            self.shares = pace::plan(budget, cpu_budget, &running);
+            // Decided again once they show as running.
+            self.decided_from = None;
         }
 
         let probe_every_us = self.targets.iter().map(|t| (t.name.clone(), self.interval(t))).collect();
@@ -468,8 +510,10 @@ mod tests {
         }
         let p = e.step(&Observation { now_us: 101_000_000, answers: vec![("disk".into(), Answer::Took(2e6))], delivered_bps: Some(500e6), mem_free: 1e11, running: vec![group("a", 300e6, 1.0), group("b", 200e6, 1.0)], ..Observation::default() });
         anyhow::ensure!(p.events.iter().any(|e| e.contains("tolerance")), "{:?}", p.events);
-        anyhow::ensure!(p.status.budget_bps == Some(250e6), "{:?}", p.status);
-        anyhow::ensure!(p.shares.iter().any(|s| s.share < 1.0 && s.why.contains("slowed")), "{:?}", p.shares);
+        // Twice the tolerance with the disks delivering 500 MB/s: what's queued takes longer to
+        // drain than the tolerance allows, so kiln's writers stop until it does.
+        anyhow::ensure!(p.status.budget_bps == Some(0.0), "{:?}", p.status);
+        anyhow::ensure!(p.shares.iter().all(|s| s.share == 0.0 && s.why.contains("stopped")), "{:?}", p.shares);
         let json = serde_json::to_string(&e.learned)?;
         let back: Learned = serde_json::from_str(&json)?;
         anyhow::ensure!(back == e.learned);

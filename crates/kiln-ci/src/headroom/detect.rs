@@ -93,7 +93,8 @@ impl Peaks {
 struct Side {
     s: f64,
     peak: f64,
-    /// A sample reached the tolerance during the excursion under way.
+    /// The excursion under way isn't noise to calibrate on: a sample reached the tolerance, or an
+    /// alarm with kiln's work running had kiln cut it (how it would have ended alone, unknown).
     harm: bool,
     peaks: Peaks,
 }
@@ -136,11 +137,15 @@ pub struct Detector {
     up: Side,
     down: Side,
     pub alarm: Option<Alarm>,
+    /// The longest a cut of kiln's has taken to show (the engine's measure): an excursion that
+    /// outlasts it under an alarm with kiln working may have been ended by kiln, so isn't noise.
+    #[serde(skip)]
+    pub lag_us: Option<f64>,
 }
 
 impl Detector {
     pub fn new(tolerance_us: f64, now_us: u64) -> Self {
-        Self { tolerance_us, regime_since_us: now_us, last_us: now_us, n: 0, sum: 0.0, up: Side::default(), down: Side::default(), alarm: None }
+        Self { tolerance_us, regime_since_us: now_us, last_us: now_us, n: 0, sum: 0.0, up: Side::default(), down: Side::default(), alarm: None, lag_us: None }
     }
 
     /// The calm mean of log-latency, once there's a sample.
@@ -202,11 +207,25 @@ impl Detector {
     }
 
     /// A probe still out after `age_us`: harm once it's out as long as the tolerance.
-    pub fn inflight(&mut self, now_us: u64, age_us: f64, quiet: bool) -> Event {
+    pub fn inflight(&mut self, now_us: u64, age_us: f64, quiet: bool, budget_per_day: f64) -> Event {
         self.last_us = self.last_us.max(now_us);
         if age_us >= self.tolerance_us && self.alarm.is_none() {
             self.alarm = Some(Alarm { since_us: now_us, harm: true, quiet });
             return Event::Alarm(format!("a probe has been out {:.0} ms, its tolerance {:.0} ms", age_us / 1e3, self.tolerance_us / 1e3));
+        }
+        // Out this long, it answers at least this slow: were that its answer, would the CUSUM cross
+        // the threshold? Then trouble is already here (nothing is recorded until it answers).
+        if self.alarm.is_none()
+            && let (Some(mean), Some(k)) = (self.mean(), self.reference())
+            && k > 0.0
+        {
+            let s = (self.up.s + age_us.max(1.0).ln() - mean - k).max(0.0);
+            let h = self.threshold(budget_per_day);
+            if s > h {
+                self.alarm = Some(Alarm { since_us: now_us, harm: false, quiet });
+                self.up.s = s;
+                return Event::Alarm(format!("a probe has been out {:.1} ms, typical {:.1} ms (CUSUM {s:.2} past {h:.2})", age_us / 1e3, mean.exp() / 1e3));
+            }
         }
         Event::Same
     }
@@ -220,6 +239,9 @@ impl Detector {
         let x = us.max(1.0).ln();
         if let Some(a) = self.alarm.as_mut() {
             a.quiet &= quiet;
+            if !a.quiet && self.lag_us.is_some_and(|l| now_us.saturating_sub(a.since_us) as f64 > l) {
+                self.up.harm = true;
+            }
         }
         if us >= self.tolerance_us {
             if self.alarm.is_none() {
@@ -374,8 +396,8 @@ mod tests {
         let mut d = Detector::new(500_000.0, 0);
         assert!(matches!(d.sample(1, 600_000.0, false, 1.0), Event::Alarm(w) if w.contains("tolerance")));
         let mut d = Detector::new(500_000.0, 0);
-        assert_eq!(d.inflight(1, 100_000.0, false), Event::Same);
-        assert!(matches!(d.inflight(2, 500_000.0, false), Event::Alarm(_)));
+        assert_eq!(d.inflight(1, 100_000.0, false, 1.0), Event::Same);
+        assert!(matches!(d.inflight(2, 500_000.0, false, 1.0), Event::Alarm(_)));
         assert!(d.alarm.as_ref().is_some_and(|a| a.harm));
     }
 
