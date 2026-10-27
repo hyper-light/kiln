@@ -300,3 +300,19 @@
   background: rgb(255 255 255 / 0.9);
   color: #0b0c0e;
 }
+
+/* The list bar's sort, on the right; on a phone the filter takes the width and the sort sits under it. */
+.ship-sort {
+  flex: 0 0 auto;
+  min-width: 11rem;
+}
+@media (max-width: 640px) {
+  .ship-tools {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .ship-facet,
+  .ship-sort {
+    width: 100%;
+  }
+}

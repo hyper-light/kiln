@@ -63,16 +63,46 @@ export function fold(commits: readonly ShipCommit[]): Item[] {
   return items;
 }
 
-export type Sort = "needs" | "newest";
+export type Sort = "needs" | "newest" | "trunk" | "stage" | "author" | "oldest";
 
-/** Needs you first (by stand, then newest), or newest first as Ship numbers them. */
+/** Ship's sorts, offered as Mission control's list bar offers its own (plan 01a175b7f20b7277b15bddd2ad001bcc, step 4). */
+export const SORTS: { value: Sort; label: string }[] = [
+  { value: "needs", label: "Needs you first" },
+  { value: "newest", label: "Newest" },
+  { value: "trunk", label: "Trunk order" },
+  { value: "stage", label: "By stage" },
+  { value: "author", label: "By author" },
+  { value: "oldest", label: "Oldest" },
+];
+export const sortOf = (s: string | null): Sort => SORTS.find((x) => x.value === s)?.value ?? "needs";
+
+/** How far an item has come: its furthest stage begun (Review 0 to Replant 6), -1 for none. */
+const reached = (it: Item) => it.head.pips.reduce((far, p, i) => (p.state !== "none" ? i : far), -1);
+
+/** The items in `sort`'s order; ties keep Ship's own (trunk) order. */
 export function order(items: readonly Item[], sort: Sort): Item[] {
-  if (sort === "newest") return [...items];
+  const by: Record<Sort, (a: Item, b: Item) => number> = {
+    needs: (a, b) => rank(a.head.stand) - rank(b.head.stand),
+    newest: (a, b) => b.head.at - a.head.at,
+    trunk: (a, b) => b.head.cursor - a.head.cursor,
+    stage: (a, b) => reached(b) - reached(a),
+    author: (a, b) => a.head.author.localeCompare(b.head.author),
+    oldest: (a, b) => a.head.at - b.head.at,
+  };
   return items
     .map((it, i) => ({ it, i }))
-    .sort((a, b) => rank(a.it.head.stand) - rank(b.it.head.stand) || a.i - b.i)
+    .sort((a, b) => by[sort](a.it, b.it) || a.i - b.i)
     .map((x) => x.it);
 }
+
+/** A repository's project: its owner, the part before the slash (the read model links it to no other). */
+export const projectOf = (repo: string) => repo.split("/")[0] ?? repo;
+
+/** A facet's options from what the list holds: each value once, sorted. */
+export const optionsOf = (values: readonly string[], label: (v: string) => string = (v) => v) => [...new Set(values.filter(Boolean))].sort().map((id) => ({ id, label: label(id) }));
+
+/** The facets Ship filters by, in the list bar's order. */
+export const FACET_KEYS = ["repo", "project", "author", "stand", "host", "kind"] as const;
 
 /** The pips the journey strip draws, Review first, every one the server sends; a state the page has no glyph for yet shows as not yet. */
 export function strip(pips: readonly ShipPip[]): Pip[] {

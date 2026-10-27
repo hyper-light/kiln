@@ -21,10 +21,11 @@ import { errorMessage } from "@/lib/hooks";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "../shared";
-import { ACTION_WORD, fold, HOSTS, KINDS, order, SHIP_STANDS, standCounts, standWord, strip, type Item, type Sort } from "./model";
+import { ACTION_WORD, FACET_KEYS, fold, HOSTS, KINDS, optionsOf, order, projectOf, SHIP_STANDS, SORTS, sortOf, standCounts, standWord, strip, type Item } from "./model";
 import "./ship.css";
 import { ShipViews } from "./views";
 import { Stands } from "@/views/harness/stands";
+import { SelectField } from "@/components/ui/misc";
 
 const LIMIT = 100;
 
@@ -44,11 +45,11 @@ export default function ShipPage() {
 function ShipList() {
   const [params, setParams] = useSearchParams();
   const lens = params.get("lens") === "review" ? "review" : "all";
-  const sort: Sort = params.get("sort") === "newest" ? "newest" : "needs";
-  const chosen: Chosen = Object.fromEntries((["host", "kind"] as const).map((k): [string, string[]] => [k, (params.get(k) ?? "").split(",").filter(Boolean)]).filter(([, v]) => v.length > 0));
+  const sort = sortOf(params.get("sort"));
+  const chosen: Chosen = Object.fromEntries(FACET_KEYS.map((k): [string, string[]] => [k, (params.get(k) ?? "").split(",").filter(Boolean)]).filter(([, v]) => v.length > 0));
   // One value of a facet is the server's to narrow by; several are narrowed here.
   const one = (k: string) => (chosen[k]?.length === 1 ? chosen[k][0] : undefined);
-  const q: ShipQuery = { repo: params.get("repo") ?? undefined, host: one("host"), kind: one("kind"), lens: lens === "review" ? "review" : undefined, limit: LIMIT };
+  const q: ShipQuery = { repo: one("repo"), host: one("host"), kind: one("kind"), lens: lens === "review" ? "review" : undefined, limit: LIMIT };
   const key = `ship/commits/${JSON.stringify(q)}`;
   // Every stage it shows moves on its own event: a run or a leg (checks, build), review and comments,
   // an app's sync and a rollout (staging, production), a runner's update (replant).
@@ -56,7 +57,17 @@ function ShipList() {
     pollMs: 15_000,
     on: ["run", "job", "review", "comment", "cd_apps", "cd_rollout", "updates", "update_job"],
   });
-  const commits = page.data.commits.filter((c) => (chosen.host ?? [c.host ?? ""]).includes(c.host ?? "") && (chosen.kind ?? [c.kind ?? "commit"]).includes(c.kind ?? "commit"));
+  const all = page.data.commits;
+  // What each facet reads of a commit; every facet chosen must hold.
+  const value: Record<string, (c: (typeof all)[number]) => string> = {
+    repo: (c) => c.repo,
+    project: (c) => projectOf(c.repo),
+    author: (c) => c.author,
+    stand: (c) => String(c.stand),
+    host: (c) => c.host ?? "",
+    kind: (c) => c.kind ?? "commit",
+  };
+  const commits = all.filter((c) => Object.entries(chosen).every(([k, vs]) => vs.length === 0 || vs.includes(value[k]?.(c) ?? "")));
   const items = order(fold(commits), sort);
 
   const set = (k: string, v: string | null) =>
@@ -77,8 +88,19 @@ function ShipList() {
         <FacetBox
           className="ship-facet"
           label="Filter commits"
-          placeholder="Host, kind…"
+          placeholder="Repository, project, author, stand…"
           facets={[
+            { id: "repo", label: "Repository", options: optionsOf(all.map((c) => c.repo)) },
+            { id: "project", label: "Project", options: optionsOf(all.map((c) => projectOf(c.repo))) },
+            { id: "author", label: "Author", options: optionsOf(all.map((c) => c.author)) },
+            {
+              id: "stand",
+              label: "Stand",
+              options: optionsOf(
+                all.map((c) => String(c.stand)),
+                standWord,
+              ),
+            },
             { id: "host", label: "Host", options: HOSTS },
             { id: "kind", label: "Kind", options: KINDS },
           ]}
@@ -87,7 +109,7 @@ function ShipList() {
             setParams(
               (prev) => {
                 const p = new URLSearchParams(prev);
-                for (const k of ["host", "kind"]) {
+                for (const k of FACET_KEYS) {
                   const v = next[k] ?? [];
                   if (v.length) p.set(k, v.join(","));
                   else p.delete(k);
@@ -107,15 +129,7 @@ function ShipList() {
             { value: "review", label: "Review" },
           ]}
         />
-        <Segmented
-          label="Order"
-          value={sort}
-          onChange={(v) => set("sort", v === "newest" ? "newest" : null)}
-          options={[
-            { value: "needs", label: "Needs you first" },
-            { value: "newest", label: "Newest" },
-          ]}
-        />
+        <SelectField className="ship-sort" label="Sort commits" hideLabel value={sort} onChange={(v) => set("sort", v === "needs" ? null : v)} options={SORTS} />
       </div>
       {items.length === 0 ? (
         <EmptyState title={lens === "review" ? "No changes under review" : "No commits yet"}>Commits show here from their first push: their runs, their review, their way to production.</EmptyState>
