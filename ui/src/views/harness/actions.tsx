@@ -1,6 +1,5 @@
 /** What you can do to an agent, from its card or its page: open, interrupt, restart, rename, duplicate, move, where its commands run, end, remove, mute its notifications. */
 import * as React from "react";
-import { useNavigate } from "@/lib/router";
 import { DropdownMenu } from "radix-ui";
 import { Check, MoreHorizontal } from "lucide-react";
 import { harnessApi, type AgentInfo, type Command } from "@/api/harness";
@@ -15,7 +14,6 @@ import { MoveDialog, movable } from "./move";
 import { useEndWithChildren } from "./family";
 
 const ReachDialog = React.lazy(() => import("./reach").then((m) => ({ default: m.ReachDialog })));
-const SpawnDialog = React.lazy(() => import("./spawn").then((m) => ({ default: m.SpawnDialog })));
 
 type Act = "end" | "remove" | "rename" | "duplicate" | "move" | "reach" | null;
 
@@ -23,7 +21,6 @@ export function useAgentActions(
   a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "kind_name" | "target" | "cwd" | "harness_session" | "left_behind" | "reach" | "keep_off">,
   after?: { onGone?: () => void },
 ) {
-  const navigate = useNavigate();
   const [act, setAct] = React.useState<Act>(null);
   // Kiln keeps it going when it stops part-way unless switched off here (shown at once, kept on the server).
   const [keepSet, setKeepSet] = React.useState<boolean | null>(null);
@@ -59,8 +56,8 @@ export function useAgentActions(
     { label: "Stop the current turn", onSelect: () => void command({ type: "interrupt" }, "interrupt it"), hidden: a.status !== "running" && a.status !== "waiting" },
     { label: "Restart", onSelect: () => void command({ type: "restart" }, "restart it"), hidden: live },
     { label: "Duplicate…", onSelect: () => setAct("duplicate") },
-    // Agents the kiln server itself runs stay there once they've started.
-    { label: "Move to…", onSelect: () => setAct("move"), hidden: !movable(a) },
+    // Agents the kiln server itself runs stay there once they've started; an ended one goes nowhere.
+    { label: "Move to…", onSelect: () => setAct("move"), hidden: !live || !movable(a) },
     { label: "Where commands run…", onSelect: () => setAct("reach"), hidden: !a.target.startsWith("agent:") },
     { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
     { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : void end()), danger: true },
@@ -133,20 +130,7 @@ export function useAgentActions(
         onConfirm={end}
       />
       {act === "move" && <MoveDialog agent={a} onClose={() => setAct(null)} />}
-      <React.Suspense fallback={null}>
-        {act === "reach" && <ReachDialog agent={a} onClose={() => setAct(null)} />}
-        {act === "duplicate" && (
-          <SpawnDialog
-            open
-            onOpenChange={(o) => !o && setAct(null)}
-            defaults={{ target: a.target, cwd: a.cwd, kind: a.kind }}
-            onStarted={(started) => {
-              setAct(null);
-              if (started.length === 1 && started[0]) navigate(`/agents/${started[0].id}`);
-            }}
-          />
-        )}
-      </React.Suspense>
+      <React.Suspense fallback={null}>{act === "reach" && <ReachDialog agent={a} onClose={() => setAct(null)} />}</React.Suspense>
     </>
   );
   return {

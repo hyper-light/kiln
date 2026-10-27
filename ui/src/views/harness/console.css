@@ -1783,3 +1783,14 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
     font-size: 18px;
   }
 }
+
+/* Opened from Mission control's composer (new-agent.tsx): what the view transition lands the composer's parts on (mission.css). */
+:root[data-opening] .ag-run {
+  view-transition-name: kiln-run;
+}
+:root[data-opening] .hx-dock .hx-compose-box {
+  view-transition-name: kiln-composer;
+}
+:root[data-opening] .ag-eyebrow {
+  view-transition-name: kiln-where;
+}

@@ -7,8 +7,8 @@
 import * as React from "react";
 import "./harness.css";
 import "./mission.css";
-import { Link, useNavigate, useSearchParams } from "@/lib/router";
-import { ArrowUpRight, ChevronRight, Plus } from "lucide-react";
+import { Link, useNavigate } from "@/lib/router";
+import { ArrowUpRight, ChevronRight } from "lucide-react";
 import { api } from "@/api/client";
 import { clientId, harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
@@ -33,7 +33,9 @@ import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
 import { missionFoundSessions, missionRows, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
-import { SpawnDialog } from "./spawn";
+import { NewAgent } from "./new-agent";
+import { MISSION_DRAFT } from "./new-agent-draft";
+import { useDrafts } from "./state";
 import { useAgentList, useAgents } from "./use-agents";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
 import { answer, asAnswered, useAnswered } from "./answered";
@@ -42,9 +44,6 @@ import { RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
 import { subagentsAtWork, throughSubagents } from "./tasks";
 import { Stands } from "./stands";
-
-/** A phone: the page's head is one line, and the message box folds. */
-const PHONE = "(max-width: 640px)";
 
 const WORD: Record<Stand, string> = {
   needs: "Needs you",
@@ -284,56 +283,16 @@ function StandsNow() {
 }
 
 export default function Mission() {
-  const [spawn, setSpawn] = React.useState(false);
-  const navigate = useNavigate();
-  const [params, setParams] = useSearchParams();
-  // ?new=1 (links from elsewhere) opens New agents: open, it stays so by itself, and the link's
-  // mark comes off the address.
-  const fromLink = params.get("new") === "1";
-  const phone = useMediaQuery(PHONE);
-  const opened = () => {
-    if (!fromLink) return;
-    setSpawn(true);
-    const n = new URLSearchParams(params);
-    n.delete("new");
-    setParams(n, { replace: true });
-  };
   return (
     <div className="container-console page ms-page">
       <title>Agents · kiln</title>
-      <PageIntro
-        index={6}
-        label="Agents"
-        title="Mission control."
-        compact
-        actions={
-          phone ? (
-            <Button size="icon" aria-label="New agents" title="New agents" onClick={() => setSpawn(true)}>
-              <Plus />
-            </Button>
-          ) : (
-            <Button onClick={() => setSpawn(true)}>
-              New agents <Plus />
-            </Button>
-          )
-        }
-      />
+      <PageIntro index={6} label="Agents" title="Mission control." compact />
       <React.Suspense fallback={<div className="st" aria-hidden="true" />}>
         <StandsNow />
       </React.Suspense>
       <Loadable label="Loading agents" fallback={<RowsLoading />}>
-        <Agents onSpawn={() => setSpawn(true)} />
+        <Agents />
       </Loadable>
-      <SpawnDialog
-        open={spawn || fromLink}
-        onOpenChange={setSpawn}
-        onOpened={opened}
-        onStarted={(started) => {
-          setSpawn(false);
-          if (started.length === 1 && started[0]) navigate(`/agents/${started[0].id}`);
-          else invalidate("harness/agents");
-        }}
-      />
     </div>
   );
 }
@@ -465,7 +424,39 @@ function RecoverMachine({ machine, count, since, others }: { machine: string; co
   );
 }
 
-function Agents({ onSpawn }: { onSpawn: () => void }) {
+/**
+ * The composer at the top of the page (no dialog, no New agents button): with agents selected it
+ * messages them (broadcast.tsx); with none it starts one (new-agent.tsx). What's written stays as it
+ * turns from one to the other, and the turn is a quick crossfade, the same lines in the same places.
+ */
+function MissionComposer({
+  picked,
+  all,
+  onPick,
+  onClear,
+  focusFor,
+}: {
+  picked: AgentInfo[];
+  all: AgentInfo[];
+  onPick: (ids: string[], on: boolean) => void;
+  onClear: () => void;
+  focusFor: "new" | "message" | null;
+}) {
+  const text = useDrafts((s) => s.drafts[MISSION_DRAFT] ?? "");
+  const setDraft = useDrafts((s) => s.setDraft);
+  const onText = React.useCallback((t: string | ((was: string) => string)) => setDraft(MISSION_DRAFT, typeof t === "function" ? t(useDrafts.getState().drafts[MISSION_DRAFT] ?? "") : t), [setDraft]);
+  return picked.length > 0 ? (
+    <div className="mc-mode" key="message">
+      <MessageBar agents={picked} reach="selected" onEnded={onClear} all={all} onPick={onPick} text={text} onText={onText} onClear={onClear} autoFocus={focusFor === "message"} />
+    </div>
+  ) : (
+    <div className="mc-mode" key="new">
+      <NewAgent text={text} onText={onText} all={all} onPick={onPick} autoFocus={focusFor === "new"} />
+    </div>
+  );
+}
+
+function Agents() {
   const { list, reload } = useAgents();
   const seen = useSeen();
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
@@ -478,9 +469,8 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
     setSelected(new Set());
     setPicking(false);
   };
-  // On a phone the message box stays folded until agents are selected or it's opened.
-  const phone = useMediaQuery(PHONE);
-  const [messaging, setMessaging] = React.useState(false);
+  // Where the composer's field takes the focus as it turns: to messaging, from an agent picked with @ in it; back to starting one, from Clear.
+  const [focusFor, setFocusFor] = React.useState<"new" | "message" | null>(null);
 
   const done = useAnswered();
   const all = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
@@ -507,7 +497,13 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
       return next;
     });
   }, []);
-  const select = React.useCallback((id: string, on: boolean) => setMany([id], on), [setMany]);
+  const select = React.useCallback(
+    (id: string, on: boolean) => {
+      setFocusFor(null);
+      setMany([id], on);
+    },
+    [setMany],
+  );
   // The rows' gestures ask what's selected now; their props are made once, with the list's hold.
   const [touch] = React.useState(() => {
     const now: { s: TouchSelect } = { s: { isSelected: () => false, set: () => undefined, selecting: false } };
@@ -537,21 +533,33 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
     },
     [some],
   );
-  const targets = checked.length > 0 ? checked.map((r) => r.a) : live.map((r) => r.a);
-  const reach = checked.length > 0 ? "selected" : filtered ? "shown" : "all";
   const findable = React.useMemo(() => all.map((r) => r.a), [all]);
-  const message = <MessageBar agents={targets} reach={reach} onEnded={clear} all={findable} onPick={setMany} />;
-  const folds = phone && checked.length === 0;
+  // Nothing selected, it starts an agent; agents selected, it messages those (and nothing else: "every agent shown" is Select all).
+  const composer = (
+    <MissionComposer
+      picked={checked.map((r) => r.a)}
+      all={findable}
+      onPick={(ids, on) => {
+        setMany(ids, on);
+        setFocusFor("message");
+      }}
+      onClear={() => {
+        clear();
+        setFocusFor("new");
+      }}
+      focusFor={focusFor}
+    />
+  );
   const renderRow = ({ a, stand, asking }: MissionRow) => <Row key={a.id} a={a} stand={stand} asking={asking} selected={selected.has(a.id)} picking={touchScreen && selecting} onSelect={select} />;
   // Every agent kiln runs, the subagents on their agents' rows too: none is listed again as found on its machine.
   const everyone = React.useMemo(() => list.map((a) => ({ a })), [list]);
 
   return (
     <>
+      {composer}
       {all.length > 0 && (
         <>
           <ListBar rows={all} q={q} onQuery={setQ} view={view} onView={setView} />
-          {!phone && message}
           <React.Suspense fallback={null}>
             <Recover rows={all} />
           </React.Suspense>
@@ -564,10 +572,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
       {all.length === 0 ? (
         <div className="ms-empty">
           <p className="ms-empty-title">No agents yet.</p>
-          <p>Claude Code, Codex, or any harness your machines have — one or a dozen. kiln runs them: steer them, answer them, review what they change.</p>
-          <Button onClick={onSpawn}>
-            New agents <Plus />
-          </Button>
+          <p>Claude Code, Codex, or any harness your machines have — one or a dozen: tell the box above what to do, and it starts. kiln runs them: steer them, answer them, review what they change.</p>
         </div>
       ) : (
         <>
@@ -632,14 +637,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
                 )}
               </>
             )}
-            {folds && (
-              <button type="button" className="ms-link ms-msg-open" aria-expanded={messaging} onClick={() => setMessaging(!messaging)}>
-                <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
-                Message agents
-              </button>
-            )}
           </div>
-          {phone && (!folds || messaging) && message}
           {live.length > 0 ? (
             <div {...touch.props} data-held={held || undefined}>
               <ul className="ms-list" ref={glide}>
