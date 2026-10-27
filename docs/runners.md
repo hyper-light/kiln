@@ -106,18 +106,34 @@ only those its platform, cores and memory show.
 
 **A CI leg** (W05) goes to a runner that is **eligible** (its labels for `runs-on`, its facts for
 the constraints, its capabilities and executors) and has **room** (a slot, or in resource mode its
-request within capacity × `overcommit`; an exclusive leg's share held, W05-R03). Among those it
-takes its preferences' best (W05-R23) when the job or a rule declares any, else the least loaded.
-One that can't go anywhere yet waits saying why: `oversized` when it asks for more than any
-eligible runner has, naming what each has ("Too big for any runner"), `capacity` while none has
-room, `unroutable` when none could ever take it.
+request within capacity × `overcommit`; an exclusive leg's share held, W05-R03), and that it leaves
+**within the target use** by the runner's live headroom: what its latest sample (every 5 s) has in
+use of its CPUs and memory, its own work's and kiln's alike, what kiln placed there since, and the
+leg's request stay within `[ci.scheduler] target_use` (85% by default) of its CPUs and of its
+memory, so memory is never placed past what a runner has. Among those it takes its preferences'
+best (W05-R23) when the job or a rule declares any, then the one it leaves the most headroom: the
+larger of its CPUs' and its memory's share in use after it, its I/O pressure on top, the lowest;
+then the least loaded. A runner whose latest sample is over a minute old is placed as before
+samples, by its room alone, after the runners with one. A v1 job goes by the same rule. One that
+can't go anywhere yet waits saying why: `oversized` when it asks for more than any eligible runner
+has, naming what each has ("Too big for any runner"), `headroom` while every runner with room
+would pass the target with it ("Runners at their target use"), `capacity` while none has room,
+`unroutable` when none could ever take it. A leg asking for more than any runner has left under
+the target waits while smaller legs fill what comes free: nothing holds room for it yet.
+
+**One rule, in the shape Hex's placement takes.** The engine and the v1 dispatcher place through
+one function, `kiln_ci::sched::place` (reach ranks a command by the same measure): what's needed and
+the nodes in, a node or a refusal saying why out, the shape of kiln-seams' `Placement`
+(docs/seams.md), whose suite it passes. Hex's placement (CP-T7.1, with priorities, quotas and fair
+share) takes its place behind that shape: which node, what's held for whom, and each node's use.
 
 **A command** (`kiln run`, MCP's `run`, code_run's `kiln.machines.run`) goes to a connected runner
 that takes reach links, meets the constraints (its reported facts, with its latest sample's
 platform, cores and memory over them) and has the room asked for idle and free (docs/reach.md §2).
 The asking machine comes first while it suits and has 4 GiB free beyond what's asked; else the
-idlest: idle cores count most, then free memory, and CI work on it, a tunnelled path and being
-overloaded count against it. It says which and why:
+one the command leaves the most headroom by the engine's measure (the larger of its CPUs' and its
+memory's share in use with what's asked, its I/O pressure on top), a tunnelled path and being
+overloaded counting against it. It says which and why:
 
 ```text
 [kiln] on big · linux/x86_64 · 32 of 32 cores idle · 60 GB free · room for 8 CPUs, 32 GiB of memory

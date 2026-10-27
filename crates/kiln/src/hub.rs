@@ -3049,16 +3049,14 @@ pub(crate) struct V1Candidate<'a> {
 }
 
 /// Where a v1 job goes of the runners that could take it, by the engine's own rule (W05, the
-/// scheduler's headroom): within the target use by its live sample, the one with the most
-/// headroom left after it ([`kiln_ci::sched::state::Headroom::fullness`]); runners without a
-/// fresh sample after those, by reach's room, then the most slots, then the name.
+/// scheduler's headroom, [`kiln_ci::sched::place::place`]): within the target use by its live
+/// sample, the one with the most headroom left after it; ties, and runners without a fresh
+/// sample after those, by reach's room, then the most slots, then the name.
 pub(crate) fn v1_best<'a>(candidates: impl IntoIterator<Item = V1Candidate<'a>>, asked: &kiln_ci::sched::state::Resources, target: f64) -> Option<&'a str> {
-    let full = |c: &V1Candidate<'_>| c.headroom.map_or(f64::INFINITY, |h| h.fullness(asked));
-    candidates
-        .into_iter()
-        .filter(|c| c.headroom.is_none_or(|h| h.within(asked, target)))
-        .min_by(|a, b| full(a).total_cmp(&full(b)).then(b.room.total_cmp(&a.room)).then(b.slots.cmp(&a.slots)).then(a.name.cmp(b.name)))
-        .map(|c| c.name)
+    let mut found: Vec<V1Candidate<'a>> = candidates.into_iter().collect();
+    found.sort_by(|a, b| b.room.total_cmp(&a.room).then(b.slots.cmp(&a.slots)).then(a.name.cmp(b.name)));
+    let nodes: Vec<kiln_ci::sched::place::Node<'a>> = found.iter().map(|c| kiln_ci::sched::place::Node { name: c.name, headroom: c.headroom }).collect();
+    kiln_ci::sched::place::place(asked, &nodes, target).ok()
 }
 
 /// A runner's headroom by its sample when it's fresh ([`kiln_ci::sched::state::SAMPLE_FRESH_MS`]).

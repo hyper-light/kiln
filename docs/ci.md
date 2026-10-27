@@ -1656,7 +1656,14 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   does one on a runner whose size isn't known. The v1 dispatcher and each runner's own admission
   hold to the same rule, so neither dispatcher's work lands in the other's share. A job's
   `resources:`, `requires:` and `exclusive:` are its needs, in the one spelling `kiln run --needs`
-  and the MCP tools take too: docs/runners.md.
+  and the MCP tools take too: docs/runners.md. **Headroom**, in either mode: each runner's live
+  sample (what it has in use of its CPUs and memory, and its I/O pressure, every 5 s) reaches the
+  engine, and a leg goes only where what the sample has in use, what kiln placed there since and
+  the leg's request stay within `[ci.scheduler] target_use` (0.85 by default, at most 1) of the
+  runner's CPUs and of its memory; a sample over a minute old is unknown, and the runner is placed
+  by its room alone, as before samples. The engine and the v1 dispatcher place through one function
+  shaped as kiln-seams' `Placement`, `kiln_ci::sched::place`, which Hex's placement (CP-T7.1) takes
+  over (docs/runners.md §5).
 - **W05-R04 Data structures.** Requirements are interned into **signatures**; each signature keeps
   its eligible runner set (recomputed when a runner or a rule changes) and a priority queue of its
   legs ordered by (effective priority descending, fair-share virtual time ascending, queue order
@@ -1823,9 +1830,11 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R23 Preferences** (opt-in: only when a rule or the job declares them): weighted terms over
   facts (`higher`/`lower`), labels, pools, `affinity: { job: <id> }` (the runner that ran that
   job's leg last, for warm caches), `spread: host`. Score = Σ weight × term (each term
-  normalized to 0..1 across the eligible set). Ties break by least loaded, then most free
-  capacity, then name. **Without preferences** the choice is today's: least loaded, then most free
-  slots.
+  normalized to 0..1 across the eligible set). Ties break by the most headroom left by the
+  runners' live samples (W05-R03: the larger of the CPUs' and the memory's share in use after the
+  leg, I/O pressure on top, the lowest; runners without a fresh sample after those), then least
+  loaded, then most free capacity, then name. **Without preferences** the choice is the most
+  headroom left, then least loaded, then most free slots.
 - **W05-R24 Unroutable legs.** When no runner kiln has ever seen, and no pool, could satisfy a
   leg, it waits with reason `unroutable` and the failing requirements, or fails after
   `[ci.routing] unroutable_timeout` if one is set.

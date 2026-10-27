@@ -1319,8 +1319,8 @@ impl Scheduler {
         let mut order: Vec<(usize, &Runner)> = rooms.into_iter().enumerate().collect();
         order.sort_by(|(i, a), (j, b)| {
             let (sa, sb) = (scores.get(*i).copied().unwrap_or(0.0), scores.get(*j).copied().unwrap_or(0.0));
-            let (fa, fb) = (self.fullness(a, l).unwrap_or(f64::INFINITY), self.fullness(b, l).unwrap_or(f64::INFINITY));
-            sb.total_cmp(&sa).then_with(|| fa.total_cmp(&fb)).then_with(|| load(a).total_cmp(&load(b))).then_with(|| free(b).cmp(&free(a))).then_with(|| a.input.id.cmp(&b.input.id))
+            let (ha, hb) = (headroom_of(a, self.now), headroom_of(b, self.now));
+            sb.total_cmp(&sa).then_with(|| super::place::before(&l.input.request, ha.as_ref(), hb.as_ref())).then_with(|| load(a).total_cmp(&load(b))).then_with(|| free(b).cmp(&free(a))).then_with(|| a.input.id.cmp(&b.input.id))
         });
         order.into_iter().map(|(_, r)| r.input.id.clone()).collect()
     }
@@ -2105,16 +2105,16 @@ impl Scheduler {
     }
 
     /// Whether a leg leaves a runner within the target use ([`Config::target_use`]): its CPUs and
-    /// its memory both. A runner with no fresh sample is placed as before samples were: within it.
+    /// its memory both ([`super::place::fits`]). A runner with no fresh sample is placed as before
+    /// samples were: within it.
     fn under_target(&self, r: &Runner, l: &Leg) -> bool {
-        headroom_of(r, self.now).is_none_or(|h| h.within(&l.input.request, self.config().target_use))
+        super::place::fits(&l.input.request, headroom_of(r, self.now).as_ref(), self.config().target_use)
     }
 
-    /// How full a leg leaves a runner: the larger of its CPUs' and its memory's share in use, and
-    /// its I/O pressure (the share of time its tasks all stalled) on top. `None` with no fresh
-    /// sample. Lower is the more headroom.
-    fn fullness(&self, r: &Runner, l: &Leg) -> Option<f64> {
-        headroom_of(r, self.now).map(|h| h.fullness(&l.input.request))
+    /// Every runner as placement weighs it (kiln-seams' `Placement::nodes`): its headroom now,
+    /// `None` without a fresh sample ([`super::place::Node`]), by id.
+    pub fn nodes(&self) -> Vec<super::place::Node<'_>> {
+        self.runners.values().map(|r| super::place::Node { name: &r.input.id, headroom: headroom_of(r, self.now) }).collect()
     }
 
     // ------------------------------------------------------------------ warm placement (W24-R18)
