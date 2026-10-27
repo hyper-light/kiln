@@ -33,6 +33,7 @@ pub mod experiments;
 pub mod expr;
 pub mod facts;
 pub mod graphql;
+pub mod headroom;
 pub mod insights;
 pub mod land;
 pub mod oidc;
