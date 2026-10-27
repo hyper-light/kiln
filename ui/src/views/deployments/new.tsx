@@ -181,7 +181,7 @@ export default function NewApp() {
   return (
     <div className="container-console page cd-page cd-new">
       <title>New app · Deployments · kiln</title>
-      <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "New app" }]} />
+      <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "New app" }]} />
       <h1 className="cd-new-title">A new app.</h1>
       <p className="lead">Where it runs, what it is, how it rolls out. Read what kiln makes of it, then keep it.</p>
       <Loadable label="the platforms" fallback={<Hold height={320} />}>

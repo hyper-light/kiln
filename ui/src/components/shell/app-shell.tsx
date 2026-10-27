@@ -22,10 +22,10 @@ const TerminalWorkspace = React.lazy(() => import("@/views/terminal/workspace"))
 /** What waits on you, answered from any page (Mission control and the asking agent's page show it themselves). */
 const RequestToasts = React.lazy(() => import("@/views/harness/approval-toasts"));
 
-export const NAV = [
+export const NAV: { to: string; label: string; end?: boolean; also?: readonly string[] }[] = [
   { to: "/", label: "Overview", end: true },
-  { to: "/runs", label: "Runs" },
-  { to: "/deployments", label: "Deployments" },
+  // Ship where Runs and Deployments were: their pages are its views, and keep their addresses.
+  { to: "/ship", label: "Ship", also: ["/runs", "/deployments"] },
   { to: "/repos", label: "Repos" },
   { to: "/runners", label: "Runners" },
   { to: "/agents", label: "Agents" },
@@ -159,7 +159,7 @@ export function AppShell({ me }: { me: Me | null }) {
           </React.Suspense>
           <nav className="desktop-nav hidden xl:flex" aria-label="Main navigation">
             {NAV.map((n, i) => (
-              <NavLink key={n.to} to={n.to} end={n.end}>
+              <NavLink key={n.to} to={n.to} end={n.end} also={n.also}>
                 <span className="nav-index" aria-hidden="true">
                   {pad2(i + 1)}
                 </span>
@@ -222,6 +222,7 @@ export function AppShell({ me }: { me: Me | null }) {
                   key={n.to}
                   to={n.to}
                   end={n.end}
+                  also={"also" in n ? n.also : undefined}
                   onClick={closeMenu}
                   className="flex min-h-14 items-center justify-between gap-4 border-b border-white/10 px-1 py-3 text-xl tracking-tight text-[#a3a5ad] transition-colors hover:text-white aria-[current=page]:text-white"
                 >

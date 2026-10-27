@@ -23,6 +23,7 @@ import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "../shared";
 import { ACTION_WORD, fold, HOSTS, KINDS, order, standWord, strip, type Item, type Sort } from "./model";
 import "./ship.css";
+import { ShipViews } from "./views";
 
 const LIMIT = 100;
 
@@ -31,6 +32,7 @@ export default function ShipPage() {
     <div className="container-console page ship">
       <title>Ship · kiln</title>
       <PageIntro index={2} label="Ship" title="Ship." lead="Every commit and change on its way from review to production, and what it needs of you." />
+      <ShipViews />
       <Loadable label="Loading commits">
         <ShipList />
       </Loadable>

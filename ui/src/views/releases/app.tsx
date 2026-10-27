@@ -692,7 +692,7 @@ function AppView({ name }: { name: string }) {
   return (
     <>
       <header className="cd-head">
-        <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: a.name }]} />
+        <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: a.name }]} />
         <h1 className="cd-title">{a.name}</h1>
         <p className="cd-note">
           {a.project}

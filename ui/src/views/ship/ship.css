@@ -272,3 +272,31 @@
     display: none;
   }
 }
+
+/* Ship's three views: its commits, and the runs and deployments it took the place of in the nav. */
+.ship-views {
+  display: flex;
+  width: fit-content;
+  gap: 0.25rem;
+  margin: 0 0 1.25rem;
+  padding: 0.25rem;
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-radius: 999px;
+}
+.ship-views__link {
+  padding: 0.45rem 1rem;
+  border-radius: 999px;
+  color: #a3a5ad;
+  font-size: 0.875rem;
+  text-decoration: none;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+.ship-views__link:hover {
+  color: #e4e5e9;
+}
+.ship-views__link.is-current {
+  background: rgb(255 255 255 / 0.9);
+  color: #0b0c0e;
+}

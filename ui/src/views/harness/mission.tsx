@@ -285,7 +285,7 @@ export default function Mission() {
     <div className="container-console page ms-page">
       <title>Agents · kiln</title>
       <PageIntro
-        index={6}
+        index={5}
         label="Agents"
         title="Mission control."
         compact

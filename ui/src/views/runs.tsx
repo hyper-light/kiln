@@ -17,6 +17,7 @@ import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { useWindowedRows } from "@/lib/virtual";
 import { EventIcon, LiveDuration, RelTime } from "./shared";
+import { ShipViews } from "@/views/ship/views";
 
 const PAGE = 50;
 /** A row's height until the first one is measured (a list of a million scrolls as one of forty: W21-AC04). */
@@ -77,6 +78,7 @@ export default function Runs() {
           </>
         }
       />
+      <ShipViews />
       <Loadable label="runs" fallback={<RunsHold />}>
         <RunsBody />
       </Loadable>

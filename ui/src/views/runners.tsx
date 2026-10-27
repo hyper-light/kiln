@@ -52,7 +52,7 @@ const LEAD = "Runners are long-lived machines that take CI jobs; Kubernetes job 
 function Intro({ lead }: { lead: React.ReactNode }) {
   return (
     <PageIntro
-      index={5}
+      index={4}
       label="Runners"
       title="Fleet"
       lead={lead}

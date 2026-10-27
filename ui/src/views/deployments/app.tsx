@@ -493,7 +493,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
 }
 
 function AppCrumbs({ project }: { project: string }) {
-  return <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: project }]} />;
+  return <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: project }]} />;
 }
 
 /** The app while it loads: its crumbs and name (both from the address), then its head's and its objects' space. */
