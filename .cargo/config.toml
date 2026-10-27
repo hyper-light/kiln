@@ -7,3 +7,9 @@
 # With SQLite's pre-update hook: the store notes the rows a write touches, for the cluster group's
 # entries (crates/kiln/src/store/capture.rs, docs/p2p.md P1).
 LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_ENABLE_PREUPDATE_HOOK"
+# The stack the kiln binary gives its threads (crates/kiln/src/main.rs, THREAD_STACK: 16 MiB), for
+# the test binaries cargo runs too: they never run kiln's main, so the runtime's shards running
+# kiln's async work got the 2 MiB a thread has by default, and in a debug build the CI dispatcher's
+# handle -> start -> commands -> actions -> queue -> commands overflowed one (frames of 180-764 KiB,
+# 2026-10-27). Reserved, not used: pages are touched as needed. A value already set stays.
+RUST_MIN_STACK = "16777216"
