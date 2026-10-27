@@ -11,6 +11,8 @@ import { Trunk } from "./ship-sim.ts";
 
 interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
+  /** One of the mock's own jobs, running if one is (server.ts), for a fixed row's leg to stream. */
+  liveJob?: () => { run: string; job: string; name: string; state: string } | null;
 }
 
 /** kiln's own trunk, simulated (ship-sim.ts); `MOCK_SHIP=static` serves the fixed rows alone, for
@@ -233,7 +235,12 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
   const one = m === "GET" ? p.match(/^\/api\/ship\/commits\/(.+)\/([0-9a-f]{7,40})$/) : null;
   if (one) {
     const [, repo, sha] = one;
-    const detail: ShipDetail | null = trunk?.detail(sha ?? "") ?? all().find((c) => c.repo === repo && c.sha.startsWith(sha ?? "")) ?? null;
+    const row = all().find((c) => c.repo === repo && c.sha.startsWith(sha ?? ""));
+    const live = ctx.liveJob?.();
+    const fixed: ShipDetail | null = row
+      ? { ...row, checks: live ? [{ pipeline: "ci", legs: [{ name: live.name, state: live.state === "running" ? "running" : "passed", attempts: 1, note: "", job: live.job, run: live.run }] }] : [] }
+      : null;
+    const detail: ShipDetail | null = trunk?.detail(sha ?? "") ?? fixed;
     if (!detail || detail.repo !== repo) ctx.json(res, 404, { error: "no such commit" });
     else ctx.json(res, 200, detail);
     return true;

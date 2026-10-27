@@ -100,6 +100,12 @@ const repoTc = new Map<string, Toolchain>();
 const runs: Run[] = []; // newest first
 const jobsByRun = new Map<string, SimJob[]>();
 const jobsById = new Map<string, SimJob>();
+/** A job for Ship's fixed rows to stream (ship.ts): one running, else the first. */
+function liveJob() {
+  const all = [...jobsById.values()];
+  const sj = all.find((j) => j.job.status === "running") ?? all[0];
+  return sj ? { run: sj.job.run_id, job: sj.job.id, name: sj.job.display || sj.job.key, state: sj.job.status } : null;
+}
 const logs = new Map<string, LogStream>();
 const agents = new Map<string, Agent>();
 const agentState = new Map<string, HostState>();
@@ -1436,7 +1442,7 @@ const server = http.createServer(async (req, res) => {
     if (await handleGoals(req, res, url)) return;
     if (await handlePrograms(req, res, url)) return;
     // ---- agents that run agents ----
-    if (await handleShip(req, res, url, { json })) return;
+    if (await handleShip(req, res, url, { json, liveJob })) return;
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body })) return;

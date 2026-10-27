@@ -11,12 +11,20 @@ import { StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, STAGE_WORD } from "@/components/ui/status-glyph-spec";
 import { pickCard, strip } from "./model";
 
+/** The cards: the journey's six stages after Review (Review is Files' to show). */
+export const cardsOf = (commit: ShipCommit) => strip(commit.pips).filter((p) => p.stage !== "review");
+
+/** The stage picked first, by the cards' rule. */
+export const firstStage = (commit: ShipCommit) => {
+  const cards = cardsOf(commit);
+  return cards[pickCard(cards)]?.stage ?? null;
+};
+
 /** Whether the track is at its start and at its end. */
 const endsOf = (el: HTMLElement) => ({ start: el.scrollLeft <= 1, end: el.scrollLeft + el.clientWidth >= el.scrollWidth - 1 });
 
 export function JobCards({ commit, onPick }: { commit: ShipCommit; onPick?: (stage: string) => void }) {
-  // Review is Files' to show; the cards are the journey's six stages after it.
-  const stages = strip(commit.pips).filter((p) => p.stage !== "review");
+  const stages = cardsOf(commit);
   // The picked card's job is the one whose output shows: yours once you click one, else the rule's.
   const [picked, setPicked] = React.useState<string | null>(null);
   const shown = picked ?? stages[pickCard(stages)]?.stage;

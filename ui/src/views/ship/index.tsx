@@ -27,7 +27,8 @@ import { ShipViews } from "./views";
 import { Stands } from "@/views/harness/stands";
 import { SelectField } from "@/components/ui/misc";
 import { useGlide, useListHold } from "@/views/harness/list-tools";
-import { JobCards } from "./jobs";
+import { firstStage, JobCards } from "./jobs";
+import { ShipOutput } from "./output";
 
 const LIMIT = 100;
 
@@ -302,6 +303,9 @@ function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () 
 
 /** An item's dropdown, in its order: Files (with the Conversation), Output, Jobs, Lanes. */
 function Dropdown({ commit }: { commit: ShipCommit }) {
+  // The picked job card: yours once you click one, else the cards' rule; Output shows its job.
+  const [stage, setStage] = React.useState<string | null>(null);
+  const shown = stage ?? firstStage(commit);
   const ch = commit.change;
   return (
     <div className="ship-open">
@@ -326,11 +330,13 @@ function Dropdown({ commit }: { commit: ShipCommit }) {
       </section>
       <section aria-label="Output" className="ship-sec">
         <h3>Output</h3>
-        {commit.runs?.length ? <p>Its runs' output: {commit.runs.map((r) => r.pipeline).join(", ")}.</p> : <p>No runs yet.</p>}
+        <Loadable label="Loading the output" className="ship-output-slot">
+          <ShipOutput commit={commit} stage={shown} />
+        </Loadable>
       </section>
       <section aria-label="Jobs" className="ship-sec">
         <h3>Jobs</h3>
-        <JobCards commit={commit} />
+        <JobCards commit={commit} onPick={setStage} />
         <ul>
           {(commit.runs ?? []).map((r) => (
             <li key={r.id}>

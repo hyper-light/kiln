@@ -454,3 +454,19 @@
   border-color: rgb(255 255 255 / 0.42);
   background: rgb(255 255 255 / 0.06);
 }
+
+/* The opened commit's Output (its step 3): the lanes card's width, one height while it loads, while
+   it streams and when there's nothing to show. */
+.ship-output-slot,
+.ship-output--none {
+  min-height: 230px;
+}
+.ship-output {
+  overflow: hidden;
+  border-radius: 0.5rem;
+}
+.ship-output--none {
+  display: grid;
+  place-items: center;
+  border: 1px dashed rgb(255 255 255 / 0.1);
+}
