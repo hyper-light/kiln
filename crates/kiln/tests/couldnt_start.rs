@@ -83,8 +83,10 @@ fn install_claude(bin: &Path) -> anyhow::Result<()> {
 #[test]
 fn an_agent_that_couldnt_start_on_the_server_moves_to_a_runner_that_has_its_harness() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let shell = login_shell(dir.path(), "/usr/bin:/bin")?;
-    let s = start_env(dir.path(), &Options { extra: "[terminal]\nenabled = true\n", ..Options::default() }, false, &[("PATH", "/usr/bin:/bin"), ("SHELL", &shell)])?;
+    // The server has no Claude Code: not on its PATH nor its login shell's, a system-wide one left out.
+    let system = agents::path_without_harnesses(dir.path())?;
+    let shell = login_shell(dir.path(), &system)?;
+    let s = start_env(dir.path(), &Options { extra: "[terminal]\nenabled = true\n", ..Options::default() }, false, &[("PATH", &system), ("SHELL", &shell)])?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
 
@@ -117,7 +119,7 @@ fn a_runner_agent_that_couldnt_start_keeps_its_first_message_moved_or_started_ag
     std::fs::create_dir_all(&work)?;
     let bare_bin = dir.path().join("bare-bin");
     std::fs::create_dir_all(&bare_bin)?;
-    let path = format!("{}:/usr/bin:/bin", bare_bin.display());
+    let path = format!("{}:{}", bare_bin.display(), agents::path_without_harnesses(dir.path())?);
     let shell = login_shell(dir.path(), &path)?;
     let bare_env = [("PATH", path.as_str()), ("SHELL", shell.as_str())];
     let talk = Talk { lines: 3, every_ms: 20 };
