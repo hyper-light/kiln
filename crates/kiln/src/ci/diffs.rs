@@ -753,6 +753,8 @@ pub(crate) struct NewVersion {
 pub(crate) async fn closed(hub: &Hub, repo: &Repo, d: &Diff, merged: bool, by: &str) -> anyhow::Result<()> {
     // Its preview goes, and its stack's once the stack has no open diff (W15-R07).
     super::previews::closed(hub, repo, d, merged).await;
+    // Its search indexes go with it (W26-R07).
+    super::search::closed(hub, d).await;
     activity(hub, repo, d, "closed", by, |p| {
         if let Some(pr) = p.get_mut("pull_request").and_then(Value::as_object_mut) {
             pr.insert("state".into(), json!("closed"));
@@ -1472,6 +1474,11 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                 (&Method::GET, ["versions", n, "blob"]) => {
                     let vs = versions(hub, &d).await.map_err(fail)?;
                     blob(hub, &d, &version_of(&vs, n)?, q).await
+                }
+                // W26-R07: a search across the version's files, backed by vorpal.
+                (&Method::GET, ["versions", n, "search"]) => {
+                    let vs = versions(hub, &d).await.map_err(fail)?;
+                    ok(super::search::version(hub, &d, &version_of(&vs, n)?, q).await?)
                 }
                 (&Method::GET, ["interdiff"]) => {
                     let vs = versions(hub, &d).await.map_err(fail)?;

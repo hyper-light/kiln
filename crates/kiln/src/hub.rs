@@ -430,6 +430,9 @@ pub struct Hub {
     pub blobs: crate::blobs::Opened,
     /// The bus kiln's events ride: its sessions' live feeds (docs/bus.md).
     pub bus: crate::bus::QuiverBus,
+    /// The search across a change (docs/ci.md W26-R07): vorpal, its indexes under the server's
+    /// cache (`crate::ci::search`).
+    pub search: Arc<dyn kiln_seams::Search>,
 }
 
 impl Hub {
@@ -467,6 +470,8 @@ impl Hub {
         let harness_dir = cfg.data("harness");
         // The bus every session's live feed rides (docs/bus.md): Quiver's node, in this process.
         let bus = crate::bus::QuiverBus::open(&cfg.bus, Arc::clone(&clock))?;
+        // The search across a change (W26-R07): an index per tree in the server's cache.
+        let search: Arc<dyn kiln_seams::Search> = Arc::new(kiln_search::VorpalSearch::open(cfg.data("cache").join("search"), kiln_search::Limits::default()).map_err(anyhow::Error::msg)?);
         let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock), Arc::new(bus.clone()));
         let contents = crate::sync::contents::Contents::start(&blobs, cfg.data("sync").join("blobs"));
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
@@ -537,6 +542,7 @@ impl Hub {
             push: crate::push::Service::default(),
             blobs,
             bus,
+            search,
         }))
     }
 

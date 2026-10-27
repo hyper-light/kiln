@@ -2,8 +2,8 @@
 resolver = "3"
 members = ["crates/*"]
 # Turso (the conversation store's engine) is vendored with its own workspace: vendor/turso/UPSTREAM.md;
-# so are Quiver, Focal's bus and hyper-raft (vendor/MANIFEST.toml), each a workspace of its own.
-exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "bench/kilndb", "bench/http"]
+# so are Quiver, Focal's bus, hyper-raft and vorpal (vendor/MANIFEST.toml), each a workspace of its own.
+exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "vendor/vorpal", "bench/kilndb", "bench/http"]
 
 [workspace.package]
 version = "0.2.0"
@@ -62,3 +62,26 @@ hyper-timing = { path = "vendor/hyper-raft/crates/hyper-timing" }
 hyper-transport = { path = "vendor/hyper-raft/crates/hyper-transport" }
 quiver = { path = "vendor/quiver/crates/quiver" }
 quiver-api = { path = "vendor/quiver/crates/quiver-api" }
+# vorpal, the search across a change (docs/ci.md W26-R07): its crates, the tree-sitter runtime it
+# carries and the grammars kiln takes, each name at its copy under vendor/vorpal, as vorpal's own
+# root manifest points them.
+vorpal-core = { path = "vendor/vorpal/crates/core" }
+vorpal-kg = { path = "vendor/vorpal/crates/kg" }
+vorpal-language = { path = "vendor/vorpal/crates/language" }
+vorpal-outline = { path = "vendor/vorpal/crates/outline" }
+tree-sitter = { path = "vendor/vorpal/vendor/tree-sitter" }
+tree-sitter-bash = { path = "vendor/vorpal/grammars/tree-sitter-bash" }
+tree-sitter-c = { path = "vendor/vorpal/grammars/tree-sitter-c" }
+tree-sitter-cpp = { path = "vendor/vorpal/grammars/tree-sitter-cpp" }
+tree-sitter-css = { path = "vendor/vorpal/grammars/tree-sitter-css" }
+tree-sitter-go = { path = "vendor/vorpal/grammars/tree-sitter-go" }
+tree-sitter-html = { path = "vendor/vorpal/grammars/tree-sitter-html" }
+tree-sitter-java = { path = "vendor/vorpal/grammars/tree-sitter-java" }
+tree-sitter-javascript = { path = "vendor/vorpal/grammars/tree-sitter-javascript" }
+tree-sitter-json = { path = "vendor/vorpal/grammars/tree-sitter-json" }
+tree-sitter-md = { path = "vendor/vorpal/grammars/tree-sitter-md" }
+tree-sitter-python = { path = "vendor/vorpal/grammars/tree-sitter-python" }
+tree-sitter-rust = { path = "vendor/vorpal/grammars/tree-sitter-rust" }
+tree-sitter-toml-ng = { path = "vendor/vorpal/grammars/tree-sitter-toml-ng" }
+tree-sitter-typescript = { path = "vendor/vorpal/grammars/tree-sitter-typescript" }
+tree-sitter-yaml = { path = "vendor/vorpal/grammars/tree-sitter-yaml" }
