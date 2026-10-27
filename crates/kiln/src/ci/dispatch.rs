@@ -451,8 +451,7 @@ fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config 
         overcommit_mem: s.overcommit.memory,
         overcommit_disk: s.overcommit.disk,
         fair_by: s.fair_levels(),
-        // Within (0, 1]: past it a runner would be filled past all it has.
-        target_use: if s.target_use > 0.0 && s.target_use <= 1.0 { s.target_use } else { kiln_ci::sched::state::TARGET_USE },
+        target_use: target_use(s),
         // Admission by load (W24-R19): off until set, and while it doesn't read.
         admission: s.admission.as_ref().and_then(|a| a.admission().inspect_err(|e| tracing::warn!(error = %e, "admission by load is off")).ok()),
         ..Config::default()
@@ -3482,9 +3481,15 @@ fn work_slots(a: &crate::hub::AgentLive) -> u32 {
     if a.skew.takes_work() { a.slots } else { 0 }
 }
 
+/// `[ci.scheduler] target_use` as placement takes it (W05): within (0, 1], else the default; past
+/// 1 a runner would be filled past all it has.
+pub(crate) fn target_use(s: &crate::config::ci::Scheduler) -> f64 {
+    if s.target_use > 0.0 && s.target_use <= 1.0 { s.target_use } else { kiln_ci::sched::state::TARGET_USE }
+}
+
 /// What the engine weighs of a runner's sample: its CPUs, the share of them busy, its load and
 /// memory, and the I/O pressure its facts last said (`work.io_full`).
-fn sample_of(s: &crate::metrics::HostSample, facts: Option<&kiln_ci::facts::RunnerFacts>) -> kiln_ci::sched::state::Sample {
+pub(crate) fn sample_of(s: &crate::metrics::HostSample, facts: Option<&kiln_ci::facts::RunnerFacts>) -> kiln_ci::sched::state::Sample {
     kiln_ci::sched::state::Sample {
         cpus: s.cpus,
         busy: f64::from(s.cpu_pct.clamp(0.0, 100.0)) / 100.0,

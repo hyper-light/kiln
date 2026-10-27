@@ -305,6 +305,40 @@ pub struct Headroom {
     pub of: Resources,
 }
 
+impl Headroom {
+    /// A runner's headroom by its sample as it is, nothing placed since: what the v1 dispatcher
+    /// and reach weigh, from the samples the server holds. Its free CPUs are those neither its
+    /// busy share nor its load average takes, whichever leaves fewer (work waiting on disk or
+    /// memory shows in its load, not its busy share).
+    pub fn of(s: &Sample) -> Headroom {
+        let all = f64::from(s.cpus);
+        let by_busy = all * (1.0 - s.busy.clamp(0.0, 1.0));
+        let by_load = (all - s.load1.max(0.0)).max(0.0);
+        Headroom { cpus: by_busy.min(by_load), mem: s.mem_total.saturating_sub(s.mem_used), io_full: s.io_full, of: Resources { cpu: all, mem: s.mem_total, ..Resources::default() } }
+    }
+
+    /// Its CPUs' and its memory's share in use with `request` on it.
+    pub fn use_with(&self, request: &Resources) -> (f64, f64) {
+        let cpu = if self.of.cpu > 0.0 { 1.0 - (self.cpus - request.cpu) / self.of.cpu } else { 0.0 };
+        let mem = if self.of.mem > 0 { 1.0 - (self.mem as f64 - request.mem as f64) / self.of.mem as f64 } else { 0.0 };
+        (cpu, mem)
+    }
+
+    /// Whether `request` leaves it within `target` of its CPUs and of its memory.
+    pub fn within(&self, request: &Resources, target: f64) -> bool {
+        let (cpu, mem) = self.use_with(request);
+        cpu <= target + 1e-9 && mem <= target + 1e-9
+    }
+
+    /// How full `request` leaves it: the larger of its CPUs' and its memory's share in use, its
+    /// I/O pressure (the share of time its tasks all stalled) on top. Lower is the more headroom:
+    /// placement's order for the engine, the v1 dispatcher and reach alike.
+    pub fn fullness(&self, request: &Resources) -> f64 {
+        let (cpu, mem) = self.use_with(request);
+        cpu.max(mem) + self.io_full.unwrap_or(0.0) / 100.0
+    }
+}
+
 /// [`Config::target_use`] by default.
 pub const TARGET_USE: f64 = 0.85;
 
@@ -2070,30 +2104,17 @@ impl Scheduler {
         self.runners.get(runner).and_then(|r| headroom_of(r, self.now))
     }
 
-    /// A runner's CPUs' and memory's share in use with a leg on it, by its live headroom: what it
-    /// uses now and what was placed since, and the leg's request. `None` with no fresh sample.
-    fn use_with(&self, r: &Runner, l: &Leg) -> Option<(f64, f64)> {
-        let h = headroom_of(r, self.now)?;
-        let q = &l.input.request;
-        let cpu = if h.of.cpu > 0.0 { 1.0 - (h.cpus - q.cpu) / h.of.cpu } else { 0.0 };
-        let mem = if h.of.mem > 0 { 1.0 - (h.mem as f64 - q.mem as f64) / h.of.mem as f64 } else { 0.0 };
-        Some((cpu, mem))
-    }
-
     /// Whether a leg leaves a runner within the target use ([`Config::target_use`]): its CPUs and
     /// its memory both. A runner with no fresh sample is placed as before samples were: within it.
     fn under_target(&self, r: &Runner, l: &Leg) -> bool {
-        let t = self.config().target_use;
-        self.use_with(r, l).is_none_or(|(cpu, mem)| cpu <= t + 1e-9 && mem <= t + 1e-9)
+        headroom_of(r, self.now).is_none_or(|h| h.within(&l.input.request, self.config().target_use))
     }
 
     /// How full a leg leaves a runner: the larger of its CPUs' and its memory's share in use, and
     /// its I/O pressure (the share of time its tasks all stalled) on top. `None` with no fresh
     /// sample. Lower is the more headroom.
     fn fullness(&self, r: &Runner, l: &Leg) -> Option<f64> {
-        let (cpu, mem) = self.use_with(r, l)?;
-        let io = headroom_of(r, self.now).and_then(|h| h.io_full).unwrap_or(0.0);
-        Some(cpu.max(mem) + io / 100.0)
+        headroom_of(r, self.now).map(|h| h.fullness(&l.input.request))
     }
 
     // ------------------------------------------------------------------ warm placement (W24-R18)
@@ -2858,10 +2879,8 @@ fn headroom_of(r: &Runner, now: i64) -> Option<Headroom> {
     if now.saturating_sub(*at) > SAMPLE_FRESH_MS {
         return None;
     }
-    let all = f64::from(s.cpus);
-    let cpus = (all * (1.0 - s.busy.clamp(0.0, 1.0)) - r.since.cpu).max(0.0);
-    let mem = s.mem_total.saturating_sub(s.mem_used).saturating_sub(r.since.mem);
-    Some(Headroom { cpus, mem, io_full: s.io_full, of: Resources { cpu: all, mem: s.mem_total, ..Resources::default() } })
+    let h = Headroom::of(s);
+    Some(Headroom { cpus: (h.cpus - r.since.cpu).max(0.0), mem: h.mem.saturating_sub(r.since.mem), ..h })
 }
 
 fn load(r: &Runner) -> f64 {
