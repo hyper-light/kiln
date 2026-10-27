@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kiln_ci::wire::AssignmentV2;
+use kiln_ci::work::reap;
 use kiln_ci::work::slots::{self, Budget, Clones, Disk, Full, LaneOf, Recovery, Slot, State, Take, Why};
 use serde::{Deserialize, Serialize};
 
@@ -768,6 +769,109 @@ pub fn sweep(work: &Path, budget: &Budget) -> Vec<String> {
     went
 }
 
+/// The runner scope's defaults (W24-R31): `KILN_WARM_MAX` as its ceiling and `KILN_WARM_FLOOR` as
+/// its floor, where they're set.
+pub fn env_policy() -> reap::Policy {
+    let env = |k: &str| std::env::var(k).ok().and_then(|v| super::cache::parse_size(&v)).map(reap::Size::Bytes);
+    reap::Policy { ceiling: env("KILN_WARM_MAX"), floor: env("KILN_WARM_FLOOR"), ..reap::Policy::default() }
+}
+
+/// What the reaper last did here (W24-R31), newest last, for the server (`WorkState`'s `reaped`).
+static REAPED: LazyLock<parking_lot::Mutex<std::collections::VecDeque<reap::Eviction>>> = LazyLock::new(Default::default);
+
+/// The reaper's evictions on this runner since the server last took them.
+pub fn take_reaped() -> Vec<reap::Eviction> {
+    REAPED.lock().drain(..).collect()
+}
+
+/// W24-R31's reaper over this runner's warm workspaces. The policy is `layers` (the server's
+/// system and runner scopes) over [`env_policy`]; the volume `disk` (`(size, free)`, measured with
+/// statvfs when `None`). When free space is under the floor, the workspaces past their ceiling, or
+/// the schedule due (`last`: when it last reaped on schedule), each slot no leg holds is an entry
+/// of its lane, worth the time its lane's warm runs save over its cold ones, and
+/// `kiln_ci::work::reap::plan` decides; each eviction is dropped under its lane's lock, logged,
+/// counted and kept for the server. Why it ran, and what went.
+pub fn reap(work: &Path, layers: &[(reap::Scope, reap::Policy)], last: Option<i64>, now: i64, disk: Option<(u64, u64)>) -> (Option<reap::Trigger>, Vec<reap::Eviction>) {
+    let Some((size, free)) = disk.or_else(|| crate::os::disk_space(&root(work))) else { return (None, Vec::new()) };
+    let env = env_policy();
+    let mut all: Vec<(reap::Scope, &reap::Policy)> = layers.iter().map(|(s, p)| (*s, p)).collect();
+    all.insert(0, (reap::Scope::Runner, &env));
+    let policy = reap::resolve(size, &all);
+    let mut entries = Vec::new();
+    let mut held_bytes = 0u64;
+    for lane in lanes(work) {
+        let runs = read_runs(&lane);
+        let median = |v: &[u64]| -> u64 {
+            let mut v = v.to_vec();
+            v.sort_unstable();
+            v.get(v.len() / 2).copied().unwrap_or(0)
+        };
+        let saved_ms = median(&runs.cold_ms).saturating_sub(median(&runs.warm_ms));
+        for slot in read_slots(&lane) {
+            held_bytes = held_bytes.saturating_add(slot.bytes);
+            if slot.state == State::Leased || held(&slot_dir(&lane, slot.n)) {
+                continue;
+            }
+            entries.push(reap::Entry { id: format!("{}#{}", lane.display(), slot.n), group: lane.display().to_string(), bytes: slot.bytes, used: slot.used, saved_ms });
+        }
+    }
+    let Some(trigger) = reap::due(&policy, free, held_bytes, 0, last, now) else { return (None, Vec::new()) };
+    let mut went = Vec::new();
+    for e in reap::plan(&policy, &entries, free, held_bytes, now) {
+        let Some((lane, n)) = e.id.rsplit_once('#').and_then(|(l, n)| Some((PathBuf::from(l), n.parse::<u32>().ok()?))) else { continue };
+        let Ok(_locked) = lock_file(&lane.join(".lock")) else { continue };
+        if read_slots(&lane).into_iter().find(|s| s.n == n).is_none_or(|s| s.state == State::Leased) || held(&slot_dir(&lane, n)) {
+            continue;
+        }
+        drop_slot(work, &lane, n);
+        let reason = match e.reason {
+            reap::Reason::MaxAge => "max_age",
+            reap::Reason::Target => "target",
+            reap::Reason::Floor => "floor",
+        };
+        tracing::info!(slot = %e.id, bytes = e.bytes, reason, rule = e.rule, scope = ?e.scope, trigger = ?trigger, "the reaper evicted a warm workspace");
+        crate::metrics::global().work_reaped_bytes.add(&["warm", reason], e.bytes);
+        went.push(e);
+    }
+    if !went.is_empty() {
+        empty_trash(work);
+        changed();
+        let mut kept = REAPED.lock();
+        kept.extend(went.iter().cloned());
+        while kept.len() > 200 {
+            kept.pop_front();
+        }
+    }
+    (Some(trigger), went)
+}
+
+/// The server's reaper policies for this runner (its system and runner scopes), as it last said.
+static SERVER_POLICIES: LazyLock<parking_lot::Mutex<Vec<(reap::Scope, reap::Policy)>>> = LazyLock::new(Default::default);
+
+/// The server's reaper policies for this runner, as it last said (W24-R31).
+pub fn set_server_policies(layers: Vec<(reap::Scope, reap::Policy)>) {
+    *SERVER_POLICIES.lock() = layers;
+}
+
+/// W24-R31: the reaper's clock on this runner. Every minute it checks whether free space, the
+/// ceiling or the schedule calls for a reap; it starts once per process.
+pub fn start_reaper(work: &Path) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let work = work.to_path_buf();
+    STARTED.call_once(move || {
+        crate::rt::spawn(async move {
+            let mut last: Option<i64> = None;
+            loop {
+                crate::rt::sleep(Duration::from_secs(60)).await;
+                let (w, l, layers, now) = (work.clone(), last, SERVER_POLICIES.lock().clone(), crate::util::now_unix());
+                if let Ok((Some(reap::Trigger::Schedule), _)) = crate::rt::blocking(move || reap(&w, &layers, l, now, None)).await {
+                    last = Some(now);
+                }
+            }
+        });
+    });
+}
+
 /// The warm workspaces this process's legs hold, by directory, each with its runner's work
 /// directory.
 static HELD: LazyLock<parking_lot::Mutex<HashMap<PathBuf, (PathBuf, Lease)>>> = LazyLock::new(Default::default);
@@ -1220,6 +1324,102 @@ mod tests {
         let took = took?;
         eprintln!("W24-AC11: {} ({}) cloned in {:.2}s; the clone removed in {:.2}s", from.display(), gib(usage(&from)), took.as_secs_f64(), removing.elapsed().as_secs_f64());
         anyhow::ensure!(took < Duration::from_secs(10), "{took:?}");
+        Ok(())
+    }
+
+    /// W24-R31 on a runner: a small volume (100 GiB) filled past its floor reaps its warm
+    /// workspaces until the target is free, keeping each lane's newest; each eviction says why; a
+    /// scheduled reap then drops what `max_age` names.
+    #[test]
+    fn w24_r31_the_runner_reaps_to_its_target_and_on_schedule() -> anyhow::Result<()> {
+        const GIB: u64 = 1 << 30;
+        let work = tempfile::tempdir()?;
+        let now = 1_800_000_000i64;
+        let mut held = 0u64;
+        for l in 0..3 {
+            let lane = lane_dir(work.path(), "acme/app", &format!("lane{l}"));
+            std::fs::create_dir_all(&lane)?;
+            for n in 0..4u32 {
+                std::fs::create_dir_all(slot_dir(&lane, n))?;
+                write_slot(&lane, &Slot { n, used: now - 86_400 * i64::from(1 + n), bytes: 6 * GIB, ..Slot::default() })?;
+                held += 6 * GIB;
+            }
+        }
+        let others = 13 * GIB;
+        let size = 100 * GIB;
+        let system = reap::Policy { floor: Some(reap::Size::Bytes(20 * GIB)), target: Some(reap::Size::Bytes(30 * GIB)), ceiling: Some(reap::Size::Bytes(size)), keep_last: Some(1), keep_within: Some(0), ..reap::Policy::default() };
+        let layers = vec![(reap::Scope::System, system)];
+        let free = size - held - others;
+        let (why, went) = reap(work.path(), &layers, Some(now), now, Some((size, free)));
+        anyhow::ensure!(why == Some(reap::Trigger::Pressure), "{why:?}");
+        let freed: u64 = went.iter().map(|e| e.bytes).sum();
+        anyhow::ensure!(free + freed >= 30 * GIB, "free space back to the target: {} GiB", (free + freed) / GIB);
+        anyhow::ensure!(went.iter().all(|e| e.reason == reap::Reason::Target && e.rule == "target" && e.scope == Some(reap::Scope::System)), "{went:?}");
+        for l in 0..3 {
+            let lane = lane_dir(work.path(), "acme/app", &format!("lane{l}"));
+            anyhow::ensure!(read_slots(&lane).iter().any(|s| s.n == 0) && slot_dir(&lane, 0).exists(), "lane{l}'s newest remains");
+        }
+        // Kept for the server; other tests' reaps in this process may be kept beside them.
+        let kept = take_reaped();
+        anyhow::ensure!(went.iter().all(|e| kept.iter().any(|k| k.id == e.id)), "kept for the server");
+        // A day later the schedule is due: a slot unused for 40 days goes, by max_age.
+        let lane = lane_dir(work.path(), "acme/app", "lane2");
+        let old = read_slots(&lane).into_iter().find(|s| s.n != 0).ok_or_else(|| anyhow::anyhow!("lane2 kept only its newest"))?;
+        write_slot(&lane, &Slot { used: now - 40 * 86_400, ..old.clone() })?;
+        let (why, went) = reap(work.path(), &layers, Some(now - 2 * 86_400), now, Some((size, 60 * GIB)));
+        anyhow::ensure!(why == Some(reap::Trigger::Schedule), "{why:?}");
+        anyhow::ensure!(went.len() == 1 && went.first().is_some_and(|e| e.reason == reap::Reason::MaxAge && e.id.ends_with(&format!("#{}", old.n))), "{went:?}");
+        Ok(())
+    }
+
+    /// W24-AC15 on a runner: a week of legs on a 100 GiB volume, three lanes adding two 4 GiB slots
+    /// a day, the system's and the runner's policies (the runner's floor the stricter). After every
+    /// reap free space is at or above the floor while anything is left to evict; what max_age names
+    /// goes; each lane's newest two stay unless the floor needed them, as their records say.
+    #[test]
+    fn w24_ac15_a_week_on_a_runner() -> anyhow::Result<()> {
+        const GIB: u64 = 1 << 30;
+        let work = tempfile::tempdir()?;
+        let (size, others) = (100 * GIB, 40 * GIB);
+        let system = reap::Policy { floor: Some(reap::Size::Bytes(20 * GIB)), target: Some(reap::Size::Bytes(25 * GIB)), keep_last: Some(2), keep_within: Some(0), max_age: Some(3 * 86_400), schedule: Some(reap::Schedule::Every(86_400)), ..reap::Policy::default() };
+        let runner = reap::Policy { floor: Some(reap::Size::Bytes(22 * GIB)), ..reap::Policy::default() };
+        let layers = vec![(reap::Scope::System, system), (reap::Scope::Runner, runner)];
+        let start = 1_800_000_000i64;
+        let mut last: Option<i64> = None;
+        let mut next = [0u32; 3];
+        for day in 0..7i64 {
+            let now = start + day * 86_400;
+            for (l, n) in next.iter_mut().enumerate() {
+                let lane = lane_dir(work.path(), "acme/app", &format!("lane{l}"));
+                std::fs::create_dir_all(&lane)?;
+                for _ in 0..2 {
+                    std::fs::create_dir_all(slot_dir(&lane, *n))?;
+                    write_slot(&lane, &Slot { n: *n, used: now - i64::from(*n % 2) * 60, bytes: 4 * GIB, ..Slot::default() })?;
+                    *n += 1;
+                }
+            }
+            let held = |w: &Path| lanes(w).iter().flat_map(|l| read_slots(l)).map(|s| s.bytes).sum::<u64>();
+            let free = size - others - held(work.path());
+            let (why, went) = reap(work.path(), &layers, last, now, Some((size, free)));
+            if why == Some(reap::Trigger::Schedule) {
+                last = Some(now);
+            }
+            let after = size - others - held(work.path());
+            let left = lanes(work.path()).iter().map(|l| read_slots(l).len()).sum::<usize>();
+            anyhow::ensure!(after >= 22 * GIB || left == 0, "day {day}: {} GiB free after the reap ({why:?})", after / GIB);
+            let floor_needed = went.iter().any(|e| e.reason == reap::Reason::Floor);
+            for l in 0..3 {
+                let lane = lane_dir(work.path(), "acme/app", &format!("lane{l}"));
+                let mut slots = read_slots(&lane);
+                slots.sort_by(|a, b| b.used.cmp(&a.used).then(a.n.cmp(&b.n)));
+                anyhow::ensure!(floor_needed || slots.len() >= 2, "day {day}: lane{l} keeps its newest two: {slots:?}");
+                for s in slots.iter().skip(2) {
+                    anyhow::ensure!(now - s.used <= 3 * 86_400 || why.is_none(), "day {day}: lane{l}'s slot {} is past max_age", s.n);
+                }
+            }
+            anyhow::ensure!(went.iter().all(|e| matches!(e.rule, "max_age" | "target" | "ceiling" | "floor")), "each eviction names its rule: {went:?}");
+        }
+        anyhow::ensure!(last.is_some(), "the schedule ran");
         Ok(())
     }
 }

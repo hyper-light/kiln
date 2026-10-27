@@ -4522,8 +4522,9 @@ async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
 }
 
 /// Who a broadcast to `to` would reach (the same picking as the broadcast itself), the machines
-/// they are on, and what they understand: their catalogs (slash commands, modes, models, efforts)
-/// merged, each entry with `count`, how many of them have it, and `agents`, which.
+/// they are on, and what they understand: their catalogs (slash commands, modes, models, efforts,
+/// and the speeds past standard their models run at) merged, each entry with `count`, how many of
+/// them have it, and `agents`, which.
 async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
     #[derive(serde::Deserialize)]
     struct Body {
@@ -4534,8 +4535,8 @@ async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
     let picked = crate::harness::broadcast::pick(&among, &b.to);
     let mut machines: Vec<String> = Vec::new();
     // (field in each agent's meta, the key naming an entry, the entries seen with the agents that have them)
-    let mut merged: [(&str, &str, Vec<(serde_json::Value, Vec<String>)>); 4] =
-        [("commands", "name", Vec::new()), ("modes", "id", Vec::new()), ("models", "id", Vec::new()), ("efforts", "id", Vec::new())];
+    let mut merged: [(&str, &str, Vec<(serde_json::Value, Vec<String>)>); 5] =
+        [("commands", "name", Vec::new()), ("modes", "id", Vec::new()), ("models", "id", Vec::new()), ("efforts", "id", Vec::new()), ("speeds", "id", Vec::new())];
     for info in &picked {
         let machine = info.target.strip_prefix("agent:").unwrap_or(&info.target).to_owned();
         if !machines.contains(&machine) {
@@ -4563,14 +4564,14 @@ async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
             })
             .collect()
     };
-    let [(_, _, commands), (_, _, modes), (_, _, models), (_, _, efforts)] = merged;
+    let [(_, _, commands), (_, _, modes), (_, _, models), (_, _, efforts), (_, _, speeds)] = merged;
     let agents: Vec<serde_json::Value> = picked
         .iter()
         .map(|i| json!({"id": i.id, "name": i.name, "machine": i.target.strip_prefix("agent:").unwrap_or(&i.target), "kind": i.kind, "status": i.status}))
         .collect();
     Ok(srv::json(
         StatusCode::OK,
-        &json!({"agents": agents, "machines": machines, "commands": counted(commands), "modes": counted(modes), "models": counted(models), "efforts": counted(efforts)}),
+        &json!({"agents": agents, "machines": machines, "commands": counted(commands), "modes": counted(modes), "models": counted(models), "efforts": counted(efforts), "speeds": counted(speeds)}),
     ))
 }
 

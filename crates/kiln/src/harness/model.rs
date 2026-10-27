@@ -721,6 +721,11 @@ pub struct ModelOption {
     /// The harness's default model: what a session started without one runs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub default: bool,
+    /// The speeds faster than standard it runs at, slowest first, when the harness says (as
+    /// `Meta::speeds` says them for the model in use): kept with the machine's models, so a new
+    /// agent can start at one (`Spec::speed`) before any session of it runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speeds: Vec<ControlOption>,
 }
 
 /// An effort level as people read it: "xhigh" is "Extra high", the rest as they are, capitalized.

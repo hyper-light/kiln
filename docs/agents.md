@@ -28,9 +28,9 @@ restarting their processes. Other ACP agents keep steering queued.
 Before a Devin session starts, each machine loads its model catalog with a bounded ACP handshake
 in a temporary configuration that keeps its native default model, with imports, MCP servers and
 automatic updates off. It sends no prompts. Each model's effort choices are read from the agent
-and kept in the existing model cache for the start dialog. Shared effort choices are offered only
+and kept in the existing model cache for Mission control's composer, which starts agents. Shared effort choices are offered only
 when every listed model
-supports them. The start dialog uses the native default model's levels before a model is chosen,
+supports them. The composer uses the native default model's levels before a model is chosen,
 then the chosen model's own levels. Resuming keeps the conversation's model and sends a selected
 effort only if that model supports it. The native permission modes are available before discovery
 finishes.
@@ -78,7 +78,7 @@ between turns. Files you attach go to it as their paths on its machine; its mode
 
 ## Where a harness is found
 
-A machine offers a harness (`/api/harness/kinds`, the machines the new-agent dialog lists) when its
+A machine offers a harness (`/api/harness/kinds`, the machines Mission control's composer lists) when its
 program is on the runner's PATH or on the PATH a login shell of the machine's user has, asked as
 reach asks it for runs (`$SHELL -l -i`; as the runner starts, then kept ten minutes). A runner's
 service keeps the PATH of the terminal it was installed from, so a harness installed since in a
@@ -157,22 +157,38 @@ counted.
 - **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select
   it (and drag over more), tap rows while selecting, or swipe one right; the list's head says how
   many, with Select all and Done. With a mouse, rows keep their checkboxes.
-- **The message box.** It writes to the agents selected (each named in its To line, put back with
-  its ×), or with none selected to every agent the list shows; @ and part of a name, machine or
-  harness finds more. A prompt goes with files (the paperclip, a paste or a drop) and what you say
-  into the mic, queued, steered or sent now as an agent's own box sends it. Above it, the agent
-  page's line of settings, permissions · model · effort, each opened in place with the same
-  controls: unset, each agent keeps its own; chosen, only the agents that have it are sent to, and
-  given it first (Reset unsets them all). In the field, / lists kiln's own commands for all of them
-  first (`/interrupt`, `/restart`, `/allow` and `/deny` what waits on you, `/end` those selected),
+- **The composer.** At the top of the page, on a desktop and a phone alike (where it's one line
+  until it's used). There is no New agents button and no dialog: with nothing selected it starts an
+  agent, its words the agent's first message. Above the box is the agent page's own line,
+  permissions · model · effort, and the bolt where the model goes faster (the speeds each model
+  runs at come with the machine's models, `KindInfo.models[].speeds`), each opened in place with
+  the same controls; choosing another harness's model starts it in that harness. In the box's top
+  slot: the agent, its machine, its folder and how many, each opened in place. Under the box, More
+  options (name, workspace, where its commands run, a shell to run in; closed, it says what isn't
+  as it starts out) and the machine's past sessions to continue, each a dropdown that opens in
+  place. Start starts it and opens it: the agent's socket opens at once, and its page opens as
+  soon as its first snapshot is in (a moment at most), one view transition carrying each part of
+  the composer to its place on the page. Several stay on Mission control: the line under the box
+  says what started, and they come into the list. Files go with the first message, sent once the
+  agent can take it. Everything else that started agents (Duplicate, a message's "Start new agent
+  on this", Ask an agent, a shell's "Start agents in this shell", the command palette) fills the
+  composer in and says where it came from, with Clear for your own defaults.
+- **Messaging agents.** With agents selected (or one picked by typing @ and part of a name, machine
+  or harness), the same composer writes to them, each named in the To line where the folder was,
+  put back with its ×, Clear for them all; what's written stays as it turns. A prompt goes with
+  files (the paperclip, a paste or a drop) and what you say into the mic, queued, steered or sent
+  now as an agent's own box sends it. The line above is theirs: unset, each agent keeps its own;
+  chosen (the speed too), only the agents that have it are sent to, and given it first (Reset
+  unsets them all). In the field, / lists kiln's own commands for all of them first
+  (`/interrupt`, `/restart`, `/allow` and `/deny` what waits on you, `/end` those selected),
   each asked once under the field, then the agents' own; Stop beside Send stops the turns of those
-  working. It empties as it sends, and says how it went.
+  working. It empties as it sends, and says how it went. Every agent the list shows is Select all.
 
 ## API
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured) |
+| GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured, and its models with the efforts and speeds each takes) |
 | GET | `/api/harness/sessions` | `Info[]` |
 | POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?}` → `Info[]` |
 | GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good |
@@ -639,8 +655,8 @@ permissions low and how to merge their work.
 
 ## Workspaces of their own
 
-An agent can work in **its own Slates volume** instead of the folder itself (New agents →
-Workspace → Its own volume; `agents.start` with `workspace: "volume"`) (docs/agentic.md, W):
+An agent can work in **its own Slates volume** instead of the folder itself (Mission control's
+composer → More options → Workspace → Own volume; `agents.start` with `workspace: "volume"`) (docs/agentic.md, W):
 
 - **What it is.** On the agent's machine, before its harness starts, kiln lays an overlay volume
   over the folder's repository and mounts it under the runner's state directory

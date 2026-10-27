@@ -28,7 +28,7 @@ import "./run-settings.css";
 type Kind = "mode" | "model" | "effort";
 
 /** One choice. */
-interface Word {
+export interface Word {
   id: string;
   /** What it shows, kept short ("Edits", "Opus 5.5"). */
   text: string;
@@ -138,10 +138,7 @@ function versionText(w: Word, family: string): string {
 
 /** "5.5 (1M)" → [5, 5]. */
 function versionNumbers(text: string): number[] {
-  return (text.match(/\d+(?:\.\d+)*/)?.[0] ?? "")
-    .split(".")
-    .filter(Boolean)
-    .map(Number);
+  return (text.match(/\d+(?:\.\d+)*/)?.[0] ?? "").split(".").filter(Boolean).map(Number);
 }
 
 /** Newest first; the plain version before its variants ("5.5" before "5.5 (1M)"). */
@@ -216,7 +213,7 @@ function glide(b: HTMLElement | null) {
 }
 
 /** A few short choices as words: a radiogroup (arrow keys move, Enter or Space picks). */
-function WordRow({ label, words, value, onPick }: { label: string; words: Word[]; value: string; onPick: (w: Word) => void }) {
+export function WordRow({ label, words, value, onPick }: { label: string; words: Word[]; value: string; onPick: (w: Word) => void }) {
   const [focus, setFocus] = React.useState<string | null>(null);
   // One stop in the tab order: the word with focus, else the current one, else the first.
   const stop = [focus, value, words[0]?.id].find((id) => id != null && words.some((w) => w.id === id));
@@ -277,7 +274,7 @@ function WordRow({ label, words, value, onPick }: { label: string; words: Word[]
  * Tap a stop or slide along the track (the name follows the finger; it applies where it's let go);
  * arrow keys, Home and End move a stop at a time.
  */
-function Scale({ label, words, value, armed, onPick }: { label: string; words: Word[]; value: string; armed?: string; onPick: (w: Word) => void }) {
+export function Scale({ label, words, value, armed, onPick }: { label: string; words: Word[]; value: string; armed?: string; onPick: (w: Word) => void }) {
   const rail = React.useRef<HTMLDivElement>(null);
   const [drag, setDrag] = React.useState<number | null>(null);
   const n = words.length;
@@ -395,9 +392,7 @@ function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; o
           </button>
         )}
       </p>
-      {versions && current && own.length > 1 && (
-        <WordRow label={`${current.name} versions`} words={own.map((v) => ({ ...v, text: versionText(v, current.name) }))} value={value} onPick={onPick} />
-      )}
+      {versions && current && own.length > 1 && <WordRow label={`${current.name} versions`} words={own.map((v) => ({ ...v, text: versionText(v, current.name) }))} value={value} onPick={onPick} />}
     </div>
   );
 }
@@ -498,6 +493,8 @@ export interface RunSettingsProps {
   className?: string;
   /** Related controls on the same line, divided from the run settings. */
   trailing?: React.ReactNode;
+  /** What choosing another harness's model does, said under its models (by default: the agent goes on there, its conversation carried over). */
+  switchWords?: (name: string) => React.ReactNode;
 }
 
 /** A change just made: what the line shows until the agent reports otherwise, and what Undo restores. */
@@ -542,6 +539,7 @@ export function RunSettings({
   running = false,
   className,
   trailing,
+  switchWords,
 }: RunSettingsProps) {
   const [open, setOpen] = React.useState<Kind | null>(null);
   const [change, setChange] = React.useState<Change | null>(null);
@@ -647,7 +645,9 @@ export function RunSettings({
     setArmed(null);
     setTick((t) => t + 1);
     const there = groups.find((g) => g.kind === toKind)?.name;
-    setSaid(`${KEY[k]}: ${nameOf(k, to)}${there ? `, in ${there}: the conversation carries over${running ? " at the end of this turn" : ""}` : nextTurn(k) ? ", from the next turn" : reapply ? ", applying now" : ""}`);
+    setSaid(
+      `${KEY[k]}: ${nameOf(k, to)}${there ? `, in ${there}: the conversation carries over${running ? " at the end of this turn" : ""}` : nextTurn(k) ? ", from the next turn" : reapply ? ", applying now" : ""}`,
+    );
   };
 
   const choose = (k: Kind, w: Word, reapply = false) => {
@@ -688,7 +688,7 @@ export function RunSettings({
   // Every setting keeps its column, even when a harness has no value for it yet.
   const parts = KINDS.map((k) => ({
     k,
-    text: shown(k) ? sets[k].words.find((w) => w.id === shown(k))?.text ?? shown(k) : editable(k) ? KEY[k] : "—",
+    text: shown(k) ? (sets[k].words.find((w) => w.id === shown(k))?.text ?? shown(k)) : editable(k) ? KEY[k] : "—",
     empty: !shown(k),
   }));
 
@@ -707,8 +707,14 @@ export function RunSettings({
               <p className="rs-elsewhere-name">{g.name}</p>
               <ModelChoice words={g.words} value={shown(k)} onPick={pick} />
               <p className="rs-desc">
-                Switches to {g.name}
-                {running ? " at the end of this turn" : ""} — the conversation carries over
+                {switchWords ? (
+                  switchWords(g.name)
+                ) : (
+                  <>
+                    Switches to {g.name}
+                    {running ? " at the end of this turn" : ""} — the conversation carries over
+                  </>
+                )}
               </p>
             </div>
           ))}
@@ -774,10 +780,16 @@ export function RunSettings({
           <span className="rs-values">
             {parts.map((p, i) => (
               <React.Fragment key={p.k}>
-                {i > 0 && <span className="rs-sep" aria-hidden="true">·</span>}
+                {i > 0 && (
+                  <span className="rs-sep" aria-hidden="true">
+                    ·
+                  </span>
+                )}
                 {editable(p.k) ? (
                   <button
-                    ref={(el) => { values.current[p.k] = el; }}
+                    ref={(el) => {
+                      values.current[p.k] = el;
+                    }}
                     type="button"
                     className="rs-v"
                     data-kind={p.k}
@@ -801,7 +813,14 @@ export function RunSettings({
           {speeds.length > 0 && <SpeedBolt line={speedLine} onPick={onSpeed ? pickSpeed : undefined} />}
         </p>
         <div className="rs-extra">
-          {trailing && <><span className="rs-divider" aria-hidden="true">|</span>{trailing}</>}
+          {trailing && (
+            <>
+              <span className="rs-divider" aria-hidden="true">
+                |
+              </span>
+              {trailing}
+            </>
+          )}
         </div>
         {undoable && (
           <span className="rs-after">

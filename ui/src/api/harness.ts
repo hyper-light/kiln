@@ -452,6 +452,8 @@ export interface ModelOption {
   default?: boolean;
   /** The effort levels it takes, lowest first (when the harness says). */
   efforts?: string[];
+  /** The speeds faster than standard it runs at, slowest first (when the harness says): a new agent can start at one (`Spec.speed`). */
+  speeds?: ControlOption[];
 }
 
 export interface SlashCommand {
@@ -576,6 +578,8 @@ export interface BroadcastPreview {
   modes: Counted<ModeOption>[];
   models: Counted<ModelOption>[];
   efforts: Counted<ControlOption>[];
+  /** The speeds past standard their models run at (servers before this leave it out). */
+  speeds?: Counted<ControlOption>[];
 }
 
 export interface ControlOption {
@@ -811,6 +815,8 @@ export interface Spec {
   allow_bypass?: boolean;
   /** The effort level to start at (none: the model's own default). */
   effort?: string;
+  /** The speed to start at ("" standard, else one of the model's `speeds`; none: the harness's own). */
+  speed?: string;
   /** Commands on other runners (kiln reach): unset, it may use any; "off", only its own machine; else where it prefers them (a runner, or `linux/x86_64`). */
   reach?: string;
   /** Where it works: its folder itself (none), or a Slates volume of its own laid over the folder (`volume`). */

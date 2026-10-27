@@ -198,7 +198,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, the graph from the plan with matrix grids, progress and what jobs wait for, critical path, summaries, annotations, artifacts, pins); the leg page (notes, timing bar, attempts, outputs, terminal, Keep); the runs list's facets and sorts; the workflow editor (checks against its repository, the schema's keys, the plan preview and its matrix, the flow view, saving as the repository takes it); Insights (repositories, workflows, runners, tests, benchmarks); Settings → CI, → People, → Tokens and → You; the Runners page's pools (their scaling history), images and executors, and the image builder; comparing runs; log search; environments (board and pages); AC01 in kiln's CI (`ci/ui/run-all.sh`), AC02, AC03 (25–30 ms, 60 fps), AC04, the run's data flow; the editor's Agentfile lints left (shards' own: blocked on shards) |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 48 of F-21's 50 green, four of them needing accounts and passing in dry configurations against stand-ins (AWS's two, Google's, Codecov's); azure/login waits for a tenant, and attest-build-provenance for GitHub's Sigstore; AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
-| W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R30, AC01–AC14; milestones M0–M6 and M1e are kiln goals with plans |
+| W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | ready | specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | ready | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa` |
 
@@ -7800,7 +7800,7 @@ its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
     GiB kept, which drives eviction.
   - Metrics: `kiln_work_lookups_total{layer,outcome}`, `kiln_work_saved_seconds_total`,
     `kiln_warm_slots{state}`, `kiln_work_verify_mismatch_total`.
-  - Operations: `kiln work why|status|warm|verify|gc` on the CLI, `ci.work.*` for agents.
+  - Operations: `kiln work why|status|warm|verify|gc|reap` on the CLI, `ci.work.*` for agents.
 
 **Requirements: containers and equivalence**
 
@@ -7844,6 +7844,30 @@ its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
   - a rewrite rule that makes operations equivalent (dropping a no-op, reordering operations that
     commute) is added only with a differential test;
   - R23's verification guards every merge: a mismatch splits the class and quarantines its lineage.
+- **W24-R31 The reaper.** One reaper keeps every W24 cache within what its machine can hold and what
+  is still worth keeping: the runner's content store and tool caches (R08), warm workspaces and kept
+  folders (R11, R15), agents' warm targets (R24), `kiln run`'s copies, and the server's ledger and
+  its objects (R02).
+  - Hardware, per volume: a `floor` of free space the caches never push below, a `ceiling` on what
+    they hold, and a `target` of free space a reap restores. Each is a size (`20GB`) or a share of
+    the volume (`10%`), as BuildKit's garbage-collection policies are written. Defaults are R15's:
+    `floor` a tenth of the volume, at most 100 GiB; `ceiling` a quarter, at most 300 GiB; `target`
+    the floor plus 5% of the volume.
+  - Time: `keep_last` keeps the newest N per lane or key (default 2), `keep_within` anything used in
+    that long (default `1d`), and `max_age` drops anything unused for longer (default `30d`).
+  - Triggers: free space below the `floor` reaps until the `target` is free; a `schedule` (an
+    interval, `6h`, or a cron expression; default daily) reaps what `max_age` drops; a write that
+    would pass the `ceiling` reaps first.
+  - Order: what `max_age` drops goes first, then the least time saved per byte (AC12), then the
+    least recently used. `keep_last` and `keep_within` protect entries unless the floor can't be
+    held otherwise, and an eviction that breaks them says so.
+  - Scopes: system and runner (the system page), repository (its page), and session, agent or
+    harness (the conversation's settings), the system's under `[ci.work.reap]`. Hardware limits come
+    from system and runner only, and the stricter of the two wins. For what to keep, the most
+    specific scope that sets a key wins. AC12's per-domain quotas still apply within those limits.
+  - Every eviction is recorded with what it freed, and the rule and scope that decided it
+    (`kiln_work_reaped_bytes_total{store,reason}`). `kiln work reap --dry-run` shows what a reap
+    would evict, and the effective policy names the scope each value came from.
 
   R03 already gives equivalence by output digest; the hits e-classes add come from rewrite rules
   and from finding a congruent result before its inputs are materialized.
@@ -8002,6 +8026,12 @@ and verification (`work::verify`).
   *Differential test.*
 - **W24-AC14 Equivalence loses no hits.** On replayed kiln history, the hit rate with e-classes is
   at least that of plain keys, with no wrong hit in verification. *Replay and verification.*
+- **W24-AC15 The reaper holds the floor and the policy.** A runner on a fixed-size volume and the
+  server, through a simulated week of runs with policies at all four scopes. Free space never stays
+  below the floor after a reap while evictable bytes remain; a scheduled reap drops what `max_age`
+  names; the newest `keep_last` of each lane remain unless the floor needed them, as their eviction
+  records say; and each scope's change shows in the effective policy. *Property test and end-to-end
+  test.*
 
 **Progress.** Specified (2026-10-24). M0 built (2026-10-25), awaiting review: R24's sync keeps the
 remote's build output (`reach/sync.rs`), R11's v1 `cache:` folders are kept per repository and job
@@ -8018,6 +8048,7 @@ plan:
 | M4 | Observation, `kiln rustc`, trust, verification | R04, R05, R09, R21–R23 |
 | M5 | Warm microVMs and k8s, remote execution, the seams | R13, R14, R26 |
 | M6 | Container builds on Hex replace BuildKit, on the e-graph cache | R29 |
+| M7 | The reaper: every cache within its disk's limits and its policies, by scope | R31 |
 
 
 **Baseline (M0, step 1).** kiln's `rust` job steps (`.kiln/ci.yaml`) on fedora, in a capped user unit
@@ -8484,6 +8515,8 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/work/status?runner=` | `ci.work.status` | runs.read | W24 |
 | POST | `/api/ci/work/warm`, `/api/ci/work/verify` | `ci.work.warm`, `ci.work.verify` | runs.write | W24 |
 | POST | `/api/ci/work/gc` | `ci.work.gc` | admin | W24 |
+| GET, PUT | `/api/ci/work/reap/policies?scope=` | `ci.work.reap.policies`, `ci.work.reap.set` | runs.read; caches.write at the scope (a session's: the server's) | W24 |
+| POST | `/api/ci/work/reap?runner=&dry_run=` | `ci.work.reap.run` | admin | W24 |
 | GET | `/api/ci/repos/:repo/workflows/:path?ref=` | `ci.workflows.get` (source, IR, diagnostics) | runs.read | W02 |
 | POST | `/api/ci/validate` | `ci.workflows.validate` | runs.read | W02 |
 | POST | `/api/ci/plan-preview` | `ci.workflows.plan_preview` | runs.read | W04 |
@@ -8610,13 +8643,13 @@ kiln metrics criterion|hyperfine|gobench|pytest-benchmark|gbench|k6 PATH
 kiln store verify|gc                    kiln ci bench [--scheduler|--expr|--parse|--cache|--logs]
 kiln tokens create|list|revoke          kiln login
 kiln repo provider <repo> [provider…]
-kiln work why <run|leg|step>            kiln work status|warm|verify|gc   kiln rerun <run> --cold
+kiln work why <run|leg|step>            kiln work status|warm|verify|gc|reap   kiln rerun <run> --cold
 kiln gocacheprog                        kiln rustc   (W24: the runner's cache helpers)
 ```
 
 ### 4.4 MCP names
 
-W24's operations: `ci.work.why`, `ci.work.status`, `ci.work.warm`, `ci.work.verify` and `ci.work.gc` (`kiln.ci.work.*` in code mode).
+W24's operations: `ci.work.why`, `ci.work.status`, `ci.work.warm`, `ci.work.verify`, `ci.work.gc` and `ci.work.reap.*` (`kiln.ci.work.*` in code mode).
 
 Code mode: `kiln.ci.<area>.<verb>(input)` (e.g. `kiln.ci.runs.rerun({ run, mode: "failed" })`),
 diffs and review among them (`kiln.ci.diffs.*`), the hosts' pull requests (`kiln.host.pulls.*`),

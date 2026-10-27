@@ -14,6 +14,7 @@ import { fileStamp, saveFile, toCsv } from "@/lib/download";
 import { absoluteTime, formatUptime } from "@/lib/format";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useLocation } from "@/lib/router";
+import { ReapSection } from "./reap";
 import { childStatus, RelTime } from "./shared";
 import { StoresHold, StoresSection } from "./stores/section";
 import { BuildsSection, UpdatesSection } from "./updates/section";
@@ -385,6 +386,8 @@ function SystemBody() {
       <StoresSection index="06" />
 
       <AuditSection />
+
+      <ReapSection index="08" />
     </>
   );
 }
@@ -412,6 +415,9 @@ function SystemHold() {
       </FoldSection>
       <FoldSection id="system.audit" index="07" label="Audit" title="Audit log">
         <TableHold head={<AuditHead />} rows={8} rowHeight={39} />
+      </FoldSection>
+      <FoldSection id="system.reaper" index="08" label="Caches" title="Cache reaper">
+        <Hold height={1700} />
       </FoldSection>
     </>
   );

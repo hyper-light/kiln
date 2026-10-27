@@ -304,6 +304,13 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             let c = boxed(|| super::services::cas::collect(hub)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             Ok(crate::http::server::json(StatusCode::OK, &serde_json::json!({ "objects": c.objects, "bytes": c.bytes })))
         }
+        // W24-R31: the reaper's policies.
+        (&Method::GET, ["work", "reap", "policies"]) => boxed(|| super::reap::get(hub, q)).await,
+        (&Method::PUT, ["work", "reap", "policies"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            let body: serde_json::Value = boxed(|| crate::http::server::body_json(req.into_body(), 1 << 16)).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            boxed(|| super::reap::put(hub, q, body, caller.as_ref())).await
+        }
         // W05-R21: routing rules, and where a leg would go.
         (&Method::GET, ["routing", "rules"]) => boxed(|| super::routing::get(hub)).await,
         (&Method::PUT, ["routing", "rules"]) => {

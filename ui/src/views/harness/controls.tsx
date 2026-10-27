@@ -10,6 +10,9 @@ import { harnessApi, type AgentInfo, type Attachment, type Command, type Control
 import { formatBytes } from "@/lib/format";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { Hold } from "@/components/ui/hold";
+import { Loadable } from "@/components/ui/loading";
+import { ReapPolicy } from "../reap";
 import { cn } from "@/lib/utils";
 import { AtLimit } from "./elsewhere";
 
@@ -256,6 +259,15 @@ export function SettingsSheet({
           <div className="hx-ctls">
             <LimitRows agent={agent} state={state} send={send} />
             <SubagentRows agent={agent} state={state} send={send} />
+            {agent && (
+              // What this session's caches keep (W24-R31): its own rules over its repository's and the system's.
+              <section className="hx-ctl-group" aria-label="What its caches keep">
+                <div className="hx-eyebrow">What its caches keep</div>
+                <Loadable label="its cache policy" fallback={<Hold height={450} />}>
+                  <ReapPolicy scope="session" target={agent.id} at={{ session: agent.id, runner: agent.target.startsWith("agent:") ? agent.target.slice(6) : undefined }} />
+                </Loadable>
+              </section>
+            )}
             {groups.length === 0 && !meta?.hooks?.length && <div className="hx-dim text-[13px]">This harness reports no further settings.</div>}
             {groups.map(([g, cs]) => (
               <section key={g} className="hx-ctl-group">

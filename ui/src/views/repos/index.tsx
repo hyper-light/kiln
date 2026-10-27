@@ -18,6 +18,7 @@ import { Button } from "@/components/ui/button";
 import { FacetBox } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
+import { ReapPolicy } from "../reap";
 import { EmptyState, PageIntro, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
@@ -586,6 +587,15 @@ function Details({
         <section className="repo-section" aria-label="Its secrets and variables">
           <Loadable label="its secrets and variables" fallback={<Hold height={120} />}>
             <ScopeSecrets scope={`repo:${r.name}`} of="Its" />
+          </Loadable>
+        </section>
+      )}
+      {r && (
+        // What its caches keep (W24-R31): its own rules over the system's.
+        <section className="repo-section" aria-label="What its caches keep">
+          <h4 className="field-label">What its caches keep</h4>
+          <Loadable label="its cache policy" fallback={<Hold height={450} />}>
+            <ReapPolicy scope="repo" target={r.name} at={{ repo: r.name }} />
           </Loadable>
         </section>
       )}
