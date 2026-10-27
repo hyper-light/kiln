@@ -436,6 +436,31 @@ fn w25_s1_readme_holds_the_report() -> Result<(), String> {
     Ok(())
 }
 
+/// W28-AC51's rest: the late commits the report counts are those `late_runs` names, each with what
+/// held it (a pod's run and job, or the job that answered it at last), and `late_table` lists each.
+#[test]
+fn w28_ac51_the_late_commits_are_named() -> Result<(), String> {
+    let t = week()?;
+    let p = Policy::p4();
+    let o = replay(&t, &p, 1);
+    let named = report::late_runs(&t, &o, "ci");
+    assert_eq!(report::late(&t, &o, "ci").iter().sum::<usize>(), named.len());
+    assert!(!named.is_empty(), "P4 leaves some of ci's commits late on the week");
+    for l in &named {
+        assert!(t.runs.get(l.run).is_some_and(|r| r.workflow == "ci" && r.branch == "main" && r.is_push()), "run {}", l.run);
+        match l.cause {
+            1 => assert!(l.pod.as_ref().is_some_and(|(r, _, _)| t.runs.get(*r).is_some()), "{l:?}"),
+            2 | 3 | 5 => assert!(l.answer.is_some(), "{l:?}"),
+            _ => {}
+        }
+    }
+    let table = report::late_table(&t, &p, &[1]);
+    for l in &named {
+        assert!(table.contains(&format!("\n| {} | ", l.run)), "run {} isn't in\n{table}", l.run);
+    }
+    Ok(())
+}
+
 /// W28-AC45: P2, deciding through `kiln_ci::sched::demand` (W28-R48), wastes at most 5% of the
 /// runner time it uses on the recorded week, the median over seeds 1-8.
 #[test]

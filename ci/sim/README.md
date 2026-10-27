@@ -248,7 +248,8 @@ over seeds 1-8).
   P3 reaches 93.3% (89.6%–95.9%) and P4 89.6%: 8 commits a week still wait at the hour on pods the
   recorded week started late, so no scheduling or verdict policy reaches 95% on this trace.
 - **P4** brings the bench's wait to 7 min (W25's step 6 asks at most 15) and waste to 0.3 runner-h,
-  at 85.6% of ci's verdicts within 60 min.
+  at 85.6% of ci's verdicts within 60 min. It has steps 4 and 6 on (the demand table and
+  admission), so W28-AC51 is measured on it: which commits it leaves late is below.
 - **P5** saves about 6 runner-h a week of release builds and 3 of ci (0.20 runner-h per ci verdict,
   against 0.36 today).
 - **The longest gap between verdicts** stays near 6.7 h under every policy: it is the week's longest
@@ -258,6 +259,99 @@ over seeds 1-8).
 Limits: recorded durations stay fixed whatever runs beside them, so a policy that runs more at once
 looks a little better than it would on the loaded server; input keys come from path sets, an
 approximation of W24's observed reads; verdicts are by job, not by test.
+
+### Which commits are late (W28-AC51)
+
+W28-AC51 asks that 95% of ci's commits on main be answered within an hour of their push, with
+steps 4 and 6 on: P4 (the demand table and admission) answers 85.6% (84.8%–86.3%) over seeds 1-8,
+P3 (no admission) 90.0%. `cargo run -p kiln-ci --example replay -- ci/sim/trace.json --late` lists
+each commit P3 and P4 leave late in any seed, where it stood at the hour (as the table under the
+report counts them) and what held it. P4's, each run by its place in `trace.json` and pushed that
+many hours into the window:
+
+| Run | Pushed | Late in seeds | Where it stood at the hour | What held it |
+|---|---|---|---|---|
+| 20 | 1.4 h | 3 of 8 | no answer in the window |  |
+| 147 | 14.1 h | 5 of 8 | pending: its answer's push not made yet | release-binary, answered by run 286 |
+| 265 | 29.4 h | 2 of 8 | no answer in the window |  |
+| 286 | 30.8 h | 2 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 286 |
+| 293 | 30.9 h | 3 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 293 |
+| 297 | 31.0 h | 5 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 297 |
+| 328 | 37.6 h | 4 of 8 | pending: a pod of its lane's work not started | rust's pod for run 328: it never started in the recorded week |
+| 332 | 37.7 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 332: the recorded week took 2.5 h to start it |
+| 363 | 48.1 h | 8 of 8 | pending: its answer's job waiting for its needs | release-binary, answered by run 363 |
+| 443 | 62.7 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 443: it never started in the recorded week |
+| 450 | 63.9 h | 4 of 8 | pending: a pod of its lane's work not started | rust's pod for run 450: it never started in the recorded week |
+| 453 | 64.1 h | 4 of 8 | pending: its answer's job waiting for its needs | release-binary, answered by run 453 |
+| 521 | 86.0 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 521: it never started in the recorded week |
+| 524 | 86.1 h | 8 of 8 | pending: its answer's job waiting for its needs | release-binary, answered by run 524 |
+| 661 | 109.4 h | 5 of 8 | pending: its answer's job running | rust, answered by run 661 |
+| 664 | 109.4 h | 7 of 8 | pending: a pod of its lane's work not started | rust's pod for run 681: it never started in the recorded week |
+| 670 | 109.6 h | 7 of 8 | pending: a pod of its lane's work not started | rust's pod for run 689: it never started in the recorded week |
+| 673 | 109.7 h | 3 of 8 | pending: its answer's push not made yet | release-binary, answered by run 724 |
+| 677 | 109.7 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 689: it never started in the recorded week |
+| 681 | 109.7 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 689: it never started in the recorded week |
+| 685 | 110.0 h | 5 of 8 | pending: its answer's job waiting for its needs | ui-checks, answered by run 689 |
+| 689 | 110.2 h | 6 of 8 | pending: its answer's job running | rust, answered by run 693 |
+| 693 | 110.4 h | 5 of 8 | pending: a pod of its lane's work not started | rust's pod for run 701: it never started in the recorded week |
+| 697 | 110.9 h | 6 of 8 | pending: its answer's job running | rust, answered by run 701 |
+| 701 | 111.2 h | 4 of 8 | pending: its answer's job running | rust, answered by run 701 |
+| 705 | 111.4 h | 3 of 8 | pending: its answer's job running | rust, answered by run 705 |
+| 732 | 114.7 h | 3 of 8 | pending: its answer's job running | release-binary, answered by run 732 |
+| 766 | 121.1 h | 6 of 8 | pending: its answer's job waiting for its needs | release-binary, answered by run 770 |
+| 770 | 121.8 h | 2 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 774 |
+| 774 | 122.4 h | 6 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 774 |
+| 808 | 123.6 h | 1 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 812 |
+| 812 | 123.7 h | 5 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 812 |
+| 816 | 124.0 h | 3 of 8 | pending: its answer's job running | release-binary, answered by run 819 |
+| 831 | 125.6 h | 8 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 831 |
+| 835 | 125.7 h | 8 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 835 |
+| 857 | 131.5 h | 2 of 8 | pending: its answer's job running | release-binary, answered by run 857 |
+| 865 | 132.5 h | 2 of 8 | pending: its answer's job running | release-binary, answered by run 865 |
+| 873 | 134.2 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 873: it never started in the recorded week |
+| 877 | 135.2 h | 8 of 8 | pending: its answer's push not made yet | ui-checks, answered by run 893 |
+| 881 | 135.4 h | 8 of 8 | pending: its answer's push not made yet | ui-checks, answered by run 893 |
+| 885 | 135.7 h | 8 of 8 | pending: its answer's push not made yet | ui-checks, answered by run 893 |
+| 889 | 136.1 h | 8 of 8 | pending: its answer's job waiting for its needs | ui-checks, answered by run 893 |
+| 893 | 136.8 h | 3 of 8 | a suspect: its bisection still going |  |
+| 913 | 141.1 h | 8 of 8 | pending: its answer's job waiting for its needs | release-binary, answered by run 917 |
+| 917 | 141.7 h | 1 of 8 | pending: its answer's job running | release-binary, answered by run 917 |
+| 935 | 148.0 h | 2 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 935 |
+| 942 | 148.7 h | 3 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 942 |
+| 958 | 150.6 h | 1 of 8 | pending: its answer's job running | ui-checks, answered by run 958 |
+| 965 | 151.5 h | 5 of 8 | pending: its answer's job running | release-binary, answered by run 965 |
+| 970 | 151.7 h | 1 of 8 | a suspect: its bisection still going |  |
+| 974 | 152.5 h | 3 of 8 | pending: its answer's job running | release-binary, answered by run 974 |
+| 997 | 158.0 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 997: it never started in the recorded week |
+| 1001 | 158.9 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 1001: it never started in the recorded week |
+| 1004 | 159.8 h | 8 of 8 | pending: its answer's job waiting for its needs | ui-checks, answered by run 1004 |
+| 1008 | 160.1 h | 4 of 8 | pending: its answer's job running | release-binary, answered by run 1008 |
+| 1017 | 165.1 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 1017: it never started in the recorded week |
+| 1028 | 166.6 h | 4 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 1032 |
+| 1032 | 166.8 h | 8 of 8 | no answer in the window |  |
+| 1036 | 167.0 h | 4 of 8 | no answer in the window |  |
+| 1039 | 167.5 h | 3 of 8 | no answer in the window |  |
+
+What holds the rest under P4, a seed's median in brackets:
+
+- **Pods the recorded week didn't start (13).** Runs 328, 332, 443, 450, 521, 664, 670, 677, 681,
+  693, 873, 997, 1001 and 1017 wait at the hour for a rust k8s pod of their lane (their own run's
+  or a later push's). The recorded week started run 332's pod 2.5 h after it was asked for; the
+  others never started: each waited for the cluster (up to 68 min) until a newer push superseded
+  it, and the replay draws a longer wait than the one recorded. No policy answers these sooner on
+  this trace.
+- **The server machine held for the bench (6, P4 alone).** release-binary runs only on the server
+  (`baremetal`, `local`), which takes no new work while the bench's exclusive job waits on its
+  cadence (W28-R62): runs 286, 293, 297, 770, 774, 808, 812, 831, 835, 935, 942 and 1028. P3 has
+  none of these: it is the price of the bench waiting 7 min instead of 20.
+- **A job running at the hour (7)**: rust or release-binary under way for a burst's commits (runs
+  661, 689, 697, 701, 705, 732, 816, 857, 865, 917, 958, 965, 974 and 1008).
+- **A job waiting for its needs (7)**: release-binary or ui-checks waiting for rust (runs 363, 453,
+  524, 685, 766, 889, 913 and 1004).
+- **A push made after the hour (4)**: runs 147, 673, 877, 881 and 885, answered by a later push's
+  run.
+- **No answer in the window (3)**: runs 20 and 265, and the week's last pushes, 1032, 1036 and 1039.
+- **A suspect's bisection still going (0)**: runs 893 and 970, in a few seeds.
 
 ## Sweeps
 

@@ -8663,7 +8663,9 @@ is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built
   don't depend on the order results come in; a culprit named clears those before it. *Property
   test* (`cargo test -p kiln-ci verdict`).
 - **W28-AC51 The recorded week.** At least 95% of ci's commits on main answered within an hour of
-  their push, P3 over seeds 1-8 (`cargo run -p kiln-ci --example replay -- ci/sim/trace.json`).
+  their push, with steps 4 and 6 on (P4: the demand table and admission), over seeds 1-8 (`cargo
+  run -p kiln-ci --example replay -- ci/sim/trace.json`; `--late` names each commit left late and
+  what held it).
 - **W28-AC52 End to end.** A native repository with a two-crate Cargo workspace whose workflow
   reports each test with TAP: a test failing at the base makes no later commit suspect; a new
   failure in crate p names exactly the commits whose diffs affect p; a quarantined test's failure
@@ -8690,13 +8692,19 @@ is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built
   ledger's answers replace tries without changing the search. *Integration and unit tests* (`cargo
   test -p kiln --test verdicts`, `cargo test -p kiln w28_r57`, `cargo test -p kiln-ci w28_r57`).
 
-**Progress.** R50–R59, AC50 and AC52–AC54 built (2026-10-25) in `kiln_ci::verdict` (its `cargo`
-reader and `culprit` planner), the replayer, `crates/kiln/src/ci/verdict.rs` (`ci.verdict`,
-`ci.verdict.wait`, `ci_verdict`, `verdict.changed`) and `ci/bisect.rs`. AC51 is not met: P3
-answers 90.0% (87.8%–90.7%) of ci's commits within the hour, against 75.9% before; with step 6's
-admission (P4), 85.6% (84.8%–86.3%). About half the
-late ones wait at the hour for a pod of their lane's work that the recorded week's cluster took 30
-min to 2.5 h to start, which no verdict answers sooner.
+**Progress.** R50–R59, AC50 and AC52–AC55 built (2026-10-25; R57's tries, R59's attribution and
+the ledger trait 2026-10-26) in `kiln_ci::verdict` (its `cargo` reader, `culprit` planner and
+`Ledger`), the replayer, `crates/kiln/src/ci/verdict.rs` (`ci.verdict`, `ci.verdict.wait`,
+`ci_verdict`, `verdict.changed` to the agent `kiln_ci::sched::actor` names), `ci/bisect.rs`
+(culprit finding on its own) and `ci/dispatch.rs` (its tries). AC51 is not met: with steps 4 and 6
+on (P4) 85.6% (84.8%–86.3%) of ci's commits are answered within the hour, against 95%; P3, without
+admission, 90.0% (87.8%–90.7%), against 75.9% before verdicts. What holds the rest, each commit
+named in ci/sim/README.md: at the hour about 13 a week wait for a rust pod the recorded week's
+cluster started 2.5 h late or never (superseded first), which no policy answers sooner on this
+trace; 6 (P4 alone) wait for release-binary on the server machine, which the bench's cadence keeps
+free for its exclusive job; 7 for a job running, 7 for a job's needs, 4 for a push made after the
+hour, and 3 have no answer before the window ends. With every pool's capacity unlimited P4 reaches
+89.6%.
 
 **Requirements: identical steps shared across pipelines** (step 7's, R70–R79; kiln plan
 `01a1751638db73ba809b8bf4abb6f386`)

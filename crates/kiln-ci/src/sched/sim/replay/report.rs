@@ -141,22 +141,49 @@ pub const LATE: [&str; 7] = [
 ];
 
 /// For a workflow's commits on main without an answer an hour after their push (P3 and later),
-/// how many stood where then, by [`LATE`]'s causes: a suspect waiting for its bisection; a pod
-/// of the lane's work since the commit (on a pool with a pod quota) still waiting to start; or
-/// pending on the job that answered it at last (waiting for a runner, running, waiting for its
-/// needs, or its push not made yet); or never answered in the window.
+/// how many stood where then, by [`LATE`]'s causes ([`late_runs`]).
 pub fn late(trace: &Trace, out: &Outcome, workflow: &str) -> [usize; 7] {
     let mut n = [0usize; 7];
+    for l in late_runs(trace, out, workflow) {
+        if let Some(x) = n.get_mut(l.cause) {
+            *x += 1;
+        }
+    }
+    n
+}
+
+/// A commit on main without an answer an hour after its push (W28-R53), and what held it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Late {
+    /// Its push's run (its place in the trace).
+    pub run: usize,
+    /// Where it stood at the hour: an index into [`LATE`].
+    pub cause: usize,
+    /// The job whose result answered it at last, and the run that job ran for.
+    pub answer: Option<(String, usize)>,
+    /// A pod of its lane's work, asked for by the hour and not started then: its run, its job, and
+    /// how long the recorded week took to start that job's pod, when the trace says.
+    pub pod: Option<(usize, String, Option<i64>)>,
+}
+
+/// A workflow's commits on main without an answer an hour after their push (P3 and later), each
+/// with where it stood then, by [`LATE`]'s causes: a suspect waiting for its bisection; a pod of
+/// the lane's work since the commit (on a pool with a pod quota) still waiting to start; or pending
+/// on the job that answered it at last (waiting for a runner, running, waiting for its needs, or
+/// its push not made yet); or never answered in the window.
+pub fn late_runs(trace: &Trace, out: &Outcome, workflow: &str) -> Vec<Late> {
+    let mut found = Vec::new();
     if !out.covers {
-        return n;
+        return found;
     }
     let lanes = super::verdict::lanes(trace);
-    let Some(runs) = lanes.get(&format!("{workflow}|push|main")) else { return n };
+    let Some(runs) = lanes.get(&format!("{workflow}|push|main")) else { return found };
     for (p, d) in super::verdict::lane_detail(trace, out, runs, Some(SOON)).into_iter().enumerate() {
         let (Some(at_hour), Some(last), Some(&r)) = (d.late, d.last, runs.get(p)) else { continue };
         let Some(run) = trace.runs.get(r) else { continue };
         let t = run.at + SOON;
-        let cause = if d.verdict.is_none() {
+        let mut late = Late { run: r, cause: 4, answer: None, pod: None };
+        late.cause = if d.verdict.is_none() {
             6
         } else if at_hour.kind == crate::verdict::Kind::Suspect {
             0
@@ -167,12 +194,17 @@ pub fn late(trace: &Trace, out: &Outcome, workflow: &str) -> [usize; 7] {
             match answer {
                 Some(a) => {
                     let by = a.by.and_then(|q| runs.get(q)).copied().unwrap_or(r);
+                    late.answer = Some((a.check.unit.clone(), by));
                     let pushed = trace.runs.get(by).is_some_and(|x| x.at <= t);
                     // A pod of the lane's work from the commit to its answer, asked for by the
                     // hour and not started then.
                     let lane = runs.get(p..=runs.iter().position(|&q| q == by).unwrap_or(p)).unwrap_or(&[]);
-                    let pod = out.execs.iter().any(|e| {
+                    let pod = out.execs.iter().find(|e| {
                         e.bisect.is_none() && lane.contains(&e.run) && e.queued <= t && e.started.is_none_or(|s| s > t) && e.ended.is_none_or(|x| x > t) && e.pool.and_then(|q| trace.pools.get(q)).is_some_and(|q| q.pods.is_some())
+                    });
+                    late.pod = pod.and_then(|e| {
+                        let job = trace.runs.get(e.run)?.jobs.get(e.job)?;
+                        Some((e.run, job.key.clone(), job.started.zip(job.queued).map(|(s, q)| s - q)))
                     });
                     let exec = out.execs.iter().filter(|e| e.bisect.is_none() && Some(e.ended) == Some(a.at)).find(|e| {
                         let (Some(er), Some(br)) = (trace.runs.get(e.run), trace.runs.get(by)) else { return false };
@@ -180,7 +212,7 @@ pub fn late(trace: &Trace, out: &Outcome, workflow: &str) -> [usize; 7] {
                     });
                     match exec {
                         _ if !pushed => 5,
-                        _ if pod => 1,
+                        _ if pod.is_some() => 1,
                         Some(e) if e.queued > t => 4,
                         Some(e) if e.started.is_none_or(|s| s > t) => 2,
                         Some(_) => 3,
@@ -190,11 +222,45 @@ pub fn late(trace: &Trace, out: &Outcome, workflow: &str) -> [usize; 7] {
                 None => 4,
             }
         };
-        if let Some(x) = n.get_mut(cause) {
-            *x += 1;
+        found.push(late);
+    }
+    found
+}
+
+/// Which of ci's commits on main a policy leaves without an answer an hour after their push, over
+/// `seeds` (W28-AC51's rest): each late in any seed, with how many seeds it was late in, where it
+/// stood then in most of them, and what held it.
+pub fn late_table(trace: &Trace, policy: &Policy, seeds: &[u64]) -> String {
+    use std::collections::BTreeMap;
+    let mut by: BTreeMap<usize, Vec<Late>> = BTreeMap::new();
+    for s in seeds {
+        for l in late_runs(trace, &replay(trace, policy, *s), "ci") {
+            by.entry(l.run).or_default().push(l);
         }
     }
-    n
+    let hours = |s: i64| format!("{:.1} h", s as f64 / 3600.0);
+    let mut out = String::new();
+    let _ = writeln!(out, "| Run | Pushed | Late in seeds | Where it stood at the hour | What held it |\n|---|---|---|---|---|");
+    for (r, ls) in &by {
+        let Some(run) = trace.runs.get(*r) else { continue };
+        let mut causes = [0usize; 7];
+        for l in ls {
+            if let Some(c) = causes.get_mut(l.cause) {
+                *c += 1;
+            }
+        }
+        let cause = (0..causes.len()).max_by_key(|&c| (causes.get(c).copied().unwrap_or(0), std::cmp::Reverse(c))).unwrap_or(4);
+        let held = ls.iter().find(|l| l.cause == cause).map_or_else(String::new, |l| match (&l.pod, &l.answer) {
+            (Some((pr, job, waited)), _) if cause == 1 => {
+                let w = waited.map_or_else(|| "it never started in the recorded week".to_owned(), |w| format!("the recorded week took {} to start it", hours(w)));
+                format!("{job}'s pod for run {pr}: {w}")
+            }
+            (_, Some((job, by))) => format!("{job}, answered by run {by}"),
+            _ => String::new(),
+        });
+        let _ = writeln!(out, "| {r} | {} | {} of {} | {} | {held} |", hours(run.at), ls.len(), seeds.len(), LATE.get(cause).copied().unwrap_or_default());
+    }
+    out
 }
 
 /// The report's columns as the trace recorded them.
