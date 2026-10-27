@@ -315,7 +315,7 @@ mod tests {
                 e = 0.9 * e + 0.2 * r.normal();
                 let t = i * every;
                 // A 0.6 s writeback stall every ~25 s raises a sample or two to ~200 ms.
-                let stall = if (t / 1_000_000) % 25 == 0 && t % 1_000_000 < every { 50.0 } else { 1.0 };
+                let stall = if (t / 1_000_000).is_multiple_of(25) && t % 1_000_000 < every { 50.0 } else { 1.0 };
                 (t, 4_000.0 * e.exp() * stall)
             })
             .collect()
