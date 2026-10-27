@@ -1261,12 +1261,16 @@ const TICK: Duration = Duration::from_secs(5);
 /// Completes when headroom has room for this session's held work: only while it holds some (so
 /// sessions with nothing waiting don't wake for it).
 async fn held_room(core: &Mutex<Core>) {
-    let waiting = {
+    // Listening before looking: room given between the look and the wait isn't missed.
+    let room = crate::headroom::room();
+    let (queued, held, granted) = {
         let c = core.lock();
-        !c.state.queue.is_empty() && crate::headroom::held(&c.session_id)
+        (!c.state.queue.is_empty(), crate::headroom::held(&c.session_id), crate::headroom::take_grant(&c.session_id))
     };
-    if waiting {
-        crate::headroom::room().await;
+    if queued && granted {
+        // Let in (perhaps before this looked): its queue goes now, once.
+    } else if queued && held {
+        room.await;
     } else {
         futures::future::pending::<()>().await;
     }

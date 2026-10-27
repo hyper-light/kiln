@@ -33,12 +33,14 @@ const LEARNED: &str = "learned.json";
 /// Who may start their next turn.
 #[derive(Default)]
 struct Admit {
-    /// Sessions let in, until when (µs since the epoch; their turn's end lets go sooner).
+    /// Sessions let in, until their turn ends (or they do).
     granted: HashMap<String, u64>,
     /// Sessions held, since when (µs since the epoch).
     waiting: HashMap<String, u64>,
     /// Sessions whose turn ended since the engine last looked.
     ended: Vec<String>,
+    /// Sessions let in whose held work hasn't been woken for yet (each wakes once a grant).
+    fresh: std::collections::HashSet<String>,
 }
 
 struct Shared {
@@ -96,6 +98,7 @@ pub fn admit(session: &str, class: Class) -> bool {
     a.waiting.entry(session.to_owned()).or_insert(now);
     drop(a);
     if first {
+        tracing::info!(session, "headroom: held until the engine lets it in");
         kick();
     }
     false
@@ -108,12 +111,20 @@ pub fn turn_ended(session: &str) {
     }
     let mut a = SHARED.admit.lock();
     a.granted.remove(session);
+    a.fresh.remove(session);
     a.ended.push(session.to_owned());
 }
 
-/// Completes when held work may be worth asking about again.
-pub async fn room() {
-    SHARED.room.listen().await;
+/// Completes when held work may be worth asking about again: listening starts when this is
+/// called, so room given before it's awaited still wakes it.
+pub fn room() -> impl std::future::Future<Output = ()> {
+    SHARED.room.listen()
+}
+
+/// Whether `session` was let in since its held work last woke for it (once a grant: what wakes
+/// for it takes it).
+pub fn take_grant(session: &str) -> bool {
+    SHARED.admit.lock().fresh.remove(session)
 }
 
 /// Whether `session` is held now.
@@ -287,6 +298,12 @@ fn mem_free() -> f64 {
         )
 }
 
+/// A group as the engine knows it: an agent session by its id (as it waits and is let in), anything
+/// else by where it is.
+fn id_of(g: &pace::Group) -> String {
+    g.session.clone().unwrap_or_else(|| g.dir.display().to_string())
+}
+
 fn run(ctx: Ctx, mut settings: Settings) {
     let _ = std::fs::create_dir_all(&ctx.dir);
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(kick);
@@ -352,7 +369,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
             .iter()
             .zip(&loads)
             .map(|(g, l)| Group {
-                id: g.dir.display().to_string(),
+                id: id_of(g),
                 key: g.session.clone().unwrap_or_else(|| g.label.clone()),
                 class: Class::Agent,
                 protected: false,
@@ -362,8 +379,9 @@ fn run(ctx: Ctx, mut settings: Settings) {
                 share: shares.get(&g.dir).copied().unwrap_or(1.0),
             })
             .collect();
-        let ended_ids: Vec<String> = groups.iter().filter(|g| g.session.as_ref().is_some_and(|s| ended.contains(s))).map(|g| g.dir.display().to_string()).collect();
-        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, mem_free: mem_free(), running, waiting, ended: ended_ids };
+        // Sessions whose turn ended, or that ended (with processes or without): by the same id
+        // they waited and run under.
+        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, mem_free: mem_free(), running, waiting, ended };
         let plan = engine.step(&obs);
         for (name, every) in &plan.probe_every_us {
             probes.set_interval(name, *every);
@@ -371,26 +389,23 @@ fn run(ctx: Ctx, mut settings: Settings) {
         // Pacing: the engine's shares, unless off or another process of this machine paces.
         let pacing = settings.enabled && !SHARED.standby.load(Ordering::Acquire);
         shares = if pacing {
-            plan.shares.iter().filter(|p| p.share < 1.0).filter_map(|p| groups.iter().find(|g| g.dir.display().to_string() == p.id).map(|g| (g.dir.clone(), p.share))).collect()
+            plan.shares.iter().filter(|p| p.share < 1.0).filter_map(|p| groups.iter().find(|g| id_of(g) == p.id).map(|g| (g.dir.clone(), p.share))).collect()
         } else {
             HashMap::new()
         };
         pacer.set(shares.iter().map(|(d, s)| (d.clone(), (s * kiln_ci::headroom::pace::SHARE_STEPS).floor().clamp(0.0, 99.0) as u8)).collect(), Duration::from_micros(probes.fastest_us()));
         // Admission: who the engine let start.
-        let started: Vec<(String, u64)> = plan
-            .decisions
-            .iter()
-            .filter(|d| d.start)
-            .map(|d| {
-                let until = engine.learned.demand.demand(&d.id).map_or(u64::MAX, |x| now.saturating_add(x.duration_us as u64));
-                (d.id.clone(), until)
-            })
-            .collect();
+        // A place holds until the session's turn ends (or it does): how long it was expected to
+        // run is the engine's to plan with, not when the place goes.
+        let started: Vec<(String, u64)> = plan.decisions.iter().filter(|d| d.start).map(|d| (d.id.clone(), u64::MAX)).collect();
         if !started.is_empty() {
             let mut a = SHARED.admit.lock();
             for (s, until) in &started {
                 a.waiting.remove(s);
                 a.granted.insert(s.clone(), *until);
+                a.fresh.insert(s.clone());
+                let why = plan.decisions.iter().find(|d| &d.id == s).map(|d| d.why.clone()).unwrap_or_default();
+                tracing::info!(session = %s, why, "headroom: let in");
             }
             drop(a);
             SHARED.room.notify(usize::MAX);

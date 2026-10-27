@@ -170,6 +170,8 @@ pub struct Engine {
     decided_from: Option<(Option<u64>, Option<u64>, Vec<String>)>,
     /// The most delivered during the trouble under way.
     trouble_bps: Option<f64>,
+    /// Since when kiln's own work has been quiet (none running, or all stopped).
+    quiet_since: Option<u64>,
     /// The last cut: when, and the first answer to a probe sent after it (its target, when it
     /// came, how long it took), which later probes of that target are measured against.
     cut: Option<(u64, Option<(String, u64, f64)>)>,
@@ -185,7 +187,7 @@ impl Engine {
             detectors.insert(t.name.clone(), d);
         }
         learned.detectors = detectors;
-        Self { policy, targets, learned, promises: Vec::new(), runs: HashMap::new(), shares: Vec::new(), decided_from: None, trouble_bps: None, cut: None }
+        Self { policy, targets, learned, promises: Vec::new(), runs: HashMap::new(), shares: Vec::new(), decided_from: None, trouble_bps: None, quiet_since: None, cut: None }
     }
 
     fn alarmed(&self) -> bool {
@@ -245,7 +247,9 @@ impl Engine {
                 self.learned.demand.record(&r.key, Demand { write_bps: r.peak_write, mem_bytes: r.peak_mem, duration_us: now.saturating_sub(r.since_us) as f64, cpu_cores: r.peak_cpu });
             }
         }
-        self.promises.retain(|p| p.until_us > now && !o.running.iter().any(|g| g.id == p.id));
+        // A promise holds until its work shows running, ends (it may never have got going), or its
+        // expected run passes.
+        self.promises.retain(|p| p.until_us > now && !o.running.iter().any(|g| g.id == p.id) && !o.ended.contains(&p.id));
         let quiet = o.running.iter().filter(|g| !g.protected).all(|g| g.write_bps <= 0.0 && g.cpu_cores <= 0.0);
         let wanted: f64 = o.running.iter().filter_map(|g| self.runs.get(&g.id)).map(|r| r.demand).sum();
         let wanted_cpu: f64 = o.running.iter().filter_map(|g| self.runs.get(&g.id)).map(|r| r.demand_cpu).sum();
@@ -283,14 +287,34 @@ impl Engine {
                 events.push(format!("{name}: {why}"));
             }
         }
-        // An alarm with kiln quiet the whole time, outlasting the longest any cut of kiln's took
-        // to show: kiln isn't the cause; the machine changed. A new regime learns it.
-        if let Some(lag) = self.learned.knee.lag_us {
+        // Trouble with kiln's own work quiet (never begun, or stopped by its cuts) for longer than
+        // any cut of kiln's took to show: kiln isn't the cause, and holding its work back can't
+        // help; the machine changed. A new regime learns it (bounds forgotten, kiln's work runs
+        // again; harm still alarms at the tolerance). Before any cut has shown, the tolerance is
+        // the longest the target was asked to wait.
+        if quiet {
+            self.quiet_since.get_or_insert(now);
+        } else {
+            self.quiet_since = None;
+        }
+        let waited = self.learned.knee.lag_us.unwrap_or_else(|| self.targets.iter().map(|t| t.tolerance_us).fold(0.0, f64::max));
+        if let Some(q) = self.quiet_since
+            && self.alarmed()
+            && now.saturating_sub(q) as f64 > waited
+        {
+            let mut any = false;
             for (name, d) in &mut self.learned.detectors {
-                if d.alarm.as_ref().is_some_and(|a| a.quiet && !a.harm && now.saturating_sub(a.since_us) as f64 > lag) {
+                if d.alarm.as_ref().is_some_and(|a| now.saturating_sub(a.since_us) as f64 > waited) {
                     d.restart(now);
-                    events.push(format!("{name}: in trouble with kiln quiet, longer than any cut took to show: the machine changed, a new regime"));
+                    any = true;
+                    events.push(format!("{name}: in trouble with kiln's work quiet, longer than any cut took to show: not kiln's; the machine changed, a new regime"));
                 }
+            }
+            if any {
+                self.learned.knee.regime();
+                self.learned.cpu_knee.regime();
+                self.cut = None;
+                self.quiet_since = None;
             }
         }
 
@@ -518,6 +542,43 @@ mod tests {
         let back: Learned = serde_json::from_str(&json)?;
         anyhow::ensure!(back == e.learned);
         Ok(())
+    }
+
+    #[test]
+    fn trouble_kiln_cannot_cause_does_not_hold_its_work_back_for_good() {
+        let mut e = engine();
+        for i in 0..100u64 {
+            e.step(&Observation { now_us: i * 1_000_000, answers: vec![("disk".into(), Answer::Took(4_000.0))], mem_free: 1e11, running: vec![group("a", 300e6, 1.0)], ..Observation::default() });
+        }
+        // Harm: kiln's writers cut to nothing.
+        let p = e.step(&Observation { now_us: 100_000_000, answers: vec![("disk".into(), Answer::Took(2e6))], delivered_bps: Some(300e6), mem_free: 1e11, running: vec![group("a", 300e6, 1.0)], ..Observation::default() });
+        assert!(p.status.budget_bps.is_some_and(|b| b < 300e6), "{:?}", p.status);
+        // Stopped, yet the disk stays slow (someone else's writes): after longer than a cut could
+        // take to show, kiln's work runs again.
+        let mut freed = false;
+        for i in 101..200u64 {
+            let p = e.step(&Observation { now_us: i * 1_000_000, answers: vec![("disk".into(), Answer::Took(2e6))], delivered_bps: Some(300e6), mem_free: 1e11, running: vec![Group { cpu_cores: 0.0, ..group("a", 0.0, 0.0) }], ..Observation::default() });
+            if p.status.budget_bps.is_none() {
+                freed = true;
+                assert!(p.events.iter().any(|e| e.contains("not kiln's")), "{:?}", p.events);
+                break;
+            }
+        }
+        assert!(freed, "kiln's work was held back for good by trouble it can't cause");
+    }
+
+    #[test]
+    fn work_let_in_that_ends_without_running_frees_its_place() {
+        let mut e = engine();
+        let w = |id: &str| Waiting { id: id.into(), key: id.into(), class: Class::Agent, since_us: 0 };
+        // Nothing learned: one unknown at a time.
+        let p = e.step(&Observation { now_us: 1, mem_free: 1e11, waiting: vec![w("a"), w("b")], ..Observation::default() });
+        assert_eq!(p.decisions.iter().filter(|d| d.start).map(|d| d.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        let p = e.step(&Observation { now_us: 2, mem_free: 1e11, waiting: vec![w("b")], ..Observation::default() });
+        assert!(!p.decisions.iter().any(|d| d.start), "a still holds the one place");
+        // a ended (its harness never started): b goes.
+        let p = e.step(&Observation { now_us: 3, mem_free: 1e11, waiting: vec![w("b")], ended: vec!["a".into()], ..Observation::default() });
+        assert_eq!(p.decisions.iter().filter(|d| d.start).map(|d| d.id.as_str()).collect::<Vec<_>>(), vec!["b"]);
     }
 
     proptest! {

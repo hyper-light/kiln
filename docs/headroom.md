@@ -117,7 +117,7 @@ decides.
 | CUSUM's reference | half the distance from the calm mean to the tolerance (the shift that matters) |
 | The alarm threshold | the higher of: the (allowed + 1)-th largest harmless excursion recorded, where allowed = budget x days recorded; and the height the record's own exponential tail (count and sum of its excursions, CUSUM's near-exponential excursions per Siegmund) puts at the budget's rate |
 | Harm | a sample, or a probe still out, at the tolerance |
-| A new regime | a fall below the calm the lower CUSUM detects with the same calibration, or an alarm with kiln quiet that outlasts the longest a cut of kiln's ever took to show |
+| A new regime | a fall below the calm the lower CUSUM detects with the same calibration, or trouble that lasts with kiln's own work quiet (never begun, or stopped by its cuts) longer than any cut of kiln's took to show (the tolerance before one has): kiln isn't the cause, and its work runs again |
 | The probe interval | (tolerance - longest measured lag) / (expected samples to alarm + 1), never under the probe's own measured cost, and for a served target never under its service time / load share |
 | The write and CPU budgets | each, for kiln's own work: bisection between the highest level held calm and the lowest level trouble began at; doubling while there is no unsafe level; halving the gap is the only step. Trouble cuts both (either may be the cause) unless the disks are delivering all they were measured to take, when only writes are cut; each is raised on its own where it limits (what runs wants more, or work waiting would take it past) |
 | A level held | the mean kiln's work used over the hold (its integral over time), not its peak: a burst a buffer took isn't a rate the machine sustains |

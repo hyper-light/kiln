@@ -17,6 +17,24 @@ fn login_shell(dir: &Path, path: &str) -> anyhow::Result<String> {
     Ok(shell.to_string_lossy().into_owned())
 }
 
+/// The system's programs (`/usr/bin`, `/bin`) without Claude Code, as one folder of links: the
+/// machine may have it installed system-wide, and these tests need a machine without it.
+fn system_without_claude(dir: &Path) -> anyhow::Result<String> {
+    let out = dir.join("system-bin");
+    std::fs::create_dir_all(&out)?;
+    for from in ["/usr/bin", "/bin"] {
+        let Ok(rd) = std::fs::read_dir(from) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let to = out.join(&name);
+            if name != "claude" && std::fs::symlink_metadata(&to).is_err() {
+                std::os::unix::fs::symlink(e.path(), to)?;
+            }
+        }
+    }
+    Ok(out.to_string_lossy().into_owned())
+}
+
 fn session(s: &Server, id: &str) -> anyhow::Result<Value> {
     Ok(serde_json::from_str(&http(s.port, "GET", &format!("/api/harness/sessions/{id}"), &s.admin, None)?.1).unwrap_or_default())
 }
@@ -83,8 +101,9 @@ fn install_claude(bin: &Path) -> anyhow::Result<()> {
 #[test]
 fn an_agent_that_couldnt_start_on_the_server_moves_to_a_runner_that_has_its_harness() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let shell = login_shell(dir.path(), "/usr/bin:/bin")?;
-    let s = start_env(dir.path(), &Options { extra: "[terminal]\nenabled = true\n", ..Options::default() }, false, &[("PATH", "/usr/bin:/bin"), ("SHELL", &shell)])?;
+    let system = system_without_claude(dir.path())?;
+    let shell = login_shell(dir.path(), &system)?;
+    let s = start_env(dir.path(), &Options { extra: "[terminal]\nenabled = true\n", ..Options::default() }, false, &[("PATH", system.as_str()), ("SHELL", &shell)])?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
 
@@ -117,7 +136,7 @@ fn a_runner_agent_that_couldnt_start_keeps_its_first_message_moved_or_started_ag
     std::fs::create_dir_all(&work)?;
     let bare_bin = dir.path().join("bare-bin");
     std::fs::create_dir_all(&bare_bin)?;
-    let path = format!("{}:/usr/bin:/bin", bare_bin.display());
+    let path = format!("{}:{}", bare_bin.display(), system_without_claude(dir.path())?);
     let shell = login_shell(dir.path(), &path)?;
     let bare_env = [("PATH", path.as_str()), ("SHELL", shell.as_str())];
     let talk = Talk { lines: 3, every_ms: 20 };

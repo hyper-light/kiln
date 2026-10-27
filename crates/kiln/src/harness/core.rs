@@ -819,6 +819,10 @@ impl Core {
 
     pub fn set_status(&mut self, s: Status) {
         if self.state.status != s {
+            // Gone (ended, or it never got going): any place headroom gave it goes.
+            if s == Status::Exited {
+                crate::headroom::turn_ended(&self.session_id);
+            }
             self.state.status = s;
             self.state_dirty = true;
         }
