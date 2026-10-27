@@ -33,8 +33,8 @@ import {
   monitorsRes,
   spanHistogramRes,
   useRange,
-  type Mark,
   type Range,
+  type Threshold,
 } from "./parts";
 import { CheckRuns, Stream } from "./widgets";
 
@@ -284,7 +284,7 @@ function Watched({ m, range }: { m: Monitor; range: Range }) {
     );
   const t = m.options.thresholds;
   // A change monitor's thresholds are of the change, not of the series drawn.
-  const marks: Mark[] =
+  const marks: Threshold[] =
     check.kind === "metric" || check.kind === "forecast"
       ? [{ label: "Critical", value: check.threshold ?? 0, color: SERIES.fail }, ...(t.warning !== null && t.warning !== undefined ? [{ label: "Warning", value: t.warning, color: SERIES.warn }] : [])]
       : [];

@@ -389,7 +389,7 @@ export function chartData(answers: QueryAnswer[], names?: readonly string[]): { 
 }
 
 /** A level drawn across a chart: a monitor's threshold. */
-export interface Mark {
+export interface Threshold {
   label: string;
   value: number;
   color: string;
@@ -413,7 +413,7 @@ export function QueryChart({
   unit?: string;
   display?: "line" | "bars" | "area";
   legend?: boolean;
-  marks?: Mark[];
+  marks?: Threshold[];
   /** How far past now to draw a forecast (ms): half the range unless said. */
   ahead?: number;
   /** Each query's name in the legend (a constant: it is compared by identity). */
