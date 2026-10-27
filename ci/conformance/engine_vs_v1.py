@@ -237,6 +237,34 @@ def compare(rec, prod=None):
     return {"match": not diffs and not rec.get("timed_out"), "diffs": diffs, "set_aside": aside}
 
 
+def retry_timeouts(sides, sha, rec, prod, timeout):
+    """`--retry-timeouts`: a job that timed out on one side only (on a machine shared with other
+    work, its timeout says as much about the load as the job) runs once more there: that side's
+    run of its workflow again, then the commit recorded anew, the first record kept in it."""
+    again = []
+    for d in compare(rec, prod)["diffs"]:
+        for s in sides:
+            if "timed_out" in (d[s.side] or []):
+                run = next((r for r in s.runs(sha) if (r.get("pipeline") or r.get("name")) == d["workflow"]), None)
+                if run and all(run is not r for _, r, _ in again):
+                    again.append((s, run, d))
+    if not again:
+        return rec
+    for s, run, d in again:
+        print(f"  {s.side} {d['workflow']}/{d['job']} timed out there only: its run again ({s.rerun(run)})", flush=True)
+    time.sleep(60)
+    runs, late = {}, rec.get("timed_out", False)
+    for s in sides:
+        got, slow = wait_for([s], sha, timeout)
+        runs.update(got)
+        late = late or slow
+    new = record(sides, sha, runs, late)
+    new.update({k: rec[k] for k in ("subject", "before", "seconds") if k in rec})
+    new["retried"] = [f"{s.side}:{d['workflow']}/{d['job']}" for s, _, d in again]
+    new["first_record"] = {side: {wf: f.get("jobs") for wf, f in v.items()} for side, v in rec["sides"].items()}
+    return new
+
+
 def report(out_dir, order, prod=None):
     rows, matched = [], 0
     for sha in order:
@@ -290,6 +318,7 @@ def main():
     ap.add_argument("--prod", help="production's failing tests by commit: {sha: {failed: [...]}}")
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--rerun", help="run a recorded commit's runs again on both sides (a commit the lab disturbed) and record it anew")
+    ap.add_argument("--retry-timeouts", action="store_true", help="a job that timed out on one side only runs once more there before the commit is recorded")
     a = ap.parse_args()
     with open(a.commits) as f:
         order = [l.split()[0] for l in f if l.strip() and not l.startswith("#")]
@@ -340,6 +369,8 @@ def main():
             timed_out = timed_out or late
         rec = record(sides, sha, runs, timed_out)
         rec.update({"subject": subject, "before": current, "seconds": round(time.time() - t0)})
+        if a.retry_timeouts:
+            rec = retry_timeouts(sides, sha, rec, prod, a.timeout)
         with open(path + ".part", "w") as f:
             json.dump(rec, f, indent=1)
         os.replace(path + ".part", path)
