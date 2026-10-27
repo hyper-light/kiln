@@ -13,6 +13,7 @@ pub mod cd_events;
 pub mod broker;
 pub mod cli;
 pub mod compare;
+pub mod conflicts;
 pub mod cr;
 pub mod deploy_step;
 pub mod diffs;

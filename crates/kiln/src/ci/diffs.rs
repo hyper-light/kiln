@@ -1500,6 +1500,11 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                     ok(json!({ "threads": super::review::threads(hub, &d, &me).await?, "gate": super::review::gate_of(hub, &d, Some(&me)).await? }))
                 }
                 (&Method::POST, ["comments"]) => ok(super::review::comment(hub, &d, caller, body).await?),
+                // Its conflicts with where it lands, resolved where they fall, then committed (W26-R12).
+                (&Method::GET, ["conflicts"]) => ok(super::conflicts::list(hub, &d).await?),
+                (&Method::POST, ["conflicts", "commit"]) => ok(super::conflicts::commit(hub, &d, caller).await?),
+                (&Method::POST, ["conflicts", id, "resolution"]) => ok(super::conflicts::resolve(hub, &d, id, caller, body).await?),
+                (&Method::DELETE, ["conflicts", id, "resolution"]) => ok(super::conflicts::undo(hub, &d, id, caller).await?),
                 (&Method::POST, ["review"]) => ok(super::review::review(hub, &d, caller, body).await?),
                 (&Method::POST, ["viewed"]) => ok(super::review::viewed(hub, &d, caller, body).await?),
                 (&Method::GET, ["land"]) => ok(super::review::readiness(hub, &d).await?),

@@ -81,6 +81,35 @@ submit again. Only the diffs that changed get new versions.
   abandon or reclaim. Anyone allowed can **commandeer** a diff and take over authorship.
 - Reviews and comments are drafted privately and published together, like a review in other tools.
 
+### Conflicts in the diff (W26-R12)
+
+kiln replays a change's latest revision onto where it lands (its trunk's tip; a diff above another
+open one, that one's latest revision) with `git merge-tree --write-tree` in its own copy: no branch
+moves. The replay is kept by revision and by what it went onto, and runs again when either moves
+(asked for by the conflicts, by approving and by landing). Where it conflicts, each conflict comes
+back where it falls:
+
+- **Text**: between git's markers (zdiff3, so they carry the base), at this change's own lines
+  (`line`, `end_line`), with main's side (at main's lines), this side and the base. It's resolved
+  there by taking main's lines, this change's, both (main's then this change's), an agent's
+  resolution, or an edit (which may hold no conflict markers).
+- **Binary**, **modify/delete** (main changed a file this change deletes), **delete/modify**, and
+  anything else git can't merge by lines (a symbolic link, a submodule, a rename against a
+  delete): named, never shown as markers, and resolved by taking a side: main's file or this
+  change's (gone where that side deleted it).
+
+An agent's own resolution is kept as the agent's, beside the conflict, for a person to take (a
+repository's automatic resolution is the conflict ladder's, W26-R17). The same conflict in a later
+replay of the revision (main moved on other files) keeps what was resolved.
+
+**Commit resolution** makes one revision of whoever commits it, its why `conflict resolved`: a
+diff's commit onto where it lands (its author and message kept, the committer the person who
+committed the resolution), or a change request's merge commit of where it lands into its branch
+(GitHub's Resolve conflicts). Agents whose resolutions were taken are its co-authors. It goes
+through the same commit path as Apply, which W27-R03 signs; until then it's unsigned. Until it's
+made, every conflict holds the gate (W26-R11): approving, landing and any automatic merge wait,
+each saying `expand.rs:18: resolve this conflict first`, or `… commit its resolution first`.
+
 ## Landing
 
 "Land D3" lands D3 and every diff below it, in order. Each must satisfy the policy on its latest
@@ -178,6 +207,9 @@ production:
 | GET/POST | `/api/diffs/:id/comments` | threads; `PATCH /api/comments/:id` resolves or edits |
 | POST | `/api/diffs/:id/review` | `{ action: accept \| request_changes \| comment \| resign, body, comments }` |
 | POST | `/api/diffs/:id/{ready,abandon,reclaim,commandeer}` | |
+| GET | `/api/diffs/:id/conflicts` | its latest revision replayed onto where it lands: each conflict where it falls, what's left to resolve, whether Commit resolution may go (`ready`) |
+| POST/DELETE | `/api/diffs/:id/conflicts/:conflict/resolution` | `{ take: main \| this \| both \| agent \| edit, lines? \| text? }` (an agent's is kept as the agent's); DELETE takes it back |
+| POST | `/api/diffs/:id/conflicts/commit` | Commit resolution: one revision, its why `conflict resolved` (`diffs.submit`, a person) |
 | POST | `/api/diffs/:id/land` | land it and everything below |
 | GET | `/api/repos/:repo/queue` | the land queue; `DELETE /api/queue/:entry` takes one out |
 | GET | `/api/stacks/:id` | a stack as a tree |

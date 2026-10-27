@@ -499,11 +499,13 @@ pub struct Thread {
     pub draft: bool,
 }
 
-/// A conflict a change's latest replay onto its trunk left unresolved (W26-R12): where it falls.
+/// A conflict a change's latest replay onto its trunk left (W26-R12): where it falls, and whether
+/// it's resolved there, waiting on Commit resolution to make a revision of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Conflict {
     pub file: String,
     pub line: Option<u32>,
+    pub taken: bool,
 }
 
 /// What holds approving and merging a change (W26-R11): a blocking thread, or a conflict.
@@ -589,9 +591,10 @@ fn open_count(n: u32, kind: &str) -> String {
 }
 
 /// The gate (W26-R11), pure: from a change's threads (each one's kind and reviewer), the conflicts
-/// its latest replay left unresolved and who asks (`asking`: whoever approves; none for merging and
-/// any automatic merge), what approving and merging may do. A blocking thread holds both until its
-/// reviewer resolves it, naming them and where it is; so does each conflict until it's resolved. An
+/// its latest replay left and who asks (`asking`: whoever approves; none for merging and any
+/// automatic merge), what approving and merging may do. A blocking thread holds both until its
+/// reviewer resolves it, naming them and where it is; so does each conflict until Commit resolution
+/// makes a revision of it (W26-R12), one resolved where it falls saying that's what it waits on. An
 /// open issue warns on approval (approve anyway); an open nit informs; questions are counted and
 /// weigh nothing. A resolved thread isn't open, and a draft is its reviewer's alone: it counts only
 /// when they ask, since approving publishes it.
@@ -601,7 +604,8 @@ pub fn gate(threads: &[Thread], conflicts: &[Conflict], asking: Option<&str>) ->
         .iter()
         .map(|c| {
             let at = place(Some(&c.file), c.line);
-            Hold { reason: format!("{at}: resolve this conflict first"), at, by: None }
+            let reason = if c.taken { format!("{at}: commit its resolution first") } else { format!("{at}: resolve this conflict first") };
+            Hold { reason, at, by: None }
         })
         .collect();
     let mut open = Open::default();
@@ -817,7 +821,7 @@ mod tests {
 
     #[test]
     fn w26_r11_conflicts_hold_until_resolved() {
-        let conflicts = [Conflict { file: EXPAND.into(), line: Some(18) }, Conflict { file: "README.md".into(), line: None }];
+        let conflicts = [Conflict { file: EXPAND.into(), line: Some(18), ..Conflict::default() }, Conflict { file: "README.md".into(), line: None, ..Conflict::default() }];
         let g = gate(&[], &conflicts, Some(ADA));
         assert_eq!((g.verdict, g.conflicts), (Verdict::Hold, 2));
         assert_eq!(g.reasons(), ["expand.rs:18: resolve this conflict first", "README.md: resolve this conflict first"]);
@@ -828,6 +832,19 @@ mod tests {
         assert_eq!(both.reasons(), ["expand.rs:18: resolve this conflict first", "expand.rs:22: kim resolves this blocking comment first"]);
         assert_eq!(gate(&[thread(Kind::Issue, KIM, 3)], conflicts.get(..1).unwrap_or_default(), Some(ADA)).approve(true), Err("expand.rs:18: resolve this conflict first".to_owned()), "a conflict isn't a warning to go past");
         assert_eq!(gate(&[], &[], Some(ADA)).verdict, Verdict::Clear, "resolved, nothing holds");
+    }
+
+    /// W26-R12, AC04: a conflict resolved where it falls still holds approving and merging until
+    /// Commit resolution makes a revision of it, saying so; the revision's replay has none.
+    #[test]
+    fn w26_r12_a_resolved_conflict_waits_on_its_commit() {
+        let taken = Conflict { file: EXPAND.into(), line: Some(18), taken: true };
+        let open = Conflict { file: EXPAND.into(), line: Some(30), ..Conflict::default() };
+        let g = gate(&[], &[taken.clone(), open], Some(ADA));
+        assert_eq!((g.verdict, g.conflicts), (Verdict::Hold, 2));
+        assert_eq!(g.reasons(), ["expand.rs:18: commit its resolution first", "expand.rs:30: resolve this conflict first"]);
+        assert_eq!(gate(&[], &[taken], None).approve(true), Err("expand.rs:18: commit its resolution first".to_owned()), "merging and force wait too");
+        assert_eq!(gate(&[], &[], Some(ADA)).approve(false), Ok(None), "committed: the new revision goes onto main cleanly");
     }
 
     #[test]
