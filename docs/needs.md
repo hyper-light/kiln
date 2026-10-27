@@ -685,7 +685,7 @@ at once; A1 only measures.
 
 | Step | | Done when |
 | --- | --- | --- |
-| E1 | The ground: integer amounts, no decision on hash-map order, the replay test, the reference engine, the kiln-sim model's skeleton | the same inputs give the same commands on x86-64 and arm64; the reference and real engines agree on 10,000 random small cases |
+| E1 (built) | The ground: integer amounts, no decision on hash-map order, the replay test, the reference engine, the kiln-sim model's skeleton | the same inputs give the same commands on x86-64 and arm64; the reference and real engines agree on 10,000 random small cases |
 | E2 | Fair share that holds: classes with floors and promotion, W05-R09's aging within a tenant, the tenant tree, dominant-share costs | G7 with staggered arrivals and mixed shapes; W05-AC03 within a tenant; a `background` item under a steady stream of `batch` starts within its bound |
 | E3 | Grants as fenced leases end to end: epoch and expiry, renewal, runners' loss and draining told to the engine, self-fencing, the store refusing stale writes, tokens that die with their grant, reconciling after failover | G2 and G10 in the simulator under the nemesis, a million seeds; live, a runner cut off past its lease: nothing it writes after the next attempt starts is taken, and its tokens no longer work |
 | E4 | Reservations and gangs | G6: a 12-CPU item among a stream of 1-CPU ones starts by its bound; a gang of 3 never half-starts |
@@ -704,3 +704,12 @@ at once; A1 only measures.
 | A7 | Goals on the engine; agents operating within grants | programs' tracks keep their weighted shares with no coordinator deciding slots |
 | A8 | What agents are told, the policy files, the views | the views pass in Chromium and WebKit at desktop and phone widths; `cargo test -p kiln --test agents_md` passes |
 | A9 | A week, measured against §1 | load probes by agents down 90 %, coordination messages down 80 % (CLM-10), go-aheads asked in prose down 90 %, and no hand-made lock, waiter or retry loop |
+
+**E1 is built** (branch `needs-engine`, 2026-10-26; docs/ci.md W05-R29 and W05-AC13). The engine
+decides in integers (`kiln_ci::sched::units`) and walks what it keeps in one order; its replay gives
+one digest on arm64 and x86-64; a reference scheduler written from W05 agrees with it on 10,000
+cases; kiln-sim's scheduler model (docs/sim.md) is E3's skeleton. On the way, the reference and the
+model found three flaws in the engine, each fixed with its test: the legs a runner lost together
+were given back one at a time, out of queue order; a leg lost with its runner waited for good for
+another runner too small to hold it (docs/sim.md's bug 10); and a leg refused by the only runner big
+enough to hold it said it waited for capacity.

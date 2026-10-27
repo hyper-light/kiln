@@ -1713,8 +1713,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   the failing requirements), `concurrency` (group and holder), `quota`, `reservation`,
   `exclusive`, `approval`, `scaling` (a pool is starting runners; how many and since when),
   `max-parallel`, `capability` (eligible runners' builds lack a capability; which),
-  `other-runner` (only the runner its retry avoids could take it: R16's `runner: different`, or a
-  runner that refused it; which), `adopted` (it waits for the same work in flight, W28-R42: which
+  `other-runner` (only the runner its retry avoids could take it, of those eligible and big enough
+  to hold it: R16's `runner: different`, or a runner that refused it; which), `adopted` (it waits for the same work in flight, W28-R42: which
   leg of which run), and admission's (W28-R60): `coalescing` (its lane, until when, at the latest
   when), `cadence` (its lane, its next start) and `speculation` (its lane, the window, how many are
   in flight). It is stored (`jobs.wait_reason`), sent as an event, and shown
@@ -1741,8 +1741,11 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `oom_kill` count rose, or exit 137 with memory at its limit), `disk-full` (ENOSPC seen, or the
   work volume full), `timeout`, `failure` (anything else).
 - **W05-R16 Defaults.** Without a policy: `runner-lost` is retried once on a different runner
-  when one can take it, else on the same one (today's requeue, kept, and shown as "retried:
-  runner X was lost"); nothing else is retried. A policy's `runner: different` waits for another
+  when one can take it (connected, eligible, not draining, and big enough to hold it: a share
+  within its size; in resource mode, what the leg asks within its capacity × overcommit), else on
+  the same one (today's requeue, kept, and shown as "retried: runner X was lost"); nothing else is
+  retried. The legs a runner loses together come back to the queue together, and go in queue
+  order, each to the best runner it has room on. A policy's `runner: different` waits for another
   runner, and says so (`other-runner`).
 - **W05-R17 Reruns**, GitHub-exact: re-run all jobs, re-run failed jobs (and the jobs that need
   them), re-run one job (and its dependents), optionally with debug logging. A rerun is a new run
@@ -1839,11 +1842,21 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   signature exceed the idle capacity of the pools that can serve it, and to scale down runners idle
   past their pool's `idle_timeout`. Today's Kubernetes pod per job becomes the pool kind `k8s`
   (ephemeral, one leg per pod), keeping its quota handling and launch backoff.
+- **W05-R29 Determinism** (docs/needs.md, E1). The same inputs give the same commands, in the same
+  order, on every machine and in every replay. The scheduler decides with integers only: CPUs in
+  thousandths, bytes, milliseconds, fair share's virtual time in fixed point, factors and weights
+  in thousandths, warmth and scores in millionths; floats come in and go out only through
+  `kiln_ci::sched::units`' conversions (config, facts, history, explanations), and clippy's
+  `float_arithmetic` is denied everywhere else in `sched`. Whatever it walks while deciding it
+  walks in one order: what it keeps is ordered, and its legs, looked up on every input, are kept in
+  a table walked in key order; hash maps hold only settings looked up by key.
 
 **Design.** `crates/kiln-ci/src/sched/`: `state.rs` (runners, signatures, queues), `fair.rs`,
 `groups.rs`, `routing.rs` (constraint parser, rule matching, eligibility, scoring, explain),
 `retry.rs`, `sim.rs` (a simulator: runners, legs, durations, failures, all driven by a seeded
-clock, used by tests and `kiln ci bench`). `crates/kiln/src/ci/dispatch.rs` owns the loop: it
+clock, used by tests and `kiln ci bench`), `units.rs` (the integers it decides with, and their
+conversions at its edges), `table.rs` (legs by key, walked in key order); in tests, `replay.rs` and
+`reference.rs` (W05-AC13), and kiln-sim's model, `crates/kiln/src/sim/sched.rs` (docs/sim.md). `crates/kiln/src/ci/dispatch.rs` owns the loop: it
 turns hub and store events into `Input`s, persists, and carries out `Command`s (sending
 `Assign`/`AssignV2`, timers, pool calls). `Hub::schedule_once` and `pick_agent` are removed when
 the dispatcher is on `main`; the v1 `Assign` path is kept for runners without `CAP_CI2`.
@@ -1889,6 +1902,18 @@ W20.
   named (through the API, and the operation MCP calls), on that one; each lists both runners and
   the one it ran on; a runner unknown, or both asks at once, is refused. *Unit test (the
   scheduler's placement, a leg's rerun, a pipeline job's retry), then E2E on a local server.*
+- **W05-AC13 Determinism** (W05-R29). Two schedulers in one process, their hash maps hashing apart,
+  give the same commands for 1,000 seeds of random inputs (`e1_3_…`). A replay of 32 seeded
+  scenarios through the simulator gives the SHA-256 committed beside it (`replay.digest`) on
+  x86-64 and arm64 (kiln's CI runs it on both, `replay-arm64` on whichever arm64 machine has
+  cargo); a change that moves a decision moves it, and updates it on purpose
+  (`KILN_SCHED_REPLAY_PRINT=1`). A reference scheduler written plainly from this section (after
+  every input, the first queued leg that may run goes to its best runner; a leg back from a runner
+  takes W05-R04's two looks in their order) agrees with the engine on
+  what runs where after every input of 10,000 small random cases, the engine's invariants held; a
+  case that parts is cut down and printed with its seed (`KILN_SCHED_REFERENCE_SEED`). kiln-sim's
+  scheduler model holds runners within their capacity and settles every leg under the network's
+  nemesis (docs/sim.md). *Unit tests, simulation.*
 
 **Scenarios**
 
