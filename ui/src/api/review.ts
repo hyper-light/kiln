@@ -421,3 +421,83 @@ export const STATE_WORD: Record<string, string> = {
   landed: "Landed",
   abandoned: "Abandoned",
 };
+
+/** A conflict's kind (W26-R12): a text file's conflicts sit where they fall and resolve line by line; the others take a side. */
+export type ConflictKind = "text" | "binary" | "modify_delete" | "delete_modify" | "other";
+
+/** How a conflict is resolved (W26-R12): main's side, this change's, both (main's then this change's), an agent's resolution, or an edit. */
+export type ConflictTake = "main" | "this" | "both" | "agent" | "edit";
+
+/** A text conflict's side (its lines, and where they start in that side's own file); a path taken whole: what that side has there, or null where it deleted it. */
+export type ConflictSide = { start?: number | null; lines: string[] } | { mode: string; blob: string } | null;
+
+/** A conflict of a change's replay onto where it lands, where it falls (W26-R12). */
+export interface Conflict {
+  id: string;
+  file: string;
+  kind: ConflictKind;
+  /** A text conflict's place among its file's, from 0. */
+  hunk: number | null;
+  /** How many conflicts its file has. */
+  of: number;
+  /** Where it falls in this change's own file (a text conflict). */
+  line: number | null;
+  end_line: number | null;
+  main: ConflictSide;
+  this: ConflictSide;
+  base: ConflictSide;
+  /** What it is, in words, for a conflict resolved by taking a side. */
+  says: string | null;
+  /** git's own words on it. */
+  git: string | null;
+  /** What resolves it. */
+  takes: ConflictTake[];
+  /** An agent's resolution, for a person to take. */
+  agent: { by: string; take: ConflictTake | null; lines: string[] | null; at: number | null } | null;
+  /** The resolution taken: what it took, the lines a text conflict resolves to, by whom and when. */
+  resolution: { take: ConflictTake; lines: string[] | null; by: string | null; at: number | null } | null;
+}
+
+/** A change's latest revision replayed onto where it lands, and its conflicts (W26-R12). */
+export interface Conflicts {
+  diff: string;
+  version: number | null;
+  /** None when there's nothing to replay; once Commit resolution made the latest revision, the replay it resolved. */
+  replay: {
+    id: string;
+    version: number;
+    commit: string;
+    onto: { name: string; commit: string };
+    state: "clean" | "conflicted" | "resolved";
+    by: string;
+    at: number;
+    resolved_in: number | null;
+    resolved_by: string | null;
+    resolved_at: number | null;
+  } | null;
+  conflicts: Conflict[];
+  unresolved: number;
+  /** Each conflict resolved: Commit resolution may go. */
+  ready: boolean;
+}
+
+/** What Commit resolution made: one revision of whoever committed it, its why `conflict resolved` (`signer` null: unsigned until W27-R03). */
+export interface ConflictsCommitted {
+  diff: string;
+  version: number;
+  why: string;
+  commit: string;
+  by: string;
+  signer: string | null;
+  replay: string;
+  conflicts: number;
+}
+
+export const conflictsApi = {
+  list: (key: string, signal?: AbortSignal) => request<Conflicts>("GET", `/api/diffs/${enc(key)}/conflicts`, undefined, { signal }),
+  resolve: (key: string, id: string, body: { take: ConflictTake; lines?: string[]; text?: string }) => request<Conflicts>("POST", `/api/diffs/${enc(key)}/conflicts/${enc(id)}/resolution`, body),
+  undo: (key: string, id: string) => request<Conflicts>("DELETE", `/api/diffs/${enc(key)}/conflicts/${enc(id)}/resolution`),
+  commit: (key: string) => request<ConflictsCommitted>("POST", `/api/diffs/${enc(key)}/conflicts/commit`, {}),
+};
+
+export const conflictsRes = (key: string): Res<Conflicts> => ({ key: `review/conflicts/${key}`, fetch: (s) => conflictsApi.list(key, s), opts: { on: ["conflict", "diff_version", "diff"] } });

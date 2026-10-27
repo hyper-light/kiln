@@ -166,10 +166,11 @@ async fn gate_threads(hub: &Hub, d: &Diff) -> Result<Vec<kiln_ci::review::Thread
 }
 
 /// The gate on `d` (W26-R11): for `asking`, whoever approves (their drafts count, since approving
-/// publishes them), or for no one, as merging and any automatic merge ask it. Conflicts join it as
-/// W26-R12 records them.
+/// publishes them), or for no one, as merging and any automatic merge ask it. Each conflict of its
+/// replay onto where it lands holds it until Commit resolution makes a revision of it (W26-R12).
 pub async fn gate_of(hub: &Hub, d: &Diff, asking: Option<&str>) -> Result<Gate, Fail> {
-    Ok(kiln_ci::review::gate(&gate_threads(hub, d).await?, &[], asking))
+    let conflicts = super::conflicts::for_gate(hub, d).await;
+    Ok(kiln_ci::review::gate(&gate_threads(hub, d).await?, &conflicts, asking))
 }
 
 /// A new comment: on a thread (`thread`), or a new thread on a version's `file`, `side` and
