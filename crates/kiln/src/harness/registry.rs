@@ -1805,6 +1805,7 @@ impl Registry {
                         left_behind: 0,
                         reach: spec.reach.clone(),
                         pause: None,
+                        room_wait: None,
                         last_turn: None,
                         keep_off: false,
                         held: None,

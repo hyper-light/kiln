@@ -484,9 +484,10 @@ fn step_under_way(core: &Core) -> bool {
 }
 
 /// A command on its way to the harness: a message sent while the session is paused (or at its
-/// stop point) joins the queue instead (None); anything else goes on.
+/// stop point), or while there's no room on its machine for it to go to work (`Core::has_room`),
+/// joins the queue instead (None); anything else goes on.
 pub fn let_through(core: &mut Core, c: Command) -> Option<Command> {
-    if !matches!(c, Command::Send { .. }) || !at_threshold(core) {
+    if !matches!(c, Command::Send { .. }) || (!at_threshold(core) && core.has_room()) {
         return Some(c);
     }
     if let Command::Send { id, text, attachments, overrides, task, .. } = c {
@@ -507,9 +508,10 @@ pub fn let_through(core: &mut Core, c: Command) -> Option<Command> {
 }
 
 /// Whether kiln's queue may send its next message now: not held for a switch, not paused, not at
-/// the stop point (which starts a pause).
+/// the stop point (which starts a pause), and room on its machine for it to go to work
+/// (`Core::has_room`: at work already, it has).
 pub fn open(core: &mut Core) -> bool {
-    !core.hold && !at_threshold(core)
+    !core.hold && !at_threshold(core) && core.has_room()
 }
 
 /// The job an `Effect::Checkpoint` comes back under (`run_done`), followed by the pause's start.
@@ -634,6 +636,33 @@ mod tests {
 
     fn window(id: &str, used: f64, resets_at: i64) -> Limit {
         Limit { id: id.to_owned(), label: if id == "five_hour" { "Session".into() } else { "Weekly".into() }, used_percent: Some(used), resets_at: Some(resets_at), ..Limit::default() }
+    }
+
+    /// No room on its machine for it to go to work (docs/agents.md, "How many agents a machine
+    /// runs"): a message waits in its queue, which waits too, its state saying since when; once
+    /// there's room, both go.
+    #[test]
+    fn without_room_on_its_machine_a_message_waits_in_the_queue() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let room = Arc::new(AtomicBool::new(false));
+        let mut core = Core::new();
+        let r = Arc::clone(&room);
+        core.room = Some(Arc::new(move || r.load(Ordering::SeqCst)));
+        let send = |id: &str| Command::Send { id: id.into(), text: "go on".into(), mode: crate::harness::model::SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+        assert!(let_through(&mut core, send("m1")).is_none(), "no room: it waits");
+        assert_eq!(core.state.queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), ["m1"]);
+        let since = core.state.room_wait;
+        assert!(since.is_some(), "its state says it waits for room");
+        assert!(!open(&mut core), "kiln's queue waits too");
+        assert_eq!(core.state.room_wait, since, "since it first did");
+        assert!(let_through(&mut core, Command::Interrupt).is_some(), "anything else goes on");
+        room.store(true, Ordering::SeqCst);
+        assert!(open(&mut core), "room: its queue goes");
+        assert_eq!(core.state.room_wait, None);
+        assert!(let_through(&mut core, send("m2")).is_some());
+        // A core of no machine's has room.
+        assert!(open(&mut Core::new()));
     }
 
     #[test]

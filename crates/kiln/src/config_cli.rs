@@ -115,10 +115,12 @@ fn show_set(key: &str, value: &str) -> String {
 
 /// When a change takes effect.
 fn when(key: &str) -> &'static str {
-    if key == "updates.accept" {
-        "This machine's runner reads it within a minute and tells its server; nothing needs restarting."
-    } else {
-        "kiln reads its config when it starts: restart it (its service) for this to take effect."
+    match key {
+        "updates.accept" => "This machine's runner reads it within a minute and tells its server; nothing needs restarting.",
+        "agent.max_agent_sessions" => {
+            "This machine's runner reads it within seconds, nothing restarting (a server reads its own as it starts); what's set for the machine on the server's Runners page wins over it."
+        }
+        _ => "kiln reads its config when it starts: restart it (its service) for this to take effect.",
     }
 }
 

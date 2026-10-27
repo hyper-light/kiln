@@ -931,6 +931,16 @@ impl Acp {
         }
     }
 
+    /// There may be room on its machine for it to go to work: what waits goes, as between turns.
+    pub fn room(&mut self, core: &mut Core) {
+        self.next(core);
+    }
+
+    /// It holds messages till its session can take them.
+    pub fn holds(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
     /// A pause ended: the turn it cut off goes on first, then kiln's queue.
     pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
         if p.cut.is_some() && !self.busy(core) && core.state.status != Status::Exited {
