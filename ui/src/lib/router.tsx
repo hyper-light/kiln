@@ -66,17 +66,19 @@ export function Navigate({ to, replace }: { to: string; replace?: boolean }) {
 }
 
 /** navigate("/runs/1?x=2", { replace }) or navigate(-1). */
-export function useNavigate(): (to: string | number, opts?: { replace?: boolean }) => void {
+export function useNavigate(): (to: string | number, opts?: { replace?: boolean; viewTransition?: boolean }) => void {
   const navigate = useTanNavigate();
   const router = useRouter();
   return React.useCallback(
-    (to: string | number, opts?: { replace?: boolean }) => {
+    (to: string | number, opts?: { replace?: boolean; viewTransition?: boolean }) => {
       if (typeof to === "number") {
         router.history.go(to);
         return;
       }
       const p = split(to);
-      void navigate({ to: p.pathname, search: p.search, hash: p.hash || undefined, replace: opts?.replace } as never);
+      // A view transition only while motion plays (kiln's own pause, or the device's reduced motion: motion.tsx).
+      const viewTransition = opts?.viewTransition && document.documentElement.dataset.motion !== "paused" ? true : undefined;
+      void navigate({ to: p.pathname, search: p.search, hash: p.hash || undefined, replace: opts?.replace, viewTransition } as never);
     },
     [navigate, router],
   );

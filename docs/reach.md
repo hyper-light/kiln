@@ -237,7 +237,7 @@ the MCP server's resources too.
 The timeline shows a `run` as the command itself, with its output, its exit code and "on beta", and a
 program by its first line.
 
-Per agent (New agents → More → Commands; `Spec.reach`): any runner it needs (the default), a
+Per agent (Mission control's composer → More options → Commands; `Spec.reach`): any runner it needs (the default), a
 runner or platform it prefers (`run` goes there unless the agent says otherwise), or only its own
 machine (no tools). An agent's **Where commands run…** changes it while it lives (the `reach`
 control): its harness takes the tools when it starts, so it starts again once its turn is over, the

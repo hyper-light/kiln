@@ -1,6 +1,7 @@
 /** What you can do to an agent, from its card or its page: open, interrupt, restart, rename, duplicate, move, where its commands run, end, remove, mute its notifications. */
 import * as React from "react";
 import { useNavigate } from "@/lib/router";
+import { startFrom } from "./new-agent-draft";
 import { DropdownMenu } from "radix-ui";
 import { Check, MoreHorizontal } from "lucide-react";
 import { harnessApi, type AgentInfo, type Command } from "@/api/harness";
@@ -15,7 +16,6 @@ import { MoveDialog } from "./move";
 import { useEndWithChildren } from "./family";
 
 const ReachDialog = React.lazy(() => import("./reach").then((m) => ({ default: m.ReachDialog })));
-const SpawnDialog = React.lazy(() => import("./spawn").then((m) => ({ default: m.SpawnDialog })));
 
 type Act = "end" | "remove" | "rename" | "duplicate" | "move" | "reach" | null;
 
@@ -58,7 +58,7 @@ export function useAgentActions(
     },
     { label: "Stop the current turn", onSelect: () => void command({ type: "interrupt" }, "interrupt it"), hidden: a.status !== "running" && a.status !== "waiting" },
     { label: "Restart", onSelect: () => void command({ type: "restart" }, "restart it"), hidden: live },
-    { label: "Duplicate…", onSelect: () => setAct("duplicate") },
+    { label: "Duplicate", onSelect: () => startFrom(navigate, { from: `Like ${a.name}`, kind: a.kind, target: a.target, cwd: a.cwd }) },
     // Agents the kiln server itself runs stay there.
     { label: "Move to…", onSelect: () => setAct("move"), hidden: !live || !a.target.startsWith("agent:") },
     { label: "Where commands run…", onSelect: () => setAct("reach"), hidden: !a.target.startsWith("agent:") },
@@ -133,20 +133,7 @@ export function useAgentActions(
         onConfirm={end}
       />
       {act === "move" && <MoveDialog agent={a} onClose={() => setAct(null)} />}
-      <React.Suspense fallback={null}>
-        {act === "reach" && <ReachDialog agent={a} onClose={() => setAct(null)} />}
-        {act === "duplicate" && (
-          <SpawnDialog
-            open
-            onOpenChange={(o) => !o && setAct(null)}
-            defaults={{ target: a.target, cwd: a.cwd, kind: a.kind }}
-            onStarted={(started) => {
-              setAct(null);
-              if (started.length === 1 && started[0]) navigate(`/agents/${started[0].id}`);
-            }}
-          />
-        )}
-      </React.Suspense>
+      <React.Suspense fallback={null}>{act === "reach" && <ReachDialog agent={a} onClose={() => setAct(null)} />}</React.Suspense>
     </>
   );
   return {
