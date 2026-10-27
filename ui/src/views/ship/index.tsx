@@ -29,6 +29,7 @@ import { SelectField } from "@/components/ui/misc";
 import { useGlide, useListHold } from "@/views/harness/list-tools";
 import { firstStage, JobCards } from "./jobs";
 import { ShipOutput } from "./output";
+import { ReviewFiles } from "./review";
 
 const LIMIT = 100;
 
@@ -306,28 +307,11 @@ function Dropdown({ commit }: { commit: ShipCommit }) {
   // The picked job card: yours once you click one, else the cards' rule; Output shows its job.
   const [stage, setStage] = React.useState<string | null>(null);
   const shown = stage ?? firstStage(commit);
-  const ch = commit.change;
   return (
     <div className="ship-open">
-      <section aria-label="Files" className="ship-sec">
-        <h3>Files</h3>
-        {ch ? (
-          <p>
-            {ch.name} · revision {ch.revision} of {ch.latest} · {ch.title}
-            {ch.open && ch.open.question + ch.open.nit + ch.open.issue + ch.open.blocking > 0 && (
-              <span className="ship-kinds">
-                {" "}
-                · {ch.open.blocking} blocking, {ch.open.issue} issues, {ch.open.nit} nits, {ch.open.question} questions
-              </span>
-            )}{" "}
-            {ch.host === "kiln" && <Link to={`/review/${ch.name}`}>Open its files and conversation</Link>}
-          </p>
-        ) : (
-          <p>
-            Commit <span className="ship-sha">{commit.short}</span> on {commit.branch || "its branch"}.
-          </p>
-        )}
-      </section>
+      {/* Dropdown boundary agreed with the Ship agent 01a1748c, 2026-10-26 20:28 PDT (NOTES.md):
+          Files (with the Conversation) first, owned by Review. */}
+      <ReviewFiles item={commit} />
       <section aria-label="Output" className="ship-sec">
         <h3>Output</h3>
         <Loadable label="Loading the output" className="ship-output-slot">

@@ -1124,6 +1124,70 @@ async fn blob(hub: &Hub, d: &Diff, v: &Version, q: &HashMap<String, String>) -> 
     Ok(srv::with_header(r, http::header::CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'; style-src 'unsafe-inline'"))
 }
 
+/// `GET /api/ship/commits/:repo/:sha/diff`: a commit with no change's diff from its parent, the
+/// same shape as a version's files (W26-R07; its Ship item's Files). The repository's own callers
+/// only (`runs.read`, as the row is).
+pub async fn ship_commit_diff(hub: &std::sync::Arc<Hub>, repo_key: &str, sha: &str, caller: &crate::authz::Caller) -> Result<Response, Fail> {
+    let (path, name) = commit_repo(hub, repo_key, sha, caller).await?;
+    let parent = gitops::run_git(hub, &["-C", &path, "rev-parse", "--verify", "--quiet", &format!("{sha}^")], LS_REMOTE_TIMEOUT)
+        .await
+        .map(|o| String::from_utf8_lossy(&o).trim().to_owned())
+        .unwrap_or_else(|_| "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned());
+    let stat = gitops::run_git(hub, &["-C", &path, "diff", "--numstat", "-z", "-M", &parent, sha], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
+    let status = gitops::run_git(hub, &["-C", &path, "diff", "--name-status", "-z", "-M", &parent, sha], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
+    let patch = gitops::run_git(hub, &["-C", &path, "diff", "--no-color", "-M", &parent, sha], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
+    let mut list = numstat(&String::from_utf8_lossy(&stat));
+    let statuses = name_status(&String::from_utf8_lossy(&status));
+    for f in &mut list {
+        let s = f.get("path").and_then(Value::as_str).and_then(|p| statuses.get(p));
+        if let (Some(o), Some(s)) = (f.as_object_mut(), s) {
+            o.insert("status".into(), json!(s));
+            o.insert("viewed".into(), json!(false));
+        }
+    }
+    const MAX: usize = 8 << 20;
+    let truncated = patch.len() > MAX;
+    let text = String::from_utf8_lossy(patch.get(..MAX.min(patch.len())).unwrap_or_default()).into_owned();
+    Ok(srv::json(StatusCode::OK, &json!({ "repo": name, "commit": sha, "parent": parent, "files": list, "patch": text, "truncated": truncated })))
+}
+
+/// `GET /api/ship/commits/:repo/:sha/blob?path=`: a file as it is at the commit, for the same
+/// Files' whole-file view; typed by its name, sandboxed, [`MAX_BLOB`] at most.
+pub async fn ship_commit_blob(hub: &std::sync::Arc<Hub>, repo_key: &str, sha: &str, q: &HashMap<String, String>, caller: &crate::authz::Caller) -> Result<Response, Fail> {
+    let (path, _) = commit_repo(hub, repo_key, sha, caller).await?;
+    let fpath = q
+        .get("path")
+        .map(String::as_str)
+        .filter(|p| !p.is_empty() && !p.starts_with('/') && !p.split('/').any(|x| x == ".." || x.is_empty()))
+        .ok_or((StatusCode::BAD_REQUEST, "`path`: a file of the repository".to_owned()))?;
+    let spec = format!("{sha}:{fpath}");
+    let size = gitops::run_git(hub, &["-C", &path, "cat-file", "-s", &spec], LS_REMOTE_TIMEOUT).await.map_err(|_| (StatusCode::NOT_FOUND, format!("no {fpath} there")))?;
+    let size: u64 = String::from_utf8_lossy(&size).trim().parse().unwrap_or(u64::MAX);
+    if size > MAX_BLOB {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("{fpath} is {size} bytes; at most {MAX_BLOB} are served")));
+    }
+    let bytes = gitops::run_git(hub, &["-C", &path, "cat-file", "blob", &spec], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
+    let r = srv::response(StatusCode::OK, content_type(fpath), srv::full(bytes));
+    let r = srv::with_header(r, http::header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    Ok(srv::with_header(r, http::header::CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'; style-src 'unsafe-inline'"))
+}
+
+/// The bare repository of `repo_key` (name or id) when `sha` exists in it and the caller may read
+/// the repository, else the API's "not found".
+async fn commit_repo(hub: &std::sync::Arc<Hub>, repo_key: &str, sha: &str, caller: &crate::authz::Caller) -> Result<(String, String), Fail> {
+    let repos = hub.store.repos().await.map_err(fail)?;
+    let repo = repos.into_iter().find(|r| r.name == repo_key || r.id == repo_key).ok_or((StatusCode::NOT_FOUND, "no such repository".to_owned()))?;
+    if !caller.can("runs.read", &Scope::Repo { repo: repo.name.clone() }) {
+        return Err((StatusCode::NOT_FOUND, "no such commit".to_owned()));
+    }
+    let path = super::hosting::native_path(hub, &repo).ok_or((StatusCode::NOT_FOUND, "the repository isn't hosted here".to_owned()))?;
+    let path = path.to_string_lossy().into_owned();
+    gitops::run_git(hub, &["-C", &path, "cat-file", "-e", &format!("{sha}^{{commit}}")], LS_REMOTE_TIMEOUT)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "no such commit".to_owned()))?;
+    Ok((path, repo.name))
+}
+
 /// A file's type by its name: images (and PDFs) as themselves, the rest as bytes.
 fn content_type(path: &str) -> &'static str {
     let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();

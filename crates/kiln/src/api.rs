@@ -455,9 +455,19 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // Ship's read model: a repository's commits and where each stands (plan 01a175b3a21174bc8769f5e784b90ecb).
         (&Method::GET, ["api", "ship", "commits"]) => boxed(|| crate::ship::list(&hub, &q, Some(&caller))).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ship", "commits", repo, sha]) => boxed(|| crate::ship::get(&hub, repo, sha, Some(&caller))).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ship", "commits", repo, sha, "diff"]) => boxed(|| crate::ci::diffs::ship_commit_diff(&hub, repo, sha, &caller)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ship", "commits", repo, sha, "blob"]) => boxed(|| crate::ci::diffs::ship_commit_blob(&hub, repo, sha, &q, &caller)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ship", "commits", owner, name, sha]) => {
             let repo = format!("{owner}/{name}");
             boxed(|| crate::ship::get(&hub, &repo, sha, Some(&caller))).await.map_err(|(c, m)| err(c, m))
+        }
+        (&Method::GET, ["api", "ship", "commits", owner, name, sha, "diff"]) => {
+            let repo = format!("{owner}/{name}");
+            boxed(|| crate::ci::diffs::ship_commit_diff(&hub, &repo, sha, &caller)).await.map_err(|(c, m)| err(c, m))
+        }
+        (&Method::GET, ["api", "ship", "commits", owner, name, sha, "blob"]) => {
+            let repo = format!("{owner}/{name}");
+            boxed(|| crate::ci::diffs::ship_commit_blob(&hub, &repo, sha, &q, &caller)).await.map_err(|(c, m)| err(c, m))
         }
         (_, ["api", "cd", rest @ ..]) => boxed(|| crate::cd::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "deploy", rest @ ..]) => boxed(|| crate::deploy::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),

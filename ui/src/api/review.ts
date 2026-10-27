@@ -501,3 +501,84 @@ export const conflictsApi = {
 };
 
 export const conflictsRes = (key: string): Res<Conflicts> => ({ key: `review/conflicts/${key}`, fetch: (s) => conflictsApi.list(key, s), opts: { on: ["conflict", "diff_version", "diff"] } });
+
+/** The threads of a change, with the gate as it stands for the caller approving (W26-R11). */
+export interface Comments {
+  threads: Thread[];
+  gate: ReviewGate | null;
+}
+
+export const commentsRes = (key: string): Res<Comments> => ({
+  key: `review/comments/${key}`,
+  fetch: (s) => request<{ threads: Thread[]; gate?: ReviewGate }>("GET", `/api/diffs/${enc(key)}/comments`, undefined, { signal: s }).then((r) => ({ threads: r.threads, gate: r.gate ?? null })),
+  opts: { on: ["comment", "review", "diff_version", "conflict"] },
+});
+
+/** A hit of a search across a change (W26-R07), vorpal's: where it is, its line's text, whether it's on a line the change touches or in a file it does. */
+export interface SearchHit {
+  path: string;
+  line: number;
+  column: number;
+  end_line: number;
+  text: string;
+  symbol: string | null;
+  kind: string | null;
+  changed: boolean;
+  in_change: boolean;
+}
+
+export interface SearchResult {
+  q: string;
+  hits: SearchHit[];
+  total: number;
+  truncated: boolean;
+  index?: string;
+}
+
+export const searchApi = {
+  /** A search across a diff's version (W26-R07): the lines the change touches first. */
+  version: (key: string, n: number, q: string, mode: "text" | "code" = "text", signal?: AbortSignal) =>
+    request<SearchResult>("GET", `/api/diffs/${enc(key)}/versions/${n}/search?q=${enc(q)}&mode=${mode}`, undefined, { signal }),
+  /** A search across a host's pull request, at its mirrored head. */
+  pull: (repo: string, n: number, q: string, mode: "text" | "code" = "text", signal?: AbortSignal) =>
+    request<SearchResult>("GET", `/api/ci/repos/${enc(repo)}/pulls/${n}/search?q=${enc(q)}&mode=${mode}`, undefined, { signal }),
+};
+
+export const searchRes = (key: string, n: number, q: string): Res<SearchResult> => ({ key: `review/search/${key}/${n}/${q}`, fetch: (s) => searchApi.version(key, n, q, "text", s) });
+export const pullSearchRes = (repo: string, n: number, q: string): Res<SearchResult> => ({ key: `review/pullsearch/${repo}/${n}/${q}`, fetch: (s) => searchApi.pull(repo, n, q, "text", s) });
+
+/** A commit with no change: its diff from its parent (the Ship dropdown's Files, W26-R07). */
+export interface CommitFiles {
+  commit: string;
+  parent: string;
+  files: ChangedFile[];
+  patch: string;
+  truncated: boolean;
+}
+
+export const commitApi = {
+  files: (repo: string, sha: string, signal?: AbortSignal) => request<CommitFiles>("GET", apiPath(`/api/ship/commits/${repo.split("/").map(enc).join("/")}/${enc(sha)}/diff`), undefined, { signal }),
+  blobUrl: (repo: string, sha: string, path: string) => apiPath(`/api/ship/commits/${repo.split("/").map(enc).join("/")}/${enc(sha)}/blob?path=${enc(path)}`),
+};
+
+export const commitFilesRes = (repo: string, sha: string): Res<CommitFiles> => ({ key: `review/commitfiles/${repo}/${sha}`, fetch: (s) => commitApi.files(repo, sha, s) });
+
+/** A file's text at a revision, for the whole-file view (`GET …/blob`, f21): nothing for binary files. */
+export const blobTextRes = (key: string, version: number, path: string, side: "old" | "new"): Res<string> => ({
+  key: `review/blob/${key}/${version}/${side}/${path}`,
+  fetch: async (s) => {
+    const r = await fetch(reviewApi.blobUrl(key, version, path, side), { signal: s });
+    if (!r.ok) throw new Error(`${path}: ${r.status}`);
+    return r.text();
+  },
+});
+
+/** A plain commit's file's text, the same view for a commit with no change. */
+export const commitBlobTextRes = (repo: string, sha: string, path: string): Res<string> => ({
+  key: `review/commitblob/${repo}/${sha}/${path}`,
+  fetch: async (s) => {
+    const r = await fetch(commitApi.blobUrl(repo, sha, path), { signal: s });
+    if (!r.ok) throw new Error(`${path}: ${r.status}`);
+    return r.text();
+  },
+});
