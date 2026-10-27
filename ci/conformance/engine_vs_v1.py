@@ -105,8 +105,8 @@ def failing_tests(log):
 class V1:
     side = "v1"
 
-    def rerun(self, run):
-        return self.s.post(f"/api/runs/{run['id']}/retry")
+    def rerun(self, run, failed_only=False):
+        return self.s.post(f"/api/runs/{run['id']}/retry", {"only_failed": failed_only})
 
     def __init__(self, server, name):
         self.s = server
@@ -139,8 +139,8 @@ class V1:
 class Engine:
     side = "engine"
 
-    def rerun(self, run):
-        return self.s.post(f"/api/ci/runs/{run['id']}/rerun")
+    def rerun(self, run, failed_only=False):
+        return self.s.post(f"/api/ci/runs/{run['id']}/rerun", {"mode": "failed" if failed_only else "all"})
 
     def __init__(self, server, name):
         self.s = server
@@ -239,8 +239,10 @@ def compare(rec, prod=None):
 
 def retry_timeouts(sides, sha, rec, prod, timeout):
     """`--retry-timeouts`: a job that timed out on one side only (on a machine shared with other
-    work, its timeout says as much about the load as the job) runs once more there: that side's
-    run of its workflow again, then the commit recorded anew, the first record kept in it."""
+    work, its timeout says as much about the load as the job) runs once more there: the jobs of
+    that side's run of its workflow that didn't succeed (others keep their results: ci-bench's
+    bench-gate would compare a second measure with the first), then the commit recorded anew, the
+    first record kept in it."""
     again = []
     for d in compare(rec, prod)["diffs"]:
         for s in sides:
@@ -251,7 +253,7 @@ def retry_timeouts(sides, sha, rec, prod, timeout):
     if not again:
         return rec
     for s, run, d in again:
-        print(f"  {s.side} {d['workflow']}/{d['job']} timed out there only: its run again ({s.rerun(run)})", flush=True)
+        print(f"  {s.side} {d['workflow']}/{d['job']} timed out there only: its run's unfinished jobs again ({s.rerun(run, failed_only=True)})", flush=True)
     time.sleep(60)
     runs, late = {}, rec.get("timed_out", False)
     for s in sides:
