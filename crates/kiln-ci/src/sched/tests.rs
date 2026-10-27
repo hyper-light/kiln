@@ -797,6 +797,64 @@ fn w05_r28_a_placed_retry() {
     assert!(assigned(&c, "e1", "c") && assigned(&c, "e2", "c"), "{c:?}");
 }
 
+/// W05-R16: "when one can take it" is one big enough to hold it. A leg lost with its runner goes
+/// back to it once it's back when the only other could never hold the leg: a share of 4 CPUs where
+/// the other has 2, and in resource mode, 6 CPUs asked where the other offers 2 (× 1.5). Found by
+/// kiln-sim's scheduler model (docs/sim.md): the leg waited for good for a runner too small for it.
+#[test]
+fn w05_r16_a_lost_leg_goes_back_when_no_other_runner_could_hold_it() {
+    let assigned = |c: &[Command], l: &str, r: &str, n: u32| c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt, .. } if leg == l && runner == r && *attempt == n));
+    let sized = |name: &str, cpus: u32, gib: u64| {
+        let mut r = linux(name, 2);
+        r.view.facts.cpu.threads = cpus;
+        r.view.facts.mem.total = gib << 30;
+        r
+    };
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(sized("big", 8, 16))), 0);
+    s.handle(Input::RunnerUp(Box::new(sized("small", 2, 4))), 0);
+    let share = LegIn { exclusive: true, request: Resources { cpu: Cpus::whole(4), mem: 4 << 30, ..Resources::default() }, ..leg("x", "acme/x", 60) };
+    let c = s.handle(Input::LegQueued(Box::new(share)), 0);
+    assert!(assigned(&c, "x", "big", 1), "{c:?}");
+    s.handle(Input::RunnerLost { runner: "big".into() }, 1);
+    let c = s.handle(Input::RunnerUp(Box::new(sized("big", 8, 16))), 2);
+    assert!(assigned(&c, "x", "big", 2), "small could never hold its share: {c:?}");
+    let offers = |name: &str, cpus: u64| {
+        let mut r = linux(name, 4);
+        r.capacity = Some(Resources { cpu: Cpus::whole(cpus), mem: 16 << 30, ..Resources::default() });
+        r
+    };
+    let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(offers("big", 8))), 0);
+    s.handle(Input::RunnerUp(Box::new(offers("small", 2))), 0);
+    let heavy = LegIn { request: Resources { cpu: Cpus::whole(6), mem: 1 << 30, ..Resources::default() }, ..leg("y", "acme/x", 60) };
+    let c = s.handle(Input::LegQueued(Box::new(heavy)), 0);
+    assert!(assigned(&c, "y", "big", 1), "{c:?}");
+    s.handle(Input::RunnerLost { runner: "big".into() }, 1);
+    let c = s.handle(Input::RunnerUp(Box::new(offers("big", 8))), 2);
+    assert!(assigned(&c, "y", "big", 2), "small could never hold what it asks: {c:?}");
+}
+
+/// W05-R13: a leg the only runner big enough to hold it refused waits for another, and says so
+/// (`other-runner`), though a smaller runner is eligible: it's no capacity that it waits for.
+#[test]
+fn w05_r13_a_leg_refused_by_the_only_runner_big_enough_says_so() {
+    let sized = |name: &str, cpus: u32| {
+        let mut r = linux(name, 2);
+        r.view.facts.cpu.threads = cpus;
+        r.view.facts.mem.total = 16 << 30;
+        r
+    };
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(sized("big", 8))), 0);
+    s.handle(Input::RunnerUp(Box::new(sized("small", 2))), 0);
+    let share = LegIn { exclusive: true, request: Resources { cpu: Cpus::whole(4), mem: 4 << 30, ..Resources::default() }, ..leg("x", "acme/x", 60) };
+    s.handle(Input::LegQueued(Box::new(share)), 0);
+    let c = s.handle(Input::Rejected { leg: "x".into() }, 1);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    assert_eq!(s.reason("x"), Some(&WaitReason::OtherRunner { avoided: "big".into(), refused: true, asked: false }));
+}
+
 // ------------------------------------------------------------------ pools (W13-R09, W05-R27)
 
 fn docker_host(name: &str) -> RunnerIn {

@@ -1424,10 +1424,29 @@ impl Scheduler {
         order.into_iter().map(|(_, r)| r.input.id.clone()).collect()
     }
 
-    /// Whether a runner other than `avoided` could take a leg: one connected, eligible for it, not
-    /// draining and allowed by its placement, with room now or not.
+    /// Whether a runner other than `avoided` could take a leg (W05-R16, "when one can take it"):
+    /// one connected, eligible for it, not draining, allowed by its placement and big enough to hold
+    /// it, with room now or not.
     fn another_could(&self, l: &Leg, avoided: &str) -> bool {
-        self.sigs.get(&l.sig).is_some_and(|s| s.eligible.iter().any(|id| id != avoided && l.input.placement.allows(id) && self.runners.get(id).is_some_and(|r| !r.draining)))
+        self.sigs.get(&l.sig).is_some_and(|s| s.eligible.iter().any(|id| id != avoided && l.input.placement.allows(id) && self.runners.get(id).is_some_and(|r| !r.draining && self.could_hold(r, l))))
+    }
+
+    /// Whether a runner is big enough to hold a leg (W05-R03): would it have room for it, idle. A
+    /// share within its size; in resource mode, a leg's request within its capacity × overcommit.
+    fn could_hold(&self, r: &Runner, l: &Leg) -> bool {
+        if l.req.pool.is_some() {
+            return true;
+        }
+        let c = self.config();
+        let size = size(r);
+        match claim(&l.input, size) {
+            Some(Claim::Whole) => true,
+            Some(Claim::Share(q)) => size.is_some_and(|s| q.cpu <= s.cpu && q.mem <= s.mem),
+            None => match (c.resources, r.input.capacity) {
+                (true, Some(cap)) => fits_beside(&Resources::default(), &Resources::default(), &cap, &l.input.request, c),
+                _ => true,
+            },
+        }
     }
 
     /// Tries again the runners that queued legs stay off only while another could take them
@@ -2733,10 +2752,13 @@ impl Scheduler {
             let busy = mine.iter().filter(|e| matches!(e.state, ExecState::Busy { .. })).count();
             return WaitReason::Capacity { eligible: mine.len(), busy, draining: 0 };
         }
+        // Only the runner it stays off could take it: the only one eligible, or the only one big
+        // enough to hold it (W05-R16, R13).
+        let could: Vec<&&Runner> = eligible.iter().filter(|r| self.could_hold(r, l)).collect();
         if let Some((a, off)) = &l.avoid
             && *off != Off::Lost
-            && !eligible.is_empty()
-            && eligible.iter().all(|r| r.input.id == *a)
+            && !could.is_empty()
+            && could.iter().all(|r| r.input.id == *a)
         {
             return WaitReason::OtherRunner { avoided: name(a), refused: *off == Off::Refused, asked: false };
         }

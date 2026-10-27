@@ -12,7 +12,8 @@
 //!   again.
 //! - Where a leg may run (W05-R19, R03, R16, R02): on a connected runner carrying every label it
 //!   asks for, with room for it, that it doesn't stay off: one that refused it, or one that lost it
-//!   while another that could take it is connected.
+//!   while another that could take it is connected (carrying its labels, and big enough: room for
+//!   it, idle).
 //! - Room (W05-R03): an exclusive leg asking for no CPUs, or on a runner whose size isn't known,
 //!   takes the whole runner, empty; one asking for CPUs holds them and the memory it asks, of what
 //!   no other share holds and the ordinary legs there don't take (a slot's share each in slots
@@ -426,11 +427,11 @@ impl Reference {
     }
 
     /// A runner the leg stays off: one that refused it; one that lost it, while another that
-    /// could take it is connected.
+    /// could take it is connected: one carrying its labels with room for it when idle.
     fn stays_off(&self, l: &Leg, runner: &str) -> bool {
         match &l.avoid {
             Some((r, Off::Refused)) => r == runner,
-            Some((r, Off::Lost)) => r == runner && self.runners.values().any(|o| o.input.id != runner && o.connected && carries(&o.input, &l.input)),
+            Some((r, Off::Lost)) => r == runner && self.runners.values().any(|o| o.input.id != runner && o.connected && carries(&o.input, &l.input) && room(&self.cfg, &o.input, &[], &l.input)),
             None => false,
         }
     }
