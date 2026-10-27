@@ -3501,7 +3501,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(kiln_events_outbox{job=\"$job\"})",
+          "expr": "sum(kiln_events_outbox_pending{job=\"$job\"})",
           "legendFormat": "rows waiting",
           "range": true,
           "instant": false
@@ -3635,7 +3635,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le, kind) (rate(kiln_events_delivery_seconds_bucket{job=\"$job\"}[5m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, kind) (rate(kiln_events_delivery_wait_seconds_bucket{job=\"$job\"}[5m])))",
           "legendFormat": "{{kind}} p50",
           "range": true,
           "instant": false
@@ -3646,7 +3646,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le, kind) (rate(kiln_events_delivery_seconds_bucket{job=\"$job\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, kind) (rate(kiln_events_delivery_wait_seconds_bucket{job=\"$job\"}[5m])))",
           "legendFormat": "{{kind}} p99",
           "range": true,
           "instant": false
@@ -3724,8 +3724,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (reader) (increase(kiln_events_missed_total{job=\"$job\"}[1h]))",
-          "legendFormat": "{{reader}} missed",
+          "expr": "sum by (kind) (increase(kiln_events_missed_total{job=\"$job\"}[1h]))",
+          "legendFormat": "{{kind}} missed",
           "range": true,
           "instant": false
         },
@@ -3746,7 +3746,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(kiln_events_unknown_total{job=\"$job\"}[1h]))",
+          "expr": "sum(increase(kiln_events_unknown_kind_total{job=\"$job\"}[1h]))",
           "legendFormat": "unknown kind",
           "range": true,
           "instant": false

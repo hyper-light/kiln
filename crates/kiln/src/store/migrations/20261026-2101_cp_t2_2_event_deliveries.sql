@@ -13,7 +13,7 @@ CREATE TABLE event_positions (
 );
 
 -- A delivery waits as `pending` until it's sent or given up: when it was logged, and when it may
--- be tried next (unix seconds).
+-- be tried next (unix milliseconds: a healthy delivery waits well under a second).
 ALTER TABLE webhook_deliveries ADD COLUMN first_at INTEGER;
 ALTER TABLE webhook_deliveries ADD COLUMN next_at INTEGER;
 CREATE INDEX webhook_deliveries_pending ON webhook_deliveries (status, integration, id);

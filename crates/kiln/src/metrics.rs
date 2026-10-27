@@ -618,23 +618,24 @@ pub struct EventsMetrics {
     /// Events said that couldn't be recorded, so won't be delivered.
     pub unrecorded: Counter,
     /// Outbox rows of a kind this build doesn't know (a later build's, after a rollback).
-    pub unknown: Counter,
+    pub unknown_kind: Counter,
     /// Outbox rows waiting to be relayed, as the relay last saw.
-    pub outbox: Gauge,
+    pub outbox_pending: Gauge,
     /// Deliveries the topic's readers logged, by kind (webhook, notify).
     pub logged: CounterVec,
     /// Tries of deliveries, by kind and result (sent, retry, failed, skipped).
     pub attempts: CounterVec,
-    /// Events a reader never took, the topic having let them go first, by reader.
+    /// Events a reader never took, the topic having let them go first, by its deliveries' kind.
     pub missed: CounterVec,
     /// How long a delivery waited from its logging to its sending, by kind.
-    pub delivery_seconds: HistogramVec,
+    pub delivery_wait: HistogramVec,
     /// Deliveries waiting to be sent, by kind, as their senders last counted.
     pub pending: GaugeVec,
 }
 
-/// A delivery's wait, from a second (sent at once) to a day (tried until given up).
-const EVENT_DELIVERY_BUCKETS: &[f64] = &[1.0, 5.0, 30.0, 60.0, 300.0, 1800.0, 3600.0, 21_600.0, 86_400.0];
+/// A delivery's wait, from a twentieth of a second (sent at once, where a healthy one's p50 and p99
+/// both fall) to a day (tried until given up).
+const EVENT_DELIVERY_BUCKETS: &[f64] = &[0.05, 0.25, 1.0, 5.0, 30.0, 60.0, 300.0, 1800.0, 3600.0, 21_600.0, 86_400.0];
 
 pub fn events() -> &'static EventsMetrics {
     static M: OnceLock<EventsMetrics> = OnceLock::new();
@@ -642,12 +643,12 @@ pub fn events() -> &'static EventsMetrics {
         relayed: Counter::default(),
         published: Counter::default(),
         unrecorded: Counter::default(),
-        unknown: Counter::default(),
-        outbox: Gauge::default(),
+        unknown_kind: Counter::default(),
+        outbox_pending: Gauge::default(),
         logged: CounterVec::new(&["kind"]),
         attempts: CounterVec::new(&["kind", "result"]),
-        missed: CounterVec::new(&["reader"]),
-        delivery_seconds: HistogramVec::new(&["kind"], EVENT_DELIVERY_BUCKETS),
+        missed: CounterVec::new(&["kind"]),
+        delivery_wait: HistogramVec::new(&["kind"], EVENT_DELIVERY_BUCKETS),
         pending: GaugeVec::new(&["kind"]),
     })
 }
@@ -664,18 +665,18 @@ fn render_events(o: &mut String) {
     let _ = writeln!(o, "kiln_events_published_total {}", m.published.get());
     help(o, "kiln_events_unrecorded_total", "counter", "Events said that couldn't be recorded, so won't be delivered.");
     let _ = writeln!(o, "kiln_events_unrecorded_total {}", m.unrecorded.get());
-    help(o, "kiln_events_unknown_total", "counter", "Outbox rows of a kind this build doesn't know (a later build's, after a rollback): they make no event.");
-    let _ = writeln!(o, "kiln_events_unknown_total {}", m.unknown.get());
-    help(o, "kiln_events_outbox", "gauge", "Outbox rows waiting to be relayed to kiln.events, as the relay last saw.");
-    let _ = writeln!(o, "kiln_events_outbox {}", m.outbox.get());
+    help(o, "kiln_events_unknown_kind_total", "counter", "Outbox rows of a kind this build doesn't know (a later build's, after a rollback): they make no event.");
+    let _ = writeln!(o, "kiln_events_unknown_kind_total {}", m.unknown_kind.get());
+    help(o, "kiln_events_outbox_pending", "gauge", "Outbox rows waiting to be relayed to kiln.events, as the relay last saw.");
+    let _ = writeln!(o, "kiln_events_outbox_pending {}", m.outbox_pending.get());
     help(o, "kiln_events_deliveries_logged_total", "counter", "Deliveries the readers of kiln.events logged, by kind (webhook, notify).");
     m.logged.render(o, "kiln_events_deliveries_logged_total");
     help(o, "kiln_events_delivery_attempts_total", "counter", "Tries of deliveries made from kiln.events, by kind and result (sent, retry, failed, skipped).");
     m.attempts.render(o, "kiln_events_delivery_attempts_total");
-    help(o, "kiln_events_missed_total", "counter", "Events a reader of kiln.events never took, the topic having let them go first, by reader.");
+    help(o, "kiln_events_missed_total", "counter", "Events a reader of kiln.events never took, the topic having let them go first, by the kind of its deliveries (webhook, notify).");
     m.missed.render(o, "kiln_events_missed_total");
-    help(o, "kiln_events_delivery_seconds", "histogram", "How long a delivery made from kiln.events waited from its logging to its sending, by kind.");
-    m.delivery_seconds.render(o, "kiln_events_delivery_seconds");
+    help(o, "kiln_events_delivery_wait_seconds", "histogram", "How long a delivery made from kiln.events waited from its logging to its sending, by kind.");
+    m.delivery_wait.render(o, "kiln_events_delivery_wait_seconds");
     help(o, "kiln_events_deliveries_pending", "gauge", "Deliveries made from kiln.events waiting to be sent, by kind, as their senders last counted.");
     m.pending.render(o, "kiln_events_deliveries_pending");
 }

@@ -142,14 +142,14 @@ kiln's events (above):
 |---|---|
 | `kiln_events_relayed_total` | Outbox rows the relay published to `kiln.events` and let go. |
 | `kiln_events_published_total` | Events published to `kiln.events` (a row makes none, one or several). |
-| `kiln_events_outbox` | Outbox rows waiting to be relayed, as the relay last saw. |
+| `kiln_events_outbox_pending` | Outbox rows waiting to be relayed, as the relay last saw. |
 | `kiln_events_unrecorded_total` | Events said that couldn't be recorded, so won't be delivered (a warning on target `kiln.events`). |
-| `kiln_events_unknown_total` | Outbox rows of a kind this build doesn't know (a later build's, after a rollback): they make no event. |
+| `kiln_events_unknown_kind_total` | Outbox rows of a kind this build doesn't know (a later build's, after a rollback): they make no event. |
 | `kiln_events_deliveries_logged_total{kind}` | Deliveries the topic's readers logged, by kind (`webhook`, `notify`). |
 | `kiln_events_delivery_attempts_total{kind,result}` | Tries of those deliveries, by kind and result: `sent`, `retry` (tried again later), `failed` (given up after a day, or never able to go), `skipped`. |
-| `kiln_events_delivery_seconds{kind}` | How long a delivery waited from its logging to its sending. |
+| `kiln_events_delivery_wait_seconds{kind}` | How long a delivery waited from its logging to its sending, from a twentieth of a second to a day. |
 | `kiln_events_deliveries_pending{kind}` | Deliveries waiting to be sent, as their senders last counted. |
-| `kiln_events_missed_total{reader}` | Events a reader never took, the topic having let them go first (a warning on target `kiln.events`). |
+| `kiln_events_missed_total{kind}` | Events a reader never took, the topic having let them go first, by the kind of its deliveries (`webhook`, `notify`; a warning on target `kiln.events`). |
 
 kiln's overview dashboard (`deploy/grafana/dashboards/kiln-overview.json`) has a "Live feed" row and
 an "Events" row of them.

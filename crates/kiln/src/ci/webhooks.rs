@@ -168,6 +168,10 @@ impl Reader for Webhooks {
         "webhooks"
     }
 
+    fn kind(&self) -> &'static str {
+        "webhook"
+    }
+
     fn plan<'a>(&'a self, hub: &'a Arc<Hub>, e: &'a Event) -> BoxFuture<'a, anyhow::Result<Logged>> {
         Box::pin(async move {
             if !EVENTS.iter().any(|(k, _)| *k == e.kind) {
@@ -185,7 +189,7 @@ impl Reader for Webhooks {
             if takers.is_empty() {
                 return Ok(Logged::none());
             }
-            let (now, kind, text) = (hub.clock.unix_s(), e.kind.clone(), body.to_string());
+            let (now, now_ms, kind, text) = (hub.clock.unix_s(), hub.clock.unix_ms(), e.kind.clone(), body.to_string());
             let rows: Vec<(String, String)> = takers.iter().map(|i| (i.name.clone(), delivery_id(e, &i.id))).collect();
             let targets = takers.into_iter().map(|i| i.name).collect();
             crate::metrics::events().logged.add(&["webhook"], u64::try_from(rows.len()).unwrap_or(0));
@@ -195,8 +199,8 @@ impl Reader for Webhooks {
                         let waiting: i64 = c.query_row("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'pending' AND integration = ?1", [&name], |r| r.get(0))?;
                         let (status, error) = if waiting >= BACKLOG { ("dropped", Some(format!("not sent: {BACKLOG} deliveries were waiting"))) } else { ("pending", None) };
                         c.execute(
-                            "INSERT INTO webhook_deliveries (ts, integration, event, delivery, status, attempts, error, body, first_at, next_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?1, ?1)",
-                            params![now, name, kind, delivery, status, error, text],
+                            "INSERT INTO webhook_deliveries (ts, integration, event, delivery, status, attempts, error, body, first_at, next_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?8)",
+                            params![now, name, kind, delivery, status, error, text, now_ms],
                         )?;
                     }
                     Ok(())
@@ -268,7 +272,7 @@ impl Log for Deliveries {
 
     fn due(&self, c: &Connection, target: &str) -> rusqlite::Result<Option<Due>> {
         c.query_row(
-            "SELECT id, COALESCE(first_at, ts), COALESCE(next_at, 0), attempts FROM webhook_deliveries WHERE status = 'pending' AND integration = ?1 ORDER BY id LIMIT 1",
+            "SELECT id, COALESCE(first_at, ts * 1000), COALESCE(next_at, 0), attempts FROM webhook_deliveries WHERE status = 'pending' AND integration = ?1 ORDER BY id LIMIT 1",
             [target],
             |r| Ok(Due { row: r.get(0)?, first_at: r.get(1)?, next_at: r.get(2)?, tries: r.get(3)? }),
         )

@@ -318,7 +318,7 @@ pub(crate) async fn relay_once(hub: &Hub, ready: &mut bool, stop: Option<Stop>) 
     let m = crate::metrics::events();
     m.relayed.add(u64::try_from(rows.len()).unwrap_or(0));
     let waiting = if rows.len() < BATCH { 0 } else { hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_outbox", [], |r| r.get::<_, i64>(0))?)).await? };
-    m.outbox.set(waiting);
+    m.outbox_pending.set(waiting);
     Ok(rows.len())
 }
 
@@ -420,7 +420,7 @@ async fn derive(hub: &Hub, kind: &str, fact: &Value) -> anyhow::Result<Vec<(Stri
         other => {
             // A kind a later build records (a rollback meets it): told, and passed over.
             tracing::warn!(target: "kiln.events", event = "unknown_kind", kind = %other, "an outbox row of a kind this build doesn't know; it makes no event");
-            crate::metrics::events().unknown.inc();
+            crate::metrics::events().unknown_kind.inc();
             Vec::new()
         }
     })
@@ -477,6 +477,8 @@ impl Logged {
 pub trait Reader: Send + Sync + 'static {
     /// Its position's name in `event_positions`.
     fn name(&self) -> &'static str;
+    /// Its deliveries' kind in metrics: its [`Log`]'s name.
+    fn kind(&self) -> &'static str;
     /// The deliveries `e` makes.
     fn plan<'a>(&'a self, hub: &'a Arc<Hub>, e: &'a Event) -> futures::future::BoxFuture<'a, anyhow::Result<Logged>>;
     /// Wakes the senders of `targets`, their deliveries logged.
@@ -547,7 +549,7 @@ async fn read_once<R: Reader>(hub: &Arc<Hub>, reader: &R) -> anyhow::Result<usiz
             // silently (a reader stopped longer than the topic keeps).
             let missed = first.saturating_sub(asked);
             tracing::warn!(target: "kiln.events", event = "behind", reader = name, asked, first, missed, "a reader of kiln's events fell behind what the topic keeps: those events make no delivery");
-            crate::metrics::events().missed.add(&[name], missed);
+            crate::metrics::events().missed.add(&[reader.kind()], missed);
             let (at, now) = (i64::try_from(first).unwrap_or(i64::MAX), hub.clock.unix_s());
             hub.store.call(move |c| Ok(c.execute("UPDATE event_positions SET next = ?2, updated_at = ?3 WHERE reader = ?1", params![name, at, now]).map(|_| ())?)).await?;
             return Ok(0);
@@ -601,8 +603,8 @@ async fn read_once<R: Reader>(hub: &Arc<Hub>, reader: &R) -> anyhow::Result<usiz
     Ok(took)
 }
 
-/// A delivery due to be tried: its row in its log, when it was logged, when it may go, and how
-/// many tries it had.
+/// A delivery due to be tried: its row in its log, when it was logged and when it may go (unix
+/// milliseconds), and how many tries it had.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Due {
     pub row: i64,
@@ -622,8 +624,8 @@ pub enum Tried {
     Done { status: &'static str, code: Option<u16>, error: Option<String> },
 }
 
-/// Where a delivery stands after a try: its status (`pending`, with when it may go next), the
-/// code and error the try had, and when it was.
+/// Where a delivery stands after a try: its status (`pending`, with when it may go next, unix
+/// milliseconds), the code and error the try had, and when it was (unix seconds).
 pub struct After<'a> {
     pub status: &'a str,
     pub code: Option<u16>,
@@ -710,7 +712,7 @@ impl<L: Log> Senders<L> {
                 }
             };
             let clock = Arc::clone(&hub.clock);
-            let now = clock.unix_s();
+            let now = clock.unix_ms();
             let Some(due) = due else {
                 drop(hub);
                 let woke = Box::pin(wake.notified());
@@ -719,29 +721,30 @@ impl<L: Log> Senders<L> {
             };
             if due.next_at > now {
                 drop(hub);
-                clock.sleep(Duration::from_secs(u64::try_from(due.next_at - now).unwrap_or(0))).await;
+                clock.sleep(Duration::from_millis(u64::try_from(due.next_at.saturating_sub(now)).unwrap_or(0))).await;
                 continue;
             }
             let tried = self.log.send(&hub, due.row).await;
-            let now = clock.unix_s();
+            let (now, now_ms) = (clock.unix_s(), clock.unix_ms());
             let tries = due.tries.saturating_add(1);
             let (status, code, error, next_at): (&str, Option<u16>, Option<String>, Option<i64>) = match tried {
                 Tried::Sent { code } => ("sent", code, None, None),
                 Tried::Done { status, code, error } => (status, code, error, None),
                 Tried::Failed { code, error } => {
-                    let given_up = now.saturating_sub(due.first_at) >= i64::try_from(RETRY_FOR.as_secs()).unwrap_or(i64::MAX);
+                    let given_up = now_ms.saturating_sub(due.first_at) >= i64::try_from(RETRY_FOR.as_millis()).unwrap_or(i64::MAX);
                     if given_up {
                         tracing::warn!(target: "kiln.events", event = "given_up", kind = name, target = %target, row = due.row, tries, error = %error, "a delivery was tried for a day and given up");
                         ("failed", code, Some(format!("{error} (given up after {tries} tries over a day)")), None)
                     } else {
-                        let wait = i64::try_from(backoff(tries).as_secs()).unwrap_or(i64::MAX);
-                        ("pending", code, Some(error), Some(now.saturating_add(wait)))
+                        let wait = i64::try_from(backoff(tries).as_millis()).unwrap_or(i64::MAX);
+                        ("pending", code, Some(error), Some(now_ms.saturating_add(wait)))
                     }
                 }
             };
             m.attempts.inc(&[name, if status == "pending" { "retry" } else { status }]);
             if status == "sent" {
-                m.delivery_seconds.observe(&[name], f64::from(i32::try_from(now.saturating_sub(due.first_at)).unwrap_or(i32::MAX)));
+                // Milliseconds: a healthy delivery waits well under a second.
+                m.delivery_wait.observe(&[name], f64::from(i32::try_from(now_ms.saturating_sub(due.first_at)).unwrap_or(i32::MAX)) / 1000.0);
             }
             let (log, row, error) = (Arc::clone(&self.log), due.row, error);
             let status = status.to_owned();

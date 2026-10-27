@@ -890,6 +890,10 @@ impl crate::events::Reader for Rules {
         "notify"
     }
 
+    fn kind(&self) -> &'static str {
+        "notify"
+    }
+
     fn plan<'a>(&'a self, hub: &'a Arc<Hub>, e: &'a crate::events::Event) -> futures::future::BoxFuture<'a, anyhow::Result<crate::events::Logged>> {
         Box::pin(async move {
             let mut sink = Sink::default();
@@ -926,7 +930,7 @@ impl crate::events::Reader for Rules {
             if sink.pending.is_empty() && sink.marks.is_empty() {
                 return Ok(crate::events::Logged::none());
             }
-            let now = hub.clock.unix_s();
+            let (now, now_ms) = (hub.clock.unix_s(), hub.clock.unix_ms());
             let mut targets: Vec<String> = sink.pending.iter().map(|p| p.spec.clone()).collect();
             targets.sort();
             targets.dedup();
@@ -942,8 +946,8 @@ impl crate::events::Reader for Rules {
                         delivery.truncate(32);
                         let message = serde_json::to_string(&p.msg).unwrap_or_default();
                         c.execute(
-                            "INSERT INTO notify_deliveries (ts, rule, event, run_id, channel, status, error, attempts, delivery, repo_id, message, first_at, next_at) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL, 0, ?6, ?7, ?8, ?1, ?1)",
-                            params![now, p.rule, p.event, p.about, p.spec, delivery, p.repo, message],
+                            "INSERT INTO notify_deliveries (ts, rule, event, run_id, channel, status, error, attempts, delivery, repo_id, message, first_at, next_at) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL, 0, ?6, ?7, ?8, ?9, ?9)",
+                            params![now, p.rule, p.event, p.about, p.spec, delivery, p.repo, message, now_ms],
                         )?;
                     }
                     Ok(())
@@ -970,7 +974,7 @@ impl crate::events::Log for Channels {
 
     fn due(&self, c: &rusqlite::Connection, target: &str) -> rusqlite::Result<Option<crate::events::Due>> {
         c.query_row(
-            "SELECT id, COALESCE(first_at, ts), COALESCE(next_at, 0), attempts FROM notify_deliveries WHERE status = 'pending' AND channel = ?1 ORDER BY id LIMIT 1",
+            "SELECT id, COALESCE(first_at, ts * 1000), COALESCE(next_at, 0), attempts FROM notify_deliveries WHERE status = 'pending' AND channel = ?1 ORDER BY id LIMIT 1",
             [target],
             |r| Ok(crate::events::Due { row: r.get(0)?, first_at: r.get(1)?, next_at: r.get(2)?, tries: r.get(3)? }),
         )

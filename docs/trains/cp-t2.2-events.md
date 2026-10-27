@@ -81,11 +81,11 @@ delivery keeps its body in kiln.db until it's sent or given up (a day).
 ## Watching it
 
 On production's `/metrics` and the overview dashboard's "Events" row (docs/bus.md, "Metrics"):
-- `kiln_events_outbox` stays near 0: rows waiting to be relayed. Growing: the relay can't publish
+- `kiln_events_outbox_pending` stays near 0: rows waiting to be relayed. Growing: the relay can't publish
   (a warning `relay_stopped` on target `kiln.events` says why).
 - `kiln_events_delivery_attempts_total{kind,result}`: `retry` and `failed` move when a subscriber
   or channel is down; `kiln_events_deliveries_pending{kind}` shows the backlog it holds.
-- `kiln_events_missed_total`, `kiln_events_unrecorded_total`, `kiln_events_unknown_total` stay at 0.
+- `kiln_events_missed_total`, `kiln_events_unrecorded_total`, `kiln_events_unknown_kind_total` stay at 0.
 - A start logs `relay_start` (rows published and not recorded, rows to publish) and
   `senders_start` (deliveries waiting) on target `kiln.events`; `kiln.bus`'s `persisted_refused`
   means the server runs without the persisted class.
@@ -120,7 +120,5 @@ The release before runs on what this one leaves:
 
 ## Open
 
-- Kiln Metrics' word on the `kiln_events_*` names.
 - The gate's 12 container tests, failing on adacachy's Docker (its address pools taken by another
   gate's leftover containers), to run again once they're gone.
-- Focal's and Mantle's agents told of the re-vendor (their Mac's disk was full).
