@@ -817,7 +817,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "harness", "changes"]) => boxed(|| own_op(&hub, &caller, "agents.changes", query_value(&q))).await,
         (&Method::GET, ["api", "harness", "agents", id, "workspace"]) => boxed(|| own_op(&hub, &caller, "agents.workspace", json!({ "agent": id }))).await,
-        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land")]) => {
+        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land" | "about")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
             // A send's idempotency key may come as the standard header (CP-T3.2).
             let key = idempotency_key(&req);
@@ -4409,10 +4409,13 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Ending a process found running is asked for with a take-over, never with a spec.
     body.spec.takeover_stop = false;
-    // Who started an agent, and the plan run it works for, are kiln's to say (`agents.start`,
-    // `plans.run`), never what's asked.
+    // Who started an agent, the plan run it works for, and whether it's that agent's subagent are
+    // kiln's to say (`agents.start`, `plans.run`, a goal stack's steps side by side), never what's
+    // asked.
     body.spec.parent = None;
     body.spec.plan_run = None;
+    body.spec.helper = None;
+    body.spec.subagent = false;
     // A workspace of its own is asked for by its kind alone (its machine makes it), and only of a
     // machine that can make one: one that can't would let it work in the folder itself, unasked.
     match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {
@@ -4486,8 +4489,9 @@ async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
 }
 
 /// Who a broadcast to `to` would reach (the same picking as the broadcast itself), the machines
-/// they are on, and what they understand: their catalogs (slash commands, modes, models, efforts)
-/// merged, each entry with `count`, how many of them have it, and `agents`, which.
+/// they are on, and what they understand: their catalogs (slash commands, modes, models, efforts,
+/// and the speeds past standard their models run at) merged, each entry with `count`, how many of
+/// them have it, and `agents`, which.
 async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
     #[derive(serde::Deserialize)]
     struct Body {
@@ -4498,8 +4502,8 @@ async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
     let picked = crate::harness::broadcast::pick(&among, &b.to);
     let mut machines: Vec<String> = Vec::new();
     // (field in each agent's meta, the key naming an entry, the entries seen with the agents that have them)
-    let mut merged: [(&str, &str, Vec<(serde_json::Value, Vec<String>)>); 4] =
-        [("commands", "name", Vec::new()), ("modes", "id", Vec::new()), ("models", "id", Vec::new()), ("efforts", "id", Vec::new())];
+    let mut merged: [(&str, &str, Vec<(serde_json::Value, Vec<String>)>); 5] =
+        [("commands", "name", Vec::new()), ("modes", "id", Vec::new()), ("models", "id", Vec::new()), ("efforts", "id", Vec::new()), ("speeds", "id", Vec::new())];
     for info in &picked {
         let machine = info.target.strip_prefix("agent:").unwrap_or(&info.target).to_owned();
         if !machines.contains(&machine) {
@@ -4527,14 +4531,14 @@ async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
             })
             .collect()
     };
-    let [(_, _, commands), (_, _, modes), (_, _, models), (_, _, efforts)] = merged;
+    let [(_, _, commands), (_, _, modes), (_, _, models), (_, _, efforts), (_, _, speeds)] = merged;
     let agents: Vec<serde_json::Value> = picked
         .iter()
         .map(|i| json!({"id": i.id, "name": i.name, "machine": i.target.strip_prefix("agent:").unwrap_or(&i.target), "kind": i.kind, "status": i.status}))
         .collect();
     Ok(srv::json(
         StatusCode::OK,
-        &json!({"agents": agents, "machines": machines, "commands": counted(commands), "modes": counted(modes), "models": counted(models), "efforts": counted(efforts)}),
+        &json!({"agents": agents, "machines": machines, "commands": counted(commands), "modes": counted(modes), "models": counted(models), "efforts": counted(efforts), "speeds": counted(speeds)}),
     ))
 }
 

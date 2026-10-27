@@ -114,8 +114,9 @@ enum Cmd {
     Spawn(kiln::harness::cli::SpawnArgs),
     /// List, stop, interrupt or message this kiln shell's agents.
     Agents(kiln::harness::cli::AgentsArgs),
-    /// Run a command on another runner (`--on linux/amd64`, `--on <name>`): this repo is synced over
-    /// first, output streams back, and the exit code is the command's.
+    /// Run a command on a runner that has what it needs (`--needs cpus=8,mem=32g,linux/amd64`), or
+    /// on one by name (`--on <name>`): this repo is synced over first, output streams back, and the
+    /// exit code is the command's.
     Run(kiln::reach::cli::RunArgs),
     /// The runners commands can run on, best first for what you need (`kiln runners linux`); a
     /// runner's facts (`kiln runners facts <name>`, `probe <name>` to have it probe them again).

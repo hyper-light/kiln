@@ -7,6 +7,7 @@
 //! - [`demand`]: demands, the work in flight, and what becomes of work no one wants (W28-R40 to R44).
 //! - [`groups`]: concurrency groups.
 //! - [`intent`]: priority by intent: gate, waiting, trunk, work in progress (W28-R64, R65).
+//! - [`needs`]: what work needs of a runner, in one grammar (docs/runners.md).
 //! - [`retry`]: retry policies and failure classes.
 //! - [`routing`]: requirements, rules, eligibility, preferences, explanations.
 //! - [`pools`]: pools of executors kiln starts and stops (W13-R09).
@@ -20,6 +21,7 @@ pub mod demand;
 pub mod load;
 pub mod groups;
 pub mod intent;
+pub mod needs;
 pub mod pools;
 pub mod reserve;
 pub mod retry;

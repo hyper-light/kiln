@@ -1011,6 +1011,27 @@ async function handleAttached(req: http.IncomingMessage, res: http.ServerRespons
   return false;
 }
 
+/** What a person asked about (agents.about), and the helpers answering. */
+interface AboutQ {
+  path: string;
+  line?: number;
+  selection?: string;
+  change?: boolean;
+}
+const helpers = new Map<string, { at: number; q: AboutQ; name: string }>();
+let aboutSeq = 0;
+
+/** A helper's answer, in the four parts (ABOUT_PARTS in crates/kiln/src/harness/ops.rs). */
+function aboutAnswer(q: AboutQ): [string, string][] {
+  const what = q.change ? "This change" : q.selection ? `\`${q.selection}\`` : `Line ${q.line ?? ""}`;
+  return [
+    ["What it is", `${what}, in \`${q.path}\`${q.line ? ` at line ${q.line}` : ""}: the retry delay for the next attempt, from 100 ms doubling with each one, with full jitter, at most 30 s.`],
+    ["What it does here", "It picks how long this loop sleeps before trying again; `.min(deadline - now)` keeps the last sleep from running past the request's deadline."],
+    ["Used elsewhere", "- `crates/kiln/src/http/retry.rs:31` `pub fn next(&mut self, now: Instant) -> Duration {`\n- `crates/kiln/src/rt/timer.rs:88` `let wait = reconnect.next(now);`\n- `crates/kiln/tests/retry.rs:24` `assert!(b.next(t0) <= Duration::from_millis(200));`"],
+    ["Worth knowing", "It counts attempts, so calling it twice in one pass skips a step. **The test at `tests/retry.rs:24` is the flaky one**: it compares against wall-clock time the jitter can overshoot."],
+  ];
+}
+
 export async function handleFamily(req: http.IncomingMessage, res: http.ServerResponse, url: URL, others: () => AgentInfo[]): Promise<boolean> {
   if (await handleRun(req, res, url)) return true;
   if (await handleAttached(req, res, url)) return true;
@@ -1061,6 +1082,48 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
       until: "settled",
       agents: ids.map((id) => all().find((a) => a.id === id)).map((a, i) => (a ? brief(a) : { id: ids[i], stand: "ended", closed: true })),
     });
+    return true;
+  }
+  // agents.about: a helper of the agent reads, searches, then answers in four parts, a part a moment, as a real one streams.
+  const ab = p.match(/^\/api\/harness\/agents\/([^/]+)\/about$/);
+  if (ab && m === "POST") {
+    const q = await body<AboutQ>(req);
+    const owner = all().find((x) => x.id === decodeURIComponent(ab[1] ?? ""));
+    if (!owner) json(res, 404, { error: "no such agent" });
+    else if (owner.max_subagents === 0) json(res, 200, { agents: [], itself: true, sent: { sent: true } });
+    else {
+      const id = `about-${++aboutSeq}`;
+      const name = `About ${q.selection ?? q.path.split("/").pop() ?? "this"}`;
+      helpers.set(id, { at: Date.now(), q, name });
+      json(res, 200, { agents: [{ id, name, kind: owner.kind, status: "running", stand: "working" }], itself: false });
+    }
+    return true;
+  }
+  const hr = p.match(/^\/api\/harness\/agents\/(about-\d+)\/(result|stop)$/);
+  if (hr) {
+    const id = hr[1] ?? "";
+    const h = helpers.get(id);
+    if (!h) json(res, 404, { error: "it ended" });
+    else if (hr[2] === "stop") {
+      helpers.delete(id);
+      json(res, 200, { ended: [id] });
+    } else {
+      const t = (Date.now() - h.at) / 1000;
+      const parts = aboutAnswer(h.q);
+      const shown = Math.max(0, Math.min(parts.length, Math.floor((t - 1.6) / 0.9) + 1));
+      const done = t > 1.6 + parts.length * 0.9;
+      const text = parts
+        .slice(0, shown)
+        .map(([head, said]) => `## ${head}\n${said}`)
+        .join("\n\n");
+      const doing = t < 0.8 ? `Reading ${h.q.path}` : t < 1.6 ? `Searching the repository for “${h.q.selection ?? "this"}”` : undefined;
+      json(res, 200, {
+        agent: { id, name: h.name, kind: "claude", status: "running", stand: done ? "finished" : "working", doing, model: "sonnet" },
+        reply: text ? { text, at: Date.now() } : null,
+        last_turn: done ? { ok: true } : null,
+        cost_usd: done ? 0.01 : 0,
+      });
+    }
     return true;
   }
   const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt|change|workspace|land))?$/);

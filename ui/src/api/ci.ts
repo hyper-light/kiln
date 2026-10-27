@@ -957,8 +957,10 @@ export function waitSentence(w: unknown): string | null {
     in_flight?: number;
     runner?: string;
     saves_s?: number;
-    asked?: boolean;
+    /** Whether its retry asked for another runner (`avoided`), or what it asks for that no runner can hold. */
+    asked?: boolean | string;
     state?: string;
+    short?: string[];
   };
   const list = (xs?: string[]) => (xs && xs.length ? `: ${xs.join(", ")}` : "");
   // A lane is a repository's workflow on a branch (W28-R60): its workflow and branch.
@@ -967,6 +969,8 @@ export function waitSentence(w: unknown): string | null {
   switch (o.reason) {
     case "capacity":
       return `Waiting for a free runner: ${o.eligible ?? 0} can take it, ${o.busy ?? 0} busy${o.draining ? `, ${o.draining} draining` : ""}.`;
+    case "oversized":
+      return `It asks for more than any runner that can take it has (${o.asked ?? "its request"})${list(o.short)}.`;
     case "no-runner":
       return `No runner that can take it is connected${list(o.offline)}.`;
     case "unroutable":

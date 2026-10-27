@@ -455,18 +455,22 @@ fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config 
 }
 
 /// What a leg asks of its runner in resource mode (W05-R03): its job's `resources:` (kiln's: `{
-/// cpu, memory, disk, gpu }`), else `[ci.scheduler] default_request`.
+/// cpu, memory, disk, gpu }`), read as its needs are (`sched::needs`), else `[ci.scheduler]
+/// default_request`. An exclusive leg's is its own alone: what it asked is what it holds of its
+/// runner, and asking nothing, it holds the whole runner (the default request never makes it a
+/// share).
 fn request_of(job: Option<&kiln_ci::wf::ir::Job>, cfg: &crate::config::ci::Ci) -> kiln_ci::sched::state::Resources {
-    use kiln_ci::wf::ir::YVal;
-    let asked = job.and_then(|j| j.kiln.resources.as_ref()).map(|v| {
-        let text = |k: &str| match v.get(k) {
-            Some(YVal::Str(t)) => Some(t.src.clone()),
-            Some(YVal::Num(n)) => Some(n.to_string()),
-            _ => None,
-        };
-        kiln_ci::sched::pools::ResourceSpec { cpu: text("cpu"), memory: text("memory"), disk: text("disk"), gpu: text("gpu").and_then(|g| g.trim().parse().ok()) }
-    });
-    asked.and_then(|a| a.resources().ok()).or_else(|| cfg.scheduler.default_request.resources().ok()).unwrap_or_default()
+    let asked = asked_of(job);
+    if job.is_some_and(|j| j.kiln.exclusive) {
+        return asked.unwrap_or_default();
+    }
+    asked.or_else(|| cfg.scheduler.default_request.resources().ok()).unwrap_or_default()
+}
+
+/// A job's own `resources:`, read as its needs are (`sched::needs`), when it says one that's a
+/// quantity.
+fn asked_of(job: Option<&kiln_ci::wf::ir::Job>) -> Option<kiln_ci::sched::state::Resources> {
+    job.and_then(|j| j.kiln.resources.as_ref()).map(kiln_ci::sched::needs::resource_spec).and_then(|a| a.resources().ok())
 }
 
 /// What a leg's executor holds it to (W05-R03): in resource mode, the memory it was given, which a
@@ -1238,7 +1242,8 @@ impl Dispatch {
             Some(f) => (**f).clone(),
             None => {
                 let mut executors = std::collections::BTreeMap::new();
-                if caps & CAP_DOCKER != 0 {
+                // Never on Windows (`crate::runner::probe`'s executors).
+                if caps & CAP_DOCKER != 0 && a.os != "windows" {
                     let rootless = caps & crate::proto::CAP_DOCKER_ROOTLESS != 0;
                     executors.insert("docker".to_owned(), kiln_ci::facts::Executor { details: [("rootless".to_owned(), rootless.to_string())].into(), ..kiln_ci::facts::Executor::default() });
                 }
@@ -2422,6 +2427,8 @@ impl Dispatch {
             if let Some(ag) = g.get_mut(runner) {
                 ag.running.push(leg.to_owned());
                 ag.busy = u32::try_from(ag.running.len()).unwrap_or(u32::MAX);
+                // What it holds there, so the v1 dispatcher packs its jobs beside it (W05-R03).
+                crate::hub::hold_on(ag, leg, kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default()));
             }
         }
         if let Some(l) = self.legs.get_mut(leg) {
@@ -2683,6 +2690,9 @@ impl Dispatch {
             // The job's warm workspace (`work: { warm }`, W24-R11), kept by its runner per lane.
             warm: job.and_then(|j| kiln_ci::work::slots::warm(j.kiln.work.as_ref())),
             cold: r.cold,
+            // Exclusive, it has its runner to itself: the share it asked for, or the whole runner.
+            exclusive: job.is_some_and(|j| j.kiln.exclusive),
+            holds: job.filter(|j| j.kiln.exclusive).and_then(|j| asked_of(Some(j))).filter(|q| q.cpu > 0.0),
         }
     }
 
@@ -3457,5 +3467,25 @@ mod tests {
         let given = serde_json::json!({ "memory": 17179869184u64, "cpus": 4 });
         assert_eq!(super::with_docker(given, "socket"), serde_json::json!({ "memory": 17179869184u64, "cpus": 4, "docker": "socket" }));
         assert_eq!(super::with_docker(serde_json::Value::Null, "socket"), serde_json::json!({ "docker": "socket" }), "slot mode: Docker alone");
+    }
+
+    /// W05-R03: a leg's request in resource mode is its job's `resources:`, read as its needs are
+    /// (`sched::needs`), else `[ci.scheduler] default_request`.
+    #[test]
+    fn w05_r03_a_legs_request_is_its_jobs_resources() -> anyhow::Result<()> {
+        use kiln_ci::sched::state::Resources;
+        let job = |resources: &str| {
+            let src = format!("on: push\njobs:\n  build:\n    runs-on: linux\n{resources}    steps:\n      - run: make\n");
+            let (wf, diags) = kiln_ci::wf::parse_workflow(".kiln/ci.yaml", &src, kiln_ci::expr::Dialect::Kiln);
+            wf.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("{diags:?}"))
+        };
+        let mut cfg = crate::config::ci::Ci::default();
+        cfg.scheduler.default_request = kiln_ci::sched::pools::ResourceSpec { cpu: Some("1".into()), memory: Some("2Gi".into()), ..Default::default() };
+        let asked = job("    resources:\n      cpu: 8\n      memory: 32Gi\n")?;
+        assert_eq!(super::request_of(Some(&asked), &cfg), Resources { cpu: 8.0, mem: 32 << 30, ..Resources::default() });
+        let fallback = Resources { cpu: 1.0, mem: 2 << 30, ..Resources::default() };
+        assert_eq!(super::request_of(Some(&job("")?), &cfg), fallback);
+        assert_eq!(super::request_of(None, &cfg), fallback);
+        Ok(())
     }
 }
