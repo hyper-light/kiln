@@ -113,8 +113,9 @@ pub struct ServerBook {
     revoked: std::collections::HashSet<String>,
     /// Each peer's key (its SPKI's SHA-256, hex), and the keys revoked (W27-R01): recorded in the
     /// store, loaded at start, so a restart keeps them and re-enrolling a name doesn't undo them.
+    /// Each revoked key maps to its refusal: when, why and by whom (`revoked at ... (why, by who)`).
     keys: HashMap<PeerId, String>,
-    revoked_keys: std::collections::HashSet<String>,
+    revoked_keys: HashMap<String, String>,
 }
 
 fn cert_name(der: &[u8]) -> Option<String> {
@@ -133,13 +134,13 @@ impl Directory for ServerBook {
     fn identify(&mut self, a: &Authenticated<'_>) -> Option<(PeerId, Role)> {
         let der = a.certificate?;
         let name = cert_name(der)?;
-        // A machine named as the server (a certificate from before machines couldn't be) is none.
-        if self.revoked.contains(&name) || crate::pki::reserved(&name) {
+        let key = crate::pki::key_sha256(der)?;
+        if let Some(why) = self.revoked_keys.get(&key) {
+            tracing::warn!(agent = %name, key = %key, "refused a revoked certificate: {why}");
             return None;
         }
-        let key = crate::pki::key_sha256(der)?;
-        if self.revoked_keys.contains(&key) {
-            tracing::warn!(agent = %name, key = %key, "refused a revoked certificate");
+        // A machine named as the server (a certificate from before machines couldn't be) is none.
+        if self.revoked.contains(&name) || crate::pki::reserved(&name) {
             return None;
         }
         let peer = peer_of(der);
@@ -179,8 +180,9 @@ pub enum Out {
     /// Accept that agent name again (an admin approved a new machine under it).
     Unrevoke { name: String },
     /// Refuse certificates for these keys (SPKI SHA-256, hex) from now on, and drop the peers
-    /// connected with them (W27-R01). Never undone: a machine enrolling again has a new key.
-    RevokeKeys { keys: Vec<String> },
+    /// connected with them (W27-R01). Never undone: a machine enrolling again has a new key. `why`
+    /// is the refusal said for each (`crate::identities::refusal`).
+    RevokeKeys { keys: Vec<String>, why: String },
     /// Agent side: dial the server.
     Connect { addr: SocketAddr },
     /// Drop the endpoint and build a new one (fresh socket and runtime); an agent re-dials.
@@ -310,8 +312,8 @@ pub struct Spec {
     /// Agent side: a dial with no answer in this long is abandoned and reported `Unreachable`.
     pub dial_deadline: Duration,
     /// Server side: the keys (SPKI SHA-256, hex) whose certificates are refused from the start
-    /// (W27-R01, `crate::identities::revoked_keys`).
-    pub revoked_keys: Vec<String>,
+    /// (W27-R01, `crate::identities::revoked_keys`), each with its refusal.
+    pub revoked_keys: Vec<(String, String)>,
 }
 
 /// How long an agent's dial may go unanswered (a server that is down, or not routable yet at
@@ -735,12 +737,15 @@ async fn run_loop(
                                 d.endpoint().directory_mut().revoked.remove(&name);
                             }
                         }
-                        Out::RevokeKeys { keys } => {
+                        Out::RevokeKeys { keys, why } => {
                             if let AnyDriver::Server(d) = &mut driver {
                                 let now = clock!(d);
                                 let book = d.endpoint().directory_mut();
                                 let peers: Vec<PeerId> = book.keys.iter().filter(|(_, k)| keys.contains(k)).map(|(p, _)| *p).collect();
-                                book.revoked_keys.extend(keys);
+                                // The first revocation of a key is the one it's refused for.
+                                for k in keys {
+                                    book.revoked_keys.entry(k).or_insert_with(|| why.clone());
+                                }
                                 for p in peers {
                                     d.endpoint().disconnect(now, p);
                                 }
@@ -928,7 +933,7 @@ mod tests {
             let (agent, _agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: old.clone(), server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
             agent.command(Out::Connect { addr: a1 }).await;
             let peer = connected_within(&srv_ev, Duration::from_secs(10)).await.ok_or_else(|| anyhow::anyhow!("never connected"))?;
-            srv.command(Out::RevokeKeys { keys: vec![old_key.clone()] }).await;
+            srv.command(Out::RevokeKeys { keys: vec![old_key.clone()], why: "revoked at 2026-10-26T21:00:00Z (runner forgotten, by ada)".into() }).await;
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 match next_event(&srv_ev, deadline).await? {
@@ -940,7 +945,7 @@ mod tests {
             assert_eq!(connected_within(&srv_ev, Duration::from_secs(3)).await, None, "a revoked key comes back: refused");
             // A server started with the key revoked (a restart reading the store).
             let a2 = addr(std::net::UdpSocket::bind("127.0.0.1:0")?)?;
-            let (_srv2, srv2_ev) = start(Spec { bind: a2, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: vec![old_key] })?;
+            let (_srv2, srv2_ev) = start(Spec { bind: a2, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: vec![(old_key, "revoked at 2026-10-26T21:00:00Z (runner forgotten, by ada)".into())] })?;
             agent.command(Out::Connect { addr: a2 }).await;
             assert_eq!(connected_within(&srv2_ev, Duration::from_secs(3)).await, None, "refused from the first handshake");
             let (agent2, _ev2) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: new, server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;

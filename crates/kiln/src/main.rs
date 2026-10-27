@@ -227,6 +227,12 @@ enum Cmd {
     Roles(kiln::authz::cli::RolesArgs),
     /// Personal access tokens and agent tokens: create (shown once), list, revoke, rotate.
     Tokens(kiln::authz::cli::TokensArgs),
+    /// The certificates kiln's CA issued (machines, runner processes, agents, legs, people, the
+    /// server and CD): list, revocations, revoke.
+    Identities(kiln::identities::IdentitiesArgs),
+    /// Forget a runner: it's removed and its certificates revoked from now on; enrolling the
+    /// machine again brings a new certificate.
+    Forget(kiln::identities::ForgetArgs),
     /// The fleet's kiln versions and update policies: list, policy, upgrade, build.
     Updates(kiln::updates_cli::UpdatesArgs),
     /// This machine's kiln config: path, show, get, set, unset (by dotted key).
@@ -973,6 +979,14 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Tokens(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             boxed(|| kiln::authz::cli::tokens(a, &cfg)).await
+        }
+        Cmd::Identities(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::identities::cli(a, &cfg)).await
+        }
+        Cmd::Forget(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::identities::forget(a, &cfg)).await
         }
         Cmd::Updates(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();

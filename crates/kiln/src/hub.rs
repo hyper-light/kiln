@@ -1228,9 +1228,10 @@ impl Hub {
     pub async fn forget_agent(&self, agent: &str, by: &str) -> anyhow::Result<()> {
         // Its certificates are revoked for good, recorded so a restart keeps it, and refused at
         // once (W27-R01); enrolling again under the name brings a new key.
-        let keys = crate::identities::revoke(&self.store, crate::identities::Target::Subject(agent.to_owned()), "runner forgotten", by, crate::util::now_unix()).await?;
+        let at = crate::util::now_unix();
+        let keys = crate::identities::revoke(&self.store, crate::identities::Target::Subject(agent.to_owned()), "runner forgotten", by, at).await?;
         if !keys.is_empty() {
-            self.net.command(crate::net::Out::RevokeKeys { keys }).await;
+            self.net.command(crate::net::Out::RevokeKeys { keys, why: crate::identities::refusal(at, "runner forgotten", by) }).await;
         }
         let mut peers: Vec<PeerId> = self.agents.lock().remove(agent).and_then(|a| a.peer).into_iter().collect();
         peers.extend(self.instances.lock().of(agent));

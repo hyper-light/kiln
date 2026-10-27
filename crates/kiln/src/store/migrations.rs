@@ -182,6 +182,34 @@ mod tests {
         Ok(())
     }
 
+    /// W27-R01: the identities and revocations tables keep each certificate issued (serial, kind,
+    /// subject, key, validity, issued at) and each revocation (serial or key, at, reason, by); a
+    /// revocation naming neither is refused; applying again changes nothing; no epoch is raised.
+    #[test]
+    fn w27_r01_identities_and_revocations_tables() -> anyhow::Result<()> {
+        const MINE: &str = "20261026-1800_w27_identities";
+        let mut c = Connection::open_in_memory()?;
+        c.execute_batch(crate::store::SCHEMA)?;
+        let (before, after): (Vec<(&str, &str)>, Vec<(&str, &str)>) = MIGRATIONS.iter().copied().partition(|(n, _)| *n < MINE);
+        apply_list(&mut c, &before)?;
+        assert!(after.first().is_some_and(|(n, _)| *n == MINE), "{MINE} is shipped");
+        apply_list(&mut c, &after)?;
+        assert!(apply_list(&mut c, MIGRATIONS)?.is_empty(), "applying again changes nothing");
+        let columns = |table: &str| -> anyhow::Result<Vec<String>> { Ok(c.prepare(&format!("SELECT name FROM pragma_table_info('{table}') ORDER BY cid"))?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?) };
+        assert_eq!(columns("identities")?, ["serial", "kind", "subject", "key_sha256", "not_before", "not_after", "issued_at", "cert_pem"]);
+        assert_eq!(columns("revocations")?, ["id", "serial", "key_sha256", "subject", "at", "reason", "by"]);
+        c.execute("INSERT INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at) VALUES ('0a', 'machine', 'fedora-2', 'k1', 1, 2, 1)", [])?;
+        assert!(c.execute("INSERT INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at) VALUES ('0a', 'machine', 'fedora-2', 'k2', 1, 2, 1)", []).is_err(), "a serial is issued once");
+        c.execute("INSERT INTO revocations (serial, subject, at, reason, by) VALUES ('0a', 'fedora-2', 1790000000, 'runner forgotten', 'ada')", [])?;
+        c.execute("INSERT INTO revocations (key_sha256, subject, at, reason, by) VALUES ('k1', 'fedora-2', 1790000001, 'key lost', 'sam')", [])?;
+        assert!(c.execute("INSERT INTO revocations (subject, at, reason, by) VALUES ('fedora-2', 1, 'x', 'ada')", []).is_err(), "a revocation names a serial or a key");
+        assert!(c.execute("INSERT INTO revocations (serial, subject, at, by) VALUES ('0a', 'fedora-2', 1, 'ada')", []).is_err(), "a revocation says why");
+        let (at, reason, by): (i64, String, String) = c.query_row("SELECT at, reason, by FROM revocations WHERE serial = '0a'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        assert_eq!((at, reason.as_str(), by.as_str()), (1_790_000_000, "runner forgotten", "ada"));
+        assert_eq!(read_min_reader(&c)?, 0, "no epoch raised: older builds still open it");
+        Ok(())
+    }
+
     #[test]
     fn shipped_epochs_are_this_builds() {
         for (name, sql) in MIGRATIONS {

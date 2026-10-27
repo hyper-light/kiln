@@ -8504,23 +8504,26 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   a person signed in only). The server's and CD's keys are in `<data>/pki` (0600).
 - *Revocations* are rows with when, why and by whom (migration `w27_identities`):
   forgetting a runner, a runner process retiring, a session moving to a new epoch (the epochs it
-  left), a session ending, a person disabled, or `POST /api/identities/revoke`. The TLS directory
-  refuses revoked keys from the first handshake after a restart, and re-enrolling a name brings a
-  new key the revocation doesn't touch. `GET /api/identities` lists what kiln issued, each checked
-  now; enrollment records who enrolled each machine.
+  left), a session ending, a person disabled, or `POST /api/identities/revoke` (`kiln identities
+  revoke`; `kiln forget <runner>` forgets one). The TLS directory refuses revoked keys from the
+  first handshake after a restart, its log naming when, why and by whom (`revoked at ... (runner
+  forgotten, by ada)`), and re-enrolling a name brings a new key the revocation doesn't touch.
+  `GET /api/identities` (`kiln identities list`) lists what kiln issued, each checked now;
+  `kiln identities revocations` lists the rows; enrollment records who enrolled each machine.
 - *Seams.* An outside Fulcio and Rekor is reached through `kiln_seams::Sigstore` (docs/seams.md);
   `ci/signing.rs`'s client is the real one. The simulator certifies and logs with keys of its own,
   so a bundle keyless signing makes through it verifies with kiln's Sigstore verifier against its
   trusted root; it and kiln's client (over Fulcio's and Rekor's HTTP APIs, in front of it) pass the
   same suite.
 - *Tests.* `kiln-ci` `w27_r01_*` (each kind; expired, revoked, wrongly issued);
-  `crates/kiln/tests/identities.rs`: `w27_ac01_chains`, `w27_ac02_keys` and one per kind, an
-  agent's `w27_r01_agent_epochs` (started, then moved twice: three epochs, each named by the
-  process holding it, the one left refused saying both epochs) and, in a build with `chaos`,
+  `crates/kiln/tests/identities.rs`: `w27_ac01_chains`, `w27_ac02_keys`, one per kind,
+  `w27_r01_revocation_survives_restart` and `w27_r01_reenroll_keeps_revocation`, an agent's
+  `w27_r01_agent_epochs` (started, then moved twice: three epochs, each named by the process
+  holding it, the one left refused saying both epochs) and, in a build with `chaos`,
   `w27_r02_agent_key_stays` (every frame each runner process sent, and everything on disk: none
-  holds the session's keys, as PEM, PEM body or DER);
-  `ci::signing`'s `w27_r12_*` (keyless signing through the simulator verifies; kiln's client passes
-  the Sigstore suite).
+  holds the session's keys, as PEM, PEM body or DER); the migration's
+  `w27_r01_identities_and_revocations_tables`; `ci::signing`'s `w27_r12_*` (keyless signing
+  through the simulator verifies; kiln's client passes the Sigstore suite).
 - *Not yet.* kiln's Sigstore client hasn't run the suite against a real Fulcio and Rekor; nothing
   signs with these identities yet (commits, reviews, CI output, lands and deploys: R03 to R11).
 

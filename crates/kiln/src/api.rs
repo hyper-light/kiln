@@ -2895,7 +2895,7 @@ async fn identity_revoke(hub: &Hub, req: Request, by: &str) -> R {
     let at = crate::util::now_unix();
     let keys = crate::identities::revoke(&hub.store, target.clone(), r.reason.trim(), by, at).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     if !keys.is_empty() {
-        hub.net.command(crate::net::Out::RevokeKeys { keys: keys.clone() }).await;
+        hub.net.command(crate::net::Out::RevokeKeys { keys: keys.clone(), why: crate::identities::refusal(at, r.reason.trim(), by) }).await;
     }
     hub.store.audit(by.to_owned(), "identity.revoke".into(), format!("{target:?}: {}", r.reason.trim())).await;
     Ok(srv::json(StatusCode::OK, &json!({ "at": at, "keys": keys })))
@@ -3030,6 +3030,9 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     // own pods.
     let by = if ephemeral { "kiln" } else { "admin" };
     crate::identities::enrolled(&hub.store, &name, by).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // A name forgotten earlier in this server's life is welcome again, as an approved join makes
+    // it: its new key works, and its revoked keys stay refused (W27-R01).
+    hub.net.command(crate::net::Out::Unrevoke { name: name.clone() }).await;
     let quic = if ephemeral {
         hub.cfg.kubernetes.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone())
     } else {

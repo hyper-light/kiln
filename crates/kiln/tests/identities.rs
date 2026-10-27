@@ -45,14 +45,10 @@ fn revocations(port: u16, admin: &str) -> anyhow::Result<Vec<Value>> {
     Ok(all.into_iter().filter(|r| r.get("reason").and_then(Value::as_str) == Some("runner forgotten")).collect())
 }
 
-#[test]
-fn w27_r01_revocation_survives_restart_and_reenrolling_keeps_it() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let mut s = start(dir.path(), &Options::default())?;
-    let state = dir.path().join("fedora-2-state");
-
-    // Enrolled and connected; then forgotten.
-    let (runner, log) = agents::runner(dir.path(), s.port, "fedora-2", None, TALK)?;
+/// `fedora-2` enrolled and connected, then forgotten (`kiln forget fedora-2`'s route): its
+/// certificate (PEM) and the revocation recorded for it, checked for when, why and by whom.
+fn enrolled_then_forgotten(dir: &Path, s: &Server) -> anyhow::Result<(String, Value)> {
+    let (runner, log) = agents::runner(dir, s.port, "fedora-2", None, TALK)?;
     agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
     // Its own log has said so too (it may trail the server's list), so what follows counts anew.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -60,37 +56,80 @@ fn w27_r01_revocation_survives_restart_and_reenrolling_keeps_it() -> anyhow::Res
         anyhow::ensure!(Instant::now() < deadline, "the runner never logged its welcome");
         std::thread::sleep(Duration::from_millis(100));
     }
-    let old_cert = std::fs::read_to_string(state.join("agent.pem"))?;
+    let old_cert = std::fs::read_to_string(dir.join("fedora-2-state").join("agent.pem"))?;
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
     let (st, body) = http(s.port, "DELETE", "/api/agents/fedora-2", &s.admin, None)?;
     anyhow::ensure!(st == 204, "forget: {st} {body}");
     let revs = revocations(s.port, &s.admin)?;
     anyhow::ensure!(revs.len() == 1, "one certificate revoked: {revs:?}");
     let rev = revs.first().cloned().unwrap_or_default();
+    assert_eq!(rev.get("serial").and_then(Value::as_str), Some(kiln::pki::fingerprints(&old_cert)?.serial.as_str()), "the certificate it had: {rev}");
     assert_eq!(rev.get("reason").and_then(Value::as_str), Some("runner forgotten"));
     assert_eq!(rev.get("by").and_then(Value::as_str), Some("admin"));
-    assert!(rev.get("at").and_then(Value::as_i64).is_some_and(|at| at > 1_700_000_000), "{rev}");
+    assert!(rev.get("at").and_then(Value::as_i64).and_then(|at| u64::try_from(at).ok()).is_some_and(|at| at >= before && at <= before + 30), "revoked at that moment: {rev}");
     assert!(!connects_again(&log, Duration::from_secs(5)), "refused at once:\n{}", std::fs::read_to_string(&log)?);
     drop(runner);
+    Ok((old_cert, rev))
+}
 
-    // The server restarts: the old certificate is still refused (before W27 a restart forgot it).
+/// What the chain checker says now of the certificate with `serial` (`GET /api/identities`).
+fn checked(s: &Server, serial: &str) -> anyhow::Result<Value> {
+    identities(s, "machine")?.into_iter().find(|i| field(i, "serial") == serial).ok_or_else(|| anyhow::anyhow!("kiln recorded no certificate {serial}"))
+}
+
+#[test]
+fn w27_r01_revocation_survives_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut s = start(dir.path(), &Options::default())?;
+    let (old_cert, rev) = enrolled_then_forgotten(dir.path(), &s)?;
+    let serial = kiln::pki::fingerprints(&old_cert)?.serial;
+    let at = rev.get("at").and_then(Value::as_i64).unwrap_or_default();
+    let when = time::OffsetDateTime::from_unix_timestamp(at)?.format(&time::format_description::well_known::Rfc3339)?;
+    let refusal = format!("revoked at {when} (runner forgotten, by admin)");
+
+    // The server's Pki and store are opened again: the old certificate is still refused, at TLS
+    // and by the chain checker, each naming the revocation's time and reason.
     s.restart()?;
-    let (runner, log) = agents::runner(dir.path(), s.port, "fedora-2", None, TALK)?;
+    let (_runner, log) = agents::runner(dir.path(), s.port, "fedora-2", None, TALK)?;
     assert!(!connects_again(&log, Duration::from_secs(8)), "the revoked certificate came back after a restart:\n{}\n{}", std::fs::read_to_string(&log)?, s.log());
-    drop(runner);
+    let server_log = std::fs::read_to_string(dir.path().join("server.log"))?;
+    assert!(
+        server_log.lines().any(|l| l.contains("refused a revoked certificate") && l.contains(&refusal)),
+        "the TLS directory's refusal names when and why ({refusal}):\n{}",
+        s.log()
+    );
+    let c = checked(&s, &serial)?;
+    assert!(field(&c, "refused").contains(&format!("was revoked at {when} (runner forgotten, by admin)")), "the chain checker's refusal: {c}");
     assert_eq!(revocations(s.port, &s.admin)?.len(), 1, "the revocation is kept");
+    Ok(())
+}
+
+#[test]
+fn w27_r01_reenroll_keeps_revocation() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (old_cert, _) = enrolled_then_forgotten(dir.path(), &s)?;
+    let state = dir.path().join("fedora-2-state");
 
     // Enrolled again under the same name: a new key, which works.
     let old_state = dir.path().join("fedora-2-old-state");
     std::fs::rename(&state, &old_state)?;
     let (_runner, log) = agents::runner(dir.path(), s.port, "fedora-2", None, TALK)?;
     agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
-    assert_ne!(std::fs::read_to_string(state.join("agent.pem"))?, old_cert, "enrolling again brings a new certificate");
+    let new_cert = std::fs::read_to_string(state.join("agent.pem"))?;
+    assert_ne!(new_cert, old_cert, "enrolling again brings a new certificate");
+    let (old, new) = (kiln::pki::fingerprints(&old_cert)?, kiln::pki::fingerprints(&new_cert)?);
+    assert_ne!(old.key, new.key, "for a new key");
+    assert!(field(&checked(&s, &new.serial)?, "refused").is_empty(), "the new certificate isn't refused");
 
     // The old certificate is still refused: a copy of the old runner, beside the new one.
     let copy = dir.path().join("fedora-2-copy-state");
     std::fs::rename(&old_state, &copy)?;
     let (_copy, copy_log) = agents::runner(dir.path(), s.port, "fedora-2-copy", None, TALK)?;
     assert!(!connects_again(&copy_log, Duration::from_secs(8)), "the old certificate connected after the name enrolled again:\n{}", std::fs::read_to_string(&copy_log)?);
+    assert!(field(&checked(&s, &old.serial)?, "refused").contains("runner forgotten"), "the chain checker still refuses the old one");
+    // The new one is still connected.
+    agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(5))?;
     assert_eq!(revocations(s.port, &s.admin)?.len(), 1, "re-enrolling undid nothing");
     Ok(())
 }

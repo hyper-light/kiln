@@ -436,18 +436,122 @@ pub async fn revocations(store: &Store) -> anyhow::Result<Vec<Revocation>> {
         .await
 }
 
-/// Every revoked key, for the TLS directory.
-pub async fn revoked_keys(store: &Store) -> anyhow::Result<Vec<String>> {
-    store
+/// What the TLS directory says as it refuses a revoked key: `revoked at <RFC 3339> (<reason>, by
+/// <who>)`, as the chain checker says it.
+pub fn refusal(at: i64, reason: &str, by: &str) -> String {
+    let when = time::OffsetDateTime::from_unix_timestamp(at).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| at.to_string());
+    format!("revoked at {when} ({reason}, by {by})")
+}
+
+/// Every revoked key, for the TLS directory, with its first revocation's [`refusal`].
+pub async fn revoked_keys(store: &Store) -> anyhow::Result<Vec<(String, String)>> {
+    let rows: Vec<(String, i64, String, String, i64)> = store
         .call(|c| {
             let mut q = c.prepare(
-                "SELECT key_sha256 FROM revocations WHERE key_sha256 IS NOT NULL \
-                 UNION SELECT i.key_sha256 FROM revocations r JOIN identities i ON i.serial = r.serial",
+                "SELECT key_sha256, at, reason, by, id FROM revocations WHERE key_sha256 IS NOT NULL \
+                 UNION SELECT i.key_sha256, r.at, r.reason, r.by, r.id FROM revocations r JOIN identities i ON i.serial = r.serial \
+                 ORDER BY 2, 5",
             )?;
-            let rows = q.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
-        .await
+        .await?;
+    let mut first: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (key, at, reason, by, _) in rows {
+        first.entry(key).or_insert_with(|| refusal(at, &reason, &by));
+    }
+    Ok(first.into_iter().collect())
+}
+
+/// `kiln identities`: the certificates kiln's CA issued, their revocations, and revoking one
+/// (W27-R01), over the API.
+#[derive(clap::Args)]
+pub struct IdentitiesArgs {
+    #[arg(long, env = "KILN_URL", global = true)]
+    url: Option<String>,
+    /// The admin token, or a personal access token with `settings.manage` (to revoke) or
+    /// `runners.read` (to list).
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
+    token: Option<String>,
+    #[command(subcommand)]
+    cmd: IdentitiesCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum IdentitiesCmd {
+    /// The certificates issued, newest first, each checked now: who it verifies as, or why not.
+    List {
+        /// Only this kind: machine, runner, agent, leg, person, server, cd.
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Every revocation: when, why, by whom.
+    Revocations,
+    /// Revoke from now on: one certificate (`--serial`), every certificate of a key (`--key`), or
+    /// every certificate of a subject (a machine's name or a kiln:// URI).
+    Revoke {
+        #[arg(long, conflicts_with_all = ["key", "subject"], required_unless_present_any = ["key", "subject"])]
+        serial: Option<String>,
+        #[arg(long, conflicts_with = "subject")]
+        key: Option<String>,
+        subject: Option<String>,
+        /// Why (`key lost`, `runner retired`).
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+/// `kiln forget <runner>`: the runner is forgotten, its certificates revoked from now on, with
+/// why (`runner forgotten`) and by whom (W27-R01); enrolling again brings a new key.
+#[derive(clap::Args)]
+pub struct ForgetArgs {
+    #[arg(long, env = "KILN_URL")]
+    url: Option<String>,
+    /// The admin token, or a personal access token that may manage runners.
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
+    token: Option<String>,
+    /// The runner's name.
+    runner: String,
+}
+
+/// `kiln forget`.
+pub async fn forget(args: ForgetArgs, cfg: &crate::config::Config) -> anyhow::Result<()> {
+    let api = crate::ci::cli::Api::connect(cfg, args.url.as_deref(), args.token.as_deref()).await?;
+    api.call_api(crate::http::client::Method::Delete, &format!("/api/agents/{}", crate::ci::cli::enc(&args.runner)), None).await?;
+    println!("forgot {}; its certificates are revoked (runner forgotten)", args.runner);
+    Ok(())
+}
+
+/// `kiln identities`.
+pub async fn cli(args: IdentitiesArgs, cfg: &crate::config::Config) -> anyhow::Result<()> {
+    use crate::ci::cli::{Api, enc, when};
+    use crate::http::client::Method;
+    use serde_json::Value;
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let api = Api::connect(cfg, args.url.as_deref(), args.token.as_deref()).await?;
+    match args.cmd {
+        IdentitiesCmd::List { kind } => {
+            let path = kind.map_or_else(|| "/api/identities".to_owned(), |k| format!("/api/identities?kind={}", enc(&k)));
+            let v = api.call_api(Method::Get, &path, None).await?;
+            for i in v.get("identities").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let state = i.get("refused").and_then(Value::as_str).map_or_else(|| s(&i, "verified"), |r| format!("refused: {r}"));
+                println!("{}  {:<8} {}  until {}  {state}", s(&i, "serial"), s(&i, "kind"), s(&i, "subject"), when(i.get("not_after").and_then(Value::as_i64)));
+            }
+        }
+        IdentitiesCmd::Revocations => {
+            let v = api.call_api(Method::Get, "/api/identities/revocations", None).await?;
+            for r in v.get("revocations").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let what = r.get("serial").and_then(Value::as_str).map_or_else(|| format!("key {}", s(&r, "key")), |x| format!("serial {x}"));
+                println!("{}  {what}  {} by {}", when(r.get("at").and_then(Value::as_i64)), s(&r, "reason"), s(&r, "by"));
+            }
+        }
+        IdentitiesCmd::Revoke { serial, key, subject, reason } => {
+            let v = api.call_api(Method::Post, "/api/identities/revoke", Some(serde_json::json!({ "serial": serial, "key": key, "subject": subject, "reason": reason }))).await?;
+            let keys = v.get("keys").and_then(Value::as_array).map_or(0, Vec::len);
+            println!("revoked at {} ({reason}); {keys} key(s) refused from now on", when(v.get("at").and_then(Value::as_i64)));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -485,15 +589,18 @@ mod tests {
             let mut want = vec![fa1.key.clone(), fa2.key.clone()];
             want.sort();
             assert_eq!(keys, want);
-            let mut stored = revoked_keys(&store).await?;
-            stored.sort();
-            assert_eq!(stored, want, "mac-1's key isn't revoked");
+            let stored = revoked_keys(&store).await?;
+            assert_eq!(stored.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), want, "mac-1's key isn't revoked");
+            assert!(stored.iter().all(|(_, why)| why == "revoked at 2026-09-21T14:13:20Z (runner forgotten, by ada)"), "{stored:?}");
             let revs = revocations(&store).await?;
             assert_eq!(revs.len(), 2);
             assert!(revs.iter().all(|r| r.at == 1_790_000_000 && r.reason == "runner forgotten" && r.by == "ada"));
+            // A later revocation of a revoked key doesn't change when it was revoked.
+            revoke(&store, Target::Subject("fedora-2".into()), "key lost", "sam", 1_790_000_050).await?;
+            assert!(revoked_keys(&store).await?.iter().all(|(_, why)| why.contains("runner forgotten")));
             // By serial: its key comes from the record.
             revoke(&store, Target::Serial(fb.serial.to_uppercase()), "key lost", "sam", 1_790_000_100).await?;
-            assert!(revoked_keys(&store).await?.contains(&fb.key));
+            assert!(revoked_keys(&store).await?.iter().any(|(k, why)| *k == fb.key && why.contains("key lost, by sam")));
             // A subject with nothing recorded revokes nothing.
             assert!(revoke(&store, Target::Subject("nobody".into()), "x", "ada", 0).await?.is_empty());
             Ok(())
