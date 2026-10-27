@@ -267,7 +267,43 @@ pub enum Input {
     /// far each is behind and what warm runs took there, and its bandwidth. From the runners'
     /// reports of their workspaces and the ledger's history.
     Warm { runner: String, held: WarmHeld },
+    /// What a runner has in use now, from the samples it sends the server: its [`Headroom`] until
+    /// the next, or until it's older than [`SAMPLE_FRESH_MS`] (the scheduler's headroom, W05).
+    RunnerSample { runner: String, sample: Sample },
 }
+
+/// What a runner has in use now, by its latest sample: what placement weighs of it besides its
+/// facts ([`Input::RunnerSample`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Sample {
+    /// Its CPUs (hardware threads).
+    pub cpus: u32,
+    /// The share of them busy, 0 to 1.
+    pub busy: f64,
+    /// Its load average over the last minute.
+    pub load1: f64,
+    /// Its memory, and how much of it is in use, in bytes.
+    pub mem_total: u64,
+    pub mem_used: u64,
+    /// The share of time all its tasks stalled on I/O at once, in percent (Linux's PSI, `full`
+    /// avg10), where it says.
+    pub io_full: Option<f64>,
+}
+
+/// A runner's headroom by its latest sample: the CPUs and memory it has free, what kiln placed
+/// there since counted in use until the next sample shows it, and its I/O pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Headroom {
+    pub cpus: f64,
+    pub mem: u64,
+    pub io_full: Option<f64>,
+    /// What it has in all: its CPUs and memory.
+    pub of: Resources,
+}
+
+/// How long a runner's sample stands: past it, its headroom is unknown, and it's placed as before
+/// samples were (W05-R23's order).
+pub const SAMPLE_FRESH_MS: i64 = 60_000;
 
 /// Why a leg waits (W05-R13): exactly one, the current one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -481,6 +517,10 @@ struct Runner {
     used: Resources,
     connected: bool,
     draining: bool,
+    /// Its latest sample and when it came ([`Input::RunnerSample`]).
+    sample: Option<(Sample, i64)>,
+    /// What was placed on it since its latest sample.
+    since: Resources,
 }
 
 /// What an exclusive leg holds of its runner (W05-R03): asking for CPUs, those and the memory it
@@ -729,6 +769,7 @@ impl Scheduler {
             }
             Input::Tick => self.tick(now, &mut out),
             Input::Warm { runner, held } => self.warm_changed(runner, held),
+            Input::RunnerSample { runner, sample } => self.sampled(&runner, sample, now),
         }
         out
     }
@@ -1019,7 +1060,7 @@ impl Scheduler {
             l.ends = ends;
         }
         // The runner may not have reconnected yet: keep what it runs until it does.
-        let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false });
+        let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, sample: None, since: Resources::default() });
         r.running.push(id.clone());
         add(&mut r.used, &request);
         // W28-R42: what its runner still runs is the execution of its work. A queued duplicate
@@ -1474,6 +1515,9 @@ impl Scheduler {
         if let Some(r) = self.runners.get_mut(runner) {
             r.running.push(id.to_owned());
             add(&mut r.used, &request);
+            if r.sample.is_some() {
+                add(&mut r.since, &request);
+            }
             executor = req.executors.iter().find(|e| super::routing::usable(&req, &r.input.view.facts, e)).cloned();
         }
         // Its pool's idle executor there, which it alone uses.
@@ -1877,8 +1921,8 @@ impl Scheduler {
                 None => {}
             }
         }
-        let (running, used) = self.runners.get(&id).map(|x| (x.running.clone(), x.used)).unwrap_or_default();
-        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false });
+        let (running, used, sample, since) = self.runners.get(&id).map(|x| (x.running.clone(), x.used, x.sample, x.since)).unwrap_or_default();
+        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false, sample, since });
         self.refresh_eligibility(&id);
         self.release_holds(now, out);
         self.try_avoided(now, out);
@@ -1992,6 +2036,23 @@ impl Scheduler {
         self.reap_idle(now, out);
         self.scale_all(now, out);
         self.review_admission(now, out);
+    }
+
+    // ------------------------------------------------------------------ headroom (W05)
+
+    /// A runner's sample came ([`Input::RunnerSample`]): its headroom from now on, what was placed
+    /// on it before now in the sample.
+    fn sampled(&mut self, runner: &str, sample: Sample, now: i64) {
+        if let Some(r) = self.runners.get_mut(runner) {
+            r.sample = Some((sample, now));
+            r.since = Resources::default();
+        }
+    }
+
+    /// A runner's headroom now ([`Headroom`]): `None` before its first sample, or with its latest
+    /// older than [`SAMPLE_FRESH_MS`].
+    pub fn headroom(&self, runner: &str) -> Option<Headroom> {
+        self.runners.get(runner).and_then(|r| headroom_of(r, self.now))
     }
 
     // ------------------------------------------------------------------ warm placement (W24-R18)
@@ -2348,6 +2409,9 @@ impl Scheduler {
             self.executors.insert(id.clone(), Executor { id: id.clone(), pool: pool.to_owned(), runner: host.clone(), state: ExecState::Starting, since: now, reserved: p.request, leg: None });
             if let Some(r) = self.runners.get_mut(&host) {
                 add(&mut r.used, &p.request);
+                if r.sample.is_some() {
+                    add(&mut r.since, &p.request);
+                }
             }
             out.push(Command::StartExecutor { pool: pool.to_owned(), executor: id, runner: host, kind: p.executor.clone(), image: p.image.clone(), leg: None });
             want -= 1;
@@ -2739,6 +2803,18 @@ fn ahead(a: (f64, u64, u64), b: (f64, u64, u64)) -> bool {
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => (a.1, a.2) < (b.1, b.2),
     }
+}
+
+/// [`Scheduler::headroom`] of a runner at `now`.
+fn headroom_of(r: &Runner, now: i64) -> Option<Headroom> {
+    let (s, at) = r.sample.as_ref()?;
+    if now.saturating_sub(*at) > SAMPLE_FRESH_MS {
+        return None;
+    }
+    let all = f64::from(s.cpus);
+    let cpus = (all * (1.0 - s.busy.clamp(0.0, 1.0)) - r.since.cpu).max(0.0);
+    let mem = s.mem_total.saturating_sub(s.mem_used).saturating_sub(r.since.mem);
+    Some(Headroom { cpus, mem, io_full: s.io_full, of: Resources { cpu: all, mem: s.mem_total, ..Resources::default() } })
 }
 
 fn load(r: &Runner) -> f64 {

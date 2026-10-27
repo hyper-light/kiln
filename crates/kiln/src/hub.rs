@@ -1689,6 +1689,8 @@ impl Hub {
                     a.sample = Some(s.clone());
                 }
                 self.record_sample(&agent, s);
+                // The CI engine weighs its headroom by it: once a sample, as it comes.
+                self.ci.send(crate::ci::dispatch::Msg::RunnerSample { agent: agent.clone() });
             }
             AgentMsg::StepStarted { job, idx } => {
                 if self.owns_job(peer, &job) {

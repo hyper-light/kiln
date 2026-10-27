@@ -1820,3 +1820,34 @@ proptest! {
     }
 }
 }
+
+/// The scheduler's headroom (W05): a runner's sample sets what it has free; what's placed there
+/// after counts against it until the next sample, which then has it; a sample older than a minute
+/// leaves the runner's headroom unknown, placed as before samples were.
+#[test]
+fn a_runners_sample_sets_its_headroom_and_what_is_placed_since_counts_until_the_next() {
+    use super::state::{Headroom, Sample};
+    const GIB: u64 = 1 << 30;
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("adacachy", 4))), 0);
+    assert_eq!(s.headroom("adacachy"), None, "no sample yet");
+    let sample = |busy: f64, used_gib: u64| Sample { cpus: 32, busy, load1: 12.0, mem_total: 124 * GIB, mem_used: used_gib * GIB, io_full: Some(2.1) };
+    let near = |h: Option<Headroom>, cpus: f64, mem_gib: u64| h.is_some_and(|h| (h.cpus - cpus).abs() < 1e-9 && h.mem == mem_gib * GIB && h.io_full == Some(2.1) && h.of.cpu == 32.0);
+    s.handle(Input::RunnerSample { runner: "adacachy".into(), sample: sample(0.4, 60) }, 1_000);
+    assert!(near(s.headroom("adacachy"), 19.2, 64), "{:?}", s.headroom("adacachy"));
+    // A leg placed a second later counts against it until the next sample.
+    let asking = LegIn { request: Resources { cpu: 8.0, mem: 16 * GIB, ..Resources::default() }, ..leg("build", "acme/x", 60) };
+    let c = s.handle(Input::LegQueued(Box::new(asking)), 2_000);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == "build" && runner == "adacachy")), "{c:?}");
+    assert!(near(s.headroom("adacachy"), 11.2, 48), "{:?}", s.headroom("adacachy"));
+    // The next sample has it in it: what's free is what the sample says.
+    s.handle(Input::RunnerSample { runner: "adacachy".into(), sample: sample(0.65, 76) }, 11_000);
+    assert!(near(s.headroom("adacachy"), 11.2, 48), "{:?}", s.headroom("adacachy"));
+    // A minute on with no sample, it's unknown again.
+    s.handle(Input::Tick, 11_000 + super::state::SAMPLE_FRESH_MS + 1);
+    assert_eq!(s.headroom("adacachy"), None);
+    // A sample for a runner kiln doesn't know is nothing.
+    s.handle(Input::RunnerSample { runner: "nowhere".into(), sample: sample(0.1, 1) }, 80_000);
+    assert_eq!(s.headroom("nowhere"), None);
+}
+

@@ -124,6 +124,9 @@ pub enum Msg {
     /// A runner's warm workspaces as placement takes them, their distances measured (W24-R18);
     /// `seq` names the report they're made of, so an older one never stands for a newer.
     Warm { agent: String, seq: u64, held: Box<kiln_ci::sched::warm::Held> },
+    /// A runner sent a sample (its CPUs busy, its memory in use): the engine weighs its headroom
+    /// by it (the scheduler's headroom, W05).
+    RunnerSample { agent: String },
 }
 
 /// Where and how a leg runs, as the scheduler placed it.
@@ -1088,6 +1091,10 @@ impl Dispatch {
                 self.runner_facts(&agent).await;
                 Ok(())
             }
+            Msg::RunnerSample { agent } => {
+                self.runner_sample(&agent).await;
+                Ok(())
+            }
             Msg::WorkState { agent, state } => {
                 self.warm_seq += 1;
                 let (seq, hub, report) = (self.warm_seq, Arc::clone(&self.hub), (*state).clone());
@@ -1286,6 +1293,17 @@ impl Dispatch {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
         let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
+        self.commands(cmds).await;
+    }
+
+    /// A runner's latest sample, to the engine ([`sample_of`]).
+    async fn runner_sample(&mut self, agent: &str) {
+        let sample = {
+            let g = self.hub.agents.lock();
+            g.get(agent).and_then(|a| a.sample.as_ref().map(|s| sample_of(s, a.facts.as_deref())))
+        };
+        let Some(sample) = sample else { return };
+        let cmds = self.sched.handle(Input::RunnerSample { runner: agent.to_owned(), sample }, now_ms());
         self.commands(cmds).await;
     }
 
@@ -3462,6 +3480,19 @@ fn work_slots(a: &crate::hub::AgentLive) -> u32 {
     if a.skew.takes_work() { a.slots } else { 0 }
 }
 
+/// What the engine weighs of a runner's sample: its CPUs, the share of them busy, its load and
+/// memory, and the I/O pressure its facts last said (`work.io_full`).
+fn sample_of(s: &crate::metrics::HostSample, facts: Option<&kiln_ci::facts::RunnerFacts>) -> kiln_ci::sched::state::Sample {
+    kiln_ci::sched::state::Sample {
+        cpus: s.cpus,
+        busy: f64::from(s.cpu_pct.clamp(0.0, 100.0)) / 100.0,
+        load1: f64::from(s.load1),
+        mem_total: s.mem_total,
+        mem_used: s.mem_used,
+        io_full: facts.and_then(|f| f.work.as_ref()).and_then(|w| w.io_full),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// W05-R17: a rerun's `github.triggering_actor` is whoever reran it, as GitHub names people; an
@@ -3513,5 +3544,23 @@ mod tests {
         assert_eq!(super::request_of(Some(&job("")?), &cfg), fallback);
         assert_eq!(super::request_of(None, &cfg), fallback);
         Ok(())
+    }
+
+    /// The scheduler's headroom (W05): a runner's sample reaches the engine as it says, its I/O
+    /// pressure from its facts, and the engine's headroom of it is the sample's.
+    #[test]
+    fn a_runners_sample_reaches_the_engine_as_it_says() {
+        use kiln_ci::sched::state::{Config, Input, RunnerIn, Scheduler};
+        const GIB: u64 = 1 << 30;
+        let host = crate::metrics::HostSample { cpus: 32, cpu_pct: 40.0, load1: 12.5, mem_total: 124 * GIB, mem_used: 60 * GIB, ..crate::metrics::HostSample::default() };
+        let facts = kiln_ci::facts::RunnerFacts { work: Some(kiln_ci::facts::WorkFacts { io_full: Some(2.1) }), ..kiln_ci::facts::RunnerFacts::default() };
+        let s = super::sample_of(&host, Some(&facts));
+        assert_eq!((s.cpus, s.busy, s.load1, s.mem_total, s.mem_used, s.io_full), (32, 0.4, 12.5, 124 * GIB, 60 * GIB, Some(2.1)));
+        assert_eq!(super::sample_of(&host, None).io_full, None, "no facts yet, no pressure said");
+        assert_eq!(super::sample_of(&crate::metrics::HostSample { cpu_pct: 250.0, ..host.clone() }, None).busy, 1.0);
+        let mut engine = Scheduler::new(Config::default());
+        engine.handle(Input::RunnerUp(Box::new(RunnerIn { id: "adacachy".into(), slots: 4, ..RunnerIn::default() })), 0);
+        engine.handle(Input::RunnerSample { runner: "adacachy".into(), sample: s }, 1_000);
+        assert!(engine.headroom("adacachy").is_some_and(|h| (h.cpus - 19.2).abs() < 1e-6 && h.mem == 64 * GIB && h.io_full == Some(2.1)), "{:?}", engine.headroom("adacachy"));
     }
 }
