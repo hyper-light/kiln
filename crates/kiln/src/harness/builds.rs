@@ -388,7 +388,10 @@ mod tests {
     /// machine has it.
     #[test]
     fn w24_r24_agents_get_the_cache_variables_under_their_persons_scope() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+        // A short root: sccache's server socket must fit a Unix socket's path (SOCKET_PATH_MAX).
+        // Under a long TMPDIR (ci/gate.sh's, ~/.cache/kiln-gate/<tree>/tmp) the wrapper is rightly
+        // left out, and what this test holds is the wrapper where it fits.
+        let dir = if cfg!(unix) { tempfile::tempdir_in("/tmp")? } else { tempfile::tempdir()? };
         let root = dir.path().to_path_buf();
         crate::rt::block_on(async move {
             let (svc, at) = serve(&root).await?;
