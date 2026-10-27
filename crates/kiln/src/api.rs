@@ -676,6 +676,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             front_door(boxed(|| crate::frontdoor::control::upload(&hub, &name, req)).await)
         }
         (&Method::GET, ["api", "runners", name, "front-door", "cert"]) => front_door(boxed(|| crate::frontdoor::control::download(&hub, name)).await),
+        // How many agent sessions a machine runs at once (`crate::harness::limit`).
+        (&Method::GET, ["api", "runners", name, "agent-limit"]) => boxed(|| crate::harness::limit::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::PUT, ["api", "runners", name, "agent-limit"]) => {
+            let name = (*name).to_owned();
+            boxed(|| crate::harness::limit::put(&hub, &name, req)).await.map_err(|(c, m)| err(c, m))
+        }
         (&Method::POST, ["api", "runners", name, "front-door", "cert", "renew"]) => front_door(boxed(|| crate::frontdoor::control::renew(&hub, name)).await),
         (&Method::GET, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::get(&hub)).await),
         (&Method::PUT, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::put(&hub, req)).await),

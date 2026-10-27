@@ -559,10 +559,15 @@ fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
+/// A task's status, not finished in any way: running, waiting to start, or paused.
+pub fn live_task(status: &str) -> bool {
+    matches!(status, "running" | "pending" | "paused")
+}
+
 impl Task {
     /// Still running (or paused): not finished in any way.
     pub fn live(&self) -> bool {
-        matches!(self.status.as_str(), "running" | "pending" | "paused")
+        live_task(&self.status)
     }
 
     /// One of the agent's own subagents, not something it left running. Older machines only report
@@ -1242,6 +1247,11 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub pause: Option<Pause>,
+    /// Since when (Unix ms) it waits for room on its machine to go to work: as many of its agents
+    /// are at work as its limit lets be (`harness::limit`). What it was sent waits in its queue
+    /// meanwhile, and goes once there's room, the longest waiting first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_wait: Option<i64>,
     /// Stop between turns once any of the account's limits is this full (percent), before the
     /// limit cuts a turn off. None: only when a limit is reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]

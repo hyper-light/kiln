@@ -129,6 +129,39 @@ Ending the agent stops what it left running, then ends whatever else is still in
 left its harness's tree included) and removes the group. kiln's own helpers and MCP servers aren't
 counted.
 
+## How many agents a machine runs
+
+A machine has at most so many agent sessions at work at once (`crate::harness::limit`). Only
+those at work count: starting, on a turn (waiting on you for an approval or an answer in the
+middle of one included), or between turns with subagents they sent off still at work, as Mission
+control shows them working, or needing you mid-turn. Finished, ready, paused, stopped and ended
+agents don't count, nor do ones whose goals wait for you. A new agent while that many are at work
+(or waiting for room) is refused, saying how many and the limit. One already there goes to work
+again only once there's room: what it's sent (a person's message, a skill, kiln's own: a goal, a
+plan step, a parent's news) waits in its queue, the longest waiting going first, and Mission
+control says it's waiting for room. A stopped one starts again (restarted, sent a message, or by
+itself after a crash) only once there's room too. Its limit is the first of these there is:
+
+1. **What's set for it on the server**: Runners, the runner's row opened, *Agent sessions*; or
+   `PUT /api/runners/:name/agent-limit` with `{"max_sessions": 128}` (`null` takes it away). It's
+   kept in the server's store, sent to the runner as it connects and whenever it changes, and kept
+   by the runner for its restarts. It wins over the config.
+2. **Its config's** `[agent] max_agent_sessions` (`kiln config set agent.max_agent_sessions 128`). A
+   runner reads it again within seconds of a change, with nothing restarting. The server's own
+   `kiln.toml` holds it for the server's own agents, read as the server starts.
+3. **kiln's default**, 64.
+
+A limit is from 1 to 4096. Lowered under what's at work, those go on, each through what waits in
+its queue, and none goes to work again until fewer are. Every session a machine ran comes back
+after a restart, however few the limit says then, and what a restart cut short goes on once there's
+room. So does each one a newer runner process of the machine takes over.
+
+The runner says what it holds and where that comes from. The Runners page shows it beside how many
+of the machine's agents are at work now, out of all it has, and how many wait for room. The
+server's own runner runs no agents: the server runs its own (the `local` machine), held to what's
+set for its runner. A runner whose kiln is older than this holds 64, whatever its config or the
+server says, and counts every session it has, ended ones included, until it's upgraded.
+
 ## Mission control
 
 - **How they stand.** Under the page's title, one rule across the page has a length for each way

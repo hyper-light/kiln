@@ -197,6 +197,7 @@ classes! {
         AgentMsg::HarnessHandOver { .. } => Class::Stream,
         AgentMsg::HarnessAdopted { .. } => Class::Answer,
         AgentMsg::WorkState { .. } => Class::State,
+        AgentMsg::AgentLimit { .. } => Class::State,
         AgentMsg::Observe { .. } => OBSERVE,
     }
 }
@@ -262,6 +263,7 @@ classes! {
         ServerMsg::Cluster { .. } => CLUSTER,
         ServerMsg::Kept { .. } => Class::State,
         ServerMsg::HarnessSend { .. } => PARKED,
+        ServerMsg::AgentLimit { .. } => Class::State,
         ServerMsg::Observe { .. } => OBSERVE,
     }
 }

@@ -241,6 +241,11 @@ pub enum AgentMsg {
     /// changed, and every 10 minutes, each superseding the last; only to a server announcing
     /// [`CAP_WORK`]. Appended last: postcard encodes variants by index.
     WorkState { json: String },
+    /// The most agent sessions this machine has at work at once, and where that comes from (JSON
+    /// [`crate::harness::limit::Held`]: what a person set from the server, its config's, or kiln's
+    /// default). Sent as it's welcomed and whenever it changes, each superseding the last; only to
+    /// a server announcing [`CAP_AGENT_LIMIT`]. Appended last: postcard encodes variants by index.
+    AgentLimit { json: String },
     /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): `json` a [`crate::observe::wire::Msg`],
     /// `bytes` what it carries (a raft message's, or a write's entry; empty when none). Only from
     /// runners announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard
@@ -384,6 +389,12 @@ pub const CAP_HANDOVER: u64 = 1 << 35;
 /// (docs/ci.md W24-R18). A runner that says it tells the server what it holds warm
 /// ([`AgentMsg::WorkState`]); a server that says it takes that.
 pub const CAP_WORK: u64 = 1 << 36;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: the most agent sessions a machine has at
+/// work at once, set from the server (docs/agents.md, "How many agents a machine runs"). A runner that
+/// says it takes [`ServerMsg::AgentLimit`] and says what it holds ([`AgentMsg::AgentLimit`]); a
+/// server that says it takes that.
+pub const CAP_AGENT_LIMIT: u64 = 1 << 37;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -628,6 +639,11 @@ pub enum ServerMsg {
     /// wire's, the cluster group's and the restarts' `Kept` (CP-T3.2 landed after them): postcard
     /// encodes variants by index.
     HarnessSend { session: String, epoch: u64, json: String },
+    /// What a person set from the server for the most agent sessions this machine has at work at
+    /// once (JSON [`crate::harness::limit::Asked`]), over its config's; none set, its config's (or
+    /// kiln's default) holds. Sent as the runner says [`CAP_AGENT_LIMIT`] and whenever it changes;
+    /// the runner keeps it for its restarts. Appended last: postcard encodes variants by index.
+    AgentLimit { json: String },
     /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): as [`AgentMsg::Observe`]. Only to runners
     /// announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard encodes
     /// variants by index.
@@ -875,6 +891,26 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&b)?, m);
         // Bit 34 is T3's CAP_INBOX.
         assert!(CAP_WORK.is_power_of_two() && CAP_WORK == 1 << 36 && CAP_WORK & (CAP_WIRE | CAP_NET_DROPS | 1 << 34 | CAP_HANDOVER) == 0);
+        Ok(())
+    }
+
+    /// A machine's agent limit comes after every older variant both ways (so a peer from before
+    /// reads every older frame as it did), and its bit is a new one.
+    #[test]
+    fn agent_limits_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let work = encode(&AgentMsg::WorkState { json: "{}".into() })?;
+        let held = AgentMsg::AgentLimit { json: r#"{"max_sessions":128,"from":"server","config":100}"#.into() };
+        let b = encode(&held)?;
+        assert_eq!(b.first().copied(), work.first().map(|i| i + 1), "AgentMsg::AgentLimit comes right after WorkState");
+        assert_eq!(b.first(), Some(&52));
+        assert_eq!(decode::<AgentMsg>(&b)?, held);
+        let send = encode(&ServerMsg::HarnessSend { session: "s".into(), epoch: 1, json: "{}".into() })?;
+        let asked = ServerMsg::AgentLimit { json: r#"{"max_sessions":128}"#.into() };
+        let b = encode(&asked)?;
+        assert_eq!(b.first().copied(), send.first().map(|i| i + 1), "ServerMsg::AgentLimit comes right after HarnessSend");
+        assert_eq!(b.first(), Some(&58));
+        assert_eq!(decode::<ServerMsg>(&b)?, asked);
+        assert!(CAP_AGENT_LIMIT.is_power_of_two() && CAP_AGENT_LIMIT == 1 << 37 && CAP_AGENT_LIMIT & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK) == 0);
         Ok(())
     }
 
@@ -1192,17 +1228,16 @@ mod tests {
 
     #[test]
     fn observe_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
-        // Right after main's last (deployed first): a session inbox's sends (CP-T3.2), and what a
-        // runner holds warm (W24).
-        let last_server = encode(&ServerMsg::HarnessSend { session: "s".into(), epoch: 1, json: "{}".into() })?;
+        // Right after main's last (deployed first): a machine's limit on agents at work, each way.
+        let last_server = encode(&ServerMsg::AgentLimit { json: "{}".into() })?;
         let s = ServerMsg::Observe { json: "{}".into(), bytes: vec![1, 2] };
         let b = encode(&s)?;
-        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after HarnessSend");
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after AgentLimit");
         assert_eq!(decode::<ServerMsg>(&b)?, s);
-        let last_agent = encode(&AgentMsg::WorkState { json: "{}".into() })?;
+        let last_agent = encode(&AgentMsg::AgentLimit { json: "{}".into() })?;
         let a = AgentMsg::Observe { json: "{}".into(), bytes: vec![3] };
         let b = encode(&a)?;
-        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Observe comes right after WorkState");
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Observe comes right after AgentLimit");
         assert_eq!(decode::<AgentMsg>(&b)?, a);
         let every = [
             CAP_UPGRADE,
