@@ -403,10 +403,10 @@ fn the_room_rule_both_dispatchers_and_the_runner_use() {
 }
 
 /// SplitMix64, as kiln-sim draws: a seed's numbers, the same on every machine.
-struct Draw(u64);
+pub(super) struct Draw(pub(super) u64);
 
 impl Draw {
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -414,11 +414,11 @@ impl Draw {
         z ^ (z >> 31)
     }
 
-    fn below(&mut self, n: u64) -> u64 {
+    pub(super) fn below(&mut self, n: u64) -> u64 {
         self.next() % n.max(1)
     }
 
-    fn pick<'a>(&mut self, of: &'a [String]) -> Option<&'a String> {
+    pub(super) fn pick<'a>(&mut self, of: &'a [String]) -> Option<&'a String> {
         of.get(usize::try_from(self.below(of.len() as u64)).unwrap_or(0))
     }
 }

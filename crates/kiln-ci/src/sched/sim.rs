@@ -40,7 +40,8 @@ pub struct Sim {
     pub durations_on: BTreeMap<(String, String), i64>,
     failures: BTreeMap<String, Vec<FailureClass>>,
     repos: BTreeMap<String, String>,
-    running: BTreeMap<String, (String, i64)>,
+    /// Each running leg's runner, start and attempt.
+    running: BTreeMap<String, (String, i64, u32)>,
     pub assigned: Vec<Assigned>,
     pub settled: Vec<(i64, String, Outcome)>,
     pub waits: Vec<(i64, String, WaitReason)>,
@@ -57,6 +58,9 @@ pub struct Sim {
     pub executor_start_ms: i64,
     /// Hosts whose executors fail to start.
     pub failing_hosts: BTreeSet<String>,
+    /// Every command the scheduler gave, with its time, when kept (`Some`): docs/needs.md E1's
+    /// replay digests it.
+    pub trace: Option<Vec<(i64, Command)>>,
     /// Executors started: (time, executor, host); and stopped: (time, executor).
     pub executors_started: Vec<(i64, String, String)>,
     pub executors_stopped: Vec<(i64, String)>,
@@ -85,6 +89,7 @@ impl Sim {
             busy_legs: Vec::new(),
             executor_start_ms: 500,
             failing_hosts: BTreeSet::new(),
+            trace: None,
             executors_started: Vec::new(),
             executors_stopped: Vec::new(),
         }
@@ -130,7 +135,11 @@ impl Sim {
                 Ev::Input(i) => self.sched.handle(*i, t),
                 Ev::Tick => self.sched.handle(Input::Tick, t),
                 Ev::Finish { leg, attempt } => {
-                    let Some((_, start)) = self.running.remove(&leg) else { continue };
+                    // An attempt that isn't the one running ended already (its runner was lost).
+                    if self.running.get(&leg).is_none_or(|r| r.2 != attempt) {
+                        continue;
+                    }
+                    let Some((_, start, _)) = self.running.remove(&leg) else { continue };
                     if let Some(repo) = self.repos.get(&leg) {
                         self.busy.push((repo.clone(), start, t));
                     }
@@ -149,19 +158,22 @@ impl Sim {
 
     fn apply(&mut self, cmds: Vec<Command>) {
         for c in cmds {
+            if let Some(trace) = self.trace.as_mut() {
+                trace.push((self.now, c.clone()));
+            }
             match c {
                 Command::Assign { leg, runner, attempt, .. } => {
                     self.assigned.push(Assigned { at: self.now, leg: leg.clone(), runner: runner.clone(), attempt });
                     let d = self.durations_on.get(&(leg.clone(), runner.clone())).or_else(|| self.durations.get(&leg)).copied().unwrap_or(60_000);
-                    self.running.insert(leg.clone(), (runner, self.now));
+                    self.running.insert(leg.clone(), (runner, self.now, attempt));
                     self.at(self.now + d, Ev::Finish { leg, attempt });
                 }
                 Command::Cancel { leg, attempt, .. } => {
                     // The runner stops at once.
-                    if self.running.contains_key(&leg) {
+                    if self.running.get(&leg).is_some_and(|r| r.2 == attempt) {
                         self.failures.remove(&leg);
                         let now = self.now;
-                        if let Some((_, start)) = self.running.remove(&leg)
+                        if let Some((_, start, _)) = self.running.remove(&leg)
                             && let Some(repo) = self.repos.get(&leg)
                         {
                             self.busy.push((repo.clone(), start, now));

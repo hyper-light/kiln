@@ -39,6 +39,8 @@ pub mod units;
 pub mod warm;
 
 #[cfg(test)]
+mod replay;
+#[cfg(test)]
 mod tests;
 
 pub use state::{Command, Config, FairBy, Input, LegIn, Outcome, PinnedState, Placement, Resources, RunnerIn, Scheduler, Supersede, WaitReason};

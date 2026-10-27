@@ -42,6 +42,20 @@ jobs:
       - name: test
         run: cargo test --locked --no-fail-fast
 
+  replay-arm64:
+    name: the scheduler's replay on arm64
+    # docs/needs.md E1: the engine gives the same commands on every machine. The rust job runs the
+    # replay (crates/kiln-ci/src/sched/replay.rs) on x86-64; this runs it on arm64, on whichever
+    # machine of that architecture has cargo, against the same committed digest. A launchd
+    # service's PATH has none of the usual tools in it.
+    runs-on: [baremetal]
+    requires: ["arch == aarch64", "tools has cargo"]
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - run: export PATH="$HOME/.cargo/bin:$PATH" && nice -n 10 cargo test --locked -p kiln-ci --lib sched::replay
+
   ui:
     name: ui typecheck + lint + build
     runs-on: [k8s]
