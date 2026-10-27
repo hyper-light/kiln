@@ -47,6 +47,11 @@ enum Cmd {
     },
     /// Shorthand for `supervise -- server`.
     Up,
+    /// Set kiln up here, with a guide: where it runs (this machine, unless you choose Docker,
+    /// Kubernetes or a kiln server to join), kiln's own code signature on a Mac (its upgrades need
+    /// it), HTTPS under a name of your own (the front door, for phones and your tailnet) and a
+    /// sign-in password. It says each step first; `--unattended` asks nothing.
+    Setup(kiln::setup::SetupArgs),
     /// Install (binary, config, start on boot) — server by default, `--agent` for an agent.
     Install(install::InstallArgs),
     /// Ask a kiln server on this network to take this machine as an agent (an admin approves it
@@ -460,8 +465,9 @@ fn main() -> ExitCode {
     }
     let cli = Cli::parse();
     // `kiln workflow run` runs a server of its own in this process: its logs are the runs', and
-    // the server says only what goes wrong unless asked for more.
-    let quiet = matches!(cli.cmd, Cmd::Workflow(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
+    // the server says only what goes wrong unless asked for more. `kiln setup` says what it does
+    // itself, the same way.
+    let quiet = matches!(cli.cmd, Cmd::Workflow(_) | Cmd::Setup(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
     init_tracing(if quiet { "warn" } else { &cli.log }, cli.json);
     install_panic_hook();
     // Everything runs on hyper-rt, hyper-raft's thread-per-core runtime, sized for the role.
@@ -681,6 +687,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             }
             boxed(|| supervise::run(supervise::Options { args: vec!["server".into()], state_dir: cfg.server.data_dir, exe: None })).await
         }
+        Cmd::Setup(a) => boxed(|| kiln::setup::cli(a)).await,
         Cmd::Install(a) => boxed(|| install::install(a)).await,
         Cmd::Uninstall { agent } => install::uninstall(agent),
         Cmd::Login { print, server } => {

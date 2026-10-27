@@ -43,6 +43,10 @@ both given to the tailnet (Tailscale asks them side by side).
 That's all. Devices take the tailnet's DNS settings by default ("Use Tailscale DNS settings"; on
 Linux `tailscale set --accept-dns=true`). Nothing else changes on them.
 
+`kiln setup` does this for the kiln on its own machine: where Tailscale runs there, it offers the
+tailnet with the front door, and takes the OAuth client's secret to keep the tailnet's DNS
+pointed there.
+
 For `kiln.dev` and other `.dev` names, browsers insist on a certificate they trust (the whole
 `.dev` domain is on the HSTS preload list: there is no "continue anyway"). With kiln's own
 certificate, trust kiln's root on the device once (see [front-door.md](front-door.md)); with your
